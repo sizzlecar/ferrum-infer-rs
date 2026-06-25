@@ -6,7 +6,9 @@
 //! and adapts it to the `ModelExecutor` trait that the scheduler calls.
 
 use ferrum_interfaces::{
-    model_executor::{KvSlotRequest, KvSlotReservation, LogitsReturnPolicy},
+    model_executor::{
+        KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy,
+    },
     RecurrentStateSpec,
 };
 use ferrum_types::{RequestId, Result, TokenId};
@@ -133,6 +135,11 @@ pub trait DecoderOnlyLLM: Send + Sync {
         _requests: &[KvSlotRequest],
     ) -> std::result::Result<Option<KvSlotReservation>, ferrum_types::FerrumError> {
         Ok(None)
+    }
+
+    /// Snapshot model-owned paged-KV capacity without allocating slots.
+    fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
+        None
     }
 
     /// Recurrent-state allocation spec for state-space or hybrid models.

@@ -19,8 +19,8 @@ use tracing::debug;
 use ferrum_interfaces::{
     model_executor::{
         AttentionType, DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus,
-        KvSlotRequest, KvSlotReservation, LogitsReturnPolicy, MemoryRequirements, PrefillInput,
-        PrefillOutput, UnifiedBatch,
+        KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy,
+        MemoryRequirements, PrefillInput, PrefillOutput, UnifiedBatch,
     },
     ModelExecutor, RecurrentStateSpec,
 };
@@ -281,6 +281,10 @@ impl ModelExecutor for LlmExecutor {
 
     fn reserve_kv_slots(&self, requests: &[KvSlotRequest]) -> Result<Option<KvSlotReservation>> {
         self.lock_model().reserve_kv_slots(requests)
+    }
+
+    fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
+        self.lock_model().kv_slot_capacity_snapshot()
     }
 
     fn recurrent_state_spec(

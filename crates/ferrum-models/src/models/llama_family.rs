@@ -22,7 +22,10 @@ use std::sync::atomic::AtomicU64;
 
 use ferrum_interfaces::{
     kv_dtype::{KvDtypeKind, KvFp16, KvInt8},
-    model_executor::{KvSlotAllocation, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy},
+    model_executor::{
+        KvSlotAllocation, KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation,
+        LogitsReturnPolicy,
+    },
 };
 use ferrum_kernels::backend::{
     Backend, BackendGraph, BackendInt8KvOps, BackendMoeFused, BackendPagedKv, BackendQuantGguf,
@@ -33,6 +36,7 @@ use ferrum_kernels::backend::{
 /// Graph cache key for the single-item decode path (`decode_internal`).
 /// Distinct from any `m_padded`-based key used by the batched path.
 pub(crate) const SINGLE_ITEM_GRAPH_KEY: u64 = 0;
+const LLAMA_PAGED_BLOCK_SIZE: usize = 16;
 
 /// Diag counters for the batched graph dispatcher (replay vs eager).
 pub(crate) static BATCHED_GRAPH_REPLAY_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -2067,14 +2071,12 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             B::supports_varlen_qkv(),
             self.cfg.sliding_window_pattern,
         );
-        const PAGED_BLOCK_SIZE: usize = 16;
-
         // Paged KV uses a vLLM-style global physical block pool. `kv_capacity`
         // defines the per-sequence logical table stride; `kv_max_blocks`
         // defines how many physical blocks the model allocates up front.
         // Sequences draw blocks on demand as their target length grows.
         let max_seqs = runtime_env.paged_max_seqs;
-        let max_blocks_per_seq = max.div_ceil(PAGED_BLOCK_SIZE);
+        let max_blocks_per_seq = max.div_ceil(LLAMA_PAGED_BLOCK_SIZE);
         let total_pool_blocks = runtime_env.paged_total_blocks(max_blocks_per_seq);
 
         // Lazy-allocate the shared paged pools on the FIRST paged
@@ -2084,7 +2086,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         if paged && self.paged_pools.is_none() {
             let mut pools = Vec::with_capacity(self.local_layer_count());
             for _ in self.local_layer_indices() {
-                let pool_floats = total_pool_blocks * nkv * PAGED_BLOCK_SIZE * hd;
+                let pool_floats = total_pool_blocks * nkv * LLAMA_PAGED_BLOCK_SIZE * hd;
                 pools.push((B::alloc(pool_floats), B::alloc(pool_floats)));
             }
             self.paged_pools = Some(pools);
@@ -2117,7 +2119,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
             (0..local_layer_count)
                 .map(|_| {
                     if paged {
-                        K::alloc_paged(max_blocks_per_seq, PAGED_BLOCK_SIZE, nkv, hd)
+                        K::alloc_paged(max_blocks_per_seq, LLAMA_PAGED_BLOCK_SIZE, nkv, hd)
                     } else {
                         K::alloc_contig(contig_initial_capacity, nkv, hd)
                     }
@@ -4907,6 +4909,16 @@ impl<B: MoeLlmBackend> DecoderOnlyLLM for LlamaFamilyModel<B, KvFp16> {
         self.reserve_paged_kv_slots(requests)
     }
 
+    fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
+        let alloc = self.paged_block_alloc.as_ref()?;
+        let alloc = alloc.lock().unwrap_or_else(|p| p.into_inner());
+        Some(KvSlotCapacitySnapshot {
+            block_size: LLAMA_PAGED_BLOCK_SIZE,
+            total_blocks: alloc.capacity() as usize,
+            free_blocks: alloc.free_count(),
+        })
+    }
+
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
         self.prefill_internal(cache_id, tokens)
     }
@@ -5127,6 +5139,16 @@ impl<B: MoeLlmBackend + BackendInt8KvOps> DecoderOnlyLLM for LlamaFamilyModel<B,
         requests: &[KvSlotRequest],
     ) -> std::result::Result<Option<KvSlotReservation>, ferrum_types::FerrumError> {
         self.reserve_paged_kv_slots(requests)
+    }
+
+    fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
+        let alloc = self.paged_block_alloc.as_ref()?;
+        let alloc = alloc.lock().unwrap_or_else(|p| p.into_inner());
+        Some(KvSlotCapacitySnapshot {
+            block_size: LLAMA_PAGED_BLOCK_SIZE,
+            total_blocks: alloc.capacity() as usize,
+            free_blocks: alloc.free_count(),
+        })
     }
 
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {

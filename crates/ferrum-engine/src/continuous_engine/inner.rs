@@ -11,6 +11,45 @@ pub(super) fn is_resource_exhausted_error(error: &FerrumError) -> bool {
     matches!(error, FerrumError::ResourceExhausted { .. })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PagedKvAdmissionPressure {
+    pub(super) admission_blocks: usize,
+    pub(super) immediate_blocks: usize,
+    pub(super) free_blocks: usize,
+}
+
+pub(super) fn paged_kv_admission_pressure(error: &FerrumError) -> Option<PagedKvAdmissionPressure> {
+    let FerrumError::ResourceExhausted { message } = error else {
+        return None;
+    };
+    let (_, after_need) = message.split_once("paged KV admission: need ")?;
+    let (admission_blocks, rest) = parse_usize_prefix(after_need)?;
+    let rest = rest.strip_prefix(" admission blocks (")?;
+    let (immediate_blocks, rest) = parse_usize_prefix(rest)?;
+    let rest = rest.strip_prefix(" immediate) but only ")?;
+    let (free_blocks, rest) = parse_usize_prefix(rest)?;
+    if rest != " free" {
+        return None;
+    }
+    Some(PagedKvAdmissionPressure {
+        admission_blocks,
+        immediate_blocks,
+        free_blocks,
+    })
+}
+
+fn parse_usize_prefix(input: &str) -> Option<(usize, &str)> {
+    let end = input
+        .char_indices()
+        .find_map(|(index, ch)| (!ch.is_ascii_digit()).then_some(index))
+        .unwrap_or(input.len());
+    if end == 0 {
+        return None;
+    }
+    let value = input[..end].parse().ok()?;
+    Some((value, &input[end..]))
+}
+
 pub(super) fn kv_slot_requests_for_unified_batch(
     batch: &ferrum_interfaces::model_executor::UnifiedBatch,
 ) -> Vec<KvSlotRequest> {
@@ -87,6 +126,50 @@ fn scheduler_trace_distribution(mut values: Vec<usize>) -> SchedulerTraceDistrib
         min: values.first().copied(),
         p50: values.get(values.len() / 2).copied(),
         max: values.last().copied(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paged_kv_admission_pressure_parses_qwen35_resource_error() {
+        let error = FerrumError::resource_exhausted(
+            "Qwen3.5 paged KV admission: need 24 admission blocks (4 immediate) but only 3 free",
+        );
+
+        assert_eq!(
+            paged_kv_admission_pressure(&error),
+            Some(PagedKvAdmissionPressure {
+                admission_blocks: 24,
+                immediate_blocks: 4,
+                free_blocks: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn paged_kv_admission_pressure_parses_generic_llama_resource_error() {
+        let error = FerrumError::resource_exhausted(
+            "paged KV admission: need 1 admission blocks (1 immediate) but only 0 free",
+        );
+
+        assert_eq!(
+            paged_kv_admission_pressure(&error),
+            Some(PagedKvAdmissionPressure {
+                admission_blocks: 1,
+                immediate_blocks: 1,
+                free_blocks: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn paged_kv_admission_pressure_ignores_unrelated_resource_errors() {
+        let error = FerrumError::resource_exhausted("synthetic unified reserve failure");
+
+        assert_eq!(paged_kv_admission_pressure(&error), None);
     }
 }
 
