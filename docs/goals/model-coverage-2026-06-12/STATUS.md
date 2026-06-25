@@ -2,6 +2,73 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ161 — 9fda1101 c32 diagnostic KEEP: mixed prefill admission improves capacity pressure
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_prefill_immediate_kv_c32_9fda1101_20260625T034421Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_9fda1101_1782359039/`.
+- Diagnostic PASS/KEEP line:
+  - `FERRUM W3 QWEN35 C32 DIAG KEEP: /workspace/artifacts/w3_qwen35_mixed_prefill_immediate_kv_c32_9fda1101_20260625T034421Z`.
+- Vast lifecycle:
+  - reused retained instance `42216671`, exact `1x RTX 4090`;
+  - no new instance was created;
+  - artifact and orchestrator metadata were copied back before stop;
+  - final stop verification reported `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`;
+  - no paid GPU remains running.
+- Git/build evidence:
+  - remote Git SHA:
+    `9fda11014c17483b0ceca479e3704b3767db0cbe`;
+  - remote git status short was empty;
+  - binary SHA256:
+    `83241b4b80e08d836cdec785165f864a79c20ad9c94f95345d77d2c4213aecc1`;
+  - no live vLLM was run;
+  - remote `cargo check` PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `ferrum run` smoke PASS;
+  - `ferrum serve` `/v1/models` and chat smoke PASS.
+- c32 diagnostic bench:
+  - command shape: `bench-serve`, sharegpt dataset, `--concurrency 32`,
+    `--num-prompts 32`, `--warmup-requests 4`, `--n-repeats 1`,
+    `--fail-on-error`, `--seed 9271`, `--ignore-eos`, `--timeout 600`;
+  - bench exit `0`;
+  - diagnostic verdict `keep`;
+  - `completed_per_run=[32]`, `errored_per_run=[0]`;
+  - `output_token_count_source=usage`;
+  - output throughput `488.596 tok/s`;
+  - total throughput `927.569 tok/s`;
+  - request throughput `3.817 req/s`;
+  - p95 TTFT `1957.994 ms`;
+  - p95 TPOT `50.578 ms`;
+  - p95 ITL `46.980 ms`;
+  - p95 E2E `8381.266 ms`.
+- Scheduler/log evidence:
+  - `Unified KV admission failed=8`, down from ZZZ153's `13`;
+  - final `capacity_deferred_total=16`, down from ZZZ153's `32`;
+  - final `admitted_total=53`, down from ZZZ153's `69`;
+  - `cancelled_total=0`;
+  - `failed_total=0`;
+  - `cancelled during decode=0`;
+  - `preempting request=0`;
+  - `OOM/out-of-memory/panic/block_pool_exhausted=0`.
+- Decision:
+  - keep `9fda1101 fix(engine): narrow mixed prefill kv admission` as a
+    positive c32 diagnostic source change;
+  - this validates the source diagnosis that mixed non-final prefill chunks
+    should reserve immediate KV only, instead of forcing future full-context
+    admission while active decodes are present.
+- Limits:
+  - this is still diagnostic only: c32, `n_repeats=1`, not `--require-ci`, and
+    not the full c=1/4/16/32 release matrix;
+  - output throughput `488.596 tok/s` remains far below the W3 80% vLLM c32
+    target (`1366.822 tok/s` from the accepted historical baseline);
+  - this is not W3 completion, final performance evidence, or release
+    readiness;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ160 — local Vast orchestrator prepared for 9fda1101 c32 diagnostic
 
 - Context:
