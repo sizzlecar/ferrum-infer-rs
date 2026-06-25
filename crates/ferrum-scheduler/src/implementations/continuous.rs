@@ -663,15 +663,26 @@ impl ContinuousBatchScheduler {
     ) {
         let mixed_epoch = self.capacity_mixed_recompute_epoch.load(Ordering::Relaxed);
         let blocked_until = mixed_epoch.saturating_add(1);
+        let mut required_blocks_per_slot_for_feedback = None;
         if let Some(required) = required_admission_blocks.filter(|required| *required > 0) {
             let width = attempted_prefill_width.unwrap_or(1).max(1);
             let required_blocks_per_slot = required.div_ceil(width).max(1);
+            required_blocks_per_slot_for_feedback = Some(required_blocks_per_slot);
             self.capacity_mixed_recompute_required_blocks_per_slot
                 .store(required_blocks_per_slot, Ordering::Relaxed);
         }
         if let Some(observed) = observed_free_blocks {
             self.capacity_mixed_recompute_observed_free_blocks
                 .store(observed, Ordering::Relaxed);
+            if let Some(required_blocks_per_slot) = required_blocks_per_slot_for_feedback {
+                let usable_free_blocks = Self::capacity_mixed_recompute_usable_free_blocks(
+                    observed,
+                    required_blocks_per_slot,
+                );
+                if usable_free_blocks >= required_blocks_per_slot {
+                    self.record_capacity_recompute_progress();
+                }
+            }
         }
         let _ = self
             .capacity_mixed_recompute_blocked_until_epoch
@@ -708,7 +719,6 @@ impl ContinuousBatchScheduler {
                 .capacity_release_epoch
                 .load(Ordering::Relaxed)
                 .saturating_add(1);
-            req.capacity_deferred_from_decode = false;
             if !self.decode_queue.read().is_empty() {
                 req.capacity_deferred_mixed_attempt_epoch =
                     Some(self.capacity_mixed_recompute_epoch.load(Ordering::Relaxed));
@@ -2720,6 +2730,73 @@ mod tests {
         assert!(
             after_enough_ids.contains(&first_ids[0]) || after_enough_ids.contains(&first_ids[1]),
             "mixed recompute should reopen once the model-owned KV snapshot reaches the failed admission need"
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_deferred_mixed_recompute_reopens_from_capacity_feedback_when_fit() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 8,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 8,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        for _ in 0..8 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_ids: Vec<_> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for request_id in &first_ids {
+            scheduler.mark_prefill_complete(request_id, 128);
+        }
+
+        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[0], 4));
+
+        let first_mixed = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_mixed_ids: HashSet<RequestId> = first_mixed
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        assert!(first_mixed_ids.contains(&first_ids[0]));
+
+        scheduler.defer_capacity_deferred_mixed_recompute_until_kv_capacity(
+            Some(4),
+            Some(0),
+            Some(1),
+        );
+        assert!(scheduler.defer_prefill_to_waiting(&first_ids[0]));
+
+        scheduler.defer_capacity_deferred_mixed_recompute_until_kv_capacity(
+            Some(4),
+            Some(5),
+            Some(1),
+        );
+
+        let reopened = scheduler.create_iteration_batch(hint).unwrap();
+        let reopened_ids: HashSet<RequestId> = reopened
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        assert!(
+            reopened_ids.contains(&first_ids[0]),
+            "structured capacity feedback with enough free blocks should reopen a narrower recompute without waiting for a separate snapshot call"
         );
     }
 
