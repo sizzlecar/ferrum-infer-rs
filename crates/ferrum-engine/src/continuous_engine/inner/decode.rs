@@ -31,6 +31,11 @@ impl EngineInner {
             match self.run_batch_decode(&chunk).await {
                 Ok(()) => {}
                 Err(e) if is_resource_exhausted_error(&e) && chunk.len() > 1 => {
+                    let pressure = paged_kv_admission_pressure(&e);
+                    self.scheduler.record_decode_capacity_pressure(
+                        chunk.len(),
+                        pressure.map(|pressure| pressure.free_blocks),
+                    );
                     let mid = chunk.len() / 2;
                     stack.push((chunk[mid..].to_vec(), pressure_width));
                     stack.push((chunk[..mid].to_vec(), pressure_width));
@@ -51,7 +56,11 @@ impl EngineInner {
                         }
                         for rid in &chunk {
                             if !self
-                                .defer_decode_for_capacity_recompute(rid, pressure_width)
+                                .defer_decode_for_capacity_recompute(
+                                    rid,
+                                    pressure_width,
+                                    pressure.map(|pressure| pressure.free_blocks),
+                                )
                                 .await
                             {
                                 warn!(

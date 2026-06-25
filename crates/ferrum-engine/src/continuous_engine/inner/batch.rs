@@ -467,6 +467,10 @@ impl EngineInner {
                 let pressure = paged_kv_admission_pressure(&e);
                 if !decode_meta.is_empty() && prefill_meta.is_empty() {
                     if let Some(pressure) = pressure {
+                        self.scheduler.record_decode_capacity_pressure(
+                            decode_meta.len(),
+                            Some(pressure.free_blocks),
+                        );
                         self.scheduler
                             .defer_capacity_deferred_mixed_recompute_until_kv_capacity(
                                 Some(pressure.admission_blocks),
@@ -950,6 +954,7 @@ impl EngineInner {
         &self,
         request_id: &RequestId,
         attempted_decode_width: usize,
+        observed_free_blocks: Option<usize>,
     ) -> bool {
         let (found, had_kv_cache, draft_kv_request_id, had_recurrent_state, model_cache_id) = {
             let mut sequences = self.sequences.write();
@@ -999,7 +1004,11 @@ impl EngineInner {
 
         let moved = self
             .scheduler
-            .defer_decode_to_waiting_for_capacity(request_id, attempted_decode_width);
+            .defer_decode_to_waiting_for_capacity_with_pressure(
+                request_id,
+                attempted_decode_width,
+                observed_free_blocks,
+            );
         if moved {
             info!(
                 "Capacity-deferred decode request {} for KV recompute after failed width {}",
