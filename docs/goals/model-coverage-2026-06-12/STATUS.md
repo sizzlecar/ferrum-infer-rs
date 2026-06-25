@@ -2,6 +2,43 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ175 — c32 diagnostic runner targets prefill progress reset source fix
+
+- Context:
+  - follows source fix `95e432bd` without starting a GPU;
+  - this only prepares a later bounded c32 diagnostic target and records the
+    expected evidence before any paid run.
+- Runner update:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now defaults to target
+    SHA `95e432bd177aad697b28a3cf07f54ba95160f756`;
+  - default artifact tag is `prefill_progress_reset`;
+  - plan lane is `W3 Qwen35 c32 prefill-progress-reset diagnostic`;
+  - strict diagnostic thresholds remain unchanged: throughput floor `600.0`,
+    max `Unified KV admission failed=13`, max `capacity_deferred_total=32`,
+    min mixed iterations `64`, max p95 ITL `25.0 ms`.
+- Local validation:
+  - `python3 -m py_compile scripts/release/w3_qwen35_vast_c32_diagnostic.py`
+    PASS;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --self-test`
+    PASS line:
+    `W3 QWEN35 VAST C32 DIAGNOSTIC ORCHESTRATOR SELFTEST PASS`;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --plan-only`
+    PASS, printed target SHA
+    `95e432bd177aad697b28a3cf07f54ba95160f756`, and did not touch Vast;
+  - `git diff --check` PASS.
+- Next paid-run rule:
+  - before any GPU start, restate the paid lane contract, query Vast inventory,
+    confirm only the intended retained 1x4090 instance is used, and stop after
+    KEEP/REJECT/failure;
+  - expected trace signal: no stale scheduler prefill progress after capacity
+    defer; `ferrum run` and `ferrum serve` smokes must still pass before the
+    c32 bench.
+- Limits:
+  - no CUDA build, GPU diagnostic, performance bench, live vLLM run, or final
+    W3 validator ran here;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ174 — source fix: prefill capacity defer resets scheduler chunk progress
 
 - Context:
