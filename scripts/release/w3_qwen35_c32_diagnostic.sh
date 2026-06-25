@@ -14,6 +14,8 @@ Options:
   --throughput-floor <tok/s>          Required output throughput floor.
   --max-kv-admission-failed <n>       Max allowed "Unified KV admission failed" count.
   --max-capacity-deferred <n>         Max allowed final capacity_deferred_total.
+  --min-mixed-iterations <n>          Min scheduler iterations with prefill+decode work.
+  --max-p95-itl-ms <ms>               Max allowed p95 inter-token latency; empty disables.
   --port <port>                       Local serve port.
   --repo <path>                       Remote repo path.
   --artifact-root <path>              Remote artifact root.
@@ -26,7 +28,7 @@ EOF
 }
 
 write_diagnostic_summary() {
-  python3 - "$1" "$2" "$3" "$4" "$5" <<'PY_SUMMARY'
+  python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PY_SUMMARY'
 import gzip
 import json
 import pathlib
@@ -38,6 +40,8 @@ sha = sys.argv[2]
 throughput_floor = float(sys.argv[3])
 max_kv_admission_failed = int(sys.argv[4])
 max_capacity_deferred = int(sys.argv[5])
+min_mixed_iterations = int(sys.argv[6])
+max_p95_itl_ms = None if sys.argv[7] == "" else float(sys.argv[7])
 summary = {
     "artifact": str(art),
     "sha": sha,
@@ -47,6 +51,8 @@ summary = {
         "output_throughput_floor_tps": throughput_floor,
         "max_kv_admission_failed": max_kv_admission_failed,
         "max_capacity_deferred_total": max_capacity_deferred,
+        "min_mixed_iterations": min_mixed_iterations,
+        "max_p95_itl_ms": max_p95_itl_ms,
         "required_completed": 32,
         "required_errors": 0,
     },
@@ -69,6 +75,19 @@ def mean_metric(name):
             return float(mean)
     return None
 
+def mean_percentile_metric(name, percentile):
+    value = bench.get(name)
+    if not isinstance(value, dict):
+        return None
+    point = value.get(percentile)
+    if isinstance(point, dict):
+        mean = point.get("mean")
+        if isinstance(mean, (int, float)):
+            return float(mean)
+    if isinstance(point, (int, float)):
+        return float(point)
+    return None
+
 summary["bench"] = {
     "concurrency": bench.get("concurrency"),
     "n_requests_per_run": bench.get("n_requests_per_run"),
@@ -81,6 +100,9 @@ summary["bench"] = {
     "output_throughput_tps": mean_metric("output_throughput_tps"),
     "total_throughput_tps": mean_metric("total_throughput_tps"),
     "request_throughput_rps": mean_metric("request_throughput_rps"),
+    "p95_ttft_ms": mean_percentile_metric("ttft_ms", "p95"),
+    "p95_tpot_ms": mean_percentile_metric("tpot_ms", "p95"),
+    "p95_itl_ms": mean_percentile_metric("itl_ms", "p95"),
 }
 
 trace = art / "server/scheduler_trace.jsonl"
@@ -91,13 +113,57 @@ elif (art / "server/scheduler_trace.jsonl.gz").exists():
 else:
     lines = []
 
+trace_stats = {
+    "some_ok_iterations": 0,
+    "prefill_only_iterations": 0,
+    "decode_only_iterations": 0,
+    "mixed_iterations": 0,
+    "scheduled_decode_tokens": 0,
+    "scheduled_prefill_tokens": 0,
+    "max_active_len": 0,
+    "max_capacity_deferred_total": 0,
+    "avg_process_us": None,
+    "avg_decode_items": None,
+}
+process_us_total = 0
+decode_items_total = 0
 last = None
-for line in lines[-2000:]:
+for line in lines:
     if line.startswith("{"):
         try:
-            last = json.loads(line)
+            row = json.loads(line)
         except Exception:
-            pass
+            continue
+        last = row
+        if row.get("event") != "scheduler_iteration" or row.get("result") != "some_ok":
+            continue
+        plan = row.get("plan") if isinstance(row.get("plan"), dict) else {}
+        before = row.get("scheduler_before") if isinstance(row.get("scheduler_before"), dict) else {}
+        timing = row.get("timing_us") if isinstance(row.get("timing_us"), dict) else {}
+        prefill_items = int(plan.get("prefill_items") or 0)
+        decode_items = int(plan.get("decode_items") or 0)
+        prefill_tokens = int(plan.get("prefill_tokens") or 0)
+        decode_tokens = int(plan.get("decode_tokens") or 0)
+        trace_stats["some_ok_iterations"] += 1
+        if prefill_items > 0 and decode_items > 0:
+            trace_stats["mixed_iterations"] += 1
+        elif prefill_items > 0:
+            trace_stats["prefill_only_iterations"] += 1
+        elif decode_items > 0:
+            trace_stats["decode_only_iterations"] += 1
+        trace_stats["scheduled_decode_tokens"] += decode_tokens
+        trace_stats["scheduled_prefill_tokens"] += prefill_tokens
+        trace_stats["max_active_len"] = max(trace_stats["max_active_len"], int(before.get("active_len") or 0))
+        trace_stats["max_capacity_deferred_total"] = max(
+            trace_stats["max_capacity_deferred_total"],
+            int(before.get("capacity_deferred_total") or 0),
+        )
+        process_us_total += int(timing.get("process") or 0)
+        decode_items_total += decode_items
+if trace_stats["some_ok_iterations"]:
+    trace_stats["avg_process_us"] = process_us_total / trace_stats["some_ok_iterations"]
+    trace_stats["avg_decode_items"] = decode_items_total / trace_stats["some_ok_iterations"]
+summary["trace_stats"] = trace_stats
 if last:
     summary["last_iteration"] = last.get("iteration")
     for section in ("scheduler_before", "scheduler_after_schedule", "scheduler_after_process"):
@@ -143,7 +209,9 @@ errored = summary["bench"].get("errored_per_run") or []
 http_500 = summary["bench"].get("http_500_per_run") or []
 panic = summary["bench"].get("panic_per_run") or []
 throughput = summary["bench"].get("output_throughput_tps")
+p95_itl_ms = summary["bench"].get("p95_itl_ms")
 kv_failed = summary["log_counts"]["unified_kv_admission_failed"]
+mixed_iterations = summary["trace_stats"]["mixed_iterations"]
 
 failures = []
 if summary["bench_exit"] != "0":
@@ -158,6 +226,10 @@ if panic and panic != [0]:
     failures.append(f"panic_per_run={panic}")
 if throughput is None or throughput <= throughput_floor:
     failures.append(f"output_throughput_tps={throughput} <= floor={throughput_floor}")
+if mixed_iterations < min_mixed_iterations:
+    failures.append(f"mixed_iterations={mixed_iterations} < {min_mixed_iterations}")
+if max_p95_itl_ms is not None and (p95_itl_ms is None or p95_itl_ms > max_p95_itl_ms):
+    failures.append(f"p95_itl_ms={p95_itl_ms} > {max_p95_itl_ms}")
 if kv_failed > max_kv_admission_failed:
     failures.append(f"unified_kv_admission_failed={kv_failed} > {max_kv_admission_failed}")
 if capacity_deferred is None:
@@ -187,14 +259,20 @@ run_self_test() {
     local bench_exit="$5"
     local completed="$6"
     local errored="$7"
+    local mixed_iterations="$8"
+    local p95_itl_ms="$9"
     local art="$tmp/$name"
     mkdir -p "$art/perf" "$art/server"
     printf '%s\n' "$bench_exit" > "$art/perf/bench.exit"
-    python3 - "$art/perf/bench_ferrum_c32_32x1.json" "$throughput" "$completed" "$errored" <<'PY_CASE_BENCH'
+    python3 - "$art/perf/bench_ferrum_c32_32x1.json" "$throughput" "$completed" "$errored" "$p95_itl_ms" <<'PY_CASE_BENCH'
 import json
 import sys
 
-path, throughput, completed, errored = sys.argv[1], float(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+path = sys.argv[1]
+throughput = float(sys.argv[2])
+completed = int(sys.argv[3])
+errored = int(sys.argv[4])
+p95_itl_ms = float(sys.argv[5])
 json.dump(
     {
         "concurrency": 32,
@@ -208,31 +286,51 @@ json.dump(
         "output_throughput_tps": {"mean": throughput},
         "total_throughput_tps": {"mean": throughput * 2},
         "request_throughput_rps": {"mean": 3.5},
+        "itl_ms": {"p95": {"mean": p95_itl_ms}},
     },
     open(path, "w"),
 )
 PY_CASE_BENCH
-    python3 - "$art/server/scheduler_trace.jsonl" "$capacity_deferred" <<'PY_CASE_TRACE'
+    python3 - "$art/server/scheduler_trace.jsonl" "$capacity_deferred" "$mixed_iterations" <<'PY_CASE_TRACE'
 import json
 import sys
 
-path, capacity = sys.argv[1], int(sys.argv[2])
-row = {
-    "iteration": 1,
-    "scheduler_after_process": {
-        "waiting_queue_len": 0,
-        "prefill_queue_len": 0,
-        "decode_queue_len": 0,
-        "active_len": 0,
-        "completed_total": 32,
-        "failed_total": 0,
-        "cancelled_total": 0,
-        "admitted_total": 64,
-        "capacity_deferred_total": capacity,
-        "capacity_blocked_waiting_len": 0,
-    },
-}
-open(path, "w").write(json.dumps(row) + "\n")
+path = sys.argv[1]
+capacity = int(sys.argv[2])
+mixed = int(sys.argv[3])
+rows = []
+for iteration in range(max(mixed, 1)):
+    plan = (
+        {"prefill_items": 1, "decode_items": 1, "prefill_tokens": 6, "decode_tokens": 1}
+        if iteration < mixed
+        else {"prefill_items": 0, "decode_items": 1, "prefill_tokens": 0, "decode_tokens": 1}
+    )
+    rows.append(
+        {
+            "event": "scheduler_iteration",
+            "iteration": iteration,
+            "result": "some_ok",
+            "plan": plan,
+            "scheduler_before": {
+                "active_len": 32,
+                "capacity_deferred_total": capacity,
+            },
+            "scheduler_after_process": {
+                "waiting_queue_len": 0,
+                "prefill_queue_len": 0,
+                "decode_queue_len": 0,
+                "active_len": 0,
+                "completed_total": 32,
+                "failed_total": 0,
+                "cancelled_total": 0,
+                "admitted_total": 64,
+                "capacity_deferred_total": capacity,
+                "capacity_blocked_waiting_len": 0,
+            },
+            "timing_us": {"process": 10000},
+        }
+    )
+open(path, "w").write("".join(json.dumps(row) + "\n" for row in rows))
 PY_CASE_TRACE
     python3 - "$art/server/serve.log" "$kv_failed" <<'PY_CASE_LOG'
 import sys
@@ -240,14 +338,16 @@ import sys
 path, count = sys.argv[1], int(sys.argv[2])
 open(path, "w").write("Unified KV admission failed\n" * count)
 PY_CASE_LOG
-    write_diagnostic_summary "$art" "selftest" "458.0662677685816" "13" "32"
+    write_diagnostic_summary "$art" "selftest" "600" "13" "32" "64" "25"
   }
 
-  make_case keep 459 13 32 0 32 0
-  make_case reject_throughput 458.0662677685816 13 32 0 32 0
-  make_case reject_kv 459 14 32 0 32 0
-  make_case reject_capacity 459 13 33 0 32 0
-  make_case reject_errors 459 13 32 0 31 1
+  make_case keep 601 13 32 0 32 0 64 25
+  make_case reject_throughput 600 13 32 0 32 0 64 25
+  make_case reject_kv 601 14 32 0 32 0 64 25
+  make_case reject_capacity 601 13 33 0 32 0 64 25
+  make_case reject_errors 601 13 32 0 31 1 64 25
+  make_case reject_mixed 601 13 32 0 32 0 63 25
+  make_case reject_itl 601 13 32 0 32 0 64 25.1
 
   python3 - "$tmp" <<'PY_ASSERT_SELFTEST'
 import json
@@ -261,6 +361,8 @@ expected = {
     "reject_kv": "reject",
     "reject_capacity": "reject",
     "reject_errors": "reject",
+    "reject_mixed": "reject",
+    "reject_itl": "reject",
 }
 for name, verdict in expected.items():
     data = json.load(open(root / name / "perf" / "diagnostic_verdict.json"))
@@ -275,6 +377,8 @@ TAG="${FERRUM_W3_TAG:-mixed_prefill_immediate_kv}"
 THROUGHPUT_FLOOR="${FERRUM_W3_THROUGHPUT_FLOOR:-458.0662677685816}"
 MAX_KV_ADMISSION_FAILED="${FERRUM_W3_MAX_KV_ADMISSION_FAILED:-13}"
 MAX_CAPACITY_DEFERRED="${FERRUM_W3_MAX_CAPACITY_DEFERRED:-32}"
+MIN_MIXED_ITERATIONS="${FERRUM_W3_MIN_MIXED_ITERATIONS:-0}"
+MAX_P95_ITL_MS="${FERRUM_W3_MAX_P95_ITL_MS:-}"
 PORT="${FERRUM_W3_PORT:-55994}"
 BRANCH="${FERRUM_W3_BRANCH:-goal/w2-w3-release-grade}"
 REPO_URL="${FERRUM_W3_REPO_URL:-https://github.com/sizzlecar/ferrum-infer-rs.git}"
@@ -304,6 +408,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --max-capacity-deferred)
       MAX_CAPACITY_DEFERRED="$2"
+      shift 2
+      ;;
+    --min-mixed-iterations)
+      MIN_MIXED_ITERATIONS="$2"
+      shift 2
+      ;;
+    --max-p95-itl-ms)
+      MAX_P95_ITL_MS="$2"
       shift 2
       ;;
     --port)
@@ -607,7 +719,8 @@ set -e
 echo "$bench_rc" > "$ART/perf/bench.exit"
 
 write_diagnostic_summary \
-  "$ART" "$SHA" "$THROUGHPUT_FLOOR" "$MAX_KV_ADMISSION_FAILED" "$MAX_CAPACITY_DEFERRED"
+  "$ART" "$SHA" "$THROUGHPUT_FLOOR" "$MAX_KV_ADMISSION_FAILED" "$MAX_CAPACITY_DEFERRED" \
+  "$MIN_MIXED_ITERATIONS" "$MAX_P95_ITL_MS"
 
 verdict="$(python3 - <<'PY_VERDICT' "$ART/perf/diagnostic_verdict.json"
 import json, sys

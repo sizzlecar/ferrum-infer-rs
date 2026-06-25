@@ -28,9 +28,11 @@ from typing import Any
 DEFAULT_INSTANCE_ID = 42216671
 DEFAULT_SHA = "9fda11014c17483b0ceca479e3704b3767db0cbe"
 DEFAULT_TAG = "mixed_prefill_immediate_kv"
-DEFAULT_THROUGHPUT_FLOOR = "458.0662677685816"
+DEFAULT_THROUGHPUT_FLOOR = "600.0"
 DEFAULT_MAX_KV_ADMISSION_FAILED = "13"
 DEFAULT_MAX_CAPACITY_DEFERRED = "32"
+DEFAULT_MIN_MIXED_ITERATIONS = "64"
+DEFAULT_MAX_P95_ITL_MS = "25.0"
 DEFAULT_REMOTE_SCRIPT = "/workspace/w3_qwen35_c32_diagnostic.sh"
 DEFAULT_REMOTE_META_ROOT = "/workspace/artifacts"
 DEFAULT_LOCAL_OUT = (
@@ -243,6 +245,10 @@ def make_remote_wrapper(args: argparse.Namespace, remote_script: str, remote_met
         args.max_kv_admission_failed,
         "--max-capacity-deferred",
         args.max_capacity_deferred,
+        "--min-mixed-iterations",
+        args.min_mixed_iterations,
+        "--max-p95-itl-ms",
+        args.max_p95_itl_ms,
     ]
     return "\n".join(
         [
@@ -283,6 +289,8 @@ def run_self_test() -> None:
             throughput_floor=DEFAULT_THROUGHPUT_FLOOR,
             max_kv_admission_failed=DEFAULT_MAX_KV_ADMISSION_FAILED,
             max_capacity_deferred=DEFAULT_MAX_CAPACITY_DEFERRED,
+            min_mixed_iterations=DEFAULT_MIN_MIXED_ITERATIONS,
+            max_p95_itl_ms=DEFAULT_MAX_P95_ITL_MS,
         ),
         "/workspace/diag.sh",
         "/workspace/artifacts/meta",
@@ -300,6 +308,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--throughput-floor", default=DEFAULT_THROUGHPUT_FLOOR)
     parser.add_argument("--max-kv-admission-failed", default=DEFAULT_MAX_KV_ADMISSION_FAILED)
     parser.add_argument("--max-capacity-deferred", default=DEFAULT_MAX_CAPACITY_DEFERRED)
+    parser.add_argument("--min-mixed-iterations", default=DEFAULT_MIN_MIXED_ITERATIONS)
+    parser.add_argument("--max-p95-itl-ms", default=DEFAULT_MAX_P95_ITL_MS)
     parser.add_argument("--local-out", default=DEFAULT_LOCAL_OUT)
     parser.add_argument("--remote-script", default=DEFAULT_REMOTE_SCRIPT)
     parser.add_argument("--remote-meta-root", default=DEFAULT_REMOTE_META_ROOT)
@@ -342,6 +352,8 @@ def main() -> int:
             "output_throughput_floor_tps": args.throughput_floor,
             "max_kv_admission_failed": args.max_kv_admission_failed,
             "max_capacity_deferred": args.max_capacity_deferred,
+            "min_mixed_iterations": args.min_mixed_iterations,
+            "max_p95_itl_ms": args.max_p95_itl_ms,
         },
         "no_live_vllm": True,
         "stop_condition": "KEEP, REJECT, SSH/CUDA unavailable, timeout, or script failure",
