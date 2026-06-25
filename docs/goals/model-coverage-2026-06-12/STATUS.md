@@ -2,6 +2,83 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ176 — 95e432bd c32 diagnostic REJECT: reset improves throughput but mixed remains too low
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_progress_reset_c32_95e432bd_20260625T062339Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_95e432bd_1782368552/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    prefill-progress-reset diagnostic, expected 10-20 minutes, about
+    `$0.08-$0.16`, stop on KEEP/REJECT/SSH-CUDA failure/timeout/script failure;
+  - inventory before start showed only retained instance `42216671`,
+    `stopped/exited`, exact `1x RTX 4090`, cost `$0.47777777777777775/hr`;
+  - no new instance was created;
+  - artifact and orchestrator metadata were copied back;
+  - stop verification after the run showed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`;
+  - independent inventory after cleanup again showed only `42216671`,
+    `stopped/exited`; no unexpected paid/scheduling sibling instances remained.
+- Remote evidence:
+  - remote Git SHA:
+    `95e432bd177aad697b28a3cf07f54ba95160f756`;
+  - remote git status short was empty;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` `/v1/models` and chat smoke passed;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, and
+    `output_token_count_source=usage`;
+  - no live vLLM run.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - remote verdict line:
+    `FERRUM W3 QWEN35 C32 DIAG REJECT:
+    /workspace/artifacts/w3_qwen35_prefill_progress_reset_c32_95e432bd_20260625T062339Z`.
+- Reject reasons:
+  - output throughput `441.972 tok/s` <= floor `600.0`;
+  - `mixed_iterations=18` < `64`;
+  - p95 ITL `59.726 ms` > `25.0`;
+  - `Unified KV admission failed=14` > `13`;
+  - `capacity_deferred_total=35` > `32`.
+- Targeted signal:
+  - throughput improved from ZZZ173 `346.958 -> 441.972 tok/s`;
+  - `avg_process_us` improved from ZZZ173 `22801.4 -> 21796.3`;
+  - `completed_per_run=[32]`, `errored_per_run=[0]`, `cancelled_total=0`,
+    `failed_total=0`, and no panic/OOM/preemption mentions;
+  - this supports keeping the source fix as a correctness/state consistency
+    improvement even though the diagnostic rejected.
+- Regressions or remaining blockers:
+  - mixed iterations dropped further from ZZZ173 `41 -> 18`;
+  - `Unified KV admission failed` rose slightly from `10 -> 14`;
+  - `capacity_deferred_total` rose from `20 -> 35`;
+  - scheduler trace gzip validates, but the final JSONL line appears partial at
+    EOF; summary/verdict files are still present and bench exit was `0`;
+  - remaining warnings are larger dynamic block attempts such as
+    `need 22`, `11`, `19`, `9`, etc., plus one late
+    `need 183 admission blocks (16 immediate) but only 160 free`.
+- Classification:
+  - diagnostic rejected, not performance progress and not release evidence;
+  - source fix should not be reverted immediately because it corrected a real
+    scheduler/engine progress-state mismatch and improved throughput;
+  - the remaining blocker is now mixed-progress starvation under capacity
+    pressure, not the earlier same-request one-block retry storm.
+- Next source direction:
+  - do not start another paid GPU diagnostic from this result alone;
+  - inspect scheduler/engine capacity feedback for why, after physical progress
+    reset, capacity-blocked waiting recomputes mostly stay skipped while decode
+    continues;
+  - the next local source hypothesis should target dynamic capacity feedback or
+    blocked-waiting fairness, with a local scheduler test proving it does not
+    reintroduce same-epoch retry churn.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ175 — c32 diagnostic runner targets prefill progress reset source fix
 
 - Context:
