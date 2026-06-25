@@ -2,41 +2,6 @@
 
 进度日志,倒序。
 
-## 2026-06-25 ZZZ151 — source candidate: dynamic decode capacity backpressure
-
-- Context:
-  - `cb0cd027` removed the c32 decode livelock and produced a completed c32
-    diagnostic run, but output throughput stayed at `449.787 tok/s`;
-  - artifact comparison against the earlier `~633-636 tok/s` diagnostics shows
-    the remaining loss is repeated model-owned KV capacity pressure and
-    recompute, not a need for model-specific or GPU-specific hard caps.
-- Implementation:
-  - added scheduler-side `decode_backpressure_limit` to trace snapshots;
-  - when decode capacity pressure defers a request for recompute, the scheduler
-    now learns a temporary active-decode scheduling width from the attempted
-    decode batch size;
-  - subsequent iterations cap decode scheduling to that learned width instead
-    of immediately resubmitting the same full active decode cohort;
-  - the limit clears only after the current decode queue drains, so one
-    successful completion inside the same capacity-pressured cohort does not
-    prematurely widen the batch again.
-- Validation:
-  - `cargo fmt --all` PASS;
-  - `cargo test -p ferrum-scheduler decode_capacity_backpressure -- --nocapture`
-    PASS (`2/2`);
-  - `cargo test -p ferrum-scheduler` PASS (`68/68`);
-  - `cargo test -p ferrum-engine --lib continuous_engine::tests -- --nocapture`
-    PASS (`56/56`);
-  - `cargo fmt --all -- --check` PASS;
-  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS.
-- Limits:
-  - no GPU diagnostic has been run for this source candidate yet;
-  - no live vLLM was run;
-  - this is not W3 completion, final performance evidence, release readiness, or
-    a substitute for the final validator;
-  - current W3 still lacks final
-    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
-
 ## 2026-06-25 ZZZ150 — cb0cd027 c32 diagnostic PASS: decode recompute removes livelock
 
 - Artifact:

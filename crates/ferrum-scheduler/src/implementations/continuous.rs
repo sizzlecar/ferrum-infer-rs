@@ -151,7 +151,6 @@ pub struct ContinuousSchedulerTraceSnapshot {
     pub admitted_total: u64,
     pub capacity_deferred_total: u64,
     pub capacity_backpressure_admit_limit: Option<usize>,
-    pub decode_backpressure_limit: Option<usize>,
 }
 
 /// Continuous batching scheduler
@@ -189,7 +188,6 @@ pub struct ContinuousBatchScheduler {
     capacity_deferred_counter: AtomicU64,
     capacity_backpressure_limit: AtomicUsize,
     capacity_backpressure_iteration: AtomicU64,
-    decode_backpressure_limit: AtomicUsize,
     total_wait_time_us: AtomicU64,
 
     /// Start time
@@ -310,7 +308,6 @@ impl ContinuousBatchScheduler {
             capacity_deferred_counter: AtomicU64::new(0),
             capacity_backpressure_limit: AtomicUsize::new(NO_CAPACITY_BACKPRESSURE_LIMIT),
             capacity_backpressure_iteration: AtomicU64::new(u64::MAX),
-            decode_backpressure_limit: AtomicUsize::new(NO_CAPACITY_BACKPRESSURE_LIMIT),
             total_wait_time_us: AtomicU64::new(0),
             start_time: Instant::now(),
             metrics_tracker: Arc::new(ContinuousBatchMetrics::new()),
@@ -360,7 +357,6 @@ impl ContinuousBatchScheduler {
             admitted_total: self.admitted_counter.load(Ordering::Relaxed),
             capacity_deferred_total: self.capacity_deferred_counter.load(Ordering::Relaxed),
             capacity_backpressure_admit_limit: self.capacity_backpressure_admit_limit(),
-            decode_backpressure_limit: self.decode_backpressure_limit(),
         }
     }
 
@@ -410,50 +406,6 @@ impl ContinuousBatchScheduler {
         } else {
             Some(limit.max(1))
         }
-    }
-
-    fn decode_backpressure_limit(&self) -> Option<usize> {
-        let limit = self.decode_backpressure_limit.load(Ordering::Relaxed);
-        if limit == NO_CAPACITY_BACKPRESSURE_LIMIT {
-            None
-        } else {
-            Some(limit.max(1))
-        }
-    }
-
-    fn record_decode_capacity_defer_feedback(&self, attempted_decode_width: usize) {
-        let max_decode = self
-            .config
-            .max_running_requests
-            .min(self.cb_config.max_decode_batch)
-            .max(1);
-        let proposed = attempted_decode_width
-            .max(1)
-            .div_ceil(2)
-            .max(1)
-            .min(max_decode);
-        let _ = self.decode_backpressure_limit.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| {
-                let current = if current == NO_CAPACITY_BACKPRESSURE_LIMIT {
-                    max_decode
-                } else {
-                    current.max(1).min(max_decode)
-                };
-                let next = proposed.min(current).max(1);
-                if next >= max_decode {
-                    Some(NO_CAPACITY_BACKPRESSURE_LIMIT)
-                } else {
-                    Some(next)
-                }
-            },
-        );
-    }
-
-    fn clear_decode_capacity_backpressure(&self) {
-        self.decode_backpressure_limit
-            .store(NO_CAPACITY_BACKPRESSURE_LIMIT, Ordering::Relaxed);
     }
 
     fn record_capacity_defer_feedback(&self, attempted_prefill_width: usize) {
@@ -570,7 +522,6 @@ impl ContinuousBatchScheduler {
             request_index.insert(request_id.clone(), RequestPhase::Waiting);
             waiting_queue.push_back(req);
             self.record_capacity_defer_feedback(attempted_decode_width.max(1));
-            self.record_decode_capacity_defer_feedback(attempted_decode_width.max(1));
             debug!("Deferred decode request {} back to waiting", request_id);
             true
         } else {
@@ -853,13 +804,9 @@ impl ContinuousBatchScheduler {
         // reaches the requested target, reducing early mixed prefill+decode
         // spikes in c=32 closed-loop runs.
         if !skip_decode_for_prefill_first {
-            let decode_schedule_limit = self
-                .decode_backpressure_limit()
-                .map(|limit| limit.min(hint.max_batch_size))
-                .unwrap_or(hint.max_batch_size);
             let decode_queue = self.decode_queue.read();
             for (_, req) in decode_queue.iter() {
-                if batch_requests.len() >= decode_schedule_limit {
+                if batch_requests.len() >= hint.max_batch_size {
                     break;
                 }
 
@@ -1151,8 +1098,6 @@ impl Scheduler for ContinuousBatchScheduler {
         // Remove from decode queue
         let mut decode_queue = self.decode_queue.write();
         if let Some(req) = decode_queue.remove(&request_id) {
-            let decode_queue_empty = decode_queue.is_empty();
-            drop(decode_queue);
             // Record metrics
             self.metrics_tracker.record_completion(&req);
 
@@ -1175,9 +1120,6 @@ impl Scheduler for ContinuousBatchScheduler {
             // Remove from index
             self.request_index.write().remove(&request_id);
             self.record_resource_progress();
-            if decode_queue_empty {
-                self.clear_decode_capacity_backpressure();
-            }
 
             Ok(())
         } else {
@@ -1693,152 +1635,6 @@ mod tests {
         assert_eq!(after.prefill_queue_len, 2);
         assert_eq!(after.active_len, 2);
         assert_eq!(after.capacity_backpressure_admit_limit, Some(2));
-    }
-
-    #[test]
-    fn decode_capacity_backpressure_caps_active_decode_scheduling() {
-        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
-            max_running_requests: 4,
-            prompt_token_estimate: true,
-            ..SchedulerConfig::default()
-        });
-        let hint = BatchHint {
-            max_batch_size: 4,
-            max_tokens: 1024,
-            target_latency_ms: None,
-            available_memory: None,
-            resource_constraints: Default::default(),
-        };
-
-        for _ in 0..4 {
-            enqueue_waiting(
-                &scheduler,
-                create_test_request_with_prompt_tokens(Priority::Normal, 128),
-            );
-        }
-
-        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
-        let first_ids: Vec<_> = first_batch
-            .requests
-            .iter()
-            .map(|request| request.request.id.clone())
-            .collect();
-        for request_id in &first_ids {
-            scheduler.mark_prefill_complete(request_id, 128);
-        }
-
-        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[0], 4));
-        let deferred = scheduler.trace_snapshot();
-        assert_eq!(deferred.decode_queue_len, 3);
-        assert_eq!(deferred.decode_backpressure_limit, Some(2));
-
-        let next_batch = scheduler.create_iteration_batch(hint).unwrap();
-        let scheduled_ids: HashSet<RequestId> = next_batch
-            .requests
-            .iter()
-            .map(|request| request.request.id.clone())
-            .collect();
-        let scheduled_decodes = first_ids[1..]
-            .iter()
-            .filter(|request_id| scheduled_ids.contains(*request_id))
-            .count();
-        assert_eq!(
-            scheduled_decodes, 2,
-            "decode capacity pressure should schedule only the learned safe decode width"
-        );
-    }
-
-    #[tokio::test]
-    async fn decode_capacity_backpressure_clears_after_decode_queue_drains() {
-        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
-            max_running_requests: 4,
-            prompt_token_estimate: true,
-            ..SchedulerConfig::default()
-        });
-        let hint = BatchHint {
-            max_batch_size: 4,
-            max_tokens: 1024,
-            target_latency_ms: None,
-            available_memory: None,
-            resource_constraints: Default::default(),
-        };
-
-        for _ in 0..4 {
-            enqueue_waiting(
-                &scheduler,
-                create_test_request_with_prompt_tokens(Priority::Normal, 128),
-            );
-        }
-
-        let first_batch = scheduler.create_iteration_batch(hint).unwrap();
-        let first_ids: Vec<_> = first_batch
-            .requests
-            .iter()
-            .map(|request| request.request.id.clone())
-            .collect();
-        for request_id in &first_ids {
-            scheduler.mark_prefill_complete(request_id, 128);
-        }
-
-        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[0], 4));
-        assert_eq!(
-            scheduler.trace_snapshot().decode_backpressure_limit,
-            Some(2)
-        );
-
-        let response = InferenceResponse {
-            request_id: first_ids[1].clone(),
-            text: String::new(),
-            tokens: Vec::new(),
-            finish_reason: ferrum_types::FinishReason::Length,
-            usage: ferrum_types::TokenUsage::new(0, 0),
-            latency_ms: 0,
-            created_at: chrono::Utc::now(),
-            metadata: Default::default(),
-            api_response: None,
-        };
-        scheduler
-            .complete(first_ids[1].clone(), &response)
-            .await
-            .unwrap();
-        assert_eq!(
-            scheduler.trace_snapshot().decode_backpressure_limit,
-            Some(2),
-            "one completion should not widen the same capacity-pressured decode cohort"
-        );
-
-        let response = InferenceResponse {
-            request_id: first_ids[2].clone(),
-            text: String::new(),
-            tokens: Vec::new(),
-            finish_reason: ferrum_types::FinishReason::Length,
-            usage: ferrum_types::TokenUsage::new(0, 0),
-            latency_ms: 0,
-            created_at: chrono::Utc::now(),
-            metadata: Default::default(),
-            api_response: None,
-        };
-        scheduler
-            .complete(first_ids[2].clone(), &response)
-            .await
-            .unwrap();
-        let response = InferenceResponse {
-            request_id: first_ids[3].clone(),
-            text: String::new(),
-            tokens: Vec::new(),
-            finish_reason: ferrum_types::FinishReason::Length,
-            usage: ferrum_types::TokenUsage::new(0, 0),
-            latency_ms: 0,
-            created_at: chrono::Utc::now(),
-            metadata: Default::default(),
-            api_response: None,
-        };
-        scheduler
-            .complete(first_ids[3].clone(), &response)
-            .await
-            .unwrap();
-
-        assert_eq!(scheduler.trace_snapshot().decode_backpressure_limit, None);
     }
 
     #[test]
