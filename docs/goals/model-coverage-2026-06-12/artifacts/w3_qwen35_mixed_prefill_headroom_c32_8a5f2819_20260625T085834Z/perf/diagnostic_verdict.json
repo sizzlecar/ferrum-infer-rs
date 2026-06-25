@@ -1,0 +1,10 @@
+{
+  "reject_reasons": [
+    "output_throughput_tps=467.31327097943995 <= floor=600.0",
+    "mixed_iterations=4 < 64",
+    "p95_itl_ms=56.016582199999995 > 25.0",
+    "unified_kv_admission_failed=15 > 13",
+    "capacity_deferred_total=37 > 32"
+  ],
+  "verdict": "reject"
+}
