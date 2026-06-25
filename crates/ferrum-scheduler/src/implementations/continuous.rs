@@ -96,7 +96,7 @@ pub struct ContinuousBatchRequest {
     pub decode_time_ms: u64,
     /// Capacity-deferred requests wait for real capacity release before re-admission.
     pub capacity_deferred_until_release_epoch: u64,
-    /// Release epoch in which a mixed recompute attempt made no recorded progress.
+    /// Capacity evidence epoch in which a mixed recompute attempt made no recorded progress.
     pub capacity_deferred_mixed_attempt_epoch: Option<u64>,
 }
 
@@ -196,7 +196,8 @@ pub struct ContinuousBatchScheduler {
     capacity_backpressure_limit: AtomicUsize,
     capacity_backpressure_iteration: AtomicU64,
     capacity_release_epoch: AtomicU64,
-    capacity_mixed_recompute_blocked_until_release_epoch: AtomicU64,
+    capacity_mixed_recompute_epoch: AtomicU64,
+    capacity_mixed_recompute_blocked_until_epoch: AtomicU64,
     total_wait_time_us: AtomicU64,
 
     /// Start time
@@ -318,7 +319,8 @@ impl ContinuousBatchScheduler {
             capacity_backpressure_limit: AtomicUsize::new(NO_CAPACITY_BACKPRESSURE_LIMIT),
             capacity_backpressure_iteration: AtomicU64::new(u64::MAX),
             capacity_release_epoch: AtomicU64::new(0),
-            capacity_mixed_recompute_blocked_until_release_epoch: AtomicU64::new(0),
+            capacity_mixed_recompute_epoch: AtomicU64::new(0),
+            capacity_mixed_recompute_blocked_until_epoch: AtomicU64::new(0),
             total_wait_time_us: AtomicU64::new(0),
             start_time: Instant::now(),
             metrics_tracker: Arc::new(ContinuousBatchMetrics::new()),
@@ -489,20 +491,27 @@ impl ContinuousBatchScheduler {
 
     fn record_capacity_release_progress(&self) {
         self.capacity_release_epoch.fetch_add(1, Ordering::Relaxed);
+        self.capacity_mixed_recompute_epoch
+            .fetch_add(1, Ordering::Relaxed);
         self.record_resource_progress();
     }
 
-    /// Suppress release-blocked mixed recompute until a real capacity release.
+    fn record_capacity_recompute_progress(&self) {
+        self.capacity_mixed_recompute_epoch
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Suppress release-blocked mixed recompute until fresh capacity evidence.
     ///
     /// The engine calls this after a mixed decode+recompute KV admission
     /// failure. Trying a different blocked recompute candidate in the same
-    /// release epoch cannot create free KV blocks; it only repeats the failed
-    /// unified admission overhead.
+    /// capacity evidence epoch cannot create free KV blocks; it only repeats
+    /// the failed unified admission overhead.
     pub fn defer_capacity_deferred_mixed_recompute_until_release(&self) {
-        let release_epoch = self.capacity_release_epoch.load(Ordering::Relaxed);
-        let blocked_until = release_epoch.saturating_add(1);
+        let mixed_epoch = self.capacity_mixed_recompute_epoch.load(Ordering::Relaxed);
+        let blocked_until = mixed_epoch.saturating_add(1);
         let _ = self
-            .capacity_mixed_recompute_blocked_until_release_epoch
+            .capacity_mixed_recompute_blocked_until_epoch
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.max(blocked_until))
             });
@@ -576,6 +585,7 @@ impl ContinuousBatchScheduler {
             request_index.insert(request_id.clone(), RequestPhase::Waiting);
             waiting_queue.push_back(req);
             self.record_capacity_defer_feedback(attempted_decode_width.max(1));
+            self.record_capacity_recompute_progress();
             debug!("Deferred decode request {} back to waiting", request_id);
             true
         } else {
@@ -781,6 +791,7 @@ impl ContinuousBatchScheduler {
         active_decode_prefill_chunk: Option<usize>,
         prefill_step_chunk: Option<usize>,
         capacity_release_epoch: u64,
+        capacity_mixed_recompute_epoch: u64,
     ) {
         if batch_requests.len() >= hint.max_batch_size || *total_tokens >= hint.max_tokens {
             return;
@@ -797,7 +808,7 @@ impl ContinuousBatchScheduler {
             let release_blocked_capacity_deferred =
                 req.capacity_deferred_until_release_epoch > capacity_release_epoch;
             if release_blocked_capacity_deferred
-                && req.capacity_deferred_mixed_attempt_epoch == Some(capacity_release_epoch)
+                && req.capacity_deferred_mixed_attempt_epoch == Some(capacity_mixed_recompute_epoch)
             {
                 continue;
             }
@@ -842,7 +853,8 @@ impl ContinuousBatchScheduler {
                     *remaining = remaining.saturating_sub(prefill_chunk_tokens);
                 }
                 if release_blocked_capacity_deferred {
-                    req.capacity_deferred_mixed_attempt_epoch = Some(capacity_release_epoch);
+                    req.capacity_deferred_mixed_attempt_epoch =
+                        Some(capacity_mixed_recompute_epoch);
                     if let Some(remaining) =
                         capacity_deferred_mixed_recompute_slots_remaining.as_mut()
                     {
@@ -913,10 +925,12 @@ impl ContinuousBatchScheduler {
             prefill_step_chunk,
         );
         let capacity_release_epoch = self.capacity_release_epoch.load(Ordering::Relaxed);
+        let capacity_mixed_recompute_epoch =
+            self.capacity_mixed_recompute_epoch.load(Ordering::Relaxed);
         let mixed_recompute_release_ready = self
-            .capacity_mixed_recompute_blocked_until_release_epoch
+            .capacity_mixed_recompute_blocked_until_epoch
             .load(Ordering::Relaxed)
-            <= capacity_release_epoch;
+            <= capacity_mixed_recompute_epoch;
         let allow_capacity_deferred_mixed_recompute = scheduled_decode_count > 0
             && active_decode_prefill_chunk.is_some()
             && active_decode_prefill_tokens_remaining.unwrap_or(0) > 0
@@ -942,6 +956,7 @@ impl ContinuousBatchScheduler {
             active_decode_prefill_chunk,
             prefill_step_chunk,
             capacity_release_epoch,
+            capacity_mixed_recompute_epoch,
         );
 
         // Check if we should admit new requests from waiting queue
@@ -971,7 +986,9 @@ impl ContinuousBatchScheduler {
                 || req.capacity_deferred_until_release_epoch <= capacity_release_epoch;
             if release_ready {
                 requests_to_admit.push(req.inner.request.id.clone());
-            } else if req.capacity_deferred_mixed_attempt_epoch == Some(capacity_release_epoch) {
+            } else if req.capacity_deferred_mixed_attempt_epoch
+                == Some(capacity_mixed_recompute_epoch)
+            {
                 continue;
             } else if allow_capacity_deferred_mixed_recompute
                 && release_blocked_capacity_deferred_admissions
@@ -1002,6 +1019,7 @@ impl ContinuousBatchScheduler {
             active_decode_prefill_chunk,
             prefill_step_chunk,
             capacity_release_epoch,
+            capacity_mixed_recompute_epoch,
         );
 
         // FERRUM_SCHED_NONE_PROF=1: log when next_batch is about to return SOME.
@@ -2039,6 +2057,7 @@ mod tests {
 
         assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[0], 4));
         assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[1], 4));
+        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[2], 4));
 
         let first_mixed = scheduler.create_iteration_batch(hint.clone()).unwrap();
         let first_mixed_ids: HashSet<RequestId> = first_mixed
@@ -2063,7 +2082,6 @@ mod tests {
         assert!(second_mixed_ids.contains(&first_ids[1]));
         assert!(scheduler.defer_prefill_to_waiting(&first_ids[1]));
 
-        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[2], 4));
         let before_third = scheduler.trace_snapshot();
         assert_eq!(before_third.capacity_blocked_waiting_len, 3);
 
@@ -2181,6 +2199,87 @@ mod tests {
         assert!(
             after_release_ids.contains(&first_ids[0]) || after_release_ids.contains(&first_ids[1]),
             "capacity release should reopen bounded mixed recompute scanning"
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_deferred_mixed_recompute_resumes_after_decode_capacity_release() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 8,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 8,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        for _ in 0..8 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_ids: Vec<_> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for request_id in &first_ids {
+            scheduler.mark_prefill_complete(request_id, 128);
+        }
+
+        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[0], 4));
+        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[1], 4));
+
+        let first_mixed = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_mixed_ids: HashSet<RequestId> = first_mixed
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        assert!(first_mixed_ids.contains(&first_ids[0]) || first_mixed_ids.contains(&first_ids[1]));
+
+        scheduler.defer_capacity_deferred_mixed_recompute_until_release();
+        assert!(scheduler.defer_prefill_to_waiting(&first_ids[0]));
+
+        let blocked_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let blocked_ids: HashSet<RequestId> = blocked_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        assert!(
+            !blocked_ids.contains(&first_ids[0]) && !blocked_ids.contains(&first_ids[1]),
+            "mixed recompute should stay blocked until fresh capacity evidence"
+        );
+
+        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[2], 4));
+        let after_decode_defer = scheduler.trace_snapshot();
+        assert_eq!(after_decode_defer.capacity_blocked_waiting_len, 3);
+
+        let after_physical_release = scheduler.create_iteration_batch(hint).unwrap();
+        let recompute_ids: Vec<_> = after_physical_release
+            .requests
+            .iter()
+            .filter(|request| {
+                first_ids[..3].contains(&request.request.id) && request.tokens_to_process != Some(1)
+            })
+            .map(|request| request.request.id.clone())
+            .collect();
+        assert_eq!(
+            recompute_ids.len(),
+            1,
+            "physical KV release from one deferred decode should reopen exactly one bounded mixed recompute"
+        );
+        assert!(
+            recompute_ids[0] == first_ids[0] || recompute_ids[0] == first_ids[1],
+            "the just-deferred decode should wait behind older blocked recomputes"
         );
     }
 
