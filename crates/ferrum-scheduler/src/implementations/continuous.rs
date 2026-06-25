@@ -1067,7 +1067,7 @@ impl ContinuousBatchScheduler {
         if fully_done {
             self.promote_to_decode(request_id);
         }
-        if made_progress {
+        if made_progress && fully_done {
             self.record_resource_progress();
         }
         fully_done
@@ -1812,7 +1812,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_backpressure_grows_after_prefill_progress() {
+    fn capacity_backpressure_survives_partial_prefill_and_grows_after_completion() {
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
             max_running_requests: 4,
             prompt_token_estimate: true,
@@ -1848,8 +1848,14 @@ mod tests {
         assert!(!scheduler.mark_prefill_chunk_processed(&progressed_id, 128, 1));
         assert_eq!(
             scheduler.trace_snapshot().capacity_backpressure_admit_limit,
+            Some(2),
+            "partial prefill progress still consumes capacity and should not reopen the failed width"
+        );
+        assert!(scheduler.mark_prefill_chunk_processed(&progressed_id, 128, 127));
+        assert_eq!(
+            scheduler.trace_snapshot().capacity_backpressure_admit_limit,
             None,
-            "real prefill progress should relax the capacity backpressure window"
+            "full prefill completion should relax the capacity backpressure window"
         );
 
         let third_batch = scheduler.create_iteration_batch(hint).unwrap();
