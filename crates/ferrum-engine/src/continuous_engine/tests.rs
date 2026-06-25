@@ -1731,14 +1731,14 @@ async fn process_batch_unified_kv_defer_does_not_preempt_decode_for_fresh_prefil
 }
 
 #[tokio::test]
-async fn process_batch_unified_reserve_defer_does_not_preempt_decode_fallback() {
+async fn process_batch_unified_reserve_defer_requeues_decode_for_recompute() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
+    let kv_cache = Arc::new(MockKvCacheManager::new(128));
     let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(FailingUnifiedReserveExecutor {
         inner: FailingBatchPrefillExecutor {
             inner: RecurrentSpecExecutor {
@@ -1758,7 +1758,7 @@ async fn process_batch_unified_reserve_defer_does_not_preempt_decode_fallback() 
         scheduler.clone(),
         tokenizer.clone(),
         sampler,
-        kv_cache,
+        kv_cache.clone(),
         executor,
         tensor_factory,
         None,
@@ -1840,28 +1840,42 @@ async fn process_batch_unified_reserve_defer_does_not_preempt_decode_fallback() 
     let trace = scheduler.trace_snapshot();
     assert_eq!(
         trace.cancelled_total, 0,
-        "model-owned KV reserve pressure from a fresh prefill must not preempt active decodes"
+        "model-owned KV reserve pressure must not cancel active decodes"
     );
-    assert_eq!(trace.decode_queue_len, 2);
+    assert_eq!(trace.waiting_queue_len, 3);
+    assert_eq!(trace.decode_queue_len, 0);
+    assert_eq!(trace.active_len, 0);
     assert_eq!(
         scheduler.trace_phase(&fresh_id),
         Some(RequestPhase::Waiting)
     );
 
     let sequences = engine.inner.sequences.read();
-    for request_id in [&first_decode_id, &second_decode_id] {
+    for (request_id, token) in [
+        (&first_decode_id, TokenId::new(5)),
+        (&second_decode_id, TokenId::new(6)),
+    ] {
         let decode = sequences
             .get(request_id)
-            .expect("decode request should remain active");
-        assert!(decode.prefill_complete);
-        assert!(decode.kv_cache.is_some());
-        assert_eq!(decode.preemption_count, 0);
+            .expect("decode request should remain available for recompute");
+        assert_eq!(decode.phase, RequestPhase::Waiting);
+        assert!(!decode.prefill_complete);
+        assert!(decode.kv_cache.is_none());
+        assert!(decode.model_cache_id.is_none());
+        assert_eq!(decode.generated_tokens, vec![token]);
+        assert_eq!(decode.preemption_count, 1);
+        assert_eq!(
+            scheduler.trace_phase(request_id),
+            Some(RequestPhase::Waiting)
+        );
     }
     let fresh = sequences
         .get(&fresh_id)
         .expect("deferred fresh request should remain in sequence state");
+    assert_eq!(fresh.phase, RequestPhase::Waiting);
     assert!(!fresh.prefill_complete);
     assert!(fresh.kv_cache.is_none());
+    assert_eq!(kv_cache.active_count(), 0);
 }
 
 #[tokio::test]
@@ -3246,7 +3260,7 @@ async fn process_batch_unified_decode_resource_exhausted_keeps_recurrent_state_w
     ));
     let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
         config,
-        scheduler,
+        scheduler.clone(),
         tokenizer.clone(),
         sampler,
         kv_cache,
@@ -3261,6 +3275,14 @@ async fn process_batch_unified_decode_resource_exhausted_keeps_recurrent_state_w
     request.prompt = "test".to_string();
     request.sampling_params.max_tokens = 4;
     let request_id = request.id.clone();
+    scheduler.submit(request.clone()).await.unwrap();
+    let initial_batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(4))
+        .await
+        .expect("decode request should first be scheduled as prefill");
+    assert_eq!(initial_batch.requests.len(), 1);
+    scheduler.mark_prefill_complete(&request_id, 1);
+
     let recurrent_spec = RecurrentStateSpec {
         request_id: request_id.clone(),
         num_layers: 1,
@@ -3292,28 +3314,37 @@ async fn process_batch_unified_decode_resource_exhausted_keeps_recurrent_state_w
         .write()
         .insert(request_id.clone(), sequence);
 
-    let batch = ferrum_interfaces::BatchPlan {
-        batch_id: ferrum_types::BatchId::new(),
-        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
-        max_sequence_length: 1,
-        estimated_time_ms: None,
-        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
-        created_at: chrono::Utc::now(),
-    };
+    let batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(4))
+        .await
+        .expect("decode request should be scheduled");
+    assert_eq!(batch.requests.len(), 1);
 
     engine.inner.process_batch(&batch).await.unwrap();
+
+    let trace = scheduler.trace_snapshot();
+    assert_eq!(trace.cancelled_total, 0);
+    assert_eq!(trace.waiting_queue_len, 1);
+    assert_eq!(trace.decode_queue_len, 0);
+    assert_eq!(
+        scheduler.trace_phase(&request_id),
+        Some(RequestPhase::Waiting)
+    );
 
     let sequences = engine.inner.sequences.read();
     let sequence = sequences
         .get(&request_id)
         .expect("resource-exhausted unified decode should remain queued");
-    assert!(sequence.prefill_complete);
-    assert!(sequence.kv_cache.is_some());
-    assert!(sequence.recurrent_state.is_some());
+    assert_eq!(sequence.phase, RequestPhase::Waiting);
+    assert!(!sequence.prefill_complete);
+    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.recurrent_state.is_none());
+    assert!(sequence.model_cache_id.is_none());
     assert_eq!(sequence.generated_tokens, vec![TokenId::new(6)]);
+    assert_eq!(sequence.preemption_count, 1);
     let recurrent_stats = recurrent_manager.stats();
-    assert_eq!(recurrent_stats.active_states, 1);
-    assert_eq!(recurrent_stats.used_batch_slots, 1);
+    assert_eq!(recurrent_stats.active_states, 0);
+    assert_eq!(recurrent_stats.used_batch_slots, 0);
 }
 
 #[test]

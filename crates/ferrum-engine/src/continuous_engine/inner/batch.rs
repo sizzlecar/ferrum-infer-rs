@@ -921,6 +921,70 @@ impl EngineInner {
         self.work_notify.notify_waiters();
     }
 
+    pub(super) async fn defer_decode_for_capacity_recompute(
+        &self,
+        request_id: &RequestId,
+        attempted_decode_width: usize,
+    ) -> bool {
+        let (found, had_kv_cache, draft_kv_request_id, had_recurrent_state, model_cache_id) = {
+            let mut sequences = self.sequences.write();
+            if let Some(seq) = sequences.get_mut(request_id) {
+                let had_kv_cache = seq.kv_cache.is_some();
+                let draft_kv_request_id = seq.draft_kv_request_id.clone();
+                let had_recurrent_state = seq.recurrent_state.is_some();
+                let model_cache_id = seq.model_cache_id.clone();
+                seq.kv_cache = None;
+                seq.draft_kv_cache = None;
+                seq.draft_kv_request_id = None;
+                seq.recurrent_state = None;
+                seq.model_cache_id = None;
+                seq.prefill_complete = false;
+                seq.prefill_tokens_processed = 0;
+                seq.phase = RequestPhase::Waiting;
+                seq.tokens_this_iteration = 0;
+                seq.preemption_count += 1;
+                (
+                    true,
+                    had_kv_cache,
+                    draft_kv_request_id,
+                    had_recurrent_state,
+                    model_cache_id,
+                )
+            } else {
+                (false, false, None, false, None)
+            }
+        };
+
+        if !found {
+            return false;
+        }
+
+        if let Some(cache_id) = model_cache_id {
+            self.model_executor.release_cache(&cache_id);
+        }
+        if had_kv_cache {
+            let _ = self.kv_cache.deallocate(request_id.clone()).await;
+        }
+        if let Some(draft_request_id) = draft_kv_request_id {
+            let _ = self.kv_cache.deallocate(draft_request_id).await;
+        }
+        if had_recurrent_state {
+            self.release_recurrent_state(request_id).await;
+        }
+
+        let moved = self
+            .scheduler
+            .defer_decode_to_waiting_for_capacity(request_id, attempted_decode_width);
+        if moved {
+            info!(
+                "Capacity-deferred decode request {} for KV recompute after failed width {}",
+                request_id, attempted_decode_width
+            );
+            self.work_notify.notify_waiters();
+        }
+        moved
+    }
+
     /// Try to preempt a decoding request to free KV cache blocks.
     ///
     /// Picks the lowest-priority victim (ties broken by fewest generated

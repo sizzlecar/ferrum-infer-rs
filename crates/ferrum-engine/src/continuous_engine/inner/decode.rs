@@ -21,8 +21,9 @@ impl EngineInner {
         request_ids: &[RequestId],
         allow_preempt: bool,
     ) -> Result<()> {
-        let mut stack = vec![self.decode_ready_request_ids(request_ids)];
-        while let Some(chunk) = stack.pop() {
+        let pressure_width = request_ids.len().max(1);
+        let mut stack = vec![(self.decode_ready_request_ids(request_ids), pressure_width)];
+        while let Some((chunk, pressure_width)) = stack.pop() {
             let chunk = self.decode_ready_request_ids(&chunk);
             if chunk.is_empty() {
                 continue;
@@ -31,21 +32,28 @@ impl EngineInner {
                 Ok(()) => {}
                 Err(e) if is_resource_exhausted_error(&e) && chunk.len() > 1 => {
                     let mid = chunk.len() / 2;
-                    stack.push(chunk[mid..].to_vec());
-                    stack.push(chunk[..mid].to_vec());
+                    stack.push((chunk[mid..].to_vec(), pressure_width));
+                    stack.push((chunk[..mid].to_vec(), pressure_width));
                 }
                 Err(e) if is_resource_exhausted_error(&e) => {
                     if !allow_preempt {
-                        warn!(
-                            "Batch decode deferred for {} request(s): capacity pressure with preemption disabled",
-                            chunk.len()
-                        );
+                        for rid in &chunk {
+                            if !self
+                                .defer_decode_for_capacity_recompute(rid, pressure_width)
+                                .await
+                            {
+                                warn!(
+                                    "Batch decode deferred for request {}: capacity pressure with no scheduler decode entry",
+                                    rid
+                                );
+                            }
+                        }
                         continue;
                     }
                     let exclude: std::collections::HashSet<RequestId> =
                         chunk.iter().cloned().collect();
                     if self.preempt_victim_excluding(&exclude).await {
-                        stack.push(chunk);
+                        stack.push((chunk, pressure_width));
                     } else {
                         warn!(
                             "Batch decode deferred for {} request(s): no preempt victim",

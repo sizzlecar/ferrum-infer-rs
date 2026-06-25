@@ -494,6 +494,41 @@ impl ContinuousBatchScheduler {
         }
     }
 
+    /// Move a capacity-deferred decode request back to waiting for KV recompute.
+    ///
+    /// The engine calls this after releasing the request's physical KV/cache
+    /// state. Logical output lives in the engine sequence state; scheduler
+    /// token counters are reset so the next prefill rebuilds from that logical
+    /// context instead of resuming the stale physical decode phase.
+    pub fn defer_decode_to_waiting_for_capacity(
+        &self,
+        request_id: &RequestId,
+        attempted_decode_width: usize,
+    ) -> bool {
+        let mut decode_queue = self.decode_queue.write();
+        let mut waiting_queue = self.waiting_queue.write();
+        let mut request_index = self.request_index.write();
+
+        if let Some(mut req) = decode_queue.remove(request_id) {
+            req.phase = RequestPhase::Waiting;
+            req.inner.state = RequestState::Waiting;
+            req.inner.started_at = None;
+            req.prefill_tokens = 0;
+            req.decode_tokens = 0;
+            req.kv_blocks.clear();
+            req.chunked_prefill = false;
+            req.prefill_chunk_offset = 0;
+            req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
+            request_index.insert(request_id.clone(), RequestPhase::Waiting);
+            waiting_queue.push_back(req);
+            self.record_capacity_defer_feedback(attempted_decode_width.max(1));
+            debug!("Deferred decode request {} back to waiting", request_id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Move request from prefill to decode queue
     fn promote_to_decode(&self, request_id: &RequestId) -> bool {
         let mut prefill_queue = self.prefill_queue.write();
@@ -1530,6 +1565,75 @@ mod tests {
         assert_eq!(after.prefill_queue_len, 2);
         assert_eq!(after.active_len, 2);
         assert_eq!(after.admitted_total, 6);
+        assert_eq!(after.capacity_backpressure_admit_limit, Some(2));
+    }
+
+    #[test]
+    fn decode_capacity_defer_requeues_for_recompute_without_cancelling() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 4,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 4,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        for _ in 0..4 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(first_batch.requests.len(), 4);
+        let first_ids: Vec<_> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for request_id in &first_ids {
+            scheduler.mark_prefill_complete(request_id, 128);
+        }
+        assert_eq!(scheduler.trace_snapshot().decode_queue_len, 4);
+
+        for request_id in &first_ids {
+            assert!(scheduler.defer_decode_to_waiting_for_capacity(request_id, 4));
+        }
+
+        let deferred = scheduler.trace_snapshot();
+        assert_eq!(deferred.waiting_queue_len, 4);
+        assert_eq!(deferred.decode_queue_len, 0);
+        assert_eq!(deferred.active_len, 0);
+        assert_eq!(deferred.cancelled_total, 0);
+        assert_eq!(deferred.capacity_deferred_total, 4);
+        assert_eq!(deferred.capacity_backpressure_admit_limit, Some(2));
+        for request_id in &first_ids {
+            assert_eq!(
+                scheduler.trace_phase(request_id),
+                Some(RequestPhase::Waiting)
+            );
+            assert_eq!(
+                scheduler.request_state(request_id),
+                Some(RequestState::Waiting)
+            );
+        }
+
+        let second_batch = scheduler.create_iteration_batch(hint).unwrap();
+        assert_eq!(
+            second_batch.requests.len(),
+            2,
+            "capacity-deferred decodes should recompute at a lower admission width"
+        );
+        let after = scheduler.trace_snapshot();
+        assert_eq!(after.waiting_queue_len, 2);
+        assert_eq!(after.prefill_queue_len, 2);
+        assert_eq!(after.active_len, 2);
         assert_eq!(after.capacity_backpressure_admit_limit, Some(2));
     }
 
