@@ -725,6 +725,45 @@ impl ContinuousBatchScheduler {
         Some(self.default_active_decode_prefill_chunk())
     }
 
+    fn effective_active_decode_prefill_chunk(
+        &self,
+        active_decode_prefill_chunk: Option<usize>,
+        prefill_step_chunk: Option<usize>,
+    ) -> Option<usize> {
+        let chunk = active_decode_prefill_chunk?;
+        Some(
+            prefill_step_chunk
+                .map(|step_chunk| step_chunk.min(chunk))
+                .unwrap_or(chunk)
+                .max(1),
+        )
+    }
+
+    fn active_decode_prefill_target_chunks(
+        &self,
+        hint: &BatchHint,
+        scheduled_decode_count: usize,
+        prefill_backlog: usize,
+    ) -> usize {
+        if scheduled_decode_count == 0 || prefill_backlog == 0 {
+            return 0;
+        }
+
+        let free_batch_slots = hint.max_batch_size.saturating_sub(scheduled_decode_count);
+        if free_batch_slots == 0 {
+            return 0;
+        }
+
+        // Keep the mixed-prefill lane bounded, but spend real batch headroom.
+        // The previous proportional scaling often collapsed to a single tiny
+        // chunk at c=32 even when 4-7 batch slots were idle, serializing
+        // capacity-deferred recompute behind decode work.
+        let max_mixed_prefill_chunks = self.cb_config.max_prefill_batch.div_ceil(2).max(1);
+        free_batch_slots
+            .min(max_mixed_prefill_chunks)
+            .min(prefill_backlog)
+    }
+
     fn maybe_active_decode_prefill_chunk(
         &self,
         req: &ContinuousBatchRequest,
@@ -768,9 +807,9 @@ impl ContinuousBatchScheduler {
         if let Some(chunk) =
             self.maybe_active_decode_prefill_chunk(req, active_decode_prefill_chunk)
         {
-            let chunk = prefill_step_chunk
-                .map(|step_chunk| step_chunk.min(chunk))
-                .unwrap_or(chunk);
+            let chunk = self
+                .effective_active_decode_prefill_chunk(Some(chunk), prefill_step_chunk)
+                .unwrap_or(chunk.max(1));
             return self
                 .chunked_prefill_budget_tokens(req, chunk)
                 .min(step_tokens_remaining)
@@ -798,10 +837,10 @@ impl ContinuousBatchScheduler {
         active_decode_prefill_chunk: Option<usize>,
         prefill_step_chunk: Option<usize>,
     ) -> Option<usize> {
-        let chunk = active_decode_prefill_chunk?;
-        let chunk = prefill_step_chunk
-            .map(|step_chunk| step_chunk.min(chunk))
-            .unwrap_or(chunk);
+        let chunk = self.effective_active_decode_prefill_chunk(
+            active_decode_prefill_chunk,
+            prefill_step_chunk,
+        )?;
         if scheduled_decode_count == 0 {
             return None;
         }
@@ -817,25 +856,34 @@ impl ContinuousBatchScheduler {
             return Some(0);
         }
 
-        // vLLM's scheduler uses the per-step token budget dynamically rather
-        // than a fixed "N prefill chunks while decoding" rule. Ferrum keeps a
-        // conservative mixed-prefill guard only once decode pressure is high,
-        // scaling by same-iteration batch headroom.
-        let max_mixed_prefill_chunks = self.cb_config.max_prefill_batch.div_ceil(2).max(1);
-        let scaled_chunks = free_batch_slots
-            .saturating_mul(max_mixed_prefill_chunks)
-            .div_ceil(hint.max_batch_size.max(1))
-            .max(1);
-        let target_chunks = scaled_chunks
-            .min(max_mixed_prefill_chunks)
-            .min(prefill_backlog)
-            .min(free_batch_slots);
+        let target_chunks =
+            self.active_decode_prefill_target_chunks(hint, scheduled_decode_count, prefill_backlog);
 
         Some(
             chunk
                 .saturating_mul(target_chunks)
                 .min(remaining_step_tokens),
         )
+    }
+
+    fn capacity_deferred_mixed_recompute_slot_budget(
+        &self,
+        active_decode_prefill_chunk: Option<usize>,
+        prefill_step_chunk: Option<usize>,
+        active_decode_prefill_tokens_remaining: Option<usize>,
+    ) -> usize {
+        let Some(tokens_remaining) = active_decode_prefill_tokens_remaining else {
+            return 0;
+        };
+        if tokens_remaining == 0 {
+            return 0;
+        }
+        let Some(chunk) = self
+            .effective_active_decode_prefill_chunk(active_decode_prefill_chunk, prefill_step_chunk)
+        else {
+            return 0;
+        };
+        tokens_remaining.div_ceil(chunk).max(1)
     }
 
     fn add_prefill_requests_to_batch(
@@ -1003,7 +1051,13 @@ impl ContinuousBatchScheduler {
             && mixed_recompute_release_ready
             && mixed_recompute_kv_capacity_ready;
         let mut capacity_deferred_mixed_recompute_slots_remaining =
-            allow_capacity_deferred_mixed_recompute.then_some(1);
+            allow_capacity_deferred_mixed_recompute.then(|| {
+                self.capacity_deferred_mixed_recompute_slot_budget(
+                    active_decode_prefill_chunk,
+                    prefill_step_chunk,
+                    active_decode_prefill_tokens_remaining,
+                )
+            });
 
         // Then, add prefill requests up to the per-iter token budget.
         // Phase 3: `max_prefill_batch=8` no longer caps the count —
@@ -1947,7 +2001,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_deferred_decode_recompute_admits_one_blocked_request_per_mixed_iteration() {
+    fn capacity_deferred_decode_recompute_spends_available_mixed_slots() {
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
             max_running_requests: 8,
             prompt_token_estimate: true,
@@ -2009,11 +2063,11 @@ mod tests {
 
         assert_eq!(scheduled_decodes, 4);
         assert_eq!(
-            scheduled_deferred, 1,
-            "bounded mixed recompute should not re-admit the whole blocked cohort"
+            scheduled_deferred, 4,
+            "bounded mixed recompute should spend available mixed-prefill slots"
         );
-        assert_eq!(prefill_tokens, vec![Some(64)]);
-        assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 3);
+        assert_eq!(prefill_tokens, vec![Some(64), Some(64), Some(64), Some(64)]);
+        assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 0);
     }
 
     #[test]
@@ -2093,11 +2147,18 @@ mod tests {
     #[test]
     fn capacity_deferred_recompute_skips_marked_requests_without_blocking_later_candidates() {
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
-            max_running_requests: 8,
+            max_running_requests: 10,
             prompt_token_estimate: true,
             ..SchedulerConfig::default()
         });
-        let hint = BatchHint {
+        let init_hint = BatchHint {
+            max_batch_size: 10,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+        let mixed_hint = BatchHint {
             max_batch_size: 8,
             max_tokens: 1024,
             target_latency_ms: None,
@@ -2105,14 +2166,14 @@ mod tests {
             resource_constraints: Default::default(),
         };
 
-        for _ in 0..8 {
+        for _ in 0..10 {
             enqueue_waiting(
                 &scheduler,
                 create_test_request_with_prompt_tokens(Priority::Normal, 128),
             );
         }
 
-        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_batch = scheduler.create_iteration_batch(init_hint).unwrap();
         let first_ids: Vec<_> = first_batch
             .requests
             .iter()
@@ -2122,21 +2183,26 @@ mod tests {
             scheduler.mark_prefill_complete(request_id, 128);
         }
 
-        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[0], 4));
-        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[1], 4));
-        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[2], 4));
+        for request_id in first_ids.iter().take(4) {
+            assert!(scheduler.defer_decode_to_waiting_for_capacity(request_id, 10));
+        }
 
-        let first_mixed = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_mixed = scheduler
+            .create_iteration_batch(mixed_hint.clone())
+            .unwrap();
         let first_mixed_ids: HashSet<RequestId> = first_mixed
             .requests
             .iter()
             .map(|request| request.request.id.clone())
             .collect();
         assert!(first_mixed_ids.contains(&first_ids[0]));
-        assert!(!first_mixed_ids.contains(&first_ids[1]));
+        assert!(first_mixed_ids.contains(&first_ids[1]));
+        assert!(!first_mixed_ids.contains(&first_ids[2]));
+        assert!(!first_mixed_ids.contains(&first_ids[3]));
         assert!(scheduler.defer_prefill_to_waiting(&first_ids[0]));
+        assert!(scheduler.defer_prefill_to_waiting(&first_ids[1]));
 
-        let second_mixed = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let second_mixed = scheduler.create_iteration_batch(mixed_hint).unwrap();
         let second_mixed_ids: HashSet<RequestId> = second_mixed
             .requests
             .iter()
@@ -2146,36 +2212,19 @@ mod tests {
             !second_mixed_ids.contains(&first_ids[0]),
             "the first failed recompute must still be skipped in the same release epoch"
         );
-        assert!(second_mixed_ids.contains(&first_ids[1]));
-        assert!(scheduler.defer_prefill_to_waiting(&first_ids[1]));
-
-        let before_third = scheduler.trace_snapshot();
-        assert_eq!(before_third.capacity_blocked_waiting_len, 3);
-
-        let third_mixed = scheduler.create_iteration_batch(hint).unwrap();
-        let third_mixed_ids: HashSet<RequestId> = third_mixed
-            .requests
-            .iter()
-            .map(|request| request.request.id.clone())
-            .collect();
-
         assert!(
-            !third_mixed_ids.contains(&first_ids[0]),
-            "already failed blocked recomputes must not retry without progress or release"
-        );
-        assert!(
-            !third_mixed_ids.contains(&first_ids[1]),
+            !second_mixed_ids.contains(&first_ids[1]),
             "already failed blocked recomputes must not consume the later candidate's slot"
         );
         assert!(
-            third_mixed_ids.contains(&first_ids[2]),
+            second_mixed_ids.contains(&first_ids[2]),
             "marked queue-head requests should not block a later untried recompute candidate"
         );
-        assert!(third_mixed_ids.contains(&first_ids[3]));
+        assert!(second_mixed_ids.contains(&first_ids[3]));
         assert_eq!(
-            third_mixed.requests.len(),
-            6,
-            "five decodes plus one bounded recompute should be scheduled"
+            second_mixed.requests.len(),
+            8,
+            "six decodes plus two bounded recomputes should be scheduled"
         );
     }
 
@@ -2329,7 +2378,7 @@ mod tests {
         assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[2], 4));
         scheduler.record_capacity_deferred_mixed_recompute_release_evidence();
         let after_decode_defer = scheduler.trace_snapshot();
-        assert_eq!(after_decode_defer.capacity_blocked_waiting_len, 3);
+        assert_eq!(after_decode_defer.capacity_blocked_waiting_len, 2);
 
         let after_physical_release = scheduler.create_iteration_batch(hint).unwrap();
         let recompute_ids: Vec<_> = after_physical_release
@@ -2342,12 +2391,14 @@ mod tests {
             .collect();
         assert_eq!(
             recompute_ids.len(),
-            1,
-            "physical KV release from one deferred decode should reopen exactly one bounded mixed recompute"
+            2,
+            "physical KV release should reopen older recomputes that fit active capacity"
         );
+        assert!(recompute_ids.contains(&first_ids[0]));
+        assert!(recompute_ids.contains(&first_ids[1]));
         assert!(
-            recompute_ids[0] == first_ids[0] || recompute_ids[0] == first_ids[1],
-            "the just-deferred decode should wait behind older blocked recomputes"
+            !recompute_ids.contains(&first_ids[2]),
+            "the just-deferred decode should wait behind older blocked recomputes when active capacity is limited"
         );
     }
 
@@ -2859,13 +2910,13 @@ mod tests {
             .collect();
         assert_eq!(
             high_decode_pressure.requests.len(),
-            7,
-            "high decode pressure should admit only bounded partial prefills"
+            8,
+            "high decode pressure should admit bounded partial prefills up to available slots"
         );
-        assert_eq!(prefill_tokens, vec![Some(64), Some(64)]);
+        assert_eq!(prefill_tokens, vec![Some(64), Some(64), Some(64)]);
         assert_eq!(
             high_decode_pressure.resource_requirements.gpu_memory,
-            (5 + 128) * 16
+            (5 + 192) * 16
         );
     }
 
@@ -3299,10 +3350,10 @@ mod tests {
         let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
         assert_eq!(
             mixed_batch.requests.len(),
-            7,
-            "high decode pressure should admit only one prefill chunk"
+            8,
+            "high decode pressure should admit bounded partial prefills up to available slots"
         );
-        assert_eq!(mixed_batch.resource_requirements.gpu_memory, (6 + 64) * 16);
+        assert_eq!(mixed_batch.resource_requirements.gpu_memory, (6 + 128) * 16);
     }
 
     #[test]
