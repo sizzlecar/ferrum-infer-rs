@@ -11,7 +11,9 @@
 - Paid GPU work requires a stated lane, expected runtime/cost, stop condition, correctness gate, and performance command before starting.
 - Before creating, starting, or resuming paid GPU capacity, reconcile the current instance inventory and state which existing instance will be reused or why a new one is necessary.
 - Long-running performance or GPU work must convert time into saved evidence: a PASS line, KEEP/REJECT diagnostic artifact, or explicit blocker. Do not count elapsed time, setup, compilation, or partial stability as final-goal progress.
+- If the user requests a local time ledger, maintain it at the repository root as `ACTION_TIME_LEDGER_<YYYYMMDD>.jsonl`, record start/end/duration/result for each meaningful action category, validate that it stays parseable JSONL, and do not commit it unless explicitly requested.
 - On long-lived goal branches, synchronize with `git pull --rebase --autostash` before staging or committing, and push validated commits promptly unless the user explicitly asks to keep work local.
+- After a paid GPU or performance diagnostic fails, copy back artifacts, record the exact failure class, stop billing or make a bounded cache-retention decision, and write the next artifact-based hypothesis before another paid run.
 - Prefer small, surgical changes. Do not combine release gate changes, kernel/model changes, and large repository cleanup in the same patch unless the goal explicitly asks for that.
 
 ## Project Structure
@@ -313,6 +315,7 @@ Rules:
 - If CUDA validation fails, collect the exact failing artifact/log, stop unnecessary processes, and avoid repeated full sweeps until the failure mode is understood.
 - Failure triage comes before machine churn. If a failure has a small, bounded follow-up that can reuse the same warmed instance, model cache, and build cache, record the keep-alive window and stop condition, then run only that follow-up. Otherwise stop the instance after artifacts are copied.
 - Account for restart, bootstrap, build, and model-cache cost when choosing between a bounded keep-alive window and stopping the instance. Do not destroy a reusable cached environment just to recover from a source-level or script-level mistake.
+- Prefer stopping a reusable Vast instance over destroying it when it contains model/build caches or unique artifacts. Destroy only when the instance has no useful cache/evidence, is misconfigured beyond repair, or the user explicitly asks for destruction.
 - Prefer CUDA smoke before CUDA full unless the task specifically requires full release evidence.
 
 ## Vast GPU Runner Policy
@@ -382,6 +385,8 @@ Shutdown and artifact handling:
 - Do not hard-code model-family prompt hacks such as forced empty Qwen3 `<think>` blocks. Prefer model-provided chat templates from GGUF/HF metadata, and keep template rendering shared between `run` and `serve`.
 - Do not infer release readiness for one model architecture from another. Dense Llama-style models and Qwen3 MoE/GPTQ models exercise different scheduler, KV, attention, quantization, tokenizer, and chat-template paths.
 - Do not hide invalid model output by filtering decoded text. If `<unk>`, `[PAD...]`, tokenizer-reserved IDs, invalid UTF-8, or mojibake appear, trace token IDs and fix sampling/logit masking or KV/logits state before accepting the regression.
+- OOM prevention belongs in admission, KV allocation, scheduler backpressure, or documented product limits before work is launched. Do not treat a kernel or allocator OOM as an acceptable way to discover capacity.
+- For KV/cache pressure fixes, add tests that simulate capacity exhaustion and verify waiting, retry, release, or backpressure behavior. Avoid model-name, GPU-name, VRAM-size, or quantization-specific workarounds unless a goal document explicitly accepts that product policy.
 - Release blocker scans should include panic, KV cache overflow, `<unk>`, `[PAD]`, invalid UTF-8/mojibake, missing or duplicate `[DONE]`, stream bulk-flush behavior, strict-schema failures, required-tool failures, and silent fallback from a requested feature to base behavior.
 
 ## Performance and M3 Work Protocol
@@ -404,9 +409,10 @@ Shutdown and artifact handling:
 ## Long-Running Work Review Protocol
 
 - When a goal spans long-running builds, paid GPU diagnostics, or repeated candidate failures, keep a local time ledger if the user requested one. The ledger must stay uncommitted unless explicitly requested otherwise.
-- Record time by action category such as source reading, code edit, local validation, remote setup, compile wait, GPU run, artifact handling, artifact analysis, status update, and git sync.
+- Record time by action category such as source reading, code edit, local validation, remote setup, compile wait, GPU run, artifact handling, artifact analysis, status update, and git sync. Each entry must be specific enough to support a later retrospective without reconstructing events from shell history.
 - Use the ledger during long tasks to check whether time is converting into goal evidence. If repeated GPU runs or validation cycles do not move the target metric, pause implementation and do a written retrospective before continuing.
 - A retrospective must distinguish stability progress, correctness progress, performance progress, and final-goal progress. Do not present stability or diagnostic progress as target-performance progress.
+- If the ledger shows most time going into machine setup, waiting, repeated builds, or rerunning the same failure, stop and narrow the loop before spending more GPU time. The next step must either reduce setup churn, reuse existing caches, or produce a smaller artifact that can change the decision.
 - During long-running goals, periodically summarize elapsed time by category and name the next artifact or PASS line that would count as real progress. If the next action cannot plausibly move that evidence, stop and choose a narrower diagnostic.
 - Status updates for long-running work must name the current artifact or PASS/KEEP/REJECT/blocker, the remaining gap to the target, the paid-machine state, and the next stop condition. Avoid vague progress claims.
 - If a candidate improves stability or error counts but remains far from the target throughput, label it as partial or diagnostic progress and identify the next bottleneck evidence before making another source change.
