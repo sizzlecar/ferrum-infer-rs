@@ -866,6 +866,34 @@ impl ContinuousBatchScheduler {
         )
     }
 
+    fn active_decode_prefill_budget_chunks(
+        &self,
+        hint: &BatchHint,
+        scheduled_decode_count: usize,
+        active_decode_prefill_chunk: Option<usize>,
+    ) -> Option<usize> {
+        active_decode_prefill_chunk?;
+        if scheduled_decode_count == 0 {
+            return None;
+        }
+
+        let remaining_step_tokens = hint.max_tokens.saturating_sub(scheduled_decode_count);
+        let free_batch_slots = hint.max_batch_size.saturating_sub(scheduled_decode_count);
+        if remaining_step_tokens == 0 || free_batch_slots == 0 {
+            return Some(0);
+        }
+
+        let prefill_backlog = self.prefilling_count().saturating_add(self.waiting_count());
+        if prefill_backlog == 0 {
+            return Some(0);
+        }
+
+        Some(
+            self.active_decode_prefill_target_chunks(hint, scheduled_decode_count, prefill_backlog)
+                .min(remaining_step_tokens),
+        )
+    }
+
     fn capacity_deferred_mixed_recompute_slot_budget(
         &self,
         active_decode_prefill_chunk: Option<usize>,
@@ -893,6 +921,7 @@ impl ContinuousBatchScheduler {
         total_tokens: &mut usize,
         scheduled_request_ids: &mut HashSet<RequestId>,
         active_decode_prefill_tokens_remaining: &mut Option<usize>,
+        active_decode_prefill_chunks_remaining: &mut Option<usize>,
         capacity_deferred_mixed_recompute_slots_remaining: &mut Option<usize>,
         active_decode_prefill_chunk: Option<usize>,
         prefill_step_chunk: Option<usize>,
@@ -924,6 +953,12 @@ impl ContinuousBatchScheduler {
                     .is_some_and(|remaining| *remaining == 0)
             {
                 continue;
+            }
+            if active_decode_prefill_chunks_remaining
+                .as_ref()
+                .is_some_and(|remaining| *remaining == 0)
+            {
+                break;
             }
 
             let mut step_tokens_remaining = hint.max_tokens.saturating_sub(*total_tokens);
@@ -957,6 +992,9 @@ impl ContinuousBatchScheduler {
                 *total_tokens += prefill_chunk_tokens;
                 if let Some(remaining) = active_decode_prefill_tokens_remaining.as_mut() {
                     *remaining = remaining.saturating_sub(prefill_chunk_tokens);
+                }
+                if let Some(remaining) = active_decode_prefill_chunks_remaining.as_mut() {
+                    *remaining = remaining.saturating_sub(1);
                 }
                 if release_blocked_capacity_deferred {
                     req.capacity_deferred_mixed_attempt_epoch =
@@ -1030,6 +1068,11 @@ impl ContinuousBatchScheduler {
             active_decode_prefill_chunk,
             prefill_step_chunk,
         );
+        let mut active_decode_prefill_chunks_remaining = self.active_decode_prefill_budget_chunks(
+            &hint,
+            scheduled_decode_count,
+            active_decode_prefill_chunk,
+        );
         let capacity_release_epoch = self.capacity_release_epoch.load(Ordering::Relaxed);
         let capacity_mixed_recompute_epoch =
             self.capacity_mixed_recompute_epoch.load(Ordering::Relaxed);
@@ -1073,6 +1116,7 @@ impl ContinuousBatchScheduler {
             &mut total_tokens,
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
+            &mut active_decode_prefill_chunks_remaining,
             &mut capacity_deferred_mixed_recompute_slots_remaining,
             active_decode_prefill_chunk,
             prefill_step_chunk,
@@ -1136,6 +1180,7 @@ impl ContinuousBatchScheduler {
             &mut total_tokens,
             &mut scheduled_request_ids,
             &mut active_decode_prefill_tokens_remaining,
+            &mut active_decode_prefill_chunks_remaining,
             &mut capacity_deferred_mixed_recompute_slots_remaining,
             active_decode_prefill_chunk,
             prefill_step_chunk,
@@ -3354,6 +3399,57 @@ mod tests {
             "high decode pressure should admit bounded partial prefills up to available slots"
         );
         assert_eq!(mixed_batch.resource_requirements.gpu_memory, (6 + 128) * 16);
+    }
+
+    #[test]
+    fn active_decode_prefill_budget_caps_small_final_chunks_by_count() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 32,
+            prompt_token_estimate: true,
+            prefill_step_chunk: Some(6),
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 32,
+            max_tokens: 192,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        let mut decode_ids = Vec::new();
+        for _ in 0..19 {
+            let request = create_test_request_with_prompt_tokens(Priority::Normal, 1);
+            decode_ids.push(request.id.clone());
+            enqueue_waiting(&scheduler, request);
+        }
+        let initial_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(initial_batch.requests.len(), 19);
+        for id in &decode_ids {
+            scheduler.mark_prefill_complete(id, 1);
+        }
+
+        for _ in 0..13 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 1),
+            );
+        }
+
+        let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
+        let prefill_tokens: Vec<_> = mixed_batch
+            .requests
+            .iter()
+            .filter(|request| !decode_ids.contains(&request.request.id))
+            .map(|request| request.tokens_to_process)
+            .collect();
+
+        assert_eq!(
+            mixed_batch.requests.len(),
+            23,
+            "small final prefill chunks must not bypass the mixed-prefill count budget"
+        );
+        assert_eq!(prefill_tokens, vec![Some(1), Some(1), Some(1), Some(1)]);
     }
 
     #[test]
