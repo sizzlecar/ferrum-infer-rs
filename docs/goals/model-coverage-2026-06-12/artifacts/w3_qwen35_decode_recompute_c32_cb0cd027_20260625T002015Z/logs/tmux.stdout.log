@@ -1,0 +1,19 @@
+2026-06-25T00:20:15Z lane_start art=/workspace/artifacts/w3_qwen35_decode_recompute_c32_cb0cd027_20260625T002015Z sha=cb0cd027026220f2b340d0b12278c373a4027c56 release_evidence=false no_live_vllm=true cost_per_hr_approx=0.456
+2026-06-25T00:20:16Z bootstrap_start
+2026-06-25T00:20:17Z bootstrap_done
+2026-06-25T00:20:17Z git_sync_start
+2026-06-25T00:20:18Z git_sync_done
+2026-06-25T00:20:18Z hf_prefetch_start
+2026-06-25T00:20:18Z cargo_check_start
+2026-06-25T00:20:22Z cargo_check_done
+2026-06-25T00:20:22Z release_build_start
+2026-06-25T00:23:51Z release_build_done
+2026-06-25T00:23:51Z hf_prefetch_wait_start
+2026-06-25T00:23:51Z hf_prefetch_done tokenizer=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+2026-06-25T00:23:51Z ferrum_run_smoke_start
+2026-06-25T00:24:21Z ferrum_run_smoke_done
+2026-06-25T00:24:21Z serve_start
+2026-06-25T00:24:52Z serve_ready
+2026-06-25T00:24:52Z serve_chat_smoke_done
+2026-06-25T00:24:52Z bench_c32_start
+2026-06-25T00:25:04Z FERRUM W3 QWEN35 DECODE RECOMPUTE C32 DIAG PASS: /workspace/artifacts/w3_qwen35_decode_recompute_c32_cb0cd027_20260625T002015Z
