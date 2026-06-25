@@ -2,6 +2,43 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ158 — reusable 9fda1101 c32 diagnostic script prepared
+
+- Context:
+  - ZZZ156 and ZZZ157 show the exact 1x4090 GPU lane is currently externally
+    blocked by Vast retained-instance and offer availability;
+  - repeating start attempts is not useful work, and it risks recreating the
+    previous pattern of spending time without producing evidence.
+- Added script:
+  - `scripts/release/w3_qwen35_c32_diagnostic.sh`.
+- Purpose:
+  - run the focused W3 Qwen3.5 c32 diagnostic as soon as an exact 1x RTX 4090
+    is available;
+  - default target SHA:
+    `9fda11014c17483b0ceca479e3704b3767db0cbe`;
+  - default artifact tag: `mixed_prefill_immediate_kv`;
+  - default throughput floor: `458.0662677685816 tok/s`, from ZZZ153;
+  - default maximum `Unified KV admission failed`: `13`, from ZZZ153;
+  - default maximum final `capacity_deferred_total`: `32`, from ZZZ153.
+- Script behavior:
+  - records preflight hardware, git SHA/status, build logs, `ferrum run` smoke,
+    `ferrum serve` smoke, effective configs, scheduler trace, c32 bench command,
+    bench JSON, and a `perf/diagnostic_verdict.json`;
+  - prints `FERRUM W3 QWEN35 C32 DIAG KEEP: <artifact>` only if the focused
+    diagnostic beats the ZZZ153 floor with `32/32` completed and zero errors;
+  - prints `FERRUM W3 QWEN35 C32 DIAG REJECT: <artifact>` on bench failure,
+    threshold miss, or capacity/admission regression;
+  - never prints `MODEL_RELEASE_GRADE_W3 PASS`.
+- Local validation:
+  - `bash -n scripts/release/w3_qwen35_c32_diagnostic.sh` PASS;
+  - `bash scripts/release/w3_qwen35_c32_diagnostic.sh --help` PASS;
+  - `git diff --check` PASS.
+- Limits:
+  - this is execution-preparation progress, not CUDA evidence;
+  - no CUDA diagnostic, performance bench, or final W3 validator ran here;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ157 — retained Vast still unavailable; no reliable exact 1x4090 offer rented
 
 - Intended diagnostic:
