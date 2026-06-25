@@ -1,0 +1,127 @@
+From https://github.com/sizzlecar/ferrum-infer-rs
+ * branch              goal/w2-w3-release-grade -> FETCH_HEAD
+Updating 6da2ac56..32a44ac1
+Fast-forward
+ .../src/implementations/continuous.rs              | 156 +++-
+ docs/goals/model-coverage-2026-06-12/STATUS.md     | 121 ++++
+ .../artifact_path                                  |   1 +
+ .../exit_code                                      |   1 +
+ .../logs/tmux.stderr.log                           |   1 +
+ .../logs/tmux.stdout.log                           |  19 +
+ .../run_remote_diagnostic.sh                       |  11 +
+ .../env/build.exit                                 |   1 +
+ .../env/cargo-check.exit                           |   1 +
+ .../env/cargo.txt                                  |   1 +
+ .../env/ferrum.sha256                              |   1 +
+ .../env/git_sha.txt                                |   1 +
+ .../env/git_status_short.txt                       |   0
+ .../env/rustc.txt                                  |   1 +
+ .../env/tokenizer_path.txt                         |   1 +
+ .../hardware/nvidia_smi_before.txt                 |  20 +
+ .../logs/build.stderr.log                          |   4 +
+ .../logs/build.stdout.log                          |   0
+ .../logs/cargo-check.stderr.log                    |   4 +
+ .../logs/cargo-check.stdout.log                    |   0
+ .../logs/git-checkout-branch.log                   |   4 +
+ .../logs/git-checkout-detach.log                   |   1 +
+ .../logs/git-fetch.log                             |   3 +
+ .../logs/git-pull.log                              | 128 ++++
+ .../logs/lane.log                                  |  19 +
+ .../logs/nvidia_after.csv                          |   1 +
+ .../logs/pip-hf.log                                |   1 +
+ .../logs/preflight.log                             |  30 +
+ .../logs/rustup-default.log                        |   4 +
+ .../logs/rustup-toolchain.log                      |   5 +
+ .../perf/bench-ferrum-c32.command.txt              |   1 +
+ .../perf/bench.exit                                |   1 +
+ .../perf/bench.stderr.log                          |  13 +
+ .../perf/bench.stdout.log                          |   0
+ .../perf/bench_ferrum_c32_32x1.json                | 246 +++++++
+ .../perf/bench_summary.json                        | 137 ++++
+ .../perf/diagnostic_verdict.json                   |   8 +
+ .../prefetch/hf-prefetch.exit                      |   1 +
+ .../prefetch/hf-prefetch.log                       |   1 +
+ .../run/decision_trace.jsonl                       |  12 +
+ .../run/effective_config.assert.txt                |   1 +
+ .../run/effective_config.json                      | 647 +++++++++++++++++
+ .../run/run.command.txt                            |   1 +
+ .../run/run.exit                                   |   1 +
+ .../run/run.stderr.log                             | 109 +++
+ .../run/run.stdout.jsonl                           |   1 +
+ .../scripts/w3_qwen35_c32_diagnostic.sh            | 805 +++++++++++++++++++++
+ .../server/chat_smoke.curl.err                     |   0
+ .../server/chat_smoke_payload.json                 |   1 +
+ .../server/chat_smoke_response.json                |   1 +
+ .../server/decision_trace.jsonl                    |  12 +
+ .../server/effective_config.assert.txt             |   1 +
+ .../server/effective_config.json                   | 606 ++++++++++++++++
+ .../server/models.curl.err                         |   0
+ .../server/models.json                             |   1 +
+ .../server/profile.jsonl.gz                        | Bin 0 -> 17164 bytes
+ .../server/scheduler_trace.jsonl.gz                | Bin 0 -> 63677 bytes
+ .../server/serve.command.txt                       |   1 +
+ .../server/serve.log                               | 235 ++++++
+ .../server/serve.stdout.log                        |  29 +
+ .../server/server.pid                              |   1 +
+ scripts/release/w3_qwen35_c32_diagnostic.sh        |   4 +-
+ scripts/release/w3_qwen35_vast_c32_diagnostic.py   |   6 +-
+ 63 files changed, 3404 insertions(+), 20 deletions(-)
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_f1bc7b7e_1782386720/artifact_path
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_f1bc7b7e_1782386720/exit_code
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_f1bc7b7e_1782386720/logs/tmux.stderr.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_f1bc7b7e_1782386720/logs/tmux.stdout.log
+ create mode 100755 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_f1bc7b7e_1782386720/run_remote_diagnostic.sh
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/env/build.exit
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/env/cargo-check.exit
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/env/cargo.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/env/ferrum.sha256
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/env/git_sha.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/env/git_status_short.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/env/rustc.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/env/tokenizer_path.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/hardware/nvidia_smi_before.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/logs/build.stderr.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/logs/build.stdout.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/logs/cargo-check.stderr.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/logs/cargo-check.stdout.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/logs/git-checkout-branch.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/logs/git-checkout-detach.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/logs/git-fetch.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/logs/git-pull.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/logs/lane.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/logs/nvidia_after.csv
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/logs/pip-hf.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/logs/preflight.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/logs/rustup-default.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/logs/rustup-toolchain.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/perf/bench-ferrum-c32.command.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/perf/bench.exit
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/perf/bench.stderr.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/perf/bench.stdout.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/perf/bench_ferrum_c32_32x1.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/perf/bench_summary.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/perf/diagnostic_verdict.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/prefetch/hf-prefetch.exit
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/prefetch/hf-prefetch.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/run/decision_trace.jsonl
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/run/effective_config.assert.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/run/effective_config.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/run/run.command.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/run/run.exit
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/run/run.stderr.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/run/run.stdout.jsonl
+ create mode 100755 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/scripts/w3_qwen35_c32_diagnostic.sh
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/server/chat_smoke.curl.err
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/server/chat_smoke_payload.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/server/chat_smoke_response.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/server/decision_trace.jsonl
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/server/effective_config.assert.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/server/effective_config.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/server/models.curl.err
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/server/models.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/server/profile.jsonl.gz
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/server/scheduler_trace.jsonl.gz
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/server/serve.command.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/server/serve.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/server/serve.stdout.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/server/server.pid

@@ -2,6 +2,126 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ207 — source candidate: structured decode KV pressure cap
+
+- Context:
+  - follows ZZZ206 `47a3a9af` c32 diagnostic REJECT;
+  - no GPU lane was started for this source step;
+  - no live vLLM run was used.
+- Source change:
+  - commit `85719c1b51f3bac6672e7c842a2f6d20ad9ff024`
+    (`perf(scheduler): use kv pressure for decode backpressure`);
+  - scheduler decode backpressure now accepts structured paged-KV pressure
+    from the engine;
+  - near-fit failures use usable `free_blocks` rather than blind halving, so a
+    `need 16/free 12` pressure signal caps closer to available KV capacity
+    instead of forcing decode width down to `8`;
+  - engine records structured decode pressure on decode-only unified KV
+    admission failures and adaptive decode chunk failures, and passes observed
+    free-block counts when a decode request is moved back to waiting.
+- Why this matches ZZZ206:
+  - ZZZ206 proved the previous patch reopened mixed scheduling
+    (`mixed_iterations 0 -> 57`) but regressed throughput from `476.311` to
+    `343.317 tok/s`;
+  - trace comparison showed average decode width dropped from `9.73` to
+    `6.70`;
+  - the remaining resource errors include near-fit cases such as
+    `need 16/free 12`, where halving is unnecessarily conservative.
+- Local validation:
+  - `cargo test -p ferrum-scheduler capacity_backpressure -- --nocapture`
+    PASS, `6/6`;
+  - `cargo test -p ferrum-scheduler decode_capacity_backpressure -- --nocapture`
+    PASS, `1/1`;
+  - `cargo test -p ferrum-engine paged_kv_admission_pressure -- --nocapture`
+    PASS, `3/3`;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture`
+    PASS, `10/10`;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS, `81/81`;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Runner targeting:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now defaults to target
+    SHA `85719c1b51f3bac6672e7c842a2f6d20ad9ff024`;
+  - default tag is now `structured_decode_kv_pressure`;
+  - `scripts/release/w3_qwen35_c32_diagnostic.sh` standalone defaults were
+    updated to the same SHA/tag.
+- Expected signal for a next scoped c32 diagnostic:
+  - keep the ZZZ206 mixed scheduling recovery instead of returning to
+    `mixed_iterations=0`;
+  - improve average decode width and throughput versus ZZZ206;
+  - reduce near-fit repeated KV admission failures without increasing
+    correctness errors, OOM, panic, or HTTP 500.
+- Limits:
+  - this is not W3 completion, not performance evidence, and not release
+    evidence;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
+## 2026-06-25 ZZZ206 — 47a3a9af c32 diagnostic REJECT: mixed lane recovers but decode cap is too conservative
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_capacity_backpressure_c32_47a3a9af_20260625T115200Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_47a3a9af_1782388257/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    decode-capacity-backpressure diagnostic;
+  - expected runtime/cost: 10-20 minutes, about `$0.08-$0.16`, using retained
+    instance `42216671`, exact `1x RTX 4090`, `$0.47777777777777775/hr`;
+  - stop condition: KEEP, REJECT, SSH/CUDA unavailable, timeout, or script
+    failure;
+  - correctness gate: remote clean SHA, `cargo check`, CUDA release build,
+    `ferrum run` smoke, `ferrum serve` models/chat smoke;
+  - performance command: `ferrum bench-serve c32 --fail-on-error --seed 9271
+    --n-repeats 1`;
+  - no live vLLM run;
+  - runner copied artifact and orchestrator metadata back;
+  - runner stop poll confirmed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Remote evidence:
+  - remote Git SHA:
+    `47a3a9af4d399287894b7e17381ad97486a86509`;
+  - remote git status short was empty;
+  - binary SHA256:
+    `c29d8becfbe193362ccb913d300fd91a75aff1155580629cbd4d2cdaa03e5b1b`;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` smoke covered `/v1/models` and `/v1/chat/completions`;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, zero
+    HTTP 500, zero panic, zero OOM mentions, and
+    `output_token_count_source=usage`.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - verdict `REJECT`;
+  - reject reasons:
+    - output throughput `343.317 tok/s` <= floor `600.0`;
+    - `mixed_iterations=57` < `64`;
+    - p95 ITL `49.459 ms` > `25.0`.
+- Comparison with ZZZ204:
+  - positive: `mixed_iterations` improved from `0` to `57`;
+  - negative: output throughput regressed from `476.311` to `343.317 tok/s`;
+  - negative: average decode items dropped from `9.73` to `6.70`;
+  - negative: `Unified KV admission failed` rose from `8` to `10`;
+  - negative: `capacity_deferred_total` rose from `16` to `24`;
+  - correctness remained clean: no request errors, HTTP 500, panic, or OOM.
+- Diagnosis:
+  - the source change hit the intended mixed scheduling failure mode, but the
+    decode cap is too conservative;
+  - the scheduler halves decode width after every decode KV pressure signal,
+    even when structured pressure shows the batch nearly fits, for example
+    `need 16/free 12`;
+  - next source direction is to feed structured paged-KV pressure into the
+    decode-width cap so near-fit failures cap to usable free blocks rather than
+    blindly halving.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ205 — source candidate: decode capacity backpressure
 
 - Context:
