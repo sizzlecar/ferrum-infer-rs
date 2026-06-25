@@ -2,6 +2,87 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ187 — e213e6eb c32 diagnostic REJECT: KV failures down, mixed recompute still too little/slow
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_recompute_kv_capacity_gate_c32_e213e6eb_20260625T082731Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_e213e6eb_1782376009/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32 focused diagnostic,
+    expected 10-20 minutes, about `$0.08-$0.16`, stop on KEEP/REJECT,
+    SSH/CUDA/preflight failure, script failure, or timeout;
+  - reused retained instance `42216671`, exact `1x RTX 4090`, cost
+    `$0.47777777777777775/hr`;
+  - no new instance was created;
+  - artifact and orchestrator metadata were copied back;
+  - runner stop poll confirmed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`;
+  - independent Vast inventory after analysis again showed `42216671`
+    `stopped/exited`.
+- Remote evidence:
+  - remote Git SHA:
+    `e213e6eb0d37739b0fcf3d9d435413e7ccf95944`;
+  - remote git status short was empty;
+  - binary SHA256:
+    `c7993f71bd02b89461c510989a050eae8638fbaa568a412c81a6e0ddf8f92ebd`;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` `/v1/models` and chat smoke passed;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, zero
+    HTTP 500, zero panic, and `output_token_count_source=usage`;
+  - no live vLLM run.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - remote verdict line:
+    `FERRUM W3 QWEN35 C32 DIAG REJECT:
+    /workspace/artifacts/w3_qwen35_mixed_recompute_kv_capacity_gate_c32_e213e6eb_20260625T082731Z`.
+- Reject reasons:
+  - output throughput `422.960 tok/s` <= floor `600.0`;
+  - `mixed_iterations=28` < threshold `64`;
+  - p95 ITL `62.386 ms` > `25.0`.
+- Positive signal versus ZZZ185:
+  - `Unified KV admission failed` improved `15 -> 9`;
+  - `capacity_deferred_total` improved `25 -> 18`;
+  - output throughput improved `374.954 -> 422.960 tok/s`;
+  - p95 ITL improved `68.221 -> 62.386 ms`;
+  - average process time improved `25414 us -> 22885 us`;
+  - correctness smoke remained clean: `32/32` completed and zero request
+    errors.
+- Remaining regressions/gap:
+  - still below ZZZ183 throughput `452.616 tok/s`;
+  - still far below diagnostic floor `600 tok/s`;
+  - `mixed_iterations=28` is below the diagnostic floor `64`;
+  - p95 ITL remains more than `2x` the `25 ms` diagnostic threshold.
+- Offline trace correction:
+  - the earlier `prefill_tokens_delta == 0` proxy is too coarse for non-final
+    chunked prefill: the trace shows `prefill_tokens_processed` advancing by
+    6-token chunks during mixed rows;
+  - e213e6eb mixed trace includes one final 1-token prefill completion row
+    and two recompute chunk sequences that advance from `0 -> 60` and
+    `0 -> 90` processed tokens before capacity pressure/defer intervenes;
+  - therefore the new gate did reduce blind KV admission retries, but mixed
+    recompute remains too serialized and too slow to hit c32 throughput/ITL.
+- Classification:
+  - diagnostic rejected, not performance evidence and not release evidence;
+  - source change direction is partially validated for reducing KV admission
+    failures, but it does not solve W3 c32.
+- Next source direction:
+  - do not rerun paid GPU from this artifact alone;
+  - inspect why mixed recompute chunks are only `6` tokens under decode
+    pressure and why only one blocked recompute is active at a time;
+  - next candidate should target useful recompute throughput per mixed
+    iteration, not merely more retry attempts;
+  - preserve the lower KV admission failure signal (`<=9`) while increasing
+    actual mixed prefill progress and reducing p95 ITL.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ186 — source fix: gate mixed recompute retry on model-owned KV capacity snapshot
 
 - Context:
