@@ -2,6 +2,50 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ196 — source diagnostic fix: enable real unified post profile
+
+- Context:
+  - follows ZZZ195 `5810442a` c32 diagnostic REJECT;
+  - no new GPU lane was started for this step;
+  - no live vLLM run was used.
+- Finding:
+  - the W3 c32 diagnostic script exported `FERRUM_UNIFIED_PROF=1`;
+  - the engine runtime actually reads `FERRUM_UNIFIED_POST_PROF`;
+  - therefore the latest artifact did not emit `[unified-prof]` rows, even
+    though those rows are the intended evidence for splitting mixed-row cost
+    into model time and decode-post time.
+- Source change:
+  - `scripts/release/w3_qwen35_c32_diagnostic.sh` now exports
+    `FERRUM_UNIFIED_POST_PROF=1`;
+  - the serve command now writes `--profile-jsonl
+    "$ART/server/profile.jsonl"`;
+  - `perf/bench_summary.json` now summarizes `[unified-prof]` rows for
+    all, mixed, prefill-only, and decode-only iterations, including average,
+    p95, and max timing fields.
+- Local validation:
+  - `bash -n scripts/release/w3_qwen35_c32_diagnostic.sh` PASS;
+  - `scripts/release/w3_qwen35_c32_diagnostic.sh --self-test` PASS, including
+    assertions that mixed, prefill-only, and decode-only profile rows are
+    parsed into the summary;
+  - `python3 -m py_compile scripts/release/w3_qwen35_vast_c32_diagnostic.py`
+    PASS;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --self-test`
+    PASS;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --plan-only`
+    PASS and still reports `no_live_vllm=true`;
+  - `git diff --check` PASS.
+- Why this matters:
+  - this directly addresses the post-ZZZ195 gap: the next paid run, if needed,
+    can answer whether mixed rows are slow in model execution or in decode
+    post-processing instead of forcing another blind scheduler-width tweak.
+- Limits:
+  - this is diagnostic instrumentation only;
+  - it does not change scheduler/model runtime behavior;
+  - it is not W3 completion, not performance evidence, and not release
+    evidence;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ195 — 5810442 c32 diagnostic REJECT: headroom reduces churn, still below target
 
 - Artifact:

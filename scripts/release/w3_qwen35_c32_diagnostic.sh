@@ -31,6 +31,7 @@ write_diagnostic_summary() {
   python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PY_SUMMARY'
 import gzip
 import json
+import math
 import pathlib
 import re
 import sys
@@ -42,6 +43,14 @@ max_kv_admission_failed = int(sys.argv[4])
 max_capacity_deferred = int(sys.argv[5])
 min_mixed_iterations = int(sys.argv[6])
 max_p95_itl_ms = None if sys.argv[7] == "" else float(sys.argv[7])
+UNIFIED_PROF_RE = re.compile(
+    r"\[unified-prof\]\s+iter#(?P<iter>\d+)\s+items=(?P<items>\d+)\s+"
+    r"prefill=(?P<prefill>\d+)\s+decode=(?P<decode>\d+)\s+"
+    r"total=(?P<total>\d+)us\s+model=(?P<model>\d+)us\s+"
+    r"decode_post=(?P<decode_post>\d+)us\s+\|\s+sample=(?P<sample>\d+)\s+"
+    r"sched=(?P<sched>\d+)\s+stream=(?P<stream>\d+)\s+stop=(?P<stop>\d+)\s+"
+    r"complete=(?P<complete>\d+)"
+)
 summary = {
     "artifact": str(art),
     "sha": sha,
@@ -187,8 +196,50 @@ if last:
 
 serve = art / "server/serve.log"
 text = serve.read_text(errors="replace") if serve.exists() else ""
+profile_rows = [
+    {key: int(value) for key, value in match.groupdict().items()}
+    for match in UNIFIED_PROF_RE.finditer(text)
+]
+
+def profile_stats(rows):
+    if not rows:
+        return {"count": 0}
+
+    def values(name):
+        return [row[name] for row in rows]
+
+    def avg(name):
+        data = values(name)
+        return sum(data) / len(data)
+
+    def p95(name):
+        data = sorted(values(name))
+        index = min(len(data) - 1, max(0, math.ceil(len(data) * 0.95) - 1))
+        return data[index]
+
+    return {
+        "count": len(rows),
+        "avg_total_us": avg("total"),
+        "p95_total_us": p95("total"),
+        "max_total_us": max(values("total")),
+        "avg_model_us": avg("model"),
+        "avg_decode_post_us": avg("decode_post"),
+        "avg_sample_us": avg("sample"),
+        "avg_sched_us": avg("sched"),
+        "avg_stream_us": avg("stream"),
+        "avg_stop_us": avg("stop"),
+        "avg_complete_us": avg("complete"),
+    }
+
+summary["unified_prof"] = {
+    "all": profile_stats(profile_rows),
+    "mixed": profile_stats([row for row in profile_rows if row["prefill"] > 0 and row["decode"] > 0]),
+    "prefill_only": profile_stats([row for row in profile_rows if row["prefill"] > 0 and row["decode"] == 0]),
+    "decode_only": profile_stats([row for row in profile_rows if row["decode"] > 0 and row["prefill"] == 0]),
+}
 summary["log_counts"] = {
     "unified_kv_admission_failed": text.count("Unified KV admission failed"),
+    "unified_prof_events": len(profile_rows),
     "cancelled_during_decode": text.count("cancelled during decode"),
     "preempting_request": text.count("Preempting request"),
     "oom_mentions": len(re.findall(r"out of memory|OutOfMemory|OOM", text)),
@@ -336,7 +387,14 @@ PY_CASE_TRACE
 import sys
 
 path, count = sys.argv[1], int(sys.argv[2])
-open(path, "w").write("Unified KV admission failed\n" * count)
+profile = "\n".join(
+    [
+        "[unified-prof] iter#1 items=32 prefill=0 decode=32 total=28000us model=27600us decode_post=300us | sample=20 sched=0 stream=280 stop=0 complete=0 (us)",
+        "[unified-prof] iter#2 items=33 prefill=1 decode=32 total=42000us model=41000us decode_post=800us | sample=30 sched=0 stream=760 stop=0 complete=10 (us)",
+        "[unified-prof] iter#3 items=1 prefill=1 decode=0 total=50000us model=49900us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)",
+    ]
+)
+open(path, "w").write(("Unified KV admission failed\n" * count) + profile + "\n")
 PY_CASE_LOG
     write_diagnostic_summary "$art" "selftest" "600" "13" "32" "64" "25"
   }
@@ -368,6 +426,11 @@ for name, verdict in expected.items():
     data = json.load(open(root / name / "perf" / "diagnostic_verdict.json"))
     actual = data["verdict"]
     assert actual == verdict, (name, actual, verdict, data)
+keep_summary = json.load(open(root / "keep" / "perf" / "bench_summary.json"))
+assert keep_summary["log_counts"]["unified_prof_events"] == 3, keep_summary["log_counts"]
+assert keep_summary["unified_prof"]["mixed"]["count"] == 1, keep_summary["unified_prof"]
+assert keep_summary["unified_prof"]["decode_only"]["count"] == 1, keep_summary["unified_prof"]
+assert keep_summary["unified_prof"]["prefill_only"]["count"] == 1, keep_summary["unified_prof"]
 print("W3 QWEN35 C32 DIAGNOSTIC SELFTEST PASS")
 PY_ASSERT_SELFTEST
 }
@@ -473,7 +536,7 @@ export HF_HOME="${HF_HOME:-/workspace/hf-cache}"
 export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
 export RUST_BACKTRACE=1
 export FERRUM_SCHED_TRACE=1
-export FERRUM_UNIFIED_PROF=1
+export FERRUM_UNIFIED_POST_PROF=1
 
 SHORT_SHA="${SHA:0:8}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -642,6 +705,7 @@ SERVE_CMD=(target/release/ferrum serve "$MODEL"
   --max-num-seqs 32 --kv-capacity 512 --max-num-batched-tokens 192
   --scheduler-prefill-first-until-active 32 --scheduler-prefill-step-chunk 6
   --effective-config-json "$ART/server/effective_config.json"
+  --profile-jsonl "$ART/server/profile.jsonl"
   --decision-trace-jsonl "$ART/server/decision_trace.jsonl"
   --scheduler-trace-jsonl "$ART/server/scheduler_trace.jsonl")
 printf '%q ' "${SERVE_CMD[@]}" > "$ART/server/serve.command.txt"
