@@ -26,8 +26,8 @@ from typing import Any
 
 
 DEFAULT_INSTANCE_ID = 42216671
-DEFAULT_SHA = "a6cbb1d0b3f3544c4927c5531cf7331182c91412"
-DEFAULT_TAG = "active_recompute_shared_slot"
+DEFAULT_SHA = "e270c5b167ea681daec36c4c1fd132608c7c543d"
+DEFAULT_TAG = "no_progress_recompute_retry"
 DEFAULT_THROUGHPUT_FLOOR = "600.0"
 DEFAULT_MAX_KV_ADMISSION_FAILED = "13"
 DEFAULT_MAX_CAPACITY_DEFERRED = "32"
@@ -337,7 +337,7 @@ def main() -> int:
         raise DiagnosticError(f"missing local diagnostic script: {local_diag_script}")
 
     plan = {
-        "lane": "W3 Qwen35 c32 active-recompute-shared-slot diagnostic",
+        "lane": "W3 Qwen35 c32 no-progress-recompute-retry diagnostic",
         "instance_id": args.instance_id,
         "target_sha": args.sha,
         "correctness_gate": [
