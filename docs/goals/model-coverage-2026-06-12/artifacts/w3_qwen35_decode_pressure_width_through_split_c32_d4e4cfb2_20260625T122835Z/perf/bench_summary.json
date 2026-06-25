@@ -1,0 +1,147 @@
+{
+  "artifact": "/workspace/artifacts/w3_qwen35_decode_pressure_width_through_split_c32_d4e4cfb2_20260625T122835Z",
+  "bench": {
+    "completed_per_run": [
+      32
+    ],
+    "concurrency": 32,
+    "errored_per_run": [
+      0
+    ],
+    "http_500_per_run": [
+      0
+    ],
+    "n_repeats": 1,
+    "n_requests_per_run": 32,
+    "output_throughput_tps": 342.11249596837,
+    "output_token_count_source": "usage",
+    "p95_itl_ms": 50.1453824,
+    "p95_tpot_ms": 76.66806637362205,
+    "p95_ttft_ms": 2132.1545472,
+    "panic_per_run": [
+      0
+    ],
+    "request_throughput_rps": 2.6727538747528907,
+    "total_throughput_tps": 649.4791915649524
+  },
+  "bench_exit": "0",
+  "last_iteration": 901,
+  "last_scheduler_after_schedule": {
+    "active_len": 0,
+    "admitted_total": 61,
+    "cancelled_total": 0,
+    "capacity_blocked_waiting_len": 0,
+    "capacity_deferred_total": 24,
+    "completed_total": 37,
+    "decode_queue_len": 0,
+    "failed_total": 0,
+    "prefill_queue_len": 0,
+    "waiting_queue_len": 0
+  },
+  "last_scheduler_before": {
+    "active_len": 0,
+    "admitted_total": 61,
+    "cancelled_total": 0,
+    "capacity_blocked_waiting_len": 0,
+    "capacity_deferred_total": 24,
+    "completed_total": 37,
+    "decode_queue_len": 0,
+    "failed_total": 0,
+    "prefill_queue_len": 0,
+    "waiting_queue_len": 0
+  },
+  "log_counts": {
+    "block_pool_exhausted": 0,
+    "cancelled_during_decode": 0,
+    "oom_mentions": 0,
+    "panic_mentions": 0,
+    "preempting_request": 0,
+    "unified_kv_admission_failed": 10,
+    "unified_prefill_alloc_deferred": 0,
+    "unified_prof_events": 84
+  },
+  "no_live_vllm": true,
+  "reject_reasons": [
+    "output_throughput_tps=342.11249596837 <= floor=600.0",
+    "mixed_iterations=57 < 64",
+    "p95_itl_ms=50.1453824 > 25.0"
+  ],
+  "release_evidence": false,
+  "sha": "d4e4cfb26e5745e93d78ecf925dba6092133eaff",
+  "thresholds": {
+    "max_capacity_deferred_total": 32,
+    "max_kv_admission_failed": 13,
+    "max_p95_itl_ms": 25.0,
+    "min_mixed_iterations": 64,
+    "output_throughput_floor_tps": 600.0,
+    "required_completed": 32,
+    "required_errors": 0
+  },
+  "trace_stats": {
+    "avg_decode_items": 6.695461200585652,
+    "avg_process_us": 19317.294289897512,
+    "decode_only_iterations": 474,
+    "max_active_len": 32,
+    "max_capacity_deferred_total": 24,
+    "mixed_iterations": 57,
+    "prefill_only_iterations": 152,
+    "scheduled_decode_tokens": 4573,
+    "scheduled_prefill_tokens": 7869,
+    "some_ok_iterations": 683
+  },
+  "unified_prof": {
+    "all": {
+      "avg_complete_us": 10.05952380952381,
+      "avg_decode_post_us": 100.39285714285714,
+      "avg_model_us": 16320.952380952382,
+      "avg_sample_us": 24.55952380952381,
+      "avg_sched_us": 0.0,
+      "avg_stop_us": 0.0,
+      "avg_stream_us": 65.77380952380952,
+      "avg_total_us": 16762.70238095238,
+      "count": 84,
+      "max_total_us": 203324,
+      "p95_total_us": 32480
+    },
+    "decode_only": {
+      "avg_complete_us": 16.568627450980394,
+      "avg_decode_post_us": 147.94117647058823,
+      "avg_model_us": 10512.176470588236,
+      "avg_sample_us": 35.431372549019606,
+      "avg_sched_us": 0.0,
+      "avg_stop_us": 0.0,
+      "avg_stream_us": 95.94117647058823,
+      "avg_total_us": 10666.823529411764,
+      "count": 51,
+      "max_total_us": 17985,
+      "p95_total_us": 14694
+    },
+    "mixed": {
+      "avg_complete_us": 0.0,
+      "avg_decode_post_us": 444.0,
+      "avg_model_us": 40212.0,
+      "avg_sample_us": 128.0,
+      "avg_sched_us": 0.0,
+      "avg_stop_us": 0.0,
+      "avg_stream_us": 316.0,
+      "avg_total_us": 40679.0,
+      "count": 2,
+      "max_total_us": 42214,
+      "p95_total_us": 42214
+    },
+    "prefill_only": {
+      "avg_complete_us": 0.0,
+      "avg_decode_post_us": 0.0,
+      "avg_model_us": 24335.967741935485,
+      "avg_sample_us": 0.0,
+      "avg_sched_us": 0.0,
+      "avg_stop_us": 0.0,
+      "avg_stream_us": 0.0,
+      "avg_total_us": 25248.41935483871,
+      "count": 31,
+      "max_total_us": 203324,
+      "p95_total_us": 81172
+    }
+  },
+  "verdict": "reject"
+}
