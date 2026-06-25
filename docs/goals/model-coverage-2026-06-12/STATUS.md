@@ -2,6 +2,72 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ208 — 85719c1b c32 diagnostic REJECT: mixed threshold passes, decode becomes too small
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_structured_decode_kv_pressure_c32_85719c1b_20260625T121151Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_85719c1b_1782389467/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    structured-decode-kv-pressure diagnostic;
+  - expected runtime/cost: 10-20 minutes, about `$0.08-$0.16`, using retained
+    instance `42216671`, exact `1x RTX 4090`, `$0.47777777777777775/hr`;
+  - stop condition: KEEP, REJECT, SSH/CUDA unavailable, timeout, or script
+    failure;
+  - correctness gate: remote clean SHA, `cargo check`, CUDA release build,
+    `ferrum run` smoke, `ferrum serve` models/chat smoke;
+  - performance command: `ferrum bench-serve c32 --fail-on-error --seed 9271
+    --n-repeats 1`;
+  - no live vLLM run;
+  - runner copied artifact and orchestrator metadata back;
+  - runner stop poll confirmed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Remote evidence:
+  - remote Git SHA:
+    `85719c1b51f3bac6672e7c842a2f6d20ad9ff024`;
+  - remote git status short was empty;
+  - binary SHA256:
+    `cf2100980c1f9ad668d7458835ee0833343eb91f98992a93af9a9044fec67ef3`;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` smoke covered `/v1/models` and `/v1/chat/completions`;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, zero
+    HTTP 500, zero panic, zero OOM mentions, and
+    `output_token_count_source=usage`.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - verdict `REJECT`;
+  - reject reasons:
+    - output throughput `303.375 tok/s` <= floor `600.0`;
+    - p95 ITL `54.243 ms` > `25.0`.
+- Comparison with ZZZ206:
+  - positive: `mixed_iterations` improved from `57` to `107`, now above the
+    diagnostic minimum `64`;
+  - positive: `Unified KV admission failed` dropped from `10` to `9`;
+  - positive: `capacity_deferred_total` dropped from `24` to `23`;
+  - negative: output throughput regressed from `343.317` to `303.375 tok/s`;
+  - negative: p95 ITL worsened from `49.459` to `54.243 ms`;
+  - negative: p95 TTFT worsened from `2150.270` to `7877.654 ms`;
+  - negative: average decode items dropped from `6.70` to `5.09`;
+  - correctness remained clean: no request errors, HTTP 500, panic, or OOM.
+- Diagnosis:
+  - structured KV pressure fixed the missing-mixed signal but overcorrected
+    the scheduler toward very small decode batches;
+  - trace shape is dominated by decode-only widths `1`, `2`, `4`, and `8`,
+    plus many small mixed batches;
+  - the next source direction is not more mixed scheduling. Decode capacity
+    backpressure must recover faster once capacity-deferred backlog is cleared
+    or once the scheduler has made safe mixed progress, so decode does not stay
+    pinned to low widths for the rest of the run.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ207 — source candidate: structured decode KV pressure cap
 
 - Context:
