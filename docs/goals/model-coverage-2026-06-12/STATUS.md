@@ -2,6 +2,139 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ199 — source candidate: gate prefill capacity retry on real release
+
+- Context:
+  - follows ZZZ198 unified-post-prof c32 diagnostic REJECT;
+  - no live vLLM run was used;
+  - no additional GPU run has been started for this source candidate yet.
+- Source change:
+  - commit `e0700638bd185d2b46873d1dc7858b9d9de6eab1`
+    (`perf(scheduler): gate prefill capacity retries on release`);
+  - `defer_prefill_to_waiting` now marks capacity-deferred prefills with the
+    next capacity-release epoch before returning them to waiting;
+  - if decode requests are active, the failed prefill also records the current
+    mixed-recompute attempt epoch, so the same prefill is not immediately
+    retried in the next mixed decode+prefill batch under unchanged capacity;
+  - when there are no active decodes, pure prefill retry can still proceed
+    under the existing backpressure width, avoiding an active=0 deadlock.
+- Why this matches the artifact:
+  - ZZZ198 showed many fast mixed rows where `capacity_deferred_total`
+    increased immediately after scheduling a prefill with active decodes;
+  - those rows were not useful progress: they were repeated KV admission
+    failures that inflated `mixed_iterations` while lowering throughput;
+  - the fix changes "empty batch slot" from implicit capacity evidence into
+    "must wait for real request completion/cancel/release or structured KV
+    capacity evidence."
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-scheduler prefill_capacity_defer_waits_for_release_while_decode_active -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler capacity_backpressure -- --nocapture`
+    PASS, `4/4`;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture`
+    PASS, `9/9`;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS, `78/78`;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Runner targeting:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now defaults to target
+    SHA `e0700638bd185d2b46873d1dc7858b9d9de6eab1`;
+  - default tag is now `prefill_capacity_release_gate`;
+  - `scripts/release/w3_qwen35_c32_diagnostic.sh` standalone defaults were
+    updated to the same SHA/tag.
+- Expected signal for a next scoped c32 diagnostic:
+  - `Unified KV admission failed` and `capacity_deferred_total` should drop
+    versus ZZZ198 (`49` and `140`);
+  - fast mixed rows that only increment capacity-deferred should largely
+    disappear;
+  - `mixed_iterations` may decrease versus ZZZ198's noisy `127`; that is
+    acceptable only if throughput and p95 ITL recover.
+- Limits:
+  - this is not W3 completion, not performance evidence, and not release
+    evidence;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
+## 2026-06-25 ZZZ198 — 1b686e40 unified-post-prof c32 diagnostic REJECT
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_recompute_kv_headroom_unified_post_prof_c32_1b686e40_20260625T101844Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_1b686e40_1782382679/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    mixed-recompute-kv-headroom unified-post-prof diagnostic;
+  - expected runtime/cost: 10-20 minutes, about `$0.08-$0.16`, using retained
+    instance `42216671`, exact `1x RTX 4090`, `$0.47777777777777775/hr`;
+  - stop condition: KEEP, REJECT, SSH/CUDA unavailable, timeout, or script
+    failure;
+  - correctness gate: remote clean SHA, `cargo check`, CUDA release build,
+    `ferrum run` smoke, `ferrum serve` models/chat smoke;
+  - performance command: `ferrum bench-serve c32 --fail-on-error --seed 9271
+    --n-repeats 1`;
+  - no live vLLM run;
+  - runner copied artifact and orchestrator metadata back;
+  - runner stop poll confirmed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Remote evidence:
+  - remote Git SHA:
+    `1b686e40aa9ca59bba4a470d2d3fadef8533bca8`;
+  - remote git status short was empty;
+  - binary SHA256:
+    `09df8d930138440ce3500fed0fc3faf04608dabe431fb3258bc3a5c0ceee6445`;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, zero
+    HTTP 500, zero panic, zero OOM mentions, and
+    `output_token_count_source=usage`.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - verdict `REJECT`;
+  - reject reasons:
+    - output throughput `351.146 tok/s` <= floor `600.0`;
+    - p95 ITL `70.847 ms` > `25.0`;
+    - `Unified KV admission failed=49` > `13`;
+    - `capacity_deferred_total=140` > `32`.
+- Unified-post profile evidence:
+  - `FERRUM_UNIFIED_POST_PROF=1` was present in the effective config;
+  - `server/profile.jsonl.gz` exists and contains `76` `unified_prof` events;
+  - decode-post cost is small:
+    - mixed sampled average `decode_post_us=498.5`;
+    - decode-only sampled average `decode_post_us=110.9`;
+  - model time dominates:
+    - mixed sampled average `model_us=51744.5`;
+    - decode-only sampled average `model_us=10381.0`;
+  - this rules out streaming/sample/decode-post as the main c32 bottleneck.
+- Scheduler trace evidence:
+  - `mixed_iterations=127`, `decode_only_iterations=255`,
+    `prefill_only_iterations=90`;
+  - mixed average process time `~41.1 ms`;
+  - decode-only average process time `~13.6 ms`;
+  - prefill-only average process time `~49.2 ms`;
+  - many fast mixed rows increased `capacity_deferred_total`, meaning they
+    scheduled prefill work only to hit KV admission failure and return it to
+    waiting.
+- Failure distribution:
+  - `20x need 1 admission block but only 0 free`;
+  - `10x need 2 admission blocks but only 0 free`;
+  - `4x need 2 admission blocks but only 1 free`;
+  - remaining failures include larger bursts such as `need 22/free 0`,
+    `need 24/free 4`, `need 21/free 6`, `need 19/free 3`, and
+    `need 16/free 0`.
+- Classification:
+  - diagnostic rejected, not performance evidence and not release evidence;
+  - the profiler succeeded and changed the next source direction: the observed
+    bottleneck is model/KV scheduling churn, not decode-post overhead.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ197 — runner target now includes unified-post-profile diagnostic script
 
 - Context:

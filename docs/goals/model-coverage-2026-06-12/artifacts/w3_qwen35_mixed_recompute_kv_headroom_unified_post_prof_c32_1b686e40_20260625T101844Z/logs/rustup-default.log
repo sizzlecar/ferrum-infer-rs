@@ -1,0 +1,4 @@
+info: using existing install for 1.96.0-x86_64-unknown-linux-gnu
+info: default toolchain set to 1.96.0-x86_64-unknown-linux-gnu
+
+  1.96.0-x86_64-unknown-linux-gnu unchanged - rustc 1.96.0 (ac68faa20 2026-05-25)
