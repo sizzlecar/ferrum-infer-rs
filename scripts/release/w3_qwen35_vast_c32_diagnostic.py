@@ -260,6 +260,14 @@ def wait_for_instance(
     raise DiagnosticError(f"timed out waiting for instance state; last={instance_summary(last or {})}")
 
 
+def start_response_resources_unavailable(response: Any) -> bool:
+    return (
+        isinstance(response, dict)
+        and response.get("success") is False
+        and response.get("error") == "resources_unavailable"
+    )
+
+
 def parse_artifact_path(text: str) -> str:
     pattern = re.compile(r"FERRUM W3 QWEN35 C32 DIAG (?:KEEP|REJECT):\s+(\S+)")
     matches = pattern.findall(text)
@@ -319,6 +327,14 @@ def run_self_test() -> None:
     reject = "FERRUM W3 QWEN35 C32 DIAG REJECT: /workspace/artifacts/b\n"
     assert parse_artifact_path(keep) == "/workspace/artifacts/a"
     assert parse_artifact_path(keep + reject) == "/workspace/artifacts/b"
+    assert start_response_resources_unavailable(
+        {
+            "success": False,
+            "error": "resources_unavailable",
+            "msg": "Required resources are currently unavailable, state change queued.",
+        }
+    )
+    assert not start_response_resources_unavailable({"success": True})
     wrapper = make_remote_wrapper(
         argparse.Namespace(
             sha=DEFAULT_SHA,
@@ -415,6 +431,11 @@ def main() -> int:
         if instance.get("cur_state") != "running" or instance.get("actual_status") != "running":
             response = vast_request("PUT", f"/instances/{args.instance_id}/", api_key, {"state": "running"})
             print(json.dumps({"start_response": response}, sort_keys=True))
+            if start_response_resources_unavailable(response):
+                raise DiagnosticError(
+                    "Vast resources unavailable for retained instance start; "
+                    "aborting before long start wait"
+                )
             instance = wait_for_instance(
                 api_key,
                 args.instance_id,
