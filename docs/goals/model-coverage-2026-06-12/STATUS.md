@@ -2,6 +2,86 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ193 — 6c2fdcc c32 diagnostic REJECT: mixed restored, KV headroom too thin
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_recompute_kv_snapshot_pacing_c32_6c2fdcc6_20260625T094134Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_6c2fdcc6_1782380438/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    mixed-recompute-kv-snapshot-pacing diagnostic;
+  - expected runtime/cost: 10-20 minutes, about `$0.08-$0.16`, using retained
+    instance `42216671`, exact `1x RTX 4090`, `$0.47777777777777775/hr`;
+  - stop condition: KEEP, REJECT, SSH/CUDA unavailable, timeout, or script
+    failure;
+  - correctness gate: remote clean SHA, `cargo check`, CUDA release build,
+    `ferrum run` smoke, `ferrum serve` models/chat smoke;
+  - performance command: `ferrum bench-serve c32 --fail-on-error --seed 9271
+    --n-repeats 1`;
+  - no live vLLM run;
+  - runner copied artifact and orchestrator metadata back;
+  - runner stop poll confirmed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Remote evidence:
+  - remote Git SHA:
+    `6c2fdcc6d434c0de098eb95ed4cb74ff1c5ed7d0`;
+  - remote git status short was empty;
+  - binary SHA256:
+    `335b394d8263341c5dc834dee133597ccaf9207ed37974821dcc50bdc0ed5459`;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, zero
+    HTTP 500, zero panic, and `output_token_count_source=usage`.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - verdict `REJECT`;
+  - reject reasons:
+    - output throughput `365.931 tok/s` <= floor `600.0`;
+    - p95 ITL `68.743 ms` > `25.0`;
+    - `Unified KV admission failed=48` > `13`;
+    - `capacity_deferred_total=121` > `32`.
+- Positive signal versus ZZZ191:
+  - `mixed_iterations` rose `8 -> 127`, so per-slot KV snapshot pacing did
+    reopen blocked recompute instead of leaving long decode-only stretches;
+  - correctness/client cleanliness remained intact: `32/32` completed, zero
+    request errors, zero HTTP 500, zero panic, no OOM.
+- Regression versus ZZZ191:
+  - throughput regressed `467.001 -> 365.931 tok/s`;
+  - p95 ITL regressed `57.247 -> 68.743 ms`;
+  - `Unified KV admission failed` regressed `12 -> 48`;
+  - `capacity_deferred_total` regressed `21 -> 121`;
+  - average process time regressed `20.905 ms -> 25.994 ms`.
+- Trace/log reading:
+  - trace has `127` mixed iterations, `255` decode-only iterations, and
+    `90` prefill-only iterations;
+  - mixed process average is `~40.511 ms`; decode-only average is
+    `~12.652 ms`;
+  - failure distribution in `serve.log` is dominated by thin-headroom misses:
+    `27x need 1 admission block but only 0 free`, and
+    `10x need 2 admission blocks but only 1 free`;
+  - mixed rows begin around iteration `391`; after that,
+    `capacity_deferred_total` climbs steadily from `0` to `121`, showing
+    admission churn rather than useful recompute throughput.
+- Classification:
+  - diagnostic rejected, not performance evidence and not release evidence;
+  - `6c2fdcc` solved the "mixed too rare" side of ZZZ191, but overshot by
+    reopening at exact/free-thin KV snapshots where active decode/immediate
+    allocation can consume the last free block.
+- Next source direction:
+  - do not rerun this artifact/commit;
+  - keep the generic per-slot idea, but add a KV headroom reserve before
+    considering a snapshot usable for capacity-blocked mixed recompute;
+  - this should target the observed `need 1/free 0` and `need 2/free 1`
+    churn without returning to model-name, GPU-name, or VRAM-specific caps.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ192 — source candidate: pace mixed recompute by KV snapshot per-slot budget
 
 - Context:
