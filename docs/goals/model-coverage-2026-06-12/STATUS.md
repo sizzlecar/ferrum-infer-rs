@@ -2,6 +2,66 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ201 — source candidate: pace release-ready KV recompute
+
+- Context:
+  - follows ZZZ200 `e0700638` c32 diagnostic REJECT;
+  - no GPU lane was started for this step;
+  - no live vLLM run was used.
+- Source change:
+  - commit `65565d30769d09d6770601c43ca70b065c2f0c2a`
+    (`perf(scheduler): pace release-ready kv recompute`);
+  - capacity-deferred requests now remain under the mixed recompute KV slot
+    budget whenever active decode pressure is present, even after their
+    release epoch has become ready;
+  - capacity-deferred requests already sitting in the prefill queue also spend
+    the same budget and record a mixed-attempt epoch, so a no-progress attempt
+    is not immediately retried in the same capacity evidence epoch;
+  - decode-only unified KV admission failures now feed structured paged-KV
+    pressure into the scheduler, preventing the next recompute window from
+    falling back to a plain batch-slot budget;
+  - singleton no-preempt decode KV failures also feed their parsed admission
+    pressure before the request is moved back to waiting.
+- Why this matches ZZZ200:
+  - ZZZ200 showed residual capacity-deferred increases at active decode
+    iterations, including release-ready waiting/prefill bursts;
+  - rows such as the post-decode window after iteration `393` could re-admit
+    several recompute prefills even when the structured KV pressure showed
+    little or no free capacity;
+  - this patch keeps those requests on the same KV-paced path instead of
+    treating release-ready as unlimited capacity.
+- Local validation:
+  - `cargo test -p ferrum-scheduler release_ready_capacity_deferred_recompute_still_uses_kv_budget_under_decode_pressure -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture`
+    PASS, `10/10`;
+  - `cargo test -p ferrum-scheduler active_decode_prefill -- --nocapture`
+    PASS, `5/5`;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS, `79/79`;
+  - `cargo test -p ferrum-engine paged_kv_admission_pressure -- --nocapture`
+    PASS, `3/3`;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Runner targeting:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now defaults to target
+    SHA `65565d30769d09d6770601c43ca70b065c2f0c2a`;
+  - default tag is now `release_ready_kv_recompute_pacing`;
+  - `scripts/release/w3_qwen35_c32_diagnostic.sh` standalone defaults were
+    updated to the same SHA/tag.
+- Expected signal for a next scoped c32 diagnostic:
+  - `Unified KV admission failed` should drop below ZZZ200's `16`;
+  - `capacity_deferred_total` should drop below ZZZ200's `43`;
+  - release-ready mixed bursts should schedule fewer recompute prefills per
+    stale KV evidence window;
+  - throughput must improve versus ZZZ200's `440.803 tok/s`; otherwise the
+    next bottleneck is likely not this admission path.
+- Limits:
+  - this is not W3 completion, not performance evidence, and not release
+    evidence;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ200 — e0700638 c32 diagnostic REJECT: release-gating reduces churn, still below target
 
 - Artifact:

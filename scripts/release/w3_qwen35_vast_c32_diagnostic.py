@@ -26,8 +26,8 @@ from typing import Any
 
 
 DEFAULT_INSTANCE_ID = 42216671
-DEFAULT_SHA = "e0700638bd185d2b46873d1dc7858b9d9de6eab1"
-DEFAULT_TAG = "prefill_capacity_release_gate"
+DEFAULT_SHA = "65565d30769d09d6770601c43ca70b065c2f0c2a"
+DEFAULT_TAG = "release_ready_kv_recompute_pacing"
 DEFAULT_THROUGHPUT_FLOOR = "600.0"
 DEFAULT_MAX_KV_ADMISSION_FAILED = "13"
 DEFAULT_MAX_CAPACITY_DEFERRED = "32"
@@ -374,7 +374,7 @@ def main() -> int:
         raise DiagnosticError(f"missing local diagnostic script: {local_diag_script}")
 
     plan = {
-        "lane": "W3 Qwen35 c32 prefill-capacity-release-gate diagnostic",
+        "lane": "W3 Qwen35 c32 release-ready-kv-recompute-pacing diagnostic",
         "instance_id": args.instance_id,
         "target_sha": args.sha,
         "correctness_gate": [
