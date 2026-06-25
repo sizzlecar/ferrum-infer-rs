@@ -2,6 +2,80 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ170 — a6cbb1d0 c32 diagnostic REJECT: shared slot reduces churn but still misses thresholds
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_active_recompute_shared_slot_c32_a6cbb1d0_20260625T052604Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_a6cbb1d0_1782365116/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    active-recompute-shared-slot diagnostic, expected 10-20 minutes, about
+    `$0.08-$0.16`, stop on KEEP/REJECT/SSH/CUDA failure/timeout/script failure;
+  - inventory before start showed only retained instance `42216671`,
+    `stopped/exited`, exact `1x RTX 4090`, cost `$0.47777777777777775/hr`;
+  - no new instance was created;
+  - artifact and orchestrator metadata were copied back;
+  - stop verification after the run showed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`;
+  - independent inventory after cleanup showed only `42216671`,
+    `stopped/exited`; no unexpected paid/scheduling sibling instances remained.
+- Remote evidence:
+  - remote Git SHA:
+    `a6cbb1d0b3f3544c4927c5531cf7331182c91412`;
+  - remote git status short was empty;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` `/v1/models` and chat smoke passed;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, and
+    `output_token_count_source=usage`;
+  - no live vLLM run.
+- Diagnostic verdict:
+  - `FERRUM W3 QWEN35 C32 DIAG REJECT:
+    /workspace/artifacts/w3_qwen35_active_recompute_shared_slot_c32_a6cbb1d0_20260625T052604Z`;
+  - local orchestrator exit code `60`.
+- Reject reasons:
+  - output throughput `300.616 tok/s` <= floor `600.0`;
+  - p95 ITL `57.579 ms` > `25.0`;
+  - `Unified KV admission failed=30` > `13`;
+  - `capacity_deferred_total=45` > `32`.
+- Trace comparison:
+  - `mixed_iterations=125`, still preserving the mixed scheduling shape;
+  - `decode_only_iterations=369`, `prefill_only_iterations=90`;
+  - `avg_process_us=24804.1`, roughly the same compute-time class as ZZZ168
+    (`24590.5`) and still far above historical `16.6-16.8 ms` references;
+  - `Unified KV admission failed` improved from ZZZ168 `50 -> 30`;
+  - `capacity_deferred_total` improved from ZZZ168 `112 -> 45`;
+  - throughput improved only slightly from ZZZ168
+    (`294.475 -> 300.616 tok/s`).
+- Classification:
+  - rejected diagnostic, but it is a real source signal: shared active
+    recompute slot reduced the key KV churn counters materially;
+  - it is still not performance progress against the target because it misses
+    every strict diagnostic threshold and remains far below the c32 goal.
+- Remaining failure class:
+  - the scheduler now keeps active release-blocked recompute width to `1`;
+  - remaining logs still show repeated release-blocked retries such as
+    `need 1 admission blocks ... only 0 free`;
+  - this suggests the next source lever should stop retrying the same
+    release-blocked recompute every iteration until there is release/progress
+    evidence, rather than further shrinking model/GPU/concurrency by
+    hard-coded policy.
+- Next source direction:
+  - add a local test where an already-promoted release-blocked recompute fails
+    to make progress and remains in `prefill_queue`;
+  - verify the scheduler does not reschedule that same blocked recompute again
+    before capacity release/progress evidence;
+  - do not run another paid GPU diagnostic until that narrower behavior is
+    implemented and locally validated.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ169 — source candidate: active recompute uses shared mixed slot
 
 - Context:
