@@ -277,6 +277,67 @@
   - Current W3 still lacks final
     `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
 
+## 2026-06-25 — W3 Qwen3.5 recurrent prefill-cohort diagnostic rejected
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/`
+  - Git SHA `d27c8145a050eac77d041a520dc928757546137f`.
+  - Vast instance `42216671` was reused for the diagnostic and then stopped
+    after artifact copyback. Local Vast notes record `cur_state=stopped` and
+    `actual_status=exited`.
+- Process retrospective follow-up:
+  - `AGENTS.md` was updated in `d27c8145` with the durable rules from the
+    long-run retrospective: inspect existing artifacts before paid diagnostics,
+    compare against historical Ferrum and vLLM source/release behavior, require
+    an expected signal and reject threshold, treat effective-concurrency caps as
+    diagnostic unless the goal accepts them, keep the local time ledger
+    uncommitted, and revert or document rejected candidates before stacking new
+    changes.
+- Correctness smoke:
+  - Remote `cargo check` PASS.
+  - CUDA release build PASS.
+  - `ferrum run` smoke PASS.
+  - `ferrum serve` `/v1/models` and chat smoke PASS.
+  - run and serve effective-config assertions PASS:
+    `selected_max_sequences=32`, `selected_recurrent_state_max_slots=32`,
+    `selected_admission_limit=32`,
+    `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE=16`,
+    `FERRUM_SCHED_PREFILL_STEP_CHUNK=6`.
+- c32 diagnostic bench:
+  - Command shape: `bench-serve`, sharegpt dataset, `--concurrency 32`,
+    `--num-prompts 32`, `--warmup-requests 4`, `--n-repeats 1`,
+    `--fail-on-error`, `--seed 9271`, `--ignore-eos`, `--timeout 600`.
+  - Completed `[32]`, errored `[0]`, `output_token_count_source=usage`.
+  - Output throughput `356.1212457460048 tok/s`.
+  - Total throughput `676.0739274709309 tok/s`.
+  - Request throughput `2.7821972323906623 rps`.
+  - p95 TTFT `7976.385634349997 ms`.
+  - p95 TPOT `55.28882579606299 ms`.
+  - Reject threshold was the prior accepted diagnostic floor
+    `458.066 tok/s`; this run was rejected:
+    `output_throughput_below_floor:356.121<458.066`.
+- Scheduler/log evidence:
+  - Trace shape changed in the intended direction:
+    `full_prefill_32_iterations=0`, `mixed_iterations=167`,
+    `decode_only_iterations=341`.
+  - Stability counters remained clean:
+    `oom_mentions=0`, `panic_mentions=0`, `cancelled_during_decode=0`,
+    `preempting_request=0`.
+  - Scheduler counters still showed significant capacity churn:
+    `capacity_deferred_total=142`,
+    `unified_kv_admission_failed=63`.
+- Decision:
+  - The candidate changed scheduler shape but worsened c32 throughput versus
+    the `7476295d` capacity-wait diagnostic (`458.066 tok/s`) and is far below
+    the W3 target derived from the historical vLLM c32 baseline.
+  - The recurrent prefill-cohort source changes from `311e51ad` are being
+    reverted rather than kept as product behavior.
+- Limits:
+  - This is diagnostic only (`n_repeats=1`, c32 only).
+  - It is not a W3 completion, performance-ready claim, or release-ready claim.
+  - Current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ149 — source fix: decode capacity defer now requeues for KV recompute
 
 - Context:
