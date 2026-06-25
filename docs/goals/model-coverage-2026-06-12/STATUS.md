@@ -2,6 +2,55 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ154 — source candidate: recurrent prefill cohort admission, local validation only
+
+- Context:
+  - ZZZ153 (`7476295d`) fixed the repeated capacity-deferred decode churn enough
+    to keep c32 stable (`32/32`, zero errors) but throughput stayed low at
+    `458.066 tok/s`;
+  - artifact trace comparison against the earlier `228933a2` diagnostic showed
+    the current 32-slot path spends about `10.17s` in scheduler `process`
+    time versus about `7.56s` for the 16/16 diagnostic;
+  - the large gap is not explained by prompt/output lengths: both runs used
+    actual input length `115` and output length `128` for all 32 requests;
+  - the main shape difference is scheduler/admission behavior: current default
+    `prefill_first_until_active:32+prefill_step_chunk:6` promotes a full
+    32-request prefill cohort before decode, while the faster diagnostic
+    entered a 16-decode plus small-prefill mixed shape earlier.
+- vLLM comparison:
+  - source/documentation inspected only; no live vLLM run was performed;
+  - the relevant design point remains capacity-aware admission: vLLM does not
+    turn a failed KV allocation into a model/GPU-specific cap, and it avoids
+    blindly promoting work that cannot be scheduled in the current capacity
+    window.
+- Implementation:
+  - changed continuous scheduler waiting admission so `prefill_first_until_active`
+    also limits initial waiting-to-prefill promotion while there are no decode
+    requests yet;
+  - changed accelerator auto-config for recurrent-state models to default the
+    prefill-first cohort to half of `max_sequences`;
+  - this does not reduce `selected_admission_limit`: the Qwen3.5 recurrent-state
+    auto-config test still asserts `selected_admission_limit=32`;
+  - no Qwen/GPU/VRAM enumerated special case was added.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo test -p ferrum-scheduler prefill_first_limits_initial_waiting_promotion_before_decode -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-types qwen35_fast_recurrent_state_budget_selects_default_slots_without_vram_special_case -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-types auto_config -- --nocapture` PASS (`54/54`);
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS (`68/68`);
+  - `cargo check -p ferrum-types -p ferrum-scheduler -p ferrum-engine -p ferrum-cli`
+    PASS.
+- Limits:
+  - no GPU diagnostic has run for this source candidate yet;
+  - no live vLLM was run;
+  - this is not W3 completion, final performance evidence, release readiness, or
+    a substitute for the final validator;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ153 — 7476295d c32 diagnostic PASS: capacity-wait reduces recompute churn
 
 - Artifact:

@@ -891,10 +891,14 @@ impl ContinuousBatchScheduler {
             .max_decode_batch
             .saturating_sub(self.decoding_count());
         let available_slots = active_capacity.min(decode_capacity);
-        let available_slots = self
+        let mut available_slots = self
             .capacity_backpressure_admit_limit()
             .map(|limit| available_slots.min(limit))
             .unwrap_or(available_slots);
+        if prefill_first_target > 0 && decoding_count == 0 {
+            available_slots =
+                available_slots.min(prefill_first_target.saturating_sub(self.active_count()));
+        }
         let active_count_for_capacity_wait = self.active_count();
         let capacity_release_epoch = self.capacity_release_epoch.load(Ordering::Relaxed);
 
@@ -2159,6 +2163,41 @@ mod tests {
             "max_tokens limits the emitted iteration batch, not waiting-to-prefill promotion"
         );
         assert_eq!(scheduler.waiting_count(), 0);
+    }
+
+    #[test]
+    fn prefill_first_limits_initial_waiting_promotion_before_decode() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 4,
+            prefill_first_until_active: Some(2),
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+
+        for _ in 0..4 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let batch = scheduler
+            .create_iteration_batch(BatchHint {
+                max_batch_size: 4,
+                max_tokens: 512,
+                target_latency_ms: None,
+                available_memory: None,
+                resource_constraints: Default::default(),
+            })
+            .unwrap();
+
+        assert_eq!(batch.requests.len(), 2);
+        assert_eq!(scheduler.prefilling_count(), 2);
+        assert_eq!(
+            scheduler.waiting_count(),
+            2,
+            "prefill-first should not promote more waiting requests than the initial cohort target"
+        );
     }
 
     #[test]

@@ -1006,8 +1006,13 @@ impl FerrumConfigBuilder {
         if max_sequences.value <= 1 || !self.is_accelerator_backend() {
             return None;
         }
+        let value = if self.model.recurrent_state_bytes_per_sequence.is_some() {
+            max_sequences.value.div_ceil(2).max(1)
+        } else {
+            max_sequences.value
+        };
         Some(ResolvedValue {
-            value: max_sequences.value,
+            value,
             source: AutoConfigSource::Default,
             source_key: None,
         })
@@ -2622,6 +2627,11 @@ mod tests {
             doc["admission"]["memory_estimate"]["recurrent_state_capacity_bytes"],
             serde_json::json!(32u64 * 32_931_840u64)
         );
+        assert_eq!(
+            decision("scheduler_admission_policy").selected,
+            "prefill_first_until_active:16+prefill_step_chunk:1"
+        );
+        assert_eq!(doc["selected_admission_limit"], serde_json::json!(32));
     }
 
     #[test]
