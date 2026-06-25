@@ -2,6 +2,63 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ188 — source candidate: spend mixed-prefill headroom for capacity-deferred recompute
+
+- Context:
+  - follows ZZZ187 `e213e6eb` c32 diagnostic REJECT without starting another
+    GPU and without running live vLLM;
+  - ZZZ187 reduced paged-KV admission failures (`15 -> 9`) but still rejected
+    on throughput `422.960 tok/s`, `mixed_iterations=28`, and p95 ITL
+    `62.386 ms`;
+  - offline trace inspection of
+    `server/scheduler_trace.jsonl.gz` showed every mixed iteration had exactly
+    one prefill item:
+    - `16` rows shaped as `decode_items=25`, `prefill_items=1`,
+      `prefill_tokens=6`;
+    - `11` rows shaped as `decode_items=28`, `prefill_items=1`,
+      `prefill_tokens=6`;
+    - `1` final mixed row shaped as `decode_items=31`, `prefill_items=1`,
+      `prefill_tokens=1`;
+  - those same rows had unused batch headroom, for example `4` to `7` free
+    batch slots, but the scheduler collapsed the aggregate mixed-prefill
+    budget to one tiny chunk and the capacity-deferred recompute path also had
+    a fixed one-slot gate.
+- Source change:
+  - commit `8a5f2819` (`perf(scheduler): spend mixed prefill headroom`);
+  - changed active-decode mixed-prefill budgeting to spend actual free batch
+    slots, bounded by `max_prefill_batch / 2`, prefill backlog, and the
+    existing per-step token budget;
+  - changed capacity-deferred mixed recompute slots from a hard-coded `1` to a
+    value derived from the same active mixed-prefill token budget;
+  - preserved the e213e6eb model-owned KV capacity gate, so blocked recompute
+    still waits for enough model-reported free KV blocks after a paged-KV
+    admission failure;
+  - did not add model-name, GPU-name, or VRAM-specific caps.
+- Expected diagnostic signal if this is worth a paid c32 run:
+  - rows like the ZZZ187 `decode_items=25/28` mixed iterations should be able
+    to schedule up to `4` small recompute chunks instead of one, when active
+    capacity and KV snapshot evidence permit it;
+  - useful prefill progress per mixed iteration should increase without
+    reverting to blind KV admission retries;
+  - the reject/keep decision must still be made by the artifact, not by this
+    source expectation.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture` PASS
+    (`8/8`);
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS (`75/75` plus
+    doctests);
+  - `cargo test -p ferrum-engine paged_kv_admission_pressure -- --nocapture`
+    PASS (`3/3`);
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `git diff --check` PASS.
+- Limits:
+  - source candidate only; no new CUDA diagnostic, no new performance artifact,
+    and no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ187 — e213e6eb c32 diagnostic REJECT: KV failures down, mixed recompute still too little/slow
 
 - Artifact:
