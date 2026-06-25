@@ -1,0 +1,24 @@
+{
+  "instance_id": 42216671,
+  "label": "ferrum-w3-qwen35-full-l5-20260623",
+  "gpu_name": "RTX 4090",
+  "num_gpus": 1,
+  "dph_total": 0.47777777777777775,
+  "cuda_max_good": 12.8,
+  "start_response": {
+    "success": false,
+    "msg": "Required resources are currently unavailable, state change queued."
+  },
+  "polls_observed": 9,
+  "final_observed_state": {
+    "cur_state": "stopped",
+    "actual_status": "exited",
+    "intended_status": "stopped",
+    "ssh_host": "ssh3.vast.ai",
+    "ssh_port": 16670,
+    "status_msg": "success, running nvidia/cuda_12.4.0-devel-ubuntu22.04/ssh"
+  },
+  "diagnostic_ran": false,
+  "new_instance_created": false,
+  "live_vllm_ran": false
+}
