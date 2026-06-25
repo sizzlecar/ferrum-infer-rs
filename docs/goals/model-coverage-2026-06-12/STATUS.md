@@ -2,6 +2,68 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ150 — cb0cd027 c32 diagnostic PASS: decode recompute removes livelock
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_recompute_c32_cb0cd027_20260625T002015Z/`.
+- PASS line:
+  - `FERRUM W3 QWEN35 DECODE RECOMPUTE C32 DIAG PASS: /workspace/artifacts/w3_qwen35_decode_recompute_c32_cb0cd027_20260625T002015Z`.
+- Vast lifecycle:
+  - reused retained instance `42439308` on exact 1x RTX 4090;
+  - cached repo target and HF model cache were reused; no environment rebuild
+    from scratch;
+  - copied artifact back before shutdown;
+  - stop verification reported `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`;
+  - the stopped instance is retained to preserve cache.
+- Git/build evidence:
+  - remote Git SHA:
+    `cb0cd027026220f2b340d0b12278c373a4027c56`;
+  - no live vLLM was run;
+  - remote `cargo check` PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `ferrum run` smoke PASS, response content `5`;
+  - `ferrum serve` `/v1/models` PASS;
+  - `ferrum serve` non-streaming chat smoke PASS, response content `5`.
+- c32 diagnostic bench:
+  - command shape: `bench-serve`, sharegpt dataset, `--concurrency 32`,
+    `--num-prompts 32`, `--warmup-requests 4`, `--n-repeats 1`,
+    `--fail-on-error`, `--seed 9271`, `--ignore-eos`, `--timeout 600`;
+  - bench exit `0`;
+  - `completed_per_run=[32]`, `errored_per_run=[0]`;
+  - `output_token_count_source=usage`;
+  - output throughput `449.787 tok/s`;
+  - total throughput `853.893 tok/s`;
+  - request throughput `3.514 req/s`;
+  - p95 TTFT `2202.593 ms`;
+  - p95 TPOT `54.343 ms`.
+- Scheduler/log evidence:
+  - `unified_kv_admission_failed=126`;
+  - `cancelled_during_decode=0`;
+  - `preempting_request=0`;
+  - `oom_mentions=0`;
+  - `panic_mentions=0`;
+  - `block_pool_exhausted=0`;
+  - `unified_prefill_alloc_deferred=0`.
+- Diagnosis:
+  - The source fix in `cb0cd027` converts the previous 032dda17 c32 failure
+    from a 32-request decode livelock (`0/32 completed`) into a completed c32
+    diagnostic run (`32/32 completed`).
+  - This confirms the narrow livelock fix: decode capacity pressure now frees
+    physical state and requeues requests for KV recompute instead of repeatedly
+    resubmitting the same un-runnable decode batch.
+  - Throughput is still below the earlier 16/16 diagnostic (`635.574 tok/s`)
+    and below the desired target discussed in the session. The next lever
+    should be performance recovery after recompute correctness, not model/GPU
+    hard-coded caps.
+- Limits:
+  - This is still a diagnostic-only run: c32 only, `n_repeats=1`.
+  - It is not W3 completion, final performance evidence, release readiness, or
+    a substitute for the final validator.
+  - Current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ149 — source fix: decode capacity defer now requeues for KV recompute
 
 - Context:
