@@ -33,7 +33,7 @@ impl EngineInner {
                 Err(e) if is_resource_exhausted_error(&e) && chunk.len() > 1 => {
                     let pressure = paged_kv_admission_pressure(&e);
                     self.scheduler.record_decode_capacity_pressure(
-                        chunk.len(),
+                        pressure_width,
                         pressure.map(|pressure| pressure.free_blocks),
                     );
                     let mid = chunk.len() / 2;
