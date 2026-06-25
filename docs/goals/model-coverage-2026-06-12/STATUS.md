@@ -2,6 +2,94 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ189 — 8a5f2819 c32 diagnostic REJECT: headroom improves throughput but regresses KV pressure
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_prefill_headroom_c32_8a5f2819_20260625T085834Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_8a5f2819_1782377854/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    mixed-prefill-headroom diagnostic;
+  - expected runtime/cost: 10-20 minutes, about `$0.08-$0.16`, using retained
+    instance `42216671`, exact `1x RTX 4090`, `$0.47777777777777775/hr`;
+  - stop condition: KEEP, REJECT, SSH/CUDA unavailable, timeout, or script
+    failure;
+  - correctness gate: remote clean SHA, `cargo check`, CUDA release build,
+    `ferrum run` smoke, `ferrum serve` models/chat smoke;
+  - performance command: `ferrum bench-serve c32 --fail-on-error --seed 9271
+    --n-repeats 1`;
+  - no live vLLM run;
+  - runner copied artifact and orchestrator metadata back;
+  - runner stop poll confirmed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`;
+  - independent Vast inventory after analysis again showed `42216671`
+    `stopped/exited`.
+- Remote evidence:
+  - remote Git SHA:
+    `8a5f2819110eb9bb876f582c5b41f2f2fe8a1bbe`;
+  - remote git status short was empty;
+  - binary SHA256:
+    `e8355a2285ed99a4c2ab32e24c04c194d66923041963a103bc5487eb5dc8e530`;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, zero
+    HTTP 500, zero panic, and `output_token_count_source=usage`.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - verdict `REJECT`;
+  - reject reasons:
+    - output throughput `467.313 tok/s` <= floor `600.0`;
+    - `mixed_iterations=4` < threshold `64`;
+    - p95 ITL `56.017 ms` > `25.0`;
+    - `unified_kv_admission_failed=15` > `13`;
+    - `capacity_deferred_total=37` > `32`.
+- Positive signal versus ZZZ187:
+  - output throughput improved `422.960 -> 467.313 tok/s`;
+  - p95 ITL improved `62.386 -> 56.017 ms`;
+  - average process time improved `22885 us -> 20817 us`;
+  - correctness/client cleanliness remained intact: `32/32` completed, zero
+    request errors, zero HTTP 500, zero panic.
+- Regression versus ZZZ187:
+  - `mixed_iterations` collapsed `28 -> 4`;
+  - `Unified KV admission failed` regressed `9 -> 15`;
+  - `capacity_deferred_total` regressed `18 -> 37`;
+  - max capacity-deferred exceeded the diagnostic threshold (`37 > 32`);
+  - serve log shows the wider mixed-prefill headroom caused larger immediate
+    admission pressure, including:
+    - `need 19 admission blocks (19 immediate) but only 0 free`;
+    - `need 15 admission blocks (15 immediate) but only 8 free`;
+    - `need 183 admission blocks (16 immediate) but only 128 free`.
+- Trace reading:
+  - the intended scheduler behavior did happen briefly: mixed rows included
+    shapes such as `decode_items=29, prefill_items=3, prefill_tokens=18` and
+    `decode_items=19, prefill_items=13, prefill_tokens=13`;
+  - after the early wider admissions hit KV pressure, the KV gate kept blocked
+    recomputes waiting and the run became mostly decode-only while
+    `capacity_blocked_waiting_len` grew;
+  - this explains the combination of better throughput/ITL and much lower
+    `mixed_iterations`.
+- Classification:
+  - diagnostic rejected, not performance evidence and not release evidence;
+  - `8a5f2819` is not sufficient for W3, but it proves the previous one-slot
+    mixed recompute path was leaving throughput on the table;
+  - do not rerun this artifact/commit.
+- Next source direction:
+  - keep the useful headroom idea, but make capacity-deferred mixed recompute
+    KV-aware before scheduling multiple recomputes;
+  - the next candidate should bound widened mixed recompute by model-owned KV
+    free-block evidence or a per-iteration admission-pressure budget, rather
+    than blindly spending all free batch slots;
+  - preserve the no-enumeration rule: no model-name, GPU-name, or VRAM-specific
+    caps.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ188 — source candidate: spend mixed-prefill headroom for capacity-deferred recompute
 
 - Context:
