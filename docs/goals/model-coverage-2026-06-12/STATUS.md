@@ -2,6 +2,84 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ168 — a8de884a c32 diagnostic REJECT: waiting admission limited, active recompute churn remains
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_single_blocked_recompute_c32_a8de884a_20260625T050632Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_a8de884a_1782363925/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    single-blocked-recompute diagnostic, expected 10-20 minutes, about
+    `$0.08-$0.16`, stop on KEEP/REJECT/SSH/CUDA failure/timeout/script failure;
+  - inventory before start showed only retained instance `42216671`,
+    `stopped/exited`, exact `1x RTX 4090`, cost `$0.47777777777777775/hr`;
+  - no new instance was created;
+  - artifact and orchestrator metadata were copied back;
+  - stop verification after the run showed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`;
+  - independent inventory after cleanup showed only `42216671`,
+    `stopped/exited`; no unexpected paid/scheduling sibling instances remained.
+- Remote evidence:
+  - remote Git SHA:
+    `a8de884a2d0685af2224d6fd2bfb9f739f65e462`;
+  - remote git status short was empty;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` `/v1/models` and chat smoke passed;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, and
+    `output_token_count_source=usage`;
+  - no live vLLM run.
+- Diagnostic verdict:
+  - `FERRUM W3 QWEN35 C32 DIAG REJECT:
+    /workspace/artifacts/w3_qwen35_single_blocked_recompute_c32_a8de884a_20260625T050632Z`;
+  - local orchestrator exit code `60`.
+- Reject reasons:
+  - output throughput `294.475 tok/s` <= floor `600.0`;
+  - p95 ITL `61.211 ms` > `25.0`;
+  - `Unified KV admission failed=50` > `13`;
+  - `capacity_deferred_total=112` > `32`.
+- Trace comparison:
+  - `mixed_iterations=125`, still close to ZZZ166's `126` and historical
+    mixed count `127`;
+  - `decode_only_iterations=384`, `prefill_only_iterations=90`;
+  - `avg_process_us=24590.5`, better than ZZZ166's `25533.6` but still far
+    worse than the historical `633/635 tok/s` references around
+    `16.6-16.8 ms`;
+  - throughput improved slightly from ZZZ166 (`282.994 -> 294.475 tok/s`) and
+    remains far below both the stricter diagnostic floor `600 tok/s` and the
+    W3 c32 target.
+- Diagnosis:
+  - the new waiting-queue admission limit did apply: around iterations
+    `396-399`, the scheduler admitted one blocked recompute per iteration from
+    waiting while active decodes continued;
+  - this did not reduce the main failure counters because active/prefill still
+    accumulated multiple capacity-deferred recompute chunks after admission;
+  - the engine then continued dense repeated admission failures, including
+    `need 4 admission blocks ... only 0-1 free`;
+  - the remaining issue is therefore not just waiting admission. It is the
+    active prefill/recompute scheduling width after a deferred recompute has
+    already been promoted.
+- Classification:
+  - rejected diagnostic, not performance progress;
+  - stability/correctness stayed intact for this smoke cell, but target
+    throughput and KV churn did not move enough;
+  - do not spend another GPU run on this candidate.
+- Next source direction:
+  - cap active capacity-deferred recompute scheduling width under decode
+    pressure, not only waiting admission;
+  - the next local test should construct multiple already-promoted
+    capacity-deferred recompute prefills plus active decodes and verify that a
+    mixed iteration schedules only the bounded recompute width before another
+    GPU diagnostic is considered.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ167 — source candidate: admit one blocked recompute per mixed iteration
 
 - Context:
