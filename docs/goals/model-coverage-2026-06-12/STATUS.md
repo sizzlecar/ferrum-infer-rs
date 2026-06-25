@@ -2,6 +2,59 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ165 — source candidate: keep capacity backpressure through partial prefill chunks
+
+- Context:
+  - follows ZZZ164 REJECT without starting another GPU;
+  - ZZZ164 restored mixed scheduling (`mixed_iterations=126`) but regressed
+    capacity churn (`Unified KV admission failed=50`,
+    `capacity_deferred_total=112`) and throughput (`274.637 tok/s`);
+  - trace/log review showed repeated small admission failures after partial
+    recompute chunks, for example `need 4 admission blocks` while only `0-1`
+    blocks were free.
+- Diagnosis:
+  - `mark_prefill_chunk_processed` treated any partial prefill progress as
+    enough evidence to relax capacity backpressure;
+  - for capacity-deferred recompute, a non-final chunk still consumes capacity
+    and does not prove that the failed admission width fits again;
+  - this reopened the admission window too aggressively and caused the repeated
+    KV admission failures seen in ZZZ164.
+- Code change:
+  - `crates/ferrum-scheduler/src/implementations/continuous.rs` now relaxes
+    capacity backpressure from chunked prefill only when the prefill is fully
+    done and promoted to decode;
+  - partial chunk progress no longer widens the capacity-backpressure admit
+    limit;
+  - full prefill completion, request completion, cancellation, and explicit
+    release paths still relax capacity as before.
+- Test update:
+  - renamed and tightened the backpressure test to
+    `capacity_backpressure_survives_partial_prefill_and_grows_after_completion`;
+  - it now verifies that a `1`-token partial chunk keeps the admit limit at
+    `Some(2)`, while the completing chunk relaxes the limit.
+- Local validation:
+  - `cargo test -p ferrum-scheduler capacity_backpressure -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred_decode -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS (`68/68`);
+  - `cargo test -p ferrum-engine --lib continuous_engine::tests -- --nocapture`
+    PASS (`56/56`);
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `git diff --check` PASS.
+- Next evidence needed:
+  - update the local Vast c32 diagnostic target to this source candidate after
+    commit;
+  - do not start another paid GPU diagnostic until the target SHA update is
+    committed and the lane contract is restated.
+- Limits:
+  - no CUDA build, GPU diagnostic, performance bench, live vLLM run, or final
+    W3 validator ran here;
+  - this is local source validation only;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ164 — fbf23458 c32 diagnostic REJECT: mixed restored, capacity churn regressed
 
 - Artifact:
