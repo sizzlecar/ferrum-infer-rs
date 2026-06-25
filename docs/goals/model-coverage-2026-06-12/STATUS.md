@@ -2,6 +2,131 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ214 — source candidate: reopen recompute from structured KV feedback
+
+- Context:
+  - follows ZZZ213 `d54f634b` c32 diagnostic REJECT;
+  - no GPU lane was started for this source step;
+  - no live vLLM run was used.
+- Source change:
+  - commit `e50ff975f1331a5f3ae967fddc2a5d768fd983b4`
+    (`perf(scheduler): reopen recompute from kv pressure feedback`);
+  - `defer_capacity_deferred_mixed_recompute_until_kv_capacity()` now advances
+    the mixed-recompute epoch when the structured KV feedback already shows
+    enough usable free blocks for one narrower recompute;
+  - decode-origin capacity-deferred recomputes now preserve their
+    `capacity_deferred_from_decode` marker when a mixed recompute prefill is
+    deferred back to waiting, instead of being misclassified as ordinary
+    prefill pressure;
+  - added regression coverage:
+    `capacity_deferred_mixed_recompute_reopens_from_capacity_feedback_when_fit`.
+- Why this matches ZZZ213:
+  - ZZZ213 improved survivor decode width and throughput, but after the first
+    mixed admission failure the trace spent `125` iterations with
+    capacity-blocked recomputes and decode-only batches;
+  - engine logs showed repeated structured KV pressure such as
+    `need 25 admission blocks ... only 4 free`, `need 16 ... only 9 free`;
+  - the scheduler recorded those free-block observations but did not reopen
+    mixed recompute from the feedback itself because the only reopen path was a
+    separate snapshot call that engine does not issue in this path.
+- Local validation:
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture`
+    PASS, `11/11`;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS, `82/82`;
+  - `cargo test -p ferrum-engine paged_kv_admission_pressure -- --nocapture`
+    PASS, `3/3`;
+  - `cargo test -p ferrum-engine process_batch_unified -- --nocapture`
+    PASS, `18/18`;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Runner targeting:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now defaults to target
+    SHA `e50ff975f1331a5f3ae967fddc2a5d768fd983b4`;
+  - default tag is now `recompute_reopens_from_kv_feedback`;
+  - `scripts/release/w3_qwen35_c32_diagnostic.sh` standalone defaults were
+    updated to the same SHA/tag.
+- Expected signal for a next scoped c32 diagnostic:
+  - capacity-blocked recompute should not remain stuck for long decode-only
+    stretches after structured KV feedback shows enough free blocks for a
+    narrower recompute;
+  - `mixed_iterations` and/or `unified_prof.mixed.count` should increase versus
+    ZZZ213's `mixed_iterations=1`, `unified_prof.mixed.count=0`;
+  - retain ZZZ213's positive survivor-width signal: average decode items should
+    stay near or above `9.73`, not collapse back to ZZZ210's `6.70`;
+  - correctness must remain clean: `32/32` complete, zero request errors, zero
+    HTTP 500, zero panic, zero OOM.
+- Limits:
+  - this is not W3 completion, not performance evidence, and not release
+    evidence;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
+## 2026-06-25 ZZZ213 — d54f634b c32 diagnostic REJECT: decode survivor width improves, recompute stays blocked
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_survivors_wide_after_kv_pressure_c32_d54f634b_20260625T130454Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_d54f634b_1782392638/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    decode-survivors-wide-after-kv-pressure diagnostic;
+  - expected runtime/cost: 10-20 minutes, about `$0.08-$0.16`, using retained
+    instance `42216671`, exact `1x RTX 4090`, `$0.47777777777777775/hr`;
+  - stop condition: KEEP, REJECT, SSH/CUDA unavailable, timeout, or script
+    failure;
+  - correctness gate: remote clean SHA, `cargo check`, CUDA release build,
+    `ferrum run` smoke, `ferrum serve` models/chat smoke;
+  - performance command: `ferrum bench-serve c32 --fail-on-error --seed 9271
+    --n-repeats 1`;
+  - no live vLLM run;
+  - runner copied artifact and orchestrator metadata back;
+  - runner stop poll confirmed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Remote evidence:
+  - remote Git SHA:
+    `d54f634bfff49f7a444a9b51e5cc3ff6f2f60771`;
+  - remote git status short was empty;
+  - binary SHA256:
+    `f2bb76c5676df1060b30098324a37a2697a14a245ed27790bd3d3125a5991ff2`;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` smoke covered `/v1/models` and `/v1/chat/completions`;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, zero
+    HTTP 500, zero panic, zero OOM mentions, and
+    `output_token_count_source=usage`.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - verdict `REJECT`;
+  - reject reasons:
+    - output throughput `450.984 tok/s` <= floor `600.0`;
+    - `mixed_iterations=1` < `64`;
+    - p95 ITL `51.363 ms` > `25.0`.
+- Comparison with ZZZ210:
+  - positive: output throughput improved from `342.112` to `450.984 tok/s`;
+  - positive: average decode items improved from `6.70` to `9.73`;
+  - positive: unified KV admission failures dropped from `10` to `8`;
+  - positive: capacity-deferred total dropped from `24` to `16`;
+  - negative: scheduler mixed iterations dropped from `57` to `1`;
+  - negative: `unified_prof.mixed.count` dropped to `0`;
+  - negative: p95 ITL remained bad, `50.145 -> 51.363 ms`.
+- Diagnosis:
+  - ZZZ211 fixed the long small-decode-batch problem and produced a real
+    throughput gain, but it also exposed the next blocker: capacity-deferred
+    recompute does not reopen from structured KV capacity feedback;
+  - trace showed `125` iterations with blocked recomputes and wide decode-only
+    batches, for example `d=28 p=0`, then `d=25 p=0`, down to `d=16 p=0`;
+  - the next source fix should use the structured KV feedback itself to reopen
+    a narrower recompute when it can fit, instead of waiting for a separate
+    snapshot or full request release.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ212 — d54f634b c32 diagnostic attempt aborted before remote execution
 
 - Attempted lane:
