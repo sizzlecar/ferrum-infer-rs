@@ -2,6 +2,58 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ200 — e0700638 c32 diagnostic REJECT: release-gating reduces churn, still below target
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_capacity_release_gate_c32_e0700638_20260625T103501Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_e0700638_1782383641/`.
+- Scope:
+  - focused W3 Qwen35 c32 diagnostic only;
+  - no live vLLM run was used;
+  - not release evidence and not a performance claim.
+- Remote evidence:
+  - remote Git SHA:
+    `e0700638bd185d2b46873d1dc7858b9d9de6eab1`;
+  - remote git status short was empty;
+  - binary SHA256:
+    `b20bd75619c790e408131118d0ade4579e82c8d86748865fdb1c65b0a247b66d`;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` smoke covered `/v1/models` and `/v1/chat/completions`;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, zero
+    HTTP 500, zero panic, zero OOM mentions, and
+    `output_token_count_source=usage`.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - verdict `REJECT`;
+  - reject reasons:
+    - output throughput `440.803 tok/s` <= floor `600.0`;
+    - `mixed_iterations=23` < `64`;
+    - p95 ITL `66.309 ms` > `25.0`;
+    - `Unified KV admission failed=16` > `13`;
+    - `capacity_deferred_total=43` > `32`.
+- Positive signal versus ZZZ198:
+  - output throughput improved from `351.146` to `440.803 tok/s`;
+  - `Unified KV admission failed` dropped from `49` to `16`;
+  - `capacity_deferred_total` dropped from `140` to `43`;
+  - fast same-capacity retry churn was materially reduced.
+- Remaining blocker:
+  - this is still far below the W3 target and still fails the diagnostic
+    thresholds;
+  - the residual pattern is not an OOM or product correctness failure;
+  - the next source investigation should focus on capacity-deferred requests
+    that become release-ready and are then admitted in bursts under active
+    decode, especially the release-window pacing between waiting, prefill, and
+    KV admission.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ199 — source candidate: gate prefill capacity retry on real release
 
 - Context:

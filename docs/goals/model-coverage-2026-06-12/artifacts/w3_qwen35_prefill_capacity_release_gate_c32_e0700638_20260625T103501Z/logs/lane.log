@@ -1,0 +1,19 @@
+2026-06-25T10:35:01Z lane_start art=/workspace/artifacts/w3_qwen35_prefill_capacity_release_gate_c32_e0700638_20260625T103501Z sha=e0700638bd185d2b46873d1dc7858b9d9de6eab1 release_evidence=false no_live_vllm=true
+2026-06-25T10:35:01Z bootstrap_start
+2026-06-25T10:35:02Z bootstrap_done
+2026-06-25T10:35:02Z git_sync_start
+2026-06-25T10:35:02Z git_sync_done
+2026-06-25T10:35:02Z hf_prefetch_start
+2026-06-25T10:35:02Z cargo_check_start
+2026-06-25T10:35:05Z cargo_check_done
+2026-06-25T10:35:05Z release_build_start
+2026-06-25T10:38:18Z release_build_done
+2026-06-25T10:38:18Z hf_prefetch_wait_start
+2026-06-25T10:38:18Z hf_prefetch_done tokenizer=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+2026-06-25T10:38:18Z ferrum_run_smoke_start
+2026-06-25T10:38:45Z ferrum_run_smoke_done
+2026-06-25T10:38:45Z serve_start
+2026-06-25T10:39:11Z serve_ready
+2026-06-25T10:39:12Z serve_chat_smoke_done
+2026-06-25T10:39:12Z bench_c32_start
+2026-06-25T10:39:24Z FERRUM W3 QWEN35 C32 DIAG REJECT: /workspace/artifacts/w3_qwen35_prefill_capacity_release_gate_c32_e0700638_20260625T103501Z

@@ -1,0 +1,149 @@
+{
+  "artifact": "/workspace/artifacts/w3_qwen35_prefill_capacity_release_gate_c32_e0700638_20260625T103501Z",
+  "bench": {
+    "completed_per_run": [
+      32
+    ],
+    "concurrency": 32,
+    "errored_per_run": [
+      0
+    ],
+    "http_500_per_run": [
+      0
+    ],
+    "n_repeats": 1,
+    "n_requests_per_run": 32,
+    "output_throughput_tps": 440.80320003751996,
+    "output_token_count_source": "usage",
+    "p95_itl_ms": 66.308908,
+    "p95_tpot_ms": 57.01389154606299,
+    "p95_ttft_ms": 2146.35558335,
+    "panic_per_run": [
+      0
+    ],
+    "request_throughput_rps": 3.4437750002931247,
+    "total_throughput_tps": 836.8373250712293
+  },
+  "bench_exit": "0",
+  "last_iteration": 688,
+  "last_scheduler_after_schedule": {
+    "active_len": 0,
+    "admitted_total": 80,
+    "cancelled_total": 0,
+    "capacity_blocked_waiting_len": 0,
+    "capacity_deferred_total": 43,
+    "completed_total": 37,
+    "decode_queue_len": 0,
+    "failed_total": 0,
+    "prefill_queue_len": 0,
+    "waiting_queue_len": 0
+  },
+  "last_scheduler_before": {
+    "active_len": 0,
+    "admitted_total": 80,
+    "cancelled_total": 0,
+    "capacity_blocked_waiting_len": 0,
+    "capacity_deferred_total": 43,
+    "completed_total": 37,
+    "decode_queue_len": 0,
+    "failed_total": 0,
+    "prefill_queue_len": 0,
+    "waiting_queue_len": 0
+  },
+  "log_counts": {
+    "block_pool_exhausted": 1,
+    "cancelled_during_decode": 0,
+    "oom_mentions": 0,
+    "panic_mentions": 0,
+    "preempting_request": 0,
+    "unified_kv_admission_failed": 16,
+    "unified_prefill_alloc_deferred": 1,
+    "unified_prof_events": 77
+  },
+  "no_live_vllm": true,
+  "reject_reasons": [
+    "output_throughput_tps=440.80320003751996 <= floor=600.0",
+    "mixed_iterations=23 < 64",
+    "p95_itl_ms=66.308908 > 25.0",
+    "unified_kv_admission_failed=16 > 13",
+    "capacity_deferred_total=43 > 32"
+  ],
+  "release_evidence": false,
+  "sha": "e0700638bd185d2b46873d1dc7858b9d9de6eab1",
+  "thresholds": {
+    "max_capacity_deferred_total": 32,
+    "max_kv_admission_failed": 13,
+    "max_p95_itl_ms": 25.0,
+    "min_mixed_iterations": 64,
+    "output_throughput_floor_tps": 600.0,
+    "required_completed": 32,
+    "required_errors": 0
+  },
+  "trace_stats": {
+    "avg_decode_items": 9.729787234042552,
+    "avg_process_us": 22806.38723404255,
+    "decode_only_iterations": 357,
+    "max_active_len": 32,
+    "max_capacity_deferred_total": 43,
+    "mixed_iterations": 23,
+    "prefill_only_iterations": 90,
+    "scheduled_decode_tokens": 4573,
+    "scheduled_prefill_tokens": 7735,
+    "some_ok_iterations": 470
+  },
+  "unified_prof": {
+    "all": {
+      "avg_complete_us": 0.8181818181818182,
+      "avg_decode_post_us": 89.31168831168831,
+      "avg_model_us": 16826.545454545456,
+      "avg_sample_us": 23.792207792207794,
+      "avg_sched_us": 0.0,
+      "avg_stop_us": 0.0,
+      "avg_stream_us": 64.7012987012987,
+      "avg_total_us": 17437.83116883117,
+      "count": 77,
+      "max_total_us": 200383,
+      "p95_total_us": 46763
+    },
+    "decode_only": {
+      "avg_complete_us": 1.3695652173913044,
+      "avg_decode_post_us": 137.34782608695653,
+      "avg_model_us": 10524.478260869566,
+      "avg_sample_us": 37.369565217391305,
+      "avg_sched_us": 0.0,
+      "avg_stop_us": 0.0,
+      "avg_stream_us": 98.6086956521739,
+      "avg_total_us": 10668.58695652174,
+      "count": 46,
+      "max_total_us": 16848,
+      "p95_total_us": 15515
+    },
+    "mixed": {
+      "avg_complete_us": 0.0,
+      "avg_decode_post_us": 559.0,
+      "avg_model_us": 47407.0,
+      "avg_sample_us": 113.0,
+      "avg_sched_us": 0.0,
+      "avg_stop_us": 0.0,
+      "avg_stream_us": 446.0,
+      "avg_total_us": 48005.0,
+      "count": 1,
+      "max_total_us": 48005,
+      "p95_total_us": 48005
+    },
+    "prefill_only": {
+      "avg_complete_us": 0.0,
+      "avg_decode_post_us": 0.0,
+      "avg_model_us": 25470.366666666665,
+      "avg_sample_us": 0.0,
+      "avg_sched_us": 0.0,
+      "avg_stop_us": 0.0,
+      "avg_stream_us": 0.0,
+      "avg_total_us": 26798.433333333334,
+      "count": 30,
+      "max_total_us": 200383,
+      "p95_total_us": 80024
+    }
+  },
+  "verdict": "reject"
+}
