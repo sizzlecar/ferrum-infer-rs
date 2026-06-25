@@ -381,9 +381,21 @@ Shutdown and artifact handling:
 - Use vLLM source and release behavior as the comparison baseline before inventing new kernels.
 - Do not run unscoped env-flip sweeps for M3 c=32. Use fresh profiler evidence to choose a lever.
 - Work one high-return lever at a time.
+- Before a new paid performance diagnostic, compare the latest relevant Ferrum artifact against the best historical Ferrum artifact and the vLLM source/release baseline. Record the specific runtime/config, scheduler trace, token length, profile, or log difference that the next lever is expected to change.
+- Do not use a GPU run to discover what should have been learned from existing artifacts. If the same failure class has an artifact, inspect that artifact first and write the falsifiable hypothesis before starting another instance.
+- Each performance diagnostic must have an expected signal and reject threshold, for example a target trace-shape change, throughput floor, error-count limit, or profile counter movement. If the threshold is missed, stop, classify the candidate as rejected or diagnostic-only, and do not stack another source change on top without a new artifact-based explanation.
+- Treat effective-concurrency or slot caps as diagnostic levers unless the goal document explicitly accepts them as product behavior. Do not substitute a lower effective concurrency for a requested c=32 release/performance target without making the effective value visible in artifacts and status notes.
 - During long CUDA builds/tests, use the time for non-overlapping source tracing, vLLM comparison, kernel review, or microbench design.
 - Performance claims need same-pod A/B and `N >= 3` for deltas under 10%. Single-pod or single-run numbers may be used as smoke or diagnostic evidence only.
 - Correctness gates precede performance claims. At minimum run Paris and multi-turn gates for MoE, attention routing, scheduler, or runtime default changes.
+
+## Long-Running Work Review Protocol
+
+- When a goal spans long-running builds, paid GPU diagnostics, or repeated candidate failures, keep a local time ledger if the user requested one. The ledger must stay uncommitted unless explicitly requested otherwise.
+- Record time by action category such as source reading, code edit, local validation, remote setup, compile wait, GPU run, artifact handling, artifact analysis, status update, and git sync.
+- Use the ledger during long tasks to check whether time is converting into goal evidence. If repeated GPU runs or validation cycles do not move the target metric, pause implementation and do a written retrospective before continuing.
+- A retrospective must distinguish stability progress, correctness progress, performance progress, and final-goal progress. Do not present stability or diagnostic progress as target-performance progress.
+- After a rejected candidate, either revert it or document why it remains useful before starting the next paid diagnostic. Avoid accumulating unproven scheduler/runtime changes that make later artifacts hard to interpret.
 
 ## Coding Style and Naming Conventions
 
