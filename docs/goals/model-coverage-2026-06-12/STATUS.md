@@ -2,6 +2,44 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ178 — c32 diagnostic runner targets blocked recompute scan source fix
+
+- Context:
+  - follows source fix `eaf405f5` without starting a GPU;
+  - this only prepares a later bounded c32 diagnostic target and records the
+    expected evidence before any paid run.
+- Runner update:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now defaults to target
+    SHA `eaf405f5ffb1e9a9762d7e65f9b60c6ff958e444`;
+  - default artifact tag is `blocked_recompute_scan`;
+  - plan lane is `W3 Qwen35 c32 blocked-recompute-scan diagnostic`;
+  - strict diagnostic thresholds remain unchanged: throughput floor `600.0`,
+    max `Unified KV admission failed=13`, max `capacity_deferred_total=32`,
+    min mixed iterations `64`, max p95 ITL `25.0 ms`.
+- Local validation:
+  - `python3 -m py_compile scripts/release/w3_qwen35_vast_c32_diagnostic.py`
+    PASS;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --self-test`
+    PASS line:
+    `W3 QWEN35 VAST C32 DIAGNOSTIC ORCHESTRATOR SELFTEST PASS`;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --plan-only`
+    PASS, printed target SHA
+    `eaf405f5ffb1e9a9762d7e65f9b60c6ff958e444`, lane
+    `W3 Qwen35 c32 blocked-recompute-scan diagnostic`, unchanged strict
+    thresholds, and did not touch Vast.
+- Next paid-run rule:
+  - before any GPU start, restate the paid lane contract, query Vast inventory,
+    confirm only the intended retained 1x4090 instance is used, and stop after
+    KEEP/REJECT/failure;
+  - expected trace signal: fewer blocked+decode-only iterations than ZZZ176
+    `109`, more mixed iterations than ZZZ176 `18`, and no return to
+    same-request one-block retry churn.
+- Limits:
+  - no CUDA build, GPU diagnostic, performance bench, live vLLM run, or final
+    W3 validator ran here;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ177 — source fix: skipped blocked recomputes no longer shut off later candidates
 
 - Context:
