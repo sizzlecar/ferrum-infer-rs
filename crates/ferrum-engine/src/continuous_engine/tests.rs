@@ -157,6 +157,12 @@ struct FailingUnifiedReserveExecutor {
     inner: FailingBatchPrefillExecutor,
 }
 
+struct StructuredPressureOnceUnifiedReserveExecutor {
+    inner: RecurrentSpecExecutor,
+    remaining_failures: std::sync::atomic::AtomicUsize,
+    message: &'static str,
+}
+
 struct FailingUnifiedForwardExecutor {
     inner: RecurrentSpecExecutor,
     resource_exhausted: bool,
@@ -463,6 +469,67 @@ impl ModelExecutor for FailingUnifiedReserveExecutor {
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
         self.inner.decode(input).await
+    }
+
+    fn capabilities(&self) -> ExecutorCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn status(&self) -> ExecutorStatus {
+        self.inner.status()
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelExecutor for StructuredPressureOnceUnifiedReserveExecutor {
+    fn info(&self) -> &ferrum_types::ModelInfo {
+        self.inner.info()
+    }
+
+    fn supports_native_unified_decode(&self) -> bool {
+        true
+    }
+
+    fn recurrent_state_spec(
+        &self,
+        request_id: &RequestId,
+        input_tokens: &[TokenId],
+    ) -> Result<Option<RecurrentStateSpec>> {
+        self.inner.recurrent_state_spec(request_id, input_tokens)
+    }
+
+    fn reserve_kv_slots(
+        &self,
+        _requests: &[ferrum_interfaces::model_executor::KvSlotRequest],
+    ) -> Result<Option<ferrum_interfaces::model_executor::KvSlotReservation>> {
+        if self
+            .remaining_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(FerrumError::resource_exhausted(self.message));
+        }
+        Ok(None)
+    }
+
+    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
+        self.inner.prefill(input).await
+    }
+
+    async fn batch_prefill(&self, inputs: &[PrefillInput]) -> Result<Vec<PrefillOutput>> {
+        self.inner.batch_prefill(inputs).await
+    }
+
+    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+        self.inner.decode(input).await
+    }
+
+    async fn unified_decode(&self, batch: &UnifiedBatch) -> Result<Vec<Option<Vec<f32>>>> {
+        self.inner.unified_decode(batch).await
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {
@@ -1891,6 +1958,126 @@ async fn process_batch_unified_reserve_defer_requeues_decode_for_recompute() {
     assert!(!fresh.prefill_complete);
     assert!(fresh.kv_cache.is_none());
     assert_eq!(kv_cache.active_count(), 0);
+}
+
+#[tokio::test]
+async fn process_batch_unified_structured_pressure_reopens_capacity_recompute_next_epoch() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache = Arc::new(MockKvCacheManager::new(128));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> =
+        Arc::new(StructuredPressureOnceUnifiedReserveExecutor {
+            inner: RecurrentSpecExecutor {
+                inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
+            },
+            remaining_failures: std::sync::atomic::AtomicUsize::new(1),
+            message:
+                "Qwen3.5 paged KV admission: need 4 admission blocks (4 immediate) but only 5 free",
+        });
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
+        InMemoryRecurrentStateConfig {
+            total_memory_bytes: 32,
+            total_batch_slots: 4,
+        },
+    ));
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler.clone(),
+        tokenizer.clone(),
+        sampler,
+        kv_cache,
+        executor,
+        tensor_factory,
+        None,
+        None,
+        Some(recurrent_manager),
+    );
+
+    let mut requests = Vec::new();
+    for _ in 0..4 {
+        let mut request = policy_request();
+        request.prompt = "test".to_string();
+        request.sampling_params.max_tokens = 4;
+        scheduler.submit(request.clone()).await.unwrap();
+        requests.push(request);
+    }
+
+    let initial_batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(4))
+        .await
+        .expect("decode requests should first be scheduled as prefills");
+    assert_eq!(initial_batch.requests.len(), 4);
+    for request in &requests {
+        scheduler.mark_prefill_complete(&request.id, 1);
+        let kv = engine
+            .inner
+            .make_model_kv_handle_with_seq(format!("decode-cache-{}", request.id), 1);
+        let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
+            request.clone(),
+            vec![TokenId::new(5)],
+            Some(tokenizer.clone()),
+            Some(64),
+        );
+        sequence.generated_tokens.push(TokenId::new(6));
+        sequence.prefill_complete = true;
+        sequence.prefill_tokens_processed = 1;
+        sequence.kv_cache = Some(kv);
+        sequence.model_cache_id = Some(format!("decode-cache-{}", request.id));
+        sequence.phase = RequestPhase::Decoding;
+        engine
+            .inner
+            .sequences
+            .write()
+            .insert(request.id.clone(), sequence);
+    }
+
+    let recompute_id = requests[0].id.clone();
+    {
+        let mut sequences = engine.inner.sequences.write();
+        let sequence = sequences
+            .get_mut(&recompute_id)
+            .expect("recompute sequence should exist");
+        sequence.kv_cache = None;
+        sequence.model_cache_id = None;
+        sequence.prefill_complete = false;
+        sequence.prefill_tokens_processed = 0;
+        sequence.phase = RequestPhase::Waiting;
+        sequence.tokens_this_iteration = 0;
+        sequence.preemption_count += 1;
+    }
+    assert!(
+        scheduler.defer_decode_to_waiting_for_capacity_with_pressure(&recompute_id, 4, Some(0))
+    );
+
+    let mixed_batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(4))
+        .await
+        .expect("decode plus capacity-deferred recompute should be scheduled");
+    assert_eq!(mixed_batch.requests.len(), 4);
+    assert!(
+        mixed_batch.requests.iter().any(|request| {
+            request.request.id == recompute_id && request.tokens_to_process != Some(1)
+        }),
+        "the first mixed attempt must contain the capacity-deferred recompute"
+    );
+
+    engine.inner.process_batch(&mixed_batch).await.unwrap();
+
+    let retry_batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(4))
+        .await
+        .expect("structured KV feedback should reopen recompute in the next epoch");
+    assert!(
+        retry_batch.requests.iter().any(|request| {
+            request.request.id == recompute_id && request.tokens_to_process != Some(1)
+        }),
+        "failed recompute must not be marked attempted in the same epoch that structured KV feedback reopens"
+    );
 }
 
 #[tokio::test]

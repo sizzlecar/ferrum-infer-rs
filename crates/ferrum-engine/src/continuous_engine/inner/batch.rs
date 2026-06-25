@@ -465,6 +465,7 @@ impl EngineInner {
             warn!("Unified KV admission failed: {}", e);
             if is_resource_exhausted_error(&e) {
                 let pressure = paged_kv_admission_pressure(&e);
+                let mixed_decode_prefill = !decode_meta.is_empty() && !prefill_meta.is_empty();
                 if !decode_meta.is_empty() && prefill_meta.is_empty() {
                     if let Some(pressure) = pressure {
                         self.scheduler.record_decode_capacity_pressure(
@@ -482,19 +483,19 @@ impl EngineInner {
                             .defer_capacity_deferred_mixed_recompute_until_release();
                     }
                 }
-                if !decode_meta.is_empty() && !prefill_meta.is_empty() {
+                for work in &prefill_meta {
+                    if work.fresh_kv {
+                        let _ = self.kv_cache.deallocate(work.rid.clone()).await;
+                    }
+                    self.defer_prefill_for_capacity(&work.rid).await;
+                }
+                if mixed_decode_prefill {
                     self.scheduler
                         .defer_capacity_deferred_mixed_recompute_until_kv_capacity(
                             pressure.map(|pressure| pressure.admission_blocks),
                             pressure.map(|pressure| pressure.free_blocks),
                             Some(prefill_meta.len()),
                         );
-                }
-                for work in &prefill_meta {
-                    if work.fresh_kv {
-                        let _ = self.kv_cache.deallocate(work.rid.clone()).await;
-                    }
-                    self.defer_prefill_for_capacity(&work.rid).await;
                 }
                 if !decode_meta.is_empty() {
                     return self
