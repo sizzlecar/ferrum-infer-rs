@@ -2,6 +2,53 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ179 — Vast startup poll aborted before gate; runner now retries transient API failures
+
+- Context:
+  - follows runner target update `2d5185cd`;
+  - a bounded paid c32 diagnostic was attempted only after stating lane,
+    expected cost/runtime, stop condition, correctness gate, and performance
+    command.
+- Vast lifecycle:
+  - pre-start inventory showed only retained instance `42216671`,
+    `stopped/exited`, exact `1x RTX 4090`, cost
+    `$0.47777777777777775/hr`;
+  - no new instance was created;
+  - the Vast start request returned success, but subsequent API polling hit
+    SSL handshake timeout before SSH, CUDA verification, remote checkout,
+    build, smoke, or benchmark began;
+  - the runner's best-effort stop also hit the same transient API timeout;
+  - independent `curl --max-time` inventory after interruption verified
+    `42216671`, `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`;
+  - no unexpected paid/scheduling sibling instances were present.
+- Evidence classification:
+  - no remote artifact directory was produced;
+  - no remote Git SHA, CUDA build, `ferrum run`, `ferrum serve`,
+    `bench-serve`, KEEP/REJECT verdict, or performance metric exists for this
+    attempt;
+  - this is an external startup/API abort, not source or model evidence.
+- Runner hardening:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now retries transient
+    Vast API `URLError`/timeout failures and retryable HTTP 5xx responses
+    before failing;
+  - HTTP 4xx remains fail-fast;
+  - retry attempts are logged without secrets.
+- Local validation:
+  - `python3 -m py_compile scripts/release/w3_qwen35_vast_c32_diagnostic.py`
+    PASS;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --self-test`
+    PASS line:
+    `W3 QWEN35 VAST C32 DIAGNOSTIC ORCHESTRATOR SELFTEST PASS`;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --plan-only`
+    PASS, printed target SHA
+    `eaf405f5ffb1e9a9762d7e65f9b60c6ff958e444`, and did not touch Vast.
+- Limits:
+  - no CUDA build, GPU diagnostic artifact, performance bench, live vLLM run,
+    or final W3 validator ran here;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ178 — c32 diagnostic runner targets blocked recompute scan source fix
 
 - Context:
