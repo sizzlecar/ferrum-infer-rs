@@ -45,6 +45,9 @@ impl EngineInner {
                                     Some(pressure.free_blocks),
                                     Some(chunk.len().max(1)),
                                 );
+                        } else {
+                            self.scheduler
+                                .defer_capacity_deferred_mixed_recompute_until_release();
                         }
                         for rid in &chunk {
                             if !self
