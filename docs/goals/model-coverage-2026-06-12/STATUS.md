@@ -2,6 +2,34 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ156 — 9fda1101 c32 GPU diagnostic blocked by retained Vast availability
+
+- Intended diagnostic:
+  - W3 Qwen3.5 `9fda1101` c32 mixed-prefill immediate-KV diagnostic;
+  - retained Vast instance `42216671`, exact `1x RTX 4090`;
+  - no live vLLM run;
+  - correctness gate would have been remote clean SHA, `cargo check`, CUDA
+    release build, `ferrum run` smoke, and `ferrum serve` models/chat smoke;
+  - performance command would have been the same c32 diagnostic shape as
+    ZZZ153, with `bench-serve --fail-on-error --seed 9271 --n-repeats 1`.
+- Start attempt:
+  - Vast start API returned
+    `Required resources are currently unavailable, state change queued.`;
+  - nine follow-up polls kept reporting `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`;
+  - no SSH/CUDA verification, remote build, product smoke, or bench ran.
+- Decision:
+  - no new machine was rented, to avoid machine churn and environment rebuild;
+  - current progress remains the pushed source candidate `9fda1101` plus local
+    validation recorded in ZZZ155;
+  - the next GPU step should reuse `42216671` only if it becomes available, or
+    explicitly choose a new exact 1x4090 lane with a fresh paid-GPU statement.
+- Limits:
+  - no CUDA diagnostic artifact exists for `9fda1101`;
+  - no performance evidence was produced;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ155 — source candidate: mixed non-final prefill uses immediate KV admission
 
 - Context:
