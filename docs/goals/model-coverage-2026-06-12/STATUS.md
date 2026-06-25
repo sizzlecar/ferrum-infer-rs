@@ -2,6 +2,77 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ183 — ff5cab92 c32 diagnostic REJECT: KV failures improve, mixed now too low
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_capacity_backoff_c32_ff5cab92_20260625T071704Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_ff5cab92_1782371771/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    mixed-capacity-backoff diagnostic, expected 10-20 minutes, about
+    `$0.08-$0.16`, stop on KEEP/REJECT/SSH-CUDA failure/timeout/script failure;
+  - pre-start inventory showed only retained instance `42216671`,
+    `stopped/exited`, exact `1x RTX 4090`, cost `$0.47777777777777775/hr`;
+  - no new instance was created;
+  - artifact and orchestrator metadata were copied back;
+  - runner stop poll showed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`;
+  - independent inventory after cleanup again showed `42216671`,
+    `stopped/exited`; no unexpected paid/scheduling sibling instances remained.
+- Remote evidence:
+  - remote Git SHA:
+    `ff5cab92175e3929e70ce5e0a70fcc706d82b8b7`;
+  - remote git status short was empty;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` `/v1/models` and chat smoke passed;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, and
+    `output_token_count_source=usage`;
+  - no live vLLM run.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - remote verdict line:
+    `FERRUM W3 QWEN35 C32 DIAG REJECT:
+    /workspace/artifacts/w3_qwen35_mixed_capacity_backoff_c32_ff5cab92_20260625T071704Z`.
+- Reject reasons:
+  - output throughput `452.616 tok/s` <= floor `600.0`;
+  - `mixed_iterations=12` < `64`;
+  - p95 ITL `59.060 ms` > `25.0`.
+- Targeted signal:
+  - `Unified KV admission failed` improved from ZZZ180 `18 -> 9`, now below
+    threshold `13`;
+  - `capacity_deferred_total` improved from ZZZ180 `32 -> 17`, below
+    threshold `32`;
+  - average process time improved from ZZZ180 `25261 us -> 21529 us`;
+  - throughput recovered from ZZZ180 `378.392 -> 452.616 tok/s`.
+- Remaining blockers:
+  - mixed iterations regressed from ZZZ180 `112 -> 12`, far below threshold
+    `64`;
+  - throughput is still `147.384 tok/s` below the diagnostic floor `600.0`;
+  - p95 ITL remains roughly unchanged and far above target;
+  - serve warnings still show admission failures, but fewer of them:
+    `Unified KV admission failed=9`.
+- Classification:
+  - diagnostic rejected, not performance progress and not release evidence;
+  - the source fix successfully reduced failed KV admission overhead, but the
+    release-epoch backoff is too coarse and suppresses mixed recompute too much.
+- Next source direction:
+  - do not start another paid GPU diagnostic from this result alone;
+  - inspect whether mixed recompute can reopen on more precise runtime capacity
+    evidence than full request completion, without returning to ZZZ180's failed
+    admission storm;
+  - the next local test should preserve the ZZZ183 lower failure-count behavior
+    while allowing bounded mixed recompute to resume before it collapses to
+    `12` iterations.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ182 — c32 diagnostic runner targets mixed capacity backoff source fix
 
 - Context:
