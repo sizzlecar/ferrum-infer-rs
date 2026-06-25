@@ -1,0 +1,19 @@
+2026-06-25T11:26:06Z lane_start art=/workspace/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z sha=f1bc7b7ea71d525b8ea9572623612552fc6232df release_evidence=false no_live_vllm=true
+2026-06-25T11:26:06Z bootstrap_start
+2026-06-25T11:26:07Z bootstrap_done
+2026-06-25T11:26:07Z git_sync_start
+2026-06-25T11:26:07Z git_sync_done
+2026-06-25T11:26:07Z hf_prefetch_start
+2026-06-25T11:26:07Z cargo_check_start
+2026-06-25T11:26:10Z cargo_check_done
+2026-06-25T11:26:10Z release_build_start
+2026-06-25T11:29:25Z release_build_done
+2026-06-25T11:29:25Z hf_prefetch_wait_start
+2026-06-25T11:29:25Z hf_prefetch_done tokenizer=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+2026-06-25T11:29:25Z ferrum_run_smoke_start
+2026-06-25T11:29:53Z ferrum_run_smoke_done
+2026-06-25T11:29:53Z serve_start
+2026-06-25T11:30:19Z serve_ready
+2026-06-25T11:30:19Z serve_chat_smoke_done
+2026-06-25T11:30:19Z bench_c32_start
+2026-06-25T11:30:31Z FERRUM W3 QWEN35 C32 DIAG REJECT: /workspace/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z

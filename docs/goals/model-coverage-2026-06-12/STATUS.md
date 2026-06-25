@@ -2,6 +2,73 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ204 — f1bc7b7e c32 diagnostic REJECT: decode defer improves KV churn, decode width still too high
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_defer_waits_for_independent_kv_release_c32_f1bc7b7e_20260625T112605Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_f1bc7b7e_1782386720/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    decode-defer-independent-kv-release diagnostic;
+  - expected runtime/cost: 10-20 minutes, about `$0.08-$0.16`, using retained
+    instance `42216671`, exact `1x RTX 4090`, `$0.47777777777777775/hr`;
+  - stop condition: KEEP, REJECT, SSH/CUDA unavailable, timeout, or script
+    failure;
+  - correctness gate: remote clean SHA, `cargo check`, CUDA release build,
+    `ferrum run` smoke, `ferrum serve` models/chat smoke;
+  - performance command: `ferrum bench-serve c32 --fail-on-error --seed 9271
+    --n-repeats 1`;
+  - no live vLLM run;
+  - runner copied artifact and orchestrator metadata back;
+  - runner stop poll confirmed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Remote evidence:
+  - remote Git SHA:
+    `f1bc7b7ea71d525b8ea9572623612552fc6232df`;
+  - remote git status short was empty;
+  - binary SHA256:
+    `f5bf989c93bca3fe51e95da8686ba7dbd1d33eb97c99f55add8b2d5e5fd6a6e3`;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` smoke covered `/v1/models` and `/v1/chat/completions`;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, zero
+    HTTP 500, zero panic, zero OOM mentions, and
+    `output_token_count_source=usage`.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - verdict `REJECT`;
+  - reject reasons:
+    - output throughput `476.311 tok/s` <= floor `600.0`;
+    - `mixed_iterations=0` < `64`;
+    - p95 ITL `48.888 ms` > `25.0`.
+- Positive signal versus ZZZ202:
+  - output throughput improved from `446.007` to `476.311 tok/s`;
+  - p95 ITL improved from `64.288` to `48.888 ms`;
+  - `Unified KV admission failed` dropped from `16` to `8`, now below the
+    diagnostic threshold `13`;
+  - `capacity_deferred_total` dropped from `43` to `16`, now below the
+    diagnostic threshold `32`;
+  - `unified_prefill_alloc_deferred` dropped from `1` to `0`;
+  - immediate mixed recompute churn was removed.
+- Remaining blocker:
+  - the diagnostic still rejects on throughput, p95 ITL, and `mixed_iterations`;
+  - `mixed_iterations=0` means the fix became too conservative: recompute waits
+    until a pure prefill window instead of using safe mixed windows;
+  - the trace still shows repeated decode-only KV admission failures at widths
+    `32`, `28`, `25`, `23`, `21`, `19`, `18`, and `17`;
+  - `capacity_backpressure_admit_limit` is set after these failures, but decode
+    scheduling still submits wider decode batches, so the next source direction
+    is to have decode batch width obey capacity backpressure under KV pressure,
+    not only waiting/prefill admission.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ203 — source candidate: decode defer waits for independent KV release
 
 - Context:
