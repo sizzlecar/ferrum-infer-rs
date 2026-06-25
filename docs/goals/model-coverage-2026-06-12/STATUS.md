@@ -2,6 +2,34 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ212 — d54f634b c32 diagnostic attempt aborted before remote execution
+
+- Attempted lane:
+  - W3 Qwen35 c32 decode-survivors-wide-after-kv-pressure diagnostic;
+  - target SHA `d54f634bfff49f7a444a9b51e5cc3ff6f2f60771`;
+  - retained Vast instance `42216671`, exact `1x RTX 4090`;
+  - no live vLLM run.
+- Result:
+  - Vast `start_response` reported success, but subsequent Vast API GET/PUT
+    calls repeatedly hit timeout / SSL EOF before SSH, CUDA verification,
+    remote build, correctness smoke, or benchmark began;
+  - runner requested stop and final observed state was `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Evidence status:
+  - no remote correctness gate ran;
+  - no `bench-serve` ran;
+  - no KEEP/REJECT artifact was produced;
+  - no performance metric exists for `d54f634b`.
+- Decision:
+  - this is an external Vast/API startup failure, not a source-code verdict;
+  - the next diagnostic, if run, should still target ZZZ211's `d54f634b`
+    candidate unless new source evidence changes the target first.
+- Limits:
+  - this is not W3 completion, not performance evidence, and not release
+    evidence;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ211 — source candidate: keep decode survivors wide after KV pressure
 
 - Context:
