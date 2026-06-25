@@ -308,6 +308,7 @@ Rules:
   - performance command.
 - Do not leave paid GPU instances idle. Stop or destroy them after validation evidence is collected unless the user explicitly asks to keep them running.
 - If CUDA validation fails, collect the exact failing artifact/log, stop unnecessary processes, and avoid repeated full sweeps until the failure mode is understood.
+- Failure triage comes before machine churn. If a failure has a small, bounded follow-up that can reuse the same warmed instance, model cache, and build cache, record the keep-alive window and stop condition, then run only that follow-up. Otherwise stop the instance after artifacts are copied.
 - Prefer CUDA smoke before CUDA full unless the task specifically requires full release evidence.
 
 ## Vast GPU Runner Policy
@@ -341,6 +342,7 @@ Instance lifecycle:
 - Start or stop an existing instance with `PUT https://console.vast.ai/api/v0/instances/<INSTANCE_ID>/` and JSON body `{"state":"running"}` or `{"state":"stopped"}`. Do not use guessed subpaths such as `/start/`.
 - After requesting start, wait for both `cur_state=running` and `actual_status=running`, then verify SSH and CUDA with `nvidia-smi` and `nvcc --version` before running paid work.
 - After requesting stop, keep polling until `actual_status=exited`; `cur_state=stopped` alone can appear while the container is still shutting down.
+- Prefer reusing a retained stopped or already-running instance with valid caches over creating a fresh machine, when it matches the lane hardware and reliability requirements. Do not reinstall or recreate the environment just to recover from a source-level mistake.
 
 Remote validation workflow:
 
@@ -384,6 +386,8 @@ Shutdown and artifact handling:
 - Before a new paid performance diagnostic, compare the latest relevant Ferrum artifact against the best historical Ferrum artifact and the vLLM source/release baseline. Record the specific runtime/config, scheduler trace, token length, profile, or log difference that the next lever is expected to change.
 - Do not use a GPU run to discover what should have been learned from existing artifacts. If the same failure class has an artifact, inspect that artifact first and write the falsifiable hypothesis before starting another instance.
 - Each performance diagnostic must have an expected signal and reject threshold, for example a target trace-shape change, throughput floor, error-count limit, or profile counter movement. If the threshold is missed, stop, classify the candidate as rejected or diagnostic-only, and do not stack another source change on top without a new artifact-based explanation.
+- Classify CUDA memory failures before fixing them: distinguish driver/CUDA OOM, allocator exhaustion, model-owned KV admission failure, scheduler capacity deferral, decode cancellation, and livelock. The fix direction must follow that classification.
+- For KV/cache capacity pressure, prefer dynamic admission, waiting, release, or backpressure logic that is derived from runtime state. Do not replace a scheduling bug with a hard-coded model, GPU, VRAM, or concurrency enumeration unless the goal document explicitly defines that product behavior.
 - Treat effective-concurrency or slot caps as diagnostic levers unless the goal document explicitly accepts them as product behavior. Do not substitute a lower effective concurrency for a requested c=32 release/performance target without making the effective value visible in artifacts and status notes.
 - During long CUDA builds/tests, use the time for non-overlapping source tracing, vLLM comparison, kernel review, or microbench design.
 - Performance claims need same-pod A/B and `N >= 3` for deltas under 10%. Single-pod or single-run numbers may be used as smoke or diagnostic evidence only.
@@ -395,6 +399,7 @@ Shutdown and artifact handling:
 - Record time by action category such as source reading, code edit, local validation, remote setup, compile wait, GPU run, artifact handling, artifact analysis, status update, and git sync.
 - Use the ledger during long tasks to check whether time is converting into goal evidence. If repeated GPU runs or validation cycles do not move the target metric, pause implementation and do a written retrospective before continuing.
 - A retrospective must distinguish stability progress, correctness progress, performance progress, and final-goal progress. Do not present stability or diagnostic progress as target-performance progress.
+- During long-running goals, periodically summarize elapsed time by category and name the next artifact or PASS line that would count as real progress. If the next action cannot plausibly move that evidence, stop and choose a narrower diagnostic.
 - After a rejected candidate, either revert it or document why it remains useful before starting the next paid diagnostic. Avoid accumulating unproven scheduler/runtime changes that make later artifacts hard to interpret.
 
 ## Coding Style and Naming Conventions
@@ -423,6 +428,7 @@ Shutdown and artifact handling:
   - `docs(agents): ...`
 - Keep commits focused and imperative.
 - Avoid mixing unrelated crates in one commit when possible.
+- For long-running goal branches, synchronize with `git pull --rebase --autostash` before staging or committing, and push completed commits promptly after validation. Keep local ledgers, scratch scripts, and non-evidence state directories untracked unless the user explicitly asks to commit them.
 - PRs should include:
   - purpose,
   - affected crates/scripts/docs,
