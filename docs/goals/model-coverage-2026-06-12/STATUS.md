@@ -2,6 +2,64 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ167 — source candidate: admit one blocked recompute per mixed iteration
+
+- Context:
+  - follows ZZZ166 REJECT without starting another GPU;
+  - ZZZ166 showed the partial-backpressure candidate still had the same failure
+    class: `Unified KV admission failed=50`, `capacity_deferred_total=112`,
+    `mixed_iterations=126`, output throughput `282.994 tok/s`, and p95 ITL
+    `62.720 ms`;
+  - the next source direction from ZZZ166 was to keep mixed scheduling while
+    preventing a whole capacity-deferred recompute cohort from being promoted
+    before real capacity release.
+- Diagnosis:
+  - the current bounded mixed path restored mixed iterations, but when release
+    gating was bypassed it allowed multiple release-blocked recomputes to be
+    admitted in one iteration;
+  - that behavior recreated the repeated KV admission churn seen in ZZZ164 and
+    ZZZ166;
+  - this is a scheduler admission/backpressure issue, not a model-name,
+    GPU-name, VRAM-size, or quantization-specific special case.
+- Code change:
+  - `crates/ferrum-scheduler/src/implementations/continuous.rs` now admits all
+    release-ready waiting requests as before;
+  - when `allow_capacity_deferred_mixed_recompute` is true but a waiting
+    request is still release-epoch blocked, only one such blocked recompute may
+    be admitted in the mixed iteration;
+  - remaining blocked recomputes stay in the waiting queue until a later
+    iteration or actual release evidence.
+- Test added:
+  - `capacity_deferred_decode_recompute_admits_one_blocked_request_per_mixed_iteration`
+    creates `4` active decodes and `4` capacity-deferred recomputes, then
+    verifies the next mixed batch schedules the active decodes plus exactly one
+    blocked recompute chunk (`Some(64)`), leaving
+    `capacity_blocked_waiting_len=3`.
+- Local validation:
+  - `cargo test -p ferrum-scheduler capacity_deferred_decode -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler capacity_backpressure -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS (`69/69`);
+  - `cargo test -p ferrum-engine --lib continuous_engine::tests -- --nocapture`
+    PASS (`56/56`);
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `git diff --check` PASS.
+- Next evidence needed:
+  - commit this source candidate, update the c32 Vast diagnostic runner to the
+    resulting source SHA, and only then decide whether one bounded 1x4090 c32
+    diagnostic is justified;
+  - the diagnostic acceptance signal should be lower `Unified KV admission
+    failed` and `capacity_deferred_total` while preserving useful mixed
+    iterations, not just another zero-error run.
+- Limits:
+  - no CUDA build, GPU diagnostic, performance bench, live vLLM run, or final
+    W3 validator ran here;
+  - this is local source validation only;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ166 — 9d43148 c32 diagnostic REJECT: partial backpressure not enough
 
 - Artifact:

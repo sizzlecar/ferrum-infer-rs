@@ -901,16 +901,23 @@ impl ContinuousBatchScheduler {
         let active_count_for_capacity_wait = self.active_count();
         let capacity_release_epoch = self.capacity_release_epoch.load(Ordering::Relaxed);
 
-        let requests_to_admit: Vec<RequestId> = waiting_queue
-            .iter()
-            .filter(|r| {
-                active_count_for_capacity_wait == 0
-                    || r.capacity_deferred_until_release_epoch <= capacity_release_epoch
-                    || allow_capacity_deferred_mixed_recompute
-            })
-            .take(available_slots)
-            .map(|r| r.inner.request.id.clone())
-            .collect();
+        let mut requests_to_admit = Vec::new();
+        let mut admitted_capacity_deferred_recompute = false;
+        for req in waiting_queue.iter() {
+            if requests_to_admit.len() >= available_slots {
+                break;
+            }
+            let release_ready = active_count_for_capacity_wait == 0
+                || req.capacity_deferred_until_release_epoch <= capacity_release_epoch;
+            if release_ready {
+                requests_to_admit.push(req.inner.request.id.clone());
+            } else if allow_capacity_deferred_mixed_recompute
+                && !admitted_capacity_deferred_recompute
+            {
+                requests_to_admit.push(req.inner.request.id.clone());
+                admitted_capacity_deferred_recompute = true;
+            }
+        }
         drop(waiting_queue);
 
         // Promote waiting requests to prefill
@@ -1741,6 +1748,76 @@ mod tests {
             "the recompute prefill should still be capped by the mixed-prefill token budget"
         );
         assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 0);
+    }
+
+    #[test]
+    fn capacity_deferred_decode_recompute_admits_one_blocked_request_per_mixed_iteration() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 8,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 8,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        for _ in 0..8 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_ids: Vec<_> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for request_id in &first_ids {
+            scheduler.mark_prefill_complete(request_id, 128);
+        }
+
+        for request_id in first_ids.iter().take(4) {
+            assert!(scheduler.defer_decode_to_waiting_for_capacity(request_id, 8));
+        }
+        let deferred = scheduler.trace_snapshot();
+        assert_eq!(deferred.waiting_queue_len, 4);
+        assert_eq!(deferred.decode_queue_len, 4);
+        assert_eq!(deferred.active_len, 4);
+        assert_eq!(deferred.capacity_blocked_waiting_len, 4);
+
+        let mixed_batch = scheduler.create_iteration_batch(hint).unwrap();
+        let scheduled_deferred = mixed_batch
+            .requests
+            .iter()
+            .filter(|request| first_ids[..4].contains(&request.request.id))
+            .count();
+        let scheduled_decodes = mixed_batch
+            .requests
+            .iter()
+            .filter(|request| {
+                first_ids[4..].contains(&request.request.id) && request.tokens_to_process == Some(1)
+            })
+            .count();
+        let prefill_tokens: Vec<_> = mixed_batch
+            .requests
+            .iter()
+            .filter(|request| first_ids[..4].contains(&request.request.id))
+            .map(|request| request.tokens_to_process)
+            .collect();
+
+        assert_eq!(scheduled_decodes, 4);
+        assert_eq!(
+            scheduled_deferred, 1,
+            "bounded mixed recompute should not re-admit the whole blocked cohort"
+        );
+        assert_eq!(prefill_tokens, vec![Some(64)]);
+        assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 3);
     }
 
     #[tokio::test]
