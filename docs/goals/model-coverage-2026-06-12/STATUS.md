@@ -2,6 +2,85 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ192 — source candidate: pace mixed recompute by KV snapshot per-slot budget
+
+- Context:
+  - follows ZZZ191 `dc456075` c32 diagnostic REJECT without starting another
+    GPU and without running live vLLM;
+  - ZZZ191 fixed the KV-pressure regression (`Unified KV admission failed`
+    `15 -> 12`, `capacity_deferred_total` `37 -> 21`) but still had only
+    `mixed_iterations=8`, throughput `467.001 tok/s`, and p95 ITL
+    `57.247 ms`;
+  - the remaining trace shape was long decode-only stretches while
+    `capacity_blocked_waiting_len` grew after model-owned KV pressure cleared.
+- Source change:
+  - commit `6c2fdcc6d434c0de098eb95ed4cb74ff1c5ed7d0`
+    (`perf(scheduler): pace mixed recompute by kv snapshot`);
+  - engine now passes the failed mixed batch's `prefill_meta.len()` alongside
+    structured paged-KV pressure (`admission_blocks`, `free_blocks`);
+  - scheduler converts failed batch pressure into a dynamic per-slot estimate:
+    `required_blocks_per_slot = ceil(admission_blocks / attempted_prefill_width)`;
+  - capacity-blocked mixed recompute now:
+    - reopens once a model-owned KV snapshot can fit at least one bounded
+      recompute slot, instead of waiting until the whole failed mixed batch can
+      be replayed;
+    - caps the reopened width by
+      `observed_free_blocks / required_blocks_per_slot`, instead of blindly
+      spending the full mixed-prefill chunk budget;
+    - still preserves the existing token/chunk-count mixed-prefill budget.
+- Regression coverage:
+  - added
+    `capacity_deferred_mixed_recompute_paces_width_by_kv_snapshot`;
+  - test shape: four capacity-blocked recomputes previously failed together
+    with `16` admission blocks, then a snapshot reports `8` free blocks;
+  - expected behavior: schedule the four active decodes plus exactly two
+    reopened recomputes, leaving two capacity-blocked waiters.
+- Local validation:
+  - `cargo fmt --all` PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred_mixed_recompute_paces_width_by_kv_snapshot -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture`
+    PASS, `9/9`;
+  - `cargo test -p ferrum-scheduler active_decode_prefill -- --nocapture`
+    PASS, `5/5`;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS, `77/77` plus
+    doctests;
+  - `cargo test -p ferrum-engine paged_kv_admission_pressure -- --nocapture`
+    PASS, `3/3`;
+  - `cargo test -p ferrum-engine process_batch_unified_capacity_defer_releases_existing_kv -- --nocapture`
+    PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Diagnostic runner:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now targets
+    `6c2fdcc6d434c0de098eb95ed4cb74ff1c5ed7d0`;
+  - default artifact tag: `mixed_recompute_kv_snapshot_pacing`;
+  - plan lane:
+    `W3 Qwen35 c32 mixed-recompute-kv-snapshot-pacing diagnostic`;
+  - `python3 -m py_compile scripts/release/w3_qwen35_vast_c32_diagnostic.py`
+    PASS;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --self-test`
+    PASS;
+  - `python3 scripts/release/w3_qwen35_vast_c32_diagnostic.py --plan-only`
+    PASS and reports `no_live_vllm=true`.
+- Expected next diagnostic signal:
+  - compared with ZZZ191, `mixed_iterations` should rise from `8` because
+    blocked recomputes can reopen when the snapshot fits one or a few slots,
+    not only when it fits the previous whole failed batch;
+  - `Unified KV admission failed` and `capacity_deferred_total` should stay at
+    or below the ZZZ191 accepted diagnostic thresholds because reopen width is
+    paced by real free KV blocks;
+  - if mixed iterations rise but throughput remains near `467 tok/s`, the next
+    lever should move away from admission width and inspect mixed-row process
+    cost/model hot path.
+- Limits:
+  - no CUDA diagnostic has run for this source candidate yet;
+  - no performance or release evidence is claimed;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ191 — dc456075 c32 diagnostic REJECT: KV pressure fixed, mixed recompute still too rare
 
 - Artifact:
