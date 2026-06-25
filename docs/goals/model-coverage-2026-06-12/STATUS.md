@@ -2,6 +2,67 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ151 — 517d49a0 diagnostic rejected: decode limit regressed throughput
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_decode_backpressure_c32_517d49a0_20260625T005252Z/`.
+- Diagnostic PASS line:
+  - `FERRUM W3 QWEN35 DECODE BACKPRESSURE C32 DIAG PASS: /workspace/artifacts/w3_qwen35_decode_backpressure_c32_517d49a0_20260625T005252Z`.
+- Vast lifecycle:
+  - reused retained instance `42439308` only; no new instance was created;
+  - queried other known instances before starting and confirmed `42216671` was
+    `stopped/exited`;
+  - copied artifact back before shutdown;
+  - stop verification reported `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`.
+- Git/build evidence:
+  - remote Git SHA:
+    `517d49a01b5b46c2685400656aac8422529801db`;
+  - no live vLLM was run;
+  - remote `cargo check` PASS;
+  - CUDA release build PASS with
+    `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`;
+  - `ferrum run` smoke PASS;
+  - `ferrum serve` `/v1/models` and chat smoke PASS.
+- c32 diagnostic bench:
+  - same command shape as ZZZ150: `bench-serve`, sharegpt dataset,
+    `--concurrency 32`, `--num-prompts 32`, `--warmup-requests 4`,
+    `--n-repeats 1`, `--fail-on-error`, `--seed 9271`, `--ignore-eos`,
+    `--timeout 600`;
+  - bench exit `0`;
+  - `completed_per_run=[32]`, `errored_per_run=[0]`;
+  - `output_token_count_source=usage`;
+  - output throughput `90.067 tok/s`;
+  - total throughput `170.986 tok/s`;
+  - request throughput `0.704 req/s`;
+  - p95 TTFT `2331.577 ms`;
+  - p95 TPOT `324.678 ms`.
+- Scheduler/log evidence:
+  - final `admitted_total=352`;
+  - final `capacity_deferred_total=315`;
+  - `unified_kv_admission_failed=168`;
+  - `cancelled_during_decode=0`;
+  - `preempting_request=0`;
+  - `oom_mentions=0`;
+  - `panic_mentions=0`;
+  - `block_pool_exhausted=0`.
+- Diagnosis:
+  - The dynamic decode backpressure source candidate completed c32 without
+    errors, but it is a performance regression: output throughput dropped from
+    ZZZ150 `449.787 tok/s` to `90.067 tok/s`.
+  - Trace distribution shows `decode_backpressure_limit=1` for most scheduling
+    iterations, which serialized too much decode work and amplified recompute
+    churn instead of reducing it.
+  - The candidate was therefore rejected and reverted by
+    `a1c72617 Revert "fix(scheduler): throttle decodes after kv capacity pressure"`.
+- Revert validation:
+  - `cargo test -p ferrum-scheduler` PASS (`66/66`);
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS.
+- Limits:
+  - This is diagnostic-only evidence and explicitly not a performance pass;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ150 — cb0cd027 c32 diagnostic PASS: decode recompute removes livelock
 
 - Artifact:
