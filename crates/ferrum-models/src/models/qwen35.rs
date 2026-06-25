@@ -16,8 +16,8 @@ use std::time::Instant;
 use ferrum_interfaces::{
     kv_dtype::KvFp16,
     model_executor::{
-        GreedyRepetitionPenalty, KvSlotAllocation, KvSlotRequest, KvSlotReservation,
-        LogitsReturnPolicy, TokenSelectionMask,
+        GreedyRepetitionPenalty, KvSlotAllocation, KvSlotCapacitySnapshot, KvSlotRequest,
+        KvSlotReservation, LogitsReturnPolicy, TokenSelectionMask,
     },
     RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,
     RecurrentStateManagerStats, RecurrentStateSpec,
@@ -4300,6 +4300,19 @@ impl<B: MoeLlmBackend + BackendPagedKv> DecoderOnlyLLM for Qwen35BackendModel<B>
         requests: &[KvSlotRequest],
     ) -> std::result::Result<Option<KvSlotReservation>, FerrumError> {
         self.reserve_paged_kv_slots(requests)
+    }
+
+    fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
+        if !self.use_paged_kv {
+            return None;
+        }
+        let alloc = self.paged_block_alloc.as_ref()?;
+        let alloc = alloc.lock().unwrap_or_else(|p| p.into_inner());
+        Some(KvSlotCapacitySnapshot {
+            block_size: QWEN35_PAGED_BLOCK_SIZE,
+            total_blocks: alloc.capacity() as usize,
+            free_blocks: alloc.free_count(),
+        })
     }
 
     fn recurrent_state_spec(

@@ -50,6 +50,19 @@ pub struct KvSlotReservation {
     pub allocations: Vec<KvSlotAllocation>,
 }
 
+/// Point-in-time model-owned paged-KV capacity snapshot.
+///
+/// This is intentionally smaller than [`KvSlotReservation`]: it lets the
+/// engine observe whether physical block capacity has actually changed after a
+/// release, without allocating speculative slots or depending on model-family
+/// names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvSlotCapacitySnapshot {
+    pub block_size: usize,
+    pub total_blocks: usize,
+    pub free_blocks: usize,
+}
+
 /// Token-validity mask for model-side greedy argmax.
 ///
 /// `valid_token_mask[id] != 0` means token `id` may be selected. Tokens at or
@@ -470,6 +483,13 @@ pub trait ModelExecutor: Send + Sync {
     /// panicking inside attention.
     fn reserve_kv_slots(&self, _requests: &[KvSlotRequest]) -> Result<Option<KvSlotReservation>> {
         Ok(None)
+    }
+
+    /// Snapshot model-owned paged-KV capacity without allocating slots.
+    ///
+    /// Executors without model-owned paged KV return `None`.
+    fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
+        None
     }
 
     /// Recurrent-state allocation spec for this request, when the model has

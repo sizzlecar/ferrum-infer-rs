@@ -465,8 +465,12 @@ impl EngineInner {
             warn!("Unified KV admission failed: {}", e);
             if is_resource_exhausted_error(&e) {
                 if !decode_meta.is_empty() && !prefill_meta.is_empty() {
+                    let pressure = paged_kv_admission_pressure(&e);
                     self.scheduler
-                        .defer_capacity_deferred_mixed_recompute_until_release();
+                        .defer_capacity_deferred_mixed_recompute_until_kv_capacity(
+                            pressure.map(|pressure| pressure.admission_blocks),
+                            pressure.map(|pressure| pressure.free_blocks),
+                        );
                 }
                 for work in &prefill_meta {
                     if work.fresh_kv {
@@ -979,10 +983,20 @@ impl EngineInner {
             self.release_recurrent_state(request_id).await;
         }
 
+        let kv_capacity_snapshot = self.model_executor.kv_slot_capacity_snapshot();
         let moved = self
             .scheduler
             .defer_decode_to_waiting_for_capacity(request_id, attempted_decode_width);
         if moved {
+            if let Some(snapshot) = kv_capacity_snapshot {
+                self.scheduler
+                    .record_capacity_deferred_mixed_recompute_kv_capacity_snapshot(
+                        snapshot.free_blocks,
+                    );
+            } else {
+                self.scheduler
+                    .record_capacity_deferred_mixed_recompute_release_evidence();
+            }
             info!(
                 "Capacity-deferred decode request {} for KV recompute after failed width {}",
                 request_id, attempted_decode_width
