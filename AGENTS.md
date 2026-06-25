@@ -9,6 +9,7 @@
 - Correctness gates must pass before performance measurements are treated as evidence.
 - Official accelerator release evidence must cover both correctness and performance on each shipped accelerator backend, and must include at least one Llama 8B-class dense model in addition to the Qwen3-30B-A3B MoE/GPTQ model.
 - Paid GPU work requires a stated lane, expected runtime/cost, stop condition, correctness gate, and performance command before starting.
+- Before creating, starting, or resuming paid GPU capacity, reconcile the current instance inventory and state which existing instance will be reused or why a new one is necessary.
 - Long-running performance or GPU work must convert time into saved evidence: a PASS line, KEEP/REJECT diagnostic artifact, or explicit blocker. Do not count elapsed time, setup, compilation, or partial stability as final-goal progress.
 - On long-lived goal branches, synchronize with `git pull --rebase --autostash` before staging or committing, and push validated commits promptly unless the user explicitly asks to keep work local.
 - Prefer small, surgical changes. Do not combine release gate changes, kernel/model changes, and large repository cleanup in the same patch unless the goal explicitly asks for that.
@@ -326,6 +327,7 @@ Credential and secret rules:
 
 Offer selection:
 
+- Before creating a new Vast instance, query existing instances and record whether each relevant instance is running, stopped, scheduling, loading, or exited. Prefer a matching retained instance with useful caches over a fresh rental.
 - Search rentable offers through the Vast HTTP API and filter locally for the exact hardware required by the lane, for example a 2x RTX 4090 host when a two-GPU CUDA lane requires it.
 - Prefer low hourly cost only after hardware count, GPU memory, disk capacity, CUDA capability, network bandwidth, and reliability are sufficient for the gate.
 - Do not broaden from the lane's required hardware, model matrix, or GPU count without explicit user approval.
@@ -343,6 +345,8 @@ Instance lifecycle:
 
 - Query an instance with `GET https://console.vast.ai/api/v0/instances/<INSTANCE_ID>/` and header `Authorization: Bearer $VAST_API_KEY`.
 - Start or stop an existing instance with `PUT https://console.vast.ai/api/v0/instances/<INSTANCE_ID>/` and JSON body `{"state":"running"}` or `{"state":"stopped"}`. Do not use guessed subpaths such as `/start/`.
+- For a single-lane diagnostic, keep at most one non-stopped paid instance unless the lane explicitly requires multiple machines or the user approves parallel capacity. Treat `scheduling`, `loading`, `running`, and unknown transitional states as potentially billable until the API proves otherwise.
+- If multiple unexpected paid or scheduling instances exist, pause new rentals and new GPU work. Pick the canonical instance, preserve any unique artifacts or caches that matter, then stop or destroy the extras according to their evidence/cache value.
 - After requesting start, wait for both `cur_state=running` and `actual_status=running`, then verify SSH and CUDA with `nvidia-smi` and `nvcc --version` before running paid work.
 - After requesting stop, keep polling until `actual_status=exited`; `cur_state=stopped` alone can appear while the container is still shutting down.
 - Prefer reusing a retained stopped or already-running instance with valid caches over creating a fresh machine, when it matches the lane hardware and reliability requirements. Do not reinstall or recreate the environment just to recover from a source-level mistake.
@@ -364,7 +368,7 @@ Shutdown and artifact handling:
 
 - Always copy back the gate artifact directory, command logs, Vast instance metadata, and any failure logs before destroying the instance.
 - Destroy or stop the Vast instance immediately after PASS, failure triage, or the stated stop condition unless the user explicitly asks to keep it running.
-- After cleanup, verify through the Vast API that the instance is no longer running, and record that cleanup check in the local notes.
+- After cleanup, verify through the Vast API that the target instance is no longer running and that no unexpected paid/scheduling sibling instances remain. Record that cleanup check in the local notes.
 
 ## Release Regression Lessons
 
