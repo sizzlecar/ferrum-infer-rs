@@ -2,6 +2,68 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ169 — source candidate: active recompute uses shared mixed slot
+
+- Context:
+  - follows ZZZ168 REJECT without starting another GPU;
+  - ZZZ168 showed that waiting admission was limited, but active/prefill still
+    accumulated multiple capacity-deferred recompute chunks and kept the same
+    failure counters: `Unified KV admission failed=50`,
+    `capacity_deferred_total=112`;
+  - the artifact showed repeated engine admission failures such as
+    `need 4 admission blocks ... only 0-1 free`.
+- Diagnosis:
+  - `promote_to_prefill` cleared
+    `capacity_deferred_until_release_epoch`, so a capacity-deferred recompute
+    stopped looking release-blocked as soon as it entered `prefill_queue`;
+  - the first mixed iteration could admit one blocked recompute correctly, but
+    later iterations treated that already-promoted recompute like a normal
+    prefill and could also admit/schedule another blocked recompute from
+    waiting;
+  - the effective cap therefore applied only to waiting admission, not to the
+    active recompute scheduling width that ZZZ168 identified.
+- Code change:
+  - `crates/ferrum-scheduler/src/implementations/continuous.rs` now preserves
+    `capacity_deferred_until_release_epoch` when a waiting recompute is
+    promoted to prefill;
+  - `promote_to_decode` clears that marker after prefill/recompute is complete
+    and physical state has been rebuilt;
+  - each mixed iteration shares one bounded capacity-deferred recompute slot
+    across already-promoted prefill requests and new waiting admission;
+  - a release-blocked recompute in `prefill_queue` consumes that slot when it
+    is actually scheduled, so waiting admission cannot add another blocked
+    recompute in the same iteration.
+- Test added:
+  - `capacity_deferred_existing_recompute_consumes_single_mixed_slot`;
+  - the test creates `4` active decodes plus `4` capacity-deferred recomputes,
+    schedules one recompute chunk in the first mixed iteration without marking
+    it complete, then verifies the next mixed iteration schedules only that
+    already-promoted recompute and does not admit another blocked recompute
+    from waiting.
+- Local validation:
+  - `cargo test -p ferrum-scheduler capacity_deferred_existing_recompute -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture` PASS;
+  - `cargo test -p ferrum-scheduler capacity_backpressure -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS (`70/70`);
+  - `cargo test -p ferrum-engine --lib continuous_engine::tests -- --nocapture`
+    PASS (`56/56`);
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `git diff --check` PASS.
+- Next evidence needed:
+  - commit this source candidate, update the c32 Vast diagnostic runner to the
+    resulting source SHA, and only then consider one bounded c32 diagnostic;
+  - the expected signal is a drop in `Unified KV admission failed` and
+    `capacity_deferred_total`, not merely a small throughput increase.
+- Limits:
+  - no CUDA build, GPU diagnostic, performance bench, live vLLM run, or final
+    W3 validator ran here;
+  - this is local source validation only;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ168 — a8de884a c32 diagnostic REJECT: waiting admission limited, active recompute churn remains
 
 - Artifact:
