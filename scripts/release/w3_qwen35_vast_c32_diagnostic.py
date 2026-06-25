@@ -26,8 +26,8 @@ from typing import Any
 
 
 DEFAULT_INSTANCE_ID = 42216671
-DEFAULT_SHA = "fbf234588ad5d778dec314642f3428037fee379b"
-DEFAULT_TAG = "bounded_mixed_recompute"
+DEFAULT_SHA = "9d43148caaf0565a0699e89fd30a44ca14d77100"
+DEFAULT_TAG = "partial_prefill_backpressure"
 DEFAULT_THROUGHPUT_FLOOR = "600.0"
 DEFAULT_MAX_KV_ADMISSION_FAILED = "13"
 DEFAULT_MAX_CAPACITY_DEFERRED = "32"
@@ -337,7 +337,7 @@ def main() -> int:
         raise DiagnosticError(f"missing local diagnostic script: {local_diag_script}")
 
     plan = {
-        "lane": "W3 Qwen35 c32 bounded-mixed-recompute diagnostic",
+        "lane": "W3 Qwen35 c32 partial-prefill-backpressure diagnostic",
         "instance_id": args.instance_id,
         "target_sha": args.sha,
         "correctness_gate": [
