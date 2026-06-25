@@ -2,6 +2,84 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ173 — e270c5b1 c32 diagnostic REJECT: churn fixed, mixed/ITL still fail
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_no_progress_recompute_retry_c32_e270c5b1_20260625T055342Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_e270c5b1_1782366756/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    no-progress-recompute-retry diagnostic, expected 10-20 minutes, about
+    `$0.08-$0.16`, stop on KEEP/REJECT/SSH-CUDA failure/timeout/script failure;
+  - inventory before start showed only retained instance `42216671`,
+    `stopped/exited`, exact `1x RTX 4090`, cost `$0.47777777777777775/hr`;
+  - no new instance was created;
+  - artifact and orchestrator metadata were copied back;
+  - stop verification after the run showed `42216671`, `cur_state=stopped`,
+    `actual_status=exited`, `intended_status=stopped`;
+  - independent inventory after cleanup again showed only `42216671`,
+    `stopped/exited`; no unexpected paid/scheduling sibling instances remained.
+- Remote evidence:
+  - remote Git SHA:
+    `e270c5b167ea681daec36c4c1fd132608c7c543d`;
+  - remote git status short was empty;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` `/v1/models` and chat smoke passed;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, and
+    `output_token_count_source=usage`;
+  - no live vLLM run.
+- Diagnostic verdict:
+  - local orchestrator exit code `60`;
+  - remote verdict line:
+    `FERRUM W3 QWEN35 C32 DIAG REJECT:
+    /workspace/artifacts/w3_qwen35_no_progress_recompute_retry_c32_e270c5b1_20260625T055342Z`.
+- Reject reasons:
+  - output throughput `346.958 tok/s` <= floor `600.0`;
+  - `mixed_iterations=41` < `64`;
+  - p95 ITL `58.666 ms` > `25.0`.
+- Targeted signal:
+  - `Unified KV admission failed=10`, down from ZZZ170 `30` and now below the
+    strict threshold `13`;
+  - `capacity_deferred_total=20`, down from ZZZ170 `45` and now below the
+    strict threshold `32`;
+  - final `admitted_total=57`, down from ZZZ170 `82`;
+  - `cancelled_total=0`, `failed_total=0`, no panic/OOM/preemption mentions.
+- Trace comparison:
+  - throughput improved from ZZZ170 `300.616 -> 346.958 tok/s`, but remains
+    far below the diagnostic floor and W3 target;
+  - p95 ITL slightly worsened from `57.579 -> 58.666 ms`;
+  - `avg_process_us` improved from `24804.1 -> 22801.4`, but remains far from
+    historical fast-path references around `16.6-16.8 ms`;
+  - mixed scheduling dropped from ZZZ170 `125 -> 41`, which is now a reject
+    reason; decode-only iterations rose from `369 -> 429`;
+  - the remaining KV warnings are fewer and mostly large-block attempts such
+    as `need 32`, `28`, `25`, `23`, etc., rather than the previous repeated
+    same-epoch one-block retry pattern.
+- Classification:
+  - diagnostic rejected, not performance progress and not release evidence;
+  - source candidate is still useful and should not be reverted immediately:
+    it delivered the predicted reduction in KV retry churn and kept
+    correctness/zero-error completion intact;
+  - the remaining blocker has shifted from excessive retry churn to insufficient
+    mixed progress plus high per-iteration compute/ITL.
+- Next source direction:
+  - do not start another paid GPU diagnostic from this result alone;
+  - first use the ZZZ173 trace against ZZZ170 and the earlier fast c32
+    artifacts to decide whether the next source lever should reopen more mixed
+    recompute only after real capacity evidence, or whether the dominant
+    bottleneck is now Qwen35 per-iteration compute/kernels;
+  - any next source change must have a local test or trace-derived prediction
+    before another GPU run.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ172 — c32 diagnostic runner targets no-progress retry source candidate
 
 - Context:
