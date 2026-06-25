@@ -32,6 +32,7 @@ use std::{
 use tracing::{debug, info, warn};
 
 const NO_CAPACITY_BACKPRESSURE_LIMIT: usize = usize::MAX;
+const CAPACITY_MIXED_RECOMPUTE_FREE_BLOCK_HEADROOM: usize = 1;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ContinuousBatchRuntimeConfig {
@@ -509,6 +510,16 @@ impl ContinuousBatchScheduler {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    fn capacity_mixed_recompute_usable_free_blocks(
+        observed_free_blocks: usize,
+        required_blocks_per_slot: usize,
+    ) -> usize {
+        if required_blocks_per_slot == 0 || observed_free_blocks == usize::MAX {
+            return observed_free_blocks;
+        }
+        observed_free_blocks.saturating_sub(CAPACITY_MIXED_RECOMPUTE_FREE_BLOCK_HEADROOM)
+    }
+
     pub fn record_capacity_deferred_mixed_recompute_release_evidence(&self) {
         self.capacity_mixed_recompute_required_blocks_per_slot
             .store(0, Ordering::Relaxed);
@@ -526,7 +537,11 @@ impl ContinuousBatchScheduler {
         let required_blocks_per_slot = self
             .capacity_mixed_recompute_required_blocks_per_slot
             .load(Ordering::Relaxed);
-        if required_blocks_per_slot > 0 && free_blocks >= required_blocks_per_slot {
+        let usable_free_blocks = Self::capacity_mixed_recompute_usable_free_blocks(
+            free_blocks,
+            required_blocks_per_slot,
+        );
+        if required_blocks_per_slot > 0 && usable_free_blocks >= required_blocks_per_slot {
             self.record_capacity_recompute_progress();
         }
     }
@@ -920,7 +935,11 @@ impl ContinuousBatchScheduler {
         if required_blocks_per_slot == 0 || observed_free_blocks == usize::MAX {
             return token_budget_slots;
         }
-        token_budget_slots.min(observed_free_blocks / required_blocks_per_slot)
+        let usable_free_blocks = Self::capacity_mixed_recompute_usable_free_blocks(
+            observed_free_blocks,
+            required_blocks_per_slot,
+        );
+        token_budget_slots.min(usable_free_blocks / required_blocks_per_slot)
     }
 
     fn add_prefill_requests_to_batch(
@@ -1096,7 +1115,10 @@ impl ContinuousBatchScheduler {
             .capacity_mixed_recompute_observed_free_blocks
             .load(Ordering::Relaxed);
         let mixed_recompute_kv_capacity_ready = mixed_recompute_required_blocks_per_slot == 0
-            || mixed_recompute_observed_free_blocks >= mixed_recompute_required_blocks_per_slot;
+            || Self::capacity_mixed_recompute_usable_free_blocks(
+                mixed_recompute_observed_free_blocks,
+                mixed_recompute_required_blocks_per_slot,
+            ) >= mixed_recompute_required_blocks_per_slot;
         let allow_capacity_deferred_mixed_recompute = scheduled_decode_count > 0
             && active_decode_prefill_chunk.is_some()
             && active_decode_prefill_tokens_remaining.unwrap_or(0) > 0
@@ -2524,6 +2546,19 @@ mod tests {
         );
 
         scheduler.record_capacity_deferred_mixed_recompute_kv_capacity_snapshot(4);
+        let exact_without_headroom = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let exact_without_headroom_ids: HashSet<RequestId> = exact_without_headroom
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        assert!(
+            !exact_without_headroom_ids.contains(&first_ids[0])
+                && !exact_without_headroom_ids.contains(&first_ids[1]),
+            "a KV snapshot must leave allocator headroom before reopening mixed recompute"
+        );
+
+        scheduler.record_capacity_deferred_mixed_recompute_kv_capacity_snapshot(5);
         let after_enough_free = scheduler.create_iteration_batch(hint).unwrap();
         let after_enough_ids: HashSet<RequestId> = after_enough_free
             .requests
@@ -2577,7 +2612,7 @@ mod tests {
             Some(0),
             Some(4),
         );
-        scheduler.record_capacity_deferred_mixed_recompute_kv_capacity_snapshot(8);
+        scheduler.record_capacity_deferred_mixed_recompute_kv_capacity_snapshot(9);
 
         let paced_mixed = scheduler.create_iteration_batch(hint).unwrap();
         let scheduled_recomputes = paced_mixed
