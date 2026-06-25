@@ -2,6 +2,80 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ164 — fbf23458 c32 diagnostic REJECT: mixed restored, capacity churn regressed
+
+- Artifact:
+  - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_bounded_mixed_recompute_c32_fbf23458_20260625T042648Z/`;
+  - orchestrator metadata:
+    `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_c32_orchestrator_fbf23458_1782361567/`.
+- Vast lifecycle:
+  - paid lane was stated before start: W3 Qwen35 c32
+    bounded-mixed-recompute diagnostic, expected 10-20 minutes, about
+    `$0.08-$0.16`, stop on KEEP/REJECT/SSH/CUDA failure/timeout/script failure;
+  - inventory before start showed only retained instance `42216671`,
+    `stopped/exited`, exact `1x RTX 4090`, cost `$0.47777777777777775/hr`;
+  - no new instance was created;
+  - artifact and orchestrator metadata were copied back;
+  - stop verification after the run showed only `42216671`,
+    `cur_state=stopped`, `actual_status=exited`,
+    `intended_status=stopped`;
+  - no unexpected paid/scheduling sibling instances remained.
+- Remote evidence:
+  - remote Git SHA:
+    `fbf234588ad5d778dec314642f3428037fee379b`;
+  - remote git status short was empty;
+  - `cargo check` exit `0`;
+  - CUDA release build exit `0`;
+  - `ferrum run` smoke exit `0`;
+  - `ferrum serve` `/v1/models` and chat smoke passed;
+  - `bench-serve` exit `0`, with `32/32` completed, zero request errors, and
+    `output_token_count_source=usage`;
+  - no live vLLM run.
+- Diagnostic verdict:
+  - `FERRUM W3 QWEN35 C32 DIAG REJECT:
+    /workspace/artifacts/w3_qwen35_bounded_mixed_recompute_c32_fbf23458_20260625T042648Z`;
+  - local orchestrator exit code `60`.
+- Reject reasons from `perf/diagnostic_verdict.json`:
+  - output throughput `274.637 tok/s` <= floor `600.0`;
+  - p95 ITL `66.492 ms` > `25.0`;
+  - `Unified KV admission failed=50` > `13`;
+  - `capacity_deferred_total=112` > `32`.
+- Trace evidence:
+  - `mixed_iterations=126`, versus ZZZ161/`9fda1101` `0` and historical
+    `633+ tok/s` references `127`;
+  - `decode_only_iterations=383`;
+  - `prefill_only_iterations=90`;
+  - `scheduled_decode_tokens=5403`;
+  - `scheduled_prefill_tokens=7855`;
+  - `avg_process_us=26297.6`, worse than the historical `633/635 tok/s`
+    references around `16.6-16.8 ms`;
+  - mixed rows returned, but many iterations repeatedly failed KV admission
+    with small immediate needs, for example `need 4 admission blocks` with
+    only `0-1` free.
+- Classification:
+  - ZZZ163 restored the desired mixed scheduling shape, but it reintroduced
+    capacity churn;
+  - this is not performance progress: throughput regressed below ZZZ161
+    (`488.596 tok/s`) and far below the W3 c32 80% target
+    (`1366.822 tok/s`);
+  - the candidate is rejected for c32 performance and should not be used as
+    release evidence.
+- Decision:
+  - keep the source evidence temporarily as the basis for the next source
+    patch, not as an accepted product behavior;
+  - next source change must preserve mixed iterations while preventing
+    repeated KV admission failures, likely by making capacity-deferred mixed
+    recompute eligibility depend on stronger capacity/backpressure evidence
+    rather than only the existence of a mixed-prefill token budget;
+  - do not run another paid GPU diagnostic until that narrower source change is
+    implemented and locally tested.
+- Limits:
+  - diagnostic only: c32, `n_repeats=1`, not `--require-ci`, no c=1/4/16/32
+    matrix;
+  - no final W3 validator ran;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ163 — source candidate: bounded mixed recompute for capacity-deferred decode
 
 - Context:
