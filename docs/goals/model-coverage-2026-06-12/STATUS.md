@@ -2,6 +2,32 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ197 — runner target now includes unified-post-profile diagnostic script
+
+- Context:
+  - follows local diagnostic fix commit
+    `1b686e40aa9ca59bba4a470d2d3fadef8533bca8`
+    (`test(release): enable qwen35 unified post profiling`);
+  - no GPU lane was started for this step;
+  - no live vLLM run was used.
+- Runner change:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now defaults to target
+    SHA `1b686e40aa9ca59bba4a470d2d3fadef8533bca8`;
+  - default tag is now
+    `mixed_recompute_kv_headroom_unified_post_prof`;
+  - the plan-only lane text now names the unified-post-prof diagnostic.
+- Reason:
+  - the orchestrator uploads the local diagnostic shell script, but the target
+    SHA should still include the diagnostic script fix so the next artifact is
+    self-contained and does not appear to have run an old repo script.
+- Limits:
+  - this is runner targeting only;
+  - it does not change scheduler/model runtime behavior;
+  - it is not W3 completion, not performance evidence, and not release
+    evidence;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ196 — source diagnostic fix: enable real unified post profile
 
 - Context:
