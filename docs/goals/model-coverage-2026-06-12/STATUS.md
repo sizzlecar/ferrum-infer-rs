@@ -2,6 +2,68 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ211 — source candidate: keep decode survivors wide after KV pressure
+
+- Context:
+  - follows ZZZ210 `d4e4cfb2` c32 diagnostic REJECT;
+  - no GPU lane was started for this source step;
+  - no live vLLM run was used.
+- vLLM source comparison:
+  - inspected local `../_external/vllm-v0.20.2/vllm/v1/core/sched/scheduler.py`
+    and `kv_cache_manager.py`;
+  - vLLM schedules RUNNING requests first, uses per-request KV allocation, and
+    preempts/frees specific requests when allocation pressure occurs;
+  - after a preemption, vLLM skips scheduling new WAITING requests for that
+    step, but it does not persistently halve the next decode survivor batch;
+  - this differs from the ZZZ210 Ferrum trace, where after the first decode KV
+    pressure event the scheduler held remaining decode-ready requests at
+    `cap=16 -> 8 -> 4 -> 2` while capacity-deferred recomputes were waiting.
+- Source change:
+  - commit `d54f634bfff49f7a444a9b51e5cc3ff6f2f60771`
+    (`perf(scheduler): keep decode survivors wide after kv pressure`);
+  - capacity-deferred requests now carry whether they came from decode
+    eviction/recompute rather than ordinary prefill capacity defer;
+  - when decode-origin recompute backlog exists, the scheduler keeps
+    decode-ready survivors at the full batch width instead of applying the
+    persistent decode backpressure cap;
+  - ordinary prefill capacity-defer still keeps the existing admission
+    backpressure and release-wait behavior, so the change does not reopen the
+    earlier prefill admission churn path.
+- Local validation:
+  - `cargo test -p ferrum-scheduler capacity_backpressure -- --nocapture`
+    PASS, `6/6`;
+  - `cargo test -p ferrum-scheduler capacity_deferred_decode -- --nocapture`
+    PASS, `3/3`;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture`
+    PASS, `10/10`;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS, `81/81`;
+  - `cargo test -p ferrum-engine paged_kv_admission_pressure -- --nocapture`
+    PASS, `3/3`;
+  - `cargo test -p ferrum-engine process_batch_unified -- --nocapture`
+    PASS, `18/18`;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `cargo fmt --all -- --check` PASS;
+  - `git diff --check` PASS.
+- Runner targeting:
+  - `scripts/release/w3_qwen35_vast_c32_diagnostic.py` now defaults to target
+    SHA `d54f634bfff49f7a444a9b51e5cc3ff6f2f60771`;
+  - default tag is now `decode_survivors_wide_after_kv_pressure`;
+  - `scripts/release/w3_qwen35_c32_diagnostic.sh` standalone defaults were
+    updated to the same SHA/tag.
+- Expected signal for a next scoped c32 diagnostic:
+  - after a decode KV pressure event, trace should not show long runs pinned to
+    survivor widths `2` or `4` while many decode-ready requests remain;
+  - average decode items should improve versus ZZZ210's `6.70`;
+  - output throughput and p95 ITL should improve versus ZZZ210's
+    `342.112 tok/s` and `50.145 ms`;
+  - correctness must remain clean: `32/32` complete, zero request errors, zero
+    HTTP 500, zero panic, zero OOM.
+- Limits:
+  - this is not W3 completion, not performance evidence, and not release
+    evidence;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ210 — d4e4cfb2 c32 diagnostic REJECT: subchunk fix removes 857 regression, still below target
 
 - Artifact:
