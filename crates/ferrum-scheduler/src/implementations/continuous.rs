@@ -195,6 +195,7 @@ pub struct ContinuousBatchScheduler {
     admitted_counter: AtomicU64,
     capacity_deferred_counter: AtomicU64,
     capacity_backpressure_limit: AtomicUsize,
+    decode_capacity_backpressure_limit: AtomicUsize,
     capacity_backpressure_iteration: AtomicU64,
     capacity_release_epoch: AtomicU64,
     capacity_mixed_recompute_epoch: AtomicU64,
@@ -320,6 +321,7 @@ impl ContinuousBatchScheduler {
             admitted_counter: AtomicU64::new(0),
             capacity_deferred_counter: AtomicU64::new(0),
             capacity_backpressure_limit: AtomicUsize::new(NO_CAPACITY_BACKPRESSURE_LIMIT),
+            decode_capacity_backpressure_limit: AtomicUsize::new(NO_CAPACITY_BACKPRESSURE_LIMIT),
             capacity_backpressure_iteration: AtomicU64::new(u64::MAX),
             capacity_release_epoch: AtomicU64::new(0),
             capacity_mixed_recompute_epoch: AtomicU64::new(0),
@@ -419,7 +421,15 @@ impl ContinuousBatchScheduler {
     }
 
     fn capacity_backpressure_admit_limit(&self) -> Option<usize> {
-        let limit = self.capacity_backpressure_limit.load(Ordering::Relaxed);
+        Self::read_backpressure_limit(&self.capacity_backpressure_limit)
+    }
+
+    fn decode_capacity_backpressure_limit(&self) -> Option<usize> {
+        Self::read_backpressure_limit(&self.decode_capacity_backpressure_limit)
+    }
+
+    fn read_backpressure_limit(limit: &AtomicUsize) -> Option<usize> {
+        let limit = limit.load(Ordering::Relaxed);
         if limit == NO_CAPACITY_BACKPRESSURE_LIMIT {
             None
         } else {
@@ -437,6 +447,22 @@ impl ContinuousBatchScheduler {
             .iter()
             .filter(|req| req.capacity_deferred_until_release_epoch > release_epoch)
             .count()
+    }
+
+    fn capacity_deferred_backlog_len(&self) -> usize {
+        let waiting = self
+            .waiting_queue
+            .read()
+            .iter()
+            .filter(|req| req.capacity_deferred_until_release_epoch > 0)
+            .count();
+        let prefilling = self
+            .prefill_queue
+            .read()
+            .iter()
+            .filter(|req| req.capacity_deferred_until_release_epoch > 0)
+            .count();
+        waiting + prefilling
     }
 
     fn record_capacity_defer_feedback(&self, attempted_prefill_width: usize) {
@@ -476,9 +502,34 @@ impl ContinuousBatchScheduler {
         );
     }
 
-    fn record_resource_progress(&self) {
+    fn record_decode_capacity_defer_feedback(&self, attempted_decode_width: usize) {
         let max_running = self.config.max_running_requests.max(1);
-        let current = self.capacity_backpressure_limit.load(Ordering::Relaxed);
+        let proposed = attempted_decode_width
+            .max(1)
+            .div_ceil(2)
+            .max(1)
+            .min(max_running);
+        let _ = self.decode_capacity_backpressure_limit.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| {
+                let current = if current == NO_CAPACITY_BACKPRESSURE_LIMIT {
+                    max_running
+                } else {
+                    current.max(1).min(max_running)
+                };
+                let next = proposed.min(current).max(1);
+                if next >= max_running {
+                    Some(NO_CAPACITY_BACKPRESSURE_LIMIT)
+                } else {
+                    Some(next)
+                }
+            },
+        );
+    }
+
+    fn relax_backpressure_limit(limit: &AtomicUsize, max_running: usize) {
+        let current = limit.load(Ordering::Relaxed);
         if current == NO_CAPACITY_BACKPRESSURE_LIMIT {
             return;
         }
@@ -490,8 +541,13 @@ impl ContinuousBatchScheduler {
         } else {
             grown.max(1)
         };
-        self.capacity_backpressure_limit
-            .store(next, Ordering::Relaxed);
+        limit.store(next, Ordering::Relaxed);
+    }
+
+    fn record_resource_progress(&self) {
+        let max_running = self.config.max_running_requests.max(1);
+        Self::relax_backpressure_limit(&self.capacity_backpressure_limit, max_running);
+        Self::relax_backpressure_limit(&self.decode_capacity_backpressure_limit, max_running);
     }
 
     fn record_capacity_release_progress(&self) {
@@ -670,6 +726,7 @@ impl ContinuousBatchScheduler {
             request_index.insert(request_id.clone(), RequestPhase::Waiting);
             waiting_queue.push_back(req);
             self.record_capacity_defer_feedback(attempted_decode_width.max(1));
+            self.record_decode_capacity_defer_feedback(attempted_decode_width.max(1));
             debug!("Deferred decode request {} back to waiting", request_id);
             true
         } else {
@@ -745,7 +802,12 @@ impl ContinuousBatchScheduler {
         if let Some(chunk) = self.runtime_config.active_decode_prefill_chunk {
             return Some(chunk);
         }
-        if scheduled_decode_count < self.decode_pressure_prefill_cap_threshold(hint) {
+        let capacity_deferred_decode_backpressure =
+            self.decode_capacity_backpressure_limit().is_some()
+                && self.capacity_deferred_backlog_len() > 0;
+        if scheduled_decode_count < self.decode_pressure_prefill_cap_threshold(hint)
+            && !capacity_deferred_decode_backpressure
+        {
             return None;
         }
         Some(self.default_active_decode_prefill_chunk())
@@ -1087,9 +1149,13 @@ impl ContinuousBatchScheduler {
         // reaches the requested target, reducing early mixed prefill+decode
         // spikes in c=32 closed-loop runs.
         if !skip_decode_for_prefill_first {
+            let decode_batch_limit = self
+                .decode_capacity_backpressure_limit()
+                .map(|limit| hint.max_batch_size.min(limit.max(1)))
+                .unwrap_or(hint.max_batch_size);
             let decode_queue = self.decode_queue.read();
             for (_, req) in decode_queue.iter() {
-                if batch_requests.len() >= hint.max_batch_size {
+                if batch_requests.len() >= decode_batch_limit {
                     break;
                 }
 
@@ -2084,7 +2150,16 @@ mod tests {
             .iter()
             .map(|request| request.request.id.clone())
             .collect();
-        assert_eq!(decode_only.requests.len(), 4);
+        let scheduled_decodes = decode_only
+            .requests
+            .iter()
+            .filter(|request| request.tokens_to_process == Some(1))
+            .count();
+        assert_eq!(
+            scheduled_decodes, 2,
+            "decode KV backpressure should cap decode width while recompute runs"
+        );
+        assert_eq!(decode_only.requests.len(), 3);
         assert!(
             scheduled_ids.contains(&first_ids[0]),
             "capacity-deferred recompute should use bounded mixed prefill budget under decode pressure"
@@ -2229,7 +2304,7 @@ mod tests {
             !retry_ids.contains(&first_ids[0]),
             "a release-blocked recompute must not be retried in the same release epoch without progress"
         );
-        assert_eq!(no_progress_retry.requests.len(), 3);
+        assert_eq!(no_progress_retry.requests.len(), 2);
         assert_eq!(scheduler.trace_snapshot().prefill_queue_len, 1);
 
         assert!(!scheduler.mark_prefill_chunk_processed(&first_ids[0], 128, 64));
@@ -2299,7 +2374,7 @@ mod tests {
             .collect();
         assert!(first_mixed_ids.contains(&first_ids[0]));
         assert!(first_mixed_ids.contains(&first_ids[1]));
-        assert!(!first_mixed_ids.contains(&first_ids[2]));
+        assert!(first_mixed_ids.contains(&first_ids[2]));
         assert!(!first_mixed_ids.contains(&first_ids[3]));
         assert!(scheduler.defer_prefill_to_waiting(&first_ids[0]));
         assert!(scheduler.defer_prefill_to_waiting(&first_ids[1]));
@@ -2319,13 +2394,13 @@ mod tests {
             "already failed blocked recomputes must not consume the later candidate's slot"
         );
         assert!(
-            second_mixed_ids.contains(&first_ids[2]),
+            second_mixed_ids.contains(&first_ids[3]),
             "marked queue-head requests should not block a later untried recompute candidate"
         );
         assert_eq!(
             second_mixed.requests.len(),
-            7,
-            "six decodes plus one backpressure-bounded recompute should be scheduled after a same-epoch failure"
+            6,
+            "five capped decodes plus one backpressure-bounded recompute should be scheduled after a same-epoch failure"
         );
     }
 
@@ -2387,8 +2462,8 @@ mod tests {
         );
         assert_eq!(
             blocked_batch.requests.len(),
-            6,
-            "decode may continue while blocked recomputes wait for capacity release"
+            2,
+            "decode may continue at the capped width while blocked recomputes wait for capacity release"
         );
 
         let response = InferenceResponse {
@@ -3587,6 +3662,57 @@ mod tests {
             second_batch.requests.len(),
             3,
             "decode progress alone must not make a capacity-limited prefill refill the remaining batch slot"
+        );
+    }
+
+    #[test]
+    fn capacity_backpressure_caps_decode_batch_width_after_decode_defer() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 8,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 8,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        for _ in 0..8 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let first_batch = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let first_ids: Vec<_> = first_batch
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for request_id in &first_ids {
+            scheduler.mark_prefill_complete(request_id, 128);
+        }
+
+        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[0], 8));
+        assert_eq!(
+            scheduler.trace_snapshot().capacity_backpressure_admit_limit,
+            Some(4)
+        );
+
+        let capped = scheduler.create_iteration_batch(hint).unwrap();
+        let scheduled_decodes = capped
+            .requests
+            .iter()
+            .filter(|request| request.tokens_to_process == Some(1))
+            .count();
+
+        assert_eq!(
+            scheduled_decodes, 4,
+            "decode scheduling must obey capacity backpressure after a decode KV failure"
         );
     }
 
