@@ -2,6 +2,67 @@
 
 进度日志,倒序。
 
+## 2026-06-25 ZZZ171 — source candidate: no-progress recompute waits for release/progress
+
+- Context:
+  - follows ZZZ170 REJECT without starting another GPU;
+  - ZZZ170 showed that the shared mixed slot reduced churn
+    (`Unified KV admission failed 50 -> 30`,
+    `capacity_deferred_total 112 -> 45`), but the trace still retried
+    release-blocked recompute work before there was enough free capacity;
+  - the next source direction was to stop retrying the same already-promoted
+    release-blocked recompute every iteration until there is capacity release
+    or actual prefill progress.
+- Code change:
+  - `ContinuousBatchRequest` now tracks
+    `capacity_deferred_mixed_attempt_epoch`;
+  - when a release-blocked capacity-deferred recompute chunk is scheduled in a
+    mixed iteration, the scheduler records the current capacity-release epoch
+    as an attempted epoch;
+  - if the same recompute is still in `prefill_queue` or returns to
+    `waiting_queue` in that same epoch without progress, the scheduler skips
+    it for blocked-recompute scheduling instead of reissuing the same work;
+  - the skipped no-progress attempt consumes the bounded mixed recompute slot
+    for release-blocked work in that iteration, while release-ready and normal
+    waiting requests can still be admitted;
+  - `mark_prefill_chunk_processed` clears the attempt marker when
+    `chunk_tokens > 0`, and `promote_to_decode` clears it once recompute
+    successfully rebuilds physical state.
+- Test updated:
+  - replaced the prior "existing recompute keeps being scheduled" expectation
+    with `capacity_deferred_recompute_waits_after_no_progress_attempt`;
+  - the test verifies the first mixed iteration can spend the bounded
+    recompute slot, the immediate no-progress retry does not reschedule the
+    same request, and recorded prefill progress makes the next chunk eligible
+    again.
+- Local validation:
+  - `cargo test -p ferrum-scheduler capacity_deferred_recompute_waits_after_no_progress_attempt -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler capacity_deferred -- --nocapture` PASS;
+  - `cargo test -p ferrum-scheduler capacity_backpressure -- --nocapture`
+    PASS;
+  - `cargo test -p ferrum-scheduler -- --nocapture` PASS (`70/70`);
+  - `cargo test -p ferrum-engine --lib continuous_engine::tests -- --nocapture`
+    PASS (`56/56`);
+  - `cargo fmt --all -- --check` PASS;
+  - `cargo check -p ferrum-scheduler -p ferrum-engine` PASS;
+  - `git diff --check` PASS.
+- Next evidence needed:
+  - after this source candidate is committed, update
+    `scripts/release/w3_qwen35_vast_c32_diagnostic.py` to target that commit
+    and run only self-test/plan-only locally;
+  - do not start another paid GPU diagnostic until the runner target records
+    the new source SHA and the expected signal;
+  - expected signal for a later single c32 diagnostic: reduce the remaining
+    same-epoch retry churn from ZZZ170, with `capacity_deferred_total` moving
+    at or below `32` and `Unified KV admission failed` moving below `30`.
+- Limits:
+  - no CUDA build, GPU diagnostic, performance bench, live vLLM run, or final
+    W3 validator ran here;
+  - this is local source validation only;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ170 — a6cbb1d0 c32 diagnostic REJECT: shared slot reduces churn but still misses thresholds
 
 - Artifact:

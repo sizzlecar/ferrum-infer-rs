@@ -96,6 +96,8 @@ pub struct ContinuousBatchRequest {
     pub decode_time_ms: u64,
     /// Capacity-deferred requests wait for real capacity release before re-admission.
     pub capacity_deferred_until_release_epoch: u64,
+    /// Release epoch in which a mixed recompute attempt made no recorded progress.
+    pub capacity_deferred_mixed_attempt_epoch: Option<u64>,
 }
 
 impl ContinuousBatchRequest {
@@ -113,6 +115,7 @@ impl ContinuousBatchRequest {
             prefill_time_ms: 0,
             decode_time_ms: 0,
             capacity_deferred_until_release_epoch: 0,
+            capacity_deferred_mixed_attempt_epoch: None,
         }
     }
 
@@ -546,6 +549,7 @@ impl ContinuousBatchScheduler {
                 .capacity_release_epoch
                 .load(Ordering::Relaxed)
                 .saturating_add(1);
+            req.capacity_deferred_mixed_attempt_epoch = None;
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
             request_index.insert(request_id.clone(), RequestPhase::Waiting);
             waiting_queue.push_back(req);
@@ -570,6 +574,7 @@ impl ContinuousBatchScheduler {
             let mut req = prefill_queue.remove(pos).unwrap();
             req.phase = RequestPhase::Decoding;
             req.capacity_deferred_until_release_epoch = 0;
+            req.capacity_deferred_mixed_attempt_epoch = None;
 
             request_index.insert(request_id.clone(), RequestPhase::Decoding);
             decode_queue.insert(request_id.clone(), req);
@@ -759,8 +764,8 @@ impl ContinuousBatchScheduler {
             return;
         }
 
-        let prefill_queue = self.prefill_queue.read();
-        for req in prefill_queue.iter() {
+        let mut prefill_queue = self.prefill_queue.write();
+        for req in prefill_queue.iter_mut() {
             if batch_requests.len() >= hint.max_batch_size {
                 break;
             }
@@ -769,6 +774,15 @@ impl ContinuousBatchScheduler {
             }
             let release_blocked_capacity_deferred =
                 req.capacity_deferred_until_release_epoch > capacity_release_epoch;
+            if release_blocked_capacity_deferred
+                && req.capacity_deferred_mixed_attempt_epoch == Some(capacity_release_epoch)
+            {
+                if let Some(remaining) = capacity_deferred_mixed_recompute_slots_remaining.as_mut()
+                {
+                    *remaining = 0;
+                }
+                continue;
+            }
             if release_blocked_capacity_deferred
                 && capacity_deferred_mixed_recompute_slots_remaining
                     .as_ref()
@@ -810,6 +824,7 @@ impl ContinuousBatchScheduler {
                     *remaining = remaining.saturating_sub(prefill_chunk_tokens);
                 }
                 if release_blocked_capacity_deferred {
+                    req.capacity_deferred_mixed_attempt_epoch = Some(capacity_release_epoch);
                     if let Some(remaining) =
                         capacity_deferred_mixed_recompute_slots_remaining.as_mut()
                     {
@@ -933,6 +948,11 @@ impl ContinuousBatchScheduler {
                 || req.capacity_deferred_until_release_epoch <= capacity_release_epoch;
             if release_ready {
                 requests_to_admit.push(req.inner.request.id.clone());
+            } else if req.capacity_deferred_mixed_attempt_epoch == Some(capacity_release_epoch) {
+                if let Some(remaining) = capacity_deferred_mixed_recompute_slots_remaining.as_mut()
+                {
+                    *remaining = 0;
+                }
             } else if allow_capacity_deferred_mixed_recompute
                 && release_blocked_capacity_deferred_admissions
                     < capacity_deferred_mixed_recompute_slots_remaining.unwrap_or(0)
@@ -1091,6 +1111,9 @@ impl ContinuousBatchScheduler {
                 .prefill_chunk_offset
                 .saturating_add(chunk_tokens)
                 .min(total_prompt_tokens);
+            if chunk_tokens > 0 {
+                req.capacity_deferred_mixed_attempt_epoch = None;
+            }
             fully_done = req.prefill_chunk_offset >= total_prompt_tokens;
             made_progress = chunk_tokens > 0;
         }
@@ -1846,21 +1869,21 @@ mod tests {
     }
 
     #[test]
-    fn capacity_deferred_existing_recompute_consumes_single_mixed_slot() {
+    fn capacity_deferred_recompute_waits_after_no_progress_attempt() {
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
-            max_running_requests: 8,
+            max_running_requests: 4,
             prompt_token_estimate: true,
             ..SchedulerConfig::default()
         });
         let hint = BatchHint {
-            max_batch_size: 8,
+            max_batch_size: 4,
             max_tokens: 1024,
             target_latency_ms: None,
             available_memory: None,
             resource_constraints: Default::default(),
         };
 
-        for _ in 0..8 {
+        for _ in 0..4 {
             enqueue_waiting(
                 &scheduler,
                 create_test_request_with_prompt_tokens(Priority::Normal, 128),
@@ -1877,40 +1900,46 @@ mod tests {
             scheduler.mark_prefill_complete(request_id, 128);
         }
 
-        for request_id in first_ids.iter().take(4) {
-            assert!(scheduler.defer_decode_to_waiting_for_capacity(request_id, 8));
-        }
+        assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[0], 4));
 
         let first_mixed = scheduler.create_iteration_batch(hint.clone()).unwrap();
-        let first_deferred = first_mixed
+        let first_scheduled_ids: HashSet<RequestId> = first_mixed
             .requests
             .iter()
-            .filter(|request| first_ids[..4].contains(&request.request.id))
-            .count();
-        assert_eq!(first_deferred, 1);
-        assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 3);
-        assert_eq!(scheduler.trace_snapshot().prefill_queue_len, 1);
-
-        let second_mixed = scheduler.create_iteration_batch(hint).unwrap();
-        let second_deferred = second_mixed
-            .requests
-            .iter()
-            .filter(|request| first_ids[..4].contains(&request.request.id))
-            .count();
-        let second_prefill_tokens: Vec<_> = second_mixed
-            .requests
-            .iter()
-            .filter(|request| first_ids[..4].contains(&request.request.id))
-            .map(|request| request.tokens_to_process)
+            .map(|request| request.request.id.clone())
             .collect();
-
-        assert_eq!(
-            second_deferred, 1,
-            "an already-promoted blocked recompute should consume the mixed recompute slot"
+        assert!(
+            first_scheduled_ids.contains(&first_ids[0]),
+            "the first mixed iteration may spend its bounded recompute slot"
         );
-        assert_eq!(second_prefill_tokens, vec![Some(64)]);
-        assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 3);
+        assert_eq!(scheduler.trace_snapshot().capacity_blocked_waiting_len, 0);
         assert_eq!(scheduler.trace_snapshot().prefill_queue_len, 1);
+
+        let no_progress_retry = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let retry_ids: HashSet<RequestId> = no_progress_retry
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        assert!(
+            !retry_ids.contains(&first_ids[0]),
+            "a release-blocked recompute must not be retried in the same release epoch without progress"
+        );
+        assert_eq!(no_progress_retry.requests.len(), 3);
+        assert_eq!(scheduler.trace_snapshot().prefill_queue_len, 1);
+
+        assert!(!scheduler.mark_prefill_chunk_processed(&first_ids[0], 128, 64));
+        let after_progress = scheduler.create_iteration_batch(hint).unwrap();
+        let progressed_tokens = after_progress
+            .requests
+            .iter()
+            .find(|request| request.request.id == first_ids[0])
+            .and_then(|request| request.tokens_to_process);
+        assert_eq!(
+            progressed_tokens,
+            Some(64),
+            "recorded prefill progress should make the next recompute chunk eligible again"
+        );
     }
 
     #[tokio::test]
