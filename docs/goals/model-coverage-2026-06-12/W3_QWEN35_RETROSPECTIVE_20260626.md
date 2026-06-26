@@ -1,5 +1,9 @@
 # W3 Qwen3.5 Retrospective — 2026-06-26
 
+Correction: this document is a first-pass evidence index, not the complete deep
+review. The deeper follow-up is
+`docs/goals/model-coverage-2026-06-12/W3_QWEN35_DEEP_REVIEW_ADDENDUM_20260626.md`.
+
 Scope: current branch `goal/w2-w3-release-grade` at
 `7e55d935e1836979908ef63aa97008fd45bda88c`, recent 500 commits, core
 scheduler/KV/engine code, local time ledger `ACTION_TIME_LEDGER_20260623.jsonl`,
