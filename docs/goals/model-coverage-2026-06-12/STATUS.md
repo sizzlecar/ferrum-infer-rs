@@ -2,10 +2,70 @@
 
 进度日志,倒序。
 
-## 2026-06-26 ZZZ222 — W3 Qwen35 long-run retrospective completed
+## 2026-06-26 ZZZ223 — W3 Qwen35 retrospective depth correction
+
+- Correction:
+  - ZZZ222 was a first-pass evidence index, not a complete deep review.
+  - User correctly challenged that a 10-minute pass could not have fully read
+    the recent commits, core code, ledger, and artifact history.
+- Addendum:
+  - `docs/goals/model-coverage-2026-06-12/W3_QWEN35_DEEP_REVIEW_ADDENDUM_20260626.md`.
+- Scope actually checked in this addendum:
+  - `git pull --rebase --autostash` confirmed local/origin already up to date
+    at `1ec261ef`;
+  - recent 500 commits grouped by day/scope and by large diff size;
+  - core scheduler/engine/KV/Qwen35 recurrent/autosize paths;
+  - 40 W3 Qwen35 c32 `perf/bench_summary.json` files;
+  - 3 c32/fp16 `perf/failure_summary.json` files;
+  - historical vLLM c32 baseline summary;
+  - local vLLM source at `../_external/vllm-v0.20.2`,
+    HEAD `bc150f50299199599673614f80d12a196f377655`.
+- Corrected artifact aggregate:
+  - 24 numeric c32 throughput rows;
+  - all 24 numeric rows were request-clean: completed `32/32`, zero request
+    errors, zero HTTP 500, zero panic, zero OOM mentions;
+  - 23 numeric rows were `reject`;
+  - 1 row was diagnostic `keep`, not release evidence;
+  - numeric throughput range `274.637` to `488.596 tok/s`, average
+    `392.886 tok/s`;
+  - p95 ITL, where present, ranged `48.888` to `70.847 ms`, average
+    `59.300 ms`;
+  - `mixed_iterations >= 64` did not correlate with progress: those rows
+    averaged `325.169 tok/s`, lower than the `mixed_iterations < 64` rows at
+    `433.517 tok/s`.
+- vLLM source finding:
+  - vLLM schedules RUNNING first, tries per-request `allocate_slots()`,
+    returns `None` on capacity failure before allocation, preempts/free KV, and
+    skips WAITING admission in a step with preemption.
+  - Ferrum W3 instead built mixed batches and then repaired state across
+    scheduler, engine KV, model-owned KV, model cache, draft KV, and recurrent
+    state after reservation/forward failures.
+- Revised conclusion:
+  - dynamic KV and recurrent capacity logic exist, but they are not enough
+    without a single local resource-ownership invariant;
+  - paid c32 artifacts were being used as the first full integration test for
+    that invariant, which caused slow progress.
+- Revised next step:
+  - add a local scheduler/engine resource-state invariant harness before any
+    new paid GPU diagnostic;
+  - do not stack another scheduler/resource-state tweak on top of `2f5a375e`
+    without either that local invariant evidence or a real c32 artifact.
+- Limits:
+  - no GPU work was run for this addendum;
+  - no live vLLM rerun was used;
+  - this is not W3 completion, not performance evidence, and not release
+    evidence;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
+## 2026-06-26 ZZZ222 — W3 Qwen35 long-run first-pass retrospective
 
 - Review artifact:
   - `docs/goals/model-coverage-2026-06-12/W3_QWEN35_RETROSPECTIVE_20260626.md`.
+- Depth correction:
+  - ZZZ223 supersedes this as the deeper review.
+  - This entry should be read as a first-pass evidence index, not complete
+    line-by-line audit.
 - Scope:
   - current branch recent 500 commits;
   - core scheduler/KV/engine code;
