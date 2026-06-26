@@ -2,6 +2,51 @@
 
 进度日志,倒序。
 
+## 2026-06-26 ZZZ222 — W3 Qwen35 long-run retrospective completed
+
+- Review artifact:
+  - `docs/goals/model-coverage-2026-06-12/W3_QWEN35_RETROSPECTIVE_20260626.md`.
+- Scope:
+  - current branch recent 500 commits;
+  - core scheduler/KV/engine code;
+  - local time ledger `ACTION_TIME_LEDGER_20260623.jsonl`;
+  - archived W3/Qwen35 artifacts.
+- No GPU work was run for this review and no live vLLM rerun was used.
+- Main finding:
+  - recent work produced real stability/correctness improvements, but it did
+    not become final W3 progress because the loop stayed below the release
+    performance target and kept discovering adjacent scheduler/KV/recurrent
+    resource-state bugs one paid diagnostic at a time.
+  - the root technical gap is not just "dynamic KV"; it is lack of a unified
+    resource-ownership invariant across scheduler phase, KV handles, model
+    cache handles, recurrent-state slots, and mixed recompute epoch/attempt
+    state.
+- Evidence snapshot from the retrospective:
+  - recent 500 commits: `docs=117`, `test=115`, `perf=108`, `fix=85`,
+    `feat=57`, with 168 failure/evidence-themed subjects;
+  - ledger: 1095 completed entries, about `40.28 h` recorded from
+    2026-06-23 through 2026-06-25;
+  - latest clean c32 diagnostics remain far below the W3 target:
+    `d54f634b` REJECT at `450.984 tok/s`, `e50ff975` REJECT at
+    `452.406 tok/s`, both with `mixed_iterations=1`;
+  - `2f5a375e` has a local regression test and remains an unverified source
+    candidate because retained Vast instance `42216671` is unavailable.
+- Decision:
+  - keep `2f5a375e` as an unverified candidate;
+  - do not stack another scheduler/resource-state change on top before either
+    a real c32 artifact for `2f5a375e` or a stronger local invariant test
+    invalidates it;
+  - do not start a different paid GPU without explicit user approval.
+- Durable rule update:
+  - `AGENTS.md` now requires scheduler/KV/model-cache/recurrent-state changes
+    to define and locally test resource-ownership invariants before paid GPU
+    validation.
+- Limits:
+  - this is not W3 completion, not performance evidence, and not release
+    evidence;
+  - current W3 still lacks final
+    `MODEL_RELEASE_GRADE_W3 PASS: <out_dir>`.
+
 ## 2026-06-25 ZZZ221 — blocked on retained Vast instance availability
 
 - Context:
