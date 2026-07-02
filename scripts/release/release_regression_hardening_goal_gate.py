@@ -144,6 +144,30 @@ def require_git_sha(data: dict[str, Any], label: str, expected_sha: str) -> str:
     return value
 
 
+def require_real_pass_line(value: Any, label: str) -> str:
+    require(isinstance(value, str) and " PASS:" in value, f"{label}.pass_line must be a gate PASS line")
+    prefix = value.split(":", 1)[0].upper()
+    require("SELFTEST" not in prefix and "SELF-TEST" not in prefix, f"{label}.pass_line must not be selftest evidence")
+    return value
+
+
+def require_string_list(value: Any, label: str) -> list[str]:
+    require(isinstance(value, list), f"{label} must be a list")
+    require(all(isinstance(item, str) for item in value), f"{label} entries must be strings")
+    return list(value)
+
+
+def normalize_command(value: Any, label: str) -> list[str]:
+    if isinstance(value, str):
+        require(value.strip(), f"{label} must be non-empty")
+        return [value]
+    if isinstance(value, list):
+        require(value, f"{label} must be non-empty")
+        require(all(isinstance(item, str) and item.strip() for item in value), f"{label} entries must be non-empty strings")
+        return list(value)
+    raise GoalGateError(f"{label} must be a non-empty string or string array")
+
+
 def load_stage_manifest(root: Path, label: str, pass_prefix: str, expected_sha: str) -> dict[str, Any]:
     manifest = read_json(root / "gate.manifest.json")
     require_status_pass(manifest, f"{label}.manifest")
@@ -339,6 +363,31 @@ def validate_l2_artifact(data: dict[str, Any], key: str, backend: str, expected_
     require(not missing, f"actual_model_regression.{key}.entrypoints missing {missing}")
     artifact_dir = artifact.get("artifact_dir")
     require(isinstance(artifact_dir, str) and artifact_dir.strip(), f"actual_model_regression.{key}.artifact_dir must be non-empty")
+    require_real_pass_line(artifact.get("pass_line"), f"actual_model_regression.{key}")
+    require(
+        isinstance(artifact.get("model_id"), str) and artifact["model_id"].strip(),
+        f"actual_model_regression.{key}.model_id must be non-empty",
+    )
+    require(
+        isinstance(artifact.get("architecture"), str) and artifact["architecture"].strip(),
+        f"actual_model_regression.{key}.architecture must be non-empty",
+    )
+    require(
+        isinstance(artifact.get("git_dirty"), bool),
+        f"actual_model_regression.{key}.git_dirty must be boolean",
+    )
+    require_string_list(artifact.get("dirty_files", []), f"actual_model_regression.{key}.dirty_files")
+    normalize_command(
+        artifact.get("command") or artifact.get("command_line"),
+        f"actual_model_regression.{key}.command",
+    )
+    profile_detail = artifact.get("profile_detail") or artifact.get("observability_profile_detail")
+    require(
+        isinstance(profile_detail, str) and profile_detail.strip(),
+        f"actual_model_regression.{key}.profile_detail must be non-empty",
+    )
+    replay_index = artifact.get("replay_bundle_index", [])
+    require(isinstance(replay_index, list), f"actual_model_regression.{key}.replay_bundle_index must be a list")
 
 
 def find_actual_model_regression_path(args: argparse.Namespace) -> Path | None:
@@ -379,6 +428,77 @@ def validate_actual_model_regression(args: argparse.Namespace, expected_sha: str
     return {**summary, "_summary_path": str(path)}
 
 
+def append_replay_index_entry(entries: list[dict[str, Any]], source: str, entry: dict[str, Any]) -> None:
+    replay_command = entry.get("replay_command") or entry.get("command")
+    request_id = entry.get("request_id")
+    bundle_dir = entry.get("bundle_dir")
+    if not (
+        isinstance(replay_command, str)
+        and replay_command.strip()
+        and isinstance(request_id, str)
+        and request_id.strip()
+        and isinstance(bundle_dir, str)
+        and bundle_dir.strip()
+    ):
+        return
+    normalized = {
+        "source": source,
+        "request_id": request_id,
+        "replay_command": replay_command,
+        "bundle_dir": bundle_dir,
+    }
+    for key in (
+        "profile_event_id",
+        "event_id",
+        "failure_kind",
+        "entrypoint",
+        "backend",
+        "model_id",
+        "artifact_dir",
+        "failure_diagnostics",
+    ):
+        if key in entry:
+            normalized[key] = entry[key]
+    entries.append(normalized)
+
+
+def build_replay_bundle_index(
+    product_summary: dict[str, Any],
+    observability_summary: dict[str, Any],
+    actual_model_summary: dict[str, Any],
+    out: Path,
+) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    for link in product_summary.get("failure_links") or []:
+        if isinstance(link, dict):
+            append_replay_index_entry(entries, "product_sentinel.failure_links", link)
+    for command in observability_summary.get("replay_commands") or []:
+        if isinstance(command, dict):
+            append_replay_index_entry(entries, "observability_profile.replay_commands", command)
+    for key in ("metal_l2_artifact", "cuda_l2_artifact"):
+        artifact = actual_model_summary.get(key)
+        if not isinstance(artifact, dict):
+            continue
+        for entry in artifact.get("replay_bundle_index") or []:
+            if isinstance(entry, dict):
+                enriched = {
+                    **entry,
+                    "backend": artifact.get("backend"),
+                    "model_id": artifact.get("model_id"),
+                    "artifact_dir": artifact.get("artifact_dir"),
+                }
+                append_replay_index_entry(entries, f"actual_model_regression.{key}", enriched)
+    require(entries, "replay bundle index must contain at least one replay entry")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "pass",
+        "goal": GOAL,
+        "path": str(out / "replay_bundle_index.json"),
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+
+
 def sanitized_env() -> dict[str, str]:
     result: dict[str, str] = {}
     for key, value in sorted(os.environ.items()):
@@ -412,6 +532,12 @@ def build_goal_manifest(args: argparse.Namespace) -> dict[str, Any]:
     observability = validate_observability_profile(args.observability_profile, expected_sha)
     native_operator = validate_native_operator(args.native_operator, expected_sha)
     actual_model = validate_actual_model_regression(args, expected_sha)
+    replay_bundle_index = build_replay_bundle_index(
+        product["summary"],
+        observability["summary"],
+        actual_model,
+        args.out,
+    )
     ended_at = int(time.time())
     pass_line = f"{PASS_LINE}: {args.out}"
     return {
@@ -467,6 +593,11 @@ def build_goal_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 "pass_line": native_operator["pass_line"],
                 "git_sha": native_operator["git_sha"],
             },
+            "actual_model_regression": {
+                "artifact_dir": str(Path(actual_model["_summary_path"]).parent),
+                "pass_line": actual_model["pass_line"],
+                "git_sha": actual_model["git_sha"],
+            },
         },
         "gate_plan": change_impact["gate_plan"],
         "release_candidate_manifest": change_impact["release_candidate_manifest"],
@@ -479,12 +610,14 @@ def build_goal_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "actual_model_regression_summary": actual_model,
         "native_operator_artifact_summary": native_operator["summary"],
         "fa2_source_removal_inventory": native_operator["fa2_source_removal_inventory"],
+        "replay_bundle_index": replay_bundle_index,
     }
 
 
 def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     args.out.mkdir(parents=True, exist_ok=True)
     manifest = build_goal_manifest(args)
+    write_json(args.out / "replay_bundle_index.json", manifest["replay_bundle_index"])
     write_json(args.out / "goal_manifest.json", manifest)
     write_json(
         args.out / "gate.manifest.json",
@@ -499,6 +632,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
             "git_dirty": manifest["git_dirty"],
             "changed_files": manifest["changed_files"],
             "goal_manifest": str(args.out / "goal_manifest.json"),
+            "replay_bundle_index": str(args.out / "replay_bundle_index.json"),
         },
     )
     (args.out / "pass_line.txt").write_text(manifest["pass_line"] + "\n", encoding="utf-8")
@@ -723,15 +857,45 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
                 "status": "pass",
                 "backend": "metal",
                 "git_sha": sha,
+                "git_dirty": False,
+                "dirty_files": [],
                 "artifact_dir": "fixtures/metal-l2",
+                "pass_line": "METAL L2 ACTUAL MODEL PASS: fixtures/metal-l2",
+                "model_id": "fixture/metal-model",
+                "architecture": "llama_dense",
                 "entrypoints": ["run", "serve", "stream", "basic_concurrency"],
+                "command": ["ferrum", "run", "fixture/metal-model", "--profile-detail", "basic"],
+                "profile_detail": "basic",
+                "replay_bundle_index": [
+                    {
+                        "request_id": "req-metal-fixture",
+                        "entrypoint": "run",
+                        "replay_command": "ferrum run fixture/metal-model",
+                        "bundle_dir": "fixtures/metal-l2/request_dump",
+                    }
+                ],
             },
             "cuda_l2_artifact": {
                 "status": "pass",
                 "backend": "cuda",
                 "git_sha": sha,
+                "git_dirty": False,
+                "dirty_files": [],
                 "artifact_dir": "fixtures/cuda-l2",
+                "pass_line": "CUDA L2 ACTUAL MODEL PASS: fixtures/cuda-l2",
+                "model_id": "fixture/cuda-model",
+                "architecture": "qwen3_moe",
                 "entrypoints": ["run", "serve", "stream", "basic_concurrency"],
+                "command": ["ferrum", "run", "fixture/cuda-model", "--profile-detail", "basic"],
+                "profile_detail": "basic",
+                "replay_bundle_index": [
+                    {
+                        "request_id": "req-cuda-fixture",
+                        "entrypoint": "run",
+                        "replay_command": "ferrum run fixture/cuda-model",
+                        "bundle_dir": "fixtures/cuda-l2/request_dump",
+                    }
+                ],
             },
             "native_operator_selection": {
                 "status": "pass",

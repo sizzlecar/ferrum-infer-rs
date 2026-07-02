@@ -80,6 +80,23 @@ def require_string(data: dict[str, Any], key: str, label: str) -> str:
     return str(value)
 
 
+def require_string_list(value: Any, label: str) -> list[str]:
+    require(isinstance(value, list), f"{label} must be a list")
+    require(all(isinstance(item, str) for item in value), f"{label} entries must be strings")
+    return list(value)
+
+
+def normalize_command(value: Any, label: str) -> list[str]:
+    if isinstance(value, str):
+        require(value.strip(), f"{label} must be non-empty")
+        return [value]
+    if isinstance(value, list):
+        require(value, f"{label} must be non-empty")
+        require(all(isinstance(item, str) and item.strip() for item in value), f"{label} entries must be non-empty strings")
+        return list(value)
+    raise ActualModelGateError(f"{label} must be a non-empty string or string array")
+
+
 def require_git_sha(data: dict[str, Any], label: str, expected_sha: str) -> str:
     value = require_string(data, "git_sha", label)
     require(GIT_SHA_RE.match(value), f"{label}.git_sha must be a 40-character SHA")
@@ -150,15 +167,27 @@ def validate_l2_artifact(
     pass_line = pass_line_is_real(artifact.get("pass_line"), label)
     model_id = require_string(artifact, "model_id", label)
     architecture = require_string(artifact, "architecture", label)
+    require(isinstance(artifact.get("git_dirty"), bool), f"{label}.git_dirty must be boolean")
+    dirty_files = require_string_list(artifact.get("dirty_files", []), f"{label}.dirty_files")
+    command = normalize_command(artifact.get("command") or artifact.get("command_line"), f"{label}.command")
+    profile_detail = artifact.get("profile_detail") or artifact.get("observability_profile_detail")
+    require(isinstance(profile_detail, str) and profile_detail.strip(), f"{label}.profile_detail must be non-empty")
+    replay_index = artifact.get("replay_bundle_index", [])
+    require(isinstance(replay_index, list), f"{label}.replay_bundle_index must be a list when present")
     return {
         "status": "pass",
         "backend": backend,
         "git_sha": artifact["git_sha"],
+        "git_dirty": artifact["git_dirty"],
+        "dirty_files": dirty_files,
         "artifact_dir": artifact_dir,
         "pass_line": pass_line,
         "model_id": model_id,
         "architecture": architecture,
         "entrypoints": sorted(entrypoints),
+        "command": command,
+        "profile_detail": profile_detail.strip(),
+        "replay_bundle_index": replay_index,
         "source": str(path),
     }
 
@@ -281,11 +310,29 @@ def make_l2_artifact(
             "status": "pass",
             "backend": backend,
             "git_sha": sha,
+            "git_dirty": False,
+            "dirty_files": [],
             "artifact_dir": f"fixtures/{backend}-l2",
             "pass_line": f"{backend.upper()} L2 ACTUAL MODEL PASS: fixtures/{backend}-l2",
             "model_id": f"fixture/{backend}-model",
             "architecture": "llama_dense" if backend == "metal" else "qwen3_moe",
             "entrypoints": entrypoints or sorted(REQUIRED_ENTRYPOINTS),
+            "command": [
+                "ferrum",
+                "run",
+                f"fixture/{backend}-model",
+                "--profile-detail",
+                "basic",
+            ],
+            "profile_detail": "basic",
+            "replay_bundle_index": [
+                {
+                    "request_id": f"req-{backend}-fixture",
+                    "entrypoint": "run",
+                    "replay_command": f"ferrum run fixture/{backend}-model",
+                    "bundle_dir": f"fixtures/{backend}-l2/request_dump",
+                }
+            ],
         },
     )
     return path
@@ -362,6 +409,26 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("missing stream/basic_concurrency unexpectedly passed")
         except ActualModelGateError as exc:
             require("entrypoints" in str(exc), f"unexpected entrypoint failure: {exc}")
+        missing_command = make_l2_artifact(root, backend="cuda", sha=sha, suffix="missing_command")
+        missing_command_data = read_json(missing_command)
+        missing_command_data.pop("command", None)
+        write_json(missing_command, missing_command_data)
+        try:
+            run_gate(
+                argparse.Namespace(
+                    out=root / "bad-missing-command",
+                    git_sha=sha,
+                    metal_l2_artifact=metal,
+                    cuda_l2_artifact=missing_command,
+                    native_operator_selected=False,
+                    native_operator_not_selected=True,
+                    native_operator_cuda_artifact=None,
+                    native_operator_non_selected_reason="fixture",
+                )
+            )
+            raise AssertionError("missing L2 command unexpectedly passed")
+        except ActualModelGateError as exc:
+            require("command" in str(exc), f"unexpected missing command failure: {exc}")
         stale = make_l2_artifact(root, backend="metal", sha="2" * 40, suffix="stale")
         try:
             run_gate(
