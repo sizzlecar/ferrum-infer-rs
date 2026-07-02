@@ -164,17 +164,18 @@
       "id": "native-operator",
       "path_globs": [
         "crates/ferrum-native-ops/**",
+        "crates/ferrum-types/src/native_operator.rs",
         "crates/ferrum-kernels/src/native_ops.rs",
         "scripts/release/native_operator_artifact_gate.py",
         "scripts/release/fixtures/native_operator/**",
         "scripts/release/schemas/native_operator_manifest.schema.json"
       ],
       "domains": ["native_operator"],
-      "required_gates": ["unit", "native_operator_artifact", "cuda_l1_native_op_smoke"],
+      "required_gates": ["unit", "native_operator_artifact_selftest", "planner_selftest"],
       "release_invalidation": ["native_operator_artifact", "cuda_sentinel", "cuda_full"],
       "exceptions": [],
       "owner": "kernels",
-      "reason": "native operator ABI, manifest, and resolver affect external kernel artifact selection"
+      "reason": "native operator ABI, manifest, and resolver skeleton changes must fail closed before FA2 migration"
     },
     {
       "id": "fa2-runtime-selection",
