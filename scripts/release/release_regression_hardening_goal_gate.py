@@ -56,6 +56,10 @@ OBSERVABILITY_SUMMARY_FIELDS = {
     "replay_commands",
 }
 REQUIRED_L2_ENTRYPOINTS = {"run", "serve", "stream", "basic_concurrency"}
+ALLOWED_L2_ARCHITECTURES_BY_BACKEND = {
+    "cuda": {"llama_dense", "qwen3_moe"},
+    "metal": {"llama_dense", "qwen3", "qwen3_moe"},
+}
 REQUIRED_RESOURCE_SCENARIOS = {
     "kv_allocate_release_success",
     "kv_capacity_reject",
@@ -887,6 +891,11 @@ def validate_l2_artifact(
     require(
         isinstance(artifact.get("architecture"), str) and artifact["architecture"].strip(),
         f"actual_model_regression.{key}.architecture must be non-empty",
+    )
+    allowed_architectures = ALLOWED_L2_ARCHITECTURES_BY_BACKEND[backend]
+    require(
+        artifact["architecture"] in allowed_architectures,
+        f"actual_model_regression.{key}.architecture must be one of {sorted(allowed_architectures)}",
     )
     require(
         isinstance(artifact.get("git_dirty"), bool),
@@ -2133,6 +2142,29 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("dirty actual-model artifact unexpectedly passed final gate")
         except GoalGateError as exc:
             require("git_dirty" in str(exc), f"unexpected dirty actual-model error: {exc}")
+        bad_architecture = root / "bad-architecture"
+        artifacts_bad_architecture = selftest_artifacts(root / "bad-architecture-fixtures", sha)
+        bad_architecture_actual = read_json(artifacts_bad_architecture["actual"])
+        bad_architecture_actual["cuda_l2_artifact"]["architecture"] = "unknown_architecture"
+        write_json(artifacts_bad_architecture["actual"], bad_architecture_actual)
+        args_bad_architecture = argparse.Namespace(
+            out=bad_architecture,
+            resource_invariant=artifacts_bad_architecture["resource"],
+            change_impact=artifacts_bad_architecture["change"],
+            product_sentinel=artifacts_bad_architecture["product"],
+            model_contract=artifacts_bad_architecture["model"],
+            support_matrix_contract=artifacts_bad_architecture["support_matrix"],
+            observability_profile=artifacts_bad_architecture["observability"],
+            native_operator=artifacts_bad_architecture["native"],
+            actual_model_regression_summary=artifacts_bad_architecture["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_architecture)
+            raise AssertionError("unknown actual-model L2 architecture unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require("architecture" in str(exc), f"unexpected actual-model architecture error: {exc}")
         bad_backend = root / "bad-backend"
         artifacts_bad_backend = selftest_artifacts(root / "bad-backend-fixtures", sha)
         bad_backend_actual = read_json(artifacts_bad_backend["actual"])
