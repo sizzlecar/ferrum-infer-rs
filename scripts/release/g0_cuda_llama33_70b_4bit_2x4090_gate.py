@@ -1158,7 +1158,7 @@ def write_metadata(
         },
         "binary_sha256": sha256(ferrum_bin),
         "command_line": command_line,
-        "build_features": ["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2", "fa2-source"],
+        "build_features": ["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"],
         "cuda_version": hardware.get("cuda_version", "unknown"),
         "driver_version": hardware.get("driver_version", "unknown"),
         "gpu_names": hardware.get("gpu_names", []),

@@ -27,7 +27,6 @@ REQUIRED_CUDA_FEATURES = {
     "cuda",
     "vllm-moe-marlin",
     "vllm-paged-attn-v2",
-    "fa2-source",
 }
 REQUIRED_REPRO_COVERAGE = {
     ("metal", "run"),

@@ -207,7 +207,10 @@ mod tests {
         NativeOperatorBuildSummary, NativeOperatorLinkage, NativeOperatorSourcePackage,
         NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn digest_bytes(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
@@ -238,11 +241,15 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> TestDir {
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("ferrum-native-ops-{name}-{unique}"));
+        let dir = std::env::temp_dir().join(format!(
+            "ferrum-native-ops-{name}-{}-{counter}-{unique}",
+            std::process::id()
+        ));
         fs::create_dir_all(&dir).unwrap();
         TestDir(dir)
     }

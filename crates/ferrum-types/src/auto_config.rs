@@ -1217,28 +1217,10 @@ impl FerrumConfigBuilder {
                 "FA layout requires vLLM paged attention layout",
             );
         }
-        if fa2_source && !self.hardware.compiled_features.fa2_source {
+        if fa2_source {
             return self.invalid(
                 "FERRUM_FA2_SOURCE",
-                "source-linked FA2 support is not compiled",
-            );
-        }
-        if fa2_source && !self.is_cuda_backend() {
-            return self.invalid(
-                "FERRUM_FA2_SOURCE",
-                "source-linked FA2 requires CUDA backend",
-            );
-        }
-        if fa2_source && !use_vllm_paged_attn {
-            return self.invalid(
-                "FERRUM_FA2_SOURCE",
-                "source-linked FA2 requires vLLM paged attention layout",
-            );
-        }
-        if fa2_source && self.cuda_compute_capability_at_least(8, 0) == Some(false) {
-            return self.invalid(
-                "FERRUM_FA2_SOURCE",
-                "source-linked FA2 requires CUDA compute capability >= 8.0",
+                "source-linked FA2 path has been removed; use a native operator artifact",
             );
         }
         if fa2_direct_ffi && !self.hardware.compiled_features.fa2_direct_ffi {
@@ -2841,20 +2823,23 @@ mod tests {
     }
 
     #[test]
-    fn source_fa2_selects_source_linked_attention_when_compiled() {
-        let resolved = m3(
+    fn source_fa2_is_rejected_even_when_legacy_feature_is_compiled() {
+        let err = m3(
             &[("FERRUM_FA2_SOURCE", "1")],
             CompiledKernelFeatures::m3_fast_path_with_source_fa2(),
         )
         .resolve()
-        .unwrap();
-        let decisions: BTreeMap<_, _> = resolved
-            .decisions
-            .iter()
-            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
-            .collect();
+        .unwrap_err();
 
-        assert_eq!(decisions["attention_prefill_mixed_backend"], "fa2_source");
+        match err {
+            AutoConfigError::InvalidOverride { key, reason } => {
+                assert_eq!(key, "FERRUM_FA2_SOURCE");
+                assert!(reason.contains("native operator artifact"));
+            }
+            AutoConfigError::UnsupportedCombination { .. } => {
+                panic!("expected invalid FERRUM_FA2_SOURCE override")
+            }
+        }
     }
 
     #[test]
