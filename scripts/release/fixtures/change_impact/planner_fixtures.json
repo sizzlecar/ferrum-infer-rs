@@ -104,13 +104,29 @@
       "id": "native_op_abi",
       "changed_files": ["crates/ferrum-native-ops/src/abi.rs"],
       "expect_domains": ["native_operator"],
-      "expect_required_gates": ["native_operator_artifact", "cuda_l1_native_op_smoke"]
+      "expect_required_gates": ["native_operator_artifact_selftest", "planner_selftest"],
+      "forbid_required_gates": ["cuda_l1_native_op_smoke"]
+    },
+    {
+      "id": "native_op_types",
+      "changed_files": ["crates/ferrum-types/src/native_operator.rs"],
+      "expect_domains": ["evidence_schema", "native_operator"],
+      "expect_required_gates": [
+        "profile_analyzer_selftest",
+        "native_operator_artifact_selftest",
+        "planner_selftest"
+      ],
+      "forbid_required_gates": ["cuda_l1_native_op_smoke"]
     },
     {
       "id": "native_op_manifest",
       "changed_files": ["scripts/release/schemas/native_operator_manifest.schema.json"],
       "expect_domains": ["evidence_schema", "native_operator", "release_gate"],
-      "expect_required_gates": ["profile_analyzer_selftest", "native_operator_artifact", "release_validator_selftest"]
+      "expect_required_gates": [
+        "profile_analyzer_selftest",
+        "native_operator_artifact_selftest",
+        "release_validator_selftest"
+      ]
     },
     {
       "id": "fa2_runtime_selection",
