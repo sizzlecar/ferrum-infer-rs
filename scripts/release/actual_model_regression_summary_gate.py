@@ -25,6 +25,10 @@ SELFTEST_PASS_LINE = "ACTUAL MODEL REGRESSION SUMMARY SELFTEST PASS"
 SCHEMA_VERSION = 1
 GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 REQUIRED_ENTRYPOINTS = {"run", "serve", "stream", "basic_concurrency"}
+ALLOWED_L2_ARCHITECTURES_BY_BACKEND = {
+    "cuda": {"llama_dense", "qwen3_moe"},
+    "metal": {"llama_dense", "qwen3", "qwen3_moe"},
+}
 
 
 class ActualModelGateError(RuntimeError):
@@ -208,6 +212,11 @@ def validate_l2_artifact(
     pass_line = pass_line_is_real(artifact.get("pass_line"), label)
     model_id = require_string(artifact, "model_id", label)
     architecture = require_string(artifact, "architecture", label)
+    allowed_architectures = ALLOWED_L2_ARCHITECTURES_BY_BACKEND[backend]
+    require(
+        architecture in allowed_architectures,
+        f"{label}.architecture must be one of {sorted(allowed_architectures)}",
+    )
     require(isinstance(artifact.get("git_dirty"), bool), f"{label}.git_dirty must be boolean")
     dirty_files = require_string_list(artifact.get("dirty_files", []), f"{label}.dirty_files")
     require(
@@ -476,6 +485,26 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("missing stream/basic_concurrency unexpectedly passed")
         except ActualModelGateError as exc:
             require("entrypoints" in str(exc), f"unexpected entrypoint failure: {exc}")
+        bad_architecture = make_l2_artifact(root, backend="cuda", sha=sha, suffix="bad_architecture")
+        bad_architecture_data = read_json(bad_architecture)
+        bad_architecture_data["architecture"] = "unknown_architecture"
+        write_json(bad_architecture, bad_architecture_data)
+        try:
+            run_gate(
+                argparse.Namespace(
+                    out=root / "bad-architecture",
+                    git_sha=sha,
+                    metal_l2_artifact=metal,
+                    cuda_l2_artifact=bad_architecture,
+                    native_operator_selected=False,
+                    native_operator_not_selected=True,
+                    native_operator_cuda_artifact=None,
+                    native_operator_non_selected_reason="fixture",
+                )
+            )
+            raise AssertionError("unknown L2 architecture unexpectedly passed")
+        except ActualModelGateError as exc:
+            require("architecture" in str(exc), f"unexpected architecture failure: {exc}")
         missing_command = make_l2_artifact(root, backend="cuda", sha=sha, suffix="missing_command")
         missing_command_data = read_json(missing_command)
         missing_command_data.pop("command", None)
