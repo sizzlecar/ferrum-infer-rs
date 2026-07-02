@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import socket
@@ -24,6 +25,33 @@ SCHEMA_VERSION = 1
 
 class SmokeError(RuntimeError):
     pass
+
+
+def git_value(args: list[str], default: str = "unknown") -> str:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return default
+    return proc.stdout.strip() or default
+
+
+def binary_sha256(args: argparse.Namespace) -> str | None:
+    if args.ferrum_bin is None:
+        return None
+    try:
+        digest = hashlib.sha256()
+        with args.ferrum_bin.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
 
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
@@ -69,6 +97,10 @@ def obs_flags(root: Path) -> list[str]:
         "--profile-sample-rate",
         "1.0",
     ]
+
+
+def profile_detail_from_flags() -> str:
+    return "basic"
 
 
 def run_checked(cmd: list[str], *, cwd: Path, timeout: int, log_path: Path, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -501,6 +533,12 @@ def run_replay_bundle_gate(out: Path, timeout: int) -> dict[str, Any]:
 def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
+    dirty_files = git_value(["status", "--short"], default="").splitlines()
+    git_sha = git_value(["rev-parse", "HEAD"])
+    git_branch = git_value(["rev-parse", "--abbrev-ref", "HEAD"])
+    pass_line = f"{PASS_LINE}: {out}"
+    command = sys.argv
+    ferrum_cmd = ferrum_base_cmd(args)
     run_result = run_actual(args, out)
     serve_result = serve_actual(args, out)
     run_profiles = validate_profile_group(out / "run", "run")
@@ -512,8 +550,20 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "status": "pass",
         "gate": "product_observability_l1_smoke",
+        "goal": "release-regression-hardening-2026-06-28",
+        "artifact_dir": str(out),
+        "pass_line": pass_line,
+        "git_sha": git_sha,
+        "git_branch": git_branch,
+        "git_dirty": bool(dirty_files),
+        "dirty_files": dirty_files,
+        "command": command,
+        "ferrum_command": ferrum_cmd,
+        "ferrum_binary_sha256": binary_sha256(args),
         "model": args.model,
+        "requested_backend": args.backend,
         "backend": args.backend,
+        "profile_detail": profile_detail_from_flags(),
         "actual_model_smoke": True,
         "entrypoints": {
             "run": {"product": run_result, "profiles": run_profiles},
@@ -528,12 +578,25 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         out / "gate.manifest.json",
         {
             "schema_version": SCHEMA_VERSION,
+            "goal": "release-regression-hardening-2026-06-28",
+            "phase": "product_observability_l1_smoke",
             "status": "pass",
+            "repo_root": str(REPO_ROOT),
+            "git_sha": git_sha,
+            "git_branch": git_branch,
+            "git_dirty": bool(dirty_files),
+            "dirty_files": dirty_files,
+            "command": command,
             "artifact_dir": str(out),
-            "pass_line": f"{PASS_LINE}: {out}",
+            "pass_line": pass_line,
             "model": args.model,
+            "requested_backend": args.backend,
             "backend": args.backend,
+            "profile_detail": profile_detail_from_flags(),
+            "ferrum_command": ferrum_cmd,
+            "ferrum_binary_sha256": summary["ferrum_binary_sha256"],
             "summary": str(out / "product_observability_l1_smoke_summary.json"),
+            "outputs": {"summary": str(out / "product_observability_l1_smoke_summary.json")},
             "profile_paths": analyzer["profiles"],
             "resource_invariant": resource_invariant,
             "request_replay_bundle": replay_bundle,
