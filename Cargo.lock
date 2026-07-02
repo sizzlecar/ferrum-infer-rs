@@ -1516,6 +1516,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-native-ops"
+version = "0.7.7"
+dependencies = [
+ "ferrum-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "ferrum-quantization"
 version = "0.7.7"
 dependencies = [

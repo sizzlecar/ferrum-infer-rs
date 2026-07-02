@@ -9,6 +9,9 @@ members = [
     "crates/ferrum-tokenizer",
     "crates/ferrum-sampler",
     "crates/ferrum-kv",
+
+    # Native operator ABI + artifact resolver (no third-party kernel sources)
+    "crates/ferrum-native-ops",
     
     # Unified compute kernels (CUDA/Metal/CPU) — Backend<B> trait stack
     # plus the fused-transformer module (formerly ferrum-attention).
@@ -140,6 +143,7 @@ ferrum-scheduler = { path = "crates/ferrum-scheduler", version = "0.7.7" }
 ferrum-tokenizer = { path = "crates/ferrum-tokenizer", version = "0.7.7" }
 ferrum-sampler = { path = "crates/ferrum-sampler", version = "0.7.7" }
 ferrum-kv = { path = "crates/ferrum-kv", version = "0.7.7" }
+ferrum-native-ops = { path = "crates/ferrum-native-ops", version = "0.7.7" }
 
 # Unified compute kernels (CUDA/Metal/CPU)
 ferrum-kernels = { path = "crates/ferrum-kernels", version = "0.7.7" }
@@ -164,5 +168,4 @@ strip = true
 
 [profile.bench]
 inherits = "release"
-
 
