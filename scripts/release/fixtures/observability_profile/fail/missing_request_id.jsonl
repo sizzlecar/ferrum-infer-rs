@@ -1,0 +1,1 @@
+{"schema_version":1,"event_id":"evt-missing-request","request_id":"","entrypoint":"run","backend":"synthetic","phase":"request_open","event_kind":"instant","timestamp":"2026-07-02T00:00:00Z","status":"ok","model":"synthetic/no-weight","attributes":{}}

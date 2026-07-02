@@ -1,0 +1,1 @@
+{"schema_version":1,"event_id":"evt-bad-resource","request_id":"req-1","entrypoint":"serve","backend":"synthetic","phase":"kv_reserve","event_kind":"resource","timestamp":"2026-07-02T00:00:00Z","status":"ok","model":"synthetic/no-weight","resource":{"owner_kind":"request","owner_id":"","resource_kind":"kv_block","action":"reserve","amount":1,"before":4,"after":3},"attributes":{}}
