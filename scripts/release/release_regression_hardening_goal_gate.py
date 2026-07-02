@@ -97,6 +97,15 @@ REQUIRED_PRODUCT_SENTINEL_SCENARIO_TYPES = {
     "resource_trace",
     "sse_fixture",
 }
+REQUIRED_RELEASE_CANDIDATE_STAGE_GATES = {
+    "actual_model_regression",
+    "model_contract",
+    "native_operator",
+    "observability_profile",
+    "product_sentinel",
+    "resource_invariant",
+    "support_matrix_contract",
+}
 
 
 class GoalGateError(RuntimeError):
@@ -373,6 +382,83 @@ def validate_release_candidate_invalidation(
     require(
         not counted_stale,
         f"release_candidate_manifest counts stale artifacts as pass evidence: {sorted(set(counted_stale))}",
+    )
+
+
+def candidate_path_variants(raw: str, *, base: Path) -> set[str]:
+    variants = {raw}
+    path = Path(raw)
+    if path.is_absolute():
+        variants.add(str(path.resolve()))
+    else:
+        variants.add(str((base / path).resolve()))
+        variants.add(str((REPO_ROOT / path).resolve()))
+    return variants
+
+
+def validate_release_candidate_stage_evidence(
+    release_candidate: dict[str, Any],
+    change_root: Path,
+    stage_artifacts: dict[str, dict[str, str]],
+) -> None:
+    required_gates = set(
+        require_string_list(
+            release_candidate.get("required_gates", []),
+            "release_candidate_manifest.required_gates",
+        )
+    )
+    satisfied_gates = set(
+        require_string_list(
+            release_candidate.get("satisfied_gates", []),
+            "release_candidate_manifest.satisfied_gates",
+        )
+    )
+    artifact_paths = require_string_list(
+        release_candidate.get("artifact_paths", []),
+        "release_candidate_manifest.artifact_paths",
+    )
+    pass_lines = set(
+        require_string_list(
+            release_candidate.get("pass_lines", []),
+            "release_candidate_manifest.pass_lines",
+        )
+    )
+
+    missing_required = sorted(REQUIRED_RELEASE_CANDIDATE_STAGE_GATES - required_gates)
+    require(
+        not missing_required,
+        f"release_candidate_manifest.required_gates missing final gates {missing_required}",
+    )
+    missing_satisfied = sorted(REQUIRED_RELEASE_CANDIDATE_STAGE_GATES - satisfied_gates)
+    require(
+        not missing_satisfied,
+        f"release_candidate_manifest.satisfied_gates missing final gates {missing_satisfied}",
+    )
+
+    artifact_path_variants: set[str] = set()
+    for raw_path in artifact_paths:
+        artifact_path_variants.update(candidate_path_variants(raw_path, base=change_root))
+
+    missing_artifact_paths: list[str] = []
+    missing_pass_lines: list[str] = []
+    for gate in sorted(REQUIRED_RELEASE_CANDIDATE_STAGE_GATES):
+        artifact = stage_artifacts.get(gate)
+        require(artifact is not None, f"final gate missing internal stage artifact entry for {gate}")
+        expected_path = artifact["artifact_dir"]
+        expected_path_variants = candidate_path_variants(expected_path, base=REPO_ROOT)
+        if not (expected_path_variants & artifact_path_variants):
+            missing_artifact_paths.append(gate)
+        if artifact["pass_line"] not in pass_lines:
+            missing_pass_lines.append(gate)
+
+    require(
+        not missing_artifact_paths,
+        "release_candidate_manifest.artifact_paths missing final stage artifacts "
+        f"{missing_artifact_paths}",
+    )
+    require(
+        not missing_pass_lines,
+        f"release_candidate_manifest.pass_lines missing final stage PASS lines {missing_pass_lines}",
     )
 
 
@@ -1117,6 +1203,53 @@ def build_goal_manifest(args: argparse.Namespace) -> dict[str, Any]:
     observability = validate_observability_profile(args.observability_profile, expected_sha)
     native_operator = validate_native_operator(args.native_operator, expected_sha)
     actual_model = validate_actual_model_regression(args, expected_sha)
+    stage_artifacts = {
+        "resource_invariant": {
+            "artifact_dir": resource["artifact_dir"],
+            "pass_line": resource["pass_line"],
+            "git_sha": resource["git_sha"],
+        },
+        "change_impact": {
+            "artifact_dir": change_impact["artifact_dir"],
+            "pass_line": change_impact["pass_line"],
+            "git_sha": change_impact["git_sha"],
+        },
+        "product_sentinel": {
+            "artifact_dir": product["artifact_dir"],
+            "pass_line": product["pass_line"],
+            "git_sha": product["git_sha"],
+        },
+        "model_contract": {
+            "artifact_dir": model_contract["artifact_dir"],
+            "pass_line": model_contract["pass_line"],
+            "git_sha": model_contract["git_sha"],
+        },
+        "support_matrix_contract": {
+            "artifact_dir": support_matrix_contract["artifact_dir"],
+            "pass_line": support_matrix_contract["pass_line"],
+            "git_sha": support_matrix_contract["git_sha"],
+        },
+        "observability_profile": {
+            "artifact_dir": observability["artifact_dir"],
+            "pass_line": observability["pass_line"],
+            "git_sha": observability["git_sha"],
+        },
+        "native_operator": {
+            "artifact_dir": native_operator["artifact_dir"],
+            "pass_line": native_operator["pass_line"],
+            "git_sha": native_operator["git_sha"],
+        },
+        "actual_model_regression": {
+            "artifact_dir": str(Path(actual_model["_summary_path"]).parent),
+            "pass_line": actual_model["pass_line"],
+            "git_sha": actual_model["git_sha"],
+        },
+    }
+    validate_release_candidate_stage_evidence(
+        change_impact["release_candidate_manifest"],
+        Path(change_impact["artifact_dir"]),
+        stage_artifacts,
+    )
     replay_bundle_index = build_replay_bundle_index(
         product["summary"],
         observability["summary"],
@@ -1142,48 +1275,7 @@ def build_goal_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "binary_sha256": validate_binary_sha256(args.binary_sha256),
         "command": sys.argv,
         "sanitized_env": sanitized_env(),
-        "stage_artifacts": {
-            "resource_invariant": {
-                "artifact_dir": resource["artifact_dir"],
-                "pass_line": resource["pass_line"],
-                "git_sha": resource["git_sha"],
-            },
-            "change_impact": {
-                "artifact_dir": change_impact["artifact_dir"],
-                "pass_line": change_impact["pass_line"],
-                "git_sha": change_impact["git_sha"],
-            },
-            "product_sentinel": {
-                "artifact_dir": product["artifact_dir"],
-                "pass_line": product["pass_line"],
-                "git_sha": product["git_sha"],
-            },
-            "model_contract": {
-                "artifact_dir": model_contract["artifact_dir"],
-                "pass_line": model_contract["pass_line"],
-                "git_sha": model_contract["git_sha"],
-            },
-            "support_matrix_contract": {
-                "artifact_dir": support_matrix_contract["artifact_dir"],
-                "pass_line": support_matrix_contract["pass_line"],
-                "git_sha": support_matrix_contract["git_sha"],
-            },
-            "observability_profile": {
-                "artifact_dir": observability["artifact_dir"],
-                "pass_line": observability["pass_line"],
-                "git_sha": observability["git_sha"],
-            },
-            "native_operator": {
-                "artifact_dir": native_operator["artifact_dir"],
-                "pass_line": native_operator["pass_line"],
-                "git_sha": native_operator["git_sha"],
-            },
-            "actual_model_regression": {
-                "artifact_dir": str(Path(actual_model["_summary_path"]).parent),
-                "pass_line": actual_model["pass_line"],
-                "git_sha": actual_model["git_sha"],
-            },
-        },
+        "stage_artifacts": stage_artifacts,
         "gate_plan": change_impact["gate_plan"],
         "release_candidate_manifest": change_impact["release_candidate_manifest"],
         "resource_invariant_summary": resource["summary"],
@@ -1321,6 +1413,37 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
 
     change = root / "change"
     change.mkdir()
+    release_candidate_stage_artifacts = {
+        "actual_model_regression": {
+            "artifact_dir": str(root),
+            "pass_line": f"ACTUAL MODEL REGRESSION SUMMARY PASS: {root}",
+        },
+        "model_contract": {
+            "artifact_dir": str(root / "model"),
+            "pass_line": f"MODEL ONBOARDING CONTRACT PASS: {root / 'model'}",
+        },
+        "native_operator": {
+            "artifact_dir": str(root / "native"),
+            "pass_line": f"NATIVE OP ARTIFACT PASS: {root / 'native'}",
+        },
+        "observability_profile": {
+            "artifact_dir": str(root / "observability"),
+            "pass_line": f"OBSERVABILITY PROFILE GATE PASS: {root / 'observability'}",
+        },
+        "product_sentinel": {
+            "artifact_dir": str(root / "product"),
+            "pass_line": f"PRODUCT BACKEND SENTINEL PASS: {root / 'product'}",
+        },
+        "resource_invariant": {
+            "artifact_dir": str(resource),
+            "pass_line": f"RESOURCE INVARIANT GATE PASS: {resource}",
+        },
+        "support_matrix_contract": {
+            "artifact_dir": str(root / "support-matrix"),
+            "pass_line": f"SUPPORT MATRIX CONTRACT PASS: {root / 'support-matrix'}",
+        },
+    }
+    release_candidate_required_gates = sorted({"unit"} | REQUIRED_RELEASE_CANDIDATE_STAGE_GATES)
     write_json(
         change / "gate_plan.json",
         {
@@ -1328,7 +1451,7 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "status": "pass",
             "head_sha": sha,
             "unknown_files": [],
-            "required_gates": ["unit"],
+            "required_gates": release_candidate_required_gates,
         },
     )
     write_json(
@@ -1336,11 +1459,17 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
         {
             "schema_version": 1,
             "head_sha": sha,
-            "required_gates": ["unit"],
+            "required_gates": release_candidate_required_gates,
             "invalidated_gates": [],
-            "satisfied_gates": [],
-            "artifact_paths": [],
-            "pass_lines": [],
+            "satisfied_gates": sorted(REQUIRED_RELEASE_CANDIDATE_STAGE_GATES),
+            "artifact_paths": [
+                artifact["artifact_dir"]
+                for _, artifact in sorted(release_candidate_stage_artifacts.items())
+            ],
+            "pass_lines": [
+                artifact["pass_line"]
+                for _, artifact in sorted(release_candidate_stage_artifacts.items())
+            ],
             "stale_artifacts": [],
         },
     )
@@ -2071,6 +2200,47 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("stale artifact counted as pass unexpectedly passed final gate")
         except GoalGateError as exc:
             require("stale artifacts" in str(exc), f"unexpected stale-counted error: {exc}")
+        bad_release_candidate_missing_stage = root / "bad-release-candidate-missing-stage"
+        artifacts_bad_release_candidate_missing_stage = selftest_artifacts(
+            root / "bad-release-candidate-missing-stage-fixtures",
+            sha,
+        )
+        bad_release_candidate_missing_stage_path = (
+            artifacts_bad_release_candidate_missing_stage["change"] / "release_candidate_manifest.json"
+        )
+        bad_release_candidate_missing_stage_manifest = read_json(
+            bad_release_candidate_missing_stage_path
+        )
+        bad_release_candidate_missing_stage_manifest["satisfied_gates"] = [
+            gate
+            for gate in bad_release_candidate_missing_stage_manifest["satisfied_gates"]
+            if gate != "observability_profile"
+        ]
+        write_json(
+            bad_release_candidate_missing_stage_path,
+            bad_release_candidate_missing_stage_manifest,
+        )
+        args_bad_release_candidate_missing_stage = argparse.Namespace(
+            out=bad_release_candidate_missing_stage,
+            resource_invariant=artifacts_bad_release_candidate_missing_stage["resource"],
+            change_impact=artifacts_bad_release_candidate_missing_stage["change"],
+            product_sentinel=artifacts_bad_release_candidate_missing_stage["product"],
+            model_contract=artifacts_bad_release_candidate_missing_stage["model"],
+            support_matrix_contract=artifacts_bad_release_candidate_missing_stage["support_matrix"],
+            observability_profile=artifacts_bad_release_candidate_missing_stage["observability"],
+            native_operator=artifacts_bad_release_candidate_missing_stage["native"],
+            actual_model_regression_summary=artifacts_bad_release_candidate_missing_stage["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_release_candidate_missing_stage)
+            raise AssertionError("release candidate missing final stage unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "release_candidate_manifest.satisfied_gates missing final gates" in str(exc),
+                f"unexpected release candidate stage evidence error: {exc}",
+            )
         bad_planner_selfcheck = root / "bad-planner-selfcheck"
         artifacts_bad_planner_selfcheck = selftest_artifacts(
             root / "bad-planner-selfcheck-fixtures",
