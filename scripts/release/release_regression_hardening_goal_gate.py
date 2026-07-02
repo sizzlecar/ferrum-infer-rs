@@ -376,7 +376,18 @@ def validate_l2_artifact(data: dict[str, Any], key: str, backend: str, expected_
         isinstance(artifact.get("git_dirty"), bool),
         f"actual_model_regression.{key}.git_dirty must be boolean",
     )
-    require_string_list(artifact.get("dirty_files", []), f"actual_model_regression.{key}.dirty_files")
+    dirty_files = require_string_list(
+        artifact.get("dirty_files", []),
+        f"actual_model_regression.{key}.dirty_files",
+    )
+    require(
+        artifact["git_dirty"] is False,
+        f"actual_model_regression.{key}.git_dirty must be false for final PASS",
+    )
+    require(
+        not dirty_files,
+        f"actual_model_regression.{key}.dirty_files must be empty for final PASS",
+    )
     normalize_command(
         artifact.get("command") or artifact.get("command_line"),
         f"actual_model_regression.{key}.command",
@@ -1001,6 +1012,32 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("missing actual model regression unexpectedly passed final gate")
         except GoalGateError as exc:
             require("actual model regression summary" in str(exc), f"unexpected missing actual error: {exc}")
+        bad_dirty = root / "bad-dirty"
+        artifacts_bad_dirty = selftest_artifacts(root / "bad-dirty-fixtures", sha)
+        bad_actual = read_json(artifacts_bad_dirty["actual"])
+        bad_actual["metal_l2_artifact"]["git_dirty"] = True
+        bad_actual["metal_l2_artifact"]["dirty_files"] = [
+            " M crates/ferrum-cli/src/commands/run.rs"
+        ]
+        write_json(artifacts_bad_dirty["actual"], bad_actual)
+        args_bad_dirty = argparse.Namespace(
+            out=bad_dirty,
+            resource_invariant=artifacts_bad_dirty["resource"],
+            change_impact=artifacts_bad_dirty["change"],
+            product_sentinel=artifacts_bad_dirty["product"],
+            model_contract=artifacts_bad_dirty["model"],
+            support_matrix_contract=artifacts_bad_dirty["support_matrix"],
+            observability_profile=artifacts_bad_dirty["observability"],
+            native_operator=artifacts_bad_dirty["native"],
+            actual_model_regression_summary=artifacts_bad_dirty["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_dirty)
+            raise AssertionError("dirty actual-model artifact unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require("git_dirty" in str(exc), f"unexpected dirty actual-model error: {exc}")
         return {
             "schema_version": SCHEMA_VERSION,
             "status": "pass",

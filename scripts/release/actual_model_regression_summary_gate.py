@@ -169,6 +169,11 @@ def validate_l2_artifact(
     architecture = require_string(artifact, "architecture", label)
     require(isinstance(artifact.get("git_dirty"), bool), f"{label}.git_dirty must be boolean")
     dirty_files = require_string_list(artifact.get("dirty_files", []), f"{label}.dirty_files")
+    require(
+        artifact["git_dirty"] is False,
+        f"{label}.git_dirty must be false for release-regression-hardening L2 evidence",
+    )
+    require(not dirty_files, f"{label}.dirty_files must be empty for L2 evidence")
     command = normalize_command(artifact.get("command") or artifact.get("command_line"), f"{label}.command")
     profile_detail = artifact.get("profile_detail") or artifact.get("observability_profile_detail")
     require(isinstance(profile_detail, str) and profile_detail.strip(), f"{label}.profile_detail must be non-empty")
@@ -446,6 +451,27 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("stale artifact unexpectedly passed")
         except ActualModelGateError as exc:
             require("stale" in str(exc), f"unexpected stale failure: {exc}")
+        dirty = make_l2_artifact(root, backend="metal", sha=sha, suffix="dirty")
+        dirty_data = read_json(dirty)
+        dirty_data["git_dirty"] = True
+        dirty_data["dirty_files"] = [" M crates/ferrum-cli/src/commands/run.rs"]
+        write_json(dirty, dirty_data)
+        try:
+            run_gate(
+                argparse.Namespace(
+                    out=root / "bad-dirty",
+                    git_sha=sha,
+                    metal_l2_artifact=dirty,
+                    cuda_l2_artifact=cuda,
+                    native_operator_selected=False,
+                    native_operator_not_selected=True,
+                    native_operator_cuda_artifact=None,
+                    native_operator_non_selected_reason="fixture",
+                )
+            )
+            raise AssertionError("dirty artifact unexpectedly passed")
+        except ActualModelGateError as exc:
+            require("git_dirty" in str(exc), f"unexpected dirty failure: {exc}")
         try:
             run_gate(
                 argparse.Namespace(
