@@ -1,0 +1,15 @@
+[package]
+name = "ferrum-native-ops"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native operator ABI and artifact resolver for Ferrum"
+
+[dependencies]
+ferrum-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub const NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NativeOperatorBackend {
     Cuda,
