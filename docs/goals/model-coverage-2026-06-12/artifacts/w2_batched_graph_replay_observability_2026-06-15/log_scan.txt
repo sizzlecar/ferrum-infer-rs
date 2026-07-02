@@ -1,0 +1,11 @@
+GRAPH_LINES
+21:[batched-graph-capture] key=4611686018427387920 m=15 m_padded=16 device_shadow=true
+22:[batched-graph-replay] origin=post_capture count=1 key=4611686018427387920 m=15 m_padded=16 device_shadow=true
+23:[batched-graph-replay] origin=pure count=2 key=4611686018427387920 m=15 m_padded=16 device_shadow=true
+24:[batched-graph-replay] origin=pure count=4 key=4611686018427387920 m=15 m_padded=16 device_shadow=true
+25:[batched-graph-replay] origin=pure count=8 key=4611686018427387920 m=15 m_padded=16 device_shadow=true
+26:[batched-graph-replay] origin=pure count=16 key=4611686018427387920 m=15 m_padded=16 device_shadow=true
+27:[batched-graph-capture] key=4611686018427387912 m=7 m_padded=8 device_shadow=true
+ERROR_SCAN
+docs/goals/model-coverage-2026-06-12/artifacts/w2_batched_graph_replay_observability_2026-06-15/bench/bench_c16.json:138:  "panic_per_run": [
+docs/goals/model-coverage-2026-06-12/artifacts/w2_batched_graph_replay_observability_2026-06-15/bench/bench_c16.json:150:      "panic": 0

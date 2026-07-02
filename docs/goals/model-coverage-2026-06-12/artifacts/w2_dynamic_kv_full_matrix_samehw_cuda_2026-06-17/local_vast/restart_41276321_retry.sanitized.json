@@ -1,0 +1,17 @@
+{
+  "actual_status": null,
+  "cur_state": null,
+  "disk_usage": null,
+  "dph_total": null,
+  "duration": null,
+  "error": "resources_unavailable",
+  "gpu_name": null,
+  "id": null,
+  "intended_status": null,
+  "msg": "Required resources are currently unavailable, state change queued.",
+  "num_gpus": null,
+  "ssh_host": null,
+  "ssh_port": null,
+  "status_msg": null,
+  "success": false
+}

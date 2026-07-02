@@ -1,0 +1,289 @@
+{
+  "model": "gemma3:27b-gptq",
+  "backend": "cuda",
+  "scenario": "closed_loop",
+  "concurrency": 16,
+  "n_prompt": 256,
+  "n_gen": 128,
+  "actual_input_tokens": {
+    "requested": 256,
+    "min": 112,
+    "max": 112,
+    "mean": 112.0
+  },
+  "actual_input_tokens_per_request": [
+    [
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112,
+      112
+    ]
+  ],
+  "output_tokens_per_request": [
+    [
+      79,
+      78,
+      69,
+      76,
+      82,
+      61,
+      66,
+      70,
+      76,
+      74,
+      75,
+      69,
+      77,
+      77,
+      76,
+      85,
+      76,
+      76,
+      71,
+      72,
+      72,
+      77,
+      63,
+      76,
+      76,
+      76,
+      75,
+      75,
+      74,
+      73,
+      76,
+      76,
+      78,
+      78,
+      71,
+      71,
+      74,
+      76,
+      67,
+      69,
+      70,
+      76,
+      77,
+      60,
+      72,
+      76,
+      76,
+      76,
+      76,
+      61,
+      74,
+      76,
+      76,
+      69,
+      59,
+      74,
+      76,
+      73,
+      76,
+      69,
+      76,
+      76,
+      75,
+      69
+    ]
+  ],
+  "output_token_count_source": "usage",
+  "n_repeats": 1,
+  "n_requests_per_run": 64,
+  "warmup_requests": 10,
+  "ttft_ms": {
+    "p50": {
+      "mean": 421.34572349999996
+    },
+    "p75": {
+      "mean": 585.2276435000001
+    },
+    "p95": {
+      "mean": 697.1003812
+    },
+    "p99": {
+      "mean": 1005.640305
+    }
+  },
+  "tpot_ms": {
+    "p50": {
+      "mean": 44.42138527123288
+    },
+    "p75": {
+      "mean": 45.79771518026316
+    },
+    "p95": {
+      "mean": 46.4611221766923
+    },
+    "p99": {
+      "mean": 48.792542404682536
+    }
+  },
+  "itl_ms": {
+    "p50": {
+      "mean": 38.7758635
+    },
+    "p75": {
+      "mean": 42.570410249999995
+    },
+    "p95": {
+      "mean": 67.81585849999999
+    },
+    "p99": {
+      "mean": 89.2770225
+    }
+  },
+  "e2e_ms": {
+    "p50": {
+      "mean": 3667.4318545
+    },
+    "p75": {
+      "mean": 3800.4927599999996
+    },
+    "p95": {
+      "mean": 4305.748883199999
+    },
+    "p99": {
+      "mean": 4702.660243119999
+    }
+  },
+  "output_throughput_tps": {
+    "mean": 312.91063917936356
+  },
+  "total_throughput_tps": {
+    "mean": 790.5391446388351
+  },
+  "request_throughput_rps": {
+    "mean": 4.26454022731671
+  },
+  "goodput_rps": {
+    "mean": 4.26454022731671
+  },
+  "slo": {
+    "ttft_p99_ms": null,
+    "tpot_p99_ms": null,
+    "e2e_p99_ms": null
+  },
+  "completed_per_run": [
+    64
+  ],
+  "errored_per_run": [
+    0
+  ],
+  "bad_output_per_run": [
+    0
+  ],
+  "malformed_stream_per_run": [
+    0
+  ],
+  "missing_done_per_run": [
+    0
+  ],
+  "duplicate_done_per_run": [
+    0
+  ],
+  "zero_output_tokens_per_run": [
+    0
+  ],
+  "stream_bulk_flush_per_run": [
+    0
+  ],
+  "http_500_per_run": [
+    0
+  ],
+  "panic_per_run": [
+    0
+  ],
+  "quality_issues_per_run": [
+    {
+      "bad_output": 0,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "duplicate_done": 0,
+      "zero_output_tokens": 0,
+      "stream_bulk_flush": 0,
+      "http_500": 0,
+      "panic": 0
+    }
+  ],
+  "env": {
+    "commit_sha": "",
+    "hw_id": "rtx-4090",
+    "driver": "565.77",
+    "cuda": "12.4",
+    "rust": "1.96.0",
+    "ferrum_features": [
+      "cuda",
+      "vllm-moe-marlin",
+      "vllm-paged-attn-v2"
+    ],
+    "gpu_clock_lock_mhz": 2790,
+    "gpu_power_limit_w": 350,
+    "gpu_persistence_mode": true,
+    "ferrum_env": {},
+    "runtime_config": {
+      "entries": []
+    }
+  },
+  "env_hash": "sha256:3d3bcfbdec09f2cc49be4ba2a066e94f573fe3b2f2cc1083ecb9b85bebdc93be"
+}

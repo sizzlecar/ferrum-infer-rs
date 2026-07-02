@@ -1,0 +1,13 @@
+{
+  "limit": 100,
+  "verified": {"eq": true},
+  "rentable": {"eq": true},
+  "rented": {"eq": false},
+  "num_gpus": {"eq": 1},
+  "compute_cap": {"gte": 890},
+  "cuda_max_good": {"gte": 12.4},
+  "disk_space": {"gte": 180},
+  "reliability2": {"gte": 0.98},
+  "gpu_name": {"eq": "RTX 4090"},
+  "type": "ondemand"
+}

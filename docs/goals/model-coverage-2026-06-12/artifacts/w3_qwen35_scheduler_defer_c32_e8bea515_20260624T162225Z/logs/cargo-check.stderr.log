@@ -1,0 +1,23 @@
+    Checking float8 v0.6.1
+   Compiling ferrum-kernels v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kernels)
+    Checking hashbrown v0.14.5
+   Compiling pin-project-internal v1.1.10
+    Checking rand_distr v0.4.3
+    Checking metrics v0.22.4
+    Checking priority-queue v2.7.0
+    Checking crossbeam-channel v0.5.15
+    Checking ferrum-kv v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kv)
+    Checking tokio-stream v0.1.17
+    Checking bytesize v1.3.3
+    Checking candle-core v0.9.2
+    Checking ferrum-sampler v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-sampler)
+    Checking dashmap v6.1.0
+    Checking pin-project v1.1.10
+    Checking ferrum-scheduler v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-scheduler)
+    Checking ferrum-tokenizer v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-tokenizer)
+    Checking candle-nn v0.9.2
+    Checking ferrum-quantization v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-quantization)
+    Checking candle-transformers v0.9.2
+    Checking ferrum-models v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-models)
+    Checking ferrum-engine v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.96s

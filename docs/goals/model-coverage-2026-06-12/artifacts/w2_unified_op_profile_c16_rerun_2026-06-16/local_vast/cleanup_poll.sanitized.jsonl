@@ -1,0 +1,7 @@
+{"id":41187356,"poll":1,"cur_state":"stopped","actual_status":"running","num_gpus":1,"gpu_name":"RTX 4090"}
+{"id":41187356,"poll":2,"cur_state":"stopped","actual_status":"running","num_gpus":1,"gpu_name":"RTX 4090"}
+{"id":41187356,"poll":3,"cur_state":"stopped","actual_status":"running","num_gpus":1,"gpu_name":"RTX 4090"}
+{"id":41187356,"poll":4,"cur_state":"stopped","actual_status":"running","num_gpus":1,"gpu_name":"RTX 4090"}
+{"id":41187356,"poll":5,"cur_state":"stopped","actual_status":"running","num_gpus":1,"gpu_name":"RTX 4090"}
+{"id":41187356,"poll":6,"cur_state":"stopped","actual_status":"running","num_gpus":1,"gpu_name":"RTX 4090"}
+{"id":41187356,"poll":7,"cur_state":"stopped","actual_status":"exited","num_gpus":1,"gpu_name":"RTX 4090"}

@@ -1,0 +1,5 @@
+{"scenario":"engine_decode_failure_rolls_back","owner_kind":"request","owner_id":"req-decode-fail","resource_kind":"request_slot","action":"request_open","capacity":1}
+{"scenario":"engine_decode_failure_rolls_back","owner_kind":"request","owner_id":"req-decode-fail","resource_kind":"backend_workspace","action":"reserve","amount":1,"before":2,"after":1,"capacity":2}
+{"scenario":"engine_decode_failure_rolls_back","owner_kind":"request","owner_id":"req-decode-fail","resource_kind":"backend_workspace","action":"commit","amount":1,"before":1,"after":1,"capacity":2}
+{"scenario":"engine_decode_failure_rolls_back","owner_kind":"request","owner_id":"req-decode-fail","resource_kind":"backend_workspace","action":"rollback","amount":1,"before":1,"after":2,"capacity":2,"reason":"decode_error"}
+{"scenario":"engine_decode_failure_rolls_back","owner_kind":"request","owner_id":"req-decode-fail","resource_kind":"request_slot","action":"request_close","capacity":1}

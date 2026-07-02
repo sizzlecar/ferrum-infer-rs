@@ -1,0 +1,9 @@
+{
+  "data": {
+    "error": "resources_unavailable",
+    "msg": "Required resources are currently unavailable, state change queued.",
+    "success": false
+  },
+  "ok": true,
+  "status": 200
+}

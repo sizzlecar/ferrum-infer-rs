@@ -56,6 +56,20 @@ impl MarlinExpertStack<CudaBackend> for CudaMarlinExpertStack {
         self.num_experts
     }
 
+    fn requires_vllm_moe(&self) -> bool {
+        #[cfg(feature = "triton-kernels")]
+        {
+            match self.store.as_ref() {
+                GptqStoreCuda::Marlin(mw) => mw.vllm_moe,
+                GptqStoreCuda::Triton(_) => false,
+            }
+        }
+        #[cfg(not(feature = "triton-kernels"))]
+        {
+            self.store.vllm_moe
+        }
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

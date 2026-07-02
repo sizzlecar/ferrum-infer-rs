@@ -1,0 +1,19 @@
+2026-06-24T23:02:54Z lane_start art=/workspace/artifacts/w3_qwen35_mixed_kv_no_preempt_c32_032dda17_20260624T230254Z sha=032dda17f5290571cde1eb96d28cc0b84bf61f33 release_evidence=false no_live_vllm=true cost_per_hr_approx=0.456
+2026-06-24T23:02:55Z bootstrap_start
+2026-06-24T23:02:56Z bootstrap_done
+2026-06-24T23:02:56Z git_sync_start
+2026-06-24T23:02:57Z git_sync_done
+2026-06-24T23:02:57Z hf_prefetch_start
+2026-06-24T23:02:57Z cargo_check_start
+2026-06-24T23:03:34Z cargo_check_done
+2026-06-24T23:03:34Z release_build_start
+2026-06-24T23:33:59Z release_build_done
+2026-06-24T23:33:59Z hf_prefetch_wait_start
+2026-06-24T23:33:59Z hf_prefetch_done tokenizer=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+2026-06-24T23:33:59Z ferrum_run_smoke_start
+2026-06-24T23:34:30Z ferrum_run_smoke_done
+2026-06-24T23:34:30Z serve_start
+2026-06-24T23:34:59Z serve_ready
+2026-06-24T23:34:59Z serve_chat_smoke_done
+2026-06-24T23:34:59Z bench_c32_start
+2026-06-24T23:45:14Z bench_c32_failed exit=1

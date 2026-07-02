@@ -1,0 +1,19 @@
+2026-06-25T03:44:21Z lane_start art=/workspace/artifacts/w3_qwen35_mixed_prefill_immediate_kv_c32_9fda1101_20260625T034421Z sha=9fda11014c17483b0ceca479e3704b3767db0cbe release_evidence=false no_live_vllm=true
+2026-06-25T03:44:21Z bootstrap_start
+2026-06-25T03:44:22Z bootstrap_done
+2026-06-25T03:44:22Z git_sync_start
+2026-06-25T03:44:23Z git_sync_done
+2026-06-25T03:44:23Z hf_prefetch_start
+2026-06-25T03:44:23Z cargo_check_start
+2026-06-25T03:44:28Z cargo_check_done
+2026-06-25T03:44:28Z release_build_start
+2026-06-25T03:48:00Z release_build_done
+2026-06-25T03:48:00Z hf_prefetch_wait_start
+2026-06-25T03:48:00Z hf_prefetch_done tokenizer=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+2026-06-25T03:48:00Z ferrum_run_smoke_start
+2026-06-25T03:48:26Z ferrum_run_smoke_done
+2026-06-25T03:48:26Z serve_start
+2026-06-25T03:48:54Z serve_ready
+2026-06-25T03:48:54Z serve_chat_smoke_done
+2026-06-25T03:48:54Z bench_c32_start
+2026-06-25T03:49:05Z FERRUM W3 QWEN35 C32 DIAG KEEP: /workspace/artifacts/w3_qwen35_mixed_prefill_immediate_kv_c32_9fda1101_20260625T034421Z

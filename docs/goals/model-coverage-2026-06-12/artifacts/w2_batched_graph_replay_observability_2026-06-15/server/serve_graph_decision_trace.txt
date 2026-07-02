@@ -1,0 +1,1 @@
+5:{"schema_version":1,"selection":"decode_graph_policy","selected":"legacy_batched_decode_graph","source":"cli","source_key":"FERRUM_BATCHED_GRAPH","candidates":["legacy_batched_decode_graph","graph_disabled"],"rejected":[{"value":"graph_disabled","reason":"legacy batched decode graph selected"}],"affects":["performance","correctness"]}

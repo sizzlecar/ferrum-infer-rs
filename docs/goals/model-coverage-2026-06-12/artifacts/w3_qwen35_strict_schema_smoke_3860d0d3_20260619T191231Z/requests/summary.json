@@ -1,0 +1,20 @@
+{
+  "status": "pass",
+  "nonstream_text": "{\"answer\":\"scenario-ok\"}",
+  "stream_done_count": 1,
+  "stream_content_chunks": 9,
+  "stream_usage_seen": true,
+  "tool_calls": [
+    {
+      "id": "call_0",
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\":\"Paris\"}"
+      }
+    }
+  ],
+  "structured": {
+    "answer": "scenario-ok"
+  }
+}

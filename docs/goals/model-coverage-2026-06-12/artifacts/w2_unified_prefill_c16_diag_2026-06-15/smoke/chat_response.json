@@ -1,0 +1,21 @@
+{
+  "id": "1cc39fc6-486d-4cee-8ea1-60474aeb2002",
+  "object": "chat.completion",
+  "created": 1781522411,
+  "model": "gemma3:27b-gptq",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "5\n"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 23,
+    "completion_tokens": 3,
+    "total_tokens": 26
+  }
+}

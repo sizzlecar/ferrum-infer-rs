@@ -1,0 +1,2 @@
+W3 QWEN35 VLLM H256 SMOKE PASS: /workspace/artifacts/w3_qwen35_vllm_h256_smoke_178d76fa_20260619T180824Z
+ABORTED: operator stopped cold-cache build before completion; ignore earlier trap PASS line

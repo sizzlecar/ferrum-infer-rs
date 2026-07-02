@@ -1,0 +1,16 @@
+{
+  "chat_template_kwargs": {
+    "enable_thinking": true
+  },
+  "max_tokens": 256,
+  "messages": [
+    {
+      "content": "Think briefly, then answer: what is 1+1?",
+      "role": "user"
+    }
+  ],
+  "model": "3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b",
+  "seed": 9271,
+  "stream": false,
+  "temperature": 0
+}

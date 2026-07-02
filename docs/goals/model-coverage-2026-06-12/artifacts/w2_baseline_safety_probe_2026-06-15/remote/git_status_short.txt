@@ -1,0 +1,31 @@
+ M README.md
+ M README_zh.md
+ M crates/ferrum-engine/src/continuous_engine.rs
+ M crates/ferrum-engine/src/continuous_engine/inner/batch.rs
+ M crates/ferrum-engine/src/continuous_engine/inner/decode.rs
+ M crates/ferrum-engine/src/continuous_engine/tests.rs
+ M crates/ferrum-interfaces/src/model_executor.rs
+ M crates/ferrum-kernels/build.rs
+ M crates/ferrum-kernels/kernels/argmax_rows.cu
+ M crates/ferrum-kernels/kernels/batched_decode_attention.cu
+ M crates/ferrum-kernels/kernels/common.cuh
+ M crates/ferrum-kernels/kernels/decode_attention_hm.cu
+ M crates/ferrum-kernels/src/backend/cuda/mod.rs
+ M crates/ferrum-kernels/src/backend/cuda/quant.rs
+ M crates/ferrum-kernels/src/backend/traits.rs
+ M crates/ferrum-kernels/tests/cuda_activation_precision.rs
+ M crates/ferrum-kernels/tests/flash_attn_batched_eq.rs
+ M crates/ferrum-models/src/common/llm.rs
+ M crates/ferrum-models/src/executor/llm_executor.rs
+ M crates/ferrum-models/src/models/llama_family.rs
+ M crates/ferrum-models/src/models/llama_family_forward_batched.rs
+ M docs/goals/model-coverage-2026-06-12/ACTIVE_PODS.md
+ M docs/goals/model-coverage-2026-06-12/GOAL.md
+ M docs/goals/model-coverage-2026-06-12/STATUS.md
+ M docs/goals/model-coverage-2026-06-12/W3_CHARTER.md
+ M scripts/README.md
+ M scripts/release/selftest_g0_validators.py
+?? crates/ferrum-kernels/kernels/sandwich_norm.cu
+?? crates/ferrum-kernels/tests/argmax_rows.rs
+?? docs/goals/model-coverage-2026-06-12/RELEASE_GRADE_GOAL.md
+?? scripts/release/model_release_grade_goal_gate.py

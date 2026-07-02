@@ -1,0 +1,263 @@
+{
+  "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_down_l2_persist_native_probe_2026-06-16",
+  "binary_sha256": "c3fafa5657c5dbc1496f6a9790ffc4440cb4f17ddf01014f55df1212226826f3",
+  "interpretation": "CUDA stream access-policy for down qweight materially restores down_proj performance after the product-shaped gate_up+GeGLU producer. On m16, no policy is 70.342us while full-window persisting is 35.088us and hit_ratio=0.6 is 33.158us. On m32, no policy is 75.148us while full-window persisting is 55.545us. This confirms a concrete W2 lever: productize a typed CUDA L2 residency policy for dense Marlin down_proj, then validate correctness before endpoint performance claims.",
+  "key_metrics": {
+    "m16_no_policy_after_gate_up_us": 70.342,
+    "m16_persist_full_hit100_us": 35.088,
+    "m16_persist_full_hit60_us": 33.158,
+    "m16_persist_half_hit100_us": 40.936,
+    "m16_warm_baseline_us": 35.135,
+    "m32_no_policy_after_gate_up_us": 75.148,
+    "m32_persist_full_hit100_us": 55.545,
+    "m32_persist_full_hit60_us": 54.434,
+    "m32_warm_baseline_us": 55.127,
+    "policy_window_bytes": 57802752
+  },
+  "lane": "W2 Gemma3 down L2 persistence native probe",
+  "probe_rc": 0,
+  "remote_head": "6cf26ca99f1958d2e326245bbe55fd8ed22c7e4a",
+  "rows": [
+    {
+      "down_us": 34.571,
+      "m": 1,
+      "mode": "down_repeated_warm_baseline",
+      "policy_window_bytes": 0,
+      "ret": 0,
+      "useful_tflops": 6.69
+    },
+    {
+      "down_us": 69.147,
+      "m": 1,
+      "mode": "no_policy_after_gate_up",
+      "policy_window_bytes": 0,
+      "ret": 0,
+      "useful_tflops": 3.34
+    },
+    {
+      "down_us": 37.15,
+      "m": 1,
+      "mode": "persist_down_full_hit_100",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 6.22
+    },
+    {
+      "down_us": 41.672,
+      "m": 1,
+      "mode": "persist_down_half_hit_100",
+      "policy_window_bytes": 28901376,
+      "ret": 0,
+      "useful_tflops": 5.55
+    },
+    {
+      "down_us": 34.44,
+      "m": 1,
+      "mode": "persist_down_full_hit_60",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 6.71
+    },
+    {
+      "down_us": 36.744,
+      "m": 1,
+      "mode": "persist_down_full_hit_100_after_down_warm",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 6.29
+    },
+    {
+      "down_us": 35.602,
+      "m": 10,
+      "mode": "down_repeated_warm_baseline",
+      "policy_window_bytes": 0,
+      "ret": 0,
+      "useful_tflops": 64.94
+    },
+    {
+      "down_us": 69.406,
+      "m": 10,
+      "mode": "no_policy_after_gate_up",
+      "policy_window_bytes": 0,
+      "ret": 0,
+      "useful_tflops": 33.31
+    },
+    {
+      "down_us": 36.882,
+      "m": 10,
+      "mode": "persist_down_full_hit_100",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 62.69
+    },
+    {
+      "down_us": 41.812,
+      "m": 10,
+      "mode": "persist_down_half_hit_100",
+      "policy_window_bytes": 28901376,
+      "ret": 0,
+      "useful_tflops": 55.3
+    },
+    {
+      "down_us": 34.263,
+      "m": 10,
+      "mode": "persist_down_full_hit_60",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 67.48
+    },
+    {
+      "down_us": 36.928,
+      "m": 10,
+      "mode": "persist_down_full_hit_100_after_down_warm",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 62.61
+    },
+    {
+      "down_us": 35.135,
+      "m": 16,
+      "mode": "down_repeated_warm_baseline",
+      "policy_window_bytes": 0,
+      "ret": 0,
+      "useful_tflops": 105.29
+    },
+    {
+      "down_us": 70.342,
+      "m": 16,
+      "mode": "no_policy_after_gate_up",
+      "policy_window_bytes": 0,
+      "ret": 0,
+      "useful_tflops": 52.59
+    },
+    {
+      "down_us": 35.088,
+      "m": 16,
+      "mode": "persist_down_full_hit_100",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 105.43
+    },
+    {
+      "down_us": 40.936,
+      "m": 16,
+      "mode": "persist_down_half_hit_100",
+      "policy_window_bytes": 28901376,
+      "ret": 0,
+      "useful_tflops": 90.37
+    },
+    {
+      "down_us": 33.158,
+      "m": 16,
+      "mode": "persist_down_full_hit_60",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 111.57
+    },
+    {
+      "down_us": 34.696,
+      "m": 16,
+      "mode": "persist_down_full_hit_100_after_down_warm",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 106.62
+    },
+    {
+      "down_us": 54.319,
+      "m": 23,
+      "mode": "down_repeated_warm_baseline",
+      "policy_window_bytes": 0,
+      "ret": 0,
+      "useful_tflops": 97.9
+    },
+    {
+      "down_us": 73.669,
+      "m": 23,
+      "mode": "no_policy_after_gate_up",
+      "policy_window_bytes": 0,
+      "ret": 0,
+      "useful_tflops": 72.19
+    },
+    {
+      "down_us": 54.434,
+      "m": 23,
+      "mode": "persist_down_full_hit_100",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 97.69
+    },
+    {
+      "down_us": 53.87,
+      "m": 23,
+      "mode": "persist_down_half_hit_100",
+      "policy_window_bytes": 28901376,
+      "ret": 0,
+      "useful_tflops": 98.72
+    },
+    {
+      "down_us": 53.445,
+      "m": 23,
+      "mode": "persist_down_full_hit_60",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 99.5
+    },
+    {
+      "down_us": 54.51,
+      "m": 23,
+      "mode": "persist_down_full_hit_100_after_down_warm",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 97.56
+    },
+    {
+      "down_us": 55.127,
+      "m": 32,
+      "mode": "down_repeated_warm_baseline",
+      "policy_window_bytes": 0,
+      "ret": 0,
+      "useful_tflops": 134.21
+    },
+    {
+      "down_us": 75.148,
+      "m": 32,
+      "mode": "no_policy_after_gate_up",
+      "policy_window_bytes": 0,
+      "ret": 0,
+      "useful_tflops": 98.46
+    },
+    {
+      "down_us": 55.545,
+      "m": 32,
+      "mode": "persist_down_full_hit_100",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 133.2
+    },
+    {
+      "down_us": 54.904,
+      "m": 32,
+      "mode": "persist_down_half_hit_100",
+      "policy_window_bytes": 28901376,
+      "ret": 0,
+      "useful_tflops": 134.76
+    },
+    {
+      "down_us": 54.434,
+      "m": 32,
+      "mode": "persist_down_full_hit_60",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 135.92
+    },
+    {
+      "down_us": 55.09,
+      "m": 32,
+      "mode": "persist_down_full_hit_100_after_down_warm",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 134.3
+    }
+  ],
+  "verdict_line": "VERDICT: gemma3 down L2 persistence native CUDA probe complete"
+}

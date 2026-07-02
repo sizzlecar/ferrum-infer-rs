@@ -1,0 +1,272 @@
+{
+  "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_triton_w4a16_native_probe_2026-06-16",
+  "binary_sha256": "83a8112f31951e930b90736fcc7a7a99db69936fdebfa1f92b17449159a6e77c",
+  "git_head": "2847822395e857cbe23196b9590b88479eadeb60",
+  "interpretation": "The existing Triton W4A16 dense GPTQ PTX is much slower than Marlin on Gemma3 tail-MLP shapes. It is not a viable W2 c16 performance lever without a new Triton kernel/tile design.",
+  "key_findings": {
+    "down_m16_marlin_us": 32.527,
+    "down_m16_triton_over_marlin": 18.747901743167215,
+    "down_m16_triton_us": 609.813,
+    "gate_up_m16_marlin_us": 137.111,
+    "gate_up_m16_triton_over_marlin": 4.514036072962782,
+    "gate_up_m16_triton_us": 618.924
+  },
+  "lane": "W2 Gemma3 dense Triton W4A16 vs Marlin native probe",
+  "probe_rc": 0,
+  "ratios": {
+    "down_m10_triton_over_marlin_us": 17.557793509585267,
+    "down_m16_triton_over_marlin_us": 18.747901743167215,
+    "down_m1_triton_over_marlin_us": 17.74345148837061,
+    "down_m23_triton_over_marlin_us": 12.386230973843654,
+    "down_m32_triton_over_marlin_us": 13.744807720534274,
+    "gate_up_m10_triton_over_marlin_us": 4.267820339182664,
+    "gate_up_m16_triton_over_marlin_us": 4.514036072962782,
+    "gate_up_m1_triton_over_marlin_us": 4.0760377330103665,
+    "gate_up_m23_triton_over_marlin_us": 4.718479829663185,
+    "gate_up_m32_triton_over_marlin_us": 5.531238274585319
+  },
+  "remote_git_status_short": "",
+  "rows": [
+    {
+      "backend": "marlin_product_ws_zero",
+      "m": 1,
+      "ret": 0,
+      "shape": "gate_up",
+      "us": 132.934,
+      "useful_tflops": 3.48
+    },
+    {
+      "backend": "marlin_kernel_only_ws_prezero_diagnostic",
+      "m": 1,
+      "ret": 0,
+      "shape": "gate_up",
+      "us": 129.999,
+      "useful_tflops": 3.56
+    },
+    {
+      "backend": "triton_w4a16",
+      "m": 1,
+      "ret": 0,
+      "shape": "gate_up",
+      "us": 541.844,
+      "useful_tflops": 0.85
+    },
+    {
+      "backend": "marlin_product_ws_zero",
+      "m": 10,
+      "ret": 0,
+      "shape": "gate_up",
+      "us": 135.856,
+      "useful_tflops": 34.04
+    },
+    {
+      "backend": "marlin_kernel_only_ws_prezero_diagnostic",
+      "m": 10,
+      "ret": 0,
+      "shape": "gate_up",
+      "us": 133.511,
+      "useful_tflops": 34.64
+    },
+    {
+      "backend": "triton_w4a16",
+      "m": 10,
+      "ret": 0,
+      "shape": "gate_up",
+      "us": 579.809,
+      "useful_tflops": 7.98
+    },
+    {
+      "backend": "marlin_product_ws_zero",
+      "m": 16,
+      "ret": 0,
+      "shape": "gate_up",
+      "us": 137.111,
+      "useful_tflops": 53.96
+    },
+    {
+      "backend": "marlin_kernel_only_ws_prezero_diagnostic",
+      "m": 16,
+      "ret": 0,
+      "shape": "gate_up",
+      "us": 134.286,
+      "useful_tflops": 55.1
+    },
+    {
+      "backend": "triton_w4a16",
+      "m": 16,
+      "ret": 0,
+      "shape": "gate_up",
+      "us": 618.924,
+      "useful_tflops": 11.95
+    },
+    {
+      "backend": "marlin_product_ws_zero",
+      "m": 23,
+      "ret": 0,
+      "shape": "gate_up",
+      "us": 139.958,
+      "useful_tflops": 75.99
+    },
+    {
+      "backend": "marlin_kernel_only_ws_prezero_diagnostic",
+      "m": 23,
+      "ret": 0,
+      "shape": "gate_up",
+      "us": 137.152,
+      "useful_tflops": 77.55
+    },
+    {
+      "backend": "triton_w4a16",
+      "m": 23,
+      "ret": 0,
+      "shape": "gate_up",
+      "us": 660.389,
+      "useful_tflops": 16.11
+    },
+    {
+      "backend": "marlin_product_ws_zero",
+      "m": 32,
+      "ret": 0,
+      "shape": "gate_up",
+      "us": 141.253,
+      "useful_tflops": 104.76
+    },
+    {
+      "backend": "marlin_kernel_only_ws_prezero_diagnostic",
+      "m": 32,
+      "ret": 0,
+      "shape": "gate_up",
+      "us": 138.334,
+      "useful_tflops": 106.97
+    },
+    {
+      "backend": "triton_w4a16",
+      "m": 32,
+      "ret": 0,
+      "shape": "gate_up",
+      "us": 781.304,
+      "useful_tflops": 18.94
+    },
+    {
+      "backend": "marlin_product_ws_zero",
+      "m": 1,
+      "ret": 0,
+      "shape": "down",
+      "us": 31.343,
+      "useful_tflops": 7.38
+    },
+    {
+      "backend": "marlin_kernel_only_ws_prezero_diagnostic",
+      "m": 1,
+      "ret": 0,
+      "shape": "down",
+      "us": 29.456,
+      "useful_tflops": 7.85
+    },
+    {
+      "backend": "triton_w4a16",
+      "m": 1,
+      "ret": 0,
+      "shape": "down",
+      "us": 556.133,
+      "useful_tflops": 0.42
+    },
+    {
+      "backend": "marlin_product_ws_zero",
+      "m": 10,
+      "ret": 0,
+      "shape": "down",
+      "us": 31.924,
+      "useful_tflops": 72.43
+    },
+    {
+      "backend": "marlin_kernel_only_ws_prezero_diagnostic",
+      "m": 10,
+      "ret": 0,
+      "shape": "down",
+      "us": 29.741,
+      "useful_tflops": 77.74
+    },
+    {
+      "backend": "triton_w4a16",
+      "m": 10,
+      "ret": 0,
+      "shape": "down",
+      "us": 560.515,
+      "useful_tflops": 4.12
+    },
+    {
+      "backend": "marlin_product_ws_zero",
+      "m": 16,
+      "ret": 0,
+      "shape": "down",
+      "us": 32.527,
+      "useful_tflops": 113.73
+    },
+    {
+      "backend": "marlin_kernel_only_ws_prezero_diagnostic",
+      "m": 16,
+      "ret": 0,
+      "shape": "down",
+      "us": 30.57,
+      "useful_tflops": 121.01
+    },
+    {
+      "backend": "triton_w4a16",
+      "m": 16,
+      "ret": 0,
+      "shape": "down",
+      "us": 609.813,
+      "useful_tflops": 6.07
+    },
+    {
+      "backend": "marlin_product_ws_zero",
+      "m": 23,
+      "ret": 0,
+      "shape": "down",
+      "us": 54.136,
+      "useful_tflops": 98.23
+    },
+    {
+      "backend": "marlin_kernel_only_ws_prezero_diagnostic",
+      "m": 23,
+      "ret": 0,
+      "shape": "down",
+      "us": 52.2,
+      "useful_tflops": 101.88
+    },
+    {
+      "backend": "triton_w4a16",
+      "m": 23,
+      "ret": 0,
+      "shape": "down",
+      "us": 670.541,
+      "useful_tflops": 7.93
+    },
+    {
+      "backend": "marlin_product_ws_zero",
+      "m": 32,
+      "ret": 0,
+      "shape": "down",
+      "us": 54.504,
+      "useful_tflops": 135.75
+    },
+    {
+      "backend": "marlin_kernel_only_ws_prezero_diagnostic",
+      "m": 32,
+      "ret": 0,
+      "shape": "down",
+      "us": 52.627,
+      "useful_tflops": 140.59
+    },
+    {
+      "backend": "triton_w4a16",
+      "m": 32,
+      "ret": 0,
+      "shape": "down",
+      "us": 749.147,
+      "useful_tflops": 9.88
+    }
+  ],
+  "verdict_line": "VERDICT: dense Triton W4A16 Gemma3 native CUDA probe complete"
+}

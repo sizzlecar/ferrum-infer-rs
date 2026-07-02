@@ -1,0 +1,14 @@
+2026-06-24T21:09:05Z lane_start art=/workspace/artifacts/w3_qwen35_decode_backpressure_c32_f304fd8d_20260624T210905Z sha=f304fd8de882c3bf729c314491167e8dcf8a84d5 release_evidence=false no_live_vllm=true
+2026-06-24T21:09:06Z git_sync_start
+2026-06-24T21:09:06Z git_sync_done
+2026-06-24T21:09:06Z cargo_check_start
+2026-06-24T21:09:07Z cargo_check_done
+2026-06-24T21:09:07Z release_build_start
+2026-06-24T21:12:19Z release_build_done
+2026-06-24T21:12:19Z ferrum_run_smoke_start
+2026-06-24T21:12:44Z ferrum_run_smoke_done
+2026-06-24T21:12:44Z serve_start
+2026-06-24T21:13:11Z serve_ready
+2026-06-24T21:13:11Z serve_chat_smoke_done
+2026-06-24T21:13:11Z bench_c32_start
+2026-06-24T21:13:30Z FERRUM W3 QWEN35 DECODE BACKPRESSURE C32 DIAG PASS: /workspace/artifacts/w3_qwen35_decode_backpressure_c32_f304fd8d_20260624T210905Z

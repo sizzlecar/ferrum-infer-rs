@@ -1,0 +1,10 @@
+info: downloading installer
+warn: It looks like you have an existing rustup settings file at:
+warn: /root/.rustup/settings.toml
+warn: Rustup will install the default toolchain as specified in the settings file,
+warn: instead of the one inferred from the default host triple.
+info: profile set to minimal
+info: default host triple is x86_64-unknown-linux-gnu
+warn: Updating existing toolchain, profile choice will be ignored
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: default toolchain set to stable-x86_64-unknown-linux-gnu

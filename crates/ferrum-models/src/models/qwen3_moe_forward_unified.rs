@@ -216,6 +216,10 @@ where
             .ensure_unified_scratch(&cfg_clone, max_seqs, max_blocks_per_seq);
 
         let mut ctx = B::new_context();
+        for (cid, tokens, pos_offset, _) in items {
+            self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cid, *pos_offset + tokens.len())
+                .expect("paged KV dynamic grow");
+        }
 
         // ── 4. Take legacy residual, embed all tokens into it ──
         let mut residual = self

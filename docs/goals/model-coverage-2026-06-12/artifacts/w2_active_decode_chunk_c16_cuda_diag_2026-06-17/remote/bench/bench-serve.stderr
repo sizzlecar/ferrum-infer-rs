@@ -1,0 +1,13 @@
+ferrum bench-serve — dataset=random num_prompts=16 warmup=10 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/1 (26 prompts including 10 warmup)
+    16 completed / 0 errored / 7.0s
+    summary c=16 (n_repeats=1, no CI)
+      TTFT_ms  p50=2611.9  p95=2685.1  p99=2685.2
+      TPOT_ms  p50=33.9  p95=42.2  p99=42.2
+      ITL_ms   p50=33.6  p95=89.2  p99=104.8
+      throughput      294.6 tok/s
+      goodput         2.30 req/s
+
+→ wrote /workspace/w2_active_decode_chunk_c16_cuda_diag_2026-06-17/bench/bench_random_c16.json

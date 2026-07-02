@@ -136,7 +136,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
 
     let engine_model_path = source.local_path.to_string_lossy().to_string();
 
-    let device = super::run::select_device(&cmd.backend);
+    let device = super::run::select_device(&cmd.backend)?;
     let backend_str = format!("{:?}", device).to_lowercase();
     eprintln!("{} {:?}", "Device:".dimmed(), device);
     let runtime_config = ferrum_types::RuntimeConfigSnapshot::capture_current();

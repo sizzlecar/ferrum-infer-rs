@@ -1,0 +1,20 @@
+[microbench] compiling scripts/microbenches/gemma3_down_prefetch_overlap_perf.cu
+-rwxr-xr-x 1 root root 699776 Jun 15 23:53 /workspace/ferrum-artifacts/w2_down_prefetch_overlap_native_probe_2026-06-16/gemma3_down_prefetch_overlap_perf
+
+[microbench] running /workspace/ferrum-artifacts/w2_down_prefetch_overlap_native_probe_2026-06-16/gemma3_down_prefetch_overlap_perf
+gemma3_down_prefetch_overlap_perf device=NVIDIA GeForce RTX 4090 sm=8.9 h=5376 im=21504 layers=8 l2=75497472 persist_max=51904512 access_window_max=134213632
+mode,m,down_us,segment_host_us,useful_tflops,ret
+cycle8_no_prefetch,16,69.744,216.072,53.04,0
+cycle8_policy_only,16,69.657,215.884,53.11,0
+cycle8_overlap_qweight,16,34.063,239.437,108.61,0
+cycle8_overlap_qweight_scales,16,32.560,238.979,113.62,0
+cycle8_serial_qweight_scales,16,32.584,243.142,113.53,0
+cycle8_down_warm_upper,16,32.817,246.239,112.73,0
+cycle8_no_prefetch,32,74.849,227.628,98.85,0
+cycle8_policy_only,32,74.777,227.090,98.94,0
+cycle8_overlap_qweight,32,53.836,268.300,137.43,0
+cycle8_overlap_qweight_scales,32,53.790,269.916,137.55,0
+cycle8_serial_qweight_scales,32,53.868,273.308,137.35,0
+cycle8_down_warm_upper,32,54.054,280.983,136.88,0
+
+VERDICT: gemma3 down prefetch-overlap native CUDA probe complete

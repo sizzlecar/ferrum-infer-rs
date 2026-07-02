@@ -1,0 +1,106 @@
+Loading /workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b...
+Using CUDA(0) backend
+Loading weights to GPU... (30s+ for >10 GB models)
+[2m2026-06-19T16:24:58.390504Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-19T16:24:58.390566Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-19T16:24:58.390596Z[0m [32m INFO[0m [2mferrum_engine::builder[0m[2m:[0m Building inference engine for model: /workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+[2m2026-06-19T16:24:58.390702Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b/tokenizer.json"
+[2m2026-06-19T16:24:58.808559Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-19T16:24:58.808612Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-19T16:24:58.808619Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-19T16:24:58.808640Z[0m [32m INFO[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Creating continuous batch scheduler: max_prefill=8, max_decode=256
+[2m2026-06-19T16:24:58.808645Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=2048
+[2m2026-06-19T16:24:58.808650Z[0m [32m INFO[0m [2mferrum_kv::managers::paged[0m[2m:[0m Creating paged KV cache manager: device=CUDA(0), block_size=16, max_gpu_blocks=2048, max_cpu_blocks=1024, prefix_cache=true
+[2m2026-06-19T16:24:58.808718Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b (format: safetensors)
+[2m2026-06-19T16:24:58.808957Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Qwen35Moe, Layers: 40, Vocab: 248320
+[2m2026-06-19T16:24:59.071273Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-19T16:24:59.071314Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Using Qwen3.5/Qwen3.6 CUDA backend executor
+[2m2026-06-19T16:25:06.226700Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:06.470687Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:07.057516Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:07.304906Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:07.738228Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:07.910348Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:08.318113Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:08.489653Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:08.962390Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:09.058026Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:09.411090Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:09.505917Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:09.858350Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:09.952021Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:10.290972Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:10.383396Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:10.734545Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:10.830263Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:11.180224Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:11.273478Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:11.636191Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:11.730599Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:12.066146Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:12.160141Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:12.515598Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:12.611483Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:13.016225Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:13.127959Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:13.498228Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:13.592736Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:13.935307Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:14.031357Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:14.387167Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:14.481189Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:14.835178Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:14.930922Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:15.284703Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:15.378751Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:15.716044Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:15.811191Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:16.165250Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:16.259518Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:16.611233Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:16.704815Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:17.062366Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:17.156781Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:17.506295Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:17.609157Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:17.964594Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:18.058498Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:18.412754Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:18.507745Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:18.951788Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:19.059622Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:19.433719Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:19.536400Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:19.927351Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:20.038559Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:20.450831Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:20.553721Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:20.948826Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:21.052572Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:21.422894Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:21.526529Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:21.918106Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:22.021707Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:22.436334Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:22.541776Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:22.931274Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:23.098960Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:23.486278Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:23.590836Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:23.985321Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:24.087256Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:24.474299Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:24.575021Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:24.967764Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:25.068716Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:25.440108Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=1024 × K=2048 (gs=128)
+[2m2026-06-19T16:25:25.539915Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda::quant[0m[2m:[0m GPTQ stacked load (vLLM marlin path): 256 experts × N=2048 × K=512 (gs=128)
+[2m2026-06-19T16:25:26.847213Z[0m [32m INFO[0m [2mferrum_engine::builder[0m[2m:[0m All components created, building ContinuousBatchEngine
+[2m2026-06-19T16:25:26.847255Z[0m [32m INFO[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Creating continuous batch scheduler: max_prefill=8, max_decode=256
+[2m2026-06-19T16:25:26.847265Z[0m [32m INFO[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Creating ContinuousBatchEngine (speculative_decoding=false, recurrent_state_manager=false)
+Model loaded in 28.9s.
+[2m2026-06-19T16:25:26.848999Z[0m [32m INFO[0m [2mferrum_scheduler::implementations::continuous[0m[2m:[0m Request c6340c0d-a486-4b24-86cd-8b9f3376f6cd queued at position 0
+[2m2026-06-19T16:25:27.021362Z[0m [32m INFO[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Background iteration loop started
+[2m2026-06-19T16:25:27.317691Z[0m [32m INFO[0m [2mferrum_kernels::backend::cuda[0m[2m:[0m vLLM moe c_tmp scratch allocated (device 0): 4194304 fp32 (16.8 MB)
+[2m2026-06-19T16:25:30.958094Z[0m [32m INFO[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Shutting down continuous batch engine
+[2m2026-06-19T16:25:30.960078Z[0m [32m INFO[0m [2mferrum_engine::continuous_engine[0m[2m:[0m Background iteration loop stopped

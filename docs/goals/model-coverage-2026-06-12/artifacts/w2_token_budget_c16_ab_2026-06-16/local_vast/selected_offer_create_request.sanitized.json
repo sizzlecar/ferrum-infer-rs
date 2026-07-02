@@ -1,0 +1,9 @@
+{
+  "image": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+  "disk": 220,
+  "runtype": "ssh",
+  "target_state": "running",
+  "cancel_unavail": true,
+  "label": "ferrum-w2-token-budget-c16-ab-20260616",
+  "onstart_present": true
+}

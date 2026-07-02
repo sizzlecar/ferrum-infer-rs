@@ -1,0 +1,12 @@
+artifact=/workspace/artifacts/w3_qwen35_tiled_recurrent_ab_20260620T084108Z_5d16eed8
+sha=5d16eed8f28e5191499b70a5dbf9718814dafeb3
+short_sha=5d16eed8
+branch=goal/w2-w3-release-grade
+baseline_shared_pack_artifact=/workspace/artifacts/w3_qwen35_shared_pack_ab_20260620T080831Z_47c4963b
+status_start
+## goal/w2-w3-release-grade...origin/goal/w2-w3-release-grade
+status_end
+gpu_start
+0, NVIDIA GeForce RTX 4090, GPU-42c92344-3195-9df2-4b65-884f1180fb3a, 49140 MiB, 28478 MiB, 580.126.09
+GPU 0: NVIDIA GeForce RTX 4090 (UUID: GPU-42c92344-3195-9df2-4b65-884f1180fb3a)
+gpu_end

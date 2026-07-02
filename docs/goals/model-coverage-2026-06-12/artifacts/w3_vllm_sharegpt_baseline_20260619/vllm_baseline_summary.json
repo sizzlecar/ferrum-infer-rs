@@ -1,0 +1,97 @@
+{
+  "artifact": "/tmp/ferrum_w3_sharegpt_ab_20b8946b_20260619T121844Z_ninja",
+  "baseline": [
+    {
+      "bad_output_per_run": [
+        0,
+        0,
+        0
+      ],
+      "completed_per_run": [
+        100,
+        100,
+        100
+      ],
+      "concurrency": 1,
+      "errored_per_run": [
+        0,
+        0,
+        0
+      ],
+      "ferrum_80pct_target_lcb": 107.49519219497597,
+      "output_tps_ci95_hw": 1.7739411162039003,
+      "output_tps_lcb": 134.36899024371996,
+      "output_tps_mean": 136.14293135992386,
+      "p95_itl_ms_mean": 6.792227883333332
+    },
+    {
+      "bad_output_per_run": [
+        0,
+        0,
+        0
+      ],
+      "completed_per_run": [
+        100,
+        100,
+        100
+      ],
+      "concurrency": 4,
+      "errored_per_run": [
+        0,
+        0,
+        0
+      ],
+      "ferrum_80pct_target_lcb": 324.0457202740351,
+      "output_tps_ci95_hw": 0.3631434621792242,
+      "output_tps_lcb": 405.0571503425438,
+      "output_tps_mean": 405.42029380472303,
+      "p95_itl_ms_mean": 9.119937366666667
+    },
+    {
+      "bad_output_per_run": [
+        0,
+        0,
+        0
+      ],
+      "completed_per_run": [
+        100,
+        100,
+        100
+      ],
+      "concurrency": 16,
+      "errored_per_run": [
+        0,
+        0,
+        0
+      ],
+      "ferrum_80pct_target_lcb": 896.2394148210169,
+      "output_tps_ci95_hw": 70.39281731137055,
+      "output_tps_lcb": 1120.2992685262711,
+      "output_tps_mean": 1190.6920858376418,
+      "p95_itl_ms_mean": 11.890187833333334
+    },
+    {
+      "bad_output_per_run": [
+        0,
+        0,
+        0
+      ],
+      "completed_per_run": [
+        100,
+        100,
+        100
+      ],
+      "concurrency": 32,
+      "errored_per_run": [
+        0,
+        0,
+        0
+      ],
+      "ferrum_80pct_target_lcb": 1349.9172251907225,
+      "output_tps_ci95_hw": 21.131318754648866,
+      "output_tps_lcb": 1687.396531488403,
+      "output_tps_mean": 1708.527850243052,
+      "p95_itl_ms_mean": 15.709839666666667
+    }
+  ]
+}

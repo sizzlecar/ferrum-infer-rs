@@ -1,0 +1,8 @@
+{
+  "fastapi": "0.116.1",
+  "prometheus-fastapi-instrumentator": "7.1.0",
+  "starlette": "0.47.2",
+  "torch": "2.7.1",
+  "transformers": "4.55.4",
+  "vllm": "0.10.1.1"
+}

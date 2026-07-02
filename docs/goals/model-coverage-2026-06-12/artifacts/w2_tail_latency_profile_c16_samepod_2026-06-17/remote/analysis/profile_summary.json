@@ -1,0 +1,7785 @@
+{
+  "all_rows_by_decode_count": {
+    "0": {
+      "act_us": {
+        "count": 3,
+        "max": 10470,
+        "mean": 6743.0,
+        "p50": 9158,
+        "p95": 10470
+      },
+      "attn_us": {
+        "count": 3,
+        "max": 40509,
+        "mean": 26052.0,
+        "p50": 35357,
+        "p95": 40509
+      },
+      "count": 3,
+      "down_us": {
+        "count": 3,
+        "max": 128152,
+        "mean": 82205.0,
+        "p50": 112895,
+        "p95": 128152
+      },
+      "final_copy_us": {
+        "count": 3,
+        "max": 51,
+        "mean": 41.666666666666664,
+        "p50": 47,
+        "p95": 51
+      },
+      "final_norm_us": {
+        "count": 3,
+        "max": 25,
+        "mean": 19.333333333333332,
+        "p50": 23,
+        "p95": 25
+      },
+      "gate_up_us": {
+        "count": 3,
+        "max": 221922,
+        "mean": 142208.66666666666,
+        "p50": 195127,
+        "p95": 221922
+      },
+      "generic_attn_us": {
+        "count": 3,
+        "max": 40509,
+        "mean": 26052.0,
+        "p50": 35357,
+        "p95": 40509
+      },
+      "generic_matmul_us": {
+        "count": 3,
+        "max": 422552,
+        "mean": 342489.3333333333,
+        "p50": 373012,
+        "p95": 422552
+      },
+      "generic_norm_us": {
+        "count": 3,
+        "max": 6650,
+        "mean": 4758.0,
+        "p50": 6063,
+        "p95": 6650
+      },
+      "generic_other_us": {
+        "count": 3,
+        "max": 13783,
+        "mean": 9087.333333333334,
+        "p50": 12218,
+        "p95": 13783
+      },
+      "generic_qkr_us": {
+        "count": 3,
+        "max": 2877,
+        "mean": 2301.0,
+        "p50": 2657,
+        "p95": 2877
+      },
+      "lm_head_us": {
+        "count": 3,
+        "max": 199418,
+        "mean": 68615.66666666667,
+        "p50": 3296,
+        "p95": 199418
+      },
+      "marlin_gather_us": {
+        "count": 3,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 3,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 3,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 3,
+        "max": 6625,
+        "mean": 4738.666666666667,
+        "p50": 6040,
+        "p95": 6625
+      },
+      "o_proj_us": {
+        "count": 3,
+        "max": 23681,
+        "mean": 15831.333333333334,
+        "p50": 21446,
+        "p95": 23681
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 3,
+        "max": 2877,
+        "mean": 2301.0,
+        "p50": 2657,
+        "p95": 2877
+      },
+      "qkv_us": {
+        "count": 3,
+        "max": 45501,
+        "mean": 33628.666666666664,
+        "p50": 40411,
+        "p95": 45501
+      },
+      "readback_us": {
+        "count": 3,
+        "max": 768,
+        "mean": 598.0,
+        "p50": 513,
+        "p95": 768
+      },
+      "resid_us": {
+        "count": 3,
+        "max": 3262,
+        "mean": 2302.6666666666665,
+        "p50": 3013,
+        "p95": 3262
+      },
+      "share_of_total": {
+        "act": 0.017469952872839572,
+        "attn": 0.06749624977654109,
+        "down": 0.21297901170276987,
+        "final_copy": 0.00010795116462034438,
+        "final_norm": 5.0089340383839795e-05,
+        "gate_up": 0.36843818845855236,
+        "generic_attn": 0.06749624977654109,
+        "generic_matmul": 0.8873309376810881,
+        "generic_norm": 0.012327159390326367,
+        "generic_other": 0.02354371719903863,
+        "generic_qkr": 0.005961495114993899,
+        "lm_head": 0.17777138706883225,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.012277070049942527,
+        "o_proj": 0.04101626089982909,
+        "other": 0.0,
+        "qkr": 0.005961495114993899,
+        "qkv": 0.08712608955110451,
+        "readback": 0.0015493151146311827,
+        "resid": 0.005965813161578713,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.0017911257233807541
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 3,
+        "max": 487487,
+        "mean": 385977.0,
+        "p50": 430474,
+        "p95": 487487
+      },
+      "unwrapped_us": {
+        "count": 3,
+        "max": 817,
+        "mean": 691.3333333333334,
+        "p50": 654,
+        "p95": 817
+      }
+    },
+    "1": {
+      "act_us": {
+        "count": 2,
+        "max": 391,
+        "mean": 383.5,
+        "p50": 376,
+        "p95": 391
+      },
+      "attn_us": {
+        "count": 2,
+        "max": 739,
+        "mean": 731.5,
+        "p50": 724,
+        "p95": 739
+      },
+      "count": 2,
+      "down_us": {
+        "count": 2,
+        "max": 4954,
+        "mean": 4910.5,
+        "p50": 4867,
+        "p95": 4954
+      },
+      "final_copy_us": {
+        "count": 2,
+        "max": 14,
+        "mean": 11.5,
+        "p50": 9,
+        "p95": 14
+      },
+      "final_norm_us": {
+        "count": 2,
+        "max": 8,
+        "mean": 8.0,
+        "p50": 8,
+        "p95": 8
+      },
+      "gate_up_us": {
+        "count": 2,
+        "max": 8940,
+        "mean": 8855.0,
+        "p50": 8770,
+        "p95": 8940
+      },
+      "generic_attn_us": {
+        "count": 2,
+        "max": 739,
+        "mean": 731.5,
+        "p50": 724,
+        "p95": 739
+      },
+      "generic_matmul_us": {
+        "count": 2,
+        "max": 21355,
+        "mean": 21064.5,
+        "p50": 20774,
+        "p95": 21355
+      },
+      "generic_norm_us": {
+        "count": 2,
+        "max": 1241,
+        "mean": 1232.5,
+        "p50": 1224,
+        "p95": 1241
+      },
+      "generic_other_us": {
+        "count": 2,
+        "max": 907,
+        "mean": 894.5,
+        "p50": 882,
+        "p95": 907
+      },
+      "generic_qkr_us": {
+        "count": 2,
+        "max": 497,
+        "mean": 489.0,
+        "p50": 481,
+        "p95": 497
+      },
+      "lm_head_us": {
+        "count": 2,
+        "max": 2994,
+        "mean": 2976.0,
+        "p50": 2958,
+        "p95": 2994
+      },
+      "marlin_gather_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 2,
+        "max": 1233,
+        "mean": 1224.5,
+        "p50": 1216,
+        "p95": 1233
+      },
+      "o_proj_us": {
+        "count": 2,
+        "max": 1836,
+        "mean": 1792.5,
+        "p50": 1749,
+        "p95": 1836
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 2,
+        "max": 497,
+        "mean": 489.0,
+        "p50": 481,
+        "p95": 497
+      },
+      "qkv_us": {
+        "count": 2,
+        "max": 2631,
+        "mean": 2530.5,
+        "p50": 2430,
+        "p95": 2631
+      },
+      "readback_us": {
+        "count": 2,
+        "max": 311,
+        "mean": 310.0,
+        "p50": 309,
+        "p95": 311
+      },
+      "resid_us": {
+        "count": 2,
+        "max": 502,
+        "mean": 499.5,
+        "p50": 497,
+        "p95": 502
+      },
+      "share_of_total": {
+        "act": 0.01514164445760537,
+        "attn": 0.028881650380021717,
+        "down": 0.19388016977593525,
+        "final_copy": 0.0004540519198499655,
+        "final_norm": 0.00031586220511301943,
+        "gate_up": 0.3496199782844734,
+        "generic_attn": 0.028881650380021717,
+        "generic_matmul": 0.8316849274503998,
+        "generic_norm": 0.04866252097522456,
+        "generic_other": 0.03531734280919949,
+        "generic_qkr": 0.019307077287533312,
+        "lm_head": 0.11750074030204323,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.04834665877011154,
+        "o_proj": 0.07077287533313592,
+        "other": 0.0,
+        "qkr": 0.019307077287533312,
+        "qkv": 0.09991116375481196,
+        "readback": 0.012239660448129503,
+        "resid": 0.019721646431744153,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.02390682064949166
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 2,
+        "max": 25643,
+        "mean": 25327.5,
+        "p50": 25012,
+        "p95": 25643
+      },
+      "unwrapped_us": {
+        "count": 2,
+        "max": 618,
+        "mean": 605.5,
+        "p50": 593,
+        "p95": 618
+      }
+    },
+    "10": {
+      "act_us": {
+        "count": 26,
+        "max": 777,
+        "mean": 570.6923076923077,
+        "p50": 440,
+        "p95": 772
+      },
+      "attn_us": {
+        "count": 26,
+        "max": 6989,
+        "mean": 3767.9615384615386,
+        "p50": 2856,
+        "p95": 6523
+      },
+      "count": 26,
+      "down_us": {
+        "count": 26,
+        "max": 12904,
+        "mean": 7958.153846153846,
+        "p50": 5011,
+        "p95": 12900
+      },
+      "final_copy_us": {
+        "count": 26,
+        "max": 51,
+        "mean": 42.80769230769231,
+        "p50": 42,
+        "p95": 50
+      },
+      "final_norm_us": {
+        "count": 26,
+        "max": 14,
+        "mean": 9.192307692307692,
+        "p50": 9,
+        "p95": 10
+      },
+      "gate_up_us": {
+        "count": 26,
+        "max": 21004,
+        "mean": 13481.5,
+        "p50": 9005,
+        "p95": 20984
+      },
+      "generic_attn_us": {
+        "count": 26,
+        "max": 6989,
+        "mean": 3767.9615384615386,
+        "p50": 2856,
+        "p95": 6523
+      },
+      "generic_matmul_us": {
+        "count": 26,
+        "max": 47276,
+        "mean": 30867.615384615383,
+        "p50": 21075,
+        "p95": 47119
+      },
+      "generic_norm_us": {
+        "count": 26,
+        "max": 1428,
+        "mean": 1358.8461538461538,
+        "p50": 1344,
+        "p95": 1422
+      },
+      "generic_other_us": {
+        "count": 26,
+        "max": 1394,
+        "mean": 1169.2692307692307,
+        "p50": 1043,
+        "p95": 1391
+      },
+      "generic_qkr_us": {
+        "count": 26,
+        "max": 709,
+        "mean": 578.8461538461538,
+        "p50": 505,
+        "p95": 701
+      },
+      "lm_head_us": {
+        "count": 26,
+        "max": 3051,
+        "mean": 3023.8846153846152,
+        "p50": 3018,
+        "p95": 3043
+      },
+      "marlin_gather_us": {
+        "count": 26,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 26,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 26,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 26,
+        "max": 1418,
+        "mean": 1349.6538461538462,
+        "p50": 1335,
+        "p95": 1413
+      },
+      "o_proj_us": {
+        "count": 26,
+        "max": 4398,
+        "mean": 2695.269230769231,
+        "p50": 1781,
+        "p95": 4273
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 26,
+        "max": 709,
+        "mean": 578.8461538461538,
+        "p50": 505,
+        "p95": 701
+      },
+      "qkv_us": {
+        "count": 26,
+        "max": 6076,
+        "mean": 3708.8076923076924,
+        "p50": 2458,
+        "p95": 5776
+      },
+      "readback_us": {
+        "count": 26,
+        "max": 511,
+        "mean": 505.0,
+        "p50": 503,
+        "p95": 510
+      },
+      "resid_us": {
+        "count": 26,
+        "max": 578,
+        "mean": 555.7692307692307,
+        "p50": 558,
+        "p95": 576
+      },
+      "share_of_total": {
+        "act": 0.014700651810137882,
+        "attn": 0.09706016686101751,
+        "down": 0.20499671568535177,
+        "final_copy": 0.001102697497282886,
+        "final_norm": 0.00023678769258814894,
+        "gate_up": 0.34727441513935303,
+        "generic_attn": 0.09706016686101751,
+        "generic_matmul": 0.7951291087370695,
+        "generic_norm": 0.03500296727673348,
+        "generic_other": 0.03011959264590927,
+        "generic_qkr": 0.014910689428667955,
+        "lm_head": 0.07789324342666468,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.03476617958414533,
+        "o_proj": 0.06942833110250926,
+        "other": 0.0,
+        "qkr": 0.014910689428667955,
+        "qkv": 0.09553640338319085,
+        "readback": 0.013008461940093705,
+        "resid": 0.014316243338488502,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.014769013110508518
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 26,
+        "max": 57671,
+        "mean": 38820.88461538462,
+        "p50": 27567,
+        "p95": 57470
+      },
+      "unwrapped_us": {
+        "count": 26,
+        "max": 621,
+        "mean": 573.3461538461538,
+        "p50": 568,
+        "p95": 618
+      }
+    },
+    "11": {
+      "act_us": {
+        "count": 14,
+        "max": 733,
+        "mean": 673.8571428571429,
+        "p50": 682,
+        "p95": 733
+      },
+      "attn_us": {
+        "count": 14,
+        "max": 5887,
+        "mean": 4611.214285714285,
+        "p50": 4267,
+        "p95": 5887
+      },
+      "count": 14,
+      "down_us": {
+        "count": 14,
+        "max": 12471,
+        "mean": 11381.214285714286,
+        "p50": 12052,
+        "p95": 12471
+      },
+      "final_copy_us": {
+        "count": 14,
+        "max": 54,
+        "mean": 47.92857142857143,
+        "p50": 46,
+        "p95": 54
+      },
+      "final_norm_us": {
+        "count": 14,
+        "max": 9,
+        "mean": 9.0,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 14,
+        "max": 20586,
+        "mean": 19039.35714285714,
+        "p50": 20315,
+        "p95": 20586
+      },
+      "generic_attn_us": {
+        "count": 14,
+        "max": 5887,
+        "mean": 4611.214285714285,
+        "p50": 4267,
+        "p95": 5887
+      },
+      "generic_matmul_us": {
+        "count": 14,
+        "max": 45646,
+        "mean": 42157.142857142855,
+        "p50": 44498,
+        "p95": 45646
+      },
+      "generic_norm_us": {
+        "count": 14,
+        "max": 1422,
+        "mean": 1380.5714285714287,
+        "p50": 1383,
+        "p95": 1422
+      },
+      "generic_other_us": {
+        "count": 14,
+        "max": 1367,
+        "mean": 1288.357142857143,
+        "p50": 1291,
+        "p95": 1367
+      },
+      "generic_qkr_us": {
+        "count": 14,
+        "max": 691,
+        "mean": 640.9285714285714,
+        "p50": 635,
+        "p95": 691
+      },
+      "lm_head_us": {
+        "count": 14,
+        "max": 3064,
+        "mean": 3038.4285714285716,
+        "p50": 3037,
+        "p95": 3064
+      },
+      "marlin_gather_us": {
+        "count": 14,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 14,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 14,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 14,
+        "max": 1413,
+        "mean": 1371.5714285714287,
+        "p50": 1374,
+        "p95": 1413
+      },
+      "o_proj_us": {
+        "count": 14,
+        "max": 3939,
+        "mean": 3613.5,
+        "p50": 3760,
+        "p95": 3939
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 14,
+        "max": 691,
+        "mean": 640.9285714285714,
+        "p50": 635,
+        "p95": 691
+      },
+      "qkv_us": {
+        "count": 14,
+        "max": 5649,
+        "mean": 5084.642857142857,
+        "p50": 5302,
+        "p95": 5649
+      },
+      "readback_us": {
+        "count": 14,
+        "max": 507,
+        "mean": 503.2142857142857,
+        "p50": 503,
+        "p95": 507
+      },
+      "resid_us": {
+        "count": 14,
+        "max": 631,
+        "mean": 566.5714285714286,
+        "p50": 563,
+        "p95": 631
+      },
+      "share_of_total": {
+        "act": 0.013170698337398277,
+        "attn": 0.09012728138302105,
+        "down": 0.22244854367034442,
+        "final_copy": 0.0009367753428444185,
+        "final_norm": 0.00017590714336571792,
+        "gate_up": 0.37212876961329744,
+        "generic_attn": 0.09012728138302105,
+        "generic_matmul": 0.8239713969400534,
+        "generic_norm": 0.026983597356925366,
+        "generic_other": 0.025181247181646462,
+        "generic_qkr": 0.012527101566830056,
+        "lm_head": 0.05938681003564214,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.026807690213559648,
+        "o_proj": 0.07062671806133575,
+        "other": 0.0,
+        "qkr": 0.012527101566830056,
+        "qkv": 0.09938055555943358,
+        "readback": 0.00983544305564669,
+        "resid": 0.011073773501403768,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.011373932515877016
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 14,
+        "max": 54993,
+        "mean": 51163.357142857145,
+        "p50": 53774,
+        "p95": 54993
+      },
+      "unwrapped_us": {
+        "count": 14,
+        "max": 605,
+        "mean": 581.9285714285714,
+        "p50": 580,
+        "p95": 605
+      }
+    },
+    "12": {
+      "act_us": {
+        "count": 39,
+        "max": 824,
+        "mean": 646.8461538461538,
+        "p50": 646,
+        "p95": 807
+      },
+      "attn_us": {
+        "count": 39,
+        "max": 5858,
+        "mean": 4772.923076923077,
+        "p50": 4787,
+        "p95": 5646
+      },
+      "count": 39,
+      "down_us": {
+        "count": 39,
+        "max": 12246,
+        "mean": 9775.25641025641,
+        "p50": 11938,
+        "p95": 12227
+      },
+      "final_copy_us": {
+        "count": 39,
+        "max": 60,
+        "mean": 51.717948717948715,
+        "p50": 51,
+        "p95": 60
+      },
+      "final_norm_us": {
+        "count": 39,
+        "max": 10,
+        "mean": 9.025641025641026,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 39,
+        "max": 21046,
+        "mean": 16343.74358974359,
+        "p50": 20276,
+        "p95": 20703
+      },
+      "generic_attn_us": {
+        "count": 39,
+        "max": 5858,
+        "mean": 4772.923076923077,
+        "p50": 4787,
+        "p95": 5646
+      },
+      "generic_matmul_us": {
+        "count": 39,
+        "max": 45226,
+        "mean": 36773.1282051282,
+        "p50": 44249,
+        "p95": 44663
+      },
+      "generic_norm_us": {
+        "count": 39,
+        "max": 1567,
+        "mean": 1395.4102564102564,
+        "p50": 1377,
+        "p95": 1561
+      },
+      "generic_other_us": {
+        "count": 39,
+        "max": 1447,
+        "mean": 1260.7948717948718,
+        "p50": 1258,
+        "p95": 1420
+      },
+      "generic_qkr_us": {
+        "count": 39,
+        "max": 807,
+        "mean": 620.3333333333334,
+        "p50": 625,
+        "p95": 659
+      },
+      "lm_head_us": {
+        "count": 39,
+        "max": 3062,
+        "mean": 3037.7179487179487,
+        "p50": 3037,
+        "p95": 3046
+      },
+      "marlin_gather_us": {
+        "count": 39,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 39,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 39,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 39,
+        "max": 1558,
+        "mean": 1386.3846153846155,
+        "p50": 1368,
+        "p95": 1552
+      },
+      "o_proj_us": {
+        "count": 39,
+        "max": 3763,
+        "mean": 3206.128205128205,
+        "p50": 3699,
+        "p95": 3760
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 39,
+        "max": 807,
+        "mean": 620.3333333333334,
+        "p50": 625,
+        "p95": 659
+      },
+      "qkv_us": {
+        "count": 39,
+        "max": 5411,
+        "mean": 4410.282051282052,
+        "p50": 5275,
+        "p95": 5315
+      },
+      "readback_us": {
+        "count": 39,
+        "max": 511,
+        "mean": 504.15384615384613,
+        "p50": 503,
+        "p95": 511
+      },
+      "resid_us": {
+        "count": 39,
+        "max": 611,
+        "mean": 562.2307692307693,
+        "p50": 560,
+        "p95": 573
+      },
+      "share_of_total": {
+        "act": 0.014094437817588576,
+        "attn": 0.10399948599188202,
+        "down": 0.212997700931081,
+        "final_copy": 0.0011269069282148555,
+        "final_norm": 0.0001966639755734403,
+        "gate_up": 0.35612158526808035,
+        "generic_attn": 0.10399948599188202,
+        "generic_matmul": 0.8012671417517061,
+        "generic_norm": 0.030405256291710783,
+        "generic_other": 0.027472057792391005,
+        "generic_qkr": 0.013516737389341595,
+        "lm_head": 0.06619027798341207,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.03020859231613734,
+        "o_proj": 0.06985984898218012,
+        "other": 0.0,
+        "qkr": 0.013516737389341595,
+        "qkv": 0.09609772858695258,
+        "readback": 0.010985247408309612,
+        "resid": 0.012250713046587572,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.01235407337465884
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 39,
+        "max": 55331,
+        "mean": 45893.717948717946,
+        "p50": 52924,
+        "p95": 54581
+      },
+      "unwrapped_us": {
+        "count": 39,
+        "max": 604,
+        "mean": 566.974358974359,
+        "p50": 570,
+        "p95": 604
+      }
+    },
+    "13": {
+      "act_us": {
+        "count": 19,
+        "max": 633,
+        "mean": 613.5263157894736,
+        "p50": 620,
+        "p95": 633
+      },
+      "attn_us": {
+        "count": 19,
+        "max": 4973,
+        "mean": 4361.578947368421,
+        "p50": 4565,
+        "p95": 4973
+      },
+      "count": 19,
+      "down_us": {
+        "count": 19,
+        "max": 7652,
+        "mean": 7410.789473684211,
+        "p50": 7496,
+        "p95": 7652
+      },
+      "final_copy_us": {
+        "count": 19,
+        "max": 65,
+        "mean": 54.73684210526316,
+        "p50": 53,
+        "p95": 65
+      },
+      "final_norm_us": {
+        "count": 19,
+        "max": 9,
+        "mean": 8.947368421052632,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 19,
+        "max": 12422,
+        "mean": 12066.631578947368,
+        "p50": 12173,
+        "p95": 12422
+      },
+      "generic_attn_us": {
+        "count": 19,
+        "max": 4973,
+        "mean": 4361.578947368421,
+        "p50": 4565,
+        "p95": 4973
+      },
+      "generic_matmul_us": {
+        "count": 19,
+        "max": 29160,
+        "mean": 28656.473684210527,
+        "p50": 28915,
+        "p95": 29160
+      },
+      "generic_norm_us": {
+        "count": 19,
+        "max": 1447,
+        "mean": 1378.7894736842106,
+        "p50": 1377,
+        "p95": 1447
+      },
+      "generic_other_us": {
+        "count": 19,
+        "max": 1423,
+        "mean": 1250.421052631579,
+        "p50": 1234,
+        "p95": 1423
+      },
+      "generic_qkr_us": {
+        "count": 19,
+        "max": 626,
+        "mean": 606.7368421052631,
+        "p50": 611,
+        "p95": 626
+      },
+      "lm_head_us": {
+        "count": 19,
+        "max": 3041,
+        "mean": 3035.6315789473683,
+        "p50": 3035,
+        "p95": 3041
+      },
+      "marlin_gather_us": {
+        "count": 19,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 19,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 19,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 19,
+        "max": 1438,
+        "mean": 1369.842105263158,
+        "p50": 1368,
+        "p95": 1438
+      },
+      "o_proj_us": {
+        "count": 19,
+        "max": 2904,
+        "mean": 2670.4210526315787,
+        "p50": 2669,
+        "p95": 2904
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 19,
+        "max": 626,
+        "mean": 606.7368421052631,
+        "p50": 611,
+        "p95": 626
+      },
+      "qkv_us": {
+        "count": 19,
+        "max": 3537,
+        "mean": 3473.0,
+        "p50": 3500,
+        "p95": 3537
+      },
+      "readback_us": {
+        "count": 19,
+        "max": 511,
+        "mean": 505.2631578947368,
+        "p50": 503,
+        "p95": 511
+      },
+      "resid_us": {
+        "count": 19,
+        "max": 751,
+        "mean": 582.1578947368421,
+        "p50": 559,
+        "p95": 751
+      },
+      "share_of_total": {
+        "act": 0.016443600580047058,
+        "attn": 0.1168981024336021,
+        "down": 0.19862238823655537,
+        "final_copy": 0.0014670450890665644,
+        "final_norm": 0.00023980544725126532,
+        "gate_up": 0.3234072686441682,
+        "generic_attn": 0.1168981024336021,
+        "generic_matmul": 0.7680446545955187,
+        "generic_norm": 0.03695401942141999,
+        "generic_other": 0.03351351656350331,
+        "generic_qkr": 0.016261630564191686,
+        "lm_head": 0.08136034577124253,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.03671421397416872,
+        "o_proj": 0.07157205166255706,
+        "other": 0.0,
+        "qkr": 0.016261630564191686,
+        "qkv": 0.09308260028099556,
+        "readback": 0.013541954668306749,
+        "resid": 0.015602870894389682,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.014786121753457431
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 19,
+        "max": 38240,
+        "mean": 37310.94736842105,
+        "p50": 37671,
+        "p95": 38240
+      },
+      "unwrapped_us": {
+        "count": 19,
+        "max": 573,
+        "mean": 551.6842105263158,
+        "p50": 552,
+        "p95": 573
+      }
+    },
+    "14": {
+      "act_us": {
+        "count": 19,
+        "max": 569,
+        "mean": 560.5263157894736,
+        "p50": 559,
+        "p95": 569
+      },
+      "attn_us": {
+        "count": 19,
+        "max": 4407,
+        "mean": 3691.0,
+        "p50": 3680,
+        "p95": 4407
+      },
+      "count": 19,
+      "down_us": {
+        "count": 19,
+        "max": 6550,
+        "mean": 5951.263157894737,
+        "p50": 5908,
+        "p95": 6550
+      },
+      "final_copy_us": {
+        "count": 19,
+        "max": 61,
+        "mean": 57.26315789473684,
+        "p50": 56,
+        "p95": 61
+      },
+      "final_norm_us": {
+        "count": 19,
+        "max": 9,
+        "mean": 9.0,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 19,
+        "max": 9805,
+        "mean": 9548.947368421053,
+        "p50": 9523,
+        "p95": 9805
+      },
+      "generic_attn_us": {
+        "count": 19,
+        "max": 4407,
+        "mean": 3691.0,
+        "p50": 3680,
+        "p95": 4407
+      },
+      "generic_matmul_us": {
+        "count": 19,
+        "max": 24328,
+        "mean": 23743.947368421053,
+        "p50": 23679,
+        "p95": 24328
+      },
+      "generic_norm_us": {
+        "count": 19,
+        "max": 1574,
+        "mean": 1389.1052631578948,
+        "p50": 1369,
+        "p95": 1574
+      },
+      "generic_other_us": {
+        "count": 19,
+        "max": 1192,
+        "mean": 1179.157894736842,
+        "p50": 1176,
+        "p95": 1192
+      },
+      "generic_qkr_us": {
+        "count": 19,
+        "max": 566,
+        "mean": 560.7368421052631,
+        "p50": 559,
+        "p95": 566
+      },
+      "lm_head_us": {
+        "count": 19,
+        "max": 3040,
+        "mean": 3034.157894736842,
+        "p50": 3034,
+        "p95": 3040
+      },
+      "marlin_gather_us": {
+        "count": 19,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 19,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 19,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 19,
+        "max": 1565,
+        "mean": 1380.1052631578948,
+        "p50": 1360,
+        "p95": 1565
+      },
+      "o_proj_us": {
+        "count": 19,
+        "max": 2363,
+        "mean": 2285.1052631578946,
+        "p50": 2282,
+        "p95": 2363
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 19,
+        "max": 566,
+        "mean": 560.7368421052631,
+        "p50": 559,
+        "p95": 566
+      },
+      "qkv_us": {
+        "count": 19,
+        "max": 2939,
+        "mean": 2924.4736842105262,
+        "p50": 2926,
+        "p95": 2939
+      },
+      "readback_us": {
+        "count": 19,
+        "max": 511,
+        "mean": 505.2631578947368,
+        "p50": 503,
+        "p95": 511
+      },
+      "resid_us": {
+        "count": 19,
+        "max": 575,
+        "mean": 561.3684210526316,
+        "p50": 559,
+        "p95": 575
+      },
+      "share_of_total": {
+        "act": 0.017732031541371412,
+        "attn": 0.11676334647557142,
+        "down": 0.18826589056422824,
+        "final_copy": 0.0018114976823485535,
+        "final_norm": 0.0002847114923544142,
+        "gate_up": 0.302077228408546,
+        "generic_attn": 0.11676334647557142,
+        "generic_matmul": 0.7511305210719804,
+        "generic_norm": 0.043943803612339495,
+        "generic_other": 0.037302200436890615,
+        "generic_qkr": 0.01773869145932122,
+        "lm_head": 0.09598440247216154,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.04365909211998508,
+        "o_proj": 0.0722884144067345,
+        "other": 0.0,
+        "qkr": 0.01773869145932122,
+        "qkv": 0.09251458522031009,
+        "readback": 0.01598380307954606,
+        "resid": 0.017758671213170655,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.01713763386435079
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 19,
+        "max": 32228,
+        "mean": 31610.947368421053,
+        "p50": 31501,
+        "p95": 32228
+      },
+      "unwrapped_us": {
+        "count": 19,
+        "max": 568,
+        "mean": 541.7368421052631,
+        "p50": 538,
+        "p95": 568
+      }
+    },
+    "15": {
+      "act_us": {
+        "count": 1,
+        "max": 503,
+        "mean": 503.0,
+        "p50": 503,
+        "p95": 503
+      },
+      "attn_us": {
+        "count": 1,
+        "max": 3901,
+        "mean": 3901.0,
+        "p50": 3901,
+        "p95": 3901
+      },
+      "count": 1,
+      "down_us": {
+        "count": 1,
+        "max": 5419,
+        "mean": 5419.0,
+        "p50": 5419,
+        "p95": 5419
+      },
+      "final_copy_us": {
+        "count": 1,
+        "max": 61,
+        "mean": 61.0,
+        "p50": 61,
+        "p95": 61
+      },
+      "final_norm_us": {
+        "count": 1,
+        "max": 9,
+        "mean": 9.0,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 1,
+        "max": 9075,
+        "mean": 9075.0,
+        "p50": 9075,
+        "p95": 9075
+      },
+      "generic_attn_us": {
+        "count": 1,
+        "max": 3901,
+        "mean": 3901.0,
+        "p50": 3901,
+        "p95": 3901
+      },
+      "generic_matmul_us": {
+        "count": 1,
+        "max": 22359,
+        "mean": 22359.0,
+        "p50": 22359,
+        "p95": 22359
+      },
+      "generic_norm_us": {
+        "count": 1,
+        "max": 1361,
+        "mean": 1361.0,
+        "p50": 1361,
+        "p95": 1361
+      },
+      "generic_other_us": {
+        "count": 1,
+        "max": 1128,
+        "mean": 1128.0,
+        "p50": 1128,
+        "p95": 1128
+      },
+      "generic_qkr_us": {
+        "count": 1,
+        "max": 523,
+        "mean": 523.0,
+        "p50": 523,
+        "p95": 523
+      },
+      "lm_head_us": {
+        "count": 1,
+        "max": 3128,
+        "mean": 3128.0,
+        "p50": 3128,
+        "p95": 3128
+      },
+      "marlin_gather_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 1,
+        "max": 1352,
+        "mean": 1352.0,
+        "p50": 1352,
+        "p95": 1352
+      },
+      "o_proj_us": {
+        "count": 1,
+        "max": 2027,
+        "mean": 2027.0,
+        "p50": 2027,
+        "p95": 2027
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 1,
+        "max": 523,
+        "mean": 523.0,
+        "p50": 523,
+        "p95": 523
+      },
+      "qkv_us": {
+        "count": 1,
+        "max": 2710,
+        "mean": 2710.0,
+        "p50": 2710,
+        "p95": 2710
+      },
+      "readback_us": {
+        "count": 1,
+        "max": 503,
+        "mean": 503.0,
+        "p50": 503,
+        "p95": 503
+      },
+      "resid_us": {
+        "count": 1,
+        "max": 564,
+        "mean": 564.0,
+        "p50": 564,
+        "p95": 564
+      },
+      "share_of_total": {
+        "act": 0.01658259980878911,
+        "attn": 0.12860580885504236,
+        "down": 0.1786503148386246,
+        "final_copy": 0.0020110111100121978,
+        "final_norm": 0.00029670655721491444,
+        "gate_up": 0.2991791118583721,
+        "generic_attn": 0.12860580885504236,
+        "generic_matmul": 0.7371179903075858,
+        "generic_norm": 0.044868624929944284,
+        "generic_other": 0.03718722183760261,
+        "generic_qkr": 0.01724194771371114,
+        "lm_head": 0.10312201232980582,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.04457191837272937,
+        "o_proj": 0.06682491016384795,
+        "other": 0.0,
+        "qkr": 0.01724194771371114,
+        "qkv": 0.08934164111693535,
+        "readback": 0.01658259980878911,
+        "resid": 0.018593610918801306,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.018395806547324697
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 1,
+        "max": 30333,
+        "mean": 30333.0,
+        "p50": 30333,
+        "p95": 30333
+      },
+      "unwrapped_us": {
+        "count": 1,
+        "max": 558,
+        "mean": 558.0,
+        "p50": 558,
+        "p95": 558
+      }
+    },
+    "16": {
+      "act_us": {
+        "count": 4,
+        "max": 455,
+        "mean": 449.0,
+        "p50": 447,
+        "p95": 455
+      },
+      "attn_us": {
+        "count": 4,
+        "max": 3133,
+        "mean": 2911.75,
+        "p50": 2835,
+        "p95": 3133
+      },
+      "count": 4,
+      "down_us": {
+        "count": 4,
+        "max": 4941,
+        "mean": 4918.5,
+        "p50": 4900,
+        "p95": 4941
+      },
+      "final_copy_us": {
+        "count": 4,
+        "max": 64,
+        "mean": 63.25,
+        "p50": 63,
+        "p95": 64
+      },
+      "final_norm_us": {
+        "count": 4,
+        "max": 9,
+        "mean": 8.75,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 4,
+        "max": 8840,
+        "mean": 8821.5,
+        "p50": 8813,
+        "p95": 8840
+      },
+      "generic_attn_us": {
+        "count": 4,
+        "max": 3133,
+        "mean": 2911.75,
+        "p50": 2835,
+        "p95": 3133
+      },
+      "generic_matmul_us": {
+        "count": 4,
+        "max": 21020,
+        "mean": 20959.25,
+        "p50": 20920,
+        "p95": 21020
+      },
+      "generic_norm_us": {
+        "count": 4,
+        "max": 1336,
+        "mean": 1312.25,
+        "p50": 1302,
+        "p95": 1336
+      },
+      "generic_other_us": {
+        "count": 4,
+        "max": 1082,
+        "mean": 1058.75,
+        "p50": 1043,
+        "p95": 1082
+      },
+      "generic_qkr_us": {
+        "count": 4,
+        "max": 503,
+        "mean": 500.25,
+        "p50": 500,
+        "p95": 503
+      },
+      "lm_head_us": {
+        "count": 4,
+        "max": 3030,
+        "mean": 3028.0,
+        "p50": 3028,
+        "p95": 3030
+      },
+      "marlin_gather_us": {
+        "count": 4,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 4,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 4,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 4,
+        "max": 1327,
+        "mean": 1303.5,
+        "p50": 1293,
+        "p95": 1327
+      },
+      "o_proj_us": {
+        "count": 4,
+        "max": 1769,
+        "mean": 1754.75,
+        "p50": 1749,
+        "p95": 1769
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 4,
+        "max": 503,
+        "mean": 500.25,
+        "p50": 500,
+        "p95": 503
+      },
+      "qkv_us": {
+        "count": 4,
+        "max": 2442,
+        "mean": 2436.5,
+        "p50": 2435,
+        "p95": 2442
+      },
+      "readback_us": {
+        "count": 4,
+        "max": 504,
+        "mean": 503.25,
+        "p50": 503,
+        "p95": 504
+      },
+      "resid_us": {
+        "count": 4,
+        "max": 563,
+        "mean": 546.5,
+        "p50": 536,
+        "p95": 563
+      },
+      "share_of_total": {
+        "act": 0.01613163993029982,
+        "attn": 0.1046131460290657,
+        "down": 0.17671151669750482,
+        "final_copy": 0.002272441482386333,
+        "final_norm": 0.00031436937503368244,
+        "gate_up": 0.3169382219268148,
+        "generic_attn": 0.1046131460290657,
+        "generic_matmul": 0.7530224369913953,
+        "generic_norm": 0.04714642427290854,
+        "generic_other": 0.038038694379075574,
+        "generic_qkr": 0.017972946269782814,
+        "lm_head": 0.10878976772594176,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.04683205489787486,
+        "o_proj": 0.06304453266746905,
+        "other": 0.0,
+        "qkr": 0.017972946269782814,
+        "qkv": 0.08753839797366483,
+        "readback": 0.01808073005550865,
+        "resid": 0.019634612966389423,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.02112562200226346
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 4,
+        "max": 28153,
+        "mean": 27833.5,
+        "p50": 27695,
+        "p95": 28153
+      },
+      "unwrapped_us": {
+        "count": 4,
+        "max": 605,
+        "mean": 588.0,
+        "p50": 577,
+        "p95": 605
+      }
+    },
+    "3": {
+      "act_us": {
+        "count": 1,
+        "max": 382,
+        "mean": 382.0,
+        "p50": 382,
+        "p95": 382
+      },
+      "attn_us": {
+        "count": 1,
+        "max": 1616,
+        "mean": 1616.0,
+        "p50": 1616,
+        "p95": 1616
+      },
+      "count": 1,
+      "down_us": {
+        "count": 1,
+        "max": 4843,
+        "mean": 4843.0,
+        "p50": 4843,
+        "p95": 4843
+      },
+      "final_copy_us": {
+        "count": 1,
+        "max": 17,
+        "mean": 17.0,
+        "p50": 17,
+        "p95": 17
+      },
+      "final_norm_us": {
+        "count": 1,
+        "max": 9,
+        "mean": 9.0,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 1,
+        "max": 8786,
+        "mean": 8786.0,
+        "p50": 8786,
+        "p95": 8786
+      },
+      "generic_attn_us": {
+        "count": 1,
+        "max": 1616,
+        "mean": 1616.0,
+        "p50": 1616,
+        "p95": 1616
+      },
+      "generic_matmul_us": {
+        "count": 1,
+        "max": 20779,
+        "mean": 20779.0,
+        "p50": 20779,
+        "p95": 20779
+      },
+      "generic_norm_us": {
+        "count": 1,
+        "max": 1356,
+        "mean": 1356.0,
+        "p50": 1356,
+        "p95": 1356
+      },
+      "generic_other_us": {
+        "count": 1,
+        "max": 966,
+        "mean": 966.0,
+        "p50": 966,
+        "p95": 966
+      },
+      "generic_qkr_us": {
+        "count": 1,
+        "max": 481,
+        "mean": 481.0,
+        "p50": 481,
+        "p95": 481
+      },
+      "lm_head_us": {
+        "count": 1,
+        "max": 2980,
+        "mean": 2980.0,
+        "p50": 2980,
+        "p95": 2980
+      },
+      "marlin_gather_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 1,
+        "max": 1347,
+        "mean": 1347.0,
+        "p50": 1347,
+        "p95": 1347
+      },
+      "o_proj_us": {
+        "count": 1,
+        "max": 1736,
+        "mean": 1736.0,
+        "p50": 1736,
+        "p95": 1736
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 1,
+        "max": 481,
+        "mean": 481.0,
+        "p50": 481,
+        "p95": 481
+      },
+      "qkv_us": {
+        "count": 1,
+        "max": 2434,
+        "mean": 2434.0,
+        "p50": 2434,
+        "p95": 2434
+      },
+      "readback_us": {
+        "count": 1,
+        "max": 524,
+        "mean": 524.0,
+        "p50": 524,
+        "p95": 524
+      },
+      "resid_us": {
+        "count": 1,
+        "max": 567,
+        "mean": 567.0,
+        "p50": 567,
+        "p95": 567
+      },
+      "share_of_total": {
+        "act": 0.014545731475135177,
+        "attn": 0.06153377503617394,
+        "down": 0.1844109359530881,
+        "final_copy": 0.000647323128474602,
+        "final_norm": 0.0003427004797806717,
+        "gate_up": 0.33455182392810906,
+        "generic_attn": 0.06153377503617394,
+        "generic_matmul": 0.7912192521513974,
+        "generic_norm": 0.0516335389536212,
+        "generic_other": 0.03678318482979209,
+        "generic_qkr": 0.018315436752722566,
+        "lm_head": 0.11347193663848908,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.05129083847384053,
+        "o_proj": 0.0661031147665829,
+        "other": 0.0,
+        "qkr": 0.018315436752722566,
+        "qkv": 0.09268144086512832,
+        "readback": 0.019952783489452442,
+        "resid": 0.021590130226182315,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.0205620287868403
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 1,
+        "max": 26262,
+        "mean": 26262.0,
+        "p50": 26262,
+        "p95": 26262
+      },
+      "unwrapped_us": {
+        "count": 1,
+        "max": 540,
+        "mean": 540.0,
+        "p50": 540,
+        "p95": 540
+      }
+    },
+    "5": {
+      "act_us": {
+        "count": 4,
+        "max": 1058,
+        "mean": 997.25,
+        "p50": 993,
+        "p95": 1058
+      },
+      "attn_us": {
+        "count": 4,
+        "max": 9199,
+        "mean": 8281.25,
+        "p50": 8198,
+        "p95": 9199
+      },
+      "count": 4,
+      "down_us": {
+        "count": 4,
+        "max": 20411,
+        "mean": 19166.0,
+        "p50": 18763,
+        "p95": 20411
+      },
+      "final_copy_us": {
+        "count": 4,
+        "max": 31,
+        "mean": 27.0,
+        "p50": 25,
+        "p95": 31
+      },
+      "final_norm_us": {
+        "count": 4,
+        "max": 12,
+        "mean": 11.5,
+        "p50": 11,
+        "p95": 12
+      },
+      "gate_up_us": {
+        "count": 4,
+        "max": 34542,
+        "mean": 32491.25,
+        "p50": 31863,
+        "p95": 34542
+      },
+      "generic_attn_us": {
+        "count": 4,
+        "max": 9199,
+        "mean": 8281.25,
+        "p50": 8198,
+        "p95": 9199
+      },
+      "generic_matmul_us": {
+        "count": 4,
+        "max": 71362,
+        "mean": 67139.75,
+        "p50": 66005,
+        "p95": 71362
+      },
+      "generic_norm_us": {
+        "count": 4,
+        "max": 1796,
+        "mean": 1784.0,
+        "p50": 1777,
+        "p95": 1796
+      },
+      "generic_other_us": {
+        "count": 4,
+        "max": 1804,
+        "mean": 1734.25,
+        "p50": 1724,
+        "p95": 1804
+      },
+      "generic_qkr_us": {
+        "count": 4,
+        "max": 867,
+        "mean": 833.5,
+        "p50": 814,
+        "p95": 867
+      },
+      "lm_head_us": {
+        "count": 4,
+        "max": 3034,
+        "mean": 3030.75,
+        "p50": 3029,
+        "p95": 3034
+      },
+      "marlin_gather_us": {
+        "count": 4,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 4,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 4,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 4,
+        "max": 1785,
+        "mean": 1772.5,
+        "p50": 1765,
+        "p95": 1785
+      },
+      "o_proj_us": {
+        "count": 4,
+        "max": 5308,
+        "mean": 4937.0,
+        "p50": 4905,
+        "p95": 5308
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 4,
+        "max": 867,
+        "mean": 833.5,
+        "p50": 814,
+        "p95": 867
+      },
+      "qkv_us": {
+        "count": 4,
+        "max": 8072,
+        "mean": 7514.75,
+        "p50": 7443,
+        "p95": 8072
+      },
+      "readback_us": {
+        "count": 4,
+        "max": 512,
+        "mean": 511.0,
+        "p50": 511,
+        "p95": 512
+      },
+      "resid_us": {
+        "count": 4,
+        "max": 722,
+        "mean": 710.0,
+        "p50": 706,
+        "p95": 722
+      },
+      "share_of_total": {
+        "act": 0.012331939072986901,
+        "attn": 0.1024054855333896,
+        "down": 0.23700570997529902,
+        "final_copy": 0.00033388052641829664,
+        "final_norm": 0.00014220837236334857,
+        "gate_up": 0.4017850242217956,
+        "generic_attn": 0.1024054855333896,
+        "generic_matmul": 0.830246484207142,
+        "generic_norm": 0.022060846634453377,
+        "generic_other": 0.02144564084966411,
+        "generic_qkr": 0.010307015509987047,
+        "lm_head": 0.037478089090453796,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.02191863826209003,
+        "o_proj": 0.06105067255285669,
+        "other": 0.0,
+        "qkr": 0.010307015509987047,
+        "qkv": 0.09292698836673684,
+        "readback": 0.006318998111101837,
+        "resid": 0.008779821250258913,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.007215529154262078
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 4,
+        "max": 85103,
+        "mean": 80867.25,
+        "p50": 78999,
+        "p95": 85103
+      },
+      "unwrapped_us": {
+        "count": 4,
+        "max": 600,
+        "mean": 583.5,
+        "p50": 584,
+        "p95": 600
+      }
+    },
+    "6": {
+      "act_us": {
+        "count": 3,
+        "max": 938,
+        "mean": 916.3333333333334,
+        "p50": 936,
+        "p95": 938
+      },
+      "attn_us": {
+        "count": 3,
+        "max": 7530,
+        "mean": 6848.666666666667,
+        "p50": 7397,
+        "p95": 7530
+      },
+      "count": 3,
+      "down_us": {
+        "count": 3,
+        "max": 18404,
+        "mean": 18190.0,
+        "p50": 18282,
+        "p95": 18404
+      },
+      "final_copy_us": {
+        "count": 3,
+        "max": 38,
+        "mean": 31.666666666666668,
+        "p50": 29,
+        "p95": 38
+      },
+      "final_norm_us": {
+        "count": 3,
+        "max": 11,
+        "mean": 11.0,
+        "p50": 11,
+        "p95": 11
+      },
+      "gate_up_us": {
+        "count": 3,
+        "max": 31778,
+        "mean": 31476.666666666668,
+        "p50": 31516,
+        "p95": 31778
+      },
+      "generic_attn_us": {
+        "count": 3,
+        "max": 7530,
+        "mean": 6848.666666666667,
+        "p50": 7397,
+        "p95": 7530
+      },
+      "generic_matmul_us": {
+        "count": 3,
+        "max": 64761,
+        "mean": 64118.0,
+        "p50": 64365,
+        "p95": 64761
+      },
+      "generic_norm_us": {
+        "count": 3,
+        "max": 1746,
+        "mean": 1732.6666666666667,
+        "p50": 1742,
+        "p95": 1746
+      },
+      "generic_other_us": {
+        "count": 3,
+        "max": 1666,
+        "mean": 1642.6666666666667,
+        "p50": 1658,
+        "p95": 1666
+      },
+      "generic_qkr_us": {
+        "count": 3,
+        "max": 807,
+        "mean": 787.0,
+        "p50": 796,
+        "p95": 807
+      },
+      "lm_head_us": {
+        "count": 3,
+        "max": 3066,
+        "mean": 3044.0,
+        "p50": 3038,
+        "p95": 3066
+      },
+      "marlin_gather_us": {
+        "count": 3,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 3,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 3,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 3,
+        "max": 1735,
+        "mean": 1721.6666666666667,
+        "p50": 1731,
+        "p95": 1735
+      },
+      "o_proj_us": {
+        "count": 3,
+        "max": 4535,
+        "mean": 4475.666666666667,
+        "p50": 4523,
+        "p95": 4535
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 3,
+        "max": 807,
+        "mean": 787.0,
+        "p50": 796,
+        "p95": 807
+      },
+      "qkv_us": {
+        "count": 3,
+        "max": 7016,
+        "mean": 6931.666666666667,
+        "p50": 7006,
+        "p95": 7016
+      },
+      "readback_us": {
+        "count": 3,
+        "max": 512,
+        "mean": 511.3333333333333,
+        "p50": 511,
+        "p95": 512
+      },
+      "resid_us": {
+        "count": 3,
+        "max": 700,
+        "mean": 694.6666666666666,
+        "p50": 694,
+        "p95": 700
+      },
+      "share_of_total": {
+        "act": 0.012020481606345624,
+        "attn": 0.08984096583629582,
+        "down": 0.23861683567052774,
+        "final_copy": 0.00041540405696720057,
+        "final_norm": 0.0001442982513675539,
+        "gate_up": 0.4129116326253974,
+        "generic_attn": 0.08984096583629582,
+        "generic_matmul": 0.84110138919862,
+        "generic_norm": 0.022729160927531668,
+        "generic_other": 0.021548538870888045,
+        "generic_qkr": 0.0103238839842059,
+        "lm_head": 0.039931261560257635,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.022584862676164115,
+        "o_proj": 0.05871189760945897,
+        "other": 0.0,
+        "qkr": 0.0103238839842059,
+        "qkv": 0.09092976173297827,
+        "readback": 0.006707682351449323,
+        "resid": 0.009112653207575221,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.007748378831009257
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 3,
+        "max": 77578,
+        "mean": 76231.0,
+        "p50": 77065,
+        "p95": 77578
+      },
+      "unwrapped_us": {
+        "count": 3,
+        "max": 619,
+        "mean": 590.6666666666666,
+        "p50": 581,
+        "p95": 619
+      }
+    },
+    "7": {
+      "act_us": {
+        "count": 2,
+        "max": 926,
+        "mean": 837.0,
+        "p50": 748,
+        "p95": 926
+      },
+      "attn_us": {
+        "count": 2,
+        "max": 8602,
+        "mean": 7415.0,
+        "p50": 6228,
+        "p95": 8602
+      },
+      "count": 2,
+      "down_us": {
+        "count": 2,
+        "max": 18225,
+        "mean": 15562.5,
+        "p50": 12900,
+        "p95": 18225
+      },
+      "final_copy_us": {
+        "count": 2,
+        "max": 35,
+        "mean": 33.0,
+        "p50": 31,
+        "p95": 35
+      },
+      "final_norm_us": {
+        "count": 2,
+        "max": 11,
+        "mean": 10.0,
+        "p50": 9,
+        "p95": 11
+      },
+      "gate_up_us": {
+        "count": 2,
+        "max": 31453,
+        "mean": 26189.0,
+        "p50": 20925,
+        "p95": 31453
+      },
+      "generic_attn_us": {
+        "count": 2,
+        "max": 8602,
+        "mean": 7415.0,
+        "p50": 6228,
+        "p95": 8602
+      },
+      "generic_matmul_us": {
+        "count": 2,
+        "max": 64228,
+        "mean": 55504.5,
+        "p50": 46781,
+        "p95": 64228
+      },
+      "generic_norm_us": {
+        "count": 2,
+        "max": 1941,
+        "mean": 1670.0,
+        "p50": 1399,
+        "p95": 1941
+      },
+      "generic_other_us": {
+        "count": 2,
+        "max": 1655,
+        "mean": 1501.0,
+        "p50": 1347,
+        "p95": 1655
+      },
+      "generic_qkr_us": {
+        "count": 2,
+        "max": 779,
+        "mean": 733.0,
+        "p50": 687,
+        "p95": 779
+      },
+      "lm_head_us": {
+        "count": 2,
+        "max": 3038,
+        "mean": 3033.5,
+        "p50": 3029,
+        "p95": 3038
+      },
+      "marlin_gather_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 2,
+        "max": 1930,
+        "mean": 1660.0,
+        "p50": 1390,
+        "p95": 1930
+      },
+      "o_proj_us": {
+        "count": 2,
+        "max": 4514,
+        "mean": 4352.0,
+        "p50": 4190,
+        "p95": 4514
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 2,
+        "max": 779,
+        "mean": 733.0,
+        "p50": 687,
+        "p95": 779
+      },
+      "qkv_us": {
+        "count": 2,
+        "max": 6998,
+        "mean": 6367.5,
+        "p50": 5737,
+        "p95": 6998
+      },
+      "readback_us": {
+        "count": 2,
+        "max": 511,
+        "mean": 510.5,
+        "p50": 510,
+        "p95": 511
+      },
+      "resid_us": {
+        "count": 2,
+        "max": 694,
+        "mean": 631.0,
+        "p50": 568,
+        "p95": 694
+      },
+      "share_of_total": {
+        "act": 0.012321688822152541,
+        "attn": 0.10915809153675161,
+        "down": 0.22909950094952083,
+        "final_copy": 0.0004858013514110321,
+        "final_norm": 0.00014721253073061579,
+        "gate_up": 0.3855348967304097,
+        "generic_attn": 0.10915809153675161,
+        "generic_matmul": 0.8170957911937464,
+        "generic_norm": 0.024584492632012837,
+        "generic_other": 0.02209660086266543,
+        "generic_qkr": 0.010790678502554137,
+        "lm_head": 0.0446569211971323,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.02443728010128222,
+        "o_proj": 0.064066893373964,
+        "other": 0.0,
+        "qkr": 0.010790678502554137,
+        "qkv": 0.0937375789427196,
+        "readback": 0.007515199693797936,
+        "resid": 0.009289110689101857,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.00875914557847164
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 2,
+        "max": 78298,
+        "mean": 67929.0,
+        "p50": 57560,
+        "p95": 78298
+      },
+      "unwrapped_us": {
+        "count": 2,
+        "max": 607,
+        "mean": 595.0,
+        "p50": 583,
+        "p95": 607
+      }
+    },
+    "8": {
+      "act_us": {
+        "count": 8,
+        "max": 840,
+        "mean": 727.5,
+        "p50": 752,
+        "p95": 840
+      },
+      "attn_us": {
+        "count": 8,
+        "max": 8177,
+        "mean": 6249.375,
+        "p50": 5510,
+        "p95": 8177
+      },
+      "count": 8,
+      "down_us": {
+        "count": 8,
+        "max": 14651,
+        "mean": 11793.25,
+        "p50": 12812,
+        "p95": 14651
+      },
+      "final_copy_us": {
+        "count": 8,
+        "max": 42,
+        "mean": 38.75,
+        "p50": 38,
+        "p95": 42
+      },
+      "final_norm_us": {
+        "count": 8,
+        "max": 9,
+        "mean": 9.0,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 8,
+        "max": 23747,
+        "mean": 19324.625,
+        "p50": 20946,
+        "p95": 23747
+      },
+      "generic_attn_us": {
+        "count": 8,
+        "max": 8177,
+        "mean": 6249.375,
+        "p50": 5510,
+        "p95": 8177
+      },
+      "generic_matmul_us": {
+        "count": 8,
+        "max": 52417,
+        "mean": 43309.75,
+        "p50": 46757,
+        "p95": 52417
+      },
+      "generic_norm_us": {
+        "count": 8,
+        "max": 1454,
+        "mean": 1398.625,
+        "p50": 1410,
+        "p95": 1454
+      },
+      "generic_other_us": {
+        "count": 8,
+        "max": 1488,
+        "mean": 1346.0,
+        "p50": 1354,
+        "p95": 1488
+      },
+      "generic_qkr_us": {
+        "count": 8,
+        "max": 760,
+        "mean": 675.125,
+        "p50": 690,
+        "p95": 760
+      },
+      "lm_head_us": {
+        "count": 8,
+        "max": 3042,
+        "mean": 3033.0,
+        "p50": 3036,
+        "p95": 3042
+      },
+      "marlin_gather_us": {
+        "count": 8,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 8,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 8,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 8,
+        "max": 1445,
+        "mean": 1389.625,
+        "p50": 1401,
+        "p95": 1445
+      },
+      "o_proj_us": {
+        "count": 8,
+        "max": 4749,
+        "mean": 3865.875,
+        "p50": 4198,
+        "p95": 4749
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 8,
+        "max": 760,
+        "mean": 675.125,
+        "p50": 690,
+        "p95": 760
+      },
+      "qkv_us": {
+        "count": 8,
+        "max": 6375,
+        "mean": 5293.0,
+        "p50": 5762,
+        "p95": 6375
+      },
+      "readback_us": {
+        "count": 8,
+        "max": 513,
+        "mean": 509.25,
+        "p50": 510,
+        "p95": 513
+      },
+      "resid_us": {
+        "count": 8,
+        "max": 609,
+        "mean": 579.75,
+        "p50": 567,
+        "p95": 609
+      },
+      "share_of_total": {
+        "act": 0.013453661152669003,
+        "attn": 0.11556972325217986,
+        "down": 0.21809263146214944,
+        "final_copy": 0.0007166039445579709,
+        "final_norm": 0.00016643704518765778,
+        "gate_up": 0.3573703871510601,
+        "generic_attn": 0.11556972325217986,
+        "generic_matmul": 0.8009274242017956,
+        "generic_norm": 0.025864779147287537,
+        "generic_other": 0.02489158475806526,
+        "generic_qkr": 0.012485090014701938,
+        "lm_head": 0.056089284228240666,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.02569834210209988,
+        "o_proj": 0.07149164578498184,
+        "other": 0.0,
+        "qkr": 0.012485090014701938,
+        "qkv": 0.09788347557536362,
+        "readback": 0.009417562806868302,
+        "resid": 0.010721319660838289,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.010843835819101425
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 8,
+        "max": 65392,
+        "mean": 54074.5,
+        "p50": 56007,
+        "p95": 65392
+      },
+      "unwrapped_us": {
+        "count": 8,
+        "max": 615,
+        "mean": 586.375,
+        "p50": 590,
+        "p95": 615
+      }
+    },
+    "9": {
+      "act_us": {
+        "count": 31,
+        "max": 901,
+        "mean": 750.8709677419355,
+        "p50": 784,
+        "p95": 816
+      },
+      "attn_us": {
+        "count": 31,
+        "max": 10300,
+        "mean": 5931.774193548387,
+        "p50": 6157,
+        "p95": 8017
+      },
+      "count": 31,
+      "down_us": {
+        "count": 31,
+        "max": 14544,
+        "mean": 12658.806451612903,
+        "p50": 13077,
+        "p95": 14507
+      },
+      "final_copy_us": {
+        "count": 31,
+        "max": 63,
+        "mean": 41.354838709677416,
+        "p50": 39,
+        "p95": 50
+      },
+      "final_norm_us": {
+        "count": 31,
+        "max": 10,
+        "mean": 9.03225806451613,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 31,
+        "max": 23796,
+        "mean": 20704.0,
+        "p50": 20958,
+        "p95": 23738
+      },
+      "generic_attn_us": {
+        "count": 31,
+        "max": 10300,
+        "mean": 5931.774193548387,
+        "p50": 6157,
+        "p95": 8017
+      },
+      "generic_matmul_us": {
+        "count": 31,
+        "max": 52501,
+        "mean": 46140.903225806454,
+        "p50": 47039,
+        "p95": 52291
+      },
+      "generic_norm_us": {
+        "count": 31,
+        "max": 1504,
+        "mean": 1419.6774193548388,
+        "p50": 1427,
+        "p95": 1458
+      },
+      "generic_other_us": {
+        "count": 31,
+        "max": 1508,
+        "mean": 1377.6774193548388,
+        "p50": 1417,
+        "p95": 1500
+      },
+      "generic_qkr_us": {
+        "count": 31,
+        "max": 882,
+        "mean": 705.8064516129032,
+        "p50": 727,
+        "p95": 862
+      },
+      "lm_head_us": {
+        "count": 31,
+        "max": 3122,
+        "mean": 3040.548387096774,
+        "p50": 3037,
+        "p95": 3094
+      },
+      "marlin_gather_us": {
+        "count": 31,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 31,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 31,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 31,
+        "max": 1495,
+        "mean": 1410.6451612903227,
+        "p50": 1418,
+        "p95": 1449
+      },
+      "o_proj_us": {
+        "count": 31,
+        "max": 4714,
+        "mean": 4106.354838709677,
+        "p50": 4232,
+        "p95": 4640
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 31,
+        "max": 882,
+        "mean": 705.8064516129032,
+        "p50": 727,
+        "p95": 862
+      },
+      "qkv_us": {
+        "count": 31,
+        "max": 6490,
+        "mean": 5631.193548387097,
+        "p50": 5763,
+        "p95": 6447
+      },
+      "readback_us": {
+        "count": 31,
+        "max": 519,
+        "mean": 508.03225806451616,
+        "p50": 510,
+        "p95": 512
+      },
+      "resid_us": {
+        "count": 31,
+        "max": 652,
+        "mean": 585.4516129032259,
+        "p50": 579,
+        "p95": 614
+      },
+      "share_of_total": {
+        "act": 0.013249462382728854,
+        "attn": 0.10466887443605684,
+        "down": 0.2233704419219661,
+        "final_copy": 0.0007297250837590063,
+        "final_norm": 0.00015937833342630404,
+        "gate_up": 0.3653315695464434,
+        "generic_attn": 0.10466887443605684,
+        "generic_matmul": 0.8141773858082701,
+        "generic_norm": 0.025050858764613,
+        "generic_other": 0.024309749514180686,
+        "generic_qkr": 0.012454278340598328,
+        "lm_head": 0.053651869906296924,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.024891480431186698,
+        "o_proj": 0.0724585132506008,
+        "other": 0.0,
+        "qkr": 0.012454278340598328,
+        "qkv": 0.09936499118296291,
+        "readback": 0.008964462046895936,
+        "resid": 0.010330562047692829,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.010374391089385062
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 31,
+        "max": 64902,
+        "mean": 56671.8064516129,
+        "p50": 58480,
+        "p95": 64032
+      },
+      "unwrapped_us": {
+        "count": 31,
+        "max": 633,
+        "mean": 587.9354838709677,
+        "p50": 592,
+        "p95": 629
+      }
+    }
+  },
+  "bench_completed_per_run": [
+    100
+  ],
+  "bench_errored_per_run": [
+    0
+  ],
+  "bench_quality_issues_per_run": [
+    {
+      "bad_output": 0,
+      "duplicate_done": 0,
+      "http_500": 0,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "panic": 0,
+      "stream_bulk_flush": 0,
+      "zero_output_tokens": 0
+    }
+  ],
+  "bench_quality_nonzero": [],
+  "dataset_sha256": "58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e  /workspace/ascii_sharegpt_w2_100.jsonl",
+  "decode_only_all": {
+    "act_us": {
+      "count": 21,
+      "max": 455,
+      "mean": 431.0952380952381,
+      "p50": 438,
+      "p95": 453
+    },
+    "attn_us": {
+      "count": 21,
+      "max": 3133,
+      "mean": 2220.5714285714284,
+      "p50": 2215,
+      "p95": 3043
+    },
+    "count": 21,
+    "down_us": {
+      "count": 21,
+      "max": 5011,
+      "mean": 4888.047619047619,
+      "p50": 4874,
+      "p95": 4954
+    },
+    "final_copy_us": {
+      "count": 21,
+      "max": 64,
+      "mean": 41.61904761904762,
+      "p50": 42,
+      "p95": 64
+    },
+    "final_norm_us": {
+      "count": 21,
+      "max": 14,
+      "mean": 9.047619047619047,
+      "p50": 9,
+      "p95": 9
+    },
+    "gate_up_us": {
+      "count": 21,
+      "max": 9005,
+      "mean": 8838.857142857143,
+      "p50": 8815,
+      "p95": 8997
+    },
+    "generic_attn_us": {
+      "count": 21,
+      "max": 3133,
+      "mean": 2220.5714285714284,
+      "p50": 2215,
+      "p95": 3043
+    },
+    "generic_matmul_us": {
+      "count": 21,
+      "max": 21355,
+      "mean": 20944.190476190477,
+      "p50": 20916,
+      "p95": 21075
+    },
+    "generic_norm_us": {
+      "count": 21,
+      "max": 1356,
+      "mean": 1314.2380952380952,
+      "p50": 1325,
+      "p95": 1348
+    },
+    "generic_other_us": {
+      "count": 21,
+      "max": 1082,
+      "mean": 1015.7142857142857,
+      "p50": 1028,
+      "p95": 1070
+    },
+    "generic_qkr_us": {
+      "count": 21,
+      "max": 505,
+      "mean": 497.9047619047619,
+      "p50": 497,
+      "p95": 504
+    },
+    "lm_head_us": {
+      "count": 21,
+      "max": 3030,
+      "mean": 3009.714285714286,
+      "p50": 3011,
+      "p95": 3028
+    },
+    "marlin_gather_us": {
+      "count": 21,
+      "max": 0,
+      "mean": 0.0,
+      "p50": 0,
+      "p95": 0
+    },
+    "marlin_kernel_us": {
+      "count": 21,
+      "max": 0,
+      "mean": 0.0,
+      "p50": 0,
+      "p95": 0
+    },
+    "marlin_ws_zero_us": {
+      "count": 21,
+      "max": 0,
+      "mean": 0.0,
+      "p50": 0,
+      "p95": 0
+    },
+    "matmul_us": null,
+    "norm_us": {
+      "count": 21,
+      "max": 1347,
+      "mean": 1305.1904761904761,
+      "p50": 1313,
+      "p95": 1339
+    },
+    "o_proj_us": {
+      "count": 21,
+      "max": 1836,
+      "mean": 1762.4761904761904,
+      "p50": 1763,
+      "p95": 1781
+    },
+    "other_us": null,
+    "qkr_us": {
+      "count": 21,
+      "max": 505,
+      "mean": 497.9047619047619,
+      "p50": 497,
+      "p95": 504
+    },
+    "qkv_us": {
+      "count": 21,
+      "max": 2631,
+      "mean": 2445.095238095238,
+      "p50": 2436,
+      "p95": 2458
+    },
+    "readback_us": {
+      "count": 21,
+      "max": 524,
+      "mean": 487.3333333333333,
+      "p50": 503,
+      "p95": 510
+    },
+    "resid_us": {
+      "count": 21,
+      "max": 567,
+      "mean": 543.0,
+      "p50": 549,
+      "p95": 563
+    },
+    "share_of_total": {
+      "act": 0.015935490571252046,
+      "attn": 0.08208370665178674,
+      "down": 0.1806873049429417,
+      "final_copy": 0.0015384534142576258,
+      "final_norm": 0.0003344463944038317,
+      "gate_up": 0.3267294839140086,
+      "generic_attn": 0.08208370665178674,
+      "generic_matmul": 0.7742046776728868,
+      "generic_norm": 0.04858097915342816,
+      "generic_other": 0.03754600838228279,
+      "generic_qkr": 0.01840511315729718,
+      "lm_head": 0.11125447322052515,
+      "marlin_gather": 0.0,
+      "marlin_kernel": 0.0,
+      "marlin_ws_zero": 0.0,
+      "matmul": 0.0,
+      "norm": 0.04824653275902433,
+      "o_proj": 0.06515015762986641,
+      "other": 0.0,
+      "qkr": 0.01840511315729718,
+      "qkv": 0.09038325796554499,
+      "readback": 0.01801433894909902,
+      "resid": 0.020072064396773122,
+      "tail_act": 0.0,
+      "tail_down": 0.0,
+      "tail_gate_up": 0.0,
+      "tail_mlp": 0.0,
+      "tail_norm": 0.0,
+      "tail_resid": 0.0,
+      "unwrapped": 0.021165176033219327
+    },
+    "tail_act_us": null,
+    "tail_down_us": null,
+    "tail_gate_up_us": null,
+    "tail_mlp_us": null,
+    "tail_norm_us": null,
+    "tail_resid_us": null,
+    "total_us": {
+      "count": 21,
+      "max": 28153,
+      "mean": 27052.52380952381,
+      "p50": 27005,
+      "p95": 27978
+    },
+    "unwrapped_us": {
+      "count": 21,
+      "max": 618,
+      "mean": 572.5714285714286,
+      "p50": 569,
+      "p95": 605
+    }
+  },
+  "decode_only_by_decode_count": {
+    "1": {
+      "act_us": {
+        "count": 2,
+        "max": 391,
+        "mean": 383.5,
+        "p50": 376,
+        "p95": 391
+      },
+      "attn_us": {
+        "count": 2,
+        "max": 739,
+        "mean": 731.5,
+        "p50": 724,
+        "p95": 739
+      },
+      "count": 2,
+      "down_us": {
+        "count": 2,
+        "max": 4954,
+        "mean": 4910.5,
+        "p50": 4867,
+        "p95": 4954
+      },
+      "final_copy_us": {
+        "count": 2,
+        "max": 14,
+        "mean": 11.5,
+        "p50": 9,
+        "p95": 14
+      },
+      "final_norm_us": {
+        "count": 2,
+        "max": 8,
+        "mean": 8.0,
+        "p50": 8,
+        "p95": 8
+      },
+      "gate_up_us": {
+        "count": 2,
+        "max": 8940,
+        "mean": 8855.0,
+        "p50": 8770,
+        "p95": 8940
+      },
+      "generic_attn_us": {
+        "count": 2,
+        "max": 739,
+        "mean": 731.5,
+        "p50": 724,
+        "p95": 739
+      },
+      "generic_matmul_us": {
+        "count": 2,
+        "max": 21355,
+        "mean": 21064.5,
+        "p50": 20774,
+        "p95": 21355
+      },
+      "generic_norm_us": {
+        "count": 2,
+        "max": 1241,
+        "mean": 1232.5,
+        "p50": 1224,
+        "p95": 1241
+      },
+      "generic_other_us": {
+        "count": 2,
+        "max": 907,
+        "mean": 894.5,
+        "p50": 882,
+        "p95": 907
+      },
+      "generic_qkr_us": {
+        "count": 2,
+        "max": 497,
+        "mean": 489.0,
+        "p50": 481,
+        "p95": 497
+      },
+      "lm_head_us": {
+        "count": 2,
+        "max": 2994,
+        "mean": 2976.0,
+        "p50": 2958,
+        "p95": 2994
+      },
+      "marlin_gather_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 2,
+        "max": 1233,
+        "mean": 1224.5,
+        "p50": 1216,
+        "p95": 1233
+      },
+      "o_proj_us": {
+        "count": 2,
+        "max": 1836,
+        "mean": 1792.5,
+        "p50": 1749,
+        "p95": 1836
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 2,
+        "max": 497,
+        "mean": 489.0,
+        "p50": 481,
+        "p95": 497
+      },
+      "qkv_us": {
+        "count": 2,
+        "max": 2631,
+        "mean": 2530.5,
+        "p50": 2430,
+        "p95": 2631
+      },
+      "readback_us": {
+        "count": 2,
+        "max": 311,
+        "mean": 310.0,
+        "p50": 309,
+        "p95": 311
+      },
+      "resid_us": {
+        "count": 2,
+        "max": 502,
+        "mean": 499.5,
+        "p50": 497,
+        "p95": 502
+      },
+      "share_of_total": {
+        "act": 0.01514164445760537,
+        "attn": 0.028881650380021717,
+        "down": 0.19388016977593525,
+        "final_copy": 0.0004540519198499655,
+        "final_norm": 0.00031586220511301943,
+        "gate_up": 0.3496199782844734,
+        "generic_attn": 0.028881650380021717,
+        "generic_matmul": 0.8316849274503998,
+        "generic_norm": 0.04866252097522456,
+        "generic_other": 0.03531734280919949,
+        "generic_qkr": 0.019307077287533312,
+        "lm_head": 0.11750074030204323,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.04834665877011154,
+        "o_proj": 0.07077287533313592,
+        "other": 0.0,
+        "qkr": 0.019307077287533312,
+        "qkv": 0.09991116375481196,
+        "readback": 0.012239660448129503,
+        "resid": 0.019721646431744153,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.02390682064949166
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 2,
+        "max": 25643,
+        "mean": 25327.5,
+        "p50": 25012,
+        "p95": 25643
+      },
+      "unwrapped_us": {
+        "count": 2,
+        "max": 618,
+        "mean": 605.5,
+        "p50": 593,
+        "p95": 618
+      }
+    },
+    "10": {
+      "act_us": {
+        "count": 13,
+        "max": 440,
+        "mean": 436.46153846153845,
+        "p50": 438,
+        "p95": 440
+      },
+      "attn_us": {
+        "count": 13,
+        "max": 2856,
+        "mean": 2230.923076923077,
+        "p50": 2173,
+        "p95": 2856
+      },
+      "count": 13,
+      "down_us": {
+        "count": 13,
+        "max": 5011,
+        "mean": 4880.846153846154,
+        "p50": 4867,
+        "p95": 5011
+      },
+      "final_copy_us": {
+        "count": 13,
+        "max": 43,
+        "mean": 41.69230769230769,
+        "p50": 42,
+        "p95": 43
+      },
+      "final_norm_us": {
+        "count": 13,
+        "max": 14,
+        "mean": 9.307692307692308,
+        "p50": 9,
+        "p95": 14
+      },
+      "gate_up_us": {
+        "count": 13,
+        "max": 9005,
+        "mean": 8833.615384615385,
+        "p50": 8815,
+        "p95": 9005
+      },
+      "generic_attn_us": {
+        "count": 13,
+        "max": 2856,
+        "mean": 2230.923076923077,
+        "p50": 2173,
+        "p95": 2856
+      },
+      "generic_matmul_us": {
+        "count": 13,
+        "max": 21075,
+        "mean": 20924.0,
+        "p50": 20905,
+        "p95": 21075
+      },
+      "generic_norm_us": {
+        "count": 13,
+        "max": 1344,
+        "mean": 1321.6153846153845,
+        "p50": 1328,
+        "p95": 1344
+      },
+      "generic_other_us": {
+        "count": 13,
+        "max": 1043,
+        "mean": 1023.9230769230769,
+        "p50": 1027,
+        "p95": 1043
+      },
+      "generic_qkr_us": {
+        "count": 13,
+        "max": 505,
+        "mean": 499.9230769230769,
+        "p50": 500,
+        "p95": 505
+      },
+      "lm_head_us": {
+        "count": 13,
+        "max": 3018,
+        "mean": 3011.769230769231,
+        "p50": 3011,
+        "p95": 3018
+      },
+      "marlin_gather_us": {
+        "count": 13,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 13,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 13,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 13,
+        "max": 1335,
+        "mean": 1312.3076923076924,
+        "p50": 1319,
+        "p95": 1335
+      },
+      "o_proj_us": {
+        "count": 13,
+        "max": 1781,
+        "mean": 1762.2307692307693,
+        "p50": 1766,
+        "p95": 1781
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 13,
+        "max": 505,
+        "mean": 499.9230769230769,
+        "p50": 500,
+        "p95": 505
+      },
+      "qkv_us": {
+        "count": 13,
+        "max": 2458,
+        "mean": 2435.5384615384614,
+        "p50": 2436,
+        "p95": 2458
+      },
+      "readback_us": {
+        "count": 13,
+        "max": 510,
+        "mean": 505.15384615384613,
+        "p50": 503,
+        "p95": 510
+      },
+      "resid_us": {
+        "count": 13,
+        "max": 562,
+        "mean": 545.7692307692307,
+        "p50": 549,
+        "p95": 562
+      },
+      "share_of_total": {
+        "act": 0.016121653989640543,
+        "attn": 0.08240398466823318,
+        "down": 0.18028464351369092,
+        "final_copy": 0.001539995851671691,
+        "final_norm": 0.0003437998119045657,
+        "gate_up": 0.3262887520635092,
+        "generic_attn": 0.08240398466823318,
+        "generic_matmul": 0.7728733424445019,
+        "generic_norm": 0.04881673196968879,
+        "generic_other": 0.03782082063026177,
+        "generic_qkr": 0.018465743616262582,
+        "lm_head": 0.11124623169834266,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.048472932157784226,
+        "o_proj": 0.06509181728034459,
+        "other": 0.0,
+        "qkr": 0.018465743616262582,
+        "qkv": 0.08996189788861454,
+        "readback": 0.01865895342791143,
+        "resid": 0.020159170788949535,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.02096042324314034
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 13,
+        "max": 27567,
+        "mean": 27073.0,
+        "p50": 26998,
+        "p95": 27567
+      },
+      "unwrapped_us": {
+        "count": 13,
+        "max": 597,
+        "mean": 567.4615384615385,
+        "p50": 567,
+        "p95": 597
+      }
+    },
+    "16": {
+      "act_us": {
+        "count": 4,
+        "max": 455,
+        "mean": 449.0,
+        "p50": 447,
+        "p95": 455
+      },
+      "attn_us": {
+        "count": 4,
+        "max": 3133,
+        "mean": 2911.75,
+        "p50": 2835,
+        "p95": 3133
+      },
+      "count": 4,
+      "down_us": {
+        "count": 4,
+        "max": 4941,
+        "mean": 4918.5,
+        "p50": 4900,
+        "p95": 4941
+      },
+      "final_copy_us": {
+        "count": 4,
+        "max": 64,
+        "mean": 63.25,
+        "p50": 63,
+        "p95": 64
+      },
+      "final_norm_us": {
+        "count": 4,
+        "max": 9,
+        "mean": 8.75,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 4,
+        "max": 8840,
+        "mean": 8821.5,
+        "p50": 8813,
+        "p95": 8840
+      },
+      "generic_attn_us": {
+        "count": 4,
+        "max": 3133,
+        "mean": 2911.75,
+        "p50": 2835,
+        "p95": 3133
+      },
+      "generic_matmul_us": {
+        "count": 4,
+        "max": 21020,
+        "mean": 20959.25,
+        "p50": 20920,
+        "p95": 21020
+      },
+      "generic_norm_us": {
+        "count": 4,
+        "max": 1336,
+        "mean": 1312.25,
+        "p50": 1302,
+        "p95": 1336
+      },
+      "generic_other_us": {
+        "count": 4,
+        "max": 1082,
+        "mean": 1058.75,
+        "p50": 1043,
+        "p95": 1082
+      },
+      "generic_qkr_us": {
+        "count": 4,
+        "max": 503,
+        "mean": 500.25,
+        "p50": 500,
+        "p95": 503
+      },
+      "lm_head_us": {
+        "count": 4,
+        "max": 3030,
+        "mean": 3028.0,
+        "p50": 3028,
+        "p95": 3030
+      },
+      "marlin_gather_us": {
+        "count": 4,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 4,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 4,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 4,
+        "max": 1327,
+        "mean": 1303.5,
+        "p50": 1293,
+        "p95": 1327
+      },
+      "o_proj_us": {
+        "count": 4,
+        "max": 1769,
+        "mean": 1754.75,
+        "p50": 1749,
+        "p95": 1769
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 4,
+        "max": 503,
+        "mean": 500.25,
+        "p50": 500,
+        "p95": 503
+      },
+      "qkv_us": {
+        "count": 4,
+        "max": 2442,
+        "mean": 2436.5,
+        "p50": 2435,
+        "p95": 2442
+      },
+      "readback_us": {
+        "count": 4,
+        "max": 504,
+        "mean": 503.25,
+        "p50": 503,
+        "p95": 504
+      },
+      "resid_us": {
+        "count": 4,
+        "max": 563,
+        "mean": 546.5,
+        "p50": 536,
+        "p95": 563
+      },
+      "share_of_total": {
+        "act": 0.01613163993029982,
+        "attn": 0.1046131460290657,
+        "down": 0.17671151669750482,
+        "final_copy": 0.002272441482386333,
+        "final_norm": 0.00031436937503368244,
+        "gate_up": 0.3169382219268148,
+        "generic_attn": 0.1046131460290657,
+        "generic_matmul": 0.7530224369913953,
+        "generic_norm": 0.04714642427290854,
+        "generic_other": 0.038038694379075574,
+        "generic_qkr": 0.017972946269782814,
+        "lm_head": 0.10878976772594176,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.04683205489787486,
+        "o_proj": 0.06304453266746905,
+        "other": 0.0,
+        "qkr": 0.017972946269782814,
+        "qkv": 0.08753839797366483,
+        "readback": 0.01808073005550865,
+        "resid": 0.019634612966389423,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.02112562200226346
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 4,
+        "max": 28153,
+        "mean": 27833.5,
+        "p50": 27695,
+        "p95": 28153
+      },
+      "unwrapped_us": {
+        "count": 4,
+        "max": 605,
+        "mean": 588.0,
+        "p50": 577,
+        "p95": 605
+      }
+    },
+    "3": {
+      "act_us": {
+        "count": 1,
+        "max": 382,
+        "mean": 382.0,
+        "p50": 382,
+        "p95": 382
+      },
+      "attn_us": {
+        "count": 1,
+        "max": 1616,
+        "mean": 1616.0,
+        "p50": 1616,
+        "p95": 1616
+      },
+      "count": 1,
+      "down_us": {
+        "count": 1,
+        "max": 4843,
+        "mean": 4843.0,
+        "p50": 4843,
+        "p95": 4843
+      },
+      "final_copy_us": {
+        "count": 1,
+        "max": 17,
+        "mean": 17.0,
+        "p50": 17,
+        "p95": 17
+      },
+      "final_norm_us": {
+        "count": 1,
+        "max": 9,
+        "mean": 9.0,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 1,
+        "max": 8786,
+        "mean": 8786.0,
+        "p50": 8786,
+        "p95": 8786
+      },
+      "generic_attn_us": {
+        "count": 1,
+        "max": 1616,
+        "mean": 1616.0,
+        "p50": 1616,
+        "p95": 1616
+      },
+      "generic_matmul_us": {
+        "count": 1,
+        "max": 20779,
+        "mean": 20779.0,
+        "p50": 20779,
+        "p95": 20779
+      },
+      "generic_norm_us": {
+        "count": 1,
+        "max": 1356,
+        "mean": 1356.0,
+        "p50": 1356,
+        "p95": 1356
+      },
+      "generic_other_us": {
+        "count": 1,
+        "max": 966,
+        "mean": 966.0,
+        "p50": 966,
+        "p95": 966
+      },
+      "generic_qkr_us": {
+        "count": 1,
+        "max": 481,
+        "mean": 481.0,
+        "p50": 481,
+        "p95": 481
+      },
+      "lm_head_us": {
+        "count": 1,
+        "max": 2980,
+        "mean": 2980.0,
+        "p50": 2980,
+        "p95": 2980
+      },
+      "marlin_gather_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 1,
+        "max": 1347,
+        "mean": 1347.0,
+        "p50": 1347,
+        "p95": 1347
+      },
+      "o_proj_us": {
+        "count": 1,
+        "max": 1736,
+        "mean": 1736.0,
+        "p50": 1736,
+        "p95": 1736
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 1,
+        "max": 481,
+        "mean": 481.0,
+        "p50": 481,
+        "p95": 481
+      },
+      "qkv_us": {
+        "count": 1,
+        "max": 2434,
+        "mean": 2434.0,
+        "p50": 2434,
+        "p95": 2434
+      },
+      "readback_us": {
+        "count": 1,
+        "max": 524,
+        "mean": 524.0,
+        "p50": 524,
+        "p95": 524
+      },
+      "resid_us": {
+        "count": 1,
+        "max": 567,
+        "mean": 567.0,
+        "p50": 567,
+        "p95": 567
+      },
+      "share_of_total": {
+        "act": 0.014545731475135177,
+        "attn": 0.06153377503617394,
+        "down": 0.1844109359530881,
+        "final_copy": 0.000647323128474602,
+        "final_norm": 0.0003427004797806717,
+        "gate_up": 0.33455182392810906,
+        "generic_attn": 0.06153377503617394,
+        "generic_matmul": 0.7912192521513974,
+        "generic_norm": 0.0516335389536212,
+        "generic_other": 0.03678318482979209,
+        "generic_qkr": 0.018315436752722566,
+        "lm_head": 0.11347193663848908,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.05129083847384053,
+        "o_proj": 0.0661031147665829,
+        "other": 0.0,
+        "qkr": 0.018315436752722566,
+        "qkv": 0.09268144086512832,
+        "readback": 0.019952783489452442,
+        "resid": 0.021590130226182315,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.0205620287868403
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 1,
+        "max": 26262,
+        "mean": 26262.0,
+        "p50": 26262,
+        "p95": 26262
+      },
+      "unwrapped_us": {
+        "count": 1,
+        "max": 540,
+        "mean": 540.0,
+        "p50": 540,
+        "p95": 540
+      }
+    },
+    "9": {
+      "act_us": {
+        "count": 1,
+        "max": 434,
+        "mean": 434.0,
+        "p50": 434,
+        "p95": 434
+      },
+      "attn_us": {
+        "count": 1,
+        "max": 2904,
+        "mean": 2904.0,
+        "p50": 2904,
+        "p95": 2904
+      },
+      "count": 1,
+      "down_us": {
+        "count": 1,
+        "max": 4860,
+        "mean": 4860.0,
+        "p50": 4860,
+        "p95": 4860
+      },
+      "final_copy_us": {
+        "count": 1,
+        "max": 39,
+        "mean": 39.0,
+        "p50": 39,
+        "p95": 39
+      },
+      "final_norm_us": {
+        "count": 1,
+        "max": 9,
+        "mean": 9.0,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 1,
+        "max": 8997,
+        "mean": 8997.0,
+        "p50": 8997,
+        "p95": 8997
+      },
+      "generic_attn_us": {
+        "count": 1,
+        "max": 2904,
+        "mean": 2904.0,
+        "p50": 2904,
+        "p95": 2904
+      },
+      "generic_matmul_us": {
+        "count": 1,
+        "max": 21071,
+        "mean": 21071.0,
+        "p50": 21071,
+        "p95": 21071
+      },
+      "generic_norm_us": {
+        "count": 1,
+        "max": 1348,
+        "mean": 1348.0,
+        "p50": 1348,
+        "p95": 1348
+      },
+      "generic_other_us": {
+        "count": 1,
+        "max": 1029,
+        "mean": 1029.0,
+        "p50": 1029,
+        "p95": 1029
+      },
+      "generic_qkr_us": {
+        "count": 1,
+        "max": 497,
+        "mean": 497.0,
+        "p50": 497,
+        "p95": 497
+      },
+      "lm_head_us": {
+        "count": 1,
+        "max": 3007,
+        "mean": 3007.0,
+        "p50": 3007,
+        "p95": 3007
+      },
+      "marlin_gather_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 1,
+        "max": 1339,
+        "mean": 1339.0,
+        "p50": 1339,
+        "p95": 1339
+      },
+      "o_proj_us": {
+        "count": 1,
+        "max": 1763,
+        "mean": 1763.0,
+        "p50": 1763,
+        "p95": 1763
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 1,
+        "max": 497,
+        "mean": 497.0,
+        "p50": 497,
+        "p95": 497
+      },
+      "qkv_us": {
+        "count": 1,
+        "max": 2444,
+        "mean": 2444.0,
+        "p50": 2444,
+        "p95": 2444
+      },
+      "readback_us": {
+        "count": 1,
+        "max": 510,
+        "mean": 510.0,
+        "p50": 510,
+        "p95": 510
+      },
+      "resid_us": {
+        "count": 1,
+        "max": 556,
+        "mean": 556.0,
+        "p50": 556,
+        "p95": 556
+      },
+      "share_of_total": {
+        "act": 0.015553883095007706,
+        "attn": 0.10407483066336953,
+        "down": 0.17417481991183745,
+        "final_copy": 0.0013976991721320288,
+        "final_norm": 0.00032254596279969894,
+        "gate_up": 0.3224384474787657,
+        "generic_attn": 0.10407483066336953,
+        "generic_matmul": 0.7551517757947174,
+        "generic_norm": 0.048310217539332685,
+        "generic_other": 0.03687775508009891,
+        "generic_qkr": 0.017811704834605598,
+        "lm_head": 0.10776619001541053,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.04798767157653299,
+        "o_proj": 0.06318317026842991,
+        "other": 0.0,
+        "qkr": 0.017811704834605598,
+        "qkv": 0.08758914812027381,
+        "readback": 0.01827760455864961,
+        "resid": 0.01992617281295918,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.01949611152922625
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 1,
+        "max": 27903,
+        "mean": 27903.0,
+        "p50": 27903,
+        "p95": 27903
+      },
+      "unwrapped_us": {
+        "count": 1,
+        "max": 544,
+        "mean": 544.0,
+        "p50": 544,
+        "p95": 544
+      }
+    }
+  },
+  "decode_only_by_num_seqs": {
+    "1": {
+      "act_us": {
+        "count": 2,
+        "max": 391,
+        "mean": 383.5,
+        "p50": 376,
+        "p95": 391
+      },
+      "attn_us": {
+        "count": 2,
+        "max": 739,
+        "mean": 731.5,
+        "p50": 724,
+        "p95": 739
+      },
+      "count": 2,
+      "down_us": {
+        "count": 2,
+        "max": 4954,
+        "mean": 4910.5,
+        "p50": 4867,
+        "p95": 4954
+      },
+      "final_copy_us": {
+        "count": 2,
+        "max": 14,
+        "mean": 11.5,
+        "p50": 9,
+        "p95": 14
+      },
+      "final_norm_us": {
+        "count": 2,
+        "max": 8,
+        "mean": 8.0,
+        "p50": 8,
+        "p95": 8
+      },
+      "gate_up_us": {
+        "count": 2,
+        "max": 8940,
+        "mean": 8855.0,
+        "p50": 8770,
+        "p95": 8940
+      },
+      "generic_attn_us": {
+        "count": 2,
+        "max": 739,
+        "mean": 731.5,
+        "p50": 724,
+        "p95": 739
+      },
+      "generic_matmul_us": {
+        "count": 2,
+        "max": 21355,
+        "mean": 21064.5,
+        "p50": 20774,
+        "p95": 21355
+      },
+      "generic_norm_us": {
+        "count": 2,
+        "max": 1241,
+        "mean": 1232.5,
+        "p50": 1224,
+        "p95": 1241
+      },
+      "generic_other_us": {
+        "count": 2,
+        "max": 907,
+        "mean": 894.5,
+        "p50": 882,
+        "p95": 907
+      },
+      "generic_qkr_us": {
+        "count": 2,
+        "max": 497,
+        "mean": 489.0,
+        "p50": 481,
+        "p95": 497
+      },
+      "lm_head_us": {
+        "count": 2,
+        "max": 2994,
+        "mean": 2976.0,
+        "p50": 2958,
+        "p95": 2994
+      },
+      "marlin_gather_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 2,
+        "max": 1233,
+        "mean": 1224.5,
+        "p50": 1216,
+        "p95": 1233
+      },
+      "o_proj_us": {
+        "count": 2,
+        "max": 1836,
+        "mean": 1792.5,
+        "p50": 1749,
+        "p95": 1836
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 2,
+        "max": 497,
+        "mean": 489.0,
+        "p50": 481,
+        "p95": 497
+      },
+      "qkv_us": {
+        "count": 2,
+        "max": 2631,
+        "mean": 2530.5,
+        "p50": 2430,
+        "p95": 2631
+      },
+      "readback_us": {
+        "count": 2,
+        "max": 311,
+        "mean": 310.0,
+        "p50": 309,
+        "p95": 311
+      },
+      "resid_us": {
+        "count": 2,
+        "max": 502,
+        "mean": 499.5,
+        "p50": 497,
+        "p95": 502
+      },
+      "share_of_total": {
+        "act": 0.01514164445760537,
+        "attn": 0.028881650380021717,
+        "down": 0.19388016977593525,
+        "final_copy": 0.0004540519198499655,
+        "final_norm": 0.00031586220511301943,
+        "gate_up": 0.3496199782844734,
+        "generic_attn": 0.028881650380021717,
+        "generic_matmul": 0.8316849274503998,
+        "generic_norm": 0.04866252097522456,
+        "generic_other": 0.03531734280919949,
+        "generic_qkr": 0.019307077287533312,
+        "lm_head": 0.11750074030204323,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.04834665877011154,
+        "o_proj": 0.07077287533313592,
+        "other": 0.0,
+        "qkr": 0.019307077287533312,
+        "qkv": 0.09991116375481196,
+        "readback": 0.012239660448129503,
+        "resid": 0.019721646431744153,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.02390682064949166
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 2,
+        "max": 25643,
+        "mean": 25327.5,
+        "p50": 25012,
+        "p95": 25643
+      },
+      "unwrapped_us": {
+        "count": 2,
+        "max": 618,
+        "mean": 605.5,
+        "p50": 593,
+        "p95": 618
+      }
+    },
+    "10": {
+      "act_us": {
+        "count": 13,
+        "max": 440,
+        "mean": 436.46153846153845,
+        "p50": 438,
+        "p95": 440
+      },
+      "attn_us": {
+        "count": 13,
+        "max": 2856,
+        "mean": 2230.923076923077,
+        "p50": 2173,
+        "p95": 2856
+      },
+      "count": 13,
+      "down_us": {
+        "count": 13,
+        "max": 5011,
+        "mean": 4880.846153846154,
+        "p50": 4867,
+        "p95": 5011
+      },
+      "final_copy_us": {
+        "count": 13,
+        "max": 43,
+        "mean": 41.69230769230769,
+        "p50": 42,
+        "p95": 43
+      },
+      "final_norm_us": {
+        "count": 13,
+        "max": 14,
+        "mean": 9.307692307692308,
+        "p50": 9,
+        "p95": 14
+      },
+      "gate_up_us": {
+        "count": 13,
+        "max": 9005,
+        "mean": 8833.615384615385,
+        "p50": 8815,
+        "p95": 9005
+      },
+      "generic_attn_us": {
+        "count": 13,
+        "max": 2856,
+        "mean": 2230.923076923077,
+        "p50": 2173,
+        "p95": 2856
+      },
+      "generic_matmul_us": {
+        "count": 13,
+        "max": 21075,
+        "mean": 20924.0,
+        "p50": 20905,
+        "p95": 21075
+      },
+      "generic_norm_us": {
+        "count": 13,
+        "max": 1344,
+        "mean": 1321.6153846153845,
+        "p50": 1328,
+        "p95": 1344
+      },
+      "generic_other_us": {
+        "count": 13,
+        "max": 1043,
+        "mean": 1023.9230769230769,
+        "p50": 1027,
+        "p95": 1043
+      },
+      "generic_qkr_us": {
+        "count": 13,
+        "max": 505,
+        "mean": 499.9230769230769,
+        "p50": 500,
+        "p95": 505
+      },
+      "lm_head_us": {
+        "count": 13,
+        "max": 3018,
+        "mean": 3011.769230769231,
+        "p50": 3011,
+        "p95": 3018
+      },
+      "marlin_gather_us": {
+        "count": 13,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 13,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 13,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 13,
+        "max": 1335,
+        "mean": 1312.3076923076924,
+        "p50": 1319,
+        "p95": 1335
+      },
+      "o_proj_us": {
+        "count": 13,
+        "max": 1781,
+        "mean": 1762.2307692307693,
+        "p50": 1766,
+        "p95": 1781
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 13,
+        "max": 505,
+        "mean": 499.9230769230769,
+        "p50": 500,
+        "p95": 505
+      },
+      "qkv_us": {
+        "count": 13,
+        "max": 2458,
+        "mean": 2435.5384615384614,
+        "p50": 2436,
+        "p95": 2458
+      },
+      "readback_us": {
+        "count": 13,
+        "max": 510,
+        "mean": 505.15384615384613,
+        "p50": 503,
+        "p95": 510
+      },
+      "resid_us": {
+        "count": 13,
+        "max": 562,
+        "mean": 545.7692307692307,
+        "p50": 549,
+        "p95": 562
+      },
+      "share_of_total": {
+        "act": 0.016121653989640543,
+        "attn": 0.08240398466823318,
+        "down": 0.18028464351369092,
+        "final_copy": 0.001539995851671691,
+        "final_norm": 0.0003437998119045657,
+        "gate_up": 0.3262887520635092,
+        "generic_attn": 0.08240398466823318,
+        "generic_matmul": 0.7728733424445019,
+        "generic_norm": 0.04881673196968879,
+        "generic_other": 0.03782082063026177,
+        "generic_qkr": 0.018465743616262582,
+        "lm_head": 0.11124623169834266,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.048472932157784226,
+        "o_proj": 0.06509181728034459,
+        "other": 0.0,
+        "qkr": 0.018465743616262582,
+        "qkv": 0.08996189788861454,
+        "readback": 0.01865895342791143,
+        "resid": 0.020159170788949535,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.02096042324314034
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 13,
+        "max": 27567,
+        "mean": 27073.0,
+        "p50": 26998,
+        "p95": 27567
+      },
+      "unwrapped_us": {
+        "count": 13,
+        "max": 597,
+        "mean": 567.4615384615385,
+        "p50": 567,
+        "p95": 597
+      }
+    },
+    "16": {
+      "act_us": {
+        "count": 4,
+        "max": 455,
+        "mean": 449.0,
+        "p50": 447,
+        "p95": 455
+      },
+      "attn_us": {
+        "count": 4,
+        "max": 3133,
+        "mean": 2911.75,
+        "p50": 2835,
+        "p95": 3133
+      },
+      "count": 4,
+      "down_us": {
+        "count": 4,
+        "max": 4941,
+        "mean": 4918.5,
+        "p50": 4900,
+        "p95": 4941
+      },
+      "final_copy_us": {
+        "count": 4,
+        "max": 64,
+        "mean": 63.25,
+        "p50": 63,
+        "p95": 64
+      },
+      "final_norm_us": {
+        "count": 4,
+        "max": 9,
+        "mean": 8.75,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 4,
+        "max": 8840,
+        "mean": 8821.5,
+        "p50": 8813,
+        "p95": 8840
+      },
+      "generic_attn_us": {
+        "count": 4,
+        "max": 3133,
+        "mean": 2911.75,
+        "p50": 2835,
+        "p95": 3133
+      },
+      "generic_matmul_us": {
+        "count": 4,
+        "max": 21020,
+        "mean": 20959.25,
+        "p50": 20920,
+        "p95": 21020
+      },
+      "generic_norm_us": {
+        "count": 4,
+        "max": 1336,
+        "mean": 1312.25,
+        "p50": 1302,
+        "p95": 1336
+      },
+      "generic_other_us": {
+        "count": 4,
+        "max": 1082,
+        "mean": 1058.75,
+        "p50": 1043,
+        "p95": 1082
+      },
+      "generic_qkr_us": {
+        "count": 4,
+        "max": 503,
+        "mean": 500.25,
+        "p50": 500,
+        "p95": 503
+      },
+      "lm_head_us": {
+        "count": 4,
+        "max": 3030,
+        "mean": 3028.0,
+        "p50": 3028,
+        "p95": 3030
+      },
+      "marlin_gather_us": {
+        "count": 4,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 4,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 4,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 4,
+        "max": 1327,
+        "mean": 1303.5,
+        "p50": 1293,
+        "p95": 1327
+      },
+      "o_proj_us": {
+        "count": 4,
+        "max": 1769,
+        "mean": 1754.75,
+        "p50": 1749,
+        "p95": 1769
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 4,
+        "max": 503,
+        "mean": 500.25,
+        "p50": 500,
+        "p95": 503
+      },
+      "qkv_us": {
+        "count": 4,
+        "max": 2442,
+        "mean": 2436.5,
+        "p50": 2435,
+        "p95": 2442
+      },
+      "readback_us": {
+        "count": 4,
+        "max": 504,
+        "mean": 503.25,
+        "p50": 503,
+        "p95": 504
+      },
+      "resid_us": {
+        "count": 4,
+        "max": 563,
+        "mean": 546.5,
+        "p50": 536,
+        "p95": 563
+      },
+      "share_of_total": {
+        "act": 0.01613163993029982,
+        "attn": 0.1046131460290657,
+        "down": 0.17671151669750482,
+        "final_copy": 0.002272441482386333,
+        "final_norm": 0.00031436937503368244,
+        "gate_up": 0.3169382219268148,
+        "generic_attn": 0.1046131460290657,
+        "generic_matmul": 0.7530224369913953,
+        "generic_norm": 0.04714642427290854,
+        "generic_other": 0.038038694379075574,
+        "generic_qkr": 0.017972946269782814,
+        "lm_head": 0.10878976772594176,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.04683205489787486,
+        "o_proj": 0.06304453266746905,
+        "other": 0.0,
+        "qkr": 0.017972946269782814,
+        "qkv": 0.08753839797366483,
+        "readback": 0.01808073005550865,
+        "resid": 0.019634612966389423,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.02112562200226346
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 4,
+        "max": 28153,
+        "mean": 27833.5,
+        "p50": 27695,
+        "p95": 28153
+      },
+      "unwrapped_us": {
+        "count": 4,
+        "max": 605,
+        "mean": 588.0,
+        "p50": 577,
+        "p95": 605
+      }
+    },
+    "3": {
+      "act_us": {
+        "count": 1,
+        "max": 382,
+        "mean": 382.0,
+        "p50": 382,
+        "p95": 382
+      },
+      "attn_us": {
+        "count": 1,
+        "max": 1616,
+        "mean": 1616.0,
+        "p50": 1616,
+        "p95": 1616
+      },
+      "count": 1,
+      "down_us": {
+        "count": 1,
+        "max": 4843,
+        "mean": 4843.0,
+        "p50": 4843,
+        "p95": 4843
+      },
+      "final_copy_us": {
+        "count": 1,
+        "max": 17,
+        "mean": 17.0,
+        "p50": 17,
+        "p95": 17
+      },
+      "final_norm_us": {
+        "count": 1,
+        "max": 9,
+        "mean": 9.0,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 1,
+        "max": 8786,
+        "mean": 8786.0,
+        "p50": 8786,
+        "p95": 8786
+      },
+      "generic_attn_us": {
+        "count": 1,
+        "max": 1616,
+        "mean": 1616.0,
+        "p50": 1616,
+        "p95": 1616
+      },
+      "generic_matmul_us": {
+        "count": 1,
+        "max": 20779,
+        "mean": 20779.0,
+        "p50": 20779,
+        "p95": 20779
+      },
+      "generic_norm_us": {
+        "count": 1,
+        "max": 1356,
+        "mean": 1356.0,
+        "p50": 1356,
+        "p95": 1356
+      },
+      "generic_other_us": {
+        "count": 1,
+        "max": 966,
+        "mean": 966.0,
+        "p50": 966,
+        "p95": 966
+      },
+      "generic_qkr_us": {
+        "count": 1,
+        "max": 481,
+        "mean": 481.0,
+        "p50": 481,
+        "p95": 481
+      },
+      "lm_head_us": {
+        "count": 1,
+        "max": 2980,
+        "mean": 2980.0,
+        "p50": 2980,
+        "p95": 2980
+      },
+      "marlin_gather_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 1,
+        "max": 1347,
+        "mean": 1347.0,
+        "p50": 1347,
+        "p95": 1347
+      },
+      "o_proj_us": {
+        "count": 1,
+        "max": 1736,
+        "mean": 1736.0,
+        "p50": 1736,
+        "p95": 1736
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 1,
+        "max": 481,
+        "mean": 481.0,
+        "p50": 481,
+        "p95": 481
+      },
+      "qkv_us": {
+        "count": 1,
+        "max": 2434,
+        "mean": 2434.0,
+        "p50": 2434,
+        "p95": 2434
+      },
+      "readback_us": {
+        "count": 1,
+        "max": 524,
+        "mean": 524.0,
+        "p50": 524,
+        "p95": 524
+      },
+      "resid_us": {
+        "count": 1,
+        "max": 567,
+        "mean": 567.0,
+        "p50": 567,
+        "p95": 567
+      },
+      "share_of_total": {
+        "act": 0.014545731475135177,
+        "attn": 0.06153377503617394,
+        "down": 0.1844109359530881,
+        "final_copy": 0.000647323128474602,
+        "final_norm": 0.0003427004797806717,
+        "gate_up": 0.33455182392810906,
+        "generic_attn": 0.06153377503617394,
+        "generic_matmul": 0.7912192521513974,
+        "generic_norm": 0.0516335389536212,
+        "generic_other": 0.03678318482979209,
+        "generic_qkr": 0.018315436752722566,
+        "lm_head": 0.11347193663848908,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.05129083847384053,
+        "o_proj": 0.0661031147665829,
+        "other": 0.0,
+        "qkr": 0.018315436752722566,
+        "qkv": 0.09268144086512832,
+        "readback": 0.019952783489452442,
+        "resid": 0.021590130226182315,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.0205620287868403
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 1,
+        "max": 26262,
+        "mean": 26262.0,
+        "p50": 26262,
+        "p95": 26262
+      },
+      "unwrapped_us": {
+        "count": 1,
+        "max": 540,
+        "mean": 540.0,
+        "p50": 540,
+        "p95": 540
+      }
+    },
+    "9": {
+      "act_us": {
+        "count": 1,
+        "max": 434,
+        "mean": 434.0,
+        "p50": 434,
+        "p95": 434
+      },
+      "attn_us": {
+        "count": 1,
+        "max": 2904,
+        "mean": 2904.0,
+        "p50": 2904,
+        "p95": 2904
+      },
+      "count": 1,
+      "down_us": {
+        "count": 1,
+        "max": 4860,
+        "mean": 4860.0,
+        "p50": 4860,
+        "p95": 4860
+      },
+      "final_copy_us": {
+        "count": 1,
+        "max": 39,
+        "mean": 39.0,
+        "p50": 39,
+        "p95": 39
+      },
+      "final_norm_us": {
+        "count": 1,
+        "max": 9,
+        "mean": 9.0,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 1,
+        "max": 8997,
+        "mean": 8997.0,
+        "p50": 8997,
+        "p95": 8997
+      },
+      "generic_attn_us": {
+        "count": 1,
+        "max": 2904,
+        "mean": 2904.0,
+        "p50": 2904,
+        "p95": 2904
+      },
+      "generic_matmul_us": {
+        "count": 1,
+        "max": 21071,
+        "mean": 21071.0,
+        "p50": 21071,
+        "p95": 21071
+      },
+      "generic_norm_us": {
+        "count": 1,
+        "max": 1348,
+        "mean": 1348.0,
+        "p50": 1348,
+        "p95": 1348
+      },
+      "generic_other_us": {
+        "count": 1,
+        "max": 1029,
+        "mean": 1029.0,
+        "p50": 1029,
+        "p95": 1029
+      },
+      "generic_qkr_us": {
+        "count": 1,
+        "max": 497,
+        "mean": 497.0,
+        "p50": 497,
+        "p95": 497
+      },
+      "lm_head_us": {
+        "count": 1,
+        "max": 3007,
+        "mean": 3007.0,
+        "p50": 3007,
+        "p95": 3007
+      },
+      "marlin_gather_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 1,
+        "max": 1339,
+        "mean": 1339.0,
+        "p50": 1339,
+        "p95": 1339
+      },
+      "o_proj_us": {
+        "count": 1,
+        "max": 1763,
+        "mean": 1763.0,
+        "p50": 1763,
+        "p95": 1763
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 1,
+        "max": 497,
+        "mean": 497.0,
+        "p50": 497,
+        "p95": 497
+      },
+      "qkv_us": {
+        "count": 1,
+        "max": 2444,
+        "mean": 2444.0,
+        "p50": 2444,
+        "p95": 2444
+      },
+      "readback_us": {
+        "count": 1,
+        "max": 510,
+        "mean": 510.0,
+        "p50": 510,
+        "p95": 510
+      },
+      "resid_us": {
+        "count": 1,
+        "max": 556,
+        "mean": 556.0,
+        "p50": 556,
+        "p95": 556
+      },
+      "share_of_total": {
+        "act": 0.015553883095007706,
+        "attn": 0.10407483066336953,
+        "down": 0.17417481991183745,
+        "final_copy": 0.0013976991721320288,
+        "final_norm": 0.00032254596279969894,
+        "gate_up": 0.3224384474787657,
+        "generic_attn": 0.10407483066336953,
+        "generic_matmul": 0.7551517757947174,
+        "generic_norm": 0.048310217539332685,
+        "generic_other": 0.03687775508009891,
+        "generic_qkr": 0.017811704834605598,
+        "lm_head": 0.10776619001541053,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.04798767157653299,
+        "o_proj": 0.06318317026842991,
+        "other": 0.0,
+        "qkr": 0.017811704834605598,
+        "qkv": 0.08758914812027381,
+        "readback": 0.01827760455864961,
+        "resid": 0.01992617281295918,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.01949611152922625
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 1,
+        "max": 27903,
+        "mean": 27903.0,
+        "p50": 27903,
+        "p95": 27903
+      },
+      "unwrapped_us": {
+        "count": 1,
+        "max": 544,
+        "mean": 544.0,
+        "p50": 544,
+        "p95": 544
+      }
+    }
+  },
+  "decode_only_rows": 21,
+  "ferrum_binary_sha256": "ca11f78f9e1be27a26bd12f50e377f3def602f14220cb10e1099eadb4f35ca93  /workspace/ferrum-infer-rs/target/release/ferrum",
+  "itl_p95_ms_mean": 57.69527414999998,
+  "lane": "w2_tail_latency_profile_c16_samepod",
+  "mixed_or_prefill_all": {
+    "act_us": {
+      "count": 155,
+      "max": 10470,
+      "mean": 799.6064516129032,
+      "p50": 680,
+      "p95": 936
+    },
+    "attn_us": {
+      "count": 155,
+      "max": 40509,
+      "mean": 5510.961290322581,
+      "p50": 4787,
+      "p95": 8177
+    },
+    "count": 155,
+    "down_us": {
+      "count": 155,
+      "max": 128152,
+      "mean": 11833.63870967742,
+      "p50": 12021,
+      "p95": 18282
+    },
+    "final_copy_us": {
+      "count": 155,
+      "max": 65,
+      "mean": 47.70967741935484,
+      "p50": 49,
+      "p95": 60
+    },
+    "final_norm_us": {
+      "count": 155,
+      "max": 25,
+      "mean": 9.329032258064515,
+      "p50": 9,
+      "p95": 11
+    },
+    "gate_up_us": {
+      "count": 155,
+      "max": 221922,
+      "mean": 19678.92258064516,
+      "p50": 20283,
+      "p95": 31516
+    },
+    "generic_attn_us": {
+      "count": 155,
+      "max": 40509,
+      "mean": 5510.961290322581,
+      "p50": 4787,
+      "p95": 8177
+    },
+    "generic_matmul_us": {
+      "count": 155,
+      "max": 422552,
+      "mean": 44696.967741935485,
+      "p50": 44372,
+      "p95": 64761
+    },
+    "generic_norm_us": {
+      "count": 155,
+      "max": 6650,
+      "mean": 1481.6,
+      "p50": 1384,
+      "p95": 1746
+    },
+    "generic_other_us": {
+      "count": 155,
+      "max": 13783,
+      "mean": 1459.1225806451612,
+      "p50": 1290,
+      "p95": 1658
+    },
+    "generic_qkr_us": {
+      "count": 155,
+      "max": 2877,
+      "mean": 679.1612903225806,
+      "p50": 631,
+      "p95": 814
+    },
+    "lm_head_us": {
+      "count": 155,
+      "max": 199418,
+      "mean": 4307.187096774193,
+      "p50": 3036,
+      "p95": 3064
+    },
+    "marlin_gather_us": {
+      "count": 155,
+      "max": 0,
+      "mean": 0.0,
+      "p50": 0,
+      "p95": 0
+    },
+    "marlin_kernel_us": {
+      "count": 155,
+      "max": 0,
+      "mean": 0.0,
+      "p50": 0,
+      "p95": 0
+    },
+    "marlin_ws_zero_us": {
+      "count": 155,
+      "max": 0,
+      "mean": 0.0,
+      "p50": 0,
+      "p95": 0
+    },
+    "matmul_us": null,
+    "norm_us": {
+      "count": 155,
+      "max": 6625,
+      "mean": 1472.2709677419355,
+      "p50": 1375,
+      "p95": 1735
+    },
+    "o_proj_us": {
+      "count": 155,
+      "max": 23681,
+      "mean": 3643.9483870967742,
+      "p50": 3727,
+      "p95": 4651
+    },
+    "other_us": null,
+    "qkr_us": {
+      "count": 155,
+      "max": 2877,
+      "mean": 679.1612903225806,
+      "p50": 631,
+      "p95": 814
+    },
+    "qkv_us": {
+      "count": 155,
+      "max": 45501,
+      "mean": 5233.270967741935,
+      "p50": 5286,
+      "p95": 7016
+    },
+    "readback_us": {
+      "count": 155,
+      "max": 768,
+      "mean": 507.60645161290324,
+      "p50": 503,
+      "p95": 512
+    },
+    "resid_us": {
+      "count": 155,
+      "max": 3262,
+      "mean": 611.8064516129032,
+      "p50": 564,
+      "p95": 701
+    },
+    "share_of_total": {
+      "act": 0.01456246170331888,
+      "attn": 0.10036582693513166,
+      "down": 0.21551465745803447,
+      "final_copy": 0.0008688903758788042,
+      "final_norm": 0.00016990067390409072,
+      "gate_up": 0.3583932519118232,
+      "generic_attn": 0.10036582693513166,
+      "generic_matmul": 0.8140227979445074,
+      "generic_norm": 0.0269829529465606,
+      "generic_other": 0.026573593369878818,
+      "generic_qkr": 0.012368910056627684,
+      "lm_head": 0.07844264765408411,
+      "marlin_gather": 0.0,
+      "marlin_kernel": 0.0,
+      "marlin_ws_zero": 0.0,
+      "matmul": 0.0,
+      "norm": 0.02681305227265651,
+      "o_proj": 0.06636372021377406,
+      "other": 0.0,
+      "qkr": 0.012368910056627684,
+      "qkv": 0.09530852070679151,
+      "readback": 0.009244547110719193,
+      "resid": 0.011142241290681136,
+      "tail_act": 0.0,
+      "tail_down": 0.0,
+      "tail_gate_up": 0.0,
+      "tail_mlp": 0.0,
+      "tail_norm": 0.0,
+      "tail_resid": 0.0,
+      "unwrapped": 0.010441371636574704
+    },
+    "tail_act_us": null,
+    "tail_down_us": null,
+    "tail_gate_up_us": null,
+    "tail_mlp_us": null,
+    "tail_norm_us": null,
+    "tail_resid_us": null,
+    "total_us": {
+      "count": 155,
+      "max": 487487,
+      "mean": 54908.74193548387,
+      "p50": 53375,
+      "p95": 78266
+    },
+    "unwrapped_us": {
+      "count": 155,
+      "max": 817,
+      "mean": 573.3225806451613,
+      "p50": 572,
+      "p95": 619
+    }
+  },
+  "mixed_or_prefill_rows": 155,
+  "model_path": "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+  "output_token_count_source": "usage",
+  "output_tps_mean": 372.00153904953766,
+  "profile_by_num_seqs": {
+    "1": {
+      "act_us": {
+        "count": 3,
+        "max": 601,
+        "mean": 456.0,
+        "p50": 391,
+        "p95": 601
+      },
+      "attn_us": {
+        "count": 3,
+        "max": 2290,
+        "mean": 1251.0,
+        "p50": 739,
+        "p95": 2290
+      },
+      "count": 3,
+      "down_us": {
+        "count": 3,
+        "max": 5568,
+        "mean": 5129.666666666667,
+        "p50": 4954,
+        "p95": 5568
+      },
+      "final_copy_us": {
+        "count": 3,
+        "max": 27,
+        "mean": 16.666666666666668,
+        "p50": 14,
+        "p95": 27
+      },
+      "final_norm_us": {
+        "count": 3,
+        "max": 10,
+        "mean": 8.666666666666666,
+        "p50": 8,
+        "p95": 10
+      },
+      "gate_up_us": {
+        "count": 3,
+        "max": 9577,
+        "mean": 9095.666666666666,
+        "p50": 8940,
+        "p95": 9577
+      },
+      "generic_attn_us": {
+        "count": 3,
+        "max": 2290,
+        "mean": 1251.0,
+        "p50": 739,
+        "p95": 2290
+      },
+      "generic_matmul_us": {
+        "count": 3,
+        "max": 231904,
+        "mean": 91344.33333333333,
+        "p50": 21355,
+        "p95": 231904
+      },
+      "generic_norm_us": {
+        "count": 3,
+        "max": 1561,
+        "mean": 1342.0,
+        "p50": 1241,
+        "p95": 1561
+      },
+      "generic_other_us": {
+        "count": 3,
+        "max": 1261,
+        "mean": 1016.6666666666666,
+        "p50": 907,
+        "p95": 1261
+      },
+      "generic_qkr_us": {
+        "count": 3,
+        "max": 1369,
+        "mean": 782.3333333333334,
+        "p50": 497,
+        "p95": 1369
+      },
+      "lm_head_us": {
+        "count": 3,
+        "max": 199418,
+        "mean": 68456.66666666667,
+        "p50": 2994,
+        "p95": 199418
+      },
+      "marlin_gather_us": {
+        "count": 3,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 3,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 3,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 3,
+        "max": 1551,
+        "mean": 1333.3333333333333,
+        "p50": 1233,
+        "p95": 1551
+      },
+      "o_proj_us": {
+        "count": 3,
+        "max": 2367,
+        "mean": 1984.0,
+        "p50": 1836,
+        "p95": 2367
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 3,
+        "max": 1369,
+        "mean": 782.3333333333334,
+        "p50": 497,
+        "p95": 1369
+      },
+      "qkv_us": {
+        "count": 3,
+        "max": 14974,
+        "mean": 6678.333333333333,
+        "p50": 2631,
+        "p95": 14974
+      },
+      "readback_us": {
+        "count": 3,
+        "max": 768,
+        "mean": 462.6666666666667,
+        "p50": 311,
+        "p95": 768
+      },
+      "resid_us": {
+        "count": 3,
+        "max": 633,
+        "mean": 544.0,
+        "p50": 502,
+        "p95": 633
+      },
+      "share_of_total": {
+        "act": 0.004707096774193549,
+        "attn": 0.012913548387096773,
+        "down": 0.052951397849462366,
+        "final_copy": 0.00017204301075268816,
+        "final_norm": 8.946236559139784e-05,
+        "gate_up": 0.09389075268817204,
+        "generic_attn": 0.012913548387096773,
+        "generic_matmul": 0.9429092473118279,
+        "generic_norm": 0.013852903225806451,
+        "generic_other": 0.01049462365591398,
+        "generic_qkr": 0.008075698924731183,
+        "lm_head": 0.7066494623655915,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.013763440860215054,
+        "o_proj": 0.02048,
+        "other": 0.0,
+        "qkr": 0.008075698924731183,
+        "qkv": 0.06893763440860215,
+        "readback": 0.0047759139784946236,
+        "resid": 0.005615483870967742,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.006978064516129032
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 3,
+        "max": 239970,
+        "mean": 96875.0,
+        "p50": 25643,
+        "p95": 239970
+      },
+      "unwrapped_us": {
+        "count": 3,
+        "max": 817,
+        "mean": 676.0,
+        "p50": 618,
+        "p95": 817
+      }
+    },
+    "10": {
+      "act_us": {
+        "count": 16,
+        "max": 10470,
+        "mean": 1074.875,
+        "p50": 438,
+        "p95": 10470
+      },
+      "attn_us": {
+        "count": 16,
+        "max": 40509,
+        "mean": 4912.375,
+        "p50": 2215,
+        "p95": 40509
+      },
+      "count": 16,
+      "down_us": {
+        "count": 16,
+        "max": 128152,
+        "mean": 12671.5625,
+        "p50": 4874,
+        "p95": 128152
+      },
+      "final_copy_us": {
+        "count": 16,
+        "max": 51,
+        "mean": 41.875,
+        "p50": 42,
+        "p95": 51
+      },
+      "final_norm_us": {
+        "count": 16,
+        "max": 25,
+        "mean": 10.25,
+        "p50": 9,
+        "p95": 25
+      },
+      "gate_up_us": {
+        "count": 16,
+        "max": 221922,
+        "mean": 22207.1875,
+        "p50": 8816,
+        "p95": 221922
+      },
+      "generic_attn_us": {
+        "count": 16,
+        "max": 40509,
+        "mean": 4912.375,
+        "p50": 2215,
+        "p95": 40509
+      },
+      "generic_matmul_us": {
+        "count": 16,
+        "max": 422552,
+        "mean": 46259.5,
+        "p50": 20907,
+        "p95": 422552
+      },
+      "generic_norm_us": {
+        "count": 16,
+        "max": 6650,
+        "mean": 1652.375,
+        "p50": 1325,
+        "p95": 6650
+      },
+      "generic_other_us": {
+        "count": 16,
+        "max": 13783,
+        "mean": 1832.5625,
+        "p50": 1028,
+        "p95": 13783
+      },
+      "generic_qkr_us": {
+        "count": 16,
+        "max": 2877,
+        "mean": 652.3125,
+        "p50": 501,
+        "p95": 2877
+      },
+      "lm_head_us": {
+        "count": 16,
+        "max": 3296,
+        "mean": 3030.0,
+        "p50": 3012,
+        "p95": 3296
+      },
+      "marlin_gather_us": {
+        "count": 16,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 16,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 16,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 16,
+        "max": 6625,
+        "mean": 1642.125,
+        "p50": 1315,
+        "p95": 6625
+      },
+      "o_proj_us": {
+        "count": 16,
+        "max": 23681,
+        "mean": 3176.6875,
+        "p50": 1766,
+        "p95": 23681
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 16,
+        "max": 2877,
+        "mean": 652.3125,
+        "p50": 501,
+        "p95": 2877
+      },
+      "qkv_us": {
+        "count": 16,
+        "max": 45501,
+        "mean": 5174.0625,
+        "p50": 2436,
+        "p95": 45501
+      },
+      "readback_us": {
+        "count": 16,
+        "max": 513,
+        "mean": 506.25,
+        "p50": 504,
+        "p95": 513
+      },
+      "resid_us": {
+        "count": 16,
+        "max": 3262,
+        "mean": 715.8125,
+        "p50": 549,
+        "p95": 3262
+      },
+      "share_of_total": {
+        "act": 0.019062651368957295,
+        "attn": 0.08711979720300649,
+        "down": 0.22472713407368572,
+        "final_copy": 0.0007426431222933706,
+        "final_norm": 0.00018178130157628773,
+        "gate_up": 0.3938391656681627,
+        "generic_attn": 0.08711979720300649,
+        "generic_matmul": 0.8204011824651983,
+        "generic_norm": 0.029304475921182287,
+        "generic_other": 0.032500058192184954,
+        "generic_qkr": 0.011568606369217775,
+        "lm_head": 0.0537363262220636,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.029122694619606,
+        "o_proj": 0.05633779399523157,
+        "other": 0.0,
+        "qkr": 0.011568606369217775,
+        "qkv": 0.09176076250605476,
+        "readback": 0.008978222821755675,
+        "resid": 0.01269476370093429,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.010127657027454518
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 16,
+        "max": 487487,
+        "mean": 56386.4375,
+        "p50": 27005,
+        "p95": 487487
+      },
+      "unwrapped_us": {
+        "count": 16,
+        "max": 604,
+        "mean": 571.0625,
+        "p50": 567,
+        "p95": 604
+      }
+    },
+    "11": {
+      "act_us": {
+        "count": 2,
+        "max": 565,
+        "mean": 562.0,
+        "p50": 559,
+        "p95": 565
+      },
+      "attn_us": {
+        "count": 2,
+        "max": 4231,
+        "mean": 4122.5,
+        "p50": 4014,
+        "p95": 4231
+      },
+      "count": 2,
+      "down_us": {
+        "count": 2,
+        "max": 5837,
+        "mean": 5830.0,
+        "p50": 5823,
+        "p95": 5837
+      },
+      "final_copy_us": {
+        "count": 2,
+        "max": 39,
+        "mean": 38.5,
+        "p50": 38,
+        "p95": 39
+      },
+      "final_norm_us": {
+        "count": 2,
+        "max": 9,
+        "mean": 9.0,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 2,
+        "max": 9528,
+        "mean": 9519.0,
+        "p50": 9510,
+        "p95": 9528
+      },
+      "generic_attn_us": {
+        "count": 2,
+        "max": 4231,
+        "mean": 4122.5,
+        "p50": 4014,
+        "p95": 4231
+      },
+      "generic_matmul_us": {
+        "count": 2,
+        "max": 23569,
+        "mean": 23553.5,
+        "p50": 23538,
+        "p95": 23569
+      },
+      "generic_norm_us": {
+        "count": 2,
+        "max": 1348,
+        "mean": 1346.5,
+        "p50": 1345,
+        "p95": 1348
+      },
+      "generic_other_us": {
+        "count": 2,
+        "max": 1160,
+        "mean": 1160.0,
+        "p50": 1160,
+        "p95": 1160
+      },
+      "generic_qkr_us": {
+        "count": 2,
+        "max": 565,
+        "mean": 562.0,
+        "p50": 559,
+        "p95": 565
+      },
+      "lm_head_us": {
+        "count": 2,
+        "max": 3019,
+        "mean": 3018.5,
+        "p50": 3018,
+        "p95": 3019
+      },
+      "marlin_gather_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 2,
+        "max": 1339,
+        "mean": 1337.5,
+        "p50": 1336,
+        "p95": 1339
+      },
+      "o_proj_us": {
+        "count": 2,
+        "max": 2276,
+        "mean": 2272.0,
+        "p50": 2268,
+        "p95": 2276
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 2,
+        "max": 565,
+        "mean": 562.0,
+        "p50": 559,
+        "p95": 565
+      },
+      "qkv_us": {
+        "count": 2,
+        "max": 2918,
+        "mean": 2914.0,
+        "p50": 2910,
+        "p95": 2918
+      },
+      "readback_us": {
+        "count": 2,
+        "max": 512,
+        "mean": 511.0,
+        "p50": 510,
+        "p95": 512
+      },
+      "resid_us": {
+        "count": 2,
+        "max": 562,
+        "mean": 559.5,
+        "p50": 557,
+        "p95": 562
+      },
+      "share_of_total": {
+        "act": 0.01769242877380765,
+        "attn": 0.12978120572957658,
+        "down": 0.18353533763576263,
+        "final_copy": 0.001212025814575791,
+        "final_norm": 0.00028333070990083423,
+        "gate_up": 0.2996694475051157,
+        "generic_attn": 0.12978120572957658,
+        "generic_matmul": 0.7414922084054777,
+        "generic_norm": 0.042389422320163704,
+        "generic_other": 0.036518180387218636,
+        "generic_qkr": 0.01769242877380765,
+        "lm_head": 0.09502597198174091,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.042106091610262866,
+        "o_proj": 0.07152526365496616,
+        "other": 0.0,
+        "qkr": 0.01769242877380765,
+        "qkv": 0.09173618762789233,
+        "readback": 0.01608688808436959,
+        "resid": 0.017613725798835196,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.016039666299386118
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 2,
+        "max": 31860,
+        "mean": 31765.0,
+        "p50": 31670,
+        "p95": 31860
+      },
+      "unwrapped_us": {
+        "count": 2,
+        "max": 513,
+        "mean": 509.5,
+        "p50": 506,
+        "p95": 513
+      }
+    },
+    "12": {
+      "act_us": {
+        "count": 1,
+        "max": 570,
+        "mean": 570.0,
+        "p50": 570,
+        "p95": 570
+      },
+      "attn_us": {
+        "count": 1,
+        "max": 4554,
+        "mean": 4554.0,
+        "p50": 4554,
+        "p95": 4554
+      },
+      "count": 1,
+      "down_us": {
+        "count": 1,
+        "max": 7335,
+        "mean": 7335.0,
+        "p50": 7335,
+        "p95": 7335
+      },
+      "final_copy_us": {
+        "count": 1,
+        "max": 41,
+        "mean": 41.0,
+        "p50": 41,
+        "p95": 41
+      },
+      "final_norm_us": {
+        "count": 1,
+        "max": 9,
+        "mean": 9.0,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 1,
+        "max": 12212,
+        "mean": 12212.0,
+        "p50": 12212,
+        "p95": 12212
+      },
+      "generic_attn_us": {
+        "count": 1,
+        "max": 4554,
+        "mean": 4554.0,
+        "p50": 4554,
+        "p95": 4554
+      },
+      "generic_matmul_us": {
+        "count": 1,
+        "max": 28739,
+        "mean": 28739.0,
+        "p50": 28739,
+        "p95": 28739
+      },
+      "generic_norm_us": {
+        "count": 1,
+        "max": 1377,
+        "mean": 1377.0,
+        "p50": 1377,
+        "p95": 1377
+      },
+      "generic_other_us": {
+        "count": 1,
+        "max": 1169,
+        "mean": 1169.0,
+        "p50": 1169,
+        "p95": 1169
+      },
+      "generic_qkr_us": {
+        "count": 1,
+        "max": 564,
+        "mean": 564.0,
+        "p50": 564,
+        "p95": 564
+      },
+      "lm_head_us": {
+        "count": 1,
+        "max": 3028,
+        "mean": 3028.0,
+        "p50": 3028,
+        "p95": 3028
+      },
+      "marlin_gather_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 1,
+        "max": 1368,
+        "mean": 1368.0,
+        "p50": 1368,
+        "p95": 1368
+      },
+      "o_proj_us": {
+        "count": 1,
+        "max": 2632,
+        "mean": 2632.0,
+        "p50": 2632,
+        "p95": 2632
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 1,
+        "max": 564,
+        "mean": 564.0,
+        "p50": 564,
+        "p95": 564
+      },
+      "qkv_us": {
+        "count": 1,
+        "max": 3532,
+        "mean": 3532.0,
+        "p50": 3532,
+        "p95": 3532
+      },
+      "readback_us": {
+        "count": 1,
+        "max": 502,
+        "mean": 502.0,
+        "p50": 502,
+        "p95": 502
+      },
+      "resid_us": {
+        "count": 1,
+        "max": 558,
+        "mean": 558.0,
+        "p50": 558,
+        "p95": 558
+      },
+      "share_of_total": {
+        "act": 0.015204459974925979,
+        "attn": 0.12147563285230334,
+        "down": 0.19565739283523167,
+        "final_copy": 0.0010936541385473072,
+        "final_norm": 0.00024007042065672597,
+        "gate_up": 0.32574888633999305,
+        "generic_attn": 0.12147563285230334,
+        "generic_matmul": 0.7665982021392942,
+        "generic_norm": 0.03673077436047907,
+        "generic_other": 0.031182480194190294,
+        "generic_qkr": 0.015044413027821495,
+        "lm_head": 0.08077035930539625,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.03649070393982235,
+        "o_proj": 0.0702072607965003,
+        "other": 0.0,
+        "qkr": 0.015044413027821495,
+        "qkv": 0.0942143028621729,
+        "readback": 0.013390594574408493,
+        "resid": 0.01488436608071701,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.015577902851503107
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 1,
+        "max": 37489,
+        "mean": 37489.0,
+        "p50": 37489,
+        "p95": 37489
+      },
+      "unwrapped_us": {
+        "count": 1,
+        "max": 584,
+        "mean": 584.0,
+        "p50": 584,
+        "p95": 584
+      }
+    },
+    "13": {
+      "act_us": {
+        "count": 6,
+        "max": 748,
+        "mean": 628.5,
+        "p50": 621,
+        "p95": 748
+      },
+      "attn_us": {
+        "count": 6,
+        "max": 6228,
+        "mean": 4461.5,
+        "p50": 4113,
+        "p95": 6228
+      },
+      "count": 6,
+      "down_us": {
+        "count": 6,
+        "max": 12900,
+        "mean": 8108.0,
+        "p50": 7450,
+        "p95": 12900
+      },
+      "final_copy_us": {
+        "count": 6,
+        "max": 54,
+        "mean": 42.666666666666664,
+        "p50": 43,
+        "p95": 54
+      },
+      "final_norm_us": {
+        "count": 6,
+        "max": 9,
+        "mean": 9.0,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 6,
+        "max": 20925,
+        "mean": 13212.833333333334,
+        "p50": 12169,
+        "p95": 20925
+      },
+      "generic_attn_us": {
+        "count": 6,
+        "max": 6228,
+        "mean": 4461.5,
+        "p50": 4113,
+        "p95": 6228
+      },
+      "generic_matmul_us": {
+        "count": 6,
+        "max": 46781,
+        "mean": 30978.166666666668,
+        "p50": 28865,
+        "p95": 46781
+      },
+      "generic_norm_us": {
+        "count": 6,
+        "max": 1399,
+        "mean": 1367.1666666666667,
+        "p50": 1374,
+        "p95": 1399
+      },
+      "generic_other_us": {
+        "count": 6,
+        "max": 1347,
+        "mean": 1231.0,
+        "p50": 1222,
+        "p95": 1347
+      },
+      "generic_qkr_us": {
+        "count": 6,
+        "max": 687,
+        "mean": 602.1666666666666,
+        "p50": 592,
+        "p95": 687
+      },
+      "lm_head_us": {
+        "count": 6,
+        "max": 3032,
+        "mean": 3028.3333333333335,
+        "p50": 3028,
+        "p95": 3032
+      },
+      "marlin_gather_us": {
+        "count": 6,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 6,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 6,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 6,
+        "max": 1390,
+        "mean": 1358.1666666666667,
+        "p50": 1365,
+        "p95": 1390
+      },
+      "o_proj_us": {
+        "count": 6,
+        "max": 4190,
+        "mean": 2850.8333333333335,
+        "p50": 2665,
+        "p95": 4190
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 6,
+        "max": 687,
+        "mean": 602.1666666666666,
+        "p50": 592,
+        "p95": 687
+      },
+      "qkv_us": {
+        "count": 6,
+        "max": 5737,
+        "mean": 3778.1666666666665,
+        "p50": 3500,
+        "p95": 5737
+      },
+      "readback_us": {
+        "count": 6,
+        "max": 511,
+        "mean": 505.3333333333333,
+        "p50": 503,
+        "p95": 511
+      },
+      "resid_us": {
+        "count": 6,
+        "max": 568,
+        "mean": 559.8333333333334,
+        "p50": 558,
+        "p95": 568
+      },
+      "share_of_total": {
+        "act": 0.01582698183527516,
+        "attn": 0.11235016620219589,
+        "down": 0.20417687942786153,
+        "final_copy": 0.0010744384380351208,
+        "final_norm": 0.00022663935802303328,
+        "gate_up": 0.33272756270355575,
+        "generic_attn": 0.11235016620219589,
+        "generic_matmul": 0.7800968673404292,
+        "generic_norm": 0.034428197293758185,
+        "generic_other": 0.03099922774737266,
+        "generic_qkr": 0.015163851861800356,
+        "lm_head": 0.07625994694960213,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.03420155793573515,
+        "o_proj": 0.07179011516637007,
+        "other": 0.0,
+        "qkr": 0.015163851861800356,
+        "qkv": 0.09514236309303965,
+        "readback": 0.01272538025047846,
+        "resid": 0.014097807474062385,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.014236309303965348
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 6,
+        "max": 57560,
+        "mean": 39710.666666666664,
+        "p50": 37072,
+        "p95": 57560
+      },
+      "unwrapped_us": {
+        "count": 6,
+        "max": 607,
+        "mean": 565.3333333333334,
+        "p50": 551,
+        "p95": 607
+      }
+    },
+    "14": {
+      "act_us": {
+        "count": 10,
+        "max": 901,
+        "mean": 689.3,
+        "p50": 653,
+        "p95": 901
+      },
+      "attn_us": {
+        "count": 10,
+        "max": 5772,
+        "mean": 4795.5,
+        "p50": 4668,
+        "p95": 5772
+      },
+      "count": 10,
+      "down_us": {
+        "count": 10,
+        "max": 17884,
+        "mean": 10579.5,
+        "p50": 12021,
+        "p95": 17884
+      },
+      "final_copy_us": {
+        "count": 10,
+        "max": 53,
+        "mean": 42.4,
+        "p50": 42,
+        "p95": 53
+      },
+      "final_norm_us": {
+        "count": 10,
+        "max": 11,
+        "mean": 9.2,
+        "p50": 9,
+        "p95": 11
+      },
+      "gate_up_us": {
+        "count": 10,
+        "max": 31136,
+        "mean": 17490.8,
+        "p50": 20279,
+        "p95": 31136
+      },
+      "generic_attn_us": {
+        "count": 10,
+        "max": 5772,
+        "mean": 4795.5,
+        "p50": 4668,
+        "p95": 5772
+      },
+      "generic_matmul_us": {
+        "count": 10,
+        "max": 63228,
+        "mean": 39141.5,
+        "p50": 44370,
+        "p95": 63228
+      },
+      "generic_norm_us": {
+        "count": 10,
+        "max": 1710,
+        "mean": 1428.5,
+        "p50": 1383,
+        "p95": 1710
+      },
+      "generic_other_us": {
+        "count": 10,
+        "max": 1604,
+        "mean": 1306.0,
+        "p50": 1249,
+        "p95": 1604
+      },
+      "generic_qkr_us": {
+        "count": 10,
+        "max": 758,
+        "mean": 641.4,
+        "p50": 623,
+        "p95": 758
+      },
+      "lm_head_us": {
+        "count": 10,
+        "max": 3066,
+        "mean": 3037.8,
+        "p50": 3032,
+        "p95": 3066
+      },
+      "marlin_gather_us": {
+        "count": 10,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 10,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 10,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 10,
+        "max": 1699,
+        "mean": 1419.3,
+        "p50": 1374,
+        "p95": 1699
+      },
+      "o_proj_us": {
+        "count": 10,
+        "max": 4369,
+        "mean": 3366.8,
+        "p50": 3755,
+        "p95": 4369
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 10,
+        "max": 758,
+        "mean": 641.4,
+        "p50": 623,
+        "p95": 758
+      },
+      "qkv_us": {
+        "count": 10,
+        "max": 6773,
+        "mean": 4666.6,
+        "p50": 5283,
+        "p95": 6773
+      },
+      "readback_us": {
+        "count": 10,
+        "max": 513,
+        "mean": 506.8,
+        "p50": 503,
+        "p95": 513
+      },
+      "resid_us": {
+        "count": 10,
+        "max": 700,
+        "mean": 574.3,
+        "p50": 560,
+        "p95": 700
+      },
+      "share_of_total": {
+        "act": 0.01424379559027132,
+        "attn": 0.09909491042092865,
+        "down": 0.21861632880788545,
+        "final_copy": 0.0008761597751740954,
+        "final_norm": 0.000190110139896266,
+        "gate_up": 0.3614324385758271,
+        "generic_attn": 0.09909491042092865,
+        "generic_matmul": 0.8088256566032277,
+        "generic_norm": 0.029518732048023473,
+        "generic_other": 0.02698737420701341,
+        "generic_qkr": 0.013253983014072284,
+        "lm_head": 0.0627735416279214,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.029328621908127208,
+        "o_proj": 0.069572045543777,
+        "other": 0.0,
+        "qkr": 0.013253983014072284,
+        "qkv": 0.09643130204781683,
+        "readback": 0.010472589010807349,
+        "resid": 0.011867418841567995,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.011846754695927096
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 10,
+        "max": 74050,
+        "mean": 48393.0,
+        "p50": 53629,
+        "p95": 74050
+      },
+      "unwrapped_us": {
+        "count": 10,
+        "max": 619,
+        "mean": 573.3,
+        "p50": 575,
+        "p95": 619
+      }
+    },
+    "15": {
+      "act_us": {
+        "count": 32,
+        "max": 993,
+        "mean": 705.5625,
+        "p50": 682,
+        "p95": 936
+      },
+      "attn_us": {
+        "count": 32,
+        "max": 10300,
+        "mean": 5565.5,
+        "p50": 5125,
+        "p95": 8878
+      },
+      "count": 32,
+      "down_us": {
+        "count": 32,
+        "max": 18763,
+        "mean": 11185.46875,
+        "p50": 12043,
+        "p95": 18528
+      },
+      "final_copy_us": {
+        "count": 32,
+        "max": 56,
+        "mean": 44.4375,
+        "p50": 45,
+        "p95": 55
+      },
+      "final_norm_us": {
+        "count": 32,
+        "max": 12,
+        "mean": 9.21875,
+        "p50": 9,
+        "p95": 11
+      },
+      "gate_up_us": {
+        "count": 32,
+        "max": 31863,
+        "mean": 18531.1875,
+        "p50": 20303,
+        "p95": 31580
+      },
+      "generic_attn_us": {
+        "count": 32,
+        "max": 10300,
+        "mean": 5565.5,
+        "p50": 5125,
+        "p95": 8878
+      },
+      "generic_matmul_us": {
+        "count": 32,
+        "max": 66005,
+        "mean": 41267.40625,
+        "p50": 44489,
+        "p95": 64762
+      },
+      "generic_norm_us": {
+        "count": 32,
+        "max": 1777,
+        "mean": 1431.75,
+        "p50": 1389,
+        "p95": 1773
+      },
+      "generic_other_us": {
+        "count": 32,
+        "max": 1724,
+        "mean": 1329.84375,
+        "p50": 1293,
+        "p95": 1668
+      },
+      "generic_qkr_us": {
+        "count": 32,
+        "max": 882,
+        "mean": 666.96875,
+        "p50": 629,
+        "p95": 862
+      },
+      "lm_head_us": {
+        "count": 32,
+        "max": 3064,
+        "mean": 3037.375,
+        "p50": 3035,
+        "p95": 3062
+      },
+      "marlin_gather_us": {
+        "count": 32,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 32,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 32,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 32,
+        "max": 1765,
+        "mean": 1422.53125,
+        "p50": 1380,
+        "p95": 1762
+      },
+      "o_proj_us": {
+        "count": 32,
+        "max": 4905,
+        "mean": 3571.75,
+        "p50": 3753,
+        "p95": 4619
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 32,
+        "max": 882,
+        "mean": 666.96875,
+        "p50": 629,
+        "p95": 862
+      },
+      "qkv_us": {
+        "count": 32,
+        "max": 7443,
+        "mean": 4941.625,
+        "p50": 5295,
+        "p95": 7051
+      },
+      "readback_us": {
+        "count": 32,
+        "max": 519,
+        "mean": 506.84375,
+        "p50": 504,
+        "p95": 513
+      },
+      "resid_us": {
+        "count": 32,
+        "max": 706,
+        "mean": 579.84375,
+        "p50": 566,
+        "p95": 701
+      },
+      "share_of_total": {
+        "act": 0.013741065690303231,
+        "attn": 0.10838997409780513,
+        "down": 0.21784074532105088,
+        "final_copy": 0.0008654351763491538,
+        "final_norm": 0.00017953823981926888,
+        "gate_up": 0.3609010750384638,
+        "generic_attn": 0.10838997409780513,
+        "generic_matmul": 0.803696540206828,
+        "generic_norm": 0.027883810154439404,
+        "generic_other": 0.02589915184918301,
+        "generic_qkr": 0.01298943949987341,
+        "lm_head": 0.05915389409313105,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.027704271914620132,
+        "o_proj": 0.06956102596062087,
+        "other": 0.0,
+        "qkr": 0.01298943949987341,
+        "qkv": 0.09623979979356145,
+        "readback": 0.009870951564843126,
+        "resid": 0.011292650982530624,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.01127013262702787
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 32,
+        "max": 78999,
+        "mean": 51347.0,
+        "p50": 53774,
+        "p95": 78266
+      },
+      "unwrapped_us": {
+        "count": 32,
+        "max": 633,
+        "mean": 578.6875,
+        "p50": 573,
+        "p95": 629
+      }
+    },
+    "16": {
+      "act_us": {
+        "count": 103,
+        "max": 1058,
+        "mean": 674.9126213592233,
+        "p50": 657,
+        "p95": 824
+      },
+      "attn_us": {
+        "count": 103,
+        "max": 9199,
+        "mean": 4980.42718446602,
+        "p50": 4710,
+        "p95": 7731
+      },
+      "count": 103,
+      "down_us": {
+        "count": 103,
+        "max": 20411,
+        "mean": 10337.456310679612,
+        "p50": 11951,
+        "p95": 14544
+      },
+      "final_copy_us": {
+        "count": 103,
+        "max": 65,
+        "mean": 50.737864077669904,
+        "p50": 52,
+        "p95": 62
+      },
+      "final_norm_us": {
+        "count": 103,
+        "max": 12,
+        "mean": 9.097087378640778,
+        "p50": 9,
+        "p95": 10
+      },
+      "gate_up_us": {
+        "count": 103,
+        "max": 34542,
+        "mean": 17105.864077669903,
+        "p50": 20286,
+        "p95": 23738
+      },
+      "generic_attn_us": {
+        "count": 103,
+        "max": 9199,
+        "mean": 4980.42718446602,
+        "p50": 4710,
+        "p95": 7731
+      },
+      "generic_matmul_us": {
+        "count": 103,
+        "max": 71362,
+        "mean": 38496.34951456311,
+        "p50": 44349,
+        "p95": 52417
+      },
+      "generic_norm_us": {
+        "count": 103,
+        "max": 1941,
+        "mean": 1414.0,
+        "p50": 1384,
+        "p95": 1573
+      },
+      "generic_other_us": {
+        "count": 103,
+        "max": 1804,
+        "mean": 1305.0485436893205,
+        "p50": 1290,
+        "p95": 1488
+      },
+      "generic_qkr_us": {
+        "count": 103,
+        "max": 867,
+        "mean": 643.1941747572815,
+        "p50": 631,
+        "p95": 779
+      },
+      "lm_head_us": {
+        "count": 103,
+        "max": 3128,
+        "mean": 3039.21359223301,
+        "p50": 3037,
+        "p95": 3046
+      },
+      "marlin_gather_us": {
+        "count": 103,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 103,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 103,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 103,
+        "max": 1930,
+        "mean": 1404.9029126213593,
+        "p50": 1375,
+        "p95": 1564
+      },
+      "o_proj_us": {
+        "count": 103,
+        "max": 5308,
+        "mean": 3377.233009708738,
+        "p50": 3723,
+        "p95": 4640
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 103,
+        "max": 867,
+        "mean": 643.1941747572815,
+        "p50": 631,
+        "p95": 779
+      },
+      "qkv_us": {
+        "count": 103,
+        "max": 8072,
+        "mean": 4636.582524271845,
+        "p50": 5283,
+        "p95": 6447
+      },
+      "readback_us": {
+        "count": 103,
+        "max": 512,
+        "mean": 505.19417475728153,
+        "p50": 503,
+        "p95": 511
+      },
+      "resid_us": {
+        "count": 103,
+        "max": 751,
+        "mean": 579.3980582524272,
+        "p50": 563,
+        "p95": 690
+      },
+      "share_of_total": {
+        "act": 0.014085768462192165,
+        "attn": 0.10394403948456737,
+        "down": 0.2157479523601301,
+        "final_copy": 0.0010589249379051766,
+        "final_norm": 0.00018986082411349988,
+        "gate_up": 0.3570080527736093,
+        "generic_attn": 0.10394403948456737,
+        "generic_matmul": 0.8034383248156,
+        "generic_norm": 0.029510896633445412,
+        "generic_other": 0.027237024522237627,
+        "generic_qkr": 0.013423788406291628,
+        "lm_head": 0.06342992798256765,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.029321035809331913,
+        "o_proj": 0.07048456453788848,
+        "other": 0.0,
+        "qkr": 0.013423788406291628,
+        "qkv": 0.09676782716140439,
+        "readback": 0.010543658466110958,
+        "resid": 0.012092331122140285,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.011902267671747048
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 103,
+        "max": 85103,
+        "mean": 47914.50485436893,
+        "p50": 53362,
+        "p95": 64902
+      },
+      "unwrapped_us": {
+        "count": 103,
+        "max": 623,
+        "mean": 570.2912621359224,
+        "p50": 572,
+        "p95": 605
+      }
+    },
+    "3": {
+      "act_us": {
+        "count": 1,
+        "max": 382,
+        "mean": 382.0,
+        "p50": 382,
+        "p95": 382
+      },
+      "attn_us": {
+        "count": 1,
+        "max": 1616,
+        "mean": 1616.0,
+        "p50": 1616,
+        "p95": 1616
+      },
+      "count": 1,
+      "down_us": {
+        "count": 1,
+        "max": 4843,
+        "mean": 4843.0,
+        "p50": 4843,
+        "p95": 4843
+      },
+      "final_copy_us": {
+        "count": 1,
+        "max": 17,
+        "mean": 17.0,
+        "p50": 17,
+        "p95": 17
+      },
+      "final_norm_us": {
+        "count": 1,
+        "max": 9,
+        "mean": 9.0,
+        "p50": 9,
+        "p95": 9
+      },
+      "gate_up_us": {
+        "count": 1,
+        "max": 8786,
+        "mean": 8786.0,
+        "p50": 8786,
+        "p95": 8786
+      },
+      "generic_attn_us": {
+        "count": 1,
+        "max": 1616,
+        "mean": 1616.0,
+        "p50": 1616,
+        "p95": 1616
+      },
+      "generic_matmul_us": {
+        "count": 1,
+        "max": 20779,
+        "mean": 20779.0,
+        "p50": 20779,
+        "p95": 20779
+      },
+      "generic_norm_us": {
+        "count": 1,
+        "max": 1356,
+        "mean": 1356.0,
+        "p50": 1356,
+        "p95": 1356
+      },
+      "generic_other_us": {
+        "count": 1,
+        "max": 966,
+        "mean": 966.0,
+        "p50": 966,
+        "p95": 966
+      },
+      "generic_qkr_us": {
+        "count": 1,
+        "max": 481,
+        "mean": 481.0,
+        "p50": 481,
+        "p95": 481
+      },
+      "lm_head_us": {
+        "count": 1,
+        "max": 2980,
+        "mean": 2980.0,
+        "p50": 2980,
+        "p95": 2980
+      },
+      "marlin_gather_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 1,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 1,
+        "max": 1347,
+        "mean": 1347.0,
+        "p50": 1347,
+        "p95": 1347
+      },
+      "o_proj_us": {
+        "count": 1,
+        "max": 1736,
+        "mean": 1736.0,
+        "p50": 1736,
+        "p95": 1736
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 1,
+        "max": 481,
+        "mean": 481.0,
+        "p50": 481,
+        "p95": 481
+      },
+      "qkv_us": {
+        "count": 1,
+        "max": 2434,
+        "mean": 2434.0,
+        "p50": 2434,
+        "p95": 2434
+      },
+      "readback_us": {
+        "count": 1,
+        "max": 524,
+        "mean": 524.0,
+        "p50": 524,
+        "p95": 524
+      },
+      "resid_us": {
+        "count": 1,
+        "max": 567,
+        "mean": 567.0,
+        "p50": 567,
+        "p95": 567
+      },
+      "share_of_total": {
+        "act": 0.014545731475135177,
+        "attn": 0.06153377503617394,
+        "down": 0.1844109359530881,
+        "final_copy": 0.000647323128474602,
+        "final_norm": 0.0003427004797806717,
+        "gate_up": 0.33455182392810906,
+        "generic_attn": 0.06153377503617394,
+        "generic_matmul": 0.7912192521513974,
+        "generic_norm": 0.0516335389536212,
+        "generic_other": 0.03678318482979209,
+        "generic_qkr": 0.018315436752722566,
+        "lm_head": 0.11347193663848908,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.05129083847384053,
+        "o_proj": 0.0661031147665829,
+        "other": 0.0,
+        "qkr": 0.018315436752722566,
+        "qkv": 0.09268144086512832,
+        "readback": 0.019952783489452442,
+        "resid": 0.021590130226182315,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.0205620287868403
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 1,
+        "max": 26262,
+        "mean": 26262.0,
+        "p50": 26262,
+        "p95": 26262
+      },
+      "unwrapped_us": {
+        "count": 1,
+        "max": 540,
+        "mean": 540.0,
+        "p50": 540,
+        "p95": 540
+      }
+    },
+    "9": {
+      "act_us": {
+        "count": 2,
+        "max": 9158,
+        "mean": 4796.0,
+        "p50": 434,
+        "p95": 9158
+      },
+      "attn_us": {
+        "count": 2,
+        "max": 35357,
+        "mean": 19130.5,
+        "p50": 2904,
+        "p95": 35357
+      },
+      "count": 2,
+      "down_us": {
+        "count": 2,
+        "max": 112895,
+        "mean": 58877.5,
+        "p50": 4860,
+        "p95": 112895
+      },
+      "final_copy_us": {
+        "count": 2,
+        "max": 47,
+        "mean": 43.0,
+        "p50": 39,
+        "p95": 47
+      },
+      "final_norm_us": {
+        "count": 2,
+        "max": 23,
+        "mean": 16.0,
+        "p50": 9,
+        "p95": 23
+      },
+      "gate_up_us": {
+        "count": 2,
+        "max": 195127,
+        "mean": 102062.0,
+        "p50": 8997,
+        "p95": 195127
+      },
+      "generic_attn_us": {
+        "count": 2,
+        "max": 35357,
+        "mean": 19130.5,
+        "p50": 2904,
+        "p95": 35357
+      },
+      "generic_matmul_us": {
+        "count": 2,
+        "max": 373012,
+        "mean": 197041.5,
+        "p50": 21071,
+        "p95": 373012
+      },
+      "generic_norm_us": {
+        "count": 2,
+        "max": 6063,
+        "mean": 3705.5,
+        "p50": 1348,
+        "p95": 6063
+      },
+      "generic_other_us": {
+        "count": 2,
+        "max": 12218,
+        "mean": 6623.5,
+        "p50": 1029,
+        "p95": 12218
+      },
+      "generic_qkr_us": {
+        "count": 2,
+        "max": 2657,
+        "mean": 1577.0,
+        "p50": 497,
+        "p95": 2657
+      },
+      "lm_head_us": {
+        "count": 2,
+        "max": 3133,
+        "mean": 3070.0,
+        "p50": 3007,
+        "p95": 3133
+      },
+      "marlin_gather_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_kernel_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "marlin_ws_zero_us": {
+        "count": 2,
+        "max": 0,
+        "mean": 0.0,
+        "p50": 0,
+        "p95": 0
+      },
+      "matmul_us": null,
+      "norm_us": {
+        "count": 2,
+        "max": 6040,
+        "mean": 3689.5,
+        "p50": 1339,
+        "p95": 6040
+      },
+      "o_proj_us": {
+        "count": 2,
+        "max": 21446,
+        "mean": 11604.5,
+        "p50": 1763,
+        "p95": 21446
+      },
+      "other_us": null,
+      "qkr_us": {
+        "count": 2,
+        "max": 2657,
+        "mean": 1577.0,
+        "p50": 497,
+        "p95": 2657
+      },
+      "qkv_us": {
+        "count": 2,
+        "max": 40411,
+        "mean": 21427.5,
+        "p50": 2444,
+        "p95": 40411
+      },
+      "readback_us": {
+        "count": 2,
+        "max": 513,
+        "mean": 511.5,
+        "p50": 510,
+        "p95": 513
+      },
+      "resid_us": {
+        "count": 2,
+        "max": 3013,
+        "mean": 1784.5,
+        "p50": 556,
+        "p95": 3013
+      },
+      "share_of_total": {
+        "act": 0.020926006322306748,
+        "attn": 0.08347059298350484,
+        "down": 0.25689552486272216,
+        "final_copy": 0.00018761848871125733,
+        "final_norm": 6.981153068325854e-05,
+        "gate_up": 0.4453190277871708,
+        "generic_attn": 0.08347059298350484,
+        "generic_matmul": 0.8597355451953305,
+        "generic_norm": 0.01616791418417591,
+        "generic_other": 0.028899792092535185,
+        "generic_qkr": 0.0068807989929686696,
+        "lm_head": 0.013395087449850232,
+        "marlin_gather": 0.0,
+        "marlin_kernel": 0.0,
+        "marlin_ws_zero": 0.0,
+        "matmul": 0.0,
+        "norm": 0.01609810265349265,
+        "o_proj": 0.05063299423836711,
+        "other": 0.0,
+        "qkr": 0.0068807989929686696,
+        "qkv": 0.09349291085722015,
+        "readback": 0.0022317873715304213,
+        "resid": 0.0077861672815171794,
+        "tail_act": 0.0,
+        "tail_down": 0.0,
+        "tail_gate_up": 0.0,
+        "tail_mlp": 0.0,
+        "tail_norm": 0.0,
+        "tail_resid": 0.0,
+        "unwrapped": 0.0026135691799544915
+      },
+      "tail_act_us": null,
+      "tail_down_us": null,
+      "tail_gate_up_us": null,
+      "tail_mlp_us": null,
+      "tail_norm_us": null,
+      "tail_resid_us": null,
+      "total_us": {
+        "count": 2,
+        "max": 430474,
+        "mean": 229188.5,
+        "p50": 27903,
+        "p95": 430474
+      },
+      "unwrapped_us": {
+        "count": 2,
+        "max": 654,
+        "mean": 599.0,
+        "p50": 544,
+        "p95": 654
+      }
+    }
+  },
+  "profile_formats": {
+    "unified-op-profile": 176
+  },
+  "profile_rows": 176,
+  "release_gate": false,
+  "remote_git_sha": "96d2df73e82ab4c0d643ced32d1f424b29dc5353",
+  "remote_git_status_short": "",
+  "same_pod_reference": {
+    "ferrum_c16_output_tps_lcb": 414.59153186899397,
+    "ferrum_c16_output_tps_mean": 422.34520497237537,
+    "ferrum_c16_p95_itl_ms_mean": 52.81935383333333,
+    "vllm_c16_output_tps_lcb": 478.39462812583776,
+    "vllm_c16_output_tps_mean": 500.67038762731977,
+    "vllm_c16_p95_itl_ms_mean": 33.06958213333332
+  },
+  "smoke": {
+    "content": "5\n",
+    "done_count": 1,
+    "malformed": [],
+    "malformed_count": 0,
+    "usage": {
+      "completion_tokens": 3,
+      "prompt_tokens": 23,
+      "total_tokens": 26
+    }
+  },
+  "status": "diagnostic_pass",
+  "top_total_rows": [
+    {
+      "attn_us": 40509,
+      "call": 3,
+      "decode": 0,
+      "down_us": 128152,
+      "format": "unified-op-profile",
+      "gate_up_us": 221922,
+      "generic_attn_us": 40509,
+      "generic_matmul_us": 422552,
+      "lm_head_us": 3296,
+      "m_total": 1220,
+      "max_kv": 122,
+      "num_seqs": 10,
+      "prefill": 10,
+      "sampled": 10,
+      "total_us": 487487
+    },
+    {
+      "attn_us": 35357,
+      "call": 82,
+      "decode": 0,
+      "down_us": 112895,
+      "format": "unified-op-profile",
+      "gate_up_us": 195127,
+      "generic_attn_us": 35357,
+      "generic_matmul_us": 373012,
+      "lm_head_us": 3133,
+      "m_total": 1098,
+      "max_kv": 122,
+      "num_seqs": 9,
+      "prefill": 9,
+      "sampled": 9,
+      "total_us": 430474
+    },
+    {
+      "attn_us": 2290,
+      "call": 0,
+      "decode": 0,
+      "down_us": 5568,
+      "format": "unified-op-profile",
+      "gate_up_us": 9577,
+      "generic_attn_us": 2290,
+      "generic_matmul_us": 231904,
+      "lm_head_us": 199418,
+      "m_total": 23,
+      "max_kv": 23,
+      "num_seqs": 1,
+      "prefill": 1,
+      "sampled": 1,
+      "total_us": 239970
+    },
+    {
+      "attn_us": 8198,
+      "call": 159,
+      "decode": 5,
+      "down_us": 20411,
+      "format": "unified-op-profile",
+      "gate_up_us": 34542,
+      "generic_attn_us": 8198,
+      "generic_matmul_us": 71362,
+      "lm_head_us": 3029,
+      "m_total": 181,
+      "max_kv": 191,
+      "num_seqs": 16,
+      "prefill": 11,
+      "sampled": 5,
+      "total_us": 85103
+    },
+    {
+      "attn_us": 9199,
+      "call": 160,
+      "decode": 5,
+      "down_us": 18962,
+      "format": "unified-op-profile",
+      "gate_up_us": 31980,
+      "generic_attn_us": 9199,
+      "generic_matmul_us": 66430,
+      "lm_head_us": 3029,
+      "m_total": 175,
+      "max_kv": 192,
+      "num_seqs": 16,
+      "prefill": 11,
+      "sampled": 6,
+      "total_us": 81101
+    },
+    {
+      "attn_us": 8878,
+      "call": 161,
+      "decode": 5,
+      "down_us": 18528,
+      "format": "unified-op-profile",
+      "gate_up_us": 31580,
+      "generic_attn_us": 8878,
+      "generic_matmul_us": 64762,
+      "lm_head_us": 3034,
+      "m_total": 153,
+      "max_kv": 193,
+      "num_seqs": 15,
+      "prefill": 10,
+      "sampled": 7,
+      "total_us": 78999
+    },
+    {
+      "attn_us": 8602,
+      "call": 162,
+      "decode": 7,
+      "down_us": 18225,
+      "format": "unified-op-profile",
+      "gate_up_us": 31453,
+      "generic_attn_us": 8602,
+      "generic_matmul_us": 64228,
+      "lm_head_us": 3038,
+      "m_total": 145,
+      "max_kv": 194,
+      "num_seqs": 16,
+      "prefill": 9,
+      "sampled": 8,
+      "total_us": 78298
+    },
+    {
+      "attn_us": 6850,
+      "call": 158,
+      "decode": 5,
+      "down_us": 18763,
+      "format": "unified-op-profile",
+      "gate_up_us": 31863,
+      "generic_attn_us": 6850,
+      "generic_matmul_us": 66005,
+      "lm_head_us": 3031,
+      "m_total": 165,
+      "max_kv": 190,
+      "num_seqs": 15,
+      "prefill": 10,
+      "sampled": 5,
+      "total_us": 78266
+    },
+    {
+      "attn_us": 7530,
+      "call": 324,
+      "decode": 6,
+      "down_us": 18404,
+      "format": "unified-op-profile",
+      "gate_up_us": 31778,
+      "generic_attn_us": 7530,
+      "generic_matmul_us": 64761,
+      "lm_head_us": 3038,
+      "m_total": 148,
+      "max_kv": 193,
+      "num_seqs": 16,
+      "prefill": 10,
+      "sampled": 9,
+      "total_us": 77578
+    },
+    {
+      "attn_us": 7397,
+      "call": 323,
+      "decode": 6,
+      "down_us": 18282,
+      "format": "unified-op-profile",
+      "gate_up_us": 31516,
+      "generic_attn_us": 7397,
+      "generic_matmul_us": 64365,
+      "lm_head_us": 3028,
+      "m_total": 150,
+      "max_kv": 192,
+      "num_seqs": 15,
+      "prefill": 9,
+      "sampled": 6,
+      "total_us": 77065
+    }
+  ]
+}

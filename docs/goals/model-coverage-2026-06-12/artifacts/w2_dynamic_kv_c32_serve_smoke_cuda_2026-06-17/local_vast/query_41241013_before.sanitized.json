@@ -1,0 +1,14 @@
+{
+  "id": 41241013,
+  "cur_state": "stopped",
+  "actual_status": "exited",
+  "intended_status": "stopped",
+  "gpu_name": "RTX 4090",
+  "num_gpus": 1,
+  "gpu_ram": 24564,
+  "dph_total": 0.47111111111111115,
+  "ssh_host": "ssh3.vast.ai",
+  "ssh_port": 11012,
+  "public_ipaddr": "<redacted>",
+  "disk_usage": 30.0
+}

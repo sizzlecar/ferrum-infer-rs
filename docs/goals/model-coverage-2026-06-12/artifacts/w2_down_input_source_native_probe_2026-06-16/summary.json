@@ -1,0 +1,265 @@
+{
+  "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_down_input_source_native_probe_2026-06-16",
+  "binary_sha256": "dd1a5ba3cd0f244603bc1fbebe8f2a6a224004f98943a5c31a21001e9aa7bfb0",
+  "interpretation": "The isolated down_proj row is fast when repeated on constant input, but it slows to the same band as the full tail-MLP chain whenever a gate_up+GeGLU producer runs immediately before it, even if down reads the separate constant input. Small constant input is not slower, so the gap is not explained by GeGLU numeric magnitude. The next bottleneck direction is cache/producer-state or weight-residency around the gate_up -> down sequence, not current Triton W4A16 or GeGLU data sensitivity.",
+  "key_metrics": {
+    "m16_const_after_geglu_immediate_down_us": 69.793,
+    "m16_const_after_l2_flush_down_us": 90.343,
+    "m16_const_baseline_down_us": 32.606,
+    "m16_copied_geglu_after_sync_down_us": 70.098,
+    "m16_geglu_after_sync_down_us": 70.2,
+    "m16_geglu_immediate_down_us": 68.356,
+    "m16_small_const_baseline_down_us": 32.67
+  },
+  "lane": "W2 Gemma3 down input-source native probe",
+  "probe_rc": 0,
+  "remote_head": "cea63ef0b5c933a2a39802a82010b34eaa1a9d45",
+  "rows": [
+    {
+      "down_us": 34.654,
+      "m": 1,
+      "mode": "const_baseline",
+      "ret": 0,
+      "useful_tflops": 6.67
+    },
+    {
+      "down_us": 34.69,
+      "m": 1,
+      "mode": "small_const_baseline",
+      "ret": 0,
+      "useful_tflops": 6.67
+    },
+    {
+      "down_us": 68.742,
+      "m": 1,
+      "mode": "const_after_geglu_immediate",
+      "ret": 0,
+      "useful_tflops": 3.36
+    },
+    {
+      "down_us": 89.394,
+      "m": 1,
+      "mode": "const_after_l2_flush",
+      "ret": 0,
+      "useful_tflops": 2.59
+    },
+    {
+      "down_us": 69.243,
+      "m": 1,
+      "mode": "geglu_immediate",
+      "ret": 0,
+      "useful_tflops": 3.34
+    },
+    {
+      "down_us": 70.548,
+      "m": 1,
+      "mode": "geglu_after_sync",
+      "ret": 0,
+      "useful_tflops": 3.28
+    },
+    {
+      "down_us": 70.49,
+      "m": 1,
+      "mode": "copied_geglu_after_sync",
+      "ret": 0,
+      "useful_tflops": 3.28
+    },
+    {
+      "down_us": 35.395,
+      "m": 10,
+      "mode": "const_baseline",
+      "ret": 0,
+      "useful_tflops": 65.32
+    },
+    {
+      "down_us": 35.645,
+      "m": 10,
+      "mode": "small_const_baseline",
+      "ret": 0,
+      "useful_tflops": 64.86
+    },
+    {
+      "down_us": 69.527,
+      "m": 10,
+      "mode": "const_after_geglu_immediate",
+      "ret": 0,
+      "useful_tflops": 33.25
+    },
+    {
+      "down_us": 90.108,
+      "m": 10,
+      "mode": "const_after_l2_flush",
+      "ret": 0,
+      "useful_tflops": 25.66
+    },
+    {
+      "down_us": 68.626,
+      "m": 10,
+      "mode": "geglu_immediate",
+      "ret": 0,
+      "useful_tflops": 33.69
+    },
+    {
+      "down_us": 70.197,
+      "m": 10,
+      "mode": "geglu_after_sync",
+      "ret": 0,
+      "useful_tflops": 32.94
+    },
+    {
+      "down_us": 70.386,
+      "m": 10,
+      "mode": "copied_geglu_after_sync",
+      "ret": 0,
+      "useful_tflops": 32.85
+    },
+    {
+      "down_us": 32.606,
+      "m": 16,
+      "mode": "const_baseline",
+      "ret": 0,
+      "useful_tflops": 113.46
+    },
+    {
+      "down_us": 32.67,
+      "m": 16,
+      "mode": "small_const_baseline",
+      "ret": 0,
+      "useful_tflops": 113.23
+    },
+    {
+      "down_us": 69.793,
+      "m": 16,
+      "mode": "const_after_geglu_immediate",
+      "ret": 0,
+      "useful_tflops": 53.0
+    },
+    {
+      "down_us": 90.343,
+      "m": 16,
+      "mode": "const_after_l2_flush",
+      "ret": 0,
+      "useful_tflops": 40.95
+    },
+    {
+      "down_us": 68.356,
+      "m": 16,
+      "mode": "geglu_immediate",
+      "ret": 0,
+      "useful_tflops": 54.12
+    },
+    {
+      "down_us": 70.2,
+      "m": 16,
+      "mode": "geglu_after_sync",
+      "ret": 0,
+      "useful_tflops": 52.7
+    },
+    {
+      "down_us": 70.098,
+      "m": 16,
+      "mode": "copied_geglu_after_sync",
+      "ret": 0,
+      "useful_tflops": 52.77
+    },
+    {
+      "down_us": 54.694,
+      "m": 23,
+      "mode": "const_baseline",
+      "ret": 0,
+      "useful_tflops": 97.23
+    },
+    {
+      "down_us": 54.558,
+      "m": 23,
+      "mode": "small_const_baseline",
+      "ret": 0,
+      "useful_tflops": 97.47
+    },
+    {
+      "down_us": 73.8,
+      "m": 23,
+      "mode": "const_after_geglu_immediate",
+      "ret": 0,
+      "useful_tflops": 72.06
+    },
+    {
+      "down_us": 95.544,
+      "m": 23,
+      "mode": "const_after_l2_flush",
+      "ret": 0,
+      "useful_tflops": 55.66
+    },
+    {
+      "down_us": 72.65,
+      "m": 23,
+      "mode": "geglu_immediate",
+      "ret": 0,
+      "useful_tflops": 73.2
+    },
+    {
+      "down_us": 74.434,
+      "m": 23,
+      "mode": "geglu_after_sync",
+      "ret": 0,
+      "useful_tflops": 71.44
+    },
+    {
+      "down_us": 74.577,
+      "m": 23,
+      "mode": "copied_geglu_after_sync",
+      "ret": 0,
+      "useful_tflops": 71.31
+    },
+    {
+      "down_us": 55.48,
+      "m": 32,
+      "mode": "const_baseline",
+      "ret": 0,
+      "useful_tflops": 133.36
+    },
+    {
+      "down_us": 55.449,
+      "m": 32,
+      "mode": "small_const_baseline",
+      "ret": 0,
+      "useful_tflops": 133.43
+    },
+    {
+      "down_us": 74.608,
+      "m": 32,
+      "mode": "const_after_geglu_immediate",
+      "ret": 0,
+      "useful_tflops": 99.17
+    },
+    {
+      "down_us": 96.932,
+      "m": 32,
+      "mode": "const_after_l2_flush",
+      "ret": 0,
+      "useful_tflops": 76.33
+    },
+    {
+      "down_us": 73.788,
+      "m": 32,
+      "mode": "geglu_immediate",
+      "ret": 0,
+      "useful_tflops": 100.27
+    },
+    {
+      "down_us": 75.136,
+      "m": 32,
+      "mode": "geglu_after_sync",
+      "ret": 0,
+      "useful_tflops": 98.47
+    },
+    {
+      "down_us": 75.045,
+      "m": 32,
+      "mode": "copied_geglu_after_sync",
+      "ret": 0,
+      "useful_tflops": 98.59
+    }
+  ],
+  "verdict_line": "VERDICT: gemma3 down input-source native CUDA probe complete"
+}

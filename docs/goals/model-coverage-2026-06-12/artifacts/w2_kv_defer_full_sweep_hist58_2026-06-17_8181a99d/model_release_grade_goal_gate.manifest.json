@@ -1,0 +1,11 @@
+{
+  "artifact_dir": "docs/goals/model-coverage-2026-06-12/artifacts/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d",
+  "goal_doc": "docs/goals/model-coverage-2026-06-12/RELEASE_GRADE_GOAL.md",
+  "lane": "w2",
+  "manifest": "docs/goals/model-coverage-2026-06-12/artifacts/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d/model_release_grade_manifest.json",
+  "pass_line": "MODEL_RELEASE_GRADE_W2 PASS: docs/goals/model-coverage-2026-06-12/artifacts/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d",
+  "problems": [],
+  "schema_version": 1,
+  "status": "pass",
+  "validated_at": "2026-06-17T20:09:01.615055+08:00"
+}

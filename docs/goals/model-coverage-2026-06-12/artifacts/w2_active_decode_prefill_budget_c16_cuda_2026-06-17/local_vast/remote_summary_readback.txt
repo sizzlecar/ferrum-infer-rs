@@ -1,0 +1,99 @@
+# W2 active-decode prefill budget c16 diagnostic
+
+This is diagnostic evidence only and did not produce `MODEL_RELEASE_GRADE_W2 PASS`.
+
+- Status: `diagnostic_pass`
+- Ferrum completed/errors/source: [100, 100, 100] / [0, 0, 0] / usage
+- Ferrum output TPS mean/LCB: 339.927 / 333.110
+- Same-pod vLLM reference TPS mean/LCB: 500.670 / 478.395
+- Ferrum LCB / vLLM LCB: 0.6963
+- Ferrum p95 ITL: 26.637 ms
+- Same-pod vLLM reference p95 ITL: 33.070 ms
+- Ferrum p95 ITL / vLLM p95 ITL: 0.8055
+- Delta vs previous Ferrum LCB: -81.482 tok/s
+- Delta vs previous Ferrum p95 ITL: -26.183 ms
+- c16 throughput diagnostic pass: False
+- c16 p95 ITL diagnostic pass: True
+---summary-json---
+{
+  "dataset_sha256": "58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e  /workspace/ascii_sharegpt_w2_100.jsonl",
+  "delta_output_tps_lcb": -81.4818495619952,
+  "delta_p95_itl_ms": -26.182588216666662,
+  "ferrum_binary_sha256": "49a60008497419336dafd283eb7394c334494ee25ea36fb2f308c87d10c2dee4  /workspace/ferrum-infer-rs/target/release/ferrum",
+  "ferrum_completed_per_run": [
+    100,
+    100,
+    100
+  ],
+  "ferrum_errored_per_run": [
+    0,
+    0,
+    0
+  ],
+  "ferrum_lcb_vs_vllm_lcb_ratio": 0.6963073218693773,
+  "ferrum_output_token_count_source": "usage",
+  "ferrum_output_tps_lcb": 333.10968230699876,
+  "ferrum_output_tps_mean": 339.927090896005,
+  "ferrum_p95_itl_ms_mean": 26.63676561666667,
+  "ferrum_p95_itl_vs_vllm_p95_itl_ratio": 0.8054763289499648,
+  "ferrum_quality_issues_per_run": [
+    {
+      "bad_output": 0,
+      "duplicate_done": 0,
+      "http_500": 0,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "panic": 0,
+      "stream_bulk_flush": 0,
+      "zero_output_tokens": 0
+    },
+    {
+      "bad_output": 0,
+      "duplicate_done": 0,
+      "http_500": 0,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "panic": 0,
+      "stream_bulk_flush": 0,
+      "zero_output_tokens": 0
+    },
+    {
+      "bad_output": 0,
+      "duplicate_done": 0,
+      "http_500": 0,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "panic": 0,
+      "stream_bulk_flush": 0,
+      "zero_output_tokens": 0
+    }
+  ],
+  "lane": "w2_active_decode_prefill_budget_c16_cuda",
+  "model_path": "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+  "previous_ferrum_output_tps_lcb": 414.59153186899397,
+  "previous_ferrum_output_tps_mean": 422.34520497237537,
+  "previous_ferrum_p95_itl_ms_mean": 52.81935383333333,
+  "release_gate": false,
+  "remote_git_sha": "699add71ad4a86cfaf6ee6ee00a98d87c27d18d2",
+  "remote_git_status_short": "",
+  "run_smoke": {
+    "assistant_events": 1,
+    "content": "5",
+    "n_tokens": 3
+  },
+  "same_pod_vllm_reference_output_tps_lcb": 478.39462812583776,
+  "same_pod_vllm_reference_output_tps_mean": 500.67038762731977,
+  "same_pod_vllm_reference_p95_itl_ms_mean": 33.06958213333332,
+  "serve_smoke": {
+    "content": "5\n",
+    "done_count": 1,
+    "usage": {
+      "completion_tokens": 3,
+      "prompt_tokens": 23,
+      "total_tokens": 26
+    }
+  },
+  "status": "diagnostic_pass",
+  "w2_p95_itl_pass_at_c16": true,
+  "w2_throughput_pass_at_c16": false
+}

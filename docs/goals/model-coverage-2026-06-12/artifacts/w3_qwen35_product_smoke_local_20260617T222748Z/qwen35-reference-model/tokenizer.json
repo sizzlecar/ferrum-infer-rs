@@ -1,0 +1,21 @@
+{
+  "added_tokens": [],
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "unk_token": "<unk>",
+    "vocab": {
+      "<unk>": 0,
+      "alpha": 1,
+      "beta": 2
+    }
+  },
+  "normalizer": null,
+  "padding": null,
+  "post_processor": null,
+  "pre_tokenizer": {
+    "type": "Whitespace"
+  },
+  "truncation": null,
+  "version": "1.0"
+}

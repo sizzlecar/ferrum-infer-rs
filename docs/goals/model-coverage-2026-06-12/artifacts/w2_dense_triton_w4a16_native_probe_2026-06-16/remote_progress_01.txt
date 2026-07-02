@@ -1,0 +1,101 @@
+poll=01 utc=23:14:52
+    PID STAT     ELAPSED CMD
+--- probe.rc
+0
+--- stdout_tail
+[microbench] compiling scripts/microbenches/dense_triton_w4a16_gemma3_perf.cu + crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu
+-rwxr-xr-x 1 root root 675872 Jun 15 23:14 /workspace/ferrum-artifacts/w2_dense_triton_w4a16_native_probe_2026-06-16/dense_triton_w4a16_gemma3_perf
+
+[microbench] running /workspace/ferrum-artifacts/w2_dense_triton_w4a16_native_probe_2026-06-16/dense_triton_w4a16_gemma3_perf crates/ferrum-kernels/triton_ptx/w4a16_gptq_f16.ptx
+dense_triton_w4a16_gemma3_perf device=NVIDIA GeForce RTX 4090 sm=8.9 ptx=crates/ferrum-kernels/triton_ptx/w4a16_gptq_f16.ptx
+backend,shape,m,us,useful_tflops,ret
+marlin_product_ws_zero,gate_up,1,132.934,3.48,0
+marlin_kernel_only_ws_prezero_diagnostic,gate_up,1,129.999,3.56,0
+triton_w4a16,gate_up,1,541.844,0.85,0
+marlin_product_ws_zero,gate_up,10,135.856,34.04,0
+marlin_kernel_only_ws_prezero_diagnostic,gate_up,10,133.511,34.64,0
+triton_w4a16,gate_up,10,579.809,7.98,0
+marlin_product_ws_zero,gate_up,16,137.111,53.96,0
+marlin_kernel_only_ws_prezero_diagnostic,gate_up,16,134.286,55.10,0
+triton_w4a16,gate_up,16,618.924,11.95,0
+marlin_product_ws_zero,gate_up,23,139.958,75.99,0
+marlin_kernel_only_ws_prezero_diagnostic,gate_up,23,137.152,77.55,0
+triton_w4a16,gate_up,23,660.389,16.11,0
+marlin_product_ws_zero,gate_up,32,141.253,104.76,0
+marlin_kernel_only_ws_prezero_diagnostic,gate_up,32,138.334,106.97,0
+triton_w4a16,gate_up,32,781.304,18.94,0
+marlin_product_ws_zero,down,1,31.343,7.38,0
+marlin_kernel_only_ws_prezero_diagnostic,down,1,29.456,7.85,0
+triton_w4a16,down,1,556.133,0.42,0
+marlin_product_ws_zero,down,10,31.924,72.43,0
+marlin_kernel_only_ws_prezero_diagnostic,down,10,29.741,77.74,0
+triton_w4a16,down,10,560.515,4.12,0
+marlin_product_ws_zero,down,16,32.527,113.73,0
+marlin_kernel_only_ws_prezero_diagnostic,down,16,30.570,121.01,0
+triton_w4a16,down,16,609.813,6.07,0
+marlin_product_ws_zero,down,23,54.136,98.23,0
+marlin_kernel_only_ws_prezero_diagnostic,down,23,52.200,101.88,0
+triton_w4a16,down,23,670.541,7.93,0
+marlin_product_ws_zero,down,32,54.504,135.75,0
+marlin_kernel_only_ws_prezero_diagnostic,down,32,52.627,140.59,0
+triton_w4a16,down,32,749.147,9.88,0
+
+VERDICT: dense Triton W4A16 Gemma3 native CUDA probe complete
+--- stderr_tail
+crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu(876): warning #177-D: variable "cols" was declared but never referenced
+    int cols = prob_n / thread_n;
+        ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu(460): warning #179-D: right operand of "%" is zero
+        if (group_blocks != -1 && pipe % (group_blocks / thread_k_blocks) == 0) {
+                                         ^
+          detected during instantiation of "void Marlin<threads,thread_m_blocks,thread_n_blocks,thread_k_blocks,stages,group_blocks>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int) [with threads=256, thread_m_blocks=1, thread_n_blocks=8, thread_k_blocks=8, stages=4, group_blocks=-1]" at line 897
+
+crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu(485): warning #39-D: division by zero
+        int4* sh_s_stage = sh_s + s_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
+                                                                                           ^
+          detected during instantiation of "void Marlin<threads,thread_m_blocks,thread_n_blocks,thread_k_blocks,stages,group_blocks>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int) [with threads=256, thread_m_blocks=1, thread_n_blocks=8, thread_k_blocks=8, stages=4, group_blocks=-1]" at line 897
+
+crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu(460): warning #179-D: right operand of "%" is zero
+        if (group_blocks != -1 && pipe % (group_blocks / thread_k_blocks) == 0) {
+                                         ^
+          detected during instantiation of "void Marlin<threads,thread_m_blocks,thread_n_blocks,thread_k_blocks,stages,group_blocks>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int) [with threads=256, thread_m_blocks=1, thread_n_blocks=16, thread_k_blocks=4, stages=4, group_blocks=-1]" at line 899
+
+crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu(485): warning #39-D: division by zero
+        int4* sh_s_stage = sh_s + s_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
+                                                                                           ^
+          detected during instantiation of "void Marlin<threads,thread_m_blocks,thread_n_blocks,thread_k_blocks,stages,group_blocks>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int) [with threads=256, thread_m_blocks=1, thread_n_blocks=16, thread_k_blocks=4, stages=4, group_blocks=-1]" at line 899
+
+crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu(460): warning #179-D: right operand of "%" is zero
+        if (group_blocks != -1 && pipe % (group_blocks / thread_k_blocks) == 0) {
+                                         ^
+          detected during instantiation of "void Marlin<threads,thread_m_blocks,thread_n_blocks,thread_k_blocks,stages,group_blocks>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int) [with threads=256, thread_m_blocks=2, thread_n_blocks=16, thread_k_blocks=4, stages=4, group_blocks=-1]" at line 901
+
+crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu(485): warning #39-D: division by zero
+        int4* sh_s_stage = sh_s + s_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
+                                                                                           ^
+          detected during instantiation of "void Marlin<threads,thread_m_blocks,thread_n_blocks,thread_k_blocks,stages,group_blocks>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int) [with threads=256, thread_m_blocks=2, thread_n_blocks=16, thread_k_blocks=4, stages=4, group_blocks=-1]" at line 901
+
+crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu(460): warning #179-D: right operand of "%" is zero
+        if (group_blocks != -1 && pipe % (group_blocks / thread_k_blocks) == 0) {
+                                         ^
+          detected during instantiation of "void Marlin<threads,thread_m_blocks,thread_n_blocks,thread_k_blocks,stages,group_blocks>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int) [with threads=256, thread_m_blocks=3, thread_n_blocks=16, thread_k_blocks=4, stages=4, group_blocks=-1]" at line 903
+
+crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu(485): warning #39-D: division by zero
+        int4* sh_s_stage = sh_s + s_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
+                                                                                           ^
+          detected during instantiation of "void Marlin<threads,thread_m_blocks,thread_n_blocks,thread_k_blocks,stages,group_blocks>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int) [with threads=256, thread_m_blocks=3, thread_n_blocks=16, thread_k_blocks=4, stages=4, group_blocks=-1]" at line 903
+
+crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu(460): warning #179-D: right operand of "%" is zero
+        if (group_blocks != -1 && pipe % (group_blocks / thread_k_blocks) == 0) {
+                                         ^
+          detected during instantiation of "void Marlin<threads,thread_m_blocks,thread_n_blocks,thread_k_blocks,stages,group_blocks>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int) [with threads=256, thread_m_blocks=4, thread_n_blocks=16, thread_k_blocks=4, stages=4, group_blocks=-1]" at line 905
+
+crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu(485): warning #39-D: division by zero
+        int4* sh_s_stage = sh_s + s_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
+                                                                                           ^
+          detected during instantiation of "void Marlin<threads,thread_m_blocks,thread_n_blocks,thread_k_blocks,stages,group_blocks>(const int4 *, const int4 *, int4 *, const int4 *, int, int, int, int, int *, const int *, const int *, const int *, int, int, int, int) [with threads=256, thread_m_blocks=4, thread_n_blocks=16, thread_k_blocks=4, stages=4, group_blocks=-1]" at line 905
+
+--- nohup_stderr

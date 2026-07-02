@@ -1,0 +1,2 @@
+UID          PID    PPID  C STIME TTY          TIME CMD
+root        8326       1 99 06:14 ?        00:02:20 /workspace/ferrum-active-chunk-8bc7cf08/target/release/ferrum serve --model gemma3:27b-gptq --backend cuda --host 127.0.0.1 --port 18141 --max-num-seqs 16 --max-num-batched-tokens 2048 --kv-capacity 512 --effective-config-json /workspace/w2_active_decode_prefill_chunk_c16_diag_2026-06-16/server/default/serve_effective_config.json --decision-trace-jsonl /workspace/w2_active_decode_prefill_chunk_c16_diag_2026-06-16/server/default/serve_decision_trace.jsonl

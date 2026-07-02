@@ -1,0 +1,8 @@
+date_utc=2026-06-20T09:13:28Z
+repo=/workspace/ferrum-w3-unified-75ec7e6e
+git_head=1fa76a807d8a209fe900e190c1e52931a09a5319
+git_status_start
+## goal/w2-w3-release-grade...origin/goal/w2-w3-release-grade
+git_status_end
+target=/workspace/ferrum-target-w3-varlen
+0, NVIDIA GeForce RTX 4090, GPU-42c92344-3195-9df2-4b65-884f1180fb3a, 49140, 1, 580.126.09

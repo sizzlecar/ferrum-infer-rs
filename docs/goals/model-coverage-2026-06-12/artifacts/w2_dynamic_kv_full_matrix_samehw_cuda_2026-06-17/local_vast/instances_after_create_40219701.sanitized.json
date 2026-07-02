@@ -1,0 +1,34 @@
+[
+  {
+    "actual_status": "exited",
+    "cur_state": "stopped",
+    "dph_total": 0.47111111111111115,
+    "gpu_name": "RTX 4090",
+    "gpu_ram": 24564,
+    "host_id": 213498,
+    "id": 41241013,
+    "image_uuid": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+    "label": "ferrum-w2-vllm-ferrum-c16-ab-20260617",
+    "machine_id": 51606,
+    "num_gpus": 1,
+    "ssh_host": "ssh3.vast.ai",
+    "ssh_port": 11012,
+    "start_date": 1781643805.2796462
+  },
+  {
+    "actual_status": "loading",
+    "cur_state": "running",
+    "dph_total": 0.8111111111111111,
+    "gpu_name": "RTX 4090",
+    "gpu_ram": 49140,
+    "host_id": 256524,
+    "id": 41276321,
+    "image_uuid": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+    "label": "ferrum-w2-dynamic-kv-full-matrix-20260617",
+    "machine_id": 56458,
+    "num_gpus": 1,
+    "ssh_host": "ssh8.vast.ai",
+    "ssh_port": 36320,
+    "start_date": 1781668854.933852
+  }
+]

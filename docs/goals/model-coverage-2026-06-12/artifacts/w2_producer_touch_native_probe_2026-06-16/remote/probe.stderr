@@ -1,0 +1,12 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+scripts/microbenches/gemma3_down_prefetch_overlap_perf.cu(288): error: class "uint4" has no suitable copy constructor
+              const uint4 v = q[pos];
+                              ^
+
+scripts/microbenches/gemma3_down_prefetch_overlap_perf.cu(297): error: class "uint4" has no suitable copy constructor
+              const uint4 v = s[pos];
+                              ^
+
+2 errors detected in the compilation of "scripts/microbenches/gemma3_down_prefetch_overlap_perf.cu".

@@ -1,0 +1,123 @@
+{
+  "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_down_prefetch_overlap_native_probe_2026-06-16",
+  "binary_sha256": "58491a34483c8c4ba0ccbd4b1d9c9b127676b1f520a6ba42a0409daae5cc64bc",
+  "interpretation": "The overlap warm kernel restores down kernel time under 8-layer rotation, but total segment wall time gets worse. At m16, overlap qweight+scales reduces down from 69.744us to 32.560us but increases segment_host_us from 216.072us to 238.979us. At m32, down drops from 74.849us to 53.790us while segment_host_us increases from 227.628us to 269.916us. Current explicit warm/prefetch is therefore not a productizable W2 performance fix; it shifts cost rather than lowering wall time.",
+  "key_metrics": {
+    "m16_no_prefetch_down_us": 69.744,
+    "m16_no_prefetch_segment_us": 216.072,
+    "m16_overlap_qweight_down_us": 34.063,
+    "m16_overlap_qweight_scales_down_us": 32.56,
+    "m16_overlap_qweight_scales_segment_us": 238.979,
+    "m16_overlap_qweight_segment_us": 239.437,
+    "m16_serial_qweight_scales_segment_us": 243.142,
+    "m32_no_prefetch_down_us": 74.849,
+    "m32_no_prefetch_segment_us": 227.628,
+    "m32_overlap_qweight_down_us": 53.836,
+    "m32_overlap_qweight_scales_down_us": 53.79,
+    "m32_overlap_qweight_scales_segment_us": 269.916,
+    "m32_overlap_qweight_segment_us": 268.3,
+    "m32_serial_qweight_scales_segment_us": 273.308
+  },
+  "lane": "W2 Gemma3 down prefetch-overlap native probe",
+  "probe_rc": 0,
+  "remote_head": "432e6588bac59902b7488484934494c751534221",
+  "rows": [
+    {
+      "down_us": 69.744,
+      "m": 16,
+      "mode": "cycle8_no_prefetch",
+      "ret": 0,
+      "segment_host_us": 216.072,
+      "useful_tflops": 53.04
+    },
+    {
+      "down_us": 69.657,
+      "m": 16,
+      "mode": "cycle8_policy_only",
+      "ret": 0,
+      "segment_host_us": 215.884,
+      "useful_tflops": 53.11
+    },
+    {
+      "down_us": 34.063,
+      "m": 16,
+      "mode": "cycle8_overlap_qweight",
+      "ret": 0,
+      "segment_host_us": 239.437,
+      "useful_tflops": 108.61
+    },
+    {
+      "down_us": 32.56,
+      "m": 16,
+      "mode": "cycle8_overlap_qweight_scales",
+      "ret": 0,
+      "segment_host_us": 238.979,
+      "useful_tflops": 113.62
+    },
+    {
+      "down_us": 32.584,
+      "m": 16,
+      "mode": "cycle8_serial_qweight_scales",
+      "ret": 0,
+      "segment_host_us": 243.142,
+      "useful_tflops": 113.53
+    },
+    {
+      "down_us": 32.817,
+      "m": 16,
+      "mode": "cycle8_down_warm_upper",
+      "ret": 0,
+      "segment_host_us": 246.239,
+      "useful_tflops": 112.73
+    },
+    {
+      "down_us": 74.849,
+      "m": 32,
+      "mode": "cycle8_no_prefetch",
+      "ret": 0,
+      "segment_host_us": 227.628,
+      "useful_tflops": 98.85
+    },
+    {
+      "down_us": 74.777,
+      "m": 32,
+      "mode": "cycle8_policy_only",
+      "ret": 0,
+      "segment_host_us": 227.09,
+      "useful_tflops": 98.94
+    },
+    {
+      "down_us": 53.836,
+      "m": 32,
+      "mode": "cycle8_overlap_qweight",
+      "ret": 0,
+      "segment_host_us": 268.3,
+      "useful_tflops": 137.43
+    },
+    {
+      "down_us": 53.79,
+      "m": 32,
+      "mode": "cycle8_overlap_qweight_scales",
+      "ret": 0,
+      "segment_host_us": 269.916,
+      "useful_tflops": 137.55
+    },
+    {
+      "down_us": 53.868,
+      "m": 32,
+      "mode": "cycle8_serial_qweight_scales",
+      "ret": 0,
+      "segment_host_us": 273.308,
+      "useful_tflops": 137.35
+    },
+    {
+      "down_us": 54.054,
+      "m": 32,
+      "mode": "cycle8_down_warm_upper",
+      "ret": 0,
+      "segment_host_us": 280.983,
+      "useful_tflops": 136.88
+    }
+  ],
+  "verdict_line": "VERDICT: gemma3 down prefetch-overlap native CUDA probe complete"
+}

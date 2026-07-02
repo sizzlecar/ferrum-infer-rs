@@ -1,0 +1,16 @@
+{
+  "checks": {
+    "bench_parse_error": "'list' object has no attribute 'get'",
+    "bench_rc": "0",
+    "chat_content": "5",
+    "chat_rc": "0",
+    "chat_usage": {
+      "completion_tokens": 1,
+      "prompt_tokens": 23,
+      "total_tokens": 24
+    },
+    "error_scan_lines": 0,
+    "ready": "1"
+  },
+  "ok": true
+}

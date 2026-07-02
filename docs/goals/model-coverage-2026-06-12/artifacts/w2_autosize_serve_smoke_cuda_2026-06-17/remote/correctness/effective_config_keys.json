@@ -1,0 +1,38 @@
+{
+  "matches": [
+    {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "16",
+      "key": "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+      "source": "default"
+    },
+    {
+      "affects": [
+        "memory"
+      ],
+      "effective_value": "512",
+      "key": "FERRUM_KV_CAPACITY",
+      "source": "cli"
+    },
+    {
+      "affects": [
+        "performance",
+        "memory"
+      ],
+      "effective_value": "2048",
+      "key": "FERRUM_MAX_BATCHED_TOKENS",
+      "source": "memory_profile"
+    },
+    {
+      "affects": [
+        "performance",
+        "memory"
+      ],
+      "effective_value": "8",
+      "key": "FERRUM_PAGED_MAX_SEQS",
+      "source": "memory_profile"
+    }
+  ]
+}

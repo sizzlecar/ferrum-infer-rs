@@ -5,6 +5,14 @@
 //! `LlmExecutor` (living in `ferrum-engine`) holds a `Box<dyn DecoderOnlyLLM>`
 //! and adapts it to the `ModelExecutor` trait that the scheduler calls.
 
+use ferrum_interfaces::{
+    model_executor::{
+        KvSlotCapacitySnapshot, KvSlotRequest, KvSlotReservation, LogitsReturnPolicy,
+    },
+    RecurrentStateSpec,
+};
+use ferrum_types::{RequestId, Result, TokenId};
+
 /// Runtime configuration every decoder-only LLM must expose.
 ///
 /// This is the *execution-facing* config — the bare minimum the surrounding
@@ -118,6 +126,35 @@ pub trait DecoderOnlyLLM: Send + Sync {
         self.config().max_seq_len
     }
 
+    /// Reserve model-owned KV slots before dispatching a prefill/decode forward.
+    ///
+    /// Paged-KV models override this to allocate physical blocks and update block
+    /// tables at the admission boundary. Non-paged models return `None`.
+    fn reserve_kv_slots(
+        &mut self,
+        _requests: &[KvSlotRequest],
+    ) -> std::result::Result<Option<KvSlotReservation>, ferrum_types::FerrumError> {
+        Ok(None)
+    }
+
+    /// Snapshot model-owned paged-KV capacity without allocating slots.
+    fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
+        None
+    }
+
+    /// Recurrent-state allocation spec for state-space or hybrid models.
+    ///
+    /// Most decoder-only models are KV-only and return `None`. Models with
+    /// model-owned recurrent state can return a spec here so the engine can
+    /// apply admission/backpressure before dispatching a forward.
+    fn recurrent_state_spec(
+        &self,
+        _request_id: &RequestId,
+        _input_tokens: &[TokenId],
+    ) -> Result<Option<RecurrentStateSpec>> {
+        Ok(None)
+    }
+
     /// Prefill the model with a prompt. Returns `[vocab_size]` logits for
     /// the last prompt token.
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32>;
@@ -148,6 +185,14 @@ pub trait DecoderOnlyLLM: Send + Sync {
         _force_full_logits: bool,
     ) -> Vec<Vec<f32>> {
         self.decode_batch(batch)
+    }
+
+    fn decode_batch_with_logits_policy(
+        &mut self,
+        batch: &[(String, u32, u32)],
+        _policies: &[LogitsReturnPolicy],
+    ) -> Vec<Vec<f32>> {
+        self.decode_batch_with_full_logits(batch, true)
     }
 
     /// Multi-position decode-verify: run a single forward over `tokens`
@@ -203,6 +248,30 @@ pub trait DecoderOnlyLLM: Send + Sync {
         Err(ferrum_types::FerrumError::unsupported(
             "unified_forward not implemented for this model",
         ))
+    }
+
+    /// Unified mixed-batch forward with per-final-item logits return policies.
+    ///
+    /// The default preserves the historical trait behavior by returning full
+    /// logits from [`Self::unified_forward`]. Implementations may override this
+    /// to return model-side greedy-argmax sentinels (`vec![token_id]`) for
+    /// policy-compatible rows and avoid downloading full vocab logits.
+    #[allow(clippy::type_complexity)]
+    fn unified_forward_with_logits_policy(
+        &mut self,
+        items: &[(String, Vec<u32>, usize, bool)],
+        _policies: &[LogitsReturnPolicy],
+    ) -> std::result::Result<Vec<Option<Vec<f32>>>, ferrum_types::FerrumError> {
+        self.unified_forward(items)
+    }
+
+    /// Whether `unified_forward` can satisfy requests that require full logits.
+    ///
+    /// The trait contract returns logits for every final chunk, so the default
+    /// is true. Implementations with an opt-in sentinel/argmax return path must
+    /// override this while that path is active.
+    fn unified_forward_can_return_full_logits(&self) -> bool {
+        true
     }
 
     /// Release the KV cache for a completed sequence.

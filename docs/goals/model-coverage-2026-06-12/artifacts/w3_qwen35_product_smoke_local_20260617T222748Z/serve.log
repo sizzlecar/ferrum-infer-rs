@@ -1,0 +1,45 @@
+
+  ______                            
+ |  ____|                           
+ | |__ ___ _ __ _ __ _   _ _ __ ___  
+ |  __/ _ \ '__| '__| | | | '_ ` _ \ 
+ | | |  __/ |  | |  | |_| | | | | | 
+ |_|  \___|_|  |_|   \__,_|_| |_| |_|
+
+   🦀 Rust LLM Inference Server
+   Version 0.7.7
+
+Model: qwen35-reference-model
+Path: /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/qwen35-reference-model
+Device: CPU
+
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Server)
+Initializing engine (continuous batching)...
+2026-06-17T22:27:48.680523Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-17T22:27:48.680545Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-17T22:27:48.680619Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/qwen35-reference-model/tokenizer.json"
+2026-06-17T22:27:48.681495Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-17T22:27:48.681511Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-17T22:27:48.681523Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-17T22:27:48.681539Z  INFO ferrum_engine::registry: Creating default KV cache manager: device=CPU, block_size=16, max_blocks=2048
+2026-06-17T22:27:48.681565Z  INFO ferrum_engine::registry: Loading model from /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/qwen35-reference-model (format: safetensors)
+2026-06-17T22:27:48.681718Z  INFO ferrum_engine::registry:   Architecture: Qwen35, Layers: 2, Vocab: 3
+2026-06-17T22:27:48.681731Z  INFO ferrum_engine::registry: Building model...
+2026-06-17T22:27:48.681742Z  INFO ferrum_engine::registry: Using Qwen3.5/Qwen3.6 explicit CPU/FP32 reference executor
+
+🚀 Server running at http://127.0.0.1:56121
+
+Endpoints:
+  POST /v1/chat/completions      - OpenAI-compatible chat
+  POST /v1/audio/transcriptions  - Speech-to-text (Whisper)
+  POST /v1/audio/speech          - Text-to-speech (TTS)
+  POST /v1/embeddings            - Text/image embeddings
+  GET  /v1/models                - List models
+  GET  /health                   - Health check
+
+Press Ctrl+C to stop.
+
+2026-06-17T22:27:48.696009Z  WARN ferrum_engine::continuous_engine::inner::batch: Unified forward failed: Unsupported operation: unified_decode not implemented for this executor; falling back to split
+2026-06-17T22:27:48.696354Z  WARN ferrum_engine::continuous_engine::inner::batch: Unified forward failed: Unsupported operation: unified_decode not implemented for this executor; falling back to split
+2026-06-17T22:27:48.702517Z  WARN ferrum_engine::continuous_engine::inner::batch: Unified forward failed: Unsupported operation: unified_decode not implemented for this executor; falling back to split
+2026-06-17T22:27:48.702830Z  WARN ferrum_engine::continuous_engine::inner::batch: Unified forward failed: Unsupported operation: unified_decode not implemented for this executor; falling back to split

@@ -1,0 +1,14 @@
+{
+  "cuda_max_good": 12.8,
+  "disk_space": 467.1504979035117,
+  "dph_total": 0.29555555555555557,
+  "geolocation": "British Columbia, CA",
+  "gpu_name": "RTX 4090",
+  "gpu_ram": 24564,
+  "id": 39797598,
+  "inet_down": 1035.6,
+  "inet_up": 377.0,
+  "machine_id": 33755,
+  "num_gpus": 1,
+  "reliability": 0.987461
+}

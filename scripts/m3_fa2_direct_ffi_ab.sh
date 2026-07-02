@@ -27,7 +27,9 @@ if [[ -z "${FA2_EXTRA_LD_LIBRARY_PATH+x}" ]]; then
 fi
 
 if [[ "$FA2_SOURCE" == "1" ]]; then
-    FEATURES="${FEATURES:-cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin,fa2-source}"
+    echo "FA2_SOURCE=1 selected the removed source-linked FA2 path." >&2
+    echo "Use a Ferrum native operator FA2 artifact instead of fa2-source." >&2
+    exit 2
 else
     FEATURES="${FEATURES:-cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin}"
     if [[ ! -r "$FA2_SHIM" ]]; then

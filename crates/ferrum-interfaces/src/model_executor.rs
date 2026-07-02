@@ -3,11 +3,152 @@
 //! This module provides the ModelExecutor trait that replaces the "fat" Model
 //! interface, focusing purely on tensor operations without tokenization or sampling.
 
-use crate::{KvCacheHandle, TensorRef};
+use crate::{KvCacheHandle, RecurrentStateHandle, RecurrentStateSpec, TensorRef};
 use async_trait::async_trait;
-use ferrum_types::{ModelInfo, Result};
+use ferrum_types::{ModelInfo, RequestId, Result, TokenId};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap},
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
+
+/// One model-owned KV slot reservation request.
+///
+/// `cache_id` is the executor/model cache key attached to a sequence. `target_len`
+/// is the sequence length that must be writable before the next forward runs.
+/// `admission_target_len`, when present, is a larger known-context bound used
+/// only for admission fit checks. Paged models must not allocate future blocks
+/// for it; it mirrors vLLM's chunked-prefill full-context fit gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvSlotRequest {
+    pub cache_id: String,
+    pub target_len: usize,
+    pub admission_target_len: Option<usize>,
+}
+
+/// Per-cache outcome from a KV slot reservation attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvSlotAllocation {
+    pub cache_id: String,
+    pub blocks_before: usize,
+    pub blocks_after: usize,
+    pub new_blocks: usize,
+}
+
+/// Model-owned paged-KV reservation evidence.
+///
+/// Executors that own a vLLM-style physical KV block pool return this after
+/// reserving all requested slots. Executors without model-owned paged KV return
+/// `None` from `reserve_kv_slots`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvSlotReservation {
+    pub block_size: usize,
+    pub total_blocks: usize,
+    pub free_blocks_before: usize,
+    pub free_blocks_after: usize,
+    pub allocations: Vec<KvSlotAllocation>,
+}
+
+/// Point-in-time model-owned paged-KV capacity snapshot.
+///
+/// This is intentionally smaller than [`KvSlotReservation`]: it lets the
+/// engine observe whether physical block capacity has actually changed after a
+/// release, without allocating speculative slots or depending on model-family
+/// names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvSlotCapacitySnapshot {
+    pub block_size: usize,
+    pub total_blocks: usize,
+    pub free_blocks: usize,
+}
+
+/// Token-validity mask for model-side greedy argmax.
+///
+/// `valid_token_mask[id] != 0` means token `id` may be selected. Tokens at or
+/// above `valid_token_mask.len()` are invalid. The fingerprint lets model
+/// backends cache an uploaded device mask without comparing the full vector on
+/// every decode step.
+#[derive(Clone)]
+pub struct TokenSelectionMask {
+    pub fingerprint: u64,
+    pub valid_token_mask: Arc<[i8]>,
+}
+
+impl TokenSelectionMask {
+    pub fn new(valid_token_mask: Vec<i8>) -> Self {
+        let mut hasher = DefaultHasher::new();
+        valid_token_mask.hash(&mut hasher);
+        Self {
+            fingerprint: hasher.finish(),
+            valid_token_mask: Arc::from(valid_token_mask),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.valid_token_mask.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.valid_token_mask.is_empty()
+    }
+}
+
+impl std::fmt::Debug for TokenSelectionMask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let valid_count = self.valid_token_mask.iter().filter(|&&v| v != 0).count();
+        f.debug_struct("TokenSelectionMask")
+            .field("fingerprint", &self.fingerprint)
+            .field("len", &self.valid_token_mask.len())
+            .field("valid_count", &valid_count)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum LogitsReturnPolicy {
+    FullLogits,
+    GreedyArgmax {
+        token_mask: Option<TokenSelectionMask>,
+        repetition_penalty: Option<GreedyRepetitionPenalty>,
+    },
+}
+
+impl Default for LogitsReturnPolicy {
+    fn default() -> Self {
+        Self::FullLogits
+    }
+}
+
+impl LogitsReturnPolicy {
+    pub fn requires_full_logits(&self) -> bool {
+        matches!(self, Self::FullLogits)
+    }
+}
+
+/// Sparse repetition-penalty metadata for model-side greedy argmax.
+///
+/// The token list is request-local and de-duplicated. Applying the penalty
+/// before GPU argmax avoids downloading full `[batch, vocab]` logits for the
+/// common greedy chat path while preserving repeat avoidance.
+#[derive(Clone, Debug)]
+pub struct GreedyRepetitionPenalty {
+    pub penalty: f32,
+    pub token_ids: Arc<[u32]>,
+}
+
+impl GreedyRepetitionPenalty {
+    pub fn new(penalty: f32, token_ids: Vec<u32>) -> Self {
+        Self {
+            penalty,
+            token_ids: Arc::from(token_ids),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.token_ids.is_empty() || self.penalty == 1.0
+    }
+}
 
 /// Input for prefill phase (processing the initial prompt)
 #[derive(Debug, Clone)]
@@ -20,6 +161,8 @@ pub struct PrefillInput {
     pub position_ids: Option<TensorRef>,
     /// Pre-allocated KV cache handle (optional, for paged attention)
     pub kv_cache: Option<Arc<dyn KvCacheHandle>>,
+    /// Pre-allocated recurrent-state handle (optional, for state-space layers)
+    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
     /// Request metadata that can affect model execution.
     pub metadata: HashMap<String, serde_json::Value>,
 }
@@ -32,6 +175,7 @@ impl PrefillInput {
             attention_mask: None,
             position_ids: None,
             kv_cache: None,
+            recurrent_state: None,
             metadata: HashMap::new(),
         }
     }
@@ -39,6 +183,12 @@ impl PrefillInput {
     /// Create prefill input with a pre-allocated KV cache handle.
     pub fn with_kv_cache(mut self, kv_cache: Arc<dyn KvCacheHandle>) -> Self {
         self.kv_cache = Some(kv_cache);
+        self
+    }
+
+    /// Create prefill input with a pre-allocated recurrent-state handle.
+    pub fn with_recurrent_state(mut self, recurrent_state: Arc<dyn RecurrentStateHandle>) -> Self {
+        self.recurrent_state = Some(recurrent_state);
         self
     }
 
@@ -82,6 +232,8 @@ pub struct PrefillOutput {
     pub logits: TensorRef,
     /// KV cache handle populated with prompt states
     pub kv_cache: Arc<dyn KvCacheHandle>,
+    /// Recurrent-state handle populated with prompt state, when used.
+    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
     /// Hidden states at each layer (optional, for analysis)
     pub hidden_states: Option<Vec<TensorRef>>,
     /// Attention weights (optional, for analysis)
@@ -94,9 +246,16 @@ impl PrefillOutput {
         Self {
             logits,
             kv_cache,
+            recurrent_state: None,
             hidden_states: None,
             attention_weights: None,
         }
+    }
+
+    /// Attach updated recurrent state to the prefill output.
+    pub fn with_recurrent_state(mut self, recurrent_state: Arc<dyn RecurrentStateHandle>) -> Self {
+        self.recurrent_state = Some(recurrent_state);
+        self
     }
 
     /// Get logits for last position (for next token generation)
@@ -126,10 +285,14 @@ pub struct DecodeInput {
     pub input_ids: TensorRef,
     /// Existing KV cache from previous steps
     pub kv_cache: Arc<dyn KvCacheHandle>,
+    /// Existing recurrent state from previous steps, when used.
+    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
     /// Position IDs for current step [batch_size, 1] (optional)
     pub position_ids: Option<TensorRef>,
     /// Request metadata that can affect model execution.
     pub metadata: HashMap<String, serde_json::Value>,
+    /// How the model may return final-position logits for this request.
+    pub logits_policy: LogitsReturnPolicy,
 }
 
 impl DecodeInput {
@@ -138,8 +301,10 @@ impl DecodeInput {
         Self {
             input_ids,
             kv_cache,
+            recurrent_state: None,
             position_ids: None,
             metadata: HashMap::new(),
+            logits_policy: LogitsReturnPolicy::FullLogits,
         }
     }
 
@@ -149,9 +314,20 @@ impl DecodeInput {
         self
     }
 
+    /// Attach recurrent state for state-space or hybrid layers.
+    pub fn with_recurrent_state(mut self, recurrent_state: Arc<dyn RecurrentStateHandle>) -> Self {
+        self.recurrent_state = Some(recurrent_state);
+        self
+    }
+
     /// Attach request metadata.
     pub fn with_metadata(mut self, metadata: HashMap<String, serde_json::Value>) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    pub fn with_logits_policy(mut self, policy: LogitsReturnPolicy) -> Self {
+        self.logits_policy = policy;
         self
     }
 
@@ -183,6 +359,8 @@ pub struct UnifiedBatchItem {
     pub q_tokens: Vec<u32>,
     /// KV cache handle for this sequence.
     pub kv_cache: Arc<dyn KvCacheHandle>,
+    /// Recurrent-state handle for this sequence, when used.
+    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
     /// Starting absolute position for the FIRST token in `q_tokens`.
     /// 0 for a fresh prefill, `kv_len` for a decode step or a continuing
     /// chunked-prefill slice.
@@ -194,6 +372,8 @@ pub struct UnifiedBatchItem {
     pub is_final_chunk: bool,
     /// Request metadata that can affect model execution.
     pub metadata: HashMap<String, serde_json::Value>,
+    /// How the model may return final-position logits for this item.
+    pub logits_policy: LogitsReturnPolicy,
 }
 
 impl std::fmt::Debug for UnifiedBatchItem {
@@ -201,6 +381,7 @@ impl std::fmt::Debug for UnifiedBatchItem {
         f.debug_struct("UnifiedBatchItem")
             .field("seq_id", &self.seq_id)
             .field("q_len", &self.q_tokens.len())
+            .field("has_recurrent_state", &self.recurrent_state.is_some())
             .field("pos_offset", &self.pos_offset)
             .field("is_final_chunk", &self.is_final_chunk)
             .finish()
@@ -243,6 +424,8 @@ pub struct DecodeOutput {
     pub logits: TensorRef,
     /// Updated KV cache with new token state
     pub kv_cache: Arc<dyn KvCacheHandle>,
+    /// Updated recurrent state, when used.
+    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
     /// Hidden state for current token (optional)
     pub hidden_state: Option<TensorRef>,
     /// Attention weights for current token (optional)
@@ -255,9 +438,16 @@ impl DecodeOutput {
         Self {
             logits,
             kv_cache,
+            recurrent_state: None,
             hidden_state: None,
             attention_weights: None,
         }
+    }
+
+    /// Attach updated recurrent state to the decode output.
+    pub fn with_recurrent_state(mut self, recurrent_state: Arc<dyn RecurrentStateHandle>) -> Self {
+        self.recurrent_state = Some(recurrent_state);
+        self
     }
 }
 
@@ -283,6 +473,37 @@ pub trait ModelExecutor: Send + Sync {
     /// runtime cache window than the model's declared context length.
     fn kv_capacity(&self) -> Option<usize> {
         None
+    }
+
+    /// Reserve model-owned KV slots before a forward is dispatched.
+    ///
+    /// This is the executor-level admission hook for vLLM-style paged KV. The
+    /// engine calls it at the batch boundary so a request that cannot grow its
+    /// KV cache is delayed or preempted before kernel launch instead of
+    /// panicking inside attention.
+    fn reserve_kv_slots(&self, _requests: &[KvSlotRequest]) -> Result<Option<KvSlotReservation>> {
+        Ok(None)
+    }
+
+    /// Snapshot model-owned paged-KV capacity without allocating slots.
+    ///
+    /// Executors without model-owned paged KV return `None`.
+    fn kv_slot_capacity_snapshot(&self) -> Option<KvSlotCapacitySnapshot> {
+        None
+    }
+
+    /// Recurrent-state allocation spec for this request, when the model has
+    /// state-space or hybrid layers that need per-request recurrent state.
+    ///
+    /// Attention-only models return `None`. If this returns `Some`, the engine
+    /// must allocate a recurrent-state handle before prefill and pass it through
+    /// prefill/decode inputs. The default keeps existing executors KV-only.
+    fn recurrent_state_spec(
+        &self,
+        _request_id: &RequestId,
+        _input_tokens: &[TokenId],
+    ) -> Result<Option<RecurrentStateSpec>> {
+        Ok(None)
     }
 
     /// Execute prefill phase (process initial prompt)

@@ -1,0 +1,8 @@
+out=/workspace/artifacts/w3_qwen35_linear_scratch_real_product_20260621T130848Z_dirty
+Sun Jun 21 13:08:48 UTC 2026
+690ba923b652109aea09d99ebe5702a4897b6995
+ M crates/ferrum-models/src/models/qwen35.rs
+9b8dfaa22208fb777d7e994617908500fa4a9a148fc7f491d4a76336fdbbeb35  target/release/ferrum
+NVIDIA GeForce RTX 4090, 49140 MiB, 1 MiB, 0 %
+W3 QWEN35 REAL PRODUCT REPORT PASS: /workspace/artifacts/w3_qwen35_linear_scratch_real_product_20260621T130848Z_dirty
+NVIDIA GeForce RTX 4090, 49140 MiB, 1 MiB, 26 %

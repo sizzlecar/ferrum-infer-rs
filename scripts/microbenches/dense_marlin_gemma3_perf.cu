@@ -1,0 +1,531 @@
+// Standalone native-CUDA probe for Ferrum's dense IST-DASLab Marlin GEMM at
+// Gemma3-27B GPTQ shapes.
+//
+// Goal: validate dense Marlin kernel/tile hypotheses without loading a model
+// or rebuilding the Rust workspace. This directly calls `marlin_cuda` from
+// crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu with synthetic buffers.
+//
+// Build:
+//   nvcc -O3 -arch=sm_89 -std=c++17 \
+//     scripts/microbenches/dense_marlin_gemma3_perf.cu \
+//     crates/ferrum-kernels/kernels/marlin_cuda_kernel.cu \
+//     -lcuda -lcudart -o /tmp/dense_marlin_gemma3_perf
+
+#include <cuda_runtime.h>
+
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+extern "C" int marlin_cuda(
+    const void* A, const void* B, void* C, void* s, int prob_m, int prob_n,
+    int prob_k, void* workspace, int groupsize, int dev, cudaStream_t stream,
+    int thread_k, int thread_n, int sms, int max_par, int prob_n_full);
+
+#define CHK(stmt)                                                                \
+    do {                                                                         \
+        cudaError_t err__ = (stmt);                                              \
+        if (err__ != cudaSuccess) {                                              \
+            std::fprintf(stderr, "CUDA %s:%d: %s\n", __FILE__, __LINE__,        \
+                         cudaGetErrorString(err__));                            \
+            std::exit(1);                                                        \
+        }                                                                        \
+    } while (0)
+
+struct Shape {
+    const char* name;
+    int k;
+    int n;
+};
+
+struct Tile {
+    const char* name;
+    int thread_k;
+    int thread_n;
+};
+
+struct BlockPolicy {
+    const char* name;
+    int blocks;
+};
+
+constexpr int GROUP_SIZE = 128;
+constexpr int MAX_PAR = 16;
+constexpr int WARMUP_ITERS = 5;
+constexpr int TIMED_ITERS = 80;
+constexpr int WEIGHT_CYCLE_SETS = 8;
+constexpr double RTX4090_FP16_TFLOPS_PEAK = 165.0;
+constexpr size_t L2_FLUSH_BYTES = 256ull * 1024ull * 1024ull;
+
+static size_t round_up(size_t value, size_t align) {
+    return ((value + align - 1) / align) * align;
+}
+
+static int padded_m(int m) {
+    return ((m + 15) / 16) * 16;
+}
+
+static int resolved_thread_n(const Tile& tile, int m) {
+    if (tile.thread_n > 0) {
+        return tile.thread_n;
+    }
+    return m <= 16 ? 128 : 256;
+}
+
+static void* cuda_alloc_bytes(size_t bytes, int pattern) {
+    void* ptr = nullptr;
+    CHK(cudaMalloc(&ptr, bytes));
+    CHK(cudaMemset(ptr, pattern, bytes));
+    return ptr;
+}
+
+static float time_one(
+    cudaStream_t stream,
+    void* a,
+    void* b,
+    void* c,
+    void* scales,
+    void* workspace,
+    size_t workspace_bytes,
+    const Shape& shape,
+    int m,
+    const Tile& tile,
+    bool include_workspace_zero,
+    int sms,
+    void* flush_buffer,
+    size_t flush_bytes) {
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    CHK(cudaEventCreate(&start));
+    CHK(cudaEventCreate(&stop));
+
+    float total_ms = 0.0f;
+    const int total_iters = WARMUP_ITERS + TIMED_ITERS;
+    for (int iter = 0; iter < total_iters; ++iter) {
+        if (!include_workspace_zero) {
+            CHK(cudaMemsetAsync(workspace, 0, workspace_bytes, stream));
+        }
+        if (flush_buffer != nullptr && flush_bytes > 0) {
+            CHK(cudaMemsetAsync(flush_buffer, iter & 0xff, flush_bytes, stream));
+            CHK(cudaStreamSynchronize(stream));
+        }
+        CHK(cudaEventRecord(start, stream));
+        if (include_workspace_zero) {
+            CHK(cudaMemsetAsync(workspace, 0, workspace_bytes, stream));
+        }
+        int ret = marlin_cuda(
+            a,
+            b,
+            c,
+            scales,
+            m,
+            shape.n,
+            shape.k,
+            workspace,
+            GROUP_SIZE,
+            0,
+            stream,
+            tile.thread_k,
+            tile.thread_n,
+            sms,
+            MAX_PAR,
+            -1);
+        if (ret != 0) {
+            CHK(cudaEventDestroy(start));
+            CHK(cudaEventDestroy(stop));
+            return -static_cast<float>(ret);
+        }
+        CHK(cudaEventRecord(stop, stream));
+        CHK(cudaEventSynchronize(stop));
+        CHK(cudaGetLastError());
+        if (iter >= WARMUP_ITERS) {
+            float ms = 0.0f;
+            CHK(cudaEventElapsedTime(&ms, start, stop));
+            total_ms += ms;
+        }
+    }
+
+    CHK(cudaEventDestroy(start));
+    CHK(cudaEventDestroy(stop));
+    return (total_ms * 1000.0f) / static_cast<float>(TIMED_ITERS);
+}
+
+static float time_one_host_sync(
+    cudaStream_t stream,
+    void* a,
+    void* b,
+    void* c,
+    void* scales,
+    void* workspace,
+    size_t workspace_bytes,
+    const Shape& shape,
+    int m,
+    const Tile& tile,
+    bool include_workspace_zero,
+    int sms) {
+    double total_us = 0.0;
+    const int total_iters = WARMUP_ITERS + TIMED_ITERS;
+    for (int iter = 0; iter < total_iters; ++iter) {
+        if (!include_workspace_zero) {
+            CHK(cudaMemsetAsync(workspace, 0, workspace_bytes, stream));
+            CHK(cudaStreamSynchronize(stream));
+        } else {
+            CHK(cudaStreamSynchronize(stream));
+        }
+        const auto start = std::chrono::steady_clock::now();
+        if (include_workspace_zero) {
+            CHK(cudaMemsetAsync(workspace, 0, workspace_bytes, stream));
+        }
+        int ret = marlin_cuda(
+            a,
+            b,
+            c,
+            scales,
+            m,
+            shape.n,
+            shape.k,
+            workspace,
+            GROUP_SIZE,
+            0,
+            stream,
+            tile.thread_k,
+            tile.thread_n,
+            sms,
+            MAX_PAR,
+            -1);
+        if (ret != 0) {
+            return -static_cast<float>(ret);
+        }
+        CHK(cudaStreamSynchronize(stream));
+        CHK(cudaGetLastError());
+        const auto stop = std::chrono::steady_clock::now();
+        if (iter >= WARMUP_ITERS) {
+            total_us += std::chrono::duration<double, std::micro>(stop - start).count();
+        }
+    }
+    return static_cast<float>(total_us / static_cast<double>(TIMED_ITERS));
+}
+
+static float time_weight_cycle(
+    cudaStream_t stream,
+    void* a,
+    const std::vector<void*>& b_set,
+    void* c,
+    const std::vector<void*>& scale_set,
+    const std::vector<void*>& workspace_set,
+    size_t workspace_bytes,
+    const Shape& shape,
+    int m,
+    const Tile& tile,
+    bool include_workspace_zero,
+    int sms) {
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    CHK(cudaEventCreate(&start));
+    CHK(cudaEventCreate(&stop));
+
+    float total_ms = 0.0f;
+    const int total_iters = WARMUP_ITERS + TIMED_ITERS;
+    const int set_count = static_cast<int>(b_set.size());
+    for (int iter = 0; iter < total_iters; ++iter) {
+        int slot = iter % set_count;
+        void* b = b_set[slot];
+        void* scales = scale_set[slot];
+        void* workspace = workspace_set[slot];
+        if (!include_workspace_zero) {
+            CHK(cudaMemsetAsync(workspace, 0, workspace_bytes, stream));
+        }
+        CHK(cudaEventRecord(start, stream));
+        if (include_workspace_zero) {
+            CHK(cudaMemsetAsync(workspace, 0, workspace_bytes, stream));
+        }
+        int ret = marlin_cuda(
+            a,
+            b,
+            c,
+            scales,
+            m,
+            shape.n,
+            shape.k,
+            workspace,
+            GROUP_SIZE,
+            0,
+            stream,
+            tile.thread_k,
+            tile.thread_n,
+            sms,
+            MAX_PAR,
+            -1);
+        if (ret != 0) {
+            CHK(cudaEventDestroy(start));
+            CHK(cudaEventDestroy(stop));
+            return -static_cast<float>(ret);
+        }
+        CHK(cudaEventRecord(stop, stream));
+        CHK(cudaEventSynchronize(stop));
+        CHK(cudaGetLastError());
+        if (iter >= WARMUP_ITERS) {
+            float ms = 0.0f;
+            CHK(cudaEventElapsedTime(&ms, start, stop));
+            total_ms += ms;
+        }
+    }
+
+    CHK(cudaEventDestroy(start));
+    CHK(cudaEventDestroy(stop));
+    return (total_ms * 1000.0f) / static_cast<float>(TIMED_ITERS);
+}
+
+static void run_shape(const Shape& shape, const std::vector<int>& m_values) {
+    int sms = 0;
+    CHK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+    cudaStream_t stream;
+    CHK(cudaStreamCreate(&stream));
+
+    int max_m = 0;
+    for (int m : m_values) max_m = max_m > m ? max_m : m;
+    size_t a_bytes = round_up(static_cast<size_t>(max_m) * shape.k * 2, 16);
+    size_t b_bytes = round_up(static_cast<size_t>(shape.k) * shape.n / 2, 16);
+    size_t c_bytes = round_up(static_cast<size_t>(max_m) * shape.n * 2, 16);
+    size_t scale_bytes =
+        round_up(static_cast<size_t>(shape.k / GROUP_SIZE) * shape.n * 2, 16);
+    size_t workspace_bytes =
+        round_up(static_cast<size_t>(shape.n / 128) * MAX_PAR * sizeof(int), 16);
+
+    void* a = cuda_alloc_bytes(a_bytes, 0x3c);
+    void* b = cuda_alloc_bytes(b_bytes, 0x11);
+    void* c = cuda_alloc_bytes(c_bytes, 0x00);
+    void* scales = cuda_alloc_bytes(scale_bytes, 0x3c);
+    void* workspace = cuda_alloc_bytes(workspace_bytes, 0x00);
+    void* flush_buffer = cuda_alloc_bytes(L2_FLUSH_BYTES, 0x5a);
+    std::vector<void*> b_cycle;
+    std::vector<void*> scale_cycle;
+    std::vector<void*> workspace_cycle;
+    b_cycle.reserve(WEIGHT_CYCLE_SETS);
+    scale_cycle.reserve(WEIGHT_CYCLE_SETS);
+    workspace_cycle.reserve(WEIGHT_CYCLE_SETS);
+    for (int i = 0; i < WEIGHT_CYCLE_SETS; ++i) {
+        b_cycle.push_back(cuda_alloc_bytes(b_bytes, 0x20 + i));
+        scale_cycle.push_back(cuda_alloc_bytes(scale_bytes, 0x40 + i));
+        workspace_cycle.push_back(cuda_alloc_bytes(workspace_bytes, 0x00));
+    }
+
+    const Tile tiles[] = {
+        {"auto", -1, -1},
+        {"128x128", 128, 128},
+        {"64x256", 64, 256},
+    };
+
+    std::printf("\nshape=%s k=%d n=%d qweight_mb=%.1f scale_mb=%.1f\n",
+                shape.name,
+                shape.k,
+                shape.n,
+                static_cast<double>(b_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(scale_bytes) / (1024.0 * 1024.0));
+    std::printf("mode,m,tile,us,useful_tflops,padded_tflops,ret\n");
+    for (int m : m_values) {
+        for (const Tile& tile : tiles) {
+            for (int mode_idx = 0; mode_idx < 4; ++mode_idx) {
+                const bool include_ws = (mode_idx % 2) != 0;
+                const bool host_sync = mode_idx >= 2;
+                float us = host_sync
+                    ? time_one_host_sync(
+                          stream,
+                          a,
+                          b,
+                          c,
+                          scales,
+                          workspace,
+                          workspace_bytes,
+                          shape,
+                          m,
+                          tile,
+                          include_ws,
+                          sms)
+                    : time_one(
+                          stream,
+                          a,
+                          b,
+                          c,
+                          scales,
+                          workspace,
+                          workspace_bytes,
+                          shape,
+                          m,
+                          tile,
+                          include_ws,
+                          sms,
+                          nullptr,
+                          0);
+                const char* mode = host_sync
+                    ? (include_ws ? "host_sync_ws_plus_kernel" : "host_sync_kernel")
+                    : (include_ws ? "ws_plus_kernel" : "kernel_only");
+                if (us < 0.0f) {
+                    std::printf("%s,%d,%s,NA,NA,NA,%d\n", mode, m, tile.name,
+                                static_cast<int>(-us));
+                    continue;
+                }
+                double useful_ops = 2.0 * static_cast<double>(m) * shape.k * shape.n;
+                double padded_ops =
+                    2.0 * static_cast<double>(padded_m(m)) * shape.k * shape.n;
+                double useful_tflops = useful_ops / (static_cast<double>(us) * 1.0e6);
+                double padded_tflops = padded_ops / (static_cast<double>(us) * 1.0e6);
+                std::printf("%s,%d,%s,%.3f,%.2f,%.2f,0\n", mode, m, tile.name, us,
+                            useful_tflops, padded_tflops);
+            }
+            if (std::strcmp(tile.name, "auto") == 0 && (m == 16 || m == 23 || m == 32)) {
+                float us = time_one(
+                    stream,
+                    a,
+                    b,
+                    c,
+                    scales,
+                    workspace,
+                    workspace_bytes,
+                    shape,
+                    m,
+                    tile,
+                    false,
+                    sms,
+                    flush_buffer,
+                    L2_FLUSH_BYTES);
+                const char* mode = "cold_cache_kernel";
+                if (us < 0.0f) {
+                    std::printf("%s,%d,%s,NA,NA,NA,%d\n", mode, m, tile.name,
+                                static_cast<int>(-us));
+                    continue;
+                }
+                double useful_ops = 2.0 * static_cast<double>(m) * shape.k * shape.n;
+                double padded_ops =
+                    2.0 * static_cast<double>(padded_m(m)) * shape.k * shape.n;
+                double useful_tflops = useful_ops / (static_cast<double>(us) * 1.0e6);
+                double padded_tflops = padded_ops / (static_cast<double>(us) * 1.0e6);
+                std::printf("%s,%d,%s,%.3f,%.2f,%.2f,0\n", mode, m, tile.name, us,
+                            useful_tflops, padded_tflops);
+
+                for (int cycle_mode = 0; cycle_mode < 2; ++cycle_mode) {
+                    const bool include_ws = cycle_mode != 0;
+                    float cycle_us = time_weight_cycle(
+                        stream,
+                        a,
+                        b_cycle,
+                        c,
+                        scale_cycle,
+                        workspace_cycle,
+                        workspace_bytes,
+                        shape,
+                        m,
+                        tile,
+                        include_ws,
+                        sms);
+                    const char* cycle_label =
+                        include_ws ? "weight_cycle_ws_plus_kernel" : "weight_cycle_kernel";
+                    if (cycle_us < 0.0f) {
+                        std::printf("%s,%d,%s,NA,NA,NA,%d\n", cycle_label, m, tile.name,
+                                    static_cast<int>(-cycle_us));
+                        continue;
+                    }
+                    double cycle_useful_tflops =
+                        useful_ops / (static_cast<double>(cycle_us) * 1.0e6);
+                    double cycle_padded_tflops =
+                        padded_ops / (static_cast<double>(cycle_us) * 1.0e6);
+                    std::printf("%s,%d,%s,%.3f,%.2f,%.2f,0\n",
+                                cycle_label,
+                                m,
+                                tile.name,
+                                cycle_us,
+                                cycle_useful_tflops,
+                                cycle_padded_tflops);
+                }
+
+                int n_tiles = shape.n / resolved_thread_n(tile, m);
+                BlockPolicy policies[] = {
+                    {"n_tiles", n_tiles},
+                    {"2sms", sms * 2},
+                };
+                for (const BlockPolicy& policy : policies) {
+                    if (policy.blocks <= 0 || policy.blocks == sms) {
+                        continue;
+                    }
+                    if (std::strcmp(policy.name, "2sms") == 0 && policy.blocks == n_tiles) {
+                        continue;
+                    }
+                    float policy_us = time_weight_cycle(
+                        stream,
+                        a,
+                        b_cycle,
+                        c,
+                        scale_cycle,
+                        workspace_cycle,
+                        workspace_bytes,
+                        shape,
+                        m,
+                        tile,
+                        false,
+                        policy.blocks);
+                    char policy_label[96];
+                    std::snprintf(policy_label,
+                                  sizeof(policy_label),
+                                  "weight_cycle_blocks_%s_kernel",
+                                  policy.name);
+                    if (policy_us < 0.0f) {
+                        std::printf("%s,%d,%s,NA,NA,NA,%d\n",
+                                    policy_label,
+                                    m,
+                                    tile.name,
+                                    static_cast<int>(-policy_us));
+                        continue;
+                    }
+                    double policy_useful_tflops =
+                        useful_ops / (static_cast<double>(policy_us) * 1.0e6);
+                    double policy_padded_tflops =
+                        padded_ops / (static_cast<double>(policy_us) * 1.0e6);
+                    std::printf("%s,%d,%s,%.3f,%.2f,%.2f,0\n",
+                                policy_label,
+                                m,
+                                tile.name,
+                                policy_us,
+                                policy_useful_tflops,
+                                policy_padded_tflops);
+                }
+            }
+        }
+    }
+
+    CHK(cudaFree(a));
+    CHK(cudaFree(b));
+    CHK(cudaFree(c));
+    CHK(cudaFree(scales));
+    CHK(cudaFree(workspace));
+    CHK(cudaFree(flush_buffer));
+    for (void* ptr : b_cycle) CHK(cudaFree(ptr));
+    for (void* ptr : scale_cycle) CHK(cudaFree(ptr));
+    for (void* ptr : workspace_cycle) CHK(cudaFree(ptr));
+    CHK(cudaStreamDestroy(stream));
+}
+
+int main() {
+    cudaDeviceProp prop;
+    CHK(cudaGetDeviceProperties(&prop, 0));
+    std::printf("dense_marlin_gemma3_perf device=%s sm=%d.%d peak_ref_tflops=%.1f\n",
+                prop.name,
+                prop.major,
+                prop.minor,
+                RTX4090_FP16_TFLOPS_PEAK);
+
+    std::vector<int> m_values = {1, 3, 6, 9, 12, 16, 23, 32};
+    const Shape shapes[] = {
+        {"qkv", 5376, 8192},
+        {"o_proj", 4096, 5376},
+        {"gate_up", 5376, 43008},
+        {"down", 21504, 5376},
+    };
+    for (const Shape& shape : shapes) {
+        run_shape(shape, m_values);
+    }
+
+    std::printf("\nVERDICT: dense Marlin native CUDA probe complete\n");
+    return 0;
+}

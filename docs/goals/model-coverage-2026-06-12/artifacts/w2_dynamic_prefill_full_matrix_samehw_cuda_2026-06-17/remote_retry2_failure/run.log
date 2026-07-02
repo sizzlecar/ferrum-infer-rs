@@ -1,0 +1,10 @@
+[w2-full-matrix] start 2026-06-17T00:09:48Z
+[w2-full-matrix] root=/workspace/ferrum-infer-rs out=/workspace/w2_dynamic_prefill_full_matrix_samehw_cuda_2026-06-17_retry2 model=gemma3:27b-gptq hf_home=/workspace/hf-cache dataset=/workspace/ascii_sharegpt_w2_100.jsonl sweep=1,4,16,32
+[w2-full-matrix] starting Ferrum CUDA release build in background
+[w2-full-matrix] ensuring vLLM venv
+[w2-full-matrix] prefetching circulus/gemma-3-27b-it-gptq
+[w2-full-matrix] waiting for Ferrum build
+[w2-full-matrix] vLLM server + smoke + sweep
+[w2-full-matrix] Ferrum run correctness
+[w2-full-matrix] Ferrum serve correctness
+expected exactly one DONE, got 0

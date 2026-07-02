@@ -1,0 +1,193 @@
+{
+  "model": "gemma3:27b-gptq",
+  "backend": "cuda",
+  "scenario": "closed_loop",
+  "concurrency": 16,
+  "n_prompt": 256,
+  "n_gen": 128,
+  "actual_input_tokens": {
+    "requested": 256,
+    "min": 256,
+    "max": 256,
+    "mean": 256.0
+  },
+  "actual_input_tokens_per_request": [
+    [
+      256,
+      256,
+      256,
+      256,
+      256,
+      256,
+      256,
+      256,
+      256,
+      256,
+      256,
+      256,
+      256,
+      256,
+      256,
+      256
+    ]
+  ],
+  "output_tokens_per_request": [
+    [
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128
+    ]
+  ],
+  "output_token_count_source": "usage",
+  "n_repeats": 1,
+  "n_requests_per_run": 16,
+  "warmup_requests": 10,
+  "ttft_ms": {
+    "p50": {
+      "mean": 2611.9474769999997
+    },
+    "p75": {
+      "mean": 2684.9676284999996
+    },
+    "p95": {
+      "mean": 2685.13075325
+    },
+    "p99": {
+      "mean": 2685.1731498500003
+    }
+  },
+  "tpot_ms": {
+    "p50": {
+      "mean": 33.897596185039376
+    },
+    "p75": {
+      "mean": 42.204338051181104
+    },
+    "p95": {
+      "mean": 42.21292870866142
+    },
+    "p99": {
+      "mean": 42.21353811968504
+    }
+  },
+  "itl_ms": {
+    "p50": {
+      "mean": 33.62975
+    },
+    "p75": {
+      "mean": 34.41858575
+    },
+    "p95": {
+      "mean": 89.17799
+    },
+    "p99": {
+      "mean": 104.8416421
+    }
+  },
+  "e2e_ms": {
+    "p50": {
+      "mean": 6916.942192500001
+    },
+    "p75": {
+      "mean": 6950.2954085
+    },
+    "p95": {
+      "mean": 6950.88012025
+    },
+    "p99": {
+      "mean": 6950.97084805
+    }
+  },
+  "output_throughput_tps": {
+    "mean": 294.61885808275144
+  },
+  "total_throughput_tps": {
+    "mean": 883.8565742482543
+  },
+  "request_throughput_rps": {
+    "mean": 2.3017098287714957
+  },
+  "goodput_rps": {
+    "mean": 2.3017098287714957
+  },
+  "slo": {
+    "ttft_p99_ms": null,
+    "tpot_p99_ms": null,
+    "e2e_p99_ms": null
+  },
+  "completed_per_run": [
+    16
+  ],
+  "errored_per_run": [
+    0
+  ],
+  "bad_output_per_run": [
+    0
+  ],
+  "malformed_stream_per_run": [
+    0
+  ],
+  "missing_done_per_run": [
+    0
+  ],
+  "duplicate_done_per_run": [
+    0
+  ],
+  "zero_output_tokens_per_run": [
+    0
+  ],
+  "stream_bulk_flush_per_run": [
+    0
+  ],
+  "http_500_per_run": [
+    0
+  ],
+  "panic_per_run": [
+    0
+  ],
+  "quality_issues_per_run": [
+    {
+      "bad_output": 0,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "duplicate_done": 0,
+      "zero_output_tokens": 0,
+      "stream_bulk_flush": 0,
+      "http_500": 0,
+      "panic": 0
+    }
+  ],
+  "env": {
+    "commit_sha": "eed031e3",
+    "hw_id": "rtx-4090",
+    "driver": "590.48.01",
+    "cuda": "12.4",
+    "rust": "1.96.0",
+    "ferrum_features": [
+      "cuda",
+      "vllm-moe-marlin",
+      "vllm-paged-attn-v2"
+    ],
+    "gpu_clock_lock_mhz": 2790,
+    "gpu_power_limit_w": 300,
+    "gpu_persistence_mode": true,
+    "ferrum_env": {},
+    "runtime_config": {
+      "entries": []
+    }
+  },
+  "env_hash": "sha256:25d07be3c7c1920ec7851b0c6209073a23f1f674587401756fa973bfcb3aec62"
+}

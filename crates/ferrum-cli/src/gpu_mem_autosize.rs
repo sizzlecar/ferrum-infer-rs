@@ -22,6 +22,13 @@ const SCRATCH_RESERVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// PagedKvPool block_size — must match `PAGED_BLOCK_SIZE` in
 /// `llama_family.rs`.
 const PAGED_BLOCK_SIZE: u64 = 16;
+const DEFAULT_MAX_BATCHED_TOKENS: usize = 2048;
+// Tight recurrent-state models carry large non-KV decode state and can be
+// allocator-fragile near the end of the memory budget. Keep aggregate prefill
+// conservative by default; widening this to 1024 was shown to OOM the W3 c16
+// product-path diagnostic even though the KV block floor itself still fit.
+const TIGHT_RECURRENT_STATE_MAX_BATCHED_TOKENS: usize = 192;
+const TIGHT_RECURRENT_STATE_KV_BLOCK_FLOOR: usize = 256;
 
 /// Bytes per element of the KV cache. ferrum currently always uses FP16
 /// for KV regardless of weight dtype (Marlin INT4 weights → FP16 KV).
@@ -71,7 +78,7 @@ impl AutoSizeResult {
         }
         if self.requested_min_blocks > self.estimated_budget_blocks {
             eprintln!(
-                "[auto-size] requested runtime floor requires KV_MAX_BLOCKS={} above estimated budget {}; honoring explicit runtime limits",
+                "[auto-size] requested runtime token floor requires KV_MAX_BLOCKS={} above estimated budget {}; honoring explicit runtime limits",
                 self.requested_min_blocks, self.estimated_budget_blocks
             );
         }
@@ -128,16 +135,12 @@ fn auto_size_kv_blocks_with_pool_copies_for_snapshot(
     let config_path = model_dir.join("config.json");
     let config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).ok()?).ok()?;
-    let num_layers = config["num_hidden_layers"]
-        .as_u64()
-        .or_else(|| config["num_layers"].as_u64())?;
-    let hidden_size = config["hidden_size"].as_u64()?;
-    let num_attn_heads = config["num_attention_heads"].as_u64()?;
-    let num_kv_heads = config["num_key_value_heads"]
-        .as_u64()
-        .unwrap_or(num_attn_heads);
-    let head_dim = config["head_dim"]
-        .as_u64()
+    let num_layers = config_or_text_u64(&config, "num_hidden_layers")
+        .or_else(|| config_or_text_u64(&config, "num_layers"))?;
+    let hidden_size = config_or_text_u64(&config, "hidden_size")?;
+    let num_attn_heads = config_or_text_u64(&config, "num_attention_heads")?;
+    let num_kv_heads = config_or_text_u64(&config, "num_key_value_heads").unwrap_or(num_attn_heads);
+    let head_dim = config_or_text_u64(&config, "head_dim")
         .unwrap_or_else(|| hidden_size / num_attn_heads.max(1));
 
     // 3. Sum .safetensors / .bin file sizes for weight estimate.
@@ -218,14 +221,31 @@ pub enum AutoSizeProfile {
     Chat,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ModelAutoSizeClass {
+    #[default]
+    Generic,
+    TightRecurrentState,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ModelAutoSizeHints {
+    has_recurrent_linear_attention_state: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ModelAutoSizeDefaults {
+    max_batched_tokens: usize,
+    presets: &'static [(usize, usize)],
+    kv_block_floor: usize,
+}
+
 /// Apply auto-sizing: read CLI flag, query nvidia-smi, set env vars.
-/// Sets BOTH `FERRUM_KV_MAX_BLOCKS` (engine-side BlockPool) and
-/// `FERRUM_PAGED_MAX_SEQS` (model-side paged_pools — sizes the GPU
-/// KV pool as `max_seqs × max_blocks_per_seq`). Without bounding
-/// max_seqs the GPU pool can grow far past the engine pool budget
-/// — e.g. on Llama-3.1-8B FP16 with PAGED_MAX_SEQS=64 +
-/// KV_CAPACITY=2048 the pool is 16 GB by itself, OOMing weight load
-/// on a 24 GB card.
+/// Sets `FERRUM_KV_MAX_BLOCKS` (global physical paged-KV block budget),
+/// `FERRUM_PAGED_MAX_SEQS` (scheduler/model concurrency shape), and
+/// `FERRUM_KV_CAPACITY` (per-sequence logical table stride). The model
+/// allocates the GPU KV pool from `KV_MAX_BLOCKS`; `PAGED_MAX_SEQS *
+/// KV_CAPACITY` no longer reserves physical KV blocks up front.
 ///
 /// Idempotent — caller invokes once per CLI invocation before engine
 /// init. Respects user overrides (no clobber if env already set).
@@ -246,95 +266,73 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
     let max_seqs_overridden = snapshot_value(&current, "FERRUM_PAGED_MAX_SEQS").is_some();
     let max_batched_tokens_overridden =
         snapshot_value(&current, "FERRUM_MAX_BATCHED_TOKENS").is_some();
+    let model_hints = model_auto_size_hints(model_dir);
     let mut entries = Vec::new();
     // ALL three knobs covered by the user — nothing to set.
     if kv_overridden && max_seqs_overridden && max_batched_tokens_overridden {
         return;
     }
+    let kv_pool_copies = kv_pool_copies_from_snapshot(&current);
+    let preliminary_result = auto_size_kv_blocks_with_pool_copies_for_snapshot(
+        model_dir,
+        gpu_util,
+        kv_pool_copies,
+        &current,
+    );
+    let model_class =
+        model_auto_size_class_from_hints_and_budget(model_hints, preliminary_result.as_ref());
+    let defaults = model_auto_size_defaults(model_class, profile);
     // Set MAX_BATCHED_TOKENS first so it lands even when the user overrode
     // FERRUM_KV_MAX_BLOCKS + FERRUM_PAGED_MAX_SEQS (apples bench does both,
     // which used to silently skip the Phase 3 scratch budget alongside).
     if !max_batched_tokens_overridden {
-        // 2048 is the safe default across both apples M2 (Llama-INT4 8B,
-        // ~4 GB) and M3 (Qwen3-30B-A3B, ~17 GB weights + 1 GB scratch +
-        // 6 GB KV pool on 24 GB cards). 4096 OOMs on M3 because the
-        // Qwen3MoE scratch grows linearly with `t` (batch_logits =
-        // t × vocab × 2 B alone is 1.2 GB at t=4096). The unified path
-        // still activates at 2048 — scheduler admits up to 4 prefill
-        // chunks (4 × 512 = 2048) per iter, m_total stays ≤ scratch.
-        let mbt = match profile {
-            AutoSizeProfile::Server => 2048,
-            AutoSizeProfile::Chat => 2048,
-        };
+        // 2048 is the safe generic default across smaller dense and MoE GPTQ
+        // profiles. Tight recurrent-state models only use the smaller scratch
+        // profile when the measured weight/VRAM budget cannot cover that
+        // generic aggregate-prefill floor.
+        let mbt = defaults.max_batched_tokens;
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_MAX_BATCHED_TOKENS",
             mbt.to_string(),
             RuntimeConfigSource::MemoryProfile,
         ));
         eprintln!(
-            "[auto-size] MAX_BATCHED_TOKENS={} (profile={:?})",
-            mbt, profile
+            "[auto-size] MAX_BATCHED_TOKENS={} (profile={:?} model={:?})",
+            mbt, profile, model_class
         );
     }
     if kv_overridden && max_seqs_overridden {
         crate::runtime_env::materialize_runtime_env_defaults(&entries);
         return;
     }
-    let kv_pool_copies = kv_pool_copies_from_snapshot(&current);
-    let Some(result) = auto_size_kv_blocks_with_pool_copies(model_dir, gpu_util, kv_pool_copies)
-    else {
+    let mut budget_snapshot = current.clone();
+    for entry in &entries {
+        budget_snapshot.upsert_entry(entry.clone());
+    }
+    let result = if entries.is_empty() {
+        preliminary_result
+    } else {
+        auto_size_kv_blocks_with_pool_copies_for_snapshot(
+            model_dir,
+            gpu_util,
+            kv_pool_copies,
+            &budget_snapshot,
+        )
+    };
+    let Some(result) = result else {
         crate::runtime_env::materialize_runtime_env_defaults(&entries);
         return;
     };
     result.print_summary();
+    let max_blocks = result.max_blocks.max(defaults.kv_block_floor);
 
-    // Pool sizing: pool_blocks = max_seqs × (KV_CAPACITY / 16).
-    // Picks the largest (max_seqs, KV_CAP) tuple from a fixed ladder
-    // whose pool fits the budget.
+    // Dynamic paged-KV sizing: the physical pool is `KV_MAX_BLOCKS`.
+    // Picks the largest (max_seqs, KV_CAP) tuple whose per-sequence table
+    // can fit in the global block budget. Multiple sequences share that pool
+    // on demand; they do not each reserve KV_CAPACITY at startup.
     //   Server: prioritise wide batch (c=16/32) over context.
-    //   Chat:   single user, multi-turn — pile budget into context.
-    const SERVER_PRESETS: &[(usize, usize)] = &[
-        // (max_seqs, KV_CAPACITY tokens)
-        (32, 2048), // best — INT4 8B on 24 GB usually lands here
-        (32, 1024), // FP16 8B at util=1.0
-        (32, 512),  // FP16 8B at util=0.95
-        (16, 2048), // long-context narrow batch
-        (16, 1024),
-        (16, 512), // last that supports c=16
-        (8, 1024), // <c=16 only
-        (8, 512),
-    ];
-    // 16384 fits a long thinking-mode reply + ~20 conversation turns
-    // before /clear. max_seqs=2 leaves a slot for any internal use;
-    // single-user CLI never needs more.
-    const CHAT_PRESETS: &[(usize, usize)] = &[
-        (2, 16384),
-        (2, 8192),
-        (2, 4096),
-        (1, 16384),
-        (1, 8192),
-        (1, 4096),
-        (1, 2048),
-    ];
-    let presets: &[(usize, usize)] = match profile {
-        AutoSizeProfile::Server => SERVER_PRESETS,
-        AutoSizeProfile::Chat => CHAT_PRESETS,
-    };
-    let (max_seqs_clamped, kv_capacity) = {
-        let pick = presets.iter().copied().find(|(seqs, cap_tokens)| {
-            let bps = (*cap_tokens / 16).max(1);
-            seqs * bps <= result.max_blocks
-        });
-        if let Some((seqs, cap)) = pick {
-            // Always override KV_CAPACITY explicitly so behaviour is
-            // independent of the static default in llama_family.rs.
-            (seqs, cap)
-        } else {
-            // Budget too tight for any preset — try min config.
-            let bps = (result.max_blocks / 8).max(8);
-            (8, bps * 16)
-        }
-    };
+    //   Chat:   single user, multi-turn -- pile budget into context.
+    let (max_seqs_clamped, kv_capacity) = select_paged_pool_preset(defaults.presets, max_blocks);
 
     let kv_capacity_overridden = snapshot_value(&current, "FERRUM_KV_CAPACITY").is_some();
     // MAX_BATCHED_TOKENS already set above (it's independent of the KV pool
@@ -345,7 +343,7 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
     if !kv_overridden {
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_KV_MAX_BLOCKS",
-            result.max_blocks.to_string(),
+            max_blocks.to_string(),
             RuntimeConfigSource::MemoryProfile,
         ));
     }
@@ -369,7 +367,7 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
         if kv_overridden {
             "<user>".to_string()
         } else {
-            result.max_blocks.to_string()
+            max_blocks.to_string()
         },
         if max_seqs_overridden {
             "<user>".to_string()
@@ -386,6 +384,136 @@ pub fn apply_auto_size_with_profile(model_dir: &Path, gpu_util: f32, profile: Au
     );
 }
 
+const SERVER_PRESETS: &[(usize, usize)] = &[
+    // (max_seqs, KV_CAPACITY tokens)
+    (32, 2048), // best — INT4 8B on 24 GB usually lands here
+    (32, 1024), // FP16 8B at util=1.0
+    (32, 512),  // FP16 8B at util=0.95
+    (16, 2048), // long-context narrow batch
+    (16, 1024),
+    (16, 512), // last that supports c=16
+    (8, 1024), // <c=16 only
+    (8, 512),
+];
+
+// 16384 fits a long thinking-mode reply + ~20 conversation turns before
+// /clear. max_seqs=2 leaves a slot for any internal use; single-user CLI
+// never needs more.
+const CHAT_PRESETS: &[(usize, usize)] = &[
+    (2, 16384),
+    (2, 8192),
+    (2, 4096),
+    (1, 16384),
+    (1, 8192),
+    (1, 4096),
+    (1, 2048),
+];
+
+const TIGHT_RECURRENT_STATE_SERVER_PRESETS: &[(usize, usize)] =
+    &[(16, 512), (8, 512), (4, 512), (1, 512)];
+const TIGHT_RECURRENT_STATE_CHAT_PRESETS: &[(usize, usize)] = &[(2, 512), (1, 512)];
+
+fn model_auto_size_defaults(
+    model_class: ModelAutoSizeClass,
+    profile: AutoSizeProfile,
+) -> ModelAutoSizeDefaults {
+    match (model_class, profile) {
+        (ModelAutoSizeClass::TightRecurrentState, AutoSizeProfile::Server) => {
+            ModelAutoSizeDefaults {
+                max_batched_tokens: TIGHT_RECURRENT_STATE_MAX_BATCHED_TOKENS,
+                presets: TIGHT_RECURRENT_STATE_SERVER_PRESETS,
+                kv_block_floor: TIGHT_RECURRENT_STATE_KV_BLOCK_FLOOR,
+            }
+        }
+        (ModelAutoSizeClass::TightRecurrentState, AutoSizeProfile::Chat) => ModelAutoSizeDefaults {
+            max_batched_tokens: TIGHT_RECURRENT_STATE_MAX_BATCHED_TOKENS,
+            presets: TIGHT_RECURRENT_STATE_CHAT_PRESETS,
+            kv_block_floor: TIGHT_RECURRENT_STATE_KV_BLOCK_FLOOR,
+        },
+        (ModelAutoSizeClass::Generic, AutoSizeProfile::Server) => ModelAutoSizeDefaults {
+            max_batched_tokens: DEFAULT_MAX_BATCHED_TOKENS,
+            presets: SERVER_PRESETS,
+            kv_block_floor: 0,
+        },
+        (ModelAutoSizeClass::Generic, AutoSizeProfile::Chat) => ModelAutoSizeDefaults {
+            max_batched_tokens: DEFAULT_MAX_BATCHED_TOKENS,
+            presets: CHAT_PRESETS,
+            kv_block_floor: 0,
+        },
+    }
+}
+
+fn model_auto_size_hints(model_dir: &Path) -> ModelAutoSizeHints {
+    let Ok(config_text) = std::fs::read_to_string(model_dir.join("config.json")) else {
+        return ModelAutoSizeHints::default();
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_text) else {
+        return ModelAutoSizeHints::default();
+    };
+    model_auto_size_hints_from_config(&config)
+}
+
+fn model_auto_size_hints_from_config(config: &serde_json::Value) -> ModelAutoSizeHints {
+    ModelAutoSizeHints {
+        has_recurrent_linear_attention_state: has_recurrent_linear_attention_state(config),
+    }
+}
+
+fn model_auto_size_class_from_hints_and_budget(
+    hints: ModelAutoSizeHints,
+    budget: Option<&AutoSizeResult>,
+) -> ModelAutoSizeClass {
+    if !hints.has_recurrent_linear_attention_state {
+        return ModelAutoSizeClass::Generic;
+    }
+    let Some(budget) = budget else {
+        return ModelAutoSizeClass::Generic;
+    };
+    let generic_prefill_blocks =
+        ceil_div_usize(DEFAULT_MAX_BATCHED_TOKENS, PAGED_BLOCK_SIZE as usize);
+    if budget.estimated_budget_blocks < generic_prefill_blocks {
+        ModelAutoSizeClass::TightRecurrentState
+    } else {
+        ModelAutoSizeClass::Generic
+    }
+}
+
+fn has_recurrent_linear_attention_state(config: &serde_json::Value) -> bool {
+    let text = config.get("text_config").unwrap_or(config);
+    let has_linear_layers = text
+        .get("layer_types")
+        .and_then(|value| value.as_array())
+        .is_some_and(|layers| {
+            layers.iter().any(|layer| {
+                layer
+                    .as_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("linear_attention"))
+            })
+        });
+    let has_linear_state_dims = [
+        "linear_conv_kernel_dim",
+        "linear_key_head_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "linear_value_head_dim",
+    ]
+    .iter()
+    .all(|key| text.get(*key).and_then(|value| value.as_u64()).is_some());
+    has_linear_layers && has_linear_state_dims
+}
+
+fn config_or_text_u64(config: &serde_json::Value, key: &str) -> Option<u64> {
+    config
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|text| text.get(key))
+                .and_then(|value| value.as_u64())
+        })
+}
+
 fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
     if divisor == 0 {
         return value;
@@ -398,6 +526,20 @@ fn ceil_div_usize(value: usize, divisor: usize) -> usize {
         return value;
     }
     value.div_ceil(divisor)
+}
+
+fn select_paged_pool_preset(presets: &[(usize, usize)], max_blocks: usize) -> (usize, usize) {
+    if let Some((seqs, cap)) = presets.iter().copied().find(|(_, cap_tokens)| {
+        let bps = ceil_div_usize(*cap_tokens, PAGED_BLOCK_SIZE as usize).max(1);
+        bps <= max_blocks
+    }) {
+        return (seqs, cap);
+    }
+
+    // Budget too tight for any preset's per-seq table. Keep the narrowest
+    // preset's concurrency shape and cap a single sequence to the pool.
+    let seqs = presets.last().map(|(seqs, _)| *seqs).unwrap_or(1);
+    (seqs, max_blocks.max(1) * PAGED_BLOCK_SIZE as usize)
 }
 
 fn weight_budget_shard_count(snapshot: &RuntimeConfigSnapshot) -> u64 {
@@ -444,19 +586,8 @@ fn requested_min_kv_blocks_from_snapshot(snapshot: &RuntimeConfigSnapshot) -> us
     let max_batched_token_blocks = snapshot_usize(snapshot, "FERRUM_MAX_BATCHED_TOKENS")
         .map(|value| ceil_div_usize(value, PAGED_BLOCK_SIZE as usize))
         .unwrap_or(0);
-    let paged_pool_blocks = match (
-        snapshot_usize(snapshot, "FERRUM_PAGED_MAX_SEQS"),
-        snapshot_usize(snapshot, "FERRUM_KV_CAPACITY"),
-    ) {
-        (Some(max_seqs), Some(kv_capacity)) => {
-            max_seqs.saturating_mul(ceil_div_usize(kv_capacity, PAGED_BLOCK_SIZE as usize))
-        }
-        _ => 0,
-    };
 
-    max_model_len_blocks
-        .max(max_batched_token_blocks)
-        .max(paged_pool_blocks)
+    max_model_len_blocks.max(max_batched_token_blocks)
 }
 
 fn snapshot_value<'a>(snapshot: &'a RuntimeConfigSnapshot, key: &str) -> Option<&'a str> {
@@ -494,6 +625,23 @@ mod tests {
 
     fn snapshot(vars: &[(&str, &str)]) -> RuntimeConfigSnapshot {
         RuntimeConfigSnapshot::from_env_vars(vars.iter().copied())
+    }
+
+    fn budget_with_estimated_blocks(estimated_budget_blocks: usize) -> AutoSizeResult {
+        AutoSizeResult {
+            total_gpu_bytes: 24 * 1024 * 1024 * 1024,
+            free_gpu_bytes: 20 * 1024 * 1024 * 1024,
+            weight_bytes: 18 * 1024 * 1024 * 1024,
+            budgeted_weight_bytes: 18 * 1024 * 1024 * 1024,
+            weight_budget_shards: 1,
+            budgeted_layer_count: 40,
+            kv_block_bytes: 4 * 1024 * 1024,
+            kv_pool_copies: 1,
+            estimated_budget_blocks,
+            requested_min_blocks: 0,
+            max_blocks: estimated_budget_blocks,
+            reserved_for_scratch: SCRATCH_RESERVE_BYTES,
+        }
     }
 
     #[test]
@@ -550,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_runtime_limits_define_kv_block_floor() {
+    fn requested_runtime_token_limits_define_kv_block_floor() {
         let snapshot = snapshot(&[
             ("FERRUM_MAX_MODEL_LEN", "8192"),
             ("FERRUM_MAX_BATCHED_TOKENS", "1024"),
@@ -558,6 +706,141 @@ mod tests {
             ("FERRUM_KV_CAPACITY", "2048"),
         ]);
 
-        assert_eq!(requested_min_kv_blocks_from_snapshot(&snapshot), 1024);
+        assert_eq!(requested_min_kv_blocks_from_snapshot(&snapshot), 512);
+    }
+
+    #[test]
+    fn paged_pool_preset_keeps_concurrency_with_dynamic_block_pool() {
+        assert_eq!(
+            select_paged_pool_preset(&[(32, 512), (8, 512)], 338),
+            (32, 512)
+        );
+        assert_eq!(
+            select_paged_pool_preset(&[(32, 512), (16, 512)], 2048),
+            (32, 512)
+        );
+        assert_eq!(
+            select_paged_pool_preset(&[(32, 2048), (8, 1024)], 64),
+            (8, 1024)
+        );
+    }
+
+    #[test]
+    fn recurrent_linear_attention_budget_pressure_selects_tight_memory_profile() {
+        let config = serde_json::json!({
+            "architectures": ["SyntheticRecurrentStateModel"],
+            "model_type": "synthetic_recurrent_state",
+            "text_config": {
+                "model_type": "synthetic_recurrent_state_text",
+                "layer_types": ["linear_attention", "full_attention"],
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 128,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 16,
+                "linear_value_head_dim": 128
+            }
+        });
+
+        let hints = model_auto_size_hints_from_config(&config);
+        assert!(hints.has_recurrent_linear_attention_state);
+        let class = model_auto_size_class_from_hints_and_budget(
+            hints,
+            Some(&budget_with_estimated_blocks(127)),
+        );
+        assert_eq!(class, ModelAutoSizeClass::TightRecurrentState);
+        let server = model_auto_size_defaults(class, AutoSizeProfile::Server);
+        assert_eq!(
+            server.max_batched_tokens,
+            TIGHT_RECURRENT_STATE_MAX_BATCHED_TOKENS
+        );
+        assert_eq!(
+            server
+                .max_batched_tokens
+                .div_ceil(PAGED_BLOCK_SIZE as usize),
+            12
+        );
+        assert!(
+            server
+                .max_batched_tokens
+                .div_ceil(PAGED_BLOCK_SIZE as usize)
+                <= server.kv_block_floor
+        );
+        assert_eq!(server.kv_block_floor, TIGHT_RECURRENT_STATE_KV_BLOCK_FLOOR);
+        assert_eq!(
+            select_paged_pool_preset(server.presets, server.kv_block_floor),
+            (16, 512)
+        );
+
+        let chat = model_auto_size_defaults(class, AutoSizeProfile::Chat);
+        assert_eq!(
+            select_paged_pool_preset(chat.presets, chat.kv_block_floor),
+            (2, 512)
+        );
+    }
+
+    #[test]
+    fn recurrent_linear_attention_memory_profile_requires_budget_pressure() {
+        let recurrent = serde_json::json!({
+            "model_type": "synthetic_recurrent_state",
+            "text_config": {
+                "layer_types": ["linear_attention", "full_attention"],
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 128,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 16,
+                "linear_value_head_dim": 128
+            }
+        });
+        let hints = model_auto_size_hints_from_config(&recurrent);
+        assert_eq!(
+            model_auto_size_class_from_hints_and_budget(
+                hints,
+                Some(&budget_with_estimated_blocks(128)),
+            ),
+            ModelAutoSizeClass::Generic
+        );
+        assert_eq!(
+            model_auto_size_class_from_hints_and_budget(hints, None),
+            ModelAutoSizeClass::Generic
+        );
+
+        let dense = serde_json::json!({
+            "model_type": "dense",
+            "text_config": {
+                "layer_types": ["full_attention", "full_attention"]
+            }
+        });
+        assert_eq!(
+            model_auto_size_class_from_hints_and_budget(
+                model_auto_size_hints_from_config(&dense),
+                Some(&budget_with_estimated_blocks(0)),
+            ),
+            ModelAutoSizeClass::Generic
+        );
+
+        let generic =
+            model_auto_size_defaults(ModelAutoSizeClass::Generic, AutoSizeProfile::Server);
+        assert_eq!(generic.max_batched_tokens, DEFAULT_MAX_BATCHED_TOKENS);
+        assert_eq!(generic.presets, SERVER_PRESETS);
+        assert_eq!(generic.kv_block_floor, 0);
+    }
+
+    #[test]
+    fn autosize_dimension_lookup_falls_back_to_text_config() {
+        let config = serde_json::json!({
+            "model_type": "synthetic_text_wrapped_model",
+            "text_config": {
+                "hidden_size": 2048,
+                "num_hidden_layers": 40,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 2,
+                "head_dim": 256
+            }
+        });
+
+        assert_eq!(config_or_text_u64(&config, "hidden_size"), Some(2048));
+        assert_eq!(config_or_text_u64(&config, "num_hidden_layers"), Some(40));
+        assert_eq!(config_or_text_u64(&config, "num_key_value_heads"), Some(2));
+        assert_eq!(config_or_text_u64(&config, "head_dim"), Some(256));
     }
 }

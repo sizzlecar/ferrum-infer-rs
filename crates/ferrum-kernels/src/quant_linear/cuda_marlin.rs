@@ -16,6 +16,21 @@ use crate::Linear;
 use ferrum_types::{FerrumError, Result};
 use std::sync::Arc;
 
+/// Read-only view of a CUDA Marlin weight that an adjacent producer kernel can
+/// lightly touch before the following down-projection GEMM.
+///
+/// The view deliberately exposes only immutable buffers plus shape metadata.
+/// It is not a second GEMM API; `CudaMarlinLinear::forward` remains the owner
+/// of Marlin execution.
+#[derive(Clone, Copy)]
+pub struct CudaMarlinTouchRef<'a> {
+    pub qweight: &'a cudarc::driver::CudaSlice<i32>,
+    pub scales: &'a cudarc::driver::CudaSlice<half::f16>,
+    pub k: usize,
+    pub n: usize,
+    pub group_size: i32,
+}
+
 /// Single-tensor GPTQ-Marlin Linear projection.
 ///
 /// Holds a `GptqStoreCuda` (Marlin tiles, optionally Triton view) plus
@@ -29,6 +44,22 @@ pub struct CudaMarlinLinear {
     pub out_features: usize,
 }
 
+impl CudaMarlinLinear {
+    pub fn marlin_weight(&self) -> Option<&crate::marlin::MarlinWeight> {
+        #[cfg(feature = "triton-kernels")]
+        {
+            match &self.store {
+                GptqStoreCuda::Marlin(mw) => Some(mw),
+                GptqStoreCuda::Triton(_) => None,
+            }
+        }
+        #[cfg(not(feature = "triton-kernels"))]
+        {
+            Some(&self.store)
+        }
+    }
+}
+
 impl Linear<CudaBackend> for CudaMarlinLinear {
     fn in_features(&self) -> usize {
         self.in_features
@@ -36,6 +67,16 @@ impl Linear<CudaBackend> for CudaMarlinLinear {
 
     fn out_features(&self) -> usize {
         self.out_features
+    }
+
+    fn cuda_marlin_touch_ref(&self) -> Option<CudaMarlinTouchRef<'_>> {
+        self.marlin_weight().map(|mw| CudaMarlinTouchRef {
+            qweight: &mw.qweight,
+            scales: &mw.scales,
+            k: mw.k,
+            n: mw.n,
+            group_size: mw.group_size,
+        })
     }
 
     #[allow(clippy::needless_return)]
@@ -186,17 +227,24 @@ impl Linear<CudaBackend> for CudaMarlinStackedExpertLinear {
                 };
                 #[cfg(not(feature = "triton-kernels"))]
                 let mw: &crate::marlin::MarlinWeight = self.store.as_ref();
-                let stream = ctx.stream.clone();
-                crate::marlin::marlin_gemm_with_offset(
-                    &stream,
-                    input.as_f16(),
-                    mw,
-                    out.as_f16_mut(),
-                    m as i32,
-                    self.expert_offset as i32,
-                    self.expert_n as i32,
-                )
-                .map_err(|e| FerrumError::model(format!("marlin offset gemm: {e}")))
+                if mw.vllm_moe {
+                    Err(FerrumError::unsupported(
+                        "vLLM Marlin-MoE packed weight cannot be dispatched through \
+                         single-expert offset Marlin GEMM",
+                    ))
+                } else {
+                    let stream = ctx.stream.clone();
+                    crate::marlin::marlin_gemm_with_offset(
+                        &stream,
+                        input.as_f16(),
+                        mw,
+                        out.as_f16_mut(),
+                        m as i32,
+                        self.expert_offset as i32,
+                        self.expert_n as i32,
+                    )
+                    .map_err(|e| FerrumError::model(format!("marlin offset gemm: {e}")))
+                }
             }
             #[cfg(not(feature = "marlin"))]
             {

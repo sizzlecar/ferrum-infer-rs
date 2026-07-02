@@ -17,6 +17,7 @@
 
 pub mod llama_family;
 pub mod llama_family_pipeline;
+pub mod qwen35;
 pub mod qwen3_moe;
 pub mod qwen3_moe_profile;
 pub mod qwen3_moe_runtime;
@@ -25,6 +26,10 @@ pub use llama_family::{LlamaFamilyConfig, LlamaFamilyModel};
 pub use llama_family_pipeline::{
     LlamaFamilyPipelineModel, LlamaPipelineMode, LlamaPipelinePlacement, LlamaPipelineStageBridge,
     LlamaPipelineStagePlacement, LlamaPipelineTransport,
+};
+pub use qwen35::{
+    Qwen35BackendModel, Qwen35ModelWeights, Qwen35RecurrentStateHandle,
+    Qwen35RecurrentStateManager, Qwen35RecurrentStateManagerConfig,
 };
 pub use qwen3_moe::Qwen3MoeModel;
 pub mod llama_family_forward_batched;

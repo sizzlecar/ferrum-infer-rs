@@ -1,0 +1,19 @@
+{
+  "cmd": [
+    "/workspace/ferrum-smoke-99859ce6/target/release/ferrum",
+    "serve",
+    "gemma3:27b-gptq",
+    "--backend",
+    "cuda",
+    "--port",
+    "18456",
+    "--kv-capacity",
+    "512",
+    "--max-num-seqs",
+    "32",
+    "--effective-config-json",
+    "/workspace/w2_autosize_serve_smoke_cuda_2026-06-17/correctness/serve_effective_config.json",
+    "--decision-trace-jsonl",
+    "/workspace/w2_autosize_serve_smoke_cuda_2026-06-17/correctness/serve_decision_trace.jsonl"
+  ]
+}

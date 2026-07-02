@@ -32,7 +32,8 @@ __inline__ __device__ float block_reduce_sum(float val) {
     val = warp_reduce_sum(val);
     if (lane == 0) shared[wid] = val;
     __syncthreads();
-    val = (threadIdx.x < blockDim.x / 32) ? shared[lane] : 0.0f;
+    const int num_warps = (blockDim.x + 31) / 32;
+    val = (threadIdx.x < num_warps) ? shared[lane] : 0.0f;
     if (wid == 0) val = warp_reduce_sum(val);
     return val;
 }
@@ -48,7 +49,8 @@ __inline__ __device__ float block_reduce_max(float val) {
     val = warp_reduce_max(val);
     if (lane == 0) shared[wid] = val;
     __syncthreads();
-    val = (threadIdx.x < blockDim.x / 32) ? shared[lane] : -1e20f;
+    const int num_warps = (blockDim.x + 31) / 32;
+    val = (threadIdx.x < num_warps) ? shared[lane] : -1e20f;
     if (wid == 0) val = warp_reduce_max(val);
     return val;
 }

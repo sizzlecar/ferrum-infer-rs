@@ -1,43 +1,15 @@
-//! Source-built FlashAttention-2 bridge.
+//! Compatibility stub for the removed source-built FlashAttention-2 bridge.
 //!
-//! This module is compiled only with the `fa2-source` cargo feature. The C ABI
-//! symbol is linked from a static library built by `build.rs` from the Ferrum
-//! FA2 shim plus vendored FlashAttention source templates, so runtime does not
-//! need vLLM, Torch, Python, or a user-provided shim `.so`.
+//! The old `fa2-source` feature compiled FlashAttention/CUTLASS inputs from the
+//! main repository into `libfa2_source.a`. That bulk source has moved out of the
+//! normal Ferrum build domain; FA2 must be provided by a native operator artifact
+//! before this runtime path can be selected again.
 
-use std::ffi::{c_char, c_int, c_void};
 use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, CudaStream};
-use ferrum_types::Result;
+use ferrum_types::{FerrumError, Result};
 use half::f16;
-
-use super::fa2_ffi::call_paged_varlen_fn;
-
-extern "C" {
-    fn ferrum_fa2_paged_varlen_fwd(
-        q: *const c_void,
-        k: *const c_void,
-        v: *const c_void,
-        out: *mut c_void,
-        lse: *mut c_void,
-        cu_seqlens_q: *const c_void,
-        seq_lens: *const c_void,
-        block_tables: *const c_void,
-        num_seqs: c_int,
-        total_q_tokens: c_int,
-        max_q_len: c_int,
-        max_kv_len: c_int,
-        num_heads: c_int,
-        num_kv_heads: c_int,
-        head_dim: c_int,
-        block_size: c_int,
-        max_blocks_per_seq: c_int,
-        stream: *mut c_void,
-        err_buf: *mut c_char,
-        err_buf_len: usize,
-    ) -> c_int;
-}
 
 pub(crate) struct Fa2SourcePagedVarlenArgs<'a> {
     pub(crate) stream: &'a Arc<CudaStream>,
@@ -60,49 +32,9 @@ pub(crate) struct Fa2SourcePagedVarlenArgs<'a> {
     pub(crate) max_blocks_per_seq: usize,
 }
 
-pub(crate) fn paged_varlen_attention_fa2_source(args: Fa2SourcePagedVarlenArgs<'_>) -> Result<()> {
-    let Fa2SourcePagedVarlenArgs {
-        stream,
-        q,
-        k_pool,
-        v_pool,
-        out,
-        lse,
-        cu_seqlens_q,
-        seq_lens,
-        block_tables,
-        num_seqs,
-        total_q_tokens,
-        max_q_len,
-        max_kv_len,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        block_size,
-        max_blocks_per_seq,
-    } = args;
-
-    unsafe {
-        call_paged_varlen_fn(
-            ferrum_fa2_paged_varlen_fwd,
-            stream,
-            q,
-            k_pool,
-            v_pool,
-            out,
-            lse,
-            cu_seqlens_q,
-            seq_lens,
-            block_tables,
-            num_seqs,
-            total_q_tokens,
-            max_q_len,
-            max_kv_len,
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            block_size,
-            max_blocks_per_seq,
-        )
-    }
+pub(crate) fn paged_varlen_attention_fa2_source(_args: Fa2SourcePagedVarlenArgs<'_>) -> Result<()> {
+    Err(FerrumError::unsupported(
+        "FERRUM_FA2_SOURCE selected the removed source-linked FA2 path; provide a \
+         Ferrum native operator artifact for FA2 or unset FERRUM_FA2_SOURCE",
+    ))
 }

@@ -1,0 +1,5 @@
+{
+  "command": ["/workspace/ferrum-infer-rs/target/release/ferrum", "serve", "--model", "gemma3:27b-gptq", "--backend", "cuda", "--host", "127.0.0.1", "--port", "18476", "--kv-capacity", "512", "--max-num-seqs", "16", "--effective-config-json", "/workspace/w2_marlin_cache_policy_sharegpt_diag_2026-06-16/server/serve_effective_config.json", "--decision-trace-jsonl", "/workspace/w2_marlin_cache_policy_sharegpt_diag_2026-06-16/server/serve_decision_trace.jsonl"],
+  "cwd": "/workspace/ferrum-sharegpt-diag-7d93c2b4",
+  "note": "product CLI flags only; no hidden performance env"
+}

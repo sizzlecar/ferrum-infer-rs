@@ -1,0 +1,14 @@
+2026-06-24T22:13:15Z lane_start art=/workspace/artifacts/w3_qwen35_fp16_indexed_state_c32_1cdc98f7_20260624T221315Z sha=1cdc98f70f2ff544784fd677a934094749db0e6f release_evidence=false no_live_vllm=true
+2026-06-24T22:13:15Z git_sync_start
+2026-06-24T22:13:15Z git_sync_done
+2026-06-24T22:13:15Z cargo_check_start
+2026-06-24T22:13:38Z cargo_check_done
+2026-06-24T22:13:38Z release_build_start
+2026-06-24T22:17:14Z release_build_done
+2026-06-24T22:17:14Z ferrum_run_smoke_start
+2026-06-24T22:17:43Z ferrum_run_smoke_done
+2026-06-24T22:17:43Z serve_start
+2026-06-24T22:18:10Z serve_ready
+2026-06-24T22:18:11Z serve_chat_smoke_done
+2026-06-24T22:18:11Z bench_c32_start
+2026-06-24T22:18:22Z FERRUM W3 QWEN35 FP16 INDEXED STATE C32 DIAG PASS: /workspace/artifacts/w3_qwen35_fp16_indexed_state_c32_1cdc98f7_20260624T221315Z

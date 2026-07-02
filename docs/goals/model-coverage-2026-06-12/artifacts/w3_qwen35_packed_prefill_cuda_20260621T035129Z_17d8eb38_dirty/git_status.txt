@@ -1,0 +1,5 @@
+ M crates/ferrum-kernels/kernels/linear_attention.cu
+ M crates/ferrum-kernels/src/backend/cuda/linear_attention.rs
+ M crates/ferrum-kernels/src/backend/cuda/mod.rs
+ M crates/ferrum-kernels/src/backend/traits.rs
+ M crates/ferrum-models/src/models/qwen35.rs

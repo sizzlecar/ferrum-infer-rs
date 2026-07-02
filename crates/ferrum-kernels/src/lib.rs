@@ -17,7 +17,7 @@ pub fn configure_native_profile_sink(
 pub mod backend;
 
 pub mod linear;
-pub use linear::Linear;
+pub use linear::{Linear, LinearMetadata, LinearProjectionRole};
 
 pub mod stacked_expert;
 pub use stacked_expert::StackedExpertGgufLinear;
@@ -81,6 +81,10 @@ pub use backend::cuda::decode_attention::decode_attention;
 pub use backend::cuda::fused_add_rms_norm::fused_add_rms_norm;
 #[cfg(feature = "cuda")]
 pub use backend::cuda::fused_silu_mul::fused_silu_mul;
+#[cfg(feature = "cuda")]
+pub use backend::cuda::gated_delta_rule::recurrent_gated_delta_rule_f32;
+#[cfg(feature = "cuda")]
+pub use backend::cuda::linear_attention::{gated_rms_norm_f32, linear_attention_prepare_f32};
 #[cfg(feature = "cuda")]
 pub use backend::cuda::residual_add::residual_add;
 #[cfg(feature = "cuda")]

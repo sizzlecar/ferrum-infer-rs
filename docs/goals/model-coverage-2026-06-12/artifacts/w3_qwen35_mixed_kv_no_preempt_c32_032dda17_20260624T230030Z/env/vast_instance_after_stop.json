@@ -1,0 +1,7 @@
+{
+  "actual_status": "exited",
+  "cur_state": "stopped",
+  "id": 42439308,
+  "intended_status": "stopped",
+  "status_msg": "success, running nvidia/cuda_12.4.0-devel-ubuntu22.04/ssh"
+}

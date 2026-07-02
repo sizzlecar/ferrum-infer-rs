@@ -1,0 +1,34 @@
+{
+  "artifact_dir": "/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16",
+  "attention_keys_seen_in_sparse_logs": [
+    "8316016994327462400",
+    "8318267720516763747"
+  ],
+  "bench_completed_per_run": [
+    64
+  ],
+  "bench_errored_per_run": [
+    0
+  ],
+  "binary_sha256": "194c92163e12d7f8d0657cda1a5f2cd0b632382ee7814b4083e0f321d85362a2  /workspace/ferrum-infer-rs/target/release/ferrum",
+  "error_scan_lines": 0,
+  "ferrum_vs_vllm_ratio_orientation": null,
+  "git_head": "b990e93904f5b1b4bb1fe016573703a76b4902cc",
+  "git_status_short": "",
+  "git_status_source_short": "",
+  "lane": "W2 Gemma3-27B CUDA unified graph attention-key c16 diagnostic",
+  "output_throughput_orientation": {
+    "mean": 344.11712150550585
+  },
+  "output_token_count_source": "usage",
+  "pass_line": null,
+  "release_grade": false,
+  "run_validation": "RUN_SMOKE_PASS content='5' tokens=3",
+  "serve_validation": "SERVE_SMOKE_PASS content='Paris' completion_tokens=2",
+  "status": "SMOKE_PASS",
+  "unified_graph_capture_log_hits": 5,
+  "unified_graph_replay_log_hits": 9,
+  "unified_graph_skip_log_hits": 5,
+  "unified_graph_stats_lines": [],
+  "vllm_c16_tps_baseline_orientation": 518.7959572662905
+}

@@ -1,0 +1,18 @@
+{
+  "cmd": [
+    "target/release/ferrum",
+    "serve",
+    "--model",
+    "gemma3:27b-gptq",
+    "--port",
+    "8451",
+    "--kv-capacity",
+    "512",
+    "--max-num-seqs",
+    "16",
+    "--effective-config-json",
+    "/workspace/w2_ferrum_natural_prompt_diag_2026-06-15/perf_diag/serve_effective_config.json",
+    "--decision-trace-jsonl",
+    "/workspace/w2_ferrum_natural_prompt_diag_2026-06-15/perf_diag/serve_decision_trace.jsonl"
+  ]
+}

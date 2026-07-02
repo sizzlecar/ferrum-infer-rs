@@ -1,0 +1,6 @@
+[unified-graph-capture] count=1 scope=layers_only key=14407501838247541573 m_total=1 num_seqs=1 max_kv_len=26
+[unified-graph-replay] origin=post_capture count=1 scope=layers_only key=14407501838247541573 m_total=1 num_seqs=1 max_kv_len=26
+[unified-graph-capture] count=2 scope=layers_only key=14406545263131187228 m_total=1 num_seqs=1 max_kv_len=27
+[unified-graph-replay] origin=post_capture count=2 scope=layers_only key=14406545263131187228 m_total=1 num_seqs=1 max_kv_len=27
+[unified-graph-capture] count=4 scope=layers_only key=14404632112898478538 m_total=1 num_seqs=1 max_kv_len=29
+[unified-graph-replay] origin=post_capture count=4 scope=layers_only key=14404632112898478538 m_total=1 num_seqs=1 max_kv_len=29

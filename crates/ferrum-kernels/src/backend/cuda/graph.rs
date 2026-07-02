@@ -65,6 +65,75 @@ fn cuda_graph_runtime_config() -> &'static CudaGraphRuntimeConfig {
     CONFIG.get_or_init(CudaGraphRuntimeConfig::from_env)
 }
 
+fn captured_graph_summary(cu_graph: cudarc::driver::sys::CUgraph) -> String {
+    use cudarc::driver::sys;
+
+    let mut parts = Vec::new();
+    let mut node_count = 0usize;
+    let nodes_status =
+        unsafe { sys::cuGraphGetNodes(cu_graph, std::ptr::null_mut(), &mut node_count) };
+    if nodes_status == sys::CUresult::CUDA_SUCCESS {
+        parts.push(format!("nodes={node_count}"));
+        if node_count > 0 {
+            let mut nodes = vec![std::ptr::null_mut(); node_count];
+            let mut filled = node_count;
+            let fill_status =
+                unsafe { sys::cuGraphGetNodes(cu_graph, nodes.as_mut_ptr(), &mut filled) };
+            if fill_status == sys::CUresult::CUDA_SUCCESS {
+                let mut by_type = std::collections::BTreeMap::<String, usize>::new();
+                let mut type_errors = 0usize;
+                for &node in nodes.iter().take(filled) {
+                    let mut ty = std::mem::MaybeUninit::<sys::CUgraphNodeType>::uninit();
+                    let ty_status = unsafe { sys::cuGraphNodeGetType(node, ty.as_mut_ptr()) };
+                    if ty_status == sys::CUresult::CUDA_SUCCESS {
+                        let ty = unsafe { ty.assume_init() };
+                        *by_type.entry(format!("{ty:?}")).or_default() += 1;
+                    } else {
+                        type_errors += 1;
+                    }
+                }
+                if !by_type.is_empty() {
+                    let counts = by_type
+                        .into_iter()
+                        .map(|(ty, count)| format!("{ty}:{count}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    parts.push(format!("node_types={counts}"));
+                }
+                if type_errors > 0 {
+                    parts.push(format!("node_type_errors={type_errors}"));
+                }
+                if filled != node_count {
+                    parts.push(format!("nodes_filled={filled}"));
+                }
+            } else {
+                parts.push(format!("nodes_fill_status={fill_status:?}"));
+            }
+        }
+    } else {
+        parts.push(format!("nodes_status={nodes_status:?}"));
+    }
+
+    let mut root_count = 0usize;
+    let roots_status =
+        unsafe { sys::cuGraphGetRootNodes(cu_graph, std::ptr::null_mut(), &mut root_count) };
+    if roots_status == sys::CUresult::CUDA_SUCCESS {
+        parts.push(format!("roots={root_count}"));
+    } else {
+        parts.push(format!("roots_status={roots_status:?}"));
+    }
+
+    match cudarc::driver::result::mem_get_info() {
+        Ok((free, total)) => parts.push(format!(
+            "mem_free_mib={} mem_total_mib={}",
+            free / (1024 * 1024),
+            total / (1024 * 1024)
+        )),
+        Err(err) => parts.push(format!("mem_get_info={err:?}")),
+    }
+    parts.join(" ")
+}
+
 impl BackendGraph for CudaBackend {
     fn set_decode_state(ctx: &mut Self::Context, token: u32, step: u32) {
         let valid_kv = (step as i32) + 1;
@@ -144,11 +213,12 @@ impl BackendGraph for CudaBackend {
         let mut cu_graph_exec: sys::CUgraphExec = std::ptr::null_mut();
         let st2 = unsafe { sys::cuGraphInstantiateWithFlags(&mut cu_graph_exec, cu_graph, flags) };
         if st2 != sys::CUresult::CUDA_SUCCESS {
+            let graph_summary = captured_graph_summary(cu_graph);
             unsafe {
                 sys::cuGraphDestroy(cu_graph);
             }
             return Err(FerrumError::unsupported(format!(
-                "cuGraphInstantiate failed: {st2:?}"
+                "cuGraphInstantiate failed: {st2:?} key={key} {graph_summary}"
             )));
         }
 
@@ -158,12 +228,13 @@ impl BackendGraph for CudaBackend {
         // graph state and SIGSEGVs on Blackwell + CUDA 13.
         let st3 = unsafe { sys::cuGraphUpload(cu_graph_exec, cu_stream) };
         if st3 != sys::CUresult::CUDA_SUCCESS {
+            let graph_summary = captured_graph_summary(cu_graph);
             unsafe {
                 sys::cuGraphExecDestroy(cu_graph_exec);
                 sys::cuGraphDestroy(cu_graph);
             }
             return Err(FerrumError::unsupported(format!(
-                "cuGraphUpload failed: {st3:?}"
+                "cuGraphUpload failed: {st3:?} key={key} {graph_summary}"
             )));
         }
 

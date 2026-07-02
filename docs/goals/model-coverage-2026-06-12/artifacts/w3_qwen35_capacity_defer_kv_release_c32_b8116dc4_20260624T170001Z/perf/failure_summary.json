@@ -1,0 +1,73 @@
+{
+  "artifact": "/workspace/artifacts/w3_qwen35_capacity_defer_kv_release_c32_b8116dc4_20260624T170001Z",
+  "bench_exit": "143",
+  "build_exit": "0",
+  "cargo_check_exit": "0",
+  "last_engine_counters": {
+    "decode_tokens_after": 569,
+    "decode_tokens_before": 569,
+    "decode_tokens_delta": 0,
+    "prefill_tokens_after": 17314,
+    "prefill_tokens_before": 17314,
+    "prefill_tokens_delta": 0
+  },
+  "last_error": null,
+  "last_iteration": 22984,
+  "last_plan": {
+    "batch_size": 32,
+    "decode_items": 0,
+    "decode_tokens": 0,
+    "prefill_items": 32,
+    "prefill_prompt_tokens": {
+      "count": 32,
+      "max": 145,
+      "min": 129,
+      "p50": 130
+    },
+    "prefill_tokens": 192,
+    "scheduled_tokens_total": 192
+  },
+  "last_result": "some_ok",
+  "last_scheduler_after_process": {
+    "active_len": 0,
+    "admitted_total": 720713,
+    "cancelled_total": 125,
+    "completed_total": 5,
+    "decode_queue_len": 0,
+    "failed_total": 0,
+    "prefill_queue_len": 0,
+    "waiting_queue_len": 32
+  },
+  "last_scheduler_after_schedule": {
+    "active_len": 32,
+    "admitted_total": 720713,
+    "cancelled_total": 125,
+    "completed_total": 5,
+    "decode_queue_len": 0,
+    "failed_total": 0,
+    "prefill_queue_len": 32,
+    "waiting_queue_len": 0
+  },
+  "last_scheduler_before": {
+    "active_len": 0,
+    "admitted_total": 720681,
+    "cancelled_total": 125,
+    "completed_total": 5,
+    "decode_queue_len": 0,
+    "failed_total": 0,
+    "prefill_queue_len": 0,
+    "waiting_queue_len": 32
+  },
+  "last_timing_us": {
+    "process": 610,
+    "schedule": 46,
+    "total_since_schedule_start": 696
+  },
+  "manual_stop_reason": "Manual stop after c32 diagnostic stall on b8116dc4.\nObserved: ferrum run PASS, serve ready and chat smoke PASS, then bench c32 entered repeated capacity-defer/no-victim churn.\nStop reason: completed_total stayed at 5 while admitted_total climbed rapidly, active_len returned to 0 each scheduler iteration, prefill_tokens_delta stayed 0, and GPU utilization was 0% with ~23.9GiB allocated.\nThis is not W3 PASS and not release/performance evidence.",
+  "no_victim_warning_count": 720615,
+  "oom_mentions": 0,
+  "release_evidence": false,
+  "result": "FAIL_MANUAL_STOP_C32_CAPACITY_DEFER_NO_VICTIM_CHURN",
+  "run_exit": "0",
+  "sha": "b8116dc498e7fad50263d0dc580daf38194cb74e"
+}

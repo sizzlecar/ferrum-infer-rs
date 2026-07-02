@@ -1,0 +1,41 @@
+{
+  "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_dense_vllm_marlin_native_probe_retry_2026-06-15",
+  "comparison_m16_us": {
+    "down": {
+      "ferrum_default_hot": 30.356,
+      "ferrum_default_weight_cycle": 68.651,
+      "vllm_dense_marlin": 36.277,
+      "vllm_vs_ferrum_hot": 1.1950520490183159,
+      "vllm_vs_ferrum_weight_cycle": 0.5284263885449594
+    },
+    "gate_up": {
+      "ferrum_default_hot": 133.715,
+      "ferrum_default_weight_cycle": 133.985,
+      "vllm_dense_marlin": 136.581,
+      "vllm_vs_ferrum_hot": 1.0214336461877873,
+      "vllm_vs_ferrum_weight_cycle": 1.0193753032055826
+    },
+    "qkv": {
+      "ferrum_default_hot": 17.005,
+      "ferrum_default_weight_cycle": 30.278,
+      "vllm_dense_marlin": 18.354,
+      "vllm_vs_ferrum_hot": 1.0793296089385476,
+      "vllm_vs_ferrum_weight_cycle": 0.6061827069159126
+    }
+  },
+  "interpretation": [
+    "vLLM dense Marlin is not materially faster than Ferrum default hot kernel for gate_up; this falsifies the dense-vLLM-kernel-swap hypothesis for the main gate_up hot path.",
+    "Down projection is close to Ferrum hot-kernel timing but much faster than Ferrum weight-cycle timing, matching the product profile down per-layer timing and pointing at weight residency/cache behavior rather than pure kernel selection.",
+    "Remaining c16 gap should be pursued in product integration: weight residency/cache cycling, launch/host scheduling, and end-to-end decode overhead, not another full gate or blind vLLM paged-attn flip."
+  ],
+  "product_profile_batch": 16,
+  "product_profile_marlin_kernel_share_mean": 0.5504521958907581,
+  "product_profile_per_layer_us": {
+    "down": 70.19792236194642,
+    "gate_up": 140.77378348824493,
+    "o_proj": 21.544696555494806,
+    "qkv": 34.39324767632586
+  },
+  "product_profile_total_us_mean": 30063.27966101695,
+  "status": "PASS"
+}

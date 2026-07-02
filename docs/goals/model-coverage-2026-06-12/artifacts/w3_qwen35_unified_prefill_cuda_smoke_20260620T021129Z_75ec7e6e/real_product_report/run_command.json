@@ -1,0 +1,31 @@
+{
+  "command_line": [
+    "/workspace/ferrum-target-w3-varlen/release/ferrum",
+    "run",
+    "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+    "--backend",
+    "cuda",
+    "--gpu-devices",
+    "0",
+    "--gpu-memory-utilization",
+    "0.90",
+    "--max-model-len",
+    "2048",
+    "--max-num-seqs",
+    "4",
+    "--max-num-batched-tokens",
+    "2048",
+    "--kv-capacity",
+    "2048",
+    "--disable-thinking",
+    "--output-format",
+    "jsonl",
+    "--temperature",
+    "0",
+    "--max-tokens",
+    "8",
+    "--prompt",
+    "What is 2+3? Answer with only the number."
+  ],
+  "returncode": 0
+}

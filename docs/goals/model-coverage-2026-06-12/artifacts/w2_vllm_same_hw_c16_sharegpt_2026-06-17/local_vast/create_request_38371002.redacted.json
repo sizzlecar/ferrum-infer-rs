@@ -1,0 +1,12 @@
+{
+  "offer_id": 38371002,
+  "payload": {
+    "cancel_unavail": true,
+    "disk": 300,
+    "image": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+    "label": "ferrum-w2-vllm-ferrum-c16-ab-20260617",
+    "onstart": "[redacted]",
+    "runtype": "ssh",
+    "target_state": "running"
+  }
+}

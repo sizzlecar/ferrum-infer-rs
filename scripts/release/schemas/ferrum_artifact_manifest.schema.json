@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Ferrum shared artifact manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_kind",
+    "producer",
+    "git_sha",
+    "dirty",
+    "created_at",
+    "status",
+    "pass_line",
+    "files"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "artifact_kind": { "type": "string", "minLength": 1 },
+    "producer": { "type": "string", "minLength": 1 },
+    "git_sha": { "type": "string", "minLength": 1 },
+    "dirty": { "type": "boolean" },
+    "dirty_files": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "created_at": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["pass", "fail", "diagnostic"] },
+    "pass_line": { "type": ["string", "null"] },
+    "command": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "sanitized_env": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "impact_domains": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+          "role": { "type": "string" }
+        }
+      }
+    }
+  }
+}

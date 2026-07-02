@@ -1,0 +1,486 @@
+[
+  {
+    "model": "3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b",
+    "backend": "cuda",
+    "scenario": "closed_loop",
+    "concurrency": 1,
+    "n_prompt": 256,
+    "n_gen": 128,
+    "actual_input_tokens": {
+      "requested": 256,
+      "min": 115,
+      "max": 115,
+      "mean": 115.0
+    },
+    "actual_input_tokens_per_request": [
+      [
+        115,
+        115,
+        115,
+        115,
+        115,
+        115,
+        115,
+        115
+      ]
+    ],
+    "output_tokens_per_request": [
+      [
+        44,
+        44,
+        46,
+        44,
+        44,
+        44,
+        44,
+        44
+      ]
+    ],
+    "output_token_count_source": "usage",
+    "n_repeats": 1,
+    "n_requests_per_run": 8,
+    "warmup_requests": 1,
+    "ttft_ms": {
+      "p50": {
+        "mean": 2694.9398924999996
+      },
+      "p75": {
+        "mean": 2726.9466500000003
+      },
+      "p95": {
+        "mean": 2747.1479114
+      },
+      "p99": {
+        "mean": 2748.23311748
+      }
+    },
+    "tpot_ms": {
+      "p50": {
+        "mean": 16.021965848837212
+      },
+      "p75": {
+        "mean": 16.057572853875964
+      },
+      "p95": {
+        "mean": 16.164325229147277
+      },
+      "p99": {
+        "mean": 16.206788376062004
+      }
+    },
+    "itl_ms": {
+      "p50": {
+        "mean": 15.6034125
+      },
+      "p75": {
+        "mean": 16.185528249999997
+      },
+      "p95": {
+        "mean": 18.06995555
+      },
+      "p99": {
+        "mean": 19.44099707
+      }
+    },
+    "e2e_ms": {
+      "p50": {
+        "mean": 3395.7530515
+      },
+      "p75": {
+        "mean": 3422.6490882499997
+      },
+      "p95": {
+        "mean": 3440.4728187
+      },
+      "p99": {
+        "mean": 3441.67621334
+      }
+    },
+    "output_throughput_tps": {
+      "mean": 13.089144609516227
+    },
+    "total_throughput_tps": {
+      "mean": 47.10613060034936
+    },
+    "request_throughput_rps": {
+      "mean": 0.29579987818115766
+    },
+    "goodput_rps": {
+      "mean": 0.29579987818115766
+    },
+    "slo": {
+      "ttft_p99_ms": null,
+      "tpot_p99_ms": null,
+      "e2e_p99_ms": null
+    },
+    "completed_per_run": [
+      8
+    ],
+    "errored_per_run": [
+      0
+    ],
+    "bad_output_per_run": [
+      0
+    ],
+    "malformed_stream_per_run": [
+      0
+    ],
+    "missing_done_per_run": [
+      0
+    ],
+    "duplicate_done_per_run": [
+      0
+    ],
+    "zero_output_tokens_per_run": [
+      0
+    ],
+    "stream_bulk_flush_per_run": [
+      0
+    ],
+    "http_500_per_run": [
+      0
+    ],
+    "panic_per_run": [
+      0
+    ],
+    "quality_issues_per_run": [
+      {
+        "bad_output": 0,
+        "malformed_stream": 0,
+        "missing_done": 0,
+        "duplicate_done": 0,
+        "zero_output_tokens": 0,
+        "stream_bulk_flush": 0,
+        "http_500": 0,
+        "panic": 0
+      }
+    ],
+    "env": {
+      "commit_sha": "050d73f",
+      "hw_id": "rtx-4090",
+      "driver": "580.126.09",
+      "cuda": "12.4",
+      "rust": "1.96.0",
+      "ferrum_features": [
+        "cuda",
+        "vllm-moe-marlin",
+        "vllm-paged-attn-v2"
+      ],
+      "gpu_clock_lock_mhz": 2730,
+      "gpu_power_limit_w": 450,
+      "gpu_persistence_mode": true,
+      "ferrum_env": {
+        "FERRUM_PROFILE_COMMIT_SHA": "0 0git rev-parse HEAD)",
+        "FERRUM_PROFILE_CONCURRENCY": "32",
+        "FERRUM_PROFILE_ENV_HASH": "sha256:qwen35-prefill-profile-050d73f3",
+        "FERRUM_PROFILE_JSONL": "/workspace/artifacts/w3_qwen35_prefill_profile_050d73f3_20260619T230656Z/qwen35_prefill_profile.jsonl",
+        "FERRUM_PROFILE_MODEL": "",
+        "FERRUM_PROFILE_RUNTIME_FLAGS_JSON": "{\"diagnostic\":\"qwen35_prefill_profile\",\"release_evidence\":false}",
+        "FERRUM_QWEN35_PREFILL_PROFILE": "1"
+      },
+      "runtime_config": {
+        "entries": [
+          {
+            "key": "FERRUM_PROFILE_COMMIT_SHA",
+            "effective_value": "0 0git rev-parse HEAD)",
+            "source": "env",
+            "affects": [
+              "diagnostics"
+            ]
+          },
+          {
+            "key": "FERRUM_PROFILE_CONCURRENCY",
+            "effective_value": "32",
+            "source": "env",
+            "affects": [
+              "diagnostics"
+            ]
+          },
+          {
+            "key": "FERRUM_PROFILE_ENV_HASH",
+            "effective_value": "sha256:qwen35-prefill-profile-050d73f3",
+            "source": "env",
+            "affects": [
+              "diagnostics"
+            ]
+          },
+          {
+            "key": "FERRUM_PROFILE_JSONL",
+            "effective_value": "/workspace/artifacts/w3_qwen35_prefill_profile_050d73f3_20260619T230656Z/qwen35_prefill_profile.jsonl",
+            "source": "env",
+            "affects": [
+              "diagnostics"
+            ]
+          },
+          {
+            "key": "FERRUM_PROFILE_MODEL",
+            "effective_value": "",
+            "source": "env",
+            "affects": [
+              "diagnostics"
+            ]
+          },
+          {
+            "key": "FERRUM_PROFILE_RUNTIME_FLAGS_JSON",
+            "effective_value": "{\"diagnostic\":\"qwen35_prefill_profile\",\"release_evidence\":false}",
+            "source": "env",
+            "affects": [
+              "diagnostics"
+            ]
+          },
+          {
+            "key": "FERRUM_QWEN35_PREFILL_PROFILE",
+            "effective_value": "1",
+            "source": "env",
+            "affects": [
+              "diagnostics"
+            ]
+          }
+        ]
+      }
+    },
+    "env_hash": "sha256:6c6bb3bc1cb4bcd752131f1f7c2af53f17f1cd5c4dc9d9495b369ed6e64183fa"
+  },
+  {
+    "model": "3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b",
+    "backend": "cuda",
+    "scenario": "closed_loop",
+    "concurrency": 32,
+    "n_prompt": 256,
+    "n_gen": 128,
+    "actual_input_tokens": {
+      "requested": 256,
+      "min": 115,
+      "max": 115,
+      "mean": 115.0
+    },
+    "actual_input_tokens_per_request": [
+      [
+        115,
+        115,
+        115,
+        115,
+        115,
+        115,
+        115,
+        115
+      ]
+    ],
+    "output_tokens_per_request": [
+      [
+        44,
+        44,
+        44,
+        44,
+        44,
+        44,
+        44,
+        44
+      ]
+    ],
+    "output_token_count_source": "usage",
+    "n_repeats": 1,
+    "n_requests_per_run": 8,
+    "warmup_requests": 1,
+    "ttft_ms": {
+      "p50": {
+        "mean": 21642.5310075
+      },
+      "p75": {
+        "mean": 21643.414947750003
+      },
+      "p95": {
+        "mean": 21643.8533314
+      },
+      "p99": {
+        "mean": 21643.90228548
+      }
+    },
+    "tpot_ms": {
+      "p50": {
+        "mean": 35.997520604651115
+      },
+      "p75": {
+        "mean": 36.05732784883726
+      },
+      "p95": {
+        "mean": 321.7659401372091
+      },
+      "p99": {
+        "mean": 444.8368923437208
+      }
+    },
+    "itl_ms": {
+      "p50": {
+        "mean": 35.8899935
+      },
+      "p75": {
+        "mean": 36.2631305
+      },
+      "p95": {
+        "mean": 37.2779635
+      },
+      "p99": {
+        "mean": 38.59931334999999
+      }
+    },
+    "e2e_ms": {
+      "p50": {
+        "mean": 23190.633136000004
+      },
+      "p75": {
+        "mean": 23190.918739499997
+      },
+      "p95": {
+        "mean": 23191.1974713
+      },
+      "p99": {
+        "mean": 23191.213560660002
+      }
+    },
+    "output_throughput_tps": {
+      "mean": 15.178063239648683
+    },
+    "total_throughput_tps": {
+      "mean": 54.848001252366835
+    },
+    "request_throughput_rps": {
+      "mean": 0.34495598271928823
+    },
+    "goodput_rps": {
+      "mean": 0.34495598271928823
+    },
+    "slo": {
+      "ttft_p99_ms": null,
+      "tpot_p99_ms": null,
+      "e2e_p99_ms": null
+    },
+    "completed_per_run": [
+      8
+    ],
+    "errored_per_run": [
+      0
+    ],
+    "bad_output_per_run": [
+      0
+    ],
+    "malformed_stream_per_run": [
+      0
+    ],
+    "missing_done_per_run": [
+      0
+    ],
+    "duplicate_done_per_run": [
+      0
+    ],
+    "zero_output_tokens_per_run": [
+      0
+    ],
+    "stream_bulk_flush_per_run": [
+      0
+    ],
+    "http_500_per_run": [
+      0
+    ],
+    "panic_per_run": [
+      0
+    ],
+    "quality_issues_per_run": [
+      {
+        "bad_output": 0,
+        "malformed_stream": 0,
+        "missing_done": 0,
+        "duplicate_done": 0,
+        "zero_output_tokens": 0,
+        "stream_bulk_flush": 0,
+        "http_500": 0,
+        "panic": 0
+      }
+    ],
+    "env": {
+      "commit_sha": "050d73f",
+      "hw_id": "rtx-4090",
+      "driver": "580.126.09",
+      "cuda": "12.4",
+      "rust": "1.96.0",
+      "ferrum_features": [
+        "cuda",
+        "vllm-moe-marlin",
+        "vllm-paged-attn-v2"
+      ],
+      "gpu_clock_lock_mhz": 2730,
+      "gpu_power_limit_w": 450,
+      "gpu_persistence_mode": true,
+      "ferrum_env": {
+        "FERRUM_PROFILE_COMMIT_SHA": "0 0git rev-parse HEAD)",
+        "FERRUM_PROFILE_CONCURRENCY": "32",
+        "FERRUM_PROFILE_ENV_HASH": "sha256:qwen35-prefill-profile-050d73f3",
+        "FERRUM_PROFILE_JSONL": "/workspace/artifacts/w3_qwen35_prefill_profile_050d73f3_20260619T230656Z/qwen35_prefill_profile.jsonl",
+        "FERRUM_PROFILE_MODEL": "",
+        "FERRUM_PROFILE_RUNTIME_FLAGS_JSON": "{\"diagnostic\":\"qwen35_prefill_profile\",\"release_evidence\":false}",
+        "FERRUM_QWEN35_PREFILL_PROFILE": "1"
+      },
+      "runtime_config": {
+        "entries": [
+          {
+            "key": "FERRUM_PROFILE_COMMIT_SHA",
+            "effective_value": "0 0git rev-parse HEAD)",
+            "source": "env",
+            "affects": [
+              "diagnostics"
+            ]
+          },
+          {
+            "key": "FERRUM_PROFILE_CONCURRENCY",
+            "effective_value": "32",
+            "source": "env",
+            "affects": [
+              "diagnostics"
+            ]
+          },
+          {
+            "key": "FERRUM_PROFILE_ENV_HASH",
+            "effective_value": "sha256:qwen35-prefill-profile-050d73f3",
+            "source": "env",
+            "affects": [
+              "diagnostics"
+            ]
+          },
+          {
+            "key": "FERRUM_PROFILE_JSONL",
+            "effective_value": "/workspace/artifacts/w3_qwen35_prefill_profile_050d73f3_20260619T230656Z/qwen35_prefill_profile.jsonl",
+            "source": "env",
+            "affects": [
+              "diagnostics"
+            ]
+          },
+          {
+            "key": "FERRUM_PROFILE_MODEL",
+            "effective_value": "",
+            "source": "env",
+            "affects": [
+              "diagnostics"
+            ]
+          },
+          {
+            "key": "FERRUM_PROFILE_RUNTIME_FLAGS_JSON",
+            "effective_value": "{\"diagnostic\":\"qwen35_prefill_profile\",\"release_evidence\":false}",
+            "source": "env",
+            "affects": [
+              "diagnostics"
+            ]
+          },
+          {
+            "key": "FERRUM_QWEN35_PREFILL_PROFILE",
+            "effective_value": "1",
+            "source": "env",
+            "affects": [
+              "diagnostics"
+            ]
+          }
+        ]
+      }
+    },
+    "env_hash": "sha256:6c6bb3bc1cb4bcd752131f1f7c2af53f17f1cd5c4dc9d9495b369ed6e64183fa"
+  }
+]

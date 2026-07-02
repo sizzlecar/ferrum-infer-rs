@@ -1,0 +1,8 @@
+{
+  "model": "3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b",
+  "messages": [{"role": "user", "content": "Answer in one short sentence: What color is the sky on a clear day?"}],
+  "max_tokens": 32,
+  "temperature": 0,
+  "stream": true,
+  "stream_options": {"include_usage": true}
+}

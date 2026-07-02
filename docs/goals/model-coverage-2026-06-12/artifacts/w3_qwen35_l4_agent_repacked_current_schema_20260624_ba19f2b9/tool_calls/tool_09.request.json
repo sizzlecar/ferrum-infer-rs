@@ -1,0 +1,39 @@
+{
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  },
+  "max_tokens": 128,
+  "messages": [
+    {
+      "content": "Use the calc tool. Return only JSON arguments: {\"expression\":\"123+456\"}",
+      "role": "user"
+    }
+  ],
+  "model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+  "seed": 9280,
+  "temperature": 0,
+  "tool_choice": "required",
+  "tools": [
+    {
+      "function": {
+        "description": "Evaluate one deterministic arithmetic expression.",
+        "name": "calc",
+        "parameters": {
+          "properties": {
+            "expression": {
+              "enum": [
+                "123+456"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "expression"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "actual_status": "exited",
+  "cpu_name": "AMD Ryzen Threadripper PRO 3955WX 16-Cores",
+  "cur_state": "stopped",
+  "disk_space": 120.0,
+  "dph_total": 0.42488888888888887,
+  "geolocation": "Iceland, IS",
+  "gpu_name": "RTX 4090",
+  "gpu_util": 0.0,
+  "id": 40826362,
+  "machine_id": 15970,
+  "num_gpus": 1,
+  "poll": 3,
+  "ssh_host": "ssh9.vast.ai",
+  "ssh_port": 26362
+}

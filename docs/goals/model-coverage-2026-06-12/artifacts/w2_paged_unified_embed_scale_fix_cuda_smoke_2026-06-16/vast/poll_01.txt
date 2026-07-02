@@ -1,0 +1,1 @@
+cur_state=running actual_status=exited ssh_host=ssh9.vast.ai ssh_port=26362

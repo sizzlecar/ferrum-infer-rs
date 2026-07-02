@@ -1,0 +1,14 @@
+[w2-c16] start 2026-06-16T20:34:03Z
+[w2-c16] root=/workspace/ferrum-infer-rs out=/workspace/w2_same_iteration_admit_c16_ci_2026-06-17 model=gemma3:27b-gptq hf_home=/workspace/hf-cache dataset=/workspace/ascii_sharegpt_w2_100.jsonl
+[w2-c16] installing rustup minimal toolchain
+[w2-c16] CUDA release build
+--- build tail ---
+   Compiling ferrum-scheduler v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-scheduler)
+   Compiling ferrum-engine v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-cli)
+--- run stdout ---
+--- stream summary ---
+--- bench stderr ---
+--- tmux ---
+w2_same_iter_c16: 1 windows (created Tue Jun 16 20:34:03 2026)

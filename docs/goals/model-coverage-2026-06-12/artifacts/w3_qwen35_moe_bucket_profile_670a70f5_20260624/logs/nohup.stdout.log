@@ -1,0 +1,3 @@
+5
+DIAG_METRIC c 16 output_tps 129.44925443545154 completed [16] errored [0] ttft_p95 1443.827339 itl_p95 82.706456
+{"bucket_rows": 1840, "events": {"qwen35_decode_prof": 17, "qwen35_linear_decode_detail": 990, "qwen35_linear_prefill_core_detail": 390, "qwen35_linear_prefill_detail": 390, "qwen35_mlp_finish_detail": 1320, "qwen35_sparse_moe_detail": 1840}}

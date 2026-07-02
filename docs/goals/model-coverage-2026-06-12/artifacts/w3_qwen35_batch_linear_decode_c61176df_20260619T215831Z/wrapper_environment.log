@@ -1,0 +1,17 @@
+wrapper_started_at_utc=2026-06-19T21:58:31Z
+repo=/workspace/ferrum-clean
+artifact=/workspace/artifacts/w3_qwen35_batch_linear_decode_c61176df_20260619T215831Z
+git_head=c61176df6aab8de688ddc5d0562c9d810911c2d8
+git_status_short_begin
+## goal/w2-w3-release-grade...origin/goal/w2-w3-release-grade
+git_status_short_end
+gpu_begin
+0, NVIDIA GeForce RTX 4090, 49140 MiB, 580.126.09, 8.9
+gpu_end
+rustc 1.96.0 (ac68faa20 2026-05-25)
+cargo 1.96.0 (30a34c682 2026-05-25)
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2024 NVIDIA Corporation
+Built on Thu_Mar_28_02:18:24_PDT_2024
+Cuda compilation tools, release 12.4, V12.4.131
+Build cuda_12.4.r12.4/compiler.34097967_0

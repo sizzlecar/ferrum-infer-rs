@@ -1,0 +1,5 @@
+{"actual_status": "running", "cur_state": "stopped", "intended_status": "stopped", "rate": null, "ts": "2026-06-17T01:13:23.674190Z"}
+{"actual_status": "running", "cur_state": "stopped", "intended_status": "stopped", "rate": null, "ts": "2026-06-17T01:13:34.896361Z"}
+{"actual_status": "running", "cur_state": "stopped", "intended_status": "stopped", "rate": null, "ts": "2026-06-17T01:13:46.301923Z"}
+{"actual_status": "running", "cur_state": "stopped", "intended_status": "stopped", "rate": null, "ts": "2026-06-17T01:14:04.704573Z"}
+{"actual_status": "exited", "cur_state": "stopped", "intended_status": "stopped", "rate": null, "ts": "2026-06-17T01:14:19.254312Z"}

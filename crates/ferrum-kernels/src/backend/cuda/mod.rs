@@ -46,8 +46,10 @@ pub mod collective;
 pub mod fa2_ffi;
 #[cfg(feature = "fa2-source")]
 pub mod fa2_source;
+pub mod gated_delta_rule;
 pub mod graph;
 pub mod int8_kv;
+pub mod linear_attention;
 pub mod moe;
 pub mod paged;
 pub mod quant;
@@ -843,6 +845,10 @@ impl Backend for CudaBackend {
         ctx.stream.synchronize().expect("CudaBackend: stream sync");
     }
 
+    fn graph_capture_in_flight(ctx: &Self::Context) -> bool {
+        ctx.capture_in_flight
+    }
+
     fn alloc(len: usize) -> Self::Buffer {
         with_stream(|stream| {
             let len = len.max(1);
@@ -887,6 +893,299 @@ impl Backend for CudaBackend {
             other => panic!(
                 "CudaBackend::write_f32_to_activation unsupported dtype {}",
                 other.name()
+            ),
+        }
+    }
+
+    fn f32_to_activation(
+        ctx: &mut Self::Context,
+        input_f32: &Self::Buffer,
+        out: &mut Self::Buffer,
+        len: usize,
+    ) {
+        match (input_f32.dtype(), out.dtype()) {
+            (crate::backend::Dtype::F32, crate::backend::Dtype::F16) => {
+                let func = ctx.func("sandwich_norm", ptx::SANDWICH_NORM, "f32_to_activation_f16");
+                let n = len as i32;
+                let block = 256u32;
+                let grid = ((len as u32) + block - 1) / block;
+                let stream = ctx.stream.clone();
+                let mut b = stream.launch_builder(&func);
+                b.arg(input_f32);
+                b.arg(out);
+                b.arg(&n);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .expect("f32_to_activation_f16 launch");
+            }
+            (crate::backend::Dtype::F32, crate::backend::Dtype::F32) => {
+                Self::copy_slice(ctx, input_f32, 0, out, 0, len);
+            }
+            (src, dst) => panic!(
+                "CudaBackend::f32_to_activation unsupported dtypes input={} out={}",
+                src.name(),
+                dst.name()
+            ),
+        }
+    }
+
+    fn supports_device_f32_residual_shadow() -> bool {
+        true
+    }
+
+    fn supports_qwen35_indexed_recurrent_state() -> bool {
+        true
+    }
+
+    fn qwen35_indexed_recurrent_state_dtype() -> crate::backend::Dtype {
+        crate::backend::Dtype::F16
+    }
+
+    fn supports_qwen35_packed_gdn_decode_prepare() -> bool {
+        true
+    }
+
+    fn supports_qwen35_packed_gdn_prefill_prepare() -> bool {
+        true
+    }
+
+    fn supports_qwen35_packed_gdn_recurrent_decode() -> bool {
+        true
+    }
+
+    fn activation_to_f32_shadow(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        dst_f32: &mut Self::Buffer,
+        len: usize,
+    ) {
+        if len == 0 {
+            return;
+        }
+        assert_eq!(
+            dst_f32.dtype(),
+            crate::backend::Dtype::F32,
+            "CudaBackend::activation_to_f32_shadow dst must be F32, got {}",
+            dst_f32.dtype().name()
+        );
+        match src.dtype() {
+            crate::backend::Dtype::F16 => {
+                let func = ctx.func(
+                    "sandwich_norm",
+                    ptx::SANDWICH_NORM,
+                    "activation_to_f32_shadow_f16",
+                );
+                let n_i32 = len as i32;
+                let block = 256u32;
+                let grid = ((len as u32) + block - 1) / block;
+                let stream = ctx.stream.clone();
+                let mut b = stream.launch_builder(&func);
+                b.arg(src);
+                b.arg(dst_f32);
+                b.arg(&n_i32);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .expect("activation_to_f32_shadow launch");
+            }
+            crate::backend::Dtype::F32 => {
+                Self::copy_slice(ctx, src, 0, dst_f32, 0, len);
+            }
+            other => panic!(
+                "CudaBackend::activation_to_f32_shadow unsupported src dtype {}",
+                other.name()
+            ),
+        }
+    }
+
+    fn activation_add_to_f32_shadow(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        residual_f32: &mut Self::Buffer,
+        scratch_f32: &mut Self::Buffer,
+        len: usize,
+    ) {
+        if len == 0 {
+            return;
+        }
+        assert_eq!(
+            residual_f32.dtype(),
+            crate::backend::Dtype::F32,
+            "CudaBackend::activation_add_to_f32_shadow residual must be F32, got {}",
+            residual_f32.dtype().name()
+        );
+        match (src.dtype(), residual_f32.dtype()) {
+            (crate::backend::Dtype::F16, crate::backend::Dtype::F32) => {
+                let func = ctx.func(
+                    "sandwich_norm",
+                    ptx::SANDWICH_NORM,
+                    "activation_add_to_f32_shadow_f16",
+                );
+                let n_i32 = len as i32;
+                let block = 256u32;
+                let grid = ((len as u32) + block - 1) / block;
+                let stream = ctx.stream.clone();
+                let mut b = stream.launch_builder(&func);
+                b.arg(src);
+                b.arg(residual_f32);
+                b.arg(&n_i32);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (grid, 1, 1),
+                        block_dim: (block, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .expect("activation_add_to_f32_shadow launch");
+            }
+            (crate::backend::Dtype::F32, crate::backend::Dtype::F32) => {
+                Self::add_inplace(ctx, residual_f32, src, len);
+            }
+            _ => {
+                Self::activation_to_f32_shadow(ctx, src, scratch_f32, len);
+                Self::add_inplace(ctx, residual_f32, scratch_f32, len);
+            }
+        }
+    }
+
+    fn rms_norm_activation_to_f32(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        weight: &Self::Buffer,
+        eps: f32,
+        out_f32: &mut Self::Buffer,
+        tokens: usize,
+        dim: usize,
+    ) {
+        match (input.dtype(), weight.dtype(), out_f32.dtype()) {
+            (crate::backend::Dtype::F16, crate::backend::Dtype::F16, crate::backend::Dtype::F32) => {
+                let func = ctx.func("sandwich_norm", ptx::SANDWICH_NORM, "rms_norm_f16_to_f32");
+                let dim_i32 = dim as i32;
+                let stream = ctx.stream.clone();
+                let mut b = stream.launch_builder(&func);
+                b.arg(input);
+                b.arg(weight);
+                b.arg(out_f32);
+                b.arg(&dim_i32);
+                b.arg(&eps);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (tokens as u32, 1, 1),
+                        block_dim: (dim.min(1024) as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .expect("rms_norm_activation_to_f32 launch");
+            }
+            (crate::backend::Dtype::F32, crate::backend::Dtype::F32, crate::backend::Dtype::F32) => {
+                Self::rms_norm(ctx, input, weight, eps, out_f32, tokens, dim);
+            }
+            (input_dtype, weight_dtype, out_dtype) => panic!(
+                "CudaBackend::rms_norm_activation_to_f32 unsupported dtypes input={} weight={} out={}",
+                input_dtype.name(),
+                weight_dtype.name(),
+                out_dtype.name()
+            ),
+        }
+    }
+
+    fn rms_norm_activation_add_to_f32(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        weight: &Self::Buffer,
+        eps: f32,
+        residual_f32: &mut Self::Buffer,
+        scratch_f32: &mut Self::Buffer,
+        tokens: usize,
+        dim: usize,
+    ) {
+        match (
+            input.dtype(),
+            weight.dtype(),
+            residual_f32.dtype(),
+            scratch_f32.dtype(),
+        ) {
+            (
+                crate::backend::Dtype::F16,
+                crate::backend::Dtype::F16,
+                crate::backend::Dtype::F32,
+                crate::backend::Dtype::F32,
+            ) => {
+                let func = ctx.func(
+                    "sandwich_norm",
+                    ptx::SANDWICH_NORM,
+                    "rms_norm_f16_add_to_f32",
+                );
+                let dim_i32 = dim as i32;
+                let stream = ctx.stream.clone();
+                let mut b = stream.launch_builder(&func);
+                b.arg(input);
+                b.arg(weight);
+                b.arg(residual_f32);
+                b.arg(&dim_i32);
+                b.arg(&eps);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (tokens as u32, 1, 1),
+                        block_dim: (dim.min(1024) as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .expect("rms_norm_activation_add_to_f32 launch");
+            }
+            _ => {
+                Self::rms_norm_activation_to_f32(ctx, input, weight, eps, scratch_f32, tokens, dim);
+                Self::add_inplace(ctx, residual_f32, scratch_f32, tokens * dim);
+            }
+        }
+    }
+
+    fn rms_norm_f32_to_activation(
+        ctx: &mut Self::Context,
+        input_f32: &Self::Buffer,
+        weight: &Self::Buffer,
+        eps: f32,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        dim: usize,
+    ) {
+        match (input_f32.dtype(), weight.dtype(), out.dtype()) {
+            (crate::backend::Dtype::F32, crate::backend::Dtype::F16, crate::backend::Dtype::F16) => {
+                let func = ctx.func("sandwich_norm", ptx::SANDWICH_NORM, "rms_norm_f32_to_f16");
+                let dim_i32 = dim as i32;
+                let stream = ctx.stream.clone();
+                let mut b = stream.launch_builder(&func);
+                b.arg(input_f32);
+                b.arg(weight);
+                b.arg(out);
+                b.arg(&dim_i32);
+                b.arg(&eps);
+                unsafe {
+                    b.launch(LaunchConfig {
+                        grid_dim: (tokens as u32, 1, 1),
+                        block_dim: (dim.min(1024) as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .expect("rms_norm_f32_to_activation launch");
+            }
+            (crate::backend::Dtype::F32, crate::backend::Dtype::F32, crate::backend::Dtype::F32) => {
+                Self::rms_norm(ctx, input_f32, weight, eps, out, tokens, dim);
+            }
+            (input_dtype, weight_dtype, out_dtype) => panic!(
+                "CudaBackend::rms_norm_f32_to_activation unsupported dtypes input={} weight={} out={}",
+                input_dtype.name(),
+                weight_dtype.name(),
+                out_dtype.name()
             ),
         }
     }
@@ -966,6 +1265,92 @@ impl Backend for CudaBackend {
         Ok(host.into_iter().map(|x| x as u32).collect())
     }
 
+    fn argmax_rows_f16_masked(
+        ctx: &mut Self::Context,
+        logits: &Self::Buffer,
+        valid_token_mask: &Self::Buffer,
+        mask_len: usize,
+        m: usize,
+        n: usize,
+    ) -> Result<Vec<u32>> {
+        let func = ctx.func("argmax_rows", ptx::ARGMAX_ROWS, "argmax_rows_f16_masked");
+        let stream = ctx.stream.clone();
+        let host = with_argmax_out(&stream, ctx.ordinal, m, |out_dev| -> Result<Vec<i32>> {
+            let n_i32 = n as i32;
+            let mask_len_i32 = mask_len as i32;
+            let mut b = stream.launch_builder(&func);
+            b.arg(logits);
+            b.arg(&n_i32);
+            b.arg(valid_token_mask);
+            b.arg(&mask_len_i32);
+            b.arg(&mut *out_dev);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (m as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| FerrumError::internal(format!("argmax_rows_masked launch: {e}")))?;
+            let mut host = vec![0i32; m];
+            let view = out_dev.slice(0..m);
+            stream
+                .memcpy_dtoh(&view, &mut host)
+                .map_err(|e| FerrumError::internal(format!("argmax_rows_masked dtoh: {e}")))?;
+            stream
+                .synchronize()
+                .map_err(|e| FerrumError::internal(format!("argmax_rows_masked sync: {e}")))?;
+            Ok(host)
+        })?;
+        Ok(host.into_iter().map(|x| x as u32).collect())
+    }
+
+    fn argmax_rows_f16_sparse_repetition_penalty(
+        ctx: &mut Self::Context,
+        logits: &mut Self::Buffer,
+        valid_token_mask: Option<(&Self::Buffer, usize)>,
+        row_offsets: &Self::Buffer,
+        token_ids: &Self::Buffer,
+        repetition_penalties: &Self::Buffer,
+        total_token_ids: usize,
+        m: usize,
+        n: usize,
+    ) -> Result<Vec<u32>> {
+        if total_token_ids > 0 {
+            let func = ctx.func(
+                "argmax_rows",
+                ptx::ARGMAX_ROWS,
+                "apply_repetition_penalties_sparse_f16",
+            );
+            let n_i32 = n as i32;
+            let total_i32 = total_token_ids as i32;
+            let mut b = ctx.stream.launch_builder(&func);
+            b.arg(&mut *logits);
+            b.arg(&n_i32);
+            b.arg(row_offsets);
+            b.arg(token_ids);
+            b.arg(repetition_penalties);
+            b.arg(&total_i32);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (m as u32, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map_err(|e| {
+                FerrumError::internal(format!("apply_repetition_penalties_sparse_f16 launch: {e}"))
+            })?;
+        }
+
+        match valid_token_mask {
+            Some((mask, mask_len)) => {
+                Self::argmax_rows_f16_masked(ctx, logits, mask, mask_len, m, n)
+            }
+            None => Self::argmax_rows_f16(ctx, logits, m, n),
+        }
+    }
+
     // ── Norms ────────────────────────────────────────────────────────────
 
     fn rms_norm(
@@ -977,7 +1362,27 @@ impl Backend for CudaBackend {
         tokens: usize,
         dim: usize,
     ) {
-        let func = ctx.func("rms_norm", ptx::RMS_NORM, "rms_norm_f16");
+        let x_dtype = x.dtype();
+        assert_eq!(
+            x_dtype,
+            w.dtype(),
+            "CudaBackend::rms_norm dtype mismatch: x={} w={}",
+            x_dtype.name(),
+            w.dtype().name()
+        );
+        assert_eq!(
+            x_dtype,
+            out.dtype(),
+            "CudaBackend::rms_norm dtype mismatch: x={} out={}",
+            x_dtype.name(),
+            out.dtype().name()
+        );
+        let fn_name = match x_dtype {
+            crate::backend::Dtype::F16 => "rms_norm_f16",
+            crate::backend::Dtype::F32 => "rms_norm_f32",
+            other => panic!("CudaBackend::rms_norm unsupported dtype {}", other.name()),
+        };
+        let func = ctx.func("rms_norm", ptx::RMS_NORM, fn_name);
         let dim_i32 = dim as i32;
         let stream = ctx.stream.clone();
         let mut b = stream.launch_builder(&func);
@@ -1146,6 +1551,7 @@ impl Backend for CudaBackend {
             };
             let valid_kv_scalar = kv_len as i32;
             let scale = cfg.scale;
+            let sliding_window = cfg.sliding_window as i32;
             // Shared-memory sizing (graph-safe):
             // - Kernel writes `s_scores[0..valid_kv_len]` per step. valid_kv_len
             //   grows over time; captured graph has a fixed shared_mem_bytes.
@@ -1161,7 +1567,12 @@ impl Backend for CudaBackend {
                 .cuda_max_kv
                 .unwrap_or(DECODE_MAX_KV_POS_DEFAULT);
             let max_kv_pos = capacity.min(env_cap as i32) as u32;
-            let shared_mem = max_kv_pos * 4;
+            let active_kv_pos = if cfg.sliding_window > 0 {
+                max_kv_pos.min(cfg.sliding_window as u32)
+            } else {
+                max_kv_pos
+            };
+            let shared_mem = active_kv_pos * 4;
             // If user bumped the cap beyond 48 KB default, opt into the
             // higher limit on Blackwell (up to 228 KB).
             if shared_mem > 48 * 1024 {
@@ -1197,6 +1608,7 @@ impl Backend for CudaBackend {
                 bld.arg(&valid_kv_scalar);
             }
             bld.arg(&scale);
+            bld.arg(&sliding_window);
             unsafe {
                 bld.launch(LaunchConfig {
                     grid_dim: (cfg.num_heads as u32, 1, 1),
@@ -1213,6 +1625,12 @@ impl Backend for CudaBackend {
             ptx::FLASH_ATTN_FULL,
             "flash_attn_full_f16",
         );
+        if cfg.head_dim > 256 {
+            panic!(
+                "flash_attn_full_f16 supports head_dim <= 256, got {}",
+                cfg.head_dim
+            );
+        }
         let params = FlashAttnParams {
             batch: batch as i32,
             num_heads: cfg.num_heads as i32,
@@ -1252,6 +1670,608 @@ impl Backend for CudaBackend {
         .expect("flash_attn_full launch");
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_f32(
+        ctx: &mut Self::Context,
+        query: &Self::Buffer,
+        key: &Self::Buffer,
+        value: &Self::Buffer,
+        g: &Self::Buffer,
+        beta: &Self::Buffer,
+        initial_state: &Self::Buffer,
+        out: &mut Self::Buffer,
+        final_state: &mut Self::Buffer,
+        tokens: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        use_qk_l2norm: bool,
+        scale: f32,
+    ) -> Result<()> {
+        gated_delta_rule::recurrent_gated_delta_rule_f32(
+            ctx,
+            query,
+            key,
+            value,
+            g,
+            beta,
+            initial_state,
+            out,
+            final_state,
+            tokens,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            use_qk_l2norm,
+            scale,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_batch_f32(
+        ctx: &mut Self::Context,
+        query: &Self::Buffer,
+        key: &Self::Buffer,
+        value: &Self::Buffer,
+        g: &Self::Buffer,
+        beta: &Self::Buffer,
+        initial_states: &Self::Buffer,
+        out: &mut Self::Buffer,
+        final_states: &mut Self::Buffer,
+        batch: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        use_qk_l2norm: bool,
+        scale: f32,
+    ) -> Result<()> {
+        gated_delta_rule::recurrent_gated_delta_rule_batch_f32(
+            ctx,
+            query,
+            key,
+            value,
+            g,
+            beta,
+            initial_states,
+            out,
+            final_states,
+            batch,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            use_qk_l2norm,
+            scale,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_batch_indexed_f32(
+        ctx: &mut Self::Context,
+        query: &Self::Buffer,
+        key: &Self::Buffer,
+        value: &Self::Buffer,
+        g: &Self::Buffer,
+        beta: &Self::Buffer,
+        state_slots: &mut Self::Buffer,
+        slot_indices: &Self::Buffer,
+        out: &mut Self::Buffer,
+        batch: usize,
+        max_slots: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        use_qk_l2norm: bool,
+        scale: f32,
+    ) -> Result<()> {
+        gated_delta_rule::recurrent_gated_delta_rule_batch_indexed_f32(
+            ctx,
+            query,
+            key,
+            value,
+            g,
+            beta,
+            state_slots,
+            slot_indices,
+            out,
+            batch,
+            max_slots,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            use_qk_l2norm,
+            scale,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_batch_indexed_packed_f32(
+        ctx: &mut Self::Context,
+        mixed_qkv: &Self::Buffer,
+        ba_raw: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        state_slots: &mut Self::Buffer,
+        slot_indices: &Self::Buffer,
+        out: &mut Self::Buffer,
+        batch: usize,
+        max_slots: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        scale: f32,
+    ) -> Result<()> {
+        gated_delta_rule::recurrent_gated_delta_rule_batch_indexed_packed_f32(
+            ctx,
+            mixed_qkv,
+            ba_raw,
+            a_log,
+            dt_bias,
+            state_slots,
+            slot_indices,
+            out,
+            batch,
+            max_slots,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            scale,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_varlen_f32(
+        ctx: &mut Self::Context,
+        query: &Self::Buffer,
+        key: &Self::Buffer,
+        value: &Self::Buffer,
+        g: &Self::Buffer,
+        beta: &Self::Buffer,
+        initial_states: &Self::Buffer,
+        cu_seqlens: &Self::Buffer,
+        out: &mut Self::Buffer,
+        final_states: &mut Self::Buffer,
+        batch: usize,
+        total_tokens: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        use_qk_l2norm: bool,
+        scale: f32,
+    ) -> Result<()> {
+        gated_delta_rule::recurrent_gated_delta_rule_varlen_f32(
+            ctx,
+            query,
+            key,
+            value,
+            g,
+            beta,
+            initial_states,
+            cu_seqlens,
+            out,
+            final_states,
+            batch,
+            total_tokens,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            use_qk_l2norm,
+            scale,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_prepare_f32(
+        ctx: &mut Self::Context,
+        mixed_qkv_raw: &Self::Buffer,
+        conv_weight: &Self::Buffer,
+        a_raw: &Self::Buffer,
+        b_raw: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        query: &mut Self::Buffer,
+        key: &mut Self::Buffer,
+        value: &mut Self::Buffer,
+        g: &mut Self::Buffer,
+        beta: &mut Self::Buffer,
+        tokens: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        conv_kernel: usize,
+        apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        linear_attention::linear_attention_prepare_f32(
+            ctx,
+            mixed_qkv_raw,
+            conv_weight,
+            a_raw,
+            b_raw,
+            a_log,
+            dt_bias,
+            query,
+            key,
+            value,
+            g,
+            beta,
+            tokens,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            conv_kernel,
+            apply_qk_l2norm,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_prepare_varlen_f32(
+        ctx: &mut Self::Context,
+        mixed_qkv_raw: &Self::Buffer,
+        conv_weight: &Self::Buffer,
+        initial_conv_states: &Self::Buffer,
+        a_raw: &Self::Buffer,
+        b_raw: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        cu_seqlens: &Self::Buffer,
+        token_seq_indices: &Self::Buffer,
+        query: &mut Self::Buffer,
+        key: &mut Self::Buffer,
+        value: &mut Self::Buffer,
+        g: &mut Self::Buffer,
+        beta: &mut Self::Buffer,
+        final_conv_states: &mut Self::Buffer,
+        batch: usize,
+        total_tokens: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        conv_kernel: usize,
+        apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        linear_attention::linear_attention_prepare_varlen_f32(
+            ctx,
+            mixed_qkv_raw,
+            conv_weight,
+            initial_conv_states,
+            a_raw,
+            b_raw,
+            a_log,
+            dt_bias,
+            cu_seqlens,
+            token_seq_indices,
+            query,
+            key,
+            value,
+            g,
+            beta,
+            final_conv_states,
+            batch,
+            total_tokens,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            conv_kernel,
+            apply_qk_l2norm,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_prepare_varlen_packed_qkvz_ba_f32(
+        ctx: &mut Self::Context,
+        mixed_qkvz_raw: &Self::Buffer,
+        ba_raw: &Self::Buffer,
+        conv_weight: &Self::Buffer,
+        initial_conv_states: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        cu_seqlens: &Self::Buffer,
+        token_seq_indices: &Self::Buffer,
+        query: &mut Self::Buffer,
+        key: &mut Self::Buffer,
+        value: &mut Self::Buffer,
+        z: &mut Self::Buffer,
+        g: &mut Self::Buffer,
+        beta: &mut Self::Buffer,
+        final_conv_states: &mut Self::Buffer,
+        batch: usize,
+        total_tokens: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        conv_kernel: usize,
+        apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        linear_attention::linear_attention_prepare_varlen_packed_qkvz_ba_f32(
+            ctx,
+            mixed_qkvz_raw,
+            ba_raw,
+            conv_weight,
+            initial_conv_states,
+            a_log,
+            dt_bias,
+            cu_seqlens,
+            token_seq_indices,
+            query,
+            key,
+            value,
+            z,
+            g,
+            beta,
+            final_conv_states,
+            batch,
+            total_tokens,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            conv_kernel,
+            apply_qk_l2norm,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_f32(
+        ctx: &mut Self::Context,
+        mixed_qkv_raw: &Self::Buffer,
+        conv_weight: &Self::Buffer,
+        conv_state: &Self::Buffer,
+        a_raw: &Self::Buffer,
+        b_raw: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        query: &mut Self::Buffer,
+        key: &mut Self::Buffer,
+        value: &mut Self::Buffer,
+        g: &mut Self::Buffer,
+        beta: &mut Self::Buffer,
+        next_conv_state: &mut Self::Buffer,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        conv_kernel: usize,
+        apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        linear_attention::linear_attention_decode_prepare_f32(
+            ctx,
+            mixed_qkv_raw,
+            conv_weight,
+            conv_state,
+            a_raw,
+            b_raw,
+            a_log,
+            dt_bias,
+            query,
+            key,
+            value,
+            g,
+            beta,
+            next_conv_state,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            conv_kernel,
+            apply_qk_l2norm,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_batch_f32(
+        ctx: &mut Self::Context,
+        mixed_qkv_raw: &Self::Buffer,
+        conv_weight: &Self::Buffer,
+        conv_states: &Self::Buffer,
+        a_raw: &Self::Buffer,
+        b_raw: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        query: &mut Self::Buffer,
+        key: &mut Self::Buffer,
+        value: &mut Self::Buffer,
+        g: &mut Self::Buffer,
+        beta: &mut Self::Buffer,
+        next_conv_states: &mut Self::Buffer,
+        batch: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        conv_kernel: usize,
+        apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        linear_attention::linear_attention_decode_prepare_batch_f32(
+            ctx,
+            mixed_qkv_raw,
+            conv_weight,
+            conv_states,
+            a_raw,
+            b_raw,
+            a_log,
+            dt_bias,
+            query,
+            key,
+            value,
+            g,
+            beta,
+            next_conv_states,
+            batch,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            conv_kernel,
+            apply_qk_l2norm,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_batch_indexed_f32(
+        ctx: &mut Self::Context,
+        mixed_qkv_raw: &Self::Buffer,
+        conv_weight: &Self::Buffer,
+        conv_state_slots: &mut Self::Buffer,
+        slot_indices: &Self::Buffer,
+        a_raw: &Self::Buffer,
+        b_raw: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        query: &mut Self::Buffer,
+        key: &mut Self::Buffer,
+        value: &mut Self::Buffer,
+        g: &mut Self::Buffer,
+        beta: &mut Self::Buffer,
+        batch: usize,
+        max_slots: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        conv_kernel: usize,
+        apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        linear_attention::linear_attention_decode_prepare_batch_indexed_f32(
+            ctx,
+            mixed_qkv_raw,
+            conv_weight,
+            conv_state_slots,
+            slot_indices,
+            a_raw,
+            b_raw,
+            a_log,
+            dt_bias,
+            query,
+            key,
+            value,
+            g,
+            beta,
+            batch,
+            max_slots,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            conv_kernel,
+            apply_qk_l2norm,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32(
+        ctx: &mut Self::Context,
+        mixed_qkvz_raw: &Self::Buffer,
+        ba_raw: &Self::Buffer,
+        conv_weight: &Self::Buffer,
+        conv_state_slots: &mut Self::Buffer,
+        slot_indices: &Self::Buffer,
+        a_log: &Self::Buffer,
+        dt_bias: &Self::Buffer,
+        query: &mut Self::Buffer,
+        key: &mut Self::Buffer,
+        value: &mut Self::Buffer,
+        z: &mut Self::Buffer,
+        g: &mut Self::Buffer,
+        beta: &mut Self::Buffer,
+        batch: usize,
+        max_slots: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        conv_kernel: usize,
+        apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        linear_attention::linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32(
+            ctx,
+            mixed_qkvz_raw,
+            ba_raw,
+            conv_weight,
+            conv_state_slots,
+            slot_indices,
+            a_log,
+            dt_bias,
+            query,
+            key,
+            value,
+            z,
+            g,
+            beta,
+            batch,
+            max_slots,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            conv_kernel,
+            apply_qk_l2norm,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32(
+        ctx: &mut Self::Context,
+        mixed_qkvz_raw: &Self::Buffer,
+        conv_weight: &Self::Buffer,
+        conv_state_slots: &mut Self::Buffer,
+        slot_indices: &Self::Buffer,
+        mixed_qkv: &mut Self::Buffer,
+        z: &mut Self::Buffer,
+        batch: usize,
+        max_slots: usize,
+        key_heads: usize,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        conv_kernel: usize,
+    ) -> Result<()> {
+        linear_attention::linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32(
+            ctx,
+            mixed_qkvz_raw,
+            conv_weight,
+            conv_state_slots,
+            slot_indices,
+            mixed_qkv,
+            z,
+            batch,
+            max_slots,
+            key_heads,
+            value_heads,
+            key_dim,
+            value_dim,
+            conv_kernel,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gated_rms_norm_f32(
+        ctx: &mut Self::Context,
+        core: &Self::Buffer,
+        z: &Self::Buffer,
+        weight: &Self::Buffer,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        linear_attention::gated_rms_norm_f32(ctx, core, z, weight, out, tokens, heads, dim, eps)
+    }
+
     // ── Buffer utilities ────────────────────────────────────────────────
 
     fn copy_slice(
@@ -1262,11 +2282,78 @@ impl Backend for CudaBackend {
         dst_offset: usize,
         len: usize,
     ) {
-        let src_view = src.as_f16().slice(src_offset..src_offset + len);
-        let mut dst_view = dst.as_f16_mut().slice_mut(dst_offset..dst_offset + len);
-        ctx.stream
-            .memcpy_dtod(&src_view, &mut dst_view)
-            .expect("copy_slice dtod");
+        if len == 0 {
+            return;
+        }
+        match (src.dtype(), dst.dtype()) {
+            (crate::backend::Dtype::F16, crate::backend::Dtype::F16) => {
+                let src_view = src.as_f16().slice(src_offset..src_offset + len);
+                let mut dst_view = dst.as_f16_mut().slice_mut(dst_offset..dst_offset + len);
+                ctx.stream
+                    .memcpy_dtod(&src_view, &mut dst_view)
+                    .expect("copy_slice f16 dtod");
+            }
+            (crate::backend::Dtype::F32, crate::backend::Dtype::F32) => {
+                let src_view = src.as_f32().slice(src_offset..src_offset + len);
+                let mut dst_view = dst.as_f32_mut().slice_mut(dst_offset..dst_offset + len);
+                ctx.stream
+                    .memcpy_dtod(&src_view, &mut dst_view)
+                    .expect("copy_slice f32 dtod");
+            }
+            (crate::backend::Dtype::F16, crate::backend::Dtype::F32) => {
+                let func = ctx.func("sandwich_norm", ptx::SANDWICH_NORM, "cast_f16_to_f32_slice");
+                let src_offset_i32 = src_offset as i32;
+                let dst_offset_i32 = dst_offset as i32;
+                let n_i32 = len as i32;
+                let block = 256u32;
+                let grid = ((len as u32) + block - 1) / block;
+                let stream = ctx.stream.clone();
+                let mut builder = stream.launch_builder(&func);
+                builder.arg(src.as_f16());
+                builder.arg(dst.as_f32_mut());
+                builder.arg(&src_offset_i32);
+                builder.arg(&dst_offset_i32);
+                builder.arg(&n_i32);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig {
+                            grid_dim: (grid, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .expect("copy_slice f16 to f32 cast");
+                }
+            }
+            (crate::backend::Dtype::F32, crate::backend::Dtype::F16) => {
+                let func = ctx.func("sandwich_norm", ptx::SANDWICH_NORM, "cast_f32_to_f16_slice");
+                let src_offset_i32 = src_offset as i32;
+                let dst_offset_i32 = dst_offset as i32;
+                let n_i32 = len as i32;
+                let block = 256u32;
+                let grid = ((len as u32) + block - 1) / block;
+                let stream = ctx.stream.clone();
+                let mut builder = stream.launch_builder(&func);
+                builder.arg(src.as_f32());
+                builder.arg(dst.as_f16_mut());
+                builder.arg(&src_offset_i32);
+                builder.arg(&dst_offset_i32);
+                builder.arg(&n_i32);
+                unsafe {
+                    builder
+                        .launch(LaunchConfig {
+                            grid_dim: (grid, 1, 1),
+                            block_dim: (block, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                        .expect("copy_slice f32 to f16 cast");
+                }
+            }
+            (src_dtype, dst_dtype) => panic!(
+                "CudaBackend::copy_slice unsupported dtypes src={} dst={}",
+                src_dtype.name(),
+                dst_dtype.name()
+            ),
+        }
     }
 
     // ── Embedding ───────────────────────────────────────────────────────
@@ -1612,6 +2699,7 @@ impl Backend for CudaBackend {
         scale: f32,
         max_valid_kv: usize,
         capacity: usize,
+        sliding_window: usize,
         slot: usize,
     ) -> Result<()> {
         use cudarc::driver::DevicePtr;
@@ -1646,10 +2734,16 @@ impl Backend for CudaBackend {
         let nkv_i32 = nkv as i32;
         let hd_i32 = hd as i32;
         let capacity_i32 = capacity as i32;
+        let sliding_window_i32 = sliding_window as i32;
         // Shared mem must cover post-append max kv_len. Caller passes
         // `max_valid_kv` already accounting for the +1; sizing also
         // bounded by capacity to mirror the per-item kernel's pattern.
-        let shared_bytes = (max_valid_kv.min(capacity).max(1) as u32) * 4;
+        let active_kv = if sliding_window > 0 {
+            max_valid_kv.min(sliding_window)
+        } else {
+            max_valid_kv
+        };
+        let shared_bytes = (active_kv.min(capacity).max(1) as u32) * 4;
         with_batched_scratch_mut(ctx.ordinal, |slot_g| {
             for i in 0..m {
                 let (kp, _) = k_caches[i].as_f16().device_ptr(&stream);
@@ -1690,6 +2784,7 @@ impl Backend for CudaBackend {
             b.arg(&hd_i32);
             b.arg(&capacity_i32);
             b.arg(&scale);
+            b.arg(&sliding_window_i32);
             unsafe {
                 b.launch(LaunchConfig {
                     grid_dim: (nq as u32, m as u32, 1),
@@ -1810,6 +2905,321 @@ impl Backend for CudaBackend {
         }
         .expect("qk_norm_rope launch");
         drop(dec_guard);
+    }
+
+    fn qk_norm_rope_partial(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        output: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        input_stride: usize,
+        input_offset: usize,
+        input_head_stride: usize,
+        pos_offset: usize,
+        eps: f32,
+        mode: i32,
+    ) -> Result<()> {
+        if rope_dim == head_dim
+            && input_stride == heads * head_dim
+            && input_offset == 0
+            && input_head_stride == head_dim
+            && mode != 3
+        {
+            Self::qk_norm_rope(
+                ctx, input, norm_w, cos, sin, output, tokens, heads, head_dim, pos_offset, eps,
+                mode,
+            );
+            return Ok(());
+        }
+
+        if tokens == 0 || heads == 0 || head_dim == 0 || rope_dim == 0 {
+            return Err(FerrumError::model(format!(
+                "qk_norm_rope_partial shape must be positive, got tokens={tokens} heads={heads} head_dim={head_dim} rope_dim={rope_dim}"
+            )));
+        }
+        if rope_dim > head_dim || rope_dim % 2 != 0 {
+            return Err(FerrumError::model(format!(
+                "qk_norm_rope_partial rope_dim {rope_dim} must be even and <= head_dim {head_dim}"
+            )));
+        }
+        if input_head_stride == 0 {
+            return Err(FerrumError::model(
+                "qk_norm_rope_partial input_head_stride must be positive",
+            ));
+        }
+        let required_width = input_offset + (heads - 1) * input_head_stride + head_dim;
+        if input_stride < required_width {
+            return Err(FerrumError::model(format!(
+                "qk_norm_rope_partial input_stride {input_stride} is too small for offset {input_offset}, heads {heads}, head_dim {head_dim}, input_head_stride {input_head_stride}"
+            )));
+        }
+
+        let func = ctx.func(
+            "qk_norm_rope_partial",
+            ptx::QK_NORM_ROPE,
+            "qk_norm_rope_partial_transpose_f16",
+        );
+        let tokens_i32 = tokens as i32;
+        let heads_i32 = heads as i32;
+        let head_dim_i32 = head_dim as i32;
+        let rope_dim_i32 = rope_dim as i32;
+        let input_stride_i32 = input_stride as i32;
+        let input_offset_i32 = input_offset as i32;
+        let input_head_stride_i32 = input_head_stride as i32;
+        let pos_offset_i32 = pos_offset as i32;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(input);
+        b.arg(norm_w);
+        b.arg(cos);
+        b.arg(sin);
+        b.arg(output);
+        b.arg(&tokens_i32);
+        b.arg(&heads_i32);
+        b.arg(&head_dim_i32);
+        b.arg(&rope_dim_i32);
+        b.arg(&input_stride_i32);
+        b.arg(&input_offset_i32);
+        b.arg(&input_head_stride_i32);
+        b.arg(&pos_offset_i32);
+        b.arg(&eps);
+        b.arg(&mode);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (tokens as u32, heads as u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("qk_norm_rope_partial: {e}")))?;
+        Ok(())
+    }
+
+    fn qwen35_apply_attention_gate(
+        ctx: &mut Self::Context,
+        context: &mut Self::Buffer,
+        query_raw: &Self::Buffer,
+        tokens: usize,
+        q_total: usize,
+        q_proj_total: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        if head_dim == 0 || q_total % head_dim != 0 {
+            return Err(FerrumError::model(format!(
+                "qwen35_apply_attention_gate q_total {q_total} must be divisible by head_dim {head_dim}"
+            )));
+        }
+        let heads = q_total / head_dim;
+        if q_proj_total < heads * 2 * head_dim {
+            return Err(FerrumError::model(format!(
+                "qwen35_apply_attention_gate q_proj_total {q_proj_total} must include per-head query and gate slices for q_total {q_total}, head_dim {head_dim}"
+            )));
+        }
+        if tokens == 0 || q_total == 0 {
+            return Ok(());
+        }
+
+        let func = ctx.func(
+            "qk_norm_rope_gate",
+            ptx::QK_NORM_ROPE,
+            "qwen35_apply_attention_gate_f16",
+        );
+        let tokens_i32 = tokens as i32;
+        let q_total_i32 = q_total as i32;
+        let q_proj_total_i32 = q_proj_total as i32;
+        let head_dim_i32 = head_dim as i32;
+        let total = tokens * q_total;
+        let block = 256u32;
+        let grid = ((total as u32) + block - 1) / block;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(context);
+        b.arg(query_raw);
+        b.arg(&tokens_i32);
+        b.arg(&q_total_i32);
+        b.arg(&q_proj_total_i32);
+        b.arg(&head_dim_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("qwen35_apply_attention_gate: {e}")))?;
+        Ok(())
+    }
+
+    fn qwen35_apply_token_gate(
+        ctx: &mut Self::Context,
+        values: &mut Self::Buffer,
+        gate: &Self::Buffer,
+        tokens: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        if tokens == 0 || hidden_size == 0 {
+            return Ok(());
+        }
+
+        let func = ctx.func(
+            "qk_norm_rope_gate",
+            ptx::QK_NORM_ROPE,
+            "qwen35_apply_token_gate_f16",
+        );
+        let tokens_i32 = tokens as i32;
+        let hidden_i32 = hidden_size as i32;
+        let total = tokens * hidden_size;
+        let block = 256u32;
+        let grid = ((total as u32) + block - 1) / block;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(values);
+        b.arg(gate);
+        b.arg(&tokens_i32);
+        b.arg(&hidden_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("qwen35_apply_token_gate: {e}")))?;
+        Ok(())
+    }
+
+    fn qwen35_apply_token_gate_and_add_inplace(
+        ctx: &mut Self::Context,
+        dst: &mut Self::Buffer,
+        values: &mut Self::Buffer,
+        gate: &Self::Buffer,
+        tokens: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        if tokens == 0 || hidden_size == 0 {
+            return Ok(());
+        }
+        let expected = tokens * hidden_size;
+        if dst.len() < expected || values.len() < expected || gate.len() < tokens {
+            return Err(FerrumError::model(format!(
+                "qwen35_apply_token_gate_and_add_inplace buffer too small: dst={} values={} gate={} expected={} gate_expected={}",
+                dst.len(),
+                values.len(),
+                gate.len(),
+                expected,
+                tokens
+            )));
+        }
+        if dst.dtype() != values.dtype() || dst.dtype() != gate.dtype() {
+            return Err(FerrumError::model(format!(
+                "qwen35_apply_token_gate_and_add_inplace dtype mismatch: dst={} values={} gate={}",
+                dst.dtype().name(),
+                values.dtype().name(),
+                gate.dtype().name()
+            )));
+        }
+
+        let func_name = match dst.dtype() {
+            crate::backend::Dtype::F16 => "qwen35_apply_token_gate_and_add_inplace_f16",
+            crate::backend::Dtype::F32 => "qwen35_apply_token_gate_and_add_inplace_f32",
+            dtype => {
+                return Err(FerrumError::model(format!(
+                    "qwen35_apply_token_gate_and_add_inplace unsupported dtype {}",
+                    dtype.name()
+                )))
+            }
+        };
+        let func = ctx.func("qk_norm_rope_gate", ptx::QK_NORM_ROPE, func_name);
+        let tokens_i32 = tokens as i32;
+        let hidden_i32 = hidden_size as i32;
+        let block = 256u32;
+        let grid = ((expected as u32) + block - 1) / block;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(dst);
+        b.arg(values);
+        b.arg(gate);
+        b.arg(&tokens_i32);
+        b.arg(&hidden_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("qwen35_apply_token_gate_and_add_inplace: {e}")))?;
+        Ok(())
+    }
+
+    fn qwen35_interleave_gate_up(
+        ctx: &mut Self::Context,
+        gate: &Self::Buffer,
+        up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        intermediate: usize,
+    ) -> Result<()> {
+        if tokens == 0 || intermediate == 0 {
+            return Ok(());
+        }
+        let expected = tokens * intermediate;
+        if gate.len() < expected || up.len() < expected || out.len() < 2 * expected {
+            return Err(FerrumError::model(format!(
+                "qwen35_interleave_gate_up buffer too small: gate={} up={} out={} expected={} out_expected={}",
+                gate.len(),
+                up.len(),
+                out.len(),
+                expected,
+                2 * expected
+            )));
+        }
+        if gate.dtype() != up.dtype() || gate.dtype() != out.dtype() {
+            return Err(FerrumError::model(format!(
+                "qwen35_interleave_gate_up dtype mismatch: gate={} up={} out={}",
+                gate.dtype().name(),
+                up.dtype().name(),
+                out.dtype().name()
+            )));
+        }
+
+        let func_name = match gate.dtype() {
+            crate::backend::Dtype::F16 => "qwen35_interleave_gate_up_f16",
+            crate::backend::Dtype::F32 => "qwen35_interleave_gate_up_f32",
+            dtype => {
+                return Err(FerrumError::model(format!(
+                    "qwen35_interleave_gate_up unsupported dtype {}",
+                    dtype.name()
+                )))
+            }
+        };
+        let func = ctx.func("qk_norm_rope_gate", ptx::QK_NORM_ROPE, func_name);
+        let tokens_i32 = tokens as i32;
+        let intermediate_i32 = intermediate as i32;
+        let block = 256u32;
+        let grid = ((expected as u32) + block - 1) / block;
+        let stream = ctx.stream.clone();
+        let mut b = stream.launch_builder(&func);
+        b.arg(gate);
+        b.arg(up);
+        b.arg(out);
+        b.arg(&tokens_i32);
+        b.arg(&intermediate_i32);
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map_err(|e| FerrumError::model(format!("qwen35_interleave_gate_up: {e}")))?;
+        Ok(())
     }
 
     /// Split QKV + qk-norm + RoPE into FP16 head-major scratch buffers.

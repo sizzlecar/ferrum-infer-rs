@@ -1,0 +1,135 @@
+From https://github.com/sizzlecar/ferrum-infer-rs
+ * branch              goal/w2-w3-release-grade -> FETCH_HEAD
+Updating d27c8145..22a7b1cd
+Fast-forward
+ AGENTS.md                                          |   6 +
+ .../src/continuous_engine/inner/batch.rs           |   5 +-
+ .../ferrum-engine/src/continuous_engine/tests.rs   |  15 +
+ .../src/implementations/continuous.rs              |  41 +-
+ crates/ferrum-types/src/auto_config.rs             |  12 +-
+ docs/goals/model-coverage-2026-06-12/STATUS.md     | 281 +++++++++
+ .../README.md                                      |  30 +
+ ..._instance_42216671_start_blocked_sanitized.json |  24 +
+ .../README.md                                      |  30 +
+ .../vast_market_snapshot_sanitized.json            |  68 +++
+ .../env/build.exit                                 |   1 +
+ .../env/cargo-check.exit                           |   1 +
+ .../env/cargo.txt                                  |   1 +
+ .../env/ferrum.sha256                              |   1 +
+ .../env/git_sha.txt                                |   1 +
+ .../env/git_status_short.txt                       |   0
+ .../env/rustc.txt                                  |   1 +
+ .../env/tokenizer_path.txt                         |   1 +
+ .../hardware/nvidia_smi_before.txt                 |  20 +
+ .../logs/build.stderr.log                          |  14 +
+ .../logs/build.stdout.log                          |   0
+ .../logs/cargo-check.stderr.log                    |  14 +
+ .../logs/cargo-check.stdout.log                    |   0
+ .../logs/git-checkout-branch.log                   |   3 +
+ .../logs/git-checkout-detach.log                   |   1 +
+ .../logs/git-fetch.log                             |   3 +
+ .../logs/git-pull.log                              | 608 +++++++++++++++++++
+ .../logs/lane.log                                  |  19 +
+ .../logs/nvidia_after.csv                          |   1 +
+ .../logs/pip-hf.log                                |   1 +
+ .../logs/preflight.log                             |  30 +
+ .../logs/rustup-default.log                        |   4 +
+ .../logs/rustup-toolchain.log                      |   5 +
+ .../perf/bench-ferrum-c32.command.txt              |   1 +
+ .../perf/bench.exit                                |   1 +
+ .../perf/bench.stderr.log                          |  13 +
+ .../perf/bench.stdout.log                          |   0
+ .../perf/bench_ferrum_c32_32x1.json                | 246 ++++++++
+ .../perf/bench_summary.json                        | 112 ++++
+ .../prefetch/hf-prefetch.exit                      |   1 +
+ .../prefetch/hf-prefetch.log                       |   1 +
+ .../run/decision_trace.jsonl                       |  12 +
+ .../run/effective_config.assert.txt                |   1 +
+ .../run/effective_config.json                      | 647 +++++++++++++++++++++
+ .../run/run.command.txt                            |   1 +
+ .../run/run.exit                                   |   1 +
+ .../run/run.stderr.log                             | 102 ++++
+ .../run/run.stdout.jsonl                           |   1 +
+ .../run_w3_qwen35_prefill_cohort_c32_d27c8145.sh   | 320 ++++++++++
+ .../server/chat_smoke.curl.err                     |   0
+ .../server/chat_smoke_payload.json                 |   1 +
+ .../server/chat_smoke_response.json                |   1 +
+ .../server/decision_trace.jsonl                    |  12 +
+ .../server/effective_config.assert.txt             |   1 +
+ .../server/effective_config.json                   | 598 +++++++++++++++++++
+ .../server/models.curl.err                         |   0
+ .../server/models.json                             |   1 +
+ .../server/scheduler_trace.jsonl.gz                | Bin 0 -> 73442 bytes
+ .../server/serve.command.txt                       |   1 +
+ .../server/serve.log                               | 160 +++++
+ .../server/serve.stdout.log                        |  29 +
+ .../server/server.pid                              |   1 +
+ .../vast/instance_after_stop.json                  |   1 +
+ .../vast/instance_before_stop.json                 |   1 +
+ .../vast/stop_poll.jsonl                           |  11 +
+ .../vast/stop_response.json                        |   1 +
+ scripts/release/w3_qwen35_c32_diagnostic.sh        | 628 ++++++++++++++++++++
+ scripts/release/w3_qwen35_vast_c32_diagnostic.py   | 499 ++++++++++++++++
+ 68 files changed, 4596 insertions(+), 52 deletions(-)
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_prefill_admission_gpu_block_9fda1101_20260625T031353Z/README.md
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_prefill_admission_gpu_block_9fda1101_20260625T031353Z/vast_instance_42216671_start_blocked_sanitized.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_prefill_admission_gpu_block_retry_9fda1101_20260625T032340Z/README.md
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_mixed_prefill_admission_gpu_block_retry_9fda1101_20260625T032340Z/vast_market_snapshot_sanitized.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/env/build.exit
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/env/cargo-check.exit
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/env/cargo.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/env/ferrum.sha256
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/env/git_sha.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/env/git_status_short.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/env/rustc.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/env/tokenizer_path.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/hardware/nvidia_smi_before.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/logs/build.stderr.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/logs/build.stdout.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/logs/cargo-check.stderr.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/logs/cargo-check.stdout.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/logs/git-checkout-branch.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/logs/git-checkout-detach.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/logs/git-fetch.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/logs/git-pull.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/logs/lane.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/logs/nvidia_after.csv
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/logs/pip-hf.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/logs/preflight.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/logs/rustup-default.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/logs/rustup-toolchain.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/perf/bench-ferrum-c32.command.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/perf/bench.exit
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/perf/bench.stderr.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/perf/bench.stdout.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/perf/bench_ferrum_c32_32x1.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/perf/bench_summary.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/prefetch/hf-prefetch.exit
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/prefetch/hf-prefetch.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/run/decision_trace.jsonl
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/run/effective_config.assert.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/run/effective_config.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/run/run.command.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/run/run.exit
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/run/run.stderr.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/run/run.stdout.jsonl
+ create mode 100755 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/scripts/run_w3_qwen35_prefill_cohort_c32_d27c8145.sh
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/server/chat_smoke.curl.err
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/server/chat_smoke_payload.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/server/chat_smoke_response.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/server/decision_trace.jsonl
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/server/effective_config.assert.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/server/effective_config.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/server/models.curl.err
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/server/models.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/server/scheduler_trace.jsonl.gz
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/server/serve.command.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/server/serve.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/server/serve.stdout.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/server/server.pid
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/vast/instance_after_stop.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/vast/instance_before_stop.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/vast/stop_poll.jsonl
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z/vast/stop_response.json
+ create mode 100755 scripts/release/w3_qwen35_c32_diagnostic.sh
+ create mode 100755 scripts/release/w3_qwen35_vast_c32_diagnostic.py

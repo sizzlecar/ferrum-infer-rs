@@ -1,0 +1,34 @@
+23d8569b8bd270a6b7c4a1e55aa9428868ccb26e
+scripts/microbenches
+total 272
+drwxr-xr-x 2 root root  4096 Jun 15 13:48 .
+drwxr-xr-x 4 root root  4096 Jun 15 13:48 ..
+-rw-r--r-- 1 root root  3801 Jun 15 13:48 README.md
+-rwxr-xr-x 1 root root   992 Jun 15 13:48 build_and_run_dense_marlin_gemma3_perf.sh
+-rwxr-xr-x 1 root root  3652 Jun 15 13:48 build_and_run_dense_vllm_marlin_gemma3_perf.sh
+-rwxr-xr-x 1 root root  3070 Jun 15 13:48 build_and_run_fa2_direct_ffi_probe.sh
+-rw-r--r-- 1 root root   915 Jun 15 13:48 build_and_run_gemma3_shadow_graph_bench.sh
+-rwxr-xr-x 1 root root  2395 Jun 15 13:48 build_and_run_moe_marlin_perf.sh
+-rwxr-xr-x 1 root root  1015 Jun 15 13:48 build_and_run_paged_varlen_window_correctness.sh
+-rw-r--r-- 1 root root   574 Jun 15 13:48 build_and_run_varlen_vllm_tiled_q_perf.sh
+-rwxr-xr-x 1 root root  3060 Jun 15 13:48 build_fa2_ferrum_shim.sh
+-rwxr-xr-x 1 root root  5564 Jun 15 13:48 build_fa2_ferrum_source_shim.sh
+-rw-r--r-- 1 root root 16180 Jun 15 13:48 dense_marlin_gemma3_perf.cu
+-rw-r--r-- 1 root root  7957 Jun 15 13:48 dense_vllm_marlin_gemma3_perf.cu
+-rw-r--r-- 1 root root 10041 Jun 15 13:48 fa2_direct_ffi_probe.cpp
+-rw-r--r-- 1 root root  5739 Jun 15 13:48 fa2_ferrum_shim.cpp
+-rw-r--r-- 1 root root  6035 Jun 15 13:48 fa2_ferrum_source_shim.cu
+-rw-r--r-- 1 root root 10956 Jun 15 13:48 gemma3_shadow_graph_bench.cu
+-rw-r--r-- 1 root root  7355 Jun 15 13:48 graph_bench.cu
+-rw-r--r-- 1 root root  2922 Jun 15 13:48 h2d_microbench.cu
+-rw-r--r-- 1 root root 21124 Jun 15 13:48 layer_split_overlap_probe.cu
+-rw-r--r-- 1 root root  9129 Jun 15 13:48 moe_marlin_active65_perf.cu
+-rw-r--r-- 1 root root 24072 Jun 15 13:48 moe_marlin_correctness.cu
+-rw-r--r-- 1 root root 19387 Jun 15 13:48 moe_marlin_perf.cu
+-rw-r--r-- 1 root root 14195 Jun 15 13:48 paged_varlen_window_correctness.cu
+-rw-r--r-- 1 root root  4024 Jun 15 13:48 scalar_type_id_test.cu
+-rw-r--r-- 1 root root  1128 Jun 15 13:48 scalar_type_id_test_other_tu.cu
+-rw-r--r-- 1 root root  8114 Jun 15 13:48 sync_barrier_bench.cu
+-rw-r--r-- 1 root root 21684 Jun 15 13:48 varlen_vllm_tiled_q_perf.cu
+-rw-r--r-- 1 root root  4524 Jun 15 13:48 vllm_flash_attn_varlen_probe.py
+file_exists

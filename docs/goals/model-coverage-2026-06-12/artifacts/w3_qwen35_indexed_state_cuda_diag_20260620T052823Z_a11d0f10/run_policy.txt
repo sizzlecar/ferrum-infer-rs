@@ -1,0 +1,5 @@
+lane=W3 qwen35 indexed recurrent-state cuda diag
+expected_runtime_cost=30-45min at 0.66296 USD/hour from restart
+stop_condition=build failure, product smoke failure, or c1/c32 diagnostic copied back
+correctness_gate=ferrum run plus ferrum serve non-stream and stream
+performance_command=bench-serve ShareGPT c=1,32 100 prompts n=1 diagnostic

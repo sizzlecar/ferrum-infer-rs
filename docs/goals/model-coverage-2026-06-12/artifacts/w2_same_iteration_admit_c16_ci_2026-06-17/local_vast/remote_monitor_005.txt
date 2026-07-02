@@ -1,0 +1,240 @@
+[w2-c16] start 2026-06-16T20:34:03Z
+[w2-c16] root=/workspace/ferrum-infer-rs out=/workspace/w2_same_iteration_admit_c16_ci_2026-06-17 model=gemma3:27b-gptq hf_home=/workspace/hf-cache dataset=/workspace/ascii_sharegpt_w2_100.jsonl
+[w2-c16] installing rustup minimal toolchain
+[w2-c16] CUDA release build
+
+real	3m21.770s
+user	3m49.306s
+sys	0m5.577s
+[w2-c16] correctness: ferrum run
+[w2-c16] correctness: ferrum serve streaming smoke
+[w2-c16] performance: ferrum serve + ShareGPT c16 CI
+{
+  "actual_input_tokens": {
+    "max": 112,
+    "mean": 112.0,
+    "min": 112,
+    "requested": 256
+  },
+  "binary_sha256": "9c7def4de9568657798c3be5dacd3fb6a5b72ced87efa84552966f1bb8320fa6",
+  "completed_per_run": [
+    100,
+    100,
+    100
+  ],
+  "dataset_sha256": "58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e",
+  "diagnostic_only": true,
+  "diagnostic_ratio_vs_historical_vllm_lcb": 0.8103115910473617,
+  "errored_per_run": [
+    0,
+    0,
+    0
+  ],
+  "gap_to_historical_80pct_threshold": -5.06453794291167,
+  "git_sha": "674c66786f0cf654009c84070b65ec0174a95357",
+  "git_status_short": [],
+  "historical_vllm_80pct_threshold": 392.92,
+  "historical_vllm_c16_lcb_same_dataset": 491.15,
+  "itl_ms": {
+    "p50": {
+      "ci95_hw": 0.023719760802182858,
+      "mean": 24.87208933333333,
+      "stddev": 0.00954771806943096
+    },
+    "p75": {
+      "ci95_hw": 1.3205621394729243,
+      "mean": 27.81203616666667,
+      "stddev": 0.5315548966114252
+    },
+    "p95": {
+      "ci95_hw": 2.9836265189879168,
+      "mean": 57.781574733333336,
+      "stddev": 1.2009743717631742
+    },
+    "p99": {
+      "ci95_hw": 17.238993274763327,
+      "mean": 78.73481828,
+      "stddev": 6.93906860869818
+    }
+  },
+  "output_throughput_tps_ci95_hw": 4.727831673618258,
+  "output_throughput_tps_lcb": 397.9845379429117,
+  "output_throughput_tps_mean": 402.71236961652994,
+  "output_token_count_source": "usage",
+  "quality_counts": {
+    "bad_output_per_run": [
+      0,
+      0,
+      0
+    ],
+    "duplicate_done_per_run": [
+      0,
+      0,
+      0
+    ],
+    "http_500_per_run": [
+      0,
+      0,
+      0
+    ],
+    "malformed_stream_per_run": [
+      0,
+      0,
+      0
+    ],
+    "missing_done_per_run": [
+      0,
+      0,
+      0
+    ],
+    "panic_per_run": [
+      0,
+      0,
+      0
+    ],
+    "stream_bulk_flush_per_run": [
+      0,
+      0,
+      0
+    ],
+    "zero_output_tokens_per_run": [
+      0,
+      0,
+      0
+    ]
+  },
+  "reason_not_release_grade": "single Ferrum c16 diagnostic; W2 requires c=1/4/16/32, same-hardware vLLM baseline, full L0-L5 correctness, and MODEL_RELEASE_GRADE_W2 PASS",
+  "status": "pass"
+}
+[w2-c16] PASS diagnostic artifact: /workspace/w2_same_iteration_admit_c16_ci_2026-06-17
+--- active chunk ---
+{
+  "matches": [
+    {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "16",
+      "key": "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+      "source": "default"
+    }
+  ]
+}
+--- bench stderr ---
+ferrum bench-serve — dataset=sharegpt num_prompts=100 warmup=10 n_repeats=3
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 18.4s
+  cell closed_loop c=16 — repeat 2/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 18.5s
+  cell closed_loop c=16 — repeat 3/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 18.3s
+    summary c=16 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=550.2±113.6  p95=869.1±186.0  p99=953.3±232.5
+      TPOT_ms  p50=30.2±1.7  p95=33.8±0.8  p99=34.8±3.0
+      ITL_ms   p50=24.9±0.0  p95=57.8±3.0  p99=78.7±17.2
+      throughput      402.7 ± 4.7 tok/s
+      goodput         5.44 ± 0.07 req/s
+
+→ wrote /workspace/w2_same_iteration_admit_c16_ci_2026-06-17/perf/bench_ferrum_sharegpt_c16_100x3.json
+--- bench json ---
+-rw-r--r-- 1 root root 11K Jun 16 20:42 /workspace/w2_same_iteration_admit_c16_ci_2026-06-17/perf/bench_ferrum_sharegpt_c16_100x3.json
+--- summary ---
+{
+  "actual_input_tokens": {
+    "max": 112,
+    "mean": 112.0,
+    "min": 112,
+    "requested": 256
+  },
+  "binary_sha256": "9c7def4de9568657798c3be5dacd3fb6a5b72ced87efa84552966f1bb8320fa6",
+  "completed_per_run": [
+    100,
+    100,
+    100
+  ],
+  "dataset_sha256": "58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e",
+  "diagnostic_only": true,
+  "diagnostic_ratio_vs_historical_vllm_lcb": 0.8103115910473617,
+  "errored_per_run": [
+    0,
+    0,
+    0
+  ],
+  "gap_to_historical_80pct_threshold": -5.06453794291167,
+  "git_sha": "674c66786f0cf654009c84070b65ec0174a95357",
+  "git_status_short": [],
+  "historical_vllm_80pct_threshold": 392.92,
+  "historical_vllm_c16_lcb_same_dataset": 491.15,
+  "itl_ms": {
+    "p50": {
+      "ci95_hw": 0.023719760802182858,
+      "mean": 24.87208933333333,
+      "stddev": 0.00954771806943096
+    },
+    "p75": {
+      "ci95_hw": 1.3205621394729243,
+      "mean": 27.81203616666667,
+      "stddev": 0.5315548966114252
+    },
+    "p95": {
+      "ci95_hw": 2.9836265189879168,
+      "mean": 57.781574733333336,
+      "stddev": 1.2009743717631742
+    },
+    "p99": {
+      "ci95_hw": 17.238993274763327,
+      "mean": 78.73481828,
+      "stddev": 6.93906860869818
+    }
+  },
+  "output_throughput_tps_ci95_hw": 4.727831673618258,
+  "output_throughput_tps_lcb": 397.9845379429117,
+  "output_throughput_tps_mean": 402.71236961652994,
+  "output_token_count_source": "usage",
+  "quality_counts": {
+    "bad_output_per_run": [
+      0,
+      0,
+      0
+    ],
+    "duplicate_done_per_run": [
+      0,
+      0,
+      0
+    ],
+    "http_500_per_run": [
+      0,
+      0,
+      0
+    ],
+    "malformed_stream_per_run": [
+      0,
+      0,
+      0
+    ],
+    "missing_done_per_run": [
+      0,
+      0,
+      0
+    ],
+    "panic_per_run": [
+      0,
+      0,
+      0
+    ],
+    "stream_bulk_flush_per_run": [
+      0,
+      0,
+      0
+    ],
+    "zero_output_tokens_per_run": [
+      0,
+      0,
+      0
+    ]
+  },
+  "reason_not_release_grade": "single Ferrum c16 diagnostic; W2 requires c=1/4/16/32, same-hardware vLLM baseline, full L0-L5 correctness, and MODEL_RELEASE_GRADE_W2 PASS",
+  "status": "pass"
+}
+--- tmux ---

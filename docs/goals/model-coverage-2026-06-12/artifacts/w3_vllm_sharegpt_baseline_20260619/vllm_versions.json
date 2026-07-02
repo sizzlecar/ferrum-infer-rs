@@ -1,0 +1,6 @@
+{
+  "cuda_available": true,
+  "cuda_device_count": 1,
+  "torch": "2.11.0+cu130",
+  "vllm": "0.23.0"
+}

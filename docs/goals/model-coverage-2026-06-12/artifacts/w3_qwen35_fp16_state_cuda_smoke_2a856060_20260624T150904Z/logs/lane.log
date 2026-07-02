@@ -1,0 +1,18 @@
+2026-06-24T15:09:04Z lane_start art=/workspace/artifacts/w3_qwen35_fp16_state_cuda_smoke_2a856060_20260624T150904Z sha=2a8560609053387de0ad36f786cfb41d04b820bb release_evidence=false no_live_vllm=true
+2026-06-24T15:09:04Z install_cmake_start
+2026-06-24T15:09:08Z install_cmake_done
+2026-06-24T15:09:08Z git_sync_start
+2026-06-24T15:09:08Z git_sync_done
+2026-06-24T15:09:09Z cargo_check_start
+2026-06-24T15:10:01Z cargo_check_done
+2026-06-24T15:10:01Z release_build_start
+2026-06-24T15:38:45Z release_build_done
+2026-06-24T15:38:45Z ferrum_run_smoke_start
+2026-06-24T15:39:13Z ferrum_run_smoke_done
+2026-06-24T15:39:13Z serve_start
+2026-06-24T15:39:41Z serve_ready
+2026-06-24T15:39:41Z serve_chat_smoke_done
+2026-06-24T15:39:41Z bench_c32_start
+2026-06-24T15:43:50Z bench_c32_failed exit=143
+finished_at=2026-06-24T15:43:50Z
+exit_code=50

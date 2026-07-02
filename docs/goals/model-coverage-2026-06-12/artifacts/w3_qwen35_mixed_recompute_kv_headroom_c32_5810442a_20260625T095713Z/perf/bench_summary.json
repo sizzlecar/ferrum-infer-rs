@@ -1,0 +1,94 @@
+{
+  "artifact": "/workspace/artifacts/w3_qwen35_mixed_recompute_kv_headroom_c32_5810442a_20260625T095713Z",
+  "bench": {
+    "completed_per_run": [
+      32
+    ],
+    "concurrency": 32,
+    "errored_per_run": [
+      0
+    ],
+    "http_500_per_run": [
+      0
+    ],
+    "n_repeats": 1,
+    "n_requests_per_run": 32,
+    "output_throughput_tps": 463.395904619631,
+    "output_token_count_source": "usage",
+    "p95_itl_ms": 62.143088,
+    "p95_tpot_ms": 54.23527208070867,
+    "p95_ttft_ms": 1949.2850859500002,
+    "panic_per_run": [
+      0
+    ],
+    "request_throughput_rps": 3.620280504840867,
+    "total_throughput_tps": 879.7281626763307
+  },
+  "bench_exit": "0",
+  "last_iteration": 686,
+  "last_scheduler_after_schedule": {
+    "active_len": 0,
+    "admitted_total": 80,
+    "cancelled_total": 0,
+    "capacity_blocked_waiting_len": 0,
+    "capacity_deferred_total": 43,
+    "completed_total": 37,
+    "decode_queue_len": 0,
+    "failed_total": 0,
+    "prefill_queue_len": 0,
+    "waiting_queue_len": 0
+  },
+  "last_scheduler_before": {
+    "active_len": 0,
+    "admitted_total": 80,
+    "cancelled_total": 0,
+    "capacity_blocked_waiting_len": 0,
+    "capacity_deferred_total": 43,
+    "completed_total": 37,
+    "decode_queue_len": 0,
+    "failed_total": 0,
+    "prefill_queue_len": 0,
+    "waiting_queue_len": 0
+  },
+  "log_counts": {
+    "block_pool_exhausted": 1,
+    "cancelled_during_decode": 0,
+    "oom_mentions": 0,
+    "panic_mentions": 0,
+    "preempting_request": 0,
+    "unified_kv_admission_failed": 16,
+    "unified_prefill_alloc_deferred": 1
+  },
+  "no_live_vllm": true,
+  "reject_reasons": [
+    "output_throughput_tps=463.395904619631 <= floor=600.0",
+    "mixed_iterations=23 < 64",
+    "p95_itl_ms=62.143088 > 25.0",
+    "unified_kv_admission_failed=16 > 13",
+    "capacity_deferred_total=43 > 32"
+  ],
+  "release_evidence": false,
+  "sha": "5810442a2da037def2923a5dccb18052dc0bc6cd",
+  "thresholds": {
+    "max_capacity_deferred_total": 32,
+    "max_kv_admission_failed": 13,
+    "max_p95_itl_ms": 25.0,
+    "min_mixed_iterations": 64,
+    "output_throughput_floor_tps": 600.0,
+    "required_completed": 32,
+    "required_errors": 0
+  },
+  "trace_stats": {
+    "avg_decode_items": 9.729787234042552,
+    "avg_process_us": 21025.836170212766,
+    "decode_only_iterations": 357,
+    "max_active_len": 32,
+    "max_capacity_deferred_total": 43,
+    "mixed_iterations": 23,
+    "prefill_only_iterations": 90,
+    "scheduled_decode_tokens": 4573,
+    "scheduled_prefill_tokens": 7735,
+    "some_ok_iterations": 470
+  },
+  "verdict": "reject"
+}

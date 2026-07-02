@@ -66,7 +66,8 @@ pub fn looks_like_gguf_path(model: &str) -> bool {
 /// dirs) and materializes missing compatibility env vars for:
 ///
 ///   - `FERRUM_KV_CAPACITY`     — 8192 dense / 4096 MoE
-///   - `FERRUM_METAL_PAGED_KV`  — 0 GGUF / 1 only for Qwen3 dense and MoE safetensors.
+///   - `FERRUM_PAGED_KV` / legacy `FERRUM_METAL_PAGED_KV` — 0 GGUF / 1 only
+///     for Qwen3 dense and MoE safetensors.
 ///     The Metal Qwen3-MoE GGUF paged-KV decode path can repeat the first
 ///     generated token until `max_tokens`; keep GGUF on the contiguous path
 ///     until that kernel path is fixed. Qwen3 dense safetensors is validated
@@ -134,11 +135,13 @@ fn chat_profile_runtime_entries_for_arch(
     // GGUF: contiguous path is the correctness baseline. For safetensors,
     // keep paged KV only on families with current product evidence.
     let need_paged = !is_gguf
-        && (is_moe || model_family.is_some_and(|family| family.eq_ignore_ascii_case("qwen3")));
-    push_missing_entry(
+        && (is_moe
+            || model_family.is_some_and(|family| {
+                family.eq_ignore_ascii_case("qwen3") || family.eq_ignore_ascii_case("qwen3_5")
+            }));
+    push_paged_kv_compat_entries(
         &mut entries,
         current,
-        "FERRUM_METAL_PAGED_KV",
         if need_paged { "1" } else { "0" },
         source,
     );
@@ -176,6 +179,25 @@ fn push_missing_entry(
     if snapshot_value(current, key).is_none() {
         entries.push(RuntimeConfigEntry::new(key, value, source));
     }
+}
+
+fn push_paged_kv_compat_entries(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    current: &RuntimeConfigSnapshot,
+    value: &str,
+    source: RuntimeConfigSource,
+) {
+    let effective_value = snapshot_value(current, "FERRUM_PAGED_KV")
+        .or_else(|| snapshot_value(current, "FERRUM_METAL_PAGED_KV"))
+        .unwrap_or(value);
+    push_missing_entry(entries, current, "FERRUM_PAGED_KV", effective_value, source);
+    push_missing_entry(
+        entries,
+        current,
+        "FERRUM_METAL_PAGED_KV",
+        effective_value,
+        source,
+    );
 }
 
 fn snapshot_value<'a>(snapshot: &'a RuntimeConfigSnapshot, key: &str) -> Option<&'a str> {
@@ -254,7 +276,18 @@ pub fn detect_model_family(path: &Path) -> Option<String> {
 
 fn normalize_model_family(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
-    if lower.contains("qwen3_moe") || lower.contains("qwen3moe") || lower.contains("qwen3_mo") {
+    if lower.contains("qwen3_5_moe")
+        || lower.contains("qwen3_5moe")
+        || lower.contains("qwen35_moe")
+        || lower.contains("qwen35moe")
+    {
+        "qwen3_5_moe".to_string()
+    } else if lower.contains("qwen3_5") || lower.contains("qwen35") {
+        "qwen3_5".to_string()
+    } else if lower.contains("qwen3_moe")
+        || lower.contains("qwen3moe")
+        || lower.contains("qwen3_mo")
+    {
         "qwen3_moe".to_string()
     } else if lower.contains("qwen3") {
         "qwen3".to_string()
@@ -360,9 +393,15 @@ pub fn serve_profile_runtime_entries_for_arch(
     } else {
         "512"
     };
+    push_missing_entry(
+        &mut entries,
+        current,
+        "FERRUM_KV_CAPACITY",
+        kv_capacity,
+        source,
+    );
+    push_paged_kv_compat_entries(&mut entries, current, "1", source);
     for (k, v) in [
-        ("FERRUM_KV_CAPACITY", kv_capacity),
-        ("FERRUM_METAL_PAGED_KV", "1"),
         (
             "FERRUM_PAGED_MAX_SEQS",
             if is_moe {
@@ -728,6 +767,7 @@ mod tests {
             value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
             Some("1")
         );
+        assert_eq!(value(&entries, "FERRUM_PAGED_KV").as_deref(), Some("1"));
         assert_eq!(value(&entries, "FERRUM_MAX_BATCH").as_deref(), Some("16"));
         assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
         assert_eq!(
@@ -758,6 +798,7 @@ mod tests {
             value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
             Some("1")
         );
+        assert_eq!(value(&entries, "FERRUM_PAGED_KV").as_deref(), Some("1"));
         assert_eq!(value(&entries, "FERRUM_MAX_BATCH").as_deref(), Some("16"));
         assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("1"));
         assert_eq!(
@@ -788,6 +829,7 @@ mod tests {
             value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
             Some("1")
         );
+        assert_eq!(value(&entries, "FERRUM_PAGED_KV").as_deref(), Some("1"));
         assert_eq!(value(&entries, "FERRUM_MOE_BATCHED"), None);
     }
 
@@ -833,11 +875,36 @@ mod tests {
             value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
             Some("1")
         );
+        assert_eq!(value(&entries, "FERRUM_PAGED_KV").as_deref(), Some("1"));
         assert_eq!(
             value(&entries, "FERRUM_PAGED_MAX_SEQS").as_deref(),
             Some("2")
         );
         assert_eq!(value(&entries, "FERRUM_MAX_BATCH").as_deref(), Some("1"));
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED"), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_profile_recognizes_qwen35_dense_without_qwen3_fallback() {
+        let dir = temp_model_dir(
+            "qwen35_dense",
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5"}"#,
+        );
+        assert_eq!(detect_model_family(&dir).as_deref(), Some("qwen3_5"));
+        assert!(!detect_moe_arch(&dir));
+
+        let entries = chat_profile_runtime_entries(
+            &dir,
+            &RuntimeConfigSnapshot::default(),
+            RuntimeConfigSource::Default,
+        );
+
+        assert_eq!(
+            value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
+            Some("1")
+        );
+        assert_eq!(value(&entries, "FERRUM_PAGED_KV").as_deref(), Some("1"));
         assert_eq!(value(&entries, "FERRUM_MOE_BATCHED"), None);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -858,6 +925,7 @@ mod tests {
             value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
             Some("0")
         );
+        assert_eq!(value(&entries, "FERRUM_PAGED_KV").as_deref(), Some("0"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -877,6 +945,7 @@ mod tests {
             value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
             Some("0")
         );
+        assert_eq!(value(&entries, "FERRUM_PAGED_KV").as_deref(), Some("0"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -904,6 +973,7 @@ mod tests {
             value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
             Some("1")
         );
+        assert_eq!(value(&entries, "FERRUM_PAGED_KV").as_deref(), Some("1"));
         assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("0"));
         assert_eq!(
             value(&entries, "FERRUM_MOE_BATCHED_DECODE").as_deref(),
@@ -913,6 +983,29 @@ mod tests {
             value(&entries, "FERRUM_MOE_BATCH_THRESHOLD").as_deref(),
             Some("2")
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_profile_recognizes_qwen35_moe_as_distinct_moe_family() {
+        let dir = temp_model_dir(
+            "qwen35_moe",
+            r#"{"architectures":["Qwen3_5MoeForConditionalGeneration"],"model_type":"qwen3_5_moe"}"#,
+        );
+        assert_eq!(detect_model_family(&dir).as_deref(), Some("qwen3_5_moe"));
+        assert!(detect_moe_arch(&dir));
+
+        let entries = chat_profile_runtime_entries(
+            &dir,
+            &RuntimeConfigSnapshot::default(),
+            RuntimeConfigSource::Default,
+        );
+
+        assert_eq!(
+            value(&entries, "FERRUM_KV_CAPACITY").as_deref(),
+            Some("4096")
+        );
+        assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("0"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -938,6 +1031,7 @@ mod tests {
             value(&entries, "FERRUM_METAL_PAGED_KV").as_deref(),
             Some("0")
         );
+        assert_eq!(value(&entries, "FERRUM_PAGED_KV").as_deref(), Some("0"));
         assert_eq!(value(&entries, "FERRUM_MOE_BATCHED").as_deref(), Some("0"));
         assert_eq!(
             value(&entries, "FERRUM_MOE_BATCHED_DECODE").as_deref(),

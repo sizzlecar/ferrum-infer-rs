@@ -1,0 +1,12 @@
+{
+  "id": null,
+  "cur_state": null,
+  "actual_status": null,
+  "intended_status": null,
+  "gpu_name": null,
+  "num_gpus": null,
+  "dph_total": null,
+  "public_ipaddr": null,
+  "ssh_host": null,
+  "ssh_port": null
+}

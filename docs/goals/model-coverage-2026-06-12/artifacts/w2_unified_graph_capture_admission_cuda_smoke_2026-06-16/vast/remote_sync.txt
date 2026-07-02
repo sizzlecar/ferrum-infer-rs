@@ -1,0 +1,5 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+error: Repository lacks these prerequisite commits:
+error: e27142f924876ad21412f781ce6fc4da3095f463

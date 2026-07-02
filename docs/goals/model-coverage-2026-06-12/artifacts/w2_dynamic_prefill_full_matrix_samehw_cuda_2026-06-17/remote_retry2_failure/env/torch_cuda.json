@@ -1,0 +1,7 @@
+{
+  "cuda": "12.6",
+  "cuda_available": true,
+  "device_count": 1,
+  "device_name_0": "NVIDIA GeForce RTX 4090",
+  "torch": "2.7.1+cu126"
+}

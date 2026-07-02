@@ -1,0 +1,10 @@
+{"scenario":"run_multiturn_resource_balance","owner_kind":"request","owner_id":"req-run-turn-1","resource_kind":"request_slot","action":"request_open","capacity":1}
+{"scenario":"run_multiturn_resource_balance","owner_kind":"request","owner_id":"req-run-turn-1","resource_kind":"kv_block","action":"reserve","amount":1,"before":4,"after":3,"capacity":4}
+{"scenario":"run_multiturn_resource_balance","owner_kind":"request","owner_id":"req-run-turn-1","resource_kind":"kv_block","action":"commit","amount":1,"before":3,"after":3,"capacity":4}
+{"scenario":"run_multiturn_resource_balance","owner_kind":"request","owner_id":"req-run-turn-1","resource_kind":"kv_block","action":"release","amount":1,"before":3,"after":4,"capacity":4}
+{"scenario":"run_multiturn_resource_balance","owner_kind":"request","owner_id":"req-run-turn-1","resource_kind":"request_slot","action":"request_close","capacity":1}
+{"scenario":"run_multiturn_resource_balance","owner_kind":"request","owner_id":"req-run-turn-2","resource_kind":"request_slot","action":"request_open","capacity":1}
+{"scenario":"run_multiturn_resource_balance","owner_kind":"request","owner_id":"req-run-turn-2","resource_kind":"kv_block","action":"reserve","amount":1,"before":4,"after":3,"capacity":4}
+{"scenario":"run_multiturn_resource_balance","owner_kind":"request","owner_id":"req-run-turn-2","resource_kind":"kv_block","action":"commit","amount":1,"before":3,"after":3,"capacity":4}
+{"scenario":"run_multiturn_resource_balance","owner_kind":"request","owner_id":"req-run-turn-2","resource_kind":"kv_block","action":"release","amount":1,"before":3,"after":4,"capacity":4}
+{"scenario":"run_multiturn_resource_balance","owner_kind":"request","owner_id":"req-run-turn-2","resource_kind":"request_slot","action":"request_close","capacity":1}

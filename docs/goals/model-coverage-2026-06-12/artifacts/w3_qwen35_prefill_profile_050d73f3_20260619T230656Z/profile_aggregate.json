@@ -1,0 +1,54 @@
+{
+  "event_count": 17,
+  "prefill_count": 5,
+  "decode_count": 12,
+  "prefill_tokens": [
+    24,
+    25,
+    22,
+    282,
+    89
+  ],
+  "prefill_layer_sum_us": {
+    "count": 5,
+    "min": 2515504,
+    "median": 2696241,
+    "max": 3042549
+  },
+  "prefill_linear_layer_sum_us": {
+    "count": 5,
+    "min": 2510597,
+    "median": 2684491,
+    "max": 3013271
+  },
+  "prefill_full_layer_sum_us": {
+    "count": 5,
+    "min": 4907,
+    "median": 6324,
+    "max": 29278
+  },
+  "prefill_lm_head_us": {
+    "count": 5,
+    "min": 1097,
+    "median": 1138,
+    "max": 25175
+  },
+  "decode_layer_sum_us": {
+    "count": 12,
+    "min": 13454,
+    "median": 14274.5,
+    "max": 15775
+  },
+  "decode_linear_layer_sum_us": {
+    "count": 12,
+    "min": 10591,
+    "median": 11126.0,
+    "max": 12183
+  },
+  "decode_full_layer_sum_us": {
+    "count": 12,
+    "min": 2863,
+    "median": 3129.0,
+    "max": 3644
+  }
+}

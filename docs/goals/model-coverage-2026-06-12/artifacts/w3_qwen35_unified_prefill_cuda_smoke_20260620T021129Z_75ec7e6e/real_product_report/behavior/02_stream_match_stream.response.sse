@@ -1,0 +1,8 @@
+data: {"id":"6ec14a94-a880-4b77-82a9-32c09da8e4cf","object":"chat.completion.chunk","created":1781923399,"model":"Qwen/Qwen3.5-35B-A3B-GPTQ-Int4","choices":[{"index":0,"delta":{"role":"assistant","content":"5"}}]}
+
+data: {"id":"6ec14a94-a880-4b77-82a9-32c09da8e4cf","object":"chat.completion.chunk","created":1781923399,"model":"Qwen/Qwen3.5-35B-A3B-GPTQ-Int4","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"stop"}]}
+
+data: {"id":"6ec14a94-a880-4b77-82a9-32c09da8e4cf","object":"chat.completion.chunk","created":1781923399,"model":"Qwen/Qwen3.5-35B-A3B-GPTQ-Int4","choices":[],"usage":{"prompt_tokens":25,"completion_tokens":2,"total_tokens":27}}
+
+data: [DONE]
+

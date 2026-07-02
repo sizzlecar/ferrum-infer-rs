@@ -1,0 +1,5 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+-rwxr-xr-x 1 501 staff 10245 Jun 15 17:17 /workspace/w2_typed_prefill_profile_2026-06-16/run_remote_profile.sh
+-rwxr-xr-x 1 501 staff 10245 Jun 15 17:17 /workspace/w2_typed_prefill_profile_retry_2026-06-16/run_remote_profile.sh

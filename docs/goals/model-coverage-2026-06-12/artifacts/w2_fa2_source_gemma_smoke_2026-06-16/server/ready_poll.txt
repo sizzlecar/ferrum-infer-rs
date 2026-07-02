@@ -1,0 +1,1 @@
+ready_at_poll=30

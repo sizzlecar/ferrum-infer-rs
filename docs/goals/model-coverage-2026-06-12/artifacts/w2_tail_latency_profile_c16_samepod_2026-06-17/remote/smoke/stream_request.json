@@ -1,0 +1,15 @@
+{
+  "max_tokens": 64,
+  "messages": [
+    {
+      "content": "What is 2+3? Answer with just the number.",
+      "role": "user"
+    }
+  ],
+  "model": "gemma3:27b-gptq",
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "temperature": 0
+}

@@ -1,0 +1,5 @@
+aborted_at=2026-06-24T13:24:39Z
+reason=prefill_first_decode_starvation_after_recurrent_defer
+runner_pid=609
+server_pid=980
+note=partial_diagnostic_not_release_evidence

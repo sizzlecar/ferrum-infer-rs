@@ -1,0 +1,8 @@
++ cargo build --release -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source
+   Compiling ferrum-kernels v0.7.7 (/workspace/ferrum-infer-rs-git/crates/ferrum-kernels)
+   Compiling ferrum-quantization v0.7.7 (/workspace/ferrum-infer-rs-git/crates/ferrum-quantization)
+   Compiling ferrum-models v0.7.7 (/workspace/ferrum-infer-rs-git/crates/ferrum-models)
+   Compiling ferrum-engine v0.7.7 (/workspace/ferrum-infer-rs-git/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.7 (/workspace/ferrum-infer-rs-git/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.7 (/workspace/ferrum-infer-rs-git/crates/ferrum-cli)
+    Finished `release` profile [optimized] target(s) in 3m 34s

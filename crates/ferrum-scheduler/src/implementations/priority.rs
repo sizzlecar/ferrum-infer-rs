@@ -249,6 +249,8 @@ impl PriorityScheduler {
                 gpu_memory,
                 cpu_memory,
                 kv_cache_blocks,
+                recurrent_state_bytes: 0,
+                recurrent_state_slots: 0,
                 compute_units: 1,
             },
             created_at: chrono::Utc::now(),

@@ -1,0 +1,46 @@
+{
+  "before_stop": {
+    "actual_status": "running",
+    "cuda_max_good": 12.8,
+    "cur_state": "running",
+    "dph_total": 0.4555555555555555,
+    "end_date": 1784405853.8324635,
+    "gpu_name": "RTX 4090",
+    "gpu_ram": 24564,
+    "host_id": 1256,
+    "id": 41287720,
+    "image_uuid": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+    "intended_status": "running",
+    "label": "ferrum-w3-delta-s0-cuda-20260617",
+    "machine_id": 10029,
+    "num_gpus": 1,
+    "ssh_host": "ssh2.vast.ai",
+    "ssh_port": 17720,
+    "start_date": 1781676917.778758
+  },
+  "cleanup_result": "stopped_exited",
+  "final": {
+    "actual_status": "exited",
+    "cuda_max_good": 12.8,
+    "cur_state": "stopped",
+    "dph_total": 0.4555555555555555,
+    "end_date": 1784405853.8324635,
+    "gpu_name": "RTX 4090",
+    "gpu_ram": 24564,
+    "host_id": 1256,
+    "id": 41287720,
+    "image_uuid": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+    "intended_status": "stopped",
+    "label": "ferrum-w3-delta-s0-cuda-20260617",
+    "machine_id": 10029,
+    "num_gpus": 1,
+    "ssh_host": "ssh2.vast.ai",
+    "ssh_port": 17720,
+    "start_date": 1781676917.778758
+  },
+  "instance_id": 41287720,
+  "raw_api_files": "removed locally because Vast raw response includes transient UI credential data",
+  "stop_response": {
+    "success": true
+  }
+}

@@ -1,0 +1,5 @@
+   Compiling ferrum-models v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-models)
+    Building [=======================> ] 386/388: ferrum-models                   Building [=======================> ] 387/388: w3_qwen35_s1_dump(example)      Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.30s
+     Running `target/debug/examples/w3_qwen35_s1_dump --model-dir /workspace/hf-cache/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17 --hf-dump /workspace/w3_hf_dump_artifacts/qwen35_08b_hf_layer_dump_20260617T141100Z_2d3092ba/dump --out /workspace/w3_qwen35_s1_compare_20260617T144200Z_7dc3de10/ferrum_dump`
+W3 QWEN35 FERRUM LAYER DUMP PASS: /workspace/w3_qwen35_s1_compare_20260617T144200Z_7dc3de10/ferrum_dump
+W3 QWEN35 LAYER COMPARE PASS: /workspace/w3_qwen35_s1_compare_20260617T144200Z_7dc3de10/compare

@@ -1,0 +1,1 @@
+{"id":"d2f05ad6-dc30-404b-886b-7b264e14aa99","object":"chat.completion","created":1781896740,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"message":{"role":"assistant","content":"The capital of France is Paris."},"finish_reason":"stop"}],"usage":{"prompt_tokens":25,"completion_tokens":8,"total_tokens":33}}

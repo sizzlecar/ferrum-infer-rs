@@ -1,0 +1,124 @@
+{
+  "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_down_l2_persist_cycle_native_probe_2026-06-16",
+  "binary_sha256": "f9c3e69f4407c4b4bd42b7f28593efcc7eb1c2bc81dff7c10ba98baf10b510f1",
+  "interpretation": "Single-layer L2 persistence reproduces the prior win, but simple per-layer access-policy does not survive 8-layer weight rotation. At m16, single-layer persist improves 69.832us to 34.493us, while cycle8 no-policy is 69.736us and cycle8 persist is 69.743us. At m32, cycle8 no-policy is 75.745us and cycle8 persist is 75.117us. Explicit down-warm remains an upper bound but adds an extra down read. Therefore simple access-policy alone should not be productized as the W2 performance fix; any viable lever needs an overlap/prefetch/reuse strategy that survives layer rotation.",
+  "key_metrics": {
+    "m16_cycle8_no_policy_us": 69.736,
+    "m16_cycle8_persist_down_warm_us": 34.634,
+    "m16_cycle8_persist_us": 69.743,
+    "m16_single_no_policy_us": 69.832,
+    "m16_single_persist_us": 34.493,
+    "m32_cycle8_no_policy_us": 75.745,
+    "m32_cycle8_persist_down_warm_us": 54.067,
+    "m32_cycle8_persist_us": 75.117,
+    "m32_single_no_policy_us": 75.903,
+    "m32_single_persist_us": 58.984,
+    "policy_window_bytes": 57802752
+  },
+  "lane": "W2 Gemma3 down L2 persistence cycle native probe",
+  "probe_rc": 0,
+  "remote_head": "357a4b98a2eb80744b8beacf256b91bbff8ae0f2",
+  "rows": [
+    {
+      "down_us": 69.832,
+      "hit_ratio": 0.0,
+      "layers": 1,
+      "m": 16,
+      "mode": "single_layer_no_policy",
+      "policy_window_bytes": 0,
+      "ret": 0,
+      "useful_tflops": 52.98
+    },
+    {
+      "down_us": 34.493,
+      "hit_ratio": 0.6,
+      "layers": 1,
+      "m": 16,
+      "mode": "single_layer_persist_hit60",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 107.25
+    },
+    {
+      "down_us": 69.736,
+      "hit_ratio": 0.0,
+      "layers": 8,
+      "m": 16,
+      "mode": "cycle8_no_policy",
+      "policy_window_bytes": 0,
+      "ret": 0,
+      "useful_tflops": 53.05
+    },
+    {
+      "down_us": 69.743,
+      "hit_ratio": 0.6,
+      "layers": 8,
+      "m": 16,
+      "mode": "cycle8_persist_hit60",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 53.04
+    },
+    {
+      "down_us": 34.634,
+      "hit_ratio": 0.6,
+      "layers": 8,
+      "m": 16,
+      "mode": "cycle8_persist_hit60_down_warm",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 106.81
+    },
+    {
+      "down_us": 75.903,
+      "hit_ratio": 0.0,
+      "layers": 1,
+      "m": 32,
+      "mode": "single_layer_no_policy",
+      "policy_window_bytes": 0,
+      "ret": 0,
+      "useful_tflops": 97.48
+    },
+    {
+      "down_us": 58.984,
+      "hit_ratio": 0.6,
+      "layers": 1,
+      "m": 32,
+      "mode": "single_layer_persist_hit60",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 125.44
+    },
+    {
+      "down_us": 75.745,
+      "hit_ratio": 0.0,
+      "layers": 8,
+      "m": 32,
+      "mode": "cycle8_no_policy",
+      "policy_window_bytes": 0,
+      "ret": 0,
+      "useful_tflops": 97.68
+    },
+    {
+      "down_us": 75.117,
+      "hit_ratio": 0.6,
+      "layers": 8,
+      "m": 32,
+      "mode": "cycle8_persist_hit60",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 98.5
+    },
+    {
+      "down_us": 54.067,
+      "hit_ratio": 0.6,
+      "layers": 8,
+      "m": 32,
+      "mode": "cycle8_persist_hit60_down_warm",
+      "policy_window_bytes": 57802752,
+      "ret": 0,
+      "useful_tflops": 136.84
+    }
+  ],
+  "verdict_line": "VERDICT: gemma3 down L2 persistence cycle native CUDA probe complete"
+}

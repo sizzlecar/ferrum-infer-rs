@@ -1,0 +1,74 @@
+{
+  "behavior": {
+    "cases_passed": 5,
+    "cases_total": 5,
+    "custom_stop": true,
+    "multi_turn": true,
+    "natural_eos": true,
+    "reasoning_extraction": true,
+    "stream_done_exactly_once": true,
+    "stream_nonstream_match": true,
+    "stream_usage_present": true
+  },
+  "cases": [
+    {
+      "artifact": "behavior/01_multi_turn.response.json",
+      "detail": {
+        "content": "orchid",
+        "finish_reason": "stop"
+      },
+      "id": "multi_turn",
+      "passed": true
+    },
+    {
+      "artifact": "behavior/02_stream_match_stream.response.sse",
+      "detail": {
+        "nonstream_artifact": "behavior/02_stream_match_nonstream.response.json",
+        "nonstream_content": "5",
+        "stream_content": "5",
+        "stream_done_count": 1,
+        "stream_usage_chunks": 1
+      },
+      "id": "stream_nonstream_match",
+      "passed": true
+    },
+    {
+      "artifact": "behavior/03_natural_eos.response.json",
+      "detail": {
+        "content": "done",
+        "finish_reason": "stop"
+      },
+      "id": "natural_eos",
+      "passed": true
+    },
+    {
+      "artifact": "behavior/04_custom_stop.response.json",
+      "detail": {
+        "content": "alpha ",
+        "finish_reason": "stop"
+      },
+      "id": "custom_stop",
+      "passed": true
+    },
+    {
+      "artifact": "behavior/05_reasoning_extraction.response.json",
+      "detail": {
+        "answer_seen": true,
+        "content": "",
+        "finish_reason": "length",
+        "leaked_think": false,
+        "reasoning_len": 888
+      },
+      "id": "reasoning_extraction",
+      "passed": true
+    }
+  ],
+  "generated_at": "2026-06-20T02:43:23.885849+00:00",
+  "hidden_env": [],
+  "level": "l3_behavior",
+  "model_id": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+  "pass_line": "W3 L3 BEHAVIOR PASS: /workspace/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e/real_product_report",
+  "product_surface": "typed_cli",
+  "schema_version": 1,
+  "status": "pass"
+}

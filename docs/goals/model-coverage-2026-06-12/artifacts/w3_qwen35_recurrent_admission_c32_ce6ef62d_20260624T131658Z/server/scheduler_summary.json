@@ -1,0 +1,34 @@
+{
+  "abort_reason": "prefill_first_decode_starvation_after_recurrent_defer",
+  "last_after_process": {
+    "active_len": 32,
+    "admitted_total": 37,
+    "cancelled_total": 0,
+    "completed_total": 5,
+    "current_iteration": 74694,
+    "decode_queue_len": 16,
+    "failed_total": 0,
+    "preempted_queue_len": 0,
+    "preempted_total": 0,
+    "prefill_queue_len": 16,
+    "waiting_queue_len": 0
+  },
+  "last_iteration": 74693,
+  "lines": 74498,
+  "max_active_len": 32,
+  "max_admitted_total": 37,
+  "max_cancelled_total": 0,
+  "max_completed_total": 5,
+  "max_generated_tokens_seen_in_prefill": 0,
+  "partial": true,
+  "prefill_with_generated_tokens_iterations": 0,
+  "prefill_with_generated_tokens_observations": 0,
+  "result_counts": {
+    "none": 6,
+    "some_ok": 74492
+  },
+  "serve_log_counts": {
+    "recurrent-state alloc deferred": 1189408
+  },
+  "trace": "/workspace/artifacts/w3_qwen35_recurrent_admission_c32_ce6ef62d_20260624T131658Z/server/scheduler_trace.jsonl"
+}

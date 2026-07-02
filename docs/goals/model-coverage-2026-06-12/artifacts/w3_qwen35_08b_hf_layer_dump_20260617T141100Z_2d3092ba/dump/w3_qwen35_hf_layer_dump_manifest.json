@@ -1,0 +1,308 @@
+{
+  "command_line": [
+    "/workspace/w3-hf-dump-venv/bin/python",
+    "scripts/release/w3_qwen35_hf_layer_dump.py",
+    "--dump",
+    "--model-id",
+    "Qwen/Qwen3.5-0.8B",
+    "--device",
+    "cpu",
+    "--torch-dtype",
+    "float32",
+    "--out",
+    "/workspace/w3_hf_dump_artifacts/qwen35_08b_hf_layer_dump_20260617T141100Z_2d3092ba/dump"
+  ],
+  "config_summary": {
+    "first_linear_layer": 0,
+    "hidden_size": 1024,
+    "layer_types": [
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention"
+    ],
+    "linear_attention": {
+      "linear_conv_kernel_dim": 4,
+      "linear_key_head_dim": 128,
+      "linear_num_key_heads": 16,
+      "linear_num_value_heads": 16,
+      "linear_value_head_dim": 128
+    },
+    "model_id": "Qwen/Qwen3.5-0.8B",
+    "moe": null,
+    "num_hidden_layers": 24,
+    "text_model_type": "qwen3_5_text"
+  },
+  "created_at": "2026-06-17T14:06:43.598862+00:00",
+  "dependencies": {
+    "torch": "2.12.0+cpu",
+    "transformers": "5.12.1"
+  },
+  "git": {
+    "is_dirty": false,
+    "sha": "2d3092bab3cc4b22c08d97d0e6f0e205b723b9a1",
+    "tracked_status_short": [],
+    "untracked_count": 0,
+    "untracked_sample": []
+  },
+  "mode": "dump",
+  "model_id": "Qwen/Qwen3.5-0.8B",
+  "note": "HF reference dump only; Ferrum dump and comparator are still required for W3-S1",
+  "pass_line": "W3 QWEN35 HF LAYER DUMP PASS: /workspace/w3_hf_dump_artifacts/qwen35_08b_hf_layer_dump_20260617T141100Z_2d3092ba/dump",
+  "prompt": "Paris is the capital of",
+  "prompt_input_ids": [
+    [
+      57590,
+      369,
+      279,
+      6511,
+      314
+    ]
+  ],
+  "runtime": {
+    "HF_HOME": "/workspace/hf-cache",
+    "device": "cpu",
+    "torch_dtype": "float32",
+    "trust_remote_code": false
+  },
+  "schema_version": 1,
+  "selected_layer_idx": 0,
+  "selected_layer_type": "linear_attention",
+  "status": "pass",
+  "tensor_dir": "/workspace/w3_hf_dump_artifacts/qwen35_08b_hf_layer_dump_20260617T141100Z_2d3092ba/dump/tensors",
+  "tensors": {
+    "a_raw": {
+      "dtype": "torch.float32",
+      "file": "a_raw.bin",
+      "numel": 80,
+      "sha256": "1aab6ce3ac929926ee6bf71ab18286ed079108e16378d69917e5b363e46abae5",
+      "shape": [
+        1,
+        5,
+        16
+      ]
+    },
+    "b_raw": {
+      "dtype": "torch.float32",
+      "file": "b_raw.bin",
+      "numel": 80,
+      "sha256": "ebaf3d8bc11ebc9c8d89d9b5b64072051c936c45d9de28c605d1fb58df22f3a0",
+      "shape": [
+        1,
+        5,
+        16
+      ]
+    },
+    "delta_beta": {
+      "dtype": "torch.float32",
+      "file": "delta_beta.bin",
+      "numel": 80,
+      "sha256": "b37f24a18896aa27a377e9bb373b412772f655e12d2af8415f68a29bd6a490b5",
+      "shape": [
+        1,
+        5,
+        16
+      ]
+    },
+    "delta_core": {
+      "dtype": "torch.float32",
+      "file": "delta_core.bin",
+      "numel": 10240,
+      "sha256": "4346988c44a02939c0c491b9c0242d095851e6ed0eb4a84ff7bbb071e3d9c1a1",
+      "shape": [
+        1,
+        5,
+        16,
+        128
+      ]
+    },
+    "delta_g": {
+      "dtype": "torch.float32",
+      "file": "delta_g.bin",
+      "numel": 80,
+      "sha256": "dc0b9af631fa64412d41db47997018e7a799077599cadb5ee66b64efc984b2ae",
+      "shape": [
+        1,
+        5,
+        16
+      ]
+    },
+    "delta_k": {
+      "dtype": "torch.float32",
+      "file": "delta_k.bin",
+      "numel": 10240,
+      "sha256": "e488cf357acddb4bad581d08acfb231af8ea535d42963c2b7378f03e2d508611",
+      "shape": [
+        1,
+        5,
+        16,
+        128
+      ]
+    },
+    "delta_norm": {
+      "dtype": "torch.float32",
+      "file": "delta_norm.bin",
+      "numel": 10240,
+      "sha256": "50221b1d2f022baa7b73d874dc62710705e8bce3883f88d2f33e90c7dbe754f6",
+      "shape": [
+        80,
+        128
+      ]
+    },
+    "delta_output": {
+      "dtype": "torch.float32",
+      "file": "delta_output.bin",
+      "numel": 5120,
+      "sha256": "7568f91ff2469118c8e40cebfa45fd4a6c560e0b01b57c4f8726d88bd3129996",
+      "shape": [
+        1,
+        5,
+        1024
+      ]
+    },
+    "delta_q": {
+      "dtype": "torch.float32",
+      "file": "delta_q.bin",
+      "numel": 10240,
+      "sha256": "a920e1451b87008fc7ae21861b0eb3597cb562308240b860eabd7ca767a75784",
+      "shape": [
+        1,
+        5,
+        16,
+        128
+      ]
+    },
+    "delta_v": {
+      "dtype": "torch.float32",
+      "file": "delta_v.bin",
+      "numel": 10240,
+      "sha256": "b3fadf064ce6b2c90bf41bdfa2fbc8afff11cf4c75eaf8c9aa65436152effd20",
+      "shape": [
+        1,
+        5,
+        16,
+        128
+      ]
+    },
+    "input_norm": {
+      "dtype": "torch.float32",
+      "file": "input_norm.bin",
+      "numel": 5120,
+      "sha256": "667d83ccbc9068824a0b602e1d72b173a832285dea16c907ff925d3f18c69673",
+      "shape": [
+        1,
+        5,
+        1024
+      ]
+    },
+    "layer_input": {
+      "dtype": "torch.float32",
+      "file": "layer_input.bin",
+      "numel": 5120,
+      "sha256": "fb0542b2a5f0b495cbdec17d9b6418f449e3c9ae39e3089858d2d23cb83450ae",
+      "shape": [
+        1,
+        5,
+        1024
+      ]
+    },
+    "layer_output": {
+      "dtype": "torch.float32",
+      "file": "layer_output.bin",
+      "numel": 5120,
+      "sha256": "446055338473caea5ca3f6be56fdb35f32d225e98d17b717ce1ad13bb64d3716",
+      "shape": [
+        1,
+        5,
+        1024
+      ]
+    },
+    "mixed_qkv_conv": {
+      "dtype": "torch.float32",
+      "file": "mixed_qkv_conv.bin",
+      "numel": 30720,
+      "sha256": "5244dbd6e8f6a56c9230a242ecfb1cac2a072ed9548807cee2f97d3417583f80",
+      "shape": [
+        1,
+        5,
+        6144
+      ]
+    },
+    "mixed_qkv_raw": {
+      "dtype": "torch.float32",
+      "file": "mixed_qkv_raw.bin",
+      "numel": 30720,
+      "sha256": "fa46b4cf365647c0cf1352f972c3989611a96116c51098d3aae9c902a232e12c",
+      "shape": [
+        1,
+        5,
+        6144
+      ]
+    },
+    "mlp_output": {
+      "dtype": "torch.float32",
+      "file": "mlp_output.bin",
+      "numel": 5120,
+      "sha256": "07577d34cf99ab2a73df8492619c985124dee70912f4fbc1303cd04a698fe1bb",
+      "shape": [
+        1,
+        5,
+        1024
+      ]
+    },
+    "post_attention_norm": {
+      "dtype": "torch.float32",
+      "file": "post_attention_norm.bin",
+      "numel": 5120,
+      "sha256": "8fbee3474864b7865682822eaeccd6f6a5e287b13dbcdcb9cb47ebf5bf9a67d3",
+      "shape": [
+        1,
+        5,
+        1024
+      ]
+    },
+    "residual_after_mixer": {
+      "dtype": "torch.float32",
+      "file": "residual_after_mixer.bin",
+      "numel": 5120,
+      "sha256": "67d79f8df4b905301d4cc8cd08f4bc1aa791154b10a4c03d195cda000c33456d",
+      "shape": [
+        1,
+        5,
+        1024
+      ]
+    },
+    "z_raw": {
+      "dtype": "torch.float32",
+      "file": "z_raw.bin",
+      "numel": 10240,
+      "sha256": "4d7080458f3701d17cc63f9a6fb4f25cd2a603c6ae49065ea6d4318be55ba1c9",
+      "shape": [
+        1,
+        5,
+        2048
+      ]
+    }
+  },
+  "text_model_type": "qwen3_5_text"
+}

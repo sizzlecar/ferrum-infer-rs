@@ -1,0 +1,95 @@
+{
+  "command_line": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/w3_qwen35_hf_layer_dump.py",
+    "--contract",
+    "--model-id",
+    "Qwen/Qwen3.5-0.8B",
+    "--config",
+    "docs/goals/model-coverage-2026-06-12/artifacts/w3_hf_config_probe_20260617T131209Z_f97c1d6f/dense_min_reference.config.json",
+    "--out",
+    "/tmp/w3_qwen35_hf_layer_harness_20260617T134658Z_d53683a6/contract"
+  ],
+  "config_summary": {
+    "first_linear_layer": 0,
+    "hidden_size": 1024,
+    "layer_types": [
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention"
+    ],
+    "linear_attention": {
+      "linear_conv_kernel_dim": 4,
+      "linear_key_head_dim": 128,
+      "linear_num_key_heads": 16,
+      "linear_num_value_heads": 16,
+      "linear_value_head_dim": 128
+    },
+    "model_id": "Qwen/Qwen3.5-0.8B",
+    "moe": null,
+    "num_hidden_layers": 24,
+    "text_model_type": "qwen3_5_text"
+  },
+  "contract": {
+    "note": "source contract only; no model weights were loaded",
+    "required_hooks": {
+      "class Qwen3_5DecoderLayer": 756,
+      "class Qwen3_5GatedDeltaNet": 371,
+      "core_attn_out = self.norm(core_attn_out, z)": 555,
+      "core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule": 535,
+      "output = self.out_proj(core_attn_out)": 558,
+      "self.chunk_gated_delta_rule": 422,
+      "self.in_proj_a = nn.Linear": 435,
+      "self.in_proj_b = nn.Linear": 434,
+      "self.in_proj_qkv = nn.Linear": 432,
+      "self.in_proj_z = nn.Linear": 433,
+      "self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)": 762,
+      "self.mlp = Qwen3_5MLP(config, config.intermediate_size)": 765,
+      "self.out_proj = nn.Linear": 418
+    },
+    "selected_layer_idx": 0,
+    "source_sha256": "395439341ea5ba4dd14c103e830383caa75686cfaf6b693dd7efb58622224da6",
+    "status": "pass",
+    "text_model_type": "qwen3_5_text"
+  },
+  "created_at": "2026-06-17T21:49:22.297214+08:00",
+  "git": {
+    "is_dirty": false,
+    "sha": "d53683a60029229ff0a60e928df6e88cd3e3e82e",
+    "tracked_status_short": [],
+    "untracked_count": 0,
+    "untracked_sample": []
+  },
+  "mode": "contract",
+  "model_id": "Qwen/Qwen3.5-0.8B",
+  "note": "config/source contract only; no model weights were downloaded",
+  "pass_line": "W3 QWEN35 HF LAYER CONTRACT PASS: /private/tmp/w3_qwen35_hf_layer_harness_20260617T134658Z_d53683a6/contract",
+  "schema_version": 1,
+  "source": {
+    "kind": "url",
+    "sha256": "395439341ea5ba4dd14c103e830383caa75686cfaf6b693dd7efb58622224da6",
+    "url": "https://raw.githubusercontent.com/huggingface/transformers/main/src/transformers/models/qwen3_5/modeling_qwen3_5.py"
+  },
+  "status": "pass"
+}

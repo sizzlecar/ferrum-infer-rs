@@ -1,0 +1,11 @@
+{
+  "model": "3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Answer with exactly one word: Paris."
+    }
+  ],
+  "temperature": 0,
+  "max_tokens": 8
+}

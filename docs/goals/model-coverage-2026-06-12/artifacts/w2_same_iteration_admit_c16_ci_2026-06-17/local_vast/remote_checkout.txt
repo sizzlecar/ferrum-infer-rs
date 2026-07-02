@@ -1,0 +1,3 @@
+674c66786f0cf654009c84070b65ec0174a95357
+58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e  /workspace/ascii_sharegpt_w2_100.jsonl
+100 /workspace/ascii_sharegpt_w2_100.jsonl

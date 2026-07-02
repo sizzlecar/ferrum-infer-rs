@@ -1,0 +1,1 @@
+SERVE_SMOKE_PASS content='Paris' completion_tokens=2

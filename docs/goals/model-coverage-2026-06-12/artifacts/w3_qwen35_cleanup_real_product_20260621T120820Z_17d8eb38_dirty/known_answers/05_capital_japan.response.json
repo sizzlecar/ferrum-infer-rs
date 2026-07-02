@@ -1,0 +1,1 @@
+{"id":"119ad2a5-7086-4166-a16c-8d80d06ae809","object":"chat.completion","created":1782043765,"model":"3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b","choices":[{"index":0,"message":{"role":"assistant","content":"Tokyo"},"finish_reason":"stop"}],"usage":{"prompt_tokens":24,"completion_tokens":3,"total_tokens":27}}

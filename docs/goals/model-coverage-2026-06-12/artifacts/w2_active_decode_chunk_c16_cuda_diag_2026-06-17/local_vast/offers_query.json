@@ -1,0 +1,1 @@
+{"compute_cap": {"gte": 890}, "cuda_max_good": {"gte": 12.4}, "disk_space": {"gte": 260}, "gpu_name": {"eq": "RTX 4090"}, "limit": 100, "num_gpus": {"eq": 1}, "reliability2": {"gte": 0.98}, "rentable": {"eq": true}, "rented": {"eq": false}, "type": "ondemand", "verified": {"eq": true}}

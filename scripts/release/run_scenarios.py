@@ -383,6 +383,42 @@ class ScenarioRunner:
         self.timeout = int(args.timeout or manifest.get("timeout_sec") or 180)
         self.base_url = args.base_url or self.manifest_base_url()
         self.started_server: StartedServer | None = None
+        self.run_observability_roots: list[Path] = []
+
+    def observability_config(self) -> dict[str, Any]:
+        raw = self.manifest.get("observability")
+        config = raw if isinstance(raw, dict) else {}
+        enabled = bool(self.args.observability or config.get("enabled") is True)
+        return {
+            "enabled": enabled,
+            "profile_detail": str(self.args.profile_detail or config.get("profile_detail") or "basic"),
+            "profile_sample_rate": float(
+                self.args.profile_sample_rate
+                if self.args.profile_sample_rate is not None
+                else config.get("profile_sample_rate", 1.0)
+            ),
+        }
+
+    def observability_enabled(self) -> bool:
+        return bool(self.observability_config()["enabled"])
+
+    def observability_args(self, root: Path) -> list[str]:
+        config = self.observability_config()
+        root.mkdir(parents=True, exist_ok=True)
+        return [
+            "--profile-jsonl",
+            str(root / "profile.jsonl"),
+            "--profile-detail",
+            str(config["profile_detail"]),
+            "--memory-profile-jsonl",
+            str(root / "memory_profile.jsonl"),
+            "--scheduler-trace-jsonl",
+            str(root / "scheduler_trace.jsonl"),
+            "--request-dump-dir",
+            str(root / "request_dump"),
+            "--profile-sample-rate",
+            str(config["profile_sample_rate"]),
+        ]
 
     def manifest_base_url(self) -> str | None:
         server = self.manifest.get("server")
@@ -419,6 +455,11 @@ class ScenarioRunner:
         if not self.needs_serve():
             return
         if self.base_url and not self.should_start_server():
+            if self.observability_enabled():
+                raise ScenarioError(
+                    "run_scenarios observability requires manifest.server.mode=start "
+                    "or --start-server so serve flags can be passed through"
+                )
             capture_health(self.base_url, self.out, self.timeout)
             return
         if not self.model:
@@ -439,6 +480,8 @@ class ScenarioRunner:
             "--decision-trace-jsonl",
             str(decision_trace),
         ]
+        if self.observability_enabled():
+            cmd.extend(self.observability_args(self.out / "observability" / "serve"))
         server = self.manifest.get("server")
         if isinstance(server, dict):
             extra_args = server.get("args")
@@ -454,6 +497,7 @@ class ScenarioRunner:
         results: list[dict[str, Any]] = []
         failures = 0
         skipped = 0
+        observability: dict[str, Any] | None = None
         try:
             self.ensure_server()
             for scenario in selected_scenarios(self.scenarios(), self.args.only):
@@ -470,6 +514,7 @@ class ScenarioRunner:
                     self.timeout,
                     filename="server.health.after.json",
                 )
+            observability = self.observability_summary()
         finally:
             if self.started_server is not None:
                 self.started_server.stop()
@@ -490,9 +535,49 @@ class ScenarioRunner:
             "failed": failures,
             "skipped": skipped,
             "scenarios": results,
+            "observability": observability,
             "pass_line": f"BACKEND REGRESSION SMOKE PASS: {self.out}" if status == "pass" else None,
         }
         write_json(self.out / "summary.json", summary)
+        return summary
+
+    def observability_summary(self) -> dict[str, Any] | None:
+        if not self.observability_enabled():
+            return None
+        roots: dict[str, Any] = {
+            "run": [str(root) for root in self.run_observability_roots],
+            "serve": None,
+        }
+        serve_root = self.out / "observability" / "serve"
+        if serve_root.exists():
+            roots["serve"] = str(serve_root)
+        profile_paths: list[str] = []
+        scheduler_trace_paths: list[str] = []
+        request_dump_dirs: list[str] = []
+        for root in [*self.run_observability_roots, serve_root]:
+            if not root.exists():
+                continue
+            for filename, bucket in [
+                ("profile.jsonl", profile_paths),
+                ("memory_profile.jsonl", profile_paths),
+                ("scheduler_trace.jsonl", profile_paths),
+            ]:
+                path = root / filename
+                if path.is_file():
+                    bucket.append(str(path))
+                    if filename == "scheduler_trace.jsonl":
+                        scheduler_trace_paths.append(str(path))
+            request_dump = root / "request_dump"
+            if request_dump.is_dir():
+                request_dump_dirs.append(str(request_dump))
+        summary = {
+            "enabled": True,
+            "roots": roots,
+            "profile_paths": profile_paths,
+            "scheduler_trace_paths": scheduler_trace_paths,
+            "request_dump_dirs": request_dump_dirs,
+        }
+        write_json(self.out / "observability_summary.json", summary)
         return summary
 
     def run_one(self, scenario: dict[str, Any]) -> dict[str, Any]:
@@ -791,8 +876,12 @@ class ScenarioRunner:
             str(out / "effective_config.json"),
             "--decision-trace-jsonl",
             str(out / "decision_trace.jsonl"),
-            self.model,
         ]
+        if self.observability_enabled():
+            root = out / "observability"
+            cmd.extend(self.observability_args(root))
+            self.run_observability_roots.append(root)
+        cmd.append(self.model)
         proc = subprocess.run(
             cmd,
             input=input_text,
@@ -1114,6 +1203,22 @@ def self_test() -> int:
             health_after = load_json_object(out / "server.health.after.json")
             if health_after.get("status") != "pass" or health_after.get("http_status") != 200:
                 raise AssertionError(health_after)
+            bad_out = root / "bad-observability-out"
+            bad = run_selftest_command(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--manifest",
+                    str(manifest),
+                    "--out",
+                    str(bad_out),
+                    "--observability",
+                ]
+            )
+            if bad.returncode == 0:
+                raise AssertionError("external-server observability unexpectedly passed")
+            if "observability requires manifest.server.mode=start" not in bad.stderr:
+                raise AssertionError(bad.stderr or bad.stdout)
     finally:
         server.shutdown()
         server.server_close()
@@ -1133,6 +1238,9 @@ def main() -> int:
     parser.add_argument("--port", type=int)
     parser.add_argument("--timeout", type=int)
     parser.add_argument("--only", action="append", default=[])
+    parser.add_argument("--observability", action="store_true")
+    parser.add_argument("--profile-detail")
+    parser.add_argument("--profile-sample-rate", type=float)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 

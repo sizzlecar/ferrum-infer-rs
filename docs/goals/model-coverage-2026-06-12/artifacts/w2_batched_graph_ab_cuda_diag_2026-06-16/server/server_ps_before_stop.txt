@@ -1,0 +1,2 @@
+UID          PID    PPID  C STIME TTY          TIME CMD
+root         422       1  0 22:03 ?        00:00:00 timeout 1200 /workspace/ferrum-infer-rs/target/release/ferrum serve --model gemma3:27b-gptq --backend cuda --batched-graph --host 127.0.0.1 --port 18087 --max-num-seqs 16 --max-num-batched-tokens 2048 --kv-capacity 512 --effective-config-json /workspace/w2_batched_graph_ab_cuda_diag_2026-06-16/server/serve_effective_config.json --decision-trace-jsonl /workspace/w2_batched_graph_ab_cuda_diag_2026-06-16/server/serve_decision_trace.jsonl

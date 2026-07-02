@@ -1,0 +1,81 @@
+CHAT_SMOKE_PASS content='5' completion_tokens=3
+{
+  "status": "PASS",
+  "release_grade": false,
+  "bench_rc": 0,
+  "chat_pass": true,
+  "concurrency": 16,
+  "n_repeats": 1,
+  "n_requests_per_run": 16,
+  "completed_per_run": [
+    16
+  ],
+  "errored_per_run": [
+    0
+  ],
+  "bad_output_per_run": [
+    0
+  ],
+  "zero_output_tokens_per_run": [
+    0
+  ],
+  "output_token_count_source": "usage",
+  "output_throughput_tps_mean": 298.24957600538823,
+  "vllm_c16_tps_baseline_orientation": 518.7959572662905,
+  "ferrum_vs_vllm_ratio_orientation": 0.5748880110341743,
+  "runtime_profiler_sources": {
+    "FERRUM_BATCH_DECODE_PROF": "config_file",
+    "FERRUM_BATCH_PREFILL_PROF": "config_file",
+    "FERRUM_DECODE_OP_PROFILE": "config_file",
+    "FERRUM_MARLIN_PROFILE": "config_file",
+    "FERRUM_MARLIN_TRACE_SHAPES": "config_file",
+    "FERRUM_MARLIN_TRACE_SHAPES_MAX": "config_file",
+    "FERRUM_NEXT_BATCH_PROF": "config_file",
+    "FERRUM_PREFILL_OP_PROFILE": "config_file",
+    "FERRUM_UNIFIED_POST_PROF": "config_file"
+  },
+  "marlin_shape_trace_line_count": 96,
+  "marlin_shape_trace_sample": [
+    "[marlin-shape-trace] call=0 label=label=llama.forward_layer.qkv_proj bucket=Qkv m=23 n=8192 k=5376 gs=128 qweight_len=5505024 scales_len=344064 workspace_len=1024 a=0x76ceac000 b=0x3b0240400 c=0x3080a9600 s=0x3b1740400 ws=0x3b0235c00",
+    "[marlin-shape-trace] call=1 label=label=llama.forward_layer.o_proj bucket=OProj m=23 n=5376 k=4096 gs=128 qweight_len=2752512 scales_len=172032 workspace_len=672 a=0x76ceac000 b=0x3b17ec400 c=0x76d1bc800 s=0x3b226c400 ws=0x3b0236c00",
+    "[marlin-shape-trace] call=2 label=label=llama.forward_layer.gate_up_proj bucket=GateUp m=23 n=43008 k=5376 gs=128 qweight_len=28901376 scales_len=1806336 workspace_len=5376 a=0x76ceac000 b=0x3b22d0000 c=0x76d1f8e00 s=0x3b9110000 ws=0x3b9482000",
+    "[marlin-shape-trace] call=3 label=label=llama.forward_layer.down_proj bucket=Down m=23 n=5376 k=21504 gs=128 qweight_len=14450688 scales_len=903168 workspace_len=672 a=0x76cee8600 b=0x3b949c400 c=0x76d4cd600 s=0x3bcbbc400 ws=0x3b22c0400",
+    "[marlin-shape-trace] call=4 label=label=llama.forward_layer.qkv_proj bucket=Qkv m=23 n=8192 k=5376 gs=128 qweight_len=5505024 scales_len=344064 workspace_len=1024 a=0x76cee8600 b=0x3bcd7fc00 c=0x3080a9600 s=0x3be27fc00 ws=0x3bcd75400",
+    "[marlin-shape-trace] call=5 label=label=llama.forward_layer.o_proj bucket=OProj m=23 n=5376 k=4096 gs=128 qweight_len=2752512 scales_len=172032 workspace_len=672 a=0x76cee8600 b=0x3be32bc00 c=0x76d1bc800 s=0x3bedabc00 ws=0x3bcd76400",
+    "[marlin-shape-trace] call=6 label=label=llama.forward_layer.gate_up_proj bucket=GateUp m=23 n=43008 k=5376 gs=128 qweight_len=28901376 scales_len=1806336 workspace_len=5376 a=0x76cee8600 b=0x3bee0f800 c=0x76d1f8e00 s=0x3c5c4f800 ws=0x3c5fc1800",
+    "[marlin-shape-trace] call=7 label=label=llama.forward_layer.down_proj bucket=Down m=23 n=5376 k=21504 gs=128 qweight_len=14450688 scales_len=903168 workspace_len=672 a=0x76cee8600 b=0x3c5fdbc00 c=0x76d4cd600 s=0x3c96fbc00 ws=0x3bedffc00",
+    "[marlin-shape-trace] call=8 label=label=llama.forward_layer.qkv_proj bucket=Qkv m=23 n=8192 k=5376 gs=128 qweight_len=5505024 scales_len=344064 workspace_len=1024 a=0x76cee8600 b=0x3c98bf400 c=0x3080a9600 s=0x3cadbf400 ws=0x3c98b4c00",
+    "[marlin-shape-trace] call=9 label=label=llama.forward_layer.o_proj bucket=OProj m=23 n=5376 k=4096 gs=128 qweight_len=2752512 scales_len=172032 workspace_len=672 a=0x76cee8600 b=0x3cae6b400 c=0x76d1bc800 s=0x3cb8eb400 ws=0x3c98b5c00",
+    "[marlin-shape-trace] call=10 label=label=llama.forward_layer.gate_up_proj bucket=GateUp m=23 n=43008 k=5376 gs=128 qweight_len=28901376 scales_len=1806336 workspace_len=5376 a=0x76cee8600 b=0x3cb94f000 c=0x76d1f8e00 s=0x3d278f000 ws=0x3d2b01000",
+    "[marlin-shape-trace] call=11 label=label=llama.forward_layer.down_proj bucket=Down m=23 n=5376 k=21504 gs=128 qweight_len=14450688 scales_len=903168 workspace_len=672 a=0x76cee8600 b=0x3d2b1b400 c=0x76d4cd600 s=0x3d623b400 ws=0x3cb93f400"
+  ],
+  "prefill_profile_line_count": 297,
+  "batched_op_profile_line_count": 126,
+  "batched_op_profile_tail": [
+    "[batched-op-profile] m=16 total=30393us  matmul=8045us(125) attn=2672us(62) qkr=691us(62) norm=468us(63) other=1377us(124) tail_norm=684us(62) tail_mlp=14901us(124) tail_gate_up=9563us(62) tail_down=5338us(62) marlin_ws_zero=1104us(248) marlin_gather=1538us(248) marlin_kernel=16537us(248) marlin_qkv_ws=271us(62) marlin_qkv_gather=318us(62) marlin_qkv_kernel=2151us(62) marlin_o_ws=271us(62) marlin_o_gather=314us(62) marlin_o_kernel=1332us(62) marlin_gate_up_ws=310us(62) marlin_gate_up_gather=353us(62) marlin_gate_up_kernel=8712us(62) marlin_down_ws=252us(62) marlin_down_gather=553us(62) marlin_down_kernel=4342us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) tail_act=433us(62) tail_resid=497us(62)  unwrapped=625us",
+    "[batched-op-profile] m=16 total=30388us  matmul=8038us(125) attn=2686us(62) qkr=682us(62) norm=449us(63) other=1368us(124) tail_norm=692us(62) tail_mlp=14905us(124) tail_gate_up=9570us(62) tail_down=5335us(62) marlin_ws_zero=1122us(248) marlin_gather=1470us(248) marlin_kernel=16566us(248) marlin_qkv_ws=296us(62) marlin_qkv_gather=313us(62) marlin_qkv_kernel=2155us(62) marlin_o_ws=260us(62) marlin_o_gather=315us(62) marlin_o_kernel=1342us(62) marlin_gate_up_ws=311us(62) marlin_gate_up_gather=322us(62) marlin_gate_up_kernel=8720us(62) marlin_down_ws=255us(62) marlin_down_gather=520us(62) marlin_down_kernel=4349us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) tail_act=434us(62) tail_resid=495us(62)  unwrapped=639us",
+    "[batched-op-profile] m=16 total=30355us  matmul=8029us(125) attn=2672us(62) qkr=681us(62) norm=474us(63) other=1368us(124) tail_norm=683us(62) tail_mlp=14888us(124) tail_gate_up=9553us(62) tail_down=5335us(62) marlin_ws_zero=1102us(248) marlin_gather=1543us(248) marlin_kernel=16537us(248) marlin_qkv_ws=269us(62) marlin_qkv_gather=324us(62) marlin_qkv_kernel=2153us(62) marlin_o_ws=270us(62) marlin_o_gather=311us(62) marlin_o_kernel=1333us(62) marlin_gate_up_ws=310us(62) marlin_gate_up_gather=353us(62) marlin_gate_up_kernel=8708us(62) marlin_down_ws=253us(62) marlin_down_gather=555us(62) marlin_down_kernel=4343us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) tail_act=435us(62) tail_resid=492us(62)  unwrapped=633us",
+    "[batched-op-profile] m=16 total=30439us  matmul=8053us(125) attn=2707us(62) qkr=684us(62) norm=446us(63) other=1375us(124) tail_norm=688us(62) tail_mlp=14911us(124) tail_gate_up=9573us(62) tail_down=5338us(62) marlin_ws_zero=1141us(248) marlin_gather=1492us(248) marlin_kernel=16552us(248) marlin_qkv_ws=299us(62) marlin_qkv_gather=319us(62) marlin_qkv_kernel=2151us(62) marlin_o_ws=270us(62) marlin_o_gather=316us(62) marlin_o_kernel=1333us(62) marlin_gate_up_ws=313us(62) marlin_gate_up_gather=323us(62) marlin_gate_up_kernel=8722us(62) marlin_down_ws=259us(62) marlin_down_gather=534us(62) marlin_down_kernel=4346us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) tail_act=433us(62) tail_resid=495us(62)  unwrapped=647us",
+    "[batched-op-profile] m=16 total=30402us  matmul=8023us(125) attn=2712us(62) qkr=679us(62) norm=459us(63) other=1373us(124) tail_norm=684us(62) tail_mlp=14905us(124) tail_gate_up=9562us(62) tail_down=5343us(62) marlin_ws_zero=1111us(248) marlin_gather=1538us(248) marlin_kernel=16534us(248) marlin_qkv_ws=267us(62) marlin_qkv_gather=317us(62) marlin_qkv_kernel=2147us(62) marlin_o_ws=274us(62) marlin_o_gather=314us(62) marlin_o_kernel=1331us(62) marlin_gate_up_ws=310us(62) marlin_gate_up_gather=357us(62) marlin_gate_up_kernel=8713us(62) marlin_down_ws=260us(62) marlin_down_gather=550us(62) marlin_down_kernel=4343us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) tail_act=438us(62) tail_resid=495us(62)  unwrapped=634us",
+    "[batched-op-profile] m=16 total=30406us  matmul=8037us(125) attn=2725us(62) qkr=686us(62) norm=460us(63) other=1366us(124) tail_norm=688us(62) tail_mlp=14891us(124) tail_gate_up=9558us(62) tail_down=5333us(62) marlin_ws_zero=1111us(248) marlin_gather=1482us(248) marlin_kernel=16549us(248) marlin_qkv_ws=290us(62) marlin_qkv_gather=320us(62) marlin_qkv_kernel=2150us(62) marlin_o_ws=259us(62) marlin_o_gather=313us(62) marlin_o_kernel=1341us(62) marlin_gate_up_ws=310us(62) marlin_gate_up_gather=320us(62) marlin_gate_up_kernel=8714us(62) marlin_down_ws=252us(62) marlin_down_gather=529us(62) marlin_down_kernel=4344us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) tail_act=433us(62) tail_resid=494us(62)  unwrapped=626us",
+    "[batched-op-profile] m=16 total=30388us  matmul=8020us(125) attn=2703us(62) qkr=677us(62) norm=462us(63) other=1366us(124) tail_norm=692us(62) tail_mlp=14908us(124) tail_gate_up=9570us(62) tail_down=5338us(62) marlin_ws_zero=1092us(248) marlin_gather=1543us(248) marlin_kernel=16539us(248) marlin_qkv_ws=261us(62) marlin_qkv_gather=317us(62) marlin_qkv_kernel=2146us(62) marlin_o_ws=267us(62) marlin_o_gather=312us(62) marlin_o_kernel=1338us(62) marlin_gate_up_ws=311us(62) marlin_gate_up_gather=361us(62) marlin_gate_up_kernel=8710us(62) marlin_down_ws=253us(62) marlin_down_gather=553us(62) marlin_down_kernel=4345us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) tail_act=434us(62) tail_resid=493us(62)  unwrapped=633us",
+    "[batched-op-profile] m=16 total=30493us  matmul=8057us(125) attn=2734us(62) qkr=683us(62) norm=447us(63) other=1384us(124) tail_norm=686us(62) tail_mlp=14930us(124) tail_gate_up=9578us(62) tail_down=5352us(62) marlin_ws_zero=1136us(248) marlin_gather=1485us(248) marlin_kernel=16565us(248) marlin_qkv_ws=309us(62) marlin_qkv_gather=320us(62) marlin_qkv_kernel=2154us(62) marlin_o_ws=254us(62) marlin_o_gather=314us(62) marlin_o_kernel=1338us(62) marlin_gate_up_ws=312us(62) marlin_gate_up_gather=321us(62) marlin_gate_up_kernel=8722us(62) marlin_down_ws=261us(62) marlin_down_gather=530us(62) marlin_down_kernel=4351us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) tail_act=436us(62) tail_resid=496us(62)  unwrapped=640us"
+  ],
+  "marlin_gate_up_kernel": {
+    "us": 8722,
+    "calls": 62
+  },
+  "marlin_down_kernel": {
+    "us": 4351,
+    "calls": 62
+  },
+  "marlin_gate_up_ws": {
+    "us": 312,
+    "calls": 62
+  },
+  "marlin_down_ws": {
+    "us": 261,
+    "calls": 62
+  },
+  "interpretation": "diagnostic typed-config Marlin profile; not release performance evidence"
+}

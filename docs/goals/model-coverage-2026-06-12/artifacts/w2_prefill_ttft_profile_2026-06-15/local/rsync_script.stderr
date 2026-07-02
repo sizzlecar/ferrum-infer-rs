@@ -1,0 +1,8 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+Transfer starting: 1 files
+run_w2_prefill_ttft_profile.sh
+
+sent 7209 bytes  received 42 bytes  4834 bytes/sec
+total size is 7054  speedup is 0.97

@@ -1,0 +1,5 @@
+{"scenario":"engine_prefill_failure_rolls_back","owner_kind":"request","owner_id":"req-prefill-fail","resource_kind":"request_slot","action":"request_open","capacity":1}
+{"scenario":"engine_prefill_failure_rolls_back","owner_kind":"request","owner_id":"req-prefill-fail","resource_kind":"kv_block","action":"reserve","amount":2,"before":8,"after":6,"capacity":8}
+{"scenario":"engine_prefill_failure_rolls_back","owner_kind":"request","owner_id":"req-prefill-fail","resource_kind":"kv_block","action":"commit","amount":2,"before":6,"after":6,"capacity":8}
+{"scenario":"engine_prefill_failure_rolls_back","owner_kind":"request","owner_id":"req-prefill-fail","resource_kind":"kv_block","action":"rollback","amount":2,"before":6,"after":8,"capacity":8,"reason":"prefill_error"}
+{"scenario":"engine_prefill_failure_rolls_back","owner_kind":"request","owner_id":"req-prefill-fail","resource_kind":"request_slot","action":"request_close","capacity":1}

@@ -1,0 +1,1 @@
+FERRUM W3 QWEN35 FUSED GATE MERGE C16 QUICK PASS: /workspace/artifacts/w3_qwen35_fused_gate_merge_c16_quick_a4bbc933_20260624T123416Z

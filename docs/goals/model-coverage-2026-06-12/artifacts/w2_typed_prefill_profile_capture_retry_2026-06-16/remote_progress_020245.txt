@@ -1,0 +1,186 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+PID=536
+    PID     ELAPSED CMD
+    536       05:05 bash /tmp/w2_capture_retry_runner.sh
+760 /workspace/ferrum-infer-rs/target/release/ferrum serve --model gemma3:27b-gptq --backend cuda --host 127.0.0.1 --port 18117 --batched-graph --max-num-seqs 16 --max-num-batched-tokens 2048 --kv-capacity 512 --effective-config-json /workspace/w2_typed_prefill_profile_capture_retry_2026-06-16/server/serve_effective_config.json --decision-trace-jsonl /workspace/w2_typed_prefill_profile_capture_retry_2026-06-16/server/serve_decision_trace.jsonl
+902 timeout 1200 /workspace/ferrum-infer-rs/target/release/ferrum bench-serve --base-url http://127.0.0.1:18117 --model gemma3:27b-gptq --tokenizer /root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2 --dataset sharegpt --sharegpt-path /workspace/w2_natural_prompt_baseline_probe_2026-06-15/dataset/ascii_sharegpt.jsonl --random-output-len 64 --concurrency-sweep 16 --num-prompts 16 --n-repeats 1 --fail-on-error --seed 9271 --out /workspace/w2_typed_prefill_profile_capture_retry_2026-06-16/bench/bench_sharegpt_c16.json
+903 /workspace/ferrum-infer-rs/target/release/ferrum bench-serve --base-url http://127.0.0.1:18117 --model gemma3:27b-gptq --tokenizer /root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2 --dataset sharegpt --sharegpt-path /workspace/w2_natural_prompt_baseline_probe_2026-06-15/dataset/ascii_sharegpt.jsonl --random-output-len 64 --concurrency-sweep 16 --num-prompts 16 --n-repeats 1 --fail-on-error --seed 9271 --out /workspace/w2_typed_prefill_profile_capture_retry_2026-06-16/bench/bench_sharegpt_c16.json
+922 bash -c ART=/workspace/w2_typed_prefill_profile_capture_retry_2026-06-16; set +e; pid=$(cat "$ART/remote/runner.pid" 2>/dev/null); echo PID=$pid; ps -p $pid -o pid,etime,cmd 2>/dev/null; pgrep -af "cargo|rustc|ferrum serve|bench-serve" | head -20; echo build_rc=$(cat "$ART/remote/cargo_build.rc" 2>/dev/null); echo profile_rc=$(cat "$ART/remote/run_remote_profile.outer.rc" 2>/dev/null); echo run_profile_rc=$(cat "$ART/run_profile.rc" 2>/dev/null); echo bench_rc=$(cat "$ART/bench/bench_sharegpt_c16.rc" 2>/dev/null); echo ready_poll=$(cat "$ART/server/ready_poll_count.txt" 2>/dev/null); echo runner_end=$(cat "$ART/remote/runner_end_utc.txt" 2>/dev/null); echo --- build stderr ---; tail -50 "$ART/logs/cargo_build.stderr" 2>/dev/null; echo --- profile stdout ---; tail -80 "$ART/logs/run_remote_profile.outer.stdout" 2>/dev/null; echo --- profile stderr ---; tail -80 "$ART/logs/run_remote_profile.outer.stderr" 2>/dev/null; echo --- server log ---; tail -160 "$ART/server/server.log" 2>/dev/null
+build_rc=0
+profile_rc=
+run_profile_rc=
+bench_rc=
+ready_poll=58
+runner_end=
+--- build stderr ---
+   Compiling ferrum-models v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-models)
+   Compiling ferrum-engine v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-cli)
+    Finished `release` profile [optimized] target(s) in 3m 29s
+--- profile stdout ---
+CHAT_SMOKE_PASS content='5' completion_tokens=3
+--- profile stderr ---
+--- server log ---
+[bg-loop-gap] call#224 inter_iter=3us
+[bg-loop-gap] call#232 inter_iter=6us
+[bg-loop-gap] call#240 inter_iter=4us
+[bg-loop-gap] call#248 inter_iter=3us
+[bg-loop-gap] call#256 inter_iter=4us
+[bg-loop-gap] call#264 inter_iter=2us
+[bg-loop-gap] call#272 inter_iter=4us
+[bg-loop-gap] call#280 inter_iter=3us
+[bg-loop-gap] call#288 inter_iter=3us
+[bg-loop-gap] call#296 inter_iter=3us
+[bg-loop-gap] call#304 inter_iter=3us
+[bg-loop-gap] call#312 inter_iter=4us
+[bg-loop-gap] call#320 inter_iter=4us
+[bg-loop-gap] call#328 inter_iter=4us
+[bg-loop-gap] call#336 inter_iter=3us
+[bg-loop-gap] call#344 inter_iter=3us
+[bg-loop-gap] call#352 inter_iter=2us
+[bg-loop-gap] call#360 inter_iter=3us
+[bg-loop-gap] call#368 inter_iter=3us
+[bg-loop-gap] call#376 inter_iter=3us
+[bg-loop-gap] call#384 inter_iter=3us
+[bg-loop-gap] call#392 inter_iter=5us
+[bg-loop-gap] call#400 inter_iter=2us
+[bg-loop-gap] call#408 inter_iter=3us
+[bg-loop-gap] call#416 inter_iter=2us
+[bg-loop-gap] call#424 inter_iter=3us
+[bg-loop-gap] call#432 inter_iter=3us
+[bg-loop-gap] call#440 inter_iter=3us
+[bg-loop-gap] call#448 inter_iter=3us
+[bg-loop-gap] call#456 inter_iter=3us
+[bg-loop-gap] call#464 inter_iter=3us
+[bg-loop-gap] call#472 inter_iter=3us
+[bg-loop-gap] call#480 inter_iter=3us
+[bg-loop-gap] call#488 inter_iter=4us
+[bg-loop-gap] call#496 inter_iter=3us
+[bg-loop-gap] call#504 inter_iter=2us
+[prefill-profile] tokens=122 layers total=91 ms
+[prefill-profile] flash_attn: 62 calls 33 ms (avg 544 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 28 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 107 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 13 us)
+[prefill-profile] tail_gate_up: 62 calls 25 ms (avg 411 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 15 us)
+[prefill-profile] tail_down: 62 calls 15 ms (avg 248 us)
+[prefill-profile] tail_mlp: 62 calls 41 ms (avg 674 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tokens=122 layers total=91 ms
+[prefill-profile] flash_attn: 62 calls 33 ms (avg 544 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 28 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 106 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 13 us)
+[prefill-profile] tail_gate_up: 62 calls 25 ms (avg 410 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 15 us)
+[prefill-profile] tail_down: 62 calls 15 ms (avg 246 us)
+[prefill-profile] tail_mlp: 62 calls 41 ms (avg 672 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[prefill-profile] tokens=122 layers total=84 ms
+[prefill-profile] flash_attn: 62 calls 30 ms (avg 497 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 27 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 98 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tail_gate_up: 62 calls 23 ms (avg 377 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 14 us)
+[prefill-profile] tail_down: 62 calls 13 ms (avg 225 us)
+[prefill-profile] tail_mlp: 62 calls 38 ms (avg 618 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[prefill-profile] tokens=122 layers total=83 ms
+[prefill-profile] flash_attn: 62 calls 30 ms (avg 491 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 27 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 97 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tail_gate_up: 62 calls 23 ms (avg 374 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 14 us)
+[prefill-profile] tail_down: 62 calls 13 ms (avg 223 us)
+[prefill-profile] tail_mlp: 62 calls 37 ms (avg 612 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[prefill-profile] tokens=122 layers total=83 ms
+[prefill-profile] flash_attn: 62 calls 30 ms (avg 491 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 27 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 97 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tail_gate_up: 62 calls 23 ms (avg 374 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 14 us)
+[prefill-profile] tail_down: 62 calls 13 ms (avg 223 us)
+[prefill-profile] tail_mlp: 62 calls 37 ms (avg 612 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[prefill-profile] tokens=122 layers total=83 ms
+[prefill-profile] flash_attn: 62 calls 30 ms (avg 491 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 26 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 97 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tail_gate_up: 62 calls 23 ms (avg 374 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 14 us)
+[prefill-profile] tail_down: 62 calls 13 ms (avg 223 us)
+[prefill-profile] tail_mlp: 62 calls 37 ms (avg 612 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[prefill-profile] tokens=122 layers total=83 ms
+[prefill-profile] flash_attn: 62 calls 30 ms (avg 491 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 27 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 97 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tail_gate_up: 62 calls 23 ms (avg 374 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 15 us)
+[prefill-profile] tail_down: 62 calls 13 ms (avg 223 us)
+[prefill-profile] tail_mlp: 62 calls 38 ms (avg 612 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[prefill-profile] tokens=122 layers total=83 ms
+[prefill-profile] flash_attn: 62 calls 30 ms (avg 491 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 27 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 97 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 13 us)
+[prefill-profile] tail_gate_up: 62 calls 23 ms (avg 374 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 15 us)
+[prefill-profile] tail_down: 62 calls 13 ms (avg 223 us)
+[prefill-profile] tail_mlp: 62 calls 38 ms (avg 613 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[prefill-profile] tokens=122 layers total=83 ms
+[prefill-profile] flash_attn: 62 calls 30 ms (avg 491 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 27 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 97 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tail_gate_up: 62 calls 23 ms (avg 374 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 14 us)
+[prefill-profile] tail_down: 62 calls 13 ms (avg 223 us)
+[prefill-profile] tail_mlp: 62 calls 38 ms (avg 613 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[prefill-profile] tokens=122 layers total=83 ms
+[prefill-profile] flash_attn: 62 calls 30 ms (avg 491 us)
+[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 27 us)
+[prefill-profile] matmuls: 62 calls 6 ms (avg 97 us)
+[prefill-profile] norms: 62 calls 0 ms (avg 8 us)
+[prefill-profile] tail_norm: 62 calls 0 ms (avg 12 us)
+[prefill-profile] tail_gate_up: 62 calls 23 ms (avg 374 us)
+[prefill-profile] tail_act: 62 calls 0 ms (avg 14 us)
+[prefill-profile] tail_down: 62 calls 13 ms (avg 223 us)
+[prefill-profile] tail_mlp: 62 calls 37 ms (avg 612 us)
+[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)
+[unified-prof] iter#3 items=10 prefill=10 decode=0 total=892506us model=890117us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)
+[batched-qkr] first batched_decode call: m=10 use_batched_qkr=true (q=None k=None v=None)
+[batched-kv-append] first call: m=10 ok=true k_err=None v_err=None
+[batched-attn] first call: m=10 ok=true err=None
+[batched-op-profile] m=10 total=27836us  matmul=7117us(125) attn=2013us(62) qkr=910us(62) norm=462us(63) other=1496us(124) tail_norm=685us(62) tail_mlp=13577us(124) tail_gate_up=8924us(62) tail_down=4653us(62) marlin_ws_zero=0us(0) marlin_kernel=0us(0) marlin_qkv_ws=0us(0) marlin_qkv_kernel=0us(0) marlin_o_ws=0us(0) marlin_o_kernel=0us(0) marlin_gate_up_ws=0us(0) marlin_gate_up_kernel=0us(0) marlin_down_ws=0us(0) marlin_down_kernel=0us(0) marlin_lm_head_ws=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_kernel=0us(0) tail_act=382us(62) tail_resid=499us(62)  unwrapped=695us
+[unified-prof] iter#4 items=10 prefill=0 decode=10 total=28681us model=28527us decode_post=141us | sample=8 sched=0 stream=133 stop=0 complete=0 (us)
+[batched-op-profile] m=10 total=26973us  matmul=6929us(125) attn=1868us(62) qkr=626us(62) norm=446us(63) other=1362us(124) tail_norm=716us(62) tail_mlp=13511us(124) tail_gate_up=8896us(62) tail_down=4615us(62) marlin_ws_zero=0us(0) marlin_kernel=0us(0) marlin_qkv_ws=0us(0) marlin_qkv_kernel=0us(0) marlin_o_ws=0us(0) marlin_o_kernel=0us(0) marlin_gate_up_ws=0us(0) marlin_gate_up_kernel=0us(0) marlin_down_ws=0us(0) marlin_down_kernel=0us(0) marlin_lm_head_ws=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_kernel=0us(0) tail_act=372us(62) tail_resid=494us(62)  unwrapped=649us
+[unified-prof] iter#5 items=10 prefill=0 decode=10 total=27727us model=27577us decode_post=140us | sample=12 sched=0 stream=128 stop=0 complete=0 (us)
+[batched-op-profile] m=10 total=26876us  matmul=6890us(125) attn=1880us(62) qkr=622us(62) norm=459us(63) other=1334us(124) tail_norm=688us(62) tail_mlp=13480us(124) tail_gate_up=8867us(62) tail_down=4613us(62) marlin_ws_zero=0us(0) marlin_kernel=0us(0) marlin_qkv_ws=0us(0) marlin_qkv_kernel=0us(0) marlin_o_ws=0us(0) marlin_o_kernel=0us(0) marlin_gate_up_ws=0us(0) marlin_gate_up_kernel=0us(0) marlin_down_ws=0us(0) marlin_down_kernel=0us(0) marlin_lm_head_ws=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_kernel=0us(0) tail_act=374us(62) tail_resid=491us(62)  unwrapped=658us
+[unified-prof] iter#6 items=10 prefill=0 decode=10 total=27673us model=27477us decode_post=182us | sample=14 sched=0 stream=168 stop=0 complete=0 (us)
+
+thread 'tokio-runtime-worker' (766) panicked at crates/ferrum-kernels/src/backend/cuda/mod.rs:843:34:
+CudaBackend: stream sync: DriverError(CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED, "operation not permitted when stream is capturing")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

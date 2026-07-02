@@ -1,0 +1,101 @@
+diff --git a/scripts/microbenches/README.md b/scripts/microbenches/README.md
+index b4587cdc..ba8f36c0 100644
+--- a/scripts/microbenches/README.md
++++ b/scripts/microbenches/README.md
+@@ -28,7 +28,7 @@ nvcc -O3 -arch=sm_89 -std=c++17 -I<include-path> \
+ | `scalar_type_id_test.cu` (+ `_other_tu.cu`) | Verifies `vllm::ScalarType::id()` constexpr produces consistent values across translation units, and that template specializations keyed on those IDs dispatch correctly. **Two-TU compile required.** |
+ | `paged_varlen_window_correctness.cu` | Direct C-ABI correctness probe for Ferrum's paged varlen attention one-pass and split-K kernels. Compares `sliding_window=0` and a local-window case against CPU reference before enabling Gemma3 unified prefill semantics. |
+ | `gemma3_shadow_graph_bench.cu` | Standalone CUDA graph probe for a Gemma3-style 62-layer device F32 residual shadow decode step. Use it to validate graph replay stability and launch-overhead headroom before enabling graph capture on the product Gemma3 shadow path. |
+-| `dense_marlin_gemma3_perf.cu` | Direct C-ABI benchmark for Ferrum's default dense Marlin GEMM on Gemma3-27B GPTQ qkv/o/gate_up/down shapes. Reports hot event timing, product-profile-style host-sync timing, limited cold-cache timing, and multi-weight-cycle timing for key auto-tile shapes. Use before changing dense Marlin tile selection or grid policy. |
++| `dense_marlin_gemma3_perf.cu` | Direct C-ABI benchmark for Ferrum's default dense Marlin GEMM on Gemma3-27B GPTQ qkv/o/gate_up/down shapes. Reports hot event timing, product-profile-style host-sync timing, limited cold-cache timing, multi-weight-cycle timing, and block-policy probes for key auto-tile shapes. Use before changing dense Marlin tile selection or grid policy. |
+ | `dense_vllm_marlin_gemma3_perf.cu` | Direct C-ABI benchmark for the vendored vLLM dense GPTQ-Marlin kernel on Gemma3-27B GPTQ qkv/gate_up/down shapes. The build script uses a temporary minimal selector, so this stays a native diagnostic and does not alter product dense GPTQ routing. |
+ | `moe_marlin_active65_perf.cu` | Direct C-ABI benchmark for Ferrum's vLLM-Marlin MoE gate/up and down kernels on the real c32 active65 route. Links against existing `ferrum-kernels` build objects, avoiding a full Cargo rebuild. |
+ | `vllm_flash_attn_varlen_probe.py` | Runs vLLM 0.20.2 `flash_attn_varlen_func` on Qwen3 paged-varlen prefill/mixed shapes. Use it to size the upside before porting a real FA-style varlen kernel into Ferrum. |
+diff --git a/scripts/microbenches/dense_marlin_gemma3_perf.cu b/scripts/microbenches/dense_marlin_gemma3_perf.cu
+index b9e6e6d1..5c77d63e 100644
+--- a/scripts/microbenches/dense_marlin_gemma3_perf.cu
++++ b/scripts/microbenches/dense_marlin_gemma3_perf.cu
+@@ -46,6 +46,11 @@ struct Tile {
+     int thread_n;
+ };
+ 
++struct BlockPolicy {
++    const char* name;
++    int blocks;
++};
++
+ constexpr int GROUP_SIZE = 128;
+ constexpr int MAX_PAR = 16;
+ constexpr int WARMUP_ITERS = 5;
+@@ -62,6 +67,13 @@ static int padded_m(int m) {
+     return ((m + 15) / 16) * 16;
+ }
+ 
++static int resolved_thread_n(const Tile& tile, int m) {
++    if (tile.thread_n > 0) {
++        return tile.thread_n;
++    }
++    return m <= 16 ? 128 : 256;
++}
++
+ static void* cuda_alloc_bytes(size_t bytes, int pattern) {
+     void* ptr = nullptr;
+     CHK(cudaMalloc(&ptr, bytes));
+@@ -427,6 +439,57 @@ static void run_shape(const Shape& shape, const std::vector<int>& m_values) {
+                                 cycle_useful_tflops,
+                                 cycle_padded_tflops);
+                 }
++
++                int n_tiles = shape.n / resolved_thread_n(tile, m);
++                BlockPolicy policies[] = {
++                    {"n_tiles", n_tiles},
++                    {"2sms", sms * 2},
++                };
++                for (const BlockPolicy& policy : policies) {
++                    if (policy.blocks <= 0 || policy.blocks == sms) {
++                        continue;
++                    }
++                    if (std::strcmp(policy.name, "2sms") == 0 && policy.blocks == n_tiles) {
++                        continue;
++                    }
++                    float policy_us = time_weight_cycle(
++                        stream,
++                        a,
++                        b_cycle,
++                        c,
++                        scale_cycle,
++                        workspace_cycle,
++                        workspace_bytes,
++                        shape,
++                        m,
++                        tile,
++                        false,
++                        policy.blocks);
++                    char policy_label[96];
++                    std::snprintf(policy_label,
++                                  sizeof(policy_label),
++                                  "weight_cycle_blocks_%s_kernel",
++                                  policy.name);
++                    if (policy_us < 0.0f) {
++                        std::printf("%s,%d,%s,NA,NA,NA,%d\n",
++                                    policy_label,
++                                    m,
++                                    tile.name,
++                                    static_cast<int>(-policy_us));
++                        continue;
++                    }
++                    double policy_useful_tflops =
++                        useful_ops / (static_cast<double>(policy_us) * 1.0e6);
++                    double policy_padded_tflops =
++                        padded_ops / (static_cast<double>(policy_us) * 1.0e6);
++                    std::printf("%s,%d,%s,%.3f,%.2f,%.2f,0\n",
++                                policy_label,
++                                m,
++                                tile.name,
++                                policy_us,
++                                policy_useful_tflops,
++                                policy_padded_tflops);
++                }
+             }
+         }
+     }

@@ -1,0 +1,6 @@
+{
+  "model": "gemma3:27b-gptq",
+  "messages": [{"role": "user", "content": "What is 2+3? Answer with just the number."}],
+  "max_tokens": 16,
+  "temperature": 0
+}

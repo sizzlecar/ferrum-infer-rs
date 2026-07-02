@@ -1,0 +1,18 @@
+[microbench] compiling scripts/microbenches/gemma3_down_l2_persist_cycle_perf.cu
+-rwxr-xr-x 1 root root 695176 Jun 15 23:44 /workspace/ferrum-artifacts/w2_down_l2_persist_cycle_native_probe_2026-06-16/gemma3_down_l2_persist_cycle_perf
+
+[microbench] running /workspace/ferrum-artifacts/w2_down_l2_persist_cycle_native_probe_2026-06-16/gemma3_down_l2_persist_cycle_perf
+gemma3_down_l2_persist_cycle_perf device=NVIDIA GeForce RTX 4090 sm=8.9 h=5376 im=21504 layers=8 l2=75497472 persist_max=51904512 access_window_max=134213632
+mode,layers,m,hit_ratio,policy_window_bytes,down_us,useful_tflops,ret
+single_layer_no_policy,1,16,0.00,0,69.832,52.98,0
+single_layer_persist_hit60,1,16,0.60,57802752,34.493,107.25,0
+cycle8_no_policy,8,16,0.00,0,69.736,53.05,0
+cycle8_persist_hit60,8,16,0.60,57802752,69.743,53.04,0
+cycle8_persist_hit60_down_warm,8,16,0.60,57802752,34.634,106.81,0
+single_layer_no_policy,1,32,0.00,0,75.903,97.48,0
+single_layer_persist_hit60,1,32,0.60,57802752,58.984,125.44,0
+cycle8_no_policy,8,32,0.00,0,75.745,97.68,0
+cycle8_persist_hit60,8,32,0.60,57802752,75.117,98.50,0
+cycle8_persist_hit60_down_warm,8,32,0.60,57802752,54.067,136.84,0
+
+VERDICT: gemma3 down L2 persistence cycle native CUDA probe complete

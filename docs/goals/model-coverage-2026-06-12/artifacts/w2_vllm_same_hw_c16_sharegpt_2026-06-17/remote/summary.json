@@ -1,0 +1,138 @@
+{
+  "dataset_sha256": "58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e  /workspace/ascii_sharegpt_w2_100.jsonl",
+  "ferrum_binary_sha256": "ca11f78f9e1be27a26bd12f50e377f3def602f14220cb10e1099eadb4f35ca93  target/release/ferrum",
+  "ferrum_completed_per_run": [
+    100,
+    100,
+    100
+  ],
+  "ferrum_errored_per_run": [
+    0,
+    0,
+    0
+  ],
+  "ferrum_lcb_vs_vllm_lcb_ratio": 0.8666308262975292,
+  "ferrum_output_token_count_source": "usage",
+  "ferrum_output_tps_lcb": 414.59153186899397,
+  "ferrum_output_tps_mean": 422.34520497237537,
+  "ferrum_p95_itl_ms_mean": 52.81935383333333,
+  "ferrum_p95_itl_vs_vllm_p95_itl_ratio": 1.597218665188174,
+  "ferrum_quality_issues_per_run": [
+    {
+      "bad_output": 0,
+      "duplicate_done": 0,
+      "http_500": 0,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "panic": 0,
+      "stream_bulk_flush": 0,
+      "zero_output_tokens": 0
+    },
+    {
+      "bad_output": 0,
+      "duplicate_done": 0,
+      "http_500": 0,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "panic": 0,
+      "stream_bulk_flush": 0,
+      "zero_output_tokens": 0
+    },
+    {
+      "bad_output": 0,
+      "duplicate_done": 0,
+      "http_500": 0,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "panic": 0,
+      "stream_bulk_flush": 0,
+      "zero_output_tokens": 0
+    }
+  ],
+  "ferrum_smoke": {
+    "content": "5\n",
+    "done_count": 1,
+    "usage": {
+      "completion_tokens": 3,
+      "prompt_tokens": 23,
+      "total_tokens": 26
+    }
+  },
+  "lane": "w2_vllm_ferrum_same_hw_c16_sharegpt_ab",
+  "model_path": "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+  "remote_git_sha": "96d2df73e82ab4c0d643ced32d1f424b29dc5353",
+  "remote_git_status_short": "",
+  "status": "diagnostic_pass",
+  "torch_cuda": {
+    "cuda": "12.6",
+    "cuda_available": true,
+    "device_count": 1,
+    "device_name_0": "NVIDIA GeForce RTX 4090",
+    "torch": "2.7.1+cu126"
+  },
+  "vllm_completed_per_run": [
+    100,
+    100,
+    100
+  ],
+  "vllm_errored_per_run": [
+    0,
+    0,
+    0
+  ],
+  "vllm_output_token_count_source": "usage",
+  "vllm_output_tps_lcb": 478.39462812583776,
+  "vllm_output_tps_mean": 500.67038762731977,
+  "vllm_p95_itl_ms_mean": 33.06958213333332,
+  "vllm_quality_issues_per_run": [
+    {
+      "bad_output": 0,
+      "duplicate_done": 0,
+      "http_500": 0,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "panic": 0,
+      "stream_bulk_flush": 0,
+      "zero_output_tokens": 0
+    },
+    {
+      "bad_output": 0,
+      "duplicate_done": 0,
+      "http_500": 0,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "panic": 0,
+      "stream_bulk_flush": 0,
+      "zero_output_tokens": 0
+    },
+    {
+      "bad_output": 0,
+      "duplicate_done": 0,
+      "http_500": 0,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "panic": 0,
+      "stream_bulk_flush": 0,
+      "zero_output_tokens": 0
+    }
+  ],
+  "vllm_smoke": {
+    "content": "5\n",
+    "done_count": 1,
+    "usage": {
+      "completion_tokens": 3,
+      "prompt_tokens": 22,
+      "total_tokens": 25
+    }
+  },
+  "vllm_versions": {
+    "fastapi": "0.116.1",
+    "prometheus-fastapi-instrumentator": "7.1.0",
+    "starlette": "0.47.2",
+    "torch": "2.7.1",
+    "transformers": "4.55.4",
+    "vllm": "0.10.1.1"
+  },
+  "w2_p95_itl_pass_at_c16": false,
+  "w2_throughput_pass_at_c16": true
+}

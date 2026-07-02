@@ -1,0 +1,13 @@
+ferrum bench-serve — dataset=sharegpt num_prompts=32 warmup=4 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=32
+  cell closed_loop c=32 — repeat 1/1 (36 prompts including 4 warmup)
+    32 completed / 0 errored / 8.8s
+    summary c=32 (n_repeats=1, no CI)
+      TTFT_ms  p50=1949.2  p95=1949.3  p99=1949.3
+      TPOT_ms  p50=33.1  p95=54.2  p99=54.2
+      ITL_ms   p50=19.0  p95=62.1  p99=129.6
+      throughput      463.4 tok/s
+      goodput         3.62 req/s
+
+→ wrote /workspace/artifacts/w3_qwen35_mixed_recompute_kv_headroom_c32_5810442a_20260625T095713Z/perf/bench_ferrum_c32_32x1.json

@@ -1,0 +1,1 @@
+DIAG_METRIC c 16 output_tps 129.44925443545154 completed [16] errored [0] ttft_p95 1443.827339 itl_p95 82.706456

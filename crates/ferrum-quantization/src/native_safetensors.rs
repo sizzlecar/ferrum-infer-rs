@@ -19,6 +19,7 @@ use std::fs::File;
 use std::path::Path;
 
 use ferrum_kernels::backend::{Backend, BackendQuantMarlin, SrcDtype};
+use ferrum_kernels::LinearMetadata;
 use ferrum_types::{FerrumError, Result};
 use half::{bf16, f16};
 use memmap2::Mmap;
@@ -344,7 +345,10 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
     ) -> Result<(Vec<i32>, Vec<f32>, Vec<i32>, Option<Vec<i32>>, usize, usize)> {
         let (qweight, qw_shape) = self.read_i32(&format!("{name}.qweight"))?;
         let (scales, _) = self.read_f32(&format!("{name}.scales"))?;
-        let (qzeros, _) = self.read_i32(&format!("{name}.qzeros"))?;
+        let (mut qzeros, _) = self.read_i32(&format!("{name}.qzeros"))?;
+        if let Some(qcfg) = self.quant_config.as_ref() {
+            canonicalize_gptq_qzeros_for_sym(qcfg, &mut qzeros);
+        }
         let g_idx = if self.has(&format!("{name}.g_idx")) {
             Some(self.read_i32(&format!("{name}.g_idx"))?.0)
         } else {
@@ -427,7 +431,8 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
                 let name = format!("{prefix}{proj}");
                 let (qw, qw_sh) = self.read_i32(&format!("{name}.qweight"))?;
                 let (sc, sc_sh) = self.read_f32(&format!("{name}.scales"))?;
-                let (qz, qz_sh) = self.read_i32(&format!("{name}.qzeros"))?;
+                let (mut qz, qz_sh) = self.read_i32(&format!("{name}.qzeros"))?;
+                canonicalize_gptq_qzeros_for_sym(qcfg, &mut qz);
                 if qw_sh.len() != 2 || sc_sh.len() != 2 || qz_sh.len() != 2 {
                     return Err(FerrumError::model(format!(
                         "stacked GPTQ '{name}': expected 2D, got qw {qw_sh:?} sc {sc_sh:?} qz {qz_sh:?}"
@@ -614,6 +619,18 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
                 return self.load_gptq_linear_fused(&parts);
             }
         }
+        if let Some(prefix) = name.strip_suffix("in_proj_qkvz") {
+            let parts = [format!("{prefix}in_proj_qkv"), format!("{prefix}in_proj_z")];
+            if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
+                return self.load_gptq_linear_fused(&parts);
+            }
+        }
+        if let Some(prefix) = name.strip_suffix("in_proj_ba") {
+            let parts = [format!("{prefix}in_proj_b"), format!("{prefix}in_proj_a")];
+            if parts.iter().all(|p| self.has(&format!("{p}.qweight"))) {
+                return self.load_gptq_linear_fused(&parts);
+            }
+        }
 
         // Direct fused `<name>.weight` next. Load straight from raw bytes
         // so fp16-preferring backends can skip the f32 Vec intermediate.
@@ -626,9 +643,10 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
                 )));
             }
             let weight = B::from_weight_bytes(raw, src_dtype);
-            return Ok(Box::new(DenseLinear::<B>::from_buffer(
-                weight, shape[0], shape[1],
-            )));
+            return Ok(Box::new(
+                DenseLinear::<B>::from_buffer(weight, shape[0], shape[1])
+                    .with_metadata(LinearMetadata::from_name(name)),
+            ));
         }
 
         // Llama-family fusion shims: synthesise qkv_proj / gate_up_proj from
@@ -644,7 +662,9 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
             if parts.iter().all(|p| self.has(p)) {
                 let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
                 let weight = B::from_weight_bytes(&bytes, dtype);
-                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols);
+                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols).with_metadata(
+                    LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
+                );
                 if let Some(bias) = self.cat_optional_biases(&parts, rows)? {
                     linear = linear.with_bias(B::from_slice(&bias));
                 }
@@ -659,7 +679,43 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
             if parts.iter().all(|p| self.has(p)) {
                 let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
                 let weight = B::from_weight_bytes(&bytes, dtype);
-                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols);
+                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols).with_metadata(
+                    LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
+                );
+                if let Some(bias) = self.cat_optional_biases(&parts, rows)? {
+                    linear = linear.with_bias(B::from_slice(&bias));
+                }
+                return Ok(Box::new(linear));
+            }
+        }
+        if let Some(prefix) = name.strip_suffix("in_proj_qkvz") {
+            let parts = [
+                format!("{prefix}in_proj_qkv.weight"),
+                format!("{prefix}in_proj_z.weight"),
+            ];
+            if parts.iter().all(|p| self.has(p)) {
+                let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
+                let weight = B::from_weight_bytes(&bytes, dtype);
+                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols).with_metadata(
+                    LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
+                );
+                if let Some(bias) = self.cat_optional_biases(&parts, rows)? {
+                    linear = linear.with_bias(B::from_slice(&bias));
+                }
+                return Ok(Box::new(linear));
+            }
+        }
+        if let Some(prefix) = name.strip_suffix("in_proj_ba") {
+            let parts = [
+                format!("{prefix}in_proj_b.weight"),
+                format!("{prefix}in_proj_a.weight"),
+            ];
+            if parts.iter().all(|p| self.has(p)) {
+                let (bytes, dtype, (rows, cols)) = self.cat_rows_bytes(&parts)?;
+                let weight = B::from_weight_bytes(&bytes, dtype);
+                let mut linear = DenseLinear::<B>::from_buffer(weight, rows, cols).with_metadata(
+                    LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
+                );
                 if let Some(bias) = self.cat_optional_biases(&parts, rows)? {
                     linear = linear.with_bias(B::from_slice(&bias));
                 }
@@ -678,6 +734,24 @@ impl<B: Backend + BackendQuantMarlin> WeightLoader<B> for NativeSafetensorsLoade
 
     fn quant_config(&self) -> Option<&QuantConfig> {
         self.quant_config.as_ref()
+    }
+
+    fn load_stacked_gptq_experts(
+        &self,
+        expert_prefix_fmt: &str,
+        num_experts: usize,
+        proj_names: &[&str],
+    ) -> Result<(
+        std::sync::Arc<dyn ferrum_kernels::MarlinExpertStack<B>>,
+        usize,
+        usize,
+    )> {
+        NativeSafetensorsLoader::load_stacked_gptq_experts(
+            self,
+            expert_prefix_fmt,
+            num_experts,
+            proj_names,
+        )
     }
 }
 
@@ -702,7 +776,8 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
 
         let (qweight, qw_shape) = self.read_i32(&format!("{name}.qweight"))?;
         let (scales_f32, sc_shape) = self.read_f32(&format!("{name}.scales"))?;
-        let (qzeros, _qz_shape) = self.read_i32(&format!("{name}.qzeros"))?;
+        let (mut qzeros, _qz_shape) = self.read_i32(&format!("{name}.qzeros"))?;
+        canonicalize_gptq_qzeros_for_sym(qcfg, &mut qzeros);
         let g_idx = if self.has(&format!("{name}.g_idx")) {
             Some(self.read_i32(&format!("{name}.g_idx"))?.0)
         } else {
@@ -739,7 +814,8 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
                 out_features,
             );
             let mut linear =
-                crate::dense::DenseLinear::<B>::from_rows(&dequant_f32, out_features, in_features);
+                crate::dense::DenseLinear::<B>::from_rows(&dequant_f32, out_features, in_features)
+                    .with_metadata(LinearMetadata::from_name(name));
             let bias_key = format!("{name}.bias");
             if self.has(&bias_key) {
                 let (bias, _) = self.read_f32(&bias_key)?;
@@ -781,7 +857,7 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
             None
         };
 
-        let linear = GptqLinear::<B>::from_raw(
+        let linear = GptqLinear::<B>::from_raw_with_metadata(
             &qweight,
             &scales_f32,
             &qzeros,
@@ -791,6 +867,7 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
             qcfg.group_size,
             in_features,
             out_features,
+            LinearMetadata::from_name(name),
         )?;
         Ok(Box::new(linear))
     }
@@ -837,7 +914,8 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
         for p in parts {
             let (qw, qw_sh) = self.read_i32(&format!("{p}.qweight"))?;
             let (sc, sc_sh) = self.read_f32(&format!("{p}.scales"))?;
-            let (qz, qz_sh) = self.read_i32(&format!("{p}.qzeros"))?;
+            let (mut qz, qz_sh) = self.read_i32(&format!("{p}.qzeros"))?;
+            canonicalize_gptq_qzeros_for_sym(qcfg, &mut qz);
             if qw_sh.len() != 2 || sc_sh.len() != 2 || qz_sh.len() != 2 {
                 return Err(FerrumError::model(format!(
                     "GPTQ fusion '{p}': expected 2D tensors, got qw {qw_sh:?} sc {sc_sh:?} qz {qz_sh:?}"
@@ -943,7 +1021,10 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
                 out_features,
             );
             let mut linear =
-                crate::dense::DenseLinear::<B>::from_rows(&dequant_f32, out_features, in_features);
+                crate::dense::DenseLinear::<B>::from_rows(&dequant_f32, out_features, in_features)
+                    .with_metadata(LinearMetadata::from_fused_names(
+                        parts.iter().map(String::as_str),
+                    ));
             let mut bias_acc: Vec<f32> = Vec::new();
             let mut any_bias = false;
             for p in parts {
@@ -1004,7 +1085,7 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
             None
         };
 
-        let linear = GptqLinear::<B>::from_raw(
+        let linear = GptqLinear::<B>::from_raw_with_metadata(
             &qw_acc,
             &sc_acc,
             &qz_acc,
@@ -1014,6 +1095,7 @@ impl<B: Backend + BackendQuantMarlin> NativeSafetensorsLoader<B> {
             qcfg.group_size,
             in_features,
             out_features,
+            LinearMetadata::from_fused_names(parts.iter().map(String::as_str)),
         )?;
 
         Ok(Box::new(linear))
@@ -1154,6 +1236,12 @@ fn gptq_qzero_stats(qzeros: &[i32]) -> GptqQzeroStats {
         max_code,
         code7_count: histogram[7],
         histogram,
+    }
+}
+
+fn canonicalize_gptq_qzeros_for_sym(qcfg: &QuantConfig, qzeros: &mut [i32]) {
+    if qcfg.method == QuantMethod::Gptq && qcfg.sym && qcfg.bits == 4 {
+        qzeros.fill(0x7777_7777);
     }
 }
 
@@ -1444,12 +1532,16 @@ mod tests {
     use super::*;
 
     fn gptq_config(desc_act: bool) -> QuantConfig {
+        gptq_config_with_sym(desc_act, true)
+    }
+
+    fn gptq_config_with_sym(desc_act: bool, sym: bool) -> QuantConfig {
         QuantConfig {
             method: QuantMethod::Gptq,
             bits: 4,
             group_size: 2,
             desc_act,
-            sym: true,
+            sym,
         }
     }
 
@@ -1538,5 +1630,24 @@ mod tests {
         assert_eq!(stats.max_code, 7);
         assert_eq!(stats.code7_count, 1);
         assert!(!stats.all_code7());
+    }
+
+    #[test]
+    fn symmetric_gptq_qzeros_are_canonicalized_to_code7() {
+        let mut qzeros = vec![0x8888_8888u32 as i32, 0x0123_4567];
+
+        canonicalize_gptq_qzeros_for_sym(&gptq_config(true), &mut qzeros);
+
+        assert_eq!(qzeros, vec![0x7777_7777, 0x7777_7777]);
+        assert!(gptq_qzero_stats(&qzeros).all_code7());
+    }
+
+    #[test]
+    fn asymmetric_gptq_qzeros_are_preserved() {
+        let mut qzeros = vec![0x8888_8888u32 as i32, 0x0123_4567];
+
+        canonicalize_gptq_qzeros_for_sym(&gptq_config_with_sym(false, false), &mut qzeros);
+
+        assert_eq!(qzeros, vec![0x8888_8888u32 as i32, 0x0123_4567]);
     }
 }

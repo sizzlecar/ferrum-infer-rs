@@ -185,6 +185,17 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub paged_max_seqs: Option<usize>,
 
+    /// Generic recurrent-state slot-pool size, equivalent to
+    /// `FERRUM_RECURRENT_STATE_MAX_SLOTS`.
+    #[serde(default)]
+    pub recurrent_state_max_slots: Option<usize>,
+
+    /// Legacy Qwen3.5 linear recurrent-state slot-pool size, equivalent to
+    /// `FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS`. Prefer
+    /// `recurrent_state_max_slots` for new configs.
+    #[serde(default)]
+    pub qwen35_linear_state_max_slots: Option<usize>,
+
     /// Scheduler/model max batched-token budget, equivalent to
     /// `FERRUM_MAX_BATCHED_TOKENS`.
     #[serde(default)]
@@ -194,6 +205,11 @@ pub struct RuntimeCliConfig {
     /// `FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE`.
     #[serde(default)]
     pub scheduler_prefill_first_until_active: Option<usize>,
+
+    /// Cap prefill chunks while decode requests are active, equivalent to
+    /// `FERRUM_ACTIVE_DECODE_PREFILL_CHUNK`.
+    #[serde(default)]
+    pub scheduler_active_decode_prefill_chunk: Option<usize>,
 
     /// Prefix cache opt-in, equivalent to `FERRUM_PREFIX_CACHE`.
     #[serde(default)]
@@ -207,6 +223,76 @@ pub struct RuntimeCliConfig {
     /// MoE CUDA graph policy override, equivalent to `FERRUM_MOE_GRAPH`.
     #[serde(default)]
     pub moe_graph: Option<bool>,
+
+    /// Legacy Llama/Gemma batched decode CUDA graph policy override,
+    /// equivalent to `FERRUM_BATCHED_GRAPH`.
+    #[serde(default)]
+    pub batched_graph: Option<bool>,
+
+    /// Unified Llama/Gemma decode CUDA graph policy override,
+    /// equivalent to `FERRUM_UNIFIED_GRAPH`.
+    #[serde(default)]
+    pub unified_graph: Option<bool>,
+
+    /// Diagnostic unified graph scope that captures only transformer layers,
+    /// equivalent to `FERRUM_UNIFIED_GRAPH_LAYERS_ONLY`.
+    #[serde(default)]
+    pub unified_graph_layers_only: Option<bool>,
+
+    /// Diagnostic unified graph scope that leaves lm_head eager, equivalent to
+    /// `FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER`.
+    #[serde(default)]
+    pub unified_graph_lm_head_eager: Option<bool>,
+
+    /// Emit engine batch iteration profile logs, equivalent to
+    /// `FERRUM_BATCH_DECODE_PROF`.
+    #[serde(default)]
+    pub batch_decode_prof: Option<bool>,
+
+    /// Emit executor batch prefill profile logs, equivalent to
+    /// `FERRUM_BATCH_PREFILL_PROF`.
+    #[serde(default)]
+    pub batch_prefill_prof: Option<bool>,
+
+    /// Emit engine next-batch scheduler profile logs, equivalent to
+    /// `FERRUM_NEXT_BATCH_PROF`.
+    #[serde(default)]
+    pub next_batch_prof: Option<bool>,
+
+    /// Emit route/batched-decode profile logs, equivalent to
+    /// `FERRUM_RBD_PROF`.
+    #[serde(default)]
+    pub rbd_prof: Option<bool>,
+
+    /// Emit unified decode postprocess profile logs, equivalent to
+    /// `FERRUM_UNIFIED_POST_PROF`.
+    #[serde(default)]
+    pub unified_post_prof: Option<bool>,
+
+    /// Emit model decode operator profile logs, equivalent to
+    /// `FERRUM_DECODE_OP_PROFILE`.
+    #[serde(default)]
+    pub decode_op_profile: Option<bool>,
+
+    /// Emit model prefill operator profile logs, equivalent to
+    /// `FERRUM_PREFILL_OP_PROFILE`.
+    #[serde(default)]
+    pub prefill_op_profile: Option<bool>,
+
+    /// Emit dense Marlin inner-kernel timing counters, equivalent to
+    /// `FERRUM_MARLIN_PROFILE`.
+    #[serde(default)]
+    pub marlin_profile: Option<bool>,
+
+    /// Emit dense Marlin shape/label trace lines, equivalent to
+    /// `FERRUM_MARLIN_TRACE_SHAPES`.
+    #[serde(default)]
+    pub marlin_trace_shapes: Option<bool>,
+
+    /// Maximum dense Marlin shape/label trace lines, equivalent to
+    /// `FERRUM_MARLIN_TRACE_SHAPES_MAX`.
+    #[serde(default)]
+    pub marlin_trace_shapes_max: Option<usize>,
 
     /// vLLM paged attention policy, equivalent to
     /// `FERRUM_USE_VLLM_PAGED_ATTN`.
@@ -270,6 +356,16 @@ impl RuntimeCliConfig {
         push_usize_entry(&mut entries, "FERRUM_PAGED_MAX_SEQS", self.paged_max_seqs);
         push_usize_entry(
             &mut entries,
+            "FERRUM_RECURRENT_STATE_MAX_SLOTS",
+            self.recurrent_state_max_slots,
+        );
+        push_usize_entry(
+            &mut entries,
+            "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS",
+            self.qwen35_linear_state_max_slots,
+        );
+        push_usize_entry(
+            &mut entries,
             "FERRUM_MAX_BATCHED_TOKENS",
             self.max_batched_tokens,
         );
@@ -278,6 +374,11 @@ impl RuntimeCliConfig {
             "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
             self.scheduler_prefill_first_until_active,
         );
+        push_usize_entry(
+            &mut entries,
+            "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+            self.scheduler_active_decode_prefill_chunk,
+        );
         push_bool_entry(&mut entries, "FERRUM_PREFIX_CACHE", self.prefix_cache);
         push_string_entry(
             &mut entries,
@@ -285,6 +386,56 @@ impl RuntimeCliConfig {
             self.layer_split_pipeline_mode.as_deref(),
         );
         push_bool_entry(&mut entries, "FERRUM_MOE_GRAPH", self.moe_graph);
+        push_bool_entry(&mut entries, "FERRUM_BATCHED_GRAPH", self.batched_graph);
+        push_bool_entry(&mut entries, "FERRUM_UNIFIED_GRAPH", self.unified_graph);
+        push_bool_entry(
+            &mut entries,
+            "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
+            self.unified_graph_layers_only,
+        );
+        push_bool_entry(
+            &mut entries,
+            "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+            self.unified_graph_lm_head_eager,
+        );
+        push_true_entry(
+            &mut entries,
+            "FERRUM_BATCH_DECODE_PROF",
+            self.batch_decode_prof,
+        );
+        push_true_entry(
+            &mut entries,
+            "FERRUM_BATCH_PREFILL_PROF",
+            self.batch_prefill_prof,
+        );
+        push_true_entry(&mut entries, "FERRUM_NEXT_BATCH_PROF", self.next_batch_prof);
+        push_true_entry(&mut entries, "FERRUM_RBD_PROF", self.rbd_prof);
+        push_true_entry(
+            &mut entries,
+            "FERRUM_UNIFIED_POST_PROF",
+            self.unified_post_prof,
+        );
+        push_true_entry(
+            &mut entries,
+            "FERRUM_DECODE_OP_PROFILE",
+            self.decode_op_profile,
+        );
+        push_true_entry(
+            &mut entries,
+            "FERRUM_PREFILL_OP_PROFILE",
+            self.prefill_op_profile,
+        );
+        push_true_entry(&mut entries, "FERRUM_MARLIN_PROFILE", self.marlin_profile);
+        push_true_entry(
+            &mut entries,
+            "FERRUM_MARLIN_TRACE_SHAPES",
+            self.marlin_trace_shapes,
+        );
+        push_usize_entry(
+            &mut entries,
+            "FERRUM_MARLIN_TRACE_SHAPES_MAX",
+            self.marlin_trace_shapes_max,
+        );
         push_bool_entry(
             &mut entries,
             "FERRUM_USE_VLLM_PAGED_ATTN",
@@ -349,6 +500,16 @@ fn push_bool_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Opti
         entries.push(RuntimeConfigEntry::new(
             key,
             if value { "1" } else { "0" },
+            RuntimeConfigSource::ConfigFile,
+        ));
+    }
+}
+
+fn push_true_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Option<bool>) {
+    if value == Some(true) {
+        entries.push(RuntimeConfigEntry::new(
+            key,
+            "1".to_string(),
             RuntimeConfigSource::ConfigFile,
         ));
     }
@@ -540,11 +701,27 @@ mod tests {
             kv_max_blocks: Some(4096),
             kv_capacity: Some(2048),
             paged_max_seqs: Some(64),
+            recurrent_state_max_slots: Some(16),
             max_batched_tokens: Some(2048),
             scheduler_prefill_first_until_active: Some(16),
+            scheduler_active_decode_prefill_chunk: Some(24),
             prefix_cache: Some(false),
             layer_split_pipeline_mode: Some("batch".to_string()),
             moe_graph: Some(true),
+            batched_graph: Some(true),
+            unified_graph: Some(true),
+            unified_graph_layers_only: Some(true),
+            unified_graph_lm_head_eager: Some(true),
+            batch_decode_prof: Some(true),
+            batch_prefill_prof: Some(true),
+            next_batch_prof: Some(true),
+            rbd_prof: Some(true),
+            unified_post_prof: Some(true),
+            decode_op_profile: Some(true),
+            prefill_op_profile: Some(true),
+            marlin_profile: Some(true),
+            marlin_trace_shapes: Some(true),
+            marlin_trace_shapes_max: Some(17),
             use_vllm_paged_attn: Some(true),
             vllm_paged_attn_v1_short: Some(false),
             vllm_moe: Some(true),
@@ -559,7 +736,7 @@ mod tests {
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 20);
+        assert_eq!(entries.len(), 36);
         let entry = |key: &str| {
             entries
                 .iter()
@@ -577,10 +754,21 @@ mod tests {
         assert_eq!(entry("FERRUM_KV_MAX_BLOCKS").effective_value, "4096");
         assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "2048");
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
+        assert_eq!(
+            entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").effective_value,
+            "16"
+        );
+        assert!(entry("FERRUM_RECURRENT_STATE_MAX_SLOTS")
+            .affects
+            .contains(&RuntimeConfigEffect::Memory));
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
         assert_eq!(
             entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE").effective_value,
             "16"
+        );
+        assert_eq!(
+            entry("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").effective_value,
+            "24"
         );
         assert_eq!(
             entry("FERRUM_LAYER_SPLIT_PIPELINE_MODE").effective_value,
@@ -588,6 +776,35 @@ mod tests {
         );
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
         assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
+        assert_eq!(entry("FERRUM_BATCHED_GRAPH").effective_value, "1");
+        assert_eq!(entry("FERRUM_UNIFIED_GRAPH").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY").effective_value,
+            "1"
+        );
+        assert_eq!(
+            entry("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER").effective_value,
+            "1"
+        );
+        assert_eq!(entry("FERRUM_BATCH_DECODE_PROF").effective_value, "1");
+        assert!(entry("FERRUM_BATCH_DECODE_PROF")
+            .affects
+            .contains(&RuntimeConfigEffect::Diagnostics));
+        assert_eq!(entry("FERRUM_BATCH_PREFILL_PROF").effective_value, "1");
+        assert_eq!(entry("FERRUM_NEXT_BATCH_PROF").effective_value, "1");
+        assert_eq!(entry("FERRUM_RBD_PROF").effective_value, "1");
+        assert_eq!(entry("FERRUM_UNIFIED_POST_PROF").effective_value, "1");
+        assert_eq!(entry("FERRUM_DECODE_OP_PROFILE").effective_value, "1");
+        assert_eq!(entry("FERRUM_PREFILL_OP_PROFILE").effective_value, "1");
+        assert_eq!(entry("FERRUM_MARLIN_PROFILE").effective_value, "1");
+        assert!(entry("FERRUM_MARLIN_PROFILE")
+            .affects
+            .contains(&RuntimeConfigEffect::Diagnostics));
+        assert_eq!(entry("FERRUM_MARLIN_TRACE_SHAPES").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_MARLIN_TRACE_SHAPES_MAX").effective_value,
+            "17"
+        );
         assert_eq!(entry("FERRUM_USE_VLLM_PAGED_ATTN").effective_value, "1");
         assert_eq!(
             entry("FERRUM_VLLM_PAGED_ATTN_V1_SHORT").effective_value,
@@ -605,6 +822,28 @@ mod tests {
         );
         assert_eq!(entry("FERRUM_MAX_MODEL_LEN").effective_value, "4096");
         assert_eq!(entry("FERRUM_MOE_BATCH_THRESHOLD").effective_value, "4");
+    }
+
+    #[test]
+    fn runtime_cli_config_diagnostic_presence_flags_are_opt_in() {
+        let entries = RuntimeCliConfig {
+            batch_decode_prof: Some(false),
+            batch_prefill_prof: Some(false),
+            next_batch_prof: Some(false),
+            rbd_prof: Some(false),
+            unified_post_prof: Some(false),
+            decode_op_profile: Some(false),
+            prefill_op_profile: Some(false),
+            marlin_profile: Some(false),
+            marlin_trace_shapes: Some(false),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+
+        assert!(
+            entries.is_empty(),
+            "false diagnostic presence flags must not materialize as FERRUM_*_PROF=0"
+        );
     }
 
     #[test]

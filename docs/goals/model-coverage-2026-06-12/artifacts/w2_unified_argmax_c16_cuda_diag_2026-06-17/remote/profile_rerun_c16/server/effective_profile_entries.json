@@ -1,0 +1,53 @@
+{
+  "FERRUM_BATCH_DECODE_PROF": {
+    "affects": [
+      "performance",
+      "diagnostics"
+    ],
+    "effective_value": "1",
+    "key": "FERRUM_BATCH_DECODE_PROF",
+    "source": "config_file"
+  },
+  "FERRUM_DECODE_OP_PROFILE": {
+    "affects": [
+      "diagnostics"
+    ],
+    "effective_value": "1",
+    "key": "FERRUM_DECODE_OP_PROFILE",
+    "source": "config_file"
+  },
+  "FERRUM_GREEDY_ARGMAX": {
+    "affects": [
+      "performance"
+    ],
+    "effective_value": "1",
+    "key": "FERRUM_GREEDY_ARGMAX",
+    "source": "memory_profile"
+  },
+  "FERRUM_MARLIN_PROFILE": {
+    "affects": [
+      "performance",
+      "diagnostics"
+    ],
+    "effective_value": "1",
+    "key": "FERRUM_MARLIN_PROFILE",
+    "source": "config_file"
+  },
+  "FERRUM_NEXT_BATCH_PROF": {
+    "affects": [
+      "performance",
+      "diagnostics"
+    ],
+    "effective_value": "1",
+    "key": "FERRUM_NEXT_BATCH_PROF",
+    "source": "config_file"
+  },
+  "FERRUM_UNIFIED_POST_PROF": {
+    "affects": [
+      "diagnostics"
+    ],
+    "effective_value": "1",
+    "key": "FERRUM_UNIFIED_POST_PROF",
+    "source": "config_file"
+  }
+}

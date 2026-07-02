@@ -1,0 +1,19 @@
+[unified-graph-capture] count=1 scope=layers_only key=11007875343381310285 attention_key=8316016994327462400 m_total=10 num_seqs=10 max_kv_len=125
+[unified-graph-replay] origin=post_capture count=1 scope=layers_only key=11007875343381310285 attention_key=8316016994327462400 m_total=10 num_seqs=10 max_kv_len=125
+[unified-graph-replay] origin=pure count=2 scope=layers_only key=11007875343381310285 attention_key=8316016994327462400 m_total=10 num_seqs=10 max_kv_len=126
+[unified-graph-replay] origin=pure count=4 scope=layers_only key=11007875343381310285 attention_key=8316016994327462400 m_total=10 num_seqs=10 max_kv_len=128
+[unified-graph-replay] origin=pure count=8 scope=layers_only key=11007875343381310285 attention_key=8316016994327462400 m_total=10 num_seqs=10 max_kv_len=132
+[unified-graph-replay] origin=pure count=16 scope=layers_only key=11007875343381310285 attention_key=8316016994327462400 m_total=10 num_seqs=10 max_kv_len=140
+[unified-graph-replay] origin=pure count=32 scope=layers_only key=11007875343381310285 attention_key=8316016994327462400 m_total=10 num_seqs=10 max_kv_len=156
+[unified-graph-replay] origin=pure count=64 scope=layers_only key=11007875343381310285 attention_key=8316016994327462400 m_total=10 num_seqs=10 max_kv_len=188
+[unified-graph-capture] count=2 scope=layers_only key=13403441693772800415 attention_key=8316016994327462400 m_total=9 num_seqs=9 max_kv_len=191
+[unified-graph-capture] count=4 scope=layers_only key=15620939968243081349 attention_key=8316016994327462400 m_total=6 num_seqs=6 max_kv_len=194
+[unified-graph-capture] count=8 scope=layers_only key=12228648760363214886 attention_key=8318267720516763747 m_total=2 num_seqs=2 max_kv_len=198
+[unified-graph-replay] origin=pure count=128 scope=layers_only key=9582445794656808421 attention_key=8316016994327462400 m_total=16 num_seqs=16 max_kv_len=170
+[unified-graph-skip] reason=mixed_or_prefill_batch count=1 scope=layers_only key=15153503415197744216 attention_key=8316016994327462400 m_total=136 num_seqs=15 max_kv_len=193 cached_keys=2
+[unified-graph-skip] reason=mixed_or_prefill_batch count=2 scope=layers_only key=10698181850300237000 attention_key=8316016994327462400 m_total=135 num_seqs=14 max_kv_len=195 cached_keys=2
+[unified-graph-skip] reason=mixed_or_prefill_batch count=4 scope=layers_only key=17546167009371390993 attention_key=8316016994327462400 m_total=257 num_seqs=15 max_kv_len=197 cached_keys=2
+[unified-graph-skip] reason=mixed_or_prefill_batch count=8 scope=layers_only key=10431893063090815294 attention_key=8316016994327462400 m_total=379 num_seqs=16 max_kv_len=131 cached_keys=3
+[unified-graph-capture] count=16 scope=layers_only key=9787872419691871549 attention_key=8316016994327462400 m_total=12 num_seqs=12 max_kv_len=197
+[unified-graph-skip] reason=mixed_or_prefill_batch count=16 scope=layers_only key=10282340311991195244 attention_key=8316016994327462400 m_total=137 num_seqs=16 max_kv_len=134 cached_keys=6
+[unified-graph-replay] origin=pure count=256 scope=layers_only key=9582445794656808421 attention_key=8316016994327462400 m_total=16 num_seqs=16 max_kv_len=168

@@ -1,0 +1,36 @@
+started_at_utc=2026-06-19T18:18:20Z
+repo=/workspace/ferrum-clean
+artifact=/workspace/artifacts/w3_qwen35_vllm_h256_smoke_178d76fa_20260619T181820Z_hot_target
+git_head=178d76fad2a7f6d947fc3d78afe7b960208ebca3
+git_status_short_begin
+## goal/w2-w3-release-grade...origin/goal/w2-w3-release-grade
+git_status_short_end
+nvidia_smi_query_begin
+0, NVIDIA GeForce RTX 4090, 49140 MiB, 580.126.09, 8.9
+nvidia_smi_query_end
+nvcc_begin
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2024 NVIDIA Corporation
+Built on Thu_Mar_28_02:18:24_PDT_2024
+Cuda compilation tools, release 12.4, V12.4.131
+Build cuda_12.4.r12.4/compiler.34097967_0
+nvcc_end
+rustc 1.96.0 (ac68faa20 2026-05-25)
+cargo 1.96.0 (30a34c682 2026-05-25)
+   Compiling ferrum-types v0.7.7 (/workspace/ferrum-clean/crates/ferrum-types)
+   Compiling ferrum-kernels v0.7.7 (/workspace/ferrum-clean/crates/ferrum-kernels)
+   Compiling ferrum-interfaces v0.7.7 (/workspace/ferrum-clean/crates/ferrum-interfaces)
+   Compiling ferrum-bench-core v0.7.7 (/workspace/ferrum-clean/crates/ferrum-bench-core)
+   Compiling ferrum-scheduler v0.7.7 (/workspace/ferrum-clean/crates/ferrum-scheduler)
+   Compiling ferrum-kv v0.7.7 (/workspace/ferrum-clean/crates/ferrum-kv)
+   Compiling ferrum-tokenizer v0.7.7 (/workspace/ferrum-clean/crates/ferrum-tokenizer)
+   Compiling ferrum-sampler v0.7.7 (/workspace/ferrum-clean/crates/ferrum-sampler)
+   Compiling ferrum-quantization v0.7.7 (/workspace/ferrum-clean/crates/ferrum-quantization)
+   Compiling ferrum-models v0.7.7 (/workspace/ferrum-clean/crates/ferrum-models)
+   Compiling ferrum-engine v0.7.7 (/workspace/ferrum-clean/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.7 (/workspace/ferrum-clean/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.7 (/workspace/ferrum-clean/crates/ferrum-cli)
+    Finished `release` profile [optimized] target(s) in 4m 41s
+4052134f6abbc1e9971165d386dac1510172d8a0c259d5a0fecffef1f50ad42f  /workspace/ferrum-w3-qwen35-ac98207/target/release/ferrum
+04_structured: HTTP 500: {"error":{"message":"model output did not satisfy response_format.json_schema.strict: invalid JSON: trailing characters at line 2 column 1","type":"internal_server_error","param":null,"code":null}}
+W3 QWEN35 VLLM H256 SMOKE FAIL rc=1: /workspace/artifacts/w3_qwen35_vllm_h256_smoke_178d76fa_20260619T181820Z_hot_target

@@ -1,0 +1,24 @@
+{
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  },
+  "max_tokens": 12,
+  "messages": [
+    {
+      "content": "Remember the code word orchid. Reply only OK.",
+      "role": "user"
+    },
+    {
+      "content": "OK.",
+      "role": "assistant"
+    },
+    {
+      "content": "What code word did I ask you to remember? Answer with one word.",
+      "role": "user"
+    }
+  ],
+  "model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+  "seed": 9271,
+  "stream": false,
+  "temperature": 0
+}

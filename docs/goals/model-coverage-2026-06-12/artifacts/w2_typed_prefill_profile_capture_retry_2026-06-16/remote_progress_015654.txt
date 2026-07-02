@@ -1,0 +1,8 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+PID=448
+    PID     ELAPSED CMD
+build_rc=127
+profile_rc=
+/tmp/w2_capture_retry_runner.sh: line 13: cargo: command not found

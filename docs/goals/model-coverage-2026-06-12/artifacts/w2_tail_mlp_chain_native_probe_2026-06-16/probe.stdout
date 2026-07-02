@@ -1,0 +1,18 @@
+[microbench] compiling scripts/microbenches/gemma3_tail_mlp_chain_perf.cu
+-rwxr-xr-x 1 root root 729032 Jun 15 23:01 /workspace/ferrum-artifacts/w2_tail_mlp_chain_native_probe_2026-06-16/gemma3_tail_mlp_chain_perf
+
+[microbench] running /workspace/ferrum-artifacts/w2_tail_mlp_chain_native_probe_2026-06-16/gemma3_tail_mlp_chain_perf
+gemma3_tail_mlp_chain_perf device=NVIDIA GeForce RTX 4090 sm=8.9 h=5376 im=21504
+mode,m,pre_norm_us,gate_up_us,geglu_us,down_us,final_norm_us,phase_sum_us,chain_event_us,chain_host_sync_us,ret
+product_ws_zero,1,6.222,133.410,3.773,70.640,6.353,220.398,209.585,213.226,0
+kernel_only_ws_prezero_diagnostic,1,6.324,130.576,4.170,68.522,6.420,216.012,207.202,209.140,0
+product_ws_zero,10,5.977,137.664,4.140,70.747,6.392,224.920,214.849,217.339,0
+kernel_only_ws_prezero_diagnostic,10,6.038,134.763,4.328,68.752,6.397,220.278,212.444,214.330,0
+product_ws_zero,16,5.914,139.671,4.680,70.903,6.352,227.520,215.750,217.782,0
+kernel_only_ws_prezero_diagnostic,16,5.757,136.124,4.690,68.288,6.096,220.954,212.986,214.422,0
+product_ws_zero,23,5.668,143.555,4.721,74.929,6.110,234.983,224.803,227.088,0
+kernel_only_ws_prezero_diagnostic,23,5.673,140.680,4.763,72.822,6.133,230.072,222.304,224.214,0
+product_ws_zero,32,5.798,145.370,5.180,75.416,6.165,237.930,227.868,230.046,0
+kernel_only_ws_prezero_diagnostic,32,5.740,142.612,5.196,73.460,6.189,233.196,225.566,227.151,0
+
+VERDICT: gemma3 tail MLP chain native CUDA probe complete

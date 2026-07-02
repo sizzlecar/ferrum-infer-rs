@@ -1,0 +1,108 @@
+Mon Jun 15 19:53:54 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 565.77                 Driver Version: 565.77         CUDA Version: 12.7     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 4090        On  |   00000000:61:00.0 Off |                  Off |
+| 30%   25C    P8             18W /  350W |       1MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+---NVCC---
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2024 NVIDIA Corporation
+Built on Thu_Mar_28_02:18:24_PDT_2024
+Cuda compilation tools, release 12.4, V12.4.131
+Build cuda_12.4.r12.4/compiler.34097967_0
+---PWD---
+/root
+---WORKSPACE---
+total 292
+drwxr-xr-x 51 root root   8192 Jun 15 19:33 .
+drwxr-xr-x  1 root root    105 Jun 15 04:19 ..
+drwxr-xr-x  2 root root     88 Jun 15 08:40 diag_scripts
+drwxr-xr-x  8 root root   4096 Jun 15 02:31 ferrum-artifacts
+drwxr-xr-x 13  501 staff  4096 Jun 15 19:20 ferrum-infer-rs
+drwxr-xr-x  9 root root   4096 Jun 15 13:09 ferrum-w2-prompt-token-admission
+-rw-r--r--  1 root root  34540 Jun 15 13:08 ferrum-w2-prompt-token-admission.bundle
+drwxr-xr-x 10 root root   4096 Jun 15 13:48 ferrum-w2-shadow-graph
+drwxr-xr-x 31 root root   4096 Jun 13 23:43 llama.cpp
+-rwxr-xr-x  1  501 staff   249 Jun 15 05:28 remote_tmux_wrapper_w2_marlin_nested.sh
+-rwxr-xr-x  1  501 staff   251 Jun 15 05:13 remote_tmux_wrapper_w2_tail_gate_down.sh
+-rwxr-xr-x  1 root root   7025 Jun 15 13:12 run_remote_prompt_token_admission_c16_ab.sh
+-rwxr-xr-x  1 root root   5802 Jun 15 04:39 run_w2_decode_op_profile.sh
+-rwxr-xr-x  1  501 staff  5979 Jun 15 06:17 run_w2_dense_vllm_marlin_diag.sh
+-rwxr-xr-x  1 root root   8114 Jun 15 04:01 run_w2_ferrum_natural_prompt_diag.sh
+-rwxr-xr-x  1  501 staff  3397 Jun 15 07:38 run_w2_ferrum_sharegpt_compare.sh
+-rwxr-xr-x  1  501 staff  7671 Jun 15 07:10 run_w2_fused_sandwich_residual.sh
+-rwxr-xr-x  1 root root   9897 Jun 15 04:22 run_w2_greedy_argmax_default_diag.sh
+-rwxr-xr-x  1  501 staff  7828 Jun 15 05:28 run_w2_marlin_nested_profile.sh
+-rwxr-xr-x  1  501 staff  6628 Jun 15 05:54 run_w2_marlin_projection_profile.sh
+-rwxr-xr-x  1  501 staff  6602 Jun 15 09:01 run_w2_prefill_bucket_profile.sh
+-rwxr-xr-x  1 root root   5450 Jun 15 07:55 run_w2_prefix_cache_sharegpt_diag.sh
+-rwxr-xr-x  1  501 staff  7413 Jun 15 05:12 run_w2_tail_gate_down_profile.sh
+-rwxr-xr-x  1 root root   6908 Jun 15 04:53 run_w2_tail_profile_buckets.sh
+-rwxr-xr-x  1  501 staff  5977 Jun 15 07:28 run_w2_vllm_sharegpt_baseline_probe.sh
+drwxr-xr-x  6 root root     87 Jun 14 19:58 vllm-venv
+drwxr-xr-x  6 root root     87 Jun 14 21:31 vllm-venv-0101-cu126
+drwxr-xr-x 21 root root   4096 Jun 13 23:54 w2
+drwxr-xr-x  8 root root    157 Jun 15 03:38 w2_baseline_safety_probe_2026-06-15
+drwxr-xr-x 11 root root    281 Jun 15 19:39 w2_batch_prefill_fallback_reason_diag_2026-06-16
+drwxr-xr-x  6 root root    133 Jun 14 23:37 w2_decode_batch_stats_probe_2026-06-15
+drwxr-xr-x  5 root root     90 Jun 15 04:41 w2_decode_op_profile_2026-06-15
+-rw-r--r--  1 root root      0 Jun 15 04:39 w2_decode_op_profile_2026-06-15.nohup.log
+-rw-r--r--  1 root root      4 Jun 15 04:39 w2_decode_op_profile_2026-06-15.nohup.pid
+drwxr-xr-x  5 root root     45 Jun 15 19:19 w2_dense_marlin_block_policy_probe_2026-06-16
+drwxr-xr-x  5 root root     56 Jun 15 06:46 w2_dense_marlin_native_probe_2026-06-15
+drwxr-xr-x  4 root root     33 Jun 15 09:43 w2_dense_marlin_weight_cycle_probe_2026-06-15
+drwxr-xr-x  7 root root    155 Jun 15 06:21 w2_dense_vllm_marlin_diag_2026-06-15
+drwxr-xr-x  8 root root    154 Jun 15 04:09 w2_ferrum_natural_prompt_diag_2026-06-15
+drwxr-xr-x  7 root root    156 Jun 15 07:17 w2_fused_sandwich_residual_2026-06-15
+drwxr-xr-x  2 root root     82 Jun 15 13:49 w2_gemma3_shadow_graph_native_probe_2026-06-15
+drwxr-xr-x  6 root root     95 Jun 15 10:57 w2_gemma_unified_tail_cuda_smoke_2026-06-15
+drwxr-xr-x  8 root root    171 Jun 15 04:30 w2_greedy_argmax_default_diag_2026-06-15
+drwxr-xr-x  5 root root     82 Jun 14 17:27 w2_legacy_batched_cuda_2026-06-15
+drwxr-xr-x 10 root root    322 Jun 15 19:06 w2_marlin_gather_profile_2026-06-16
+drwxr-xr-x  6 root root    136 Jun 15 05:35 w2_marlin_nested_profile_2026-06-15
+drwxr-xr-x  6 root root    136 Jun 15 06:00 w2_marlin_projection_profile_2026-06-15
+drwxr-xr-x 10 root root   4096 Jun 15 18:46 w2_marlin_typed_profile_2026-06-16
+drwxr-xr-x  9 root root    278 Jun 15 03:47 w2_natural_prompt_baseline_probe_2026-06-15
+drwxr-xr-x  7 root root    135 Jun 15 16:14 w2_output_token_c16_diag_2026-06-15
+drwxr-xr-x  2 root root    299 Jun 15 10:29 w2_paged_varlen_window_native_probe_2026-06-15
+drwxr-xr-x  8 root root    140 Jun 15 09:06 w2_prefill_bucket_profile_2026-06-15
+drwxr-xr-x  7 root root    150 Jun 15 08:42 w2_prefill_ttft_profile_2026-06-15
+drwxr-xr-x  6 root root    135 Jun 15 07:56 w2_prefix_cache_sharegpt_diag_2026-06-15
+drwxr-xr-x  9 root root    273 Jun 15 18:22 w2_profiler_graph_disabled_retry_2026-06-16
+drwxr-xr-x  8 root root    172 Jun 15 13:21 w2_prompt_token_admission_c16_ab_2026-06-15
+drwxr-xr-x  5 root root     82 Jun 14 17:38 w2_release_shape_ferrum_cuda_2026-06-15
+-rwxr-xr-x  1 root root   8536 Jun 15 02:52 w2_run_remote_matrix.sh
+-rwxr-xr-x  1 root root   7084 Jun 15 03:44 w2_run_remote_natural_vllm_probe.sh
+-rwxr-xr-x  1 root root   6162 Jun 15 03:35 w2_run_remote_vllm_probe.sh
+drwxr-xr-x  7 root root    138 Jun 15 03:26 w2_sentinel_fix_release_shape_ferrum_ci_2026-06-15
+-rw-r--r--  1 root root  52372 Jun 15 13:48 w2_shadow_graph_23d8569b.bundle
+-rw-r--r--  1 root root    746 Jun 15 13:54 w2_shadow_graph_c46d9540.bundle
+-rw-r--r--  1 root root    722 Jun 15 13:51 w2_shadow_graph_e927e4c1.bundle
+drwxr-xr-x  7 root root    148 Jun 14 23:59 w2_sliding_batched_attn_probe_2026-06-15
+drwxr-xr-x  6 root root    136 Jun 15 05:18 w2_tail_gate_down_profile_2026-06-15
+drwxr-xr-x  6 root root    103 Jun 15 04:58 w2_tail_profile_buckets_2026-06-15
+-rw-r--r--  1 root root      0 Jun 15 04:53 w2_tail_profile_buckets_2026-06-15.nohup.log
+-rw-r--r--  1 root root      4 Jun 15 04:53 w2_tail_profile_buckets_2026-06-15.nohup.pid
+drwxr-xr-x  9 root root    257 Jun 15 16:46 w2_typed_decode_profile_2026-06-16
+drwxr-xr-x 10 root root    299 Jun 15 17:23 w2_typed_prefill_profile_2026-06-16
+drwxr-xr-x  9 root root    235 Jun 15 18:03 w2_typed_prefill_profile_capture_retry_2026-06-16
+drwxr-xr-x  9 root root    278 Jun 15 17:42 w2_typed_prefill_profile_retry_2026-06-16
+drwxr-xr-x  7 root root    161 Jun 15 11:20 w2_unified_prefill_c16_diag_2026-06-15
+drwxr-xr-x 12 root root    228 Jun 14 23:15 w2_vllm0101_cuda12_baseline_probe_2026-06-15
+drwxr-xr-x  4 root root     62 Jun 14 20:00 w2_vllm_baseline_probe_2026-06-15
+drwxr-xr-x  7 root root    168 Jun 15 08:22 w2_vllm_paged_attn_gemma_diag_2026-06-15
+drwxr-xr-x  8 root root    176 Jun 15 07:39 w2_vllm_sharegpt_baseline_probe_2026-06-15

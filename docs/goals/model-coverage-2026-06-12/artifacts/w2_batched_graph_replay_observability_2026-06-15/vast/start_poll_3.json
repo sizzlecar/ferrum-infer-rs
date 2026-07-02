@@ -1,0 +1,9 @@
+{
+  "id": 40826362,
+  "cur_state": "running",
+  "actual_status": "running",
+  "intended_status": "running",
+  "ssh_host": "ssh9.vast.ai",
+  "ssh_port": 26362,
+  "public_ipaddr": "213.181.123.23"
+}

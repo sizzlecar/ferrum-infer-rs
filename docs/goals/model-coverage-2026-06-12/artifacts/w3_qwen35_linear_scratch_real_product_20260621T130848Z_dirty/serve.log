@@ -1,0 +1,41 @@
+
+  ______                            
+ |  ____|                           
+ | |__ ___ _ __ _ __ _   _ _ __ ___  
+ |  __/ _ \ '__| '__| | | | '_ ` _ \ 
+ | | |  __/ |  | |  | |_| | | | | | 
+ |_|  \___|_|  |_|   \__,_|_| |_| |_|
+
+   🦀 Rust LLM Inference Server
+   Version 0.7.7
+
+Model: 3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+Path: /workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+CUDA GPUs: 0 (single_gpu)
+Device: CUDA(0)
+
+Initializing engine (continuous batching)...
+2026-06-21T13:09:20.711697Z  INFO ferrum_engine::registry: Initializing global component registry
+2026-06-21T13:09:20.711725Z  INFO ferrum_engine::registry: Registering default component factories
+2026-06-21T13:09:20.711822Z  INFO ferrum_engine::registry: Loading HuggingFace tokenizer from: "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b/tokenizer.json"
+2026-06-21T13:09:21.204399Z  INFO ferrum_engine::registry: HuggingFace tokenizer loaded successfully
+2026-06-21T13:09:21.204449Z  INFO ferrum_engine::registry: Creating multinomial sampler
+2026-06-21T13:09:21.204455Z  INFO ferrum_engine::registry: Creating continuous batch scheduler
+2026-06-21T13:09:21.204462Z  INFO ferrum_engine::registry: Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=2048
+2026-06-21T13:09:21.204558Z  INFO ferrum_engine::registry: Loading model from /workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b (format: safetensors)
+2026-06-21T13:09:21.204816Z  INFO ferrum_engine::registry:   Architecture: Qwen35Moe, Layers: 40, Vocab: 248320
+2026-06-21T13:09:21.350398Z  INFO ferrum_engine::registry: Building model...
+2026-06-21T13:09:21.350445Z  INFO ferrum_engine::registry: Using Qwen3.5/Qwen3.6 CUDA backend executor
+
+🚀 Server running at http://127.0.0.1:53695
+
+Endpoints:
+  POST /v1/chat/completions      - OpenAI-compatible chat
+  POST /v1/audio/transcriptions  - Speech-to-text (Whisper)
+  POST /v1/audio/speech          - Text-to-speech (TTS)
+  POST /v1/embeddings            - Text/image embeddings
+  GET  /v1/models                - List models
+  GET  /health                   - Health check
+
+Press Ctrl+C to stop.
+

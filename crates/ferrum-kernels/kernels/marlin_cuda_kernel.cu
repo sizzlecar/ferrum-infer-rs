@@ -71,12 +71,27 @@ __device__ inline void cp_async4_pred(void* smem_ptr, const void* glob_ptr, bool
 __device__ inline void cp_async4_stream(void* smem_ptr, const void* glob_ptr) {
   const int BYTES = 16;
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  // Use plain cp.async.cg without L2 cache hint (createpolicy.fractional
-  // is not supported on all architectures, e.g. Blackwell sm_120).
+#if !defined(FERRUM_MARLIN_CP_ASYNC_PLAIN) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 1200)
+  // B weights are streamed exactly once by a Marlin tile. Hinting them as
+  // evict-first keeps more room for activation/output state in L2 on Ampere
+  // and Ada. Blackwell sm_120 falls back below because this PTX policy syntax
+  // is not accepted there.
+  asm volatile(
+    "{\n"
+    "   .reg .b64 cache_policy;\n"
+    "   createpolicy.fractional.L2::evict_first.b64 cache_policy, 1.0;\n"
+    "   cp.async.cg.shared.global.L2::cache_hint [%0], [%1], %2, cache_policy;\n"
+    "}\n"
+    :: "r"(smem), "l"(glob_ptr), "n"(BYTES)
+  );
+#else
+  // Plain cp.async.cg fallback for Blackwell sm_120 and for legacy native
+  // diagnostics compiled with FERRUM_MARLIN_CP_ASYNC_PLAIN.
   asm volatile(
     "cp.async.cg.shared.global [%0], [%1], %2;\n"
     :: "r"(smem), "l"(glob_ptr), "n"(BYTES)
   );
+#endif
 }
 
 // Async copy fence.

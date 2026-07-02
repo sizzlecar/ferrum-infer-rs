@@ -1,0 +1,4 @@
+Manual stop after c32 diagnostic stall on b8116dc4.
+Observed: ferrum run PASS, serve ready and chat smoke PASS, then bench c32 entered repeated capacity-defer/no-victim churn.
+Stop reason: completed_total stayed at 5 while admitted_total climbed rapidly, active_len returned to 0 each scheduler iteration, prefill_tokens_delta stayed 0, and GPU utilization was 0% with ~23.9GiB allocated.
+This is not W3 PASS and not release/performance evidence.

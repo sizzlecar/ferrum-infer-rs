@@ -1,0 +1,13 @@
+ferrum bench-serve — dataset=random num_prompts=16 warmup=0 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/1 (16 prompts including 0 warmup)
+    16 completed / 0 errored / 1.4s
+    summary c=16 (n_repeats=1, no CI)
+      TTFT_ms  p50=357.4  p95=654.0  p99=654.1
+      TPOT_ms  p50=31.7  p95=45.3  p99=78.0
+      ITL_ms   p50=23.4  p95=28.9  p99=273.6
+      throughput      348.0 tok/s
+      goodput         11.48 req/s
+
+→ wrote docs/goals/model-coverage-2026-06-12/artifacts/w2_batched_graph_replay_observability_2026-06-15/bench/bench_c16.json

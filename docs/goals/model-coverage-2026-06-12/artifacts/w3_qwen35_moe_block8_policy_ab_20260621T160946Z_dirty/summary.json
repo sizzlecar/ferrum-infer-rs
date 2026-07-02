@@ -1,0 +1,64 @@
+{
+  "artifact_dir": "/workspace/artifacts/w3_qwen35_moe_block8_policy_ab_20260621T160946Z_dirty",
+  "binary_sha256": "6490496e78ccb768a19f6933b3e0987092a17b5545b0e75574660fa21671baf5",
+  "correctness_default_block8_passline": "W3 QWEN35 REAL PRODUCT REPORT PASS: /workspace/artifacts/w3_qwen35_moe_block8_policy_ab_20260621T160946Z_dirty/correctness_default_block8",
+  "default_block8": {
+    "bad_output_per_run": [
+      0
+    ],
+    "completed_per_run": [
+      100
+    ],
+    "duplicate_done_per_run": [
+      0
+    ],
+    "errored_per_run": [
+      0
+    ],
+    "missing_done_per_run": [
+      0
+    ],
+    "moe_block_size_env": "default",
+    "output_token_count_source": "usage",
+    "output_tps_mean": 694.0957598710125,
+    "path": "/workspace/artifacts/w3_qwen35_moe_block8_policy_ab_20260621T160946Z_dirty/bench_default_block8/bench_c32_100x1.json",
+    "zero_output_tokens_per_run": [
+      0
+    ]
+  },
+  "default_vs_vllm_mean_ratio": 0.40625369956422575,
+  "diagnostic_only": true,
+  "forced_block16": {
+    "bad_output_per_run": [
+      0
+    ],
+    "completed_per_run": [
+      100
+    ],
+    "duplicate_done_per_run": [
+      0
+    ],
+    "errored_per_run": [
+      0
+    ],
+    "missing_done_per_run": [
+      0
+    ],
+    "moe_block_size_env": "16",
+    "output_token_count_source": "usage",
+    "output_tps_mean": 678.0431104857319,
+    "path": "/workspace/artifacts/w3_qwen35_moe_block8_policy_ab_20260621T160946Z_dirty/bench_forced_block16/bench_c32_100x1.json",
+    "zero_output_tokens_per_run": [
+      0
+    ]
+  },
+  "git_head": "4a0fdbfc640b24534330c2844ba9ee3ee8f09652",
+  "ratio_default_over_forced16": 1.023674968651744,
+  "schema_version": 1,
+  "source_status": [
+    " M crates/ferrum-models/src/moe/dispatch.rs"
+  ],
+  "status": "pass_after_manual_summary",
+  "vllm_80pct_target_mean": 1366.82228,
+  "vllm_c32_mean": 1708.52785
+}

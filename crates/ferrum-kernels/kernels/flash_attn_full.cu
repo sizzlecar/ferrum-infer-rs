@@ -18,6 +18,7 @@
 
 #define TILE_Q 16
 #define TILE_KV 32
+#define MAX_HEAD_DIM 256
 
 struct FlashAttnParams {
     int batch;
@@ -66,7 +67,9 @@ extern "C" __global__ void flash_attn_full_f32(
     // Online softmax state
     float m_prev = -FLT_MAX;  // running max
     float l_prev = 0.0f;       // running sum of exp
-    float acc[128];            // accumulator for output (max head_dim = 128)
+    if (hd > MAX_HEAD_DIM) return;
+
+    float acc[MAX_HEAD_DIM];   // accumulator for output
     for (int d = 0; d < hd; d++) acc[d] = 0.0f;
 
     // Iterate over KV tiles
@@ -162,7 +165,9 @@ extern "C" __global__ void flash_attn_full_f16(
 
     float m_prev = -FLT_MAX;
     float l_prev = 0.0f;
-    float acc[128];
+    if (hd > MAX_HEAD_DIM) return;
+
+    float acc[MAX_HEAD_DIM];
     for (int d = 0; d < hd; d++) acc[d] = 0.0f;
 
     for (int kv_start = 0; kv_start < sk; kv_start += TILE_KV) {

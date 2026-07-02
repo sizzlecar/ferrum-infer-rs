@@ -3,6 +3,92 @@ use super::*;
 impl EngineInner {
     // ── batch decode ──────────────────────────────────────────────────
 
+    pub(super) async fn run_batch_decode_adaptive(&self, request_ids: &[RequestId]) -> Result<()> {
+        self.run_batch_decode_adaptive_inner(request_ids, true)
+            .await
+    }
+
+    pub(super) async fn run_batch_decode_adaptive_no_preempt(
+        &self,
+        request_ids: &[RequestId],
+    ) -> Result<()> {
+        self.run_batch_decode_adaptive_inner(request_ids, false)
+            .await
+    }
+
+    async fn run_batch_decode_adaptive_inner(
+        &self,
+        request_ids: &[RequestId],
+        allow_preempt: bool,
+    ) -> Result<()> {
+        let pressure_width = request_ids.len().max(1);
+        let mut stack = vec![(self.decode_ready_request_ids(request_ids), pressure_width)];
+        while let Some((chunk, pressure_width)) = stack.pop() {
+            let chunk = self.decode_ready_request_ids(&chunk);
+            if chunk.is_empty() {
+                continue;
+            }
+            match self.run_batch_decode(&chunk).await {
+                Ok(()) => {}
+                Err(e) if is_resource_exhausted_error(&e) && chunk.len() > 1 => {
+                    let pressure = paged_kv_admission_pressure(&e);
+                    self.scheduler.record_decode_capacity_pressure(
+                        pressure_width,
+                        pressure.map(|pressure| pressure.free_blocks),
+                    );
+                    let mid = chunk.len() / 2;
+                    stack.push((chunk[mid..].to_vec(), pressure_width));
+                    stack.push((chunk[..mid].to_vec(), pressure_width));
+                }
+                Err(e) if is_resource_exhausted_error(&e) => {
+                    if !allow_preempt {
+                        let pressure = paged_kv_admission_pressure(&e);
+                        if let Some(pressure) = pressure {
+                            self.scheduler
+                                .defer_capacity_deferred_mixed_recompute_until_kv_capacity(
+                                    Some(pressure.admission_blocks),
+                                    Some(pressure.free_blocks),
+                                    Some(chunk.len().max(1)),
+                                );
+                        } else {
+                            self.scheduler
+                                .defer_capacity_deferred_mixed_recompute_until_release();
+                        }
+                        for rid in &chunk {
+                            if !self
+                                .defer_decode_for_capacity_recompute(
+                                    rid,
+                                    pressure_width,
+                                    pressure.map(|pressure| pressure.free_blocks),
+                                )
+                                .await
+                            {
+                                warn!(
+                                    "Batch decode deferred for request {}: capacity pressure with no scheduler decode entry",
+                                    rid
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    let exclude: std::collections::HashSet<RequestId> =
+                        chunk.iter().cloned().collect();
+                    if self.preempt_victim_excluding(&exclude).await {
+                        stack.push((chunk, pressure_width));
+                    } else {
+                        warn!(
+                            "Batch decode deferred for {} request(s): no preempt victim",
+                            chunk.len()
+                        );
+                        continue;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Run batch decode for multiple requests in a single forward pass.
     ///
     /// Dispatches via the unified-batch API: we build a `UnifiedBatch`
@@ -15,21 +101,22 @@ impl EngineInner {
     pub(super) async fn run_batch_decode(&self, request_ids: &[RequestId]) -> Result<()> {
         use ferrum_interfaces::model_executor::{UnifiedBatch, UnifiedBatchItem};
 
-        let rids: Vec<RequestId> = request_ids.to_vec();
+        let mut rids: Vec<RequestId> = Vec::new();
 
         // Build the unified batch from sequence state.
         let mut batch = UnifiedBatch::new();
         {
             let sequences = self.sequences.read();
-            for rid in &rids {
-                let seq = sequences
-                    .get(rid)
-                    .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-                let kv_cache = seq
-                    .kv_cache
-                    .as_ref()
-                    .ok_or_else(|| FerrumError::internal("No KV cache"))?
-                    .clone();
+            for rid in request_ids {
+                let Some(seq) = sequences.get(rid) else {
+                    continue;
+                };
+                if !seq.prefill_complete || seq.generated_tokens.is_empty() {
+                    continue;
+                }
+                let Some(kv_cache) = seq.kv_cache.clone() else {
+                    continue;
+                };
                 let last_token = seq
                     .generated_tokens
                     .last()
@@ -55,12 +142,21 @@ impl EngineInner {
                     seq_id,
                     q_tokens: vec![last_token.get()],
                     kv_cache,
+                    recurrent_state: seq.recurrent_state.clone(),
                     pos_offset,
                     is_final_chunk: true,
                     metadata: seq.model_decode_metadata(),
+                    logits_policy: seq.model_decode_logits_policy(),
                 });
+                rids.push(rid.clone());
             }
         }
+        if batch.items.is_empty() {
+            return Ok(());
+        }
+
+        let kv_requests = kv_slot_requests_for_unified_batch(&batch);
+        self.model_executor.reserve_kv_slots(&kv_requests)?;
 
         let prof = self.runtime_config.rbd_prof;
         let t_decode = if prof { Some(Instant::now()) } else { None };
@@ -90,23 +186,19 @@ impl EngineInner {
             })?;
 
             let t0_sample = if prof { Some(Instant::now()) } else { None };
-            let next_token = {
+            let next_token_result = {
                 let mut sequences = self.sequences.write();
                 let seq = sequences
                     .get_mut(rid)
                     .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-                // Greedy fast path: the model did GPU argmax and emitted
-                // one f32 carrying the token id (under `FERRUM_GREEDY_ARGMAX=1`).
-                // Skip sample_with_processors entirely — at vocab=152064
-                // (Qwen3), the host argmax scan is ~150 µs per item and
-                // dominates the engine's per-iter overhead at c=32.
+                // Greedy fast path: the model did GPU argmax and emitted one
+                // f32 carrying the token id. The sequence still validates that
+                // this request is eligible for model-side argmax and that the
+                // returned token satisfies the same hard token-quality masks.
                 let token = if logits.len() == 1 {
-                    if seq.requires_full_logits_for_sampling() {
-                        return Err(FerrumError::model(
-                            "model returned greedy token sentinel for request requiring full logits",
-                        ));
-                    }
-                    TokenId::new(logits[0] as u32)
+                    let token = TokenId::new(logits[0] as u32);
+                    seq.accept_model_greedy_argmax_token(Some(self.tokenizer.as_ref()), token)?;
+                    token
                 } else {
                     seq.sample_with_processors_with_tokenizer(
                         &mut logits,
@@ -114,13 +206,31 @@ impl EngineInner {
                     )?
                 };
                 seq.generated_tokens.push(token);
+                let cache_id = seq
+                    .model_cache_id
+                    .clone()
+                    .unwrap_or_else(|| rid.to_string());
+                let kv_len = seq
+                    .input_tokens
+                    .len()
+                    .saturating_add(seq.generated_tokens.len())
+                    .saturating_sub(1);
+                seq.kv_cache = Some(self.make_model_kv_handle_with_seq(cache_id, kv_len));
                 seq.tokens_this_iteration += 1;
                 // pos_offset is sourced from SequenceState bookkeeping
                 // (see process_batch_unified). The engine-side KV handle's
                 // sequence_length is not used for position tracking
                 // anymore — production handles (Paged/Default) don't
                 // update it across iterations.
-                token
+                Ok::<TokenId, FerrumError>(token)
+            };
+            let next_token = match next_token_result {
+                Ok(token) => token,
+                Err(e) => {
+                    warn!("Batch decode post-process failed for {}: {}", rid, e);
+                    self.complete_request(rid, FinishReason::Error).await?;
+                    continue;
+                }
             };
 
             if let Some(t0) = t0_sample {
@@ -208,16 +318,24 @@ impl EngineInner {
                 .as_ref()
                 .ok_or_else(|| FerrumError::internal("No KV cache"))?
                 .clone();
+            let recurrent_state = seq.recurrent_state.clone();
             let last_token = seq
                 .generated_tokens
                 .last()
                 .copied()
                 .unwrap_or(TokenId::new(0));
             let tensor = self.tokens_to_tensor(&[last_token.get()])?;
-            ferrum_interfaces::model_executor::DecodeInput::new(tensor, kv_cache)
+            let input = ferrum_interfaces::model_executor::DecodeInput::new(tensor, kv_cache)
                 .with_metadata(seq.model_decode_metadata())
+                .with_logits_policy(seq.model_decode_logits_policy());
+            if let Some(state) = recurrent_state {
+                input.with_recurrent_state(state)
+            } else {
+                input
+            }
         };
 
+        let input_recurrent_state = decode_input.recurrent_state.clone();
         let decode_output = self.model_executor.decode(&decode_input).await?;
         let logits_vec = decode_output.logits.to_vec_f32()?;
 
@@ -227,12 +345,22 @@ impl EngineInner {
                 .get_mut(request_id)
                 .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
             let mut logits = logits_vec;
-            let token = seq.sample_with_processors_with_tokenizer(
-                &mut logits,
-                Some(self.tokenizer.as_ref()),
-            )?;
+            let token = if logits.len() == 1 {
+                let token = TokenId::new(logits[0] as u32);
+                seq.accept_model_greedy_argmax_token(Some(self.tokenizer.as_ref()), token)?;
+                token
+            } else {
+                seq.sample_with_processors_with_tokenizer(
+                    &mut logits,
+                    Some(self.tokenizer.as_ref()),
+                )?
+            };
             seq.generated_tokens.push(token);
             seq.kv_cache = Some(decode_output.kv_cache.clone());
+            seq.recurrent_state = decode_output
+                .recurrent_state
+                .clone()
+                .or(input_recurrent_state);
             seq.tokens_this_iteration += 1;
             token
         };
@@ -312,8 +440,9 @@ impl EngineInner {
                 seq.input_tokens.iter().map(|t| t.get()).collect::<Vec<_>>()
             };
             let model_info = draft_exec.info();
+            let draft_kv_request_id = RequestId::new();
             let alloc_request = AllocationRequest {
-                request_id: request_id.clone(),
+                request_id: draft_kv_request_id.clone(),
                 initial_tokens: prompt_u32s.len(),
                 max_sequence_length: model_info.max_sequence_length,
                 num_layers: model_info.num_layers,
@@ -324,14 +453,32 @@ impl EngineInner {
                 priority: Priority::Normal,
             };
             let draft_kv_handle = self.kv_cache.allocate(&alloc_request).await?;
-            let prompt_tensor = self.tokens_to_tensor(&prompt_u32s)?;
+            let draft_kv_resource_blocks = self.kv_resource_blocks_for_tokens(prompt_u32s.len());
+            self.trace_kv_allocate(request_id, draft_kv_resource_blocks);
+            let prompt_tensor = match self.tokens_to_tensor(&prompt_u32s) {
+                Ok(tensor) => tensor,
+                Err(e) => {
+                    let _ = self.kv_cache.deallocate(draft_kv_request_id).await;
+                    self.trace_kv_release(request_id, draft_kv_resource_blocks);
+                    return Err(e);
+                }
+            };
             let pfx = PrefillInput::new(prompt_tensor).with_kv_cache(draft_kv_handle);
-            let pfx_out = draft_exec.prefill(&pfx).await?;
+            let pfx_out = match draft_exec.prefill(&pfx).await {
+                Ok(output) => output,
+                Err(e) => {
+                    let _ = self.kv_cache.deallocate(draft_kv_request_id).await;
+                    self.trace_kv_release(request_id, draft_kv_resource_blocks);
+                    return Err(e);
+                }
+            };
             let kv = pfx_out.kv_cache.clone();
             {
                 let mut sequences = self.sequences.write();
                 if let Some(s) = sequences.get_mut(request_id) {
                     s.draft_kv_cache = Some(kv.clone());
+                    s.draft_kv_request_id = Some(draft_kv_request_id);
+                    s.draft_kv_resource_blocks = Some(draft_kv_resource_blocks);
                 }
             }
             kv

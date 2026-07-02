@@ -1,0 +1,258 @@
+{
+  "command_line": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/w3_qwen35_hf_layer_dump.py",
+    "--self-test",
+    "--out",
+    "/tmp/w3_qwen35_hf_layer_harness_20260617T134658Z_d53683a6/selftest"
+  ],
+  "config_summary": {
+    "first_linear_layer": 0,
+    "hidden_size": 16,
+    "layer_types": [
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention"
+    ],
+    "linear_attention": {
+      "linear_conv_kernel_dim": 4,
+      "linear_key_head_dim": 4,
+      "linear_num_key_heads": 2,
+      "linear_num_value_heads": 2,
+      "linear_value_head_dim": 4
+    },
+    "model_id": "self-test/qwen3.5",
+    "moe": null,
+    "num_hidden_layers": 4,
+    "text_model_type": "qwen3_5_text"
+  },
+  "contract": {
+    "note": "source contract only; no model weights were loaded",
+    "required_hooks": {
+      "class Qwen3_5DecoderLayer": 12,
+      "class Qwen3_5GatedDeltaNet": 10,
+      "core_attn_out = self.norm(core_attn_out, z)": 8,
+      "core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule": 7,
+      "output = self.out_proj(core_attn_out)": 9,
+      "self.chunk_gated_delta_rule": 6,
+      "self.in_proj_a = nn.Linear": 4,
+      "self.in_proj_b = nn.Linear": 3,
+      "self.in_proj_qkv = nn.Linear": 1,
+      "self.in_proj_z = nn.Linear": 2,
+      "self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)": 11,
+      "self.mlp = Qwen3_5MLP(config, config.intermediate_size)": 13,
+      "self.out_proj = nn.Linear": 5
+    },
+    "selected_layer_idx": 0,
+    "source_sha256": "54443ef03c08e61ef8c296f3d8bc0d57d168d61aa9b5df727f183db885c862f5",
+    "status": "pass",
+    "text_model_type": "qwen3_5_text"
+  },
+  "created_at": "2026-06-17T21:49:12.607180+08:00",
+  "git": {
+    "is_dirty": false,
+    "sha": "d53683a60029229ff0a60e928df6e88cd3e3e82e",
+    "tracked_status_short": [],
+    "untracked_count": 0,
+    "untracked_sample": []
+  },
+  "mode": "self-test",
+  "note": "self-test validates schema and source-hook contract only",
+  "pass_line": "W3 QWEN35 HF LAYER DUMP SELFTEST PASS: /private/tmp/w3_qwen35_hf_layer_harness_20260617T134658Z_d53683a6/selftest",
+  "schema_version": 1,
+  "status": "pass",
+  "tensor_dir": "/private/tmp/w3_qwen35_hf_layer_harness_20260617T134658Z_d53683a6/selftest/synthetic_tensors",
+  "tensors": {
+    "a_raw": {
+      "dtype": "float32",
+      "file": "a_raw.bin",
+      "numel": 4,
+      "sha256": "c562717447cf0ebf0815e36d32c9fce8ad3cd04fa486c621f7127713657772b5",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "b_raw": {
+      "dtype": "float32",
+      "file": "b_raw.bin",
+      "numel": 4,
+      "sha256": "69b184c931b76fc50ab2dc09e194212579eb0533e8f9efec8d1933a043222df3",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "delta_beta": {
+      "dtype": "float32",
+      "file": "delta_beta.bin",
+      "numel": 4,
+      "sha256": "8e44678ce5d76932f65948ddceb462205fa61408fcac9d813c6c3cadbe102f82",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "delta_core": {
+      "dtype": "float32",
+      "file": "delta_core.bin",
+      "numel": 4,
+      "sha256": "2a4b8a070a2b7537a4e09ae0712883435072937dd659e4dcd3e98d11b09ed6b4",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "delta_g": {
+      "dtype": "float32",
+      "file": "delta_g.bin",
+      "numel": 4,
+      "sha256": "6846e4a535083a7db7a19426abfdaab03e6491c36b5a37a771a5aeed153035e0",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "delta_k": {
+      "dtype": "float32",
+      "file": "delta_k.bin",
+      "numel": 4,
+      "sha256": "011bbd591902bd7b6b31c8e4de89bd5219048b476187dc06334b5d839cf9ca85",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "delta_norm": {
+      "dtype": "float32",
+      "file": "delta_norm.bin",
+      "numel": 4,
+      "sha256": "de9272ce5e689c4f72759ec59fe24cd5f5fac31cf2cb1e1d8f4a80c3d3a5e267",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "delta_output": {
+      "dtype": "float32",
+      "file": "delta_output.bin",
+      "numel": 4,
+      "sha256": "856e095aba9ce1fe3236f01a274ea7f3b7fbef4fce27284fa2d82b2ce9145c87",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "delta_q": {
+      "dtype": "float32",
+      "file": "delta_q.bin",
+      "numel": 4,
+      "sha256": "a838e3029f0c951d507a5dc0abfe4190e2626a87e52a6d4b8290b6943e0eadf4",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "delta_v": {
+      "dtype": "float32",
+      "file": "delta_v.bin",
+      "numel": 4,
+      "sha256": "07b374eaadd77dae1282d3aa7947b0939c1899806148e31640c96a26ab3708ad",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "input_norm": {
+      "dtype": "float32",
+      "file": "input_norm.bin",
+      "numel": 4,
+      "sha256": "80548010e3ad26a7534756d9356f1bf32a287b525609b8350f8d1847f5bf3d83",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "layer_input": {
+      "dtype": "float32",
+      "file": "layer_input.bin",
+      "numel": 4,
+      "sha256": "1ff5402496aa55156db71a6510433f7ac108498ef4e73ca8caf277dd0b32049c",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "layer_output": {
+      "dtype": "float32",
+      "file": "layer_output.bin",
+      "numel": 4,
+      "sha256": "a177b483dd39fe9f369ce63650cdef2b2265c6e00e22f83eeadf3b44994ca160",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "mixed_qkv_conv": {
+      "dtype": "float32",
+      "file": "mixed_qkv_conv.bin",
+      "numel": 4,
+      "sha256": "1006160ca8c476cbfdcf81d9f149d52bb87e9bed2c225735d8c6b6469fb59c62",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "mixed_qkv_raw": {
+      "dtype": "float32",
+      "file": "mixed_qkv_raw.bin",
+      "numel": 4,
+      "sha256": "e2dbb219ab591b7ab6fe616a49d95936aea60ce9e8014527c4b7f0cb7baaf760",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "mlp_output": {
+      "dtype": "float32",
+      "file": "mlp_output.bin",
+      "numel": 4,
+      "sha256": "f455ae5e143b5826424fc5ab2cfdccccc97a8db139fca017bc122088e7fca300",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "post_attention_norm": {
+      "dtype": "float32",
+      "file": "post_attention_norm.bin",
+      "numel": 4,
+      "sha256": "0da2f2e3fd0725a734ed55e9df457cb1fea03b3723eff01e863ddb1bc0e94c77",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "residual_after_mixer": {
+      "dtype": "float32",
+      "file": "residual_after_mixer.bin",
+      "numel": 4,
+      "sha256": "5e2d035baa5eb094fe369da42592dbc4f0cdbf3b1ec2e7ce4a60651f35f714c5",
+      "shape": [
+        1,
+        4
+      ]
+    },
+    "z_raw": {
+      "dtype": "float32",
+      "file": "z_raw.bin",
+      "numel": 4,
+      "sha256": "3890c93119d9b3af136731f672e83b5e6bf7a1eb021f9d996f6ababee4c45bc4",
+      "shape": [
+        1,
+        4
+      ]
+    }
+  }
+}

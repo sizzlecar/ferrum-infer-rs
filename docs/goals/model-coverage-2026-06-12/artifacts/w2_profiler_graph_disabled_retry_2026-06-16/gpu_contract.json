@@ -1,0 +1,12 @@
+{
+  "lane": "W2 profiler graph-disabled retry",
+  "instance_id": 40826362,
+  "hardware": "1x RTX 4090 Vast existing instance",
+  "expected_runtime": "8-15 minutes, hard cap 25 minutes",
+  "expected_cost_usd": "~0.425/hr prorated, plus existing storage charge",
+  "stop_condition": "stop after first build/serve/chat/bench failure or after minimal c16 profile artifact is collected",
+  "correctness_gate": "CUDA release build; ferrum serve ready; non-stream chat smoke returns 5 with usage; ferrum bench-serve --fail-on-error c16 completes without request errors",
+  "performance_command": "diagnostic single c16 ShareGPT bench-serve with profiler config; no release performance claim",
+  "source_fix": "f7612c3a disables CUDA graph capture while syncing diagnostics/profilers are active",
+  "created_utc": "2026-06-15T18:15:42Z"
+}

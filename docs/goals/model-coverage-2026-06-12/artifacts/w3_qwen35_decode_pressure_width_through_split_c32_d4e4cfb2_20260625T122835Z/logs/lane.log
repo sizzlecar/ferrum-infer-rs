@@ -1,0 +1,19 @@
+2026-06-25T12:28:35Z lane_start art=/workspace/artifacts/w3_qwen35_decode_pressure_width_through_split_c32_d4e4cfb2_20260625T122835Z sha=d4e4cfb26e5745e93d78ecf925dba6092133eaff release_evidence=false no_live_vllm=true
+2026-06-25T12:28:35Z bootstrap_start
+2026-06-25T12:28:36Z bootstrap_done
+2026-06-25T12:28:36Z git_sync_start
+2026-06-25T12:28:36Z git_sync_done
+2026-06-25T12:28:36Z hf_prefetch_start
+2026-06-25T12:28:36Z cargo_check_start
+2026-06-25T12:28:39Z cargo_check_done
+2026-06-25T12:28:39Z release_build_start
+2026-06-25T12:31:53Z release_build_done
+2026-06-25T12:31:53Z hf_prefetch_wait_start
+2026-06-25T12:31:53Z hf_prefetch_done tokenizer=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+2026-06-25T12:31:53Z ferrum_run_smoke_start
+2026-06-25T12:32:21Z ferrum_run_smoke_done
+2026-06-25T12:32:21Z serve_start
+2026-06-25T12:32:49Z serve_ready
+2026-06-25T12:32:49Z serve_chat_smoke_done
+2026-06-25T12:32:49Z bench_c32_start
+2026-06-25T12:33:04Z FERRUM W3 QWEN35 C32 DIAG REJECT: /workspace/artifacts/w3_qwen35_decode_pressure_width_through_split_c32_d4e4cfb2_20260625T122835Z

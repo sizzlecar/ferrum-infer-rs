@@ -1,0 +1,112 @@
+[auto-size] gpu=24.0 GB total / 23.5 GB free | weights=22.7 GB budget / 22.7 GB total | layers=40 budget | scratch reserve=4.0 GB | KV pool budget 0.0 GB → max_blocks=12
+[auto-size] requested runtime token floor requires KV_MAX_BLOCKS=12 above estimated budget 0; honoring explicit runtime limits
+[auto-size] KV_MAX_BLOCKS=256 PAGED_MAX_SEQS=<user> KV_CAPACITY=<user>
+[2m2026-06-25T07:53:38.337962Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-25T07:53:38.337976Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-25T07:53:38.338024Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b/tokenizer.json"
+[2m2026-06-25T07:53:38.789803Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-25T07:53:38.789841Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-25T07:53:38.789846Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-25T07:53:38.789861Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=256
+[2m2026-06-25T07:53:38.789916Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b (format: safetensors)
+[2m2026-06-25T07:53:38.790082Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Qwen35Moe, Layers: 40, Vocab: 248320
+[2m2026-06-25T07:53:38.894148Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-25T07:53:38.894179Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Using Qwen3.5/Qwen3.6 CUDA backend executor
+[2m2026-06-25T07:53:39.624087Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading globals and 40 layers
+[2m2026-06-25T07:53:44.797660Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: globals loaded in 5.2s
+[2m2026-06-25T07:53:44.797703Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 1/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:45.652991Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 1/40 loaded in 0.9s
+[2m2026-06-25T07:53:45.653028Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 2/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:46.501458Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 2/40 loaded in 0.8s
+[2m2026-06-25T07:53:46.501499Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 3/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:47.352018Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 3/40 loaded in 0.9s
+[2m2026-06-25T07:53:47.352054Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 4/40 (FullAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:48.024084Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 4/40 loaded in 0.7s
+[2m2026-06-25T07:53:48.024128Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 5/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:48.910632Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 5/40 loaded in 0.9s
+[2m2026-06-25T07:53:48.910717Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 6/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:49.812512Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 6/40 loaded in 0.9s
+[2m2026-06-25T07:53:49.812558Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 7/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:50.532013Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 7/40 loaded in 0.7s
+[2m2026-06-25T07:53:50.532052Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 8/40 (FullAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:50.913645Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 8/40 loaded in 0.4s
+[2m2026-06-25T07:53:50.913687Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 9/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:51.376002Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 9/40 loaded in 0.5s
+[2m2026-06-25T07:53:51.376039Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 10/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:51.835846Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 10/40 loaded in 0.5s
+[2m2026-06-25T07:53:51.835893Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 11/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:52.295409Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 11/40 loaded in 0.5s
+[2m2026-06-25T07:53:52.295451Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 12/40 (FullAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:52.674275Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 12/40 loaded in 0.4s
+[2m2026-06-25T07:53:52.674316Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 13/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:53.133271Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 13/40 loaded in 0.5s
+[2m2026-06-25T07:53:53.133313Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 14/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:53.592654Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 14/40 loaded in 0.5s
+[2m2026-06-25T07:53:53.592697Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 15/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:54.051209Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 15/40 loaded in 0.5s
+[2m2026-06-25T07:53:54.051249Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 16/40 (FullAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:54.429994Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 16/40 loaded in 0.4s
+[2m2026-06-25T07:53:54.430034Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 17/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:54.893288Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 17/40 loaded in 0.5s
+[2m2026-06-25T07:53:54.893333Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 18/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:55.355263Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 18/40 loaded in 0.5s
+[2m2026-06-25T07:53:55.355319Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 19/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:55.817097Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 19/40 loaded in 0.5s
+[2m2026-06-25T07:53:55.817138Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 20/40 (FullAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:56.197905Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 20/40 loaded in 0.4s
+[2m2026-06-25T07:53:56.197947Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 21/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:56.659345Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 21/40 loaded in 0.5s
+[2m2026-06-25T07:53:56.659381Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 22/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:57.122172Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 22/40 loaded in 0.5s
+[2m2026-06-25T07:53:57.122209Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 23/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:57.584783Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 23/40 loaded in 0.5s
+[2m2026-06-25T07:53:57.584824Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 24/40 (FullAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:57.966078Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 24/40 loaded in 0.4s
+[2m2026-06-25T07:53:57.966118Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 25/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:58.428076Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 25/40 loaded in 0.5s
+[2m2026-06-25T07:53:58.428118Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 26/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:58.891153Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 26/40 loaded in 0.5s
+[2m2026-06-25T07:53:58.891194Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 27/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:59.355117Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 27/40 loaded in 0.5s
+[2m2026-06-25T07:53:59.355159Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 28/40 (FullAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:53:59.738039Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 28/40 loaded in 0.4s
+[2m2026-06-25T07:53:59.738077Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 29/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:54:00.201341Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 29/40 loaded in 0.5s
+[2m2026-06-25T07:54:00.201380Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 30/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:54:00.665362Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 30/40 loaded in 0.5s
+[2m2026-06-25T07:54:00.665416Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 31/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:54:01.129890Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 31/40 loaded in 0.5s
+[2m2026-06-25T07:54:01.129929Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 32/40 (FullAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:54:01.515523Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 32/40 loaded in 0.4s
+[2m2026-06-25T07:54:01.515564Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 33/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:54:01.979168Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 33/40 loaded in 0.5s
+[2m2026-06-25T07:54:01.979207Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 34/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:54:02.444667Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 34/40 loaded in 0.5s
+[2m2026-06-25T07:54:02.444702Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 35/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:54:02.910134Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 35/40 loaded in 0.5s
+[2m2026-06-25T07:54:02.910175Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 36/40 (FullAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:54:03.295036Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 36/40 loaded in 0.4s
+[2m2026-06-25T07:54:03.295077Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 37/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:54:03.759355Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 37/40 loaded in 0.5s
+[2m2026-06-25T07:54:03.759396Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 38/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:54:04.224761Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 38/40 loaded in 0.5s
+[2m2026-06-25T07:54:04.224801Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 39/40 (LinearAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:54:04.689591Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 39/40 loaded in 0.5s
+[2m2026-06-25T07:54:04.689631Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loading layer 40/40 (FullAttention, SparseMoeSharedExpert)
+[2m2026-06-25T07:54:05.075032Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: layer 40/40 loaded in 0.4s
+[2m2026-06-25T07:54:05.075072Z[0m [32m INFO[0m [2mferrum_models::models::qwen35[0m[2m:[0m Qwen3.5 native weights: loaded 40 layers in 25.5s
+[2m2026-06-25T07:54:11.408154Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine::inner::batch[0m[2m:[0m Unified KV admission failed: Resource exhausted: Qwen3.5 paged KV admission: need 28 admission blocks (28 immediate) but only 0 free
+[2m2026-06-25T07:54:12.141079Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine::inner::batch[0m[2m:[0m Unified KV admission failed: Resource exhausted: Qwen3.5 paged KV admission: need 1 admission blocks (1 immediate) but only 0 free
+[2m2026-06-25T07:54:12.243793Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine::inner::batch[0m[2m:[0m Unified KV admission failed: Resource exhausted: Qwen3.5 paged KV admission: need 24 admission blocks (24 immediate) but only 4 free
+[2m2026-06-25T07:54:12.328766Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine::inner::batch[0m[2m:[0m Unified KV admission failed: Resource exhausted: Qwen3.5 paged KV admission: need 5 admission blocks (5 immediate) but only 0 free
+[2m2026-06-25T07:54:13.209350Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine::inner::batch[0m[2m:[0m Unified KV admission failed: Resource exhausted: Qwen3.5 paged KV admission: need 22 admission blocks (22 immediate) but only 0 free
+[2m2026-06-25T07:54:13.718246Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine::inner::batch[0m[2m:[0m Unified KV admission failed: Resource exhausted: Qwen3.5 paged KV admission: need 1 admission blocks (1 immediate) but only 0 free
+[2m2026-06-25T07:54:13.855605Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine::inner::batch[0m[2m:[0m Unified KV admission failed: Resource exhausted: Qwen3.5 paged KV admission: need 20 admission blocks (20 immediate) but only 3 free
+[2m2026-06-25T07:54:14.416793Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine::inner::batch[0m[2m:[0m Unified KV admission failed: Resource exhausted: Qwen3.5 paged KV admission: need 1 admission blocks (1 immediate) but only 0 free
+[2m2026-06-25T07:54:14.515141Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine::inner::batch[0m[2m:[0m Unified KV admission failed: Resource exhausted: Qwen3.5 paged KV admission: need 18 admission blocks (18 immediate) but only 4 free
+[2m2026-06-25T07:54:15.210697Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine::inner::batch[0m[2m:[0m Unified KV admission failed: Resource exhausted: Qwen3.5 paged KV admission: need 16 admission blocks (16 immediate) but only 3 free
+[2m2026-06-25T07:54:15.744652Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine::inner::batch[0m[2m:[0m Unified KV admission failed: Resource exhausted: Qwen3.5 paged KV admission: need 1 admission blocks (1 immediate) but only 0 free
+[2m2026-06-25T07:54:15.844864Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine::inner::batch[0m[2m:[0m Unified KV admission failed: Resource exhausted: Qwen3.5 paged KV admission: need 15 admission blocks (15 immediate) but only 4 free
+[2m2026-06-25T07:54:15.977954Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine::inner::batch[0m[2m:[0m Unified KV admission failed: Resource exhausted: Qwen3.5 paged KV admission: need 1 admission blocks (1 immediate) but only 0 free
+[2m2026-06-25T07:54:16.238235Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine::inner::batch[0m[2m:[0m Unified KV admission failed: Resource exhausted: Qwen3.5 paged KV admission: need 14 admission blocks (14 immediate) but only 1 free
+[2m2026-06-25T07:54:16.286467Z[0m [33m WARN[0m [2mferrum_engine::continuous_engine::inner::batch[0m[2m:[0m Unified KV admission failed: Resource exhausted: Qwen3.5 paged KV admission: need 4 admission blocks (4 immediate) but only 3 free

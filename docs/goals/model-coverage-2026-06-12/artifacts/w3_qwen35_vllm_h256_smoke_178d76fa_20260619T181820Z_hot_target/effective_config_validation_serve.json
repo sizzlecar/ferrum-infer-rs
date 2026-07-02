@@ -1,0 +1,35 @@
+{
+  "status": "pass",
+  "checks": [
+    {
+      "label": "serve",
+      "selected_attention_impl": "vllm_paged_attn_v2",
+      "entries": {
+        "FERRUM_USE_VLLM_PAGED_ATTN": {
+          "key": "FERRUM_USE_VLLM_PAGED_ATTN",
+          "effective_value": "1",
+          "source": "memory_profile",
+          "affects": [
+            "performance"
+          ]
+        },
+        "FERRUM_VLLM_PAGED_ATTN_V1_SHORT": {
+          "key": "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
+          "effective_value": "0",
+          "source": "memory_profile",
+          "affects": [
+            "performance"
+          ]
+        },
+        "FERRUM_VLLM_MOE": {
+          "key": "FERRUM_VLLM_MOE",
+          "effective_value": "1",
+          "source": "memory_profile",
+          "affects": [
+            "performance"
+          ]
+        }
+      }
+    }
+  ]
+}

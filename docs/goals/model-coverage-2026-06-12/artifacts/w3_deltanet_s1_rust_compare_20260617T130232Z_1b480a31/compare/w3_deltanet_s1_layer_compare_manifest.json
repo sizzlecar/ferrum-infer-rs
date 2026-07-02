@@ -1,0 +1,376 @@
+{
+  "checks": {
+    "delta_rule": "pass",
+    "deltanet_layer": "pass",
+    "expert_layout": "pass",
+    "router_topk": "pass",
+    "shared_expert_merge": "pass"
+  },
+  "command_line": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/w3_deltanet_s1_layer_compare.py",
+    "--compare",
+    "--reference-dump",
+    "/tmp/w3_deltanet_s1_rust_compare_20260617T130232Z_1b480a31/reference_bundle/reference_dump",
+    "--ferrum-dump",
+    "/tmp/w3_deltanet_s1_rust_compare_20260617T130232Z_1b480a31/ferrum_dump",
+    "--out",
+    "/tmp/w3_deltanet_s1_rust_compare_20260617T130232Z_1b480a31/compare"
+  ],
+  "comparisons": {
+    "delta_beta": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_core": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_gate": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_k": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_output": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_q": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_v": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "input": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "layer_output": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "moe_output": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "routed_expert_output": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "router_logits": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "router_topk_indices": {
+      "first_mismatch": null,
+      "mismatches": 0,
+      "status": "pass"
+    },
+    "router_topk_weights": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "shared_expert_output": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    }
+  },
+  "created_at": "2026-06-17T21:03:13.057222+08:00",
+  "ferrum_dump": "/private/tmp/w3_deltanet_s1_rust_compare_20260617T130232Z_1b480a31/ferrum_dump",
+  "ferrum_manifest": {
+    "float_tensors": {
+      "delta_beta": "delta_beta.bin",
+      "delta_core": "delta_core.bin",
+      "delta_gate": "delta_gate.bin",
+      "delta_k": "delta_k.bin",
+      "delta_output": "delta_output.bin",
+      "delta_q": "delta_q.bin",
+      "delta_v": "delta_v.bin",
+      "input": "input.bin",
+      "layer_output": "layer_output.bin",
+      "moe_output": "moe_output.bin",
+      "routed_expert_output": "routed_expert_output.bin",
+      "router_logits": "router_logits.bin",
+      "router_topk_weights": "router_topk_weights.bin",
+      "shared_expert_output": "shared_expert_output.bin"
+    },
+    "int_tensors": {
+      "router_topk_indices": "router_topk_indices.json"
+    },
+    "layout": "token-major contiguous float32 unless noted",
+    "producer": "ferrum-models-w3-deltanet-s1",
+    "schema_version": 1,
+    "seed": 9271,
+    "semantics": {
+      "delta_output": "matmul(delta_core * sigmoid(x @ w_delta_gate), w_o)",
+      "delta_rule": "S_t = S_{t-1} + beta_t * k_t^T * (v_t - k_t @ S_{t-1}); core_t = q_t @ S_t",
+      "expert": "down(silu(x @ gate) * (x @ up))",
+      "layer_output": "input + delta_output + moe_output",
+      "moe_merge": "routed_topk_expert_sum + shared_expert_output",
+      "router": "Ferrum MoE route() stable top-k ids; dump weights are selected-logit softmax for reference alignment"
+    },
+    "shape": {
+      "expert_hidden_dim": 6,
+      "experts": 5,
+      "heads": 2,
+      "hidden_dim": 8,
+      "key_dim": 3,
+      "tokens": 6,
+      "top_k": 2,
+      "value_dim": 4
+    },
+    "tensor_shapes": {
+      "delta_beta": [
+        6,
+        2
+      ],
+      "delta_core": [
+        6,
+        2,
+        4
+      ],
+      "delta_gate": [
+        6,
+        8
+      ],
+      "delta_k": [
+        6,
+        2,
+        3
+      ],
+      "delta_output": [
+        6,
+        8
+      ],
+      "delta_q": [
+        6,
+        2,
+        3
+      ],
+      "delta_v": [
+        6,
+        2,
+        4
+      ],
+      "input": [
+        6,
+        8
+      ],
+      "layer_output": [
+        6,
+        8
+      ],
+      "moe_output": [
+        6,
+        8
+      ],
+      "routed_expert_output": [
+        6,
+        8
+      ],
+      "router_logits": [
+        6,
+        5
+      ],
+      "router_topk_indices": [
+        6,
+        2
+      ],
+      "router_topk_weights": [
+        6,
+        2
+      ],
+      "shared_expert_output": [
+        6,
+        8
+      ]
+    }
+  },
+  "git": {
+    "is_dirty": false,
+    "sha": "1b480a31091fb890d753f1e85e008c28db3b1d39",
+    "tracked_status_short": [],
+    "untracked_count": 0,
+    "untracked_sample": []
+  },
+  "mode": "compare",
+  "note": "real W3-S1 evidence only if reference_dump is from official/HF reference and ferrum_dump is product-generated",
+  "pass_line": "W3 DELTANET S1 LAYER COMPARE PASS: /private/tmp/w3_deltanet_s1_rust_compare_20260617T130232Z_1b480a31/compare",
+  "reference_dump": "/private/tmp/w3_deltanet_s1_rust_compare_20260617T130232Z_1b480a31/reference_bundle/reference_dump",
+  "reference_manifest": {
+    "created_at": "2026-06-17T21:02:34.753869+08:00",
+    "float_tensors": {
+      "delta_beta": "delta_beta.bin",
+      "delta_core": "delta_core.bin",
+      "delta_gate": "delta_gate.bin",
+      "delta_k": "delta_k.bin",
+      "delta_output": "delta_output.bin",
+      "delta_q": "delta_q.bin",
+      "delta_v": "delta_v.bin",
+      "input": "input.bin",
+      "layer_output": "layer_output.bin",
+      "moe_output": "moe_output.bin",
+      "routed_expert_output": "routed_expert_output.bin",
+      "router_logits": "router_logits.bin",
+      "router_topk_weights": "router_topk_weights.bin",
+      "shared_expert_output": "shared_expert_output.bin"
+    },
+    "int_tensors": {
+      "router_topk_indices": "router_topk_indices.json"
+    },
+    "layout": "token-major contiguous float32 unless noted",
+    "producer": "internal-python-reference",
+    "schema_version": 1,
+    "seed": 9271,
+    "semantics": {
+      "delta_output": "matmul(delta_core * sigmoid(x @ w_delta_gate), w_o)",
+      "delta_rule": "S_t = S_{t-1} + beta_t * k_t^T * (v_t - k_t @ S_{t-1}); core_t = q_t @ S_t",
+      "expert": "down(silu(x @ gate) * (x @ up))",
+      "layer_output": "input + delta_output + moe_output",
+      "moe_merge": "routed_topk_expert_sum + shared_expert_output",
+      "router": "stable top-k by descending logit then ascending expert id; weights are softmax over selected logits"
+    },
+    "shape": {
+      "expert_hidden_dim": 6,
+      "experts": 5,
+      "heads": 2,
+      "hidden_dim": 8,
+      "key_dim": 3,
+      "tokens": 6,
+      "top_k": 2,
+      "value_dim": 4
+    },
+    "tensor_shapes": {
+      "delta_beta": [
+        6,
+        2
+      ],
+      "delta_core": [
+        6,
+        2,
+        4
+      ],
+      "delta_gate": [
+        6,
+        8
+      ],
+      "delta_k": [
+        6,
+        2,
+        3
+      ],
+      "delta_output": [
+        6,
+        8
+      ],
+      "delta_q": [
+        6,
+        2,
+        3
+      ],
+      "delta_v": [
+        6,
+        2,
+        4
+      ],
+      "input": [
+        6,
+        8
+      ],
+      "layer_output": [
+        6,
+        8
+      ],
+      "moe_output": [
+        6,
+        8
+      ],
+      "routed_expert_output": [
+        6,
+        8
+      ],
+      "router_logits": [
+        6,
+        5
+      ],
+      "router_topk_indices": [
+        6,
+        2
+      ],
+      "router_topk_weights": [
+        6,
+        2
+      ],
+      "shared_expert_output": [
+        6,
+        8
+      ]
+    }
+  },
+  "schema_version": 1,
+  "status": "pass",
+  "tolerance": {
+    "max_abs": 1e-06
+  }
+}

@@ -1,0 +1,38 @@
+[microbench] compiling legacy_plain: scripts/microbenches/gemma3_tail_mlp_chain_perf.cu
+-rwxr-xr-x 1 root root 729032 Jun 16 00:12 /tmp/gemma3_tail_mlp_cache_policy_legacy_plain
+[microbench] compiling product_default: scripts/microbenches/gemma3_tail_mlp_chain_perf.cu
+-rwxr-xr-x 1 root root 733128 Jun 16 00:12 /tmp/gemma3_tail_mlp_cache_policy_product_default
+
+### variant=legacy_plain
+gemma3_tail_mlp_chain_perf device=NVIDIA GeForce RTX 4090 sm=8.9 h=5376 im=21504
+mode,m,pre_norm_us,gate_up_us,geglu_us,down_us,final_norm_us,phase_sum_us,chain_event_us,chain_host_sync_us,ret
+product_ws_zero,1,6.246,133.538,3.837,70.797,6.414,220.833,209.607,212.221,0
+kernel_only_ws_prezero_diagnostic,1,6.428,130.589,4.227,68.584,6.462,216.290,207.375,209.174,0
+product_ws_zero,10,6.098,137.706,4.174,70.906,6.451,225.336,214.821,217.425,0
+kernel_only_ws_prezero_diagnostic,10,5.890,134.548,4.432,68.493,6.328,219.692,210.664,212.369,0
+product_ws_zero,16,5.687,139.046,4.499,70.496,6.161,225.889,215.344,217.656,0
+kernel_only_ws_prezero_diagnostic,16,5.808,136.402,4.911,68.574,6.316,222.012,213.098,214.672,0
+product_ws_zero,23,5.825,143.653,4.782,75.040,6.184,235.485,224.792,227.086,0
+kernel_only_ws_prezero_diagnostic,23,5.794,140.793,4.805,72.764,6.143,230.298,222.267,224.071,0
+product_ws_zero,32,5.728,145.549,5.247,75.653,6.168,238.345,227.980,230.162,0
+kernel_only_ws_prezero_diagnostic,32,5.822,142.674,5.320,73.469,6.193,233.478,225.525,227.173,0
+
+VERDICT: gemma3 tail MLP chain native CUDA probe complete
+
+### variant=product_default
+gemma3_tail_mlp_chain_perf device=NVIDIA GeForce RTX 4090 sm=8.9 h=5376 im=21504
+mode,m,pre_norm_us,gate_up_us,geglu_us,down_us,final_norm_us,phase_sum_us,chain_event_us,chain_host_sync_us,ret
+product_ws_zero,1,5.222,132.711,3.720,66.830,5.206,213.690,202.714,204.791,0
+kernel_only_ws_prezero_diagnostic,1,5.033,129.830,3.828,64.812,5.274,208.777,199.864,201.941,0
+product_ws_zero,10,5.108,136.688,3.733,68.152,5.259,218.940,208.771,210.746,0
+kernel_only_ws_prezero_diagnostic,10,5.158,133.952,3.802,66.077,5.252,214.240,205.838,207.816,0
+product_ws_zero,16,5.059,138.527,4.206,68.852,5.250,221.895,211.791,213.572,0
+kernel_only_ws_prezero_diagnostic,16,5.123,135.694,4.241,66.695,5.268,217.021,208.816,210.655,0
+product_ws_zero,23,5.202,143.110,4.720,73.970,5.272,232.274,221.724,223.707,0
+kernel_only_ws_prezero_diagnostic,23,5.086,140.158,4.526,71.882,5.244,226.897,218.506,220.354,0
+product_ws_zero,32,5.086,144.439,5.123,75.414,5.226,235.288,225.103,226.952,0
+kernel_only_ws_prezero_diagnostic,32,5.135,141.553,5.102,73.419,5.252,230.461,222.195,224.108,0
+
+VERDICT: gemma3 tail MLP chain native CUDA probe complete
+
+VERDICT: gemma3 Marlin cache-policy native CUDA probe complete

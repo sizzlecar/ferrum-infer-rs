@@ -1,0 +1,22 @@
+SERVE_SMOKE_OK True
+{
+  "bench_rc": 0,
+  "completed_per_run": [
+    16
+  ],
+  "errored_per_run": [
+    0
+  ],
+  "itl_p95_ms": 27.1778395,
+  "output_throughput_tps": 273.31374287329345,
+  "output_token_count_source": "usage",
+  "previous_output_tps": 158.877,
+  "previous_target_readback_us": 22039,
+  "request_throughput_rps": 17.08210892958084,
+  "target_mixed_frame": null,
+  "throughput_delta_tps_vs_previous": 114.43674287329344,
+  "throughput_ratio_vs_previous": 1.720285144314743,
+  "ttft_p50_ms": 583.790647,
+  "ttft_p95_ms": 584.2009304999999,
+  "unified_profile_rows": []
+}

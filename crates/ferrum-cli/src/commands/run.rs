@@ -10,7 +10,7 @@ use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, Promp
 use ferrum_types::{
     FerrumConfigBuilder, FerrumError, FinishReason, InferenceRequest, ModelCapabilities, Priority,
     RequestId, ResolvedFerrumConfig, Result, RuntimeConfigEntry, RuntimeConfigSnapshot,
-    SamplingParams, WorkloadProfile,
+    RuntimeConfigSource, SamplingParams, WorkloadProfile, DEFAULT_CHAT_REPETITION_PENALTY,
 };
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -213,9 +213,14 @@ pub struct RunCommand {
     #[arg(long, default_value = "0.0")]
     pub temperature: f32,
 
-    /// Backend: auto, cpu, metal (default: auto)
+    /// Backend: auto, cpu, metal, cuda (default: auto)
     #[arg(long, default_value = "auto")]
     pub backend: String,
+
+    /// Enable the explicit CPU/FP32 Qwen3.5/Qwen3.6 reference executor for W3
+    /// correctness bring-up. This is not a release-performance path.
+    #[arg(long)]
+    pub qwen35_reference: bool,
 
     /// CUDA GPU ids to use, comma-separated. Multi-GPU requests select
     /// layer-split for supported Llama-family safetensors models.
@@ -262,7 +267,7 @@ pub struct RunCommand {
     /// with no penalty deterministically locks into token loops on some
     /// inputs (the "2D/3D 2D/3D..." degeneration). Pass `--repeat-penalty 1.0`
     /// for an unpenalized greedy baseline.
-    #[arg(long, default_value = "1.1")]
+    #[arg(long, default_value_t = DEFAULT_CHAT_REPETITION_PENALTY)]
     pub repeat_penalty: f32,
 
     /// Number of recent tokens that the repetition penalty considers.
@@ -294,6 +299,38 @@ pub struct RunCommand {
     #[arg(long, value_name = "N")]
     pub max_num_batched_tokens: Option<usize>,
 
+    /// Enable legacy Llama/Gemma batched decode CUDA graph replay.
+    #[arg(long, conflicts_with = "disable_batched_graph")]
+    pub batched_graph: bool,
+
+    /// Disable legacy Llama/Gemma batched decode CUDA graph replay.
+    #[arg(long, conflicts_with = "batched_graph")]
+    pub disable_batched_graph: bool,
+
+    /// Enable Llama/Gemma unified decode CUDA graph replay.
+    #[arg(long, conflicts_with = "disable_unified_graph")]
+    pub unified_graph: bool,
+
+    /// Disable Llama/Gemma unified decode CUDA graph replay.
+    #[arg(long, conflicts_with = "unified_graph")]
+    pub disable_unified_graph: bool,
+
+    /// Capture only Llama/Gemma unified transformer layers in CUDA graph replay.
+    #[arg(long, conflicts_with = "disable_unified_graph_layers_only")]
+    pub unified_graph_layers_only: bool,
+
+    /// Disable layers-only unified CUDA graph capture scope.
+    #[arg(long, conflicts_with = "unified_graph_layers_only")]
+    pub disable_unified_graph_layers_only: bool,
+
+    /// Capture unified layers plus final packing; leave lm_head eager.
+    #[arg(long, conflicts_with = "disable_unified_graph_lm_head_eager")]
+    pub unified_graph_lm_head_eager: bool,
+
+    /// Disable lm-head-eager unified CUDA graph capture scope.
+    #[arg(long, conflicts_with = "unified_graph_lm_head_eager")]
+    pub disable_unified_graph_lm_head_eager: bool,
+
     /// KV cache element dtype (Dim 5 polymorphism point). Accepts
     /// `fp16`, `bf16`, `int8`, `fp8`. Default `fp16`. INT8 / FP8
     /// require model wire-up; today only the kernel + type layer ships.
@@ -317,6 +354,34 @@ pub struct RunCommand {
     #[arg(long)]
     pub decision_trace_jsonl: Option<PathBuf>,
 
+    /// Generate a synthetic/no-weight observability vertical-slice artifact and exit.
+    #[arg(long, value_name = "DIR")]
+    pub observability_vertical_slice_out: Option<PathBuf>,
+
+    /// Write product observability profile events to this JSONL path.
+    #[arg(long, value_name = "PATH")]
+    pub profile_jsonl: Option<PathBuf>,
+
+    /// Product observability detail level.
+    #[arg(long, value_enum, default_value_t = crate::observability_product::ProfileDetailArg::Off)]
+    pub profile_detail: crate::observability_product::ProfileDetailArg,
+
+    /// Write product memory profile events to this JSONL path.
+    #[arg(long, value_name = "PATH")]
+    pub memory_profile_jsonl: Option<PathBuf>,
+
+    /// Write scheduler/admission trace events to this JSONL path.
+    #[arg(long, value_name = "PATH")]
+    pub scheduler_trace_jsonl: Option<PathBuf>,
+
+    /// Write a sanitized request/replay bundle to this directory.
+    #[arg(long, value_name = "DIR")]
+    pub request_dump_dir: Option<PathBuf>,
+
+    /// Product observability sampling rate for resource lifecycle events.
+    #[arg(long, default_value_t = crate::observability_product::default_profile_sample_rate())]
+    pub profile_sample_rate: f64,
+
     /// Output format. `text` (default) — streaming text + stats UX.
     /// `jsonl` — one JSON record per event on stdout; used by tests and scripts.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -324,6 +389,42 @@ pub struct RunCommand {
 }
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
+    if let Some(out_dir) = cmd.observability_vertical_slice_out.as_ref() {
+        crate::observability_vertical_slice::write_observability_vertical_slice(
+            ferrum_types::ProfileEntrypoint::Run,
+            out_dir,
+        )?;
+        println!(
+            "OBSERVABILITY VERTICAL SLICE ARTIFACT: {}",
+            out_dir.display()
+        );
+        return Ok(());
+    }
+    let product_observability = crate::observability_product::ProductObservabilityConfig::new(
+        ferrum_types::ProfileEntrypoint::Run,
+        &cmd.model,
+        cmd.profile_jsonl.as_ref(),
+        cmd.profile_detail,
+        cmd.memory_profile_jsonl.as_ref(),
+        cmd.scheduler_trace_jsonl.as_ref(),
+        cmd.request_dump_dir.as_ref(),
+        cmd.profile_sample_rate,
+    );
+    if product_observability.synthetic_no_weight_enabled() {
+        let written = crate::observability_product::write_synthetic_product_observability(
+            &product_observability,
+        )?;
+        println!(
+            "OBSERVABILITY PRODUCT ARTIFACTS: {}",
+            written
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        return Ok(());
+    }
+
     // Resolve graph-clean Qwen3-MoE defaults as typed entries first, then
     // materialize them only for legacy backend readers.
     let moe_graph_defaults = crate::runtime_env::moe_graph_default_entries(
@@ -337,7 +438,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
     // Select device before model resolution so CPU runs do not materialize
     // GPU/Metal chat-profile defaults such as paged KV.
-    let mut device = select_device(&cmd.backend);
+    let mut device = select_device(&cmd.backend)?;
     let mut gpu_selection =
         crate::gpu_devices::resolve_cuda_gpu_devices(cmd.gpu_devices.as_deref(), &device)?;
     if let Some(selection) = &gpu_selection {
@@ -418,6 +519,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         "model_path".to_string(),
         serde_json::Value::String(engine_model_path),
     );
+    if cmd.qwen35_reference {
+        engine_config.backend.backend_options.insert(
+            "qwen35_reference".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
     let runtime_config = RuntimeConfigSnapshot::capture_current();
     if let Some(selection) = &gpu_selection {
         selection.insert_backend_options(&mut engine_config.backend.backend_options);
@@ -431,6 +538,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let startup_auto_config = run_startup_auto_config(
         &device,
         model_definition_for_config.as_ref(),
+        crate::commands::serve::model_weight_bytes_from_path(&source.local_path),
         effective_runtime_config,
     )?;
     // Apply the resolved auto-config knobs the same way `serve` does. Without
@@ -447,7 +555,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     engine_config
         .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
         .map_err(ferrum_types::FerrumError::config)?;
-    if runtime_config_bool(&runtime_config, "FERRUM_METAL_PAGED_KV").unwrap_or(false) {
+    if runtime_config_bool(&startup_auto_config.runtime_config, "FERRUM_PAGED_KV")
+        .or_else(|| {
+            runtime_config_bool(&startup_auto_config.runtime_config, "FERRUM_METAL_PAGED_KV")
+        })
+        .unwrap_or(false)
+    {
         engine_config.kv_cache.cache_type = ferrum_types::KvCacheType::Paged;
     }
     let effective_kv_dtype = cmd
@@ -484,11 +597,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         )?;
         maybe_warn_context_shift(&plan, format);
         let metadata = run_request_metadata(&plan.prompt, &chat_template_options);
+        let prompt_chars = plan.prompt.chars().count();
         let request = InferenceRequest {
             id: RequestId(Uuid::new_v4()),
             model_id: ferrum_types::ModelId(model_id.clone()),
             prompt: plan.prompt,
-            sampling_params: plan.sampling_params,
+            sampling_params: plan.sampling_params.clone(),
             stream: false,
             priority: Priority::Normal,
             client_id: None,
@@ -497,9 +611,52 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             api_request: None,
             metadata,
         };
+        let profile_request_id = request.id.to_string();
+        let memory_sampler = crate::memory_profile::ProcessMemorySampler;
+        let memory_before = product_observability
+            .enabled()
+            .then(|| memory_sampler.sample())
+            .flatten();
         let start = std::time::Instant::now();
-        let response = engine.infer(request).await?;
+        let response = match engine.infer(request).await {
+            Ok(response) => response,
+            Err(err) => {
+                let memory = product_observability
+                    .enabled()
+                    .then(|| memory_sampler.observe(memory_before))
+                    .flatten();
+                let elapsed = start.elapsed().as_secs_f64();
+                if let Err(observability_err) =
+                    crate::observability_product::write_actual_run_failure_observability(
+                        &product_observability,
+                        &crate::observability_product::ActualRunFailureObservation {
+                            request_id: profile_request_id,
+                            duration_us: (elapsed * 1_000_000.0).max(0.0) as u64,
+                            sampling_params: plan.sampling_params.clone(),
+                            prompt_token_count: plan.prompt_tokens,
+                            prompt_chars,
+                            failure_kind: err.observability_failure_kind().to_string(),
+                            error_kind: err.observability_error_kind().to_string(),
+                            error_message: err.to_string(),
+                            memory,
+                        },
+                    )
+                {
+                    eprintln!("failed to write run failure observability: {observability_err}");
+                }
+                return Err(err);
+            }
+        };
+        let memory = product_observability
+            .enabled()
+            .then(|| memory_sampler.observe(memory_before))
+            .flatten();
         let tokens = response.tokens.len();
+        let output_token_ids = response
+            .tokens
+            .iter()
+            .map(|token| token.get())
+            .collect::<Vec<_>>();
         let content = display_response_text(&response.text);
         let chunk_count = usize::from(!content.is_empty());
         let finish_reason = Some(response.finish_reason);
@@ -535,6 +692,23 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 );
             }
         }
+        crate::observability_product::write_actual_run_observability(
+            &product_observability,
+            &crate::observability_product::ActualRunObservation {
+                request_id: profile_request_id,
+                duration_us: (elapsed * 1_000_000.0).max(0.0) as u64,
+                sampling_params: plan.sampling_params.clone(),
+                prompt_token_count: plan.prompt_tokens,
+                output_tokens: tokens,
+                output_token_ids,
+                chunk_count,
+                finish_reason: finish_reason.map(finish_reason_str).map(str::to_string),
+                prompt_chars,
+                response_chars: content.chars().count(),
+                response_text: content.clone(),
+                memory,
+            },
+        )?;
         engine.shutdown().await?;
         return Ok(());
     }
@@ -1578,43 +1752,48 @@ pub fn find_cached_gguf(cache_dir: &PathBuf, repo: &str, filename: &str) -> Opti
     None
 }
 
-pub fn select_device(backend: &str) -> ferrum_types::Device {
-    match backend.to_lowercase().as_str() {
-        "cpu" => ferrum_types::Device::CPU,
+pub fn select_device(backend: &str) -> Result<ferrum_types::Device> {
+    match backend.trim().to_lowercase().as_str() {
+        "cpu" => Ok(ferrum_types::Device::CPU),
         "metal" => {
             #[cfg(all(target_os = "macos", feature = "metal"))]
             {
-                return ferrum_types::Device::Metal;
+                return Ok(ferrum_types::Device::Metal);
             }
-            #[allow(unreachable_code)]
+            #[cfg(not(all(target_os = "macos", feature = "metal")))]
             {
-                eprintln!("Metal not available, falling back to CPU");
-                ferrum_types::Device::CPU
+                Err(FerrumError::config(
+                    "requested backend 'metal' but this ferrum binary was not built with Metal support; use --backend auto/cpu or build with the metal feature",
+                ))
             }
         }
         "cuda" => {
             #[cfg(feature = "cuda")]
             {
-                return ferrum_types::Device::CUDA(0);
+                return Ok(ferrum_types::Device::CUDA(0));
             }
-            #[allow(unreachable_code)]
+            #[cfg(not(feature = "cuda"))]
             {
-                eprintln!("CUDA not available, falling back to CPU");
-                ferrum_types::Device::CPU
+                Err(FerrumError::config(
+                    "requested backend 'cuda' but this ferrum binary was not built with CUDA support; use --backend auto/cpu or build with the cuda feature",
+                ))
             }
         }
-        "auto" | _ => {
+        "auto" => {
             #[cfg(all(target_os = "macos", feature = "metal"))]
             {
-                return ferrum_types::Device::Metal;
+                return Ok(ferrum_types::Device::Metal);
             }
             #[cfg(feature = "cuda")]
             {
-                return ferrum_types::Device::CUDA(0);
+                return Ok(ferrum_types::Device::CUDA(0));
             }
             #[allow(unreachable_code)]
-            ferrum_types::Device::CPU
+            Ok(ferrum_types::Device::CPU)
         }
+        other => Err(FerrumError::config(format!(
+            "unknown backend {other:?}; expected one of: auto, cpu, metal, cuda"
+        ))),
     }
 }
 
@@ -1696,14 +1875,79 @@ fn run_startup_cli_runtime_entries(
         "FERRUM_MAX_BATCHED_TOKENS",
         cmd.max_num_batched_tokens,
     );
+    if let Some(enabled) = bool_cli_override(cmd.batched_graph, cmd.disable_batched_graph) {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_BATCHED_GRAPH",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if let Some(enabled) = bool_cli_override(cmd.unified_graph, cmd.disable_unified_graph) {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_UNIFIED_GRAPH",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if let Some(enabled) = bool_cli_override(
+        cmd.unified_graph_layers_only,
+        cmd.disable_unified_graph_layers_only,
+    ) {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if let Some(enabled) = bool_cli_override(
+        cmd.unified_graph_lm_head_eager,
+        cmd.disable_unified_graph_lm_head_eager,
+    ) {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
     crate::layer_split_pipeline::push_cli_runtime_entry(
         &mut entries,
         cmd.layer_split_pipeline_mode,
     );
+    if let Some(path) = &cmd.profile_jsonl {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PROFILE_JSONL",
+            path.to_string_lossy().to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if let Some(path) = &cmd.scheduler_trace_jsonl {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_SCHEDULER_TRACE_JSONL",
+            path.to_string_lossy().to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if cmd.profile_jsonl.is_some() || cmd.scheduler_trace_jsonl.is_some() {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PROFILE_ENTRYPOINT",
+            "run",
+            RuntimeConfigSource::Cli,
+        ));
+    }
     if let Some(selection) = gpu_selection {
         entries.extend(selection.runtime_config_entries());
     }
     entries
+}
+
+fn bool_cli_override(enable: bool, disable: bool) -> Option<bool> {
+    if enable {
+        Some(true)
+    } else if disable {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn materialize_run_cli_runtime_entries(entries: &[RuntimeConfigEntry]) {
@@ -1718,12 +1962,19 @@ fn materialize_run_cli_runtime_entries(entries: &[RuntimeConfigEntry]) {
 fn run_startup_auto_config(
     device: &ferrum_types::Device,
     model_definition: Option<&ferrum_models::ModelDefinition>,
+    model_weight_bytes: Option<u64>,
     runtime_config: RuntimeConfigSnapshot,
 ) -> Result<ResolvedFerrumConfig> {
-    let model = model_definition
-        .map(crate::commands::serve::model_capabilities_from_definition)
-        .unwrap_or_else(ModelCapabilities::unknown);
     let hardware = crate::commands::serve::hardware_capabilities_for_device(device);
+    let model = model_definition
+        .map(|definition| {
+            crate::commands::serve::model_capabilities_from_definition_with_weight_bytes_for_hardware(
+                definition,
+                model_weight_bytes,
+                &hardware,
+            )
+        })
+        .unwrap_or_else(ModelCapabilities::unknown);
     let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
     FerrumConfigBuilder::new(runtime_config)
         .with_model_capabilities(model)
@@ -1797,6 +2048,7 @@ mod tests {
             disable_thinking: false,
             temperature: 0.0,
             backend: "auto".to_string(),
+            qwen35_reference: false,
             gpu_devices: None,
             layer_split_pipeline_mode: None,
             prompt: None,
@@ -1811,11 +2063,26 @@ mod tests {
             max_model_len: None,
             max_num_seqs: None,
             max_num_batched_tokens: None,
+            batched_graph: false,
+            disable_batched_graph: false,
+            unified_graph: false,
+            disable_unified_graph: false,
+            unified_graph_layers_only: false,
+            disable_unified_graph_layers_only: false,
+            unified_graph_lm_head_eager: false,
+            disable_unified_graph_lm_head_eager: false,
             kv_dtype: None,
             kv_capacity: None,
             kv_max_blocks: None,
             effective_config_json: None,
             decision_trace_jsonl: None,
+            observability_vertical_slice_out: None,
+            profile_jsonl: None,
+            profile_detail: crate::observability_product::ProfileDetailArg::Off,
+            memory_profile_jsonl: None,
+            scheduler_trace_jsonl: None,
+            request_dump_dir: None,
+            profile_sample_rate: crate::observability_product::default_profile_sample_rate(),
             output_format: OutputFormat::Text,
         }
     }
@@ -1849,6 +2116,37 @@ mod tests {
     }
 
     #[test]
+    fn run_effective_runtime_config_records_observability_paths() {
+        let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
+        let mut cmd = test_run_cmd();
+        cmd.profile_jsonl = Some(PathBuf::from("/tmp/run-profile.jsonl"));
+        cmd.scheduler_trace_jsonl = Some(PathBuf::from("/tmp/run-scheduler.jsonl"));
+
+        let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
+        let effective = run_effective_runtime_config(&snapshot, &cli_entries);
+        let entry = |key: &str| {
+            effective
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key} entry"))
+        };
+
+        assert_eq!(
+            entry("FERRUM_PROFILE_JSONL").effective_value,
+            "/tmp/run-profile.jsonl"
+        );
+        assert_eq!(
+            entry("FERRUM_SCHEDULER_TRACE_JSONL").effective_value,
+            "/tmp/run-scheduler.jsonl"
+        );
+        assert_eq!(entry("FERRUM_PROFILE_ENTRYPOINT").effective_value, "run");
+        assert!(entry("FERRUM_PROFILE_ENTRYPOINT")
+            .affects
+            .contains(&ferrum_types::RuntimeConfigEffect::Diagnostics));
+    }
+
+    #[test]
     fn run_effective_runtime_config_records_layer_split_pipeline_mode() {
         let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
         let mut cmd = test_run_cmd();
@@ -1863,6 +2161,51 @@ mod tests {
             .expect("missing layer split pipeline mode entry");
         assert_eq!(entry.effective_value, "batch");
         assert_eq!(entry.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn run_effective_runtime_config_records_batched_graph_flag() {
+        let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
+        let mut cmd = test_run_cmd();
+        cmd.batched_graph = true;
+        cmd.unified_graph = true;
+        cmd.unified_graph_layers_only = true;
+        cmd.unified_graph_lm_head_eager = true;
+        let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
+        let effective = run_effective_runtime_config(&snapshot, &cli_entries);
+        let entry = |key: &str| {
+            effective
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key} entry"))
+        };
+        assert_eq!(entry("FERRUM_BATCHED_GRAPH").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_BATCHED_GRAPH").source,
+            RuntimeConfigSource::Cli
+        );
+        assert_eq!(entry("FERRUM_UNIFIED_GRAPH").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_UNIFIED_GRAPH").source,
+            RuntimeConfigSource::Cli
+        );
+        assert_eq!(
+            entry("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY").effective_value,
+            "1"
+        );
+        assert_eq!(
+            entry("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY").source,
+            RuntimeConfigSource::Cli
+        );
+        assert_eq!(
+            entry("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER").effective_value,
+            "1"
+        );
+        assert_eq!(
+            entry("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER").source,
+            RuntimeConfigSource::Cli
+        );
     }
 
     #[test]
@@ -1928,9 +2271,29 @@ mod tests {
     }
 
     #[test]
+    fn run_effective_runtime_config_applies_recurrent_state_slots_to_engine_config() {
+        let cmd = test_run_cmd();
+        let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+            "FERRUM_RECURRENT_STATE_MAX_SLOTS",
+            "16",
+            RuntimeConfigSource::ConfigFile,
+        )]);
+        let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
+        let effective = run_effective_runtime_config(&snapshot, &cli_entries);
+        let mut engine_config = ferrum_types::EngineConfig::default();
+
+        engine_config
+            .apply_runtime_config_snapshot(&effective)
+            .expect("run effective runtime config should apply");
+
+        assert_eq!(engine_config.runtime.recurrent_state_max_slots, Some(16));
+    }
+
+    #[test]
     fn run_startup_auto_config_renders_effective_config_schema() {
         let resolved = run_startup_auto_config(
             &ferrum_types::Device::CPU,
+            None,
             None,
             RuntimeConfigSnapshot::from_entries(Vec::new()),
         )
@@ -1942,6 +2305,37 @@ mod tests {
         assert!(doc["hardware_capabilities"].is_object());
         assert!(doc["workload_profile"].is_object());
         assert!(doc["decisions"].is_array());
+    }
+
+    #[test]
+    fn unknown_backend_is_rejected() {
+        let err = select_device("not-a-backend").expect_err("unknown backend must fail");
+        assert!(
+            err.to_string().contains("unknown backend"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[test]
+    fn explicit_metal_backend_without_compiled_support_is_rejected() {
+        let err = select_device("metal").expect_err("unsupported explicit Metal must fail");
+        assert!(
+            err.to_string()
+                .contains("requested backend 'metal' but this ferrum binary was not built"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn explicit_cuda_backend_without_compiled_support_is_rejected() {
+        let err = select_device("cuda").expect_err("unsupported explicit CUDA must fail");
+        assert!(
+            err.to_string()
+                .contains("requested backend 'cuda' but this ferrum binary was not built"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2036,6 +2430,21 @@ mod tests {
             build_sampling_params(&parsed.run).repetition_penalty > 1.0,
             "build_sampling_params must propagate the default penalty"
         );
+    }
+
+    #[test]
+    fn run_parses_explicit_qwen35_reference_flag() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            run: RunCommand,
+        }
+
+        let parsed = TestCli::parse_from(["ferrum", "qwen3.5", "--qwen35-reference"]);
+
+        assert!(parsed.run.qwen35_reference);
     }
 
     #[test]

@@ -1,0 +1,10 @@
+{
+  "offer": 37347938,
+  "image": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+  "disk": 260,
+  "runtype": "ssh",
+  "target_state": "running",
+  "cancel_unavail": true,
+  "label": "ferrum-w2-unified-argmax-c16-20260617",
+  "onstart_present": true
+}

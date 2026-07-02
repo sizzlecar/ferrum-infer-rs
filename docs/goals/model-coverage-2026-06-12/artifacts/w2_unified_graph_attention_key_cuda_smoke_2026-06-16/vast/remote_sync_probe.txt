@@ -1,0 +1,12 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+Tue Jun 16 09:00:23 UTC 2026
+59 sshd: /usr/sbin/sshd -E /proc/1/fd/1 [listener] 0 of 10-100 startups
+65 ssh -i /etc/forward_key -R *:26362:localhost:22 -R *:26363:localhost:8080 -N -o TCPKeepAlive=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=2 ubuntu@ssh9.vast.ai -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o RequestTTY=no -o ExitOnForwardFailure=yes
+370 sshd: root@notty
+381 /usr/lib/openssh/sftp-server
+382 sshd: root@notty
+393 bash -c set -e; date -u; pgrep -af "git|scp|ssh|ferrum-b990e939|cargo|rustc" | head -80; ls -lh /workspace/ferrum-b990e939.bundle 2>/dev/null || true; du -sh /workspace/ferrum-infer-rs 2>/dev/null || true
+-rw-r--r-- 1 root root 73M Jun 16 09:00 /workspace/ferrum-b990e939.bundle
+5.1G	/workspace/ferrum-infer-rs

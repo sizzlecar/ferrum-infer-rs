@@ -1,0 +1,1535 @@
+{
+  "bucket_ms_mean": {
+    "flash_attn": 29.25925925925926,
+    "matmuls": 6,
+    "norms": 0,
+    "qk_norm_rope": 1,
+    "tail_act": 0,
+    "tail_down": 12.814814814814815,
+    "tail_gate_up": 22.59259259259259,
+    "tail_mlp": 36.77777777777778,
+    "tail_norm": 0,
+    "tail_resid": 0
+  },
+  "calls": [
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 96,
+          "calls": 62,
+          "ms": 5
+        },
+        "matmuls": {
+          "avg_us": 111,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 29,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 7,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 83,
+          "calls": 62,
+          "ms": 5
+        },
+        "tail_gate_up": {
+          "avg_us": 150,
+          "calls": 62,
+          "ms": 9
+        },
+        "tail_mlp": {
+          "avg_us": 240,
+          "calls": 62,
+          "ms": 14
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 23,
+      "total_ms": 34
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 545,
+          "calls": 62,
+          "ms": 33
+        },
+        "matmuls": {
+          "avg_us": 109,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 9,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 28,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 250,
+          "calls": 62,
+          "ms": 15
+        },
+        "tail_gate_up": {
+          "avg_us": 412,
+          "calls": 62,
+          "ms": 25
+        },
+        "tail_mlp": {
+          "avg_us": 678,
+          "calls": 62,
+          "ms": 42
+        },
+        "tail_norm": {
+          "avg_us": 13,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 92
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 529,
+          "calls": 62,
+          "ms": 32
+        },
+        "matmuls": {
+          "avg_us": 104,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 28,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 241,
+          "calls": 62,
+          "ms": 14
+        },
+        "tail_gate_up": {
+          "avg_us": 401,
+          "calls": 62,
+          "ms": 24
+        },
+        "tail_mlp": {
+          "avg_us": 657,
+          "calls": 62,
+          "ms": 40
+        },
+        "tail_norm": {
+          "avg_us": 13,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 89
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 493,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 14,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 224,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 375,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 614,
+          "calls": 62,
+          "ms": 38
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 613,
+          "calls": 62,
+          "ms": 38
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 37
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 37
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 373,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 37
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 37
+        },
+        "tail_norm": {
+          "avg_us": 13,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 613,
+          "calls": 62,
+          "ms": 38
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 14,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 37
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 98,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 28,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 613,
+          "calls": 62,
+          "ms": 38
+        },
+        "tail_norm": {
+          "avg_us": 13,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 99,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 28,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 613,
+          "calls": 62,
+          "ms": 38
+        },
+        "tail_norm": {
+          "avg_us": 13,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 38
+        },
+        "tail_norm": {
+          "avg_us": 13,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 28,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 614,
+          "calls": 62,
+          "ms": 38
+        },
+        "tail_norm": {
+          "avg_us": 13,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 37
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 37
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 37
+        },
+        "tail_norm": {
+          "avg_us": 13,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 37
+        },
+        "tail_norm": {
+          "avg_us": 13,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 373,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 37
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 37
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 28,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 37
+        },
+        "tail_norm": {
+          "avg_us": 13,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 38
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 37
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 15,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 37
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 14,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 374,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 612,
+          "calls": 62,
+          "ms": 38
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 11,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    },
+    {
+      "buckets": {
+        "flash_attn": {
+          "avg_us": 491,
+          "calls": 62,
+          "ms": 30
+        },
+        "matmuls": {
+          "avg_us": 97,
+          "calls": 62,
+          "ms": 6
+        },
+        "norms": {
+          "avg_us": 8,
+          "calls": 62,
+          "ms": 0
+        },
+        "qk_norm_rope": {
+          "avg_us": 27,
+          "calls": 62,
+          "ms": 1
+        },
+        "tail_act": {
+          "avg_us": 14,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_down": {
+          "avg_us": 223,
+          "calls": 62,
+          "ms": 13
+        },
+        "tail_gate_up": {
+          "avg_us": 373,
+          "calls": 62,
+          "ms": 23
+        },
+        "tail_mlp": {
+          "avg_us": 611,
+          "calls": 62,
+          "ms": 37
+        },
+        "tail_norm": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        },
+        "tail_resid": {
+          "avg_us": 12,
+          "calls": 62,
+          "ms": 0
+        }
+      },
+      "tokens": 122,
+      "total_ms": 83
+    }
+  ],
+  "num_prefills": 27,
+  "total_ms": {
+    "max": 92,
+    "mean": 81.74074074074075,
+    "median": 83,
+    "min": 34
+  }
+}

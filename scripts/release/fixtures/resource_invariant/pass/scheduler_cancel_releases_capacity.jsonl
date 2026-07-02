@@ -1,0 +1,5 @@
+{"scenario":"scheduler_cancel_releases_capacity","owner_kind":"request","owner_id":"req-cancel","resource_kind":"request_slot","action":"request_open","capacity":1}
+{"scenario":"scheduler_cancel_releases_capacity","owner_kind":"request","owner_id":"req-cancel","resource_kind":"scheduler_admission_slot","action":"reserve","amount":1,"before":2,"after":1,"capacity":2}
+{"scenario":"scheduler_cancel_releases_capacity","owner_kind":"request","owner_id":"req-cancel","resource_kind":"scheduler_admission_slot","action":"commit","amount":1,"before":1,"after":1,"capacity":2}
+{"scenario":"scheduler_cancel_releases_capacity","owner_kind":"request","owner_id":"req-cancel","resource_kind":"scheduler_admission_slot","action":"rollback","amount":1,"before":1,"after":2,"capacity":2,"reason":"cancelled"}
+{"scenario":"scheduler_cancel_releases_capacity","owner_kind":"request","owner_id":"req-cancel","resource_kind":"request_slot","action":"request_close","capacity":1}

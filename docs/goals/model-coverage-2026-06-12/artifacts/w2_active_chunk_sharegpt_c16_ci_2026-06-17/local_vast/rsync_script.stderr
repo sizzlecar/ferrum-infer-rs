@@ -1,0 +1,8 @@
+Warning: Permanently added '[ssh7.vast.ai]:30498' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+Transfer starting: 1 files
+run_remote_sharegpt_c16_ci.sh
+
+sent 12128 bytes  received 42 bytes  8113 bytes/sec
+total size is 11974  speedup is 0.98

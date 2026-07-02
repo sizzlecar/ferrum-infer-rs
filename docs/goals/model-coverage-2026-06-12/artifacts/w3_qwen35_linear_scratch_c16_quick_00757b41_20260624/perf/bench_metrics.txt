@@ -1,0 +1,1 @@
+DIAG_METRIC c 16 output_tps 678.630239827307 completed [32] errored [0] itl_p95 20.23245625 ratio_vs_zzz104 1.0296839741013903

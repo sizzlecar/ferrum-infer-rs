@@ -11,8 +11,8 @@
 use crate::registry::{ComponentConfig, ComponentRegistry};
 use ferrum_interfaces::engine::LlmInferenceEngine;
 use ferrum_interfaces::{
-    KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler, TensorFactory,
-    Tokenizer,
+    KvCacheManager, ModelExecutor, RecurrentStateManager, Sampler, SchedulerInterface as Scheduler,
+    TensorFactory, Tokenizer,
 };
 use ferrum_types::{EngineConfig, FerrumError, Result, SchedulingPolicy};
 use std::sync::Arc;
@@ -48,6 +48,8 @@ pub struct EngineBuilder {
     custom_scheduler: Option<Arc<dyn Scheduler + Send + Sync>>,
     /// Pre-created KV cache (skip factory)
     custom_kv_cache: Option<Arc<dyn KvCacheManager + Send + Sync>>,
+    /// Pre-created recurrent-state manager (skip factory)
+    custom_recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
     /// Pre-created executor (skip factory)
     custom_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
 }
@@ -72,6 +74,7 @@ impl EngineBuilder {
             custom_sampler: None,
             custom_scheduler: None,
             custom_kv_cache: None,
+            custom_recurrent_state_manager: None,
             custom_executor: None,
         }
     }
@@ -121,6 +124,15 @@ impl EngineBuilder {
     /// Set a pre-created KV cache manager
     pub fn with_custom_kv_cache(mut self, kv_cache: Arc<dyn KvCacheManager + Send + Sync>) -> Self {
         self.custom_kv_cache = Some(kv_cache);
+        self
+    }
+
+    /// Set a pre-created recurrent-state manager.
+    pub fn with_custom_recurrent_state_manager(
+        mut self,
+        manager: Arc<dyn RecurrentStateManager + Send + Sync>,
+    ) -> Self {
+        self.custom_recurrent_state_manager = Some(manager);
         self
     }
 
@@ -242,6 +254,7 @@ impl EngineBuilder {
         let custom_sampler = self.custom_sampler;
         let custom_scheduler = self.custom_scheduler;
         let custom_kv_cache = self.custom_kv_cache;
+        let custom_recurrent_state_manager = self.custom_recurrent_state_manager;
         let custom_executor = self.custom_executor;
 
         // 2. Create or use provided tokenizer
@@ -393,7 +406,10 @@ impl EngineBuilder {
             _ => (None, None),
         };
 
-        let engine = crate::ContinuousBatchEngine::new_with_speculation(
+        let recurrent_state_manager = custom_recurrent_state_manager
+            .or_else(|| default_recurrent_state_manager(&config, &component_config));
+
+        let engine = crate::ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
             config,
             cb_scheduler,
             tokenizer,
@@ -403,9 +419,44 @@ impl EngineBuilder {
             tensor_factory,
             draft_executor,
             spec_config,
+            recurrent_state_manager,
         );
         Ok(Box::new(engine))
     }
+}
+
+fn default_recurrent_state_manager(
+    config: &EngineConfig,
+    component_config: &ComponentConfig,
+) -> Option<Arc<dyn RecurrentStateManager + Send + Sync>> {
+    let total_batch_slots = config
+        .runtime
+        .recurrent_state_max_slots
+        .or(config.runtime.qwen35_linear_state_max_slots)
+        .unwrap_or(usize::MAX);
+    if component_config
+        .get_option::<bool>("qwen35_reference")
+        .unwrap_or(false)
+    {
+        return Some(
+            Arc::new(ferrum_models::models::Qwen35RecurrentStateManager::<
+                ferrum_kernels::backend::cpu::CpuBackend,
+            >::new(
+                ferrum_models::models::Qwen35RecurrentStateManagerConfig {
+                    total_memory_bytes: usize::MAX,
+                    total_batch_slots,
+                },
+            )) as Arc<dyn RecurrentStateManager + Send + Sync>,
+        );
+    }
+    Some(
+        Arc::new(crate::recurrent_state::InMemoryRecurrentStateManager::new(
+            crate::recurrent_state::InMemoryRecurrentStateConfig {
+                total_memory_bytes: usize::MAX,
+                total_batch_slots,
+            },
+        )) as Arc<dyn RecurrentStateManager + Send + Sync>,
+    )
 }
 
 fn validate_layer_split_plan(component_config: &ComponentConfig) -> Result<()> {
@@ -469,6 +520,60 @@ pub async fn create_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_interfaces::{
+        RecurrentStateHandle, RecurrentStateManager, RecurrentStateManagerStats,
+        RecurrentStateSpec, RecurrentStateTensorSpec,
+    };
+    use ferrum_types::{DataType, Device, RequestId};
+
+    #[derive(Debug)]
+    struct NoopRecurrentStateManager;
+
+    #[async_trait::async_trait]
+    impl RecurrentStateManager for NoopRecurrentStateManager {
+        async fn allocate(
+            &self,
+            _spec: &RecurrentStateSpec,
+        ) -> Result<Arc<dyn RecurrentStateHandle>> {
+            Err(FerrumError::unsupported(
+                "noop recurrent-state manager does not allocate",
+            ))
+        }
+
+        async fn deallocate(&self, _request_id: RequestId) -> Result<()> {
+            Ok(())
+        }
+
+        fn can_allocate(&self, _spec: &RecurrentStateSpec) -> bool {
+            false
+        }
+
+        fn get_handle(&self, _request_id: RequestId) -> Option<Arc<dyn RecurrentStateHandle>> {
+            None
+        }
+
+        fn list_handles(&self) -> Vec<(RequestId, Arc<dyn RecurrentStateHandle>)> {
+            Vec::new()
+        }
+
+        fn stats(&self) -> RecurrentStateManagerStats {
+            RecurrentStateManagerStats {
+                total_memory_bytes: 0,
+                used_memory_bytes: 0,
+                active_states: 0,
+                active_state_tensors: 0,
+                total_batch_slots: 0,
+                used_batch_slots: 0,
+                allocation_count: 0,
+                allocation_failures: 0,
+                eviction_count: 0,
+            }
+        }
+
+        async fn reset(&self) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_builder_creation() {
@@ -476,6 +581,7 @@ mod tests {
         let builder = EngineBuilder::new(config);
 
         assert!(builder.tokenizer_name.is_none());
+        assert!(builder.custom_recurrent_state_manager.is_none());
     }
 
     #[test]
@@ -493,6 +599,15 @@ mod tests {
         assert_eq!(builder.scheduler_name, Some("priority".to_string()));
         assert_eq!(builder.kv_cache_name, Some("paged".to_string()));
         assert_eq!(builder.executor_name, Some("custom_executor".to_string()));
+    }
+
+    #[test]
+    fn test_builder_with_custom_recurrent_state_manager() {
+        let config = EngineConfig::default();
+        let manager = Arc::new(NoopRecurrentStateManager);
+        let builder = EngineBuilder::new(config).with_custom_recurrent_state_manager(manager);
+
+        assert!(builder.custom_recurrent_state_manager.is_some());
     }
 
     #[test]
@@ -531,6 +646,108 @@ mod tests {
             Some("/models/draft")
         );
         assert_eq!(component_config.get_option::<usize>("spec_n"), Some(6));
+    }
+
+    #[test]
+    fn test_builder_qwen35_reference_uses_typed_recurrent_state_manager() {
+        let mut config = EngineConfig::default();
+        config.backend.device = Device::CPU;
+        config.runtime.recurrent_state_max_slots = Some(4);
+        config.backend.backend_options.insert(
+            "qwen35_reference".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let component_config = ComponentConfig::from_engine_config(&config);
+        let manager = default_recurrent_state_manager(&config, &component_config)
+            .expect("qwen35 reference CPU path should install a recurrent-state manager");
+        let spec = RecurrentStateSpec {
+            request_id: RequestId::new(),
+            num_layers: 2,
+            tensors: vec![RecurrentStateTensorSpec::new(
+                0,
+                "delta_state",
+                vec![1, 1, 1],
+            )],
+            dtype: DataType::FP32,
+            device: Device::CPU,
+            max_batch_slots: 1,
+        };
+
+        let handle = tokio_test::block_on(manager.allocate(&spec)).unwrap();
+
+        assert!(
+            handle
+                .as_any()
+                .is::<ferrum_models::models::Qwen35RecurrentStateHandle<
+                    ferrum_kernels::backend::cpu::CpuBackend,
+                >>(),
+            "qwen35 reference should allocate typed Qwen35 recurrent-state handles"
+        );
+    }
+
+    #[test]
+    fn test_builder_cuda_recurrent_state_manager_uses_recurrent_state_slot_cap() {
+        let mut config = EngineConfig::default();
+        config.backend.device = Device::CUDA(0);
+        config.runtime.recurrent_state_max_slots = Some(2);
+        let component_config = ComponentConfig::from_engine_config(&config);
+        let manager = default_recurrent_state_manager(&config, &component_config)
+            .expect("cuda product path should install admission recurrent-state manager");
+        let spec = |request_id| RecurrentStateSpec {
+            request_id,
+            num_layers: 1,
+            tensors: vec![RecurrentStateTensorSpec::new(
+                0,
+                "delta_state",
+                vec![1, 1, 1],
+            )],
+            dtype: DataType::FP32,
+            device: Device::CUDA(0),
+            max_batch_slots: 1,
+        };
+
+        tokio_test::block_on(manager.allocate(&spec(RequestId::new()))).unwrap();
+        tokio_test::block_on(manager.allocate(&spec(RequestId::new()))).unwrap();
+        let err = tokio_test::block_on(manager.allocate(&spec(RequestId::new())))
+            .expect_err("third recurrent allocation should exceed the two-slot cap");
+
+        assert!(matches!(err, FerrumError::ResourceExhausted { .. }));
+        let stats = manager.stats();
+        assert_eq!(stats.total_batch_slots, 2);
+        assert_eq!(stats.used_batch_slots, 2);
+        assert_eq!(stats.allocation_failures, 1);
+    }
+
+    #[test]
+    fn test_builder_cuda_recurrent_state_manager_accepts_legacy_qwen35_slot_cap() {
+        let mut config = EngineConfig::default();
+        config.backend.device = Device::CUDA(0);
+        config.runtime.qwen35_linear_state_max_slots = Some(1);
+        let component_config = ComponentConfig::from_engine_config(&config);
+        let manager = default_recurrent_state_manager(&config, &component_config)
+            .expect("cuda product path should install admission recurrent-state manager");
+        let spec = |request_id| RecurrentStateSpec {
+            request_id,
+            num_layers: 1,
+            tensors: vec![RecurrentStateTensorSpec::new(
+                0,
+                "delta_state",
+                vec![1, 1, 1],
+            )],
+            dtype: DataType::FP32,
+            device: Device::CUDA(0),
+            max_batch_slots: 1,
+        };
+
+        tokio_test::block_on(manager.allocate(&spec(RequestId::new()))).unwrap();
+        let err = tokio_test::block_on(manager.allocate(&spec(RequestId::new())))
+            .expect_err("second recurrent allocation should exceed the one-slot legacy cap");
+
+        assert!(matches!(err, FerrumError::ResourceExhausted { .. }));
+        let stats = manager.stats();
+        assert_eq!(stats.total_batch_slots, 1);
+        assert_eq!(stats.used_batch_slots, 1);
+        assert_eq!(stats.allocation_failures, 1);
     }
 
     #[test]

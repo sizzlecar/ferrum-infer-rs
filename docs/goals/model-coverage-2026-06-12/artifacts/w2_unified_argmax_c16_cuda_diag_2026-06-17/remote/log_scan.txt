@@ -1,0 +1,2 @@
+/workspace/artifacts/w2_unified_argmax_c16_cuda_diag_2026-06-17/c16_profile/bench.stderr:5:    16 completed / 0 errored / 0.9s
+/workspace/artifacts/w2_unified_argmax_c16_cuda_diag_2026-06-17/c16_profile/bench.stderr:13:→ wrote /workspace/artifacts/w2_unified_argmax_c16_cuda_diag_2026-06-17/c16_profile/bench.json

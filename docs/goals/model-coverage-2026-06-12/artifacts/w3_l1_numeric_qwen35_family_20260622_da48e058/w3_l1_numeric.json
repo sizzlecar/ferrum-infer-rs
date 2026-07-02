@@ -1,0 +1,76 @@
+{
+  "commands": [
+    {
+      "command_line": [
+        "cargo",
+        "test",
+        "-p",
+        "ferrum-models",
+        "qwen35",
+        "--",
+        "--nocapture"
+      ],
+      "returncode": 0,
+      "stderr": "docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058/cargo_qwen35_numeric.stderr.txt",
+      "stdout": "docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058/cargo_qwen35_numeric.stdout.txt"
+    }
+  ],
+  "coverage": {
+    "deltanet": true,
+    "full_attention": true,
+    "full_attention_official_shape": true,
+    "linear_attention": true,
+    "lm_head": true,
+    "moe_or_dense": true
+  },
+  "coverage_tests": {
+    "deltanet": [
+      "gated_delta_attention_matches_gating_plus_recurrent_reference",
+      "recurrent_delta_rule_single_token_updates_state",
+      "recurrent_delta_rule_repeats_qk_heads_over_value_heads"
+    ],
+    "full_attention": [
+      "full_attention_core_applies_causal_softmax",
+      "dense_full_attention_layer_composes_attention_residual_and_dense_mlp",
+      "sparse_moe_full_attention_layer_composes_attention_residual_and_moe"
+    ],
+    "full_attention_official_shape": [
+      "rope_uses_partial_interleaved_rotation",
+      "full_attention_core_applies_qwen35_output_gate",
+      "dense_full_attention_layer_accepts_qwen35_gate_shape_with_hidden_not_q_total"
+    ],
+    "linear_attention": [
+      "linear_attention_core_composes_conv_gdn_delta_and_norm",
+      "dense_linear_attention_layer_composes_attention_residual_and_dense_mlp",
+      "sparse_moe_linear_attention_layer_composes_attention_residual_and_moe"
+    ],
+    "lm_head": [
+      "dense_reference_model_forward_composes_layers_norm_and_lm_head",
+      "sparse_moe_reference_model_forward_composes_layers_norm_and_lm_head"
+    ],
+    "moe_or_dense": [
+      "dense_reference_model_forward_composes_layers_norm_and_lm_head",
+      "sparse_moe_reference_model_forward_composes_layers_norm_and_lm_head",
+      "sparse_moe_shared_expert_composes_router_fused_experts_and_shared_gate"
+    ]
+  },
+  "generated_at": "2026-06-22T06:34:29.649925+08:00",
+  "hidden_env": [],
+  "level": "l1_numeric",
+  "model_id": "Qwen/Qwen3.5-35B-A3B+Qwen/Qwen3.6-35B-A3B",
+  "numeric": {
+    "atol": 1e-05,
+    "comparisons_passed": 17,
+    "comparisons_total": 17,
+    "deterministic": true,
+    "source": "cargo_test_qwen35_reference_components"
+  },
+  "pass_line": "W3 L1 NUMERIC PASS: docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058",
+  "product_surface": "typed_config",
+  "reference": {
+    "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w3_l1_numeric_qwen35_family_20260622_da48e058/cargo_qwen35_numeric.stdout.txt",
+    "engine": "Ferrum Rust CPU reference tests"
+  },
+  "schema_version": 1,
+  "status": "pass"
+}

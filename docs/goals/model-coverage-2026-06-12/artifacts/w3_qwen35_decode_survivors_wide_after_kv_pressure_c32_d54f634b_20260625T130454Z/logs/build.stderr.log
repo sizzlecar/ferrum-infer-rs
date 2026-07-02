@@ -1,0 +1,5 @@
+   Compiling ferrum-scheduler v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-scheduler)
+   Compiling ferrum-engine v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-cli)
+    Finished `release` profile [optimized] target(s) in 3m 15s

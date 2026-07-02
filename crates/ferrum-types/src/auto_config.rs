@@ -28,6 +28,7 @@ pub struct ModelCapabilities {
     pub head_dim: Option<usize>,
     pub kv_heads: Option<usize>,
     pub estimated_weight_bytes: Option<u64>,
+    pub recurrent_state_bytes_per_sequence: Option<u64>,
     pub supported_dtypes: Vec<String>,
     pub graph_safe_moe: bool,
 }
@@ -43,6 +44,7 @@ impl ModelCapabilities {
             head_dim: None,
             kv_heads: None,
             estimated_weight_bytes: None,
+            recurrent_state_bytes_per_sequence: None,
             supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
             graph_safe_moe: false,
         }
@@ -66,6 +68,7 @@ impl ModelCapabilities {
             // at the historical 2048 KV blocks while still allowing smaller
             // GPUs to be downgraded before startup allocation.
             estimated_weight_bytes: Some(18 * GIB),
+            recurrent_state_bytes_per_sequence: None,
             supported_dtypes: vec!["fp16".to_string()],
             graph_safe_moe: false,
         }
@@ -81,6 +84,7 @@ impl ModelCapabilities {
             head_dim: Some(128),
             kv_heads: Some(8),
             estimated_weight_bytes: Some(39 * GIB),
+            recurrent_state_bytes_per_sequence: None,
             supported_dtypes: vec!["fp16".to_string()],
             graph_safe_moe: false,
         }
@@ -351,6 +355,9 @@ impl ResolvedFerrumConfig {
         let selected_max_model_len = self.selected_usize("max_model_len");
         let selected_kv_capacity = self.runtime_usize("FERRUM_KV_CAPACITY");
         let selected_max_batched_tokens = self.selected_usize("max_batched_tokens");
+        let selected_recurrent_state_max_slots = self.selected_recurrent_state_max_slots();
+        let selected_admission_limit =
+            effective_admission_limit(selected_max_sequences, selected_recurrent_state_max_slots);
         serde_json::json!({
             "schema_version": 1,
             "preset": self.preset,
@@ -368,12 +375,13 @@ impl ResolvedFerrumConfig {
             "selected_weight_placement": if selected_layer_split_plan.is_some() { "layer_split" } else { "single_device" },
             "selected_kv_layout": if backend.eq_ignore_ascii_case("cpu") { "contiguous" } else { "paged" },
             "selected_attention_impl": self.selected_string("attention_decode_backend"),
-            "selected_graph_mode": self.selected_string("moe_graph_policy"),
+            "selected_graph_mode": self.selected_graph_mode(),
             "selected_max_sequences": selected_max_sequences,
             "selected_max_model_len": selected_max_model_len,
             "selected_kv_capacity": selected_kv_capacity,
             "selected_max_batched_tokens": selected_max_batched_tokens,
-            "selected_admission_limit": selected_max_sequences,
+            "selected_recurrent_state_max_slots": selected_recurrent_state_max_slots,
+            "selected_admission_limit": selected_admission_limit,
             "entries": self.runtime_config.entries,
             "model_capabilities": self.model_capabilities,
             "hardware_capabilities": self.hardware_capabilities,
@@ -385,12 +393,17 @@ impl ResolvedFerrumConfig {
 
     pub fn admission_summary_document(&self) -> serde_json::Value {
         let max_sequences = self.selected_usize("max_sequences");
+        let recurrent_state_max_slots = self.selected_recurrent_state_max_slots();
+        let effective_max_concurrent =
+            effective_admission_limit(max_sequences, recurrent_state_max_slots);
         let kv_blocks = self.selected_usize("kv_block_count");
         let max_batched_tokens = self.selected_usize("max_batched_tokens");
         let max_model_len = self.selected_usize("max_model_len");
         let kv_capacity_tokens =
             kv_blocks.map(|blocks| blocks.saturating_mul(DEFAULT_KV_BLOCK_SIZE_TOKENS));
         let kv_bytes_per_token = kv_cache_bytes_per_token_for_model(&self.model_capabilities);
+        let recurrent_budget =
+            recurrent_state_budget_for(&self.model_capabilities, &self.hardware_capabilities);
         let scheduler_policy = self
             .selected_string("scheduler_admission_policy")
             .unwrap_or_else(|| "unknown".to_string());
@@ -399,7 +412,7 @@ impl ResolvedFerrumConfig {
             "backend": self.hardware_capabilities.backend,
             "model_architecture": self.model_capabilities.architecture,
             "scheduler_policy": scheduler_policy,
-            "effective_max_concurrent": max_sequences,
+            "effective_max_concurrent": effective_max_concurrent,
             "queue_depth": 0u64,
             "active_prefill": 0u64,
             "active_decode": 0u64,
@@ -408,6 +421,7 @@ impl ResolvedFerrumConfig {
             "failed_requests_total": 0u64,
             "completed_requests_total": 0u64,
             "max_sequences": max_sequences,
+            "recurrent_state_max_slots": recurrent_state_max_slots,
             "kv_block_count": kv_blocks,
             "kv_block_size_tokens": DEFAULT_KV_BLOCK_SIZE_TOKENS,
             "kv_capacity_tokens": kv_capacity_tokens,
@@ -417,6 +431,16 @@ impl ResolvedFerrumConfig {
                 "vram_bytes": self.hardware_capabilities.vram_bytes,
                 "estimated_weight_bytes": self.model_capabilities.estimated_weight_bytes,
                 "kv_bytes_per_token": kv_bytes_per_token,
+                "recurrent_state_bytes_per_sequence": self.model_capabilities.recurrent_state_bytes_per_sequence,
+                "recurrent_state_budget_bytes": recurrent_budget.map(|budget| budget.remaining_bytes),
+                "recurrent_state_budget_raw_slots": recurrent_budget.map(|budget| budget.raw_slots),
+                "recurrent_state_budget_max_slots": recurrent_budget.map(|budget| budget.floored_slots),
+                "recurrent_state_capacity_bytes": match (recurrent_state_max_slots, self.model_capabilities.recurrent_state_bytes_per_sequence) {
+                    (Some(slots), Some(bytes_per_sequence)) => {
+                        (slots as u64).checked_mul(bytes_per_sequence)
+                    }
+                    _ => None,
+                },
                 "kv_capacity_bytes": match (kv_capacity_tokens, kv_bytes_per_token) {
                     (Some(tokens), Some(bytes_per_token)) => {
                         (tokens as u64).checked_mul(bytes_per_token)
@@ -453,6 +477,23 @@ impl ResolvedFerrumConfig {
             .iter()
             .find(|decision| decision.selection == selection)
             .map(|decision| decision.selected.clone())
+    }
+
+    fn selected_recurrent_state_max_slots(&self) -> Option<usize> {
+        self.selected_usize("recurrent_state_max_slots")
+            .or_else(|| self.runtime_usize("FERRUM_RECURRENT_STATE_MAX_SLOTS"))
+            .or_else(|| self.runtime_usize("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS"))
+    }
+
+    fn selected_graph_mode(&self) -> Option<String> {
+        let decode_graph = self.selected_string("decode_graph_policy");
+        if decode_graph
+            .as_deref()
+            .is_some_and(|mode| mode != "graph_disabled")
+        {
+            return decode_graph;
+        }
+        self.selected_string("moe_graph_policy")
     }
 
     fn runtime_entry_value(&self, key: &str) -> Option<String> {
@@ -582,12 +623,12 @@ impl FerrumConfigBuilder {
                 let q = q.to_ascii_lowercase();
                 q.contains("gptq") || q.contains("int4")
             });
-        let cuda_qwen3_moe = cuda_backend
+        let cuda_qwen_moe = cuda_backend
             && self.model.moe.is_some()
-            && self.model.architecture.eq_ignore_ascii_case("qwen3_moe");
+            && qwen_moe_architecture_uses_vllm_paged_attn(&self.model.architecture);
         let use_vllm_paged_attn = self.bool_value(
             "FERRUM_USE_VLLM_PAGED_ATTN",
-            (self.workload.is_m3_preset() || cuda_qwen3_moe)
+            (self.workload.is_m3_preset() || cuda_qwen_moe)
                 && cuda_backend
                 && self.hardware.compiled_features.vllm_paged_attn,
             AutoConfigSource::WorkloadPreset,
@@ -607,7 +648,7 @@ impl FerrumConfigBuilder {
         )?;
         let vllm_v1_short = self.bool_value(
             "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
-            use_vllm_paged_attn.value,
+            use_vllm_paged_attn.value && self.model.head_dim.unwrap_or(128) <= 128,
             AutoConfigSource::Default,
         )?;
         let vllm_moe = self.bool_value(
@@ -627,12 +668,25 @@ impl FerrumConfigBuilder {
             AutoConfigSource::WorkloadPreset,
         )?;
         let graph = self.bool_value("FERRUM_MOE_GRAPH", false, AutoConfigSource::WorkloadPreset)?;
+        let batched_graph =
+            self.bool_value("FERRUM_BATCHED_GRAPH", false, AutoConfigSource::Default)?;
+        let unified_graph =
+            self.bool_value("FERRUM_UNIFIED_GRAPH", false, AutoConfigSource::Default)?;
+        let unified_graph_layers_only = self.bool_value(
+            "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
+            false,
+            AutoConfigSource::Default,
+        )?;
+        let unified_graph_lm_head_eager = self.bool_value(
+            "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+            false,
+            AutoConfigSource::Default,
+        )?;
         let greedy = self.bool_value(
             "FERRUM_GREEDY_ARGMAX",
-            self.workload.is_m3_preset()
-                && cuda_backend
+            (cuda_backend || self.hardware.backend.eq_ignore_ascii_case("metal"))
                 && self.hardware.compiled_features.greedy_argmax,
-            AutoConfigSource::WorkloadPreset,
+            AutoConfigSource::HardwareCapability,
         )?;
         let prefix_cache = self.bool_value(
             "FERRUM_PREFIX_CACHE",
@@ -649,6 +703,24 @@ impl FerrumConfigBuilder {
             default_max_sequences.value,
             default_max_sequences.source,
         )?;
+        let default_recurrent_state_max_slots =
+            self.default_recurrent_state_max_slots(&max_sequences);
+        let recurrent_state_max_slots = if default_recurrent_state_max_slots.is_some()
+            || self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_some()
+            || self.entry("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS").is_some()
+        {
+            let default = default_recurrent_state_max_slots
+                .as_ref()
+                .unwrap_or(&max_sequences);
+            Some(self.usize_value_with_legacy_alias(
+                "FERRUM_RECURRENT_STATE_MAX_SLOTS",
+                "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS",
+                default.value,
+                default.source,
+            )?)
+        } else {
+            None
+        };
         let default_kv_blocks = self.default_kv_blocks(&max_sequences);
         let kv_blocks = self.usize_value(
             "FERRUM_KV_MAX_BLOCKS",
@@ -663,7 +735,10 @@ impl FerrumConfigBuilder {
             default_max_batched_tokens.source,
         )?;
         let max_model_len = self.optional_usize_value("FERRUM_MAX_MODEL_LEN")?;
-
+        let default_prefill_first_until_active =
+            self.default_prefill_first_until_active(&max_sequences);
+        let default_prefill_step_chunk =
+            self.default_prefill_step_chunk(&max_sequences, &max_batched_tokens);
         self.validate_attention(
             use_vllm_paged_attn.value,
             fa_layout.value,
@@ -678,9 +753,16 @@ impl FerrumConfigBuilder {
             pair_ids.value,
             graph.value,
         )?;
+        self.validate_batched_graph(batched_graph.value)?;
+        self.validate_unified_graph(
+            unified_graph.value,
+            unified_graph_layers_only.value,
+            unified_graph_lm_head_eager.value,
+        )?;
         self.validate_memory(
             kv_blocks.value,
             max_sequences.value,
+            recurrent_state_max_slots.as_ref().map(|slots| slots.value),
             max_batched_tokens.value,
             max_model_len.as_ref().map(|value| value.value),
         )?;
@@ -710,6 +792,17 @@ impl FerrumConfigBuilder {
             ("FERRUM_VLLM_MOE", &vllm_moe),
             ("FERRUM_MOE_DEVICE_ROUTE", &device_route),
             ("FERRUM_VLLM_MOE_PAIR_IDS", &pair_ids),
+            ("FERRUM_BATCHED_GRAPH", &batched_graph),
+            ("FERRUM_UNIFIED_GRAPH", &unified_graph),
+            (
+                "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
+                &unified_graph_layers_only,
+            ),
+            (
+                "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+                &unified_graph_lm_head_eager,
+            ),
+            ("FERRUM_GREEDY_ARGMAX", &greedy),
         ] {
             if resolved.source != AutoConfigSource::Env {
                 runtime_config.upsert(
@@ -719,8 +812,49 @@ impl FerrumConfigBuilder {
                 );
             }
         }
+        if let Some(until) = default_prefill_first_until_active.as_ref() {
+            if self
+                .entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
+                .is_none()
+                && self.entry("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE").is_none()
+            {
+                runtime_config.upsert(
+                    "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
+                    until.value.to_string(),
+                    RuntimeConfigSource::Default,
+                );
+            }
+        }
+        if let Some(chunk) = default_prefill_step_chunk.as_ref() {
+            if self.entry("FERRUM_SCHED_PREFILL_STEP_CHUNK").is_none()
+                && self.entry("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE").is_none()
+            {
+                runtime_config.upsert(
+                    "FERRUM_SCHED_PREFILL_STEP_CHUNK",
+                    chunk.value.to_string(),
+                    RuntimeConfigSource::Default,
+                );
+            }
+        }
+        if let Some(slots) = recurrent_state_max_slots.as_ref() {
+            if self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_none()
+                && self.entry("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS").is_none()
+            {
+                runtime_config.upsert(
+                    "FERRUM_RECURRENT_STATE_MAX_SLOTS",
+                    slots.value.to_string(),
+                    RuntimeConfigSource::MemoryProfile,
+                );
+            }
+        }
         decisions.push(self.moe_decision(vllm_moe, device_route, pair_ids));
         decisions.push(self.graph_decision(graph));
+        decisions.push(self.decode_graph_decision(
+            batched_graph,
+            unified_graph,
+            unified_graph_layers_only,
+            unified_graph_lm_head_eager,
+        ));
         decisions.push(self.scalar_decision(
             "kv_block_count",
             kv_blocks,
@@ -731,6 +865,13 @@ impl FerrumConfigBuilder {
             max_sequences,
             RuntimeConfigEffect::Memory,
         ));
+        if let Some(slots) = recurrent_state_max_slots {
+            decisions.push(self.scalar_decision(
+                "recurrent_state_max_slots",
+                slots,
+                RuntimeConfigEffect::Memory,
+            ));
+        }
         decisions.push(self.scalar_decision(
             "max_batched_tokens",
             max_batched_tokens,
@@ -744,7 +885,10 @@ impl FerrumConfigBuilder {
             ));
         }
         decisions.push(self.prefix_cache_decision(prefix_cache));
-        decisions.push(self.scheduler_decision()?);
+        decisions.push(self.scheduler_decision(
+            default_prefill_first_until_active,
+            default_prefill_step_chunk,
+        )?);
         decisions.push(self.sampling_decision(greedy));
 
         Ok(ResolvedFerrumConfig {
@@ -785,6 +929,10 @@ impl FerrumConfigBuilder {
 
     fn is_cuda_backend(&self) -> bool {
         self.hardware.backend.eq_ignore_ascii_case("cuda")
+    }
+
+    fn is_accelerator_backend(&self) -> bool {
+        self.is_cuda_backend() || self.hardware.backend.eq_ignore_ascii_case("metal")
     }
 
     fn cuda_compute_capability_at_least(&self, major: u32, minor: u32) -> Option<bool> {
@@ -851,6 +999,38 @@ impl FerrumConfigBuilder {
         }
     }
 
+    fn default_prefill_first_until_active(
+        &self,
+        max_sequences: &ResolvedValue<usize>,
+    ) -> Option<ResolvedValue<usize>> {
+        if max_sequences.value <= 1 || !self.is_accelerator_backend() {
+            return None;
+        }
+        Some(ResolvedValue {
+            value: max_sequences.value,
+            source: AutoConfigSource::Default,
+            source_key: None,
+        })
+    }
+
+    fn default_prefill_step_chunk(
+        &self,
+        max_sequences: &ResolvedValue<usize>,
+        max_batched_tokens: &ResolvedValue<usize>,
+    ) -> Option<ResolvedValue<usize>> {
+        if max_sequences.value <= 1 || !self.is_accelerator_backend() {
+            return None;
+        }
+        Some(ResolvedValue {
+            value: max_batched_tokens
+                .value
+                .div_ceil(max_sequences.value.max(1))
+                .max(1),
+            source: AutoConfigSource::Default,
+            source_key: None,
+        })
+    }
+
     fn default_kv_blocks(&self, max_sequences: &ResolvedValue<usize>) -> ResolvedValue<usize> {
         let min_blocks = ceil_div(max_sequences.value.max(1), DEFAULT_KV_BLOCK_SIZE_TOKENS);
         if self
@@ -889,6 +1069,32 @@ impl FerrumConfigBuilder {
             },
             source_key: None,
         }
+    }
+
+    fn default_recurrent_state_max_slots(
+        &self,
+        max_sequences: &ResolvedValue<usize>,
+    ) -> Option<ResolvedValue<usize>> {
+        let limit = self.recurrent_state_budget_max_slots()?;
+        let selected = max_sequences.value.min(limit.max(1));
+        Some(ResolvedValue {
+            value: selected.max(1),
+            source: if selected < max_sequences.value {
+                AutoConfigSource::MemoryProfile
+            } else {
+                max_sequences.source
+            },
+            source_key: None,
+        })
+    }
+
+    fn recurrent_state_budget_max_slots(&self) -> Option<usize> {
+        self.recurrent_state_budget()
+            .map(|budget| budget.floored_slots)
+    }
+
+    fn recurrent_state_budget(&self) -> Option<RecurrentStateBudget> {
+        recurrent_state_budget_for(&self.model, &self.hardware)
     }
 
     fn kv_cache_bytes_per_token(&self) -> Option<u64> {
@@ -945,6 +1151,26 @@ impl FerrumConfigBuilder {
         }
     }
 
+    fn usize_value_with_legacy_alias(
+        &self,
+        primary_key: &str,
+        legacy_key: &str,
+        default: usize,
+        default_source: AutoConfigSource,
+    ) -> Result<ResolvedValue<usize>, AutoConfigError> {
+        if self.entry(primary_key).is_some() {
+            return self.usize_value(primary_key, default, default_source);
+        }
+        if self.entry(legacy_key).is_some() {
+            return self.usize_value(legacy_key, default, default_source);
+        }
+        Ok(ResolvedValue {
+            value: default,
+            source: default_source,
+            source_key: None,
+        })
+    }
+
     fn optional_usize_value(
         &self,
         key: &str,
@@ -991,28 +1217,10 @@ impl FerrumConfigBuilder {
                 "FA layout requires vLLM paged attention layout",
             );
         }
-        if fa2_source && !self.hardware.compiled_features.fa2_source {
+        if fa2_source {
             return self.invalid(
                 "FERRUM_FA2_SOURCE",
-                "source-linked FA2 support is not compiled",
-            );
-        }
-        if fa2_source && !self.is_cuda_backend() {
-            return self.invalid(
-                "FERRUM_FA2_SOURCE",
-                "source-linked FA2 requires CUDA backend",
-            );
-        }
-        if fa2_source && !use_vllm_paged_attn {
-            return self.invalid(
-                "FERRUM_FA2_SOURCE",
-                "source-linked FA2 requires vLLM paged attention layout",
-            );
-        }
-        if fa2_source && self.cuda_compute_capability_at_least(8, 0) == Some(false) {
-            return self.invalid(
-                "FERRUM_FA2_SOURCE",
-                "source-linked FA2 requires CUDA compute capability >= 8.0",
+                "source-linked FA2 path has been removed; use a native operator artifact",
             );
         }
         if fa2_direct_ffi && !self.hardware.compiled_features.fa2_direct_ffi {
@@ -1104,6 +1312,92 @@ impl FerrumConfigBuilder {
         Ok(())
     }
 
+    fn validate_batched_graph(&self, graph: bool) -> Result<(), AutoConfigError> {
+        if !graph {
+            return Ok(());
+        }
+        if self.model.moe.is_some() {
+            return self.invalid(
+                "FERRUM_BATCHED_GRAPH",
+                "legacy batched decode graph does not apply to MoE models",
+            );
+        }
+        if !self.is_cuda_backend() {
+            return self.invalid(
+                "FERRUM_BATCHED_GRAPH",
+                "legacy batched decode graph requires CUDA backend",
+            );
+        }
+        if !self.hardware.graph_support {
+            return self.invalid(
+                "FERRUM_BATCHED_GRAPH",
+                "hardware/backend does not support CUDA graph replay",
+            );
+        }
+        if !self.hardware.compiled_features.cuda_graph {
+            return self.invalid("FERRUM_BATCHED_GRAPH", "CUDA graph support is not compiled");
+        }
+        Ok(())
+    }
+
+    fn validate_unified_graph(
+        &self,
+        graph: bool,
+        layers_only: bool,
+        lm_head_eager: bool,
+    ) -> Result<(), AutoConfigError> {
+        if layers_only && !graph {
+            return self.invalid(
+                "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
+                "layers-only unified graph capture requires FERRUM_UNIFIED_GRAPH=1",
+            );
+        }
+        if lm_head_eager && !graph {
+            return self.invalid(
+                "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+                "lm-head-eager unified graph capture requires FERRUM_UNIFIED_GRAPH=1",
+            );
+        }
+        if layers_only && lm_head_eager {
+            return self.invalid(
+                "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+                "lm-head-eager unified graph capture conflicts with layers-only capture",
+            );
+        }
+        if !graph {
+            return Ok(());
+        }
+        if self.model.moe.is_some() {
+            return self.invalid(
+                "FERRUM_UNIFIED_GRAPH",
+                "unified decode graph does not apply to MoE models",
+            );
+        }
+        if self.model.architecture.eq_ignore_ascii_case("gemma3") && !layers_only && !lm_head_eager
+        {
+            return self.invalid(
+                "FERRUM_UNIFIED_GRAPH",
+                "full unified decode graph is disabled for Gemma3 sandwich-norm models",
+            );
+        }
+        if !self.is_cuda_backend() {
+            return self.invalid(
+                "FERRUM_UNIFIED_GRAPH",
+                "unified decode graph requires CUDA backend",
+            );
+        }
+        if !self.hardware.graph_support {
+            return self.invalid(
+                "FERRUM_UNIFIED_GRAPH",
+                "hardware/backend does not support CUDA graph replay",
+            );
+        }
+        if !self.hardware.compiled_features.cuda_graph {
+            return self.invalid("FERRUM_UNIFIED_GRAPH", "CUDA graph support is not compiled");
+        }
+        Ok(())
+    }
+
     fn validate_sampling(&self, greedy: bool) -> Result<(), AutoConfigError> {
         if greedy && !self.hardware.compiled_features.greedy_argmax {
             return self.invalid("FERRUM_GREEDY_ARGMAX", "GPU argmax is not compiled");
@@ -1123,6 +1417,7 @@ impl FerrumConfigBuilder {
         &self,
         kv_blocks: usize,
         max_sequences: usize,
+        recurrent_state_max_slots: Option<usize>,
         max_batched_tokens: usize,
         requested_max_model_len: Option<usize>,
     ) -> Result<(), AutoConfigError> {
@@ -1131,6 +1426,30 @@ impl FerrumConfigBuilder {
         }
         if max_sequences == 0 {
             return self.invalid("FERRUM_PAGED_MAX_SEQS", "must be greater than zero");
+        }
+        if recurrent_state_max_slots == Some(0) {
+            return self.invalid(
+                "FERRUM_RECURRENT_STATE_MAX_SLOTS",
+                "must be greater than zero",
+            );
+        }
+        if let Some(limit) = self.recurrent_state_budget_max_slots() {
+            let recurrent_slots = recurrent_state_max_slots.unwrap_or(max_sequences);
+            if recurrent_slots > limit {
+                let key = if self.entry("FERRUM_RECURRENT_STATE_MAX_SLOTS").is_some() {
+                    "FERRUM_RECURRENT_STATE_MAX_SLOTS"
+                } else if self.entry("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS").is_some() {
+                    "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS"
+                } else {
+                    "FERRUM_PAGED_MAX_SEQS"
+                };
+                return Err(AutoConfigError::InvalidOverride {
+                    key: key.to_string(),
+                    reason: format!(
+                        "recurrent-state slot pool exceeds the model/hardware memory budget: slots={recurrent_slots}, budget={limit}; use FERRUM_RECURRENT_STATE_MAX_SLOTS={limit}, lower --max-num-seqs, or a larger-memory GPU."
+                    ),
+                });
+            }
         }
         if max_batched_tokens < max_sequences {
             return self.invalid(
@@ -1380,6 +1699,73 @@ impl FerrumConfigBuilder {
         )
     }
 
+    fn decode_graph_decision(
+        &self,
+        batched_graph: ResolvedValue<bool>,
+        unified_graph: ResolvedValue<bool>,
+        unified_graph_layers_only: ResolvedValue<bool>,
+        unified_graph_lm_head_eager: ResolvedValue<bool>,
+    ) -> AutoConfigDecision {
+        let selected = if unified_graph.value && unified_graph_layers_only.value {
+            "unified_decode_graph_layers_only"
+        } else if unified_graph.value && unified_graph_lm_head_eager.value {
+            "unified_decode_graph_lm_head_eager"
+        } else if unified_graph.value {
+            "unified_decode_graph"
+        } else if batched_graph.value {
+            "legacy_batched_decode_graph"
+        } else {
+            "graph_disabled"
+        };
+        let source_value = if unified_graph_layers_only.value {
+            unified_graph_layers_only
+        } else if unified_graph_lm_head_eager.value {
+            unified_graph_lm_head_eager
+        } else if unified_graph.value
+            || (!batched_graph.value && unified_graph.source != AutoConfigSource::Default)
+        {
+            unified_graph
+        } else {
+            batched_graph
+        };
+        self.decision(
+            "decode_graph_policy",
+            selected,
+            source_value.source,
+            source_value.source_key,
+            [
+                "unified_decode_graph_layers_only",
+                "unified_decode_graph_lm_head_eager",
+                "unified_decode_graph",
+                "legacy_batched_decode_graph",
+                "graph_disabled",
+            ],
+            self.rejected_except(
+                selected,
+                [
+                    (
+                        "unified_decode_graph_layers_only",
+                        "layers-only unified decode graph not selected",
+                    ),
+                    (
+                        "unified_decode_graph_lm_head_eager",
+                        "lm-head-eager unified decode graph not selected",
+                    ),
+                    ("unified_decode_graph", "unified decode graph not selected"),
+                    (
+                        "legacy_batched_decode_graph",
+                        "legacy batched decode graph not selected",
+                    ),
+                    ("graph_disabled", "decode graph selected"),
+                ],
+            ),
+            vec![
+                RuntimeConfigEffect::Performance,
+                RuntimeConfigEffect::Correctness,
+            ],
+        )
+    }
+
     fn scalar_decision(
         &self,
         selection: &str,
@@ -1397,54 +1783,167 @@ impl FerrumConfigBuilder {
         )
     }
 
-    fn scheduler_decision(&self) -> Result<AutoConfigDecision, AutoConfigError> {
+    fn scheduler_decision(
+        &self,
+        default_prefill_first_until_active: Option<ResolvedValue<usize>>,
+        default_prefill_step_chunk: Option<ResolvedValue<usize>>,
+    ) -> Result<AutoConfigDecision, AutoConfigError> {
         let entries = self.entries();
-        let mut selected = "continuous_default".to_string();
-        let mut source_key = None;
-        if let Some(chunk) = entries.get("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK") {
-            parse_usize_env_value(chunk).map_err(|reason| AutoConfigError::InvalidOverride {
-                key: "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK".to_string(),
-                reason,
+        let prompt_scheduler =
+            || -> Result<(String, AutoConfigSource, Option<String>), AutoConfigError> {
+                let prompt_token_estimate = self.bool_value(
+                    "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE",
+                    true,
+                    AutoConfigSource::Default,
+                )?;
+                let selected = if prompt_token_estimate.value {
+                    "prompt_token_estimate"
+                } else {
+                    "continuous_default"
+                };
+                Ok((
+                    selected.to_string(),
+                    prompt_token_estimate.source,
+                    prompt_token_estimate.source_key,
+                ))
+            };
+        let explicit_prefill_first = entries.get("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE");
+        let explicit_prefill_first_present = explicit_prefill_first.is_some();
+        let implicit_prefill_first = if explicit_prefill_first.is_none()
+            && !entries.contains_key("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE")
+        {
+            default_prefill_first_until_active
+                .as_ref()
+                .map(|until| until.value.to_string())
+        } else {
+            None
+        };
+        let prefill_first = explicit_prefill_first
+            .copied()
+            .or(implicit_prefill_first.as_deref());
+        let active_decode_chunk = entries.get("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK");
+        if let Some(chunk) = active_decode_chunk {
+            let chunk_value = parse_usize_env_value(chunk).map_err(|reason| {
+                AutoConfigError::InvalidOverride {
+                    key: "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK".to_string(),
+                    reason,
+                }
             })?;
-            selected = format!("active_decode_prefill_chunk:{chunk}");
-            source_key = Some("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK".to_string());
-        } else if let Some(until) = entries.get("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE") {
+            self.unsupported_if(
+                chunk_value == 0,
+                "scheduler_admission_policy",
+                "active decode prefill chunk must be greater than zero",
+            )?;
+        }
+        let explicit_prefill_step_chunk = entries.get("FERRUM_SCHED_PREFILL_STEP_CHUNK");
+        let explicit_prefill_step_chunk_present = explicit_prefill_step_chunk.is_some();
+        let implicit_prefill_step_chunk = if explicit_prefill_step_chunk.is_none()
+            && !entries.contains_key("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE")
+        {
+            default_prefill_step_chunk
+                .as_ref()
+                .map(|chunk| chunk.value.to_string())
+        } else {
+            None
+        };
+        let prefill_step_chunk = explicit_prefill_step_chunk
+            .copied()
+            .or(implicit_prefill_step_chunk.as_deref());
+        if let Some(chunk) = prefill_step_chunk {
+            let chunk_value = parse_usize_env_value(chunk).map_err(|reason| {
+                AutoConfigError::InvalidOverride {
+                    key: "FERRUM_SCHED_PREFILL_STEP_CHUNK".to_string(),
+                    reason,
+                }
+            })?;
+            self.unsupported_if(
+                chunk_value == 0,
+                "scheduler_admission_policy",
+                "scheduler prefill step chunk must be greater than zero",
+            )?;
+        }
+        let (mut selected, mut source, mut source_key) = if let (Some(until), Some(chunk)) =
+            (prefill_first, active_decode_chunk)
+        {
             parse_usize_env_value(until).map_err(|reason| AutoConfigError::InvalidOverride {
                 key: "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE".to_string(),
                 reason,
             })?;
-            selected = format!("prefill_first_until_active:{until}");
-            source_key = Some("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE".to_string());
-        } else if self
-            .bool_value(
-                "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE",
-                false,
-                AutoConfigSource::Default,
-            )?
-            .value
-        {
-            selected = "prompt_token_estimate".to_string();
-            source_key = Some("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE".to_string());
+            parse_usize_env_value(chunk).map_err(|reason| AutoConfigError::InvalidOverride {
+                key: "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK".to_string(),
+                reason,
+            })?;
+            let key = "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK";
+            (
+                format!("prefill_first_until_active:{until}+active_decode_prefill_chunk:{chunk}"),
+                self.source_for_key(key, AutoConfigSource::Default),
+                Some(key.to_string()),
+            )
+        } else if let Some(chunk) = active_decode_chunk {
+            parse_usize_env_value(chunk).map_err(|reason| AutoConfigError::InvalidOverride {
+                key: "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK".to_string(),
+                reason,
+            })?;
+            let key = "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK";
+            (
+                format!("active_decode_prefill_chunk:{chunk}"),
+                self.source_for_key(key, AutoConfigSource::Default),
+                Some(key.to_string()),
+            )
+        } else if let Some(until) = prefill_first {
+            parse_usize_env_value(until).map_err(|reason| AutoConfigError::InvalidOverride {
+                key: "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE".to_string(),
+                reason,
+            })?;
+            let key = "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE";
+            let (source, source_key) = if explicit_prefill_first_present {
+                (
+                    self.source_for_key(key, AutoConfigSource::Default),
+                    Some(key.to_string()),
+                )
+            } else if let Some(default) = default_prefill_first_until_active.as_ref() {
+                (default.source, default.source_key.clone())
+            } else {
+                (AutoConfigSource::Default, None)
+            };
+            (
+                format!("prefill_first_until_active:{until}"),
+                source,
+                source_key,
+            )
+        } else if !entries.contains_key("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE") {
+            if let Some(until) = default_prefill_first_until_active.as_ref() {
+                (
+                    format!("prefill_first_until_active:{}", until.value),
+                    until.source,
+                    until.source_key.clone(),
+                )
+            } else {
+                prompt_scheduler()?
+            }
+        } else {
+            prompt_scheduler()?
+        };
+        if let Some(chunk) = prefill_step_chunk {
+            selected.push_str(&format!("+prefill_step_chunk:{chunk}"));
+            if explicit_prefill_step_chunk_present && source_key.is_none() {
+                let key = "FERRUM_SCHED_PREFILL_STEP_CHUNK";
+                source = self.source_for_key(key, AutoConfigSource::Default);
+                source_key = Some(key.to_string());
+            }
         }
-        self.unsupported_if(
-            source_key.as_deref() == Some("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK")
-                && selected.ends_with(":0"),
-            "scheduler_admission_policy",
-            "active decode prefill chunk must be greater than zero",
-        )?;
         Ok(self.decision(
             "scheduler_admission_policy",
             &selected,
-            source_key
-                .as_deref()
-                .map(|key| self.source_for_key(key, AutoConfigSource::Default))
-                .unwrap_or(AutoConfigSource::Default),
+            source,
             source_key,
             [
                 "continuous_default",
                 "prompt_token_estimate",
                 "prefill_first_until_active",
+                "prefill_first_until_active+active_decode_prefill_chunk",
                 "active_decode_prefill_chunk",
+                "prefill_step_chunk",
             ],
             Vec::new(),
             vec![RuntimeConfigEffect::Performance],
@@ -1583,11 +2082,46 @@ fn kv_cache_bytes_per_token_for_model(model: &ModelCapabilities) -> Option<u64> 
         .checked_mul(2)
 }
 
+fn qwen_moe_architecture_uses_vllm_paged_attn(architecture: &str) -> bool {
+    architecture.eq_ignore_ascii_case("qwen3_moe")
+        || architecture.eq_ignore_ascii_case("qwen3_5_moe")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedValue<T> {
     value: T,
     source: AutoConfigSource,
     source_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecurrentStateBudget {
+    remaining_bytes: u64,
+    bytes_per_sequence: u64,
+    raw_slots: usize,
+    floored_slots: usize,
+}
+
+fn recurrent_state_budget_for(
+    model: &ModelCapabilities,
+    hardware: &HardwareCapabilities,
+) -> Option<RecurrentStateBudget> {
+    if !(hardware.backend.eq_ignore_ascii_case("cuda")
+        || hardware.backend.eq_ignore_ascii_case("metal"))
+    {
+        return None;
+    }
+    let bytes_per_sequence = model.recurrent_state_bytes_per_sequence?.max(1);
+    let vram_bytes = hardware.vram_bytes?;
+    let weight_bytes = model.estimated_weight_bytes?;
+    let remaining = vram_bytes.saturating_sub(weight_bytes);
+    let raw_slots = (remaining / bytes_per_sequence) as usize;
+    Some(RecurrentStateBudget {
+        remaining_bytes: remaining,
+        bytes_per_sequence,
+        raw_slots,
+        floored_slots: floor_power_of_two(raw_slots.max(1)),
+    })
 }
 
 fn parse_compute_capability(value: &str) -> Option<(u32, u32)> {
@@ -1614,6 +2148,25 @@ fn default_gpu_devices_for_backend(backend: &str) -> Option<Vec<usize>> {
 
 fn ceil_div(value: usize, divisor: usize) -> usize {
     value.div_ceil(divisor)
+}
+
+fn effective_admission_limit(
+    max_sequences: Option<usize>,
+    recurrent_state_max_slots: Option<usize>,
+) -> Option<usize> {
+    match (max_sequences, recurrent_state_max_slots) {
+        (Some(max_sequences), Some(recurrent_slots)) => Some(max_sequences.min(recurrent_slots)),
+        (Some(max_sequences), None) => Some(max_sequences),
+        (None, Some(recurrent_slots)) => Some(recurrent_slots),
+        (None, None) => None,
+    }
+}
+
+fn floor_power_of_two(value: usize) -> usize {
+    if value <= 1 {
+        return 1;
+    }
+    1usize << (usize::BITS - 1 - value.leading_zeros())
 }
 
 fn auto_config_source_from_runtime(source: RuntimeConfigSource) -> AutoConfigSource {
@@ -1666,6 +2219,33 @@ mod tests {
             .with_workload_profile(WorkloadProfile::m3_qwen3_30b_a3b_int4())
     }
 
+    fn qwen35_moe_gptq_int4_model() -> ModelCapabilities {
+        let mut model = ModelCapabilities::qwen3_30b_a3b_gptq_int4();
+        model.architecture = "qwen3_5_moe".to_string();
+        model.head_dim = Some(256);
+        model.num_hidden_layers = Some(40);
+        model.kv_heads = Some(8);
+        model.estimated_weight_bytes = Some(24_419_939_760);
+        model.recurrent_state_bytes_per_sequence = Some(32_931_840);
+        model
+    }
+
+    fn synthetic_tight_recurrent_state_model() -> ModelCapabilities {
+        ModelCapabilities {
+            architecture: "synthetic_recurrent_state".to_string(),
+            quantization: None,
+            moe: None,
+            max_context_len: Some(262_144),
+            num_hidden_layers: Some(40),
+            head_dim: Some(256),
+            kv_heads: Some(8),
+            estimated_weight_bytes: Some(24_419_939_760),
+            recurrent_state_bytes_per_sequence: Some(65_863_680),
+            supported_dtypes: vec!["fp16".to_string()],
+            graph_safe_moe: false,
+        }
+    }
+
     fn qwen25_layer_split_runtime_entries(source: RuntimeConfigSource) -> RuntimeConfigSnapshot {
         snapshot_with_sources(&[
             ("FERRUM_REQUESTED_GPU_DEVICES", "0,1", source),
@@ -1689,6 +2269,22 @@ mod tests {
             ("FERRUM_MAX_BATCHED_TOKENS", "1536", source),
             ("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE", "16", source),
         ])
+    }
+
+    fn gemma3_gptq_model() -> ModelCapabilities {
+        ModelCapabilities {
+            architecture: "gemma3".to_string(),
+            quantization: Some("gptq_int4".to_string()),
+            moe: None,
+            max_context_len: Some(131_072),
+            num_hidden_layers: Some(62),
+            head_dim: Some(256),
+            kv_heads: Some(16),
+            estimated_weight_bytes: Some(15 * GIB),
+            recurrent_state_bytes_per_sequence: None,
+            supported_dtypes: vec!["fp16".to_string()],
+            graph_safe_moe: false,
+        }
     }
 
     fn expect_invalid_key(vars: &[(&str, &str)], key: &str) {
@@ -1754,6 +2350,7 @@ mod tests {
             "vllm_marlin_moe_device_route_pair_ids"
         );
         assert_eq!(decisions["moe_graph_policy"], "graph_disabled");
+        assert_eq!(decisions["decode_graph_policy"], "graph_disabled");
         assert_eq!(decisions["prefix_cache_policy"], "prefix_cache_disabled");
         assert_eq!(decisions["sampling_readback_path"], "gpu_greedy_argmax");
         assert_eq!(
@@ -1848,6 +2445,314 @@ mod tests {
     }
 
     #[test]
+    fn cuda_qwen35_moe_enables_vllm_paged_attn_v2_without_m3_preset() {
+        // Qwen3.5-MoE shares the Qwen MoE CUDA fast-path requirements, but its
+        // full-attention head_dim is 256. The H256 path uses the v2 paged
+        // attention launcher, so the default decision trace must not report
+        // the H128-oriented v1-short path.
+        let mut hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        hardware.vram_bytes = Some(48 * GIB);
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let model = qwen35_moe_gptq_int4_model();
+        let resolved = FerrumConfigBuilder::new(snapshot(&[]))
+            .with_model_capabilities(model)
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+        assert_eq!(
+            decisions["attention_prefill_mixed_backend"],
+            "vllm_paged_varlen"
+        );
+        assert_eq!(decisions["attention_decode_backend"], "vllm_paged_attn_v2");
+        let entry = |key: &str| {
+            resolved
+                .runtime_config
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing runtime config entry {key}"))
+        };
+        assert_eq!(entry("FERRUM_USE_VLLM_PAGED_ATTN").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_VLLM_PAGED_ATTN_V1_SHORT").effective_value,
+            "0"
+        );
+    }
+
+    #[test]
+    fn recurrent_state_budget_caps_default_slots_without_model_vram_special_case() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]))
+            .with_model_capabilities(synthetic_tight_recurrent_state_model())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let decision = |selection: &str| {
+            resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == selection)
+                .unwrap_or_else(|| panic!("missing decision {selection}"))
+        };
+
+        assert_eq!(decision("max_sequences").selected, "32");
+        assert_eq!(decision("recurrent_state_max_slots").selected, "16");
+        assert_eq!(
+            decision("recurrent_state_max_slots").source,
+            AutoConfigSource::MemoryProfile
+        );
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_RECURRENT_STATE_MAX_SLOTS")
+            .expect("memory-profile recurrent slot cap should reach effective runtime config");
+        assert_eq!(entry.effective_value, "16");
+        assert_eq!(entry.source, RuntimeConfigSource::MemoryProfile);
+        let doc = resolved.effective_config_document();
+        assert_eq!(doc["selected_max_sequences"], serde_json::json!(32));
+        assert_eq!(
+            doc["selected_recurrent_state_max_slots"],
+            serde_json::json!(16)
+        );
+        assert_eq!(doc["selected_admission_limit"], serde_json::json!(16));
+        assert_eq!(
+            doc["admission"]["effective_max_concurrent"],
+            serde_json::json!(16)
+        );
+        assert_eq!(
+            doc["admission"]["recurrent_state_max_slots"],
+            serde_json::json!(16)
+        );
+        assert_eq!(
+            doc["admission"]["memory_estimate"]["recurrent_state_bytes_per_sequence"],
+            serde_json::json!(65_863_680u64)
+        );
+        assert_eq!(
+            doc["admission"]["memory_estimate"]["recurrent_state_budget_bytes"],
+            serde_json::json!(24u64 * GIB - 24_419_939_760u64)
+        );
+        assert_eq!(
+            doc["admission"]["memory_estimate"]["recurrent_state_budget_raw_slots"],
+            serde_json::json!(20)
+        );
+        assert_eq!(
+            doc["admission"]["memory_estimate"]["recurrent_state_budget_max_slots"],
+            serde_json::json!(16)
+        );
+        assert_eq!(
+            doc["admission"]["memory_estimate"]["recurrent_state_capacity_bytes"],
+            serde_json::json!(16u64 * 65_863_680u64)
+        );
+    }
+
+    #[test]
+    fn qwen35_fast_recurrent_state_budget_selects_default_slots_without_vram_special_case() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]))
+            .with_model_capabilities(qwen35_moe_gptq_int4_model())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let decision = |selection: &str| {
+            resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == selection)
+                .unwrap_or_else(|| panic!("missing decision {selection}"))
+        };
+
+        assert_eq!(decision("max_sequences").selected, "32");
+        assert_eq!(decision("recurrent_state_max_slots").selected, "32");
+        assert_eq!(
+            decision("recurrent_state_max_slots").source,
+            AutoConfigSource::Env
+        );
+        let doc = resolved.effective_config_document();
+        assert_eq!(doc["selected_max_sequences"], serde_json::json!(32));
+        assert_eq!(
+            doc["selected_recurrent_state_max_slots"],
+            serde_json::json!(32)
+        );
+        assert_eq!(doc["selected_admission_limit"], serde_json::json!(32));
+        assert_eq!(
+            doc["admission"]["memory_estimate"]["recurrent_state_bytes_per_sequence"],
+            serde_json::json!(32_931_840u64)
+        );
+        assert_eq!(
+            doc["admission"]["memory_estimate"]["recurrent_state_budget_raw_slots"],
+            serde_json::json!(40)
+        );
+        assert_eq!(
+            doc["admission"]["memory_estimate"]["recurrent_state_budget_max_slots"],
+            serde_json::json!(32)
+        );
+        assert_eq!(
+            doc["admission"]["memory_estimate"]["recurrent_state_capacity_bytes"],
+            serde_json::json!(32u64 * 32_931_840u64)
+        );
+    }
+
+    #[test]
+    fn recurrent_state_budget_rejects_explicit_slot_pool_above_budget() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err = FerrumConfigBuilder::new(snapshot(&[
+            ("FERRUM_PAGED_MAX_SEQS", "32"),
+            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "32"),
+        ]))
+        .with_model_capabilities(synthetic_tight_recurrent_state_model())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap_err();
+
+        match err {
+            AutoConfigError::InvalidOverride { key, reason } => {
+                assert_eq!(key, "FERRUM_RECURRENT_STATE_MAX_SLOTS");
+                assert!(
+                    reason.contains("recurrent-state slot pool exceeds"),
+                    "{reason}"
+                );
+                assert!(
+                    reason.contains("FERRUM_RECURRENT_STATE_MAX_SLOTS=16"),
+                    "{reason}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effective_admission_limit_is_capped_by_recurrent_state_slots_when_present() {
+        assert_eq!(effective_admission_limit(Some(32), Some(16)), Some(16));
+        assert_eq!(effective_admission_limit(Some(16), Some(32)), Some(16));
+        assert_eq!(effective_admission_limit(Some(32), None), Some(32));
+        assert_eq!(effective_admission_limit(None, Some(16)), Some(16));
+        assert_eq!(effective_admission_limit(None, None), None);
+    }
+
+    #[test]
+    fn explicit_recurrent_state_slot_cap_can_keep_scheduler_width_above_state_pool() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[
+            ("FERRUM_PAGED_MAX_SEQS", "32"),
+            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "16"),
+        ]))
+        .with_model_capabilities(synthetic_tight_recurrent_state_model())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap();
+        let decision = |selection: &str| {
+            resolved
+                .decisions
+                .iter()
+                .find(|decision| decision.selection == selection)
+                .unwrap_or_else(|| panic!("missing decision {selection}"))
+        };
+        assert_eq!(decision("max_sequences").selected, "32");
+        assert_eq!(decision("recurrent_state_max_slots").selected, "16");
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_RECURRENT_STATE_MAX_SLOTS")
+            .expect("recurrent-state slot cap should reach effective runtime config");
+        assert_eq!(entry.effective_value, "16");
+    }
+
+    #[test]
+    fn recurrent_state_budget_accepts_legacy_qwen35_slot_alias() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[
+            ("FERRUM_PAGED_MAX_SEQS", "32"),
+            ("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "16"),
+        ]))
+        .with_model_capabilities(synthetic_tight_recurrent_state_model())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap();
+        let decision = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "recurrent_state_max_slots")
+            .expect("missing recurrent_state_max_slots decision");
+        assert_eq!(decision.selected, "16");
+        assert_eq!(
+            decision.source_key.as_deref(),
+            Some("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS")
+        );
+        assert!(resolved
+            .runtime_config
+            .entries
+            .iter()
+            .any(|entry| entry.key == "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS"
+                && entry.effective_value == "16"));
+    }
+
+    #[test]
+    fn recurrent_state_budget_rejects_zero_slot_pool() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err = FerrumConfigBuilder::new(snapshot(&[
+            ("FERRUM_PAGED_MAX_SEQS", "16"),
+            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "0"),
+        ]))
+        .with_model_capabilities(synthetic_tight_recurrent_state_model())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, .. }
+                if key == "FERRUM_RECURRENT_STATE_MAX_SLOTS"
+        ));
+    }
+
+    #[test]
+    fn recurrent_state_budget_allows_c32_when_memory_budget_fits() {
+        let mut hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        hardware.vram_bytes = Some(48 * GIB);
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[("FERRUM_PAGED_MAX_SEQS", "32")]))
+            .with_model_capabilities(synthetic_tight_recurrent_state_model())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let max_sequences = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "max_sequences")
+            .unwrap();
+        assert_eq!(max_sequences.selected, "32");
+    }
+
+    #[test]
     fn cuda_qwen3_moe_vllm_paged_attn_env_opt_out_is_materialized() {
         let hardware =
             HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
@@ -1904,7 +2809,7 @@ mod tests {
         assert_eq!(decision("max_model_len").selected, "4096");
         assert_eq!(
             decision("scheduler_admission_policy").selected,
-            "prefill_first_until_active:16"
+            "prefill_first_until_active:16+prefill_step_chunk:96"
         );
         assert_eq!(
             decision("scheduler_admission_policy").source,
@@ -1918,20 +2823,23 @@ mod tests {
     }
 
     #[test]
-    fn source_fa2_selects_source_linked_attention_when_compiled() {
-        let resolved = m3(
+    fn source_fa2_is_rejected_even_when_legacy_feature_is_compiled() {
+        let err = m3(
             &[("FERRUM_FA2_SOURCE", "1")],
             CompiledKernelFeatures::m3_fast_path_with_source_fa2(),
         )
         .resolve()
-        .unwrap();
-        let decisions: BTreeMap<_, _> = resolved
-            .decisions
-            .iter()
-            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
-            .collect();
+        .unwrap_err();
 
-        assert_eq!(decisions["attention_prefill_mixed_backend"], "fa2_source");
+        match err {
+            AutoConfigError::InvalidOverride { key, reason } => {
+                assert_eq!(key, "FERRUM_FA2_SOURCE");
+                assert!(reason.contains("native operator artifact"));
+            }
+            AutoConfigError::UnsupportedCombination { .. } => {
+                panic!("expected invalid FERRUM_FA2_SOURCE override")
+            }
+        }
     }
 
     #[test]
@@ -2246,6 +3154,90 @@ mod tests {
             .find(|decision| decision.selection == "max_sequences")
             .unwrap();
         assert_eq!(max_sequences.selected, "32");
+        let scheduler = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "scheduler_admission_policy")
+            .unwrap();
+        assert_eq!(
+            scheduler.selected,
+            "prefill_first_until_active:32+prefill_step_chunk:64"
+        );
+        assert_eq!(scheduler.source, AutoConfigSource::Default);
+        let scheduler_entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
+            .unwrap_or_else(|| panic!("missing FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE entry"));
+        assert_eq!(scheduler_entry.effective_value, "32");
+        assert_eq!(scheduler_entry.source, RuntimeConfigSource::Default);
+        let step_entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SCHED_PREFILL_STEP_CHUNK")
+            .unwrap_or_else(|| panic!("missing FERRUM_SCHED_PREFILL_STEP_CHUNK entry"));
+        assert_eq!(step_entry.effective_value, "64");
+        assert_eq!(step_entry.source, RuntimeConfigSource::Default);
+    }
+
+    #[test]
+    fn accelerator_serving_default_enables_greedy_argmax_when_compiled() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[]))
+            .with_model_capabilities(ModelCapabilities::unknown())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let sampling = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "sampling_readback_path")
+            .unwrap();
+        assert_eq!(sampling.selected, "gpu_greedy_argmax");
+        assert_eq!(sampling.source, AutoConfigSource::HardwareCapability);
+        let greedy_entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_GREEDY_ARGMAX")
+            .unwrap_or_else(|| panic!("missing FERRUM_GREEDY_ARGMAX entry"));
+        assert_eq!(greedy_entry.effective_value, "1");
+    }
+
+    #[test]
+    fn explicit_greedy_argmax_disable_keeps_logits_readback() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot_with_sources(&[(
+            "FERRUM_GREEDY_ARGMAX",
+            "0",
+            RuntimeConfigSource::Cli,
+        )]))
+        .with_model_capabilities(ModelCapabilities::unknown())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap();
+        let sampling = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "sampling_readback_path")
+            .unwrap();
+        assert_eq!(sampling.selected, "logits_readback");
+        assert_eq!(sampling.source, AutoConfigSource::Cli);
+        let greedy_entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_GREEDY_ARGMAX")
+            .unwrap_or_else(|| panic!("missing FERRUM_GREEDY_ARGMAX entry"));
+        assert_eq!(greedy_entry.effective_value, "0");
     }
 
     #[test]
@@ -2257,6 +3249,28 @@ mod tests {
         };
         let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
         assert_eq!(workload.target_concurrency, 1);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[]))
+            .with_model_capabilities(ModelCapabilities::unknown())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let scheduler = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "scheduler_admission_policy")
+            .unwrap();
+        assert_eq!(scheduler.selected, "prompt_token_estimate");
+        assert!(resolved
+            .runtime_config
+            .entries
+            .iter()
+            .all(|entry| entry.key != "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE"));
+        assert!(resolved
+            .runtime_config
+            .entries
+            .iter()
+            .all(|entry| entry.key != "FERRUM_SCHED_PREFILL_STEP_CHUNK"));
     }
 
     #[test]
@@ -2380,7 +3394,287 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_override_is_reflected_in_decision_trace() {
+    fn batched_graph_override_materializes_decode_graph_policy() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot_with_sources(&[(
+            "FERRUM_BATCHED_GRAPH",
+            "1",
+            RuntimeConfigSource::Cli,
+        )]))
+        .with_model_capabilities(ModelCapabilities::unknown())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap();
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+        assert_eq!(
+            decisions["decode_graph_policy"],
+            "legacy_batched_decode_graph"
+        );
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_BATCHED_GRAPH")
+            .expect("batched graph entry");
+        assert_eq!(entry.effective_value, "1");
+        assert_eq!(
+            resolved.effective_config_document()["selected_graph_mode"],
+            "legacy_batched_decode_graph"
+        );
+    }
+
+    #[test]
+    fn unified_graph_override_materializes_decode_graph_policy() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot_with_sources(&[(
+            "FERRUM_UNIFIED_GRAPH",
+            "1",
+            RuntimeConfigSource::Cli,
+        )]))
+        .with_model_capabilities(ModelCapabilities::unknown())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap();
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+        assert_eq!(decisions["decode_graph_policy"], "unified_decode_graph");
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_UNIFIED_GRAPH")
+            .expect("unified graph entry");
+        assert_eq!(entry.effective_value, "1");
+        assert_eq!(
+            resolved.effective_config_document()["selected_graph_mode"],
+            "unified_decode_graph"
+        );
+    }
+
+    #[test]
+    fn unified_graph_layers_only_override_materializes_decode_graph_policy() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot_with_sources(&[
+            ("FERRUM_UNIFIED_GRAPH", "1", RuntimeConfigSource::Cli),
+            (
+                "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
+                "1",
+                RuntimeConfigSource::Cli,
+            ),
+        ]))
+        .with_model_capabilities(gemma3_gptq_model())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap();
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+        assert_eq!(
+            decisions["decode_graph_policy"],
+            "unified_decode_graph_layers_only"
+        );
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY")
+            .expect("unified graph layers-only entry");
+        assert_eq!(entry.effective_value, "1");
+        assert_eq!(
+            resolved.effective_config_document()["selected_graph_mode"],
+            "unified_decode_graph_layers_only"
+        );
+    }
+
+    #[test]
+    fn unified_graph_lm_head_eager_override_materializes_decode_graph_policy() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot_with_sources(&[
+            ("FERRUM_UNIFIED_GRAPH", "1", RuntimeConfigSource::Cli),
+            (
+                "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+                "1",
+                RuntimeConfigSource::Cli,
+            ),
+        ]))
+        .with_model_capabilities(gemma3_gptq_model())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .unwrap();
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+        assert_eq!(
+            decisions["decode_graph_policy"],
+            "unified_decode_graph_lm_head_eager"
+        );
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER")
+            .expect("unified graph lm-head-eager entry");
+        assert_eq!(entry.effective_value, "1");
+        assert_eq!(
+            resolved.effective_config_document()["selected_graph_mode"],
+            "unified_decode_graph_lm_head_eager"
+        );
+    }
+
+    #[test]
+    fn unified_graph_layers_only_requires_unified_graph() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err = FerrumConfigBuilder::new(snapshot(&[("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY", "1")]))
+            .with_model_capabilities(ModelCapabilities::unknown())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .expect_err("layers-only graph scope should require unified graph");
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, .. }
+                if key == "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY"
+        ));
+    }
+
+    #[test]
+    fn unified_graph_lm_head_eager_requires_unified_graph() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err =
+            FerrumConfigBuilder::new(snapshot(&[("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER", "1")]))
+                .with_model_capabilities(ModelCapabilities::unknown())
+                .with_hardware_capabilities(hardware)
+                .with_workload_profile(workload)
+                .resolve()
+                .expect_err("lm-head-eager graph scope should require unified graph");
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, .. }
+                if key == "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER"
+        ));
+    }
+
+    #[test]
+    fn unified_graph_lm_head_eager_conflicts_with_layers_only() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err = FerrumConfigBuilder::new(snapshot(&[
+            ("FERRUM_UNIFIED_GRAPH", "1"),
+            ("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY", "1"),
+            ("FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER", "1"),
+        ]))
+        .with_model_capabilities(ModelCapabilities::unknown())
+        .with_hardware_capabilities(hardware)
+        .with_workload_profile(workload)
+        .resolve()
+        .expect_err("lm-head-eager graph scope should conflict with layers-only graph scope");
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, .. }
+                if key == "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER"
+        ));
+    }
+
+    #[test]
+    fn batched_graph_requires_cuda_graph_support() {
+        let mut features = CompiledKernelFeatures::m3_fast_path_without_fa2();
+        features.cuda_graph = false;
+        let hardware = HardwareCapabilities::rtx4090_cuda(features);
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err = FerrumConfigBuilder::new(snapshot(&[("FERRUM_BATCHED_GRAPH", "1")]))
+            .with_model_capabilities(ModelCapabilities::unknown())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .expect_err("batched graph should require compiled graph support");
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, .. } if key == "FERRUM_BATCHED_GRAPH"
+        ));
+    }
+
+    #[test]
+    fn unified_graph_requires_cuda_graph_support() {
+        let mut features = CompiledKernelFeatures::m3_fast_path_without_fa2();
+        features.cuda_graph = false;
+        let hardware = HardwareCapabilities::rtx4090_cuda(features);
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err = FerrumConfigBuilder::new(snapshot(&[("FERRUM_UNIFIED_GRAPH", "1")]))
+            .with_model_capabilities(ModelCapabilities::unknown())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .expect_err("unified graph should require compiled graph support");
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, .. } if key == "FERRUM_UNIFIED_GRAPH"
+        ));
+    }
+
+    #[test]
+    fn unified_graph_rejects_gemma3_sandwich_models() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err = FerrumConfigBuilder::new(snapshot(&[("FERRUM_UNIFIED_GRAPH", "1")]))
+            .with_model_capabilities(gemma3_gptq_model())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .expect_err("Gemma3 unified graph should stay disabled until graph instantiate fits");
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, .. } if key == "FERRUM_UNIFIED_GRAPH"
+        ));
+    }
+
+    #[test]
+    fn batched_graph_rejects_non_cuda_backend() {
+        let hardware =
+            cpu_hardware_with_features(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let err = FerrumConfigBuilder::new(snapshot(&[("FERRUM_BATCHED_GRAPH", "1")]))
+            .with_model_capabilities(ModelCapabilities::unknown())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .expect_err("batched graph should require CUDA");
+        assert!(matches!(
+            err,
+            AutoConfigError::InvalidOverride { key, .. } if key == "FERRUM_BATCHED_GRAPH"
+        ));
+    }
+
+    #[test]
+    fn scheduler_active_chunk_combines_with_accelerator_prefill_first_default() {
         let resolved = m3(
             &[("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK", "64")],
             CompiledKernelFeatures::m3_fast_path_without_fa2(),
@@ -2392,10 +3686,181 @@ mod tests {
             .iter()
             .find(|decision| decision.selection == "scheduler_admission_policy")
             .unwrap();
-        assert_eq!(scheduler.selected, "active_decode_prefill_chunk:64");
+        assert_eq!(
+            scheduler.selected,
+            "prefill_first_until_active:32+active_decode_prefill_chunk:64+prefill_step_chunk:64"
+        );
         assert_eq!(
             scheduler.source_key.as_deref(),
             Some("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK")
+        );
+        let prefill_entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
+            .expect("accelerator default prefill-first should still be materialized");
+        assert_eq!(prefill_entry.effective_value, "32");
+        assert_eq!(prefill_entry.source, RuntimeConfigSource::Default);
+        let step_entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SCHED_PREFILL_STEP_CHUNK")
+            .expect("accelerator default prefill-step chunk should be materialized");
+        assert_eq!(step_entry.effective_value, "64");
+        assert_eq!(step_entry.source, RuntimeConfigSource::Default);
+    }
+
+    #[test]
+    fn scheduler_prefill_step_chunk_override_is_reflected_in_decision_trace() {
+        let resolved = m3(
+            &[("FERRUM_SCHED_PREFILL_STEP_CHUNK", "128")],
+            CompiledKernelFeatures::m3_fast_path_without_fa2(),
+        )
+        .resolve()
+        .unwrap();
+        let scheduler = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "scheduler_admission_policy")
+            .unwrap();
+        assert_eq!(
+            scheduler.selected,
+            "prefill_first_until_active:32+prefill_step_chunk:128"
+        );
+        assert_eq!(scheduler.source, AutoConfigSource::Env);
+        assert_eq!(
+            scheduler.source_key.as_deref(),
+            Some("FERRUM_SCHED_PREFILL_STEP_CHUNK")
+        );
+        let step_entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SCHED_PREFILL_STEP_CHUNK")
+            .expect("explicit prefill-step chunk should be preserved");
+        assert_eq!(step_entry.effective_value, "128");
+        assert_eq!(step_entry.source, RuntimeConfigSource::Env);
+    }
+
+    #[test]
+    fn cuda_gemma3_gptq_uses_generic_scheduler_default() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved = FerrumConfigBuilder::new(snapshot(&[]))
+            .with_model_capabilities(gemma3_gptq_model())
+            .with_hardware_capabilities(hardware)
+            .with_workload_profile(workload)
+            .resolve()
+            .unwrap();
+        let scheduler = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "scheduler_admission_policy")
+            .unwrap();
+        assert_eq!(
+            scheduler.selected,
+            "prefill_first_until_active:32+prefill_step_chunk:64"
+        );
+        assert_eq!(scheduler.source, AutoConfigSource::Default);
+        assert!(resolved
+            .runtime_config
+            .entries
+            .iter()
+            .all(|entry| entry.key != "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK"));
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
+            .expect("generic scheduler default should be materialized");
+        assert_eq!(entry.effective_value, "32");
+        assert_eq!(entry.source, RuntimeConfigSource::Default);
+    }
+
+    #[test]
+    fn explicit_scheduler_prompt_estimate_is_reflected_for_gemma3() {
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+        let resolved =
+            FerrumConfigBuilder::new(snapshot(&[("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE", "1")]))
+                .with_model_capabilities(gemma3_gptq_model())
+                .with_hardware_capabilities(hardware)
+                .with_workload_profile(workload)
+                .resolve()
+                .unwrap();
+        let scheduler = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "scheduler_admission_policy")
+            .unwrap();
+        assert_eq!(scheduler.selected, "prompt_token_estimate");
+        assert_eq!(
+            scheduler.source_key.as_deref(),
+            Some("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE")
+        );
+        assert!(resolved
+            .runtime_config
+            .entries
+            .iter()
+            .all(|entry| entry.key != "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK"));
+    }
+
+    #[test]
+    fn scheduler_prefill_first_is_default_accelerator_policy() {
+        let resolved = m3(&[], CompiledKernelFeatures::m3_fast_path_without_fa2())
+            .resolve()
+            .unwrap();
+        let scheduler = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "scheduler_admission_policy")
+            .unwrap();
+        assert_eq!(
+            scheduler.selected,
+            "prefill_first_until_active:32+prefill_step_chunk:64"
+        );
+        assert_eq!(scheduler.source, AutoConfigSource::Default);
+        assert_eq!(scheduler.source_key, None);
+        let entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE")
+            .expect("generic scheduler default should be materialized");
+        assert_eq!(entry.effective_value, "32");
+        assert_eq!(entry.source, RuntimeConfigSource::Default);
+        let step_entry = resolved
+            .runtime_config
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SCHED_PREFILL_STEP_CHUNK")
+            .expect("generic scheduler chunk default should be materialized");
+        assert_eq!(step_entry.effective_value, "64");
+        assert_eq!(step_entry.source, RuntimeConfigSource::Default);
+    }
+
+    #[test]
+    fn scheduler_prompt_token_estimate_can_be_disabled_in_decision_trace() {
+        let resolved = m3(
+            &[("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE", "0")],
+            CompiledKernelFeatures::m3_fast_path_without_fa2(),
+        )
+        .resolve()
+        .unwrap();
+        let scheduler = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "scheduler_admission_policy")
+            .unwrap();
+        assert_eq!(scheduler.selected, "continuous_default");
+        assert_eq!(scheduler.source, AutoConfigSource::Env);
+        assert_eq!(
+            scheduler.source_key.as_deref(),
+            Some("FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE")
         );
     }
 
@@ -2467,7 +3932,10 @@ mod tests {
         );
 
         let scheduler = decision("scheduler_admission_policy");
-        assert_eq!(scheduler.selected, "prefill_first_until_active:32");
+        assert_eq!(
+            scheduler.selected,
+            "prefill_first_until_active:32+prefill_step_chunk:64"
+        );
         assert_eq!(scheduler.source, AutoConfigSource::ScriptCase);
         assert_eq!(
             scheduler.source_key.as_deref(),
