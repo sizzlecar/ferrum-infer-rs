@@ -85,6 +85,14 @@ REQUIRED_NATIVE_RESOLVER_FAIL_CLOSED_CASES = {
     "missing_manifest",
     "operator_mismatch",
 }
+REQUIRED_PRODUCT_SENTINEL_SCENARIO_TYPES = {
+    "native_op_manifest",
+    "profile_artifact",
+    "profile_replay_link",
+    "replay_bundle",
+    "resource_trace",
+    "sse_fixture",
+}
 
 
 class GoalGateError(RuntimeError):
@@ -453,12 +461,51 @@ def validate_change_impact(root: Path, expected_sha: str) -> dict[str, Any]:
     }
 
 
+def validate_product_scenario_coverage(summary: dict[str, Any]) -> None:
+    required = summary.get("required_stage2_fixture_count")
+    require(
+        isinstance(required, int) and required >= 12,
+        "product_sentinel.summary must cover >=12 stage-2 fixtures",
+    )
+    scenario_count = summary.get("scenario_count")
+    require(
+        isinstance(scenario_count, int) and scenario_count >= required,
+        "product_sentinel.summary.scenario_count must be >= required_stage2_fixture_count",
+    )
+    scenarios = summary.get("scenarios")
+    require(isinstance(scenarios, list), "product_sentinel.summary.scenarios must be a list")
+    require(
+        len(scenarios) == scenario_count,
+        "product_sentinel.summary.scenarios length must match scenario_count",
+    )
+    scenario_types: set[str] = set()
+    for index, scenario in enumerate(scenarios):
+        require(
+            isinstance(scenario, dict),
+            f"product_sentinel.summary.scenarios[{index}] must be an object",
+        )
+        require(
+            scenario.get("status") == "pass",
+            f"product_sentinel.summary.scenarios[{index}].status must be pass",
+        )
+        scenario_type = scenario.get("type")
+        require(
+            isinstance(scenario_type, str) and scenario_type.strip(),
+            f"product_sentinel.summary.scenarios[{index}].type must be non-empty",
+        )
+        scenario_types.add(scenario_type)
+    missing_types = sorted(REQUIRED_PRODUCT_SENTINEL_SCENARIO_TYPES - scenario_types)
+    require(
+        not missing_types,
+        f"product_sentinel.summary.scenarios missing scenario types {missing_types}",
+    )
+
+
 def validate_product_sentinel(root: Path, expected_sha: str) -> dict[str, Any]:
     stage = load_stage_manifest(root, "product_sentinel", "PRODUCT BACKEND SENTINEL PASS", expected_sha)
     summary = load_summary_from_manifest(stage, "product_backend_sentinel_summary.json")
     require(summary.get("failed") == 0, "product_sentinel.summary.failed must be 0")
-    required = summary.get("required_stage2_fixture_count")
-    require(isinstance(required, int) and required >= 12, "product_sentinel.summary must cover >=12 stage-2 fixtures")
+    validate_product_scenario_coverage(summary)
     failure_links = summary.get("failure_links")
     require(isinstance(failure_links, list), "product_sentinel.summary.failure_links must be a list")
     required_failure_kinds = {"bad_output", "oom_admission", "panic_error"}
@@ -1316,6 +1363,20 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
     )
 
     product = root / "product"
+    product_scenarios = [
+        {"name": "profile_run_serve", "type": "profile_artifact", "status": "pass"},
+        {"name": "profile_replay_link", "type": "profile_replay_link", "status": "pass"},
+        {"name": "resource_trace", "type": "resource_trace", "status": "pass"},
+        {"name": "replay_normal", "type": "replay_bundle", "status": "pass"},
+        {"name": "replay_bad_output", "type": "replay_bundle", "status": "pass"},
+        {"name": "replay_oom_admission", "type": "replay_bundle", "status": "pass"},
+        {"name": "replay_panic_error", "type": "replay_bundle", "status": "pass"},
+        {"name": "serve_stream_done_once_pass", "type": "sse_fixture", "status": "pass"},
+        {"name": "serve_stream_missing_done_fail", "type": "sse_fixture", "status": "pass"},
+        {"name": "serve_stream_duplicate_done_fail", "type": "sse_fixture", "status": "pass"},
+        {"name": "serve_stream_malformed_json_fail", "type": "sse_fixture", "status": "pass"},
+        {"name": "native_op_manifest", "type": "native_op_manifest", "status": "pass"},
+    ]
     make_gate_manifest(
         product,
         "PRODUCT BACKEND SENTINEL PASS",
@@ -1326,9 +1387,9 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "status": "pass",
             "gate": "product_backend_sentinel",
             "failed": 0,
-            "scenario_count": 12,
+            "scenario_count": len(product_scenarios),
             "required_stage2_fixture_count": 12,
-            "scenarios": [],
+            "scenarios": product_scenarios,
             "failure_links": [
                 {
                     "failure_kind": "bad_output",
@@ -1811,6 +1872,38 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("missing product failure links unexpectedly passed final gate")
         except GoalGateError as exc:
             require("failure_links missing" in str(exc), f"unexpected product sentinel error: {exc}")
+        bad_product_scenario = root / "bad-product-scenario"
+        artifacts_bad_product_scenario = selftest_artifacts(
+            root / "bad-product-scenario-fixtures",
+            sha,
+        )
+        bad_product_scenario_summary_path = (
+            artifacts_bad_product_scenario["product"] / "product_backend_sentinel_summary.json"
+        )
+        bad_product_scenario_summary = read_json(bad_product_scenario_summary_path)
+        bad_product_scenario_summary["scenarios"][0]["status"] = "fail"
+        write_json(bad_product_scenario_summary_path, bad_product_scenario_summary)
+        args_bad_product_scenario = argparse.Namespace(
+            out=bad_product_scenario,
+            resource_invariant=artifacts_bad_product_scenario["resource"],
+            change_impact=artifacts_bad_product_scenario["change"],
+            product_sentinel=artifacts_bad_product_scenario["product"],
+            model_contract=artifacts_bad_product_scenario["model"],
+            support_matrix_contract=artifacts_bad_product_scenario["support_matrix"],
+            observability_profile=artifacts_bad_product_scenario["observability"],
+            native_operator=artifacts_bad_product_scenario["native"],
+            actual_model_regression_summary=artifacts_bad_product_scenario["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_product_scenario)
+            raise AssertionError("failed product sentinel scenario unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "product_sentinel.summary.scenarios[0].status" in str(exc),
+                f"unexpected product scenario error: {exc}",
+            )
         bad_support_contract_link = root / "bad-support-contract-link"
         artifacts_bad_support_contract_link = selftest_artifacts(
             root / "bad-support-contract-link-fixtures",
