@@ -114,6 +114,12 @@
       "expect_required_gates": ["release_validator_selftest"]
     },
     {
+      "id": "release_regression_hardening_goal_gate",
+      "changed_files": ["scripts/release/release_regression_hardening_goal_gate.py"],
+      "expect_domains": ["release_gate"],
+      "expect_required_gates": ["release_validator_selftest"]
+    },
+    {
       "id": "docs_goal_only",
       "changed_files": ["docs/goals/release-regression-hardening-2026-06-28/GOAL.md"],
       "expect_domains": ["docs_only"],
