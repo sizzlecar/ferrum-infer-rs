@@ -376,7 +376,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // backend requests must fail closed instead of doing model work and then
     // silently running on CPU.
     let mut device = super::run::select_device(&backend)?;
-    let gpu_selection =
+    let mut gpu_selection =
         crate::gpu_devices::resolve_cuda_gpu_devices(gpu_devices.as_deref(), &device)?;
     if let Some(selection) = &gpu_selection {
         device = selection.primary_device();
