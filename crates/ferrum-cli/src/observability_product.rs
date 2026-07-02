@@ -51,6 +51,16 @@ pub struct ProductObservabilityConfig {
     pub profile_sample_rate: f64,
 }
 
+pub struct ActualRunObservation {
+    pub request_id: String,
+    pub duration_us: u64,
+    pub output_tokens: usize,
+    pub chunk_count: usize,
+    pub finish_reason: Option<String>,
+    pub prompt_chars: usize,
+    pub response_chars: usize,
+}
+
 impl ProductObservabilityConfig {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -85,6 +95,14 @@ impl ProductObservabilityConfig {
 
     pub fn synthetic_no_weight_enabled(&self) -> bool {
         self.enabled() && self.model == SYNTHETIC_MODEL
+    }
+
+    pub fn unified_product_profile_enabled(&self) -> bool {
+        self.enabled()
+            && (self.profile_detail != ProfileDetailArg::Off
+                || self.memory_profile_jsonl.is_some()
+                || self.scheduler_trace_jsonl.is_some()
+                || self.request_dump_dir.is_some())
     }
 
     fn validate(&self) -> Result<()> {
@@ -155,6 +173,78 @@ pub fn write_synthetic_product_observability(
         write_json(
             &request_path,
             &request_dump(config, &request_id, &replay_command),
+        )?;
+        fs_write(&replay_path, format!("{replay_command}\n"))?;
+        written.push(request_path);
+        written.push(replay_path);
+    }
+    Ok(written)
+}
+
+pub fn write_actual_run_observability(
+    config: &ProductObservabilityConfig,
+    observation: &ActualRunObservation,
+) -> Result<Vec<PathBuf>> {
+    if !config.enabled() {
+        return Ok(Vec::new());
+    }
+    config.validate()?;
+    let replay_command = replay_command(config);
+    let events = actual_run_events(config, observation, &replay_command);
+    write_actual_artifacts(config, &events, &observation.request_id, &replay_command)
+}
+
+pub fn write_actual_serve_startup_observability(
+    config: &ProductObservabilityConfig,
+    startup_duration_us: u64,
+) -> Result<Vec<PathBuf>> {
+    if !config.unified_product_profile_enabled() {
+        return Ok(Vec::new());
+    }
+    config.validate()?;
+    let request_id = format!("serve-startup-{}", Uuid::new_v4().simple());
+    let replay_command = replay_command(config);
+    let events =
+        actual_serve_startup_events(config, &request_id, startup_duration_us, &replay_command);
+    write_actual_artifacts(config, &events, &request_id, &replay_command)
+}
+
+fn write_actual_artifacts(
+    config: &ProductObservabilityConfig,
+    events: &[FerrumProfileEvent],
+    request_id: &str,
+    replay_command: &str,
+) -> Result<Vec<PathBuf>> {
+    let mut written = Vec::new();
+    if let Some(path) = &config.profile_jsonl {
+        write_profile_jsonl(path, events)?;
+        written.push(path.clone());
+    }
+    if let Some(path) = &config.memory_profile_jsonl {
+        let memory_events: Vec<_> = events
+            .iter()
+            .filter(|event| event.memory.is_some())
+            .cloned()
+            .collect();
+        write_profile_jsonl(path, &memory_events)?;
+        written.push(path.clone());
+    }
+    if let Some(path) = &config.scheduler_trace_jsonl {
+        let scheduler_events: Vec<_> = events
+            .iter()
+            .filter(|event| event.resource.is_some())
+            .cloned()
+            .collect();
+        write_profile_jsonl(path, &scheduler_events)?;
+        written.push(path.clone());
+    }
+    if let Some(dir) = &config.request_dump_dir {
+        fs_create_dir_all(dir)?;
+        let request_path = dir.join("request.json");
+        let replay_path = dir.join("replay_command.txt");
+        write_json(
+            &request_path,
+            &actual_request_dump(config, request_id, replay_command),
         )?;
         fs_write(&replay_path, format!("{replay_command}\n"))?;
         written.push(request_path);
@@ -254,6 +344,148 @@ fn product_events(
     vec![open, scheduler, prefill, complete]
 }
 
+fn actual_run_events(
+    config: &ProductObservabilityConfig,
+    observation: &ActualRunObservation,
+    replay_command: &str,
+) -> Vec<FerrumProfileEvent> {
+    let base = Utc::now();
+    let mut open = actual_base_event(
+        config,
+        &observation.request_id,
+        "request_open",
+        ProfileEventKind::Resource,
+        base,
+    );
+    open.resource = Some(ResourceTraceEvent {
+        owner_kind: "request".to_string(),
+        owner_id: observation.request_id.clone(),
+        resource_kind: "request_slot".to_string(),
+        action: ResourceAction::RequestOpen,
+        amount: None,
+        before: None,
+        after: None,
+        capacity: Some(1),
+        reason: None,
+    });
+
+    let mut generation = actual_base_event(
+        config,
+        &observation.request_id,
+        "actual_run_generation",
+        ProfileEventKind::TimedSpan,
+        base + Duration::microseconds(10),
+    );
+    generation.duration_us = Some(observation.duration_us);
+    generation.memory = Some(MemorySnapshot {
+        scope: "process".to_string(),
+        backend: None,
+        before_bytes: Some(0),
+        after_bytes: Some(0),
+        high_water_bytes: Some(0),
+        available_bytes: None,
+    });
+    generation
+        .attributes
+        .insert("memory_measurement".to_string(), json!("not_collected"));
+    generation.attributes.insert(
+        "output_tokens".to_string(),
+        json!(observation.output_tokens),
+    );
+    generation
+        .attributes
+        .insert("chunk_count".to_string(), json!(observation.chunk_count));
+    generation.attributes.insert(
+        "finish_reason".to_string(),
+        json!(observation.finish_reason.as_deref().unwrap_or("unknown")),
+    );
+
+    let mut close = actual_base_event(
+        config,
+        &observation.request_id,
+        "request_complete",
+        ProfileEventKind::Instant,
+        base + Duration::microseconds(20),
+    );
+    close.replay = Some(ReplayReference {
+        command: replay_command.to_string(),
+        bundle_dir: config
+            .request_dump_dir
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string()),
+    });
+    close
+        .attributes
+        .insert("prompt_chars".to_string(), json!(observation.prompt_chars));
+    close.attributes.insert(
+        "response_chars".to_string(),
+        json!(observation.response_chars),
+    );
+    vec![open, generation, close]
+}
+
+fn actual_serve_startup_events(
+    config: &ProductObservabilityConfig,
+    request_id: &str,
+    startup_duration_us: u64,
+    replay_command: &str,
+) -> Vec<FerrumProfileEvent> {
+    let base = Utc::now();
+    let mut open = actual_base_event(
+        config,
+        request_id,
+        "server_startup_open",
+        ProfileEventKind::Resource,
+        base,
+    );
+    open.resource = Some(ResourceTraceEvent {
+        owner_kind: "server".to_string(),
+        owner_id: request_id.to_string(),
+        resource_kind: "startup_slot".to_string(),
+        action: ResourceAction::RequestOpen,
+        amount: None,
+        before: None,
+        after: None,
+        capacity: Some(1),
+        reason: None,
+    });
+    let mut startup = actual_base_event(
+        config,
+        request_id,
+        "actual_serve_startup",
+        ProfileEventKind::TimedSpan,
+        base + Duration::microseconds(10),
+    );
+    startup.duration_us = Some(startup_duration_us);
+    startup.memory = Some(MemorySnapshot {
+        scope: "process".to_string(),
+        backend: None,
+        before_bytes: Some(0),
+        after_bytes: Some(0),
+        high_water_bytes: Some(0),
+        available_bytes: None,
+    });
+    startup
+        .attributes
+        .insert("memory_measurement".to_string(), json!("not_collected"));
+
+    let mut ready = actual_base_event(
+        config,
+        request_id,
+        "server_ready_for_requests",
+        ProfileEventKind::Instant,
+        base + Duration::microseconds(20),
+    );
+    ready.replay = Some(ReplayReference {
+        command: replay_command.to_string(),
+        bundle_dir: config
+            .request_dump_dir
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string()),
+    });
+    vec![open, startup, ready]
+}
+
 fn base_event(
     config: &ProductObservabilityConfig,
     request_id: &str,
@@ -288,6 +520,19 @@ fn base_event(
     }
 }
 
+fn actual_base_event(
+    config: &ProductObservabilityConfig,
+    request_id: &str,
+    phase: &str,
+    event_kind: ProfileEventKind,
+    timestamp: chrono::DateTime<Utc>,
+) -> FerrumProfileEvent {
+    let mut event = base_event(config, request_id, phase, event_kind, timestamp);
+    event.backend = "actual".to_string();
+    event.attributes = actual_attrs(config);
+    event
+}
+
 fn common_attrs(config: &ProductObservabilityConfig) -> BTreeMap<String, Value> {
     BTreeMap::from([
         (
@@ -303,6 +548,25 @@ fn common_attrs(config: &ProductObservabilityConfig) -> BTreeMap<String, Value> 
             json!(config.profile_detail.diagnostic_only()),
         ),
         ("l0_only".to_string(), json!(true)),
+    ])
+}
+
+fn actual_attrs(config: &ProductObservabilityConfig) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        (
+            "profile_detail".to_string(),
+            json!(config.profile_detail.as_str()),
+        ),
+        (
+            "profile_sample_rate".to_string(),
+            json!(config.profile_sample_rate),
+        ),
+        (
+            "diagnostic_only".to_string(),
+            json!(config.profile_detail.diagnostic_only()),
+        ),
+        ("l0_only".to_string(), json!(false)),
+        ("actual_model_smoke".to_string(), json!(true)),
     ])
 }
 
@@ -360,6 +624,26 @@ fn request_dump(
             "replay_command": replay_command
         }),
     }
+}
+
+fn actual_request_dump(
+    config: &ProductObservabilityConfig,
+    request_id: &str,
+    replay_command: &str,
+) -> serde_json::Value {
+    json!({
+        "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        "entrypoint": entrypoint_label(config.entrypoint),
+        "request_id": request_id,
+        "model": config.model,
+        "backend": "actual",
+        "profile_detail": config.profile_detail.as_str(),
+        "profile_sample_rate": config.profile_sample_rate,
+        "l0_only": false,
+        "actual_model_smoke": true,
+        "sanitized": true,
+        "replay_command": replay_command
+    })
 }
 
 fn replay_command(config: &ProductObservabilityConfig) -> String {

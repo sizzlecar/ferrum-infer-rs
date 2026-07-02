@@ -597,6 +597,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         )?;
         maybe_warn_context_shift(&plan, format);
         let metadata = run_request_metadata(&plan.prompt, &chat_template_options);
+        let prompt_chars = plan.prompt.chars().count();
         let request = InferenceRequest {
             id: RequestId(Uuid::new_v4()),
             model_id: ferrum_types::ModelId(model_id.clone()),
@@ -610,6 +611,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             api_request: None,
             metadata,
         };
+        let profile_request_id = request.id.to_string();
         let start = std::time::Instant::now();
         let response = engine.infer(request).await?;
         let tokens = response.tokens.len();
@@ -648,6 +650,18 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 );
             }
         }
+        crate::observability_product::write_actual_run_observability(
+            &product_observability,
+            &crate::observability_product::ActualRunObservation {
+                request_id: profile_request_id,
+                duration_us: (elapsed * 1_000_000.0).max(0.0) as u64,
+                output_tokens: tokens,
+                chunk_count,
+                finish_reason: finish_reason.map(finish_reason_str).map(str::to_string),
+                prompt_chars,
+                response_chars: content.chars().count(),
+            },
+        )?;
         engine.shutdown().await?;
         return Ok(());
     }

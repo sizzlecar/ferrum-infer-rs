@@ -341,6 +341,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         .or(model_option)
         .or(config.models.default_model.clone())
         .unwrap_or_else(|| "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string());
+    let serve_start = std::time::Instant::now();
     let product_observability = crate::observability_product::ProductObservabilityConfig::new(
         ferrum_types::ProfileEntrypoint::Serve,
         &model_name,
@@ -682,6 +683,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         materialized_runtime_keys.dedup();
     }
 
+    let legacy_scheduler_trace_jsonl = if product_observability.unified_product_profile_enabled() {
+        None
+    } else {
+        scheduler_trace_jsonl.as_ref()
+    };
     let mut startup_cli_runtime_entries = serve_cli_runtime_entries(
         kv_dtype.as_deref(),
         kv_capacity,
@@ -703,7 +709,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         session_cache_max_entries,
         session_cache_max_tokens,
         profile_jsonl.as_ref(),
-        scheduler_trace_jsonl.as_ref(),
+        legacy_scheduler_trace_jsonl,
         profile_commit_sha.as_deref(),
         profile_env_hash.as_deref(),
         profile_model.as_deref(),
@@ -793,8 +799,13 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         effective_config_json.as_deref(),
         decision_trace_jsonl.as_deref(),
     )?;
+    let native_profile_jsonl = if product_observability.unified_product_profile_enabled() {
+        None
+    } else {
+        profile_jsonl
+    };
     configure_profile_sink(
-        profile_jsonl,
+        native_profile_jsonl,
         ProfileSinkCliFields {
             commit_sha: profile_commit_sha,
             env_hash: profile_env_hash,
@@ -946,6 +957,14 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     } else {
         server.with_lora_adapters(model_id.clone(), lora_server_models)
     };
+    crate::observability_product::write_actual_serve_startup_observability(
+        &product_observability,
+        serve_start
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX),
+    )?;
 
     // Create server config
     let server_config = ServerConfig {
