@@ -17,6 +17,27 @@ pub enum ProfileEntrypoint {
     Synthetic,
 }
 
+impl ProfileEntrypoint {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "run" => Some(Self::Run),
+            "serve" => Some(Self::Serve),
+            "bench_serve" | "bench-serve" | "benchserve" => Some(Self::BenchServe),
+            "synthetic" => Some(Self::Synthetic),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Serve => "serve",
+            Self::BenchServe => "bench_serve",
+            Self::Synthetic => "synthetic",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileEventKind {

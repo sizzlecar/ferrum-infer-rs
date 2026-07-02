@@ -688,11 +688,6 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         materialized_runtime_keys.dedup();
     }
 
-    let legacy_scheduler_trace_jsonl = if product_observability.unified_product_profile_enabled() {
-        None
-    } else {
-        scheduler_trace_jsonl.as_ref()
-    };
     let mut startup_cli_runtime_entries = serve_cli_runtime_entries(
         kv_dtype.as_deref(),
         kv_capacity,
@@ -714,7 +709,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         session_cache_max_entries,
         session_cache_max_tokens,
         profile_jsonl.as_ref(),
-        legacy_scheduler_trace_jsonl,
+        scheduler_trace_jsonl.as_ref(),
         profile_commit_sha.as_deref(),
         profile_env_hash.as_deref(),
         profile_model.as_deref(),
@@ -1320,6 +1315,13 @@ fn serve_cli_runtime_entries(
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_SCHEDULER_TRACE_JSONL",
             path.to_string_lossy().to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if profile_jsonl.is_some() || scheduler_trace_jsonl.is_some() {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PROFILE_ENTRYPOINT",
+            "serve",
             RuntimeConfigSource::Cli,
         ));
     }
@@ -2227,6 +2229,7 @@ mod tests {
             entry("FERRUM_SCHEDULER_TRACE_JSONL").effective_value,
             "/tmp/scheduler-trace.jsonl"
         );
+        assert_eq!(entry("FERRUM_PROFILE_ENTRYPOINT").effective_value, "serve");
         assert_eq!(
             entry("FERRUM_PROFILE_ENV_HASH").effective_value,
             "sha256:test"

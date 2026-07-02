@@ -2,7 +2,7 @@
 
 use crate::{
     parse_bool_env_value, parse_path_env_value, parse_usize_env_value, DataType, Device, ModelId,
-    ModelInfo, RuntimeConfigSnapshot, SamplingParams, SamplingPresets,
+    ModelInfo, ProfileEntrypoint, RuntimeConfigSnapshot, SamplingParams, SamplingPresets,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, time::Duration};
@@ -20,6 +20,8 @@ pub struct RuntimeKnobs {
     pub next_batch_prof: bool,
     pub rbd_prof: bool,
     pub scheduler_trace_jsonl: Option<PathBuf>,
+    pub legacy_scheduler_trace_jsonl: Option<PathBuf>,
+    pub profile_entrypoint: Option<ProfileEntrypoint>,
     pub unified_post_prof: bool,
     pub prefix_cache_enabled: bool,
     pub recurrent_state_max_slots: Option<usize>,
@@ -113,6 +115,15 @@ impl EngineConfig {
         self.runtime.rbd_prof |= runtime_config_value(snapshot, "FERRUM_RBD_PROF").is_some();
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHEDULER_TRACE_JSONL") {
             self.runtime.scheduler_trace_jsonl = Some(parse_path_env_value(value)?);
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_LEGACY_SCHEDULER_TRACE_JSONL") {
+            self.runtime.legacy_scheduler_trace_jsonl = Some(parse_path_env_value(value)?);
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_PROFILE_ENTRYPOINT") {
+            self.runtime.profile_entrypoint = Some(parse_profile_entrypoint(
+                "FERRUM_PROFILE_ENTRYPOINT",
+                value,
+            )?);
         }
         self.runtime.unified_post_prof |=
             runtime_config_value(snapshot, "FERRUM_UNIFIED_POST_PROF").is_some();
@@ -284,6 +295,15 @@ fn parse_required_positive_usize(key: &str, value: &str) -> std::result::Result<
     } else {
         Ok(parsed)
     }
+}
+
+fn parse_profile_entrypoint(
+    key: &str,
+    value: &str,
+) -> std::result::Result<ProfileEntrypoint, String> {
+    ProfileEntrypoint::parse(value).ok_or_else(|| {
+        format!("{key}: expected one of run, serve, bench_serve, synthetic; got {value:?}")
+    })
 }
 
 fn parse_presence_bool(value: &str) -> std::result::Result<bool, String> {
@@ -733,5 +753,20 @@ mod tests {
 
         assert_eq!(config.runtime.recurrent_state_max_slots, Some(8));
         assert_eq!(config.runtime.qwen35_linear_state_max_slots, Some(16));
+    }
+
+    #[test]
+    fn engine_config_applies_profile_entrypoint_runtime_key() {
+        let mut config = EngineConfig::default();
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([("FERRUM_PROFILE_ENTRYPOINT", "run")]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(
+            config.runtime.profile_entrypoint,
+            Some(ProfileEntrypoint::Run)
+        );
     }
 }

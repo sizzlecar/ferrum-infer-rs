@@ -262,7 +262,7 @@ impl EngineInner {
     }
 
     fn scheduler_trace_enabled(&self) -> bool {
-        self.scheduler_trace_jsonl.is_some()
+        self.legacy_scheduler_trace_jsonl.is_some()
     }
 
     pub(super) fn scheduler_trace_plan_stats(
@@ -346,7 +346,7 @@ impl EngineInner {
     }
 
     fn write_scheduler_trace_event(&self, event: serde_json::Value) {
-        let Some(file) = &self.scheduler_trace_jsonl else {
+        let Some(file) = &self.legacy_scheduler_trace_jsonl else {
             return;
         };
         let mut file = file.lock();

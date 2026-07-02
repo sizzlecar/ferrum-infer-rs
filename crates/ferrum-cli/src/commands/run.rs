@@ -1871,6 +1871,27 @@ fn run_startup_cli_runtime_entries(
         &mut entries,
         cmd.layer_split_pipeline_mode,
     );
+    if let Some(path) = &cmd.profile_jsonl {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PROFILE_JSONL",
+            path.to_string_lossy().to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if let Some(path) = &cmd.scheduler_trace_jsonl {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_SCHEDULER_TRACE_JSONL",
+            path.to_string_lossy().to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if cmd.profile_jsonl.is_some() || cmd.scheduler_trace_jsonl.is_some() {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PROFILE_ENTRYPOINT",
+            "run",
+            RuntimeConfigSource::Cli,
+        ));
+    }
     if let Some(selection) = gpu_selection {
         entries.extend(selection.runtime_config_entries());
     }
@@ -2050,6 +2071,37 @@ mod tests {
             .expect("missing kv dtype entry");
         assert_eq!(entry.effective_value, "int8");
         assert_eq!(entry.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn run_effective_runtime_config_records_observability_paths() {
+        let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
+        let mut cmd = test_run_cmd();
+        cmd.profile_jsonl = Some(PathBuf::from("/tmp/run-profile.jsonl"));
+        cmd.scheduler_trace_jsonl = Some(PathBuf::from("/tmp/run-scheduler.jsonl"));
+
+        let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
+        let effective = run_effective_runtime_config(&snapshot, &cli_entries);
+        let entry = |key: &str| {
+            effective
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key} entry"))
+        };
+
+        assert_eq!(
+            entry("FERRUM_PROFILE_JSONL").effective_value,
+            "/tmp/run-profile.jsonl"
+        );
+        assert_eq!(
+            entry("FERRUM_SCHEDULER_TRACE_JSONL").effective_value,
+            "/tmp/run-scheduler.jsonl"
+        );
+        assert_eq!(entry("FERRUM_PROFILE_ENTRYPOINT").effective_value, "run");
+        assert!(entry("FERRUM_PROFILE_ENTRYPOINT")
+            .affects
+            .contains(&ferrum_types::RuntimeConfigEffect::Diagnostics));
     }
 
     #[test]
