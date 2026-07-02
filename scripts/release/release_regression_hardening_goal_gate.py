@@ -400,11 +400,55 @@ def validate_model_contract(root: Path, expected_sha: str) -> dict[str, Any]:
     summary = load_summary_from_manifest(stage, "model_onboarding_contract_summary.json")
     contracts = summary.get("contracts")
     require(isinstance(contracts, list) and contracts, "model_contract.summary.contracts must be non-empty")
+    seen_contract_ids: set[str] = set()
     for index, contract in enumerate(contracts):
         require(isinstance(contract, dict), f"model_contract.summary.contracts[{index}] must be an object")
         require(contract.get("status") == "pass", f"model_contract.summary.contracts[{index}].status must be pass")
+        contract_id = contract.get("contract_id")
+        require(
+            isinstance(contract_id, str) and contract_id.strip(),
+            f"model_contract.summary.contracts[{index}].contract_id must be non-empty",
+        )
+        require(
+            contract_id not in seen_contract_ids,
+            f"model_contract.summary.contracts duplicate contract_id {contract_id!r}",
+        )
+        seen_contract_ids.add(contract_id)
     stage["summary"] = summary
     return stage
+
+
+def validate_model_support_linkage(
+    model_summary: dict[str, Any],
+    support_summary: dict[str, Any],
+) -> None:
+    contracts = model_summary.get("contracts")
+    require(isinstance(contracts, list), "model_contract.summary.contracts must be a list")
+    contract_ids = {
+        contract["contract_id"]
+        for contract in contracts
+        if isinstance(contract, dict)
+        and isinstance(contract.get("contract_id"), str)
+        and contract["contract_id"].strip()
+    }
+    require(contract_ids, "model_contract.summary must expose at least one contract_id")
+    rows = support_summary.get("rows")
+    require(isinstance(rows, list), "support_matrix_contract.summary.rows must be a list")
+    missing: list[str] = []
+    for index, row in enumerate(rows):
+        require(isinstance(row, dict), f"support_matrix_contract.summary.rows[{index}] must be an object")
+        contract_id = row.get("contract_id")
+        require(
+            isinstance(contract_id, str) and contract_id.strip(),
+            f"support_matrix_contract.summary.rows[{index}].contract_id must be non-empty",
+        )
+        if contract_id not in contract_ids:
+            missing.append(f"{row.get('model_id', f'row-{index}')}->{contract_id}")
+    require(
+        not missing,
+        "support_matrix_contract.summary references contracts missing from model_contract.summary: "
+        + ", ".join(missing),
+    )
 
 
 def validate_support_matrix_contract(root: Path, expected_sha: str) -> dict[str, Any]:
@@ -875,6 +919,7 @@ def build_goal_manifest(args: argparse.Namespace) -> dict[str, Any]:
     product = validate_product_sentinel(args.product_sentinel, expected_sha)
     model_contract = validate_model_contract(args.model_contract, expected_sha)
     support_matrix_contract = validate_support_matrix_contract(args.support_matrix_contract, expected_sha)
+    validate_model_support_linkage(model_contract["summary"], support_matrix_contract["summary"])
     observability = validate_observability_profile(args.observability_profile, expected_sha)
     native_operator = validate_native_operator(args.native_operator, expected_sha)
     actual_model = validate_actual_model_regression(args, expected_sha)
@@ -1475,6 +1520,39 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("missing product failure links unexpectedly passed final gate")
         except GoalGateError as exc:
             require("failure_links missing" in str(exc), f"unexpected product sentinel error: {exc}")
+        bad_support_contract_link = root / "bad-support-contract-link"
+        artifacts_bad_support_contract_link = selftest_artifacts(
+            root / "bad-support-contract-link-fixtures",
+            sha,
+        )
+        bad_support_summary_path = (
+            artifacts_bad_support_contract_link["support_matrix"]
+            / "support_matrix_contract_summary.json"
+        )
+        bad_support_summary = read_json(bad_support_summary_path)
+        bad_support_summary["rows"][0]["contract_id"] = "missing-contract"
+        write_json(bad_support_summary_path, bad_support_summary)
+        args_bad_support_contract_link = argparse.Namespace(
+            out=bad_support_contract_link,
+            resource_invariant=artifacts_bad_support_contract_link["resource"],
+            change_impact=artifacts_bad_support_contract_link["change"],
+            product_sentinel=artifacts_bad_support_contract_link["product"],
+            model_contract=artifacts_bad_support_contract_link["model"],
+            support_matrix_contract=artifacts_bad_support_contract_link["support_matrix"],
+            observability_profile=artifacts_bad_support_contract_link["observability"],
+            native_operator=artifacts_bad_support_contract_link["native"],
+            actual_model_regression_summary=artifacts_bad_support_contract_link["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_support_contract_link)
+            raise AssertionError("support matrix row with missing contract unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "references contracts missing" in str(exc),
+                f"unexpected support/model contract linkage error: {exc}",
+            )
         bad_dirty_stage = root / "bad-dirty-stage"
         artifacts_bad_dirty_stage = selftest_artifacts(root / "bad-dirty-stage-fixtures", sha)
         bad_dirty_manifest_path = artifacts_bad_dirty_stage["product"] / "gate.manifest.json"
