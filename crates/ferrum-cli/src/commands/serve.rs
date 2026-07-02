@@ -974,6 +974,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let server_config = ServerConfig {
         host: host.clone(),
         port,
+        request_dump_dir: request_dump_dir.clone(),
         ..Default::default()
     };
 
