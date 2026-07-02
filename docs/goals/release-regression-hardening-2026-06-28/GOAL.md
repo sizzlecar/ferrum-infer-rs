@@ -4,12 +4,13 @@
 
 草案目标文件，创建于 2026-06-28。
 
-本目标用于解决四类反复出现的问题：
+本目标用于解决五类反复出现的问题：
 
 - 资源所有权不清导致 OOM、slot 泄漏、defer/rollback 不一致。
 - CUDA 与 Metal 相互影响，优化一端改坏另一端。
 - 问题发现太晚，经常到 release 前由人工手测暴露。
 - release 回归像乒乓球，CUDA 修完回归 Metal，Metal 修完又回归 CUDA。
+- 正确性、内存、耗时问题缺少统一 profile/replay artifact，定位常依赖临场日志和人工猜测。
 
 本目标不能因为“代码改完了”“某个 smoke 过了”就宣称完成。只有最终验证器打印下面这一行，才算完成：
 
@@ -38,6 +39,7 @@ scripts/release/release_regression_hardening_goal_gate.py
 | 晚发现 | release 前人工 smoke 才发现 | full release gate 前必须先过 cheap sentinel，覆盖 `ferrum run` 和 `ferrum serve` |
 | 乒乓回归 | gate 状态没有显式 invalidation | release candidate manifest 记录每个 lane 的 SHA、dirty、impact domain、失效原因 |
 | 新模型接入质量 | 模型支持靠临场判断和补丁 | 每个新增模型必须有 model onboarding contract，缺合同不得写入支持矩阵 |
+| 定位痛苦 | 正确性/内存/耗时问题缺统一 request/resource/memory/latency 证据 | `run` 和 `serve` 都能产出同一 schema 的 observability profile；100% blocking failure 有 request id、phase、first failure event、memory/resource 快照和 replay command |
 
 ## 非目标
 
@@ -50,7 +52,7 @@ scripts/release/release_regression_hardening_goal_gate.py
 
 ## 为什么原版不够
 
-原版目标文档只定义了四个方向和最终 PASS line，作为立项合同够用，但不足以指导实现。
+原版目标文档只定义了四个方向和最终 PASS line，作为立项合同够用，但不足以指导实现。后续补充的第五个方向必须把这些阶段串起来，解决“知道失败但不知道在哪里失败、为什么失败、如何复现”的问题。
 
 本目标必须补齐以下工程细节：
 
@@ -61,6 +63,7 @@ scripts/release/release_regression_hardening_goal_gate.py
 - 哪些 gate 是 dry-run，哪些 gate 是 release hard gate。
 - 如何证明 CUDA/Metal 没有互相污染。
 - 如何证明新增模型不是靠模型名和临时补丁接入。
+- 如何在正确性、内存、耗时故障出现时，用固定 artifact 在 10 分钟内定位到 request、资源、阶段和可 replay 输入。
 
 没有这些细节，目标仍会退化成“到 release 前人工判断还差什么”。
 
@@ -82,6 +85,58 @@ scripts/release/release_regression_hardening_goal_gate.py
 | backend boundary | `scripts/release/backend_boundary_audit.py`、`scripts/release/backend_boundary_allowlist.json` | boundary 只能证明隔离，不能代替 product sentinel |
 | product scenarios | `scripts/release/run_scenarios.py`、`scripts/release/scenarios/*.json` | 扩展为 planner 可调用的 cheap sentinel |
 | unified gate | `scripts/release/run_gate.py`、`scripts/release/g0_source_gate.sh` | 最终由 gate planner 输出 lane 顺序和 invalidation |
+| existing profile JSONL | `crates/ferrum-bench-core/src/profile.rs` | 现有 bench/profile envelope 可保留，但必须升级为 product `run`/`serve` 共用的 request-scoped observability schema |
+| chrome trace | `crates/ferrum-bench-core/src/trace.rs` | 继续作为 Perfetto/Nsight 友好的时间线输出，但不能代替 JSONL 诊断证据 |
+| server metrics | `crates/ferrum-server/src/traits.rs`、`crates/ferrum-types/src/metrics.rs`、`scripts/release/g1_vllm_migration_gate.py` | Prometheus/health 指标必须和 profile summary 可交叉核对 |
+| runtime memory sizing | `crates/ferrum-cli/src/gpu_mem_autosize.rs`、`crates/ferrum-engine/src/continuous_engine/inner.rs` | startup/profile-run/graph/KV/recurrent/serve 运行期内存快照必须落入统一 memory profile |
+
+## 本地 vLLM 代码对照与 Ferrum 设计映射
+
+本节只使用本地源码对照，不要求 live vLLM 运行或跑分。对照版本：
+
+```text
+/Users/chejinxuan/py_ws/vllm
+git rev-parse HEAD = 0b3ba88f165976e77ca5e6a7a3f5bba4562b80af
+```
+
+主要审计文件：
+
+- `vllm/config/observability.py`：typed observability config、KV residency、NVTX、iteration details。
+- `vllm/config/profiler.py`、`vllm/profiler/wrapper.py`、`vllm/entrypoints/serve/profile/api_router.py`：typed profiler config、delay/max iteration、start/stop profile。
+- `vllm/utils/mem_utils.py`、`vllm/v1/worker/gpu_worker.py`：startup memory snapshot、profile_run memory accounting、KV cache available memory calculation。
+- `vllm/v1/core/kv_cache_metrics.py`、`vllm/v1/metrics/stats.py`、`vllm/v1/metrics/loggers.py`：KV residency sampling、scheduler/request stats、Prometheus/logging metrics。
+- `vllm/tracing/utils.py`、`vllm/v1/engine/output_processor.py`、`tests/v1/tracing/test_tracing.py`：request-level OTel span fields and tests。
+
+vLLM 的可借鉴点不是某个单点 profiler，而是五层闭环：
+
+| vLLM 本地源码 | 关键做法 | Ferrum 设计映射 | 量化指标 |
+|---|---|---|---|
+| `vllm/config/observability.py` | `ObservabilityConfig` 统一控制 OTel、detailed traces、KV cache residency、CUDA graph、NVTX、MFU、iteration details；详细 trace 明确标注可能有开销 | 新增 typed `FerrumObservabilityConfig`，由 CLI/config 显式设置，禁止只靠隐藏 env 作为产品验收入口；`run` 和 `serve` 使用同一配置结构 | 100% product observability 功能有 typed flag/config 字段；0 个 release gate 依赖未文档化 env-only 开关 |
+| `vllm/config/profiler.py`、`vllm/profiler/wrapper.py`、`vllm/entrypoints/serve/profile/api_router.py` | profiler 类型、输出目录、stack/flops/memory/shapes、delay/max/warmup/active/wait iteration 全部是 typed config；start/stop 幂等；API profiler 明确只用于本地开发 | Ferrum 分成低开销 always-available JSONL profile 与高开销 diagnostic profiler；serve 的 start/stop profile 只能在显式 diagnostic 模式启用，artifact 必须标注不可作为 performance evidence | basic profile c=1/c=4 吞吐开销 <= 1%；debug/full profiler artifact 一律标记 `diagnostic_only=true`；start/stop profiler 自测覆盖重复 start、stop-before-start、delay、max-iteration |
+| `vllm/utils/mem_utils.py`、`vllm/v1/worker/gpu_worker.py` | 先 init distributed/NCCL 再取 memory snapshot；把内存分为外部进程、torch/current instance、non-torch/current instance；profile_run 后计算 non-KV、peak activation、weights、CUDA graph estimate，再决定 KV cache 可用内存；若 profiling 期间外部内存变化，显式 fail | Ferrum 启动和 autosize 必须输出分阶段 memory profile：device/backend init、model weights、warmup/profile run、CUDA graph/Metal pipeline cache、KV cache、recurrent state、backend workspace、serve runtime high-water；CUDA 和 Metal 使用各自可用采样源但写入同一 schema | 每次 CUDA/Metal product sentinel 至少 6 个 memory snapshot stage；内存事件 100% 有 before/after/current/high_water bytes；`available_kv_or_state_bytes` 不允许为负；外部显存波动超过 256 MiB 或 2% 必须标为 `external_memory_changed` 并阻止 performance claim |
+| `vllm/v1/core/kv_cache_metrics.py`、`vllm/v1/metrics/stats.py` | KV block lifetime/idle/reuse gaps 采样；scheduler stats 记录 running/waiting/skipped/deferred、KV usage、prefix hit、preemptions、corrupted requests；request stats 记录 queued/scheduled/first/last token 时间 | Ferrum 的 KV blocks 和 recurrent-state slots 都要有生命周期采样；scheduler/admission/resource invariant 共享 request id/sequence id/correlation id；defer/reject/reopen 事件必须能和 profile summary 对齐 | KV/recurrent 采样默认 1%，可配置到 100% 用于 fixture；profile summary 输出 p50/p95/p99 lifetime/idle/reuse gap；0 个 request close 后仍有 active sampled slot/block；defer/reject 100% 有容量原因 |
+| `vllm/tracing/utils.py`、`vllm/v1/engine/output_processor.py`、`tests/v1/tracing/test_tracing.py` | OTel span 带 request id、prompt/completion tokens、temperature/top_p/max_tokens/n、queue/TTFT/e2e/prefill/decode/inference latency；测试验证 span 属性存在 | Ferrum JSONL profile 先成为 release evidence；OTel 作为可选导出层，字段从同一 typed event 派生，避免 JSONL/OTel 两套语义漂移 | 100% finished request 有 request id、prompt token count、output token count、finish reason、TTFT、ITL、E2E；OTel 开启时 span 与 JSONL request summary 数值误差 <= 1ms 或 1% |
+| `vllm/v1/metrics/loggers.py`、`vllm/v1/metrics/prometheus.py`、`vllm/v1/metrics/reader.py` | 人类日志、Prometheus 指标、in-memory snapshot 共用 scheduler/request stats；Prometheus 多进程目录有生命周期约束 | Ferrum `/metrics`、`/health`、profile summary、gate analyzer 必须由同一 runtime stats 源生成或可校验一致；release gate 不能只信日志字符串 | profile summary 与 `/metrics` 中 active/queued/failed/prefix-cache 计数差异必须为 0；多进程/多 worker 指标目录或临时文件必须在 manifest 中记录并由 gate 检查清理 |
+
+结合 Ferrum 当前架构，本目标不照搬 PyTorch/TorchProfiler 细节，而采用以下分层：
+
+1. **Schema 层**：`ferrum-types` 定义 `FerrumProfileEvent`、`FerrumMemorySnapshot`、`FerrumRequestReplayBundle`、`FerrumObservabilityConfig`。所有事件可 JSON 序列化，可由 unit tests 和 release scripts 离线验证。
+2. **Runtime emit 层**：`ferrum-engine`、`ferrum-kv`、`ferrum-scheduler`、recurrent-state manager 只发事件，不各自实现 checker；事件必须带 `request_id`、`sequence_id`、`correlation_id`、`backend`、`model_id`、`phase`。
+3. **Product wiring 层**：`ferrum run` 和 `ferrum serve` 暴露相同 typed profile/replay flags。`run` 不能只靠 bench-only env，`serve` 不能只靠 HTTP benchmark side-channel。
+4. **Backend adapter 层**：CUDA/Metal/CPU 只负责填充 backend-specific memory/workspace/graph/pipeline 字段；公共 analyzer 不允许读取 backend 专用日志才能判断是否 PASS。
+5. **Gate/analyzer 层**：release scripts 只消费 artifact，不需要 attach 到 live process；失败后输出 first failure event、最小 replay command、resource/memory/latency 摘要。
+
+本阶段的核心量化目标：
+
+| 指标 | 目标 |
+|---|---|
+| 失败定位闭环 | 每个 blocking failure 在 artifact 中有 `first_failure_event`、`request_id` 或 `global_failure_id`、phase、error kind、nearest resource event、nearest memory snapshot、replay command |
+| 定位时间 | 对已覆盖 fixture，gate summary 必须能在 10 分钟内从 artifact 定位到具体 request/phase/resource，不依赖屏幕日志 |
+| profile 完整性 | product sentinel 中 100% `run`/`serve` request 有 lifecycle summary；100% timed event 有 `duration_us`；100% memory event 有 before/after/high-water bytes |
+| replay 覆盖 | 100% correctness blocker、OOM/admission blocker、panic/error blocker 产出 replay bundle；synthetic replay gate 0 failure |
+| 低开销 | `profile_detail=basic` 在 no-weight/synthetic 或小模型 c=1/c=4 下吞吐开销 <= 1%，事件丢失率 0；`debug/full` 允许更高开销但必须标记 diagnostic-only |
+| 跨入口一致性 | `ferrum run` 与 `ferrum serve` 的 event schema 完全相同；同一 synthetic request 的 token counts、finish reason、bad-output classification 一致 |
+| 跨后端一致性 | CUDA、Metal 同名阶段字段一致；backend 专有字段只能放在 `backend_detail`，公共 gate 不依赖专有字段 |
 
 ## Artifact 目录约定
 
@@ -846,9 +901,363 @@ MODEL ONBOARDING CONTRACT PASS: <out_dir>
 
 阶段 3 完成后，新增模型接入应该先填合同，再写代码和 gate；不再反过来先把模型跑起来，release 前补文档。
 
+## 阶段 4: Unified observability profile and replay diagnostics
+
+### 目标
+
+把正确性、内存、耗时问题的定位从“看散落日志、猜哪条路径变了”改成固定 artifact 驱动。
+
+阶段 4 必须覆盖：
+
+- `ferrum run`。
+- `ferrum serve` 非流式。
+- `ferrum serve` 流式。
+- scheduler/admission/defer/reject/reopen。
+- KV cache blocks。
+- recurrent-state slots。
+- CUDA/Metal/CPU 公共阶段。
+- 后端专有 memory/workspace/graph/pipeline 细节。
+- bad output、OOM/prevented OOM、panic/error、client cancel、missing/duplicate `[DONE]`。
+
+阶段 4 不替代阶段 0/1/2/3，而是为这些阶段提供同一证据底座：
+
+- 阶段 0 的 resource invariant 消费 resource/resource-lifecycle events。
+- 阶段 2 的 product sentinel 消费 request lifecycle、bad-output、streaming、latency、memory events。
+- 阶段 3 的 model onboarding contract 引用 request replay bundle、token dump、runtime preset snapshot。
+- 最终 goal gate 只接受已经通过 analyzer 的 observability profile summary。
+
+### 必须交付
+
+建议新增或扩展以下路径：
+
+```text
+crates/ferrum-types/src/observability_profile.rs
+crates/ferrum-bench-core/src/profile.rs
+crates/ferrum-engine/src/observability/
+crates/ferrum-cli/src/commands/run.rs
+crates/ferrum-cli/src/commands/serve.rs
+scripts/release/analyze_ferrum_profile.py
+scripts/release/observability_profile_gate.py
+scripts/release/fixtures/observability_profile/
+```
+
+`crates/ferrum-types` 是 schema 源头；`ferrum-bench-core` 可以继续承载 bench profile 兼容层，但 product runtime 的 schema 不应只定义在 bench crate 里。
+
+必须新增 typed product flags/config，至少包括：
+
+| Option | 入口 | 默认 | 要求 |
+|---|---|---|---|
+| `--profile-jsonl <path>` | `run`、`serve` | off | 输出统一 request-scoped JSONL profile |
+| `--profile-detail <off|basic|debug|full>` | `run`、`serve` | `off` | `basic` 为低开销 release 诊断；`debug/full` 标记 diagnostic-only |
+| `--memory-profile-jsonl <path>` | `run`、`serve` | off | 输出 memory lifecycle snapshot，可与 profile-jsonl 合并但 schema 必须一致 |
+| `--scheduler-trace-jsonl <path>` | `run`、`serve` | off | 输出 admission/defer/reject/reopen/batch composition |
+| `--request-dump-dir <dir>` | `run`、`serve` | off | 输出 sanitized request/replay bundle |
+| `--profile-sample-rate <float>` | `run`、`serve` | `0.01` | 控制 KV/recurrent lifecycle sampling，fixture 可设为 1.0 |
+
+隐藏 env 可以作为开发 shortcut，但 release gate 和产品验收必须使用 typed options 或 documented config preset。
+
+### JSONL event envelope
+
+统一 profile JSONL 至少包含以下顶层字段：
+
+| Field | 必需 | 说明 |
+|---|---|---|
+| `schema_version` | yes | 例如 `ferrum.observability.v1` |
+| `ts_unix_nanos` | yes | 单调排序可验证 |
+| `event_id` | yes | 单事件唯一 id |
+| `event_kind` | yes | `request`、`scheduler`、`resource`、`memory`、`latency`、`token`、`stream`、`error`、`profile_marker` |
+| `phase` | yes | `startup`、`load_model`、`warmup`、`prefill`、`decode`、`stream_send`、`shutdown` 等 |
+| `request_id` | conditional | request-scoped event 必须有；global failure 用 `global_failure_id` |
+| `sequence_id` | conditional | sequence-scoped event 必须有 |
+| `correlation_id` | yes | 同一次 product command 内贯穿 run/serve/server/engine/scheduler |
+| `backend` | yes | `cpu`、`cuda`、`metal` |
+| `entrypoint` | yes | `run`、`serve`、`bench-serve`、`test` |
+| `model_id` | yes | HF id、本地模型 label 或 fixture label |
+| `runtime_preset_hash` | yes | 与 runtime preset snapshot 对齐 |
+| `duration_us` | conditional | timed event 必须有，且大于等于 0 |
+| `shape` | yes | batch size、tokens、seq len、blocks、slots 等 |
+| `resource` | conditional | resource event 必须有 owner、kind、capacity、reserved、committed、released |
+| `memory` | conditional | memory event 必须有 before/after/current/high_water bytes |
+| `token` | conditional | token event 必须有 token id/source；文本可脱敏或省略 |
+| `error` | conditional | error event 必须有 error kind、recoverability、first/caused_by |
+| `backend_detail` | no | 后端专有字段，只能被 backend-specific analyzer 使用 |
+
+示例：
+
+```json
+{
+  "schema_version": "ferrum.observability.v1",
+  "ts_unix_nanos": 1783000000000000000,
+  "event_id": "evt-000123",
+  "event_kind": "memory",
+  "phase": "profile_run",
+  "request_id": null,
+  "sequence_id": null,
+  "correlation_id": "cmd-20260702-204400",
+  "backend": "cuda",
+  "entrypoint": "serve",
+  "model_id": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+  "runtime_preset_hash": "sha256:...",
+  "duration_us": 1182234,
+  "shape": {"batch_size": 1, "max_num_seqs": 16},
+  "memory": {
+    "stage": "after_profile_run",
+    "before_bytes": 16911433728,
+    "after_bytes": 18791268352,
+    "current_bytes": 18791268352,
+    "high_water_bytes": 19025346560,
+    "free_before_bytes": 7969177600,
+    "free_after_bytes": 6089342976,
+    "weights_bytes": 14500000000,
+    "kv_cache_bytes": 0,
+    "recurrent_state_bytes": 0,
+    "graph_or_pipeline_bytes": 391000000,
+    "backend_workspace_bytes": 294000000,
+    "external_delta_bytes": 0
+  },
+  "backend_detail": {"cuda_device": 0}
+}
+```
+
+### Memory profile requirements
+
+借鉴 vLLM startup memory profiling，但按 Ferrum 架构扩展到 CUDA/Metal。
+
+必须采集这些阶段：
+
+| Stage | CUDA | Metal | 量化要求 |
+|---|---|---|---|
+| `process_start` | driver/NVIDIA visible memory when available | process RSS/Metal device info when available | command 启动后第一张快照 |
+| `backend_initialized` | CUDA context/NCCL/workspace 初始化后 | Metal device/pipeline/cache 初始化后 | 必须发生在容量 autosize 前 |
+| `model_loaded` | weights、quant buffers、backend workspace | weights、Metal buffers、pipeline cache | 记录 weights/current/high-water |
+| `profile_run_done` | warmup/profile_run peak activation、non-KV memory、CUDA graph estimate | warmup/profile peak、pipeline/workspace estimate | 用于决定 KV/recurrent 可用容量 |
+| `cache_allocated` | KV blocks、recurrent slots、graph pool | KV/recurrent buffers、Metal cache | 记录 capacity 和 reservation |
+| `first_request_done` | runtime high-water | runtime high-water | 与 request TTFT/E2E 对齐 |
+| `shutdown` | remaining allocations | remaining allocations | resource leak count 必须为 0 |
+
+Memory analyzer 必须输出：
+
+- `memory_high_water_bytes` per backend/device。
+- `weights_bytes`。
+- `kv_cache_bytes`。
+- `recurrent_state_bytes`。
+- `graph_or_pipeline_bytes`。
+- `backend_workspace_bytes`。
+- `peak_activation_bytes`。
+- `external_delta_bytes`。
+- `available_kv_or_state_bytes`。
+- `oom_prevented_count`。
+- `oom_after_admission_count`。
+
+量化验收：
+
+- `available_kv_or_state_bytes < 0` 必须 fail。
+- 没有 admission/reject/defer 事件而出现 CUDA/Metal OOM，必须计为 `silent_oom` fail。
+- 外部显存/进程内存在 profile_run 前后变化超过 256 MiB 或 2%，必须把 artifact 标为 diagnostic-only，不允许作为 performance claim。
+- `shutdown` 后 resource leak count 必须为 0。
+
+### KV/recurrent residency sampling
+
+借鉴 vLLM KV cache residency metrics，但 Ferrum 必须同时覆盖 recurrent-state slots。
+
+采样对象：
+
+- KV block。
+- paged KV page/block。
+- recurrent-state slot。
+- scheduler admission capacity token。
+- backend temporary workspace allocation，若可追踪。
+
+采样事件：
+
+| Event | 字段 |
+|---|---|
+| `resource_allocated` | owner、kind、id、capacity、amount、request_id、phase |
+| `resource_accessed` | owner、kind、id、request_id、phase |
+| `resource_deferred` | owner、kind、needed、available、reason |
+| `resource_released` | owner、kind、id、request_id、phase |
+| `resource_evicted` | owner、kind、id、lifetime_us、idle_us、reuse_gap_us[]、reason |
+
+量化验收：
+
+- 默认 sample rate 为 1%，fixture 必须可设为 100%。
+- summary 必须输出 lifetime/idle/reuse gap 的 p50/p95/p99。
+- request close 后仍 active 的 sampled resource 数必须为 0。
+- defer/reject 事件 100% 有 `needed`、`available`、`capacity`、`reason`。
+
+### Request dump and replay
+
+每个 correctness blocker 必须产出 sanitized replay bundle。
+
+目录结构：
+
+```text
+request_dumps/
+  <request_id>/
+    request.json
+    prompt_token_ids.json
+    sampling_params.json
+    runtime_effective_config.json
+    backend_selection.json
+    output_token_ids.json
+    output_text.txt
+    bad_output_scan.json
+    replay.command.json
+```
+
+`request.json` 必须脱敏用户原文；release fixtures 可保存完整 synthetic prompt。真实用户文本默认不写入 artifact，除非 gate 明确使用公开 fixture。
+
+Replay 必须支持：
+
+- 不启动 HTTP server 的 engine-level replay。
+- `ferrum run` replay。
+- `ferrum serve` request replay，至少能重放 request body、headers 中的 trace context、stream/nonstream 模式。
+
+量化验收：
+
+- 100% bad-output blocker 有 request dump。
+- 100% OOM/admission blocker 有 capacity/resource/memory dump。
+- 100% panic/error blocker 有 first failure event、backtrace/log excerpt、nearest request 或 global failure id。
+- replay fixture 成功率 100%；replay 失败必须成为 gate failure，而不是 warning。
+
+### Correctness and stream diagnostics
+
+Profile analyzer 必须分类并计数：
+
+- `<unk>`。
+- `[PAD]` 或 tokenizer reserved id 泄漏。
+- invalid UTF-8/mojibake。
+- bad stop reason。
+- missing `[DONE]`。
+- duplicate `[DONE]`。
+- malformed SSE JSON。
+- stream bulk flush。
+- strict schema failure。
+- required tool failure。
+- NaN/Inf logits，若 backend 可检测。
+- silent fallback from requested feature to base behavior。
+
+量化验收：
+
+- release candidate 中 `bad_text_count == 0`。
+- `stream_missing_done_count == 0`。
+- `stream_duplicate_done_count == 0`。
+- `malformed_sse_count == 0`。
+- `silent_fallback_count == 0`。
+- 如果出现 bad output，`first_bad_token_id` 或 `first_bad_text_span` 必须存在。
+
+### Latency diagnostics
+
+Profile analyzer 必须输出 request 和 iteration 两层 latency。
+
+Request latency：
+
+- queued。
+- scheduled。
+- prefill。
+- decode。
+- inference。
+- time to first token。
+- inter-token latency。
+- e2e。
+- stream send。
+- tokenizer/template time，若可观测。
+
+Iteration latency：
+
+- iteration id。
+- running request count。
+- waiting request count。
+- deferred request count。
+- prefill token count。
+- decode token count。
+- batch composition。
+- model forward。
+- sampler/logits。
+- detokenize。
+- response serialization/send。
+
+量化验收：
+
+- 100% finished request 有 TTFT/E2E。
+- 生成 token 数大于 1 的 request 必须有 ITL summary。
+- c=1/c=4 synthetic sentinel 必须输出 TTFT/ITL/E2E p50/p95/p99。
+- summary 必须输出 top 5 slow phases，且每个 slow phase 能链接到 event id。
+
+### OTel/NVTX/Chrome trace 关系
+
+OTel、NVTX、Chrome trace 是可选诊断导出层，不是唯一 release evidence。
+
+规则：
+
+- JSONL observability profile 是 hard gate 输入。
+- OTel span 字段必须从同一 request lifecycle event 派生。
+- NVTX/layerwise trace 只能在 diagnostic/full profile 启用。
+- Chrome trace 可用于 Perfetto/Nsight，但 analyzer 不能只靠 Chrome trace 判断 correctness。
+- `debug/full` profile 产生的 performance 数字默认 diagnostic-only，除非另有同硬件 A/B 证据和低开销证明。
+
+### 阶段 4 fixture 明细
+
+至少覆盖：
+
+| Fixture | 期望 |
+|---|---|
+| `run_success_basic_profile` | pass，包含 request lifecycle、TTFT/E2E、token count |
+| `serve_nonstream_success_basic_profile` | pass，包含 request lifecycle、finish reason、metrics 对齐 |
+| `serve_stream_success_basic_profile` | pass，exactly one `[DONE]`，usage/token count 对齐 |
+| `missing_request_id` | fail |
+| `timed_event_missing_duration` | fail |
+| `memory_event_missing_before_after` | fail |
+| `resource_event_missing_owner` | fail |
+| `bad_output_without_replay_bundle` | fail |
+| `oom_without_admission_event` | fail |
+| `panic_without_first_failure_event` | fail |
+| `scheduler_defer_without_capacity_reason` | fail |
+| `kv_recurrent_lifecycle_leak` | fail |
+| `profile_schema_run_serve_mismatch` | fail |
+| `debug_profile_used_as_perf_claim` | fail |
+| `prometheus_profile_count_mismatch` | fail |
+
+### 阶段验收
+
+必须有阶段验证器：
+
+```bash
+python3 scripts/release/observability_profile_gate.py \
+  --out <out_dir> \
+  --fixtures scripts/release/fixtures/observability_profile
+```
+
+必需 PASS line：
+
+```text
+OBSERVABILITY PROFILE GATE PASS: <out_dir>
+```
+
+阶段 4 通过标准：
+
+- 15 个 fixture 全过。
+- `run` 和 `serve` 至少各有一个通过 analyzer 的 artifact。
+- `profile_detail=basic` overhead fixture <= 1% 或在 no-weight/synthetic gate 中证明事件写入路径固定成本满足预算。
+- `observability_profile_summary.json` 存在，并包含：
+  - `request_count`
+  - `failed_count`
+  - `corrupted_count`
+  - `bad_text_count`
+  - `oom_prevented_count`
+  - `silent_oom_count`
+  - `latency_p50_p95_p99`
+  - `memory_high_water_bytes`
+  - `resource_leak_count`
+  - `top_slow_phases`
+  - `first_failure_event`
+  - `replay_commands`
+- `first_failure_event` 对失败 fixture 100% 存在。
+- release claim 中 0 个 unclassified failure。
+
 ## 最终验收
 
-最终 gate 必须聚合四个阶段：
+最终 gate 必须聚合五个阶段：
 
 ```bash
 python3 scripts/release/release_regression_hardening_goal_gate.py \
@@ -856,7 +1265,8 @@ python3 scripts/release/release_regression_hardening_goal_gate.py \
   --resource-invariant <resource_invariant_out> \
   --change-impact <change_impact_out> \
   --product-sentinel <product_sentinel_out> \
-  --model-contract <model_contract_out>
+  --model-contract <model_contract_out> \
+  --observability-profile <observability_profile_out>
 ```
 
 必需最终 PASS line：
@@ -868,7 +1278,7 @@ RELEASE_REGRESSION_HARDENING GOAL PASS: <out_dir>
 最终 artifact 必须包含：
 
 - `goal_manifest.json`
-- 四个阶段的 artifact 路径和 PASS line
+- 五个阶段的 artifact 路径和 PASS line
 - git SHA
 - dirty status
 - changed files
@@ -879,27 +1289,95 @@ RELEASE_REGRESSION_HARDENING GOAL PASS: <out_dir>
 - resource invariant summary
 - product scenario summary
 - model contract summary
+- observability profile summary
+- replay bundle index
 
 最终量化通过标准：
 
-- 4/4 阶段 PASS。
+- 5/5 阶段 PASS。
 - 0 个 unknown impact domain。
 - 0 个 invalidated-but-counted-as-pass lane。
 - 0 个 leaked resources。
 - 0 个 silent fallback。
 - 0 个 product sentinel failed request。
 - 0 个 bad output blocker。
+- 0 个 missing request/correlation id。
+- 0 个 unclassified failure。
+- 0 个 replay bundle failure。
 - 至少 1 个 CUDA/Metal shared-runtime fixture 证明 gate planner 会同时要求两端 sentinel。
 - 至少 1 个 backend-local fixture 证明 gate planner 不会无脑触发另一端 full gate。
+
+## 依赖关系与修改切片
+
+本目标必须先把依赖关系切清楚，避免先做一轮局部重构，后面接 observability、sentinel、model contract 时再推翻。
+
+### 总依赖图
+
+```text
+A. shared schema + offline analyzers + fixtures
+   ├── B. resource invariant checker schema
+   ├── C. product run/serve observability flags + sink wiring
+   │     ├── D. engine/scheduler/KV/recurrent instrumentation
+   │     │     ├── E. product/backend sentinel consumes profile artifacts
+   │     │     └── F. request dump + failure replay
+   │     └── G. backend memory adapters: CUDA / Metal / CPU
+   ├── H. change-impact planner consumes changed files + artifact domains
+   └── I. model onboarding contract consumes sentinel + replay + runtime preset artifacts
+
+J. final goal gate aggregates A-I only after each phase validator has PASS artifacts.
+```
+
+关键约束：
+
+- A 是根。没有统一 schema、analyzer fixture 和 PASS/FAIL 样例，不允许先大面积改 engine instrumentation。
+- B 和阶段 4 的 resource/memory event envelope 必须在同一 schema 里设计；不能做两套 `resource_trace.jsonl` 与 `profile.jsonl` 语义。
+- C 必须同时覆盖 `ferrum run` 和 `ferrum serve`。只接一个入口会制造新的回归盲区。
+- D 只能填充 A 定义的事件，不允许每个模块自造字段。
+- E 依赖 C/D/F；product sentinel 失败必须能直接链接 profile event 和 replay bundle。
+- I 依赖 E/F；模型合同不应该反向驱动 runtime schema 重构，只能引用已稳定 artifact。
+
+### 必须放在一起改
+
+| 修改组 | 必须一起的原因 | 最小交付 |
+|---|---|---|
+| Schema + analyzer + fixtures | schema 没有 offline validator 就会变成日志格式，后续每接一个模块都可能重改 | `FerrumProfileEvent`、resource/memory/request 子结构、pass/fail JSONL fixtures、`analyze_ferrum_profile.py` 自测 |
+| Resource event envelope + phase 0 invariant input | OOM/slot/KV/recurrent 与 observability 共用 request/resource/memory 语义，拆开会出现两个 owner/capacity 定义 | `resource` 字段规范、invariant checker 消费同一 JSONL、leak/underflow/defer fixtures |
+| `run` + `serve` typed flags/config propagation | release 问题反复出在单入口通过、另一个入口坏；入口配置必须同源 | `--profile-jsonl`、`--profile-detail`、`--memory-profile-jsonl`、`--scheduler-trace-jsonl`、`--request-dump-dir` 两个入口都可用 |
+| Scheduler admission + capacity/defer/reject event semantics | defer/reopen、OOM prevention、resource invariant 是同一状态机，拆开容易出现“等待释放”和“直接 OOM”两套行为 | admission decision event、capacity snapshot、defer/reject/reopen reason、unit fixtures |
+| Request dump + bad-output classifier + replay command | 只有 bad-output 分类没有 replay，定位仍会回到人工日志；只有 replay 没有分类，gate 不能自动拦截 | bad text/stream/schema/tool failure 分类、request dump、engine-level replay command、fixture |
+
+### 必须分开改
+
+| 修改组 | 分开的原因 | 前置依赖 |
+|---|---|---|
+| CUDA memory sampler | 后端细节多，容易把 CUDA 语义漏进公共 schema | A 的 `memory` 公共字段稳定 |
+| Metal memory sampler | Metal 可见内存能力与 CUDA 不同，不能被 CUDA profiling 设计绑死 | A 的 `memory` 公共字段稳定 |
+| Prometheus/OTel/NVTX export | 它们是导出层，不是 hard gate 输入；先做会分散语义来源 | A/C/D 稳定，JSONL analyzer 已通过 |
+| Product sentinel scenario 扩展 | sentinel 应消费已稳定 artifact，而不是边跑场景边定义日志格式 | A/C/D/F |
+| Model contract pilot | 模型合同应引用稳定的 run/serve/replay evidence，不应推动 runtime 重构 | E/F 与 runtime preset snapshot 稳定 |
+| Final aggregator | 只聚合 PASS artifacts，不承载业务逻辑 | A-I 的阶段 gate 都存在 |
+
+### 防二次重构规则
+
+- 新字段必须先进入 schema fixture，再进入 runtime emitter。
+- 一旦 D 开始接 engine instrumentation，A 的 breaking schema change 必须写 migration note，并同步更新 analyzer、fixtures、阶段 0/4 文档。
+- backend 专有信息只能进入 `backend_detail`；公共 analyzer 需要的字段必须先抽到公共 schema。
+- `run` 和 `serve` 任何一个入口缺 profile wiring，相关 PR 不能声称 product observability 完成。
+- product sentinel 不允许解析非结构化日志来弥补 profile schema 缺字段；缺字段必须回到 A 修 schema。
+- 模型合同不得要求新增临时 profile 字段；需要新证据时先扩展 A，再更新 E/F，最后更新 I。
 
 ## 执行顺序
 
 推荐顺序：
 
-1. 阶段 1：先做 change-impact classifier 和 gate planner，让后续工作不再靠人工选择 gate。
-2. 阶段 0：做资源 invariant，解决 OOM/slot/KV/recurrent 的根因可观测性。
-3. 阶段 2：把便宜 product/backend sentinel 接到 planner。
-4. 阶段 3：把模型接入合同接到 README/support matrix 和 release gate。
+1. A：先定 shared schema、offline analyzer、fixture，锁住事件语义。
+2. 阶段 1：做 change-impact classifier 和 gate planner，让后续工作不再靠人工选择 gate。
+3. 阶段 0：做资源 invariant，但输入必须复用 A 的 resource event envelope。
+4. C/D/F：接 `run`/`serve` observability wiring、engine/scheduler/KV/recurrent instrumentation、request dump/replay。
+5. 阶段 2：把便宜 product/backend sentinel 接到 planner，并消费 profile/replay artifact。
+6. G：按共享 memory schema 分别补 CUDA/Metal memory sampler。
+7. 阶段 3：把模型接入合同接到 README/support matrix 和 release gate，引用稳定 artifact。
+8. J：最终 aggregator 只聚合各阶段 PASS artifact。
 
 阶段 1 可以先落地 dry-run，不阻塞开发；一旦 fixture 覆盖完整，再改成 release 候选硬门禁。
 
@@ -907,7 +1385,31 @@ RELEASE_REGRESSION_HARDENING GOAL PASS: <out_dir>
 
 本目标必须拆成小 PR，避免把 release gate、runtime 行为、模型合同和测试架构混在一个 patch。
 
-### WP1: Planner dry-run
+### WP1: Shared observability/resource schema and analyzer fixtures
+
+范围：
+
+- `crates/ferrum-types/src/observability_profile.rs`
+- `crates/ferrum-types/src/resource_trace.rs`
+- `scripts/release/analyze_ferrum_profile.py`
+- `scripts/release/fixtures/observability_profile/`
+- synthetic pass/fail JSONL fixtures
+
+要求：
+
+- 先定义公共 envelope，再接任何 runtime emitter。
+- resource、memory、request、latency、token、stream、error 子结构必须一次性设计清楚。
+- analyzer 必须能在没有模型、没有 GPU 的情况下验证 fixture。
+
+不允许修改 engine/runtime 行为。
+
+完成标准：
+
+- analyzer 自测通过。
+- 所有 schema fixture pass/fail 结果符合预期。
+- 缺 `request_id`、缺 `duration_us`、缺 memory before/after、缺 resource owner 的 fixture 必须 fail。
+
+### WP2: Planner dry-run
 
 范围：
 
@@ -924,11 +1426,11 @@ RELEASE_REGRESSION_HARDENING GOAL PASS: <out_dir>
 - 16 个 fixture 全过。
 - 当前工作树能生成 `gate_plan.md`，并清楚列出本 PR 只影响 planner。
 
-### WP2: Resource trace schema and offline checker
+### WP3: Resource invariant checker on shared envelope
 
 范围：
 
-- `ferrum-types` trace event/schema。
+- 复用 WP1 的 resource event/schema。
 - offline checker。
 - synthetic JSONL pass/fail fixtures。
 
@@ -939,7 +1441,24 @@ RELEASE_REGRESSION_HARDENING GOAL PASS: <out_dir>
 - checker 能发现 leak、underflow、overcommit、defer-with-commit、rollback incomplete。
 - `RESOURCE INVARIANT GATE PASS` 可以在 synthetic fixtures 上通过。
 
-### WP3: Resource instrumentation
+### WP4: Product observability wiring for both entrypoints
+
+范围：
+
+- `ferrum run` typed profile/replay flags。
+- `ferrum serve` typed profile/replay flags。
+- shared config propagation into engine/server。
+- artifact manifest records profile paths and profile detail level。
+
+必须把 `run` 和 `serve` 放在同一个 WP。只接一个入口不允许合并为完成。
+
+完成标准：
+
+- `run` 和 `serve` 都能写出同一 schema 的 empty/no-weight 或 synthetic profile artifact。
+- profile 关闭时产品行为不变。
+- release gate 不依赖 hidden env-only 开关。
+
+### WP5: Engine, scheduler, KV, and recurrent instrumentation
 
 范围：
 
@@ -956,13 +1475,33 @@ RELEASE_REGRESSION_HARDENING GOAL PASS: <out_dir>
 - trace 关闭时现有测试行为不变。
 - trace 打开时 artifact 能离线 replay。
 
-### WP4: Product/backend sentinel manifest
+### WP6: Request dump, bad-output classifier, and replay
+
+范围：
+
+- sanitized request dump。
+- prompt/output token id dump。
+- runtime effective config dump。
+- bad text/stream/schema/tool failure classifier。
+- engine-level replay command。
+- serve request replay command。
+
+必须和 classifier 一起交付；不能只 dump、不分类，也不能只分类、不能 replay。
+
+完成标准：
+
+- bad-output、OOM/admission、panic/error synthetic fixtures 都产出 replay bundle。
+- replay command fixture 100% 通过。
+- `OBSERVABILITY PROFILE GATE PASS` 覆盖 replay bundle 校验。
+
+### WP7: Product/backend sentinel manifest consumes profile artifacts
 
 范围：
 
 - `scripts/release/scenarios/product_backend_sentinel.json`
 - `run_scenarios.py` 必要扩展。
 - synthetic bad-output/SSE selftests。
+- profile/replay artifact 引用。
 
 不允许新增第二套 HTTP benchmark 客户端。
 
@@ -970,8 +1509,9 @@ RELEASE_REGRESSION_HARDENING GOAL PASS: <out_dir>
 
 - 12 个阶段 2 fixture 全过。
 - `PRODUCT BACKEND SENTINEL PASS` 在 synthetic/no-weight 层可验证。
+- sentinel failure summary 能链接到 profile event id 和 replay command。
 
-### WP5: Sentinel integration with planner
+### WP8: Sentinel integration with planner
 
 范围：
 
@@ -985,7 +1525,29 @@ RELEASE_REGRESSION_HARDENING GOAL PASS: <out_dir>
 - backend-local fixture 不会无脑要求另一端 full gate。
 - 修改已 PASS lane 相关文件会自动 invalidate 该 lane。
 
-### WP6: Model contract schema and validator
+### WP9: Backend memory profile adapters
+
+范围：
+
+- common memory snapshot adapter trait/schema。
+- CUDA memory sampler。
+- Metal memory sampler。
+- CPU/no-weight fallback sampler。
+- memory profile analyzer summary。
+
+切片规则：
+
+- common trait/schema 必须先做。
+- CUDA 与 Metal sampler 可以分 PR，但不能改变公共 schema。
+- 后端专有字段只能写入 `backend_detail`。
+
+完成标准：
+
+- `process_start`、`backend_initialized`、`model_loaded`、`profile_run_done`、`cache_allocated`、`first_request_done`、`shutdown` 至少在 synthetic/no-weight fixture 中可验证。
+- `available_kv_or_state_bytes < 0` fixture fail。
+- external memory delta 超阈值 fixture 标记 diagnostic-only。
+
+### WP10: Model contract schema and validator
 
 范围：
 
@@ -999,8 +1561,9 @@ RELEASE_REGRESSION_HARDENING GOAL PASS: <out_dir>
 
 - 阶段 3 fixture 全过。
 - validator 能拒绝 silent fallback、缺 run/serve artifact、缺能力证据。
+- contract 引用稳定 profile/replay artifact，不新增临时诊断字段。
 
-### WP7: First real model contract pilot
+### WP11: First real model contract pilot
 
 范围：
 
@@ -1012,12 +1575,12 @@ RELEASE_REGRESSION_HARDENING GOAL PASS: <out_dir>
 - `MODEL ONBOARDING CONTRACT PASS: <out_dir>`。
 - README/support matrix 引用合同字段，而不是重复手写能力声明。
 
-### WP8: Final aggregator
+### WP12: Final aggregator
 
 范围：
 
 - `scripts/release/release_regression_hardening_goal_gate.py`
-- 聚合四阶段 artifacts。
+- 聚合五阶段 artifacts。
 - final selftest。
 
 完成标准：
@@ -1038,12 +1601,18 @@ RELEASE_REGRESSION_HARDENING GOAL PASS: <out_dir>
 - 未运行 gate 的原因。
 - 是否触碰 shared runtime。
 - 是否需要 CUDA/Metal cross-backend sentinel。
+- 是否新增、修改或消费 observability profile 字段。
+- 如果出现 correctness/memory/latency 风险，artifact 是否包含 replay command 或明确说明为什么不需要。
 
 如果 PR 修改了 `crates/` 但 planner 结果是 `docs_only`，PR 必须 fail。
 
 如果 PR 修改了 shared runtime，但没有 Metal/CUDA sentinel 计划，PR 必须 fail。
 
 如果 PR 修改了模型能力、模板、registry、runtime preset，但没有 model contract 或 product sentinel 计划，PR 必须 fail。
+
+如果 PR 修改了 scheduler/admission、KV、recurrent-state、engine request lifecycle、CLI `run`、CLI `serve`、server streaming、memory autosize 或 backend runtime path，但没有 observability profile impact 说明，PR 必须 fail。
+
+如果 PR 新增 profile 字段但没有更新 schema fixture、analyzer 和对应阶段文档，PR 必须 fail。
 
 ## 成功后的日常工作流
 
@@ -1053,6 +1622,7 @@ RELEASE_REGRESSION_HARDENING GOAL PASS: <out_dir>
 python3 scripts/release/plan_gates.py --base origin/main --head HEAD --out <out>/plan
 cat <out>/plan/gate_plan.md
 python3 scripts/release/run_gate.py unit --out <out>/unit
+python3 scripts/release/observability_profile_gate.py --out <out>/observability
 python3 scripts/release/release_regression_hardening_goal_gate.py --out <out>/final ...
 ```
 
@@ -1107,6 +1677,18 @@ python3 scripts/release/release_regression_hardening_goal_gate.py --out <out>/fi
 2. 缺 artifact，先补 smoke，不补 README。
 3. silent fallback，先修产品路径。
 4. correctness 未过，不写性能 claim。
+
+### Observability/replay 失败
+
+处理顺序：
+
+1. 先看 `observability_profile_summary.json` 的 `first_failure_event`。
+2. 如果缺 request/correlation id，先修 schema/emitter，不继续查模型输出。
+3. 如果是 memory event 缺字段，先修 memory sampler 或 adapter，不用日志补证据。
+4. 如果是 resource lifecycle 不闭合，回到阶段 0 checker。
+5. 如果是 bad output 但缺 replay bundle，先补 request dump/replay，再修模型路径。
+6. 如果是 debug/full profile 被用于 performance claim，重新跑 basic profile 或正式 performance gate。
+7. 在 observability gate pass 前，不把 product sentinel failure 当成已定位。
 
 ## GPU 与成本规则
 
