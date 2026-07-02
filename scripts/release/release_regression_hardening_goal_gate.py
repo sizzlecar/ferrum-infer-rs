@@ -399,12 +399,34 @@ def validate_release_candidate_shape(
     gate_plan: dict[str, Any],
     release_candidate: dict[str, Any],
 ) -> None:
+    base_sha = release_candidate.get("base_sha")
+    require(
+        isinstance(base_sha, str) and base_sha.strip(),
+        "release_candidate_manifest.base_sha must be non-empty",
+    )
+    plan_base_sha = gate_plan.get("base_sha")
+    require(
+        isinstance(plan_base_sha, str) and plan_base_sha.strip(),
+        "change_impact.gate_plan.base_sha must be non-empty",
+    )
+    require(
+        base_sha == plan_base_sha,
+        "release_candidate_manifest.base_sha must match change_impact.gate_plan.base_sha",
+    )
     dirty = release_candidate.get("dirty")
     require(isinstance(dirty, bool), "release_candidate_manifest.dirty must be boolean")
     require(dirty is False, "release_candidate_manifest.dirty must be false for final PASS")
-    require_string_list(
+    release_changed_files = require_string_list(
         release_candidate.get("changed_files", []),
         "release_candidate_manifest.changed_files",
+    )
+    plan_changed_files = require_string_list(
+        gate_plan.get("changed_files", []),
+        "change_impact.gate_plan.changed_files",
+    )
+    require(
+        release_changed_files == plan_changed_files,
+        "release_candidate_manifest.changed_files must match change_impact.gate_plan.changed_files",
     )
     release_domains = set(
         require_string_list(
@@ -1648,6 +1670,7 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
         {
             "schema_version": 1,
             "status": "pass",
+            "base_sha": sha,
             "head_sha": sha,
             "dirty": False,
             "changed_files": [],
@@ -1660,6 +1683,7 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
         change / "release_candidate_manifest.json",
         {
             "schema_version": 1,
+            "base_sha": sha,
             "head_sha": sha,
             "dirty": False,
             "changed_files": [],
@@ -2697,6 +2721,38 @@ def run_selftest() -> dict[str, Any]:
             require(
                 "release_candidate_manifest.dirty" in str(exc),
                 f"unexpected dirty release candidate error: {exc}",
+            )
+        bad_release_candidate_shape = root / "bad-release-candidate-shape"
+        artifacts_bad_release_candidate_shape = selftest_artifacts(
+            root / "bad-release-candidate-shape-fixtures",
+            sha,
+        )
+        bad_release_candidate_shape_path = (
+            artifacts_bad_release_candidate_shape["change"] / "release_candidate_manifest.json"
+        )
+        bad_release_candidate_shape_manifest = read_json(bad_release_candidate_shape_path)
+        bad_release_candidate_shape_manifest["base_sha"] = "different-base-sha"
+        write_json(bad_release_candidate_shape_path, bad_release_candidate_shape_manifest)
+        args_bad_release_candidate_shape = argparse.Namespace(
+            out=bad_release_candidate_shape,
+            resource_invariant=artifacts_bad_release_candidate_shape["resource"],
+            change_impact=artifacts_bad_release_candidate_shape["change"],
+            product_sentinel=artifacts_bad_release_candidate_shape["product"],
+            model_contract=artifacts_bad_release_candidate_shape["model"],
+            support_matrix_contract=artifacts_bad_release_candidate_shape["support_matrix"],
+            observability_profile=artifacts_bad_release_candidate_shape["observability"],
+            native_operator=artifacts_bad_release_candidate_shape["native"],
+            actual_model_regression_summary=artifacts_bad_release_candidate_shape["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_release_candidate_shape)
+            raise AssertionError("release candidate base_sha mismatch unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "release_candidate_manifest.base_sha" in str(exc),
+                f"unexpected release candidate shape error: {exc}",
             )
         bad_planner_selfcheck = root / "bad-planner-selfcheck"
         artifacts_bad_planner_selfcheck = selftest_artifacts(
