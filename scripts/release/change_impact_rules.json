@@ -133,11 +133,13 @@
       "required_gates": [
         "unit",
         "model_onboarding_contract_selftest",
+        "support_matrix_contract_selftest",
         "model_contract",
         "product_sentinel"
       ],
       "release_invalidation": [
         "model_onboarding_contract_selftest",
+        "support_matrix_contract_selftest",
         "model_contract",
         "product_sentinel",
         "support_matrix"

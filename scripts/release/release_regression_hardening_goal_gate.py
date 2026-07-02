@@ -235,6 +235,21 @@ def validate_model_contract(root: Path, expected_sha: str) -> dict[str, Any]:
     return stage
 
 
+def validate_support_matrix_contract(root: Path, expected_sha: str) -> dict[str, Any]:
+    stage = load_stage_manifest(root, "support_matrix_contract", "SUPPORT MATRIX CONTRACT PASS", expected_sha)
+    summary = load_summary_from_manifest(stage, "support_matrix_contract_summary.json")
+    rows = summary.get("rows")
+    require(isinstance(rows, list) and rows, "support_matrix_contract.summary.rows must be non-empty")
+    for index, row in enumerate(rows):
+        require(isinstance(row, dict), f"support_matrix_contract.summary.rows[{index}] must be an object")
+        require(
+            isinstance(row.get("contract_id"), str) and row["contract_id"],
+            f"support_matrix_contract.summary.rows[{index}].contract_id must be non-empty",
+        )
+    stage["summary"] = summary
+    return stage
+
+
 def load_vertical_slice(path_value: Any, observability_root: Path) -> dict[str, Any]:
     require(isinstance(path_value, str) and path_value.strip(), "observability_profile.summary.vertical_slice_artifact is required")
     path = resolve_path(path_value, base=observability_root)
@@ -369,6 +384,7 @@ def build_goal_manifest(args: argparse.Namespace) -> dict[str, Any]:
     change_impact = validate_change_impact(args.change_impact, expected_sha)
     product = validate_product_sentinel(args.product_sentinel, expected_sha)
     model_contract = validate_model_contract(args.model_contract, expected_sha)
+    support_matrix_contract = validate_support_matrix_contract(args.support_matrix_contract, expected_sha)
     observability = validate_observability_profile(args.observability_profile, expected_sha)
     native_operator = validate_native_operator(args.native_operator, expected_sha)
     actual_model = validate_actual_model_regression(args, expected_sha)
@@ -412,6 +428,11 @@ def build_goal_manifest(args: argparse.Namespace) -> dict[str, Any]:
                 "pass_line": model_contract["pass_line"],
                 "git_sha": model_contract["git_sha"],
             },
+            "support_matrix_contract": {
+                "artifact_dir": support_matrix_contract["artifact_dir"],
+                "pass_line": support_matrix_contract["pass_line"],
+                "git_sha": support_matrix_contract["git_sha"],
+            },
             "observability_profile": {
                 "artifact_dir": observability["artifact_dir"],
                 "pass_line": observability["pass_line"],
@@ -428,6 +449,7 @@ def build_goal_manifest(args: argparse.Namespace) -> dict[str, Any]:
         "resource_invariant_summary": resource["summary"],
         "product_scenario_summary": product["summary"],
         "model_contract_summary": model_contract["summary"],
+        "support_matrix_contract_summary": support_matrix_contract["summary"],
         "observability_profile_summary": observability["summary"],
         "observability_vertical_slice_summary": observability["vertical_slice"],
         "actual_model_regression_summary": actual_model,
@@ -602,6 +624,27 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
         },
     )
 
+    support_matrix = root / "support-matrix"
+    make_gate_manifest(
+        support_matrix,
+        "SUPPORT MATRIX CONTRACT PASS",
+        sha,
+        "support_matrix_contract_summary.json",
+        {
+            "schema_version": 1,
+            "status": "pass",
+            "gate": "support_matrix_contract",
+            "git_sha": sha,
+            "rows": [
+                {
+                    "model_id": "fixture/qwen3-moe",
+                    "contract_id": "fixture",
+                    "claims": {"cuda": True, "metal": False, "int4_gptq": True},
+                }
+            ],
+        },
+    )
+
     native = root / "native"
     make_gate_manifest(
         native,
@@ -652,6 +695,7 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
         "change": change,
         "product": product,
         "model": model,
+        "support_matrix": support_matrix,
         "observability": observability,
         "native": native,
         "actual": actual,
@@ -670,6 +714,7 @@ def run_selftest() -> dict[str, Any]:
             change_impact=artifacts["change"],
             product_sentinel=artifacts["product"],
             model_contract=artifacts["model"],
+            support_matrix_contract=artifacts["support_matrix"],
             observability_profile=artifacts["observability"],
             native_operator=artifacts["native"],
             actual_model_regression_summary=artifacts["actual"],
@@ -690,6 +735,7 @@ def run_selftest() -> dict[str, Any]:
             change_impact=artifacts_bad["change"],
             product_sentinel=artifacts_bad["product"],
             model_contract=artifacts_bad["model"],
+            support_matrix_contract=artifacts_bad["support_matrix"],
             observability_profile=artifacts_bad["observability"],
             native_operator=artifacts_bad["native"],
             actual_model_regression_summary=artifacts_bad["actual"],
@@ -728,6 +774,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--change-impact", type=Path)
     parser.add_argument("--product-sentinel", type=Path)
     parser.add_argument("--model-contract", type=Path)
+    parser.add_argument("--support-matrix-contract", type=Path)
     parser.add_argument("--observability-profile", type=Path)
     parser.add_argument("--native-operator", type=Path)
     parser.add_argument("--actual-model-regression-summary", type=Path)
@@ -745,6 +792,7 @@ def require_normal_args(args: argparse.Namespace) -> None:
             ("--change-impact", args.change_impact),
             ("--product-sentinel", args.product_sentinel),
             ("--model-contract", args.model_contract),
+            ("--support-matrix-contract", args.support_matrix_contract),
             ("--observability-profile", args.observability_profile),
             ("--native-operator", args.native_operator),
         ]
