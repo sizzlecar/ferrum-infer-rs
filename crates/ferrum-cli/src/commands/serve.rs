@@ -372,6 +372,22 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         return Ok(());
     }
 
+    // Select the requested device before model/cache resolution. Explicit
+    // backend requests must fail closed instead of doing model work and then
+    // silently running on CPU.
+    let mut device = super::run::select_device(&backend)?;
+    let gpu_selection =
+        crate::gpu_devices::resolve_cuda_gpu_devices(gpu_devices.as_deref(), &device)?;
+    if let Some(selection) = &gpu_selection {
+        device = selection.primary_device();
+        println!(
+            "{} {} ({})",
+            "CUDA GPUs:".dimmed(),
+            selection.selected_csv(),
+            selection.selected_distributed_strategy
+        );
+    }
+
     // Print banner
     print_banner();
 
@@ -559,19 +575,6 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         );
     }
 
-    // Select device
-    let mut device = super::run::select_device(&backend);
-    let mut gpu_selection =
-        crate::gpu_devices::resolve_cuda_gpu_devices(gpu_devices.as_deref(), &device)?;
-    if let Some(selection) = &gpu_selection {
-        device = selection.primary_device();
-        println!(
-            "{} {} ({})",
-            "CUDA GPUs:".dimmed(),
-            selection.selected_csv(),
-            selection.selected_distributed_strategy
-        );
-    }
     println!("{} {:?}", "Device:".dimmed(), device);
     let serve_profile_entries = crate::source_resolver::serve_profile_runtime_entries(
         &source.local_path,
