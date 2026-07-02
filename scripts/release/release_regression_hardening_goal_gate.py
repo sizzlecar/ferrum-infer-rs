@@ -272,6 +272,63 @@ def validate_release_candidate_invalidation(
     )
 
 
+def validate_required_planner_fixture(
+    fixtures: dict[str, dict[str, Any]],
+    fixture_id: str,
+    *,
+    required_gates: set[str],
+    forbidden_gates: set[str] | None = None,
+) -> None:
+    fixture = fixtures.get(fixture_id)
+    require(fixture is not None, f"planner_selfcheck missing fixture {fixture_id}")
+    require(fixture.get("status") == "pass", f"planner_selfcheck.{fixture_id}.status must be pass")
+    actual_required = set(
+        require_string_list(
+            fixture.get("required_gates", []),
+            f"planner_selfcheck.{fixture_id}.required_gates",
+        )
+    )
+    missing = sorted(required_gates - actual_required)
+    require(not missing, f"planner_selfcheck.{fixture_id}.required_gates missing {missing}")
+    forbidden = sorted((forbidden_gates or set()) & actual_required)
+    require(not forbidden, f"planner_selfcheck.{fixture_id}.required_gates unexpectedly contained {forbidden}")
+
+
+def validate_planner_selfcheck(root: Path) -> dict[str, Any]:
+    path = root / "planner_selfcheck.json"
+    selfcheck = read_json(path)
+    require_status_pass(selfcheck, "change_impact.planner_selfcheck")
+    fixtures = selfcheck.get("fixtures")
+    require(isinstance(fixtures, list) and fixtures, "change_impact.planner_selfcheck.fixtures must be non-empty")
+    fixture_map: dict[str, dict[str, Any]] = {}
+    for index, fixture in enumerate(fixtures):
+        require(isinstance(fixture, dict), f"change_impact.planner_selfcheck.fixtures[{index}] must be an object")
+        fixture_id = fixture.get("id")
+        require(
+            isinstance(fixture_id, str) and fixture_id.strip(),
+            f"change_impact.planner_selfcheck.fixtures[{index}].id must be non-empty",
+        )
+        fixture_map[fixture_id] = fixture
+    validate_required_planner_fixture(
+        fixture_map,
+        "engine_shared_runtime",
+        required_gates={"metal_sentinel", "cuda_sentinel"},
+    )
+    validate_required_planner_fixture(
+        fixture_map,
+        "cuda_kernel_local",
+        required_gates={"cuda_sentinel", "metal_boundary_smoke"},
+        forbidden_gates={"metal_full"},
+    )
+    validate_required_planner_fixture(
+        fixture_map,
+        "metal_kernel_local",
+        required_gates={"metal_sentinel", "cuda_boundary_smoke"},
+        forbidden_gates={"cuda_full"},
+    )
+    return {**selfcheck, "_summary_path": str(path)}
+
+
 def validate_change_impact(root: Path, expected_sha: str) -> dict[str, Any]:
     gate_plan = read_json(root / "gate_plan.json")
     require_status_pass(gate_plan, "change_impact.gate_plan")
@@ -290,6 +347,7 @@ def validate_change_impact(root: Path, expected_sha: str) -> dict[str, Any]:
         "release_candidate_manifest.required_gates must be a list",
     )
     validate_release_candidate_invalidation(gate_plan, release_candidate)
+    planner_selfcheck = validate_planner_selfcheck(root)
     pass_line = f"CHANGE IMPACT GATE PLAN PASS: {root}"
     return {
         "label": "change_impact",
@@ -299,6 +357,7 @@ def validate_change_impact(root: Path, expected_sha: str) -> dict[str, Any]:
         "git_sha": gate_plan.get("head_sha"),
         "gate_plan": gate_plan,
         "release_candidate_manifest": release_candidate,
+        "planner_selfcheck": planner_selfcheck,
     }
 
 
@@ -903,6 +962,32 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "stale_artifacts": [],
         },
     )
+    write_json(
+        change / "planner_selfcheck.json",
+        {
+            "schema_version": 1,
+            "status": "pass",
+            "fixture_count": 3,
+            "failures": [],
+            "fixtures": [
+                {
+                    "id": "engine_shared_runtime",
+                    "status": "pass",
+                    "required_gates": ["unit", "resource_invariant", "metal_sentinel", "cuda_sentinel"],
+                },
+                {
+                    "id": "cuda_kernel_local",
+                    "status": "pass",
+                    "required_gates": ["cuda_sentinel", "metal_boundary_smoke"],
+                },
+                {
+                    "id": "metal_kernel_local",
+                    "status": "pass",
+                    "required_gates": ["metal_sentinel", "cuda_boundary_smoke"],
+                },
+            ],
+        },
+    )
 
     product = root / "product"
     make_gate_manifest(
@@ -1304,6 +1389,39 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("stale artifact counted as pass unexpectedly passed final gate")
         except GoalGateError as exc:
             require("stale artifacts" in str(exc), f"unexpected stale-counted error: {exc}")
+        bad_planner_selfcheck = root / "bad-planner-selfcheck"
+        artifacts_bad_planner_selfcheck = selftest_artifacts(
+            root / "bad-planner-selfcheck-fixtures",
+            sha,
+        )
+        bad_planner_selfcheck_path = (
+            artifacts_bad_planner_selfcheck["change"] / "planner_selfcheck.json"
+        )
+        bad_planner_selfcheck_data = read_json(bad_planner_selfcheck_path)
+        bad_planner_selfcheck_data["fixtures"] = [
+            fixture
+            for fixture in bad_planner_selfcheck_data["fixtures"]
+            if fixture["id"] != "engine_shared_runtime"
+        ]
+        write_json(bad_planner_selfcheck_path, bad_planner_selfcheck_data)
+        args_bad_planner_selfcheck = argparse.Namespace(
+            out=bad_planner_selfcheck,
+            resource_invariant=artifacts_bad_planner_selfcheck["resource"],
+            change_impact=artifacts_bad_planner_selfcheck["change"],
+            product_sentinel=artifacts_bad_planner_selfcheck["product"],
+            model_contract=artifacts_bad_planner_selfcheck["model"],
+            support_matrix_contract=artifacts_bad_planner_selfcheck["support_matrix"],
+            observability_profile=artifacts_bad_planner_selfcheck["observability"],
+            native_operator=artifacts_bad_planner_selfcheck["native"],
+            actual_model_regression_summary=artifacts_bad_planner_selfcheck["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_planner_selfcheck)
+            raise AssertionError("missing planner shared-runtime fixture unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require("planner_selfcheck" in str(exc), f"unexpected planner selfcheck error: {exc}")
         missing_actual = argparse.Namespace(
             **{
                 **args.__dict__,
