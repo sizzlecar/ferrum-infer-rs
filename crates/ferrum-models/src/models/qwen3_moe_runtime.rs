@@ -34,6 +34,7 @@ pub(crate) struct Qwen3MoeRuntimeEnv {
     pub(crate) vllm_decode_varlen: bool,
     pub(crate) vllm_varlen_tiled_q4: bool,
     kv_capacity: Option<usize>,
+    kv_max_blocks: Option<usize>,
     metal_paged_kv: Option<bool>,
 }
 
@@ -64,7 +65,7 @@ impl Qwen3MoeRuntimeEnv {
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
             .collect();
-        let fa2_source = trueish(vars.get("FERRUM_FA2_SOURCE"));
+        let fa2_source = false;
         let fa2_direct_ffi = match vars.get("FERRUM_FA2_DIRECT_FFI").map(String::as_str) {
             Some("0" | "false" | "FALSE" | "off" | "OFF") => false,
             Some("1" | "true" | "TRUE" | "on" | "ON") => true,
@@ -131,6 +132,7 @@ impl Qwen3MoeRuntimeEnv {
                 .get("FERRUM_VLLM_VARLEN_TILED_Q4")
                 .is_some_and(|v| v == "1"),
             kv_capacity: positive_usize(&vars, "FERRUM_KV_CAPACITY"),
+            kv_max_blocks: positive_usize(&vars, "FERRUM_KV_MAX_BLOCKS"),
             metal_paged_kv: vars.get("FERRUM_METAL_PAGED_KV").map(|v| v != "0"),
         }
     }
@@ -140,6 +142,12 @@ impl Qwen3MoeRuntimeEnv {
         self.kv_capacity
             .map(|cap| cap.min(model_max))
             .unwrap_or_else(|| model_max.min(DEFAULT_KV_CAPACITY))
+    }
+
+    pub(crate) fn paged_total_blocks(&self, max_blocks_per_seq: usize) -> usize {
+        self.kv_max_blocks
+            .unwrap_or_else(|| self.paged_max_seqs * max_blocks_per_seq)
+            .max(1)
     }
 
     pub(crate) fn metal_paged_kv_enabled(&self, backend_default: bool) -> bool {
@@ -168,13 +176,6 @@ fn positive_usize(vars: &HashMap<String, String>, name: &str) -> Option<usize> {
     vars.get(name)
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
-}
-
-fn trueish(value: Option<&String>) -> bool {
-    matches!(
-        value.map(String::as_str),
-        Some("1" | "true" | "TRUE" | "on" | "ON")
-    )
 }
 
 #[cfg(test)]
@@ -246,6 +247,7 @@ mod tests {
     fn qwen3_moe_runtime_env_uses_defaults_and_bounds() {
         let env = Qwen3MoeRuntimeEnv::from_env_vars([
             ("FERRUM_KV_CAPACITY", "4096"),
+            ("FERRUM_KV_MAX_BLOCKS", "512"),
             ("FERRUM_MOE_HOST_ROUTE", "1"),
             ("FERRUM_MOE_GRAPH", "1"),
             ("FERRUM_VLLM_MOE", "1"),
@@ -254,6 +256,7 @@ mod tests {
         assert_eq!(env.initial_scratch_tokens, 2048);
         assert_eq!(env.kv_capacity(1024), 1024);
         assert_eq!(env.kv_capacity(8192), 4096);
+        assert_eq!(env.paged_total_blocks(128), 512);
         assert!(env.metal_paged_kv_enabled(true));
         assert!(!env.metal_paged_kv_enabled(false));
         assert!(env.moe_batched_enabled);
@@ -268,10 +271,10 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_moe_runtime_env_keeps_fa2_source_distinct_from_direct_ffi() {
+    fn qwen3_moe_runtime_env_ignores_removed_fa2_source_path() {
         let env = Qwen3MoeRuntimeEnv::from_env_vars([("FERRUM_FA2_SOURCE", "1")]);
 
-        assert!(env.fa2_source);
+        assert!(!env.fa2_source);
         assert!(!env.fa2_direct_ffi);
     }
 

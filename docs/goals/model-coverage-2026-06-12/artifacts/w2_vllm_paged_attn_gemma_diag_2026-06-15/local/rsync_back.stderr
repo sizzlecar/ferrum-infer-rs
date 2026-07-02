@@ -1,0 +1,47 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+Transfer starting: 40 files
+./
+bench/
+config/
+remote/
+server/
+smoke/
+ferrum.toml (823 B, 100.0% downloaded)
+gpu_contract.md (1.1 KB, 0.0% downloaded)
+nohup.log (0 B, 100.0% downloaded)
+nohup.pid (4 B, 100.0% downloaded)
+run.status (5 B, 100.0% downloaded)
+bench/bench-serve.command.json (672 B, 100.0% downloaded)
+bench/bench-serve.rc (2 B, 100.0% downloaded)
+bench/bench-serve.stderr (1.0 KB, 100.0% downloaded)
+bench/bench-serve.stdout (0 B, 100.0% downloaded)
+bench/bench_ferrum_vllm_paged_attn_sharegpt_c16_c32_16x1.json (6.4 KB, 100.0% downloaded)
+config/ferrum.toml (823 B, 100.0% downloaded)
+remote/end_utc.txt (21 B, 100.0% downloaded)
+remote/ferrum.sha256 (115 B, 100.0% downloaded)
+remote/git_head.txt (41 B, 100.0% downloaded)
+remote/git_status_short.txt (51.5 KB, 100.0% downloaded)
+remote/nvidia_smi_after_bench.txt (1.6 KB, 100.0% downloaded)
+remote/nvidia_smi_before.txt (1.7 KB, 100.0% downloaded)
+remote/start_utc.txt (21 B, 100.0% downloaded)
+server/attention_selection.status (63 B, 100.0% downloaded)
+server/health_after.err (0 B, 100.0% downloaded)
+server/health_after.json (9.2 KB, 100.0% downloaded)
+server/health_before.err (0 B, 100.0% downloaded)
+server/health_before.json (9.1 KB, 100.0% downloaded)
+server/models.err (0 B, 100.0% downloaded)
+server/models.json (164 B, 100.0% downloaded)
+server/ready_poll.txt (3 B, 100.0% downloaded)
+server/serve.command.json (445 B, 100.0% downloaded)
+server/serve_decision_trace.jsonl (3.2 KB, 100.0% downloaded)
+server/serve_effective_config.json (9.3 KB, 100.0% downloaded)
+server/server.log (3.9 KB, 100.0% downloaded)
+server/server.pid (4 B, 100.0% downloaded)
+smoke/chat_request.json (163 B, 100.0% downloaded)
+smoke/chat_response.err (0 B, 100.0% downloaded)
+smoke/chat_response.json (282 B, 100.0% downloaded)
+
+sent 776 bytes  received 105449 bytes  212450 bytes/sec
+total size is 104049  speedup is 0.98

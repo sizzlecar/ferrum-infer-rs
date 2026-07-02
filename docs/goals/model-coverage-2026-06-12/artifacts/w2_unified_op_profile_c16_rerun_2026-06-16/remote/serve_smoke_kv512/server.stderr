@@ -1,0 +1,264 @@
+[auto-size] gpu=24.0 GB total / 23.5 GB free | weights=15.0 GB budget / 15.0 GB total | layers=62 budget | scratch reserve=4.0 GB | KV pool budget 3.9 GB → max_blocks=512
+[auto-size] requested runtime floor requires KV_MAX_BLOCKS=512 above estimated budget 338; honoring explicit runtime limits
+[auto-size] KV_MAX_BLOCKS=512 PAGED_MAX_SEQS=<user> KV_CAPACITY=<user>
+[2m2026-06-16T15:29:39.895163Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-16T15:29:39.895196Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-16T15:29:39.895273Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2/tokenizer.json"
+[2m2026-06-16T15:29:41.290645Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-16T15:29:41.290722Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-16T15:29:41.290729Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-16T15:29:41.290932Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=512
+[2m2026-06-16T15:29:41.291184Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2 (format: safetensors)
+[2m2026-06-16T15:29:41.291509Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Gemma3, Layers: 62, Vocab: 262208
+[2m2026-06-16T15:29:41.534427Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-16T15:29:41.534587Z[0m [32m INFO[0m [2mferrum_models::loader::gptq_loader[0m[2m:[0m GPTQ config: QuantizeConfig { bits: 4, group_size: 128, sym: true, desc_act: true, quant_method: "gptq" }
+[2m2026-06-16T15:29:41.534612Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading Gemma3 via LlamaFamilyModel (5:1 SWA, dual rope, GeGLU, sandwich norms)
+[2m2026-06-16T15:29:41.534626Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Backend: CUDA, KV: fp16
+[2m2026-06-16T15:31:18.458899Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head
+[2m2026-06-16T15:31:27.312018Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m Gemma3 family: legacy batched_decode=true varlen_unified=true
+[unified-logits] call#0 row=0 orig_idx=0 global=22 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[236810:42.031250,239374:20.453125,247918:20.453125,239341:20.187500,242323:20.015625]
+[unified-op-profile] call#0 m_total=23 num_seqs=1 prefill=1 decode=0 max_kv=23 sampled=1 total=242793us qkv=15851us(62) qkr=1189us(62) attn=1925us(62) o_proj=3270us(62) norm=1412us(124) gate_up=11720us(62) act=554us(62) down=6613us(62) resid=557us(62) final_norm=8us(1) final_copy=31us(1) lm_head=194118us(1) readback=1399us(1) generic_matmul=231572us(249) generic_attn=1925us(62) generic_qkr=1189us(62) generic_norm=1420us(125) generic_other=1142us(125) marlin_ws_zero=3452us(248) marlin_gather=2130us(248) marlin_kernel=29233us(248) marlin_qkv_ws=723us(62) marlin_qkv_gather=472us(62) marlin_qkv_kernel=13843us(62) marlin_o_ws=595us(62) marlin_o_gather=434us(62) marlin_o_kernel=1739us(62) marlin_gate_up_ws=1636us(62) marlin_gate_up_gather=481us(62) marlin_gate_up_kernel=8757us(62) marlin_down_ws=498us(62) marlin_down_gather=743us(62) marlin_down_kernel=4894us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=4146us
+[unified-decode] call#0 items=1 prefill=1 decode=0 total_q=23 attempted_unified=true fallback=false fallback_reason=none elapsed=283222us
+[first-token-prof] req=70067fa3-3e97-47dd-b5f7-1b5e1beb912f source=unified_prefill prompt_tokens=23 chunk_start=0 chunk_len=23 queue_to_model_start=2323us model_batch=283317us queue_to_first_token=285879us
+[stream-ttft-prof] req=70067fa3-3e97-47dd-b5f7-1b5e1beb912f prompt_tokens=23 generated_tokens=1 ttft=292260us
+[unified-prof] iter#0 items=1 prefill=1 decode=0 total=296272us model=283317us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)
+[iter-prof] iter#0 total=304760us sched=51us process=304709us batch_size=1
+[unified-logits] call#1 row=0 orig_idx=0 global=0 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[107:41.906250,106:38.000000,236743:26.656250,236761:24.437500,108:23.656250]
+[unified-op-profile] call#1 m_total=1 num_seqs=1 prefill=0 decode=1 max_kv=24 sampled=1 total=30538us qkv=3114us(62) qkr=441us(62) attn=699us(62) o_proj=2350us(62) norm=1183us(124) gate_up=9426us(62) act=373us(62) down=5485us(62) resid=495us(62) final_norm=8us(1) final_copy=13us(1) lm_head=2987us(1) readback=551us(1) generic_matmul=23362us(249) generic_attn=699us(62) generic_qkr=441us(62) generic_norm=1191us(125) generic_other=881us(125) marlin_ws_zero=1537us(248) marlin_gather=1500us(248) marlin_kernel=16315us(248) marlin_qkv_ws=381us(62) marlin_qkv_gather=380us(62) marlin_qkv_kernel=2095us(62) marlin_o_ws=352us(62) marlin_o_gather=372us(62) marlin_o_kernel=1375us(62) marlin_gate_up_ws=452us(62) marlin_gate_up_gather=372us(62) marlin_gate_up_kernel=8350us(62) marlin_down_ws=352us(62) marlin_down_gather=376us(62) marlin_down_kernel=4495us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=3413us
+[unified-decode] call#1 items=1 prefill=0 decode=1 total_q=1 attempted_unified=true fallback=false fallback_reason=none elapsed=30885us
+[unified-prof] iter#1 items=1 prefill=0 decode=1 total=31173us model=30921us decode_post=250us | sample=213 sched=0 stream=37 stop=0 complete=0 (us)
+[iter-prof] iter#1 total=37559us sched=17us process=37541us batch_size=1
+[unified-logits] call#2 row=0 orig_idx=0 global=0 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[106:45.750000,954:18.828125,236743:18.828125,236770:18.750000,236761:18.453125]
+[unified-op-profile] call#2 m_total=1 num_seqs=1 prefill=0 decode=1 max_kv=25 sampled=1 total=29956us qkv=2975us(62) qkr=446us(62) attn=690us(62) o_proj=2282us(62) norm=1177us(124) gate_up=9288us(62) act=372us(62) down=5404us(62) resid=497us(62) final_norm=8us(1) final_copy=8us(1) lm_head=2958us(1) readback=541us(1) generic_matmul=22907us(249) generic_attn=690us(62) generic_qkr=446us(62) generic_norm=1185us(125) generic_other=877us(125) marlin_ws_zero=1312us(248) marlin_gather=1493us(248) marlin_kernel=16247us(248) marlin_qkv_ws=312us(62) marlin_qkv_gather=372us(62) marlin_qkv_kernel=2058us(62) marlin_o_ws=319us(62) marlin_o_gather=371us(62) marlin_o_kernel=1371us(62) marlin_gate_up_ws=371us(62) marlin_gate_up_gather=372us(62) marlin_gate_up_kernel=8336us(62) marlin_down_ws=310us(62) marlin_down_gather=378us(62) marlin_down_kernel=4482us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=3310us
+[unified-decode] call#2 items=1 prefill=0 decode=1 total_q=1 attempted_unified=true fallback=false fallback_reason=none elapsed=30270us
+[unified-prof] iter#2 items=1 prefill=0 decode=1 total=30560us model=30306us decode_post=252us | sample=212 sched=0 stream=0 stop=0 complete=40 (us)
+[iter-prof] iter#2 total=36987us sched=11us process=36975us batch_size=1
+[bg-loop-gap] call#8 inter_iter=4us
+[bg-loop-gap] call#16 inter_iter=10us
+[bg-loop-gap] call#24 inter_iter=10us
+[bg-loop-gap] call#32 inter_iter=10us
+[bg-loop-gap] call#40 inter_iter=10us
+[bg-loop-gap] call#48 inter_iter=6us
+[bg-loop-gap] call#56 inter_iter=5us
+[bg-loop-gap] call#64 inter_iter=5us
+[bg-loop-gap] call#72 inter_iter=3us
+[bg-loop-gap] call#80 inter_iter=8us
+[bg-loop-gap] call#88 inter_iter=8us
+[bg-loop-gap] call#96 inter_iter=5us
+[bg-loop-gap] call#104 inter_iter=5us
+[bg-loop-gap] call#112 inter_iter=5us
+[bg-loop-gap] call#120 inter_iter=8us
+[bg-loop-gap] call#128 inter_iter=8us
+[bg-loop-gap] call#136 inter_iter=8us
+[bg-loop-gap] call#144 inter_iter=4us
+[bg-loop-gap] call#152 inter_iter=4us
+[bg-loop-gap] call#160 inter_iter=9us
+[bg-loop-gap] call#168 inter_iter=9us
+[bg-loop-gap] call#176 inter_iter=9us
+[bg-loop-gap] call#184 inter_iter=9us
+[bg-loop-gap] call#192 inter_iter=9us
+[bg-loop-gap] call#200 inter_iter=9us
+[bg-loop-gap] call#208 inter_iter=10us
+[bg-loop-gap] call#216 inter_iter=9us
+[bg-loop-gap] call#224 inter_iter=9us
+[bg-loop-gap] call#232 inter_iter=8us
+[bg-loop-gap] call#240 inter_iter=9us
+[bg-loop-gap] call#248 inter_iter=9us
+[bg-loop-gap] call#256 inter_iter=9us
+[bg-loop-gap] call#264 inter_iter=9us
+[bg-loop-gap] call#272 inter_iter=9us
+[bg-loop-gap] call#280 inter_iter=9us
+[bg-loop-gap] call#288 inter_iter=9us
+[bg-loop-gap] call#296 inter_iter=9us
+[bg-loop-gap] call#304 inter_iter=9us
+[bg-loop-gap] call#312 inter_iter=10us
+[bg-loop-gap] call#320 inter_iter=10us
+[bg-loop-gap] call#328 inter_iter=9us
+[bg-loop-gap] call#336 inter_iter=9us
+[bg-loop-gap] call#344 inter_iter=9us
+[bg-loop-gap] call#352 inter_iter=10us
+[bg-loop-gap] call#360 inter_iter=8us
+[bg-loop-gap] call#368 inter_iter=4us
+[bg-loop-gap] call#376 inter_iter=3us
+[bg-loop-gap] call#384 inter_iter=3us
+[bg-loop-gap] call#392 inter_iter=4us
+[bg-loop-gap] call#400 inter_iter=2us
+[bg-loop-gap] call#408 inter_iter=5us
+[bg-loop-gap] call#416 inter_iter=3us
+[bg-loop-gap] call#424 inter_iter=4us
+[bg-loop-gap] call#432 inter_iter=2us
+[bg-loop-gap] call#440 inter_iter=2us
+[bg-loop-gap] call#448 inter_iter=4us
+[bg-loop-gap] call#456 inter_iter=107us
+[bg-loop-gap] call#464 inter_iter=5us
+[bg-loop-gap] call#472 inter_iter=4us
+[bg-loop-gap] call#480 inter_iter=10us
+[bg-loop-gap] call#488 inter_iter=10us
+[bg-loop-gap] call#496 inter_iter=10us
+[bg-loop-gap] call#504 inter_iter=5us
+[bg-loop-gap] call#512 inter_iter=5us
+[bg-loop-gap] call#520 inter_iter=10us
+[bg-loop-gap] call#528 inter_iter=10us
+[bg-loop-gap] call#536 inter_iter=10us
+[bg-loop-gap] call#544 inter_iter=7us
+[bg-loop-gap] call#552 inter_iter=5us
+[bg-loop-gap] call#560 inter_iter=5us
+[bg-loop-gap] call#568 inter_iter=5us
+[bg-loop-gap] call#576 inter_iter=9us
+[bg-loop-gap] call#584 inter_iter=9us
+[bg-loop-gap] call#592 inter_iter=9us
+[bg-loop-gap] call#600 inter_iter=9us
+[bg-loop-gap] call#608 inter_iter=9us
+[bg-loop-gap] call#616 inter_iter=10us
+[bg-loop-gap] call#624 inter_iter=4us
+[bg-loop-gap] call#632 inter_iter=9us
+[bg-loop-gap] call#640 inter_iter=9us
+[bg-loop-gap] call#648 inter_iter=9us
+[bg-loop-gap] call#656 inter_iter=10us
+[bg-loop-gap] call#664 inter_iter=9us
+[bg-loop-gap] call#672 inter_iter=9us
+[unified-logits] call#3 row=0 orig_idx=0 global=74 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[33792:23.234375,238358:22.312500,18405:22.078125,236777:21.515625,238756:21.000000]
+[unified-logits] call#3 row=1 orig_idx=1 global=149 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[2094:30.109375,19058:27.796875,1509:22.921875,6372:21.656250,85103:21.078125]
+[unified-op-profile] call#3 m_total=150 num_seqs=2 prefill=2 decode=0 max_kv=75 sampled=2 total=90880us qkv=8476us(62) qkr=902us(62) attn=4982us(62) o_proj=5808us(62) norm=1923us(124) gate_up=33702us(62) act=1037us(62) down=19992us(62) resid=771us(62) final_norm=11us(1) final_copy=20us(1) lm_head=3212us(1) readback=2910us(1) generic_matmul=71190us(249) generic_attn=4982us(62) generic_qkr=902us(62) generic_norm=1934us(125) generic_other=1828us(125) marlin_ws_zero=1827us(248) marlin_gather=4621us(248) marlin_kernel=59928us(248) marlin_qkv_ws=441us(62) marlin_qkv_gather=765us(62) marlin_qkv_kernel=6869us(62) marlin_o_ws=423us(62) marlin_o_gather=602us(62) marlin_o_kernel=4383us(62) marlin_gate_up_ws=557us(62) marlin_gate_up_gather=775us(62) marlin_gate_up_kernel=31970us(62) marlin_down_ws=406us(62) marlin_down_gather=2479us(62) marlin_down_kernel=16706us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=7134us
+[unified-decode] call#3 items=2 prefill=2 decode=0 total_q=150 attempted_unified=true fallback=false fallback_reason=none elapsed=96817us
+[first-token-prof] req=087a1280-867c-40ce-a4fb-a43def1ae00d source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=10230us model_batch=96857us queue_to_first_token=107328us
+[stream-ttft-prof] req=087a1280-867c-40ce-a4fb-a43def1ae00d prompt_tokens=75 generated_tokens=1 ttft=113744us
+[first-token-prof] req=580ca0ed-cca0-436e-8329-83fdae9efc21 source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=9189us model_batch=96857us queue_to_first_token=119296us
+[stream-ttft-prof] req=580ca0ed-cca0-436e-8329-83fdae9efc21 prompt_tokens=75 generated_tokens=1 ttft=125644us
+[unified-prof] iter#3 items=2 prefill=2 decode=0 total=122746us model=96857us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)
+[unified-logits] call#4 row=0 orig_idx=0 global=0 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[7412:36.375000,5724:36.125000,563:33.562500,1816:33.156250,2744:32.843750]
+[unified-logits] call#4 row=1 orig_idx=1 global=1 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[237357:32.937500,87889:24.937500,237226:24.562500,237145:21.093750,33792:20.468750]
+[unified-op-profile] call#4 m_total=2 num_seqs=2 prefill=0 decode=2 max_kv=76 sampled=2 total=34222us qkv=3006us(62) qkr=455us(62) attn=1016us(62) o_proj=2319us(62) norm=1470us(124) gate_up=9353us(62) act=373us(62) down=5456us(62) resid=508us(62) final_norm=9us(1) final_copy=14us(1) lm_head=2989us(1) readback=1097us(1) generic_matmul=23123us(249) generic_attn=1016us(62) generic_qkr=455us(62) generic_norm=1479us(125) generic_other=895us(125) marlin_ws_zero=1350us(248) marlin_gather=1508us(248) marlin_kernel=16282us(248) marlin_qkv_ws=325us(62) marlin_qkv_gather=372us(62) marlin_qkv_kernel=2054us(62) marlin_o_ws=323us(62) marlin_o_gather=372us(62) marlin_o_kernel=1379us(62) marlin_gate_up_ws=381us(62) marlin_gate_up_gather=373us(62) marlin_gate_up_kernel=8358us(62) marlin_down_ws=321us(62) marlin_down_gather=391us(62) marlin_down_kernel=4491us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=6157us
+[unified-decode] call#4 items=2 prefill=0 decode=2 total_q=2 attempted_unified=true fallback=false fallback_reason=none elapsed=34535us
+[unified-prof] iter#4 items=2 prefill=0 decode=2 total=35080us model=34572us decode_post=505us | sample=447 sched=0 stream=58 stop=0 complete=0 (us)
+[unified-logits] call#5 row=0 orig_idx=0 global=73 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[2094:27.703125,19058:25.609375,18405:21.093750,8978:20.296875,1509:20.281250]
+[unified-logits] call#5 row=1 orig_idx=1 global=148 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[2094:28.250000,237815:25.078125,19058:24.640625,1509:23.781250,818:22.609375]
+[unified-op-profile] call#5 m_total=151 num_seqs=4 prefill=2 decode=2 max_kv=77 sampled=4 total=89182us qkv=7737us(62) qkr=760us(62) attn=4152us(62) o_proj=5233us(62) norm=1688us(124) gate_up=32416us(62) act=931us(62) down=19060us(62) resid=680us(62) final_norm=10us(1) final_copy=22us(1) lm_head=3082us(1) readback=5489us(1) generic_matmul=67528us(249) generic_attn=4152us(62) generic_qkr=760us(62) generic_norm=1698us(125) generic_other=1633us(125) marlin_ws_zero=1429us(248) marlin_gather=4171us(248) marlin_kernel=57897us(248) marlin_qkv_ws=352us(62) marlin_qkv_gather=670us(62) marlin_qkv_kernel=6482us(62) marlin_o_ws=343us(62) marlin_o_gather=511us(62) marlin_o_kernel=4138us(62) marlin_gate_up_ws=408us(62) marlin_gate_up_gather=658us(62) marlin_gate_up_kernel=31116us(62) marlin_down_ws=326us(62) marlin_down_gather=2332us(62) marlin_down_kernel=16161us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=7922us
+[unified-decode] call#5 items=4 prefill=2 decode=2 total_q=151 attempted_unified=true fallback=false fallback_reason=none elapsed=93323us
+[first-token-prof] req=21938969-cdd2-45d3-9a95-86b943601ad5 source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=184326us model_batch=93363us queue_to_first_token=277936us
+[stream-ttft-prof] req=21938969-cdd2-45d3-9a95-86b943601ad5 prompt_tokens=74 generated_tokens=1 ttft=284249us
+[first-token-prof] req=2eac1f36-ef0e-44bb-9762-ebf3bc5cc78f source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=183653us model_batch=93363us queue_to_first_token=290127us
+[stream-ttft-prof] req=2eac1f36-ef0e-44bb-9762-ebf3bc5cc78f prompt_tokens=75 generated_tokens=1 ttft=296446us
+[unified-prof] iter#5 items=4 prefill=2 decode=2 total=119505us model=93363us decode_post=517us | sample=463 sched=0 stream=54 stop=0 complete=0 (us)
+[unified-logits] call#6 row=0 orig_idx=0 global=0 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[7412:39.906250,5724:38.875000,1816:36.750000,563:36.437500,2744:35.906250]
+[unified-logits] call#6 row=1 orig_idx=1 global=1 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[577:43.000000,496:27.734375,3014:25.859375,786:24.765625,735:23.375000]
+[unified-op-profile] call#6 m_total=4 num_seqs=4 prefill=0 decode=4 max_kv=78 sampled=4 total=35299us qkv=3023us(62) qkr=447us(62) attn=1063us(62) o_proj=2317us(62) norm=1247us(124) gate_up=9394us(62) act=379us(62) down=5462us(62) resid=502us(62) final_norm=8us(1) final_copy=23us(1) lm_head=3022us(1) readback=2138us(1) generic_matmul=23218us(249) generic_attn=1063us(62) generic_qkr=447us(62) generic_norm=1255us(125) generic_other=904us(125) marlin_ws_zero=1404us(248) marlin_gather=1562us(248) marlin_kernel=16258us(248) marlin_qkv_ws=349us(62) marlin_qkv_gather=379us(62) marlin_qkv_kernel=2062us(62) marlin_o_ws=332us(62) marlin_o_gather=371us(62) marlin_o_kernel=1368us(62) marlin_gate_up_ws=405us(62) marlin_gate_up_gather=372us(62) marlin_gate_up_kernel=8358us(62) marlin_down_ws=318us(62) marlin_down_gather=440us(62) marlin_down_kernel=4470us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=6274us
+[unified-decode] call#6 items=4 prefill=0 decode=4 total_q=4 attempted_unified=true fallback=false fallback_reason=none elapsed=35662us
+[unified-prof] iter#6 items=4 prefill=0 decode=4 total=36748us model=35700us decode_post=1044us | sample=889 sched=1 stream=154 stop=0 complete=0 (us)
+[unified-logits] call#7 row=0 orig_idx=0 global=0 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[531:43.500000,496:26.078125,618:25.546875,1133:25.078125,13298:23.796875]
+[unified-logits] call#7 row=1 orig_idx=1 global=1 finite=262208 nan=0 pos_inf=0 neg_inf=0 top=[496:39.625000,614:30.812500,13298:28.859375,10723:28.390625,6269:28.203125]
+[unified-op-profile] call#7 m_total=4 num_seqs=4 prefill=0 decode=4 max_kv=79 sampled=4 total=35358us qkv=3025us(62) qkr=444us(62) attn=1200us(62) o_proj=2311us(62) norm=1243us(124) gate_up=9339us(62) act=372us(62) down=5459us(62) resid=499us(62) final_norm=8us(1) final_copy=22us(1) lm_head=3010us(1) readback=2170us(1) generic_matmul=23144us(249) generic_attn=1200us(62) generic_qkr=444us(62) generic_norm=1251us(125) generic_other=893us(125) marlin_ws_zero=1383us(248) marlin_gather=1559us(248) marlin_kernel=16255us(248) marlin_qkv_ws=351us(62) marlin_qkv_gather=372us(62) marlin_qkv_kernel=2060us(62) marlin_o_ws=327us(62) marlin_o_gather=380us(62) marlin_o_kernel=1370us(62) marlin_gate_up_ws=382us(62) marlin_gate_up_gather=371us(62) marlin_gate_up_kernel=8347us(62) marlin_down_ws=323us(62) marlin_down_gather=436us(62) marlin_down_kernel=4478us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=6256us
+[unified-decode] call#7 items=4 prefill=0 decode=4 total_q=4 attempted_unified=true fallback=false fallback_reason=none elapsed=35697us
+[unified-prof] iter#7 items=4 prefill=0 decode=4 total=36790us model=35746us decode_post=1038us | sample=900 sched=0 stream=138 stop=0 complete=0 (us)
+[bg-loop-gap] call#680 inter_iter=4us
+[unified-op-profile] call#8 m_total=4 num_seqs=4 prefill=0 decode=4 max_kv=80 sampled=4 total=29771us qkv=3017us(62) qkr=444us(62) attn=1059us(62) o_proj=2283us(62) norm=1254us(124) gate_up=9363us(62) act=389us(62) down=5453us(62) resid=499us(62) final_norm=8us(1) final_copy=21us(1) lm_head=3009us(1) readback=2164us(1) generic_matmul=23125us(249) generic_attn=1059us(62) generic_qkr=444us(62) generic_norm=1262us(125) generic_other=909us(125) marlin_ws_zero=1402us(248) marlin_gather=1535us(248) marlin_kernel=16269us(248) marlin_qkv_ws=354us(62) marlin_qkv_gather=372us(62) marlin_qkv_kernel=2062us(62) marlin_o_ws=324us(62) marlin_o_gather=372us(62) marlin_o_kernel=1369us(62) marlin_gate_up_ws=404us(62) marlin_gate_up_gather=372us(62) marlin_gate_up_kernel=8357us(62) marlin_down_ws=320us(62) marlin_down_gather=419us(62) marlin_down_kernel=4481us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=808us
+[unified-prof] iter#8 items=4 prefill=0 decode=4 total=31172us model=30127us decode_post=1040us | sample=905 sched=0 stream=135 stop=0 complete=0 (us)
+[unified-op-profile] call#9 m_total=4 num_seqs=4 prefill=0 decode=4 max_kv=81 sampled=4 total=29770us qkv=3030us(62) qkr=443us(62) attn=1063us(62) o_proj=2311us(62) norm=1251us(124) gate_up=9344us(62) act=372us(62) down=5463us(62) resid=499us(62) final_norm=8us(1) final_copy=22us(1) lm_head=3008us(1) readback=2157us(1) generic_matmul=23156us(249) generic_attn=1063us(62) generic_qkr=443us(62) generic_norm=1259us(125) generic_other=893us(125) marlin_ws_zero=1385us(248) marlin_gather=1560us(248) marlin_kernel=16278us(248) marlin_qkv_ws=333us(62) marlin_qkv_gather=376us(62) marlin_qkv_kernel=2072us(62) marlin_o_ws=328us(62) marlin_o_gather=378us(62) marlin_o_kernel=1376us(62) marlin_gate_up_ws=391us(62) marlin_gate_up_gather=372us(62) marlin_gate_up_kernel=8351us(62) marlin_down_ws=333us(62) marlin_down_gather=434us(62) marlin_down_kernel=4479us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=799us
+[unified-prof] iter#9 items=4 prefill=0 decode=4 total=31170us model=30128us decode_post=1037us | sample=899 sched=0 stream=138 stop=0 complete=0 (us)
+[unified-op-profile] call#10 m_total=4 num_seqs=4 prefill=0 decode=4 max_kv=82 sampled=4 total=30379us qkv=3086us(62) qkr=478us(62) attn=1074us(62) o_proj=2390us(62) norm=1375us(124) gate_up=9445us(62) act=381us(62) down=5528us(62) resid=516us(62) final_norm=8us(1) final_copy=24us(1) lm_head=3011us(1) readback=2192us(1) generic_matmul=23460us(249) generic_attn=1074us(62) generic_qkr=478us(62) generic_norm=1383us(125) generic_other=921us(125) marlin_ws_zero=1448us(248) marlin_gather=1558us(248) marlin_kernel=16367us(248) marlin_qkv_ws=352us(62) marlin_qkv_gather=374us(62) marlin_qkv_kernel=2089us(62) marlin_o_ws=337us(62) marlin_o_gather=373us(62) marlin_o_kernel=1406us(62) marlin_gate_up_ws=421us(62) marlin_gate_up_gather=378us(62) marlin_gate_up_kernel=8375us(62) marlin_down_ws=338us(62) marlin_down_gather=433us(62) marlin_down_kernel=4497us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=871us
+[unified-prof] iter#10 items=4 prefill=0 decode=4 total=31837us model=30756us decode_post=1074us | sample=932 sched=0 stream=142 stop=0 complete=0 (us)
+[unified-op-profile] call#11 m_total=4 num_seqs=4 prefill=0 decode=4 max_kv=83 sampled=4 total=29835us qkv=3014us(62) qkr=444us(62) attn=1075us(62) o_proj=2301us(62) norm=1263us(124) gate_up=9359us(62) act=379us(62) down=5453us(62) resid=502us(62) final_norm=8us(1) final_copy=22us(1) lm_head=3010us(1) readback=2185us(1) generic_matmul=23137us(249) generic_attn=1075us(62) generic_qkr=444us(62) generic_norm=1271us(125) generic_other=903us(125) marlin_ws_zero=1357us(248) marlin_gather=1551us(248) marlin_kernel=16281us(248) marlin_qkv_ws=334us(62) marlin_qkv_gather=372us(62) marlin_qkv_kernel=2065us(62) marlin_o_ws=323us(62) marlin_o_gather=372us(62) marlin_o_kernel=1375us(62) marlin_gate_up_ws=378us(62) marlin_gate_up_gather=379us(62) marlin_gate_up_kernel=8363us(62) marlin_down_ws=322us(62) marlin_down_gather=428us(62) marlin_down_kernel=4478us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=820us
+[unified-prof] iter#11 items=4 prefill=0 decode=4 total=31295us model=30219us decode_post=1072us | sample=916 sched=0 stream=156 stop=0 complete=0 (us)
+[unified-op-profile] call#12 m_total=4 num_seqs=4 prefill=0 decode=4 max_kv=84 sampled=4 total=30573us qkv=3016us(62) qkr=442us(62) attn=1080us(62) o_proj=2285us(62) norm=1264us(124) gate_up=9454us(62) act=379us(62) down=5455us(62) resid=499us(62) final_norm=8us(1) final_copy=22us(1) lm_head=3151us(1) readback=2649us(1) generic_matmul=23361us(249) generic_attn=1080us(62) generic_qkr=442us(62) generic_norm=1272us(125) generic_other=900us(125) marlin_ws_zero=1382us(248) marlin_gather=1544us(248) marlin_kernel=16376us(248) marlin_qkv_ws=356us(62) marlin_qkv_gather=372us(62) marlin_qkv_kernel=2056us(62) marlin_o_ws=323us(62) marlin_o_gather=372us(62) marlin_o_kernel=1369us(62) marlin_gate_up_ws=385us(62) marlin_gate_up_gather=371us(62) marlin_gate_up_kernel=8473us(62) marlin_down_ws=318us(62) marlin_down_gather=429us(62) marlin_down_kernel=4478us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=869us
+[unified-prof] iter#12 items=4 prefill=0 decode=4 total=32352us model=31142us decode_post=1205us | sample=972 sched=0 stream=233 stop=0 complete=0 (us)
+[unified-op-profile] call#13 m_total=4 num_seqs=4 prefill=0 decode=4 max_kv=85 sampled=4 total=30041us qkv=3042us(62) qkr=443us(62) attn=1112us(62) o_proj=2325us(62) norm=1245us(124) gate_up=9397us(62) act=373us(62) down=5527us(62) resid=504us(62) final_norm=8us(1) final_copy=23us(1) lm_head=3019us(1) readback=2164us(1) generic_matmul=23310us(249) generic_attn=1112us(62) generic_qkr=443us(62) generic_norm=1253us(125) generic_other=900us(125) marlin_ws_zero=1444us(248) marlin_gather=1557us(248) marlin_kernel=16327us(248) marlin_qkv_ws=356us(62) marlin_qkv_gather=373us(62) marlin_qkv_kernel=2061us(62) marlin_o_ws=336us(62) marlin_o_gather=372us(62) marlin_o_kernel=1372us(62) marlin_gate_up_ws=420us(62) marlin_gate_up_gather=380us(62) marlin_gate_up_kernel=8360us(62) marlin_down_ws=332us(62) marlin_down_gather=432us(62) marlin_down_kernel=4534us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=859us
+[unified-prof] iter#13 items=4 prefill=0 decode=4 total=31512us model=30436us decode_post=1069us | sample=913 sched=0 stream=156 stop=0 complete=0 (us)
+[unified-op-profile] call#14 m_total=4 num_seqs=4 prefill=0 decode=4 max_kv=86 sampled=4 total=29918us qkv=3019us(62) qkr=455us(62) attn=1111us(62) o_proj=2306us(62) norm=1253us(124) gate_up=9373us(62) act=383us(62) down=5469us(62) resid=502us(62) final_norm=9us(1) final_copy=22us(1) lm_head=3010us(1) readback=2196us(1) generic_matmul=23177us(249) generic_attn=1111us(62) generic_qkr=455us(62) generic_norm=1262us(125) generic_other=907us(125) marlin_ws_zero=1396us(248) marlin_gather=1553us(248) marlin_kernel=16261us(248) marlin_qkv_ws=341us(62) marlin_qkv_gather=372us(62) marlin_qkv_kernel=2060us(62) marlin_o_ws=326us(62) marlin_o_gather=371us(62) marlin_o_kernel=1368us(62) marlin_gate_up_ws=403us(62) marlin_gate_up_gather=376us(62) marlin_gate_up_kernel=8354us(62) marlin_down_ws=326us(62) marlin_down_gather=434us(62) marlin_down_kernel=4479us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=810us
+[unified-prof] iter#14 items=4 prefill=0 decode=4 total=31446us model=30315us decode_post=1124us | sample=957 sched=0 stream=167 stop=0 complete=0 (us)
+[unified-op-profile] call#15 m_total=4 num_seqs=4 prefill=0 decode=4 max_kv=87 sampled=4 total=30168us qkv=3036us(62) qkr=443us(62) attn=1115us(62) o_proj=2342us(62) norm=1274us(124) gate_up=9559us(62) act=377us(62) down=5483us(62) resid=513us(62) final_norm=8us(1) final_copy=22us(1) lm_head=3012us(1) readback=2152us(1) generic_matmul=23432us(249) generic_attn=1115us(62) generic_qkr=443us(62) generic_norm=1282us(125) generic_other=912us(125) marlin_ws_zero=1409us(248) marlin_gather=1552us(248) marlin_kernel=16459us(248) marlin_qkv_ws=347us(62) marlin_qkv_gather=373us(62) marlin_qkv_kernel=2067us(62) marlin_o_ws=320us(62) marlin_o_gather=373us(62) marlin_o_kernel=1388us(62) marlin_gate_up_ws=406us(62) marlin_gate_up_gather=380us(62) marlin_gate_up_kernel=8525us(62) marlin_down_ws=336us(62) marlin_down_gather=426us(62) marlin_down_kernel=4479us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=832us
+[unified-prof] iter#15 items=4 prefill=0 decode=4 total=31634us model=30545us decode_post=1084us | sample=930 sched=0 stream=154 stop=0 complete=0 (us)
+[bg-loop-gap] call#688 inter_iter=7us
+[unified-prof] iter#16 items=4 prefill=0 decode=4 total=31337us model=30243us decode_post=1088us | sample=940 sched=0 stream=148 stop=0 complete=0 (us)
+[unified-prof] iter#17 items=4 prefill=0 decode=4 total=31291us model=30198us decode_post=1087us | sample=928 sched=0 stream=159 stop=0 complete=0 (us)
+[unified-prof] iter#18 items=4 prefill=0 decode=4 total=31207us model=30033us decode_post=1166us | sample=927 sched=0 stream=152 stop=0 complete=87 (us)
+[unified-prof] iter#19 items=2 prefill=0 decode=2 total=29602us model=29056us decode_post=541us | sample=466 sched=0 stream=75 stop=0 complete=0 (us)
+[unified-prof] iter#20 items=2 prefill=0 decode=2 total=29189us model=28578us decode_post=606us | sample=454 sched=0 stream=78 stop=0 complete=74 (us)
+[unified-op-profile] call#21 m_total=373 num_seqs=5 prefill=5 decode=0 max_kv=75 sampled=5 total=161377us qkv=15872us(62) qkr=1251us(62) attn=8519us(62) o_proj=9487us(62) norm=2358us(124) gate_up=68098us(62) act=1738us(62) down=39570us(62) resid=1330us(62) final_norm=14us(1) final_copy=32us(1) lm_head=3141us(1) readback=7416us(1) generic_matmul=136168us(249) generic_attn=8519us(62) generic_qkr=1251us(62) generic_norm=2372us(125) generic_other=3100us(125) marlin_ws_zero=1695us(248) marlin_gather=8064us(248) marlin_kernel=121991us(248) marlin_qkv_ws=412us(62) marlin_qkv_gather=1068us(62) marlin_qkv_kernel=14069us(62) marlin_o_ws=383us(62) marlin_o_gather=726us(62) marlin_o_kernel=8066us(62) marlin_gate_up_ws=502us(62) marlin_gate_up_gather=1082us(62) marlin_gate_up_kernel=66188us(62) marlin_down_ws=398us(62) marlin_down_gather=5188us(62) marlin_down_kernel=33668us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=2551us
+[unified-decode] call#21 items=5 prefill=5 decode=0 total_q=373 attempted_unified=true fallback=false fallback_reason=none elapsed=171156us
+[first-token-prof] req=aefb98bf-b26c-4af2-a77e-01822a71947d source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=12421us model_batch=171198us queue_to_first_token=183863us
+[stream-ttft-prof] req=aefb98bf-b26c-4af2-a77e-01822a71947d prompt_tokens=74 generated_tokens=1 ttft=190732us
+[first-token-prof] req=4dcb2f79-0fe3-400e-bdd7-75f21b30319b source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=10177us model_batch=171198us queue_to_first_token=195335us
+[stream-ttft-prof] req=4dcb2f79-0fe3-400e-bdd7-75f21b30319b prompt_tokens=75 generated_tokens=1 ttft=201860us
+[first-token-prof] req=7407e52e-308a-4e57-8851-e3bd616e9f32 source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=8235us model_batch=171198us queue_to_first_token=206629us
+[stream-ttft-prof] req=7407e52e-308a-4e57-8851-e3bd616e9f32 prompt_tokens=74 generated_tokens=1 ttft=213161us
+[first-token-prof] req=829f306c-9d8c-40f3-bc8f-7c24df16e8fa source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=8235us model_batch=171198us queue_to_first_token=219799us
+[stream-ttft-prof] req=829f306c-9d8c-40f3-bc8f-7c24df16e8fa prompt_tokens=75 generated_tokens=1 ttft=226330us
+[first-token-prof] req=8951370b-9c75-4f88-a6ec-e0636499c839 source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=8094us model_batch=171198us queue_to_first_token=232870us
+[stream-ttft-prof] req=8951370b-9c75-4f88-a6ec-e0636499c839 prompt_tokens=75 generated_tokens=1 ttft=239320us
+[unified-prof] iter#21 items=5 prefill=5 decode=0 total=237575us model=171198us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)
+[unified-prof] iter#22 items=5 prefill=0 decode=5 total=34173us model=32616us decode_post=1549us | sample=1343 sched=1 stream=205 stop=0 complete=0 (us)
+[bg-loop-gap] call#696 inter_iter=3us
+[unified-op-profile] call#23 m_total=822 num_seqs=16 prefill=11 decode=5 max_kv=77 sampled=16 total=339796us qkv=30569us(62) qkr=2048us(62) attn=18567us(62) o_proj=16654us(62) norm=4492us(124) gate_up=143991us(62) act=5935us(62) down=82787us(62) resid=2542us(62) final_norm=20us(1) final_copy=66us(1) lm_head=3150us(1) readback=22039us(1) generic_matmul=277151us(249) generic_attn=18567us(62) generic_qkr=2048us(62) generic_norm=4512us(125) generic_other=8543us(125) marlin_ws_zero=1588us(248) marlin_gather=15710us(248) marlin_kernel=255630us(248) marlin_qkv_ws=386us(62) marlin_qkv_gather=1797us(62) marlin_qkv_kernel=28120us(62) marlin_o_ws=359us(62) marlin_o_gather=1065us(62) marlin_o_kernel=14974us(62) marlin_gate_up_ws=468us(62) marlin_gate_up_gather=1777us(62) marlin_gate_up_kernel=141474us(62) marlin_down_ws=375us(62) marlin_down_gather=11071us(62) marlin_down_kernel=71062us(62) marlin_lm_head_ws=0us(0) marlin_lm_head_gather=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_gather=0us(0) marlin_other_kernel=0us(0) unwrapped=6936us
+[unified-decode] call#23 items=16 prefill=11 decode=5 total_q=822 attempted_unified=true fallback=false fallback_reason=none elapsed=362599us
+[first-token-prof] req=b62b2cce-5ff6-43b1-81af-9a3285ac8e11 source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=321199us model_batch=362641us queue_to_first_token=684169us
+[stream-ttft-prof] req=b62b2cce-5ff6-43b1-81af-9a3285ac8e11 prompt_tokens=74 generated_tokens=1 ttft=690586us
+[first-token-prof] req=22fe5818-35d6-435a-9718-00dfe93a7c84 source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=320083us model_batch=362641us queue_to_first_token=696128us
+[stream-ttft-prof] req=22fe5818-35d6-435a-9718-00dfe93a7c84 prompt_tokens=74 generated_tokens=1 ttft=702558us
+[first-token-prof] req=1f746707-7962-4d59-851a-6bcc4c534ddb source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=319153us model_batch=362641us queue_to_first_token=708173us
+[stream-ttft-prof] req=1f746707-7962-4d59-851a-6bcc4c534ddb prompt_tokens=74 generated_tokens=1 ttft=714492us
+[first-token-prof] req=be7d797e-0d53-464e-b737-e549581a79ef source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=318755us model_batch=362641us queue_to_first_token=720644us
+[stream-ttft-prof] req=be7d797e-0d53-464e-b737-e549581a79ef prompt_tokens=74 generated_tokens=1 ttft=726960us
+[first-token-prof] req=63e15530-b244-4356-9a8f-e61d07030d99 source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=319096us model_batch=362641us queue_to_first_token=733854us
+[stream-ttft-prof] req=63e15530-b244-4356-9a8f-e61d07030d99 prompt_tokens=74 generated_tokens=1 ttft=740318us
+[first-token-prof] req=3a6eb227-74fa-4650-8a16-518efefbad55 source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=318783us model_batch=362641us queue_to_first_token=746857us
+[stream-ttft-prof] req=3a6eb227-74fa-4650-8a16-518efefbad55 prompt_tokens=75 generated_tokens=1 ttft=753213us
+[first-token-prof] req=1e1646ed-77fb-43ef-8a84-fda3c99039b3 source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=318767us model_batch=362641us queue_to_first_token=759763us
+[stream-ttft-prof] req=1e1646ed-77fb-43ef-8a84-fda3c99039b3 prompt_tokens=74 generated_tokens=1 ttft=766133us
+[first-token-prof] req=b9572fe7-00fe-45f2-9d3e-7530e2efa3a6 source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=317233us model_batch=362641us queue_to_first_token=771197us
+[stream-ttft-prof] req=b9572fe7-00fe-45f2-9d3e-7530e2efa3a6 prompt_tokens=74 generated_tokens=1 ttft=777549us
+[first-token-prof] req=9be36131-024f-4345-9ab8-25ad2497e9b0 source=unified_prefill prompt_tokens=74 chunk_start=0 chunk_len=74 queue_to_model_start=317353us model_batch=362641us queue_to_first_token=784228us
+[stream-ttft-prof] req=9be36131-024f-4345-9ab8-25ad2497e9b0 prompt_tokens=74 generated_tokens=1 ttft=790546us
+[first-token-prof] req=dc26c37a-16fd-49a5-888d-32588b8c43d5 source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=317086us model_batch=362641us queue_to_first_token=796917us
+[stream-ttft-prof] req=dc26c37a-16fd-49a5-888d-32588b8c43d5 prompt_tokens=75 generated_tokens=1 ttft=803243us
+[first-token-prof] req=6d5d3c1b-cbc9-4f46-a9ea-bb2b46f22ac0 source=unified_prefill prompt_tokens=75 chunk_start=0 chunk_len=75 queue_to_model_start=316564us model_batch=362641us queue_to_first_token=809262us
+[stream-ttft-prof] req=6d5d3c1b-cbc9-4f46-a9ea-bb2b46f22ac0 prompt_tokens=75 generated_tokens=1 ttft=815569us
+[unified-prof] iter#23 items=16 prefill=11 decode=5 total=506655us model=362641us decode_post=1345us | sample=1214 sched=0 stream=131 stop=0 complete=0 (us)
+[unified-prof] iter#24 items=16 prefill=0 decode=16 total=45450us model=40275us decode_post=5146us | sample=4510 sched=1 stream=635 stop=0 complete=0 (us)
+[unified-prof] iter#25 items=16 prefill=0 decode=16 total=44028us model=39459us decode_post=4542us | sample=3987 sched=2 stream=553 stop=0 complete=0 (us)
+[unified-prof] iter#26 items=16 prefill=0 decode=16 total=44283us model=39454us decode_post=4804us | sample=4203 sched=1 stream=600 stop=0 complete=0 (us)
+[unified-prof] iter#27 items=16 prefill=0 decode=16 total=44836us model=39601us decode_post=5207us | sample=4224 sched=1 stream=982 stop=0 complete=0 (us)
+[unified-prof] iter#28 items=16 prefill=0 decode=16 total=44229us model=39564us decode_post=4642us | sample=4035 sched=2 stream=605 stop=0 complete=0 (us)
+[unified-prof] iter#29 items=16 prefill=0 decode=16 total=44240us model=39607us decode_post=4606us | sample=4008 sched=2 stream=596 stop=0 complete=0 (us)
+[iter-prof] iter#703 total=50937us sched=66us process=50870us batch_size=16
+[unified-prof] iter#30 items=16 prefill=0 decode=16 total=44456us model=39491us decode_post=4943us | sample=4335 sched=2 stream=606 stop=0 complete=0 (us)
+[bg-loop-gap] call#704 inter_iter=3us
+[unified-prof] iter#31 items=16 prefill=0 decode=16 total=45118us model=39712us decode_post=5377us | sample=4637 sched=2 stream=738 stop=0 complete=0 (us)
+[unified-decode] call#32 items=16 prefill=0 decode=16 total_q=16 attempted_unified=true fallback=false fallback_reason=none elapsed=40086us
+[unified-prof] iter#32 items=16 prefill=0 decode=16 total=45097us model=40180us decode_post=4892us | sample=4076 sched=2 stream=814 stop=0 complete=0 (us)
+[unified-prof] iter#33 items=16 prefill=0 decode=16 total=44379us model=39619us decode_post=4735us | sample=4101 sched=2 stream=632 stop=0 complete=0 (us)
+[unified-prof] iter#34 items=16 prefill=0 decode=16 total=44636us model=39895us decode_post=4715us | sample=4067 sched=2 stream=646 stop=0 complete=0 (us)
+[unified-prof] iter#35 items=16 prefill=0 decode=16 total=45195us model=40108us decode_post=5063us | sample=4336 sched=2 stream=725 stop=0 complete=0 (us)
+[unified-prof] iter#36 items=16 prefill=0 decode=16 total=45305us model=40195us decode_post=5082us | sample=4116 sched=2 stream=702 stop=0 complete=262 (us)
+[unified-prof] iter#37 items=11 prefill=0 decode=11 total=39105us model=35784us decode_post=3306us | sample=2807 sched=2 stream=497 stop=0 complete=0 (us)
+[unified-prof] iter#38 items=11 prefill=0 decode=11 total=39669us model=35771us decode_post=3875us | sample=2826 sched=1 stream=664 stop=0 complete=384 (us)
+[bg-loop-gap] call#712 inter_iter=3us
+[bg-loop-gap] call#720 inter_iter=2us
+[bg-loop-gap] call#728 inter_iter=3us
+[bg-loop-gap] call#736 inter_iter=4us
+[bg-loop-gap] call#744 inter_iter=4us
+[bg-loop-gap] call#752 inter_iter=4us
+[bg-loop-gap] call#760 inter_iter=4us
+[bg-loop-gap] call#768 inter_iter=4us
+[bg-loop-gap] call#776 inter_iter=4us
+[bg-loop-gap] call#784 inter_iter=4us
+[bg-loop-gap] call#792 inter_iter=4us
+[bg-loop-gap] call#800 inter_iter=4us
+[bg-loop-gap] call#808 inter_iter=4us
+[bg-loop-gap] call#816 inter_iter=4us
+[bg-loop-gap] call#824 inter_iter=4us
+[bg-loop-gap] call#832 inter_iter=4us
+[bg-loop-gap] call#840 inter_iter=4us
+[bg-loop-gap] call#848 inter_iter=4us
+[bg-loop-gap] call#856 inter_iter=4us
+[bg-loop-gap] call#864 inter_iter=6us
+[bg-loop-gap] call#872 inter_iter=9us
+[bg-loop-gap] call#880 inter_iter=14us
+[bg-loop-gap] call#888 inter_iter=9us
+[bg-loop-gap] call#896 inter_iter=10us
+[bg-loop-gap] call#904 inter_iter=8us
+[bg-loop-gap] call#912 inter_iter=9us
+[bg-loop-gap] call#920 inter_iter=9us
+[bg-loop-gap] call#928 inter_iter=12us
+[bg-loop-gap] call#936 inter_iter=9us
+[bg-loop-gap] call#944 inter_iter=9us
+[bg-loop-gap] call#952 inter_iter=10us

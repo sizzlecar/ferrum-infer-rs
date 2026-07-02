@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Ferrum native operator manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "operator",
+    "operator_abi_version",
+    "ferrum_native_abi_version",
+    "backend",
+    "compute_capabilities",
+    "source_package",
+    "inputs_sha256",
+    "binary_sha256",
+    "linkage",
+    "exports",
+    "license_files",
+    "build_summary"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "operator": { "type": "string", "minLength": 1 },
+    "operator_abi_version": { "type": "string", "minLength": 1 },
+    "ferrum_native_abi_version": { "type": "string", "minLength": 1 },
+    "backend": { "enum": ["cuda", "metal", "cpu"] },
+    "cuda_toolkit": { "type": ["string", "null"] },
+    "cuda_runtime_min": { "type": ["string", "null"] },
+    "compute_capabilities": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^sm_[0-9]+$" }
+    },
+    "source_package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "revision", "sha256"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "revision": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" }
+      }
+    },
+    "inputs_sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+    "binary_sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+    "linkage": { "enum": ["static", "dynamic"] },
+    "exports": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "contains": { "const": "ferrum_native_op_init" }
+    },
+    "license_files": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "build_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["builder_sha", "elapsed_ms", "nvcc_version", "host_compiler"],
+      "properties": {
+        "builder_sha": { "type": "string", "minLength": 1 },
+        "elapsed_ms": { "type": "integer", "minimum": 0 },
+        "nvcc_version": { "type": ["string", "null"] },
+        "host_compiler": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

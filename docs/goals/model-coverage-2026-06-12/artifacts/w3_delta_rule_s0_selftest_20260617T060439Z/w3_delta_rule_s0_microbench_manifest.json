@@ -1,0 +1,66 @@
+{
+  "chunk_size": 3,
+  "chunked_reference_error": {
+    "max_abs": 0.0,
+    "max_rel": 0.0,
+    "rmse": 0.0
+  },
+  "command_line": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/w3_delta_rule_s0_microbench.py",
+    "--self-test",
+    "--out",
+    "docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_selftest_20260617T060439Z"
+  ],
+  "created_at": "2026-06-17T14:04:39.145513+08:00",
+  "cuda": null,
+  "cuda_error": null,
+  "git": {
+    "is_dirty": true,
+    "sha": "4c759f4e31c3bf19bd9e65eef29423db67ae830a",
+    "tracked_status_short": [],
+    "untracked_count": 1625,
+    "untracked_sample": [
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/ferrum_699add71_to_a7444587.bundle",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/query_41241013.raw.json",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_001.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_001.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_002.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_002.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_003.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_003.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_004.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_004.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_005.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_005.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_006.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_006.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_007.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_007.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_008.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_008.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_009.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_009.txt"
+    ]
+  },
+  "mode": "self-test",
+  "note": "self-test is not W3-S0 CUDA evidence",
+  "reference": {
+    "formula": "S_t = S_{t-1} + beta_t * k_t^T * (v_t - k_t @ S_{t-1}); o_t = q_t @ S_t",
+    "name": "internal-python-delta-rule-reference",
+    "revision": "self-test"
+  },
+  "schema_version": 1,
+  "seed": 9271,
+  "shape": {
+    "batch": 2,
+    "heads": 2,
+    "key_dim": 4,
+    "tokens": 8,
+    "value_dim": 4
+  },
+  "status": "pass",
+  "tolerance": {
+    "max_abs": 0.001
+  }
+}

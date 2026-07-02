@@ -1,0 +1,97 @@
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+From https://github.com/sizzlecar/ferrum-infer-rs
+   0486ed97..909747e6  goal/w2-w3-release-grade -> origin/goal/w2-w3-release-grade
+Updating 0486ed97..909747e6
+Fast-forward
+ .../src/continuous_engine/inner/batch.rs           |  22 +-
+ .../ferrum-engine/src/continuous_engine/tests.rs   | 111 ++++
+ docs/goals/model-coverage-2026-06-12/STATUS.md     | 121 ++++
+ .../env/build.exit                                 |   1 +
+ .../env/cargo-check.exit                           |   1 +
+ .../env/ferrum.sha256                              |   1 +
+ .../env/git_sha.txt                                |   1 +
+ .../env/git_status_short.txt                       |   0
+ .../env/tokenizer_path.txt                         |   1 +
+ .../hardware/nvidia_smi_before.txt                 |  20 +
+ .../logs/build.stderr.log                          |   5 +
+ .../logs/build.stdout.log                          |   0
+ .../logs/cargo-check.stderr.log                    |   3 +
+ .../logs/cargo-check.stdout.log                    |   0
+ .../logs/git-clean.log                             |   0
+ .../logs/git-fetch.log                             |   3 +
+ .../logs/git-reset.log                             |   1 +
+ .../logs/lane.log                                  |  14 +
+ .../logs/nvidia_after.csv                          |   1 +
+ .../logs/preflight.log                             |  30 +
+ .../perf/bench-ferrum-c32.command.txt              |   1 +
+ .../perf/bench.exit                                |   1 +
+ .../perf/bench.stderr.log                          |   4 +
+ .../perf/bench.stdout.log                          |   0
+ .../perf/bench_summary.json                        |  68 +++
+ .../run/decision_trace.jsonl                       |  12 +
+ .../run/effective_config.assert.txt                |   1 +
+ .../run/effective_config.json                      | 647 +++++++++++++++++++++
+ .../run/run.command.txt                            |   1 +
+ .../run/run.exit                                   |   1 +
+ .../run/run.stderr.log                             | 102 ++++
+ .../run/run.stdout.jsonl                           |   1 +
+ .../run_w3_qwen35_fresh_kv_defer_c32_0486ed97.sh   | 155 +++++
+ .../server/chat_smoke.curl.err                     |   0
+ .../server/chat_smoke_payload.json                 |   1 +
+ .../server/chat_smoke_response.json                |   1 +
+ .../server/decision_trace.jsonl                    |  12 +
+ .../server/effective_config.assert.txt             |   1 +
+ .../server/effective_config.json                   | 598 +++++++++++++++++++
+ .../server/models.curl.err                         |   0
+ .../server/models.json                             |   1 +
+ .../server/scheduler_trace.jsonl.gz                | Bin 0 -> 5458888 bytes
+ .../server/serve.command.txt                       |   1 +
+ .../server/serve.log.gz                            | Bin 0 -> 9455479 bytes
+ .../server/serve.stdout.log                        |  29 +
+ .../server/server.pid                              |   1 +
+ 46 files changed, 1966 insertions(+), 9 deletions(-)
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/env/build.exit
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/env/cargo-check.exit
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/env/ferrum.sha256
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/env/git_sha.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/env/git_status_short.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/env/tokenizer_path.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/hardware/nvidia_smi_before.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/logs/build.stderr.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/logs/build.stdout.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/logs/cargo-check.stderr.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/logs/cargo-check.stdout.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/logs/git-clean.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/logs/git-fetch.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/logs/git-reset.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/logs/lane.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/logs/nvidia_after.csv
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/logs/preflight.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/perf/bench-ferrum-c32.command.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/perf/bench.exit
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/perf/bench.stderr.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/perf/bench.stdout.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/perf/bench_summary.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/run/decision_trace.jsonl
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/run/effective_config.assert.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/run/effective_config.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/run/run.command.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/run/run.exit
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/run/run.stderr.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/run/run.stdout.jsonl
+ create mode 100755 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/scripts/run_w3_qwen35_fresh_kv_defer_c32_0486ed97.sh
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/server/chat_smoke.curl.err
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/server/chat_smoke_payload.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/server/chat_smoke_response.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/server/decision_trace.jsonl
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/server/effective_config.assert.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/server/effective_config.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/server/models.curl.err
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/server/models.json
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/server/scheduler_trace.jsonl.gz
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/server/serve.command.txt
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/server/serve.log.gz
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/server/serve.stdout.log
+ create mode 100644 docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_fresh_kv_defer_c32_0486ed97_20260624T182348Z/server/server.pid
+909747e61dbf7527be2e1af3362ff58b677e7658

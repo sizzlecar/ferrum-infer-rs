@@ -1,0 +1,8 @@
+{
+  "reject_reasons": [
+    "output_throughput_tps=467.0005918294168 <= floor=600.0",
+    "mixed_iterations=8 < 64",
+    "p95_itl_ms=57.247343599999965 > 25.0"
+  ],
+  "verdict": "reject"
+}

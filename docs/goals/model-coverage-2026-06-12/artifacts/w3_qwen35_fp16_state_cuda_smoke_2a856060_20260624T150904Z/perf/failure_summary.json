@@ -1,0 +1,32 @@
+{
+  "bench_exit": "143",
+  "last_admitted_total": 553,
+  "last_cancelled_total": 516,
+  "last_completed_total": 5,
+  "last_engine_decode_delta": 0,
+  "last_engine_prefill_delta": 0,
+  "last_plan_decode_items": 0,
+  "last_plan_prefill_items": 32,
+  "last_plan_scheduled_tokens_total": 192,
+  "last_prefill_generated_tokens_max": 18,
+  "manual_stop": "manual_stop_reason=scheduler_starvation_no_progress_completed5_cancelled516_prefill_delta0_gpu0",
+  "max_active_len": 32,
+  "max_admitted_total": 553,
+  "max_cancelled_total": 516,
+  "max_completed_total": 5,
+  "max_decode_queue_len": 32,
+  "max_failed_total": 0,
+  "max_iteration": 35003,
+  "max_prefill_queue_len": 32,
+  "max_waiting_queue_len": 32,
+  "prefill_with_generated_tokens_iterations": 34612,
+  "result_counts": {
+    "none": 6,
+    "some_ok": 34791
+  },
+  "scheduler_lines": 34797,
+  "serve_log_counts": {
+    "Unified prefill alloc deferred": 1095794,
+    "WARN": 1096311
+  }
+}

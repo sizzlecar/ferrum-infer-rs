@@ -3026,6 +3026,7 @@ impl CudaDecodeRunner {
         nq: usize,
         nkv: usize,
         hd: usize,
+        sliding_window: usize,
         block_size: usize,
         max_blocks_per_seq: usize,
         scale: f32,
@@ -3047,6 +3048,7 @@ impl CudaDecodeRunner {
         let hdi = hd as i32;
         let mbps = max_blocks_per_seq as i32;
         let bsi = block_size as i32;
+        let swi = sliding_window as i32;
         let mut b = stream.launch_builder(&func);
         b.arg(&qv);
         b.arg(&kp);
@@ -3062,6 +3064,7 @@ impl CudaDecodeRunner {
         b.arg(&mbps);
         b.arg(&bsi);
         b.arg(&scale);
+        b.arg(&swi);
         // Shared memory holds one f32 score per kv position the longest-
         // query block will visit. max_kv_len = max over seqs of
         // (pos_offset + q_len), passed by caller — bounds the worst case.

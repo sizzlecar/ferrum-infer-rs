@@ -1,0 +1,14 @@
+{
+  "path": "/workspace/w2_natural_prompt_baseline_probe_2026-06-15/dataset/ascii_sharegpt.jsonl",
+  "preview_rows": [
+    {
+      "input": "You are evaluating an inference server. Answer concisely using plain ASCII text. Summarize the following numbered facts and then give a short conclusion. 1. The system should preserve correctness before measuring throughput. 2. Each request should return useful text without reserved tokens. 3. The response should avoid special markup and non ASCII symbols. 4. The benchmark client records usage tokens from the server response. 5. The final answer should be stable under deterministic decoding. Case id 000. Provide exactly four short bullet lines in words, not symbols."
+    },
+    {
+      "input": "You are evaluating an inference server. Answer concisely using plain ASCII text. Summarize the following numbered facts and then give a short conclusion. 1. The system should preserve correctness before measuring throughput. 2. Each request should return useful text without reserved tokens. 3. The response should avoid special markup and non ASCII symbols. 4. The benchmark client records usage tokens from the server response. 5. The final answer should be stable under deterministic decoding. Case id 001. Provide exactly four short bullet lines in words, not symbols."
+    },
+    {
+      "input": "You are evaluating an inference server. Answer concisely using plain ASCII text. Summarize the following numbered facts and then give a short conclusion. 1. The system should preserve correctness before measuring throughput. 2. Each request should return useful text without reserved tokens. 3. The response should avoid special markup and non ASCII symbols. 4. The benchmark client records usage tokens from the server response. 5. The final answer should be stable under deterministic decoding. Case id 002. Provide exactly four short bullet lines in words, not symbols."
+    }
+  ]
+}

@@ -13,6 +13,7 @@ use ferrum_types::{
     RuntimeConfigSource, WorkloadProfile, M3_QWEN3_30B_A3B_INT4_PRESET,
     QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET,
 };
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -48,6 +49,11 @@ pub struct ServeCommand {
     /// Backend: auto, cpu, metal, cuda.
     #[arg(long, default_value = "auto")]
     pub backend: String,
+
+    /// Enable the explicit CPU/FP32 Qwen3.5/Qwen3.6 reference executor for W3
+    /// correctness bring-up. This is not a release-performance path.
+    #[arg(long)]
+    pub qwen35_reference: bool,
 
     /// CUDA GPU ids to use, comma-separated. Multi-GPU requests select
     /// layer-split for supported Llama-family safetensors models.
@@ -91,6 +97,14 @@ pub struct ServeCommand {
     /// Prefer prefilling until this many requests are active before early decodes.
     #[arg(long, value_name = "N")]
     pub scheduler_prefill_first_until_active: Option<usize>,
+
+    /// Cap per-request scheduler prefill chunks before they enter the engine.
+    #[arg(long, value_name = "N")]
+    pub scheduler_prefill_step_chunk: Option<usize>,
+
+    /// Cap prefill chunks while decode requests are active.
+    #[arg(long, value_name = "N")]
+    pub scheduler_active_decode_prefill_chunk: Option<usize>,
 
     /// Enable prefix caching (`FERRUM_PREFIX_CACHE=1`).
     #[arg(
@@ -137,6 +151,10 @@ pub struct ServeCommand {
     #[arg(long, value_name = "N")]
     pub kv_capacity: Option<usize>,
 
+    /// Global KV block budget (`FERRUM_KV_MAX_BLOCKS`).
+    #[arg(long, value_name = "N")]
+    pub kv_max_blocks: Option<usize>,
+
     /// Use GPU argmax for greedy decoding (`FERRUM_GREEDY_ARGMAX=1`).
     #[arg(long, conflicts_with = "disable_greedy_argmax")]
     pub greedy_argmax: bool,
@@ -144,6 +162,38 @@ pub struct ServeCommand {
     /// Disable GPU argmax for greedy decoding (`FERRUM_GREEDY_ARGMAX=0`).
     #[arg(long, conflicts_with = "greedy_argmax")]
     pub disable_greedy_argmax: bool,
+
+    /// Enable legacy Llama/Gemma batched decode CUDA graph replay.
+    #[arg(long, conflicts_with = "disable_batched_graph")]
+    pub batched_graph: bool,
+
+    /// Disable legacy Llama/Gemma batched decode CUDA graph replay.
+    #[arg(long, conflicts_with = "batched_graph")]
+    pub disable_batched_graph: bool,
+
+    /// Enable Llama/Gemma unified decode CUDA graph replay.
+    #[arg(long, conflicts_with = "disable_unified_graph")]
+    pub unified_graph: bool,
+
+    /// Disable Llama/Gemma unified decode CUDA graph replay.
+    #[arg(long, conflicts_with = "unified_graph")]
+    pub disable_unified_graph: bool,
+
+    /// Capture only Llama/Gemma unified transformer layers in CUDA graph replay.
+    #[arg(long, conflicts_with = "disable_unified_graph_layers_only")]
+    pub unified_graph_layers_only: bool,
+
+    /// Disable layers-only unified CUDA graph capture scope.
+    #[arg(long, conflicts_with = "unified_graph_layers_only")]
+    pub disable_unified_graph_layers_only: bool,
+
+    /// Capture unified layers plus final packing; leave lm_head eager.
+    #[arg(long, conflicts_with = "disable_unified_graph_lm_head_eager")]
+    pub unified_graph_lm_head_eager: bool,
+
+    /// Disable lm-head-eager unified CUDA graph capture scope.
+    #[arg(long, conflicts_with = "unified_graph_lm_head_eager")]
+    pub disable_unified_graph_lm_head_eager: bool,
 
     /// Named startup/runtime preset, for example
     /// `m3_qwen3_30b_a3b_int4`.
@@ -158,9 +208,33 @@ pub struct ServeCommand {
     #[arg(long, value_name = "PATH")]
     pub decision_trace_jsonl: Option<PathBuf>,
 
+    /// Generate a synthetic/no-weight observability vertical-slice artifact and exit.
+    #[arg(long, value_name = "DIR")]
+    pub observability_vertical_slice_out: Option<PathBuf>,
+
     /// Write native structured profile events to this JSONL path.
     #[arg(long, value_name = "PATH")]
     pub profile_jsonl: Option<PathBuf>,
+
+    /// Product observability detail level.
+    #[arg(long, value_enum, default_value_t = crate::observability_product::ProfileDetailArg::Off)]
+    pub profile_detail: crate::observability_product::ProfileDetailArg,
+
+    /// Write product memory profile events to this JSONL path.
+    #[arg(long, value_name = "PATH")]
+    pub memory_profile_jsonl: Option<PathBuf>,
+
+    /// Write scheduler iteration trace events to this JSONL path.
+    #[arg(long, value_name = "PATH")]
+    pub scheduler_trace_jsonl: Option<PathBuf>,
+
+    /// Write a sanitized request/replay bundle to this directory.
+    #[arg(long, value_name = "DIR")]
+    pub request_dump_dir: Option<PathBuf>,
+
+    /// Product observability sampling rate for resource lifecycle events.
+    #[arg(long, default_value_t = crate::observability_product::default_profile_sample_rate())]
+    pub profile_sample_rate: f64,
 
     /// Git commit stamped into native structured profile events.
     #[arg(long, value_name = "SHA")]
@@ -199,6 +273,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         port,
         tts_slots,
         backend,
+        qwen35_reference,
         gpu_devices,
         layer_split_pipeline_mode,
         spec_draft,
@@ -208,6 +283,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         max_num_seqs,
         max_num_batched_tokens,
         scheduler_prefill_first_until_active,
+        scheduler_prefill_step_chunk,
+        scheduler_active_decode_prefill_chunk,
         enable_prefix_caching,
         no_enable_prefix_caching,
         enable_prefix_cache,
@@ -217,12 +294,27 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         session_cache_max_tokens,
         kv_dtype,
         kv_capacity,
+        kv_max_blocks,
         greedy_argmax,
         disable_greedy_argmax,
+        batched_graph,
+        disable_batched_graph,
+        unified_graph,
+        disable_unified_graph,
+        unified_graph_layers_only,
+        disable_unified_graph_layers_only,
+        unified_graph_lm_head_eager,
+        disable_unified_graph_lm_head_eager,
         runtime_preset,
         effective_config_json,
         decision_trace_jsonl,
+        observability_vertical_slice_out,
         profile_jsonl,
+        profile_detail,
+        memory_profile_jsonl,
+        scheduler_trace_jsonl,
+        request_dump_dir,
+        profile_sample_rate,
         profile_commit_sha,
         profile_env_hash,
         profile_model,
@@ -232,14 +324,72 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         lora_model_id_template,
     } = cmd;
 
-    // Print banner
-    print_banner();
+    if let Some(out_dir) = observability_vertical_slice_out.as_ref() {
+        crate::observability_vertical_slice::write_observability_vertical_slice(
+            ferrum_types::ProfileEntrypoint::Serve,
+            out_dir,
+        )?;
+        println!(
+            "OBSERVABILITY VERTICAL SLICE ARTIFACT: {}",
+            out_dir.display()
+        );
+        return Ok(());
+    }
 
     // Resolve model
     let model_name = model
         .or(model_option)
         .or(config.models.default_model.clone())
         .unwrap_or_else(|| "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string());
+    let serve_start = std::time::Instant::now();
+    let product_observability = crate::observability_product::ProductObservabilityConfig::new(
+        ferrum_types::ProfileEntrypoint::Serve,
+        &model_name,
+        profile_jsonl.as_ref(),
+        profile_detail,
+        memory_profile_jsonl.as_ref(),
+        scheduler_trace_jsonl.as_ref(),
+        request_dump_dir.as_ref(),
+        profile_sample_rate,
+    );
+    let memory_sampler = crate::memory_profile::ProcessMemorySampler;
+    let startup_memory_before = product_observability
+        .enabled()
+        .then(|| memory_sampler.sample())
+        .flatten();
+    if product_observability.synthetic_no_weight_enabled() {
+        let written = crate::observability_product::write_synthetic_product_observability(
+            &product_observability,
+        )?;
+        println!(
+            "OBSERVABILITY PRODUCT ARTIFACTS: {}",
+            written
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        return Ok(());
+    }
+
+    // Select the requested device before model/cache resolution. Explicit
+    // backend requests must fail closed instead of doing model work and then
+    // silently running on CPU.
+    let mut device = super::run::select_device(&backend)?;
+    let gpu_selection =
+        crate::gpu_devices::resolve_cuda_gpu_devices(gpu_devices.as_deref(), &device)?;
+    if let Some(selection) = &gpu_selection {
+        device = selection.primary_device();
+        println!(
+            "{} {} ({})",
+            "CUDA GPUs:".dimmed(),
+            selection.selected_csv(),
+            selection.selected_distributed_strategy
+        );
+    }
+
+    // Print banner
+    print_banner();
 
     // GGUF short-circuit: if the user passed a `.gguf` file path directly OR
     // an alias resolving to a GGUF (e.g. `qwen3:8b-q4_k_m`), look up the
@@ -425,19 +575,6 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         );
     }
 
-    // Select device
-    let mut device = super::run::select_device(&backend);
-    let mut gpu_selection =
-        crate::gpu_devices::resolve_cuda_gpu_devices(gpu_devices.as_deref(), &device)?;
-    if let Some(selection) = &gpu_selection {
-        device = selection.primary_device();
-        println!(
-            "{} {} ({})",
-            "CUDA GPUs:".dimmed(),
-            selection.selected_csv(),
-            selection.selected_distributed_strategy
-        );
-    }
     println!("{} {:?}", "Device:".dimmed(), device);
     let serve_profile_entries = crate::source_resolver::serve_profile_runtime_entries(
         &source.local_path,
@@ -557,10 +694,13 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let mut startup_cli_runtime_entries = serve_cli_runtime_entries(
         kv_dtype.as_deref(),
         kv_capacity,
+        kv_max_blocks,
         max_model_len,
         max_num_seqs,
         max_num_batched_tokens,
         scheduler_prefill_first_until_active,
+        scheduler_prefill_step_chunk,
+        scheduler_active_decode_prefill_chunk,
         greedy_argmax_cli_override(greedy_argmax, disable_greedy_argmax),
         prefix_cache_cli_override(
             enable_prefix_caching,
@@ -572,6 +712,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         session_cache_max_entries,
         session_cache_max_tokens,
         profile_jsonl.as_ref(),
+        scheduler_trace_jsonl.as_ref(),
         profile_commit_sha.as_deref(),
         profile_env_hash.as_deref(),
         profile_model.as_deref(),
@@ -579,6 +720,39 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         profile_runtime_flags_json.as_deref(),
         layer_split_pipeline_mode,
     );
+    if let Some(enabled) = batched_graph_cli_override(batched_graph, disable_batched_graph) {
+        startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
+            "FERRUM_BATCHED_GRAPH",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if let Some(enabled) = batched_graph_cli_override(unified_graph, disable_unified_graph) {
+        startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
+            "FERRUM_UNIFIED_GRAPH",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if let Some(enabled) =
+        batched_graph_cli_override(unified_graph_layers_only, disable_unified_graph_layers_only)
+    {
+        startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
+            "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if let Some(enabled) = batched_graph_cli_override(
+        unified_graph_lm_head_eager,
+        disable_unified_graph_lm_head_eager,
+    ) {
+        startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
+            "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+            if enabled { "1" } else { "0" },
+            RuntimeConfigSource::Cli,
+        ));
+    }
     if let Some(selection) = &gpu_selection {
         startup_cli_runtime_entries.extend(selection.runtime_config_entries());
     }
@@ -592,12 +766,17 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // HF-cache models are not `local_dir_path`, but they still need the same
     // KV block sizing as direct local safetensors directories.
     crate::gpu_mem_autosize::apply_auto_size(&source.local_path, gpu_memory_utilization);
-    let autosize_runtime_entries = runtime_entries_added_by_snapshot(
+    let autosize_runtime_entries = runtime_entries_changed_by_snapshot(
         &autosize_env_before,
         &RuntimeConfigSnapshot::capture_current(),
         SERVE_AUTOSIZE_RUNTIME_KEYS,
         RuntimeConfigSource::MemoryProfile,
     );
+    let autosize_runtime_keys: Vec<String> = autosize_runtime_entries
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect();
+    startup_cli_runtime_entries.retain(|entry| !autosize_runtime_keys.contains(&entry.key));
     materialized_runtime_keys.extend(
         autosize_runtime_entries
             .iter()
@@ -611,6 +790,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         &device,
         arch_for_dispatch,
         model_definition.as_ref(),
+        model_weight_bytes_from_path(&source.local_path),
         selected_runtime_preset_name.as_deref(),
         non_env_runtime_entries,
         materialized_runtime_keys,
@@ -622,8 +802,13 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         effective_config_json.as_deref(),
         decision_trace_jsonl.as_deref(),
     )?;
+    let native_profile_jsonl = if product_observability.unified_product_profile_enabled() {
+        None
+    } else {
+        profile_jsonl
+    };
     configure_profile_sink(
-        profile_jsonl,
+        native_profile_jsonl,
         ProfileSinkCliFields {
             commit_sha: profile_commit_sha,
             env_hash: profile_env_hash,
@@ -738,6 +923,12 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 "model_path".to_string(),
                 serde_json::Value::String(engine_model_path.clone()),
             );
+            if qwen35_reference {
+                engine_config.backend.backend_options.insert(
+                    "qwen35_reference".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
             if let Some(selection) = &gpu_selection {
                 selection.insert_backend_options(&mut engine_config.backend.backend_options);
             }
@@ -769,11 +960,24 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     } else {
         server.with_lora_adapters(model_id.clone(), lora_server_models)
     };
+    crate::observability_product::write_actual_serve_startup_observability(
+        &product_observability,
+        serve_start
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX),
+        product_observability
+            .enabled()
+            .then(|| memory_sampler.observe(startup_memory_before))
+            .flatten(),
+    )?;
 
     // Create server config
     let server_config = ServerConfig {
         host: host.clone(),
         port,
+        request_dump_dir: request_dump_dir.clone(),
         ..Default::default()
     };
 
@@ -881,6 +1085,7 @@ fn startup_auto_config(
     device: &ferrum_types::Device,
     architecture: Option<ferrum_models::Architecture>,
     model_definition: Option<&ferrum_models::ModelDefinition>,
+    model_weight_bytes: Option<u64>,
     runtime_preset: Option<&str>,
     non_env_runtime_entries: Vec<RuntimeConfigEntry>,
     materialized_runtime_keys: Vec<String>,
@@ -890,10 +1095,16 @@ fn startup_auto_config(
     env_snapshot = remove_materialized_config_env_entries(env_snapshot, &materialized_runtime_keys);
     let runtime_config =
         merge_runtime_config_sources(non_env_runtime_entries, env_snapshot, cli_runtime_entries);
-    let model = model_definition
-        .map(model_capabilities_from_definition)
-        .unwrap_or_else(ModelCapabilities::unknown);
     let hardware = hardware_capabilities_for_device(device);
+    let model = model_definition
+        .map(|definition| {
+            model_capabilities_from_definition_with_weight_bytes_for_hardware(
+                definition,
+                model_weight_bytes,
+                &hardware,
+            )
+        })
+        .unwrap_or_else(ModelCapabilities::unknown);
     let workload = match runtime_preset {
         Some(M3_QWEN3_30B_A3B_INT4_PRESET) => WorkloadProfile::m3_qwen3_30b_a3b_int4(),
         Some(QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET) => {
@@ -950,7 +1161,7 @@ pub(crate) const SERVE_AUTOSIZE_RUNTIME_KEYS: &[&str] = &[
     "FERRUM_KV_CAPACITY",
 ];
 
-pub(crate) fn runtime_entries_added_by_snapshot(
+pub(crate) fn runtime_entries_changed_by_snapshot(
     before: &RuntimeConfigSnapshot,
     after: &RuntimeConfigSnapshot,
     keys: &[&str],
@@ -962,6 +1173,9 @@ pub(crate) fn runtime_entries_added_by_snapshot(
             let after_value = runtime_snapshot_value(after, key);
             match (before_value, after_value) {
                 (None, Some(value)) => Some(RuntimeConfigEntry::new(*key, value, source)),
+                (Some(before), Some(after)) if before != after => {
+                    Some(RuntimeConfigEntry::new(*key, after, source))
+                }
                 _ => None,
             }
         })
@@ -1012,16 +1226,20 @@ pub(crate) fn runtime_preset_entries(
 fn serve_cli_runtime_entries(
     kv_dtype: Option<&str>,
     kv_capacity: Option<usize>,
+    kv_max_blocks: Option<usize>,
     max_model_len: Option<usize>,
     max_num_seqs: Option<usize>,
     max_num_batched_tokens: Option<usize>,
     scheduler_prefill_first_until_active: Option<usize>,
+    scheduler_prefill_step_chunk: Option<usize>,
+    scheduler_active_decode_prefill_chunk: Option<usize>,
     greedy_argmax: Option<bool>,
     prefix_cache: Option<bool>,
     session_cache: Option<&str>,
     session_cache_max_entries: Option<usize>,
     session_cache_max_tokens: Option<usize>,
     profile_jsonl: Option<&PathBuf>,
+    scheduler_trace_jsonl: Option<&PathBuf>,
     profile_commit_sha: Option<&str>,
     profile_env_hash: Option<&str>,
     profile_model: Option<&str>,
@@ -1032,6 +1250,7 @@ fn serve_cli_runtime_entries(
     let mut entries = Vec::new();
     push_cli_runtime_entry(&mut entries, "FERRUM_KV_DTYPE", kv_dtype);
     push_cli_runtime_usize(&mut entries, "FERRUM_KV_CAPACITY", kv_capacity);
+    push_cli_runtime_usize(&mut entries, "FERRUM_KV_MAX_BLOCKS", kv_max_blocks);
     push_cli_runtime_usize(&mut entries, "FERRUM_MAX_MODEL_LEN", max_model_len);
     push_cli_runtime_usize(&mut entries, "FERRUM_PAGED_MAX_SEQS", max_num_seqs);
     push_cli_runtime_usize(
@@ -1043,6 +1262,16 @@ fn serve_cli_runtime_entries(
         &mut entries,
         "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
         scheduler_prefill_first_until_active,
+    );
+    push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_SCHED_PREFILL_STEP_CHUNK",
+        scheduler_prefill_step_chunk,
+    );
+    push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+        scheduler_active_decode_prefill_chunk,
     );
     if let Some(enabled) = greedy_argmax {
         entries.push(RuntimeConfigEntry::new(
@@ -1086,6 +1315,20 @@ fn serve_cli_runtime_entries(
             RuntimeConfigSource::Cli,
         ));
     }
+    if let Some(path) = scheduler_trace_jsonl {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_SCHEDULER_TRACE_JSONL",
+            path.to_string_lossy().to_string(),
+            RuntimeConfigSource::Cli,
+        ));
+    }
+    if profile_jsonl.is_some() || scheduler_trace_jsonl.is_some() {
+        entries.push(RuntimeConfigEntry::new(
+            "FERRUM_PROFILE_ENTRYPOINT",
+            "serve",
+            RuntimeConfigSource::Cli,
+        ));
+    }
     push_cli_runtime_entry(
         &mut entries,
         "FERRUM_PROFILE_COMMIT_SHA",
@@ -1125,6 +1368,16 @@ fn prefix_cache_cli_override(
 }
 
 fn greedy_argmax_cli_override(enable: bool, disable: bool) -> Option<bool> {
+    if enable {
+        Some(true)
+    } else if disable {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn batched_graph_cli_override(enable: bool, disable: bool) -> Option<bool> {
     if enable {
         Some(true)
     } else if disable {
@@ -1264,12 +1517,40 @@ fn configure_profile_sink(
     Ok(())
 }
 
-pub(crate) fn model_capabilities_from_definition(
+#[cfg(test)]
+pub(crate) fn model_capabilities_from_definition_with_weight_bytes(
     definition: &ferrum_models::ModelDefinition,
+    model_weight_bytes: Option<u64>,
+) -> ModelCapabilities {
+    model_capabilities_from_definition_with_weight_bytes_and_recurrent_state_dtype(
+        definition,
+        model_weight_bytes,
+        ferrum_types::DataType::FP32,
+    )
+}
+
+pub(crate) fn model_capabilities_from_definition_with_weight_bytes_for_hardware(
+    definition: &ferrum_models::ModelDefinition,
+    model_weight_bytes: Option<u64>,
+    hardware: &HardwareCapabilities,
+) -> ModelCapabilities {
+    model_capabilities_from_definition_with_weight_bytes_and_recurrent_state_dtype(
+        definition,
+        model_weight_bytes,
+        qwen35_recurrent_state_dtype_for_hardware(hardware),
+    )
+}
+
+fn model_capabilities_from_definition_with_weight_bytes_and_recurrent_state_dtype(
+    definition: &ferrum_models::ModelDefinition,
+    model_weight_bytes: Option<u64>,
+    recurrent_state_dtype: ferrum_types::DataType,
 ) -> ModelCapabilities {
     let architecture = match definition.architecture {
         ferrum_models::Architecture::Qwen3Moe => "qwen3_moe",
+        ferrum_models::Architecture::Qwen35Moe => "qwen3_5_moe",
         ferrum_models::Architecture::Gemma3 => "gemma3",
+        ferrum_models::Architecture::Qwen35 => "qwen3_5",
         ferrum_models::Architecture::Qwen3 => "qwen3",
         ferrum_models::Architecture::Qwen2 => "qwen2",
         ferrum_models::Architecture::Llama => "llama",
@@ -1292,7 +1573,10 @@ pub(crate) fn model_capabilities_from_definition(
             (definition.num_attention_heads > 0)
                 .then_some(definition.hidden_size / definition.num_attention_heads)
         });
-    let moe = if definition.architecture == ferrum_models::Architecture::Qwen3Moe {
+    let moe = if matches!(
+        definition.architecture,
+        ferrum_models::Architecture::Qwen3Moe | ferrum_models::Architecture::Qwen35Moe
+    ) {
         let num_experts = definition
             .extra_params
             .get("num_experts")
@@ -1315,6 +1599,8 @@ pub(crate) fn model_capabilities_from_definition(
     } else {
         None
     };
+    let recurrent_state_bytes_per_sequence =
+        recurrent_state_bytes_per_sequence_from_definition(definition, recurrent_state_dtype);
 
     ModelCapabilities {
         architecture,
@@ -1324,10 +1610,69 @@ pub(crate) fn model_capabilities_from_definition(
         num_hidden_layers: Some(definition.num_hidden_layers),
         head_dim,
         kv_heads: definition.num_key_value_heads,
-        estimated_weight_bytes: estimated_weight_bytes_from_definition(definition),
+        estimated_weight_bytes: model_weight_bytes
+            .filter(|value| *value > 0)
+            .or_else(|| estimated_weight_bytes_from_definition(definition)),
+        recurrent_state_bytes_per_sequence,
         supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
         graph_safe_moe: false,
     }
+}
+
+fn qwen35_recurrent_state_dtype_for_hardware(
+    hardware: &HardwareCapabilities,
+) -> ferrum_types::DataType {
+    if hardware.backend.eq_ignore_ascii_case("cuda") && hardware.compiled_features.cuda {
+        ferrum_types::DataType::FP16
+    } else {
+        ferrum_types::DataType::FP32
+    }
+}
+
+fn recurrent_state_bytes_per_sequence_from_definition(
+    definition: &ferrum_models::ModelDefinition,
+    dtype: ferrum_types::DataType,
+) -> Option<u64> {
+    if !matches!(
+        definition.architecture,
+        ferrum_models::Architecture::Qwen35 | ferrum_models::Architecture::Qwen35Moe
+    ) {
+        return None;
+    }
+    Some(
+        ferrum_models::qwen35_config::Qwen35TextConfig::from_model_definition(definition)
+            .ok()?
+            .recurrent_state_bytes_per_slot(dtype)
+            .ok()?,
+    )
+}
+
+pub(crate) fn model_weight_bytes_from_path(path: &Path) -> Option<u64> {
+    if path.is_file() {
+        return std::fs::metadata(path)
+            .ok()
+            .map(|metadata| metadata.len())
+            .filter(|value| *value > 0);
+    }
+    if !path.is_dir() {
+        return None;
+    }
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path).ok()?.flatten() {
+        let entry_path = entry.path();
+        let is_weight = entry_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|ext| ext == "safetensors" || ext == "bin")
+            .unwrap_or(false);
+        if !is_weight {
+            continue;
+        }
+        if let Ok(metadata) = std::fs::metadata(&entry_path) {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    (total > 0).then_some(total)
 }
 
 fn quantization_from_definition(definition: &ferrum_models::ModelDefinition) -> Option<String> {
@@ -1347,7 +1692,7 @@ fn quantization_from_definition(definition: &ferrum_models::ModelDefinition) -> 
 fn estimated_weight_bytes_from_definition(
     definition: &ferrum_models::ModelDefinition,
 ) -> Option<u64> {
-    let params = definition.to_model_info("__auto_config").num_parameters;
+    let params = estimated_total_parameters_from_definition(definition)?;
     if params == 0 {
         return None;
     }
@@ -1358,6 +1703,64 @@ fn estimated_weight_bytes_from_definition(
         .filter(|bits| *bits > 0)
         .unwrap_or(16);
     Some(params.saturating_mul(bits_per_param).div_ceil(8))
+}
+
+fn estimated_total_parameters_from_definition(
+    definition: &ferrum_models::ModelDefinition,
+) -> Option<u64> {
+    let dense_params = definition.to_model_info("__auto_config").num_parameters;
+    if !matches!(
+        definition.architecture,
+        ferrum_models::Architecture::Qwen3Moe | ferrum_models::Architecture::Qwen35Moe
+    ) {
+        return Some(dense_params);
+    }
+
+    let hidden = definition.hidden_size as u128;
+    let layers = definition.num_hidden_layers as u128;
+    let vocab = definition.vocab_size as u128;
+    let num_experts = definition
+        .extra_params
+        .get("num_experts")
+        .and_then(|value| value.as_u64())? as u128;
+    let moe_intermediate = definition
+        .extra_params
+        .get("moe_intermediate_size")
+        .and_then(|value| value.as_u64())
+        .or_else(|| {
+            (definition.intermediate_size > 0).then_some(definition.intermediate_size as u64)
+        })? as u128;
+    let shared_intermediate = definition
+        .extra_params
+        .get("shared_expert_intermediate_size")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as u128;
+
+    let embedding_params = vocab.saturating_mul(hidden);
+    let lm_head_params = embedding_params;
+    let attention_params = layers
+        .saturating_mul(4)
+        .saturating_mul(hidden)
+        .saturating_mul(hidden);
+    let norm_params = layers.saturating_mul(2).saturating_mul(hidden);
+    let router_params = layers.saturating_mul(hidden).saturating_mul(num_experts);
+    let expert_params = layers
+        .saturating_mul(num_experts)
+        .saturating_mul(3)
+        .saturating_mul(hidden)
+        .saturating_mul(moe_intermediate);
+    let shared_expert_params = layers
+        .saturating_mul(3)
+        .saturating_mul(hidden)
+        .saturating_mul(shared_intermediate);
+    let total = embedding_params
+        .saturating_add(lm_head_params)
+        .saturating_add(attention_params)
+        .saturating_add(norm_params)
+        .saturating_add(router_params)
+        .saturating_add(expert_params)
+        .saturating_add(shared_expert_params);
+    Some(total.min(u64::MAX as u128) as u64)
 }
 
 pub(crate) fn hardware_capabilities_for_device(
@@ -1553,7 +1956,7 @@ fn compiled_kernel_features() -> CompiledKernelFeatures {
         vllm_moe_marlin: cfg!(feature = "vllm-moe-marlin"),
         cuda_graph: cfg!(feature = "cuda"),
         greedy_argmax: cfg!(feature = "cuda") || cfg!(feature = "metal"),
-        fa2_source: cfg!(feature = "fa2-source"),
+        fa2_source: false,
         fa2_direct_ffi: cfg!(feature = "cuda"),
     }
 }
@@ -1725,21 +2128,46 @@ fn to_candle_device(device: &ferrum_types::Device) -> candle_core::Device {
 mod tests {
     use super::*;
 
+    const QWEN35_ARTIFACT_ROOT: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/goals/model-coverage-2026-06-12/artifacts/",
+        "w3_hf_config_probe_20260617T131209Z_f97c1d6f"
+    );
+
+    #[test]
+    fn serve_parses_explicit_qwen35_reference_flag() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            serve: ServeCommand,
+        }
+
+        let parsed = TestCli::parse_from(["ferrum", "--model", "qwen3.5", "--qwen35-reference"]);
+
+        assert!(parsed.serve.qwen35_reference);
+    }
+
     #[test]
     fn serve_cli_runtime_entries_are_cli_sourced_and_classified() {
         let entries = serve_cli_runtime_entries(
             Some("int8"),
             Some(1024),
             Some(4096),
+            Some(4096),
             Some(64),
             Some(2048),
             Some(8),
+            Some(16),
+            Some(24),
             Some(true),
             Some(false),
             Some("memory"),
             Some(16),
             Some(1024),
             Some(&PathBuf::from("/tmp/profile.jsonl")),
+            Some(&PathBuf::from("/tmp/scheduler-trace.jsonl")),
             Some("abc123"),
             Some("sha256:test"),
             Some("Qwen/Qwen3-30B-A3B-GPTQ-Int4"),
@@ -1763,11 +2191,24 @@ mod tests {
             .contains(&ferrum_types::RuntimeConfigEffect::Correctness));
         assert_eq!(entry("FERRUM_MAX_MODEL_LEN").effective_value, "4096");
         assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "1024");
+        assert_eq!(entry("FERRUM_KV_MAX_BLOCKS").effective_value, "4096");
+        assert_eq!(
+            entry("FERRUM_KV_MAX_BLOCKS").source,
+            RuntimeConfigSource::Cli
+        );
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
         assert_eq!(
             entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE").effective_value,
             "8"
+        );
+        assert_eq!(
+            entry("FERRUM_SCHED_PREFILL_STEP_CHUNK").effective_value,
+            "16"
+        );
+        assert_eq!(
+            entry("FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").effective_value,
+            "24"
         );
         assert_eq!(entry("FERRUM_GREEDY_ARGMAX").effective_value, "1");
         assert_eq!(entry("FERRUM_PREFIX_CACHE").effective_value, "0");
@@ -1789,6 +2230,11 @@ mod tests {
             "/tmp/profile.jsonl"
         );
         assert_eq!(
+            entry("FERRUM_SCHEDULER_TRACE_JSONL").effective_value,
+            "/tmp/scheduler-trace.jsonl"
+        );
+        assert_eq!(entry("FERRUM_PROFILE_ENTRYPOINT").effective_value, "serve");
+        assert_eq!(
             entry("FERRUM_PROFILE_ENV_HASH").effective_value,
             "sha256:test"
         );
@@ -1798,6 +2244,9 @@ mod tests {
             "batch"
         );
         assert!(entry("FERRUM_PROFILE_JSONL")
+            .affects
+            .contains(&ferrum_types::RuntimeConfigEffect::Diagnostics));
+        assert!(entry("FERRUM_SCHEDULER_TRACE_JSONL")
             .affects
             .contains(&ferrum_types::RuntimeConfigEffect::Diagnostics));
     }
@@ -1850,6 +2299,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(
@@ -1864,6 +2317,34 @@ mod tests {
             .unwrap();
         assert_eq!(kv.effective_value, "int8");
         assert_eq!(kv.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn serve_runtime_snapshot_applies_recurrent_state_slots_to_engine_config() {
+        let config_entries = crate::config::RuntimeCliConfig {
+            recurrent_state_max_slots: Some(16),
+            ..Default::default()
+        }
+        .runtime_config_entries();
+        let snapshot = merge_runtime_config_sources(
+            config_entries,
+            RuntimeConfigSnapshot::default(),
+            Vec::new(),
+        );
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_RECURRENT_STATE_MAX_SLOTS")
+            .expect("missing recurrent state slot entry");
+        let mut engine_config = ferrum_types::EngineConfig::default();
+
+        engine_config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("serve runtime config should apply to engine config");
+
+        assert_eq!(entry.effective_value, "16");
+        assert_eq!(entry.source, RuntimeConfigSource::ConfigFile);
+        assert_eq!(engine_config.runtime.recurrent_state_max_slots, Some(16));
     }
 
     #[test]
@@ -1904,12 +2385,16 @@ mod tests {
         let cli_entries = serve_cli_runtime_entries(
             None,
             Some(1024),
+            None,
             Some(4096),
             Some(8),
             Some(512),
             Some(8),
+            Some(16),
+            Some(32),
             Some(false),
             Some(false),
+            None,
             None,
             None,
             None,
@@ -1939,6 +2424,10 @@ mod tests {
             "512"
         );
         assert_eq!(
+            entry(&cli_over_env, "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK").effective_value,
+            "32"
+        );
+        assert_eq!(
             entry(&cli_over_env, "FERRUM_PREFIX_CACHE").effective_value,
             "0"
         );
@@ -1949,14 +2438,16 @@ mod tests {
     }
 
     #[test]
-    fn autosize_snapshot_diff_marks_only_new_values_as_memory_profile() {
+    fn autosize_snapshot_diff_marks_new_and_changed_values_as_memory_profile() {
         let before = RuntimeConfigSnapshot::from_entries([
             RuntimeConfigEntry::new("FERRUM_KV_MAX_BLOCKS", "2048", RuntimeConfigSource::Env),
             RuntimeConfigEntry::new("FERRUM_MOE_GRAPH", "1", RuntimeConfigSource::Env),
+            RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "512", RuntimeConfigSource::Cli),
         ]);
         let after = RuntimeConfigSnapshot::from_entries([
             RuntimeConfigEntry::new("FERRUM_KV_MAX_BLOCKS", "2048", RuntimeConfigSource::Env),
             RuntimeConfigEntry::new("FERRUM_MOE_GRAPH", "1", RuntimeConfigSource::Env),
+            RuntimeConfigEntry::new("FERRUM_KV_CAPACITY", "256", RuntimeConfigSource::Env),
             RuntimeConfigEntry::new(
                 "FERRUM_MAX_BATCHED_TOKENS",
                 "2048",
@@ -1965,7 +2456,7 @@ mod tests {
             RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "32", RuntimeConfigSource::Env),
         ]);
 
-        let entries = runtime_entries_added_by_snapshot(
+        let entries = runtime_entries_changed_by_snapshot(
             &before,
             &after,
             SERVE_AUTOSIZE_RUNTIME_KEYS,
@@ -1980,12 +2471,17 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {key}"))
         };
 
-        assert_eq!(snapshot.entries.len(), 2);
+        assert_eq!(snapshot.entries.len(), 3);
         assert_eq!(
             entry("FERRUM_MAX_BATCHED_TOKENS").source,
             RuntimeConfigSource::MemoryProfile
         );
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "32");
+        assert_eq!(entry("FERRUM_KV_CAPACITY").effective_value, "256");
+        assert_eq!(
+            entry("FERRUM_KV_CAPACITY").source,
+            RuntimeConfigSource::MemoryProfile
+        );
         assert!(snapshot
             .entries
             .iter()
@@ -2151,6 +2647,131 @@ mod tests {
             }
         });
         definition
+    }
+
+    fn qwen35_moe_reference_definition() -> ferrum_models::ModelDefinition {
+        let raw = std::fs::read_to_string(format!(
+            "{QWEN35_ARTIFACT_ROOT}/moe_shared_expert_reference.config.json"
+        ))
+        .expect("read Qwen3.5 MoE reference config");
+        let root: serde_json::Value =
+            serde_json::from_str(&raw).expect("parse Qwen3.5 MoE reference config");
+        let text = root
+            .get("text_config")
+            .and_then(|value| value.as_object())
+            .expect("Qwen3.5 reference config should include text_config");
+        let mut extra_params = root
+            .as_object()
+            .expect("Qwen3.5 reference config root should be an object")
+            .clone();
+        for (key, value) in text {
+            extra_params.insert(key.clone(), value.clone());
+        }
+
+        ferrum_models::ModelDefinition {
+            architecture: ferrum_models::Architecture::Qwen35Moe,
+            hidden_size: 2048,
+            intermediate_size: 512,
+            num_hidden_layers: 40,
+            num_attention_heads: 16,
+            num_key_value_heads: Some(2),
+            max_position_embeddings: 262144,
+            vocab_size: 248320,
+            extra_params: serde_json::Value::Object(extra_params),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn qwen35_moe_model_capabilities_preserve_moe_shape() {
+        let definition = qwen35_moe_reference_definition();
+
+        let capabilities = model_capabilities_from_definition_with_weight_bytes(&definition, None);
+
+        assert_eq!(capabilities.architecture, "qwen3_5_moe");
+        assert_eq!(capabilities.head_dim, Some(256));
+        assert_eq!(capabilities.num_hidden_layers, Some(40));
+        let moe = capabilities.moe.expect("Qwen3.5 MoE should be marked MoE");
+        assert_eq!(moe.num_experts, 256);
+        assert_eq!(moe.experts_per_token, 8);
+        assert_eq!(moe.moe_intermediate_size, Some(512));
+        assert!(
+            capabilities.estimated_weight_bytes.unwrap() > 14 * 1024 * 1024 * 1024,
+            "Qwen3.5 MoE weight estimate must account for all resident experts, not only active params"
+        );
+        assert_eq!(
+            capabilities.recurrent_state_bytes_per_sequence,
+            Some(30 * (8192 * 3 + 32 * 128 * 128) * 4)
+        );
+    }
+
+    #[test]
+    fn qwen35_moe_cuda_model_capabilities_use_cuda_recurrent_state_dtype() {
+        let definition = qwen35_moe_reference_definition();
+        let hardware =
+            HardwareCapabilities::rtx4090_cuda(CompiledKernelFeatures::m3_fast_path_without_fa2());
+
+        let capabilities = model_capabilities_from_definition_with_weight_bytes_for_hardware(
+            &definition,
+            None,
+            &hardware,
+        );
+
+        assert_eq!(
+            capabilities.recurrent_state_bytes_per_sequence,
+            Some(30 * (8192 * 3 + 32 * 128 * 128) * 2)
+        );
+    }
+
+    #[test]
+    fn model_capabilities_prefer_measured_weight_bytes_from_model_source() {
+        let mut definition = ferrum_models::ModelDefinition {
+            architecture: ferrum_models::Architecture::Qwen35Moe,
+            hidden_size: 2048,
+            intermediate_size: 512,
+            num_hidden_layers: 40,
+            num_attention_heads: 16,
+            num_key_value_heads: Some(2),
+            max_position_embeddings: 262144,
+            ..Default::default()
+        };
+        definition.extra_params = serde_json::json!({
+            "head_dim": 256,
+            "num_experts": 256,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 512,
+            "shared_expert_intermediate_size": 512,
+            "quantization_config": {
+                "bits": 4,
+                "quant_method": "gptq"
+            }
+        });
+
+        let capabilities =
+            model_capabilities_from_definition_with_weight_bytes(&definition, Some(19_123_456_789));
+
+        assert_eq!(capabilities.estimated_weight_bytes, Some(19_123_456_789));
+    }
+
+    #[test]
+    fn model_weight_bytes_from_path_sums_local_weight_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrum-weight-bytes-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp model dir");
+        std::fs::write(dir.join("model-00001-of-00002.safetensors"), vec![0u8; 7])
+            .expect("write safetensors shard");
+        std::fs::write(dir.join("model-00002-of-00002.safetensors"), vec![0u8; 11])
+            .expect("write safetensors shard");
+        std::fs::write(dir.join("tokenizer.json"), vec![0u8; 101]).expect("write non-weight file");
+
+        let result = model_weight_bytes_from_path(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(result, Some(18));
     }
 
     fn two_gpu_layer_split_selection() -> crate::gpu_devices::GpuDeviceSelection {
@@ -2466,6 +3087,10 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(Vec::new(), env_snapshot, cli_entries);
@@ -2505,7 +3130,11 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
             prefix_cache_cli_override(true, false, false, false),
+            None,
             None,
             None,
             None,
@@ -2525,7 +3154,11 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
             prefix_cache_cli_override(false, false, true, false),
+            None,
             None,
             None,
             None,
@@ -2545,7 +3178,11 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
             prefix_cache_cli_override(false, true, false, false),
+            None,
             None,
             None,
             None,
@@ -2565,7 +3202,11 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
             prefix_cache_cli_override(false, false, false, true),
+            None,
             None,
             None,
             None,
@@ -2580,6 +3221,13 @@ mod tests {
 
         assert_eq!(enabled_entries, product_enabled_entries);
         assert_eq!(disabled_entries, product_disabled_entries);
+    }
+
+    #[test]
+    fn batched_graph_cli_override_records_flag_state() {
+        assert_eq!(batched_graph_cli_override(true, false), Some(true));
+        assert_eq!(batched_graph_cli_override(false, true), Some(false));
+        assert_eq!(batched_graph_cli_override(false, false), None);
     }
 
     #[test]

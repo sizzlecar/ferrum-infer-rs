@@ -1,0 +1,246 @@
+{
+  "model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+  "backend": "cuda",
+  "scenario": "closed_loop",
+  "concurrency": 32,
+  "n_prompt": 256,
+  "n_gen": 128,
+  "actual_input_tokens": {
+    "requested": 256,
+    "min": 115,
+    "max": 115,
+    "mean": 115.0
+  },
+  "actual_input_tokens_per_request": [
+    [
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115
+    ]
+  ],
+  "output_tokens_per_request": [
+    [
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128
+    ]
+  ],
+  "output_token_count_source": "usage",
+  "n_repeats": 1,
+  "n_requests_per_run": 32,
+  "warmup_requests": 4,
+  "ttft_ms": {
+    "p50": {
+      "mean": 1957.8612175
+    },
+    "p75": {
+      "mean": 1957.932258
+    },
+    "p95": {
+      "mean": 1957.9943574
+    },
+    "p99": {
+      "mean": 1958.14931638
+    }
+  },
+  "tpot_ms": {
+    "p50": {
+      "mean": 29.177597440944883
+    },
+    "p75": {
+      "mean": 47.076856291338586
+    },
+    "p95": {
+      "mean": 50.57767883228346
+    },
+    "p99": {
+      "mean": 50.58632224598425
+    }
+  },
+  "itl_ms": {
+    "p50": {
+      "mean": 18.631693000000002
+    },
+    "p75": {
+      "mean": 19.0352545
+    },
+    "p95": {
+      "mean": 46.979611899999995
+    },
+    "p99": {
+      "mean": 105.7793274
+    }
+  },
+  "e2e_ms": {
+    "p50": {
+      "mean": 5663.433731
+    },
+    "p75": {
+      "mean": 7936.5991985
+    },
+    "p95": {
+      "mean": 8381.2660528
+    },
+    "p99": {
+      "mean": 8382.39512637
+    }
+  },
+  "output_throughput_tps": {
+    "mean": 488.5959440811624
+  },
+  "total_throughput_tps": {
+    "mean": 927.5688625915816
+  },
+  "request_throughput_rps": {
+    "mean": 3.817155813134081
+  },
+  "goodput_rps": {
+    "mean": 3.817155813134081
+  },
+  "slo": {
+    "ttft_p99_ms": null,
+    "tpot_p99_ms": null,
+    "e2e_p99_ms": null
+  },
+  "completed_per_run": [
+    32
+  ],
+  "errored_per_run": [
+    0
+  ],
+  "bad_output_per_run": [
+    0
+  ],
+  "malformed_stream_per_run": [
+    0
+  ],
+  "missing_done_per_run": [
+    0
+  ],
+  "duplicate_done_per_run": [
+    0
+  ],
+  "zero_output_tokens_per_run": [
+    0
+  ],
+  "stream_bulk_flush_per_run": [
+    0
+  ],
+  "http_500_per_run": [
+    0
+  ],
+  "panic_per_run": [
+    0
+  ],
+  "quality_issues_per_run": [
+    {
+      "bad_output": 0,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "duplicate_done": 0,
+      "zero_output_tokens": 0,
+      "stream_bulk_flush": 0,
+      "http_500": 0,
+      "panic": 0
+    }
+  ],
+  "env": {
+    "commit_sha": "9fda1101",
+    "hw_id": "rtx-4090",
+    "driver": "570.153.02",
+    "cuda": "12.4",
+    "rust": "1.96.0",
+    "ferrum_features": [
+      "cuda",
+      "vllm-moe-marlin",
+      "vllm-paged-attn-v2"
+    ],
+    "gpu_clock_lock_mhz": 2670,
+    "gpu_power_limit_w": 450,
+    "gpu_persistence_mode": true,
+    "ferrum_env": {
+      "FERRUM_SCHED_TRACE": "1",
+      "FERRUM_UNIFIED_PROF": "1"
+    },
+    "runtime_config": {
+      "entries": [
+        {
+          "key": "FERRUM_SCHED_TRACE",
+          "effective_value": "1",
+          "source": "env",
+          "affects": [
+            "performance",
+            "diagnostics"
+          ]
+        },
+        {
+          "key": "FERRUM_UNIFIED_PROF",
+          "effective_value": "1",
+          "source": "env",
+          "affects": [
+            "diagnostics"
+          ]
+        }
+      ]
+    }
+  },
+  "env_hash": "sha256:c3c3bbf04498c0d61527f1a58c51794ed5ea3734899182fceec108860732271a"
+}

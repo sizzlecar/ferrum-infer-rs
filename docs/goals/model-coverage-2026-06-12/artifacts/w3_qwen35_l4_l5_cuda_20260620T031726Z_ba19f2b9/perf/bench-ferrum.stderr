@@ -1,0 +1,55 @@
+ferrum bench-serve — dataset=sharegpt num_prompts=100 warmup=10 n_repeats=3
+→ closed_loop c=1
+  cell closed_loop c=1 — repeat 1/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 87.3s
+  cell closed_loop c=1 — repeat 2/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 87.1s
+  cell closed_loop c=1 — repeat 3/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 87.7s
+    summary c=1 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=206.9±2.7  p95=208.8±0.7  p99=209.8±2.2
+      TPOT_ms  p50=14.5±0.1  p95=14.6±0.3  p99=14.7±0.4
+      ITL_ms   p50=14.5±0.1  p95=14.7±0.2  p99=15.1±0.6
+      throughput      53.8 ± 0.5 tok/s
+      goodput         1.14 ± 0.01 req/s
+→ closed_loop c=4
+  cell closed_loop c=4 — repeat 1/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 47.1s
+  cell closed_loop c=4 — repeat 2/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 43.7s
+  cell closed_loop c=4 — repeat 3/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 47.4s
+    summary c=4 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=307.1±365.8  p95=624.9±76.7  p99=642.9±82.5
+      TPOT_ms  p50=33.2±13.5  p95=39.8±3.5  p99=42.1±1.8
+      ITL_ms   p50=25.6±5.7  p95=32.6±22.5  p99=224.4±6.9
+      throughput      99.1 ± 8.0 tok/s
+      goodput         2.17 ± 0.25 req/s
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 30.5s
+  cell closed_loop c=16 — repeat 2/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 32.5s
+  cell closed_loop c=16 — repeat 3/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 32.5s
+    summary c=16 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=1650.8±809.8  p95=2419.6±35.6  p99=2430.4±34.2
+      TPOT_ms  p50=75.5±16.1  p95=113.2±16.2  p99=118.3±21.8
+      ITL_ms   p50=56.0±11.7  p95=137.4±262.6  p99=688.3±70.8
+      throughput      142.2 ± 12.4 tok/s
+      goodput         3.14 ± 0.28 req/s
+→ closed_loop c=32
+  cell closed_loop c=32 — repeat 1/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 31.6s
+  cell closed_loop c=32 — repeat 2/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 31.6s
+  cell closed_loop c=32 — repeat 3/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 31.4s
+    summary c=32 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=3960.4±1400.6  p95=4718.6±893.5  p99=4942.3±169.2
+      TPOT_ms  p50=130.4±10.1  p95=177.4±84.3  p99=192.3±112.4
+      ITL_ms   p50=112.9±0.0  p95=199.0±243.2  p99=771.2±939.7
+      throughput      142.8 ± 5.0 tok/s
+      goodput         3.17 ± 0.03 req/s
+
+→ wrote /workspace/artifacts/w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9/perf/bench_ferrum_sharegpt_sweep_100x3.json

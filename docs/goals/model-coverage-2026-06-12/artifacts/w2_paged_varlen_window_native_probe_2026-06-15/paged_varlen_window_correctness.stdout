@@ -1,0 +1,8 @@
+[microbench] compiling scripts/microbenches/paged_varlen_window_correctness.cu + crates/ferrum-kernels/kernels/paged_varlen_attention.cu
+-rwxr-xr-x 1 root root 95016 Jun 15 10:23 /tmp/paged_varlen_window_correctness
+
+[microbench] running /tmp/paged_varlen_window_correctness
+sliding_window=0 one_pass_max_abs_err=0.00003045 split_k_max_abs_err=0.00003045
+sliding_window=3 one_pass_max_abs_err=0.00002996 split_k_max_abs_err=0.00002996
+semantic_delta_full_vs_window=0.02593978
+VERDICT: paged varlen window correctness PASS

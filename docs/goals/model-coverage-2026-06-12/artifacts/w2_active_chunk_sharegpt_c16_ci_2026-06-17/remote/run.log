@@ -1,0 +1,109 @@
+[w2-c16] start 2026-06-16T20:14:56Z
+[w2-c16] root=/workspace/ferrum-infer-rs out=/workspace/w2_active_chunk_sharegpt_c16_ci_2026-06-17 model=gemma3:27b-gptq hf_home=/workspace/hf-cache dataset=/workspace/ascii_sharegpt_w2_100.jsonl
+[w2-c16] installing rustup minimal toolchain
+[w2-c16] CUDA release build
+
+real	0m0.298s
+user	0m0.214s
+sys	0m0.077s
+[w2-c16] correctness: ferrum run
+[w2-c16] correctness: ferrum serve streaming smoke
+[w2-c16] performance: ferrum serve + ShareGPT c16 CI
+{
+  "actual_input_tokens": {
+    "max": 112,
+    "mean": 112.0,
+    "min": 112,
+    "requested": 256
+  },
+  "binary_sha256": "426c9b029d08ede6edb986a7dd80e5330e2a9f7489ce7de6224a1b482361d4c7",
+  "completed_per_run": [
+    100,
+    100,
+    100
+  ],
+  "dataset_sha256": "58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e",
+  "diagnostic_only": true,
+  "diagnostic_ratio_vs_historical_vllm_lcb": 0.7868516218682632,
+  "errored_per_run": [
+    0,
+    0,
+    0
+  ],
+  "gap_to_historical_80pct_threshold": 6.45782591940258,
+  "git_sha": "b99afdea19c11cdb4e6244ab2f5bedda20624bdb",
+  "git_status_short": [],
+  "historical_vllm_80pct_threshold": 392.92,
+  "historical_vllm_c16_lcb_same_dataset": 491.15,
+  "itl_ms": {
+    "p50": {
+      "ci95_hw": 0.18382200034112536,
+      "mean": 24.7954225,
+      "stddev": 0.07399234118981468
+    },
+    "p75": {
+      "ci95_hw": 3.03490309155851,
+      "mean": 26.5732785,
+      "stddev": 1.2216143041197303
+    },
+    "p95": {
+      "ci95_hw": 3.664062114521729,
+      "mean": 58.72799453333334,
+      "stddev": 1.4748644537392257
+    },
+    "p99": {
+      "ci95_hw": 17.752801058354137,
+      "mean": 79.18897418666667,
+      "stddev": 7.145887383158703
+    }
+  },
+  "output_throughput_tps_ci95_hw": 6.8386526650326855,
+  "output_throughput_tps_lcb": 386.46217408059744,
+  "output_throughput_tps_mean": 393.3008267456301,
+  "output_token_count_source": "usage",
+  "quality_counts": {
+    "bad_output_per_run": [
+      0,
+      0,
+      0
+    ],
+    "duplicate_done_per_run": [
+      0,
+      0,
+      0
+    ],
+    "http_500_per_run": [
+      0,
+      0,
+      0
+    ],
+    "malformed_stream_per_run": [
+      0,
+      0,
+      0
+    ],
+    "missing_done_per_run": [
+      0,
+      0,
+      0
+    ],
+    "panic_per_run": [
+      0,
+      0,
+      0
+    ],
+    "stream_bulk_flush_per_run": [
+      0,
+      0,
+      0
+    ],
+    "zero_output_tokens_per_run": [
+      0,
+      0,
+      0
+    ]
+  },
+  "reason_not_release_grade": "single Ferrum c16 diagnostic; W2 requires c=1/4/16/32, same-hardware vLLM baseline, full L0-L5 correctness, and MODEL_RELEASE_GRADE_W2 PASS",
+  "status": "pass"
+}
+[w2-c16] PASS diagnostic artifact: /workspace/w2_active_chunk_sharegpt_c16_ci_2026-06-17

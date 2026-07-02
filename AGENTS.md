@@ -9,6 +9,13 @@
 - Correctness gates must pass before performance measurements are treated as evidence.
 - Official accelerator release evidence must cover both correctness and performance on each shipped accelerator backend, and must include at least one Llama 8B-class dense model in addition to the Qwen3-30B-A3B MoE/GPTQ model.
 - Paid GPU work requires a stated lane, expected runtime/cost, stop condition, correctness gate, and performance command before starting.
+- Before creating, starting, or resuming paid GPU capacity, reconcile the current instance inventory and state which existing instance will be reused or why a new one is necessary.
+- Long-running performance or GPU work must convert time into saved evidence: a PASS line, KEEP/REJECT diagnostic artifact, or explicit blocker. Do not count elapsed time, setup, compilation, or partial stability as final-goal progress.
+- Status reports for long-running goals must be artifact-backed: cite the latest artifact or status entry, exact metric-versus-target gap or failure class, paid-machine state, and next stop condition. Do not answer with activity summaries alone.
+- If the user asks to stop and review progress, stop source edits, paid GPU work, and new machine actions immediately. Use the ledger and artifacts to produce the review first, then update durable rules or the goal status before resuming implementation.
+- If the user requests a local time ledger, maintain it at the repository root as `ACTION_TIME_LEDGER_<YYYYMMDD>.jsonl`, record start/end/duration/result for each meaningful action category, validate that it stays parseable JSONL, and do not commit it unless explicitly requested.
+- On long-lived goal branches, synchronize with `git pull --rebase --autostash` before staging or committing, and push validated commits promptly unless the user explicitly asks to keep work local.
+- After a paid GPU or performance diagnostic fails, copy back artifacts, record the exact failure class, stop billing or make a bounded cache-retention decision, and write the next artifact-based hypothesis before another paid run.
 - Prefer small, surgical changes. Do not combine release gate changes, kernel/model changes, and large repository cleanup in the same patch unless the goal explicitly asks for that.
 
 ## Project Structure
@@ -308,6 +315,11 @@ Rules:
   - performance command.
 - Do not leave paid GPU instances idle. Stop or destroy them after validation evidence is collected unless the user explicitly asks to keep them running.
 - If CUDA validation fails, collect the exact failing artifact/log, stop unnecessary processes, and avoid repeated full sweeps until the failure mode is understood.
+- After two consecutive paid GPU REJECT artifacts for the same failure class, do not start another paid GPU diagnostic until there is a narrow source-level hypothesis, a local test or plan-only validation showing the intended behavior, and a written prediction for which artifact metric or trace shape should change.
+- If a paid diagnostic remains far below the required floor or repeats the same blocker, do not spend another paid run to confirm the miss. Switch to artifact/source analysis until a specific code or configuration delta predicts a measurable artifact change.
+- Failure triage comes before machine churn. If a failure has a small, bounded follow-up that can reuse the same warmed instance, model cache, and build cache, record the keep-alive window and stop condition, then run only that follow-up. Otherwise stop the instance after artifacts are copied.
+- Account for restart, bootstrap, build, and model-cache cost when choosing between a bounded keep-alive window and stopping the instance. Do not destroy a reusable cached environment just to recover from a source-level or script-level mistake.
+- Prefer stopping a reusable Vast instance over destroying it when it contains model/build caches or unique artifacts. Destroy only when the instance has no useful cache/evidence, is misconfigured beyond repair, or the user explicitly asks for destruction.
 - Prefer CUDA smoke before CUDA full unless the task specifically requires full release evidence.
 
 ## Vast GPU Runner Policy
@@ -322,6 +334,7 @@ Credential and secret rules:
 
 Offer selection:
 
+- Before creating a new Vast instance, query existing instances and record whether each relevant instance is running, stopped, scheduling, loading, or exited. Prefer a matching retained instance with useful caches over a fresh rental.
 - Search rentable offers through the Vast HTTP API and filter locally for the exact hardware required by the lane, for example a 2x RTX 4090 host when a two-GPU CUDA lane requires it.
 - Prefer low hourly cost only after hardware count, GPU memory, disk capacity, CUDA capability, network bandwidth, and reliability are sufficient for the gate.
 - Do not broaden from the lane's required hardware, model matrix, or GPU count without explicit user approval.
@@ -339,8 +352,11 @@ Instance lifecycle:
 
 - Query an instance with `GET https://console.vast.ai/api/v0/instances/<INSTANCE_ID>/` and header `Authorization: Bearer $VAST_API_KEY`.
 - Start or stop an existing instance with `PUT https://console.vast.ai/api/v0/instances/<INSTANCE_ID>/` and JSON body `{"state":"running"}` or `{"state":"stopped"}`. Do not use guessed subpaths such as `/start/`.
+- For a single-lane diagnostic, keep at most one non-stopped paid instance unless the lane explicitly requires multiple machines or the user approves parallel capacity. Treat `scheduling`, `loading`, `running`, and unknown transitional states as potentially billable until the API proves otherwise.
+- If multiple unexpected paid or scheduling instances exist, pause new rentals and new GPU work. Pick the canonical instance, preserve any unique artifacts or caches that matter, then stop or destroy the extras according to their evidence/cache value.
 - After requesting start, wait for both `cur_state=running` and `actual_status=running`, then verify SSH and CUDA with `nvidia-smi` and `nvcc --version` before running paid work.
 - After requesting stop, keep polling until `actual_status=exited`; `cur_state=stopped` alone can appear while the container is still shutting down.
+- Prefer reusing a retained stopped or already-running instance with valid caches over creating a fresh machine, when it matches the lane hardware and reliability requirements. Do not reinstall or recreate the environment just to recover from a source-level mistake.
 
 Remote validation workflow:
 
@@ -359,7 +375,7 @@ Shutdown and artifact handling:
 
 - Always copy back the gate artifact directory, command logs, Vast instance metadata, and any failure logs before destroying the instance.
 - Destroy or stop the Vast instance immediately after PASS, failure triage, or the stated stop condition unless the user explicitly asks to keep it running.
-- After cleanup, verify through the Vast API that the instance is no longer running, and record that cleanup check in the local notes.
+- After cleanup, verify through the Vast API that the target instance is no longer running and that no unexpected paid/scheduling sibling instances remain. Record that cleanup check in the local notes.
 
 ## Release Regression Lessons
 
@@ -373,17 +389,42 @@ Shutdown and artifact handling:
 - Do not hard-code model-family prompt hacks such as forced empty Qwen3 `<think>` blocks. Prefer model-provided chat templates from GGUF/HF metadata, and keep template rendering shared between `run` and `serve`.
 - Do not infer release readiness for one model architecture from another. Dense Llama-style models and Qwen3 MoE/GPTQ models exercise different scheduler, KV, attention, quantization, tokenizer, and chat-template paths.
 - Do not hide invalid model output by filtering decoded text. If `<unk>`, `[PAD...]`, tokenizer-reserved IDs, invalid UTF-8, or mojibake appear, trace token IDs and fix sampling/logit masking or KV/logits state before accepting the regression.
+- OOM prevention belongs in admission, KV allocation, scheduler backpressure, or documented product limits before work is launched. Do not treat a kernel or allocator OOM as an acceptable way to discover capacity.
+- For KV/cache pressure fixes, add tests that simulate capacity exhaustion and verify waiting, retry, release, or backpressure behavior. Avoid model-name, GPU-name, VRAM-size, or quantization-specific workarounds unless a goal document explicitly accepts that product policy.
 - Release blocker scans should include panic, KV cache overflow, `<unk>`, `[PAD]`, invalid UTF-8/mojibake, missing or duplicate `[DONE]`, stream bulk-flush behavior, strict-schema failures, required-tool failures, and silent fallback from a requested feature to base behavior.
 
 ## Performance and M3 Work Protocol
 
 - Current CUDA M3 goal details belong in `docs/bench/m3-80pct-goal-2026-05-25/GOAL.md` and current status docs, not in `AGENTS.md`.
 - Use vLLM source and release behavior as the comparison baseline before inventing new kernels.
+- When historical vLLM artifacts or published/source behavior are sufficient for comparison, use them instead of spending GPU time on a live vLLM rerun. Only run live vLLM when the goal explicitly requires fresh same-pod vLLM evidence.
 - Do not run unscoped env-flip sweeps for M3 c=32. Use fresh profiler evidence to choose a lever.
 - Work one high-return lever at a time.
+- Before a new paid performance diagnostic, compare the latest relevant Ferrum artifact against the best historical Ferrum artifact and the vLLM source/release baseline. Record the specific runtime/config, scheduler trace, token length, profile, or log difference that the next lever is expected to change.
+- Do not use a GPU run to discover what should have been learned from existing artifacts. If the same failure class has an artifact, inspect that artifact first and write the falsifiable hypothesis before starting another instance.
+- Each performance diagnostic must have an expected signal and reject threshold, for example a target trace-shape change, throughput floor, error-count limit, or profile counter movement. If the threshold is missed, stop, classify the candidate as rejected or diagnostic-only, and do not stack another source change on top without a new artifact-based explanation.
+- Do not treat relative throughput improvement as final or meaningful goal progress when the absolute release floor is still missed. Record the remaining gap to the floor and identify the next bottleneck counter or trace shape before continuing.
+- Classify CUDA memory failures before fixing them: distinguish driver/CUDA OOM, allocator exhaustion, model-owned KV admission failure, scheduler capacity deferral, decode cancellation, and livelock. The fix direction must follow that classification.
+- For KV/cache capacity pressure, prefer dynamic admission, waiting, release, or backpressure logic that is derived from runtime state. Do not replace a scheduling bug with a hard-coded model, GPU, VRAM, or concurrency enumeration unless the goal document explicitly defines that product behavior.
+- Scheduler, KV, model-cache, and recurrent-state changes must define the resource-ownership invariant they rely on before paid GPU validation. A fix that moves requests between waiting, prefill, decode, or capacity-deferred states must have a local test showing which physical resources remain owned, which are released, and when re-admission is legal; a test for only the latest failure branch is not enough when the change touches shared resource state.
+- Treat effective-concurrency or slot caps as diagnostic levers unless the goal document explicitly accepts them as product behavior. Do not substitute a lower effective concurrency for a requested c=32 release/performance target without making the effective value visible in artifacts and status notes.
 - During long CUDA builds/tests, use the time for non-overlapping source tracing, vLLM comparison, kernel review, or microbench design.
 - Performance claims need same-pod A/B and `N >= 3` for deltas under 10%. Single-pod or single-run numbers may be used as smoke or diagnostic evidence only.
 - Correctness gates precede performance claims. At minimum run Paris and multi-turn gates for MoE, attention routing, scheduler, or runtime default changes.
+
+## Long-Running Work Review Protocol
+
+- When a goal spans long-running builds, paid GPU diagnostics, or repeated candidate failures, keep a local time ledger if the user requested one. The ledger must stay uncommitted unless explicitly requested otherwise.
+- Record time by action category such as source reading, code edit, local validation, remote setup, compile wait, GPU run, artifact handling, artifact analysis, status update, and git sync. Each entry must be specific enough to support a later retrospective without reconstructing events from shell history.
+- Use the ledger during long tasks to check whether time is converting into goal evidence. If repeated GPU runs or validation cycles do not move the target metric, pause implementation and do a written retrospective before continuing.
+- A retrospective must distinguish stability progress, correctness progress, performance progress, and final-goal progress. Do not present stability or diagnostic progress as target-performance progress.
+- A retrospective must end with an explicit decision: keep, revert, or narrow the last candidate; state whether any paid machine is stopped, kept with a deadline, or should not be started; and name the next artifact, counter, trace change, or PASS line that would count as progress.
+- If the ledger shows most time going into machine setup, waiting, repeated builds, or rerunning the same failure, stop and narrow the loop before spending more GPU time. The next step must either reduce setup churn, reuse existing caches, or produce a smaller artifact that can change the decision.
+- During long-running goals, periodically summarize elapsed time by category and name the next artifact or PASS line that would count as real progress. If the next action cannot plausibly move that evidence, stop and choose a narrower diagnostic.
+- When the user asks for current progress after a long run, answer from the ledger plus the latest artifact. Say plainly when there is no final-goal progress, and separate setup time, coding time, validation wait, artifact analysis, stability progress, and performance progress.
+- Status updates for long-running work must name the current artifact or PASS/KEEP/REJECT/blocker, the remaining gap to the target, the paid-machine state, and the next stop condition. Avoid vague progress claims.
+- If a candidate improves stability or error counts but remains far from the target throughput, label it as partial or diagnostic progress and identify the next bottleneck evidence before making another source change.
+- After a rejected candidate, either revert it or document why it remains useful before starting the next paid diagnostic. Avoid accumulating unproven scheduler/runtime changes that make later artifacts hard to interpret.
 
 ## Coding Style and Naming Conventions
 
@@ -411,6 +452,7 @@ Shutdown and artifact handling:
   - `docs(agents): ...`
 - Keep commits focused and imperative.
 - Avoid mixing unrelated crates in one commit when possible.
+- For long-running goal branches, synchronize with `git pull --rebase --autostash` before staging or committing, and push completed commits promptly after validation. Keep local ledgers, scratch scripts, and non-evidence state directories untracked unless the user explicitly asks to commit them.
 - PRs should include:
   - purpose,
   - affected crates/scripts/docs,

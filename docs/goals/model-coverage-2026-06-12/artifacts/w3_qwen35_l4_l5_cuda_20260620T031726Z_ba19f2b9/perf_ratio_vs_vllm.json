@@ -1,0 +1,67 @@
+{
+  "baseline_report": "docs/goals/model-coverage-2026-06-12/artifacts/w3_vllm_sharegpt_baseline_20260619/bench_vllm_sharegpt_sweep_100x3.json",
+  "cells": [
+    {
+      "concurrency": 1,
+      "ferrum_lcb_to_vllm_mean_ratio": 0.391817,
+      "ferrum_output_tps_ci95_hw": 0.463056,
+      "ferrum_output_tps_lcb": 53.343051,
+      "ferrum_output_tps_mean": 53.806107,
+      "ferrum_p95_itl_ms": 14.730462,
+      "mean_ratio": 0.395218,
+      "p95_itl_multiple": 2.168723,
+      "pass": false,
+      "vllm_output_tps_ci95_hw": 1.773941,
+      "vllm_output_tps_mean": 136.142931,
+      "vllm_p95_itl_ms": 6.792228
+    },
+    {
+      "concurrency": 4,
+      "ferrum_lcb_to_vllm_mean_ratio": 0.224698,
+      "ferrum_output_tps_ci95_hw": 8.033121,
+      "ferrum_output_tps_lcb": 91.097093,
+      "ferrum_output_tps_mean": 99.130214,
+      "ferrum_p95_itl_ms": 32.615224,
+      "mean_ratio": 0.244512,
+      "p95_itl_multiple": 3.576255,
+      "pass": false,
+      "vllm_output_tps_ci95_hw": 0.363143,
+      "vllm_output_tps_mean": 405.420294,
+      "vllm_p95_itl_ms": 9.119937
+    },
+    {
+      "concurrency": 16,
+      "ferrum_lcb_to_vllm_mean_ratio": 0.108987,
+      "ferrum_output_tps_ci95_hw": 12.406857,
+      "ferrum_output_tps_lcb": 129.769736,
+      "ferrum_output_tps_mean": 142.176592,
+      "ferrum_p95_itl_ms": 137.435077,
+      "mean_ratio": 0.119407,
+      "p95_itl_multiple": 11.558697,
+      "pass": false,
+      "vllm_output_tps_ci95_hw": 70.392817,
+      "vllm_output_tps_mean": 1190.692086,
+      "vllm_p95_itl_ms": 11.890188
+    },
+    {
+      "concurrency": 32,
+      "ferrum_lcb_to_vllm_mean_ratio": 0.080653,
+      "ferrum_output_tps_ci95_hw": 5.040752,
+      "ferrum_output_tps_lcb": 137.798096,
+      "ferrum_output_tps_mean": 142.838848,
+      "ferrum_p95_itl_ms": 198.98877,
+      "mean_ratio": 0.083603,
+      "p95_itl_multiple": 12.666505,
+      "pass": false,
+      "vllm_output_tps_ci95_hw": 21.131319,
+      "vllm_output_tps_mean": 1708.52785,
+      "vllm_p95_itl_ms": 15.70984
+    }
+  ],
+  "ferrum_report": "docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9/perf/bench_ferrum_sharegpt_sweep_100x3.json",
+  "model_id": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+  "reason": "Ferrum output throughput is below 80% of same-shape vLLM baseline for all required cells.",
+  "required_ratio": 0.8,
+  "schema_version": 1,
+  "status": "fail"
+}

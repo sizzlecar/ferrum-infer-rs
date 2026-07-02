@@ -1,0 +1,1 @@
+{"actual_status": "exited", "cur_state": "stopped", "id": 41422823, "intended_status": "stopped", "poll": 1, "ts": "2026-06-21T16:26:28.197156+00:00"}

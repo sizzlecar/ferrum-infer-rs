@@ -1,0 +1,15 @@
+{
+  "assistant": {
+    "chunk_count": 1,
+    "content": "5",
+    "event": "assistant",
+    "finish_reason": "stop",
+    "ms": 438.730256,
+    "n_tokens": 3,
+    "turn": 0
+  },
+  "bad_output": false,
+  "row_count": 1,
+  "run_rc": 0,
+  "status": "pass"
+}

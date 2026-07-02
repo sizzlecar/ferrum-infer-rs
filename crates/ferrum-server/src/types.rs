@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use ferrum_types::RequestId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// HTTP request representation
@@ -155,6 +156,10 @@ pub struct ServerConfig {
 
     /// API versioning
     pub api_version: ApiVersion,
+
+    /// Optional sanitized request/replay bundle output directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_dump_dir: Option<PathBuf>,
 }
 
 /// API version
@@ -401,6 +406,7 @@ impl Default for ServerConfig {
             compression: None,
             auth: None,
             api_version: ApiVersion::V1,
+            request_dump_dir: None,
         }
     }
 }

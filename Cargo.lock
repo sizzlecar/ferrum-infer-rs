@@ -1339,9 +1339,11 @@ dependencies = [
  "reqwest",
  "rexpect",
  "rstest",
+ "safetensors 0.4.5",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "shellexpand",
  "thiserror 1.0.69",
  "tokenizers",
@@ -1492,6 +1494,7 @@ dependencies = [
  "hf-hub",
  "image",
  "indicatif",
+ "memmap2",
  "once_cell",
  "parking_lot",
  "pathdiff",
@@ -1511,6 +1514,17 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "ferrum-native-ops"
+version = "0.7.7"
+dependencies = [
+ "ferrum-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1609,6 +1623,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",

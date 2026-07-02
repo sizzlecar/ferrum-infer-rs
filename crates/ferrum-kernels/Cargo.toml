@@ -47,11 +47,9 @@ vllm-paged-attn-v2 = ["cuda"]  # vLLM paged_attention_v2 port (2026-05-12).
                         # PTX kernel which writes the vLLM K/V layout vLLM v2
                         # expects (`[blocks, heads, head/x, block, x]` K).
                         # Runtime selection via `FERRUM_USE_VLLM_PAGED_ATTN=1`.
-fa2-source = ["cuda"]  # Source-linked FA2 bridge. Builds Ferrum's FA2 C ABI
-                        # shim plus FlashAttention source templates into a
-                        # static library. Runtime selection is opt-in with
-                        # `FERRUM_FA2_SOURCE=1`; no vLLM/Torch/Python runtime
-                        # shared object is loaded.
+fa2-source = ["cuda"]  # Backward-compatible obsolete alias. It no longer
+                        # compiles vendored FlashAttention/CUTLASS source;
+                        # FA2 must come from a Ferrum native operator artifact.
 tensor-parallel = ["cuda"]  # Kept as alias for backward compat; cuda already includes NCCL
 # Use triton-rs-compiled PTX in place of hand-written .cu kernels.
 # Requires `cuda` (we still launch via cudarc) and pre-generated PTX files

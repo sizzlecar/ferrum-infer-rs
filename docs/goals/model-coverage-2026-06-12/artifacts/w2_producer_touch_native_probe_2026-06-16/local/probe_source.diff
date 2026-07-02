@@ -1,0 +1,161 @@
+diff --git a/scripts/microbenches/gemma3_down_prefetch_overlap_perf.cu b/scripts/microbenches/gemma3_down_prefetch_overlap_perf.cu
+index f2e6494b..7d192c20 100644
+--- a/scripts/microbenches/gemma3_down_prefetch_overlap_perf.cu
++++ b/scripts/microbenches/gemma3_down_prefetch_overlap_perf.cu
+@@ -6,8 +6,13 @@
+ //   - it does not survive product-like multi-layer weight rotation;
+ //   - explicit down warmup is an upper bound but adds an extra down read.
+ //
+-// This probe tests the next concrete lever: a lightweight qweight/scales read
+-// kernel on a second stream, overlapped with gate_up+GeGLU, followed by down.
++// This probe tests two concrete levers:
++//   1. a lightweight qweight/scales read kernel on a second stream, overlapped
++//      with gate_up+GeGLU, followed by down;
++//   2. a producer-integrated GeGLU variant that touches down qweight/scales
++//      from the existing activation kernel instead of adding a standalone warm
++//      kernel.
++//
+ // It reports both down kernel time and host-synchronized segment time so a
+ // warmup that only improves down by adding equal or greater wall time can be
+ // rejected before touching product code.
+@@ -134,6 +139,8 @@ struct Mode {
+     bool warm_scales;
+     bool overlap_warm;
+     bool down_warm_upper_bound;
++    int producer_touch_rounds;
++    bool producer_touch_scales;
+ };
+
+ struct Timing {
+@@ -251,15 +258,87 @@ static void launch_marlin(
+     }
+ }
+
+-static void launch_geglu(cudaStream_t stream, Buffers& buffers, int m) {
++__global__ void fused_gelu_tanh_mul_interleaved_f16_touch_down(
++    const __half* __restrict__ gate_up,
++    __half* __restrict__ output,
++    const int inter,
++    const int total,
++    const uint4* __restrict__ down_qweight,
++    const int down_qweight_vec4,
++    const uint4* __restrict__ down_scales,
++    const int down_scales_vec4,
++    unsigned int* __restrict__ sink,
++    const int touch_rounds,
++    const int touch_scales) {
++    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    unsigned int acc = static_cast<unsigned int>(idx);
++    if (idx < total) {
++        const int b = idx / inter;
++        const int i = idx % inter;
++        const float g = __half2float(gate_up[b * 2 * inter + i]);
++        const float u = __half2float(gate_up[b * 2 * inter + inter + i]);
++        float inner = 0.7978845608f * (g + 0.044715f * g * g * g);
++        inner = fminf(fmaxf(inner, -9.5f), 9.5f);
++        const float gelu_g = 0.5f * g * (1.0f + tanhf(inner));
++        output[idx] = __float2half(gelu_g * u);
++
++        for (int r = 0; r < touch_rounds && down_qweight_vec4 > 0; ++r) {
++            const int pos = (idx + r * total) % down_qweight_vec4;
++            const uint4 v = down_qweight[pos];
++            acc ^= v.x;
++            acc = acc * 1664525u + v.y;
++            acc ^= v.z;
++            acc = acc * 1013904223u + v.w;
++        }
++        if (touch_scales && down_scales_vec4 > 0) {
++            const int pos = (idx + touch_rounds * total) % down_scales_vec4;
++            const uint4 v = down_scales[pos];
++            acc ^= v.x;
++            acc = acc * 1664525u + v.y;
++            acc ^= v.z;
++            acc = acc * 1013904223u + v.w;
++        }
++    }
++    if ((idx & 255) == 0) {
++        sink[(idx / 256) % PREFETCH_BLOCKS] = acc;
++    }
++}
++
++static void launch_geglu(
++    cudaStream_t stream,
++    Buffers& buffers,
++    LayerWeights& layer,
++    int m,
++    const Mode& mode) {
+     const int total = m * INTERMEDIATE;
+     const int block = 256;
+-    fused_gelu_tanh_mul_interleaved_f16<<<ceil_div_int(total, block), block, 0, stream>>>(
+-        buffers.gate_up_out, buffers.geglu_out, INTERMEDIATE, total);
++    const int grid = ceil_div_int(total, block);
++    if (mode.producer_touch_rounds > 0) {
++        fused_gelu_tanh_mul_interleaved_f16_touch_down<<<grid, block, 0, stream>>>(
++            buffers.gate_up_out,
++            buffers.geglu_out,
++            INTERMEDIATE,
++            total,
++            static_cast<const uint4*>(layer.down.qweight),
++            static_cast<int>(layer.down.qweight_bytes / sizeof(uint4)),
++            reinterpret_cast<const uint4*>(layer.down.scales),
++            static_cast<int>(layer.down.scales_bytes / sizeof(uint4)),
++            buffers.warm_sink,
++            mode.producer_touch_rounds,
++            mode.producer_touch_scales ? 1 : 0);
++    } else {
++        fused_gelu_tanh_mul_interleaved_f16<<<grid, block, 0, stream>>>(
++            buffers.gate_up_out, buffers.geglu_out, INTERMEDIATE, total);
++    }
+     CHK(cudaGetLastError());
+ }
+
+-static void prepare_geglu(cudaStream_t stream, Buffers& buffers, LayerWeights& layer, int m) {
++static void prepare_geglu(
++    cudaStream_t stream,
++    Buffers& buffers,
++    LayerWeights& layer,
++    int m,
++    const Mode& mode) {
+     const Shape gate_up_shape{"gate_up", HIDDEN, GATE_UP_N};
+     launch_marlin(
+         stream,
+@@ -269,7 +348,7 @@ static void prepare_geglu(cudaStream_t stream, Buffers& buffers, LayerWeights& l
+         buffers.gate_up_out,
+         m,
+         gate_up_shape);
+-    launch_geglu(stream, buffers, m);
++    launch_geglu(stream, buffers, layer, m, mode);
+ }
+
+ static void warm_bytes(cudaStream_t stream, const void* ptr, size_t bytes, unsigned int* sink) {
+@@ -366,7 +445,7 @@ static Timing time_mode(
+                 warm_down(main_stream, buffers, layer, mode.warm_scales);
+             }
+
+-            prepare_geglu(main_stream, buffers, layer, m);
++            prepare_geglu(main_stream, buffers, layer, m, mode);
+             if (mode.warm_qweight && mode.overlap_warm) {
+                 CHK(cudaStreamWaitEvent(main_stream, warm_done, 0));
+             }
+@@ -454,12 +533,15 @@ int main() {
+         MAX_LAYERS);
+
+     const Mode modes[] = {
+-        {"cycle8_no_prefetch", false, false, false, false, false},
+-        {"cycle8_policy_only", true, false, false, false, false},
+-        {"cycle8_overlap_qweight", true, true, false, true, false},
+-        {"cycle8_overlap_qweight_scales", true, true, true, true, false},
+-        {"cycle8_serial_qweight_scales", true, true, true, false, false},
+-        {"cycle8_down_warm_upper", true, false, false, false, true},
++        {"cycle8_no_prefetch", false, false, false, false, false, 0, false},
++        {"cycle8_policy_only", true, false, false, false, false, 0, false},
++        {"cycle8_overlap_qweight", true, true, false, true, false, 0, false},
++        {"cycle8_overlap_qweight_scales", true, true, true, true, false, 0, false},
++        {"cycle8_serial_qweight_scales", true, true, true, false, false, 0, false},
++        {"cycle8_producer_touch_qweight_1x", true, false, false, false, false, 1, false},
++        {"cycle8_producer_touch_qweight_4x", true, false, false, false, false, 4, false},
++        {"cycle8_producer_touch_qweight_scales_4x", true, false, false, false, false, 4, true},
++        {"cycle8_down_warm_upper", true, false, false, false, true, 0, false},
+     };
+
+     for (int m : m_values) {

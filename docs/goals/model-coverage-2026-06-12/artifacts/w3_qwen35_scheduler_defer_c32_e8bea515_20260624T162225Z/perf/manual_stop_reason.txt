@@ -1,0 +1,1 @@
+Manual stop: c32 bench made no progress after short stall sample. completed_total remained 5 while scheduler iterations/admitted_total increased rapidly, active_len returned to 0 after every scheduled prefill batch, GPU util stayed 0%, and logs repeated Unified prefill alloc deferred: no victim. Stop condition triggered to avoid waiting full 600s timeout.

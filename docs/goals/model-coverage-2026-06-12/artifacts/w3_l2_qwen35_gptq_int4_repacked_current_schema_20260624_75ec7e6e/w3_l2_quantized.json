@@ -1,0 +1,97 @@
+{
+  "commands": [
+    {
+      "command_line": [
+        "/workspace/ferrum-target-w3-varlen/release/ferrum",
+        "run",
+        "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+        "--backend",
+        "cuda",
+        "--gpu-devices",
+        "0",
+        "--gpu-memory-utilization",
+        "0.90",
+        "--max-model-len",
+        "2048",
+        "--max-num-seqs",
+        "4",
+        "--max-num-batched-tokens",
+        "2048",
+        "--kv-capacity",
+        "2048",
+        "--disable-thinking",
+        "--output-format",
+        "jsonl",
+        "--temperature",
+        "0",
+        "--max-tokens",
+        "8",
+        "--prompt",
+        "What is 2+3? Answer with only the number."
+      ],
+      "entrypoint": "ferrum run",
+      "model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
+    },
+    {
+      "command_line": [
+        "/workspace/ferrum-target-w3-varlen/release/ferrum",
+        "serve",
+        "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "33677",
+        "--backend",
+        "cuda",
+        "--gpu-devices",
+        "0",
+        "--gpu-memory-utilization",
+        "0.90",
+        "--max-model-len",
+        "2048",
+        "--max-num-seqs",
+        "4",
+        "--max-num-batched-tokens",
+        "2048",
+        "--kv-capacity",
+        "2048"
+      ],
+      "entrypoint": "ferrum serve",
+      "model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
+    }
+  ],
+  "generated_at": "2026-06-24T13:57:02.404769+08:00",
+  "hidden_env": [],
+  "level": "l2_quantized",
+  "model_id": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+  "model_source": null,
+  "output_hygiene": {
+    "artifact_text_scanned": true,
+    "case_entrypoints": [
+      "ferrum run",
+      "ferrum serve"
+    ],
+    "content_non_empty": true,
+    "forbidden_patterns_absent": true,
+    "known_answer_cases_checked": 11,
+    "response_artifacts_checked": 11
+  },
+  "pass_line": "W3 L2 QUANTIZED PASS: docs/goals/model-coverage-2026-06-12/artifacts/w3_l2_qwen35_gptq_int4_repacked_current_schema_20260624_75ec7e6e",
+  "product_entrypoints": [
+    "ferrum run",
+    "ferrum serve"
+  ],
+  "product_surface": "typed_cli",
+  "quantized_semantics": {
+    "format": "hf-gptq-int4",
+    "known_answer_passed": 11,
+    "known_answer_total": 11,
+    "model_source": null,
+    "real_size_model": true,
+    "semantic_pass": true,
+    "source_report": "docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e/real_product_report/known_answer_report.json",
+    "waived": false
+  },
+  "schema_version": 1,
+  "status": "pass"
+}

@@ -1,0 +1,2 @@
+poll=01 cur_state=stopped actual_status=running intended_status=stopped
+poll=02 cur_state=stopped actual_status=exited intended_status=stopped

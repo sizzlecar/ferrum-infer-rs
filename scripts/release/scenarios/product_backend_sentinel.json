@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "gate": "product_backend_sentinel",
+  "required_stage2_fixture_count": 12,
+  "scenarios": [
+    {
+      "name": "run_profile_replay_reference",
+      "type": "profile_artifact",
+      "product_scenarios": [
+        "run_multiturn",
+        "run_first_token"
+      ],
+      "profile_jsonl": [
+        "scripts/release/fixtures/observability_profile/pass/run_success_basic_profile.jsonl"
+      ],
+      "expected_entrypoints": [
+        "run"
+      ],
+      "min_replay_commands": 1
+    },
+    {
+      "name": "serve_nonstream_profile_replay_reference",
+      "type": "profile_artifact",
+      "product_scenarios": [
+        "serve_chat",
+        "serve_multiturn"
+      ],
+      "profile_jsonl": [
+        "scripts/release/fixtures/observability_profile/pass/serve_nonstream_success_basic_profile.jsonl"
+      ],
+      "expected_entrypoints": [
+        "serve"
+      ],
+      "min_replay_commands": 1
+    },
+    {
+      "name": "serve_stream_profile_replay_reference",
+      "type": "profile_artifact",
+      "product_scenarios": [
+        "serve_stream"
+      ],
+      "profile_jsonl": [
+        "scripts/release/fixtures/observability_profile/pass/serve_stream_success_basic_profile.jsonl"
+      ],
+      "expected_entrypoints": [
+        "serve"
+      ],
+      "min_replay_commands": 1
+    },
+    {
+      "name": "profile_replay_bundle_link",
+      "type": "profile_replay_link",
+      "product_scenarios": [
+        "serve_concurrency_quality"
+      ]
+    },
+    {
+      "name": "resource_oom_prevented_by_admission",
+      "type": "resource_trace",
+      "trace_jsonl": "scripts/release/fixtures/resource_invariant/pass/oom_prevented_by_admission.jsonl"
+    },
+    {
+      "name": "replay_bad_output_blocker",
+      "type": "replay_bundle",
+      "product_scenarios": [
+        "serve_structured_output"
+      ],
+      "fixture_kind": "bad_output"
+    },
+    {
+      "name": "replay_oom_admission_blocker",
+      "type": "replay_bundle",
+      "fixture_kind": "oom_admission"
+    },
+    {
+      "name": "replay_panic_error_blocker",
+      "type": "replay_bundle",
+      "fixture_kind": "panic_error"
+    },
+    {
+      "name": "native_operator_manifest_reference",
+      "type": "native_op_manifest",
+      "product_scenarios": [
+        "serve_tool_call"
+      ],
+      "manifest": "scripts/release/fixtures/native_operator/pass/dummy_manifest.json",
+      "operator": "dummy",
+      "backend": "cuda",
+      "compute_capability": "sm_89",
+      "source_package_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "inputs_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "binary_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    {
+      "name": "sse_missing_done_detected",
+      "type": "sse_fixture",
+      "fixture_kind": "missing_done",
+      "expected_error": "missing_done"
+    },
+    {
+      "name": "sse_duplicate_done_detected",
+      "type": "sse_fixture",
+      "fixture_kind": "duplicate_done",
+      "expected_error": "duplicate_done"
+    },
+    {
+      "name": "sse_malformed_json_detected",
+      "type": "sse_fixture",
+      "fixture_kind": "malformed_json",
+      "expected_error": "malformed_sse"
+    }
+  ]
+}

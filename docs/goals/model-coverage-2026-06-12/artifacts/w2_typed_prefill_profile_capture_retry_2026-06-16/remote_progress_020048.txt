@@ -1,0 +1,20 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+PID=536
+    PID     ELAPSED CMD
+    536       03:08 bash /tmp/w2_capture_retry_runner.sh
+build_rc=
+profile_rc=
+run_profile_rc=
+bench_rc=
+ready_poll=
+runner_end=
+--- build stderr ---
+   Compiling ferrum-models v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-models)
+   Compiling ferrum-engine v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-cli)
+--- profile stdout ---
+--- profile stderr ---
+--- server log ---

@@ -1,11 +1,11 @@
 //! Configuration types for Ferrum components
 
 use crate::{
-    parse_bool_env_value, parse_usize_env_value, DataType, Device, ModelId, ModelInfo,
-    RuntimeConfigSnapshot, SamplingParams, SamplingPresets,
+    parse_bool_env_value, parse_path_env_value, parse_usize_env_value, DataType, Device, ModelId,
+    ModelInfo, ProfileEntrypoint, RuntimeConfigSnapshot, SamplingParams, SamplingPresets,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 /// Engine runtime knobs the CLI/autosizer resolves and injects via the
 /// runtime-config snapshot. The continuous engine reads these from the typed
@@ -19,8 +19,15 @@ pub struct RuntimeKnobs {
     pub batch_decode_prof: bool,
     pub next_batch_prof: bool,
     pub rbd_prof: bool,
+    pub scheduler_trace_jsonl: Option<PathBuf>,
+    pub legacy_scheduler_trace_jsonl: Option<PathBuf>,
+    pub profile_entrypoint: Option<ProfileEntrypoint>,
     pub unified_post_prof: bool,
     pub prefix_cache_enabled: bool,
+    pub recurrent_state_max_slots: Option<usize>,
+    /// Legacy Qwen3.5-specific alias retained for existing configs. New
+    /// product/runtime code should use `recurrent_state_max_slots`.
+    pub qwen35_linear_state_max_slots: Option<usize>,
 
     // Engine-build composition knobs. Previously read directly from the
     // environment by `builder.rs` (FERRUM_MODEL_PATH / FERRUM_SPEC_DRAFT /
@@ -82,6 +89,21 @@ impl EngineConfig {
                 value,
             )?);
         }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_RECURRENT_STATE_MAX_SLOTS") {
+            self.runtime.recurrent_state_max_slots = Some(parse_required_positive_usize(
+                "FERRUM_RECURRENT_STATE_MAX_SLOTS",
+                value,
+            )?);
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS")
+        {
+            let parsed =
+                parse_required_positive_usize("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", value)?;
+            self.runtime.qwen35_linear_state_max_slots = Some(parsed);
+            if self.runtime.recurrent_state_max_slots.is_none() {
+                self.runtime.recurrent_state_max_slots = Some(parsed);
+            }
+        }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_CHUNKED_PREFILL") {
             self.runtime.chunked_prefill_size =
                 parse_usize_env_value(value).ok().filter(|&v| v > 0);
@@ -91,6 +113,18 @@ impl EngineConfig {
         self.runtime.next_batch_prof |=
             runtime_config_value(snapshot, "FERRUM_NEXT_BATCH_PROF").is_some();
         self.runtime.rbd_prof |= runtime_config_value(snapshot, "FERRUM_RBD_PROF").is_some();
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHEDULER_TRACE_JSONL") {
+            self.runtime.scheduler_trace_jsonl = Some(parse_path_env_value(value)?);
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_LEGACY_SCHEDULER_TRACE_JSONL") {
+            self.runtime.legacy_scheduler_trace_jsonl = Some(parse_path_env_value(value)?);
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_PROFILE_ENTRYPOINT") {
+            self.runtime.profile_entrypoint = Some(parse_profile_entrypoint(
+                "FERRUM_PROFILE_ENTRYPOINT",
+                value,
+            )?);
+        }
         self.runtime.unified_post_prof |=
             runtime_config_value(snapshot, "FERRUM_UNIFIED_POST_PROF").is_some();
         self.runtime.prefix_cache_enabled |=
@@ -168,11 +202,14 @@ pub struct SchedulerConfig {
     /// SLA enforcement enabled
     pub enable_sla_enforcement: bool,
     /// Use prompt-token metadata for initial continuous-batch admission estimates.
-    #[serde(default)]
+    #[serde(default = "default_prompt_token_estimate")]
     pub prompt_token_estimate: bool,
     /// Prefer new prefills over early decodes until this many requests are active.
     #[serde(default)]
     pub prefill_first_until_active: Option<usize>,
+    /// Cap per-request prefill chunks at the scheduler token-budget layer.
+    #[serde(default)]
+    pub prefill_step_chunk: Option<usize>,
     /// Cap prefill admission chunks only while decode requests are already active.
     #[serde(default)]
     pub active_decode_prefill_chunk: Option<usize>,
@@ -191,12 +228,17 @@ impl Default for SchedulerConfig {
             enable_load_balancing: false,
             fair_share_weights: HashMap::new(),
             enable_sla_enforcement: false,
-            prompt_token_estimate: false,
+            prompt_token_estimate: default_prompt_token_estimate(),
             prefill_first_until_active: None,
+            prefill_step_chunk: None,
             active_decode_prefill_chunk: None,
             scheduler_none_prof: false,
         }
     }
+}
+
+fn default_prompt_token_estimate() -> bool {
+    true
 }
 
 impl SchedulerConfig {
@@ -213,6 +255,10 @@ impl SchedulerConfig {
         {
             self.prefill_first_until_active =
                 parse_optional_positive_usize("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE", value)?;
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHED_PREFILL_STEP_CHUNK") {
+            self.prefill_step_chunk =
+                parse_optional_positive_usize("FERRUM_SCHED_PREFILL_STEP_CHUNK", value)?;
         }
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK") {
             self.active_decode_prefill_chunk =
@@ -249,6 +295,15 @@ fn parse_required_positive_usize(key: &str, value: &str) -> std::result::Result<
     } else {
         Ok(parsed)
     }
+}
+
+fn parse_profile_entrypoint(
+    key: &str,
+    value: &str,
+) -> std::result::Result<ProfileEntrypoint, String> {
+    ProfileEntrypoint::parse(value).ok_or_else(|| {
+        format!("{key}: expected one of run, serve, bench_serve, synthetic; got {value:?}")
+    })
 }
 
 fn parse_presence_bool(value: &str) -> std::result::Result<bool, String> {
@@ -649,5 +704,69 @@ impl Default for BatchConfig {
             enable_continuous: false,
             max_num_batched_tokens: Self::default_max_num_batched_tokens(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_config_applies_recurrent_state_max_slots_runtime_key() {
+        let mut config = EngineConfig::default();
+        let snapshot =
+            RuntimeConfigSnapshot::from_env_vars([("FERRUM_RECURRENT_STATE_MAX_SLOTS", "16")]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(config.runtime.recurrent_state_max_slots, Some(16));
+        assert_eq!(config.runtime.qwen35_linear_state_max_slots, None);
+    }
+
+    #[test]
+    fn engine_config_accepts_legacy_qwen35_linear_state_max_slots_alias() {
+        let mut config = EngineConfig::default();
+        let snapshot =
+            RuntimeConfigSnapshot::from_env_vars([("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "16")]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(config.runtime.recurrent_state_max_slots, Some(16));
+        assert_eq!(config.runtime.qwen35_linear_state_max_slots, Some(16));
+    }
+
+    #[test]
+    fn engine_config_prefers_generic_recurrent_state_slots_over_legacy_alias() {
+        let mut config = EngineConfig::default();
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([
+            ("FERRUM_RECURRENT_STATE_MAX_SLOTS", "8"),
+            ("FERRUM_QWEN35_LINEAR_STATE_MAX_SLOTS", "16"),
+        ]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(config.runtime.recurrent_state_max_slots, Some(8));
+        assert_eq!(config.runtime.qwen35_linear_state_max_slots, Some(16));
+    }
+
+    #[test]
+    fn engine_config_applies_profile_entrypoint_runtime_key() {
+        let mut config = EngineConfig::default();
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([("FERRUM_PROFILE_ENTRYPOINT", "run")]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(
+            config.runtime.profile_entrypoint,
+            Some(ProfileEntrypoint::Run)
+        );
     }
 }

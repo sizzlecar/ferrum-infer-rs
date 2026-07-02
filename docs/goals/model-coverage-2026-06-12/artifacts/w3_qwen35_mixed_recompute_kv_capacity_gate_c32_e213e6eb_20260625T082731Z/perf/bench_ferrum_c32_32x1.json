@@ -1,0 +1,246 @@
+{
+  "model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+  "backend": "cuda",
+  "scenario": "closed_loop",
+  "concurrency": 32,
+  "n_prompt": 256,
+  "n_gen": 128,
+  "actual_input_tokens": {
+    "requested": 256,
+    "min": 115,
+    "max": 115,
+    "mean": 115.0
+  },
+  "actual_input_tokens_per_request": [
+    [
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115,
+      115
+    ]
+  ],
+  "output_tokens_per_request": [
+    [
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128
+    ]
+  ],
+  "output_token_count_source": "usage",
+  "n_repeats": 1,
+  "n_requests_per_run": 32,
+  "warmup_requests": 4,
+  "ttft_ms": {
+    "p50": {
+      "mean": 2083.556331
+    },
+    "p75": {
+      "mean": 2083.602165
+    },
+    "p95": {
+      "mean": 2083.6916697
+    },
+    "p99": {
+      "mean": 2129.97358204
+    }
+  },
+  "tpot_ms": {
+    "p50": {
+      "mean": 44.21846637401575
+    },
+    "p75": {
+      "mean": 56.38585325984251
+    },
+    "p95": {
+      "mean": 59.832268518897635
+    },
+    "p99": {
+      "mean": 59.84072178015747
+    }
+  },
+  "itl_ms": {
+    "p50": {
+      "mean": 19.462160500000003
+    },
+    "p75": {
+      "mean": 20.6122215
+    },
+    "p95": {
+      "mean": 62.386368049999994
+    },
+    "p99": {
+      "mean": 138.40183156999998
+    }
+  },
+  "e2e_ms": {
+    "p50": {
+      "mean": 7732.9072405
+    },
+    "p75": {
+      "mean": 9244.54231125
+    },
+    "p95": {
+      "mean": 9682.263286599999
+    },
+    "p99": {
+      "mean": 9683.367631869998
+    }
+  },
+  "output_throughput_tps": {
+    "mean": 422.9602673856092
+  },
+  "total_throughput_tps": {
+    "mean": 802.9636326148675
+  },
+  "request_throughput_rps": {
+    "mean": 3.304377088950072
+  },
+  "goodput_rps": {
+    "mean": 3.304377088950072
+  },
+  "slo": {
+    "ttft_p99_ms": null,
+    "tpot_p99_ms": null,
+    "e2e_p99_ms": null
+  },
+  "completed_per_run": [
+    32
+  ],
+  "errored_per_run": [
+    0
+  ],
+  "bad_output_per_run": [
+    0
+  ],
+  "malformed_stream_per_run": [
+    0
+  ],
+  "missing_done_per_run": [
+    0
+  ],
+  "duplicate_done_per_run": [
+    0
+  ],
+  "zero_output_tokens_per_run": [
+    0
+  ],
+  "stream_bulk_flush_per_run": [
+    0
+  ],
+  "http_500_per_run": [
+    0
+  ],
+  "panic_per_run": [
+    0
+  ],
+  "quality_issues_per_run": [
+    {
+      "bad_output": 0,
+      "malformed_stream": 0,
+      "missing_done": 0,
+      "duplicate_done": 0,
+      "zero_output_tokens": 0,
+      "stream_bulk_flush": 0,
+      "http_500": 0,
+      "panic": 0
+    }
+  ],
+  "env": {
+    "commit_sha": "e213e6eb",
+    "hw_id": "rtx-4090",
+    "driver": "570.153.02",
+    "cuda": "12.4",
+    "rust": "1.96.0",
+    "ferrum_features": [
+      "cuda",
+      "vllm-moe-marlin",
+      "vllm-paged-attn-v2"
+    ],
+    "gpu_clock_lock_mhz": 2655,
+    "gpu_power_limit_w": 450,
+    "gpu_persistence_mode": true,
+    "ferrum_env": {
+      "FERRUM_SCHED_TRACE": "1",
+      "FERRUM_UNIFIED_PROF": "1"
+    },
+    "runtime_config": {
+      "entries": [
+        {
+          "key": "FERRUM_SCHED_TRACE",
+          "effective_value": "1",
+          "source": "env",
+          "affects": [
+            "performance",
+            "diagnostics"
+          ]
+        },
+        {
+          "key": "FERRUM_UNIFIED_PROF",
+          "effective_value": "1",
+          "source": "env",
+          "affects": [
+            "diagnostics"
+          ]
+        }
+      ]
+    }
+  },
+  "env_hash": "sha256:0629026d4f5e13cf10504971043f20f870c0a96af863b5343538a41ce33b8c8e"
+}

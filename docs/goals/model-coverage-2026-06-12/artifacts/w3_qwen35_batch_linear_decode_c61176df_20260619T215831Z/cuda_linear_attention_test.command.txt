@@ -1,0 +1,1 @@
+cargo test -p ferrum-kernels --features cuda --test linear_attention_cuda_eq -- --nocapture 

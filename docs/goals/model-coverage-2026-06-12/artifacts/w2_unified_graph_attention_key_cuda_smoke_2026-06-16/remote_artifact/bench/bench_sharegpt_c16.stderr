@@ -1,0 +1,13 @@
+ferrum bench-serve — dataset=sharegpt num_prompts=64 warmup=10 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/1 (74 prompts including 10 warmup)
+    64 completed / 0 errored / 13.9s
+    summary c=16 (n_repeats=1, no CI)
+      TTFT_ms  p50=293.1  p95=838.4  p99=838.9
+      TPOT_ms  p50=41.9  p95=44.9  p99=46.0
+      ITL_ms   p50=35.1  p95=83.1  p99=167.8
+      throughput      344.1 tok/s
+      goodput         4.61 req/s
+
+→ wrote /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/bench/bench_sharegpt_c16.json

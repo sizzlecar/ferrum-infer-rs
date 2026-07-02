@@ -17,12 +17,18 @@
       "estimated_weight_bytes": 23622320128,
       "kv_bytes_per_token": 98304,
       "kv_capacity_bytes": 3221225472,
+      "recurrent_state_budget_bytes": null,
+      "recurrent_state_budget_max_slots": null,
+      "recurrent_state_budget_raw_slots": null,
+      "recurrent_state_bytes_per_sequence": null,
+      "recurrent_state_capacity_bytes": null,
       "vram_bytes": 68719476736
     },
     "model_architecture": "qwen3_moe",
     "queue_depth": 0,
+    "recurrent_state_max_slots": null,
     "rejected_requests_total": 0,
-    "scheduler_policy": "continuous_default",
+    "scheduler_policy": "prefill_first_until_active:32+prefill_step_chunk:64",
     "schema_version": 1
   },
   "candidate_groups": [
@@ -235,6 +241,42 @@
     },
     {
       "affects": [
+        "performance",
+        "correctness"
+      ],
+      "candidates": [
+        "unified_decode_graph_layers_only",
+        "unified_decode_graph_lm_head_eager",
+        "unified_decode_graph",
+        "legacy_batched_decode_graph",
+        "graph_disabled"
+      ],
+      "rejected": [
+        {
+          "reason": "layers-only unified decode graph not selected",
+          "value": "unified_decode_graph_layers_only"
+        },
+        {
+          "reason": "lm-head-eager unified decode graph not selected",
+          "value": "unified_decode_graph_lm_head_eager"
+        },
+        {
+          "reason": "unified decode graph not selected",
+          "value": "unified_decode_graph"
+        },
+        {
+          "reason": "legacy batched decode graph not selected",
+          "value": "legacy_batched_decode_graph"
+        }
+      ],
+      "schema_version": 1,
+      "selected": "graph_disabled",
+      "selection": "decode_graph_policy",
+      "source": "default",
+      "source_key": null
+    },
+    {
+      "affects": [
         "memory"
       ],
       "candidates": [
@@ -305,11 +347,13 @@
         "continuous_default",
         "prompt_token_estimate",
         "prefill_first_until_active",
-        "active_decode_prefill_chunk"
+        "prefill_first_until_active+active_decode_prefill_chunk",
+        "active_decode_prefill_chunk",
+        "prefill_step_chunk"
       ],
       "rejected": [],
       "schema_version": 1,
-      "selected": "continuous_default",
+      "selected": "prefill_first_until_active:32+prefill_step_chunk:64",
       "selection": "scheduler_admission_policy",
       "source": "default",
       "source_key": null
@@ -332,12 +376,109 @@
       "schema_version": 1,
       "selected": "logits_readback",
       "selection": "sampling_readback_path",
-      "source": "workload_preset",
+      "source": "hardware_capability",
       "source_key": null
     }
   ],
   "description": "Metal + Qwen3-30B-A3B MoE GGUF",
-  "entries": [],
+  "entries": [
+    {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "0",
+      "key": "FERRUM_BATCHED_GRAPH",
+      "source": "memory_profile"
+    },
+    {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "0",
+      "key": "FERRUM_GREEDY_ARGMAX",
+      "source": "memory_profile"
+    },
+    {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "0",
+      "key": "FERRUM_MOE_DEVICE_ROUTE",
+      "source": "memory_profile"
+    },
+    {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "32",
+      "key": "FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE",
+      "source": "default"
+    },
+    {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "64",
+      "key": "FERRUM_SCHED_PREFILL_STEP_CHUNK",
+      "source": "default"
+    },
+    {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "0",
+      "key": "FERRUM_UNIFIED_GRAPH",
+      "source": "memory_profile"
+    },
+    {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "0",
+      "key": "FERRUM_UNIFIED_GRAPH_LAYERS_ONLY",
+      "source": "memory_profile"
+    },
+    {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "0",
+      "key": "FERRUM_UNIFIED_GRAPH_LM_HEAD_EAGER",
+      "source": "memory_profile"
+    },
+    {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "0",
+      "key": "FERRUM_USE_VLLM_PAGED_ATTN",
+      "source": "memory_profile"
+    },
+    {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "0",
+      "key": "FERRUM_VLLM_MOE",
+      "source": "memory_profile"
+    },
+    {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "0",
+      "key": "FERRUM_VLLM_MOE_PAIR_IDS",
+      "source": "memory_profile"
+    },
+    {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "0",
+      "key": "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
+      "source": "memory_profile"
+    }
+  ],
   "hardware_capabilities": {
     "backend": "metal",
     "compiled_features": {
@@ -376,6 +517,7 @@
     },
     "num_hidden_layers": 48,
     "quantization": "q4_k_m",
+    "recurrent_state_bytes_per_sequence": null,
     "supported_dtypes": [
       "fp16"
     ]
@@ -394,7 +536,7 @@
     "model_architecture": "qwen3_moe",
     "model_quantization": "q4_k_m",
     "moe_decode_path": "legacy_moe",
-    "scheduler": "continuous_default"
+    "scheduler": "prefill_first_until_active:32+prefill_step_chunk:64"
   },
   "workload_profile": {
     "output_length_class": "unknown",

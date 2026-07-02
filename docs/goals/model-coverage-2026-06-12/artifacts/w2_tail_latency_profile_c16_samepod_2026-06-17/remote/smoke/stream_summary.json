@@ -1,0 +1,11 @@
+{
+  "content": "5\n",
+  "done_count": 1,
+  "malformed": [],
+  "malformed_count": 0,
+  "usage": {
+    "completion_tokens": 3,
+    "prompt_tokens": 23,
+    "total_tokens": 26
+  }
+}

@@ -1,0 +1,4 @@
+{"scenario":"defer_with_committed_resource","owner_kind":"request","owner_id":"req-defer-committed","resource_kind":"request_slot","action":"request_open","capacity":1}
+{"scenario":"defer_with_committed_resource","owner_kind":"request","owner_id":"req-defer-committed","resource_kind":"scheduler_admission_slot","action":"reserve","amount":1,"before":1,"after":0,"capacity":1}
+{"scenario":"defer_with_committed_resource","owner_kind":"request","owner_id":"req-defer-committed","resource_kind":"scheduler_admission_slot","action":"commit","amount":1,"before":0,"after":0,"capacity":1}
+{"scenario":"defer_with_committed_resource","owner_kind":"request","owner_id":"req-defer-committed","resource_kind":"scheduler_admission_slot","action":"defer","reason":"capacity_wait_after_commit","capacity":1}

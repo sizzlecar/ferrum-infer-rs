@@ -24,10 +24,14 @@ use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngin
 use ferrum_types::{
     EngineMetrics, EngineStatus, FerrumConfigBuilder, FerrumError as Error, FinishReason,
     InferenceRequest, InferenceResponse, ModelId, Priority, RequestId, ResolvedFerrumConfig,
-    RuntimeConfigSnapshot, SamplingParams, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    RuntimeConfigSnapshot, SamplingParams, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY,
+    DEFAULT_MAX_TOKENS_METADATA_KEY, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 use tokio::sync::mpsc;
@@ -173,9 +177,12 @@ impl AxumServer {
     }
 
     /// Build the router with all routes
+    #[allow(dead_code)]
     fn build_router(&self) -> Router {
-        let app_state = self.state.clone();
+        self.build_router_with_state(self.state.clone())
+    }
 
+    fn build_router_with_state(&self, app_state: AppState) -> Router {
         Router::new()
             // OpenAI API routes
             .route("/v1/chat/completions", post(chat_completions_handler))
@@ -210,6 +217,7 @@ pub struct AppState {
     pub auto_config: Option<ResolvedFerrumConfig>,
     pub prompt_template: Option<Arc<ModelChatTemplate>>,
     pub lora_registry: Arc<LoraModelRegistry>,
+    pub request_dump_dir: Option<Arc<PathBuf>>,
     cache: Arc<CacheRuntimeState>,
 }
 
@@ -332,6 +340,11 @@ impl AppState {
         adapters: Vec<LoraAdapterModel>,
     ) -> Self {
         self.lora_registry = Arc::new(LoraModelRegistry::new(base_model_id, adapters));
+        self
+    }
+
+    pub fn with_request_dump_dir(mut self, request_dump_dir: Option<PathBuf>) -> Self {
+        self.request_dump_dir = request_dump_dir.map(Arc::new);
         self
     }
 
@@ -798,7 +811,11 @@ impl HttpServer for AxumServer {
         let addr = format!("{}:{}", config.host, config.port);
         info!("Starting Axum server on {}", addr);
 
-        let app = self.build_router();
+        let app = self.build_router_with_state(
+            self.state
+                .clone()
+                .with_request_dump_dir(config.request_dump_dir.clone()),
+        );
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| Error::internal(format!("Failed to bind to {}: {}", addr, e)))?;
@@ -915,6 +932,11 @@ async fn chat_completions_handler(
     state
         .cache
         .record_prefix_prompt(&inference_request.prompt, &cache_policy);
+    if let Err(err) =
+        write_chat_request_replay_bundle(&state, &headers, &request, &inference_request)
+    {
+        warn!("failed to write chat request replay bundle: {}", err);
+    }
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
@@ -922,6 +944,552 @@ async fn chat_completions_handler(
     } else {
         handle_chat_completions_sync(state, request, inference_request, session_context).await
     }
+}
+
+fn write_chat_request_replay_bundle(
+    state: &AppState,
+    headers: &HeaderMap,
+    openai_request: &ChatCompletionsRequest,
+    inference_request: &InferenceRequest,
+) -> std::result::Result<(), String> {
+    let Some(root) = state.request_dump_dir.as_ref() else {
+        return Ok(());
+    };
+    let request_id = inference_request.id.to_string();
+    let bundle_dir = root.join(&request_id);
+    fs::create_dir_all(&bundle_dir).map_err(|err| err.to_string())?;
+
+    let sanitized_body = sanitized_chat_request_body(openai_request);
+    let replay_body_path = bundle_dir.join("replay_body.json");
+    write_json_value(&replay_body_path, &sanitized_body)?;
+
+    let request = serde_json::json!({
+        "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        "entrypoint": "serve",
+        "request_id": request_id,
+        "model": openai_request.model.clone(),
+        "backend": "actual",
+        "endpoint": "/v1/chat/completions",
+        "method": "POST",
+        "stream": openai_request.stream.unwrap_or(false),
+        "actual_model_smoke": true,
+        "sanitized": true,
+        "http": {
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": sanitized_replay_headers(headers),
+            "body": sanitized_body
+        }
+    });
+    let files = [
+        ("request.json", request),
+        (
+            "prompt_token_ids.json",
+            serde_json::json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "model": openai_request.model.clone(),
+                "tokenizer_or_model": openai_request.model.clone(),
+                "token_ids": null,
+                "token_count": null,
+                "unavailable_reason": "server request replay captures the OpenAI body before prompt token ids are retained",
+                "sanitized": true
+            }),
+        ),
+        (
+            "sampling_params.json",
+            serde_json::json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "sampling_params": inference_request.sampling_params.clone(),
+                "unavailable_reason": null
+            }),
+        ),
+        (
+            "runtime_effective_config.json",
+            serde_json::json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "entrypoint": "serve",
+                "endpoint": "/v1/chat/completions",
+                "stream": openai_request.stream.unwrap_or(false),
+                "request_dump_dir": root.to_string_lossy(),
+                "sanitized": true
+            }),
+        ),
+        (
+            "backend_selection.json",
+            serde_json::json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "backend": "actual",
+                "model": openai_request.model.clone(),
+                "actual_model_smoke": true
+            }),
+        ),
+        (
+            "output_token_ids.json",
+            serde_json::json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "token_ids": [],
+                "token_count": 0,
+                "finish_reason": null,
+                "unavailable_reason": "server request replay bundle is emitted at request admission in this WP9 slice"
+            }),
+        ),
+        (
+            "bad_output_scan.json",
+            serde_json::json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "bad_output": false,
+                "bad_text_count": 0,
+                "reasons": [],
+                "first_bad_text_span": null,
+                "failure_kind": null,
+                "output_chars": 0,
+                "output_sha256": sha256_hex(b"")
+            }),
+        ),
+        (
+            "replay.command.json",
+            serde_json::json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "entrypoint": "serve",
+                "command": replay_curl_command(&bundle_dir),
+                "argv": replay_curl_argv(&bundle_dir),
+                "bundle_dir": bundle_dir.to_string_lossy(),
+                "requires_running_server": true,
+                "sanitized": true
+            }),
+        ),
+    ];
+    for (name, value) in files {
+        write_json_value(&bundle_dir.join(name), &value)?;
+    }
+    fs::write(
+        bundle_dir.join("output_text.txt"),
+        format!(
+            "[server request replay emitted before response]\nsha256={}\nchars=0\n",
+            sha256_hex(b"")
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn write_chat_request_failure_diagnostics(
+    state: &AppState,
+    request_id: &str,
+    failure_kind: &str,
+    phase: &str,
+    error_kind: &str,
+    message: &str,
+    engine_status: Option<&EngineStatus>,
+) -> std::result::Result<(), String> {
+    let admission_summary = state
+        .auto_config
+        .as_ref()
+        .map(|config| config.admission_summary_document());
+    write_chat_request_failure_diagnostics_at_root(
+        state.request_dump_dir.as_ref().map(|root| root.as_path()),
+        admission_summary.as_ref(),
+        engine_status,
+        request_id,
+        failure_kind,
+        phase,
+        error_kind,
+        message,
+    )
+}
+
+fn write_chat_request_failure_diagnostics_at_root(
+    request_dump_dir: Option<&Path>,
+    admission_summary: Option<&serde_json::Value>,
+    engine_status: Option<&EngineStatus>,
+    request_id: &str,
+    failure_kind: &str,
+    phase: &str,
+    error_kind: &str,
+    message: &str,
+) -> std::result::Result<(), String> {
+    let Some(root) = request_dump_dir else {
+        return Ok(());
+    };
+    let bundle_dir = root.join(request_id);
+    fs::create_dir_all(&bundle_dir).map_err(|err| err.to_string())?;
+    let message = sanitize_diagnostic_text(message);
+    let now = chrono::Utc::now();
+
+    let bad_scan_path = bundle_dir.join("bad_output_scan.json");
+    let mut bad_scan = fs::read_to_string(&bad_scan_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let bad_scan_obj = bad_scan
+        .as_object_mut()
+        .expect("bad scan fallback should be an object");
+    bad_scan_obj.insert(
+        "schema_version".to_string(),
+        serde_json::json!(OBSERVABILITY_PROFILE_SCHEMA_VERSION),
+    );
+    bad_scan_obj.insert("request_id".to_string(), serde_json::json!(request_id));
+    bad_scan_obj
+        .entry("bad_output".to_string())
+        .or_insert_with(|| serde_json::json!(false));
+    bad_scan_obj
+        .entry("bad_text_count".to_string())
+        .or_insert_with(|| serde_json::json!(0));
+    bad_scan_obj
+        .entry("reasons".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    bad_scan_obj
+        .entry("first_bad_text_span".to_string())
+        .or_insert(serde_json::Value::Null);
+    bad_scan_obj.insert("failure_kind".to_string(), serde_json::json!(failure_kind));
+    bad_scan_obj.insert("failure_phase".to_string(), serde_json::json!(phase));
+    bad_scan_obj.insert("error_kind".to_string(), serde_json::json!(error_kind));
+    bad_scan_obj
+        .entry("output_chars".to_string())
+        .or_insert_with(|| serde_json::json!(0));
+    bad_scan_obj
+        .entry("output_sha256".to_string())
+        .or_insert_with(|| serde_json::json!(sha256_hex(b"")));
+    write_json_value(&bad_scan_path, &bad_scan)?;
+
+    let diagnostics = if chat_resource_failure_kind(failure_kind) {
+        chat_resource_failure_diagnostics(
+            request_id,
+            failure_kind,
+            phase,
+            error_kind,
+            &message,
+            now.timestamp_millis(),
+            admission_summary,
+            engine_status,
+        )
+    } else {
+        serde_json::json!({
+            "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            "entrypoint": "serve",
+            "request_id": request_id,
+            "failure_kind": failure_kind,
+            "phase": phase,
+            "first_failure_event": {
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "entrypoint": "serve",
+                "request_id": request_id,
+                "phase": phase,
+                "error_kind": error_kind,
+                "message": message,
+                "timestamp_unix_ms": now.timestamp_millis()
+            },
+            "nearest_request_id": request_id,
+            "log_excerpt": format!("{phase}: {message}"),
+            "backtrace_excerpt": null,
+            "nearest_resource_event": null,
+            "nearest_memory_snapshot": null
+        })
+    };
+    write_json_value(&bundle_dir.join("failure_diagnostics.json"), &diagnostics)?;
+    Ok(())
+}
+
+fn chat_resource_failure_diagnostics(
+    request_id: &str,
+    failure_kind: &str,
+    phase: &str,
+    error_kind: &str,
+    message: &str,
+    timestamp_unix_ms: i64,
+    admission_summary: Option<&serde_json::Value>,
+    engine_status: Option<&EngineStatus>,
+) -> serde_json::Value {
+    let resource_kind = chat_resource_kind_for_failure(failure_kind);
+    let memory = engine_status
+        .map(|status| &status.memory_usage)
+        .map(|memory| {
+            let current = memory.used_bytes as i64;
+            let high_water = current.max(0);
+            serde_json::json!({
+                "scope": "serve_failure",
+                "backend": "engine_status",
+                "current_bytes": current.max(0),
+                "high_water_bytes": high_water,
+                "total_bytes": memory.total_bytes,
+                "free_bytes": memory.free_bytes,
+                "gpu_memory_bytes": memory.gpu_memory_bytes,
+                "cpu_memory_bytes": memory.cpu_memory_bytes,
+                "source": "engine_status"
+            })
+        })
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "scope": "serve_failure",
+                "backend": "engine_status",
+                "current_bytes": 0,
+                "high_water_bytes": 0,
+                "source": "not_collected"
+            })
+        });
+    let capacity = chat_failure_capacity(resource_kind, admission_summary, engine_status, message);
+    let needed = capacity
+        .get("needed")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(1)
+        .max(1);
+    let capacity_value = capacity
+        .get("capacity")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0)
+        .max(0);
+    serde_json::json!({
+        "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        "entrypoint": "serve",
+        "request_id": request_id,
+        "failure_kind": failure_kind,
+        "phase": phase,
+        "first_failure_event": {
+            "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            "entrypoint": "serve",
+            "request_id": request_id,
+            "phase": phase,
+            "error_kind": error_kind,
+            "message": message,
+            "timestamp_unix_ms": timestamp_unix_ms
+        },
+        "nearest_request_id": request_id,
+        "log_excerpt": format!("{phase}: {message}"),
+        "capacity": capacity,
+        "nearest_resource_event": {
+            "owner_kind": "request",
+            "owner_id": request_id,
+            "resource_kind": resource_kind,
+            "action": "reject",
+            "amount": needed,
+            "before": capacity_value,
+            "after": capacity_value,
+            "capacity": capacity_value,
+            "reason": message
+        },
+        "nearest_memory_snapshot": memory
+    })
+}
+
+fn chat_failure_capacity(
+    resource_kind: &str,
+    admission_summary: Option<&serde_json::Value>,
+    engine_status: Option<&EngineStatus>,
+    reason: &str,
+) -> serde_json::Value {
+    if resource_kind == "device_memory" {
+        let (needed, available, capacity) = engine_status
+            .map(|status| {
+                let memory = &status.memory_usage;
+                let used = memory.used_bytes as i64;
+                let available = memory.free_bytes as i64;
+                let capacity = memory.total_bytes as i64;
+                (
+                    used.saturating_add(1).max(1),
+                    available.max(0),
+                    capacity.max(0),
+                )
+            })
+            .unwrap_or((1, 0, 0));
+        return serde_json::json!({
+            "resource_kind": resource_kind,
+            "needed": needed,
+            "available": available,
+            "capacity": capacity,
+            "reason": reason
+        });
+    }
+    let capacity = admission_summary
+        .and_then(|summary| summary.get("effective_max_concurrent"))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().map(|value| value as i64))
+        })
+        .unwrap_or_else(|| {
+            engine_status
+                .map(|status| {
+                    (status.active_requests as i64)
+                        .saturating_add(status.queued_requests as i64)
+                        .saturating_add(1)
+                })
+                .unwrap_or(0)
+        })
+        .max(0);
+    let used = engine_status
+        .map(|status| (status.active_requests as i64).saturating_add(status.queued_requests as i64))
+        .unwrap_or(0)
+        .max(0);
+    serde_json::json!({
+        "resource_kind": resource_kind,
+        "needed": 1,
+        "available": capacity.saturating_sub(used),
+        "capacity": capacity,
+        "reason": reason
+    })
+}
+
+fn chat_resource_failure_kind(failure_kind: &str) -> bool {
+    matches!(
+        failure_kind,
+        "oom" | "prevented_oom" | "admission" | "admission_reject" | "oom_admission"
+    )
+}
+
+fn chat_resource_kind_for_failure(failure_kind: &str) -> &'static str {
+    match failure_kind {
+        "oom" | "prevented_oom" => "device_memory",
+        _ => "admission_capacity",
+    }
+}
+
+fn sanitize_diagnostic_text(message: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return "generation failed without an error message".to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("authorization")
+        || lower.contains("cookie")
+        || lower.contains("api_key")
+        || lower.contains("access_token")
+        || lower.contains("refresh_token")
+        || lower.contains("password")
+        || trimmed.contains("sk-")
+    {
+        return "[redacted diagnostic message]".to_string();
+    }
+    trimmed.chars().take(2048).collect()
+}
+
+fn sanitized_replay_headers(headers: &HeaderMap) -> serde_json::Value {
+    let mut result = serde_json::Map::new();
+    for key in ["content-type", "traceparent", "tracestate"] {
+        if let Some(value) = headers.get(key).and_then(|value| value.to_str().ok()) {
+            result.insert(key.to_string(), serde_json::json!(value));
+        }
+    }
+    result.insert("authorization".to_string(), serde_json::json!("[redacted]"));
+    result.insert("cookie".to_string(), serde_json::json!("[redacted]"));
+    serde_json::Value::Object(result)
+}
+
+fn sanitized_chat_request_body(request: &ChatCompletionsRequest) -> serde_json::Value {
+    let mut value = serde_json::to_value(request).unwrap_or_else(|_| {
+        serde_json::json!({
+            "model": request.model.clone(),
+            "stream": request.stream.unwrap_or(false),
+            "messages": []
+        })
+    });
+    redact_json_value(&mut value, None);
+    value
+}
+
+fn redact_json_value(value: &mut serde_json::Value, key: Option<&str>) {
+    if key.is_some_and(is_secret_key) {
+        *value = serde_json::json!("[redacted]");
+        return;
+    }
+    if matches!(key, Some("content" | "arguments")) && value.is_string() {
+        *value = serde_json::json!("[redacted]");
+        return;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for field in ["content", "arguments"] {
+                if let Some(chars) = map
+                    .get(field)
+                    .and_then(|child| child.as_str())
+                    .map(|text| text.chars().count())
+                {
+                    map.insert(field.to_string(), serde_json::json!("[redacted]"));
+                    map.insert(format!("{field}_redacted"), serde_json::json!(true));
+                    map.insert(format!("{field}_chars"), serde_json::json!(chars));
+                }
+            }
+            for (child_key, child) in map.iter_mut() {
+                redact_json_value(child, Some(child_key.as_str()));
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                redact_json_value(child, None);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_secret_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| *ch != '-' && *ch != '_')
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "authorization"
+            | "cookie"
+            | "secret"
+            | "apikey"
+            | "password"
+            | "accesstoken"
+            | "refreshtoken"
+            | "idtoken"
+    )
+}
+
+fn replay_curl_argv(bundle_dir: &Path) -> Vec<String> {
+    vec![
+        "curl".to_string(),
+        "-sS".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        "http://127.0.0.1:8000/v1/chat/completions".to_string(),
+        "-H".to_string(),
+        "content-type: application/json".to_string(),
+        "--data-binary".to_string(),
+        format!("@{}", bundle_dir.join("replay_body.json").display()),
+    ]
+}
+
+fn replay_curl_command(bundle_dir: &Path) -> String {
+    replay_curl_argv(bundle_dir)
+        .iter()
+        .map(|part| shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '@'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn write_json_value(path: &Path, value: &serde_json::Value) -> std::result::Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|err| err.to_string())?;
+    fs::write(path, [bytes, b"\n".to_vec()].concat()).map_err(|err| err.to_string())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 /// Handle streaming chat completions
@@ -956,12 +1524,35 @@ async fn handle_chat_completions_stream(
     // R1-distill-style templates open the think block inside the prompt;
     // the parser must know generation starts mid-think.
     let started_in_think = has_unclosed_thinking_block(&inference_request.prompt);
+    let replay_request_id = inference_request.id.to_string();
     let mut stream = match engine.infer_stream(inference_request).await {
         Ok(stream) => stream,
         Err(e) => {
-            error!("Stream generation failed before first chunk: {}", e);
+            let failure_kind = e.observability_failure_kind();
+            let error_kind = e.observability_error_kind();
+            let error_message = e.to_string();
+            let engine_status = if chat_resource_failure_kind(failure_kind) {
+                Some(engine.status().await)
+            } else {
+                None
+            };
+            error!(
+                "Stream generation failed before first chunk: {}",
+                error_message
+            );
+            if let Err(err) = write_chat_request_failure_diagnostics(
+                &state,
+                &replay_request_id,
+                failure_kind,
+                "chat_completions_stream_start",
+                error_kind,
+                &error_message,
+                engine_status.as_ref(),
+            ) {
+                warn!("failed to write chat stream failure diagnostics: {}", err);
+            }
             let _ = tx.send(Ok(openai_error_sse_event(
-                e.to_string(),
+                error_message,
                 "internal_server_error",
                 None,
             )));
@@ -970,6 +1561,12 @@ async fn handle_chat_completions_stream(
             return Ok(Sse::new(stream).into_response());
         }
     };
+    let request_dump_dir = state.request_dump_dir.clone();
+    let admission_summary = state
+        .auto_config
+        .as_ref()
+        .map(|config| config.admission_summary_document());
+    let diagnostics_engine = engine.clone();
 
     tokio::spawn(async move {
         let mut current_text = String::new();
@@ -1209,9 +1806,32 @@ async fn handle_chat_completions_stream(
                     }
                 }
                 Err(e) => {
-                    error!("Stream generation error: {}", e);
+                    let failure_kind = e.observability_failure_kind();
+                    let error_kind = e.observability_error_kind();
+                    let error_message = e.to_string();
+                    let engine_status = if chat_resource_failure_kind(failure_kind) {
+                        Some(diagnostics_engine.status().await)
+                    } else {
+                        None
+                    };
+                    error!("Stream generation error: {}", error_message);
+                    if let Err(err) = write_chat_request_failure_diagnostics_at_root(
+                        request_dump_dir.as_ref().map(|root| root.as_path()),
+                        admission_summary.as_ref(),
+                        engine_status.as_ref(),
+                        &replay_request_id,
+                        failure_kind,
+                        "chat_completions_stream_next",
+                        error_kind,
+                        &error_message,
+                    ) {
+                        warn!(
+                            "failed to write chat stream chunk failure diagnostics: {}",
+                            err
+                        );
+                    }
                     let _ = tx.send(Ok(openai_error_sse_event(
-                        e.to_string(),
+                        error_message,
                         "internal_server_error",
                         None,
                     )));
@@ -1252,6 +1872,7 @@ async fn handle_chat_completions_sync(
         });
     // R1-distill-style templates open the think block inside the prompt.
     let started_in_think = has_unclosed_thinking_block(&inference_request.prompt);
+    let replay_request_id = inference_request.id.to_string();
     match engine.infer(inference_request).await {
         Ok(output) => {
             let InferenceResponse {
@@ -1347,7 +1968,29 @@ async fn handle_chat_completions_sync(
             Ok(Json(response).into_response())
         }
         Err(e) => {
-            error!("Generation failed: {}", e);
+            let failure_kind = e.observability_failure_kind();
+            let error_kind = e.observability_error_kind();
+            let error_message = e.to_string();
+            let engine_status = if chat_resource_failure_kind(failure_kind) {
+                Some(engine.status().await)
+            } else {
+                None
+            };
+            error!("Generation failed: {}", error_message);
+            if let Err(err) = write_chat_request_failure_diagnostics(
+                &state,
+                &replay_request_id,
+                failure_kind,
+                "chat_completions_sync",
+                error_kind,
+                &error_message,
+                engine_status.as_ref(),
+            ) {
+                warn!(
+                    "failed to write chat generation failure diagnostics: {}",
+                    err
+                );
+            }
             Err(server_error_from_ferrum_error(e))
         }
     }
@@ -1386,6 +2029,7 @@ fn convert_chat_request_with_template_model(
         .or(default_tool_choice.as_ref());
     let functions = request.functions.as_deref().unwrap_or_default();
     let forced_response_format = forced_tool_choice_response_format(request);
+    let requested_response_format = requested_response_format_for_sampling(request)?;
     let render_messages =
         render_messages_with_response_format_instruction(request, forced_response_format.as_ref());
     let chat_template_options = chat_template_options_for_request(request, model_template)?;
@@ -1478,7 +2122,7 @@ fn convert_chat_request_with_template_model(
             temperature: request.temperature.unwrap_or(DEFAULT_SAMPLING_TEMPERATURE),
             top_p: request.top_p.unwrap_or(DEFAULT_SAMPLING_TOP_P),
             top_k: None, // OpenAI doesn't use top-k
-            repetition_penalty: 1.0,
+            repetition_penalty: DEFAULT_CHAT_REPETITION_PENALTY,
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
             stop_sequences: request.stop.clone().unwrap_or_default(),
@@ -1488,6 +2132,8 @@ fn convert_chat_request_with_template_model(
             typical_p: None,
             mirostat: None,
             response_format: forced_response_format
+                .clone()
+                .or(requested_response_format)
                 .or_else(|| inferred_auto_tool_response_format(request))
                 .unwrap_or(ferrum_types::ResponseFormat::Text),
         },
@@ -1605,6 +2251,35 @@ fn forced_tool_choice_response_format(
     serde_json::to_string(&schema)
         .ok()
         .map(ferrum_types::ResponseFormat::JsonSchema)
+}
+
+fn requested_response_format_for_sampling(
+    request: &ChatCompletionsRequest,
+) -> ferrum_types::Result<Option<ferrum_types::ResponseFormat>> {
+    let Some(format) = request.response_format.as_ref() else {
+        return Ok(None);
+    };
+    match format.format_type.as_str() {
+        "json_schema" => {
+            let Some(schema) = format.json_schema.as_ref() else {
+                return Err(Error::invalid_request(
+                    "response_format.json_schema.schema is required",
+                ));
+            };
+            if !schema.strict.unwrap_or(false) {
+                return Ok(None);
+            }
+            let Some(schema_value) = schema.schema.as_ref() else {
+                return Err(Error::invalid_request(
+                    "response_format.json_schema.schema is required",
+                ));
+            };
+            serde_json::to_string(schema_value)
+                .map(|schema| Some(ferrum_types::ResponseFormat::JsonSchema(schema)))
+                .map_err(|err| Error::invalid_request(err.to_string()))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn inferred_auto_tool_response_format(
@@ -3490,6 +4165,9 @@ mod tests {
     struct FailingLlm {
         config: EngineConfig,
         fail_after_stream_start: bool,
+        infer_failure: ferrum_types::FerrumError,
+        stream_start_failure: ferrum_types::FerrumError,
+        stream_chunk_failure: ferrum_types::FerrumError,
     }
 
     impl FailingLlm {
@@ -3499,12 +4177,29 @@ mod tests {
             Self {
                 config,
                 fail_after_stream_start: false,
+                infer_failure: ferrum_types::FerrumError::internal("stub generation failed"),
+                stream_start_failure: ferrum_types::FerrumError::internal("stub stream failed"),
+                stream_chunk_failure: ferrum_types::FerrumError::internal(
+                    "stub stream chunk failed",
+                ),
             }
         }
 
         fn after_stream_start() -> Self {
             Self {
                 fail_after_stream_start: true,
+                ..Self::new()
+            }
+        }
+
+        fn resource_exhausted() -> Self {
+            let failure = ferrum_types::FerrumError::resource_exhausted(
+                "admission capacity exhausted while reserving request resources",
+            );
+            Self {
+                infer_failure: failure.clone(),
+                stream_start_failure: failure.clone(),
+                stream_chunk_failure: failure,
                 ..Self::new()
             }
         }
@@ -3915,9 +4610,7 @@ mod tests {
             &self,
             _request: InferenceRequest,
         ) -> ferrum_types::Result<InferenceResponse> {
-            Err(ferrum_types::FerrumError::internal(
-                "stub generation failed",
-            ))
+            Err(self.infer_failure.clone())
         }
 
         async fn infer_stream(
@@ -3928,11 +4621,11 @@ mod tests {
         > {
             if self.fail_after_stream_start {
                 let _request_id = request.id;
-                return Ok(Box::pin(stream::iter(vec![Err(
-                    ferrum_types::FerrumError::internal("stub stream chunk failed"),
-                )])));
+                return Ok(Box::pin(stream::iter(vec![Err(self
+                    .stream_chunk_failure
+                    .clone())])));
             }
-            Err(ferrum_types::FerrumError::internal("stub stream failed"))
+            Err(self.stream_start_failure.clone())
         }
     }
 
@@ -4014,14 +4707,113 @@ mod tests {
         AxumServer::from_llm(Arc::new(FailingLlm::new())).build_router()
     }
 
+    fn router_with_failing_llm_and_request_dump_dir(request_dump_dir: PathBuf) -> Router {
+        AxumServer::from_state(
+            AppState::default()
+                .with_llm(Arc::new(FailingLlm::new()))
+                .with_request_dump_dir(Some(request_dump_dir)),
+        )
+        .build_router()
+    }
+
+    fn router_with_resource_exhausted_llm_and_request_dump_dir(
+        request_dump_dir: PathBuf,
+    ) -> Router {
+        AxumServer::from_state(
+            AppState::default()
+                .with_llm(Arc::new(FailingLlm::resource_exhausted()))
+                .with_request_dump_dir(Some(request_dump_dir)),
+        )
+        .build_router()
+    }
+
     fn router_with_stream_chunk_failing_llm() -> Router {
         AxumServer::from_llm(Arc::new(FailingLlm::after_stream_start())).build_router()
+    }
+
+    fn router_with_stream_chunk_failing_llm_and_request_dump_dir(
+        request_dump_dir: PathBuf,
+    ) -> Router {
+        AxumServer::from_state(
+            AppState::default()
+                .with_llm(Arc::new(FailingLlm::after_stream_start()))
+                .with_request_dump_dir(Some(request_dump_dir)),
+        )
+        .build_router()
     }
 
     fn router_with_capturing_llm() -> (Router, Arc<CapturingLlm>) {
         let engine = Arc::new(CapturingLlm::new());
         let router = AxumServer::from_llm(engine.clone()).build_router();
         (router, engine)
+    }
+
+    fn unique_request_dump_dir(test_name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("ferrum-server-{test_name}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&path).expect("create request dump dir");
+        path
+    }
+
+    fn only_replay_bundle(root: &Path) -> PathBuf {
+        let mut dirs = fs::read_dir(root)
+            .expect("read request dump dir")
+            .filter_map(|entry| {
+                let path = entry.expect("dir entry").path();
+                path.is_dir().then_some(path)
+            })
+            .collect::<Vec<_>>();
+        dirs.sort();
+        assert_eq!(
+            dirs.len(),
+            1,
+            "expected exactly one replay bundle in {root:?}"
+        );
+        dirs.remove(0)
+    }
+
+    fn read_json_file(path: impl AsRef<Path>) -> Value {
+        let path = path.as_ref();
+        let text = fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!("failed to read {}: {}", path.display(), err);
+        });
+        serde_json::from_str(&text).unwrap_or_else(|err| {
+            panic!("failed to parse {}: {}", path.display(), err);
+        })
+    }
+
+    fn assert_chat_failure_replay_bundle(
+        root: &Path,
+        expected_phase: &str,
+        expected_error_kind: &str,
+        expected_message: &str,
+    ) {
+        let bundle = only_replay_bundle(root);
+        let request = read_json_file(bundle.join("request.json"));
+        let request_id = request["request_id"]
+            .as_str()
+            .expect("request id")
+            .to_string();
+        let bad_scan = read_json_file(bundle.join("bad_output_scan.json"));
+        assert_eq!(bad_scan["request_id"], request_id);
+        assert_eq!(bad_scan["failure_kind"], "error");
+        assert_eq!(bad_scan["failure_phase"], expected_phase);
+        assert_eq!(bad_scan["error_kind"], expected_error_kind);
+
+        let diagnostics = read_json_file(bundle.join("failure_diagnostics.json"));
+        assert_eq!(diagnostics["request_id"], request_id);
+        assert_eq!(diagnostics["failure_kind"], "error");
+        assert_eq!(diagnostics["first_failure_event"]["phase"], expected_phase);
+        assert_eq!(
+            diagnostics["first_failure_event"]["error_kind"],
+            expected_error_kind
+        );
+        assert_eq!(diagnostics["nearest_request_id"], request_id);
+        assert!(diagnostics["log_excerpt"]
+            .as_str()
+            .expect("log excerpt")
+            .contains(expected_message));
+        assert!(bundle.join("replay.command.json").is_file());
     }
 
     fn router_with_capturing_llm_and_template(
@@ -4173,6 +4965,23 @@ mod tests {
             obj.insert(k.clone(), v.clone());
         }
         serde_json::from_value(value).expect("chat request")
+    }
+
+    #[test]
+    fn sanitized_chat_request_body_redacts_user_text_and_secret_metadata() {
+        let request = chat_request(json!({
+            "messages": [{"role": "user", "content": "private prompt"}],
+            "metadata": {"api_key": "should-not-survive"},
+            "stream": true
+        }));
+        let body = sanitized_chat_request_body(&request);
+        assert_eq!(body["model"], "stub-model");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "[redacted]");
+        assert_eq!(body["messages"][0]["content_redacted"], true);
+        assert_eq!(body["messages"][0]["content_chars"], 14);
+        assert_eq!(body["metadata"]["api_key"], "[redacted]");
     }
 
     #[tokio::test]
@@ -5567,6 +6376,10 @@ mod tests {
             request.sampling_params.temperature,
             DEFAULT_SAMPLING_TEMPERATURE
         );
+        assert_eq!(
+            request.sampling_params.repetition_penalty,
+            DEFAULT_CHAT_REPETITION_PENALTY
+        );
         assert_eq!(request.sampling_params.stop_sequences, vec!["<END>"]);
     }
 
@@ -5907,6 +6720,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_chat_generation_failure_writes_replay_diagnostics() {
+        let root = unique_request_dump_dir("chat-sync-failure");
+        let response = post_json(
+            router_with_failing_llm_and_request_dump_dir(root.clone()),
+            "/v1/chat/completions",
+            json!({
+                "model": "failing-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::INTERNAL_SERVER_ERROR);
+        assert_chat_failure_replay_bundle(
+            &root,
+            "chat_completions_sync",
+            "internal",
+            "stub generation failed",
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn route_chat_resource_failure_writes_resource_replay_diagnostics() {
+        let root = unique_request_dump_dir("chat-resource-failure");
+        let response = post_json(
+            router_with_resource_exhausted_llm_and_request_dump_dir(root.clone()),
+            "/v1/chat/completions",
+            json!({
+                "model": "failing-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::SERVICE_UNAVAILABLE);
+        let bundle = only_replay_bundle(&root);
+        let bad_scan = read_json_file(bundle.join("bad_output_scan.json"));
+        assert_eq!(bad_scan["failure_kind"], "oom_admission");
+        let diagnostics = read_json_file(bundle.join("failure_diagnostics.json"));
+        assert_eq!(diagnostics["failure_kind"], "oom_admission");
+        assert_eq!(
+            diagnostics["first_failure_event"]["error_kind"],
+            "resource_exhausted"
+        );
+        assert_eq!(
+            diagnostics["capacity"]["resource_kind"],
+            "admission_capacity"
+        );
+        assert!(diagnostics["capacity"]["reason"]
+            .as_str()
+            .expect("capacity reason")
+            .contains("admission capacity exhausted"));
+        assert_eq!(
+            diagnostics["nearest_resource_event"]["resource_kind"],
+            "admission_capacity"
+        );
+        assert!(diagnostics["nearest_memory_snapshot"]["current_bytes"].is_number());
+        assert!(diagnostics["nearest_memory_snapshot"]["high_water_bytes"].is_number());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn route_chat_stream_generation_failure_emits_openai_error_event() {
         let response = post_json(
             router_with_failing_llm(),
@@ -5924,6 +6798,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_chat_stream_generation_failure_writes_replay_diagnostics() {
+        let root = unique_request_dump_dir("chat-stream-start-failure");
+        let response = post_json(
+            router_with_failing_llm_and_request_dump_dir(root.clone()),
+            "/v1/chat/completions",
+            json!({
+                "model": "failing-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert_openai_stream_error(&body, "stub stream failed");
+        assert_chat_failure_replay_bundle(
+            &root,
+            "chat_completions_stream_start",
+            "internal",
+            "stub stream failed",
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn route_chat_stream_chunk_failure_emits_openai_error_event() {
         let response = post_json(
             router_with_stream_chunk_failing_llm(),
@@ -5938,6 +6837,31 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_text(response).await;
         assert_openai_stream_error(&body, "stub stream chunk failed");
+    }
+
+    #[tokio::test]
+    async fn route_chat_stream_chunk_failure_writes_replay_diagnostics() {
+        let root = unique_request_dump_dir("chat-stream-chunk-failure");
+        let response = post_json(
+            router_with_stream_chunk_failing_llm_and_request_dump_dir(root.clone()),
+            "/v1/chat/completions",
+            json!({
+                "model": "failing-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert_openai_stream_error(&body, "stub stream chunk failed");
+        assert_chat_failure_replay_bundle(
+            &root,
+            "chat_completions_stream_next",
+            "internal",
+            "stub stream chunk failed",
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -7457,7 +8381,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_json_schema_response_format_uses_text_sampling_mode() {
+    fn strict_json_schema_response_format_uses_guided_sampling_mode() {
         let request = chat_request(json!({
             "response_format": {
                 "type": "json_schema",
@@ -7481,11 +8405,18 @@ mod tests {
             "response_format instruction should reach the model prompt: {}",
             internal.prompt
         );
-        assert_eq!(
-            internal.sampling_params.response_format,
-            ferrum_types::ResponseFormat::Text,
-            "strict json_schema is validated after generation instead of applying JSON soft bias during Qwen3 thinking"
-        );
+        let ferrum_types::ResponseFormat::JsonSchema(schema) =
+            internal.sampling_params.response_format
+        else {
+            panic!(
+                "strict json_schema must reach guided decoding, got {:?}",
+                internal.sampling_params.response_format
+            );
+        };
+        let schema: serde_json::Value = serde_json::from_str(&schema).unwrap();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["answer"]["type"], "string");
+        assert_eq!(schema["required"], json!(["answer"]));
     }
 
     #[tokio::test]

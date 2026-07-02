@@ -63,7 +63,7 @@ run_metal() {
 }
 
 cuda_build() {
-  cargo build --release -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source | tee "$OUT_ROOT/cuda-build.log"
+  cargo build --release -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2 | tee "$OUT_ROOT/cuda-build.log"
 }
 
 run_cuda_template() {

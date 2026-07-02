@@ -70,6 +70,53 @@ pub static MOE_BUCKET_GEMM3_US: AtomicU64 = AtomicU64::new(0);
 pub static MOE_BUCKET_COMBINE_US: AtomicU64 = AtomicU64::new(0);
 pub static MOE_BUCKET_LAYER_CALLS: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MoeBucketProfileSnapshot {
+    pub layers: u64,
+    pub sync_us: u64,
+    pub d2h_us: u64,
+    pub route_us: u64,
+    pub plan_us: u64,
+    pub gather_us: u64,
+    pub gemm1_us: u64,
+    pub silu_us: u64,
+    pub gemm3_us: u64,
+    pub combine_us: u64,
+}
+
+impl MoeBucketProfileSnapshot {
+    pub fn total_us(self) -> u64 {
+        self.sync_us
+            + self.d2h_us
+            + self.route_us
+            + self.plan_us
+            + self.gather_us
+            + self.gemm1_us
+            + self.silu_us
+            + self.gemm3_us
+            + self.combine_us
+    }
+
+    pub fn has_layers(self) -> bool {
+        self.layers > 0
+    }
+}
+
+pub fn drain_moe_bucket_profile() -> MoeBucketProfileSnapshot {
+    MoeBucketProfileSnapshot {
+        layers: MOE_BUCKET_LAYER_CALLS.swap(0, Ordering::Relaxed),
+        sync_us: MOE_BUCKET_SYNC_US.swap(0, Ordering::Relaxed),
+        d2h_us: MOE_BUCKET_D2H_US.swap(0, Ordering::Relaxed),
+        route_us: MOE_BUCKET_ROUTE_US.swap(0, Ordering::Relaxed),
+        plan_us: MOE_BUCKET_PLAN_US.swap(0, Ordering::Relaxed),
+        gather_us: MOE_BUCKET_GATHER_US.swap(0, Ordering::Relaxed),
+        gemm1_us: MOE_BUCKET_GEMM1_US.swap(0, Ordering::Relaxed),
+        silu_us: MOE_BUCKET_SILU_US.swap(0, Ordering::Relaxed),
+        gemm3_us: MOE_BUCKET_GEMM3_US.swap(0, Ordering::Relaxed),
+        combine_us: MOE_BUCKET_COMBINE_US.swap(0, Ordering::Relaxed),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MoeDispatchRuntimeConfig {
     moe_profile: bool,
@@ -982,7 +1029,35 @@ impl<B: QuantLlmBackend + BackendMoeFused> ExpertStack<B> {
             self.down.len(),
             "ExpertStack: gate_up and down disagree on expert count"
         );
-        self.gate_up.len()
+        if !self.gate_up.is_empty() || !self.down.is_empty() {
+            return self.gate_up.len();
+        }
+        if let Some(gate) = self.gate_stacked.as_deref() {
+            let num_experts = gate.num_experts();
+            debug_assert_eq!(
+                self.up_stacked.as_deref().map(|up| up.num_experts()),
+                Some(num_experts),
+                "ExpertStack: gate/up stacked expert counts disagree"
+            );
+            debug_assert_eq!(
+                self.down_stacked.as_deref().map(|down| down.num_experts()),
+                Some(num_experts),
+                "ExpertStack: gate/down stacked expert counts disagree"
+            );
+            return num_experts;
+        }
+        if let Some(gate_up) = self.gate_up_marlin_stack.as_deref() {
+            let num_experts = gate_up.num_experts();
+            debug_assert_eq!(
+                self.down_marlin_stack
+                    .as_deref()
+                    .map(|down| down.num_experts()),
+                Some(num_experts),
+                "ExpertStack: gate_up/down Marlin expert counts disagree"
+            );
+            return num_experts;
+        }
+        0
     }
 }
 
@@ -1472,6 +1547,7 @@ pub struct MoeForwardBucketedParams<'a, B: QuantLlmBackend + BackendMoeFused> {
     pub silu_packed: &'a mut B::Buffer,
     pub down_packed: &'a mut B::Buffer,
     pub route_scratch: &'a mut MoeRouteScratch,
+    pub profile_bucket: bool,
     // Optional device routing scratch — when Some AND
     // FERRUM_MOE_DEVICE_ROUTE=1 AND FERRUM_VLLM_MOE=1, runs the
     // graph-capturable device-routing branch. None / unset = legacy
@@ -1499,6 +1575,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         silu_packed,
         down_packed,
         route_scratch,
+        profile_bucket,
         device_route,
     } = params;
     if experts.num_experts() != num_experts {
@@ -1511,7 +1588,7 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     let runtime_config = moe_dispatch_runtime_config();
     // Bucket profiling fires on either FERRUM_MOE_PROFILE=1 (legacy)
     // or FERRUM_DECODE_OP_PROFILE=1 (the gate the print site uses).
-    let prof = runtime_config.moe_profile || runtime_config.decode_op_profile;
+    let prof = profile_bucket || runtime_config.moe_profile || runtime_config.decode_op_profile;
     if prof {
         MOE_BUCKET_LAYER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
@@ -1529,10 +1606,19 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     //
     // This is the prerequisite for CUDA Graph capture over the MoE
     // layer loop in Qwen3MoeModel::decode_batch_internal.
-    let use_vllm_moe = runtime_config.vllm_moe;
+    let stack_requires_vllm = experts
+        .gate_up_marlin_stack
+        .as_ref()
+        .is_some_and(|stack| stack.requires_vllm_moe())
+        || experts
+            .down_marlin_stack
+            .as_ref()
+            .is_some_and(|stack| stack.requires_vllm_moe());
+    let use_vllm_moe = runtime_config.vllm_moe || stack_requires_vllm;
     // Device-routing path: enabled whenever the caller passes
-    // pre-allocated `DeviceRouteScratch` AND `FERRUM_VLLM_MOE=1` is on.
-    // No separate env var — the device path is strictly faster than
+    // pre-allocated `DeviceRouteScratch` AND the vLLM MoE path is selected
+    // by runtime config or by the loaded weight stack. No separate env var
+    // — the device path is strictly faster than
     // the host path (+15.4% c=32 on Qwen3-30B-A3B-GPTQ-Int4, RTX 4090
     // bench docs/bench/moe-phase3-vast-2026-05-12); the host path's
     // per-layer `try_gpu_route_topk_into_host` (D2H + cuStreamSynchronize)
@@ -1901,6 +1987,14 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     };
     if let Some((sorted_tokens, block_ids, total_post_pad)) = vllm_refs {
         // fp32_reduce path: kernel writes C directly via global reduce.
+        #[cfg(feature = "cuda")]
+        let _marlin_label = if ferrum_kernels::backend::cuda::marlin::profile_marlin() {
+            Some(ferrum_kernels::backend::cuda::push_alloc_label(
+                "moe.vllm.gate_up_proj",
+            ))
+        } else {
+            None
+        };
         if use_vllm_pair_ids {
             gu_store.gemm_phase_vllm(
                 ctx,
@@ -1995,6 +2089,14 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
         None
     };
     if let Some((sorted_tokens, block_ids, total_post_pad)) = vllm_refs {
+        #[cfg(feature = "cuda")]
+        let _marlin_label = if ferrum_kernels::backend::cuda::marlin::profile_marlin() {
+            Some(ferrum_kernels::backend::cuda::push_alloc_label(
+                "moe.vllm.down_proj",
+            ))
+        } else {
+            None
+        };
         d_store.gemm_phase_vllm(
             ctx,
             silu_packed,
@@ -2251,7 +2353,163 @@ type _CandleResult<T> = CandleResult<T>;
 
 #[cfg(test)]
 mod tests {
-    use super::{pick_moe_block_size_with_config, MoeDispatchRuntimeConfig};
+    use std::sync::atomic::Ordering;
+
+    use ferrum_kernels::backend::cpu::CpuBackend;
+    use ferrum_kernels::backend::Backend;
+    use ferrum_kernels::StackedExpertGgufLinear;
+
+    use super::{
+        drain_moe_bucket_profile, pick_moe_block_size_with_config, ExpertStack,
+        MoeDispatchRuntimeConfig, MOE_BUCKET_COMBINE_US, MOE_BUCKET_D2H_US, MOE_BUCKET_GATHER_US,
+        MOE_BUCKET_GEMM1_US, MOE_BUCKET_GEMM3_US, MOE_BUCKET_LAYER_CALLS, MOE_BUCKET_PLAN_US,
+        MOE_BUCKET_ROUTE_US, MOE_BUCKET_SILU_US, MOE_BUCKET_SYNC_US,
+    };
+
+    struct FakeStackedGgufLinear {
+        num_experts: usize,
+        rows: usize,
+        cols: usize,
+    }
+
+    impl StackedExpertGgufLinear<CpuBackend> for FakeStackedGgufLinear {
+        fn num_experts(&self) -> usize {
+            self.num_experts
+        }
+
+        fn n_rows(&self) -> usize {
+            self.rows
+        }
+
+        fn n_cols(&self) -> usize {
+            self.cols
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn gemv_moe_id(
+            &self,
+            _ctx: &mut <CpuBackend as Backend>::Context,
+            _a: &<CpuBackend as Backend>::Buffer,
+            _ids: &<CpuBackend as Backend>::Buffer,
+            _out: &mut <CpuBackend as Backend>::Buffer,
+            _n_selected: usize,
+            _src1_stride: usize,
+        ) -> ferrum_types::Result<()> {
+            unimplemented!("num_experts test does not dispatch kernels")
+        }
+
+        fn gemv_moe_id_offset(
+            &self,
+            _ctx: &mut <CpuBackend as Backend>::Context,
+            _a: &<CpuBackend as Backend>::Buffer,
+            _a_offset: usize,
+            _ids: &<CpuBackend as Backend>::Buffer,
+            _ids_offset: usize,
+            _out: &mut <CpuBackend as Backend>::Buffer,
+            _n_selected: usize,
+            _src1_stride: usize,
+        ) -> ferrum_types::Result<()> {
+            unimplemented!("num_experts test does not dispatch kernels")
+        }
+
+        fn gemv_moe_id_gate_up_silu(
+            &self,
+            _ctx: &mut <CpuBackend as Backend>::Context,
+            _a: &<CpuBackend as Backend>::Buffer,
+            _other_up: &dyn StackedExpertGgufLinear<CpuBackend>,
+            _ids: &<CpuBackend as Backend>::Buffer,
+            _silu_out: &mut <CpuBackend as Backend>::Buffer,
+            _n_selected: usize,
+        ) -> ferrum_types::Result<()> {
+            unimplemented!("num_experts test does not dispatch kernels")
+        }
+
+        fn gemv_moe_id_batched(
+            &self,
+            _ctx: &mut <CpuBackend as Backend>::Context,
+            _a: &<CpuBackend as Backend>::Buffer,
+            _ids: &<CpuBackend as Backend>::Buffer,
+            _out: &mut <CpuBackend as Backend>::Buffer,
+            _m: usize,
+            _top_k: usize,
+            _src1_outer_stride: usize,
+            _src1_inner_stride: usize,
+        ) -> ferrum_types::Result<()> {
+            unimplemented!("num_experts test does not dispatch kernels")
+        }
+
+        fn gemv_moe_id_gate_up_silu_batched(
+            &self,
+            _ctx: &mut <CpuBackend as Backend>::Context,
+            _a: &<CpuBackend as Backend>::Buffer,
+            _other_up: &dyn StackedExpertGgufLinear<CpuBackend>,
+            _ids: &<CpuBackend as Backend>::Buffer,
+            _silu_out: &mut <CpuBackend as Backend>::Buffer,
+            _m: usize,
+            _top_k: usize,
+            _src1_outer_stride: usize,
+            _src1_inner_stride: usize,
+        ) -> ferrum_types::Result<()> {
+            unimplemented!("num_experts test does not dispatch kernels")
+        }
+
+        fn gemm_moe_id(
+            &self,
+            _ctx: &mut <CpuBackend as Backend>::Context,
+            _a: &<CpuBackend as Backend>::Buffer,
+            _ids: &<CpuBackend as Backend>::Buffer,
+            _tpe: &<CpuBackend as Backend>::Buffer,
+            _out: &mut <CpuBackend as Backend>::Buffer,
+            _ne11: usize,
+            _top_k: usize,
+            _max_per_expert: usize,
+            _batch: usize,
+        ) -> ferrum_types::Result<()> {
+            unimplemented!("num_experts test does not dispatch kernels")
+        }
+
+        fn gemm_moe_id_indirect(
+            &self,
+            _ctx: &mut <CpuBackend as Backend>::Context,
+            _src1: &<CpuBackend as Backend>::Buffer,
+            _ids: &<CpuBackend as Backend>::Buffer,
+            _tpe: &<CpuBackend as Backend>::Buffer,
+            _out: &mut <CpuBackend as Backend>::Buffer,
+            _args_buf: &<CpuBackend as Backend>::Buffer,
+            _ne11: usize,
+            _top_k: usize,
+            _max_per_expert: usize,
+            _batch: usize,
+        ) -> ferrum_types::Result<()> {
+            unimplemented!("num_experts test does not dispatch kernels")
+        }
+    }
+
+    fn fake_stacked(num_experts: usize) -> Box<dyn StackedExpertGgufLinear<CpuBackend>> {
+        Box::new(FakeStackedGgufLinear {
+            num_experts,
+            rows: 4,
+            cols: 4,
+        })
+    }
+
+    #[test]
+    fn expert_stack_num_experts_uses_stacked_fast_path_count() {
+        let experts = ExpertStack::<CpuBackend> {
+            gate_up: Vec::new(),
+            down: Vec::new(),
+            gate_stacked: Some(fake_stacked(7)),
+            up_stacked: Some(fake_stacked(7)),
+            down_stacked: Some(fake_stacked(7)),
+            gate_up_marlin_stack: None,
+            down_marlin_stack: None,
+        };
+
+        assert_eq!(experts.num_experts(), 7);
+    }
 
     #[test]
     fn moe_dispatch_runtime_config_parses_m3_startup_knobs() {
@@ -2278,6 +2536,31 @@ mod tests {
         assert_eq!(config.moe_large_m_min_pairs, 2048);
         assert!(config.vllm_moe);
         assert!(config.moe_host_route);
+    }
+
+    #[test]
+    fn drain_moe_bucket_profile_returns_and_clears_counters() {
+        let _ = drain_moe_bucket_profile();
+        MOE_BUCKET_LAYER_CALLS.store(2, Ordering::Relaxed);
+        MOE_BUCKET_SYNC_US.store(3, Ordering::Relaxed);
+        MOE_BUCKET_D2H_US.store(5, Ordering::Relaxed);
+        MOE_BUCKET_ROUTE_US.store(7, Ordering::Relaxed);
+        MOE_BUCKET_PLAN_US.store(11, Ordering::Relaxed);
+        MOE_BUCKET_GATHER_US.store(13, Ordering::Relaxed);
+        MOE_BUCKET_GEMM1_US.store(17, Ordering::Relaxed);
+        MOE_BUCKET_SILU_US.store(19, Ordering::Relaxed);
+        MOE_BUCKET_GEMM3_US.store(23, Ordering::Relaxed);
+        MOE_BUCKET_COMBINE_US.store(29, Ordering::Relaxed);
+
+        let snapshot = drain_moe_bucket_profile();
+        assert_eq!(snapshot.layers, 2);
+        assert_eq!(snapshot.total_us(), 127);
+        assert!(snapshot.has_layers());
+
+        let cleared = drain_moe_bucket_profile();
+        assert_eq!(cleared.layers, 0);
+        assert_eq!(cleared.total_us(), 0);
+        assert!(!cleared.has_layers());
     }
 
     #[test]

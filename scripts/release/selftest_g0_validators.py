@@ -17,11 +17,18 @@ SUMMARY_VALIDATOR = REPO_ROOT / "scripts/release/g0_release_summary.py"
 RELEASE_BINARY_GATE = REPO_ROOT / "scripts/release/release_binary_gate.py"
 RUN_GATE = REPO_ROOT / "scripts/release/run_gate.py"
 RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
+PRODUCT_BACKEND_SENTINEL_GATE = REPO_ROOT / "scripts/release/product_backend_sentinel_gate.py"
 BACKEND_RUNTIME_GOAL_GATE = REPO_ROOT / "scripts/release/backend_runtime_preset_goal_gate.py"
 LLAMA33_GOAL_GATE = REPO_ROOT / "scripts/release/llama33_70b_4bit_2x4090_goal_gate.py"
 LAYER_SPLIT_PERF_GOAL_GATE = REPO_ROOT / "scripts/release/layer_split_perf_goal_gate.py"
 LAYER_SPLIT_PERF_ORCHESTRATOR = REPO_ROOT / "scripts/release/run_layer_split_perf_goal.py"
 LLAMA33_SOURCE_GATE = REPO_ROOT / "scripts/release/g0_cuda_llama33_70b_4bit_2x4090_gate.py"
+MODEL_RELEASE_GRADE_GOAL_GATE = REPO_ROOT / "scripts/release/model_release_grade_goal_gate.py"
+MODEL_RELEASE_GRADE_MANIFEST = REPO_ROOT / "scripts/release/model_release_grade_manifest.py"
+MODEL_ONBOARDING_CONTRACT_GATE = REPO_ROOT / "scripts/release/model_onboarding_contract_gate.py"
+RELEASE_REGRESSION_HARDENING_GOAL_GATE = REPO_ROOT / "scripts/release/release_regression_hardening_goal_gate.py"
+ACTUAL_MODEL_REGRESSION_SUMMARY_GATE = REPO_ROOT / "scripts/release/actual_model_regression_summary_gate.py"
+SUPPORT_MATRIX_CONTRACT_GATE = REPO_ROOT / "scripts/release/support_matrix_contract_gate.py"
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from m3_validate_runner_artifact import (  # noqa: E402
@@ -227,6 +234,12 @@ def test_run_scenarios_selftest() -> None:
     require("BACKEND SCENARIO RUNNER SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
+def test_product_backend_sentinel_selftest() -> None:
+    ok = run([sys.executable, str(PRODUCT_BACKEND_SENTINEL_GATE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("PRODUCT BACKEND SENTINEL SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
 def test_backend_runtime_goal_gate_selftest() -> None:
     ok = run([sys.executable, str(BACKEND_RUNTIME_GOAL_GATE), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -258,6 +271,42 @@ def test_llama33_source_gate_selftest() -> None:
         "G0 CUDA LLAMA33 70B 4BIT 2X4090 GATE SELFTEST PASS" in ok.stdout,
         ok.stdout,
     )
+
+
+def test_model_release_grade_goal_gate_selftest() -> None:
+    ok = run([sys.executable, str(MODEL_RELEASE_GRADE_GOAL_GATE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("MODEL RELEASE GRADE GOAL SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_model_release_grade_manifest_selftest() -> None:
+    ok = run([sys.executable, str(MODEL_RELEASE_GRADE_MANIFEST), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("MODEL RELEASE GRADE MANIFEST SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_model_onboarding_contract_gate_selftest() -> None:
+    ok = run([sys.executable, str(MODEL_ONBOARDING_CONTRACT_GATE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("MODEL ONBOARDING CONTRACT SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_release_regression_hardening_goal_gate_selftest() -> None:
+    ok = run([sys.executable, str(RELEASE_REGRESSION_HARDENING_GOAL_GATE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("RELEASE_REGRESSION_HARDENING GOAL SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_actual_model_regression_summary_gate_selftest() -> None:
+    ok = run([sys.executable, str(ACTUAL_MODEL_REGRESSION_SUMMARY_GATE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("ACTUAL MODEL REGRESSION SUMMARY SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_support_matrix_contract_gate_selftest() -> None:
+    ok = run([sys.executable, str(SUPPORT_MATRIX_CONTRACT_GATE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("SUPPORT MATRIX CONTRACT SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
 def test_m3_quality_gate_artifact_validators() -> None:
@@ -338,11 +387,18 @@ def main() -> int:
     test_release_binary_gate_staged_asset_path()
     test_run_gate_selftest()
     test_run_scenarios_selftest()
+    test_product_backend_sentinel_selftest()
     test_backend_runtime_goal_gate_selftest()
     test_llama33_goal_gate_selftest()
     test_layer_split_perf_goal_gate_selftest()
     test_layer_split_perf_orchestrator_selftest()
     test_llama33_source_gate_selftest()
+    test_model_release_grade_goal_gate_selftest()
+    test_model_release_grade_manifest_selftest()
+    test_model_onboarding_contract_gate_selftest()
+    test_actual_model_regression_summary_gate_selftest()
+    test_support_matrix_contract_gate_selftest()
+    test_release_regression_hardening_goal_gate_selftest()
     test_m3_quality_gate_artifact_validators()
     print("G0 VALIDATOR SELFTEST PASS")
     return 0

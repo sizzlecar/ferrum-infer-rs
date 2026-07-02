@@ -1,0 +1,339 @@
+bash: line 1: cargo: command not found
+ Downloading 1 crate                                                           Downloading 2 crates                                                          Downloading 3 crates                                                           Downloaded async-stream-impl v0.3.6
+ Downloading 2 crates                                                           Downloaded tokio-test v0.4.4
+ Downloading 1 crate                                                            Downloaded async-stream v0.3.6
+ Downloading 0 crates                                                           Downloaded 3 crates (29.8KiB) in 0.45s
+   Compiling proc-macro2 v1.0.103
+   Compiling quote v1.0.41
+   Compiling unicode-ident v1.0.20
+   Compiling cfg-if v1.0.4
+   Compiling libc v0.2.186
+   Compiling serde_core v1.0.228
+   Compiling serde v1.0.228
+   Compiling libm v0.2.15
+   Compiling autocfg v1.5.0
+   Compiling once_cell v1.21.3
+   Compiling memchr v2.7.6
+   Compiling version_check v0.9.5
+   Compiling getrandom v0.3.4
+   Compiling zerocopy v0.8.27
+   Compiling shlex v1.3.0
+   Compiling find-msvc-tools v0.1.4
+   Compiling bitflags v2.10.0
+   Compiling itoa v1.0.15
+   Compiling pin-project-lite v0.2.16
+   Compiling crossbeam-utils v0.8.21
+   Compiling futures-core v0.3.31
+   Compiling stable_deref_trait v1.2.1
+   Compiling bytes v1.10.1
+   Compiling parking_lot_core v0.9.12
+   Compiling scopeguard v1.2.0
+   Compiling rayon-core v1.13.0
+   Compiling log v0.4.28
+   Compiling ryu v1.0.20
+   Compiling futures-sink v0.3.31
+   Compiling equivalent v1.0.2
+    Building [                           ] 0/388: proc-macro2(build.rs), serd…   Compiling serde_json v1.0.145
+    Building [                           ] 1/388: proc-macro2(build.rs), serd…   Compiling fnv v1.0.7
+    Building [                           ] 2/388: proc-macro2(build.rs), serd…   Compiling cc v1.2.43
+    Building [                           ] 3/388: proc-macro2(build.rs), serd…   Compiling paste v1.0.15
+    Building [                           ] 4/388: proc-macro2(build.rs), serd…    Building [                           ] 5/388: proc-macro2(build.rs), serd…    Building [                           ] 6/388: proc-macro2(build.rs), serd…   Compiling hashbrown v0.17.1
+    Building [                           ] 7/388: proc-macro2(build.rs), serd…    Building [                           ] 9/388: proc-macro2(build.rs), find…   Compiling pkg-config v0.3.32
+   Compiling either v1.15.0
+    Building [                          ] 12/388: crossbeam-utils(build.rs), …   Compiling slab v0.4.11
+    Building [                          ] 14/388: crossbeam-utils(build.rs), …    Building [>                         ] 15/388: crossbeam-utils(build.rs), …    Building [>                         ] 16/388: crossbeam-utils(build.rs), …   Compiling pin-utils v0.1.0
+    Building [>                         ] 17/388: crossbeam-utils(build.rs), …   Compiling futures-io v0.3.31
+   Compiling pulp v0.22.2
+    Building [>                         ] 20/388: pulp(build.rs), crossbeam-u…   Compiling futures-task v0.3.31
+   Compiling tracing-core v0.1.34
+   Compiling typenum v1.19.0
+    Building [>                         ] 23/388: pulp(build.rs), crossbeam-u…   Compiling reborrow v0.5.5
+   Compiling dyn-stack-macros v0.1.3
+    Building [>                         ] 27/388: pulp(build.rs), crossbeam-u…   Compiling raw-cpuid v11.6.0
+    Building [>                         ] 28/388: pulp(build.rs), crossbeam-u…   Compiling num-traits v0.2.19
+    Building [>                         ] 29/388: pulp(build.rs), crossbeam-u…    Building [=>                        ] 30/388: pulp(build.rs), crossbeam-u…    Building [=>                        ] 31/388: pulp(build.rs), crossbeam-u…   Compiling lock_api v0.4.14
+    Building [=>                        ] 32/388: pulp(build.rs), crossbeam-u…   Compiling futures-channel v0.3.31
+    Building [=>                        ] 33/388: pulp(build.rs), crossbeam-u…   Compiling pulp-wasm-simd-flag v0.1.0
+    Building [=>                        ] 34/388: pulp(build.rs), crossbeam-u…   Compiling crc32fast v1.5.0
+    Building [=>                        ] 35/388: pulp(build.rs), crossbeam-u…    Building [=>                        ] 37/388: pulp(build.rs), crossbeam-u…   Compiling generic-array v0.14.9
+    Building [=>                        ] 38/388: pulp(build.rs), crossbeam-u…   Compiling seq-macro v0.3.6
+   Compiling lazy_static v1.5.0
+    Building [=>                        ] 40/388: pulp(build.rs), crossbeam-u…   Compiling arrayvec v0.7.6
+   Compiling vcpkg v0.2.15
+    Building [=>                        ] 42/388: pulp(build.rs), crossbeam-u…    Building [=>                        ] 43/388: pulp(build.rs), crossbeam-u…   Compiling bitflags v1.3.2
+   Compiling encoding_rs v0.8.35
+    Building [==>                       ] 45/388: pulp(build.rs), crossbeam-u…    Building [==>                       ] 46/388: crossbeam-utils(build), pul…    Building [==>                       ] 47/388: crossbeam-utils(build), pul…   Compiling thiserror v2.0.17
+    Building [==>                       ] 48/388: crossbeam-utils(build), pul…    Building [==>                       ] 49/388: pulp(build.rs), crc32fast(b…   Compiling writeable v0.6.1
+    Building [==>                       ] 50/388: writeable, pulp(build.rs), …   Compiling zeroize v1.8.2
+    Building [==>                       ] 51/388: writeable, pulp(build.rs), …   Compiling litemap v0.8.0
+    Building [==>                       ] 52/388: writeable, pulp(build.rs), …   Compiling icu_normalizer_data v2.0.0
+    Building [==>                       ] 53/388: writeable, pulp(build.rs), …    Building [==>                       ] 54/388: writeable, pulp(build.rs), …    Building [==>                       ] 55/388: writeable, crc32fast(build.…    Building [==>                       ] 56/388: writeable, crc32fast(build.…   Compiling percent-encoding v2.3.2
+    Building [==>                       ] 57/388: writeable, crc32fast(build.…    Building [==>                       ] 58/388: writeable, crc32fast(build.…    Building [==>                       ] 59/388: writeable, memchr, thiserro…   Compiling icu_properties_data v2.0.1
+    Building [===>                      ] 60/388: writeable, memchr, thiserro…   Compiling byteorder v1.5.0
+    Building [===>                      ] 61/388: writeable, memchr, thiserro…   Compiling thiserror v1.0.69
+    Building [===>                      ] 62/388: writeable, memchr, thiserro…    Building [===>                      ] 63/388: writeable, memchr, typenum,…    Building [===>                      ] 64/388: writeable, memchr, typenum,…   Compiling rustls-pki-types v1.12.0
+    Building [===>                      ] 65/388: writeable, memchr, typenum,…   Compiling untrusted v0.9.0
+    Building [===>                      ] 66/388: writeable, memchr, typenum,…   Compiling cpufeatures v0.2.17
+    Building [===>                      ] 67/388: writeable, memchr, typenum,…   Compiling allocator-api2 v0.2.21
+    Building [===>                      ] 68/388: writeable, memchr, typenum,…    Building [===>                      ] 69/388: writeable, memchr, typenum,…   Compiling foldhash v0.2.0
+    Building [===>                      ] 70/388: writeable, memchr, typenum,…   Compiling openssl v0.10.74
+    Building [===>                      ] 71/388: writeable, memchr, typenum,…   Compiling foreign-types-shared v0.1.1
+    Building [===>                      ] 72/388: writeable, memchr, typenum,…    Building [===>                      ] 73/388: writeable, memchr, typenum,…   Compiling iana-time-zone v0.1.64
+    Building [===>                      ] 74/388: writeable, memchr, typenum,…   Compiling httparse v1.10.1
+    Building [====>                     ] 75/388: writeable, memchr, typenum,…    Building [====>                     ] 76/388: writeable, memchr, typenum,…    Building [====>                     ] 77/388: writeable, memchr, typenum,…   Compiling foreign-types v0.3.2
+    Building [====>                     ] 78/388: writeable, memchr, foreign-…    Building [====>                     ] 79/388: writeable, memchr, foreign-…   Compiling indexmap v2.14.0
+    Building [====>                     ] 80/388: memchr, foreign-types, type…   Compiling rustls v0.23.34
+    Building [====>                     ] 81/388: memchr, foreign-types, type…   Compiling native-tls v0.2.14
+    Building [====>                     ] 82/388: memchr, native-tls(build.rs…    Building [====>                     ] 83/388: native-tls(build.rs), forei…   Compiling typed-path v0.12.3
+    Building [====>                     ] 84/388: native-tls(build.rs), typen…   Compiling try-lock v0.2.5
+    Building [====>                     ] 85/388: native-tls(build.rs), typen…   Compiling http v1.3.1
+    Building [====>                     ] 86/388: native-tls(build.rs), typen…    Building [====>                     ] 87/388: native-tls(build.rs), typen…   Compiling ident_case v1.0.1
+    Building [====>                     ] 88/388: native-tls(build.rs), typen…   Compiling simd-adler32 v0.3.7
+    Building [====>                     ] 89/388: native-tls(build.rs), typen…   Compiling tower-service v0.3.3
+   Compiling strsim v0.11.1
+    Building [=====>                    ] 91/388: tower-service, native-tls(b…   Compiling crossbeam-epoch v0.9.18
+    Building [=====>                    ] 92/388: tower-service, native-tls(b…   Compiling atomic-waker v1.1.2
+    Building [=====>                    ] 93/388: tower-service, atomic-waker…   Compiling want v0.3.1
+    Building [=====>                    ] 94/388: tower-service, atomic-waker…   Compiling openssl-probe v0.1.6
+    Building [=====>                    ] 95/388: tower-service, atomic-waker…   Compiling adler2 v2.0.1
+    Building [=====>                    ] 96/388: atomic-waker, native-tls(bu…    Building [=====>                    ] 97/388: atomic-waker, native-tls(bu…   Compiling base64 v0.22.1
+    Building [=====>                    ] 98/388: atomic-waker, native-tls(bu…   Compiling glob v0.3.3
+    Building [=====>                    ] 99/388: atomic-waker, typenum, strs…   Compiling subtle v2.6.1
+    Building [=====>                   ] 100/388: atomic-waker, typenum, strs…   Compiling webpki-roots v1.0.3
+    Building [=====>                   ] 101/388: atomic-waker, typenum, webp…   Compiling miniz_oxide v0.8.9
+    Building [=====>                   ] 102/388: atomic-waker, miniz_oxide, …   Compiling form_urlencoded v1.2.2
+    Building [=====>                   ] 103/388: atomic-waker, miniz_oxide, …   Compiling aho-corasick v1.1.3
+    Building [=====>                   ] 104/388: atomic-waker, miniz_oxide, …   Compiling utf8_iter v1.0.4
+    Building [=====>                   ] 105/388: miniz_oxide, typenum, webpk…    Building [=====>                   ] 106/388: miniz_oxide, typenum, webpk…   Compiling regex-syntax v0.8.8
+    Building [=====>                   ] 107/388: miniz_oxide, typenum, webpk…   Compiling rustversion v1.0.22
+    Building [=====>                   ] 108/388: miniz_oxide, rustversion(bu…   Compiling ipnet v2.11.0
+    Building [======>                  ] 109/388: ipnet, miniz_oxide, rustver…    Building [======>                  ] 110/388: ipnet, miniz_oxide, rustver…   Compiling option-ext v0.2.0
+    Building [======>                  ] 111/388: ipnet, miniz_oxide, rustver…   Compiling portable-atomic v1.11.1
+    Building [======>                  ] 112/388: ipnet, miniz_oxide, rustver…   Compiling sync_wrapper v1.0.2
+    Building [======>                  ] 113/388: ipnet, miniz_oxide, rustver…   Compiling syn v2.0.108
+    Building [======>                  ] 114/388: ipnet, miniz_oxide, rustver…   Compiling crossbeam-deque v0.8.6
+    Building [======>                  ] 115/388: ipnet, miniz_oxide, rustver…   Compiling unicode-width v0.2.2
+    Building [======>                  ] 116/388: unicode-width, ipnet, miniz…   Compiling anyhow v1.0.100
+    Building [======>                  ] 117/388: unicode-width, ipnet, miniz…   Compiling audio-core v0.2.1
+    Building [======>                  ] 118/388: unicode-width, ipnet, miniz…   Compiling strength_reduce v0.2.4
+    Building [======>                  ] 119/388: unicode-width, ipnet, miniz…   Compiling tower-layer v0.3.3
+    Building [======>                  ] 120/388: unicode-width, ipnet, miniz…    Building [======>                  ] 121/388: unicode-width, ipnet, miniz…   Compiling ahash v0.8.12
+    Building [======>                  ] 122/388: unicode-width, ipnet, miniz…   Compiling number_prefix v0.4.0
+    Building [======>                  ] 123/388: unicode-width, ipnet, miniz…   Compiling bit-vec v0.8.0
+    Building [======>                  ] 124/388: unicode-width, ipnet, miniz…    Building [=======>                 ] 125/388: unicode-width, ipnet, miniz…   Compiling mio v1.1.0
+    Building [=======>                 ] 126/388: unicode-width, ipnet, miniz…   Compiling signal-hook-registry v1.4.6
+   Compiling socket2 v0.6.1
+    Building [=======>                 ] 128/388: unicode-width, ipnet, miniz…    Building [=======>                 ] 129/388: unicode-width, ipnet, miniz…    Building [=======>                 ] 130/388: unicode-width, ipnet, miniz…   Compiling getrandom v0.2.16
+    Building [=======>                 ] 131/388: unicode-width, ipnet, miniz…   Compiling num_cpus v1.17.0
+   Compiling memmap2 v0.9.9
+    Building [=======>                 ] 134/388: unicode-width, ipnet, miniz…   Compiling console v0.15.11
+    Building [=======>                 ] 135/388: unicode-width, ipnet, miniz…   Compiling iri-string v0.7.8
+    Building [=======>                 ] 136/388: unicode-width, ipnet, miniz…    Building [=======>                 ] 137/388: unicode-width, ipnet, miniz…   Compiling minimal-lexical v0.2.1
+    Building [=======>                 ] 138/388: ipnet, miniz_oxide, memmap2…    Building [=======>                 ] 139/388: ipnet, miniz_oxide, memmap2…   Compiling rand_core v0.9.3
+    Building [========>                ] 140/388: ipnet, miniz_oxide, memmap2…    Building [========>                ] 141/388: ipnet, miniz_oxide, memmap2…   Compiling flate2 v1.1.5
+    Building [========>                ] 142/388: ipnet, miniz_oxide, memmap2…    Building [========>                ] 143/388: ipnet, miniz_oxide, memmap2…    Building [========>                ] 144/388: ipnet, miniz_oxide, memmap2…   Compiling rand_core v0.6.4
+    Building [========>                ] 145/388: ipnet, miniz_oxide, memmap2…   Compiling openssl-sys v0.9.110
+    Building [========>                ] 146/388: ipnet, miniz_oxide, memmap2…   Compiling ring v0.17.14
+    Building [========>                ] 147/388: ipnet, miniz_oxide, memmap2…   Compiling onig_sys v69.9.1
+    Building [========>                ] 148/388: ipnet, miniz_oxide, num-tra…   Compiling esaxx-rs v0.1.10
+    Building [========>                ] 149/388: ipnet, miniz_oxide, num-tra…   Compiling nom v7.1.3
+    Building [========>                ] 150/388: ipnet, miniz_oxide, num-tra…   Compiling http-body v1.0.1
+    Building [========>                ] 151/388: ipnet, miniz_oxide, num-tra…   Compiling bit-set v0.8.0
+    Building [========>                ] 152/388: bit-set, miniz_oxide, num-t…    Building [========>                ] 153/388: bit-set, miniz_oxide, num-t…   Compiling rayon v1.11.0
+    Building [========>                ] 154/388: bit-set, miniz_oxide, num-t…    Building [========>                ] 155/388: bit-set, miniz_oxide, num-t…   Compiling http-body-util v0.1.3
+    Building [=========>               ] 156/388: bit-set, num-traits, anyhow…   Compiling socks v0.3.4
+   Compiling dirs-sys v0.5.0
+    Building [=========>               ] 158/388: bit-set, num-traits, anyhow…    Building [=========>               ] 159/388: bit-set, esaxx-rs(build), n…   Compiling zip v7.2.0
+    Building [=========>               ] 160/388: esaxx-rs(build), num-traits…    Building [=========>               ] 161/388: esaxx-rs(build), num-traits…   Compiling crypto-common v0.1.6
+    Building [=========>               ] 162/388: esaxx-rs(build), num-traits…   Compiling block-buffer v0.10.4
+    Building [=========>               ] 163/388: esaxx-rs(build), block-buff…   Compiling num-integer v0.1.46
+    Building [=========>               ] 164/388: esaxx-rs(build), block-buff…   Compiling audioadapter v3.0.0
+    Building [=========>               ] 165/388: esaxx-rs(build), block-buff…   Compiling castaway v0.2.4
+    Building [=========>               ] 166/388: esaxx-rs(build), block-buff…   Compiling audioadapter-sample v3.0.0
+    Building [=========>               ] 167/388: esaxx-rs(build), block-buff…   Compiling webpki-roots v0.26.11
+    Building [=========>               ] 168/388: esaxx-rs(build), block-buff…    Building [=========>               ] 169/388: esaxx-rs(build), block-buff…    Building [=========>               ] 170/388: esaxx-rs(build), block-buff…   Compiling digest v0.10.7
+    Building [==========>              ] 171/388: esaxx-rs(build), block-buff…   Compiling indicatif v0.17.11
+    Building [==========>              ] 172/388: esaxx-rs(build), block-buff…   Compiling fdeflate v0.3.7
+    Building [==========>              ] 173/388: esaxx-rs(build), indicatif,…   Compiling itertools v0.14.0
+    Building [==========>              ] 174/388: esaxx-rs(build), indicatif,…   Compiling mime v0.3.17
+    Building [==========>              ] 175/388: esaxx-rs(build), indicatif,…    Building [==========>              ] 176/388: esaxx-rs(build), indicatif,…    Building [==========>              ] 177/388: esaxx-rs(build), indicatif,…    Building [==========>              ] 178/388: esaxx-rs(build), indicatif,…   Compiling quick-error v2.0.1
+    Building [==========>              ] 179/388: esaxx-rs(build), indicatif,…   Compiling static_assertions v1.1.0
+    Building [==========>              ] 180/388: esaxx-rs(build), indicatif,…   Compiling pxfm v0.1.28
+    Building [==========>              ] 181/388: esaxx-rs(build), indicatif,…   Compiling extended v0.1.0
+    Building [==========>              ] 182/388: esaxx-rs(build), indicatif,…   Compiling rustix v1.1.2
+    Building [==========>              ] 183/388: esaxx-rs(build), indicatif,…   Compiling base64 v0.13.1
+    Building [==========>              ] 184/388: esaxx-rs(build), indicatif,…   Compiling transpose v0.2.3
+    Building [==========>              ] 185/388: esaxx-rs(build), indicatif,…   Compiling sha2 v0.10.9
+    Building [==========>              ] 186/388: esaxx-rs(build), indicatif,…   Compiling primal-check v0.3.4
+    Building [===========>             ] 187/388: esaxx-rs(build), indicatif,…   Compiling winnow v0.7.13
+    Building [===========>             ] 188/388: esaxx-rs(build), indicatif,…   Compiling byteorder-lite v0.1.0
+    Building [===========>             ] 189/388: esaxx-rs(build), indicatif,…   Compiling macro_rules_attribute-proc_macro v0.2.2
+    Building [===========>             ] 190/388: esaxx-rs(build), indicatif,…   Compiling unicode-segmentation v1.12.0
+    Building [===========>             ] 191/388: esaxx-rs(build), indicatif,…   Compiling zune-core v0.5.1
+    Building [===========>             ] 192/388: esaxx-rs(build), indicatif,…   Compiling toml_write v0.1.2
+    Building [===========>             ] 193/388: esaxx-rs(build), toml_write…   Compiling audioadapter-buffers v3.0.0
+    Building [===========>             ] 194/388: esaxx-rs(build), toml_write…    Building [===========>             ] 195/388: toml_write, indicatif, esax…   Compiling png v0.18.1
+    Building [===========>             ] 196/388: toml_write, indicatif, esax…    Building [===========>             ] 197/388: toml_write, indicatif, rust…   Compiling dirs v6.0.0
+    Building [===========>             ] 198/388: toml_write, indicatif, rust…    Building [===========>             ] 199/388: toml_write, indicatif, rust…   Compiling image-webp v0.2.4
+    Building [===========>             ] 200/388: indicatif, rustix(build), e…   Compiling zune-jpeg v0.5.15
+    Building [===========>             ] 201/388: indicatif, rustix(build), e…   Compiling windowfunctions v0.1.1
+    Building [============>            ] 202/388: indicatif, rustix(build), e…   Compiling dirs-sys v0.4.1
+    Building [============>            ] 203/388: indicatif, rustix(build), e…   Compiling unicode_categories v0.1.1
+    Building [============>            ] 204/388: indicatif, esaxx-rs, audioa…   Compiling linux-raw-sys v0.11.0
+    Building [============>            ] 205/388: indicatif, esaxx-rs, audioa…   Compiling fastrand v2.3.0
+    Building [============>            ] 206/388: indicatif, esaxx-rs, audioa…   Compiling pathdiff v0.2.3
+    Building [============>            ] 207/388: indicatif, esaxx-rs, pathdi…   Compiling macro_rules_attribute v0.2.2
+    Building [============>            ] 208/388: indicatif, esaxx-rs, pathdi…    Building [============>            ] 209/388: indicatif, esaxx-rs, pathdi…    Building [============>            ] 210/388: indicatif, esaxx-rs, pathdi…    Building [============>            ] 211/388: indicatif, esaxx-rs, pathdi…    Building [============>            ] 212/388: indicatif, pathdiff, audioa…    Building [============>            ] 213/388: indicatif, audioadapter-buf…   Compiling dirs v5.0.1
+    Building [============>            ] 214/388: indicatif, audioadapter-buf…    Building [============>            ] 215/388: indicatif, audioadapter-buf…    Building [============>            ] 216/388: indicatif, regex-syntax, se…    Building [============>            ] 217/388: indicatif, regex-syntax, se…    Building [=============>           ] 218/388: indicatif, regex-syntax, se…    Building [=============>           ] 219/388: indicatif, regex-syntax, se…    Building [=============>           ] 220/388: regex-syntax, serde_json, r…    Building [=============>           ] 221/388: regex-syntax, serde_json, r…   Compiling regex-automata v0.4.13
+    Building [=============>           ] 221/388: regex-automata, regex-synta…    Building [=============>           ] 222/388: regex-automata, regex-synta…    Building [=============>           ] 223/388: regex-automata, regex-synta…    Building [=============>           ] 224/388: regex-automata, regex-synta…    Building [=============>           ] 225/388: regex-automata, regex-synta…    Building [=============>           ] 226/388: regex-automata, regex-synta…    Building [=============>           ] 227/388: regex-automata, regex-synta…    Building [=============>           ] 228/388: regex-automata, serde_json,…    Building [=============>           ] 229/388: regex-automata, serde_json,…    Building [=============>           ] 230/388: regex-automata, serde_json,…    Building [=============>           ] 231/388: regex-automata, ring(build)…    Building [=============>           ] 232/388: regex-automata, ring(build)…   Compiling rayon-cond v0.4.0
+    Building [=============>           ] 232/388: regex-automata, ring(build)…   Compiling bindgen_cuda v0.1.6
+    Building [=============>           ] 232/388: regex-automata, bindgen_cud…    Building [==============>          ] 233/388: regex-automata, bindgen_cud…    Building [==============>          ] 234/388: regex-automata, bindgen_cud…    Building [==============>          ] 235/388: regex-automata, bindgen_cud…    Building [==============>          ] 236/388: regex-automata, bindgen_cud…   Compiling ferrum-kernels v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kernels)
+    Building [==============>          ] 237/388: regex-automata, ring(build)…    Building [==============>          ] 238/388: regex-automata, ferrum-kern…    Building [==============>          ] 239/388: regex-automata, ferrum-kern…   Compiling tempfile v3.23.0
+    Building [==============>          ] 239/388: regex-automata, ferrum-kern…    Building [==============>          ] 240/388: regex-automata, ferrum-kern…   Compiling moxcms v0.8.1
+    Building [==============>          ] 240/388: regex-automata, ferrum-kern…    Building [==============>          ] 241/388: regex-automata, ferrum-kern…   Compiling synstructure v0.13.2
+   Compiling darling_core v0.20.11
+    Building [==============>          ] 241/388: regex-automata, ferrum-kern…    Building [==============>          ] 242/388: regex-automata, ferrum-kern…    Building [==============>          ] 243/388: regex-automata, ring, darli…    Building [==============>          ] 244/388: regex-automata, ring, darli…    Building [==============>          ] 245/388: regex-automata, ring, darli…   Compiling serde_derive v1.0.228
+   Compiling bytemuck_derive v1.10.2
+   Compiling zerocopy-derive v0.8.27
+   Compiling zerofrom-derive v0.1.6
+   Compiling yoke-derive v0.8.0
+   Compiling tokio-macros v2.6.0
+   Compiling futures-macro v0.3.31
+   Compiling zerovec-derive v0.11.1
+   Compiling tracing-attributes v0.1.30
+   Compiling displaydoc v0.2.5
+   Compiling thiserror-impl v2.0.17
+   Compiling thiserror-impl v1.0.69
+   Compiling openssl-macros v0.1.1
+   Compiling async-trait v0.1.89
+   Compiling monostate-impl v0.1.18
+   Compiling visibility v0.1.1
+   Compiling async-stream-impl v0.3.6
+    Building [==============>          ] 246/388: monostate-impl, tokio-macro…   Compiling rustls-webpki v0.103.7
+    Building [==============>          ] 246/388: monostate-impl, tokio-macro…    Building [==============>          ] 247/388: monostate-impl, tokio-macro…    Building [==============>          ] 248/388: monostate-impl, tokio-macro…    Building [===============>         ] 249/388: monostate-impl, tokio-macro…   Compiling fancy-regex v0.17.0
+    Building [===============>         ] 249/388: monostate-impl, fancy-regex…   Compiling regex v1.12.2
+    Building [===============>         ] 249/388: monostate-impl, fancy-regex…   Compiling monostate v0.1.18
+    Building [===============>         ] 250/388: fancy-regex, tokio-macros, …   Compiling onig v6.5.1
+    Building [===============>         ] 250/388: fancy-regex, tokio-macros, …    Building [===============>         ] 251/388: fancy-regex, tokio-macros, …   Compiling async-stream v0.3.6
+    Building [===============>         ] 252/388: fancy-regex, tokio-macros, …    Building [===============>         ] 253/388: fancy-regex, tokio-macros, …    Building [===============>         ] 254/388: fancy-regex, regex-automata…    Building [===============>         ] 255/388: fancy-regex, regex-automata…    Building [===============>         ] 256/388: fancy-regex, regex-automata…    Building [===============>         ] 257/388: fancy-regex, regex-automata…    Building [===============>         ] 258/388: fancy-regex, regex-automata…   Compiling futures-util v0.3.31
+    Building [===============>         ] 259/388: fancy-regex, regex-automata…    Building [===============>         ] 260/388: fancy-regex, regex-automata…   Compiling zerofrom v0.1.6
+    Building [===============>         ] 261/388: fancy-regex, regex-automata…    Building [===============>         ] 262/388: fancy-regex, regex-automata…    Building [===============>         ] 263/388: fancy-regex, regex-automata…   Compiling yoke v0.8.1
+    Building [===============>         ] 263/388: fancy-regex, regex-automata…    Building [================>        ] 264/388: fancy-regex, regex-automata…    Building [================>        ] 265/388: fancy-regex, regex-automata…   Compiling bytemuck v1.24.0
+    Building [================>        ] 266/388: fancy-regex, regex-automata…   Compiling tracing v0.1.41
+    Building [================>        ] 267/388: fancy-regex, regex-automata…    Building [================>        ] 268/388: fancy-regex, regex-automata…    Building [================>        ] 269/388: fancy-regex, regex-automata…    Building [================>        ] 270/388: fancy-regex, regex-automata…    Building [================>        ] 271/388: fancy-regex, regex-automata…    Building [================>        ] 272/388: fancy-regex, regex-automata…    Building [================>        ] 273/388: fancy-regex, regex-automata…   Compiling zerovec v0.11.4
+   Compiling zerotrie v0.2.2
+    Building [================>        ] 273/388: fancy-regex, regex-automata…    Building [================>        ] 274/388: fancy-regex, regex-automata…    Building [================>        ] 275/388: fancy-regex, regex-automata…   Compiling num-complex v0.4.6
+   Compiling dyn-stack v0.13.2
+   Compiling symphonia-core v0.5.5
+    Building [================>        ] 275/388: fancy-regex, regex-automata…   Compiling darling_macro v0.20.11
+    Building [================>        ] 276/388: fancy-regex, regex-automata…    Building [================>        ] 277/388: fancy-regex, regex-automata…    Building [================>        ] 278/388: regex-automata, serde_deriv…    Building [================>        ] 279/388: regex-automata, serde_deriv…    Building [=================>       ] 280/388: regex-automata, serde_deriv…   Compiling darling v0.20.11
+    Building [=================>       ] 281/388: regex-automata, serde_deriv…   Compiling derive_builder_core v0.20.2
+    Building [=================>       ] 281/388: regex-automata, serde_deriv…    Building [=================>       ] 282/388: regex-automata, serde_deriv…   Compiling rustfft v6.4.1
+    Building [=================>       ] 282/388: regex-automata, serde_deriv…    Building [=================>       ] 283/388: serde_derive, futures-util,…    Building [=================>       ] 284/388: serde_derive, futures-util,…   Compiling tinystr v0.8.1
+   Compiling potential_utf v0.1.3
+    Building [=================>       ] 284/388: serde_derive, futures-util,…    Building [=================>       ] 285/388: serde_derive, futures-util,…   Compiling icu_collections v2.0.0
+    Building [=================>       ] 285/388: serde_derive, futures-util,…   Compiling symphonia-metadata v0.5.5
+   Compiling symphonia-codec-pcm v0.5.5
+   Compiling symphonia-codec-aac v0.5.5
+    Building [=================>       ] 285/388: serde_derive, futures-util,…   Compiling derive_builder_macro v0.20.2
+    Building [=================>       ] 286/388: serde_derive, futures-util,…    Building [=================>       ] 287/388: serde_derive, futures-util,…   Compiling icu_locale_core v2.0.0
+    Building [=================>       ] 287/388: serde_derive, futures-util,…    Building [=================>       ] 288/388: serde_derive, futures-util,…    Building [=================>       ] 289/388: futures-util, icu_collectio…    Building [=================>       ] 290/388: futures-util, icu_collectio…   Compiling derive_builder v0.20.2
+    Building [=================>       ] 291/388: derive_builder, futures-uti…    Building [=================>       ] 292/388: derive_builder, futures-uti…   Compiling symphonia-utils-xiph v0.5.5
+   Compiling symphonia-bundle-mp3 v0.5.5
+   Compiling symphonia-format-riff v0.5.5
+    Building [=================>       ] 292/388: derive_builder, futures-uti…    Building [=================>       ] 293/388: futures-util, icu_collectio…    Building [=================>       ] 294/388: futures-util, symphonia-bun…   Compiling symphonia-bundle-flac v0.5.5
+   Compiling symphonia-format-isomp4 v0.5.5
+   Compiling symphonia-format-ogg v0.5.5
+   Compiling symphonia-codec-vorbis v0.5.5
+    Building [=================>       ] 294/388: symphonia-bundle-flac, symp…    Building [==================>      ] 295/388: symphonia-bundle-flac, symp…    Building [==================>      ] 296/388: symphonia-bundle-flac, symp…    Building [==================>      ] 297/388: symphonia-bundle-flac, symp…    Building [==================>      ] 298/388: symphonia-bundle-flac, symp…   Compiling icu_provider v2.0.0
+    Building [==================>      ] 298/388: symphonia-bundle-flac, symp…   Compiling ppv-lite86 v0.2.21
+    Building [==================>      ] 298/388: symphonia-bundle-flac, symp…   Compiling smallvec v1.15.1
+   Compiling hashbrown v0.16.0
+   Compiling chrono v0.4.42
+   Compiling uuid v1.18.1
+   Compiling toml_datetime v0.6.11
+   Compiling serde_urlencoded v0.7.1
+   Compiling serde_spanned v0.6.9
+   Compiling compact_str v0.9.0
+   Compiling spm_precompiled v0.1.4
+   Compiling safetensors v0.4.5
+   Compiling dary_heap v0.3.8
+   Compiling serde_plain v1.0.2
+    Building [==================>      ] 298/388: safetensors, serde_urlencod…    Building [==================>      ] 299/388: safetensors, serde_urlencod…    Building [==================>      ] 300/388: safetensors, serde_urlencod…    Building [==================>      ] 301/388: safetensors, serde_urlencod…   Compiling toml_edit v0.22.27
+    Building [==================>      ] 301/388: safetensors, serde_urlencod…    Building [==================>      ] 302/388: safetensors, serde_urlencod…    Building [==================>      ] 303/388: safetensors, serde_urlencod…    Building [==================>      ] 304/388: safetensors, serde_urlencod…   Compiling unicode-normalization-alignments v0.1.12
+    Building [==================>      ] 304/388: safetensors, serde_urlencod…   Compiling icu_normalizer v2.0.0
+    Building [==================>      ] 305/388: safetensors, serde_urlencod…   Compiling icu_properties v2.0.1
+    Building [==================>      ] 306/388: safetensors, serde_urlencod…    Building [==================>      ] 307/388: safetensors, serde_urlencod…    Building [==================>      ] 308/388: safetensors, symphonia-bund…    Building [==================>      ] 309/388: safetensors, symphonia-bund…    Building [==================>      ] 310/388: safetensors, symphonia-bund…   Compiling rand_chacha v0.9.0
+    Building [==================>      ] 310/388: safetensors, symphonia-bund…   Compiling rand_chacha v0.3.1
+    Building [==================>      ] 310/388: safetensors, symphonia-bund…    Building [===================>     ] 311/388: safetensors, symphonia-code…    Building [===================>     ] 312/388: safetensors, symphonia-code…   Compiling symphonia v0.5.5
+    Building [===================>     ] 312/388: safetensors, symphonia, sym…    Building [===================>     ] 313/388: safetensors, symphonia, sym…   Compiling parking_lot v0.12.5
+    Building [===================>     ] 313/388: safetensors, symphonia, sym…    Building [===================>     ] 314/388: safetensors, symphonia, sym…    Building [===================>     ] 315/388: safetensors, symphonia, sym…    Building [===================>     ] 316/388: safetensors, symphonia-code…   Compiling rand v0.9.2
+    Building [===================>     ] 317/388: safetensors, futures-util, …   Compiling rand v0.8.5
+    Building [===================>     ] 318/388: safetensors, futures-util, …    Building [===================>     ] 319/388: futures-util, rand, rand_ch…   Compiling image v0.25.10
+    Building [===================>     ] 320/388: futures-util, rand, rand_ch…   Compiling safetensors v0.7.0
+    Building [===================>     ] 320/388: futures-util, rand, rand_ch…   Compiling tokio v1.48.0
+    Building [===================>     ] 320/388: futures-util, rand, rand_ch…    Building [===================>     ] 321/388: futures-util, rand, rand_ch…    Building [===================>     ] 322/388: futures-util, rand, rand_ch…    Building [===================>     ] 323/388: futures-util, rand, rand_ch…   Compiling futures-executor v0.3.31
+    Building [===================>     ] 323/388: futures-util, rand, rand_ch…    Building [===================>     ] 324/388: futures-util, rand, rand_ch…    Building [===================>     ] 325/388: futures-util, rand, chrono,…    Building [====================>    ] 326/388: futures-util, rand, chrono,…    Building [====================>    ] 327/388: futures-util, rand, chrono,…    Building [====================>    ] 328/388: futures-util, rand, chrono,…   Compiling futures v0.3.31
+    Building [====================>    ] 328/388: futures-util, rand, chrono,…    Building [====================>    ] 329/388: futures-util, rand, chrono,…    Building [====================>    ] 330/388: rand, chrono, futures-execu…    Building [====================>    ] 331/388: rand, chrono, futures-execu…    Building [====================>    ] 332/388: rand, chrono, icu_propertie…   Compiling rand_distr v0.5.1
+   Compiling tokenizers v0.21.4
+    Building [====================>    ] 332/388: rand_distr, tokenizers, ran…   Compiling ferrum-types v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-types)
+    Building [====================>    ] 332/388: rand_distr, tokenizers, fer…    Building [====================>    ] 333/388: rand_distr, tokenizers, fer…    Building [====================>    ] 334/388: rand_distr, tokenizers, fer…   Compiling idna_adapter v1.2.1
+    Building [====================>    ] 334/388: rand_distr, tokenizers, fer…    Building [====================>    ] 335/388: rand_distr, tokenizers, fer…   Compiling idna v1.1.0
+    Building [====================>    ] 335/388: rand_distr, tokenizers, fer…    Building [====================>    ] 336/388: rand_distr, tokenizers, fer…    Building [====================>    ] 337/388: rand_distr, tokenizers, fer…    Building [====================>    ] 338/388: rand_distr, tokenizers, fer…   Compiling half v2.7.1
+    Building [====================>    ] 338/388: rand_distr, tokenizers, fer…   Compiling url v2.5.7
+    Building [====================>    ] 338/388: rand_distr, tokenizers, fer…    Building [====================>    ] 339/388: tokenizers, ferrum-types, i…    Building [====================>    ] 340/388: tokenizers, ferrum-types, r…   Compiling float8 v0.6.1
+    Building [====================>    ] 340/388: tokenizers, ferrum-types, f…    Building [====================>    ] 341/388: tokenizers, ferrum-types, f…   Compiling ureq v2.12.1
+    Building [====================>    ] 341/388: tokenizers, ferrum-types, f…    Building [=====================>   ] 342/388: tokenizers, ferrum-types, u…   Compiling toml v0.8.23
+    Building [=====================>   ] 342/388: tokenizers, ferrum-types, u…   Compiling gemm-common v0.19.0
+    Building [=====================>   ] 342/388: tokenizers, ferrum-types, u…    Building [=====================>   ] 343/388: tokenizers, ferrum-types, u…    Building [=====================>   ] 344/388: tokenizers, ferrum-types, u…    Building [=====================>   ] 345/388: tokenizers, ferrum-types, u…   Compiling gemm-f32 v0.19.0
+   Compiling gemm-c64 v0.19.0
+   Compiling gemm-c32 v0.19.0
+   Compiling gemm-f64 v0.19.0
+    Building [=====================>   ] 345/388: gemm-c32, tokenizers, ferru…    Building [=====================>   ] 346/388: gemm-c32, tokenizers, ferru…    Building [=====================>   ] 347/388: gemm-c32, tokenizers, ferru…    Building [=====================>   ] 348/388: gemm-c32, tokenizers, ferru…    Building [=====================>   ] 349/388: gemm-c32, tokenizers, ferru…   Compiling gemm-f16 v0.19.0
+    Building [=====================>   ] 349/388: gemm-c32, tokenizers, ferru…   Compiling realfft v3.5.0
+    Building [=====================>   ] 349/388: gemm-c32, tokenizers, ferru…   Compiling rubato v2.0.0
+    Building [=====================>   ] 349/388: gemm-c32, tokenizers, ferru…    Building [=====================>   ] 350/388: gemm-c32, tokenizers, ferru…    Building [=====================>   ] 351/388: gemm-c32, tokenizers, ferru…    Building [=====================>   ] 352/388: gemm-c32, tokenizers, ferru…    Building [=====================>   ] 353/388: gemm-c32, tokenizers, ferru…   Compiling gemm v0.19.0
+    Building [=====================>   ] 353/388: gemm-c32, tokenizers, ferru…   Compiling candle-core v0.9.2
+    Building [=====================>   ] 353/388: gemm-c32, tokenizers, ferru…    Building [=====================>   ] 354/388: gemm-c32, tokenizers, ferru…    Building [=====================>   ] 355/388: gemm-c32, tokenizers, ferru…    Building [=====================>   ] 356/388: gemm-c32, tokenizers, ferru…    Building [======================>  ] 357/388: gemm-c32, tokenizers, ferru…    Building [======================>  ] 358/388: gemm-c32, tokenizers, ferru…   Compiling tokio-util v0.7.16
+   Compiling tokio-rustls v0.26.4
+   Compiling tower v0.5.2
+   Compiling tokio-native-tls v0.3.1
+   Compiling tokio-stream v0.1.17
+    Building [======================>  ] 358/388: tower, gemm-c32, tokenizers…    Building [======================>  ] 359/388: tower, gemm-c32, tokenizers…    Building [======================>  ] 360/388: tower, gemm-c32, tokenizers…    Building [======================>  ] 361/388: tower, tokenizers, ferrum-t…    Building [======================>  ] 362/388: tower, tokenizers, ferrum-t…   Compiling tokio-test v0.4.4
+    Building [======================>  ] 362/388: tower, tokenizers, ferrum-t…    Building [======================>  ] 363/388: tower, tokenizers, ferrum-t…   Compiling tower-http v0.6.6
+    Building [======================>  ] 363/388: tower, tokenizers, ferrum-t…   Compiling h2 v0.4.12
+    Building [======================>  ] 363/388: tower, tokenizers, ferrum-t…    Building [======================>  ] 364/388: tokenizers, ferrum-types, t…    Building [======================>  ] 365/388: tokenizers, ferrum-types, t…    Building [======================>  ] 366/388: tokenizers, ferrum-types, t…    Building [======================>  ] 367/388: tokenizers, ferrum-types, c…    Building [======================>  ] 368/388: tokenizers, ferrum-types, c…   Compiling ferrum-interfaces v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-interfaces)
+   Compiling ferrum-bench-core v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-bench-core)
+    Building [======================>  ] 368/388: tokenizers, ferrum-types, f…    Building [======================>  ] 369/388: tokenizers, ferrum-interfac…    Building [======================>  ] 370/388: tokenizers, ferrum-interfac…    Building [======================>  ] 371/388: ferrum-interfaces, candle-c…   Compiling ferrum-kv v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kv)
+    Building [======================>  ] 371/388: ferrum-interfaces, candle-c…   Compiling hyper v1.7.0
+    Building [======================>  ] 371/388: ferrum-interfaces, hyper, c…    Building [======================>  ] 372/388: hyper, candle-core, ferrum-…    Building [=======================> ] 373/388: hyper, candle-core, ferrum-…   Compiling hyper-util v0.1.17
+    Building [=======================> ] 373/388: hyper-util, hyper, candle-c…   Compiling candle-nn v0.9.2
+    Building [=======================> ] 373/388: hyper-util, hyper, candle-c…    Building [=======================> ] 374/388: hyper-util, hyper, candle-c…    Building [=======================> ] 375/388: hyper-util, candle-core, ca…   Compiling ferrum-quantization v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-quantization)
+   Compiling ferrum-testkit v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-testkit)
+    Building [=======================> ] 375/388: ferrum-testkit, hyper-util,…    Building [=======================> ] 376/388: ferrum-testkit, hyper-util,…   Compiling candle-transformers v0.9.2
+    Building [=======================> ] 376/388: ferrum-testkit, hyper-util,…   Compiling hyper-tls v0.6.0
+   Compiling hyper-rustls v0.27.7
+    Building [=======================> ] 376/388: ferrum-testkit, hyper-rustl…    Building [=======================> ] 377/388: ferrum-testkit, hyper-rustl…   Compiling reqwest v0.12.24
+    Building [=======================> ] 377/388: ferrum-testkit, hyper-rustl…    Building [=======================> ] 378/388: ferrum-testkit, hyper-rustl…    Building [=======================> ] 379/388: ferrum-testkit, reqwest, fe…    Building [=======================> ] 380/388: ferrum-testkit, reqwest, ca…    Building [=======================> ] 381/388: reqwest, candle-core, candl…    Building [=======================> ] 382/388: reqwest, candle-core, candl…   Compiling hf-hub v0.4.3
+    Building [=======================> ] 382/388: hf-hub, reqwest, candle-cor…    Building [=======================> ] 383/388: reqwest, candle-core, candl…    Building [=======================> ] 384/388: candle-core, candle-transfo…    Building [=======================> ] 385/388: candle-transformers            Compiling ferrum-models v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-models)
+    Building [=======================> ] 385/388: ferrum-models, candle-trans…    Building [=======================> ] 386/388: ferrum-models                   Building [=======================> ] 387/388: w3_qwen35_s1_dump(example)      Finished `dev` profile [unoptimized + debuginfo] target(s) in 28.46s
+     Running `target/debug/examples/w3_qwen35_s1_dump --model-dir /workspace/hf-cache/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17 --hf-dump /workspace/w3_hf_dump_artifacts/qwen35_08b_hf_layer_dump_20260617T141100Z_2d3092ba/dump --out /workspace/w3_qwen35_s1_compare_20260617T144200Z_7dc3de10/ferrum_dump`
+W3 QWEN35 FERRUM LAYER DUMP PASS: /workspace/w3_qwen35_s1_compare_20260617T144200Z_7dc3de10/ferrum_dump
+Traceback (most recent call last):
+  File "/workspace/ferrum-infer-rs/scripts/release/w3_qwen35_layer_compare.py", line 306, in <module>
+    raise SystemExit(main(sys.argv[1:]))
+  File "/workspace/ferrum-infer-rs/scripts/release/w3_qwen35_layer_compare.py", line 299, in main
+    return run_compare(args)
+  File "/workspace/ferrum-infer-rs/scripts/release/w3_qwen35_layer_compare.py", line 203, in run_compare
+    result = compare(Path(args.hf_dump).resolve(), Path(args.ferrum_dump).resolve(), atol=args.atol)
+  File "/workspace/ferrum-infer-rs/scripts/release/w3_qwen35_layer_compare.py", line 178, in compare
+    ferrum_values, ferrum_shape = read_tensor(ferrum_dir, ferrum_manifest, name)
+  File "/workspace/ferrum-infer-rs/scripts/release/w3_qwen35_layer_compare.py", line 135, in read_tensor
+    values = read_f32(root / "tensors" / rel)
+  File "/workspace/ferrum-infer-rs/scripts/release/w3_qwen35_layer_compare.py", line 106, in read_f32
+    raw = path.read_bytes()
+  File "/usr/lib/python3.10/pathlib.py", line 1126, in read_bytes
+    with self.open(mode='rb') as f:
+  File "/usr/lib/python3.10/pathlib.py", line 1119, in open
+    return self._accessor.open(self, mode, buffering, encoding, errors,
+FileNotFoundError: [Errno 2] No such file or directory: '/workspace/w3_qwen35_s1_compare_20260617T144200Z_7dc3de10/ferrum_dump/tensors/layer_input.bin'

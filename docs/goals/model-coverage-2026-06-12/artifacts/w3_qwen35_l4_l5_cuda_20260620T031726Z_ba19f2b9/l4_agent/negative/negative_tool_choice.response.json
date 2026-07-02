@@ -1,0 +1,1 @@
+{"error":{"message":"tool_choice selects a function that is not declared in tools","type":"invalid_request_error","param":"tool_choice","code":null}}

@@ -1,0 +1,269 @@
+{
+  "agent": {
+    "json_schema_strict": true,
+    "real_model": true,
+    "required_tool_enforced": true,
+    "strict_schema_passed": 20,
+    "strict_schema_total": 20,
+    "tool_calls_passed": 10,
+    "tool_calls_total": 10
+  },
+  "base_url": "http://127.0.0.1:18173",
+  "generated_at": "2026-06-20T03:18:13.610703+00:00",
+  "hidden_env": [],
+  "level": "l4_agent",
+  "model_id": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+  "negative_contracts": {
+    "response_format_400": true,
+    "tool_choice_400": true
+  },
+  "pass_line": "W3 L4 AGENT PASS: /workspace/artifacts/w3_qwen35_l4_l5_cuda_20260620T031726Z_ba19f2b9/l4_agent",
+  "product_surface": "typed_cli",
+  "request_model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+  "schema_version": 1,
+  "status": "pass",
+  "strict_schema_cases": [
+    {
+      "content": {
+        "answer": "ok-0"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_00",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-1"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_01",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-2"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_02",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-3"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_03",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-4"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_04",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-5"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_05",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-6"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_06",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-7"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_07",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-8"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_08",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-9"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_09",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-10"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_10",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-11"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_11",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-12"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_12",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-13"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_13",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-14"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_14",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-15"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_15",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-16"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_16",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-17"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_17",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-18"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_18",
+      "passed": true
+    },
+    {
+      "content": {
+        "answer": "ok-19"
+      },
+      "finish_reason": "stop",
+      "id": "strict_schema_19",
+      "passed": true
+    }
+  ],
+  "tool_call_cases": [
+    {
+      "arguments": {
+        "expression": "123+456"
+      },
+      "finish_reason": "tool_calls",
+      "id": "tool_00",
+      "passed": true
+    },
+    {
+      "arguments": {
+        "expression": "123+456"
+      },
+      "finish_reason": "tool_calls",
+      "id": "tool_01",
+      "passed": true
+    },
+    {
+      "arguments": {
+        "expression": "123+456"
+      },
+      "finish_reason": "tool_calls",
+      "id": "tool_02",
+      "passed": true
+    },
+    {
+      "arguments": {
+        "expression": "123+456"
+      },
+      "finish_reason": "tool_calls",
+      "id": "tool_03",
+      "passed": true
+    },
+    {
+      "arguments": {
+        "expression": "123+456"
+      },
+      "finish_reason": "tool_calls",
+      "id": "tool_04",
+      "passed": true
+    },
+    {
+      "arguments": {
+        "expression": "123+456"
+      },
+      "finish_reason": "tool_calls",
+      "id": "tool_05",
+      "passed": true
+    },
+    {
+      "arguments": {
+        "expression": "123+456"
+      },
+      "finish_reason": "tool_calls",
+      "id": "tool_06",
+      "passed": true
+    },
+    {
+      "arguments": {
+        "expression": "123+456"
+      },
+      "finish_reason": "tool_calls",
+      "id": "tool_07",
+      "passed": true
+    },
+    {
+      "arguments": {
+        "expression": "123+456"
+      },
+      "finish_reason": "tool_calls",
+      "id": "tool_08",
+      "passed": true
+    },
+    {
+      "arguments": {
+        "expression": "123+456"
+      },
+      "finish_reason": "tool_calls",
+      "id": "tool_09",
+      "passed": true
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+--- files ---
+/workspace/w2_greedy_argmax_default_diag_2026-06-15/gpu_contract.md
+/workspace/w2_greedy_argmax_default_diag_2026-06-15/nohup.pid
+/workspace/w2_greedy_argmax_default_diag_2026-06-15/remote/git_head.txt
+/workspace/w2_greedy_argmax_default_diag_2026-06-15/remote/git_status_short.txt
+/workspace/w2_greedy_argmax_default_diag_2026-06-15/remote/local_target_git_head.txt
+/workspace/w2_greedy_argmax_default_diag_2026-06-15/remote/rustc_version.txt
+/workspace/w2_greedy_argmax_default_diag_2026-06-15/remote/start_utc.txt
+/workspace/w2_greedy_argmax_default_diag_2026-06-15/run.log
+--- runlog ---
+/workspace/run_w2_greedy_argmax_default_diag.sh: line 26: rustc: command not found
+--- status ---

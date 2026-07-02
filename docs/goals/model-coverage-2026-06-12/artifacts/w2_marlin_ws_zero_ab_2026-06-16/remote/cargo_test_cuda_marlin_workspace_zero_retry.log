@@ -1,0 +1,9 @@
+   Compiling ferrum-kernels v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kernels)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.52s
+     Running unittests src/lib.rs (target/debug/deps/ferrum_kernels-38a5b07254597d15)
+
+running 1 test
+test backend::cuda::marlin::tests::marlin_workspace_zeroing_follows_runtime_config ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.00s
+

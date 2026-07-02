@@ -42,7 +42,7 @@ CUDA_BUILD_COMMAND = [
     "--bin",
     "ferrum",
     "--features",
-    "cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source",
+    "cuda,vllm-moe-marlin,vllm-paged-attn-v2",
 ]
 GPU_QUERY_FIELDS = [
     "index",

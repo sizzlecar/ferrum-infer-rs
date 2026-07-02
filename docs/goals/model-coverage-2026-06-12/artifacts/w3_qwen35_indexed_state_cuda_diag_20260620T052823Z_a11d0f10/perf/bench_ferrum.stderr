@@ -1,0 +1,22 @@
+ferrum bench-serve — dataset=sharegpt num_prompts=100 warmup=10 n_repeats=1
+  [warn] n_repeats < 3 — emitting mean only, no stddev/CI95 (PLAYBOOK § 0.4)
+→ closed_loop c=1
+  cell closed_loop c=1 — repeat 1/1 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 82.3s
+    summary c=1 (n_repeats=1, no CI)
+      TTFT_ms  p50=205.7  p95=208.5  p99=214.5
+      TPOT_ms  p50=13.4  p95=13.6  p99=13.7
+      ITL_ms   p50=13.3  p95=13.9  p99=14.5
+      throughput      57.0 tok/s
+      goodput         1.22 req/s
+→ closed_loop c=32
+  cell closed_loop c=32 — repeat 1/1 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 24.4s
+    summary c=32 (n_repeats=1, no CI)
+      TTFT_ms  p50=3958.6  p95=4931.3  p99=4932.0
+      TPOT_ms  p50=85.5  p95=138.6  p99=167.0
+      ITL_ms   p50=54.6  p95=60.2  p99=1013.7
+      throughput      182.0 tok/s
+      goodput         4.09 req/s
+
+→ wrote /workspace/artifacts/w3_qwen35_indexed_state_cuda_diag_20260620T052823Z_a11d0f10/perf/bench_ferrum_sharegpt_c1_c32_100x1.json

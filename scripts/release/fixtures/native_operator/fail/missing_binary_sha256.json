@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "operator": "fa2",
+  "operator_abi_version": "1",
+  "ferrum_native_abi_version": "1",
+  "backend": "cuda",
+  "cuda_toolkit": "12.4",
+  "cuda_runtime_min": "12.4",
+  "compute_capabilities": ["sm_89"],
+  "source_package": {
+    "kind": "external_archive",
+    "revision": "fixture",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "inputs_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "binary_sha256": "",
+  "linkage": "static",
+  "exports": ["ferrum_native_op_init"],
+  "license_files": ["LICENSE"],
+  "build_summary": {
+    "builder_sha": "fixture-builder",
+    "elapsed_ms": 1,
+    "nvcc_version": "12.4",
+    "host_compiler": "clang"
+  }
+}

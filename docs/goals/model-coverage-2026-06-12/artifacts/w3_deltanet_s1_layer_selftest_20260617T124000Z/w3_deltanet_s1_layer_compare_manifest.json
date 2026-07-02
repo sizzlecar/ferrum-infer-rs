@@ -1,0 +1,185 @@
+{
+  "checks": {
+    "delta_rule": "pass",
+    "deltanet_layer": "pass",
+    "expert_layout": "pass",
+    "router_topk": "pass",
+    "shared_expert_merge": "pass"
+  },
+  "command_line": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/w3_deltanet_s1_layer_compare.py",
+    "--self-test",
+    "--out",
+    "docs/goals/model-coverage-2026-06-12/artifacts/w3_deltanet_s1_layer_selftest_20260617T124000Z"
+  ],
+  "comparisons": {
+    "delta_beta": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_core": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_gate": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_k": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_output": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_q": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "delta_v": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "input": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "layer_output": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "moe_output": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "routed_expert_output": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "router_logits": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "router_topk_indices": {
+      "first_mismatch": null,
+      "mismatches": 0,
+      "status": "pass"
+    },
+    "router_topk_weights": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    },
+    "shared_expert_output": {
+      "atol": 1e-06,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "mean_abs": 0.0,
+      "rmse": 0.0,
+      "status": "pass"
+    }
+  },
+  "created_at": "2026-06-17T20:43:44.230084+08:00",
+  "ferrum_dump": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_deltanet_s1_layer_selftest_20260617T124000Z/synthetic_ferrum_dump",
+  "git": {
+    "is_dirty": true,
+    "sha": "ef53e9812731e1d70ca2aebd8f8481f1c5eede6f",
+    "tracked_status_short": [],
+    "untracked_count": 1857,
+    "untracked_sample": [
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/ferrum_699add71_to_a7444587.bundle",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/query_41241013.raw.json",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_001.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_001.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_002.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_002.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_003.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_003.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_004.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_004.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_005.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_005.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_006.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_006.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_007.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_007.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_008.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_008.txt",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_009.err",
+      "docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17/local_vast/remote_monitor_009.txt"
+    ]
+  },
+  "mode": "self-test",
+  "note": "self-test validates the S1 dump contract only; it is not real-model W3-S1 evidence",
+  "pass_line": "W3 DELTANET S1 LAYER COMPARE SELFTEST PASS: /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_deltanet_s1_layer_selftest_20260617T124000Z",
+  "reference_dump": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/goals/model-coverage-2026-06-12/artifacts/w3_deltanet_s1_layer_selftest_20260617T124000Z/reference_dump",
+  "schema_version": 1,
+  "seed": 9271,
+  "shape": {
+    "expert_hidden_dim": 6,
+    "experts": 5,
+    "heads": 2,
+    "hidden_dim": 8,
+    "key_dim": 3,
+    "tokens": 6,
+    "top_k": 2,
+    "value_dim": 4
+  },
+  "status": "pass",
+  "tolerance": {
+    "max_abs": 1e-06
+  }
+}

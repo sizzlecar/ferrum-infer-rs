@@ -1,0 +1,9 @@
+[unified-graph-skip] reason=cache_full count=1 scope=layers_only key=16798760801528114760 m_total=10 num_seqs=10 max_kv_len=141 cached_keys=16
+[unified-graph-skip] reason=cache_full count=2 scope=layers_only key=16801630526877177795 m_total=10 num_seqs=10 max_kv_len=142 cached_keys=16
+[unified-graph-skip] reason=cache_full count=4 scope=layers_only key=16811196278040721245 m_total=10 num_seqs=10 max_kv_len=144 cached_keys=16
+[unified-graph-skip] reason=cache_full count=8 scope=layers_only key=16807369977575303865 m_total=10 num_seqs=10 max_kv_len=148 cached_keys=16
+[unified-graph-skip] reason=cache_full count=16 scope=layers_only key=16815022578506138625 m_total=10 num_seqs=10 max_kv_len=156 cached_keys=16
+[unified-graph-skip] reason=cache_full count=32 scope=layers_only key=16830327780367808145 m_total=10 num_seqs=10 max_kv_len=172 cached_keys=16
+[unified-graph-skip] reason=cache_full count=64 scope=layers_only key=15433538063023423148 m_total=16 num_seqs=16 max_kv_len=145 cached_keys=16
+[unified-graph-skip] reason=mixed_or_prefill_batch count=128 scope=layers_only key=13055585321574199491 m_total=137 num_seqs=16 max_kv_len=135 cached_keys=16
+[unified-graph-skip] reason=cache_full count=256 scope=layers_only key=15387622457438414588 m_total=16 num_seqs=16 max_kv_len=193 cached_keys=16

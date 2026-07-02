@@ -78,6 +78,11 @@ pub struct BenchServeCommand {
     #[arg(long, default_value_t = 128)]
     pub random_output_len: usize,
 
+    /// Send vLLM-compatible `ignore_eos=true` so fixed-output benchmark
+    /// requests run until `max_tokens` instead of stopping on model EOS.
+    #[arg(long)]
+    pub ignore_eos: bool,
+
     /// Path to a ShareGPT-format JSONL file (`--dataset sharegpt`).
     /// Each line should be a `{"conversations": [{"from": "...", "value":
     /// "..."}, ...]}` object (HF anon8231489123/ShareGPT_Vicuna format).
@@ -235,16 +240,10 @@ async fn stream_one(
     model: &str,
     prompt: PromptCase,
     max_tokens: usize,
+    ignore_eos: bool,
     timeout_s: f64,
 ) -> RequestRecord {
-    let body = serde_json::json!({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt.text}],
-        "max_tokens": max_tokens,
-        "stream": true,
-        "stream_options": {"include_usage": true},
-        "temperature": 0.0,
-    });
+    let body = chat_completion_body(model, &prompt.text, max_tokens, ignore_eos);
     let start = Instant::now();
     let mut state = StreamState::new(start, prompt.input_tokens);
 
@@ -328,6 +327,26 @@ async fn stream_one(
         }
     }
     state.finish()
+}
+
+fn chat_completion_body(
+    model: &str,
+    prompt_text: &str,
+    max_tokens: usize,
+    ignore_eos: bool,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt_text}],
+        "max_tokens": max_tokens,
+        "stream": true,
+        "stream_options": {"include_usage": true},
+        "temperature": 0.0,
+    });
+    if ignore_eos {
+        body["ignore_eos"] = serde_json::json!(true);
+    }
+    body
 }
 
 fn failed_record(
@@ -837,6 +856,7 @@ struct RunContext {
     base_url: Arc<String>,
     model: Arc<String>,
     max_out: usize,
+    ignore_eos: bool,
     timeout_s: f64,
 }
 
@@ -872,6 +892,7 @@ async fn run_closed_loop(
                     &ctx_c.model,
                     p,
                     ctx_c.max_out,
+                    ctx_c.ignore_eos,
                     ctx_c.timeout_s,
                 )
                 .await
@@ -897,6 +918,7 @@ async fn run_closed_loop(
                 &ctx_c.model,
                 prompt,
                 ctx_c.max_out,
+                ctx_c.ignore_eos,
                 ctx_c.timeout_s,
             )
             .await
@@ -935,6 +957,7 @@ async fn run_open_loop(
             &ctx.model,
             prompt.clone(),
             ctx.max_out,
+            ctx.ignore_eos,
             ctx.timeout_s,
         )
         .await;
@@ -961,6 +984,7 @@ async fn run_open_loop(
                 &ctx_c.model,
                 prompt,
                 ctx_c.max_out,
+                ctx_c.ignore_eos,
                 ctx_c.timeout_s,
             )
             .await
@@ -986,6 +1010,7 @@ impl RunContext {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             max_out: self.max_out,
+            ignore_eos: self.ignore_eos,
             timeout_s: self.timeout_s,
         }
     }
@@ -1257,6 +1282,7 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
         base_url: Arc::new(cmd.base_url.clone()),
         model: Arc::new(cmd.model.clone()),
         max_out: cmd.random_output_len,
+        ignore_eos: cmd.ignore_eos,
         timeout_s: cmd.timeout,
     };
 
@@ -1524,6 +1550,25 @@ mod tests {
     }
 
     #[test]
+    fn chat_completion_body_omits_ignore_eos_by_default() {
+        let body = chat_completion_body("model", "prompt", 128, false);
+        assert_eq!(body["model"], serde_json::json!("model"));
+        assert_eq!(body["max_tokens"], serde_json::json!(128));
+        assert_eq!(body["stream"], serde_json::json!(true));
+        assert_eq!(
+            body["stream_options"]["include_usage"],
+            serde_json::json!(true)
+        );
+        assert!(body.get("ignore_eos").is_none());
+    }
+
+    #[test]
+    fn chat_completion_body_sends_ignore_eos_when_requested() {
+        let body = chat_completion_body("model", "prompt", 128, true);
+        assert_eq!(body["ignore_eos"], serde_json::json!(true));
+    }
+
+    #[test]
     fn stream_done_with_usage_succeeds() {
         let mut state = StreamState::new(Instant::now(), 7);
         state
@@ -1730,6 +1775,7 @@ mod tests {
             dataset: "random".to_string(),
             random_input_len: 4,
             random_output_len: 3,
+            ignore_eos: false,
             sharegpt_path: None,
             shared_prefix_len: 1024,
             shared_suffix_len: 64,
@@ -1759,6 +1805,10 @@ mod tests {
         assert_eq!(json["completed_per_run"], serde_json::json!([1]));
         assert_eq!(json["errored_per_run"], serde_json::json!([1]));
         assert_eq!(json["http_500_per_run"], serde_json::json!([1]));
+        assert_eq!(
+            json["output_tokens_per_request"],
+            serde_json::json!([[3, 0]])
+        );
         let _ = std::fs::remove_file(out);
     }
 }

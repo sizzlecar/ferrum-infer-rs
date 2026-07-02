@@ -1,0 +1,8 @@
+{
+  "lane": "W3 Qwen3.5 GPTQ-Int4 paged-KV architecture smoke on 1x RTX 4090",
+  "expected_runtime": "20-45 minutes",
+  "expected_cost": "existing Vast instance runtime only; stop after PASS or first actionable failure",
+  "stop_condition": "CUDA build failure, ferrum run failure, ferrum serve/stream failure, bench-serve failure, or diagnostic smoke PASS",
+  "correctness_gate": "CUDA release build plus ferrum run one-shot plus ferrum serve non-stream and streaming include_usage smoke",
+  "performance_command": "diagnostic-only ferrum bench-serve --fail-on-error --seed 9271 --n-repeats 1 --concurrency-sweep 1,32; no release performance claim"
+}

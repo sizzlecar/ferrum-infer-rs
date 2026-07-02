@@ -1,0 +1,315 @@
+
+  ______
+ |  ____|
+ | |__ ___ _ __ _ __ _   _ _ __ ___
+ |  __/ _ \ '__| '__| | | | '_ ` _ \
+ | | |  __/ |  | |  | |_| | | | | |
+ |_|  \___|_|  |_|   \__,_|_| |_| |_|
+
+   🦀 Rust LLM Inference Server
+   Version 0.7.7
+
+Model: circulus/gemma-3-27b-it-gptq
+Path: /root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2
+Device: CUDA(0)
+
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Server)
+[auto-size] gpu=24.0 GB total / 23.5 GB free | weights=15.0 GB budget / 15.0 GB total | layers=62 budget | scratch reserve=4.0 GB | KV pool budget 3.9 GB → max_blocks=512
+[auto-size] requested runtime floor requires KV_MAX_BLOCKS=512 above estimated budget 338; honoring explicit runtime limits
+[auto-size] KV_MAX_BLOCKS=512 PAGED_MAX_SEQS=<user> KV_CAPACITY=<user>
+Initializing engine (continuous batching)...
+[2m2026-06-15T04:57:27.815280Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-15T04:57:27.815300Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-15T04:57:27.815369Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2/tokenizer.json"
+[2m2026-06-15T04:57:28.853999Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-15T04:57:28.854040Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-15T04:57:28.854044Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-15T04:57:28.854057Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=512
+[2m2026-06-15T04:57:28.854234Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2 (format: safetensors)
+[2m2026-06-15T04:57:28.854470Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Gemma3, Layers: 62, Vocab: 262208
+[2m2026-06-15T04:57:29.029901Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-15T04:57:29.029990Z[0m [32m INFO[0m [2mferrum_models::loader::gptq_loader[0m[2m:[0m GPTQ config: QuantizeConfig { bits: 4, group_size: 128, sym: true, desc_act: true, quant_method: "gptq" }
+[2m2026-06-15T04:57:29.029998Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading Gemma3 via LlamaFamilyModel (5:1 SWA, dual rope, GeGLU, sandwich norms)
+[2m2026-06-15T04:57:29.030009Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Backend: CUDA, KV: fp16
+[2m2026-06-15T04:58:21.670800Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head
+[2m2026-06-15T04:58:26.354045Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m Gemma3 family: legacy batched_decode=true varlen_unified=false
+
+🚀 Server running at http://127.0.0.1:8463
+
+Endpoints:
+  POST /v1/chat/completions      - OpenAI-compatible chat
+  POST /v1/audio/transcriptions  - Speech-to-text (Whisper)
+  POST /v1/audio/speech          - Text-to-speech (TTS)
+  POST /v1/embeddings            - Text/image embeddings
+  GET  /v1/models                - List models
+  GET  /health                   - Health check
+
+Press Ctrl+C to stop.
+
+[batched-qkr] first batched_decode call: m=4 use_batched_qkr=true (q=None k=None v=None)
+[batched-kv-append] first call: m=4 ok=true k_err=None v_err=None
+[batched-attn] first call: m=4 ok=true err=None
+[batched-op-profile] m=4 total=27229us  matmul=6900us(125) attn=1871us(62) qkr=884us(62) norm=458us(63) other=1428us(124) tail_norm=782us(62) tail_mlp=13308us(124) tail_act=371us(62) tail_resid=559us(62)  unwrapped=668us
+[batched-op-profile] m=6 total=26731us  matmul=6810us(125) attn=1797us(62) qkr=624us(62) norm=450us(63) other=1359us(124) tail_norm=783us(62) tail_mlp=13349us(124) tail_act=372us(62) tail_resid=561us(62)  unwrapped=626us
+[batched-op-profile] m=9 total=27035us  matmul=6877us(125) attn=1867us(62) qkr=636us(62) norm=456us(63) other=1371us(124) tail_norm=792us(62) tail_mlp=13461us(124) tail_act=372us(62) tail_resid=559us(62)  unwrapped=644us
+[batched-op-profile] m=10 total=27057us  matmul=6892us(125) attn=1874us(62) qkr=625us(62) norm=448us(63) other=1344us(124) tail_norm=793us(62) tail_mlp=13497us(124) tail_act=373us(62) tail_resid=559us(62)  unwrapped=652us
+[batched-op-profile] m=10 total=27018us  matmul=6863us(125) attn=1880us(62) qkr=621us(62) norm=451us(63) other=1316us(124) tail_norm=793us(62) tail_mlp=13495us(124) tail_act=372us(62) tail_resid=558us(62)  unwrapped=669us
+[batched-op-profile] m=10 total=27029us  matmul=6862us(125) attn=1880us(62) qkr=621us(62) norm=450us(63) other=1327us(124) tail_norm=793us(62) tail_mlp=13502us(124) tail_act=372us(62) tail_resid=560us(62)  unwrapped=662us
+[batched-op-profile] m=10 total=27022us  matmul=6854us(125) attn=1896us(62) qkr=622us(62) norm=449us(63) other=1313us(124) tail_norm=790us(62) tail_mlp=13499us(124) tail_act=373us(62) tail_resid=558us(62)  unwrapped=668us
+[batched-op-profile] m=10 total=27069us  matmul=6873us(125) attn=1922us(62) qkr=623us(62) norm=446us(63) other=1323us(124) tail_norm=790us(62) tail_mlp=13499us(124) tail_act=373us(62) tail_resid=560us(62)  unwrapped=660us
+[batched-op-profile] m=10 total=27074us  matmul=6865us(125) attn=1930us(62) qkr=623us(62) norm=449us(63) other=1324us(124) tail_norm=789us(62) tail_mlp=13491us(124) tail_act=372us(62) tail_resid=565us(62)  unwrapped=666us
+[batched-op-profile] m=10 total=27104us  matmul=6878us(125) attn=1932us(62) qkr=623us(62) norm=445us(63) other=1325us(124) tail_norm=793us(62) tail_mlp=13500us(124) tail_act=373us(62) tail_resid=561us(62)  unwrapped=674us
+[batched-op-profile] m=10 total=27103us  matmul=6864us(125) attn=1936us(62) qkr=623us(62) norm=450us(63) other=1330us(124) tail_norm=792us(62) tail_mlp=13500us(124) tail_act=372us(62) tail_resid=565us(62)  unwrapped=671us
+[batched-op-profile] m=10 total=27127us  matmul=6872us(125) attn=1962us(62) qkr=622us(62) norm=443us(63) other=1349us(124) tail_norm=796us(62) tail_mlp=13502us(124) tail_act=372us(62) tail_resid=558us(62)  unwrapped=651us
+[batched-op-profile] m=10 total=27110us  matmul=6861us(125) attn=1963us(62) qkr=627us(62) norm=448us(63) other=1331us(124) tail_norm=786us(62) tail_mlp=13499us(124) tail_act=372us(62) tail_resid=561us(62)  unwrapped=662us
+[batched-op-profile] m=10 total=27121us  matmul=6873us(125) attn=1964us(62) qkr=622us(62) norm=446us(63) other=1333us(124) tail_norm=793us(62) tail_mlp=13505us(124) tail_act=372us(62) tail_resid=559us(62)  unwrapped=654us
+[batched-op-profile] m=10 total=27145us  matmul=6880us(125) attn=1980us(62) qkr=623us(62) norm=453us(63) other=1328us(124) tail_norm=796us(62) tail_mlp=13508us(124) tail_act=374us(62) tail_resid=560us(62)  unwrapped=643us
+[batched-op-profile] m=10 total=27146us  matmul=6868us(125) attn=1995us(62) qkr=623us(62) norm=444us(63) other=1318us(124) tail_norm=791us(62) tail_mlp=13499us(124) tail_act=374us(62) tail_resid=558us(62)  unwrapped=676us
+[batched-op-profile] m=10 total=27160us  matmul=6870us(125) attn=1996us(62) qkr=624us(62) norm=449us(63) other=1334us(124) tail_norm=796us(62) tail_mlp=13494us(124) tail_act=373us(62) tail_resid=558us(62)  unwrapped=666us
+[batched-op-profile] m=10 total=27387us  matmul=6928us(125) attn=2029us(62) qkr=640us(62) norm=451us(63) other=1361us(124) tail_norm=790us(62) tail_mlp=13535us(124) tail_act=390us(62) tail_resid=577us(62)  unwrapped=686us
+[batched-op-profile] m=10 total=27290us  matmul=6896us(125) attn=2022us(62) qkr=631us(62) norm=447us(63) other=1344us(124) tail_norm=796us(62) tail_mlp=13544us(124) tail_act=373us(62) tail_resid=572us(62)  unwrapped=665us
+[batched-op-profile] m=10 total=27322us  matmul=6905us(125) attn=2043us(62) qkr=628us(62) norm=452us(63) other=1358us(124) tail_norm=799us(62) tail_mlp=13519us(124) tail_act=377us(62) tail_resid=563us(62)  unwrapped=678us
+[batched-op-profile] m=10 total=27289us  matmul=6894us(125) attn=2057us(62) qkr=629us(62) norm=454us(63) other=1339us(124) tail_norm=796us(62) tail_mlp=13525us(124) tail_act=380us(62) tail_resid=560us(62)  unwrapped=655us
+[batched-op-profile] m=10 total=27214us  matmul=6868us(125) attn=2046us(62) qkr=623us(62) norm=458us(63) other=1326us(124) tail_norm=796us(62) tail_mlp=13504us(124) tail_act=373us(62) tail_resid=559us(62)  unwrapped=661us
+[batched-op-profile] m=10 total=27228us  matmul=6872us(125) attn=2051us(62) qkr=625us(62) norm=451us(63) other=1333us(124) tail_norm=813us(62) tail_mlp=13500us(124) tail_act=374us(62) tail_resid=560us(62)  unwrapped=649us
+[batched-op-profile] m=10 total=27314us  matmul=6891us(125) attn=2070us(62) qkr=622us(62) norm=447us(63) other=1353us(124) tail_norm=791us(62) tail_mlp=13529us(124) tail_act=372us(62) tail_resid=563us(62)  unwrapped=676us
+[batched-op-profile] m=10 total=27286us  matmul=6883us(125) attn=2097us(62) qkr=624us(62) norm=444us(63) other=1345us(124) tail_norm=794us(62) tail_mlp=13519us(124) tail_act=372us(62) tail_resid=559us(62)  unwrapped=649us
+[batched-op-profile] m=10 total=27251us  matmul=6862us(125) attn=2094us(62) qkr=621us(62) norm=449us(63) other=1333us(124) tail_norm=796us(62) tail_mlp=13499us(124) tail_act=374us(62) tail_resid=558us(62)  unwrapped=665us
+[batched-op-profile] m=10 total=27338us  matmul=6880us(125) attn=2111us(62) qkr=625us(62) norm=450us(63) other=1364us(124) tail_norm=800us(62) tail_mlp=13519us(124) tail_act=374us(62) tail_resid=560us(62)  unwrapped=655us
+[batched-op-profile] m=10 total=27271us  matmul=6871us(125) attn=2110us(62) qkr=624us(62) norm=447us(63) other=1342us(124) tail_norm=788us(62) tail_mlp=13508us(124) tail_act=373us(62) tail_resid=558us(62)  unwrapped=650us
+[batched-op-profile] m=10 total=27307us  matmul=6868us(125) attn=2124us(62) qkr=624us(62) norm=446us(63) other=1343us(124) tail_norm=795us(62) tail_mlp=13508us(124) tail_act=374us(62) tail_resid=562us(62)  unwrapped=663us
+[batched-op-profile] m=10 total=27311us  matmul=6876us(125) attn=2114us(62) qkr=624us(62) norm=450us(63) other=1339us(124) tail_norm=805us(62) tail_mlp=13508us(124) tail_act=373us(62) tail_resid=559us(62)  unwrapped=663us
+[batched-op-profile] m=10 total=27270us  matmul=6874us(125) attn=2122us(62) qkr=623us(62) norm=446us(63) other=1325us(124) tail_norm=793us(62) tail_mlp=13491us(124) tail_act=372us(62) tail_resid=558us(62)  unwrapped=666us
+[batched-op-profile] m=10 total=27332us  matmul=6874us(125) attn=2159us(62) qkr=622us(62) norm=449us(63) other=1336us(124) tail_norm=795us(62) tail_mlp=13503us(124) tail_act=373us(62) tail_resid=567us(62)  unwrapped=654us
+[batched-op-profile] m=10 total=27342us  matmul=6864us(125) attn=2170us(62) qkr=632us(62) norm=448us(63) other=1328us(124) tail_norm=793us(62) tail_mlp=13508us(124) tail_act=373us(62) tail_resid=559us(62)  unwrapped=667us
+[batched-op-profile] m=10 total=27315us  matmul=6866us(125) attn=2173us(62) qkr=624us(62) norm=448us(63) other=1325us(124) tail_norm=795us(62) tail_mlp=13494us(124) tail_act=372us(62) tail_resid=558us(62)  unwrapped=660us
+[batched-op-profile] m=10 total=27326us  matmul=6867us(125) attn=2173us(62) qkr=625us(62) norm=450us(63) other=1319us(124) tail_norm=799us(62) tail_mlp=13505us(124) tail_act=373us(62) tail_resid=559us(62)  unwrapped=656us
+[batched-op-profile] m=10 total=27367us  matmul=6878us(125) attn=2180us(62) qkr=624us(62) norm=449us(63) other=1339us(124) tail_norm=798us(62) tail_mlp=13511us(124) tail_act=372us(62) tail_resid=558us(62)  unwrapped=658us
+[batched-op-profile] m=10 total=27361us  matmul=6861us(125) attn=2198us(62) qkr=626us(62) norm=445us(63) other=1329us(124) tail_norm=798us(62) tail_mlp=13509us(124) tail_act=373us(62) tail_resid=560us(62)  unwrapped=662us
+[batched-op-profile] m=10 total=27348us  matmul=6874us(125) attn=2191us(62) qkr=622us(62) norm=444us(63) other=1325us(124) tail_norm=798us(62) tail_mlp=13501us(124) tail_act=372us(62) tail_resid=558us(62)  unwrapped=663us
+[batched-op-profile] m=10 total=27332us  matmul=6861us(125) attn=2196us(62) qkr=623us(62) norm=449us(63) other=1317us(124) tail_norm=782us(62) tail_mlp=13504us(124) tail_act=373us(62) tail_resid=558us(62)  unwrapped=669us
+[batched-op-profile] m=10 total=27361us  matmul=6868us(125) attn=2232us(62) qkr=623us(62) norm=446us(63) other=1318us(124) tail_norm=788us(62) tail_mlp=13495us(124) tail_act=376us(62) tail_resid=564us(62)  unwrapped=651us
+[batched-op-profile] m=10 total=27393us  matmul=6864us(125) attn=2237us(62) qkr=625us(62) norm=447us(63) other=1319us(124) tail_norm=806us(62) tail_mlp=13503us(124) tail_act=376us(62) tail_resid=561us(62)  unwrapped=655us
+[batched-op-profile] m=10 total=27354us  matmul=6861us(125) attn=2239us(62) qkr=623us(62) norm=448us(63) other=1322us(124) tail_norm=791us(62) tail_mlp=13482us(124) tail_act=372us(62) tail_resid=559us(62)  unwrapped=657us
+[batched-op-profile] m=10 total=27382us  matmul=6868us(125) attn=2242us(62) qkr=624us(62) norm=445us(63) other=1326us(124) tail_norm=784us(62) tail_mlp=13488us(124) tail_act=372us(62) tail_resid=563us(62)  unwrapped=670us
+[batched-op-profile] m=10 total=27432us  matmul=6867us(125) attn=2268us(62) qkr=621us(62) norm=451us(63) other=1328us(124) tail_norm=798us(62) tail_mlp=13507us(124) tail_act=375us(62) tail_resid=559us(62)  unwrapped=658us
+[batched-op-profile] m=10 total=27427us  matmul=6875us(125) attn=2269us(62) qkr=624us(62) norm=447us(63) other=1332us(124) tail_norm=797us(62) tail_mlp=13506us(124) tail_act=375us(62) tail_resid=564us(62)  unwrapped=638us
+[batched-op-profile] m=10 total=27424us  matmul=6863us(125) attn=2277us(62) qkr=624us(62) norm=451us(63) other=1329us(124) tail_norm=787us(62) tail_mlp=13506us(124) tail_act=372us(62) tail_resid=560us(62)  unwrapped=655us
+[batched-op-profile] m=10 total=27450us  matmul=6875us(125) attn=2288us(62) qkr=625us(62) norm=448us(63) other=1338us(124) tail_norm=795us(62) tail_mlp=13499us(124) tail_act=372us(62) tail_resid=568us(62)  unwrapped=642us
+[batched-op-profile] m=10 total=27465us  matmul=6881us(125) attn=2302us(62) qkr=622us(62) norm=446us(63) other=1335us(124) tail_norm=795us(62) tail_mlp=13500us(124) tail_act=372us(62) tail_resid=560us(62)  unwrapped=652us
+[batched-op-profile] m=10 total=27469us  matmul=6873us(125) attn=2307us(62) qkr=621us(62) norm=443us(63) other=1334us(124) tail_norm=794us(62) tail_mlp=13498us(124) tail_act=372us(62) tail_resid=560us(62)  unwrapped=667us
+[batched-op-profile] m=10 total=27482us  matmul=6869us(125) attn=2312us(62) qkr=628us(62) norm=443us(63) other=1333us(124) tail_norm=791us(62) tail_mlp=13501us(124) tail_act=372us(62) tail_resid=558us(62)  unwrapped=675us
+[batched-op-profile] m=10 total=27480us  matmul=6865us(125) attn=2322us(62) qkr=624us(62) norm=447us(63) other=1333us(124) tail_norm=798us(62) tail_mlp=13492us(124) tail_act=373us(62) tail_resid=560us(62)  unwrapped=666us
+[batched-op-profile] m=10 total=27486us  matmul=6864us(125) attn=2354us(62) qkr=622us(62) norm=449us(63) other=1320us(124) tail_norm=800us(62) tail_mlp=13490us(124) tail_act=372us(62) tail_resid=558us(62)  unwrapped=657us
+[batched-op-profile] m=10 total=27532us  matmul=6883us(125) attn=2355us(62) qkr=625us(62) norm=449us(63) other=1326us(124) tail_norm=801us(62) tail_mlp=13502us(124) tail_act=374us(62) tail_resid=565us(62)  unwrapped=652us
+[batched-op-profile] m=10 total=27563us  matmul=6887us(125) attn=2353us(62) qkr=626us(62) norm=450us(63) other=1350us(124) tail_norm=797us(62) tail_mlp=13520us(124) tail_act=377us(62) tail_resid=560us(62)  unwrapped=643us
+[batched-op-profile] m=10 total=27529us  matmul=6872us(125) attn=2359us(62) qkr=622us(62) norm=448us(63) other=1344us(124) tail_norm=791us(62) tail_mlp=13500us(124) tail_act=372us(62) tail_resid=558us(62)  unwrapped=663us
+[batched-op-profile] m=10 total=27541us  matmul=6875us(125) attn=2370us(62) qkr=623us(62) norm=450us(63) other=1333us(124) tail_norm=801us(62) tail_mlp=13499us(124) tail_act=376us(62) tail_resid=559us(62)  unwrapped=655us
+[batched-op-profile] m=10 total=27540us  matmul=6869us(125) attn=2389us(62) qkr=623us(62) norm=452us(63) other=1338us(124) tail_norm=794us(62) tail_mlp=13494us(124) tail_act=373us(62) tail_resid=559us(62)  unwrapped=649us
+[batched-op-profile] m=10 total=27541us  matmul=6869us(125) attn=2390us(62) qkr=622us(62) norm=447us(63) other=1321us(124) tail_norm=793us(62) tail_mlp=13502us(124) tail_act=374us(62) tail_resid=558us(62)  unwrapped=665us
+[batched-op-profile] m=10 total=27574us  matmul=6877us(125) attn=2410us(62) qkr=627us(62) norm=457us(63) other=1329us(124) tail_norm=787us(62) tail_mlp=13499us(124) tail_act=372us(62) tail_resid=559us(62)  unwrapped=657us
+[batched-op-profile] m=10 total=27576us  matmul=6873us(125) attn=2416us(62) qkr=623us(62) norm=450us(63) other=1315us(124) tail_norm=788us(62) tail_mlp=13505us(124) tail_act=379us(62) tail_resid=558us(62)  unwrapped=669us
+[batched-op-profile] m=10 total=27579us  matmul=6862us(125) attn=2417us(62) qkr=629us(62) norm=448us(63) other=1337us(124) tail_norm=788us(62) tail_mlp=13501us(124) tail_act=373us(62) tail_resid=559us(62)  unwrapped=665us
+[batched-op-profile] m=10 total=27590us  matmul=6873us(125) attn=2426us(62) qkr=624us(62) norm=445us(63) other=1344us(124) tail_norm=797us(62) tail_mlp=13492us(124) tail_act=374us(62) tail_resid=558us(62)  unwrapped=657us
+[batched-op-profile] m=10 total=27588us  matmul=6876us(125) attn=2428us(62) qkr=622us(62) norm=448us(63) other=1324us(124) tail_norm=795us(62) tail_mlp=13499us(124) tail_act=373us(62) tail_resid=558us(62)  unwrapped=665us
+[batched-op-profile] m=6 total=27170us  matmul=6796us(125) attn=2307us(62) qkr=621us(62) norm=446us(63) other=1317us(124) tail_norm=772us(62) tail_mlp=13335us(124) tail_act=372us(62) tail_resid=558us(62)  unwrapped=646us
+[batched-op-profile] m=4 total=26993us  matmul=6771us(125) attn=2271us(62) qkr=621us(62) norm=447us(63) other=1311us(124) tail_norm=770us(62) tail_mlp=13270us(124) tail_act=371us(62) tail_resid=557us(62)  unwrapped=604us
+[batched-op-profile] m=4 total=26563us  matmul=6768us(125) attn=1748us(62) qkr=621us(62) norm=457us(63) other=1358us(124) tail_norm=780us(62) tail_mlp=13270us(124) tail_act=372us(62) tail_resid=560us(62)  unwrapped=629us
+[batched-op-profile] m=7 total=26772us  matmul=6821us(125) attn=1800us(62) qkr=626us(62) norm=444us(63) other=1347us(124) tail_norm=779us(62) tail_mlp=13377us(124) tail_act=372us(62) tail_resid=559us(62)  unwrapped=647us
+[batched-op-profile] m=10 total=27089us  matmul=6879us(125) attn=1879us(62) qkr=626us(62) norm=457us(63) other=1372us(124) tail_norm=795us(62) tail_mlp=13492us(124) tail_act=373us(62) tail_resid=558us(62)  unwrapped=658us
+[batched-op-profile] m=13 total=27491us  matmul=6941us(125) attn=1976us(62) qkr=631us(62) norm=445us(63) other=1436us(124) tail_norm=803us(62) tail_mlp=13631us(124) tail_act=392us(62) tail_resid=562us(62)  unwrapped=674us
+[batched-op-profile] m=16 total=27684us  matmul=6977us(125) attn=2087us(62) qkr=639us(62) norm=451us(63) other=1365us(124) tail_norm=801us(62) tail_mlp=13723us(124) tail_act=433us(62) tail_resid=565us(62)  unwrapped=643us
+[batched-op-profile] m=16 total=27639us  matmul=6940us(125) attn=2092us(62) qkr=642us(62) norm=443us(63) other=1356us(124) tail_norm=796us(62) tail_mlp=13734us(124) tail_act=429us(62) tail_resid=565us(62)  unwrapped=642us
+[batched-op-profile] m=16 total=27611us  matmul=6945us(125) attn=2093us(62) qkr=635us(62) norm=447us(63) other=1355us(124) tail_norm=800us(62) tail_mlp=13709us(124) tail_act=431us(62) tail_resid=562us(62)  unwrapped=634us
+[batched-op-profile] m=16 total=27618us  matmul=6941us(125) attn=2107us(62) qkr=632us(62) norm=447us(63) other=1339us(124) tail_norm=788us(62) tail_mlp=13717us(124) tail_act=431us(62) tail_resid=561us(62)  unwrapped=655us
+[batched-op-profile] m=16 total=27641us  matmul=6948us(125) attn=2120us(62) qkr=635us(62) norm=446us(63) other=1345us(124) tail_norm=793us(62) tail_mlp=13722us(124) tail_act=428us(62) tail_resid=561us(62)  unwrapped=643us
+[batched-op-profile] m=16 total=27667us  matmul=6934us(125) attn=2133us(62) qkr=644us(62) norm=443us(63) other=1367us(124) tail_norm=792us(62) tail_mlp=13720us(124) tail_act=430us(62) tail_resid=563us(62)  unwrapped=641us
+[batched-op-profile] m=16 total=27688us  matmul=6937us(125) attn=2142us(62) qkr=640us(62) norm=445us(63) other=1357us(124) tail_norm=797us(62) tail_mlp=13732us(124) tail_act=436us(62) tail_resid=564us(62)  unwrapped=638us
+[batched-op-profile] m=16 total=27702us  matmul=6944us(125) attn=2158us(62) qkr=631us(62) norm=445us(63) other=1360us(124) tail_norm=794us(62) tail_mlp=13709us(124) tail_act=433us(62) tail_resid=562us(62)  unwrapped=666us
+[batched-op-profile] m=16 total=27673us  matmul=6934us(125) attn=2164us(62) qkr=631us(62) norm=446us(63) other=1351us(124) tail_norm=788us(62) tail_mlp=13717us(124) tail_act=431us(62) tail_resid=562us(62)  unwrapped=649us
+[batched-op-profile] m=16 total=27712us  matmul=6957us(125) attn=2175us(62) qkr=628us(62) norm=446us(63) other=1347us(124) tail_norm=797us(62) tail_mlp=13723us(124) tail_act=432us(62) tail_resid=565us(62)  unwrapped=642us
+[batched-op-profile] m=16 total=27692us  matmul=6932us(125) attn=2177us(62) qkr=632us(62) norm=447us(63) other=1350us(124) tail_norm=798us(62) tail_mlp=13707us(124) tail_act=444us(62) tail_resid=562us(62)  unwrapped=643us
+[batched-op-profile] m=16 total=27721us  matmul=6932us(125) attn=2194us(62) qkr=632us(62) norm=445us(63) other=1350us(124) tail_norm=802us(62) tail_mlp=13723us(124) tail_act=432us(62) tail_resid=560us(62)  unwrapped=651us
+[batched-op-profile] m=16 total=27979us  matmul=7004us(125) attn=2222us(62) qkr=643us(62) norm=450us(63) other=1397us(124) tail_norm=805us(62) tail_mlp=13771us(124) tail_act=438us(62) tail_resid=571us(62)  unwrapped=678us
+[batched-op-profile] m=16 total=27874us  matmul=6990us(125) attn=2228us(62) qkr=645us(62) norm=444us(63) other=1364us(124) tail_norm=795us(62) tail_mlp=13759us(124) tail_act=434us(62) tail_resid=561us(62)  unwrapped=654us
+[batched-op-profile] m=16 total=27760us  matmul=6947us(125) attn=2233us(62) qkr=630us(62) norm=444us(63) other=1349us(124) tail_norm=795us(62) tail_mlp=13727us(124) tail_act=436us(62) tail_resid=561us(62)  unwrapped=638us
+[batched-op-profile] m=16 total=27758us  matmul=6946us(125) attn=2245us(62) qkr=634us(62) norm=444us(63) other=1346us(124) tail_norm=792us(62) tail_mlp=13716us(124) tail_act=432us(62) tail_resid=565us(62)  unwrapped=638us
+[batched-op-profile] m=16 total=29468us  matmul=7302us(125) attn=2385us(62) qkr=766us(62) norm=500us(63) other=1670us(124) tail_norm=910us(62) tail_mlp=14017us(124) tail_act=467us(62) tail_resid=656us(62)  unwrapped=795us
+[batched-op-profile] m=16 total=27960us  matmul=6990us(125) attn=2271us(62) qkr=644us(62) norm=450us(63) other=1366us(124) tail_norm=801us(62) tail_mlp=13783us(124) tail_act=433us(62) tail_resid=562us(62)  unwrapped=660us
+[batched-op-profile] m=16 total=27864us  matmul=6959us(125) attn=2278us(62) qkr=642us(62) norm=451us(63) other=1363us(124) tail_norm=803us(62) tail_mlp=13740us(124) tail_act=438us(62) tail_resid=566us(62)  unwrapped=624us
+[batched-op-profile] m=16 total=27894us  matmul=6962us(125) attn=2292us(62) qkr=639us(62) norm=445us(63) other=1367us(124) tail_norm=808us(62) tail_mlp=13739us(124) tail_act=434us(62) tail_resid=566us(62)  unwrapped=642us
+[batched-op-profile] m=16 total=27921us  matmul=6955us(125) attn=2309us(62) qkr=638us(62) norm=456us(63) other=1378us(124) tail_norm=804us(62) tail_mlp=13743us(124) tail_act=433us(62) tail_resid=563us(62)  unwrapped=642us
+[batched-op-profile] m=16 total=27909us  matmul=6959us(125) attn=2319us(62) qkr=633us(62) norm=450us(63) other=1364us(124) tail_norm=800us(62) tail_mlp=13750us(124) tail_act=433us(62) tail_resid=564us(62)  unwrapped=637us
+[batched-op-profile] m=16 total=27912us  matmul=6958us(125) attn=2322us(62) qkr=642us(62) norm=448us(63) other=1362us(124) tail_norm=806us(62) tail_mlp=13735us(124) tail_act=434us(62) tail_resid=563us(62)  unwrapped=642us
+[batched-op-profile] m=16 total=27954us  matmul=6966us(125) attn=2339us(62) qkr=635us(62) norm=455us(63) other=1370us(124) tail_norm=804us(62) tail_mlp=13742us(124) tail_act=434us(62) tail_resid=565us(62)  unwrapped=644us
+[batched-op-profile] m=16 total=27971us  matmul=6969us(125) attn=2355us(62) qkr=646us(62) norm=453us(63) other=1365us(124) tail_norm=804us(62) tail_mlp=13748us(124) tail_act=434us(62) tail_resid=564us(62)  unwrapped=633us
+[batched-op-profile] m=16 total=27989us  matmul=6957us(125) attn=2361us(62) qkr=646us(62) norm=450us(63) other=1368us(124) tail_norm=804us(62) tail_mlp=13768us(124) tail_act=432us(62) tail_resid=562us(62)  unwrapped=641us
+[batched-op-profile] m=16 total=27982us  matmul=6981us(125) attn=2362us(62) qkr=643us(62) norm=448us(63) other=1367us(124) tail_norm=804us(62) tail_mlp=13739us(124) tail_act=433us(62) tail_resid=568us(62)  unwrapped=637us
+[batched-op-profile] m=16 total=27984us  matmul=6959us(125) attn=2377us(62) qkr=636us(62) norm=443us(63) other=1365us(124) tail_norm=809us(62) tail_mlp=13744us(124) tail_act=434us(62) tail_resid=565us(62)  unwrapped=652us
+[batched-op-profile] m=16 total=27991us  matmul=6967us(125) attn=2396us(62) qkr=638us(62) norm=451us(63) other=1367us(124) tail_norm=803us(62) tail_mlp=13740us(124) tail_act=432us(62) tail_resid=565us(62)  unwrapped=632us
+[batched-op-profile] m=16 total=28037us  matmul=6970us(125) attn=2410us(62) qkr=637us(62) norm=442us(63) other=1396us(124) tail_norm=805us(62) tail_mlp=13737us(124) tail_act=434us(62) tail_resid=563us(62)  unwrapped=643us
+[batched-op-profile] m=16 total=28030us  matmul=6972us(125) attn=2411us(62) qkr=637us(62) norm=445us(63) other=1369us(124) tail_norm=805us(62) tail_mlp=13745us(124) tail_act=433us(62) tail_resid=564us(62)  unwrapped=649us
+[batched-op-profile] m=16 total=28014us  matmul=6961us(125) attn=2424us(62) qkr=639us(62) norm=445us(63) other=1366us(124) tail_norm=804us(62) tail_mlp=13734us(124) tail_act=432us(62) tail_resid=565us(62)  unwrapped=644us
+[batched-op-profile] m=16 total=28047us  matmul=6968us(125) attn=2428us(62) qkr=637us(62) norm=458us(63) other=1367us(124) tail_norm=814us(62) tail_mlp=13740us(124) tail_act=434us(62) tail_resid=566us(62)  unwrapped=635us
+[batched-op-profile] m=16 total=28050us  matmul=6977us(125) attn=2437us(62) qkr=642us(62) norm=444us(63) other=1367us(124) tail_norm=803us(62) tail_mlp=13748us(124) tail_act=434us(62) tail_resid=563us(62)  unwrapped=635us
+[batched-op-profile] m=16 total=28054us  matmul=6963us(125) attn=2449us(62) qkr=645us(62) norm=447us(63) other=1366us(124) tail_norm=803us(62) tail_mlp=13739us(124) tail_act=433us(62) tail_resid=563us(62)  unwrapped=646us
+[batched-op-profile] m=16 total=28053us  matmul=6957us(125) attn=2465us(62) qkr=637us(62) norm=447us(63) other=1373us(124) tail_norm=804us(62) tail_mlp=13731us(124) tail_act=434us(62) tail_resid=563us(62)  unwrapped=642us
+[batched-op-profile] m=16 total=28080us  matmul=6960us(125) attn=2489us(62) qkr=634us(62) norm=453us(63) other=1366us(124) tail_norm=808us(62) tail_mlp=13733us(124) tail_act=434us(62) tail_resid=563us(62)  unwrapped=640us
+[batched-op-profile] m=16 total=28096us  matmul=6965us(125) attn=2490us(62) qkr=640us(62) norm=451us(63) other=1365us(124) tail_norm=801us(62) tail_mlp=13735us(124) tail_act=434us(62) tail_resid=567us(62)  unwrapped=648us
+[batched-op-profile] m=16 total=28097us  matmul=6962us(125) attn=2500us(62) qkr=634us(62) norm=448us(63) other=1362us(124) tail_norm=804us(62) tail_mlp=13753us(124) tail_act=433us(62) tail_resid=560us(62)  unwrapped=641us
+[batched-op-profile] m=16 total=28120us  matmul=6964us(125) attn=2509us(62) qkr=638us(62) norm=450us(63) other=1367us(124) tail_norm=811us(62) tail_mlp=13735us(124) tail_act=434us(62) tail_resid=562us(62)  unwrapped=650us
+[batched-op-profile] m=16 total=28143us  matmul=6971us(125) attn=2522us(62) qkr=634us(62) norm=446us(63) other=1368us(124) tail_norm=802us(62) tail_mlp=13749us(124) tail_act=433us(62) tail_resid=566us(62)  unwrapped=652us
+[batched-op-profile] m=16 total=28144us  matmul=6961us(125) attn=2540us(62) qkr=638us(62) norm=452us(63) other=1368us(124) tail_norm=811us(62) tail_mlp=13731us(124) tail_act=433us(62) tail_resid=568us(62)  unwrapped=642us
+[batched-op-profile] m=16 total=28173us  matmul=6988us(125) attn=2554us(62) qkr=633us(62) norm=452us(63) other=1366us(124) tail_norm=803us(62) tail_mlp=13736us(124) tail_act=433us(62) tail_resid=568us(62)  unwrapped=640us
+[batched-op-profile] m=16 total=28200us  matmul=7005us(125) attn=2555us(62) qkr=639us(62) norm=450us(63) other=1364us(124) tail_norm=805us(62) tail_mlp=13744us(124) tail_act=433us(62) tail_resid=564us(62)  unwrapped=641us
+[batched-op-profile] m=16 total=28236us  matmul=6979us(125) attn=2571us(62) qkr=653us(62) norm=449us(63) other=1366us(124) tail_norm=807us(62) tail_mlp=13749us(124) tail_act=433us(62) tail_resid=576us(62)  unwrapped=653us
+[batched-op-profile] m=16 total=28218us  matmul=6966us(125) attn=2590us(62) qkr=642us(62) norm=449us(63) other=1366us(124) tail_norm=805us(62) tail_mlp=13762us(124) tail_act=438us(62) tail_resid=560us(62)  unwrapped=640us
+[batched-op-profile] m=16 total=28219us  matmul=6965us(125) attn=2588us(62) qkr=649us(62) norm=448us(63) other=1365us(124) tail_norm=802us(62) tail_mlp=13737us(124) tail_act=433us(62) tail_resid=568us(62)  unwrapped=664us
+[batched-op-profile] m=16 total=28212us  matmul=6962us(125) attn=2608us(62) qkr=640us(62) norm=449us(63) other=1369us(124) tail_norm=805us(62) tail_mlp=13730us(124) tail_act=434us(62) tail_resid=562us(62)  unwrapped=653us
+[batched-op-profile] m=16 total=28251us  matmul=6970us(125) attn=2617us(62) qkr=637us(62) norm=449us(63) other=1371us(124) tail_norm=805us(62) tail_mlp=13752us(124) tail_act=434us(62) tail_resid=575us(62)  unwrapped=641us
+[batched-op-profile] m=16 total=28235us  matmul=6968us(125) attn=2616us(62) qkr=637us(62) norm=450us(63) other=1367us(124) tail_norm=804us(62) tail_mlp=13749us(124) tail_act=433us(62) tail_resid=560us(62)  unwrapped=651us
+[batched-op-profile] m=16 total=28249us  matmul=6965us(125) attn=2631us(62) qkr=640us(62) norm=448us(63) other=1375us(124) tail_norm=805us(62) tail_mlp=13735us(124) tail_act=434us(62) tail_resid=562us(62)  unwrapped=654us
+[batched-op-profile] m=16 total=28283us  matmul=6965us(125) attn=2641us(62) qkr=640us(62) norm=449us(63) other=1366us(124) tail_norm=803us(62) tail_mlp=13753us(124) tail_act=434us(62) tail_resid=580us(62)  unwrapped=652us
+[batched-op-profile] m=16 total=28304us  matmul=6979us(125) attn=2660us(62) qkr=640us(62) norm=449us(63) other=1365us(124) tail_norm=803us(62) tail_mlp=13749us(124) tail_act=434us(62) tail_resid=578us(62)  unwrapped=647us
+[batched-op-profile] m=16 total=28289us  matmul=6972us(125) attn=2673us(62) qkr=636us(62) norm=449us(63) other=1365us(124) tail_norm=805us(62) tail_mlp=13740us(124) tail_act=434us(62) tail_resid=568us(62)  unwrapped=647us
+[batched-op-profile] m=16 total=28287us  matmul=6965us(125) attn=2671us(62) qkr=636us(62) norm=453us(63) other=1371us(124) tail_norm=804us(62) tail_mlp=13743us(124) tail_act=434us(62) tail_resid=563us(62)  unwrapped=647us
+[batched-op-profile] m=16 total=28309us  matmul=6964us(125) attn=2693us(62) qkr=638us(62) norm=450us(63) other=1368us(124) tail_norm=802us(62) tail_mlp=13751us(124) tail_act=434us(62) tail_resid=563us(62)  unwrapped=646us
+[batched-op-profile] m=16 total=28314us  matmul=6951us(125) attn=2703us(62) qkr=640us(62) norm=451us(63) other=1372us(124) tail_norm=805us(62) tail_mlp=13744us(124) tail_act=434us(62) tail_resid=562us(62)  unwrapped=652us
+[batched-op-profile] m=16 total=28339us  matmul=6970us(125) attn=2723us(62) qkr=639us(62) norm=447us(63) other=1368us(124) tail_norm=803us(62) tail_mlp=13742us(124) tail_act=434us(62) tail_resid=567us(62)  unwrapped=646us
+[batched-op-profile] m=16 total=28331us  matmul=6964us(125) attn=2719us(62) qkr=643us(62) norm=450us(63) other=1364us(124) tail_norm=803us(62) tail_mlp=13749us(124) tail_act=434us(62) tail_resid=564us(62)  unwrapped=641us
+[batched-op-profile] m=12 total=27901us  matmul=6939us(125) attn=2511us(62) qkr=624us(62) norm=446us(63) other=1343us(124) tail_norm=807us(62) tail_mlp=13611us(124) tail_act=381us(62) tail_resid=559us(62)  unwrapped=680us
+[batched-op-profile] m=9 total=27595us  matmul=6873us(125) attn=2413us(62) qkr=627us(62) norm=451us(63) other=1338us(124) tail_norm=800us(62) tail_mlp=13472us(124) tail_act=373us(62) tail_resid=560us(62)  unwrapped=688us
+[batched-op-profile] m=6 total=27267us  matmul=6798us(125) attn=2329us(62) qkr=634us(62) norm=445us(63) other=1316us(124) tail_norm=784us(62) tail_mlp=13361us(124) tail_act=372us(62) tail_resid=558us(62)  unwrapped=670us
+[batched-op-profile] m=3 total=27005us  matmul=6781us(125) attn=2252us(62) qkr=624us(62) norm=452us(63) other=1312us(124) tail_norm=785us(62) tail_mlp=13244us(124) tail_act=370us(62) tail_resid=558us(62)  unwrapped=627us
+[batched-op-profile] m=4 total=26614us  matmul=6797us(125) attn=1743us(62) qkr=629us(62) norm=449us(63) other=1352us(124) tail_norm=779us(62) tail_mlp=13294us(124) tail_act=372us(62) tail_resid=559us(62)  unwrapped=640us
+[batched-op-profile] m=6 total=26754us  matmul=6794us(125) attn=1798us(62) qkr=624us(62) norm=460us(63) other=1344us(124) tail_norm=794us(62) tail_mlp=13358us(124) tail_act=372us(62) tail_resid=568us(62)  unwrapped=642us
+[batched-op-profile] m=9 total=27041us  matmul=6892us(125) attn=1868us(62) qkr=623us(62) norm=449us(63) other=1364us(124) tail_norm=801us(62) tail_mlp=13469us(124) tail_act=373us(62) tail_resid=560us(62)  unwrapped=642us
+[batched-op-profile] m=10 total=27126us  matmul=6890us(125) attn=1881us(62) qkr=624us(62) norm=454us(63) other=1349us(124) tail_norm=804us(62) tail_mlp=13512us(124) tail_act=376us(62) tail_resid=562us(62)  unwrapped=674us
+[batched-op-profile] m=10 total=27149us  matmul=6887us(125) attn=1894us(62) qkr=625us(62) norm=454us(63) other=1371us(124) tail_norm=813us(62) tail_mlp=13515us(124) tail_act=373us(62) tail_resid=560us(62)  unwrapped=657us
+[batched-op-profile] m=10 total=28093us  matmul=7069us(125) attn=1982us(62) qkr=720us(62) norm=499us(63) other=1490us(124) tail_norm=854us(62) tail_mlp=13679us(124) tail_act=427us(62) tail_resid=608us(62)  unwrapped=765us
+[batched-op-profile] m=10 total=27160us  matmul=6890us(125) attn=1914us(62) qkr=626us(62) norm=456us(63) other=1361us(124) tail_norm=805us(62) tail_mlp=13522us(124) tail_act=374us(62) tail_resid=564us(62)  unwrapped=648us
+[batched-op-profile] m=10 total=27178us  matmul=6900us(125) attn=1931us(62) qkr=629us(62) norm=449us(63) other=1360us(124) tail_norm=802us(62) tail_mlp=13504us(124) tail_act=372us(62) tail_resid=562us(62)  unwrapped=669us
+[batched-op-profile] m=10 total=27247us  matmul=6898us(125) attn=1943us(62) qkr=656us(62) norm=452us(63) other=1358us(124) tail_norm=801us(62) tail_mlp=13523us(124) tail_act=384us(62) tail_resid=558us(62)  unwrapped=674us
+[batched-op-profile] m=10 total=27193us  matmul=6895us(125) attn=1949us(62) qkr=631us(62) norm=453us(63) other=1358us(124) tail_norm=806us(62) tail_mlp=13511us(124) tail_act=375us(62) tail_resid=559us(62)  unwrapped=656us
+[batched-op-profile] m=10 total=27272us  matmul=6911us(125) attn=1971us(62) qkr=632us(62) norm=451us(63) other=1367us(124) tail_norm=806us(62) tail_mlp=13533us(124) tail_act=374us(62) tail_resid=564us(62)  unwrapped=663us
+[batched-op-profile] m=10 total=27250us  matmul=6900us(125) attn=1978us(62) qkr=626us(62) norm=463us(63) other=1348us(124) tail_norm=804us(62) tail_mlp=13524us(124) tail_act=379us(62) tail_resid=561us(62)  unwrapped=667us
+[batched-op-profile] m=10 total=27220us  matmul=6896us(125) attn=1977us(62) qkr=625us(62) norm=451us(63) other=1353us(124) tail_norm=800us(62) tail_mlp=13518us(124) tail_act=374us(62) tail_resid=560us(62)  unwrapped=666us
+[batched-op-profile] m=10 total=27220us  matmul=6898us(125) attn=1983us(62) qkr=629us(62) norm=444us(63) other=1356us(124) tail_norm=801us(62) tail_mlp=13520us(124) tail_act=374us(62) tail_resid=558us(62)  unwrapped=657us
+[batched-op-profile] m=10 total=27259us  matmul=6896us(125) attn=1999us(62) qkr=625us(62) norm=464us(63) other=1356us(124) tail_norm=798us(62) tail_mlp=13539us(124) tail_act=374us(62) tail_resid=559us(62)  unwrapped=649us
+[batched-op-profile] m=10 total=27243us  matmul=6888us(125) attn=2001us(62) qkr=627us(62) norm=453us(63) other=1347us(124) tail_norm=802us(62) tail_mlp=13523us(124) tail_act=372us(62) tail_resid=560us(62)  unwrapped=670us
+[batched-op-profile] m=10 total=27267us  matmul=6898us(125) attn=2017us(62) qkr=624us(62) norm=449us(63) other=1358us(124) tail_norm=802us(62) tail_mlp=13521us(124) tail_act=373us(62) tail_resid=560us(62)  unwrapped=665us
+[batched-op-profile] m=10 total=27293us  matmul=6906us(125) attn=2029us(62) qkr=629us(62) norm=448us(63) other=1363us(124) tail_norm=807us(62) tail_mlp=13511us(124) tail_act=379us(62) tail_resid=559us(62)  unwrapped=662us
+[batched-op-profile] m=10 total=27281us  matmul=6903us(125) attn=2040us(62) qkr=625us(62) norm=449us(63) other=1354us(124) tail_norm=798us(62) tail_mlp=13515us(124) tail_act=375us(62) tail_resid=559us(62)  unwrapped=663us
+[batched-op-profile] m=10 total=27270us  matmul=6896us(125) attn=2044us(62) qkr=624us(62) norm=452us(63) other=1336us(124) tail_norm=797us(62) tail_mlp=13507us(124) tail_act=372us(62) tail_resid=574us(62)  unwrapped=668us
+[batched-op-profile] m=10 total=27300us  matmul=6898us(125) attn=2055us(62) qkr=624us(62) norm=447us(63) other=1340us(124) tail_norm=804us(62) tail_mlp=13520us(124) tail_act=372us(62) tail_resid=562us(62)  unwrapped=678us
+[batched-op-profile] m=10 total=27343us  matmul=6893us(125) attn=2055us(62) qkr=630us(62) norm=454us(63) other=1362us(124) tail_norm=804us(62) tail_mlp=13536us(124) tail_act=385us(62) tail_resid=560us(62)  unwrapped=664us
+[batched-op-profile] m=10 total=27545us  matmul=6992us(125) attn=2069us(62) qkr=626us(62) norm=452us(63) other=1380us(124) tail_norm=805us(62) tail_mlp=13606us(124) tail_act=373us(62) tail_resid=562us(62)  unwrapped=680us
+[batched-op-profile] m=10 total=27612us  matmul=6999us(125) attn=2106us(62) qkr=633us(62) norm=447us(63) other=1382us(124) tail_norm=817us(62) tail_mlp=13618us(124) tail_act=376us(62) tail_resid=561us(62)  unwrapped=673us
+[batched-op-profile] m=10 total=27542us  matmul=6985us(125) attn=2106us(62) qkr=628us(62) norm=450us(63) other=1371us(124) tail_norm=803us(62) tail_mlp=13591us(124) tail_act=375us(62) tail_resid=560us(62)  unwrapped=673us
+[batched-op-profile] m=10 total=27637us  matmul=7006us(125) attn=2125us(62) qkr=628us(62) norm=460us(63) other=1377us(124) tail_norm=805us(62) tail_mlp=13623us(124) tail_act=374us(62) tail_resid=568us(62)  unwrapped=671us
+[batched-op-profile] m=10 total=27495us  matmul=6946us(125) attn=2114us(62) qkr=628us(62) norm=449us(63) other=1369us(124) tail_norm=799us(62) tail_mlp=13575us(124) tail_act=373us(62) tail_resid=560us(62)  unwrapped=682us
+[batched-op-profile] m=10 total=27380us  matmul=6894us(125) attn=2117us(62) qkr=627us(62) norm=454us(63) other=1363us(124) tail_norm=803us(62) tail_mlp=13532us(124) tail_act=375us(62) tail_resid=560us(62)  unwrapped=655us
+[batched-op-profile] m=10 total=27409us  matmul=6892us(125) attn=2124us(62) qkr=635us(62) norm=457us(63) other=1360us(124) tail_norm=805us(62) tail_mlp=13528us(124) tail_act=379us(62) tail_resid=561us(62)  unwrapped=668us
+[batched-op-profile] m=10 total=27384us  matmul=6893us(125) attn=2123us(62) qkr=626us(62) norm=451us(63) other=1360us(124) tail_norm=801us(62) tail_mlp=13526us(124) tail_act=375us(62) tail_resid=560us(62)  unwrapped=669us
+[batched-op-profile] m=10 total=27408us  matmul=6896us(125) attn=2142us(62) qkr=634us(62) norm=453us(63) other=1361us(124) tail_norm=803us(62) tail_mlp=13521us(124) tail_act=373us(62) tail_resid=560us(62)  unwrapped=665us
+[batched-op-profile] m=10 total=27417us  matmul=6889us(125) attn=2171us(62) qkr=625us(62) norm=452us(63) other=1361us(124) tail_norm=811us(62) tail_mlp=13514us(124) tail_act=374us(62) tail_resid=567us(62)  unwrapped=653us
+[batched-op-profile] m=10 total=27418us  matmul=6892us(125) attn=2177us(62) qkr=629us(62) norm=452us(63) other=1341us(124) tail_norm=806us(62) tail_mlp=13515us(124) tail_act=373us(62) tail_resid=566us(62)  unwrapped=667us
+[batched-op-profile] m=10 total=27419us  matmul=6895us(125) attn=2181us(62) qkr=625us(62) norm=448us(63) other=1341us(124) tail_norm=809us(62) tail_mlp=13514us(124) tail_act=374us(62) tail_resid=558us(62)  unwrapped=674us
+[batched-op-profile] m=10 total=27447us  matmul=6894us(125) attn=2184us(62) qkr=627us(62) norm=457us(63) other=1361us(124) tail_norm=802us(62) tail_mlp=13515us(124) tail_act=377us(62) tail_resid=560us(62)  unwrapped=670us
+[batched-op-profile] m=10 total=27437us  matmul=6895us(125) attn=2192us(62) qkr=625us(62) norm=450us(63) other=1346us(124) tail_norm=801us(62) tail_mlp=13517us(124) tail_act=374us(62) tail_resid=566us(62)  unwrapped=671us
+[batched-op-profile] m=10 total=27453us  matmul=6899us(125) attn=2203us(62) qkr=626us(62) norm=458us(63) other=1351us(124) tail_norm=800us(62) tail_mlp=13512us(124) tail_act=377us(62) tail_resid=562us(62)  unwrapped=665us
+[batched-op-profile] m=10 total=27456us  matmul=6900us(125) attn=2217us(62) qkr=625us(62) norm=454us(63) other=1340us(124) tail_norm=802us(62) tail_mlp=13521us(124) tail_act=378us(62) tail_resid=559us(62)  unwrapped=660us
+[batched-op-profile] m=10 total=27453us  matmul=6882us(125) attn=2222us(62) qkr=634us(62) norm=453us(63) other=1353us(124) tail_norm=806us(62) tail_mlp=13519us(124) tail_act=373us(62) tail_resid=560us(62)  unwrapped=651us
+[batched-op-profile] m=10 total=27516us  matmul=6895us(125) attn=2241us(62) qkr=625us(62) norm=449us(63) other=1355us(124) tail_norm=810us(62) tail_mlp=13521us(124) tail_act=376us(62) tail_resid=560us(62)  unwrapped=684us
+[batched-op-profile] m=10 total=27516us  matmul=6911us(125) attn=2248us(62) qkr=631us(62) norm=450us(63) other=1355us(124) tail_norm=799us(62) tail_mlp=13517us(124) tail_act=374us(62) tail_resid=560us(62)  unwrapped=671us
+[batched-op-profile] m=10 total=27485us  matmul=6887us(125) attn=2247us(62) qkr=622us(62) norm=450us(63) other=1338us(124) tail_norm=804us(62) tail_mlp=13536us(124) tail_act=373us(62) tail_resid=561us(62)  unwrapped=667us
+[batched-op-profile] m=10 total=27498us  matmul=6895us(125) attn=2265us(62) qkr=623us(62) norm=455us(63) other=1345us(124) tail_norm=794us(62) tail_mlp=13525us(124) tail_act=373us(62) tail_resid=562us(62)  unwrapped=661us
+[batched-op-profile] m=10 total=27501us  matmul=6890us(125) attn=2275us(62) qkr=625us(62) norm=448us(63) other=1350us(124) tail_norm=802us(62) tail_mlp=13507us(124) tail_act=376us(62) tail_resid=559us(62)  unwrapped=669us
+[batched-op-profile] m=10 total=27570us  matmul=6892us(125) attn=2287us(62) qkr=629us(62) norm=450us(63) other=1370us(124) tail_norm=820us(62) tail_mlp=13527us(124) tail_act=372us(62) tail_resid=559us(62)  unwrapped=664us
+[batched-op-profile] m=10 total=27529us  matmul=6888us(125) attn=2289us(62) qkr=627us(62) norm=448us(63) other=1358us(124) tail_norm=803us(62) tail_mlp=13524us(124) tail_act=374us(62) tail_resid=559us(62)  unwrapped=659us
+[batched-op-profile] m=10 total=27547us  matmul=6893us(125) attn=2297us(62) qkr=623us(62) norm=456us(63) other=1353us(124) tail_norm=804us(62) tail_mlp=13522us(124) tail_act=372us(62) tail_resid=560us(62)  unwrapped=667us
+[batched-op-profile] m=10 total=27544us  matmul=6889us(125) attn=2320us(62) qkr=627us(62) norm=448us(63) other=1353us(124) tail_norm=804us(62) tail_mlp=13509us(124) tail_act=374us(62) tail_resid=559us(62)  unwrapped=661us
+[batched-op-profile] m=10 total=27567us  matmul=6895us(125) attn=2323us(62) qkr=630us(62) norm=457us(63) other=1350us(124) tail_norm=804us(62) tail_mlp=13521us(124) tail_act=372us(62) tail_resid=559us(62)  unwrapped=656us
+[batched-op-profile] m=10 total=27559us  matmul=6890us(125) attn=2339us(62) qkr=625us(62) norm=462us(63) other=1339us(124) tail_norm=803us(62) tail_mlp=13514us(124) tail_act=373us(62) tail_resid=561us(62)  unwrapped=653us
+[batched-op-profile] m=10 total=27621us  matmul=6895us(125) attn=2353us(62) qkr=633us(62) norm=445us(63) other=1369us(124) tail_norm=810us(62) tail_mlp=13525us(124) tail_act=377us(62) tail_resid=561us(62)  unwrapped=653us
+[batched-op-profile] m=10 total=27590us  matmul=6894us(125) attn=2351us(62) qkr=627us(62) norm=447us(63) other=1349us(124) tail_norm=802us(62) tail_mlp=13529us(124) tail_act=373us(62) tail_resid=558us(62)  unwrapped=660us
+[batched-op-profile] m=10 total=27584us  matmul=6889us(125) attn=2363us(62) qkr=623us(62) norm=447us(63) other=1351us(124) tail_norm=805us(62) tail_mlp=13519us(124) tail_act=375us(62) tail_resid=559us(62)  unwrapped=653us
+[batched-op-profile] m=10 total=27593us  matmul=6891us(125) attn=2359us(62) qkr=626us(62) norm=452us(63) other=1349us(124) tail_norm=801us(62) tail_mlp=13514us(124) tail_act=379us(62) tail_resid=564us(62)  unwrapped=658us
+[batched-op-profile] m=10 total=27619us  matmul=6893us(125) attn=2371us(62) qkr=621us(62) norm=452us(63) other=1350us(124) tail_norm=802us(62) tail_mlp=13538us(124) tail_act=381us(62) tail_resid=560us(62)  unwrapped=651us
+[batched-op-profile] m=10 total=27629us  matmul=6894us(125) attn=2386us(62) qkr=630us(62) norm=448us(63) other=1357us(124) tail_norm=802us(62) tail_mlp=13519us(124) tail_act=374us(62) tail_resid=560us(62)  unwrapped=659us
+[batched-op-profile] m=10 total=27662us  matmul=6893us(125) attn=2405us(62) qkr=630us(62) norm=445us(63) other=1361us(124) tail_norm=804us(62) tail_mlp=13511us(124) tail_act=383us(62) tail_resid=558us(62)  unwrapped=672us
+[batched-op-profile] m=10 total=27660us  matmul=6894us(125) attn=2415us(62) qkr=625us(62) norm=455us(63) other=1341us(124) tail_norm=803us(62) tail_mlp=13522us(124) tail_act=378us(62) tail_resid=562us(62)  unwrapped=665us
+[batched-op-profile] m=10 total=27681us  matmul=6896us(125) attn=2420us(62) qkr=629us(62) norm=451us(63) other=1364us(124) tail_norm=797us(62) tail_mlp=13525us(124) tail_act=376us(62) tail_resid=565us(62)  unwrapped=658us
+[batched-op-profile] m=10 total=27638us  matmul=6889us(125) attn=2422us(62) qkr=623us(62) norm=450us(63) other=1346us(124) tail_norm=800us(62) tail_mlp=13515us(124) tail_act=374us(62) tail_resid=559us(62)  unwrapped=660us
+[batched-op-profile] m=10 total=27728us  matmul=6910us(125) attn=2429us(62) qkr=625us(62) norm=449us(63) other=1344us(124) tail_norm=808us(62) tail_mlp=13549us(124) tail_act=378us(62) tail_resid=561us(62)  unwrapped=675us
+[batched-op-profile] m=10 total=27709us  matmul=6899us(125) attn=2439us(62) qkr=628us(62) norm=447us(63) other=1356us(124) tail_norm=802us(62) tail_mlp=13531us(124) tail_act=374us(62) tail_resid=561us(62)  unwrapped=672us
+[batched-op-profile] m=10 total=27686us  matmul=6890us(125) attn=2446us(62) qkr=629us(62) norm=452us(63) other=1350us(124) tail_norm=797us(62) tail_mlp=13513us(124) tail_act=374us(62) tail_resid=566us(62)  unwrapped=669us
+[batched-op-profile] m=6 total=27242us  matmul=6809us(125) attn=2300us(62) qkr=621us(62) norm=447us(63) other=1313us(124) tail_norm=784us(62) tail_mlp=13362us(124) tail_act=372us(62) tail_resid=558us(62)  unwrapped=676us
+[batched-op-profile] m=4 total=27081us  matmul=6783us(125) attn=2267us(62) qkr=625us(62) norm=445us(63) other=1313us(124) tail_norm=796us(62) tail_mlp=13288us(124) tail_act=372us(62) tail_resid=558us(62)  unwrapped=634us
+[batched-op-profile] m=4 total=26693us  matmul=6813us(125) attn=1757us(62) qkr=630us(62) norm=465us(63) other=1348us(124) tail_norm=800us(62) tail_mlp=13308us(124) tail_act=377us(62) tail_resid=562us(62)  unwrapped=633us
+[batched-op-profile] m=7 total=26979us  matmul=6856us(125) attn=1812us(62) qkr=628us(62) norm=494us(63) other=1373us(124) tail_norm=802us(62) tail_mlp=13415us(124) tail_act=372us(62) tail_resid=560us(62)  unwrapped=667us
+[batched-op-profile] m=10 total=27085us  matmul=6863us(125) attn=1880us(62) qkr=629us(62) norm=453us(63) other=1382us(124) tail_norm=782us(62) tail_mlp=13492us(124) tail_act=376us(62) tail_resid=559us(62)  unwrapped=669us
+[batched-op-profile] m=13 total=27529us  matmul=6929us(125) attn=1980us(62) qkr=632us(62) norm=449us(63) other=1441us(124) tail_norm=809us(62) tail_mlp=13621us(124) tail_act=408us(62) tail_resid=570us(62)  unwrapped=690us
+[batched-op-profile] m=16 total=27753us  matmul=6977us(125) attn=2096us(62) qkr=656us(62) norm=452us(63) other=1375us(124) tail_norm=803us(62) tail_mlp=13739us(124) tail_act=434us(62) tail_resid=570us(62)  unwrapped=651us
+[batched-op-profile] m=16 total=27720us  matmul=6968us(125) attn=2099us(62) qkr=640us(62) norm=449us(63) other=1369us(124) tail_norm=803us(62) tail_mlp=13735us(124) tail_act=435us(62) tail_resid=569us(62)  unwrapped=653us
+[batched-op-profile] m=16 total=27732us  matmul=6975us(125) attn=2104us(62) qkr=644us(62) norm=447us(63) other=1364us(124) tail_norm=804us(62) tail_mlp=13741us(124) tail_act=434us(62) tail_resid=566us(62)  unwrapped=653us
+[batched-op-profile] m=16 total=27716us  matmul=6966us(125) attn=2117us(62) qkr=641us(62) norm=449us(63) other=1365us(124) tail_norm=804us(62) tail_mlp=13734us(124) tail_act=434us(62) tail_resid=566us(62)  unwrapped=640us
+[batched-op-profile] m=16 total=27816us  matmul=6978us(125) attn=2137us(62) qkr=640us(62) norm=451us(63) other=1374us(124) tail_norm=807us(62) tail_mlp=13751us(124) tail_act=438us(62) tail_resid=578us(62)  unwrapped=662us
+[batched-op-profile] m=16 total=27790us  matmul=6978us(125) attn=2155us(62) qkr=645us(62) norm=447us(63) other=1370us(124) tail_norm=807us(62) tail_mlp=13749us(124) tail_act=433us(62) tail_resid=566us(62)  unwrapped=640us
+[batched-op-profile] m=16 total=27759us  matmul=6965us(125) attn=2158us(62) qkr=639us(62) norm=451us(63) other=1365us(124) tail_norm=804us(62) tail_mlp=13739us(124) tail_act=435us(62) tail_resid=563us(62)  unwrapped=640us
+[batched-op-profile] m=16 total=27782us  matmul=6964us(125) attn=2167us(62) qkr=648us(62) norm=445us(63) other=1369us(124) tail_norm=801us(62) tail_mlp=13743us(124) tail_act=433us(62) tail_resid=562us(62)  unwrapped=650us
+[batched-op-profile] m=16 total=27878us  matmul=6986us(125) attn=2188us(62) qkr=659us(62) norm=454us(63) other=1377us(124) tail_norm=805us(62) tail_mlp=13741us(124) tail_act=434us(62) tail_resid=583us(62)  unwrapped=651us
+[batched-op-profile] m=16 total=27816us  matmul=6969us(125) attn=2181us(62) qkr=639us(62) norm=446us(63) other=1374us(124) tail_norm=806us(62) tail_mlp=13740us(124) tail_act=434us(62) tail_resid=564us(62)  unwrapped=663us
+[batched-op-profile] m=16 total=27816us  matmul=6974us(125) attn=2194us(62) qkr=639us(62) norm=449us(63) other=1366us(124) tail_norm=802us(62) tail_mlp=13744us(124) tail_act=434us(62) tail_resid=573us(62)  unwrapped=641us
+[batched-op-profile] m=16 total=27960us  matmul=6992us(125) attn=2221us(62) qkr=670us(62) norm=452us(63) other=1374us(124) tail_norm=809us(62) tail_mlp=13757us(124) tail_act=441us(62) tail_resid=581us(62)  unwrapped=663us
+[batched-op-profile] m=16 total=27851us  matmul=6972us(125) attn=2222us(62) qkr=640us(62) norm=454us(63) other=1375us(124) tail_norm=805us(62) tail_mlp=13744us(124) tail_act=435us(62) tail_resid=572us(62)  unwrapped=632us
+[batched-op-profile] m=16 total=27852us  matmul=6968us(125) attn=2233us(62) qkr=643us(62) norm=450us(63) other=1370us(124) tail_norm=803us(62) tail_mlp=13734us(124) tail_act=433us(62) tail_resid=569us(62)  unwrapped=649us
+[batched-op-profile] m=16 total=27853us  matmul=6970us(125) attn=2244us(62) qkr=640us(62) norm=454us(63) other=1368us(124) tail_norm=804us(62) tail_mlp=13736us(124) tail_act=434us(62) tail_resid=569us(62)  unwrapped=634us
+[batched-op-profile] m=16 total=27899us  matmul=6985us(125) attn=2247us(62) qkr=643us(62) norm=446us(63) other=1373us(124) tail_norm=807us(62) tail_mlp=13756us(124) tail_act=434us(62) tail_resid=562us(62)  unwrapped=646us
+[batched-op-profile] m=16 total=27867us  matmul=6964us(125) attn=2264us(62) qkr=636us(62) norm=445us(63) other=1365us(124) tail_norm=804us(62) tail_mlp=13742us(124) tail_act=434us(62) tail_resid=562us(62)  unwrapped=651us
+[batched-op-profile] m=16 total=27888us  matmul=6965us(125) attn=2281us(62) qkr=642us(62) norm=447us(63) other=1368us(124) tail_norm=803us(62) tail_mlp=13746us(124) tail_act=435us(62) tail_resid=562us(62)  unwrapped=639us
+[batched-op-profile] m=16 total=27966us  matmul=6978us(125) attn=2281us(62) qkr=649us(62) norm=453us(63) other=1378us(124) tail_norm=807us(62) tail_mlp=13760us(124) tail_act=437us(62) tail_resid=568us(62)  unwrapped=655us
+[batched-op-profile] m=16 total=27945us  matmul=6968us(125) attn=2290us(62) qkr=645us(62) norm=448us(63) other=1367us(124) tail_norm=804us(62) tail_mlp=13757us(124) tail_act=437us(62) tail_resid=566us(62)  unwrapped=663us
+[batched-op-profile] m=16 total=27938us  matmul=6964us(125) attn=2312us(62) qkr=640us(62) norm=449us(63) other=1370us(124) tail_norm=804us(62) tail_mlp=13740us(124) tail_act=440us(62) tail_resid=562us(62)  unwrapped=657us
+[batched-op-profile] m=16 total=27957us  matmul=6973us(125) attn=2323us(62) qkr=643us(62) norm=447us(63) other=1375us(124) tail_norm=801us(62) tail_mlp=13736us(124) tail_act=434us(62) tail_resid=563us(62)  unwrapped=662us
+[batched-op-profile] m=16 total=27965us  matmul=6973us(125) attn=2328us(62) qkr=640us(62) norm=452us(63) other=1370us(124) tail_norm=809us(62) tail_mlp=13747us(124) tail_act=435us(62) tail_resid=566us(62)  unwrapped=645us
+[batched-op-profile] m=16 total=27972us  matmul=6970us(125) attn=2340us(62) qkr=643us(62) norm=452us(63) other=1374us(124) tail_norm=806us(62) tail_mlp=13748us(124) tail_act=433us(62) tail_resid=565us(62)  unwrapped=641us
+[batched-op-profile] m=16 total=27984us  matmul=6964us(125) attn=2360us(62) qkr=643us(62) norm=444us(63) other=1370us(124) tail_norm=802us(62) tail_mlp=13744us(124) tail_act=434us(62) tail_resid=564us(62)  unwrapped=659us
+[batched-op-profile] m=16 total=28086us  matmul=6982us(125) attn=2365us(62) qkr=647us(62) norm=467us(63) other=1379us(124) tail_norm=808us(62) tail_mlp=13762us(124) tail_act=437us(62) tail_resid=571us(62)  unwrapped=668us
+[batched-op-profile] m=16 total=28014us  matmul=6969us(125) attn=2372us(62) qkr=641us(62) norm=450us(63) other=1372us(124) tail_norm=808us(62) tail_mlp=13747us(124) tail_act=434us(62) tail_resid=562us(62)  unwrapped=659us
+[batched-op-profile] m=16 total=28003us  matmul=6967us(125) attn=2385us(62) qkr=645us(62) norm=453us(63) other=1365us(124) tail_norm=811us(62) tail_mlp=13745us(124) tail_act=434us(62) tail_resid=568us(62)  unwrapped=630us
+[batched-op-profile] m=16 total=28015us  matmul=6974us(125) attn=2399us(62) qkr=636us(62) norm=458us(63) other=1364us(124) tail_norm=805us(62) tail_mlp=13739us(124) tail_act=433us(62) tail_resid=565us(62)  unwrapped=642us
+[batched-op-profile] m=16 total=28065us  matmul=6970us(125) attn=2417us(62) qkr=646us(62) norm=449us(63) other=1370us(124) tail_norm=804us(62) tail_mlp=13754us(124) tail_act=437us(62) tail_resid=574us(62)  unwrapped=644us
+[batched-op-profile] m=16 total=28028us  matmul=6957us(125) attn=2420us(62) qkr=638us(62) norm=452us(63) other=1371us(124) tail_norm=803us(62) tail_mlp=13731us(124) tail_act=433us(62) tail_resid=566us(62)  unwrapped=657us
+[batched-op-profile] m=16 total=28066us  matmul=6986us(125) attn=2428us(62) qkr=638us(62) norm=449us(63) other=1367us(124) tail_norm=804us(62) tail_mlp=13746us(124) tail_act=434us(62) tail_resid=568us(62)  unwrapped=646us
+[batched-op-profile] m=16 total=28173us  matmul=6988us(125) attn=2441us(62) qkr=644us(62) norm=453us(63) other=1381us(124) tail_norm=807us(62) tail_mlp=13792us(124) tail_act=440us(62) tail_resid=573us(62)  unwrapped=654us
+[batched-op-profile] m=16 total=28079us  matmul=6971us(125) attn=2447us(62) qkr=640us(62) norm=449us(63) other=1370us(124) tail_norm=813us(62) tail_mlp=13740us(124) tail_act=434us(62) tail_resid=567us(62)  unwrapped=648us
+[batched-op-profile] m=16 total=28059us  matmul=6962us(125) attn=2447us(62) qkr=643us(62) norm=450us(63) other=1367us(124) tail_norm=805us(62) tail_mlp=13739us(124) tail_act=434us(62) tail_resid=568us(62)  unwrapped=644us
+[batched-op-profile] m=16 total=28104us  matmul=6972us(125) attn=2476us(62) qkr=640us(62) norm=446us(63) other=1368us(124) tail_norm=806us(62) tail_mlp=13751us(124) tail_act=433us(62) tail_resid=565us(62)  unwrapped=647us
+[batched-op-profile] m=16 total=28112us  matmul=6971us(125) attn=2492us(62) qkr=635us(62) norm=446us(63) other=1371us(124) tail_norm=815us(62) tail_mlp=13735us(124) tail_act=437us(62) tail_resid=571us(62)  unwrapped=639us
+[batched-op-profile] m=16 total=28107us  matmul=6955us(125) attn=2508us(62) qkr=644us(62) norm=446us(63) other=1366us(124) tail_norm=803us(62) tail_mlp=13752us(124) tail_act=433us(62) tail_resid=561us(62)  unwrapped=639us
+[batched-op-profile] m=16 total=28112us  matmul=6960us(125) attn=2505us(62) qkr=637us(62) norm=447us(63) other=1376us(124) tail_norm=805us(62) tail_mlp=13736us(124) tail_act=432us(62) tail_resid=565us(62)  unwrapped=649us
+[batched-op-profile] m=16 total=28162us  matmul=6974us(125) attn=2523us(62) qkr=640us(62) norm=447us(63) other=1369us(124) tail_norm=813us(62) tail_mlp=13741us(124) tail_act=433us(62) tail_resid=573us(62)  unwrapped=649us
+[batched-op-profile] m=16 total=28146us  matmul=6984us(125) attn=2526us(62) qkr=639us(62) norm=447us(63) other=1365us(124) tail_norm=803us(62) tail_mlp=13749us(124) tail_act=433us(62) tail_resid=569us(62)  unwrapped=631us
+[batched-op-profile] m=16 total=28145us  matmul=6963us(125) attn=2538us(62) qkr=636us(62) norm=447us(63) other=1368us(124) tail_norm=798us(62) tail_mlp=13742us(124) tail_act=434us(62) tail_resid=564us(62)  unwrapped=655us
+[batched-op-profile] m=16 total=28209us  matmul=6975us(125) attn=2547us(62) qkr=661us(62) norm=454us(63) other=1372us(124) tail_norm=809us(62) tail_mlp=13742us(124) tail_act=435us(62) tail_resid=567us(62)  unwrapped=647us
+[batched-op-profile] m=16 total=28175us  matmul=6970us(125) attn=2555us(62) qkr=648us(62) norm=446us(63) other=1368us(124) tail_norm=805us(62) tail_mlp=13742us(124) tail_act=437us(62) tail_resid=563us(62)  unwrapped=641us
+[batched-op-profile] m=16 total=28179us  matmul=6973us(125) attn=2568us(62) qkr=635us(62) norm=447us(63) other=1368us(124) tail_norm=802us(62) tail_mlp=13745us(124) tail_act=432us(62) tail_resid=558us(62)  unwrapped=651us
+[batched-op-profile] m=16 total=28270us  matmul=6987us(125) attn=2591us(62) qkr=648us(62) norm=446us(63) other=1380us(124) tail_norm=809us(62) tail_mlp=13747us(124) tail_act=435us(62) tail_resid=564us(62)  unwrapped=663us
+[batched-op-profile] m=16 total=28257us  matmul=6983us(125) attn=2599us(62) qkr=641us(62) norm=449us(63) other=1372us(124) tail_norm=805us(62) tail_mlp=13746us(124) tail_act=440us(62) tail_resid=565us(62)  unwrapped=657us
+[batched-op-profile] m=16 total=28215us  matmul=6968us(125) attn=2606us(62) qkr=641us(62) norm=447us(63) other=1365us(124) tail_norm=801us(62) tail_mlp=13748us(124) tail_act=431us(62) tail_resid=564us(62)  unwrapped=644us
+[batched-op-profile] m=16 total=28231us  matmul=6969us(125) attn=2616us(62) qkr=639us(62) norm=449us(63) other=1367us(124) tail_norm=805us(62) tail_mlp=13736us(124) tail_act=434us(62) tail_resid=566us(62)  unwrapped=650us
+[batched-op-profile] m=16 total=28272us  matmul=6985us(125) attn=2626us(62) qkr=643us(62) norm=451us(63) other=1367us(124) tail_norm=804us(62) tail_mlp=13754us(124) tail_act=433us(62) tail_resid=560us(62)  unwrapped=649us
+[batched-op-profile] m=16 total=28294us  matmul=6972us(125) attn=2634us(62) qkr=648us(62) norm=448us(63) other=1370us(124) tail_norm=805us(62) tail_mlp=13754us(124) tail_act=438us(62) tail_resid=564us(62)  unwrapped=661us
+[batched-op-profile] m=16 total=28263us  matmul=6966us(125) attn=2647us(62) qkr=634us(62) norm=447us(63) other=1373us(124) tail_norm=808us(62) tail_mlp=13742us(124) tail_act=438us(62) tail_resid=562us(62)  unwrapped=646us
+[batched-op-profile] m=16 total=28342us  matmul=6990us(125) attn=2671us(62) qkr=643us(62) norm=454us(63) other=1376us(124) tail_norm=807us(62) tail_mlp=13752us(124) tail_act=435us(62) tail_resid=567us(62)  unwrapped=647us
+[batched-op-profile] m=16 total=28360us  matmul=7001us(125) attn=2681us(62) qkr=644us(62) norm=446us(63) other=1373us(124) tail_norm=805us(62) tail_mlp=13752us(124) tail_act=434us(62) tail_resid=570us(62)  unwrapped=654us
+[batched-op-profile] m=16 total=28360us  matmul=6971us(125) attn=2698us(62) qkr=660us(62) norm=447us(63) other=1371us(124) tail_norm=805us(62) tail_mlp=13742us(124) tail_act=434us(62) tail_resid=566us(62)  unwrapped=666us
+[batched-op-profile] m=16 total=28316us  matmul=6964us(125) attn=2697us(62) qkr=642us(62) norm=446us(63) other=1366us(124) tail_norm=804us(62) tail_mlp=13742us(124) tail_act=435us(62) tail_resid=564us(62)  unwrapped=656us
+[batched-op-profile] m=16 total=28398us  matmul=6983us(125) attn=2718us(62) qkr=658us(62) norm=453us(63) other=1374us(124) tail_norm=805us(62) tail_mlp=13744us(124) tail_act=436us(62) tail_resid=569us(62)  unwrapped=658us
+[batched-op-profile] m=16 total=28352us  matmul=6977us(125) attn=2725us(62) qkr=641us(62) norm=447us(63) other=1367us(124) tail_norm=807us(62) tail_mlp=13740us(124) tail_act=432us(62) tail_resid=563us(62)  unwrapped=653us
+[batched-op-profile] m=16 total=28337us  matmul=6969us(125) attn=2722us(62) qkr=639us(62) norm=449us(63) other=1366us(124) tail_norm=802us(62) tail_mlp=13736us(124) tail_act=434us(62) tail_resid=559us(62)  unwrapped=661us
+[batched-op-profile] m=12 total=27997us  matmul=6934us(125) attn=2541us(62) qkr=636us(62) norm=453us(63) other=1367us(124) tail_norm=812us(62) tail_mlp=13619us(124) tail_act=390us(62) tail_resid=563us(62)  unwrapped=682us
+[batched-op-profile] m=9 total=27670us  matmul=6890us(125) attn=2424us(62) qkr=651us(62) norm=458us(63) other=1396us(124) tail_norm=797us(62) tail_mlp=13474us(124) tail_act=375us(62) tail_resid=564us(62)  unwrapped=641us
+[batched-op-profile] m=5 total=27354us  matmul=6896us(125) attn=2300us(62) qkr=625us(62) norm=445us(63) other=1335us(124) tail_norm=792us(62) tail_mlp=13373us(124) tail_act=372us(62) tail_resid=562us(62)  unwrapped=654us
+[batched-op-profile] m=3 total=27214us  matmul=6866us(125) attn=2257us(62) qkr=627us(62) norm=452us(63) other=1321us(124) tail_norm=792us(62) tail_mlp=13338us(124) tail_act=372us(62) tail_resid=559us(62)  unwrapped=630us

@@ -11,8 +11,8 @@
 //! tensors directly into backend-native buffers (zero-copy on Apple Silicon
 //! shared memory, dtoh/htod for CUDA, etc.).
 
-use ferrum_kernels::backend::Backend;
-use ferrum_types::Result;
+use ferrum_kernels::{backend::Backend, MarlinExpertStack};
+use ferrum_types::{FerrumError, Result};
 
 use crate::config::QuantConfig;
 use crate::traits::Linear;
@@ -36,6 +36,21 @@ pub trait WeightLoader<B: Backend>: Send + Sync {
     /// Quantization metadata (parsed from `quantize_config.json` or a GGUF header).
     /// `None` means the source is dense.
     fn quant_config(&self) -> Option<&QuantConfig>;
+
+    /// Load per-expert GPTQ projections into one backend-native stacked expert
+    /// tile. Backends/loaders that do not expose native stacked GPTQ return an
+    /// explicit unsupported error.
+    fn load_stacked_gptq_experts(
+        &self,
+        expert_prefix_fmt: &str,
+        num_experts: usize,
+        proj_names: &[&str],
+    ) -> Result<(std::sync::Arc<dyn MarlinExpertStack<B>>, usize, usize)> {
+        let _ = (expert_prefix_fmt, num_experts, proj_names);
+        Err(FerrumError::unsupported(
+            "load_stacked_gptq_experts not implemented for this weight loader",
+        ))
+    }
 }
 
 /// Adapter that prepends a fixed prefix to every tensor name before
@@ -76,5 +91,18 @@ impl<'a, B: Backend> WeightLoader<B> for PrefixedLoader<'a, B> {
 
     fn quant_config(&self) -> Option<&QuantConfig> {
         self.inner.quant_config()
+    }
+
+    fn load_stacked_gptq_experts(
+        &self,
+        expert_prefix_fmt: &str,
+        num_experts: usize,
+        proj_names: &[&str],
+    ) -> Result<(std::sync::Arc<dyn MarlinExpertStack<B>>, usize, usize)> {
+        self.inner.load_stacked_gptq_experts(
+            &format!("{}{}", self.prefix, expert_prefix_fmt),
+            num_experts,
+            proj_names,
+        )
     }
 }

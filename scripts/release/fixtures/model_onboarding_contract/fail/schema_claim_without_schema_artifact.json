@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "contract_id": "schema_claim_without_schema_artifact",
+  "source_git_sha": "1111111111111111111111111111111111111111",
+  "model": {
+    "id": "fixture/schema-claim",
+    "family": "qwen3_moe",
+    "architecture": "qwen3_moe",
+    "weight_format": "gptq_int4",
+    "source": "hf"
+  },
+  "facts": {},
+  "runtime_preset": {
+    "selected": "cuda-qwen3-moe-gptq",
+    "rejected_candidates": ["cpu-default"]
+  },
+  "fallback_policy": {
+    "allow_builtin_template_fallback": false,
+    "allow_backend_fallback": false,
+    "allow_attention_fallback": false
+  },
+  "capabilities": {
+    "structured_output": {
+      "supported": true,
+      "source": "server_guided_decode"
+    }
+  },
+  "backend_support": []
+}

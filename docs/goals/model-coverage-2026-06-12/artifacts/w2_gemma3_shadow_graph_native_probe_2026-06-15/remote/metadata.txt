@@ -1,0 +1,8 @@
+# command
+bash scripts/microbenches/build_and_run_gemma3_shadow_graph_bench.sh
+# git
+c46d95408d12c8c1e177145f7c4c217a34080e62
+# gpu
+NVIDIA GeForce RTX 4090, 24564 MiB, 565.77
+# nvcc
+Build cuda_12.4.r12.4/compiler.34097967_0

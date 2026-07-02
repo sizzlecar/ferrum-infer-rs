@@ -1,0 +1,72 @@
+{
+  "status": "diagnostic_pass",
+  "release_grade": false,
+  "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_batch_prefill_fallback_reason_diag_2026-06-16",
+  "lane": "W2 batch-prefill fallback-reason diagnostic",
+  "vast_instance_id": 40826362,
+  "gpu": "1x RTX 4090",
+  "correctness_checks": {
+    "cuda_build_rc": 0,
+    "server_ready": true,
+    "chat_smoke_pass": true,
+    "bench_rc": 0
+  },
+  "shutdown": {
+    "cur_state": "stopped",
+    "actual_status": "exited"
+  },
+  "batch_prefill_profiler": {
+    "enabled_source": "config_file",
+    "batch_prefill_or_fallback_reason_lines": 0,
+    "interpretation": "LlmExecutor::batch_prefill was not the observed product path"
+  },
+  "unified_prefill": {
+    "observed": true,
+    "unique_prefill_iterations": 2,
+    "samples": [
+      {
+        "iter": 0,
+        "items": 1,
+        "prefill": 1,
+        "decode": 0,
+        "total_us": 147324,
+        "model_us": 146946
+      },
+      {
+        "iter": 3,
+        "items": 10,
+        "prefill": 10,
+        "decode": 0,
+        "total_us": 946123,
+        "model_us": 943620
+      }
+    ]
+  },
+  "bench": {
+    "concurrency": 16,
+    "n_repeats": 1,
+    "n_requests_per_run": 16,
+    "completed_per_run": [
+      16
+    ],
+    "errored_per_run": [
+      0
+    ],
+    "output_token_count_source": "usage",
+    "output_throughput_tps_mean": 284.90049780836483,
+    "vllm_c16_tps_baseline_orientation": 518.7959572662905,
+    "ferrum_vs_vllm_ratio_orientation": 0.549157127803387
+  },
+  "marlin_tail_sample": {
+    "gate_up_kernel_us": 8384,
+    "gate_up_kernel_calls": 62,
+    "down_kernel_us": 4354,
+    "down_kernel_calls": 62,
+    "gate_up_ws_us": 379,
+    "gate_up_ws_calls": 62,
+    "down_ws_us": 329,
+    "down_ws_calls": 62
+  },
+  "conclusion": "The serial batch_prefill fallback hypothesis is rejected for this c16 product path; next work should target unified prefill wall time and dense GPTQ Marlin MLP/prefill attention costs.",
+  "release_grade_blocker": "No model_release_grade_manifest.json and no MODEL_RELEASE_GRADE_W2 PASS line."
+}

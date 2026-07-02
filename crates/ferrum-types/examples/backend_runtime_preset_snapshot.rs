@@ -26,6 +26,7 @@ fn llama_8b_dense(quantization: Option<&str>) -> ModelCapabilities {
             Some("q4_k_m") | Some("gptq_int4") => 5 * GIB,
             _ => 16 * GIB,
         }),
+        recurrent_state_bytes_per_sequence: None,
         supported_dtypes: vec!["fp16".to_string(), "fp32".to_string()],
         graph_safe_moe: false,
     }

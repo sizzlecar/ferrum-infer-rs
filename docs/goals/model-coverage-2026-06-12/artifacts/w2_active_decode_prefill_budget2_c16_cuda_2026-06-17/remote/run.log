@@ -1,0 +1,11 @@
+[w2-post-sched-c16] start 2026-06-16T23:20:23Z
+[w2-post-sched-c16] root=/workspace/ferrum-infer-rs out=/workspace/w2_active_decode_prefill_budget2_c16_cuda_2026-06-17 model=gemma3:27b-gptq hf_home=/workspace/hf-cache dataset=/workspace/ascii_sharegpt_w2_100.jsonl
+[w2-post-sched-c16] installing rustup minimal toolchain
+
+real	3m58.593s
+user	4m26.435s
+sys	0m10.930s
+[w2-post-sched-c16] Ferrum run correctness
+[w2-post-sched-c16] Ferrum serve correctness
+[w2-post-sched-c16] Ferrum serve + c16 bench
+[w2-post-sched-c16] done 2026-06-16T23:30:46Z

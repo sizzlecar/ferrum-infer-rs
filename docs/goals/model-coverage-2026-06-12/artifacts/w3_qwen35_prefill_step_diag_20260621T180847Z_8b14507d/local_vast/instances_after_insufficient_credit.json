@@ -1,0 +1,12 @@
+[
+  {
+    "actual_status": "exited",
+    "cur_state": "stopped",
+    "dph_total": 0.662962962962963,
+    "id": 41422823,
+    "intended_status": "stopped",
+    "label": "ferrum-w3-qwen35-cuda-eq-20260618",
+    "ssh_host": "ssh7.vast.ai",
+    "ssh_port": 22822
+  }
+]

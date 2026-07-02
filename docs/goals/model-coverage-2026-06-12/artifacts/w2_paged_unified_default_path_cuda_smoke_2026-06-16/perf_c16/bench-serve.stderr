@@ -1,0 +1,18 @@
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+ferrum bench-serve — dataset=random num_prompts=100 warmup=10 n_repeats=3
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 43.3s
+  cell closed_loop c=16 — repeat 2/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 42.9s
+  cell closed_loop c=16 — repeat 3/3 (110 prompts including 10 warmup)
+    100 completed / 0 errored / 43.1s
+    summary c=16 (n_repeats=3, ± = ci95_hw)
+      TTFT_ms  p50=798.7±162.5  p95=1616.5±207.6  p99=1908.6±63.9
+      TPOT_ms  p50=45.5±1.3  p95=49.8±1.5  p99=50.0±1.8
+      ITL_ms   p50=37.6±0.7  p95=40.8±4.7  p99=291.8±146.1
+      throughput      295.8 ± 5.2 tok/s
+      goodput         2.32 ± 0.03 req/s
+
+→ wrote /workspace/w2_paged_unified_default_path_cuda_smoke_2026-06-16/perf_c16/ferrum_c16.json

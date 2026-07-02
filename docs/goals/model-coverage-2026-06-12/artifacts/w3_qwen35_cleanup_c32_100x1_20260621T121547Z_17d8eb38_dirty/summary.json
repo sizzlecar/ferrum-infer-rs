@@ -1,0 +1,26 @@
+{
+  "artifact": "/workspace/artifacts/w3_qwen35_cleanup_c32_100x1_20260621T121547Z_17d8eb38_dirty",
+  "bad_output": [
+    0
+  ],
+  "completed": [
+    100
+  ],
+  "duplicate_done": [
+    0
+  ],
+  "errored": [
+    0
+  ],
+  "itl_p50_ms": 19.147299999999998,
+  "missing_done": [
+    0
+  ],
+  "output_tps": {
+    "mean": 691.8722159177407
+  },
+  "tpot_p50_ms": 23.408071543521594,
+  "zero_output_tokens": [
+    0
+  ]
+}

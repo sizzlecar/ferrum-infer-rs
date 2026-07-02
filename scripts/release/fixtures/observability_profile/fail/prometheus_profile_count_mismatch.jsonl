@@ -1,0 +1,1 @@
+{"schema_version":1,"event_id":"evt-metrics-mismatch","request_id":"req-metrics","entrypoint":"serve","backend":"synthetic","phase":"metrics_snapshot","event_kind":"instant","timestamp":"2026-07-02T00:00:00Z","status":"ok","model":"synthetic/no-weight","attributes":{"profile_detail":"basic","profile_completed_requests":2,"prometheus_completed_requests":1}}

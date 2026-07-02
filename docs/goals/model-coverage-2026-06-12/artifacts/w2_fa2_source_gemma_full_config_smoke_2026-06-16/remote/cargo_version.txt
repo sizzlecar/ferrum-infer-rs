@@ -1,0 +1,1 @@
+/workspace/w2_fa2_source_gemma_full_config_smoke_2026-06-16/run_fa2_source_smoke.sh: line 22: cargo: command not found

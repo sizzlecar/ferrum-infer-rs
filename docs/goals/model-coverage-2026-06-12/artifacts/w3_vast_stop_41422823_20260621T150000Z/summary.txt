@@ -1,0 +1,3 @@
+instance_id=41422823
+final_cur_state=stopped
+final_actual_status=exited

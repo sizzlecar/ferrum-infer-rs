@@ -1,0 +1,13 @@
+started_at=2026-06-24T08:10:42Z
+lane=W3_QWEN35_MOE_ZERO_SKIP_C16_QUICK_REGRESSION
+git_sha=55368e57cd604d594f9fc5b0466ec0f0c6817ec0
+stop_condition=run_smoke_failure_or_server_failure_or_c16_bench_failure_or_completion
+correctness_gate=ferrum_run_smoke_and_ferrum_serve_chat_smoke
+performance_command=ferrum_bench_serve_c16_num_prompts32_n_repeats1_fail_on_error_seed9271_ignore_eos
+no_live_vllm=true
+tokenizer=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+7a26dc964f5eacf02f76684a197a3007177da586bc6ca91393f432665f5eb3eb  target/release/ferrum
+58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e  /workspace/ferrum-infer-rs-git/docs/goals/model-coverage-2026-06-12/artifacts/w2_natural_prompt_baseline_probe_2026-06-15/dataset/ascii_sharegpt.jsonl
+NVIDIA GeForce RTX 4090, 24564, 1, 24091, 570.153.02
+Build cuda_12.4.r12.4/compiler.34097967_0
+finished_at=2026-06-24T08:11:46Z

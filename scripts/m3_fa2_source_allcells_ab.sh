@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# All-cell A/B wrapper for the source-linked FA2 path.
+# Obsolete all-cell wrapper for the removed source-linked FA2 path.
 #
 # Usage on a GPU pod from the repo root:
 #   OUT_ROOT=/workspace/m3-fa2-source-allcells-n3 \
@@ -25,6 +25,9 @@ echo "NUM_PROMPTS=$NUM_PROMPTS"
 echo "WARMUP_REQUESTS=$WARMUP_REQUESTS"
 echo "CONCURRENCIES=$CONCURRENCIES"
 echo "VALIDATION_CHANGE_TYPE=$VALIDATION_CHANGE_TYPE"
+echo "The source-linked FA2 path has been removed from the main repository." >&2
+echo "Use a Ferrum native operator FA2 artifact instead of this wrapper." >&2
+exit 2
 
 {
     echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"

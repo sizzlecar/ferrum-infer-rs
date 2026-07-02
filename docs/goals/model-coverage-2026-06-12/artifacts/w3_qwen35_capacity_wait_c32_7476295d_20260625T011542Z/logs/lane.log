@@ -1,0 +1,19 @@
+2026-06-25T01:15:42Z lane_start art=/workspace/artifacts/w3_qwen35_capacity_wait_c32_7476295d_20260625T011542Z sha=7476295db6f4c5510d83328e450440b2aec1d8cf release_evidence=false no_live_vllm=true cost_per_hr_approx=0.583
+2026-06-25T01:15:42Z bootstrap_start
+2026-06-25T01:15:43Z bootstrap_done
+2026-06-25T01:15:43Z git_sync_start
+2026-06-25T01:15:44Z git_sync_done
+2026-06-25T01:15:44Z hf_prefetch_start
+2026-06-25T01:15:44Z cargo_check_start
+2026-06-25T01:15:48Z cargo_check_done
+2026-06-25T01:15:48Z release_build_start
+2026-06-25T01:19:15Z release_build_done
+2026-06-25T01:19:15Z hf_prefetch_wait_start
+2026-06-25T01:19:15Z hf_prefetch_done tokenizer=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+2026-06-25T01:19:15Z ferrum_run_smoke_start
+2026-06-25T01:19:44Z ferrum_run_smoke_done
+2026-06-25T01:19:44Z serve_start
+2026-06-25T01:20:15Z serve_ready
+2026-06-25T01:20:16Z serve_chat_smoke_done
+2026-06-25T01:20:16Z bench_c32_start
+2026-06-25T01:20:27Z FERRUM W3 QWEN35 CAPACITY WAIT C32 DIAG PASS: /workspace/artifacts/w3_qwen35_capacity_wait_c32_7476295d_20260625T011542Z

@@ -1,0 +1,8 @@
+    Finished `release` profile [optimized] target(s) in 0.20s
+     Running tests/argmax_rows.rs (target/release/deps/argmax_rows-a7da735565262364)
+
+running 2 tests
+test argmax_rows_f16_masked_returns_sentinel_without_finite_valid_token ... ok
+test argmax_rows_f16_masked_skips_invalid_tokens ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s

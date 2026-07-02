@@ -1,0 +1,37 @@
+runner_pid=474
+
+    PID ELAPSED CMD
+    474      22 bash /workspace/w2_unified_graph_typed_c16_2026-06-16/run_remote_unified_graph_c16.sh
+/workspace/w2_unified_graph_typed_c16_2026-06-16/build/release_build.command.txt
+/workspace/w2_unified_graph_typed_c16_2026-06-16/build/release_build.stderr
+/workspace/w2_unified_graph_typed_c16_2026-06-16/build/release_build.stdout
+/workspace/w2_unified_graph_typed_c16_2026-06-16/gpu_contract.md
+/workspace/w2_unified_graph_typed_c16_2026-06-16/logs/nohup.stderr
+/workspace/w2_unified_graph_typed_c16_2026-06-16/logs/nohup.stdout
+/workspace/w2_unified_graph_typed_c16_2026-06-16/remote/cargo_version.txt
+/workspace/w2_unified_graph_typed_c16_2026-06-16/remote/git_head.txt
+/workspace/w2_unified_graph_typed_c16_2026-06-16/remote/git_status_short.txt
+/workspace/w2_unified_graph_typed_c16_2026-06-16/remote/git_status_source_short.txt
+/workspace/w2_unified_graph_typed_c16_2026-06-16/remote/nvcc_version.txt
+/workspace/w2_unified_graph_typed_c16_2026-06-16/remote/nvidia_smi_before.txt
+/workspace/w2_unified_graph_typed_c16_2026-06-16/remote/rustc_version.txt
+/workspace/w2_unified_graph_typed_c16_2026-06-16/remote/start_utc.txt
+/workspace/w2_unified_graph_typed_c16_2026-06-16/remote_runner.pid
+/workspace/w2_unified_graph_typed_c16_2026-06-16/run_remote_unified_graph_c16.sh
+--- nohup stdout
+--- nohup stderr
+--- build stderr
+   Compiling ferrum-types v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-types)
+   Compiling ferrum-interfaces v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-interfaces)
+   Compiling ferrum-bench-core v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-bench-core)
+   Compiling ferrum-kernels v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kernels)
+   Compiling ferrum-scheduler v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-scheduler)
+   Compiling ferrum-kv v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kv)
+   Compiling ferrum-sampler v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-sampler)
+   Compiling ferrum-tokenizer v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-tokenizer)
+   Compiling ferrum-quantization v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-quantization)
+   Compiling ferrum-models v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-models)
+   Compiling ferrum-engine v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-cli)
+--- build stdout

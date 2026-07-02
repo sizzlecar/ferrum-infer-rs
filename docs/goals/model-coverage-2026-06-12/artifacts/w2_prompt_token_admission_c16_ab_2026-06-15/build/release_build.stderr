@@ -1,0 +1,18 @@
+   Compiling ferrum-types v0.7.7 (/workspace/ferrum-w2-prompt-token-admission/crates/ferrum-types)
+   Compiling candle-kernels v0.9.2
+   Compiling ferrum-kernels v0.7.7 (/workspace/ferrum-w2-prompt-token-admission/crates/ferrum-kernels)
+   Compiling candle-core v0.9.2
+   Compiling ferrum-interfaces v0.7.7 (/workspace/ferrum-w2-prompt-token-admission/crates/ferrum-interfaces)
+   Compiling ferrum-bench-core v0.7.7 (/workspace/ferrum-w2-prompt-token-admission/crates/ferrum-bench-core)
+   Compiling ferrum-kv v0.7.7 (/workspace/ferrum-w2-prompt-token-admission/crates/ferrum-kv)
+   Compiling ferrum-scheduler v0.7.7 (/workspace/ferrum-w2-prompt-token-admission/crates/ferrum-scheduler)
+   Compiling ferrum-sampler v0.7.7 (/workspace/ferrum-w2-prompt-token-admission/crates/ferrum-sampler)
+   Compiling candle-nn v0.9.2
+   Compiling ferrum-tokenizer v0.7.7 (/workspace/ferrum-w2-prompt-token-admission/crates/ferrum-tokenizer)
+   Compiling candle-transformers v0.9.2
+   Compiling ferrum-quantization v0.7.7 (/workspace/ferrum-w2-prompt-token-admission/crates/ferrum-quantization)
+   Compiling ferrum-models v0.7.7 (/workspace/ferrum-w2-prompt-token-admission/crates/ferrum-models)
+   Compiling ferrum-engine v0.7.7 (/workspace/ferrum-w2-prompt-token-admission/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.7 (/workspace/ferrum-w2-prompt-token-admission/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.7 (/workspace/ferrum-w2-prompt-token-admission/crates/ferrum-cli)
+    Finished `release` profile [optimized] target(s) in 3m 46s

@@ -1,0 +1,362 @@
+diff --git a/crates/ferrum-models/src/common/llm.rs b/crates/ferrum-models/src/common/llm.rs
+index 6919c920..f0d38ba5 100644
+--- a/crates/ferrum-models/src/common/llm.rs
++++ b/crates/ferrum-models/src/common/llm.rs
+@@ -215,6 +215,15 @@ pub trait DecoderOnlyLLM: Send + Sync {
+         ))
+     }
+ 
++    /// Whether `unified_forward` can satisfy requests that require full logits.
++    ///
++    /// The trait contract returns logits for every final chunk, so the default
++    /// is true. Implementations with an opt-in sentinel/argmax return path must
++    /// override this while that path is active.
++    fn unified_forward_can_return_full_logits(&self) -> bool {
++        true
++    }
++
+     /// Release the KV cache for a completed sequence.
+     fn release(&mut self, cache_id: &str);
+ 
+diff --git a/crates/ferrum-models/src/executor/llm_executor.rs b/crates/ferrum-models/src/executor/llm_executor.rs
+index 69e41a7c..f54f95ce 100644
+--- a/crates/ferrum-models/src/executor/llm_executor.rs
++++ b/crates/ferrum-models/src/executor/llm_executor.rs
+@@ -117,6 +117,30 @@ fn metadata_kv_capacity_hint(
+         .map(|value| value as usize)
+ }
+ 
++fn unified_fallback_reason_code(message: &str) -> &'static str {
++    if message.contains("fresh prefill with prefix cache enabled") {
++        "prefix_cache_fresh_prefill"
++    } else if message.contains("backend lacks varlen")
++        || message.contains("varlen QKV support disabled")
++    {
++        "unified_varlen_qkv_disabled"
++    } else if message.contains("sandwich-norm family requires")
++        && message.contains("sliding-window layer pattern")
++    {
++        "sandwich_window_pattern_required"
++    } else if message.contains("sandwich-norm family requires")
++        && message.contains("F32 residual shadow")
++    {
++        "sandwich_f32_shadow_required"
++    } else if message.contains("active LoRA adapter") {
++        "active_lora_adapter"
++    } else if message.contains("paged KV required") {
++        "paged_kv_required"
++    } else {
++        "unified_unsupported"
++    }
++}
++
+ /// Map a `ferrum_types::Device` to the matching `candle_core::Device`.
+ /// Used when materialising KV cache handles so downstream readers see
+ /// the real backend the model runs on (Metal / CUDA / CPU) rather than
+@@ -390,6 +414,7 @@ impl ModelExecutor for LlmExecutor {
+             None
+         };
+         let mut took_fallback = false;
++        let mut fallback_reason = "none";
+         let per_item_logits: Vec<Vec<f32>> = {
+             let mut model = self.lock_model();
+             for ((cache_id, adapter), input) in cache_ids
+@@ -404,6 +429,7 @@ impl ModelExecutor for LlmExecutor {
+             }
+             if force_full_logits {
+                 took_fallback = true;
++                fallback_reason = "requires_full_logits";
+                 let mut out = Vec::with_capacity(inputs.len());
+                 for (cid, toks) in cache_ids.iter().zip(tokens_per_input.iter()) {
+                     out.push(model.prefill(cid, toks));
+@@ -415,8 +441,9 @@ impl ModelExecutor for LlmExecutor {
+                         .into_iter()
+                         .map(|opt| opt.expect("is_final_chunk=true must yield logits"))
+                         .collect(),
+-                    Err(FerrumError::Unsupported { .. }) => {
++                    Err(FerrumError::Unsupported { message }) => {
+                         took_fallback = true;
++                        fallback_reason = unified_fallback_reason_code(&message);
+                         let mut out = Vec::with_capacity(inputs.len());
+                         for (cid, toks) in cache_ids.iter().zip(tokens_per_input.iter()) {
+                             out.push(model.prefill(cid, toks));
+@@ -430,10 +457,11 @@ impl ModelExecutor for LlmExecutor {
+         if let Some(t0) = bp_t0 {
+             let total_q: usize = unified_items.iter().map(|it| it.1.len()).sum();
+             eprintln!(
+-                "[batch-prefill] n_items={} total_q={} fallback={} elapsed={}us",
++                "[batch-prefill] n_items={} total_q={} fallback={} fallback_reason={} elapsed={}us",
+                 inputs.len(),
+                 total_q,
+                 took_fallback,
++                fallback_reason,
+                 t0.elapsed().as_micros()
+             );
+         }
+@@ -816,7 +844,7 @@ impl ModelExecutor for LlmExecutor {
+             .items
+             .iter()
+             .any(|item| metadata_requires_full_logits(&item.metadata));
+-        if !force_full_logits {
++        {
+             let model_result = {
+                 let mut model = self.lock_model();
+                 for item in &batch.items {
+@@ -830,23 +858,29 @@ impl ModelExecutor for LlmExecutor {
+                         }
+                     }
+                 }
+-                model.unified_forward(&unified_items)
++                if force_full_logits && !model.unified_forward_can_return_full_logits() {
++                    None
++                } else {
++                    Some(model.unified_forward(&unified_items))
++                }
+             };
+-            match model_result {
+-                Ok(per_item) => {
+-                    if per_item.len() != batch.items.len() {
+-                        return Err(FerrumError::model(format!(
+-                            "unified_forward returned {} entries for {} items",
+-                            per_item.len(),
+-                            batch.items.len(),
+-                        )));
++            if let Some(model_result) = model_result {
++                match model_result {
++                    Ok(per_item) => {
++                        if per_item.len() != batch.items.len() {
++                            return Err(FerrumError::model(format!(
++                                "unified_forward returned {} entries for {} items",
++                                per_item.len(),
++                                batch.items.len(),
++                            )));
++                        }
++                        return Ok(per_item);
+                     }
+-                    return Ok(per_item);
+-                }
+-                Err(FerrumError::Unsupported { .. }) => {
+-                    // Fall through to the dispatch fallback below.
++                    Err(FerrumError::Unsupported { .. }) => {
++                        // Fall through to the dispatch fallback below.
++                    }
++                    Err(e) => return Err(e),
+                 }
+-                Err(e) => return Err(e),
+             }
+         }
+ 
+@@ -989,12 +1023,16 @@ mod tests {
+     struct RecordingLlm {
+         calls: Arc<Mutex<RecordingCalls>>,
+         config: crate::common::LlmRuntimeConfig,
++        unified_unsupported_message: Option<String>,
++        unified_full_logits_supported: bool,
+     }
+ 
+     impl RecordingLlm {
+         fn new(calls: Arc<Mutex<RecordingCalls>>) -> Self {
+             Self {
+                 calls,
++                unified_unsupported_message: None,
++                unified_full_logits_supported: true,
+                 config: crate::common::LlmRuntimeConfig {
+                     hidden_size: 4,
+                     num_layers: 1,
+@@ -1005,6 +1043,23 @@ mod tests {
+                 },
+             }
+         }
++
++        fn with_unified_unsupported_message(
++            calls: Arc<Mutex<RecordingCalls>>,
++            message: impl Into<String>,
++        ) -> Self {
++            Self {
++                unified_unsupported_message: Some(message.into()),
++                ..Self::new(calls)
++            }
++        }
++
++        fn without_unified_full_logits(calls: Arc<Mutex<RecordingCalls>>) -> Self {
++            Self {
++                unified_full_logits_supported: false,
++                ..Self::new(calls)
++            }
++        }
+     }
+ 
+     impl DecoderOnlyLLM for RecordingLlm {
+@@ -1039,12 +1094,19 @@ mod tests {
+             items: &[(String, Vec<u32>, usize, bool)],
+         ) -> std::result::Result<Vec<Option<Vec<f32>>>, FerrumError> {
+             self.calls.lock().unified_forward += 1;
++            if let Some(message) = &self.unified_unsupported_message {
++                return Err(FerrumError::unsupported(message.clone()));
++            }
+             Ok(items
+                 .iter()
+-                .map(|(_, _, _, is_final_chunk)| is_final_chunk.then_some(vec![99.0]))
++                .map(|(_, _, _, is_final_chunk)| is_final_chunk.then_some(vec![0.0, 1.0, 2.0, 3.0]))
+                 .collect())
+         }
+ 
++        fn unified_forward_can_return_full_logits(&self) -> bool {
++            self.unified_full_logits_supported
++        }
++
+         fn prepare_kv_capacity(&mut self, cache_id: &str, capacity_hint: usize) {
+             self.calls
+                 .lock()
+@@ -1084,6 +1146,27 @@ mod tests {
+         LlmExecutor::new(Box::new(RecordingLlm::new(calls)), test_model_info())
+     }
+ 
++    fn recording_executor_with_unified_unsupported(
++        calls: Arc<Mutex<RecordingCalls>>,
++        message: impl Into<String>,
++    ) -> LlmExecutor {
++        LlmExecutor::new(
++            Box::new(RecordingLlm::with_unified_unsupported_message(
++                calls, message,
++            )),
++            test_model_info(),
++        )
++    }
++
++    fn recording_executor_without_unified_full_logits(
++        calls: Arc<Mutex<RecordingCalls>>,
++    ) -> LlmExecutor {
++        LlmExecutor::new(
++            Box::new(RecordingLlm::without_unified_full_logits(calls)),
++            test_model_info(),
++        )
++    }
++
+     fn full_logits_metadata() -> HashMap<String, serde_json::Value> {
+         HashMap::from([(
+             "ferrum_require_full_logits".to_string(),
+@@ -1148,6 +1231,49 @@ mod tests {
+         assert!(!env.batch_decode_prof);
+     }
+ 
++    #[test]
++    fn unified_fallback_reason_code_classifies_gemma3_varlen_guard() {
++        assert_eq!(
++            unified_fallback_reason_code(
++                "LlamaFamilyModel::unified_forward: varlen QKV support disabled. \
++                 Engine will fall back to per-item dispatch."
++            ),
++            "unified_varlen_qkv_disabled"
++        );
++        assert_eq!(
++            unified_fallback_reason_code(
++                "LlamaFamilyModel::unified_forward: sandwich-norm family requires \
++                 backend device-side F32 residual shadow support for unified GeGLU"
++            ),
++            "sandwich_f32_shadow_required"
++        );
++        assert_eq!(
++            unified_fallback_reason_code("unrecognized model-specific reason"),
++            "unified_unsupported"
++        );
++    }
++
++    #[test]
++    fn batch_prefill_falls_back_after_unified_unsupported() {
++        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
++        let executor = recording_executor_with_unified_unsupported(
++            calls.clone(),
++            "LlamaFamilyModel::unified_forward: varlen QKV support disabled. \
++             Engine will fall back to per-item dispatch.",
++        );
++        let inputs = vec![
++            PrefillInput::new(MockTensor::from_u32(&[1, 2], &[2]).into_ref()),
++            PrefillInput::new(MockTensor::from_u32(&[3, 4, 5], &[3]).into_ref()),
++        ];
++
++        let outputs = tokio_test::block_on(executor.batch_prefill(&inputs)).unwrap();
++
++        assert_eq!(outputs.len(), 2);
++        let calls = calls.lock();
++        assert_eq!(calls.unified_forward, 1);
++        assert_eq!(calls.prefill, 2);
++    }
++
+     #[test]
+     fn prefill_skips_unified_forward_when_full_logits_required() {
+         let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+@@ -1190,7 +1316,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn unified_decode_skips_unified_forward_when_full_logits_required() {
++    fn unified_decode_uses_unified_forward_when_full_logits_supported() {
+         let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+         let executor = recording_executor(calls.clone());
+         let mut batch = UnifiedBatch::new();
+@@ -1206,6 +1332,29 @@ mod tests {
+ 
+         let output = tokio_test::block_on(executor.unified_decode(&batch)).unwrap();
+ 
++        assert_eq!(output[0].as_ref().unwrap().len(), 4);
++        let calls = calls.lock();
++        assert_eq!(calls.unified_forward, 1);
++        assert!(calls.decode_batch_force_full_logits.is_empty());
++    }
++
++    #[test]
++    fn unified_decode_skips_unified_forward_when_full_logits_unsupported() {
++        let calls = Arc::new(Mutex::new(RecordingCalls::default()));
++        let executor = recording_executor_without_unified_full_logits(calls.clone());
++        let mut batch = UnifiedBatch::new();
++        batch.items.push(UnifiedBatchItem {
++            seq_id: "decode-cache".to_string(),
++            q_tokens: vec![7],
++            kv_cache: test_kv_handle("decode-cache", 3),
++            pos_offset: 3,
++            is_final_chunk: true,
++            metadata: full_logits_metadata(),
++            logits_policy: Default::default(),
++        });
++
++        let output = tokio_test::block_on(executor.unified_decode(&batch)).unwrap();
++
+         assert_eq!(output[0].as_ref().unwrap().len(), 4);
+         let calls = calls.lock();
+         assert_eq!(calls.unified_forward, 0);
+@@ -1245,7 +1394,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn unified_decode_full_logits_prefill_prepares_kv_capacity_hint() {
++    fn unified_decode_full_logits_prefill_uses_unified_forward_and_prepares_kv_capacity_hint() {
+         let calls = Arc::new(Mutex::new(RecordingCalls::default()));
+         let executor = recording_executor(calls.clone());
+         let mut metadata = full_logits_metadata();
+@@ -1265,8 +1414,8 @@ mod tests {
+ 
+         assert_eq!(output[0].as_ref().unwrap().len(), 4);
+         let calls = calls.lock();
+-        assert_eq!(calls.unified_forward, 0);
+-        assert_eq!(calls.prefill, 1);
++        assert_eq!(calls.unified_forward, 1);
++        assert_eq!(calls.prefill, 0);
+         assert_eq!(calls.prepared_kv, vec![("prefill-cache".to_string(), 11)]);
+     }
+ 
+diff --git a/crates/ferrum-models/src/models/qwen3_moe/api.rs b/crates/ferrum-models/src/models/qwen3_moe/api.rs
+index 4936a789..e28b0fe4 100644
+--- a/crates/ferrum-models/src/models/qwen3_moe/api.rs
++++ b/crates/ferrum-models/src/models/qwen3_moe/api.rs
+@@ -172,6 +172,10 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
+         Ok(self.unified_forward_internal(items))
+     }
+ 
++    fn unified_forward_can_return_full_logits(&self) -> bool {
++        !self.runtime_env.unified_greedy_argmax
++    }
++
+     fn release(&mut self, cache_id: &str) {
+         // Mirror LlamaFamilyModel::release — do NOT reset the captured
+         // graphs here. Graphs reference paged_pool addresses (model-

@@ -151,11 +151,12 @@ fn cuda_quant_runtime_config() -> &'static CudaQuantRuntimeConfig {
 fn reject_dense_vllm_marlin_if_requested(config: &CudaQuantRuntimeConfig) -> Result<()> {
     if config.vllm_marlin {
         return Err(FerrumError::unsupported(
-            "FERRUM_VLLM_MARLIN=1 is disabled for dense GPTQ: dense load_gptq \
-             stores IST-DASLab Marlin tiles, while the vLLM Marlin kernel \
-             requires vLLM-repacked weights. Use the default dense Marlin path; \
-             vLLM-repacked Marlin remains wired through FERRUM_VLLM_MOE for \
-             stacked MoE weights.",
+            "FERRUM_VLLM_MARLIN=1 is disabled for dense GPTQ: the vendored \
+             dense vLLM Marlin dispatcher currently compiles with \
+             kernel_selector.h disabled for the CUDA hidden-symbol workaround, \
+             so it cannot select a real GEMM kernel safely. Use the default \
+             dense Marlin path; vLLM Marlin MoE remains wired through \
+             FERRUM_VLLM_MOE for stacked MoE weights.",
         ));
     }
     Ok(())
@@ -438,8 +439,12 @@ pub fn marlin_gemm_with_perm(
     m: usize,
 ) -> Result<()> {
     let runtime_config = cuda_quant_runtime_config();
-    reject_dense_vllm_marlin_if_requested(runtime_config)?;
     let use_vllm = runtime_config.vllm_marlin;
+    if weight.vllm_moe {
+        return Err(FerrumError::unsupported(
+            "vLLM Marlin-MoE packed weight cannot be dispatched through dense Marlin GEMM",
+        ));
+    }
 
     if let Some(perm) = weight.perm.as_ref() {
         let k = weight.k;
@@ -459,6 +464,13 @@ pub fn marlin_gemm_with_perm(
         // even a weaker single-slot pool is correct as long as we
         // don't leave the function before the kernel queues complete.
         with_marlin_gather_scratch(&stream, ctx.ordinal, m * k, |a_gathered| -> Result<()> {
+            let profile = crate::marlin::profile_marlin();
+            if profile {
+                stream.synchronize().map_err(|e| {
+                    FerrumError::model(format!("marlin gather profile pre-sync: {e}"))
+                })?;
+            }
+            let t0 = profile.then(std::time::Instant::now);
             let mut b = stream.launch_builder(&func);
             b.arg(a);
             b.arg(perm);
@@ -473,6 +485,14 @@ pub fn marlin_gemm_with_perm(
                 })
             }
             .map_err(|e| FerrumError::model(format!("gather_columns launch: {e}")))?;
+            if let Some(t0) = t0 {
+                stream.synchronize().map_err(|e| {
+                    FerrumError::model(format!("marlin gather profile post-sync: {e}"))
+                })?;
+                crate::marlin::record_marlin_gather_for_current_label(
+                    t0.elapsed().as_micros() as u64
+                );
+            }
             if use_vllm {
                 return launch_vllm_marlin(&ctx.stream, a_gathered, weight, out, m);
             }
@@ -654,6 +674,7 @@ impl BackendQuantMarlin for CudaBackend {
         }
 
         reject_unsupported_marlin_qzeros("CUDA GPTQ Marlin", qzeros)?;
+        reject_dense_vllm_marlin_if_requested(cuda_quant_runtime_config())?;
 
         // Detect desc_act=true (act-order GPTQ): g_idx is non-trivial.
         // AutoGPTQ writes g_idx[k] = k/group_size for desc_act=false; any
@@ -717,10 +738,12 @@ impl BackendQuantMarlin for CudaBackend {
         let marlin_weight = crate::marlin::MarlinWeight {
             qweight: qweight_dev,
             scales: scales_dev,
+            qzeros: None,
             workspace: workspace_dev,
             k,
             n,
             group_size: group_size as i32,
+            vllm_moe: false,
             perm: perm_dev_opt,
         };
 
@@ -769,25 +792,25 @@ impl BackendQuantMarlin for CudaBackend {
                 qzeros.len()
             )));
         }
-        for (idx, qz) in qzeros.iter().enumerate() {
-            reject_unsupported_marlin_qzeros(
-                &format!("CUDA GPTQ stacked Marlin expert {idx}"),
-                qz,
-            )?;
-        }
+        let needs_vllm_qzeros = qzeros
+            .iter()
+            .any(|qz| !marlin_qzeros_are_symmetric_code7(qz));
 
         // vLLM marlin_moe_wna16 path: stacked weight in vLLM Marlin tile
         // format (NOT IST-DASLab). Run gptq_marlin_repack per expert,
         // permute scales with the same _scale_perm IST-DASLab uses.
-        // Opt-in via FERRUM_VLLM_MOE=1 — paired with the dispatch-side
-        // switch in moe_forward_bucketed.
+        // Non-symmetric GPTQ qzeros require this path because the standard
+        // IST-DASLab Marlin wrapper only handles the symmetric uint4b8
+        // zero-point bias. FERRUM_VLLM_MOE=1 remains an opt-in for
+        // symmetric models; asymmetric stacks select vLLM automatically.
         #[cfg(feature = "vllm-moe-marlin")]
-        if use_vllm_moe() {
+        if use_vllm_moe() || needs_vllm_qzeros {
             let stream = default_stream();
             let mw = crate::vllm_marlin::load_stacked_gptq_vllm_marlin(
                 &stream,
                 qweights,
                 scales,
+                qzeros,
                 bits,
                 group_size,
                 k,
@@ -810,6 +833,22 @@ impl BackendQuantMarlin for CudaBackend {
                     k,
                 ),
             ));
+        }
+
+        #[cfg(not(feature = "vllm-moe-marlin"))]
+        if needs_vllm_qzeros {
+            return Err(FerrumError::unsupported(
+                "CUDA GPTQ stacked Marlin found non-symmetric qzeros; rebuild with \
+                 --features vllm-moe-marlin so Ferrum can use the vLLM MoE \
+                 Marlin zero-point path",
+            ));
+        }
+
+        for (idx, qz) in qzeros.iter().enumerate() {
+            reject_unsupported_marlin_qzeros(
+                &format!("CUDA GPTQ stacked Marlin expert {idx}"),
+                qz,
+            )?;
         }
 
         // Triton path: would need a stacked variant — not implemented.
@@ -909,10 +948,12 @@ impl BackendQuantMarlin for CudaBackend {
         let marlin_weight = crate::marlin::MarlinWeight {
             qweight: qweight_dev,
             scales: scales_dev,
+            qzeros: None,
             workspace: workspace_dev,
             k,
             n: total_n,
             group_size: group_size as i32,
+            vllm_moe: false,
             perm: perm_dev_opt,
         };
 
@@ -968,6 +1009,12 @@ pub(crate) fn moe_gemm_phase_batched_impl(
     };
     #[cfg(not(feature = "triton-kernels"))]
     let mw: &crate::marlin::MarlinWeight = weight;
+    if mw.vllm_moe {
+        return Err(FerrumError::unsupported(
+            "vLLM Marlin-MoE packed weight cannot be dispatched through bucketed Marlin; \
+             use gemm_phase_vllm",
+        ));
+    }
 
     // ── Stage 12.1: fused MoE Marlin path (default ON) ──────────────
     // Dispatches all experts in this phase as a small number of
@@ -1195,9 +1242,10 @@ mod tests {
 
         let message = err.to_string();
         assert!(message.contains("FERRUM_VLLM_MARLIN=1 is disabled for dense GPTQ"));
-        assert!(message.contains("vLLM-repacked weights"));
+        assert!(message.contains("kernel_selector.h disabled"));
+        assert!(message.contains("FERRUM_VLLM_MOE"));
 
-        let default_config = CudaQuantRuntimeConfig::from_env_vars([]);
+        let default_config = CudaQuantRuntimeConfig::from_env_vars([] as [(&str, &str); 0]);
         reject_dense_vllm_marlin_if_requested(&default_config).unwrap();
     }
 

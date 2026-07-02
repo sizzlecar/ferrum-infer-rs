@@ -1,0 +1,23 @@
+[microbench] compiling scripts/microbenches/gemma3_gate_up_split_perf.cu
+-rwxr-xr-x 1 root root 703544 Jun 16 05:14 /workspace/ferrum-artifacts/w2_gate_up_split_native_probe_2026-06-16/gemma3_gate_up_split_perf
+
+[microbench] running /workspace/ferrum-artifacts/w2_gate_up_split_native_probe_2026-06-16/gemma3_gate_up_split_perf
+gemma3_gate_up_split_perf device=NVIDIA GeForce RTX 4090 sm=8.9 h=5376 im=21504 layers=8
+mode,m,segment_host_us,speedup_vs_product,effective_projection_tflops,ret
+cycle8_product_fused_gate_up_act,1,135.473,1.0000,3.41,0
+cycle8_split_serial_gate_up_act,1,140.896,0.9615,3.28,0
+cycle8_split_overlap_gate_up_act,1,135.405,1.0005,3.42,0
+cycle8_product_fused_gate_up_act,10,139.265,1.0000,33.20,0
+cycle8_split_serial_gate_up_act,10,143.366,0.9714,32.25,0
+cycle8_split_overlap_gate_up_act,10,137.672,1.0116,33.59,0
+cycle8_product_fused_gate_up_act,16,139.507,1.0000,53.03,0
+cycle8_split_serial_gate_up_act,16,142.770,0.9771,51.82,0
+cycle8_split_overlap_gate_up_act,16,137.641,1.0136,53.75,0
+cycle8_product_fused_gate_up_act,23,143.324,1.0000,74.21,0
+cycle8_split_serial_gate_up_act,23,152.206,0.9416,69.88,0
+cycle8_split_overlap_gate_up_act,23,145.832,0.9828,72.93,0
+cycle8_product_fused_gate_up_act,32,145.377,1.0000,101.79,0
+cycle8_split_serial_gate_up_act,32,153.468,0.9473,96.42,0
+cycle8_split_overlap_gate_up_act,32,146.855,0.9899,100.76,0
+
+VERDICT: gemma3 gate_up split native CUDA probe complete

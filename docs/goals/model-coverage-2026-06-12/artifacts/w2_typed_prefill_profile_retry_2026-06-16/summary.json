@@ -1,0 +1,27 @@
+{
+  "status": "FAIL",
+  "failure": "retry after f352ff3f still hit CUDA stream capture unsupported panic",
+  "run_profile_rc": "143",
+  "bench_rc": "143",
+  "chat_smoke_pass": true,
+  "panic_present": true,
+  "panic_line": [
+    "CudaBackend: stream sync: DriverError(CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED, \"operation not permitted when stream is capturing\")"
+  ],
+  "unified_prof_samples": [
+    "[unified-prof] iter#0 items=1 prefill=1 decode=0 total=128313us model=127951us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)",
+    "[unified-prof] iter#1 items=1 prefill=0 decode=1 total=26010us model=25837us decode_post=171us | sample=170 sched=0 stream=1 stop=0 complete=0 (us)",
+    "[unified-prof] iter#2 items=1 prefill=0 decode=1 total=25444us model=25260us decode_post=183us | sample=168 sched=0 stream=0 stop=0 complete=15 (us)",
+    "[unified-prof] iter#3 items=9 prefill=9 decode=0 total=810684us model=808447us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)",
+    "[unified-prof] iter#4 items=9 prefill=0 decode=9 total=28560us model=28428us decode_post=119us | sample=6 sched=0 stream=113 stop=0 complete=0 (us)",
+    "[unified-prof] iter#5 items=10 prefill=1 decode=9 total=115906us model=115357us decode_post=139us | sample=11 sched=0 stream=128 stop=0 complete=0 (us)",
+    "[unified-prof] iter#6 items=10 prefill=0 decode=10 total=27785us model=27637us decode_post=133us | sample=14 sched=0 stream=119 stop=0 complete=0 (us)"
+  ],
+  "batched_op_profile_samples": [
+    "[batched-op-profile] m=9 total=27737us  matmul=7069us(125) attn=1993us(62) qkr=922us(62) norm=445us(63) other=1464us(124) tail_norm=687us(62) tail_mlp=13544us(124) tail_gate_up=8898us(62) tail_down=4646us(62) marlin_ws_zero=0us(0) marlin_kernel=0us(0) marlin_qkv_ws=0us(0) marlin_qkv_kernel=0us(0) marlin_o_ws=0us(0) marlin_o_kernel=0us(0) marlin_gate_up_ws=0us(0) marlin_gate_up_kernel=0us(0) marlin_down_ws=0us(0) marlin_down_kernel=0us(0) marlin_lm_head_ws=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_kernel=0us(0) tail_act=399us(62) tail_resid=496us(62)  unwrapped=718us",
+    "[batched-op-profile] m=9 total=26898us  matmul=6894us(125) attn=1867us(62) qkr=629us(62) norm=453us(63) other=1377us(124) tail_norm=687us(62) tail_mlp=13459us(124) tail_gate_up=8860us(62) tail_down=4599us(62) marlin_ws_zero=0us(0) marlin_kernel=0us(0) marlin_qkv_ws=0us(0) marlin_qkv_kernel=0us(0) marlin_o_ws=0us(0) marlin_o_kernel=0us(0) marlin_gate_up_ws=0us(0) marlin_gate_up_kernel=0us(0) marlin_down_ws=0us(0) marlin_down_kernel=0us(0) marlin_lm_head_ws=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_kernel=0us(0) tail_act=372us(62) tail_resid=496us(62)  unwrapped=664us",
+    "[batched-op-profile] m=10 total=27036us  matmul=6947us(125) attn=1878us(62) qkr=633us(62) norm=465us(63) other=1349us(124) tail_norm=683us(62) tail_mlp=13532us(124) tail_gate_up=8916us(62) tail_down=4616us(62) marlin_ws_zero=0us(0) marlin_kernel=0us(0) marlin_qkv_ws=0us(0) marlin_qkv_kernel=0us(0) marlin_o_ws=0us(0) marlin_o_kernel=0us(0) marlin_gate_up_ws=0us(0) marlin_gate_up_kernel=0us(0) marlin_down_ws=0us(0) marlin_down_kernel=0us(0) marlin_lm_head_ws=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_kernel=0us(0) tail_act=373us(62) tail_resid=518us(62)  unwrapped=658us"
+  ],
+  "prefill_profile_present": true,
+  "batched_op_profile_present": true
+}

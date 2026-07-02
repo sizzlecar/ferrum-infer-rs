@@ -1,0 +1,59 @@
+Warning: Permanently added '[ssh9.vast.ai]:26362' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+Tue Jun 16 09:08:47 UTC 2026
+w2-attention-key-smoke: 1 windows (created Tue Jun 16 09:03:50 2026)
+540 tmux new-session -d -s w2-attention-key-smoke bash /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.run.sh > /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stdout 2> /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stderr
+541 bash -c bash /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.run.sh > /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stdout 2> /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.nohup.stderr
+544 bash /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16.run.sh
+964 /workspace/ferrum-infer-rs/target/release/ferrum serve --model gemma3:27b-gptq --backend cuda --host 127.0.0.1 --port 18166 --kv-capacity 512 --max-num-seqs 16 --max-num-batched-tokens 2048 --unified-graph --unified-graph-layers-only --effective-config-json /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/serve_effective_config.json --decision-trace-jsonl /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/serve_decision_trace.jsonl
+1011 bash -c set -e; date -u; tmux ls || true; pgrep -af "w2_unified_graph_attention_key|ferrum run|ferrum serve|bench-serve" | head -80 || true; find /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16 -maxdepth 2 -type f | sort | sed -n "1,260p"; echo RUN_VALIDATION; cat /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run_validation.txt 2>/dev/null || true; echo SERVE_VALIDATION; cat /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/serve_chat_validation.txt 2>/dev/null || true; echo SERVER_LOG; tail -180 /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/server.log 2>/dev/null || true; echo BENCH; tail -120 /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/bench/bench_sharegpt_c16.stderr 2>/dev/null || true; echo RC; cat /workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/run_remote.rc 2>/dev/null || true
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/build/ferrum.sha256
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/build/ferrum_version.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/build/release_build.command.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/build/release_build.stderr
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/build/release_build.stdout
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run.command.json
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run.stderr
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run.stdout
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run_decision_trace.jsonl
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run_effective_config.json
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/correctness/run_validation.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/cargo_version.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/git_head.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/git_status_short.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/git_status_source_short.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/nvcc_version.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/nvidia_smi_before.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/rustc_version.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/remote/start_utc.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/models.json.tmp
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/models_curl_last.err
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/serve.command.txt
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/serve_decision_trace.jsonl
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/serve_effective_config.json
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/server.log
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/server.pid
+/workspace/w2_unified_graph_attention_key_cuda_smoke_2026-06-16/server/server.stdout
+RUN_VALIDATION
+RUN_SMOKE_PASS content='5' tokens=3
+SERVE_VALIDATION
+SERVER_LOG
+[auto-size] gpu=24.0 GB total / 23.5 GB free | weights=15.0 GB budget / 15.0 GB total | layers=62 budget | scratch reserve=4.0 GB | KV pool budget 3.9 GB → max_blocks=512
+[auto-size] requested runtime floor requires KV_MAX_BLOCKS=512 above estimated budget 338; honoring explicit runtime limits
+[auto-size] KV_MAX_BLOCKS=512 PAGED_MAX_SEQS=<user> KV_CAPACITY=<user>
+[2m2026-06-16T09:08:35.611248Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-16T09:08:35.611265Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-16T09:08:35.611306Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2/tokenizer.json"
+[2m2026-06-16T09:08:36.664114Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-16T09:08:36.664154Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-16T09:08:36.664158Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-16T09:08:36.664163Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=512
+[2m2026-06-16T09:08:36.664340Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2 (format: safetensors)
+[2m2026-06-16T09:08:36.664601Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Gemma3, Layers: 62, Vocab: 262208
+[2m2026-06-16T09:08:36.818306Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-16T09:08:36.818398Z[0m [32m INFO[0m [2mferrum_models::loader::gptq_loader[0m[2m:[0m GPTQ config: QuantizeConfig { bits: 4, group_size: 128, sym: true, desc_act: true, quant_method: "gptq" }
+[2m2026-06-16T09:08:36.818408Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading Gemma3 via LlamaFamilyModel (5:1 SWA, dual rope, GeGLU, sandwich norms)
+[2m2026-06-16T09:08:36.818417Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Backend: CUDA, KV: fp16
+BENCH
+RC

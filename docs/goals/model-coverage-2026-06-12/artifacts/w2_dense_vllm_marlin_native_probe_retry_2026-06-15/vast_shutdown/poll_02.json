@@ -1,0 +1,11 @@
+{
+  "actual_status": "exited",
+  "cur_state": "stopped",
+  "dph_total": 0.42488888888888887,
+  "gpu_name": "RTX 4090",
+  "id": 40826362,
+  "num_gpus": 1,
+  "poll": 2,
+  "ssh_host": "ssh9.vast.ai",
+  "ssh_port": 26362
+}

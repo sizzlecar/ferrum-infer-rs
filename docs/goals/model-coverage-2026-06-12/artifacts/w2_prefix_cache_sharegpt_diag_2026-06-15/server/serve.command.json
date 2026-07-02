@@ -1,0 +1,1 @@
+{"cmd":["target/release/ferrum","serve","--model","gemma3:27b-gptq","--port","8476","--kv-capacity","512","--max-num-seqs","16","--enable-prefix-cache","--effective-config-json","/workspace/w2_prefix_cache_sharegpt_diag_2026-06-15/server/serve_effective_config.json","--decision-trace-jsonl","/workspace/w2_prefix_cache_sharegpt_diag_2026-06-15/server/serve_decision_trace.jsonl"]}

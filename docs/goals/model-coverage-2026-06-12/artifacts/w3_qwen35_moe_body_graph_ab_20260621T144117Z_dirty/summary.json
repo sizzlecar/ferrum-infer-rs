@@ -1,0 +1,76 @@
+{
+  "artifact_dir": "/workspace/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty",
+  "binary_sha256": "240f57824a35fa8a3e1841a8f19d3a74ff93a125fc749d22195ffc6614dee58d",
+  "dirty": true,
+  "git_head": "690ba923b652109aea09d99ebe5702a4897b6995",
+  "graph_off": {
+    "bad_output_per_run": [
+      0
+    ],
+    "completed_per_run": [
+      100
+    ],
+    "duplicate_done_per_run": [
+      0
+    ],
+    "errored_per_run": [
+      0
+    ],
+    "missing_done_per_run": [
+      0
+    ],
+    "moe_graph_entry": {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "0",
+      "key": "FERRUM_MOE_GRAPH",
+      "source": "config_file"
+    },
+    "output_token_count_source": "usage",
+    "output_tps_mean": 690.5137934755809,
+    "path": "/workspace/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/bench_graph_off/bench_c32_100x1.json",
+    "selected_graph_mode": "graph_disabled",
+    "zero_output_tokens_per_run": [
+      0
+    ]
+  },
+  "graph_on": {
+    "bad_output_per_run": [
+      0
+    ],
+    "completed_per_run": [
+      100
+    ],
+    "duplicate_done_per_run": [
+      0
+    ],
+    "errored_per_run": [
+      0
+    ],
+    "missing_done_per_run": [
+      0
+    ],
+    "moe_graph_entry": {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "1",
+      "key": "FERRUM_MOE_GRAPH",
+      "source": "config_file"
+    },
+    "output_token_count_source": "usage",
+    "output_tps_mean": 658.857379674344,
+    "path": "/workspace/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/bench_graph_on/bench_c32_100x1.json",
+    "selected_graph_mode": "graph_clean_decode",
+    "zero_output_tokens_per_run": [
+      0
+    ]
+  },
+  "graph_on_vs_vllm_mean_ratio": 0.3856287034913385,
+  "ratio_on_over_off": 0.9541552766934606,
+  "schema_version": 1,
+  "status": "pass",
+  "vllm_80pct_target_mean": 1366.82228,
+  "vllm_c32_mean": 1708.52785
+}

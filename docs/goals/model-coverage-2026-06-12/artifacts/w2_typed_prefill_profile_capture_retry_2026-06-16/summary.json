@@ -1,0 +1,59 @@
+{
+  "status": "FAIL",
+  "lane": "W2 typed prefill profile capture-lifecycle retry",
+  "artifact_dir": "docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_capture_retry_2026-06-16",
+  "git_head": "a9d8b439097f89011fb02dc78e1046ddb07d73e6",
+  "source_status_short": "",
+  "build_rc": 0,
+  "profile_outer_rc": 143,
+  "run_profile_rc": 143,
+  "bench_rc": 143,
+  "binary_sha256": "e111e6ec9653fd141ad5eb8ed504f18997a7d29244dbbe685be9955d2277a350  /workspace/ferrum-infer-rs/target/release/ferrum",
+  "chat_validation": {
+    "content": "5\n",
+    "finish_reason": "stop",
+    "completion_tokens": 3,
+    "usage_present": true,
+    "bad_output": false,
+    "pass": true
+  },
+  "ready_poll_count": 58,
+  "panic": true,
+  "panic_line": "thread 'tokio-runtime-worker' (766) panicked at crates/ferrum-kernels/src/backend/cuda/mod.rs:843:34:",
+  "prefill_profile_line_count": 121,
+  "batched_op_profile_line_count": 3,
+  "unified_prof_line_count": 7,
+  "manual_stop_recorded": true,
+  "vast_stopped_actual_status": "exited",
+  "vast_stopped_cur_state": "stopped",
+  "first_runner_failure": "cargo not found in non-login shell; preserved as *.first_no_cargo logs, not a CUDA/source result",
+  "release_grade": false,
+  "pass_line": null,
+  "prefill_profile_tail": [
+    "[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)",
+    "[prefill-profile] tokens=122 layers total=83 ms",
+    "[prefill-profile] flash_attn: 62 calls 30 ms (avg 491 us)",
+    "[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 27 us)",
+    "[prefill-profile] matmuls: 62 calls 6 ms (avg 97 us)",
+    "[prefill-profile] norms: 62 calls 0 ms (avg 8 us)",
+    "[prefill-profile] tail_norm: 62 calls 0 ms (avg 12 us)",
+    "[prefill-profile] tail_gate_up: 62 calls 23 ms (avg 374 us)",
+    "[prefill-profile] tail_act: 62 calls 0 ms (avg 14 us)",
+    "[prefill-profile] tail_down: 62 calls 13 ms (avg 223 us)",
+    "[prefill-profile] tail_mlp: 62 calls 37 ms (avg 612 us)",
+    "[prefill-profile] tail_resid: 62 calls 0 ms (avg 11 us)"
+  ],
+  "batched_op_profile_tail": [
+    "[batched-op-profile] m=10 total=27836us  matmul=7117us(125) attn=2013us(62) qkr=910us(62) norm=462us(63) other=1496us(124) tail_norm=685us(62) tail_mlp=13577us(124) tail_gate_up=8924us(62) tail_down=4653us(62) marlin_ws_zero=0us(0) marlin_kernel=0us(0) marlin_qkv_ws=0us(0) marlin_qkv_kernel=0us(0) marlin_o_ws=0us(0) marlin_o_kernel=0us(0) marlin_gate_up_ws=0us(0) marlin_gate_up_kernel=0us(0) marlin_down_ws=0us(0) marlin_down_kernel=0us(0) marlin_lm_head_ws=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_kernel=0us(0) tail_act=382us(62) tail_resid=499us(62)  unwrapped=695us",
+    "[batched-op-profile] m=10 total=26973us  matmul=6929us(125) attn=1868us(62) qkr=626us(62) norm=446us(63) other=1362us(124) tail_norm=716us(62) tail_mlp=13511us(124) tail_gate_up=8896us(62) tail_down=4615us(62) marlin_ws_zero=0us(0) marlin_kernel=0us(0) marlin_qkv_ws=0us(0) marlin_qkv_kernel=0us(0) marlin_o_ws=0us(0) marlin_o_kernel=0us(0) marlin_gate_up_ws=0us(0) marlin_gate_up_kernel=0us(0) marlin_down_ws=0us(0) marlin_down_kernel=0us(0) marlin_lm_head_ws=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_kernel=0us(0) tail_act=372us(62) tail_resid=494us(62)  unwrapped=649us",
+    "[batched-op-profile] m=10 total=26876us  matmul=6890us(125) attn=1880us(62) qkr=622us(62) norm=459us(63) other=1334us(124) tail_norm=688us(62) tail_mlp=13480us(124) tail_gate_up=8867us(62) tail_down=4613us(62) marlin_ws_zero=0us(0) marlin_kernel=0us(0) marlin_qkv_ws=0us(0) marlin_qkv_kernel=0us(0) marlin_o_ws=0us(0) marlin_o_kernel=0us(0) marlin_gate_up_ws=0us(0) marlin_gate_up_kernel=0us(0) marlin_down_ws=0us(0) marlin_down_kernel=0us(0) marlin_lm_head_ws=0us(0) marlin_lm_head_kernel=0us(0) marlin_other_ws=0us(0) marlin_other_kernel=0us(0) tail_act=374us(62) tail_resid=491us(62)  unwrapped=658us"
+  ],
+  "unified_prof_tail": [
+    "[unified-prof] iter#1 items=1 prefill=0 decode=1 total=25640us model=25468us decode_post=171us | sample=170 sched=0 stream=1 stop=0 complete=0 (us)",
+    "[unified-prof] iter#2 items=1 prefill=0 decode=1 total=25085us model=24897us decode_post=185us | sample=170 sched=0 stream=0 stop=0 complete=15 (us)",
+    "[unified-prof] iter#3 items=10 prefill=10 decode=0 total=892506us model=890117us decode_post=0us | sample=0 sched=0 stream=0 stop=0 complete=0 (us)",
+    "[unified-prof] iter#4 items=10 prefill=0 decode=10 total=28681us model=28527us decode_post=141us | sample=8 sched=0 stream=133 stop=0 complete=0 (us)",
+    "[unified-prof] iter#5 items=10 prefill=0 decode=10 total=27727us model=27577us decode_post=140us | sample=12 sched=0 stream=128 stop=0 complete=0 (us)",
+    "[unified-prof] iter#6 items=10 prefill=0 decode=10 total=27673us model=27477us decode_post=182us | sample=14 sched=0 stream=168 stop=0 complete=0 (us)"
+  ]
+}

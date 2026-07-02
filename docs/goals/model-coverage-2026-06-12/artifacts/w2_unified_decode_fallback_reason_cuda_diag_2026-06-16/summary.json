@@ -1,0 +1,62 @@
+{
+  "status": "PASS",
+  "release_grade": false,
+  "bench_rc": 0,
+  "chat_pass": true,
+  "concurrency": 16,
+  "n_repeats": 1,
+  "n_requests_per_run": 16,
+  "completed_per_run": [
+    16
+  ],
+  "errored_per_run": [
+    0
+  ],
+  "bad_output_per_run": [
+    0
+  ],
+  "zero_output_tokens_per_run": [
+    0
+  ],
+  "output_token_count_source": "usage",
+  "output_throughput_tps_mean": 315.39451845233344,
+  "vllm_c16_tps_baseline_orientation": 518.7959572662905,
+  "ferrum_vs_vllm_ratio_orientation": 0.6079355747378077,
+  "runtime_profiler_sources": {
+    "FERRUM_BATCHED_GRAPH": "memory_profile",
+    "FERRUM_BATCH_DECODE_PROF": "config_file",
+    "FERRUM_BATCH_PREFILL_PROF": "config_file",
+    "FERRUM_DECODE_OP_PROFILE": "config_file",
+    "FERRUM_NEXT_BATCH_PROF": "config_file",
+    "FERRUM_PREFILL_OP_PROFILE": "config_file",
+    "FERRUM_UNIFIED_POST_PROF": "config_file"
+  },
+  "unified_decode_line_count": 131,
+  "unified_decode_prefill_line_count": 3,
+  "unified_decode_first_prefill_line": "[unified-decode] call#0 items=1 prefill=1 decode=0 total_q=23 attempted_unified=true fallback=true fallback_reason=paged_kv_required elapsed=126897us",
+  "unified_decode_fallback_reasons": {
+    "paged_kv_required": 131
+  },
+  "prefill_profile_line_count": 297,
+  "prefill_profile_head": [
+    "[prefill-profile] tokens=23 layers total=33 ms",
+    "[prefill-profile] flash_attn: 62 calls 5 ms (avg 92 us)",
+    "[prefill-profile] qk_norm_rope: 62 calls 1 ms (avg 28 us)",
+    "[prefill-profile] matmuls: 62 calls 6 ms (avg 109 us)",
+    "[prefill-profile] norms: 62 calls 0 ms (avg 8 us)",
+    "[prefill-profile] tail_norm: 62 calls 0 ms (avg 11 us)",
+    "[prefill-profile] tail_gate_up: 62 calls 9 ms (avg 149 us)",
+    "[prefill-profile] tail_act: 62 calls 0 ms (avg 7 us)"
+  ],
+  "nb_profile_tail": [],
+  "iter_profile_tail": [
+    "[iter-prof] iter#0 total=127665us sched=9us process=127656us batch_size=1",
+    "[iter-prof] iter#1 total=26006us sched=8us process=25997us batch_size=1",
+    "[iter-prof] iter#2 total=25365us sched=2us process=25362us batch_size=1",
+    "[iter-prof] iter#543 total=28140us sched=13us process=28126us batch_size=10",
+    "[iter-prof] iter#575 total=28590us sched=12us process=28577us batch_size=10",
+    "[iter-prof] iter#607 total=28835us sched=30us process=28805us batch_size=16",
+    "[iter-prof] iter#639 total=29452us sched=20us process=29432us batch_size=16"
+  ],
+  "interpretation": "diagnostic unified_decode fallback_reason profile; not release performance evidence"
+}

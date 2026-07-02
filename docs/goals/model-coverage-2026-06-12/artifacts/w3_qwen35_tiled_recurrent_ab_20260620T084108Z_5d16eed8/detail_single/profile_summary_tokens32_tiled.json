@@ -1,0 +1,94 @@
+{
+  "linear_tokens32": {
+    "event": "qwen35_linear_decode_detail",
+    "events": 0,
+    "tokens": 32
+  },
+  "sparse_moe_tokens32": {
+    "accounted": {
+      "max": 382.0,
+      "mean": 184.90833333333333,
+      "n": 1680,
+      "p50": 182.0,
+      "p95": 213.0
+    },
+    "event": "qwen35_sparse_moe_detail",
+    "events": 1680,
+    "merge": {
+      "max": 19.0,
+      "mean": 8.072619047619048,
+      "n": 1680,
+      "p50": 8.0,
+      "p95": 9.0
+    },
+    "routed_experts": {
+      "max": 292.0,
+      "mean": 95.29940476190477,
+      "n": 1680,
+      "p50": 92.0,
+      "p95": 120.0
+    },
+    "router": {
+      "max": 26.0,
+      "mean": 12.424404761904762,
+      "n": 1680,
+      "p50": 14.0,
+      "p95": 15.0
+    },
+    "shared_down": {
+      "max": 30.0,
+      "mean": 13.79702380952381,
+      "n": 1680,
+      "p50": 14.0,
+      "p95": 15.0
+    },
+    "shared_fused": {
+      "max": 16.0,
+      "mean": 3.801190476190476,
+      "n": 1680,
+      "p50": 4.0,
+      "p95": 4.0
+    },
+    "shared_gate": {
+      "max": 37.0,
+      "mean": 13.020833333333334,
+      "n": 1680,
+      "p50": 13.0,
+      "p95": 14.0
+    },
+    "shared_pack": {
+      "max": 15.0,
+      "mean": 4.198214285714286,
+      "n": 1680,
+      "p50": 4.0,
+      "p95": 5.0
+    },
+    "shared_path": {
+      "max": 259.0,
+      "mean": 69.11190476190477,
+      "n": 1680,
+      "p50": 69.0,
+      "p95": 72.0
+    },
+    "tokens": 32,
+    "total": {
+      "max": 541.0,
+      "mean": 266.37142857142857,
+      "n": 1680,
+      "p50": 264.0,
+      "p95": 296.0
+    }
+  },
+  "token_counts": {
+    "qwen35_linear_decode_detail:None": 3180,
+    "qwen35_sparse_moe_detail:1": 720,
+    "qwen35_sparse_moe_detail:1905": 40,
+    "qwen35_sparse_moe_detail:2": 40,
+    "qwen35_sparse_moe_detail:2159": 40,
+    "qwen35_sparse_moe_detail:3": 40,
+    "qwen35_sparse_moe_detail:30": 40,
+    "qwen35_sparse_moe_detail:32": 1680,
+    "qwen35_sparse_moe_detail:4": 1720,
+    "qwen35_sparse_moe_detail:508": 40
+  }
+}

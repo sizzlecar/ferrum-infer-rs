@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use ferrum_interfaces::{
     KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
 };
-use ferrum_types::{Device, EngineConfig, FerrumError, Result, RuntimeKnobs};
+use ferrum_types::{DataType, Device, EngineConfig, FerrumError, Result, RuntimeKnobs};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -1441,6 +1441,75 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 )?;
                 Ok(Arc::new(executor))
             }
+            ferrum_models::Architecture::Qwen35 | ferrum_models::Architecture::Qwen35Moe => {
+                let reference_enabled = config
+                    .get_option::<bool>("qwen35_reference")
+                    .unwrap_or(false);
+                if !reference_enabled {
+                    if !matches!(config.device, Device::CUDA(_)) {
+                        return Err(FerrumError::unsupported(
+                            "Qwen3.5/Qwen3.6 product execution is CUDA-only in the W3 path. \
+                             CPU is available only through explicit --qwen35-reference for \
+                             correctness bring-up; CPU product execution is not wired yet.",
+                        ));
+                    }
+                    #[cfg(feature = "cuda")]
+                    {
+                        info!("Using Qwen3.5/Qwen3.6 CUDA backend executor");
+                        let model_dir = std::path::Path::new(&model_path);
+                        let llm = ferrum_models::models::Qwen35BackendModel::<
+                            ferrum_kernels::backend::cuda::CudaBackend,
+                        >::from_definition_with_native_safetensors(
+                            &model_def, model_dir
+                        )?;
+                        let mut model_info = model_def
+                            .to_model_info(config.engine_config.model.model_id.to_string());
+                        model_info.dtype = DataType::FP16;
+                        model_info.device = config.device.clone();
+                        return Ok(Arc::new(ferrum_models::LlmExecutor::new(
+                            Box::new(llm),
+                            model_info,
+                        )));
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        return Err(FerrumError::device(
+                            "CUDA requested but 'cuda' feature not enabled",
+                        ));
+                    }
+                }
+                if config.device != Device::CPU || dtype != DType::F32 {
+                    return Err(FerrumError::unsupported(
+                        "Qwen3.5/Qwen3.6 reference execution requires --backend cpu and FP32; \
+                         CUDA/Metal release execution is not wired yet.",
+                    ));
+                }
+                info!("Using Qwen3.5/Qwen3.6 explicit CPU/FP32 reference executor");
+                let model_dir = std::path::Path::new(&model_path);
+                let model_id = config.engine_config.model.model_id.to_string();
+                let executor = match model_def.architecture {
+                    ferrum_models::Architecture::Qwen35 => {
+                        ferrum_models::Qwen35W3Executor::from_definition_with_dense_reference_cpu_safetensors(
+                            model_id,
+                            &model_def,
+                            model_dir,
+                            DataType::FP32,
+                            Device::CPU,
+                        )?
+                    }
+                    ferrum_models::Architecture::Qwen35Moe => {
+                        ferrum_models::Qwen35W3Executor::from_definition_with_sparse_moe_reference_cpu_safetensors(
+                            model_id,
+                            &model_def,
+                            model_dir,
+                            DataType::FP32,
+                            Device::CPU,
+                        )?
+                    }
+                    _ => unreachable!("matched Qwen35 architectures above"),
+                };
+                Ok(Arc::new(executor))
+            }
             _ => Err(FerrumError::model(format!(
                 "Architecture {:?} not supported",
                 model_def.architecture
@@ -1592,6 +1661,242 @@ pub fn set_global_registry(registry: Arc<ComponentRegistry>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_interfaces::model_executor::PrefillInput;
+    use ferrum_testkit::MockTensor;
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+    use std::path::{Path, PathBuf};
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "ferrum-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_qwen35_reference_config(dir: &Path) {
+        let config = serde_json::json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "vocab_size": 3,
+            "max_position_embeddings": 16,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": false,
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 2,
+                "intermediate_size": 2,
+                "num_hidden_layers": 2,
+                "layer_types": ["linear_attention", "full_attention"],
+                "linear_num_key_heads": 1,
+                "linear_num_value_heads": 1,
+                "linear_key_head_dim": 1,
+                "linear_value_head_dim": 1,
+                "linear_conv_kernel_dim": 1,
+                "head_dim": 2,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "tie_word_embeddings": false
+            }
+        });
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_qwen35_reference_safetensors(dir: &Path) {
+        let tensors: Vec<(String, Vec<f32>)> = vec![
+            (
+                "model.embed_tokens.weight".to_string(),
+                vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            ("model.norm.weight".to_string(), vec![0.0, 0.0]),
+            (
+                "model.lm_head.weight".to_string(),
+                vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            (
+                "model.layers.0.input_layernorm.weight".to_string(),
+                vec![0.0, 0.0],
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight".to_string(),
+                vec![0.0, 0.0],
+            ),
+            (
+                "model.layers.0.linear_attn.in_proj_qkv.weight".to_string(),
+                vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            (
+                "model.layers.0.linear_attn.in_proj_z.weight".to_string(),
+                vec![1.0, -1.0],
+            ),
+            (
+                "model.layers.0.linear_attn.in_proj_b.weight".to_string(),
+                vec![0.5, 0.25],
+            ),
+            (
+                "model.layers.0.linear_attn.in_proj_a.weight".to_string(),
+                vec![-0.25, 0.75],
+            ),
+            (
+                "model.layers.0.linear_attn.conv1d.weight".to_string(),
+                vec![1.0, 1.0, 1.0],
+            ),
+            ("model.layers.0.linear_attn.A_log".to_string(), vec![0.0]),
+            ("model.layers.0.linear_attn.dt_bias".to_string(), vec![0.0]),
+            (
+                "model.layers.0.linear_attn.norm.weight".to_string(),
+                vec![1.0],
+            ),
+            (
+                "model.layers.0.linear_attn.out_proj.weight".to_string(),
+                vec![1.0, -0.5],
+            ),
+            (
+                "model.layers.0.mlp.gate_proj.weight".to_string(),
+                vec![0.2, 0.1, -0.1, 0.3],
+            ),
+            (
+                "model.layers.0.mlp.up_proj.weight".to_string(),
+                vec![0.4, -0.2, 0.3, 0.5],
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight".to_string(),
+                vec![1.0, 0.0, 0.0, 1.0],
+            ),
+            (
+                "model.layers.1.input_layernorm.weight".to_string(),
+                vec![0.0, 0.0],
+            ),
+            (
+                "model.layers.1.post_attention_layernorm.weight".to_string(),
+                vec![0.0, 0.0],
+            ),
+            (
+                "model.layers.1.self_attn.q_proj.weight".to_string(),
+                vec![1.0, 0.0, 0.0, 1.0],
+            ),
+            (
+                "model.layers.1.self_attn.k_proj.weight".to_string(),
+                vec![0.5, 0.0, 0.0, 0.5],
+            ),
+            (
+                "model.layers.1.self_attn.v_proj.weight".to_string(),
+                vec![1.0, 1.0, -0.5, 0.5],
+            ),
+            (
+                "model.layers.1.self_attn.o_proj.weight".to_string(),
+                vec![1.0, 0.0, 0.0, 1.0],
+            ),
+            (
+                "model.layers.1.self_attn.q_norm.weight".to_string(),
+                vec![1.0, 1.0],
+            ),
+            (
+                "model.layers.1.self_attn.k_norm.weight".to_string(),
+                vec![1.0, 1.0],
+            ),
+            (
+                "model.layers.1.mlp.gate_proj.weight".to_string(),
+                vec![-0.2, 0.2, 0.1, 0.3],
+            ),
+            (
+                "model.layers.1.mlp.up_proj.weight".to_string(),
+                vec![0.25, 0.5, -0.3, 0.4],
+            ),
+            (
+                "model.layers.1.mlp.down_proj.weight".to_string(),
+                vec![0.5, 0.25, -0.2, 0.75],
+            ),
+        ];
+        let views = tensors
+            .into_iter()
+            .map(|(name, values)| {
+                let bytes = values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                let bytes: &'static [u8] = Box::leak(bytes);
+                (
+                    name,
+                    TensorView::new(Dtype::F32, vec![values.len()], bytes).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        serialize_to_file(
+            views,
+            &None::<std::collections::HashMap<String, String>>,
+            &dir.join("model.safetensors"),
+        )
+        .unwrap();
+    }
+
+    fn write_qwen35_reference_model_dir() -> PathBuf {
+        let dir = unique_test_dir("qwen35-reference");
+        write_qwen35_reference_config(&dir);
+        write_qwen35_reference_safetensors(&dir);
+        dir
+    }
+
+    fn qwen35_reference_component_config(model_dir: &Path, enabled: bool) -> ComponentConfig {
+        let mut engine_config = EngineConfig::default();
+        engine_config.backend.device = Device::CPU;
+        engine_config.backend.backend_options.insert(
+            "model_path".to_string(),
+            serde_json::Value::String(model_dir.to_string_lossy().to_string()),
+        );
+        if enabled {
+            engine_config
+                .backend
+                .backend_options
+                .insert("qwen35_reference".to_string(), serde_json::json!(true));
+        }
+        ComponentConfig::from_engine_config(&engine_config)
+    }
+
+    #[test]
+    fn qwen35_registry_requires_explicit_reference_option() {
+        let dir = write_qwen35_reference_model_dir();
+        let config = qwen35_reference_component_config(&dir, false);
+
+        let err = match tokio_test::block_on(LlmExecutorFactory.create(&config)) {
+            Ok(_) => panic!("Qwen3.5 product loading must remain opt-in"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("--qwen35-reference"), "{err}");
+        assert!(err.contains("not wired yet"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn qwen35_registry_loads_explicit_cpu_reference_executor() {
+        let dir = write_qwen35_reference_model_dir();
+        let config = qwen35_reference_component_config(&dir, true);
+
+        let executor = tokio_test::block_on(LlmExecutorFactory.create(&config))
+            .expect("explicit Qwen3.5 reference path should load toy safetensors");
+        let input = PrefillInput::new(MockTensor::from_u32(&[0, 1], &[2]).into_ref());
+        let output = tokio_test::block_on(executor.prefill(&input))
+            .expect("explicit Qwen3.5 reference path should prefill");
+
+        assert_eq!(output.logits.shape(), &[1, 1, 3]);
+        assert_eq!(output.kv_cache.block_table().sequence_length, 2);
+        let status = executor.status();
+        assert!(status.is_ready, "{status:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn test_registry_creation() {

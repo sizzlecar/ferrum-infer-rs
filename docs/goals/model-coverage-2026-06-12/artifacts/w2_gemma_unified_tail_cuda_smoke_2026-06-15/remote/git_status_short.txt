@@ -1,0 +1,7 @@
+remote HEAD: ab0dc99cdc71345e236513dbe0300ce52b162416
+
+Remote git status was intentionally dirty for this diagnostic checkpoint because
+rsync excluded local historical artifact directories. The resulting `git status
+--short` contained 892 lines of old artifact deletions unrelated to the build.
+Source files for the smoke were synced from the local committed worktree at the
+HEAD above.

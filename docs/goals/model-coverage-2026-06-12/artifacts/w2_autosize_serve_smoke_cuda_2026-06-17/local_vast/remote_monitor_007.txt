@@ -1,0 +1,233 @@
+---RUN---
+[autosize-smoke] start 2026-06-17T01:33:55Z
+[autosize-smoke] root=/workspace/ferrum-smoke-99859ce6 out=/workspace/w2_autosize_serve_smoke_cuda_2026-06-17 model=gemma3:27b-gptq hf_home=/workspace/hf-cache port=18456
+[autosize-smoke] build
+[autosize-smoke] serve correctness
+W2 AUTOSIZE SERVE SMOKE PASS: /workspace/w2_autosize_serve_smoke_cuda_2026-06-17
+---BUILD---
+   Compiling smallvec v1.15.1
+   Compiling chrono v0.4.42
+   Compiling uuid v1.18.1
+   Compiling hashbrown v0.16.0
+   Compiling serde_urlencoded v0.7.1
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling dary_heap v0.3.8
+   Compiling spm_precompiled v0.1.4
+   Compiling symphonia-utils-xiph v0.5.5
+   Compiling compact_str v0.9.0
+   Compiling symphonia-bundle-mp3 v0.5.5
+   Compiling symphonia-format-riff v0.5.5
+   Compiling safetensors v0.4.5
+   Compiling toml_edit v0.22.27
+   Compiling unicode-normalization-alignments v0.1.12
+   Compiling ppv-lite86 v0.2.21
+   Compiling symphonia-format-ogg v0.5.5
+   Compiling parking_lot v0.12.5
+   Compiling symphonia-format-isomp4 v0.5.5
+   Compiling symphonia-codec-vorbis v0.5.5
+   Compiling symphonia-bundle-flac v0.5.5
+   Compiling serde_plain v1.0.2
+   Compiling hashbrown v0.14.5
+   Compiling rand_chacha v0.9.0
+   Compiling tokio v1.48.0
+   Compiling futures-executor v0.3.31
+   Compiling icu_provider v2.0.0
+   Compiling rand_chacha v0.3.1
+   Compiling rand v0.9.2
+   Compiling futures v0.3.31
+   Compiling safetensors v0.7.0
+   Compiling metrics v0.22.4
+   Compiling image v0.25.10
+   Compiling icu_properties v2.0.1
+   Compiling icu_normalizer v2.0.0
+   Compiling rand v0.8.5
+   Compiling dashmap v6.1.0
+   Compiling ordered-multimap v0.7.3
+   Compiling hashlink v0.8.4
+   Compiling rand_distr v0.5.1
+   Compiling ferrum-types v0.7.7 (/workspace/ferrum-smoke-99859ce6/crates/ferrum-types)
+   Compiling symphonia v0.5.5
+   Compiling rust-ini v0.20.0
+   Compiling metrics-util v0.16.3
+   Compiling yaml-rust2 v0.8.1
+   Compiling rand_distr v0.4.3
+   Compiling tungstenite v0.24.0
+   Compiling axum-core v0.4.5
+   Compiling ron v0.8.1
+   Compiling minijinja v2.20.0
+   Compiling json5 v0.4.1
+   Compiling tower v0.4.13
+   Compiling half v2.7.1
+   Compiling idna_adapter v1.2.1
+   Compiling idna v1.1.0
+   Compiling toml v0.8.23
+   Compiling tinytemplate v1.2.1
+   Compiling tracing-serde v0.2.0
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling float8 v0.7.0
+   Compiling ciborium-ll v0.2.2
+   Compiling gemm-common v0.19.0
+   Compiling url v2.5.7
+   Compiling ciborium v0.2.2
+   Compiling config v0.14.1
+   Compiling tracing-subscriber v0.3.20
+   Compiling gemm-f32 v0.19.0
+   Compiling rustls-webpki v0.103.7
+   Compiling gemm-c32 v0.19.0
+   Compiling gemm-f64 v0.19.0
+   Compiling gemm-c64 v0.19.0
+   Compiling realfft v3.5.0
+   Compiling jsonwebtoken v9.3.1
+   Compiling criterion v0.5.1
+   Compiling gemm-f16 v0.19.0
+   Compiling onig v6.5.1
+   Compiling rubato v2.0.0
+   Compiling tokenizers v0.21.4
+   Compiling gemm v0.19.0
+   Compiling float8 v0.6.1
+   Compiling minijinja-contrib v2.20.0
+   Compiling tokio-util v0.7.16
+   Compiling tokio-native-tls v0.3.1
+   Compiling tower v0.5.2
+   Compiling hyper v0.14.32
+   Compiling tokio-stream v0.1.17
+   Compiling tokio-tungstenite v0.24.0
+   Compiling h2 v0.4.12
+   Compiling tower-http v0.6.6
+   Compiling ferrum-interfaces v0.7.7 (/workspace/ferrum-smoke-99859ce6/crates/ferrum-interfaces)
+   Compiling ferrum-bench-core v0.7.7 (/workspace/ferrum-smoke-99859ce6/crates/ferrum-bench-core)
+   Compiling ferrum-scheduler v0.7.7 (/workspace/ferrum-smoke-99859ce6/crates/ferrum-scheduler)
+   Compiling ferrum-sampler v0.7.7 (/workspace/ferrum-smoke-99859ce6/crates/ferrum-sampler)
+   Compiling ferrum-kv v0.7.7 (/workspace/ferrum-smoke-99859ce6/crates/ferrum-kv)
+   Compiling tokio-rustls v0.26.4
+   Compiling ureq v2.12.1
+   Compiling hyper-tls v0.5.0
+   Compiling metrics-exporter-prometheus v0.13.1
+   Compiling hyper v1.7.0
+   Compiling hyper-util v0.1.17
+   Compiling hyper-rustls v0.27.7
+   Compiling hyper-tls v0.6.0
+   Compiling axum v0.7.9
+   Compiling reqwest v0.12.24
+   Compiling hf-hub v0.4.3
+   Compiling ferrum-tokenizer v0.7.7 (/workspace/ferrum-smoke-99859ce6/crates/ferrum-tokenizer)
+   Compiling candle-core v0.9.2
+   Compiling candle-nn v0.9.2
+   Compiling candle-transformers v0.9.2
+   Compiling ferrum-quantization v0.7.7 (/workspace/ferrum-smoke-99859ce6/crates/ferrum-quantization)
+   Compiling ferrum-models v0.7.7 (/workspace/ferrum-smoke-99859ce6/crates/ferrum-models)
+   Compiling ferrum-engine v0.7.7 (/workspace/ferrum-smoke-99859ce6/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.7 (/workspace/ferrum-smoke-99859ce6/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.7 (/workspace/ferrum-smoke-99859ce6/crates/ferrum-cli)
+    Finished `release` profile [optimized] target(s) in 39m 02s
+
+real	39m2.337s
+user	48m44.742s
+sys	3m4.293s
+---SERVE---
+
+  ______                            
+ |  ____|                           
+ | |__ ___ _ __ _ __ _   _ _ __ ___  
+ |  __/ _ \ '__| '__| | | | '_ ` _ \ 
+ | | |  __/ |  | |  | |_| | | | | | 
+ |_|  \___|_|  |_|   \__,_|_| |_| |_|
+
+   🦀 Rust LLM Inference Server
+   Version 0.7.7
+
+Model: circulus/gemma-3-27b-it-gptq
+Path: /workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2
+Device: CUDA(0)
+
+[auto-size] MAX_BATCHED_TOKENS=2048 (profile=Server)
+[auto-size] gpu=24.0 GB total / 23.5 GB free | weights=15.0 GB budget / 15.0 GB total | layers=62 budget | scratch reserve=4.0 GB | KV pool budget 2.6 GB → max_blocks=338
+[auto-size] requested paged KV pool requires 1024 blocks (max_seqs=32 kv_capacity=512) above memory budget 338; clamping to max_seqs=8 kv_capacity=512
+[auto-size] KV_MAX_BLOCKS=338 PAGED_MAX_SEQS=<user> KV_CAPACITY=<user>
+Initializing engine (continuous batching)...
+[2m2026-06-17T02:12:59.309145Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Initializing global component registry
+[2m2026-06-17T02:12:59.309200Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Registering default component factories
+[2m2026-06-17T02:12:59.309366Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading HuggingFace tokenizer from: "/workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2/tokenizer.json"
+[2m2026-06-17T02:13:01.081668Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m HuggingFace tokenizer loaded successfully
+[2m2026-06-17T02:13:01.081768Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating multinomial sampler
+[2m2026-06-17T02:13:01.081776Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating continuous batch scheduler
+[2m2026-06-17T02:13:01.081807Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Creating paged KV cache manager: device=CUDA(0), block_size=16, max_blocks=338
+[2m2026-06-17T02:13:01.082103Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading model from /workspace/hf-cache/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2 (format: safetensors)
+[2m2026-06-17T02:13:01.082561Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Architecture: Gemma3, Layers: 62, Vocab: 262208
+[2m2026-06-17T02:13:01.368615Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Building model...
+[2m2026-06-17T02:13:01.368844Z[0m [32m INFO[0m [2mferrum_models::loader::gptq_loader[0m[2m:[0m GPTQ config: QuantizeConfig { bits: 4, group_size: 128, sym: true, desc_act: true, quant_method: "gptq" }
+[2m2026-06-17T02:13:01.368867Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m Loading Gemma3 via LlamaFamilyModel (5:1 SWA, dual rope, GeGLU, sandwich norms)
+[2m2026-06-17T02:13:01.368885Z[0m [32m INFO[0m [2mferrum_engine::registry[0m[2m:[0m   Backend: CUDA, KV: fp16
+[2m2026-06-17T02:14:46.610970Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m LlamaFamilyModel: tied embeddings — loading model.embed_tokens.weight as lm_head
+[2m2026-06-17T02:14:56.570553Z[0m [32m INFO[0m [2mferrum_models::models::llama_family[0m[2m:[0m Gemma3 family: legacy batched_decode=true varlen_unified=true
+
+🚀 Server running at http://127.0.0.1:18456
+
+Endpoints:
+  POST /v1/chat/completions      - OpenAI-compatible chat
+  POST /v1/audio/transcriptions  - Speech-to-text (Whisper)
+  POST /v1/audio/speech          - Text-to-speech (TTS)
+  POST /v1/embeddings            - Text/image embeddings
+  GET  /v1/models                - List models
+  GET  /health                   - Health check
+
+Press Ctrl+C to stop.
+
+---SUMMARY---
+{
+  "binary_sha256": "33a1999b0805c1daca1dd5b102eb9e5d91065951343d11e966a1816f3b418dc1  /workspace/ferrum-smoke-99859ce6/target/release/ferrum",
+  "effective_config_keys": {
+    "matches": [
+      {
+        "affects": [
+          "performance"
+        ],
+        "effective_value": "16",
+        "key": "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+        "source": "default"
+      },
+      {
+        "affects": [
+          "memory"
+        ],
+        "effective_value": "512",
+        "key": "FERRUM_KV_CAPACITY",
+        "source": "cli"
+      },
+      {
+        "affects": [
+          "performance",
+          "memory"
+        ],
+        "effective_value": "2048",
+        "key": "FERRUM_MAX_BATCHED_TOKENS",
+        "source": "memory_profile"
+      },
+      {
+        "affects": [
+          "performance",
+          "memory"
+        ],
+        "effective_value": "8",
+        "key": "FERRUM_PAGED_MAX_SEQS",
+        "source": "memory_profile"
+      }
+    ]
+  },
+  "git_head": "99859ce6e9e0c315ebf614f02a0ccec661a6c215",
+  "status": "pass",
+  "stream_summary": {
+    "content": "5\n",
+    "done_count": 1,
+    "usage": {
+      "completion_tokens": 3,
+      "prompt_tokens": 23,
+      "total_tokens": 26
+    }
+  }
+}
+---EXIT---
+EXIT:0
+---PROC---
+8412 bash -c set -e; echo ---RUN---; tail -120 /workspace/w2_autosize_serve_smoke_cuda_2026-06-17/run.log 2>/dev/null || true; echo ---BUILD---; tail -120 /workspace/w2_autosize_serve_smoke_cuda_2026-06-17/build/cargo_build_release.log 2>/dev/null || true; echo ---SERVE---; tail -180 /workspace/w2_autosize_serve_smoke_cuda_2026-06-17/correctness/serve.log 2>/dev/null || true; echo ---SUMMARY---; cat /workspace/w2_autosize_serve_smoke_cuda_2026-06-17/summary.json 2>/dev/null || true; echo ---EXIT---; cat /workspace/w2_autosize_serve_smoke_cuda_2026-06-17/tmux_exit.txt 2>/dev/null || true; echo ---PROC---; pgrep -af "cargo|nvcc|rustc|ferrum|run_remote_serve" || true

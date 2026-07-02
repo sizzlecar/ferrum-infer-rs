@@ -1,0 +1,18 @@
+{
+  "artifacts": {
+    "known_answer_report": "known_answer_report.json",
+    "l3_behavior": "w3_l3_behavior.json",
+    "w3_s2_whole_model_product_path": "w3_s2_whole_model_product_path.json"
+  },
+  "backend": "cuda",
+  "behavior_cases_total": 5,
+  "format": "hf-gptq-int4",
+  "generated_at": "2026-06-21T15:44:22.010206+00:00",
+  "goal_doc": "docs/goals/model-coverage-2026-06-12/W3_QWEN35_RELEASE_GRADE_GOAL.md",
+  "known_answer_total": 11,
+  "model_id": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+  "pass_line": "W3 QWEN35 REAL PRODUCT REPORT PASS: /workspace/artifacts/w3_qwen35_aux_overlap_ab_20260621T153830Z_dirty/correctness_default_on",
+  "s2_pass_line": "W3 QWEN35 REAL PRODUCT PATH PASS: /workspace/artifacts/w3_qwen35_aux_overlap_ab_20260621T153830Z_dirty/correctness_default_on",
+  "schema_version": 1,
+  "status": "pass"
+}

@@ -1,0 +1,16 @@
+{
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  },
+  "max_tokens": 8,
+  "messages": [
+    {
+      "content": "Does water freeze at 0 degrees Celsius? Answer yes or no.",
+      "role": "user"
+    }
+  ],
+  "model": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+  "seed": 9271,
+  "stream": false,
+  "temperature": 0
+}

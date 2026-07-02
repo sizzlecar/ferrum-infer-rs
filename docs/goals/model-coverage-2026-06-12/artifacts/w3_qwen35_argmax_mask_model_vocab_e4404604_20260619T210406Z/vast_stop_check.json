@@ -1,0 +1,15 @@
+{
+  "checked_at_utc": "2026-06-19T21:13:54Z",
+  "poll": "1",
+  "id": 41422823,
+  "label": "ferrum-w3-qwen35-cuda-eq-20260618",
+  "cur_state": "stopped",
+  "actual_status": "exited",
+  "intended_status": "stopped",
+  "gpu_name": "RTX 4090",
+  "num_gpus": 1,
+  "gpu_totalram": 49140,
+  "dph_total": 0.662962962962963,
+  "ssh_host": "ssh7.vast.ai",
+  "ssh_port": 22822
+}

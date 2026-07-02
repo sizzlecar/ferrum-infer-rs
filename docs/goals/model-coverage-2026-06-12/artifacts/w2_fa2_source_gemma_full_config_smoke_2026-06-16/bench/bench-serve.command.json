@@ -1,0 +1,31 @@
+{
+  "cmd": [
+    "/workspace/ferrum-infer-rs/target/release/ferrum",
+    "bench-serve",
+    "--base-url",
+    "http://127.0.0.1:18479",
+    "--model",
+    "gemma3:27b-gptq",
+    "--tokenizer",
+    "/root/.cache/huggingface/hub/models--circulus--gemma-3-27b-it-gptq/snapshots/70d89a3a6b401b5f56558cb5d4c0f1fd158980b2",
+    "--dataset",
+    "sharegpt",
+    "--sharegpt-path",
+    "/workspace/w2_natural_prompt_baseline_probe_2026-06-15/dataset/ascii_sharegpt.jsonl",
+    "--random-output-len",
+    "64",
+    "--concurrency-sweep",
+    "16",
+    "--num-prompts",
+    "16",
+    "--n-repeats",
+    "1",
+    "--fail-on-error",
+    "--seed",
+    "9271",
+    "--out",
+    "/workspace/w2_fa2_source_gemma_full_config_smoke_2026-06-16/bench/bench_fa2_source_sharegpt_c16_16x1.json"
+  ],
+  "release_grade": false,
+  "reason": "minimal typed FA2-source product smoke; no --require-ci"
+}

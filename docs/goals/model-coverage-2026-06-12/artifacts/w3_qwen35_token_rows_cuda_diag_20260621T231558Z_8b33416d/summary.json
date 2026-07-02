@@ -1,0 +1,22 @@
+{
+  "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_token_rows_cuda_diag_20260621T231558Z_8b33416d",
+  "commit": "8b33416d",
+  "instance_id": 41422823,
+  "lane": "W3 Qwen3.5 GPTQ-Int4 CUDA build + correctness smoke + c32 diagnostic",
+  "result": "gpu_start_blocked",
+  "start_response": {
+    "error": "resources_unavailable",
+    "msg": "Required resources are currently unavailable, state change queued.",
+    "success": false
+  },
+  "final_instance_status": {
+    "actual_status": "exited",
+    "cur_state": "stopped",
+    "gpu_name": "RTX 4090",
+    "num_gpus": 1,
+    "ssh_host": "ssh7.vast.ai",
+    "ssh_port": 22822
+  },
+  "next_required_external_state": "A reachable running 1x RTX 4090 instance for CUDA build, product correctness smoke, and c32 diagnostic benchmark.",
+  "performance_claim": false
+}

@@ -1,0 +1,4 @@
+   Compiling ferrum-engine v0.7.7 (/workspace/ferrum-clean/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.7 (/workspace/ferrum-clean/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.7 (/workspace/ferrum-clean/crates/ferrum-cli)
+    Finished `release` profile [optimized] target(s) in 4m 13s

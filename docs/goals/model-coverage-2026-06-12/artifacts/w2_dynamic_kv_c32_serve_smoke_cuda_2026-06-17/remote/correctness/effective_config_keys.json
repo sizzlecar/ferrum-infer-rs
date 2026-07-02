@@ -1,0 +1,44 @@
+{
+  "FERRUM_KV_MAX_BLOCKS": {
+    "key": "FERRUM_KV_MAX_BLOCKS",
+    "effective_value": "338",
+    "source": "memory_profile",
+    "affects": [
+      "memory"
+    ]
+  },
+  "FERRUM_KV_CAPACITY": {
+    "key": "FERRUM_KV_CAPACITY",
+    "effective_value": "2048",
+    "source": "memory_profile",
+    "affects": [
+      "memory"
+    ]
+  },
+  "FERRUM_PAGED_MAX_SEQS": {
+    "key": "FERRUM_PAGED_MAX_SEQS",
+    "effective_value": "32",
+    "source": "cli",
+    "affects": [
+      "performance",
+      "memory"
+    ]
+  },
+  "FERRUM_MAX_BATCHED_TOKENS": {
+    "key": "FERRUM_MAX_BATCHED_TOKENS",
+    "effective_value": "2048",
+    "source": "memory_profile",
+    "affects": [
+      "performance",
+      "memory"
+    ]
+  },
+  "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK": {
+    "key": "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+    "effective_value": "16",
+    "source": "default",
+    "affects": [
+      "performance"
+    ]
+  }
+}

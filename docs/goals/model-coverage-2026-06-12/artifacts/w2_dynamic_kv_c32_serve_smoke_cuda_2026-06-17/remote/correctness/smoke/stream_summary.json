@@ -1,0 +1,13 @@
+{
+  "elapsed_s": 0.6907474994659424,
+  "done_count": 1,
+  "json_error_count": 0,
+  "json_errors": [],
+  "chunk_count": 4,
+  "content": "5\n",
+  "usage": {
+    "prompt_tokens": 18,
+    "completion_tokens": 3,
+    "total_tokens": 21
+  }
+}

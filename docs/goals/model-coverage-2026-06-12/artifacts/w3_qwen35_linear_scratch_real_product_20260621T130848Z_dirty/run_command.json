@@ -1,0 +1,29 @@
+{
+  "command_line": [
+    "/workspace/ferrum-w3-clean-b6/target/release/ferrum",
+    "run",
+    "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b",
+    "--backend",
+    "cuda",
+    "--gpu-devices",
+    "0",
+    "--max-model-len",
+    "2048",
+    "--max-num-seqs",
+    "32",
+    "--max-num-batched-tokens",
+    "8192",
+    "--kv-capacity",
+    "2048",
+    "--disable-thinking",
+    "--output-format",
+    "jsonl",
+    "--temperature",
+    "0",
+    "--max-tokens",
+    "8",
+    "--prompt",
+    "What is 2+3? Answer with only the number."
+  ],
+  "returncode": 0
+}

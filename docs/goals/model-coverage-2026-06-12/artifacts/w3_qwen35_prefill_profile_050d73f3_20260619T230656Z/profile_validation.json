@@ -1,0 +1,86 @@
+{
+  "status": "pass",
+  "qwen35_prefill_prof_events": 17,
+  "top_slow_layers": [
+    {
+      "layer": 0,
+      "kind": "linear",
+      "us": 283080
+    },
+    {
+      "layer": 32,
+      "kind": "linear",
+      "us": 101307
+    },
+    {
+      "layer": 38,
+      "kind": "linear",
+      "us": 100810
+    },
+    {
+      "layer": 2,
+      "kind": "linear",
+      "us": 83741
+    },
+    {
+      "layer": 17,
+      "kind": "linear",
+      "us": 83706
+    },
+    {
+      "layer": 34,
+      "kind": "linear",
+      "us": 83679
+    },
+    {
+      "layer": 1,
+      "kind": "linear",
+      "us": 82760
+    },
+    {
+      "layer": 8,
+      "kind": "linear",
+      "us": 82617
+    },
+    {
+      "layer": 0,
+      "kind": "linear",
+      "us": 274764
+    },
+    {
+      "layer": 18,
+      "kind": "linear",
+      "us": 105736
+    },
+    {
+      "layer": 26,
+      "kind": "linear",
+      "us": 97363
+    },
+    {
+      "layer": 10,
+      "kind": "linear",
+      "us": 95627
+    },
+    {
+      "layer": 21,
+      "kind": "linear",
+      "us": 94945
+    },
+    {
+      "layer": 32,
+      "kind": "linear",
+      "us": 94757
+    },
+    {
+      "layer": 20,
+      "kind": "linear",
+      "us": 93871
+    },
+    {
+      "layer": 33,
+      "kind": "linear",
+      "us": 93680
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+{"error":{"message":"model output did not satisfy response_format.json_schema.strict: invalid JSON: trailing characters at line 2 column 1","type":"internal_server_error","param":null,"code":null}}

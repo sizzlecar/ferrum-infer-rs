@@ -1,0 +1,1 @@
+{"id":"c95f5315-ff3e-4a1e-8398-2e052530046f","object":"chat.completion","created":1781558998,"model":"gemma3:27b-gptq","choices":[{"index":0,"message":{"role":"assistant","content":"5"},"finish_reason":"length"}],"usage":{"prompt_tokens":23,"completion_tokens":1,"total_tokens":24}}

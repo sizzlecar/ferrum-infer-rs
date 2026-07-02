@@ -1,0 +1,101 @@
+diff --git a/crates/ferrum-models/src/moe/dispatch.rs b/crates/ferrum-models/src/moe/dispatch.rs
+index 2b0b6c26..dfeb9864 100644
+--- a/crates/ferrum-models/src/moe/dispatch.rs
++++ b/crates/ferrum-models/src/moe/dispatch.rs
+@@ -1235,11 +1235,9 @@ fn pick_moe_block_size_with_config(
+     use_device_route: bool,
+     total_pairs: usize,
+ ) -> usize {
+-    const CANDIDATES: &[usize] = &[64, 32, 16];
++    const CANDIDATES: &[usize] = &[64, 48, 32, 16, 8];
+     const PADDING_BUDGET: f64 = 1.30; // ≤ 30% overhead vs actual tokens
+                                       // Manual override (testing / autotuning): FERRUM_MOE_BLOCK_SIZE=8/16/32/48/64.
+-                                      // vLLM 0.20.2 often selects 8 for small-M MoE; keep it override-only
+-                                      // until full-model correctness + throughput beats the 16 default.
+     if let Some(bs) = config.moe_block_size {
+         return bs;
+     }
+@@ -1249,25 +1247,17 @@ fn pick_moe_block_size_with_config(
+                 return bs;
+             }
+         }
+-        // Empirical 2026-05-13: block_size=64 (`thread_m_blocks=4`,
+-        // matching vLLM's tile) regresses M3 c=32 by 5.7% on RTX 4090
+-        // because sparse routing (top_k=8 / num_experts=128 / m=32 ≈
+-        // 2 pairs per active expert) pads each expert's tile by ~32×,
+-        // and the wasted sentinel-row compute exceeds the tile-width
+-        // win. block_size=32 is within noise of 16. Keep 16 as default;
+-        // FERRUM_MOE_BLOCK_SIZE override stays for future autotuning
+-        // when m / routing density changes (e.g. dense Llama at m=32).
+-        return 16;
++        return pick_vllm_moe_block_size_for_density(total_pairs, num_experts);
+     }
+     let Some(plan) = plan else {
+-        return 16;
++        return pick_vllm_moe_block_size_for_density(total_pairs, num_experts);
+     };
+     let m_e: Vec<usize> = (0..num_experts)
+         .map(|e| plan.expert_offsets[e + 1] - plan.expert_offsets[e])
+         .collect();
+     let total_actual: usize = m_e.iter().sum();
+     if total_actual == 0 {
+-        return 16;
++        return pick_vllm_moe_block_size_for_density(total_pairs, num_experts);
+     }
+     for &bs in CANDIDATES {
+         let total_padded: usize = m_e.iter().map(|&m| m.div_ceil(bs) * bs).sum();
+@@ -1275,7 +1265,19 @@ fn pick_moe_block_size_with_config(
+             return bs;
+         }
+     }
+-    16
++    8
++}
++
++fn pick_vllm_moe_block_size_for_density(total_pairs: usize, num_experts: usize) -> usize {
++    if total_pairs == 0 || num_experts == 0 {
++        return 8;
++    }
++    for bs in [8usize, 16, 32, 48, 64] {
++        if (total_pairs as f64) / (num_experts as f64) / (bs as f64) < 0.9 {
++            return bs;
++        }
++    }
++    64
+ }
+ 
+ /// Bucket plan: per-expert lists of which (token, k_slot) pairs route
+@@ -2331,7 +2333,7 @@ mod tests {
+ 
+         assert_eq!(
+             pick_moe_block_size_with_config(&config, None, 128, true, 256),
+-            16
++            8
+         );
+         assert_eq!(
+             pick_moe_block_size_with_config(&config, None, 128, true, 1024),
+@@ -2339,6 +2341,24 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn device_route_default_block_size_matches_vllm_density_policy() {
++        let config = MoeDispatchRuntimeConfig::default();
++
++        assert_eq!(
++            pick_moe_block_size_with_config(&config, None, 256, true, 256),
++            8
++        );
++        assert_eq!(
++            pick_moe_block_size_with_config(&config, None, 256, true, 2048),
++            16
++        );
++        assert_eq!(
++            pick_moe_block_size_with_config(&config, None, 256, true, 16384),
++            64
++        );
++    }
++
+     #[test]
+     fn global_moe_block_size_override_still_wins() {
+         let config = MoeDispatchRuntimeConfig::from_env_vars([

@@ -1,0 +1,10 @@
+    Checking ferrum-interfaces v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-interfaces)
+    Checking ferrum-kernels v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kernels)
+    Checking ferrum-tokenizer v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-tokenizer)
+    Checking ferrum-kv v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kv)
+    Checking ferrum-sampler v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-sampler)
+    Checking ferrum-scheduler v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-scheduler)
+    Checking ferrum-quantization v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-quantization)
+    Checking ferrum-models v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-models)
+    Checking ferrum-engine v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.15s

@@ -11,7 +11,10 @@ pub mod errors;
 pub mod ids;
 pub mod metrics;
 pub mod models;
+pub mod native_operator;
+pub mod observability_profile;
 pub mod requests;
+pub mod resource_trace;
 pub mod runtime_config;
 pub mod sampling;
 
@@ -23,7 +26,10 @@ pub use errors::*;
 pub use ids::*;
 pub use metrics::*;
 pub use models::*;
+pub use native_operator::*;
+pub use observability_profile::*;
 pub use requests::*;
+pub use resource_trace::*;
 pub use runtime_config::*;
 pub use sampling::*;
 

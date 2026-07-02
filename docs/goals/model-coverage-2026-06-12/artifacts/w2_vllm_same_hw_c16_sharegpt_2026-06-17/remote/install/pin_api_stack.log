@@ -1,0 +1,33 @@
+Collecting fastapi==0.116.1
+  Downloading fastapi-0.116.1-py3-none-any.whl.metadata (28 kB)
+Collecting starlette==0.47.2
+  Downloading starlette-0.47.2-py3-none-any.whl.metadata (6.2 kB)
+Collecting prometheus-fastapi-instrumentator==7.1.0
+  Downloading prometheus_fastapi_instrumentator-7.1.0-py3-none-any.whl.metadata (13 kB)
+Requirement already satisfied: pydantic!=1.8,!=1.8.1,!=2.0.0,!=2.0.1,!=2.1.0,<3.0.0,>=1.7.4 in /workspace/vllm-venv-0101-cu126/lib/python3.10/site-packages (from fastapi==0.116.1) (2.13.4)
+Requirement already satisfied: typing-extensions>=4.8.0 in /workspace/vllm-venv-0101-cu126/lib/python3.10/site-packages (from fastapi==0.116.1) (4.15.0)
+Requirement already satisfied: anyio<5,>=3.6.2 in /workspace/vllm-venv-0101-cu126/lib/python3.10/site-packages (from starlette==0.47.2) (4.14.0)
+Requirement already satisfied: prometheus-client<1.0.0,>=0.8.0 in /workspace/vllm-venv-0101-cu126/lib/python3.10/site-packages (from prometheus-fastapi-instrumentator==7.1.0) (0.25.0)
+Requirement already satisfied: exceptiongroup>=1.0.2 in /workspace/vllm-venv-0101-cu126/lib/python3.10/site-packages (from anyio<5,>=3.6.2->starlette==0.47.2) (1.3.1)
+Requirement already satisfied: idna>=2.8 in /workspace/vllm-venv-0101-cu126/lib/python3.10/site-packages (from anyio<5,>=3.6.2->starlette==0.47.2) (3.18)
+Requirement already satisfied: annotated-types>=0.6.0 in /workspace/vllm-venv-0101-cu126/lib/python3.10/site-packages (from pydantic!=1.8,!=1.8.1,!=2.0.0,!=2.0.1,!=2.1.0,<3.0.0,>=1.7.4->fastapi==0.116.1) (0.7.0)
+Requirement already satisfied: pydantic-core==2.46.4 in /workspace/vllm-venv-0101-cu126/lib/python3.10/site-packages (from pydantic!=1.8,!=1.8.1,!=2.0.0,!=2.0.1,!=2.1.0,<3.0.0,>=1.7.4->fastapi==0.116.1) (2.46.4)
+Requirement already satisfied: typing-inspection>=0.4.2 in /workspace/vllm-venv-0101-cu126/lib/python3.10/site-packages (from pydantic!=1.8,!=1.8.1,!=2.0.0,!=2.0.1,!=2.1.0,<3.0.0,>=1.7.4->fastapi==0.116.1) (0.4.2)
+Downloading fastapi-0.116.1-py3-none-any.whl (95 kB)
+Downloading starlette-0.47.2-py3-none-any.whl (72 kB)
+Downloading prometheus_fastapi_instrumentator-7.1.0-py3-none-any.whl (19 kB)
+Installing collected packages: starlette, prometheus-fastapi-instrumentator, fastapi
+  Attempting uninstall: starlette
+    Found existing installation: starlette 1.3.1
+    Uninstalling starlette-1.3.1:
+      Successfully uninstalled starlette-1.3.1
+  Attempting uninstall: prometheus-fastapi-instrumentator
+    Found existing installation: prometheus-fastapi-instrumentator 8.0.0
+    Uninstalling prometheus-fastapi-instrumentator-8.0.0:
+      Successfully uninstalled prometheus-fastapi-instrumentator-8.0.0
+  Attempting uninstall: fastapi
+    Found existing installation: fastapi 0.137.1
+    Uninstalling fastapi-0.137.1:
+      Successfully uninstalled fastapi-0.137.1
+
+Successfully installed fastapi-0.116.1 prometheus-fastapi-instrumentator-7.1.0 starlette-0.47.2

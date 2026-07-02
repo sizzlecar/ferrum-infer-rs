@@ -1,0 +1,4 @@
+{
+  "http_error": 400,
+  "body": "{\"success\":false,\"error\":\"invalid_args\",\"msg\":\"error 404/3603: no_such_ask  Instance type by id 30872861 is not available.\",\"ask_id\":30872861}"
+}

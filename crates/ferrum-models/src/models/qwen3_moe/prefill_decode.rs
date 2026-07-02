@@ -80,6 +80,8 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         let h = self.cfg.base.hidden_size;
         let vocab = self.cfg.base.vocab_size;
         let mut ctx = B::new_context();
+        self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cache_id, pos_offset + seq_len)
+            .expect("paged KV dynamic grow");
 
         // FERRUM_DECODE_OP_PROFILE doubles as the prefill-profile gate
         // for Qwen3-MoE: when set, dump (attn-us, moe-us, total-us) at
@@ -244,6 +246,14 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         let h = self.cfg.base.hidden_size;
         let vocab = self.cfg.base.vocab_size;
         let mut ctx = B::new_context();
+        let target_len = self
+            .kv_caches
+            .get(cache_id)
+            .and_then(|layers| layers.first())
+            .map(|cache| cache.len.saturating_add(1))
+            .unwrap_or_else(|| (pos as usize).saturating_add(1));
+        self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cache_id, target_len)
+            .expect("paged KV dynamic grow");
 
         let decode_t0 = if self.runtime_env.moe_profile {
             Some(std::time::Instant::now())

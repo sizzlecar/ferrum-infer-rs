@@ -1,0 +1,10 @@
+{
+  "client_id": "me",
+  "image": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+  "disk": 260,
+  "label": "ferrum-w2-active-chunk-c16-20260617",
+  "runtype": "ssh",
+  "target_state": "running",
+  "cancel_unavail": true,
+  "onstart": "set -e\nmkdir -p /root/.ssh /run/sshd /workspace\nprintf '%s\n' 'c3NoLWVkMjU1MTkgQUFBQUMzTnphQzFsWkRJMU5URTVBQUFBSUs0SmEwZWE4Uk4vMDBZYkdsbWI4cGwvancyZEdEdzYyVjhhQ1dtdDZkK2cgcnVucG9kCg==' | base64 -d > /root/.ssh/authorized_keys\nchmod 700 /root/.ssh\nchmod 600 /root/.ssh/authorized_keys\napt-get update\nDEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server git curl ca-certificates build-essential pkg-config libssl-dev python3 python3-venv python3-pip jq rsync tmux xz-utils cmake\n/usr/sbin/sshd\nsleep infinity"
+}

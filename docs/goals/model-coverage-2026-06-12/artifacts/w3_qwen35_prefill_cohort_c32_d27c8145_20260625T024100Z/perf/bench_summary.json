@@ -1,0 +1,112 @@
+{
+  "artifact": "/workspace/artifacts/w3_qwen35_prefill_cohort_c32_d27c8145_20260625T024100Z",
+  "bench_exit": "0",
+  "completed_per_run": [
+    32
+  ],
+  "diagnostic_rejected": true,
+  "errored_per_run": [
+    0
+  ],
+  "itl_ms": {
+    "p50": {
+      "mean": 32.146224000000004
+    },
+    "p75": {
+      "mean": 41.868539000000006
+    },
+    "p95": {
+      "mean": 48.673769
+    },
+    "p99": {
+      "mean": 69.27969520000109
+    }
+  },
+  "last_iteration": 767,
+  "last_scheduler_after_schedule": {
+    "active_len": 0,
+    "admitted_total": 179,
+    "cancelled_total": 0,
+    "capacity_backpressure_admit_limit": null,
+    "capacity_blocked_waiting_len": 0,
+    "capacity_deferred_total": 142,
+    "completed_total": 37,
+    "decode_queue_len": 0,
+    "failed_total": 0,
+    "prefill_queue_len": 0,
+    "waiting_queue_len": 0
+  },
+  "last_scheduler_before": {
+    "active_len": 0,
+    "admitted_total": 179,
+    "cancelled_total": 0,
+    "capacity_backpressure_admit_limit": null,
+    "capacity_blocked_waiting_len": 0,
+    "capacity_deferred_total": 142,
+    "completed_total": 37,
+    "decode_queue_len": 0,
+    "failed_total": 0,
+    "prefill_queue_len": 0,
+    "waiting_queue_len": 0
+  },
+  "log_counts": {
+    "block_pool_exhausted": 0,
+    "cancelled_during_decode": 0,
+    "oom_mentions": 0,
+    "panic_mentions": 0,
+    "preempting_request": 0,
+    "unified_kv_admission_failed": 63,
+    "unified_prefill_alloc_deferred": 0
+  },
+  "no_live_vllm": true,
+  "output_throughput_tps": {
+    "mean": 356.1212457460048
+  },
+  "output_token_count_source": "usage",
+  "reject_reasons": [
+    "output_throughput_below_floor:356.121<458.066"
+  ],
+  "release_evidence": false,
+  "request_throughput_rps": {
+    "mean": 2.7821972323906623
+  },
+  "scheduler_trace_lines": 568,
+  "sha": "d27c8145a050eac77d041a520dc928757546137f",
+  "throughput_floor": 458.066,
+  "total_throughput_tps": {
+    "mean": 676.0739274709309
+  },
+  "tpot_ms": {
+    "p50": {
+      "mean": 32.95280237795276
+    },
+    "p75": {
+      "mean": 32.968481305118104
+    },
+    "p95": {
+      "mean": 55.28882579606299
+    },
+    "p99": {
+      "mean": 57.81385217000002
+    }
+  },
+  "trace_shape": {
+    "decode_only_iterations": 341,
+    "full_prefill_32_iterations": 0,
+    "mixed_iterations": 167
+  },
+  "ttft_ms": {
+    "p50": {
+      "mean": 1401.0405125
+    },
+    "p75": {
+      "mean": 6274.8898855
+    },
+    "p95": {
+      "mean": 7976.385634349997
+    },
+    "p99": {
+      "mean": 9866.080443670002
+    }
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "status": "PASS",
+  "artifact": "docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15",
+  "diagnostic_only": true,
+  "release_performance_evidence": false,
+  "remote_head": "c46d95408d12c8c1e177145f7c4c217a34080e62",
+  "gpu": {
+    "name": "NVIDIA GeForce RTX 4090",
+    "memory_total_mib": 24564,
+    "driver": "565.77"
+  },
+  "cuda_compiler": "Build cuda_12.4.r12.4/compiler.34097967_0",
+  "command": "bash scripts/microbenches/build_and_run_gemma3_shadow_graph_bench.sh",
+  "probe_rc": 0,
+  "verdict": "VERDICT: Gemma3 shadow graph native CUDA probe complete",
+  "shape": {
+    "layers": 62,
+    "batch": 16,
+    "hidden": 5376,
+    "kernels_per_step": 498,
+    "timed_iterations": 120,
+    "warmup_iterations": 8
+  },
+  "measurements": {
+    "eager_ordered_state_upload_ms_per_step": 1.143,
+    "eager_presync_state_upload_ms_per_step": 1.137,
+    "graph_ordered_state_upload_ms_per_step": 0.565,
+    "graph_presync_state_upload_ms_per_step": 0.568,
+    "graph_ordered_speedup_vs_eager_ordered": 2.02,
+    "graph_presync_speedup_vs_eager_presync": 2.0,
+    "checksum16": 127.94618988
+  },
+  "vast_cleanup": {
+    "instance_id": 40826362,
+    "cur_state": "stopped",
+    "actual_status": "exited"
+  },
+  "interpretation": "Native CUDA graph replay is stable for a Gemma3-style device F32 residual shadow decode step and has about 2x launch-overhead headroom. Product graph remains disabled on the shadow path until a narrow shadow-safe guard is implemented and product correctness is validated."
+}

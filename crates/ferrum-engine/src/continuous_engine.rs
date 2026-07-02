@@ -10,22 +10,29 @@ use ferrum_bench_core::{global_profile, profile_fields_from_json};
 use ferrum_interfaces::{
     engine::{InferenceEngine, LlmInferenceEngine},
     kv_cache::AllocationRequest,
-    KvCacheHandle, KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler,
-    TensorFactory, TensorRef, Tokenizer,
+    model_executor::{
+        GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy, TokenSelectionMask,
+    },
+    KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,
+    Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
 };
 use ferrum_kv::cache::prefix::PrefixCache;
 use ferrum_sampler::json_mode::JsonModeProcessor;
 use ferrum_scheduler::implementations::{ContinuousBatchScheduler, RequestPhase};
 use ferrum_types::{
-    DataType, Device, EngineConfig, EngineStatus, FerrumError, FinishReason, InferenceRequest,
-    InferenceResponse, Priority, RequestId, Result, SamplingParams, StreamChunk, TokenId,
-    TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY, PROMPT_TOKENS_METADATA_KEY,
+    DataType, Device, EngineConfig, EngineStatus, FerrumError, FerrumProfileEvent, FinishReason,
+    InferenceRequest, InferenceResponse, Priority, ProfileEntrypoint, ProfileEventKind,
+    ProfileStatus, RequestId, ResourceAction, ResourceTraceEvent, Result, SamplingParams,
+    StreamChunk, TokenId, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_TOKENS_METADATA_KEY,
 };
 use futures::stream::Stream;
 use metrics::{counter, gauge, histogram};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rand::{rngs::StdRng, SeedableRng};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -56,6 +63,7 @@ const RBD_PROF_ENV: &str = "FERRUM_RBD_PROF";
 const UNIFIED_POST_PROF_ENV: &str = "FERRUM_UNIFIED_POST_PROF";
 const GENERATION_POLICY_SCAN_LIMIT: usize = 262_144;
 const FORBIDDEN_DECODE_RESAMPLE_LIMIT: usize = 64;
+const KV_ADMISSION_TARGET_LEN_METADATA_KEY: &str = "ferrum_kv_admission_target_len";
 const GENERATED_CONTROL_TOKEN_TEXTS: &[&str] = &[
     "<think>",
     "</think>",
@@ -78,8 +86,11 @@ struct ContinuousEngineRuntimeConfig {
     kv_capacity: Option<usize>,
     max_model_len: Option<usize>,
     next_batch_prof: bool,
+    profile_entrypoint: Option<ProfileEntrypoint>,
     prefix_cache_enabled: bool,
     rbd_prof: bool,
+    scheduler_trace_jsonl: Option<PathBuf>,
+    legacy_scheduler_trace_jsonl: Option<PathBuf>,
     unified_post_prof: bool,
 }
 
@@ -97,8 +108,11 @@ impl ContinuousEngineRuntimeConfig {
             kv_capacity: r.kv_capacity,
             max_model_len: r.max_model_len,
             next_batch_prof: r.next_batch_prof,
+            profile_entrypoint: r.profile_entrypoint,
             prefix_cache_enabled: r.prefix_cache_enabled,
             rbd_prof: r.rbd_prof,
+            scheduler_trace_jsonl: r.scheduler_trace_jsonl.clone(),
+            legacy_scheduler_trace_jsonl: r.legacy_scheduler_trace_jsonl.clone(),
             unified_post_prof: r.unified_post_prof,
         }
     }
@@ -122,10 +136,19 @@ impl ContinuousEngineRuntimeConfig {
             kv_capacity: parse_positive_usize_env(&vars, KV_CAPACITY_ENV),
             max_model_len: parse_positive_usize_env(&vars, MAX_MODEL_LEN_ENV),
             next_batch_prof: vars.contains_key(NEXT_BATCH_PROF_ENV),
+            profile_entrypoint: vars
+                .get("FERRUM_PROFILE_ENTRYPOINT")
+                .and_then(|value| ProfileEntrypoint::parse(value)),
             prefix_cache_enabled: vars
                 .get(WHOLE_PROMPT_PREFIX_CACHE_ENV)
                 .is_some_and(|v| v == "1"),
             rbd_prof: vars.contains_key(RBD_PROF_ENV),
+            scheduler_trace_jsonl: vars
+                .get("FERRUM_SCHEDULER_TRACE_JSONL")
+                .and_then(|value| ferrum_types::parse_path_env_value(value).ok()),
+            legacy_scheduler_trace_jsonl: vars
+                .get("FERRUM_LEGACY_SCHEDULER_TRACE_JSONL")
+                .and_then(|value| ferrum_types::parse_path_env_value(value).ok()),
             unified_post_prof: vars.contains_key(UNIFIED_POST_PROF_ENV),
         }
     }
@@ -305,6 +328,58 @@ fn resolve_sampling_token_constraints(
     (forbidden, Some(tok.vocab_size()), allowed_extended)
 }
 
+fn build_argmax_token_mask(
+    tok: &(dyn Tokenizer + Send + Sync),
+    model_vocab_size: Option<usize>,
+    forbidden_token_ids: &HashSet<u32>,
+    initial_forbidden_token_ids: &HashSet<u32>,
+    stop_token_ids: &HashSet<u32>,
+    allowed_extended_token_ids: &HashSet<u32>,
+) -> TokenSelectionMask {
+    let tokenizer_vocab_size = tok.vocab_size();
+    let max_allowed_id = allowed_extended_token_ids
+        .iter()
+        .chain(stop_token_ids.iter())
+        .copied()
+        .max()
+        .map(|id| id as usize + 1)
+        .unwrap_or(0);
+    let mask_len = model_vocab_size
+        .unwrap_or(tokenizer_vocab_size)
+        .max(tokenizer_vocab_size)
+        .max(max_allowed_id);
+    let mut valid = vec![1i8; mask_len];
+    for &token_id in forbidden_token_ids
+        .iter()
+        .chain(initial_forbidden_token_ids.iter())
+    {
+        if let Some(slot) = valid.get_mut(token_id as usize) {
+            *slot = 0;
+        }
+    }
+    for token_id in tokenizer_vocab_size..mask_len {
+        if !allowed_extended_token_ids.contains(&(token_id as u32)) {
+            valid[token_id] = 0;
+        }
+    }
+    for &token_id in allowed_extended_token_ids {
+        if stop_token_ids.contains(&token_id) {
+            continue;
+        }
+        let token = TokenId::new(token_id);
+        let should_mask = tok
+            .decode(&[token], true)
+            .map(|text| decoded_delta_has_forbidden_quality(&text, 0, false, true))
+            .unwrap_or(true);
+        if should_mask {
+            if let Some(slot) = valid.get_mut(token_id as usize) {
+                *slot = 0;
+            }
+        }
+    }
+    TokenSelectionMask::new(valid)
+}
+
 fn cached_forbidden_generation_tokens(
     tok: &(dyn Tokenizer + Send + Sync),
     allowed_generated_controls: &HashSet<u32>,
@@ -316,6 +391,9 @@ fn cached_forbidden_generation_tokens(
     }
 
     let mut forbidden = HashSet::new();
+    let scan_limit = tok.vocab_size().min(GENERATION_POLICY_SCAN_LIMIT);
+    let has_reverse_vocab =
+        (0..scan_limit).any(|token_id| tok.token_text(TokenId::new(token_id as u32)).is_some());
     let special = tok.special_tokens();
     for token in [
         special.bos_token,
@@ -350,21 +428,20 @@ fn cached_forbidden_generation_tokens(
             }
         }
     }
-    let scan_limit = tok.vocab_size().min(GENERATION_POLICY_SCAN_LIMIT);
     for token_id in 0..scan_limit {
         let id = token_id as u32;
         if allowed_generated_controls.contains(&id) {
             continue;
         }
         let token = TokenId::new(id);
-        let raw_text_forbidden = tok
-            .token_text(token)
-            .is_some_and(is_forbidden_generation_token_text);
+        let raw_text = tok.token_text(token);
+        let missing_token_text = has_reverse_vocab && raw_text.is_none();
+        let raw_text_forbidden = raw_text.is_some_and(is_forbidden_generation_token_text);
         let decoded_text_forbidden = tok
             .decode(&[token], true)
             .map(|text| is_forbidden_generation_token_text(&text))
             .unwrap_or(true);
-        if raw_text_forbidden || decoded_text_forbidden {
+        if missing_token_text || raw_text_forbidden || decoded_text_forbidden {
             forbidden.insert(id);
         }
     }
@@ -379,6 +456,49 @@ fn cached_forbidden_generation_tokens(
 fn tokenizer_cache_key(tok: &(dyn Tokenizer + Send + Sync)) -> usize {
     let ptr = tok as *const (dyn Tokenizer + Send + Sync);
     ptr.cast::<()>() as usize
+}
+
+fn maybe_trace_prompt_tokens(
+    tok: &(dyn Tokenizer + Send + Sync),
+    request_id: &RequestId,
+    prompt: &str,
+) {
+    if std::env::var_os("FERRUM_TRACE_PROMPT_TOKENS").is_none() {
+        return;
+    }
+
+    let prompt_json = serde_json::to_string(prompt).unwrap_or_else(|_| "<json-error>".to_string());
+    eprintln!("[prompt-tokens] request_id={request_id} prompt={prompt_json}");
+    for add_special in [true, false] {
+        match tok.encode(prompt, add_special) {
+            Ok(tokens) => {
+                let ids: Vec<u32> = tokens.iter().map(|token| token.get()).collect();
+                let head_ids: Vec<u32> = ids.iter().copied().take(96).collect();
+                let mut tail_ids: Vec<u32> = ids.iter().rev().copied().take(32).collect();
+                tail_ids.reverse();
+                let head_texts: Vec<String> = tokens
+                    .iter()
+                    .take(24)
+                    .map(|token| {
+                        tok.decode(&[*token], false)
+                            .unwrap_or_else(|_| "<decode-error>".to_string())
+                    })
+                    .collect();
+                eprintln!(
+                    "[prompt-tokens] request_id={request_id} add_special={add_special} len={} head_ids={:?} tail_ids={:?} head_texts={:?}",
+                    tokens.len(),
+                    head_ids,
+                    tail_ids,
+                    head_texts,
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "[prompt-tokens] request_id={request_id} add_special={add_special} error={err}"
+                );
+            }
+        }
+    }
 }
 
 fn is_forbidden_generation_token_text(text: &str) -> bool {
@@ -471,6 +591,9 @@ pub struct SequenceState {
     pub input_tokens: Vec<TokenId>,
     pub generated_tokens: Vec<TokenId>,
     pub kv_cache: Option<Arc<dyn KvCacheHandle>>,
+    pub kv_resource_blocks: Option<usize>,
+    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
+    pub recurrent_state_slots: Option<usize>,
     pub sampling_params: SamplingParams,
     pub phase: RequestPhase,
     pub rng: StdRng,
@@ -506,6 +629,13 @@ pub struct SequenceState {
     /// Draft-model KV cache (only populated when engine has speculative
     /// decoding enabled). Allocated + prefilled lazily on the first decode.
     pub draft_kv_cache: Option<Arc<dyn KvCacheHandle>>,
+    pub draft_kv_resource_blocks: Option<usize>,
+    /// Resource-manager request id for the draft-model KV allocation.
+    ///
+    /// Draft KV must not reuse the target request id because KV managers are
+    /// keyed by `RequestId`; a second allocation under the same key can
+    /// replace the target handle while leaving resource counters/blocks alive.
+    pub draft_kv_request_id: Option<RequestId>,
     /// Token frequency counts for repetition penalty.
     pub token_frequencies: HashMap<TokenId, usize>,
     /// Model executor's KV cache key for this sequence (for cleanup on completion).
@@ -530,6 +660,10 @@ pub struct SequenceState {
     /// Multi-token text stop sequences (`stop_sequences` entries that don't
     /// resolve to a single token). Checked via accumulated decoded text.
     pub stop_text_seqs: Vec<String>,
+    /// Base token-validity mask for model-side greedy argmax.
+    pub argmax_token_mask: Option<TokenSelectionMask>,
+    /// First-token variant that also applies `initial_forbidden_token_ids`.
+    pub initial_argmax_token_mask: Option<TokenSelectionMask>,
     /// Bytes of decoded `generated_tokens` already flushed via the stream
     /// channel. Used by `send_stream_update` to compute per-call delta from
     /// the full-history decode, so multi-byte UTF-8 sequences (Chinese chars,
@@ -551,6 +685,15 @@ impl SequenceState {
         request: InferenceRequest,
         input_tokens: Vec<TokenId>,
         tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
+    ) -> Self {
+        Self::new_with_tokenizer_and_model_vocab_size(request, input_tokens, tokenizer, None)
+    }
+
+    pub fn new_with_tokenizer_and_model_vocab_size(
+        request: InferenceRequest,
+        input_tokens: Vec<TokenId>,
+        tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
+        model_vocab_size: Option<usize>,
     ) -> Self {
         use ferrum_types::ResponseFormat;
         let rng = request
@@ -617,12 +760,40 @@ impl SequenceState {
                 }
             }
         }
+        let empty_initial_forbidden = HashSet::new();
+        let argmax_token_mask = tokenizer.as_deref().map(|tok| {
+            build_argmax_token_mask(
+                tok,
+                model_vocab_size,
+                &forbidden_token_ids,
+                &empty_initial_forbidden,
+                &stop_token_ids,
+                &allowed_extended_token_ids,
+            )
+        });
+        let initial_argmax_token_mask = if initial_forbidden_token_ids.is_empty() {
+            None
+        } else {
+            tokenizer.as_deref().map(|tok| {
+                build_argmax_token_mask(
+                    tok,
+                    model_vocab_size,
+                    &forbidden_token_ids,
+                    &initial_forbidden_token_ids,
+                    &stop_token_ids,
+                    &allowed_extended_token_ids,
+                )
+            })
+        };
         Self {
             request_id: request.id.clone(),
             original_request: request.clone(),
             input_tokens,
             generated_tokens: Vec::new(),
             kv_cache: None,
+            kv_resource_blocks: None,
+            recurrent_state: None,
+            recurrent_state_slots: None,
             sampling_params: request.sampling_params,
             phase: RequestPhase::Waiting,
             rng,
@@ -639,6 +810,8 @@ impl SequenceState {
             json_processor,
             regex_processor,
             draft_kv_cache: None,
+            draft_kv_resource_blocks: None,
+            draft_kv_request_id: None,
             token_frequencies: HashMap::new(),
             model_cache_id: None,
             stop_token_ids,
@@ -647,6 +820,8 @@ impl SequenceState {
             tokenizer_base_vocab_size,
             allowed_extended_token_ids,
             stop_text_seqs,
+            argmax_token_mask,
+            initial_argmax_token_mask,
             streamed_text_len: 0,
         }
     }
@@ -655,9 +830,23 @@ impl SequenceState {
         self.input_tokens.len() + self.generated_tokens.len()
     }
 
+    pub fn prefill_context_tokens(&self) -> Vec<TokenId> {
+        if self.generated_tokens.is_empty() {
+            return self.input_tokens.clone();
+        }
+        let mut tokens = Vec::with_capacity(self.input_tokens.len() + self.generated_tokens.len());
+        tokens.extend_from_slice(&self.input_tokens);
+        tokens.extend_from_slice(&self.generated_tokens);
+        tokens
+    }
+
+    pub fn prefill_context_len(&self) -> usize {
+        self.input_tokens.len() + self.generated_tokens.len()
+    }
+
     pub fn model_decode_metadata(&self) -> HashMap<String, serde_json::Value> {
         let mut metadata = self.original_request.metadata.clone();
-        if self.requires_full_logits_for_sampling() {
+        if self.requires_engine_full_logits_for_sampling() {
             metadata.insert(
                 "ferrum_require_full_logits".to_string(),
                 serde_json::json!(true),
@@ -665,31 +854,190 @@ impl SequenceState {
         }
         metadata.insert(
             "ferrum_kv_capacity_hint".to_string(),
-            serde_json::json!(
-                self.input_tokens.len() + self.sampling_params.max_tokens.saturating_sub(1)
-            ),
+            serde_json::json!(self
+                .prefill_context_len()
+                .max(self.input_tokens.len() + self.sampling_params.max_tokens.saturating_sub(1))),
+        );
+        metadata.insert(
+            KV_ADMISSION_TARGET_LEN_METADATA_KEY.to_string(),
+            serde_json::json!(self.prefill_context_len()),
         );
         metadata
     }
 
-    pub fn requires_full_logits_for_sampling(&self) -> bool {
+    pub fn model_decode_logits_policy(&self) -> LogitsReturnPolicy {
+        if !self.can_use_model_greedy_argmax() {
+            return LogitsReturnPolicy::FullLogits;
+        }
+        let token_mask =
+            if self.generated_tokens.is_empty() && self.initial_argmax_token_mask.is_some() {
+                self.initial_argmax_token_mask.clone()
+            } else {
+                self.argmax_token_mask.clone()
+            };
+        LogitsReturnPolicy::GreedyArgmax {
+            token_mask,
+            repetition_penalty: self.model_decode_repetition_penalty(),
+        }
+    }
+
+    fn can_use_model_greedy_argmax(&self) -> bool {
         use ferrum_types::ResponseFormat;
 
-        let needs_sampling_masks = !self.forbidden_token_ids.is_empty()
-            || (self.generated_tokens.is_empty() && !self.initial_forbidden_token_ids.is_empty());
-        let needs_extended_vocab_mask = self.tokenizer_base_vocab_size.is_some_and(|base| {
-            self.allowed_extended_token_ids
-                .iter()
-                .any(|&token_id| token_id as usize >= base)
-        });
+        let params = &self.sampling_params;
+        params.temperature == 0.0
+            && params.top_p == 1.0
+            && params.top_k.is_none()
+            && params.repetition_penalty > 0.0
+            && params.presence_penalty == 0.0
+            && params.frequency_penalty == 0.0
+            && params.min_p.is_none()
+            && params.tfs.is_none()
+            && params.typical_p.is_none()
+            && params.mirostat.is_none()
+            && self.json_processor.is_none()
+            && self.regex_processor.is_none()
+            && matches!(params.response_format, ResponseFormat::Text)
+    }
+
+    fn model_decode_repetition_penalty(&self) -> Option<GreedyRepetitionPenalty> {
+        let penalty = self.sampling_params.repetition_penalty;
+        if penalty == 1.0 || self.generated_tokens.is_empty() {
+            return None;
+        }
+        let mut seen = HashSet::new();
+        let mut token_ids = Vec::new();
+        for token in &self.generated_tokens {
+            if seen.insert(token.get()) {
+                token_ids.push(token.get());
+            }
+        }
+        if token_ids.is_empty() {
+            None
+        } else {
+            Some(GreedyRepetitionPenalty::new(penalty, token_ids))
+        }
+    }
+
+    pub fn accept_model_greedy_argmax_token(
+        &self,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        token: TokenId,
+    ) -> Result<()> {
+        let token_detail = || self.describe_model_greedy_argmax_token(tokenizer, token);
+        if !self.can_use_model_greedy_argmax() {
+            return Err(FerrumError::model(format!(
+                "model returned greedy token sentinel for request requiring full logits ({})",
+                token_detail()
+            )));
+        }
+
+        let token_id = token.get();
+        if self.forbidden_token_ids.contains(&token_id) {
+            return Err(FerrumError::model(format!(
+                "model greedy argmax returned a forbidden token ({})",
+                token_detail()
+            )));
+        }
+        if self.generated_tokens.is_empty() && self.initial_forbidden_token_ids.contains(&token_id)
+        {
+            return Err(FerrumError::model(format!(
+                "model greedy argmax returned an initially forbidden token ({})",
+                token_detail()
+            )));
+        }
+        if self
+            .tokenizer_base_vocab_size
+            .is_some_and(|base| token_id as usize >= base)
+            && !self.allowed_extended_token_ids.contains(&token_id)
+        {
+            return Err(FerrumError::model(format!(
+                "model greedy argmax returned a disallowed extended-vocab token ({})",
+                token_detail()
+            )));
+        }
+        if self.sample_candidate_decodes_to_forbidden_output(
+            tokenizer,
+            self.streamed_text_len,
+            token,
+        ) {
+            return Err(FerrumError::model(format!(
+                "model greedy argmax token decoded to forbidden output ({})",
+                token_detail()
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn describe_model_greedy_argmax_token(
+        &self,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        token: TokenId,
+    ) -> String {
+        let token_text = tokenizer
+            .and_then(|tokenizer| tokenizer.token_text(token))
+            .map(|text| format!("{text:?}"))
+            .unwrap_or_else(|| "None".to_string());
+        let decoded_delta = tokenizer
+            .map(|tokenizer| tokenizer.decode_incremental(&self.generated_tokens, token))
+            .map(|result| match result {
+                Ok(text) => format!("{text:?}"),
+                Err(err) => format!("decode_error:{err}"),
+            })
+            .unwrap_or_else(|| "None".to_string());
+        format!(
+            "token_id={}, token_text={}, decoded_delta={}, generated_tokens={}, \
+             forbidden_count={}, initial_forbidden_count={}, base_vocab_size={:?}, \
+             allowed_extended_count={}, argmax_mask={}, initial_argmax_mask={}",
+            token.get(),
+            token_text,
+            decoded_delta,
+            self.generated_tokens.len(),
+            self.forbidden_token_ids.len(),
+            self.initial_forbidden_token_ids.len(),
+            self.tokenizer_base_vocab_size,
+            self.allowed_extended_token_ids.len(),
+            Self::describe_argmax_mask_value(self.argmax_token_mask.as_ref(), token),
+            Self::describe_argmax_mask_value(self.initial_argmax_token_mask.as_ref(), token)
+        )
+    }
+
+    fn describe_argmax_mask_value(mask: Option<&TokenSelectionMask>, token: TokenId) -> String {
+        match mask {
+            Some(mask) => {
+                let value = mask
+                    .valid_token_mask
+                    .get(token.get() as usize)
+                    .copied()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "out_of_range".to_string());
+                format!(
+                    "fingerprint={},len={},value={}",
+                    mask.fingerprint,
+                    mask.len(),
+                    value
+                )
+            }
+            None => "none".to_string(),
+        }
+    }
+
+    pub fn requires_engine_full_logits_for_sampling(&self) -> bool {
+        use ferrum_types::ResponseFormat;
+
         self.json_processor.is_some()
             || self.regex_processor.is_some()
             || matches!(
                 self.sampling_params.response_format,
                 ResponseFormat::JsonSchema(_)
             )
-            || needs_sampling_masks
-            || needs_extended_vocab_mask
+    }
+
+    pub fn requires_full_logits_for_sampling(&self) -> bool {
+        self.requires_engine_full_logits_for_sampling()
+            || self.argmax_token_mask.is_some()
+            || (self.generated_tokens.is_empty() && self.initial_argmax_token_mask.is_some())
     }
 
     pub fn reset_guided_processors(&self) -> Result<()> {
@@ -996,6 +1344,7 @@ struct EngineInner {
     // Retained for constructor API; sampling now uses per-request SamplingConfig
     sampler: Arc<dyn Sampler + Send + Sync>,
     kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
+    recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
     model_executor: Arc<dyn ModelExecutor + Send + Sync>,
     /// Optional draft executor for speculative decoding. When set alongside
     /// `spec_config`, `run_single_decode` routes through `SpeculativeRunner`.
@@ -1013,6 +1362,10 @@ struct EngineInner {
     /// Prefix cache: shares KV blocks across requests with common prompts.
     prefix_cache: PrefixCache,
     runtime_config: ContinuousEngineRuntimeConfig,
+    scheduler_trace_jsonl: Option<Mutex<std::fs::File>>,
+    legacy_scheduler_trace_jsonl: Option<Mutex<std::fs::File>>,
+    scheduler_trace_none_streak: AtomicU64,
+    resource_trace_event_counter: AtomicU64,
     // stats
     iteration_count: AtomicU64,
     total_prefill_tokens: AtomicU64,
@@ -1053,6 +1406,415 @@ impl EngineInner {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    fn trace_entrypoint(&self) -> ProfileEntrypoint {
+        self.runtime_config
+            .profile_entrypoint
+            .unwrap_or(ProfileEntrypoint::Synthetic)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn trace_resource_event(
+        &self,
+        request_id: &RequestId,
+        owner_kind: &str,
+        owner_id: &str,
+        resource_kind: &str,
+        phase: &str,
+        action: ResourceAction,
+        amount: Option<i64>,
+        before: Option<i64>,
+        after: Option<i64>,
+        capacity: Option<i64>,
+        reason: Option<String>,
+    ) {
+        let Some(sink) = &self.scheduler_trace_jsonl else {
+            return;
+        };
+        let entrypoint = self.trace_entrypoint();
+        let event_num = self
+            .resource_trace_event_counter
+            .fetch_add(1, Ordering::Relaxed);
+        let mut attributes = BTreeMap::from([
+            (
+                "actual_model_smoke".to_string(),
+                serde_json::json!(matches!(
+                    entrypoint,
+                    ProfileEntrypoint::Run | ProfileEntrypoint::Serve
+                )),
+            ),
+            (
+                "backend_device".to_string(),
+                serde_json::json!(format!("{:?}", self.config.backend.device)),
+            ),
+            (
+                "backend_type".to_string(),
+                serde_json::json!(format!("{:?}", self.config.backend.backend_type)),
+            ),
+            ("diagnostic_only".to_string(), serde_json::json!(false)),
+            ("l0_only".to_string(), serde_json::json!(false)),
+            ("profile_detail".to_string(), serde_json::json!("basic")),
+            (
+                "resource_trace_source".to_string(),
+                serde_json::json!("engine"),
+            ),
+        ]);
+        if let Some(reason) = reason.as_deref() {
+            attributes.insert("resource_reason".to_string(), serde_json::json!(reason));
+        }
+        let event = FerrumProfileEvent {
+            schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            event_id: format!("evt-engine-resource-{event_num}"),
+            request_id: request_id.to_string(),
+            correlation_id: Some(request_id.to_string()),
+            entrypoint,
+            backend: "actual".to_string(),
+            phase: phase.to_string(),
+            event_kind: ProfileEventKind::Resource,
+            timestamp: chrono::Utc::now(),
+            status: ProfileStatus::Ok,
+            model: Some(self.config.model.model_id.to_string()),
+            duration_us: None,
+            memory: None,
+            resource: Some(ResourceTraceEvent {
+                owner_kind: owner_kind.to_string(),
+                owner_id: owner_id.to_string(),
+                resource_kind: resource_kind.to_string(),
+                action,
+                amount,
+                before,
+                after,
+                capacity,
+                reason,
+            }),
+            error: None,
+            replay: None,
+            attributes,
+        };
+        if let Err(error) = event.validate() {
+            warn!("Skipping invalid engine resource trace event: {}", error);
+            return;
+        }
+        let mut line = match serde_json::to_string(&event) {
+            Ok(line) => line,
+            Err(error) => {
+                warn!("Failed to serialize engine resource trace event: {}", error);
+                return;
+            }
+        };
+        line.push('\n');
+        let mut file = sink.lock();
+        if let Err(error) = file.write_all(line.as_bytes()) {
+            warn!("Failed to write engine resource trace event: {}", error);
+            return;
+        }
+    }
+
+    fn resource_amount_i64(amount: usize) -> i64 {
+        amount.min(i64::MAX as usize) as i64
+    }
+
+    fn trace_request_open(&self, request_id: &RequestId) {
+        self.trace_resource_event(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "request_slot",
+            "engine_request_open",
+            ResourceAction::RequestOpen,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    fn trace_request_admitted(&self, request_id: &RequestId) {
+        self.trace_resource_reserve_commit(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "request_slot",
+            "engine_request_slot",
+            1,
+            None,
+        );
+    }
+
+    fn trace_request_rejected(&self, request_id: &RequestId, reason: String) {
+        self.trace_resource_event(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "request_slot",
+            "engine_request_reject",
+            ResourceAction::Reject,
+            None,
+            None,
+            None,
+            Some(Self::resource_amount_i64(
+                self.config.scheduler.max_waiting_requests,
+            )),
+            Some(reason),
+        );
+        self.trace_request_owner_close(request_id);
+    }
+
+    fn trace_request_close(&self, request_id: &RequestId) {
+        self.trace_resource_event(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "request_slot",
+            "engine_request_slot_release",
+            ResourceAction::Release,
+            Some(1),
+            Some(1),
+            Some(0),
+            None,
+            None,
+        );
+        self.trace_request_owner_close(request_id);
+    }
+
+    fn trace_request_owner_close(&self, request_id: &RequestId) {
+        self.trace_resource_event(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "request_slot",
+            "engine_request_close",
+            ResourceAction::RequestClose,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    fn trace_scheduler_defer(&self, request_id: &RequestId, phase: &str, reason: &str) {
+        self.trace_resource_event(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "scheduler_capacity",
+            phase,
+            ResourceAction::Defer,
+            None,
+            None,
+            None,
+            Some(Self::resource_amount_i64(
+                self.config.scheduler.max_running_requests.max(1),
+            )),
+            Some(reason.to_string()),
+        );
+    }
+
+    fn trace_resource_reserve_commit(
+        &self,
+        request_id: &RequestId,
+        owner_kind: &str,
+        owner_id: &str,
+        resource_kind: &str,
+        phase_prefix: &str,
+        amount: usize,
+        capacity: Option<usize>,
+    ) {
+        let amount = Self::resource_amount_i64(amount.max(1));
+        let capacity_i64 = capacity.map(Self::resource_amount_i64);
+        let before = capacity_i64.unwrap_or(amount).max(amount);
+        let after = before.saturating_sub(amount);
+        self.trace_resource_event(
+            request_id,
+            owner_kind,
+            owner_id,
+            resource_kind,
+            &format!("{phase_prefix}_reserve"),
+            ResourceAction::Reserve,
+            Some(amount),
+            Some(before),
+            Some(after),
+            capacity_i64,
+            None,
+        );
+        self.trace_resource_event(
+            request_id,
+            owner_kind,
+            owner_id,
+            resource_kind,
+            &format!("{phase_prefix}_commit"),
+            ResourceAction::Commit,
+            Some(amount),
+            Some(0),
+            Some(amount),
+            capacity_i64,
+            None,
+        );
+    }
+
+    fn trace_resource_release(
+        &self,
+        request_id: &RequestId,
+        owner_kind: &str,
+        owner_id: &str,
+        resource_kind: &str,
+        phase: &str,
+        amount: usize,
+        capacity: Option<usize>,
+    ) {
+        let amount = Self::resource_amount_i64(amount.max(1));
+        self.trace_resource_event(
+            request_id,
+            owner_kind,
+            owner_id,
+            resource_kind,
+            phase,
+            ResourceAction::Release,
+            Some(amount),
+            Some(amount),
+            Some(0),
+            capacity.map(Self::resource_amount_i64),
+            None,
+        );
+    }
+
+    fn kv_resource_blocks_for_tokens(&self, tokens: usize) -> usize {
+        tokens
+            .div_ceil(self.config.kv_cache.block_size.max(1))
+            .max(1)
+    }
+
+    fn trace_kv_allocate(&self, request_id: &RequestId, blocks: usize) {
+        self.trace_resource_reserve_commit(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "kv_block",
+            "engine_kv_block",
+            blocks,
+            Some(self.config.kv_cache.max_blocks),
+        );
+    }
+
+    fn trace_kv_release(&self, request_id: &RequestId, blocks: usize) {
+        self.trace_resource_release(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "kv_block",
+            "engine_kv_block_release",
+            blocks,
+            Some(self.config.kv_cache.max_blocks),
+        );
+    }
+
+    fn trace_recurrent_allocate(
+        &self,
+        request_id: &RequestId,
+        slots: usize,
+        capacity: Option<usize>,
+    ) {
+        self.trace_resource_reserve_commit(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "recurrent_state_slot",
+            "engine_recurrent_state_slot",
+            slots,
+            capacity,
+        );
+    }
+
+    fn trace_recurrent_release(
+        &self,
+        request_id: &RequestId,
+        slots: usize,
+        capacity: Option<usize>,
+    ) {
+        self.trace_resource_release(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "recurrent_state_slot",
+            "engine_recurrent_state_slot_release",
+            slots,
+            capacity,
+        );
+    }
+
+    async fn ensure_recurrent_state(
+        &self,
+        request_id: &RequestId,
+        spec: Option<ferrum_interfaces::RecurrentStateSpec>,
+    ) -> Result<Option<Arc<dyn RecurrentStateHandle>>> {
+        if let Some(existing) = self
+            .sequences
+            .read()
+            .get(request_id)
+            .and_then(|seq| seq.recurrent_state.clone())
+        {
+            return Ok(Some(existing));
+        }
+
+        let Some(spec) = spec else {
+            return Ok(None);
+        };
+
+        debug_assert_eq!(&spec.request_id, request_id);
+        let Some(manager) = &self.recurrent_state_manager else {
+            return Err(FerrumError::config(format!(
+                "model '{}' requires recurrent state for request {}, but no recurrent-state manager is configured",
+                self.model_executor.info().model_id, request_id
+            )));
+        };
+
+        let before_stats = manager.stats();
+        let slots = spec.max_batch_slots.max(1);
+        let handle = match manager.allocate(&spec).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.trace_resource_event(
+                    request_id,
+                    "request",
+                    &request_id.to_string(),
+                    "recurrent_state_slot",
+                    "engine_recurrent_state_slot_reject",
+                    ResourceAction::Reject,
+                    None,
+                    None,
+                    None,
+                    Some(Self::resource_amount_i64(before_stats.total_batch_slots)),
+                    Some(error.to_string()),
+                );
+                return Err(error);
+            }
+        };
+        let after_stats = manager.stats();
+        self.trace_recurrent_allocate(request_id, slots, Some(after_stats.total_batch_slots));
+
+        if let Some(seq) = self.sequences.write().get_mut(request_id) {
+            seq.recurrent_state = Some(handle.clone());
+            seq.recurrent_state_slots = Some(slots);
+        }
+
+        Ok(Some(handle))
+    }
+
+    async fn release_recurrent_state(&self, request_id: &RequestId) {
+        let released_slots = self.sequences.write().get_mut(request_id).and_then(|seq| {
+            seq.recurrent_state = None;
+            seq.recurrent_state_slots.take()
+        });
+        if let Some(manager) = &self.recurrent_state_manager {
+            let capacity = manager.stats().total_batch_slots;
+            let _ = manager.deallocate(request_id.clone()).await;
+            if let Some(slots) = released_slots {
+                self.trace_recurrent_release(request_id, slots, Some(capacity));
+            }
+        }
+    }
+
     fn performance_breakdown(&self) -> ferrum_types::PerformanceBreakdown {
         ferrum_types::PerformanceBreakdown {
             scheduling_time_ms: avg_duration_ms(
@@ -1081,6 +1843,47 @@ fn avg_duration_ms(total_us: u64, samples: u64) -> f64 {
         0.0
     } else {
         total_us as f64 / samples as f64 / 1000.0
+    }
+}
+
+fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<Mutex<std::fs::File>> {
+    let path = path?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                warn!(
+                    "Failed to create scheduler trace directory {}: {}",
+                    parent.display(),
+                    error
+                );
+                return None;
+            }
+        }
+    }
+    if let Err(error) = std::fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                "Failed to clear scheduler trace JSONL {}: {}",
+                path.display(),
+                error
+            );
+            return None;
+        }
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => Some(Mutex::new(file)),
+        Err(error) => {
+            warn!(
+                "Failed to open scheduler trace JSONL {}: {}",
+                path.display(),
+                error
+            );
+            None
+        }
     }
 }
 
@@ -1137,11 +1940,45 @@ impl ContinuousBatchEngine {
         draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
         spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
     ) -> Self {
+        Self::new_with_speculation_and_recurrent_state_manager(
+            config,
+            scheduler,
+            tokenizer,
+            sampler,
+            kv_cache,
+            model_executor,
+            tensor_factory,
+            draft_executor,
+            spec_config,
+            None,
+        )
+    }
+
+    /// Build an engine with optional speculative decoding and an optional
+    /// recurrent-state manager for state-space / hybrid models.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_speculation_and_recurrent_state_manager(
+        config: EngineConfig,
+        scheduler: Arc<ContinuousBatchScheduler>,
+        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+        sampler: Arc<dyn Sampler + Send + Sync>,
+        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
+        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+        tensor_factory: Arc<dyn TensorFactory>,
+        draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
+        spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
+        recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
+    ) -> Self {
         info!(
-            "Creating ContinuousBatchEngine (speculative_decoding={})",
-            draft_executor.is_some() && spec_config.is_some()
+            "Creating ContinuousBatchEngine (speculative_decoding={}, recurrent_state_manager={})",
+            draft_executor.is_some() && spec_config.is_some(),
+            recurrent_state_manager.is_some()
         );
         let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
+        let scheduler_trace_jsonl =
+            create_scheduler_trace_sink(runtime_config.scheduler_trace_jsonl.as_deref());
+        let legacy_scheduler_trace_jsonl =
+            create_scheduler_trace_sink(runtime_config.legacy_scheduler_trace_jsonl.as_deref());
 
         Self {
             inner: Arc::new(EngineInner {
@@ -1150,6 +1987,7 @@ impl ContinuousBatchEngine {
                 tokenizer,
                 sampler,
                 kv_cache,
+                recurrent_state_manager,
                 model_executor,
                 draft_executor,
                 spec_config,
@@ -1162,6 +2000,10 @@ impl ContinuousBatchEngine {
                 iteration_count: AtomicU64::new(0),
                 prefix_cache: PrefixCache::new(256, 2),
                 runtime_config,
+                scheduler_trace_jsonl,
+                legacy_scheduler_trace_jsonl,
+                scheduler_trace_none_streak: AtomicU64::new(0),
+                resource_trace_event_counter: AtomicU64::new(0),
                 total_prefill_tokens: AtomicU64::new(0),
                 total_decode_tokens: AtomicU64::new(0),
                 total_preemptions: AtomicU64::new(0),
@@ -1253,6 +2095,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         counter!("ferrum.engine.requests_total").increment(1);
         gauge!("ferrum.engine.active_requests").increment(1.0);
 
+        maybe_trace_prompt_tokens(&*self.inner.tokenizer, &request_id, &request.prompt);
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
         clamp_default_max_tokens_to_context(
             &mut request,
@@ -1274,14 +2117,21 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         );
 
         // Submit to scheduler
-        self.inner.scheduler.submit(request.clone()).await?;
+        self.inner.trace_request_open(&request_id);
+        if let Err(error) = self.inner.scheduler.submit(request.clone()).await {
+            self.inner
+                .trace_request_rejected(&request_id, error.to_string());
+            return Err(error);
+        }
+        self.inner.trace_request_admitted(&request_id);
 
         // Create sequence state with oneshot channel
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let mut seq_state = SequenceState::new_with_tokenizer(
+        let mut seq_state = SequenceState::new_with_tokenizer_and_model_vocab_size(
             request,
             input_tokens,
             Some(self.inner.tokenizer.clone()),
+            Some(self.inner.model_executor.info().vocab_size),
         );
         seq_state.response_sender = Some(resp_tx);
         self.inner
@@ -1324,6 +2174,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         let (tx, rx) = mpsc::channel(100);
         let request_id = request.id.clone();
 
+        maybe_trace_prompt_tokens(&*self.inner.tokenizer, &request_id, &request.prompt);
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
         clamp_default_max_tokens_to_context(
             &mut request,
@@ -1345,13 +2196,20 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         );
 
         // Submit to scheduler
-        self.inner.scheduler.submit(request.clone()).await?;
+        self.inner.trace_request_open(&request_id);
+        if let Err(error) = self.inner.scheduler.submit(request.clone()).await {
+            self.inner
+                .trace_request_rejected(&request_id, error.to_string());
+            return Err(error);
+        }
+        self.inner.trace_request_admitted(&request_id);
 
         // Create sequence state with stream sender
-        let mut seq_state = SequenceState::new_with_tokenizer(
+        let mut seq_state = SequenceState::new_with_tokenizer_and_model_vocab_size(
             request,
             input_tokens,
             Some(self.inner.tokenizer.clone()),
+            Some(self.inner.model_executor.info().vocab_size),
         );
         seq_state.stream_sender = Some(tx);
         self.inner

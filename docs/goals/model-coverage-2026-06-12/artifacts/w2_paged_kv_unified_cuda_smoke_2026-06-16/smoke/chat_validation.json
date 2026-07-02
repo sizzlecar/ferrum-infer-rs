@@ -1,0 +1,8 @@
+{
+  "content": "",
+  "finish_reason": "stop",
+  "completion_tokens": 1,
+  "usage_present": true,
+  "bad_output": false,
+  "pass": false
+}

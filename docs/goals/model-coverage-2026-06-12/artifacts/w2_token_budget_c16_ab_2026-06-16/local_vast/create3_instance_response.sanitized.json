@@ -1,0 +1,9 @@
+{
+  "body": {
+    "ask_id": 39214870,
+    "error": "invalid_args",
+    "msg": "error 404/3603: no_such_ask  Instance type by id 39214870 is not available.",
+    "success": false
+  },
+  "http_status": 400
+}

@@ -29,7 +29,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use ferrum_bench_core::{global_profile, profile_fields_from_json};
-use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16};
+use ferrum_interfaces::{
+    kv_dtype::{KvDtypeKind, KvFp16},
+    model_executor::{KvSlotAllocation, KvSlotRequest, KvSlotReservation},
+};
 use ferrum_kernels::backend::{
     Backend, BackendGraph, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin,
     KvCache, LlmBackend, MoeLlmBackend, QuantLlmBackend,

@@ -1,0 +1,14 @@
+2026-06-24T17:52:40Z lane_start art=/workspace/artifacts/w3_qwen35_paged_kv_rollback_c32_d62b18cf_20260624T175240Z sha=d62b18cfe877a2b260a5ddab3bfa4772a45cb7ff release_evidence=false no_live_vllm=true
+2026-06-24T17:52:40Z git_sync_start
+2026-06-24T17:52:41Z git_sync_done
+2026-06-24T17:52:41Z cargo_check_start
+2026-06-24T17:52:42Z cargo_check_done
+2026-06-24T17:52:42Z release_build_start
+2026-06-24T17:55:54Z release_build_done
+2026-06-24T17:55:54Z ferrum_run_smoke_start
+2026-06-24T17:56:22Z ferrum_run_smoke_done
+2026-06-24T17:56:22Z serve_start
+2026-06-24T17:56:50Z serve_ready
+2026-06-24T17:56:50Z serve_chat_smoke_done
+2026-06-24T17:56:50Z bench_c32_start
+2026-06-24T18:03:42Z FERRUM W3 QWEN35 PAGED KV ROLLBACK C32 DIAG PASS: /workspace/artifacts/w3_qwen35_paged_kv_rollback_c32_d62b18cf_20260624T175240Z

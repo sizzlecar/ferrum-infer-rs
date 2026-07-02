@@ -1,0 +1,17 @@
+total 0
+lrwxrwxrwx 1 root root 52 Jun 13 14:17 README.md -> ../../blobs/7be5fc7f47d5db027d120b8024982df93db95b74
+lrwxrwxrwx 1 root root 52 Jun 13 14:17 added_tokens.json -> ../../blobs/e17bde03d42feda32d1abfca6d3b598b9a020df7
+lrwxrwxrwx 1 root root 52 Jun 13 14:17 config.json -> ../../blobs/6341de23be31d0ee06f69ec214df420647c067fd
+lrwxrwxrwx 1 root root 52 Jun 13 14:17 generation_config.json -> ../../blobs/05aaef35cf565a3018a8a23f4350f30d17f38148
+lrwxrwxrwx 1 root root 76 Jun 13 14:21 model-00001-of-00005.safetensors -> ../../blobs/f548f774bb7ed5eb2aeb423838eb947dba4b308c7b99e0b05502f3facff8d47f
+lrwxrwxrwx 1 root root 76 Jun 13 14:20 model-00002-of-00005.safetensors -> ../../blobs/0252dd63b23411f15b80c3d6520a59b58a15241132e726829410b17f84b4210d
+lrwxrwxrwx 1 root root 76 Jun 13 14:20 model-00003-of-00005.safetensors -> ../../blobs/f202f0d2d0a0411278592cb8295f8bf51785b3ea1a98d620143afc8f88f4f440
+lrwxrwxrwx 1 root root 76 Jun 13 14:22 model-00004-of-00005.safetensors -> ../../blobs/42a0f7116c9008d43d3dfaab4fc1a8a9ae4d45d42364c2d4b52e0173a0952d29
+lrwxrwxrwx 1 root root 76 Jun 13 14:17 model-00005-of-00005.safetensors -> ../../blobs/3bd574bf63e34081e97536f2a0ade1c9785a4145eb0ce293ea3ca0fbdfae290e
+lrwxrwxrwx 1 root root 52 Jun 13 14:17 model.safetensors.index.json -> ../../blobs/2a0f811a171bff98fe39e2c3b278d4121960c4c4
+lrwxrwxrwx 1 root root 52 Jun 13 14:17 quant_log.csv -> ../../blobs/6f25980c6db50876317ac03f3bd938f66d4a3aa7
+lrwxrwxrwx 1 root root 52 Jun 13 14:17 quantize_config.json -> ../../blobs/4bee5eedf6b1c384f3167b4fd863abb563baefa4
+lrwxrwxrwx 1 root root 52 Jun 13 14:17 special_tokens_map.json -> ../../blobs/cf3ad01701953e98f92b26eb6873c817e33e0965
+lrwxrwxrwx 1 root root 76 Jun 13 14:17 tokenizer.json -> ../../blobs/4667f2089529e8e7657cfb6d1c19910ae71ff5f28aa7ab2ff2763330affad795
+lrwxrwxrwx 1 root root 76 Jun 13 14:17 tokenizer.model -> ../../blobs/1299c11d7cf632ef3b4e11937501358ada021bbdf7c47638d13c0ee982f2e79c
+lrwxrwxrwx 1 root root 52 Jun 13 14:17 tokenizer_config.json -> ../../blobs/c3982b0be2a8507dfb259910bf602c07a0c7243a

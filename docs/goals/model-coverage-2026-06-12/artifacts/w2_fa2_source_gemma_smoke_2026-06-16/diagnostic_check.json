@@ -1,0 +1,8 @@
+{
+  "bench_rc": null,
+  "ok": false,
+  "reason": "artifact-local ferrum.toml contained only [runtime], failed to inject config-file runtime entries, so serve selected legacy_paged_varlen; no bench was run",
+  "release_grade": false,
+  "rows": [],
+  "selected_attention_prefill_mixed_backend": "legacy_paged_varlen"
+}

@@ -1,0 +1,68 @@
+{
+  "timestamp": "2026-06-25T11:23:40+08:00",
+  "target_sha": "9fda1101",
+  "target_lane": "W3 Qwen35 c32 mixed-prefill immediate-KV diagnostic",
+  "live_vllm_ran": false,
+  "retained_instance": {
+    "id": 42216671,
+    "gpu_name": "RTX 4090",
+    "num_gpus": 1,
+    "dph_total": 0.47777777777777775,
+    "cuda_max_good": 12.8,
+    "start_response": {
+      "success": false,
+      "msg": "Required resources are currently unavailable, state change queued."
+    },
+    "polls_observed": 6,
+    "final_state": {
+      "cur_state": "stopped",
+      "actual_status": "exited",
+      "intended_status": "stopped"
+    }
+  },
+  "exact_1x4090_candidates": [
+    {
+      "id": 32668905,
+      "gpu_ram": 24564,
+      "cuda_max_good": 13.0,
+      "dph_total": 0.13555555555555554,
+      "disk_space": 821.2375,
+      "reliability2": 0.9982716,
+      "verification": "deverified",
+      "rentable": false
+    },
+    {
+      "id": 30872861,
+      "gpu_ram": 24564,
+      "cuda_max_good": 12.4,
+      "dph_total": 0.16888888888888887,
+      "disk_space": 3148.0,
+      "reliability2": 0.9944766,
+      "verification": "unverified",
+      "rentable": false
+    },
+    {
+      "id": 42061573,
+      "gpu_ram": 49140,
+      "cuda_max_good": 13.0,
+      "dph_total": 0.27037037037037037,
+      "disk_space": 419.31666666666666,
+      "reliability2": 0.9637168,
+      "verification": "verified",
+      "rentable": false
+    }
+  ],
+  "new_instance_created": false,
+  "diagnostic_ran": false,
+  "final_instances": [
+    {
+      "id": 42216671,
+      "cur_state": "stopped",
+      "actual_status": "exited",
+      "intended_status": "stopped",
+      "gpu_name": "RTX 4090",
+      "num_gpus": 1,
+      "dph_total": 0.47777777777777775
+    }
+  ]
+}

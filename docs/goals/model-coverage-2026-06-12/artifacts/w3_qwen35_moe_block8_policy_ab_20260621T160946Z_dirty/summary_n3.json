@@ -1,0 +1,93 @@
+{
+  "artifact_dir": "/workspace/artifacts/w3_qwen35_moe_block8_policy_ab_20260621T160946Z_dirty",
+  "binary_sha256": "6490496e78ccb768a19f6933b3e0987092a17b5545b0e75574660fa21671baf5",
+  "default_block8_n3": {
+    "bad_output_per_run": [
+      0,
+      0,
+      0
+    ],
+    "completed_per_run": [
+      100,
+      100,
+      100
+    ],
+    "duplicate_done_per_run": [
+      0,
+      0,
+      0
+    ],
+    "errored_per_run": [
+      0,
+      0,
+      0
+    ],
+    "missing_done_per_run": [
+      0,
+      0,
+      0
+    ],
+    "moe_block_size_env": "default",
+    "output_token_count_source": "usage",
+    "output_tps": {
+      "ci95_hw": 259.8810517637914,
+      "mean": 627.4866287030608,
+      "stddev": 104.6077586751857
+    },
+    "output_tps_mean": 627.4866287030608,
+    "path": "/workspace/artifacts/w3_qwen35_moe_block8_policy_ab_20260621T160946Z_dirty/bench_default_block8_n3/bench_c32_100x3.json",
+    "zero_output_tokens_per_run": [
+      0,
+      0,
+      0
+    ]
+  },
+  "default_vs_vllm_mean_ratio_n3": 0.36726742774667726,
+  "diagnostic_only": true,
+  "forced_block16_n3": {
+    "bad_output_per_run": [
+      0,
+      0,
+      0
+    ],
+    "completed_per_run": [
+      100,
+      100,
+      100
+    ],
+    "duplicate_done_per_run": [
+      0,
+      0,
+      0
+    ],
+    "errored_per_run": [
+      0,
+      0,
+      0
+    ],
+    "missing_done_per_run": [
+      0,
+      0,
+      0
+    ],
+    "moe_block_size_env": "16",
+    "output_token_count_source": "usage",
+    "output_tps": {
+      "ci95_hw": 15.124401845857886,
+      "mean": 682.3350864003527,
+      "stddev": 6.087899705116051
+    },
+    "output_tps_mean": 682.3350864003527,
+    "path": "/workspace/artifacts/w3_qwen35_moe_block8_policy_ab_20260621T160946Z_dirty/bench_forced_block16_n3/bench_c32_100x3.json",
+    "zero_output_tokens_per_run": [
+      0,
+      0,
+      0
+    ]
+  },
+  "ratio_default_over_forced16_n3": 0.9196165362290777,
+  "schema_version": 1,
+  "status": "pass",
+  "vllm_80pct_target_mean": 1366.82228,
+  "vllm_c32_mean": 1708.52785
+}

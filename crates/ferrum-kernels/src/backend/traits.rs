@@ -5,6 +5,7 @@ use ferrum_types::{FerrumError, Result};
 pub use super::capabilities::{
     BackendCollective, BackendGraph, BackendMoeFused, BackendQuantGguf, BackendQuantMarlin,
 };
+use super::dtype::Dtype;
 pub use super::types::MoeRouting;
 use super::types::{AttnConfig, KvCacheQuant, SrcDtype};
 
@@ -87,6 +88,16 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// Flush accumulated work and wait for completion.
     /// CPU: no-op. Metal: commit + waitUntilCompleted. CUDA: stream sync.
     fn sync(ctx: &mut Self::Context);
+
+    /// Whether the backend context is currently inside a graph-capture window.
+    ///
+    /// Synchronizing a CUDA stream while capture is active raises
+    /// `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`; diagnostic probes that time
+    /// sub-ops with explicit sync boundaries must skip those boundaries while
+    /// this returns true. Backends without graph capture use the default.
+    fn graph_capture_in_flight(_ctx: &Self::Context) -> bool {
+        false
+    }
 
     /// Prepare pending GPU work for a following host readback.
     ///
@@ -231,6 +242,524 @@ pub trait Backend: Send + Sync + Sized + 'static {
         Err(FerrumError::unsupported(
             "mla_attention not implemented for this backend; required by \
              DeepSeek V2/V3 (Phase D/E)",
+        ))
+    }
+
+    /// Recurrent gated DeltaNet update used by linear-attention layers.
+    ///
+    /// Layouts are token-major:
+    /// - `query` / `key`: `[tokens, key_heads, key_dim]`
+    /// - `value` / `out`: `[tokens, value_heads, value_dim]`
+    /// - `g` / `beta`: `[tokens, value_heads]`
+    /// - `initial_state` / `final_state`: `[value_heads, value_dim, key_dim]`
+    ///
+    /// Backends may require these buffers to be F32. CUDA currently provides
+    /// the native W3 path; unsupported backends should use the model-level
+    /// reference path instead of silently round-tripping through the host.
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_f32(
+        _ctx: &mut Self::Context,
+        _query: &Self::Buffer,
+        _key: &Self::Buffer,
+        _value: &Self::Buffer,
+        _g: &Self::Buffer,
+        _beta: &Self::Buffer,
+        _initial_state: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _final_state: &mut Self::Buffer,
+        _tokens: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _use_qk_l2norm: bool,
+        _scale: f32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "recurrent_gated_delta_rule_f32 not implemented for this backend",
+        ))
+    }
+
+    /// Batched one-token recurrent gated DeltaNet update.
+    ///
+    /// Layouts are independent-sequence token-major:
+    /// - `query` / `key`: `[batch, key_heads, key_dim]`
+    /// - `value` / `out`: `[batch, value_heads, value_dim]`
+    /// - `g` / `beta`: `[batch, value_heads]`
+    /// - `initial_states` / `final_states`: `[batch, value_heads, value_dim, key_dim]`
+    ///
+    /// This is the decode-time counterpart of
+    /// [`Self::recurrent_gated_delta_rule_f32`] for continuous batching. Each
+    /// batch row has its own recurrent state; there is no temporal dependency
+    /// across rows.
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_batch_f32(
+        _ctx: &mut Self::Context,
+        _query: &Self::Buffer,
+        _key: &Self::Buffer,
+        _value: &Self::Buffer,
+        _g: &Self::Buffer,
+        _beta: &Self::Buffer,
+        _initial_states: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _final_states: &mut Self::Buffer,
+        _batch: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _use_qk_l2norm: bool,
+        _scale: f32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "recurrent_gated_delta_rule_batch_f32 not implemented for this backend",
+        ))
+    }
+
+    /// Whether this backend can update Qwen3.5 decode-time recurrent state
+    /// directly from a persistent slot-indexed state slab.
+    fn supports_qwen35_indexed_recurrent_state() -> bool {
+        false
+    }
+
+    /// Persistent state-slab dtype supported by the fast indexed Qwen3.5 GDN
+    /// kernels. Activation/cache dtype alone is not sufficient: each backend
+    /// must report the dtype its indexed conv and DeltaNet kernels can update
+    /// directly.
+    fn qwen35_indexed_recurrent_state_dtype() -> Dtype {
+        Dtype::F32
+    }
+
+    /// Whether this backend can consume Qwen3.5 GDN decode projections in the
+    /// vLLM-packed layout:
+    /// - `in_proj_qkvz`: `[q, k, v, z]`
+    /// - `in_proj_ba`: `[b, a]`
+    ///
+    /// This avoids two small decode projection launches and lets the prepare
+    /// kernel split the packed outputs while updating indexed recurrent state.
+    fn supports_qwen35_packed_gdn_decode_prepare() -> bool {
+        false
+    }
+
+    /// Whether this backend can consume Qwen3.5 GDN prefill projections in the
+    /// vLLM-packed layout:
+    /// - `in_proj_qkvz`: `[q, k, v, z]`
+    /// - `in_proj_ba`: `[b, a]`
+    ///
+    /// This avoids two projection launches on chunked/varlen prefill and lets
+    /// the prepare kernel split the packed outputs while doing causal conv.
+    fn supports_qwen35_packed_gdn_prefill_prepare() -> bool {
+        false
+    }
+
+    /// Whether this backend can keep Qwen3.5 packed GDN decode projections
+    /// packed through the recurrent update, without splitting q/k/v/g/beta
+    /// into intermediate buffers.
+    fn supports_qwen35_packed_gdn_recurrent_decode() -> bool {
+        false
+    }
+
+    /// Batched one-token recurrent gated DeltaNet update over a persistent
+    /// slot-indexed state slab.
+    ///
+    /// Layouts:
+    /// - `query` / `key`: `[batch, key_heads, key_dim]`
+    /// - `value` / `out`: `[batch, value_heads, value_dim]`
+    /// - `g` / `beta`: `[batch, value_heads]`
+    /// - `state_slots`: `[max_slots, value_heads, value_dim, key_dim]`
+    /// - `slot_indices`: `[batch]` u32 indices into `state_slots`
+    ///
+    /// Each row reads and updates the state slot selected by `slot_indices[row]`.
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_batch_indexed_f32(
+        _ctx: &mut Self::Context,
+        _query: &Self::Buffer,
+        _key: &Self::Buffer,
+        _value: &Self::Buffer,
+        _g: &Self::Buffer,
+        _beta: &Self::Buffer,
+        _state_slots: &mut Self::Buffer,
+        _slot_indices: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _batch: usize,
+        _max_slots: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _use_qk_l2norm: bool,
+        _scale: f32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "recurrent_gated_delta_rule_batch_indexed_f32 not implemented for this backend",
+        ))
+    }
+
+    /// Batched one-token recurrent gated DeltaNet update directly from packed
+    /// decode-time q/k/v and raw b/a projections.
+    ///
+    /// Layouts:
+    /// - `mixed_qkv`: `[batch, q, k, v]` where q/k are
+    ///   `[key_heads, key_dim]` and v is `[value_heads, value_dim]`
+    /// - `ba_raw`: `[batch, b, a]` with each half `[value_heads]`
+    /// - `state_slots`: `[max_slots, value_heads, value_dim, key_dim]`
+    /// - `slot_indices`: `[batch]` u32 indices into `state_slots`
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_batch_indexed_packed_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkv: &Self::Buffer,
+        _ba_raw: &Self::Buffer,
+        _a_log: &Self::Buffer,
+        _dt_bias: &Self::Buffer,
+        _state_slots: &mut Self::Buffer,
+        _slot_indices: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _batch: usize,
+        _max_slots: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _scale: f32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "recurrent_gated_delta_rule_batch_indexed_packed_f32 not implemented for this backend",
+        ))
+    }
+
+    /// Variable-length batched recurrent gated DeltaNet prefill update.
+    ///
+    /// Layouts are token-major over all concatenated prefill chunks:
+    /// - `query` / `key`: `[total_tokens, key_heads, key_dim]`
+    /// - `value` / `out`: `[total_tokens, value_heads, value_dim]`
+    /// - `g` / `beta`: `[total_tokens, value_heads]`
+    /// - `cu_seqlens`: `[batch + 1]` u32 prefix sum into the flat token axis
+    /// - `initial_states` / `final_states`: `[batch, value_heads, value_dim, key_dim]`
+    ///
+    /// Each sequence advances independently from its own initial recurrent
+    /// state and writes one final state. This is the prefill counterpart of
+    /// [`Self::recurrent_gated_delta_rule_batch_f32`] and matches the
+    /// `cu_seqlens` shape used by vLLM-style chunked GDN prefill.
+    #[allow(clippy::too_many_arguments)]
+    fn recurrent_gated_delta_rule_varlen_f32(
+        _ctx: &mut Self::Context,
+        _query: &Self::Buffer,
+        _key: &Self::Buffer,
+        _value: &Self::Buffer,
+        _g: &Self::Buffer,
+        _beta: &Self::Buffer,
+        _initial_states: &Self::Buffer,
+        _cu_seqlens: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _final_states: &mut Self::Buffer,
+        _batch: usize,
+        _total_tokens: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _use_qk_l2norm: bool,
+        _scale: f32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "recurrent_gated_delta_rule_varlen_f32 not implemented for this backend",
+        ))
+    }
+
+    /// Prepare a gated-Delta linear-attention block:
+    /// depthwise causal conv + SiLU over `mixed_qkv_raw`, split into Q/K/V,
+    /// and compute GDN gates `g` and `beta`.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_prepare_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkv_raw: &Self::Buffer,
+        _conv_weight: &Self::Buffer,
+        _a_raw: &Self::Buffer,
+        _b_raw: &Self::Buffer,
+        _a_log: &Self::Buffer,
+        _dt_bias: &Self::Buffer,
+        _query: &mut Self::Buffer,
+        _key: &mut Self::Buffer,
+        _value: &mut Self::Buffer,
+        _g: &mut Self::Buffer,
+        _beta: &mut Self::Buffer,
+        _tokens: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _conv_kernel: usize,
+        _apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "linear_attention_prepare_f32 not implemented for this backend",
+        ))
+    }
+
+    /// Varlen prefill-time gated-Delta linear-attention preparation.
+    ///
+    /// This is the batched/stateful counterpart of
+    /// [`Self::linear_attention_prepare_f32`]:
+    /// - `mixed_qkv_raw`: `[total_tokens, conv_channels]`
+    /// - `a_raw` / `b_raw` / `g` / `beta`: `[total_tokens, value_heads]`
+    /// - `query` / `key`: `[total_tokens, key_heads, key_dim]`
+    /// - `value`: `[total_tokens, value_heads, value_dim]`
+    /// - `cu_seqlens`: `[batch + 1]` u32 prefix sum into the flat token axis
+    /// - `token_seq_indices`: `[total_tokens]` u32 sequence row per flat token
+    /// - `initial_conv_states` / `final_conv_states`:
+    ///   `[batch, conv_channels, conv_kernel - 1]`
+    ///
+    /// Each sequence's depthwise causal conv reads only that sequence plus its
+    /// own initial conv state and writes one final conv state. That boundary
+    /// handling is required before a varlen recurrent GDN pass can be used for
+    /// product prefill batching.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_prepare_varlen_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkv_raw: &Self::Buffer,
+        _conv_weight: &Self::Buffer,
+        _initial_conv_states: &Self::Buffer,
+        _a_raw: &Self::Buffer,
+        _b_raw: &Self::Buffer,
+        _a_log: &Self::Buffer,
+        _dt_bias: &Self::Buffer,
+        _cu_seqlens: &Self::Buffer,
+        _token_seq_indices: &Self::Buffer,
+        _query: &mut Self::Buffer,
+        _key: &mut Self::Buffer,
+        _value: &mut Self::Buffer,
+        _g: &mut Self::Buffer,
+        _beta: &mut Self::Buffer,
+        _final_conv_states: &mut Self::Buffer,
+        _batch: usize,
+        _total_tokens: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _conv_kernel: usize,
+        _apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "linear_attention_prepare_varlen_f32 not implemented for this backend",
+        ))
+    }
+
+    /// Varlen prefill-time gated-Delta linear-attention preparation from
+    /// vLLM-packed Qwen3.5 projections.
+    ///
+    /// Layouts:
+    /// - `mixed_qkvz_raw`: `[total_tokens, q, k, v, z]`
+    /// - `ba_raw`: `[total_tokens, b, a]`
+    /// - `z`: `[total_tokens, value_heads, value_dim]`
+    /// Other outputs and state layouts match [`Self::linear_attention_prepare_varlen_f32`].
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_prepare_varlen_packed_qkvz_ba_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkvz_raw: &Self::Buffer,
+        _ba_raw: &Self::Buffer,
+        _conv_weight: &Self::Buffer,
+        _initial_conv_states: &Self::Buffer,
+        _a_log: &Self::Buffer,
+        _dt_bias: &Self::Buffer,
+        _cu_seqlens: &Self::Buffer,
+        _token_seq_indices: &Self::Buffer,
+        _query: &mut Self::Buffer,
+        _key: &mut Self::Buffer,
+        _value: &mut Self::Buffer,
+        _z: &mut Self::Buffer,
+        _g: &mut Self::Buffer,
+        _beta: &mut Self::Buffer,
+        _final_conv_states: &mut Self::Buffer,
+        _batch: usize,
+        _total_tokens: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _conv_kernel: usize,
+        _apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "linear_attention_prepare_varlen_packed_qkvz_ba_f32 not implemented for this backend",
+        ))
+    }
+
+    /// Decode-time gated-Delta linear-attention preparation for one token.
+    ///
+    /// This is the stateful counterpart of [`Self::linear_attention_prepare_f32`]:
+    /// it reads `[conv_channels, conv_kernel - 1]` causal-conv state, appends the
+    /// current raw QKV token, writes the next conv state, then emits Q/K/V and
+    /// GDN gates for the current token. The layout mirrors vLLM's Qwen GDN
+    /// `conv_state` + temporal-state split.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkv_raw: &Self::Buffer,
+        _conv_weight: &Self::Buffer,
+        _conv_state: &Self::Buffer,
+        _a_raw: &Self::Buffer,
+        _b_raw: &Self::Buffer,
+        _a_log: &Self::Buffer,
+        _dt_bias: &Self::Buffer,
+        _query: &mut Self::Buffer,
+        _key: &mut Self::Buffer,
+        _value: &mut Self::Buffer,
+        _g: &mut Self::Buffer,
+        _beta: &mut Self::Buffer,
+        _next_conv_state: &mut Self::Buffer,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _conv_kernel: usize,
+        _apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "linear_attention_decode_prepare_f32 not implemented for this backend",
+        ))
+    }
+
+    /// Batched stateful one-token linear-attention preparation.
+    ///
+    /// This processes `batch` independent decode rows:
+    /// - `mixed_qkv_raw`: `[batch, conv_channels]`
+    /// - `conv_states` / `next_conv_states`: `[batch, conv_channels, conv_kernel - 1]`
+    /// - `a_raw` / `b_raw` / `g` / `beta`: `[batch, value_heads]`
+    /// - `query` / `key`: `[batch, key_heads, key_dim]`
+    /// - `value`: `[batch, value_heads, value_dim]`
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_batch_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkv_raw: &Self::Buffer,
+        _conv_weight: &Self::Buffer,
+        _conv_states: &Self::Buffer,
+        _a_raw: &Self::Buffer,
+        _b_raw: &Self::Buffer,
+        _a_log: &Self::Buffer,
+        _dt_bias: &Self::Buffer,
+        _query: &mut Self::Buffer,
+        _key: &mut Self::Buffer,
+        _value: &mut Self::Buffer,
+        _g: &mut Self::Buffer,
+        _beta: &mut Self::Buffer,
+        _next_conv_states: &mut Self::Buffer,
+        _batch: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _conv_kernel: usize,
+        _apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "linear_attention_decode_prepare_batch_f32 not implemented for this backend",
+        ))
+    }
+
+    /// Batched stateful one-token linear-attention preparation over a
+    /// persistent slot-indexed conv-state slab.
+    ///
+    /// `conv_state_slots` has layout `[max_slots, conv_channels, conv_kernel-1]`
+    /// and is updated in place at `slot_indices[row]`.
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_batch_indexed_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkv_raw: &Self::Buffer,
+        _conv_weight: &Self::Buffer,
+        _conv_state_slots: &mut Self::Buffer,
+        _slot_indices: &Self::Buffer,
+        _a_raw: &Self::Buffer,
+        _b_raw: &Self::Buffer,
+        _a_log: &Self::Buffer,
+        _dt_bias: &Self::Buffer,
+        _query: &mut Self::Buffer,
+        _key: &mut Self::Buffer,
+        _value: &mut Self::Buffer,
+        _g: &mut Self::Buffer,
+        _beta: &mut Self::Buffer,
+        _batch: usize,
+        _max_slots: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _conv_kernel: usize,
+        _apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "linear_attention_decode_prepare_batch_indexed_f32 not implemented for this backend",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkvz_raw: &Self::Buffer,
+        _ba_raw: &Self::Buffer,
+        _conv_weight: &Self::Buffer,
+        _conv_state_slots: &mut Self::Buffer,
+        _slot_indices: &Self::Buffer,
+        _a_log: &Self::Buffer,
+        _dt_bias: &Self::Buffer,
+        _query: &mut Self::Buffer,
+        _key: &mut Self::Buffer,
+        _value: &mut Self::Buffer,
+        _z: &mut Self::Buffer,
+        _g: &mut Self::Buffer,
+        _beta: &mut Self::Buffer,
+        _batch: usize,
+        _max_slots: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _conv_kernel: usize,
+        _apply_qk_l2norm: bool,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "linear_attention_decode_prepare_batch_indexed_packed_qkvz_ba_f32 not implemented for this backend",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32(
+        _ctx: &mut Self::Context,
+        _mixed_qkvz_raw: &Self::Buffer,
+        _conv_weight: &Self::Buffer,
+        _conv_state_slots: &mut Self::Buffer,
+        _slot_indices: &Self::Buffer,
+        _mixed_qkv: &mut Self::Buffer,
+        _z: &mut Self::Buffer,
+        _batch: usize,
+        _max_slots: usize,
+        _key_heads: usize,
+        _value_heads: usize,
+        _key_dim: usize,
+        _value_dim: usize,
+        _conv_kernel: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "linear_attention_decode_prepare_batch_indexed_packed_qkvz_to_mixed_f32 not implemented for this backend",
+        ))
+    }
+
+    /// Gated RMSNorm used after recurrent DeltaNet core:
+    /// `out = rms_norm(core) * weight * silu(z)`.
+    #[allow(clippy::too_many_arguments)]
+    fn gated_rms_norm_f32(
+        _ctx: &mut Self::Context,
+        _core: &Self::Buffer,
+        _z: &Self::Buffer,
+        _weight: &Self::Buffer,
+        _out: &mut Self::Buffer,
+        _tokens: usize,
+        _heads: usize,
+        _dim: usize,
+        _eps: f32,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "gated_rms_norm_f32 not implemented for this backend",
         ))
     }
 
@@ -380,6 +909,145 @@ pub trait Backend: Send + Sync + Sized + 'static {
         mode: i32,
     );
 
+    /// Q/K preparation variant for Qwen3.5 full attention.
+    ///
+    /// `input_stride` is the per-token feature width in `input`, and
+    /// `input_offset` is the first feature for this projection inside each
+    /// token row. This lets Q read the first `num_heads * head_dim` slice from
+    /// Qwen3.5's gated `q_proj` output while leaving the attention gate slice
+    /// in place for a later device-side post-op.
+    ///
+    /// `rope_dim` may be smaller than `head_dim`; dimensions outside
+    /// `rope_dim` are normalized and copied but not rotated. `mode` follows
+    /// [`Backend::qk_norm_rope`]: 0 transpose only, 1 RMSNorm+RoPE, 2 RoPE
+    /// only, 3 RMSNorm+interleaved RoPE for Qwen3.5's mrope layout.
+    #[allow(clippy::too_many_arguments)]
+    fn qk_norm_rope_partial(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        norm_w: &Self::Buffer,
+        cos: &Self::Buffer,
+        sin: &Self::Buffer,
+        output: &mut Self::Buffer,
+        tokens: usize,
+        heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        input_stride: usize,
+        input_offset: usize,
+        input_head_stride: usize,
+        pos_offset: usize,
+        eps: f32,
+        mode: i32,
+    ) -> Result<()> {
+        if rope_dim == head_dim
+            && input_stride == heads * head_dim
+            && input_offset == 0
+            && input_head_stride == head_dim
+            && mode != 3
+        {
+            Self::qk_norm_rope(
+                ctx, input, norm_w, cos, sin, output, tokens, heads, head_dim, pos_offset, eps,
+                mode,
+            );
+            return Ok(());
+        }
+        Err(FerrumError::unsupported(
+            "qk_norm_rope_partial not implemented for this backend",
+        ))
+    }
+
+    /// Apply Qwen3.5 attention output gate in place. Gated Qwen3.5 full
+    /// attention stores q_proj rows as per-head `[query, gate]` slices, so
+    /// `context[token, head, dim] *= sigmoid(q_proj[token, head, head_dim + dim])`.
+    ///
+    /// The CUDA implementation is a single device kernel. Backends that do not
+    /// implement it must fail rather than silently copying data through host
+    /// memory on product paths.
+    fn qwen35_apply_attention_gate(
+        _ctx: &mut Self::Context,
+        _context: &mut Self::Buffer,
+        _query_raw: &Self::Buffer,
+        _tokens: usize,
+        _q_total: usize,
+        _q_proj_total: usize,
+        _head_dim: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "qwen35_apply_attention_gate not implemented for this backend",
+        ))
+    }
+
+    /// Apply one scalar gate per token to a token-major hidden buffer:
+    /// `values[token, dim] *= sigmoid(gate[token])`.
+    fn qwen35_apply_token_gate(
+        _ctx: &mut Self::Context,
+        _values: &mut Self::Buffer,
+        _gate: &Self::Buffer,
+        _tokens: usize,
+        _hidden_size: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "qwen35_apply_token_gate not implemented for this backend",
+        ))
+    }
+
+    /// Apply one scalar gate per token to `values`, then add the gated values
+    /// into `dst` in place:
+    /// `values[token, dim] *= sigmoid(gate[token])`;
+    /// `dst[token, dim] += values[token, dim]`.
+    ///
+    /// The default preserves the old two-dispatch behavior. CUDA overrides
+    /// this for Qwen3.5 sparse-MoE shared-expert decode, where it removes the
+    /// separate token-gate and merge launches while keeping the gated
+    /// `values` buffer available for tracing/debugging.
+    fn qwen35_apply_token_gate_and_add_inplace(
+        ctx: &mut Self::Context,
+        dst: &mut Self::Buffer,
+        values: &mut Self::Buffer,
+        gate: &Self::Buffer,
+        tokens: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        Self::qwen35_apply_token_gate(ctx, values, gate, tokens, hidden_size)?;
+        Self::add_inplace(ctx, dst, values, tokens * hidden_size);
+        Ok(())
+    }
+
+    /// Interleave shared-expert gate/up projections from token-major
+    /// `[tokens, intermediate]` buffers into `[tokens, 2 * intermediate]`.
+    ///
+    /// The default keeps backend behavior unchanged. CUDA overrides this to
+    /// avoid `2 * tokens` tiny device-to-device copies per MoE layer.
+    fn qwen35_interleave_gate_up(
+        ctx: &mut Self::Context,
+        gate: &Self::Buffer,
+        up: &Self::Buffer,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        intermediate: usize,
+    ) -> Result<()> {
+        for token in 0..tokens {
+            Self::copy_slice(
+                ctx,
+                gate,
+                token * intermediate,
+                out,
+                token * 2 * intermediate,
+                intermediate,
+            );
+            Self::copy_slice(
+                ctx,
+                up,
+                token * intermediate,
+                out,
+                token * 2 * intermediate + intermediate,
+                intermediate,
+            );
+        }
+        Ok(())
+    }
+
     /// Batched kv_cache_append across M caches in one launch. Each item
     /// writes its (head-major) K-or-V row into its own cache at offset
     /// read from `cache_lens[i]`. Replaces M sequential
@@ -429,6 +1097,9 @@ pub trait Backend: Send + Sync + Sized + 'static {
     /// `kernels/batched_decode_attention.cu`).
     /// `kv_lens`: device buffer (u32 storage, length ≥ m) — same
     /// design as `kv_cache_append_batched_per_cache::cache_lens`.
+    /// `sliding_window`: common decode window for every item; `0` means
+    /// full causal attention, `w > 0` means each item attends only to the
+    /// last `w` valid KV positions.
     fn flash_attention_batched_per_cache(
         _ctx: &mut Self::Context,
         _q: &Self::Buffer,
@@ -442,6 +1113,7 @@ pub trait Backend: Send + Sync + Sized + 'static {
         _scale: f32,
         _max_valid_kv: usize,
         _capacity: usize,
+        _sliding_window: usize,
         _slot: usize,
     ) -> Result<()> {
         Err(FerrumError::unsupported(
@@ -706,6 +1378,131 @@ pub trait Backend: Send + Sync + Sized + 'static {
         Self::copy_slice(ctx, &src, 0, dst, 0, data.len());
     }
 
+    /// Convert a typed F32 device buffer into the backend activation dtype.
+    ///
+    /// CUDA activations are FP16 for tensor-core/Marlin kernels, while the
+    /// Qwen3.5 gated-Delta core keeps recurrent math in F32. Backends with
+    /// non-F32 activations should override this with a device-side conversion.
+    fn f32_to_activation(
+        ctx: &mut Self::Context,
+        input_f32: &Self::Buffer,
+        out: &mut Self::Buffer,
+        len: usize,
+    ) {
+        Self::sync(ctx);
+        let values = Self::to_vec(input_f32, len);
+        Self::write_f32_to_activation(ctx, out, &values);
+    }
+
+    /// Whether this backend can keep Gemma-style sandwich residuals in a
+    /// device-side F32 shadow while continuing to feed FP16 activations into
+    /// projection kernels. The default is false so existing CPU/Metal paths
+    /// keep their current host-side fallback behavior.
+    fn supports_device_f32_residual_shadow() -> bool {
+        false
+    }
+
+    /// Copy an activation buffer into a typed F32 shadow buffer.
+    fn activation_to_f32_shadow(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        dst_f32: &mut Self::Buffer,
+        len: usize,
+    ) {
+        let data = Self::to_vec(src, len);
+        Self::write_typed::<f32>(ctx, dst_f32, &data);
+    }
+
+    /// Add an activation buffer directly into an existing F32 residual shadow.
+    ///
+    /// `scratch_f32` is provided for portable fallback implementations. CUDA can
+    /// fuse the activation-to-F32 conversion and residual add into one kernel.
+    fn activation_add_to_f32_shadow(
+        ctx: &mut Self::Context,
+        src: &Self::Buffer,
+        residual_f32: &mut Self::Buffer,
+        scratch_f32: &mut Self::Buffer,
+        len: usize,
+    ) {
+        Self::activation_to_f32_shadow(ctx, src, scratch_f32, len);
+        Self::add_inplace(ctx, residual_f32, scratch_f32, len);
+    }
+
+    /// RMSNorm an activation buffer and write the result into a typed F32
+    /// scratch buffer. Used for Gemma post-attn/post-ffn branch norms.
+    fn rms_norm_activation_to_f32(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        weight: &Self::Buffer,
+        eps: f32,
+        out_f32: &mut Self::Buffer,
+        tokens: usize,
+        dim: usize,
+    ) {
+        let input_h = Self::to_vec(input, tokens * dim);
+        let weight_h = Self::to_vec(weight, dim);
+        let mut out = vec![0.0f32; tokens * dim];
+        for row in 0..tokens {
+            let offset = row * dim;
+            let mut variance = 0.0f32;
+            for i in 0..dim {
+                let x = input_h[offset + i];
+                variance += x * x;
+            }
+            let inv_rms = (variance / dim as f32 + eps).sqrt().recip();
+            for i in 0..dim {
+                out[offset + i] = input_h[offset + i] * inv_rms * weight_h[i];
+            }
+        }
+        Self::write_typed::<f32>(ctx, out_f32, &out);
+    }
+
+    /// RMSNorm an activation buffer and add the F32 result directly into an
+    /// existing F32 residual shadow. `scratch_f32` is provided for backend
+    /// fallbacks that need to materialize the normalized branch.
+    fn rms_norm_activation_add_to_f32(
+        ctx: &mut Self::Context,
+        input: &Self::Buffer,
+        weight: &Self::Buffer,
+        eps: f32,
+        residual_f32: &mut Self::Buffer,
+        scratch_f32: &mut Self::Buffer,
+        tokens: usize,
+        dim: usize,
+    ) {
+        Self::rms_norm_activation_to_f32(ctx, input, weight, eps, scratch_f32, tokens, dim);
+        Self::add_inplace(ctx, residual_f32, scratch_f32, tokens * dim);
+    }
+
+    /// RMSNorm a typed F32 shadow buffer and write the normalized result back
+    /// to the backend's regular activation dtype.
+    fn rms_norm_f32_to_activation(
+        ctx: &mut Self::Context,
+        input_f32: &Self::Buffer,
+        weight: &Self::Buffer,
+        eps: f32,
+        out: &mut Self::Buffer,
+        tokens: usize,
+        dim: usize,
+    ) {
+        let input_h = Self::to_vec(input_f32, tokens * dim);
+        let weight_h = Self::to_vec(weight, dim);
+        let mut normed = vec![0.0f32; tokens * dim];
+        for row in 0..tokens {
+            let offset = row * dim;
+            let mut variance = 0.0f32;
+            for i in 0..dim {
+                let x = input_h[offset + i];
+                variance += x * x;
+            }
+            let inv_rms = (variance / dim as f32 + eps).sqrt().recip();
+            for i in 0..dim {
+                normed[offset + i] = input_h[offset + i] * inv_rms * weight_h[i];
+            }
+        }
+        Self::write_f32_to_activation(ctx, out, &normed);
+    }
+
     /// Greedy-decode fast path: GPU argmax over each row of a
     /// `[m, n]` FP16 logits buffer, returning the m token indices on the
     /// host. Saves `m × n × 2` bytes of D2H per call (e.g. 19.5 MB at
@@ -736,6 +1533,42 @@ pub trait Backend: Send + Sync + Sized + 'static {
             out.push(max_idx as u32);
         }
         Ok(out)
+    }
+
+    fn argmax_rows_f16_masked(
+        _ctx: &mut Self::Context,
+        _logits: &Self::Buffer,
+        _valid_token_mask: &Self::Buffer,
+        _mask_len: usize,
+        _m: usize,
+        _n: usize,
+    ) -> Result<Vec<u32>> {
+        Err(FerrumError::unsupported(
+            "masked GPU argmax is not implemented for this backend",
+        ))
+    }
+
+    /// Greedy-decode fast path with sparse repetition penalty.
+    ///
+    /// `row_offsets` has length `m + 1` and indexes into `token_ids`; row `r`
+    /// owns `token_ids[row_offsets[r]..row_offsets[r + 1]]`. Backends should
+    /// apply each row's `repetition_penalties[r]` to those logits in-place,
+    /// then run raw or masked argmax and return one token id per row.
+    #[allow(clippy::too_many_arguments)]
+    fn argmax_rows_f16_sparse_repetition_penalty(
+        _ctx: &mut Self::Context,
+        _logits: &mut Self::Buffer,
+        _valid_token_mask: Option<(&Self::Buffer, usize)>,
+        _row_offsets: &Self::Buffer,
+        _token_ids: &Self::Buffer,
+        _repetition_penalties: &Self::Buffer,
+        _total_token_ids: usize,
+        _m: usize,
+        _n: usize,
+    ) -> Result<Vec<u32>> {
+        Err(FerrumError::unsupported(
+            "sparse repetition-penalty GPU argmax is not implemented for this backend",
+        ))
     }
 
     /// Load a weight tensor straight from its on-disk byte representation,
@@ -954,8 +1787,9 @@ pub trait BackendPagedKv: Backend {
     ///   position of each seq's first q token (= prior `kv_len`).
     /// - `block_tables`: `[num_seqs, max_num_blocks_per_seq]` i32 grid.
     ///
-    /// Each query token attends causally to all KV positions
-    /// `[0, pos_offsets[s] + local_idx]`.
+    /// Each query token attends causally to KV positions
+    /// `[0, pos_offsets[s] + local_idx]` when `sliding_window == 0`, or
+    /// only the most recent `sliding_window` positions when non-zero.
     #[allow(clippy::too_many_arguments)]
     fn paged_varlen_attention(
         _ctx: &mut Self::Context,
@@ -972,6 +1806,7 @@ pub trait BackendPagedKv: Backend {
         _num_heads: usize,
         _num_kv_heads: usize,
         _head_dim: usize,
+        _sliding_window: usize,
         _block_size: usize,
         _max_num_blocks_per_seq: usize,
     ) -> Result<()> {
@@ -1056,6 +1891,94 @@ pub trait BackendPagedKv: Backend {
     /// the layouts are not compatible. Default `false`.
     fn supports_vllm_paged_attn() -> bool {
         false
+    }
+
+    /// Qwen3.5 full-attention uses separate q/k/v projections and partial
+    /// RoPE/gated-Q layout, so it cannot use the fused-QKV paged writer
+    /// directly. Backends that implement this method can write those
+    /// separate projections into Ferrum's legacy paged pool consumed by
+    /// [`Self::paged_batched_decode_attention`].
+    fn supports_qwen35_paged_qkv() -> bool {
+        false
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_split_qkv_norm_rope_into_paged_cache_varlen(
+        _ctx: &mut Self::Context,
+        _query_raw: &Self::Buffer,
+        _key_raw: &Self::Buffer,
+        _value_raw: &Self::Buffer,
+        _q_norm_w: &Self::Buffer,
+        _k_norm_w: &Self::Buffer,
+        _cos: &Self::Buffer,
+        _sin: &Self::Buffer,
+        _q_out: &mut Self::Buffer,
+        _cache_k: &mut Self::Buffer,
+        _cache_v: &mut Self::Buffer,
+        _cu_seqlens_q: &Self::Buffer,
+        _token_seq_indices: &Self::Buffer,
+        _pos_offsets: &Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _num_seqs: usize,
+        _total_q_tokens: usize,
+        _q_heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _rope_dim: usize,
+        _q_proj_stride: usize,
+        _q_head_stride: usize,
+        _kv_proj_stride: usize,
+        _eps: f32,
+        _qk_mode: i32,
+        _block_size: usize,
+        _max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "qwen35_split_qkv_norm_rope_into_paged_cache_varlen not implemented for this backend",
+        ))
+    }
+
+    /// vLLM-layout variant of the Qwen3.5 separate q/k/v writer. K/V are
+    /// written in the layout consumed by [`Self::paged_decode_attention_v2`],
+    /// while Q remains token-major `[total_q_tokens, q_heads, head_dim]`.
+    fn supports_qwen35_paged_qkv_vllm() -> bool {
+        false
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_split_qkv_norm_rope_into_paged_cache_varlen_vllm(
+        _ctx: &mut Self::Context,
+        _query_raw: &Self::Buffer,
+        _key_raw: &Self::Buffer,
+        _value_raw: &Self::Buffer,
+        _q_norm_w: &Self::Buffer,
+        _k_norm_w: &Self::Buffer,
+        _cos: &Self::Buffer,
+        _sin: &Self::Buffer,
+        _q_out: &mut Self::Buffer,
+        _cache_k: &mut Self::Buffer,
+        _cache_v: &mut Self::Buffer,
+        _cu_seqlens_q: &Self::Buffer,
+        _token_seq_indices: &Self::Buffer,
+        _pos_offsets: &Self::Buffer,
+        _block_tables: &Self::Buffer,
+        _num_seqs: usize,
+        _total_q_tokens: usize,
+        _q_heads: usize,
+        _kv_heads: usize,
+        _head_dim: usize,
+        _rope_dim: usize,
+        _q_proj_stride: usize,
+        _q_head_stride: usize,
+        _kv_proj_stride: usize,
+        _eps: f32,
+        _qk_mode: i32,
+        _block_size: usize,
+        _max_blocks_per_seq: usize,
+    ) -> Result<()> {
+        Err(FerrumError::unsupported(
+            "qwen35_split_qkv_norm_rope_into_paged_cache_varlen_vllm not implemented for this backend",
+        ))
     }
 
     /// vLLM-layout variant of

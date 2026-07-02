@@ -1,0 +1,8 @@
+{
+  "selected_graph_mode": "legacy_batched_decode_graph",
+  "selected_attention_impl": "legacy_paged_decode",
+  "backend": "cuda",
+  "selected_max_sequences": 16,
+  "selected_kv_capacity": 256,
+  "selected_max_batched_tokens": 1024
+}

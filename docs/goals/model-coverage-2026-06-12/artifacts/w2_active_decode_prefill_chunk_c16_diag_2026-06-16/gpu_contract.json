@@ -1,0 +1,14 @@
+{
+  "correctness_gate": "release CUDA build; ferrum run 2+3; default and chunk32 serve chat smoke",
+  "diagnostic_only": true,
+  "expected_cost_usd": "0.18-0.32",
+  "expected_runtime_minutes": "25-45",
+  "hard_stop_minutes": 60,
+  "hardware": "1x NVIDIA GeForce RTX 4090",
+  "hourly_usd": 0.42488888888888887,
+  "instance_id": 40826362,
+  "lane": "W2 c16 active-decode prefill chunk diagnostic",
+  "performance_command": "ferrum bench-serve --dataset sharegpt --random-output-len 128 --concurrency-sweep 16 --num-prompts 64 --n-repeats 1 --fail-on-error --seed 9271",
+  "release_claim": false,
+  "stop_condition": "startup/SSH/CUDA/build/ferrum run/serve smoke first failure, or complete default vs chunk32 c16 diagnostic, artifact copied, instance confirmed exited"
+}

@@ -1,0 +1,17 @@
+/tmp/ferrum_dense_vllm_marlin_probe_build/vllm_marlin/marlin_template.h(245): warning #2190-D: GNU attributes on a template redeclaration have no effect (the attributes of the original declaration at line 43 of /tmp/ferrum_dense_vllm_marlin_probe_build/vllm_marlin/kernel.h apply instead)
+  __attribute__((visibility("default")))
+                 ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/tmp/ferrum_dense_vllm_marlin_probe_build/vllm_marlin/marlin_template.h(245): warning #2190-D: GNU attributes on a template redeclaration have no effect (the attributes of the original declaration at line 43 of /tmp/ferrum_dense_vllm_marlin_probe_build/vllm_marlin/kernel.h apply instead)
+  __attribute__((visibility("default")))
+                 ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+/tmp/ferrum_dense_vllm_marlin_probe_build/vllm_marlin/marlin_template.h:273:15: warning: ‘visibility’ attribute ignored [-Wattributes]
+  273 |     int max_shared_mem) {
+      |               ^
+/tmp/ferrum_dense_vllm_marlin_probe_build/vllm_marlin/marlin.cu:475: is_valid_config(thread_tfg, thread_m_blocks, prob_m_split, prob_n, prob_k, num_bits, group_size, has_act_order, is_k_full, has_zp, is_zp_float, is_a_8bit, stages, max_shared_mem_new) :: Invalid thread config: thread_m_blocks = 1, thread_k = -1, thread_n = -1, num_threads = -1 for MKN = [16, 5376, 8192] and num_bits = 4, prob_m_split = 16, group_size = 128, has_act_order = 0, is_k_full = 1, has_zp = 0, is_zp_float = 0, stages = 4, max_shared_mem_new = 101376
+scripts/microbenches/build_and_run_dense_vllm_marlin_gemma3_perf.sh: line 84:   546 Aborted                 "$OUT_BIN"

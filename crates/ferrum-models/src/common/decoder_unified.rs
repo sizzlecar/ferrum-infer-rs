@@ -97,17 +97,125 @@ pub fn compute_final_indices(
         .collect()
 }
 
+/// Compact key for host-side varlen-attention launch decisions captured in a
+/// unified CUDA graph.
+///
+/// The raw `max_kv_len` changes almost every decode step, but the non-split-K
+/// CUDA launcher sizes dynamic shared memory to `max(kv_capacity, max_kv_len)`.
+/// Within that configured capacity, replaying a graph captured at a shorter KV
+/// length is safe because the captured launch already reserved the same shared
+/// memory. Split-K still uses an exact chunk-shaped dynamic shared allocation,
+/// so keep it conservative there.
+pub fn unified_attention_launch_key(
+    total_q_tokens: usize,
+    num_seqs: usize,
+    max_kv_len: usize,
+    kv_capacity: usize,
+    split_k_attn: Option<bool>,
+) -> u64 {
+    let use_split_k = split_k_attn
+        .unwrap_or_else(|| total_q_tokens <= 64 && (num_seqs <= 4 || max_kv_len >= 768));
+    if use_split_k {
+        let num_splits = match max_kv_len {
+            kv if kv <= 384 => 2usize,
+            kv if kv <= 1024 => 4,
+            kv if kv <= 2048 => 8,
+            _ => 16,
+        };
+        let chunk = (max_kv_len + num_splits - 1) / num_splits;
+        return 0x7370_6c69_7400_0000u64 ^ ((num_splits as u64) << 32) ^ (chunk.max(1) as u64);
+    }
+
+    let shared_kv = kv_capacity.max(max_kv_len).max(1);
+    0x7368_6d65_6d00_0000u64 ^ (shared_kv as u64)
+}
+
 /// Graph cache key for a unified mixed-batch forward. High bit set so we
 /// never collide with legacy decode/batched keys (which use the low 63
 /// bits for `m_padded` / `SINGLE_ITEM = 0`).
 ///
-/// Keyed by `(m_total, num_seqs)` because the captured kernel launches
-/// bake in grid_dim / per-seq scratch indexing for that specific shape;
-/// reusing a graph for a different shape leads to wrong-shape memory
-/// access. (See memory `project_moe_phase3_graph_bug.md` for the same
-/// rationale in the legacy MoE path.)
-pub const fn unified_graph_key(m_total: usize, num_seqs: usize) -> u64 {
-    (1u64 << 63) | ((m_total as u64) << 32) | (num_seqs as u64)
+/// The captured region bakes in more than launch grid shape:
+/// - varlen attention freezes the dynamic shared-memory size and split-K
+///   branch represented by `attention_launch_key`;
+/// - final-token packing records concrete `copy_slice` offsets from
+///   `final_indices`.
+///
+/// Include those host-side shape decisions in the key so a graph is only
+/// replayed for the same captured launch/memcpy layout. Device buffers
+/// such as cu_seqlens, position offsets, and block tables remain dynamic.
+pub fn unified_graph_key(
+    m_total: usize,
+    num_seqs: usize,
+    attention_launch_key: u64,
+    final_indices: &[(usize, usize)],
+) -> u64 {
+    scoped_unified_graph_key(
+        0x6675_6c6c_5f67_7261,
+        m_total,
+        num_seqs,
+        attention_launch_key,
+        final_indices,
+    )
+}
+
+/// Graph cache key for a diagnostic unified graph that captures only the
+/// transformer layer loop. Final norm, final-row packing, and lm_head remain
+/// eager, so final-token offsets are intentionally not part of the key.
+pub fn unified_layers_only_graph_key(
+    m_total: usize,
+    num_seqs: usize,
+    attention_launch_key: u64,
+) -> u64 {
+    scoped_unified_graph_key(
+        0x6c61_7965_725f_6772,
+        m_total,
+        num_seqs,
+        attention_launch_key,
+        &[],
+    )
+}
+
+/// Graph cache key for a diagnostic unified graph that captures transformer
+/// layers plus final norm / final-row packing, while leaving lm_head eager.
+pub fn unified_lm_head_eager_graph_key(
+    m_total: usize,
+    num_seqs: usize,
+    attention_launch_key: u64,
+    final_indices: &[(usize, usize)],
+) -> u64 {
+    scoped_unified_graph_key(
+        0x6c6d_6865_5f65_6772,
+        m_total,
+        num_seqs,
+        attention_launch_key,
+        final_indices,
+    )
+}
+
+fn scoped_unified_graph_key(
+    scope_tag: u64,
+    m_total: usize,
+    num_seqs: usize,
+    attention_launch_key: u64,
+    final_indices: &[(usize, usize)],
+) -> u64 {
+    fn feed(mut hash: u64, value: u64) -> u64 {
+        hash ^= value;
+        hash = hash.wrapping_mul(0x100000001b3);
+        hash
+    }
+
+    let mut hash = 0xcbf29ce484222325u64;
+    hash = feed(hash, scope_tag);
+    hash = feed(hash, m_total as u64);
+    hash = feed(hash, num_seqs as u64);
+    hash = feed(hash, attention_launch_key);
+    hash = feed(hash, final_indices.len() as u64);
+    for &(orig_idx, global_idx) in final_indices {
+        hash = feed(hash, orig_idx as u64);
+        hash = feed(hash, global_idx as u64);
+    }
+    (1u64 << 63) | (hash & !(1u64 << 63))
 }
 
 #[cfg(test)]
@@ -161,11 +269,74 @@ mod tests {
 
     #[test]
     fn graph_key_high_bit_set() {
-        let k = unified_graph_key(32, 4);
+        let launch_key = unified_attention_launch_key(32, 4, 128, 512, None);
+        let k = unified_graph_key(32, 4, launch_key, &[(0, 0), (1, 1), (2, 2), (3, 3)]);
         assert!(k & (1u64 << 63) != 0, "high bit must be set");
         // Legacy key with same low bits should differ.
         let legacy = ((32u64) << 32) | 4u64;
         assert_ne!(k, legacy);
+    }
+
+    #[test]
+    fn attention_launch_key_coalesces_non_split_k_under_capacity() {
+        let short = unified_attention_launch_key(16, 16, 128, 512, None);
+        let longer_under_capacity = unified_attention_launch_key(16, 16, 256, 512, None);
+        let over_capacity = unified_attention_launch_key(16, 16, 640, 512, None);
+
+        assert_eq!(short, longer_under_capacity);
+        assert_ne!(short, over_capacity);
+    }
+
+    #[test]
+    fn attention_launch_key_keeps_split_k_chunk_shape() {
+        let short = unified_attention_launch_key(2, 2, 128, 512, None);
+        let longer = unified_attention_launch_key(2, 2, 256, 512, None);
+        let forced_off = unified_attention_launch_key(2, 2, 128, 512, Some(false));
+
+        assert_ne!(short, longer);
+        assert_ne!(short, forced_off);
+    }
+
+    #[test]
+    fn graph_key_uses_attention_launch_shape_and_final_offsets() {
+        let decode_final = vec![(0, 0), (1, 1)];
+        let same_launch_short = unified_attention_launch_key(16, 16, 128, 512, None);
+        let same_launch_long = unified_attention_launch_key(16, 16, 256, 512, None);
+        let over_capacity = unified_attention_launch_key(16, 16, 640, 512, None);
+        let same_grid_short_kv = unified_graph_key(16, 16, same_launch_short, &decode_final);
+        let same_grid_long_kv = unified_graph_key(16, 16, same_launch_long, &decode_final);
+        let different_launch = unified_graph_key(16, 16, over_capacity, &decode_final);
+        assert_eq!(same_grid_short_kv, same_grid_long_kv);
+        assert_ne!(same_grid_short_kv, different_launch);
+
+        let prefill_final = vec![(0, 4), (1, 5)];
+        let prefill_launch = unified_attention_launch_key(6, 2, 128, 512, None);
+        let different_final_offsets = unified_graph_key(6, 2, prefill_launch, &prefill_final);
+        let same_grid_other_offsets = unified_graph_key(6, 2, prefill_launch, &[(0, 2), (1, 5)]);
+        assert_ne!(different_final_offsets, same_grid_other_offsets);
+
+        let no_sample = unified_graph_key(6, 2, prefill_launch, &[]);
+        assert_ne!(different_final_offsets, no_sample);
+    }
+
+    #[test]
+    fn graph_key_distinguishes_capture_scope() {
+        let launch_short = unified_attention_launch_key(6, 2, 128, 512, None);
+        let launch_long = unified_attention_launch_key(6, 2, 640, 512, None);
+        let full_no_sample = unified_graph_key(6, 2, launch_short, &[]);
+        let layers_only = unified_layers_only_graph_key(6, 2, launch_short);
+        let lm_head_eager = unified_lm_head_eager_graph_key(6, 2, launch_short, &[(0, 4), (1, 5)]);
+        assert_ne!(full_no_sample, layers_only);
+        assert_ne!(full_no_sample, lm_head_eager);
+        assert_ne!(layers_only, lm_head_eager);
+        assert_ne!(
+            layers_only,
+            unified_layers_only_graph_key(6, 2, launch_long)
+        );
+        assert_ne!(
+            lm_head_eager,
+            unified_lm_head_eager_graph_key(6, 2, launch_long, &[(0, 4), (1, 5)])
+        );
     }
 
     #[test]

@@ -1,0 +1,41 @@
+[w2-c16] start 2026-06-16T20:14:56Z
+[w2-c16] root=/workspace/ferrum-infer-rs out=/workspace/w2_active_chunk_sharegpt_c16_ci_2026-06-17 model=gemma3:27b-gptq hf_home=/workspace/hf-cache dataset=/workspace/ascii_sharegpt_w2_100.jsonl
+[w2-c16] installing rustup minimal toolchain
+[w2-c16] CUDA release build
+
+real	0m0.298s
+user	0m0.214s
+sys	0m0.077s
+[w2-c16] correctness: ferrum run
+[w2-c16] correctness: ferrum serve streaming smoke
+[w2-c16] performance: ferrum serve + ShareGPT c16 CI
+--- stream summary ---
+{
+  "content": "5\n",
+  "done_count": 1,
+  "usage": {
+    "completion_tokens": 3,
+    "prompt_tokens": 23,
+    "total_tokens": 26
+  }
+}
+--- active chunk ---
+{
+  "matches": [
+    {
+      "affects": [
+        "performance"
+      ],
+      "effective_value": "16",
+      "key": "FERRUM_ACTIVE_DECODE_PREFILL_CHUNK",
+      "source": "default"
+    }
+  ]
+}
+--- bench stderr ---
+ferrum bench-serve — dataset=sharegpt num_prompts=100 warmup=10 n_repeats=3
+→ closed_loop c=16
+  cell closed_loop c=16 — repeat 1/3 (110 prompts including 10 warmup)
+--- summary ---
+--- tmux ---
+w2_c16_ci: 1 windows (created Tue Jun 16 20:14:56 2026)

@@ -109,6 +109,10 @@ pub struct BenchReport {
     pub actual_input_tokens: Option<TokenLengthStats>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_input_tokens_per_request: Option<Vec<Vec<u32>>>,
+    /// Per measured request output token counts for each repeat, in
+    /// completion order. Failed requests keep their recorded count, usually 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens_per_request: Option<Vec<Vec<u32>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_token_count_source: Option<String>,
     pub n_repeats: u32,
@@ -328,9 +332,11 @@ pub fn compute_metrics(
     let mut stream_bulk_flush_per_run = Vec::with_capacity(runs.len());
     let mut http_500_per_run = Vec::with_capacity(runs.len());
     let mut panic_per_run = Vec::with_capacity(runs.len());
+    let mut output_tokens_per_request = Vec::with_capacity(runs.len());
 
     for run in &runs {
         let success: Vec<&RequestRecord> = run.records.iter().filter(|r| r.success).collect();
+        output_tokens_per_request.push(run.records.iter().map(|r| r.output_tokens).collect());
         completed_per_run.push(success.len() as u32);
         errored_per_run.push((run.records.len() - success.len()) as u32);
         let mut quality = QualityIssueCounts::default();
@@ -394,6 +400,7 @@ pub fn compute_metrics(
         n_gen,
         actual_input_tokens: None,
         actual_input_tokens_per_request: None,
+        output_tokens_per_request: Some(output_tokens_per_request),
         output_token_count_source: None,
         n_repeats,
         n_requests_per_run,

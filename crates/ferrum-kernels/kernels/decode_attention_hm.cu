@@ -32,13 +32,17 @@ extern "C" __global__ void decode_attention_head_major_f16_dyn(
     const int head_dim,
     const int capacity,
     const int* __restrict__ valid_kv_len_ptr,  // device: single int32
-    const float scale
+    const float scale,
+    const int sliding_window
 ) {
     const int q_head = blockIdx.x;
     const int tid = threadIdx.x;
     const int nq_per_kv = num_q_heads / num_kv_heads;
     const int kv_head = q_head / nq_per_kv;
     const int valid_kv_len = valid_kv_len_ptr[0];
+    const int attend_start = (sliding_window > 0 && valid_kv_len > sliding_window)
+        ? valid_kv_len - sliding_window : 0;
+    const int active_kv_len = valid_kv_len - attend_start;
 
     const __half* q_ptr = q + q_head * head_dim;
     __half* out_ptr = output + q_head * head_dim;
@@ -48,18 +52,19 @@ extern "C" __global__ void decode_attention_head_major_f16_dyn(
 
     extern __shared__ float s_scores[];
 
-    for (int p = tid; p < valid_kv_len; p += blockDim.x) {
+    for (int local_p = tid; local_p < active_kv_len; local_p += blockDim.x) {
+        const int p = attend_start + local_p;
         const __half* k_ptr = k_head_base + (size_t)p * head_dim;
         float dot = 0.0f;
         for (int d = 0; d < head_dim; d++) {
             dot += __half2float(q_ptr[d]) * __half2float(k_ptr[d]);
         }
-        s_scores[p] = dot * scale;
+        s_scores[local_p] = dot * scale;
     }
     __syncthreads();
 
     float local_max = -1e30f;
-    for (int p = tid; p < valid_kv_len; p += blockDim.x) {
+    for (int p = tid; p < active_kv_len; p += blockDim.x) {
         if (s_scores[p] > local_max) local_max = s_scores[p];
     }
     float block_max = block_reduce_max(local_max);
@@ -69,7 +74,7 @@ extern "C" __global__ void decode_attention_head_major_f16_dyn(
     const float row_max = s_block_max;
 
     float local_sum = 0.0f;
-    for (int p = tid; p < valid_kv_len; p += blockDim.x) {
+    for (int p = tid; p < active_kv_len; p += blockDim.x) {
         float e = expf(s_scores[p] - row_max);
         s_scores[p] = e;
         local_sum += e;
@@ -82,9 +87,10 @@ extern "C" __global__ void decode_attention_head_major_f16_dyn(
 
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
-        for (int p = 0; p < valid_kv_len; p++) {
+        for (int local_p = 0; local_p < active_kv_len; local_p++) {
+            const int p = attend_start + local_p;
             const __half* v_ptr = v_head_base + (size_t)p * head_dim;
-            acc += s_scores[p] * __half2float(v_ptr[d]);
+            acc += s_scores[local_p] * __half2float(v_ptr[d]);
         }
         out_ptr[d] = __float2half(acc * inv_sum);
     }
@@ -100,12 +106,16 @@ extern "C" __global__ void decode_attention_head_major_f16(
     const int head_dim,
     const int capacity,
     const int valid_kv_len,
-    const float scale
+    const float scale,
+    const int sliding_window
 ) {
     const int q_head = blockIdx.x;
     const int tid = threadIdx.x;
     const int nq_per_kv = num_q_heads / num_kv_heads;
     const int kv_head = q_head / nq_per_kv;
+    const int attend_start = (sliding_window > 0 && valid_kv_len > sliding_window)
+        ? valid_kv_len - sliding_window : 0;
+    const int active_kv_len = valid_kv_len - attend_start;
 
     const __half* q_ptr = q + q_head * head_dim;
     __half* out_ptr = output + q_head * head_dim;
@@ -114,24 +124,25 @@ extern "C" __global__ void decode_attention_head_major_f16(
     const __half* k_head_base = k_cache + (size_t)kv_head * capacity * head_dim;
     const __half* v_head_base = v_cache + (size_t)kv_head * capacity * head_dim;
 
-    extern __shared__ float s_scores[]; // valid_kv_len entries
+    extern __shared__ float s_scores[]; // active_kv_len entries
 
     // ── Step 1: scores[p] = dot(Q, K[kv_head, p, :]) * scale ──
     // Each thread walks a subset of KV positions.
-    for (int p = tid; p < valid_kv_len; p += blockDim.x) {
+    for (int local_p = tid; local_p < active_kv_len; local_p += blockDim.x) {
+        const int p = attend_start + local_p;
         const __half* k_ptr = k_head_base + (size_t)p * head_dim;
         float dot = 0.0f;
         for (int d = 0; d < head_dim; d++) {
             dot += __half2float(q_ptr[d]) * __half2float(k_ptr[d]);
         }
-        s_scores[p] = dot * scale;
+        s_scores[local_p] = dot * scale;
     }
     __syncthreads();
 
     // ── Step 2: online softmax (single-pass max-stable) ──
     // Each thread computes a partial max over its slice, then reduce across block.
     float local_max = -1e30f;
-    for (int p = tid; p < valid_kv_len; p += blockDim.x) {
+    for (int p = tid; p < active_kv_len; p += blockDim.x) {
         if (s_scores[p] > local_max) local_max = s_scores[p];
     }
     float block_max = block_reduce_max(local_max);
@@ -142,7 +153,7 @@ extern "C" __global__ void decode_attention_head_major_f16(
 
     // Convert scores to exp(score - max), sum.
     float local_sum = 0.0f;
-    for (int p = tid; p < valid_kv_len; p += blockDim.x) {
+    for (int p = tid; p < active_kv_len; p += blockDim.x) {
         float e = expf(s_scores[p] - row_max);
         s_scores[p] = e;
         local_sum += e;
@@ -157,9 +168,10 @@ extern "C" __global__ void decode_attention_head_major_f16(
     // Each thread handles a subset of head_dim elements.
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
-        for (int p = 0; p < valid_kv_len; p++) {
+        for (int local_p = 0; local_p < active_kv_len; local_p++) {
+            const int p = attend_start + local_p;
             const __half* v_ptr = v_head_base + (size_t)p * head_dim;
-            acc += s_scores[p] * __half2float(v_ptr[d]);
+            acc += s_scores[local_p] * __half2float(v_ptr[d]);
         }
         out_ptr[d] = __float2half(acc * inv_sum);
     }

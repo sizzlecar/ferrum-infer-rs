@@ -1,0 +1,10 @@
+[microbench] compiling scripts/microbenches/paged_varlen_split_qkv_correctness.cu + crates/ferrum-kernels/kernels/split_qkv_norm_rope_into_paged_cache.cu + crates/ferrum-kernels/kernels/paged_varlen_attention.cu
+-rwxr-xr-x 1 root root 159440 Jun 15 20:56 /tmp/paged_varlen_split_qkv_correctness
+
+[microbench] running /tmp/paged_varlen_split_qkv_correctness
+qk_mode=1 sliding_window=0 q_err=0.00000000 k_err=0.00000000 v_err=0.00000000 attn_err=0.00012147 ok
+qk_mode=1 sliding_window=3 q_err=0.00000000 k_err=0.00000000 v_err=0.00000000 attn_err=0.00012141 ok
+qk_mode=2 sliding_window=3 q_err=0.00000000 k_err=0.00000000 v_err=0.00000000 attn_err=0.00011945 ok
+qk_mode=3 sliding_window=3 q_err=0.00000000 k_err=0.00000000 v_err=0.00000000 attn_err=0.00011978 ok
+qk_mode=1 semantic_delta_full_vs_window=0.06742159
+VERDICT: paged varlen split-qkv correctness PASS

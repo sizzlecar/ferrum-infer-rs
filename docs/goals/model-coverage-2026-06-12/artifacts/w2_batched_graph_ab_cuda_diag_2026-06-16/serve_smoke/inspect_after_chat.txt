@@ -1,0 +1,116 @@
+CHAT_RESPONSE
+{"id":"1e0b2f7a-c448-4c86-8aa7-12fb07d6eeda","object":"chat.completion","created":1781561109,"model":"gemma3:27b-gptq","choices":[{"index":0,"message":{"role":"assistant","content":"5"},"finish_reason":"length"}],"usage":{"prompt_tokens":23,"completion_tokens":1,"total_tokens":24}}
+GRAPH_CONFIG
+{
+  "selected_graph_mode": "legacy_batched_decode_graph",
+  "selected_kv_layout": "paged",
+  "selected_attention_impl": "legacy_paged_decode",
+  "selected_max_sequences": 16,
+  "selected_kv_capacity": 512,
+  "selected_max_batched_tokens": 2048,
+  "entries": [
+    {
+      "key": "FERRUM_BATCHED_GRAPH",
+      "effective_value": "1",
+      "source": "memory_profile",
+      "affects": [
+        "performance"
+      ]
+    },
+    {
+      "key": "FERRUM_GREEDY_ARGMAX",
+      "effective_value": "1",
+      "source": "memory_profile",
+      "affects": [
+        "performance"
+      ]
+    },
+    {
+      "key": "FERRUM_KV_CAPACITY",
+      "effective_value": "512",
+      "source": "cli",
+      "affects": [
+        "memory"
+      ]
+    },
+    {
+      "key": "FERRUM_KV_MAX_BLOCKS",
+      "effective_value": "512",
+      "source": "memory_profile",
+      "affects": [
+        "memory"
+      ]
+    },
+    {
+      "key": "FERRUM_MAX_BATCHED_TOKENS",
+      "effective_value": "2048",
+      "source": "cli",
+      "affects": [
+        "performance",
+        "memory"
+      ]
+    },
+    {
+      "key": "FERRUM_MOE_DEVICE_ROUTE",
+      "effective_value": "0",
+      "source": "memory_profile",
+      "affects": [
+        "performance"
+      ]
+    },
+    {
+      "key": "FERRUM_PAGED_MAX_SEQS",
+      "effective_value": "16",
+      "source": "cli",
+      "affects": [
+        "performance",
+        "memory"
+      ]
+    },
+    {
+      "key": "FERRUM_USE_VLLM_PAGED_ATTN",
+      "effective_value": "0",
+      "source": "memory_profile",
+      "affects": [
+        "performance"
+      ]
+    },
+    {
+      "key": "FERRUM_VLLM_MOE",
+      "effective_value": "0",
+      "source": "memory_profile",
+      "affects": [
+        "performance"
+      ]
+    },
+    {
+      "key": "FERRUM_VLLM_MOE_PAIR_IDS",
+      "effective_value": "0",
+      "source": "memory_profile",
+      "affects": [
+        "performance"
+      ]
+    },
+    {
+      "key": "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
+      "effective_value": "0",
+      "source": "memory_profile",
+      "affects": [
+        "performance"
+      ]
+    }
+  ]
+}
+
+DECISION_GRAPH
+{"schema_version":1,"selection":"decode_graph_policy","selected":"legacy_batched_decode_graph","source":"cli","source_key":"FERRUM_BATCHED_GRAPH","candidates":["legacy_batched_decode_graph","graph_disabled"],"rejected":[{"value":"graph_disabled","reason":"legacy batched decode graph selected"}],"affects":["performance","correctness"]}
+
+ERROR_SCAN
+
+HEALTH
+{
+  "successful": 1,
+  "failed": 0,
+  "active": 0,
+  "queued": 0
+}

@@ -1,0 +1,14 @@
+2026-06-24T17:31:54Z lane_start art=/workspace/artifacts/w3_qwen35_capacity_backpressure_c32_2203a9cd_20260624T173154Z sha=2203a9cd9c0b1244705c756c6c204235638c8477 release_evidence=false no_live_vllm=true
+2026-06-24T17:31:54Z git_sync_start
+2026-06-24T17:31:54Z git_sync_done
+2026-06-24T17:31:54Z cargo_check_start
+2026-06-24T17:31:56Z cargo_check_done
+2026-06-24T17:31:56Z release_build_start
+2026-06-24T17:35:11Z release_build_done
+2026-06-24T17:35:11Z ferrum_run_smoke_start
+2026-06-24T17:35:38Z ferrum_run_smoke_done
+2026-06-24T17:35:38Z serve_start
+2026-06-24T17:36:05Z serve_ready
+2026-06-24T17:36:05Z serve_chat_smoke_done
+2026-06-24T17:36:05Z bench_c32_start
+2026-06-24T17:37:40Z bench_c32_failed exit=143

@@ -52,6 +52,13 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
         self.runtime_env.kv_capacity(model_max)
     }
 
+    fn reserve_kv_slots(
+        &mut self,
+        requests: &[KvSlotRequest],
+    ) -> std::result::Result<Option<KvSlotReservation>, FerrumError> {
+        self.reserve_paged_kv_slots(requests)
+    }
+
     fn prefill(&mut self, cache_id: &str, tokens: &[u32]) -> Vec<f32> {
         self.prefill_internal(cache_id, tokens)
     }
@@ -170,6 +177,10 @@ impl<B: MoeLlmBackend + BackendPagedKv, K: KvDtypeKind> DecoderOnlyLLM for Qwen3
             )));
         }
         Ok(self.unified_forward_internal(items))
+    }
+
+    fn unified_forward_can_return_full_logits(&self) -> bool {
+        !self.runtime_env.unified_greedy_argmax
     }
 
     fn release(&mut self, cache_id: &str) {

@@ -1,0 +1,90 @@
+{
+  "attempts": [
+    {
+      "body": {
+        "ask_id": 39214870,
+        "error": "invalid_args",
+        "msg": "error 404/3603: no_such_ask  Instance type by id 39214870 is not available.",
+        "success": false
+      },
+      "http_status": 400,
+      "offer": 39214870,
+      "offer_summary": {
+        "ask_contract_id": 39214870,
+        "cpu_cores_effective": 32.0,
+        "cpu_ram": 110654,
+        "cuda_max_good": 13.0,
+        "direct_port_count": 98,
+        "disk_bw": 1162.0,
+        "disk_space": 854.0,
+        "dph_total": 0.37777777777777777,
+        "driver_version": "580.119.02",
+        "geolocation": "California, US",
+        "gpu_name": "RTX 4090",
+        "host_id": 366851,
+        "id": 39214870,
+        "inet_down": 14778.1,
+        "inet_up": 6153.3,
+        "machine_id": 137567,
+        "num_gpus": 1,
+        "reliability2": 0.9872601,
+        "verification": "verified"
+      }
+    },
+    {
+      "body": {
+        "instance_api_key": "<redacted>",
+        "new_contract": 41212840,
+        "success": true
+      },
+      "http_status": 200,
+      "offer": 36846332,
+      "offer_summary": {
+        "ask_contract_id": 36846332,
+        "cpu_cores_effective": 32.0,
+        "cpu_ram": 120734,
+        "cuda_max_good": 13.0,
+        "direct_port_count": 98,
+        "disk_bw": 3027.0,
+        "disk_space": 759.0,
+        "dph_total": 0.4044444444444444,
+        "driver_version": "580.119.02",
+        "geolocation": "California, US",
+        "gpu_name": "RTX 4090",
+        "host_id": 366851,
+        "id": 36846332,
+        "inet_down": 11656.6,
+        "inet_up": 4420.0,
+        "machine_id": 114237,
+        "num_gpus": 1,
+        "reliability2": 0.9946932,
+        "verification": "verified"
+      }
+    }
+  ],
+  "created": {
+    "new_contract": 41212840,
+    "offer": 36846332,
+    "offer_summary": {
+      "ask_contract_id": 36846332,
+      "cpu_cores_effective": 32.0,
+      "cpu_ram": 120734,
+      "cuda_max_good": 13.0,
+      "direct_port_count": 98,
+      "disk_bw": 3027.0,
+      "disk_space": 759.0,
+      "dph_total": 0.4044444444444444,
+      "driver_version": "580.119.02",
+      "geolocation": "California, US",
+      "gpu_name": "RTX 4090",
+      "host_id": 366851,
+      "id": 36846332,
+      "inet_down": 11656.6,
+      "inet_up": 4420.0,
+      "machine_id": 114237,
+      "num_gpus": 1,
+      "reliability2": 0.9946932,
+      "verification": "verified"
+    }
+  }
+}

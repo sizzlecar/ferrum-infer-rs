@@ -1,0 +1,8 @@
+Warning: Permanently added '[ssh7.vast.ai]:30498' (ED25519) to the list of known hosts.
+Welcome to vast.ai. If authentication fails, try again after a few seconds, and double check your ssh key.
+Have fun!
+Transfer starting: 1 files
+ferrum_b99_to_674.bundle
+
+sent 32990 bytes  received 42 bytes  4404 bytes/sec
+total size is 32837  speedup is 0.99

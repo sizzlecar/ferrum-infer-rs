@@ -1,0 +1,3 @@
+ssh-ok
+NVIDIA GeForce RTX 4090, 24564 MiB, 565.77
+Build cuda_12.4.r12.4/compiler.34097967_0

@@ -1,0 +1,1 @@
+W3 Qwen35 MoE bucket profile c16 diagnostic: run/serve smoke passed, c16 short bench completed, routed_bucket profile rows captured. Diagnostic only; no release performance claim.

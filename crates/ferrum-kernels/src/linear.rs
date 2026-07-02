@@ -14,6 +14,90 @@
 
 use crate::backend::Backend;
 
+/// Stable projection role metadata derived from model weight names.
+///
+/// This is intentionally small and backend-neutral. It lets product code
+/// choose a typed optimization path without depending on profiling labels or
+/// hidden environment variables.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinearProjectionRole {
+    Qkv,
+    Query,
+    Key,
+    Value,
+    GdnQkv,
+    GdnZ,
+    GdnQkvz,
+    GdnB,
+    GdnA,
+    GdnBa,
+    Output,
+    GateUp,
+    Gate,
+    Up,
+    Down,
+    LmHead,
+}
+
+/// Optional metadata carried by a loaded linear projection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinearMetadata {
+    pub layer_index: Option<usize>,
+    pub role: Option<LinearProjectionRole>,
+}
+
+impl LinearMetadata {
+    pub const fn new(layer_index: Option<usize>, role: Option<LinearProjectionRole>) -> Self {
+        Self { layer_index, role }
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.layer_index.is_none() && self.role.is_none()
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        let base = strip_tensor_suffix(name);
+        Self {
+            layer_index: parse_layer_index(base),
+            role: parse_projection_role(base),
+        }
+    }
+
+    pub fn from_fused_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut layer_index = None;
+        let mut roles = Vec::new();
+
+        for name in names {
+            let metadata = Self::from_name(name);
+            if layer_index.is_none() {
+                layer_index = metadata.layer_index;
+            }
+            if let Some(role) = metadata.role {
+                roles.push(role);
+            }
+        }
+
+        let role = match roles.as_slice() {
+            [LinearProjectionRole::Query, LinearProjectionRole::Key, LinearProjectionRole::Value] => {
+                Some(LinearProjectionRole::Qkv)
+            }
+            [LinearProjectionRole::GdnQkv, LinearProjectionRole::GdnZ] => {
+                Some(LinearProjectionRole::GdnQkvz)
+            }
+            [LinearProjectionRole::GdnB, LinearProjectionRole::GdnA] => {
+                Some(LinearProjectionRole::GdnBa)
+            }
+            [LinearProjectionRole::Gate, LinearProjectionRole::Up] => {
+                Some(LinearProjectionRole::GateUp)
+            }
+            [single] => Some(*single),
+            _ => None,
+        };
+
+        Self { layer_index, role }
+    }
+}
+
 /// A weight-bearing linear projection.
 ///
 /// `forward` computes `out[m, out_features] = input[m, in_features] @ W^T`.
@@ -23,7 +107,117 @@ pub trait Linear<B: Backend>: Send + Sync {
     fn in_features(&self) -> usize;
     fn out_features(&self) -> usize;
 
+    fn metadata(&self) -> LinearMetadata {
+        LinearMetadata::default()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_marlin_touch_ref(
+        &self,
+    ) -> Option<crate::quant_linear::cuda_marlin::CudaMarlinTouchRef<'_>> {
+        None
+    }
+
     /// Append GEMM work onto `ctx`. Caller flushes the context when results
     /// must be materialised.
     fn forward(&self, ctx: &mut B::Context, input: &B::Buffer, out: &mut B::Buffer, m: usize);
+}
+
+fn strip_tensor_suffix(name: &str) -> &str {
+    for suffix in [
+        ".weight", ".qweight", ".scales", ".qzeros", ".g_idx", ".bias",
+    ] {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            return stripped;
+        }
+    }
+    name
+}
+
+fn parse_layer_index(name: &str) -> Option<usize> {
+    let mut prev_was_layers = false;
+    for part in name.split('.') {
+        if prev_was_layers {
+            return part.parse::<usize>().ok();
+        }
+        prev_was_layers = part == "layers";
+    }
+    None
+}
+
+fn parse_projection_role(name: &str) -> Option<LinearProjectionRole> {
+    let tail = name.rsplit('.').next().unwrap_or(name);
+    match tail {
+        "qkv_proj" => Some(LinearProjectionRole::Qkv),
+        "q_proj" => Some(LinearProjectionRole::Query),
+        "k_proj" => Some(LinearProjectionRole::Key),
+        "v_proj" => Some(LinearProjectionRole::Value),
+        "in_proj_qkv" => Some(LinearProjectionRole::GdnQkv),
+        "in_proj_z" => Some(LinearProjectionRole::GdnZ),
+        "in_proj_qkvz" => Some(LinearProjectionRole::GdnQkvz),
+        "in_proj_b" => Some(LinearProjectionRole::GdnB),
+        "in_proj_a" => Some(LinearProjectionRole::GdnA),
+        "in_proj_ba" => Some(LinearProjectionRole::GdnBa),
+        "o_proj" => Some(LinearProjectionRole::Output),
+        "gate_up_proj" => Some(LinearProjectionRole::GateUp),
+        "gate_proj" => Some(LinearProjectionRole::Gate),
+        "up_proj" => Some(LinearProjectionRole::Up),
+        "down_proj" => Some(LinearProjectionRole::Down),
+        "lm_head" => Some(LinearProjectionRole::LmHead),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LinearMetadata, LinearProjectionRole};
+
+    #[test]
+    fn metadata_parses_llama_layer_projection_roles() {
+        assert_eq!(
+            LinearMetadata::from_name("model.layers.17.mlp.down_proj.qweight"),
+            LinearMetadata::new(Some(17), Some(LinearProjectionRole::Down))
+        );
+        assert_eq!(
+            LinearMetadata::from_name("language_model.model.layers.3.self_attn.o_proj.weight"),
+            LinearMetadata::new(Some(3), Some(LinearProjectionRole::Output))
+        );
+        assert_eq!(
+            LinearMetadata::from_name("lm_head.weight"),
+            LinearMetadata::new(None, Some(LinearProjectionRole::LmHead))
+        );
+    }
+
+    #[test]
+    fn metadata_parses_fused_projection_roles() {
+        assert_eq!(
+            LinearMetadata::from_fused_names([
+                "model.layers.2.self_attn.q_proj",
+                "model.layers.2.self_attn.k_proj",
+                "model.layers.2.self_attn.v_proj",
+            ]),
+            LinearMetadata::new(Some(2), Some(LinearProjectionRole::Qkv))
+        );
+        assert_eq!(
+            LinearMetadata::from_fused_names([
+                "model.layers.9.mlp.gate_proj.qweight",
+                "model.layers.9.mlp.up_proj.qweight",
+            ]),
+            LinearMetadata::new(Some(9), Some(LinearProjectionRole::GateUp))
+        );
+        assert_eq!(
+            LinearMetadata::from_fused_names([
+                "model.layers.2.linear_attn.in_proj_qkv.qweight",
+                "model.layers.2.linear_attn.in_proj_z.qweight",
+            ]),
+            LinearMetadata::new(Some(2), Some(LinearProjectionRole::GdnQkvz))
+        );
+        assert_eq!(
+            LinearMetadata::from_fused_names([
+                "model.layers.2.linear_attn.in_proj_b.qweight",
+                "model.layers.2.linear_attn.in_proj_a.qweight",
+            ]),
+            LinearMetadata::new(Some(2), Some(LinearProjectionRole::GdnBa))
+        );
+    }
 }

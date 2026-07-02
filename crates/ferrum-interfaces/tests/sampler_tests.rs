@@ -54,17 +54,20 @@ fn topp_masks_beyond_p() {
 
 #[test]
 fn repetition_penalty_applies() {
-    let mut logits = vec![1.0, 1.0, 1.0];
+    let mut logits = vec![1.0, 1.0, -2.0];
     let params = SamplingParams::default();
-    let prev = vec![TokenId::new(1)];
+    let prev = vec![TokenId::new(1), TokenId::new(1), TokenId::new(2)];
     let mut freqs = std::collections::HashMap::new();
     freqs.insert(TokenId::new(1), 2usize);
+    freqs.insert(TokenId::new(2), 1usize);
     let vocab_size = 3;
     let mut ctx = SamplingContext::new(0, &params, &mut logits, &prev, &freqs, vocab_size);
     RepetitionPenaltyProcessor::new(1.1)
         .process(&mut ctx)
         .unwrap();
-    assert!(ctx.logits[1] != 1.0);
+    assert_eq!(ctx.logits[0], 1.0);
+    assert!((ctx.logits[1] - (1.0 / 1.1)).abs() < 1e-6);
+    assert!((ctx.logits[2] - (-2.0 * 1.1)).abs() < 1e-6);
 }
 
 #[test]

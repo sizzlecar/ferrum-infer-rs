@@ -1,0 +1,5 @@
+[autosize-smoke] start 2026-06-17T01:33:55Z
+[autosize-smoke] root=/workspace/ferrum-smoke-99859ce6 out=/workspace/w2_autosize_serve_smoke_cuda_2026-06-17 model=gemma3:27b-gptq hf_home=/workspace/hf-cache port=18456
+[autosize-smoke] build
+[autosize-smoke] serve correctness
+W2 AUTOSIZE SERVE SMOKE PASS: /workspace/w2_autosize_serve_smoke_cuda_2026-06-17

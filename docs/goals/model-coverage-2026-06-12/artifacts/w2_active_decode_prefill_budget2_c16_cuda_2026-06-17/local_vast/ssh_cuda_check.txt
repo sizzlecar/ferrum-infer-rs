@@ -1,0 +1,9 @@
+cb0f808956e3
+NVIDIA GeForce RTX 4090, 24564 MiB, 580.95.05
+Build cuda_12.4.r12.4/compiler.34097967_0
+Filesystem      Size  Used Avail Use% Mounted on
+overlay         300G   30G  271G  10% /
+overlay         300G   30G  271G  10% /
+699add71ad4a86cfaf6ee6ee00a98d87c27d18d2
+100 /workspace/ascii_sharegpt_w2_100.jsonl
+model-cache-ok

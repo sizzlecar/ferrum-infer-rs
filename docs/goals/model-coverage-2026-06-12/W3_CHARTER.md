@@ -4,6 +4,11 @@
 > 独立 goal。进入条件:`MODEL_COVERAGE_W1 GOAL PASS` + `MODEL_COVERAGE_W2
 > GOAL PASS` 均已打印(W1 已于 2026-06-13 达成;W2 已于 2026-06-14 达成)。
 
+> 发布级补充:本 charter 的 `≥0.5× llama.cpp` 只是模型覆盖阶段 sanity floor。
+> W2/W3 若要进入 release-grade/README 发布矩阵,以
+> `RELEASE_GRADE_GOAL.md` 为准:正确性必须全过,性能必须达到同硬件同模型
+> 主流推理引擎至少 80%。
+
 ## 选型决议
 
 **默认选项:Gated DeltaNet**(对 gpt-oss-20b 备选的裁决理由,引 GOAL.md):

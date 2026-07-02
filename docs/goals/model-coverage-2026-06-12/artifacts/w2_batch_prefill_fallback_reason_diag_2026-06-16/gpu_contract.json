@@ -1,0 +1,12 @@
+{
+  "lane": "W2 batch-prefill fallback-reason diagnostic",
+  "instance_id": 40826362,
+  "hardware": "1x RTX 4090 on Vast, cache-retained instance",
+  "expected_runtime_minutes": "15-25",
+  "expected_cost_usd": "0.11-0.18",
+  "stop_condition": "Stop after CUDA build, ferrum serve chat smoke, one c16 bench-serve diagnostic, and captured [batch-prefill] fallback_reason lines, or at first failure.",
+  "correctness_gate": "CUDA release build rc=0, ferrum serve ready, deterministic chat smoke returns 5, bench-serve rc=0 with --fail-on-error.",
+  "performance_command": "timeout 1200 target/release/ferrum bench-serve --base-url http://127.0.0.1:18117 --model gemma3:27b-gptq --dataset sharegpt --concurrency-sweep 16 --num-prompts 16 --n-repeats 1 --fail-on-error --seed 9271 --out <artifact>/bench/bench_sharegpt_c16.json",
+  "release_evidence": false,
+  "notes": "Diagnostic-only product-path run to identify why Gemma3 c16 batch prefill falls back to serial prefill. Not a model release-grade gate."
+}

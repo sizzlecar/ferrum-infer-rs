@@ -1,0 +1,19 @@
+2026-06-25T04:44:10Z lane_start art=/workspace/artifacts/w3_qwen35_partial_prefill_backpressure_c32_9d43148c_20260625T044410Z sha=9d43148caaf0565a0699e89fd30a44ca14d77100 release_evidence=false no_live_vllm=true
+2026-06-25T04:44:10Z bootstrap_start
+2026-06-25T04:44:11Z bootstrap_done
+2026-06-25T04:44:11Z git_sync_start
+2026-06-25T04:44:11Z git_sync_done
+2026-06-25T04:44:11Z hf_prefetch_start
+2026-06-25T04:44:11Z cargo_check_start
+2026-06-25T04:44:14Z cargo_check_done
+2026-06-25T04:44:14Z release_build_start
+2026-06-25T04:47:23Z release_build_done
+2026-06-25T04:47:24Z hf_prefetch_wait_start
+2026-06-25T04:47:24Z hf_prefetch_done tokenizer=/workspace/hf-cache/hub/models--Qwen--Qwen3.5-35B-A3B-GPTQ-Int4/snapshots/3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b
+2026-06-25T04:47:24Z ferrum_run_smoke_start
+2026-06-25T04:47:52Z ferrum_run_smoke_done
+2026-06-25T04:47:52Z serve_start
+2026-06-25T04:48:18Z serve_ready
+2026-06-25T04:48:18Z serve_chat_smoke_done
+2026-06-25T04:48:18Z bench_c32_start
+2026-06-25T04:48:35Z FERRUM W3 QWEN35 C32 DIAG REJECT: /workspace/artifacts/w3_qwen35_partial_prefill_backpressure_c32_9d43148c_20260625T044410Z

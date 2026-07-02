@@ -48,7 +48,8 @@ extern "C" __global__ void paged_varlen_attn_f16(
     const int head_dim,
     const int max_blocks_per_seq,
     const int block_size,
-    const float scale
+    const float scale,
+    const int sliding_window
 ) {
     const int q_head = blockIdx.x;
     const int token_global = blockIdx.y;
@@ -63,6 +64,10 @@ extern "C" __global__ void paged_varlen_attn_f16(
     const int local_idx = token_global - cu_seqlens_q[seq_idx];
     const int abs_kv_pos = pos_offsets[seq_idx] + local_idx;
     const int valid_kv_len = abs_kv_pos + 1; // causal: attend to [0, abs_kv_pos]
+    const int attend_start =
+        (sliding_window > 0 && valid_kv_len > sliding_window)
+            ? valid_kv_len - sliding_window : 0;
+    const int active_kv_len = valid_kv_len - attend_start;
 
     if (valid_kv_len <= 0) {
         // Defensive — shouldn't happen for well-formed input.
@@ -98,7 +103,7 @@ extern "C" __global__ void paged_varlen_attn_f16(
     int lane_id = threadIdx.x % WARP_SIZE;
     int num_warps = blockDim.x / WARP_SIZE;
 
-    for (int kv_pos = warp_id; kv_pos < valid_kv_len; kv_pos += num_warps) {
+    for (int kv_pos = attend_start + warp_id; kv_pos < valid_kv_len; kv_pos += num_warps) {
         int logical_block = kv_pos / block_size;
         int slot = kv_pos % block_size;
         int physical_block = my_block_table[logical_block];
@@ -115,13 +120,13 @@ extern "C" __global__ void paged_varlen_attn_f16(
         }
         float score = warp_reduce_sum(dot) * scale;
         if (lane_id == 0)
-            s_scores[kv_pos] = score;
+            s_scores[kv_pos - attend_start] = score;
     }
     __syncthreads();
 
     // ====== Step 2: Softmax ======
     float thread_max = -1e20f;
-    for (int i = threadIdx.x; i < valid_kv_len; i += blockDim.x)
+    for (int i = threadIdx.x; i < active_kv_len; i += blockDim.x)
         thread_max = fmaxf(thread_max, s_scores[i]);
     __shared__ float s_global_max;
     float bmax = block_reduce_max(thread_max);
@@ -130,7 +135,7 @@ extern "C" __global__ void paged_varlen_attn_f16(
     float global_max = s_global_max;
 
     float thread_sum = 0.0f;
-    for (int i = threadIdx.x; i < valid_kv_len; i += blockDim.x) {
+    for (int i = threadIdx.x; i < active_kv_len; i += blockDim.x) {
         float val = expf(s_scores[i] - global_max);
         s_scores[i] = val;
         thread_sum += val;
@@ -143,14 +148,15 @@ extern "C" __global__ void paged_varlen_attn_f16(
     __syncthreads();
     float inv_sum = 1.0f / s_global_sum;
 
-    for (int i = threadIdx.x; i < valid_kv_len; i += blockDim.x)
+    for (int i = threadIdx.x; i < active_kv_len; i += blockDim.x)
         s_scores[i] *= inv_sum;
     __syncthreads();
 
     // ====== Step 3: Weighted V sum (paged) ======
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
-        for (int kv_pos = 0; kv_pos < valid_kv_len; kv_pos++) {
+        for (int i = 0; i < active_kv_len; i++) {
+            int kv_pos = attend_start + i;
             int logical_block = kv_pos / block_size;
             int slot = kv_pos % block_size;
             int physical_block = my_block_table[logical_block];
@@ -158,7 +164,7 @@ extern "C" __global__ void paged_varlen_attn_f16(
                 v_block_pool + physical_block * block_stride_val
                              + slot * kv_stride
                              + kv_head * head_dim;
-            acc += s_scores[kv_pos] * __half2float(v_row[d]);
+            acc += s_scores[i] * __half2float(v_row[d]);
         }
         out_ptr[d] = __float2half(acc);
     }
@@ -198,6 +204,7 @@ extern "C" __global__ void paged_varlen_attn_split_k_phase1_f16(
     const int max_blocks_per_seq,
     const int block_size,
     const float scale,
+    const int sliding_window,
     const int num_splits
 ) {
     const int q_head = blockIdx.x;
@@ -213,10 +220,14 @@ extern "C" __global__ void paged_varlen_attn_split_k_phase1_f16(
     const int local_idx = token_global - cu_seqlens_q[seq_idx];
     const int abs_kv_pos = pos_offsets[seq_idx] + local_idx;
     const int valid_kv_len = abs_kv_pos + 1;
+    const int attend_start =
+        (sliding_window > 0 && valid_kv_len > sliding_window)
+            ? valid_kv_len - sliding_window : 0;
+    const int active_kv_len = valid_kv_len - attend_start;
 
-    const int chunk = (valid_kv_len + num_splits - 1) / num_splits;
+    const int chunk = (active_kv_len + num_splits - 1) / num_splits;
     const int split_start = split_id * chunk;
-    const int split_end = min(split_start + chunk, valid_kv_len);
+    const int split_end = min(split_start + chunk, active_kv_len);
     const int my_len = split_end - split_start;
 
     const int out_idx =
@@ -257,7 +268,7 @@ extern "C" __global__ void paged_varlen_attn_split_k_phase1_f16(
 
     // Step 1: Q·K^T over our chunk.
     for (int pos = warp_id; pos < my_len; pos += num_warps) {
-        int kv_pos = split_start + pos;
+        int kv_pos = attend_start + split_start + pos;
         int logical_block = kv_pos / block_size;
         int slot = kv_pos % block_size;
         int physical_block = my_block_table[logical_block];
@@ -311,7 +322,7 @@ extern "C" __global__ void paged_varlen_attn_split_k_phase1_f16(
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (int i = 0; i < my_len; i++) {
-            int kv_pos = split_start + i;
+            int kv_pos = attend_start + split_start + i;
             int logical_block = kv_pos / block_size;
             int slot = kv_pos % block_size;
             int physical_block = my_block_table[logical_block];

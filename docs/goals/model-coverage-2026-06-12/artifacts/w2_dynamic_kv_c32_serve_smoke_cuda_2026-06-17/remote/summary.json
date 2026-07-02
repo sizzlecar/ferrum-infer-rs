@@ -1,0 +1,7 @@
+{
+  "pass_line": "W2 DYNAMIC KV C32 SERVE SMOKE PASS: /workspace/w2_dynamic_kv_c32_serve_smoke_cuda_2026-06-17",
+  "artifact_dir": "/workspace/w2_dynamic_kv_c32_serve_smoke_cuda_2026-06-17",
+  "git_head": "9fbfb77395dfbbbe38d90836463bc4dddaaeca78",
+  "build_seconds": 2232,
+  "binary_sha256": "c0a48db82e77f98d7ebde3225b5be103997198a85e467cbdbbf75c2803e12749"
+}
