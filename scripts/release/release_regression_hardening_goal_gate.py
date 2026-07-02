@@ -422,21 +422,77 @@ def validate_support_matrix_contract(root: Path, expected_sha: str) -> dict[str,
     return stage
 
 
-def load_vertical_slice(path_value: Any, observability_root: Path) -> dict[str, Any]:
+def validate_vertical_entrypoint(entry: Any, *, entrypoint: str, artifact_root: Path) -> None:
+    require(
+        isinstance(entry, dict),
+        f"observability_vertical_slice.summary.entrypoints.{entrypoint} must be an object",
+    )
+    require(
+        entry.get("schema_version") == SCHEMA_VERSION,
+        f"observability_vertical_slice.summary.entrypoints.{entrypoint}.schema_version must be {SCHEMA_VERSION}",
+    )
+    event_count = entry.get("event_count")
+    require(
+        isinstance(event_count, int) and event_count > 0,
+        f"observability_vertical_slice.summary.entrypoints.{entrypoint}.event_count must be positive",
+    )
+    for key in ("profile_jsonl", "request_dump", "summary"):
+        value = entry.get(key)
+        require(
+            isinstance(value, str) and value.strip(),
+            f"observability_vertical_slice.summary.entrypoints.{entrypoint}.{key} must be non-empty",
+        )
+        resolved = resolve_path(value, base=artifact_root)
+        require(
+            resolved.is_file(),
+            f"observability_vertical_slice.summary.entrypoints.{entrypoint}.{key} must exist: {resolved}",
+        )
+    replay_command = entry.get("replay_command")
+    require(
+        isinstance(replay_command, str) and replay_command.strip(),
+        f"observability_vertical_slice.summary.entrypoints.{entrypoint}.replay_command must be non-empty",
+    )
+
+
+def validate_vertical_slice_summary(summary: dict[str, Any], *, artifact_root: Path) -> None:
+    require(
+        summary.get("gate") == "observability_vertical_slice",
+        "observability_vertical_slice.summary.gate must be observability_vertical_slice",
+    )
+    require(summary.get("l0_only") is True, "observability_vertical_slice.summary.l0_only must be true")
+    require(summary.get("same_schema_version") is True, "observability_vertical_slice.summary.same_schema_version must be true")
+    entrypoints = summary.get("entrypoints")
+    require(isinstance(entrypoints, dict), "observability_vertical_slice.summary.entrypoints must be an object")
+    for entrypoint in ("run", "serve"):
+        validate_vertical_entrypoint(
+            entrypoints.get(entrypoint),
+            entrypoint=entrypoint,
+            artifact_root=artifact_root,
+        )
+    analyzer = summary.get("analyzer")
+    require(isinstance(analyzer, dict), "observability_vertical_slice.summary.analyzer must be an object")
+    stdout = analyzer.get("stdout")
+    require(
+        isinstance(stdout, str) and "FERRUM PROFILE ANALYZER PASS" in stdout,
+        "observability_vertical_slice.summary.analyzer.stdout must include FERRUM PROFILE ANALYZER PASS",
+    )
+
+
+def load_vertical_slice(path_value: Any, observability_root: Path, expected_sha: str) -> dict[str, Any]:
     require(isinstance(path_value, str) and path_value.strip(), "observability_profile.summary.vertical_slice_artifact is required")
     path = resolve_path(path_value, base=observability_root)
-    if path.is_dir():
-        manifest_path = path / "observability_vertical_slice_manifest.json"
-        manifest = read_json(manifest_path)
-        require_status_pass(manifest, "observability_vertical_slice.manifest")
-        require_pass_line(manifest, "observability_vertical_slice.manifest", "OBSERVABILITY VERTICAL SLICE PASS")
-        summary_path = resolve_path(str(manifest.get("summary")), base=path) if manifest.get("summary") else path / "observability_profile_summary.json"
-        summary = read_json(summary_path)
-        require_status_pass(summary, "observability_vertical_slice.summary")
-        return {"manifest": manifest, "summary": summary, "summary_path": str(summary_path)}
-    summary = read_json(path)
+    require(path.is_dir(), f"observability_profile.summary.vertical_slice_artifact must be an artifact directory: {path}")
+    manifest_path = path / "observability_vertical_slice_manifest.json"
+    manifest = read_json(manifest_path)
+    require_status_pass(manifest, "observability_vertical_slice.manifest")
+    require_pass_line(manifest, "observability_vertical_slice.manifest", "OBSERVABILITY VERTICAL SLICE PASS")
+    require_git_sha(manifest, "observability_vertical_slice.manifest", expected_sha)
+    require_clean_manifest(manifest, "observability_vertical_slice.manifest")
+    summary_path = resolve_path(str(manifest.get("summary")), base=path) if manifest.get("summary") else path / "observability_profile_summary.json"
+    summary = read_json(summary_path)
     require_status_pass(summary, "observability_vertical_slice.summary")
-    return {"manifest": None, "summary": summary, "summary_path": str(path)}
+    validate_vertical_slice_summary(summary, artifact_root=path)
+    return {"manifest": manifest, "summary": summary, "summary_path": str(summary_path)}
 
 
 def require_zero_count(summary: dict[str, Any], field: str, label: str) -> None:
@@ -488,7 +544,7 @@ def validate_observability_profile(root: Path, expected_sha: str) -> dict[str, A
     entrypoints = set(summary.get("entrypoints") or [])
     require({"run", "serve"} <= entrypoints, "observability_profile.summary must include run and serve entrypoints")
     stage["summary"] = summary
-    stage["vertical_slice"] = load_vertical_slice(summary.get("vertical_slice_artifact"), root)
+    stage["vertical_slice"] = load_vertical_slice(summary.get("vertical_slice_artifact"), root, expected_sha)
     return stage
 
 
@@ -1085,11 +1141,76 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
     )
 
     vertical = root / "vertical"
+    vertical_entrypoints: dict[str, dict[str, Any]] = {}
+    for entrypoint in ("run", "serve"):
+        entry_dir = vertical / entrypoint
+        request_dump = entry_dir / "request_dump" / "request.json"
+        profile = entry_dir / "profile.jsonl"
+        entry_summary = entry_dir / "observability_profile_summary.json"
+        request_dump.parent.mkdir(parents=True, exist_ok=True)
+        profile.write_text(
+            json.dumps(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "event_id": f"evt-{entrypoint}-complete",
+                    "request_id": f"req-{entrypoint}-fixture",
+                    "entrypoint": entrypoint,
+                    "backend": "synthetic",
+                    "phase": "request_complete",
+                    "event_kind": "instant",
+                    "timestamp": "2026-07-02T00:00:00Z",
+                    "status": "ok",
+                    "model": "synthetic/no-weight",
+                    "replay": {
+                        "command": f"ferrum {entrypoint} synthetic/no-weight",
+                        "bundle_dir": f"request_dumps/req-{entrypoint}-fixture",
+                    },
+                    "attributes": {},
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        write_json(
+            request_dump,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "entrypoint": entrypoint,
+                "request_id": f"req-{entrypoint}-fixture",
+                "l0_only": True,
+                "sanitized": True,
+            },
+        )
+        write_json(
+            entry_summary,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "entrypoint": entrypoint,
+                "l0_only": True,
+                "status": "pass",
+            },
+        )
+        vertical_entrypoints[entrypoint] = {
+            "entrypoint": entrypoint,
+            "schema_version": SCHEMA_VERSION,
+            "profile_jsonl": str(profile),
+            "event_count": 1,
+            "request_dump": str(request_dump),
+            "replay_command": f"ferrum {entrypoint} synthetic/no-weight",
+            "summary": str(entry_summary),
+        }
     vertical_summary = {
         "schema_version": 1,
         "gate": "observability_vertical_slice",
         "status": "pass",
-        "entrypoints": {"run": {}, "serve": {}},
+        "l0_only": True,
+        "same_schema_version": True,
+        "entrypoints": vertical_entrypoints,
+        "analyzer": {
+            "out": str(vertical / "analyzer"),
+            "stdout": "FERRUM PROFILE ANALYZER PASS: fixture\n",
+        },
     }
     write_json(vertical / "observability_profile_summary.json", vertical_summary)
     write_json(
@@ -1099,6 +1220,9 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "status": "pass",
             "artifact_dir": str(vertical),
             "pass_line": f"OBSERVABILITY VERTICAL SLICE PASS: {vertical}",
+            "git_sha": sha,
+            "git_dirty": False,
+            "dirty_files": [],
             "summary": str(vertical / "observability_profile_summary.json"),
         },
     )
@@ -1376,6 +1500,42 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("dirty stage artifact unexpectedly passed final gate")
         except GoalGateError as exc:
             require("git_dirty" in str(exc), f"unexpected dirty stage error: {exc}")
+        bad_dirty_vertical = root / "bad-dirty-vertical"
+        artifacts_bad_dirty_vertical = selftest_artifacts(root / "bad-dirty-vertical-fixtures", sha)
+        bad_dirty_observability_summary = read_json(
+            artifacts_bad_dirty_vertical["observability"] / "observability_profile_summary.json"
+        )
+        bad_dirty_vertical_manifest_path = (
+            Path(bad_dirty_observability_summary["vertical_slice_artifact"])
+            / "observability_vertical_slice_manifest.json"
+        )
+        bad_dirty_vertical_manifest = read_json(bad_dirty_vertical_manifest_path)
+        bad_dirty_vertical_manifest["git_dirty"] = True
+        bad_dirty_vertical_manifest["dirty_files"] = [
+            " M scripts/release/observability_vertical_slice_gate.py"
+        ]
+        write_json(bad_dirty_vertical_manifest_path, bad_dirty_vertical_manifest)
+        args_bad_dirty_vertical = argparse.Namespace(
+            out=bad_dirty_vertical,
+            resource_invariant=artifacts_bad_dirty_vertical["resource"],
+            change_impact=artifacts_bad_dirty_vertical["change"],
+            product_sentinel=artifacts_bad_dirty_vertical["product"],
+            model_contract=artifacts_bad_dirty_vertical["model"],
+            support_matrix_contract=artifacts_bad_dirty_vertical["support_matrix"],
+            observability_profile=artifacts_bad_dirty_vertical["observability"],
+            native_operator=artifacts_bad_dirty_vertical["native"],
+            actual_model_regression_summary=artifacts_bad_dirty_vertical["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_dirty_vertical)
+            raise AssertionError("dirty observability vertical slice unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "observability_vertical_slice.manifest.git_dirty" in str(exc),
+                f"unexpected dirty vertical slice error: {exc}",
+            )
         bad_invalidated_counted = root / "bad-invalidated-counted"
         artifacts_bad_invalidated_counted = selftest_artifacts(
             root / "bad-invalidated-counted-fixtures",
