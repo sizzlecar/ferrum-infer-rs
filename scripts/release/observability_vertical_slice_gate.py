@@ -22,6 +22,20 @@ class GateError(RuntimeError):
     pass
 
 
+def git_value(args: list[str], default: str = "unknown") -> str:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return default
+    return proc.stdout.strip() or default
+
+
 def load_json(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -178,6 +192,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     analyzer = run_analyzer(args, out)
     if run_summary["schema_version"] != serve_summary["schema_version"]:
         raise GateError("run and serve schema versions differ")
+    dirty_files = git_value(["status", "--short"], default="").splitlines()
     summary = {
         "schema_version": SCHEMA_VERSION,
         "gate": "observability_vertical_slice",
@@ -198,6 +213,10 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
             "status": "pass",
             "artifact_dir": str(out),
             "pass_line": f"{PASS_LINE}: {out}",
+            "git_sha": git_value(["rev-parse", "HEAD"]),
+            "git_branch": git_value(["rev-parse", "--abbrev-ref", "HEAD"]),
+            "git_dirty": bool(dirty_files),
+            "dirty_files": dirty_files,
             "summary": str(out / "observability_profile_summary.json"),
         },
     )
