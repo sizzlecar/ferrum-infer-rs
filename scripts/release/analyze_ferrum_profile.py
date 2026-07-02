@@ -164,6 +164,12 @@ def validate_profile_semantics(path: Path, events: list[dict[str, Any]]) -> None
     }
     if len(schema_fingerprints) > 1:
         raise ValidationError(f"{path} mixes profile schema fingerprints: {sorted(schema_fingerprints)}")
+    has_latency_sample = any(
+        event.get("event_kind") == "timed_span" and isinstance(event.get("duration_us"), int)
+        for event in events
+    )
+    if not has_latency_sample:
+        raise ValidationError(f"{path} requires at least one duration_us latency sample")
 
     for event in events:
         attrs = event_attributes(event)
@@ -201,6 +207,8 @@ def validate_profile_semantics(path: Path, events: list[dict[str, Any]]) -> None
         blocking = (event.get("error") or {}).get("blocking") is True
         if blocking and attrs.get("first_failure_event") is not True:
             raise ValidationError(f"{context} blocking failure requires first_failure_event=true")
+        if blocking and "memory" not in event and "resource" not in event:
+            raise ValidationError(f"{context} blocking failure requires memory or resource snapshot")
         if kind in {"bad_output", "bad_text", "missing_done", "duplicate_done", "malformed_sse"}:
             if "replay" not in event:
                 raise ValidationError(f"{context} correctness failure requires replay command")

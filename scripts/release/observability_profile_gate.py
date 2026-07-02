@@ -160,6 +160,8 @@ def validate_gate_semantics(path: Path, events: list[dict[str, Any]]) -> None:
         error = event.get("error") if isinstance(event.get("error"), dict) else {}
         if error.get("blocking") is True and event_attrs.get("first_failure_event") is not True:
             raise GateError(f"{context} blocking failure requires first_failure_event=true")
+        if error.get("blocking") is True and "memory" not in event and "resource" not in event:
+            raise GateError(f"{context} blocking failure requires memory or resource snapshot")
         if kind in BAD_TEXT_KINDS and "replay" not in event:
             raise GateError(f"{context} correctness failure requires replay command")
         if kind in OOM_KINDS and str(event.get("request_id", "")) not in capacity_by_request:
