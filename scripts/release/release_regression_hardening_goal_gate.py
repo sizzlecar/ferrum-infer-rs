@@ -371,7 +371,28 @@ def validate_backend_resolution(artifact: dict[str, Any], label: str, backend: s
     )
 
 
-def validate_l2_artifact(data: dict[str, Any], key: str, backend: str, expected_sha: str) -> None:
+def validate_replay_index(value: Any, *, artifact_dir: Path, label: str) -> None:
+    require(isinstance(value, list), f"{label}.replay_bundle_index must be a list")
+    for index, entry in enumerate(value):
+        entry_label = f"{label}.replay_bundle_index[{index}]"
+        require(isinstance(entry, dict), f"{entry_label} must be an object")
+        for key in ("request_id", "replay_command", "bundle_dir"):
+            require(
+                isinstance(entry.get(key), str) and entry[key].strip(),
+                f"{entry_label}.{key} must be non-empty",
+            )
+        bundle_dir = resolve_path(entry["bundle_dir"], base=artifact_dir)
+        require(bundle_dir.is_dir(), f"{entry_label}.bundle_dir must exist: {bundle_dir}")
+
+
+def validate_l2_artifact(
+    data: dict[str, Any],
+    key: str,
+    backend: str,
+    expected_sha: str,
+    *,
+    summary_path: Path,
+) -> None:
     artifact = data.get(key)
     require(isinstance(artifact, dict), f"actual_model_regression.{key} must be an object")
     artifact_git_sha(artifact, f"actual_model_regression.{key}", expected_sha)
@@ -382,6 +403,11 @@ def validate_l2_artifact(data: dict[str, Any], key: str, backend: str, expected_
     require(not missing, f"actual_model_regression.{key}.entrypoints missing {missing}")
     artifact_dir = artifact.get("artifact_dir")
     require(isinstance(artifact_dir, str) and artifact_dir.strip(), f"actual_model_regression.{key}.artifact_dir must be non-empty")
+    resolved_artifact_dir = resolve_path(artifact_dir, base=summary_path.parent)
+    require(
+        resolved_artifact_dir.is_dir(),
+        f"actual_model_regression.{key}.artifact_dir must exist and be a directory: {resolved_artifact_dir}",
+    )
     require_real_pass_line(artifact.get("pass_line"), f"actual_model_regression.{key}")
     require(
         isinstance(artifact.get("model_id"), str) and artifact["model_id"].strip(),
@@ -417,7 +443,11 @@ def validate_l2_artifact(data: dict[str, Any], key: str, backend: str, expected_
         f"actual_model_regression.{key}.profile_detail must be non-empty",
     )
     replay_index = artifact.get("replay_bundle_index", [])
-    require(isinstance(replay_index, list), f"actual_model_regression.{key}.replay_bundle_index must be a list")
+    validate_replay_index(
+        replay_index,
+        artifact_dir=resolved_artifact_dir,
+        label=f"actual_model_regression.{key}",
+    )
 
 
 def find_actual_model_regression_path(args: argparse.Namespace) -> Path | None:
@@ -443,8 +473,20 @@ def validate_actual_model_regression(args: argparse.Namespace, expected_sha: str
     require_status_pass(summary, "actual_model_regression")
     require_pass_line(summary, "actual_model_regression", "ACTUAL MODEL REGRESSION SUMMARY PASS")
     require_git_sha(summary, "actual_model_regression", expected_sha)
-    validate_l2_artifact(summary, "metal_l2_artifact", "metal", expected_sha)
-    validate_l2_artifact(summary, "cuda_l2_artifact", "cuda", expected_sha)
+    validate_l2_artifact(
+        summary,
+        "metal_l2_artifact",
+        "metal",
+        expected_sha,
+        summary_path=path,
+    )
+    validate_l2_artifact(
+        summary,
+        "cuda_l2_artifact",
+        "cuda",
+        expected_sha,
+        summary_path=path,
+    )
     selection = summary.get("native_operator_selection")
     require(isinstance(selection, dict), "actual_model_regression.native_operator_selection must be an object")
     require(selection.get("status") == "pass", "actual_model_regression.native_operator_selection.status must be pass")
@@ -875,6 +917,12 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
         },
     )
 
+    for path in (
+        root / "fixtures/metal-l2/request_dump",
+        root / "fixtures/cuda-l2/request_dump",
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+
     actual = root / "actual_model_regression_summary.json"
     write_json(
         actual,
@@ -891,7 +939,7 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
                 "git_sha": sha,
                 "git_dirty": False,
                 "dirty_files": [],
-                "artifact_dir": "fixtures/metal-l2",
+                "artifact_dir": str(root / "fixtures/metal-l2"),
                 "pass_line": "METAL L2 ACTUAL MODEL PASS: fixtures/metal-l2",
                 "model_id": "fixture/metal-model",
                 "architecture": "llama_dense",
@@ -903,7 +951,7 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
                         "request_id": "req-metal-fixture",
                         "entrypoint": "run",
                         "replay_command": "ferrum run fixture/metal-model",
-                        "bundle_dir": "fixtures/metal-l2/request_dump",
+                        "bundle_dir": str(root / "fixtures/metal-l2/request_dump"),
                     }
                 ],
             },
@@ -915,7 +963,7 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
                 "git_sha": sha,
                 "git_dirty": False,
                 "dirty_files": [],
-                "artifact_dir": "fixtures/cuda-l2",
+                "artifact_dir": str(root / "fixtures/cuda-l2"),
                 "pass_line": "CUDA L2 ACTUAL MODEL PASS: fixtures/cuda-l2",
                 "model_id": "fixture/cuda-model",
                 "architecture": "qwen3_moe",
@@ -927,7 +975,7 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
                         "request_id": "req-cuda-fixture",
                         "entrypoint": "run",
                         "replay_command": "ferrum run fixture/cuda-model",
-                        "bundle_dir": "fixtures/cuda-l2/request_dump",
+                        "bundle_dir": str(root / "fixtures/cuda-l2/request_dump"),
                     }
                 ],
             },
@@ -1085,6 +1133,59 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("backend fallback actual-model artifact unexpectedly passed final gate")
         except GoalGateError as exc:
             require("effective_backend" in str(exc), f"unexpected backend mismatch error: {exc}")
+        bad_artifact_dir = root / "bad-artifact-dir"
+        artifacts_bad_artifact_dir = selftest_artifacts(root / "bad-artifact-dir-fixtures", sha)
+        bad_artifact_dir_actual = read_json(artifacts_bad_artifact_dir["actual"])
+        bad_artifact_dir_actual["metal_l2_artifact"]["artifact_dir"] = str(
+            root / "missing-metal-l2-artifact-dir"
+        )
+        write_json(artifacts_bad_artifact_dir["actual"], bad_artifact_dir_actual)
+        args_bad_artifact_dir = argparse.Namespace(
+            out=bad_artifact_dir,
+            resource_invariant=artifacts_bad_artifact_dir["resource"],
+            change_impact=artifacts_bad_artifact_dir["change"],
+            product_sentinel=artifacts_bad_artifact_dir["product"],
+            model_contract=artifacts_bad_artifact_dir["model"],
+            support_matrix_contract=artifacts_bad_artifact_dir["support_matrix"],
+            observability_profile=artifacts_bad_artifact_dir["observability"],
+            native_operator=artifacts_bad_artifact_dir["native"],
+            actual_model_regression_summary=artifacts_bad_artifact_dir["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_artifact_dir)
+            raise AssertionError("missing actual-model artifact_dir unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require("artifact_dir" in str(exc), f"unexpected artifact_dir error: {exc}")
+        bad_replay_bundle = root / "bad-replay-bundle"
+        artifacts_bad_replay_bundle = selftest_artifacts(
+            root / "bad-replay-bundle-fixtures",
+            sha,
+        )
+        bad_replay_bundle_actual = read_json(artifacts_bad_replay_bundle["actual"])
+        bad_replay_bundle_actual["metal_l2_artifact"]["replay_bundle_index"][0][
+            "bundle_dir"
+        ] = str(root / "missing-replay-bundle")
+        write_json(artifacts_bad_replay_bundle["actual"], bad_replay_bundle_actual)
+        args_bad_replay_bundle = argparse.Namespace(
+            out=bad_replay_bundle,
+            resource_invariant=artifacts_bad_replay_bundle["resource"],
+            change_impact=artifacts_bad_replay_bundle["change"],
+            product_sentinel=artifacts_bad_replay_bundle["product"],
+            model_contract=artifacts_bad_replay_bundle["model"],
+            support_matrix_contract=artifacts_bad_replay_bundle["support_matrix"],
+            observability_profile=artifacts_bad_replay_bundle["observability"],
+            native_operator=artifacts_bad_replay_bundle["native"],
+            actual_model_regression_summary=artifacts_bad_replay_bundle["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_replay_bundle)
+            raise AssertionError("missing L2 replay bundle unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require("bundle_dir" in str(exc), f"unexpected replay bundle error: {exc}")
         return {
             "schema_version": SCHEMA_VERSION,
             "status": "pass",
