@@ -236,6 +236,12 @@ def execute_replay(bundle: Path, *, out: Path, timeout: int) -> dict[str, Any]:
     argv = replay.get("argv")
     if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
         raise BundleError(f"{bundle / 'replay.command.json'}.argv must be a string array")
+    if "synthetic/no-weight" not in argv and replay.get("requires_running_server") is True:
+        return {
+            "source_bundle_dir": str(bundle),
+            "status": "skipped_requires_running_server",
+            "reason": "offline replay execution only runs synthetic/no-weight commands",
+        }
     replay_out = out / "executed_replays" / safe_path_part(bundle.name)
     replay_out.mkdir(parents=True, exist_ok=True)
     rewritten = rewrite_replay_argv(argv, replay_out)
@@ -415,14 +421,25 @@ def main() -> int:
         replay_executions = []
         if args.execute_replay:
             for bundle in bundle_paths:
-                replay_executions.append(execute_replay(bundle, out=args.out, timeout=args.timeout))
+                replay_executions.append(
+                    execute_replay(bundle, out=args.out, timeout=args.timeout)
+                )
         summary = {
             "schema_version": SCHEMA_VERSION,
             "status": "pass",
             "bundle_count": len(results),
             "bundles": results,
             "execute_replay": bool(args.execute_replay),
-            "replay_execution_count": len(replay_executions),
+            "replay_execution_count": sum(
+                1
+                for item in replay_executions
+                if item.get("status") != "skipped_requires_running_server"
+            ),
+            "replay_execution_skipped_count": sum(
+                1
+                for item in replay_executions
+                if item.get("status") == "skipped_requires_running_server"
+            ),
             "replay_executions": replay_executions,
         }
         write_json(args.out / "request_replay_bundle_summary.json", summary)

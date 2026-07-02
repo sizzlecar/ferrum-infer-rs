@@ -25,10 +25,13 @@ use ferrum_types::{
     EngineMetrics, EngineStatus, FerrumConfigBuilder, FerrumError as Error, FinishReason,
     InferenceRequest, InferenceResponse, ModelId, Priority, RequestId, ResolvedFerrumConfig,
     RuntimeConfigSnapshot, SamplingParams, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY,
-    DEFAULT_MAX_TOKENS_METADATA_KEY,
+    DEFAULT_MAX_TOKENS_METADATA_KEY, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 use tokio::sync::mpsc;
@@ -174,9 +177,12 @@ impl AxumServer {
     }
 
     /// Build the router with all routes
+    #[allow(dead_code)]
     fn build_router(&self) -> Router {
-        let app_state = self.state.clone();
+        self.build_router_with_state(self.state.clone())
+    }
 
+    fn build_router_with_state(&self, app_state: AppState) -> Router {
         Router::new()
             // OpenAI API routes
             .route("/v1/chat/completions", post(chat_completions_handler))
@@ -211,6 +217,7 @@ pub struct AppState {
     pub auto_config: Option<ResolvedFerrumConfig>,
     pub prompt_template: Option<Arc<ModelChatTemplate>>,
     pub lora_registry: Arc<LoraModelRegistry>,
+    pub request_dump_dir: Option<Arc<PathBuf>>,
     cache: Arc<CacheRuntimeState>,
 }
 
@@ -333,6 +340,11 @@ impl AppState {
         adapters: Vec<LoraAdapterModel>,
     ) -> Self {
         self.lora_registry = Arc::new(LoraModelRegistry::new(base_model_id, adapters));
+        self
+    }
+
+    pub fn with_request_dump_dir(mut self, request_dump_dir: Option<PathBuf>) -> Self {
+        self.request_dump_dir = request_dump_dir.map(Arc::new);
         self
     }
 
@@ -799,7 +811,11 @@ impl HttpServer for AxumServer {
         let addr = format!("{}:{}", config.host, config.port);
         info!("Starting Axum server on {}", addr);
 
-        let app = self.build_router();
+        let app = self.build_router_with_state(
+            self.state
+                .clone()
+                .with_request_dump_dir(config.request_dump_dir.clone()),
+        );
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .map_err(|e| Error::internal(format!("Failed to bind to {}: {}", addr, e)))?;
@@ -916,6 +932,11 @@ async fn chat_completions_handler(
     state
         .cache
         .record_prefix_prompt(&inference_request.prompt, &cache_policy);
+    if let Err(err) =
+        write_chat_request_replay_bundle(&state, &headers, &request, &inference_request)
+    {
+        warn!("failed to write chat request replay bundle: {}", err);
+    }
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
@@ -923,6 +944,262 @@ async fn chat_completions_handler(
     } else {
         handle_chat_completions_sync(state, request, inference_request, session_context).await
     }
+}
+
+fn write_chat_request_replay_bundle(
+    state: &AppState,
+    headers: &HeaderMap,
+    openai_request: &ChatCompletionsRequest,
+    inference_request: &InferenceRequest,
+) -> std::result::Result<(), String> {
+    let Some(root) = state.request_dump_dir.as_ref() else {
+        return Ok(());
+    };
+    let request_id = inference_request.id.to_string();
+    let bundle_dir = root.join(&request_id);
+    fs::create_dir_all(&bundle_dir).map_err(|err| err.to_string())?;
+
+    let sanitized_body = sanitized_chat_request_body(openai_request);
+    let replay_body_path = bundle_dir.join("replay_body.json");
+    write_json_value(&replay_body_path, &sanitized_body)?;
+
+    let request = serde_json::json!({
+        "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        "entrypoint": "serve",
+        "request_id": request_id,
+        "model": openai_request.model.clone(),
+        "backend": "actual",
+        "endpoint": "/v1/chat/completions",
+        "method": "POST",
+        "stream": openai_request.stream.unwrap_or(false),
+        "actual_model_smoke": true,
+        "sanitized": true,
+        "http": {
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": sanitized_replay_headers(headers),
+            "body": sanitized_body
+        }
+    });
+    let files = [
+        ("request.json", request),
+        (
+            "prompt_token_ids.json",
+            serde_json::json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "model": openai_request.model.clone(),
+                "tokenizer_or_model": openai_request.model.clone(),
+                "token_ids": null,
+                "token_count": null,
+                "unavailable_reason": "server request replay captures the OpenAI body before prompt token ids are retained",
+                "sanitized": true
+            }),
+        ),
+        (
+            "sampling_params.json",
+            serde_json::json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "sampling_params": inference_request.sampling_params.clone(),
+                "unavailable_reason": null
+            }),
+        ),
+        (
+            "runtime_effective_config.json",
+            serde_json::json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "entrypoint": "serve",
+                "endpoint": "/v1/chat/completions",
+                "stream": openai_request.stream.unwrap_or(false),
+                "request_dump_dir": root.to_string_lossy(),
+                "sanitized": true
+            }),
+        ),
+        (
+            "backend_selection.json",
+            serde_json::json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "backend": "actual",
+                "model": openai_request.model.clone(),
+                "actual_model_smoke": true
+            }),
+        ),
+        (
+            "output_token_ids.json",
+            serde_json::json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "token_ids": [],
+                "token_count": 0,
+                "finish_reason": null,
+                "unavailable_reason": "server request replay bundle is emitted at request admission in this WP9 slice"
+            }),
+        ),
+        (
+            "bad_output_scan.json",
+            serde_json::json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "bad_output": false,
+                "bad_text_count": 0,
+                "reasons": [],
+                "first_bad_text_span": null,
+                "failure_kind": null,
+                "output_chars": 0,
+                "output_sha256": sha256_hex(b"")
+            }),
+        ),
+        (
+            "replay.command.json",
+            serde_json::json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "entrypoint": "serve",
+                "command": replay_curl_command(&bundle_dir),
+                "argv": replay_curl_argv(&bundle_dir),
+                "bundle_dir": bundle_dir.to_string_lossy(),
+                "requires_running_server": true,
+                "sanitized": true
+            }),
+        ),
+    ];
+    for (name, value) in files {
+        write_json_value(&bundle_dir.join(name), &value)?;
+    }
+    fs::write(
+        bundle_dir.join("output_text.txt"),
+        format!(
+            "[server request replay emitted before response]\nsha256={}\nchars=0\n",
+            sha256_hex(b"")
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn sanitized_replay_headers(headers: &HeaderMap) -> serde_json::Value {
+    let mut result = serde_json::Map::new();
+    for key in ["content-type", "traceparent", "tracestate"] {
+        if let Some(value) = headers.get(key).and_then(|value| value.to_str().ok()) {
+            result.insert(key.to_string(), serde_json::json!(value));
+        }
+    }
+    result.insert("authorization".to_string(), serde_json::json!("[redacted]"));
+    result.insert("cookie".to_string(), serde_json::json!("[redacted]"));
+    serde_json::Value::Object(result)
+}
+
+fn sanitized_chat_request_body(request: &ChatCompletionsRequest) -> serde_json::Value {
+    let mut value = serde_json::to_value(request).unwrap_or_else(|_| {
+        serde_json::json!({
+            "model": request.model.clone(),
+            "stream": request.stream.unwrap_or(false),
+            "messages": []
+        })
+    });
+    redact_json_value(&mut value, None);
+    value
+}
+
+fn redact_json_value(value: &mut serde_json::Value, key: Option<&str>) {
+    if key.is_some_and(is_secret_key) {
+        *value = serde_json::json!("[redacted]");
+        return;
+    }
+    if matches!(key, Some("content" | "arguments")) && value.is_string() {
+        *value = serde_json::json!("[redacted]");
+        return;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for field in ["content", "arguments"] {
+                if let Some(chars) = map
+                    .get(field)
+                    .and_then(|child| child.as_str())
+                    .map(|text| text.chars().count())
+                {
+                    map.insert(field.to_string(), serde_json::json!("[redacted]"));
+                    map.insert(format!("{field}_redacted"), serde_json::json!(true));
+                    map.insert(format!("{field}_chars"), serde_json::json!(chars));
+                }
+            }
+            for (child_key, child) in map.iter_mut() {
+                redact_json_value(child, Some(child_key.as_str()));
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                redact_json_value(child, None);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_secret_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| *ch != '-' && *ch != '_')
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "authorization"
+            | "cookie"
+            | "secret"
+            | "apikey"
+            | "password"
+            | "accesstoken"
+            | "refreshtoken"
+            | "idtoken"
+    )
+}
+
+fn replay_curl_argv(bundle_dir: &Path) -> Vec<String> {
+    vec![
+        "curl".to_string(),
+        "-sS".to_string(),
+        "-X".to_string(),
+        "POST".to_string(),
+        "http://127.0.0.1:8000/v1/chat/completions".to_string(),
+        "-H".to_string(),
+        "content-type: application/json".to_string(),
+        "--data-binary".to_string(),
+        format!("@{}", bundle_dir.join("replay_body.json").display()),
+    ]
+}
+
+fn replay_curl_command(bundle_dir: &Path) -> String {
+    replay_curl_argv(bundle_dir)
+        .iter()
+        .map(|part| shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '@'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn write_json_value(path: &Path, value: &serde_json::Value) -> std::result::Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|err| err.to_string())?;
+    fs::write(path, [bytes, b"\n".to_vec()].concat()).map_err(|err| err.to_string())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 /// Handle streaming chat completions
@@ -4206,6 +4483,23 @@ mod tests {
             obj.insert(k.clone(), v.clone());
         }
         serde_json::from_value(value).expect("chat request")
+    }
+
+    #[test]
+    fn sanitized_chat_request_body_redacts_user_text_and_secret_metadata() {
+        let request = chat_request(json!({
+            "messages": [{"role": "user", "content": "private prompt"}],
+            "metadata": {"api_key": "should-not-survive"},
+            "stream": true
+        }));
+        let body = sanitized_chat_request_body(&request);
+        assert_eq!(body["model"], "stub-model");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"], "[redacted]");
+        assert_eq!(body["messages"][0]["content_redacted"], true);
+        assert_eq!(body["messages"][0]["content_chars"], 14);
+        assert_eq!(body["metadata"]["api_key"], "[redacted]");
     }
 
     #[tokio::test]
