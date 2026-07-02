@@ -439,14 +439,52 @@ def load_vertical_slice(path_value: Any, observability_root: Path) -> dict[str, 
     return {"manifest": None, "summary": summary, "summary_path": str(path)}
 
 
+def require_zero_count(summary: dict[str, Any], field: str, label: str) -> None:
+    value = summary.get(field)
+    require(
+        isinstance(value, int) and value == 0,
+        f"{label}.{field} must be 0 for final PASS",
+    )
+
+
+def validate_replay_commands(value: Any, label: str) -> None:
+    require(isinstance(value, list) and value, f"{label} must contain at least one replay command")
+    for index, command in enumerate(value):
+        require(isinstance(command, dict), f"{label}[{index}] must be an object")
+        for key in ("event_id", "request_id", "command", "bundle_dir"):
+            item = command.get(key)
+            require(
+                isinstance(item, str) and item.strip(),
+                f"{label}[{index}].{key} must be non-empty",
+            )
+
+
 def validate_observability_profile(root: Path, expected_sha: str) -> dict[str, Any]:
     stage = load_stage_manifest(root, "observability_profile", "OBSERVABILITY PROFILE GATE PASS", expected_sha)
     summary = load_summary_from_manifest(stage, "observability_profile_summary.json")
     missing = sorted(OBSERVABILITY_SUMMARY_FIELDS - set(summary))
     require(not missing, f"observability_profile.summary missing fields: {missing}")
-    require(summary.get("bad_text_count") == 0, "observability_profile.summary.bad_text_count must be 0")
-    require(summary.get("silent_oom_count") == 0, "observability_profile.summary.silent_oom_count must be 0")
-    require(summary.get("resource_leak_count") == 0, "observability_profile.summary.resource_leak_count must be 0")
+    request_count = summary.get("request_count")
+    require(
+        isinstance(request_count, int) and request_count > 0,
+        "observability_profile.summary.request_count must be a positive integer",
+    )
+    for field in (
+        "failed_count",
+        "corrupted_count",
+        "bad_text_count",
+        "silent_oom_count",
+        "resource_leak_count",
+    ):
+        require_zero_count(summary, field, "observability_profile.summary")
+    require(
+        summary.get("first_failure_event") is None,
+        "observability_profile.summary.first_failure_event must be null when failed_count is 0",
+    )
+    validate_replay_commands(
+        summary.get("replay_commands"),
+        "observability_profile.summary.replay_commands",
+    )
     entrypoints = set(summary.get("entrypoints") or [])
     require({"run", "serve"} <= entrypoints, "observability_profile.summary must include run and serve entrypoints")
     stage["summary"] = summary
@@ -1087,7 +1125,20 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "resource_leak_count": 0,
             "top_slow_phases": [],
             "first_failure_event": None,
-            "replay_commands": [],
+            "replay_commands": [
+                {
+                    "event_id": "evt-run-complete",
+                    "request_id": "req-run-fixture",
+                    "command": "ferrum run synthetic/no-weight",
+                    "bundle_dir": "fixtures/run-request-dump",
+                },
+                {
+                    "event_id": "evt-serve-complete",
+                    "request_id": "req-serve-fixture",
+                    "command": "curl -s http://127.0.0.1:8000/v1/chat/completions",
+                    "bundle_dir": "fixtures/serve-request-dump",
+                },
+            ],
             "vertical_slice_artifact": str(vertical),
             "actual_smoke_artifact": "fixture-l1-smoke",
         },

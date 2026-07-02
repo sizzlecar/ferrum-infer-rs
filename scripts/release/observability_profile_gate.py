@@ -34,6 +34,13 @@ BAD_TEXT_KINDS = {
     "required_tool_failure",
 }
 OOM_KINDS = {"cuda_oom", "metal_oom", "oom", "silent_oom"}
+PASSING_PROFILE_ZERO_FIELDS = (
+    "failed_count",
+    "corrupted_count",
+    "bad_text_count",
+    "silent_oom_count",
+    "resource_leak_count",
+)
 
 
 class GateError(RuntimeError):
@@ -293,6 +300,28 @@ def summarize_events(profile_paths: list[Path], events_by_path: dict[str, list[d
     }
 
 
+def validate_passing_profile_summary(summary: dict[str, Any], label: str) -> None:
+    request_count = summary.get("request_count")
+    if not isinstance(request_count, int) or request_count <= 0:
+        raise GateError(f"{label}.request_count must be a positive integer")
+    for field in PASSING_PROFILE_ZERO_FIELDS:
+        value = summary.get(field)
+        if not isinstance(value, int) or value != 0:
+            raise GateError(f"{label}.{field} must be 0 for a passing product profile")
+    if summary.get("first_failure_event") is not None:
+        raise GateError(f"{label}.first_failure_event must be null when failed_count is 0")
+    replay_commands = summary.get("replay_commands")
+    if not isinstance(replay_commands, list) or not replay_commands:
+        raise GateError(f"{label}.replay_commands must contain at least one replay command")
+    for index, command in enumerate(replay_commands):
+        if not isinstance(command, dict):
+            raise GateError(f"{label}.replay_commands[{index}] must be an object")
+        for key in ("event_id", "request_id", "command", "bundle_dir"):
+            value = command.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise GateError(f"{label}.replay_commands[{index}].{key} must be non-empty")
+
+
 def validate_replay_bundles(events_by_path: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     results: list[dict[str, Any]] = []
@@ -341,12 +370,15 @@ def run_fixture_selftest(root: Path) -> dict[str, Any]:
     pass_results = []
     for path in pass_files:
         events = load_and_validate_profiles([path])
-        pass_results.append(summarize_events([path], events))
+        summary = summarize_events([path], events)
+        validate_passing_profile_summary(summary, str(path))
+        pass_results.append(summary)
     fail_results = []
     for path in fail_files:
         try:
             events = load_and_validate_profiles([path])
-            summarize_events([path], events)
+            summary = summarize_events([path], events)
+            validate_passing_profile_summary(summary, str(path))
         except (GateError, ValidationError) as exc:
             fail_results.append({"path": str(path), "error": str(exc)})
             continue
@@ -431,12 +463,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     summary = summarize_events(args.profile_jsonl, events_by_path)
     if "run" not in summary["entrypoints"] or "serve" not in summary["entrypoints"]:
         raise GateError("observability profile gate requires both run and serve entrypoint artifacts")
-    if summary["bad_text_count"] != 0:
-        raise GateError("bad_text_count must be 0 for passing product profiles")
-    if summary["silent_oom_count"] != 0:
-        raise GateError("silent_oom_count must be 0 for passing product profiles")
-    if summary["resource_leak_count"] != 0:
-        raise GateError("resource_leak_count must be 0 for passing product profiles")
+    validate_passing_profile_summary(summary, "observability_profile.summary")
     summary["gate"] = "observability_profile"
     summary["fixture_summary"] = fixture_summary
     summary["replay_bundle_summary"] = replay_bundle_summary
