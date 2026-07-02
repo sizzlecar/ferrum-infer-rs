@@ -642,6 +642,11 @@ def validate_model_contract(root: Path, expected_sha: str) -> dict[str, Any]:
             contract_id not in seen_contract_ids,
             f"model_contract.summary.contracts duplicate contract_id {contract_id!r}",
         )
+        model_id = contract.get("model_id")
+        require(
+            isinstance(model_id, str) and model_id.strip(),
+            f"model_contract.summary.contracts[{index}].model_id must be non-empty",
+        )
         seen_contract_ids.add(contract_id)
     stage["summary"] = summary
     return stage
@@ -653,30 +658,54 @@ def validate_model_support_linkage(
 ) -> None:
     contracts = model_summary.get("contracts")
     require(isinstance(contracts, list), "model_contract.summary.contracts must be a list")
-    contract_ids = {
-        contract["contract_id"]
+    contract_model_ids = {
+        contract["contract_id"]: contract["model_id"]
         for contract in contracts
         if isinstance(contract, dict)
         and isinstance(contract.get("contract_id"), str)
         and contract["contract_id"].strip()
+        and isinstance(contract.get("model_id"), str)
+        and contract["model_id"].strip()
     }
-    require(contract_ids, "model_contract.summary must expose at least one contract_id")
+    require(contract_model_ids, "model_contract.summary must expose at least one contract_id/model_id pair")
     rows = support_summary.get("rows")
     require(isinstance(rows, list), "support_matrix_contract.summary.rows must be a list")
     missing: list[str] = []
+    mismatched_model_ids: list[str] = []
     for index, row in enumerate(rows):
         require(isinstance(row, dict), f"support_matrix_contract.summary.rows[{index}] must be an object")
+        row_model_id = row.get("model_id")
+        require(
+            isinstance(row_model_id, str) and row_model_id.strip(),
+            f"support_matrix_contract.summary.rows[{index}].model_id must be non-empty",
+        )
         contract_id = row.get("contract_id")
         require(
             isinstance(contract_id, str) and contract_id.strip(),
             f"support_matrix_contract.summary.rows[{index}].contract_id must be non-empty",
         )
-        if contract_id not in contract_ids:
+        if contract_id not in contract_model_ids:
             missing.append(f"{row.get('model_id', f'row-{index}')}->{contract_id}")
+            continue
+        contract_model_id = row.get("contract_model_id")
+        require(
+            isinstance(contract_model_id, str) and contract_model_id.strip(),
+            f"support_matrix_contract.summary.rows[{index}].contract_model_id must be non-empty",
+        )
+        expected_model_id = contract_model_ids[contract_id]
+        if contract_model_id != expected_model_id:
+            mismatched_model_ids.append(
+                f"{row_model_id}->{contract_id} contract_model_id={contract_model_id!r} expected={expected_model_id!r}"
+            )
     require(
         not missing,
         "support_matrix_contract.summary references contracts missing from model_contract.summary: "
         + ", ".join(missing),
+    )
+    require(
+        not mismatched_model_ids,
+        "support_matrix_contract.summary contract_model_id mismatches model_contract.summary: "
+        + ", ".join(mismatched_model_ids),
     )
 
 
@@ -1632,7 +1661,13 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "schema_version": 1,
             "status": "pass",
             "gate": "model_onboarding_contract",
-            "contracts": [{"contract_id": "fixture", "status": "pass"}],
+            "contracts": [
+                {
+                    "contract_id": "fixture",
+                    "model_id": "fixture/qwen3-moe",
+                    "status": "pass",
+                }
+            ],
         },
     )
 
@@ -1793,6 +1828,7 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
                 {
                     "model_id": "fixture/qwen3-moe",
                     "contract_id": "fixture",
+                    "contract_model_id": "fixture/qwen3-moe",
                     "claims": {"cuda": True, "metal": False, "int4_gptq": True},
                 }
             ],
@@ -2153,6 +2189,39 @@ def run_selftest() -> dict[str, Any]:
             require(
                 "references contracts missing" in str(exc),
                 f"unexpected support/model contract linkage error: {exc}",
+            )
+        bad_support_contract_model_link = root / "bad-support-contract-model-link"
+        artifacts_bad_support_contract_model_link = selftest_artifacts(
+            root / "bad-support-contract-model-link-fixtures",
+            sha,
+        )
+        bad_support_model_summary_path = (
+            artifacts_bad_support_contract_model_link["support_matrix"]
+            / "support_matrix_contract_summary.json"
+        )
+        bad_support_model_summary = read_json(bad_support_model_summary_path)
+        bad_support_model_summary["rows"][0]["contract_model_id"] = "fixture/different-model"
+        write_json(bad_support_model_summary_path, bad_support_model_summary)
+        args_bad_support_contract_model_link = argparse.Namespace(
+            out=bad_support_contract_model_link,
+            resource_invariant=artifacts_bad_support_contract_model_link["resource"],
+            change_impact=artifacts_bad_support_contract_model_link["change"],
+            product_sentinel=artifacts_bad_support_contract_model_link["product"],
+            model_contract=artifacts_bad_support_contract_model_link["model"],
+            support_matrix_contract=artifacts_bad_support_contract_model_link["support_matrix"],
+            observability_profile=artifacts_bad_support_contract_model_link["observability"],
+            native_operator=artifacts_bad_support_contract_model_link["native"],
+            actual_model_regression_summary=artifacts_bad_support_contract_model_link["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_support_contract_model_link)
+            raise AssertionError("support matrix row with mismatched contract_model_id unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "contract_model_id mismatches" in str(exc),
+                f"unexpected support/model id linkage error: {exc}",
             )
         bad_dirty_stage = root / "bad-dirty-stage"
         artifacts_bad_dirty_stage = selftest_artifacts(root / "bad-dirty-stage-fixtures", sha)
