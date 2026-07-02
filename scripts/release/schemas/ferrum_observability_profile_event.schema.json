@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Ferrum observability profile event",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "event_id",
+    "request_id",
+    "entrypoint",
+    "backend",
+    "phase",
+    "event_kind",
+    "timestamp",
+    "status"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "event_id": { "type": "string", "minLength": 1 },
+    "request_id": { "type": "string", "minLength": 1 },
+    "correlation_id": { "type": "string" },
+    "entrypoint": { "enum": ["run", "serve", "bench_serve", "synthetic"] },
+    "backend": { "type": "string", "minLength": 1 },
+    "phase": { "type": "string", "minLength": 1 },
+    "event_kind": { "enum": ["instant", "timed_span", "resource", "memory", "error"] },
+    "timestamp": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["ok", "failure", "diagnostic_only"] },
+    "model": { "type": "string" },
+    "duration_us": { "type": "integer", "minimum": 0 },
+    "memory": {
+      "type": "object",
+      "required": ["scope", "before_bytes", "after_bytes"],
+      "properties": {
+        "scope": { "type": "string", "minLength": 1 },
+        "backend": { "type": "string" },
+        "before_bytes": { "type": "integer", "minimum": 0 },
+        "after_bytes": { "type": "integer", "minimum": 0 },
+        "high_water_bytes": { "type": "integer", "minimum": 0 },
+        "available_bytes": { "type": "integer" }
+      }
+    },
+    "resource": {
+      "type": "object",
+      "required": ["owner_kind", "owner_id", "resource_kind", "action"],
+      "properties": {
+        "owner_kind": { "type": "string", "minLength": 1 },
+        "owner_id": { "type": "string", "minLength": 1 },
+        "resource_kind": { "type": "string", "minLength": 1 },
+        "action": {
+          "enum": [
+            "request_open",
+            "reserve",
+            "commit",
+            "defer",
+            "reject",
+            "release",
+            "rollback",
+            "request_close",
+            "capacity_snapshot"
+          ]
+        },
+        "amount": { "type": "integer" },
+        "before": { "type": "integer" },
+        "after": { "type": "integer" },
+        "capacity": { "type": "integer" },
+        "reason": { "type": "string" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["kind", "message"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "blocking": { "type": "boolean" }
+      }
+    },
+    "replay": {
+      "type": "object",
+      "required": ["command"],
+      "properties": {
+        "command": { "type": "string", "minLength": 1 },
+        "bundle_dir": { "type": "string" }
+      }
+    },
+    "attributes": { "type": "object" }
+  }
+}
