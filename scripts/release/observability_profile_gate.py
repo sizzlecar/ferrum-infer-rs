@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from analyze_ferrum_profile import ValidationError, validate_profile_event
+from request_replay_bundle_gate import BundleError, validate_bundle_root
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -292,6 +293,32 @@ def summarize_events(profile_paths: list[Path], events_by_path: dict[str, list[d
     }
 
 
+def validate_replay_bundles(events_by_path: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    results: list[dict[str, Any]] = []
+    for profile_path, events in events_by_path.items():
+        profile_parent = Path(profile_path).parent
+        for event in events:
+            replay = event.get("replay")
+            if not isinstance(replay, dict):
+                continue
+            bundle_dir = replay.get("bundle_dir")
+            if not isinstance(bundle_dir, str) or not bundle_dir.strip():
+                continue
+            candidate = Path(bundle_dir)
+            if not candidate.is_absolute():
+                candidate = (profile_parent / candidate).resolve()
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                results.extend(validate_bundle_root(candidate))
+            except BundleError as exc:
+                raise GateError(f"invalid replay bundle {candidate}: {exc}") from exc
+    return results
+
+
 def load_and_validate_profiles(profile_paths: list[Path]) -> dict[str, list[dict[str, Any]]]:
     events_by_path: dict[str, list[dict[str, Any]]] = {}
     for path in profile_paths:
@@ -385,6 +412,7 @@ def build_manifest(
             "bad_text_count": summary["bad_text_count"],
             "silent_oom_count": summary["silent_oom_count"],
             "resource_leak_count": summary["resource_leak_count"],
+            "replay_bundle_count": len(summary.get("replay_bundle_summary", [])),
             "fixture_pass_count": fixture_summary["pass_fixture_count"],
             "fixture_fail_count": fixture_summary["fail_fixture_count"],
         },
@@ -399,6 +427,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     if len(args.profile_jsonl) < 2:
         raise GateError("provide at least two --profile-jsonl paths covering run and serve artifacts")
     events_by_path = load_and_validate_profiles(args.profile_jsonl)
+    replay_bundle_summary = validate_replay_bundles(events_by_path)
     summary = summarize_events(args.profile_jsonl, events_by_path)
     if "run" not in summary["entrypoints"] or "serve" not in summary["entrypoints"]:
         raise GateError("observability profile gate requires both run and serve entrypoint artifacts")
@@ -410,6 +439,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         raise GateError("resource_leak_count must be 0 for passing product profiles")
     summary["gate"] = "observability_profile"
     summary["fixture_summary"] = fixture_summary
+    summary["replay_bundle_summary"] = replay_bundle_summary
     summary["vertical_slice_artifact"] = str(args.vertical_slice) if args.vertical_slice else None
     summary["actual_smoke_artifact"] = str(args.actual_smoke) if args.actual_smoke else None
     write_json(out / "observability_profile_summary.json", summary)
