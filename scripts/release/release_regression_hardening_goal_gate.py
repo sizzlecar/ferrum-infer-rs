@@ -56,6 +56,27 @@ OBSERVABILITY_SUMMARY_FIELDS = {
     "replay_commands",
 }
 REQUIRED_L2_ENTRYPOINTS = {"run", "serve", "stream", "basic_concurrency"}
+REQUIRED_RESOURCE_SCENARIOS = {
+    "kv_allocate_release_success",
+    "kv_capacity_reject",
+    "recurrent_slot_limit_reject",
+    "scheduler_defer_reopen_after_capacity",
+    "scheduler_cancel_releases_capacity",
+    "engine_prefill_failure_rolls_back",
+    "engine_decode_failure_rolls_back",
+    "serve_client_disconnect_cleans_up",
+    "run_multiturn_resource_balance",
+    "mixed_batch_partial_failure",
+    "oom_prevented_by_admission",
+    "trace_replay_selftest",
+}
+REQUIRED_RESOURCE_KINDS = {
+    "backend_workspace",
+    "kv_block",
+    "recurrent_state_slot",
+    "scheduler_admission_slot",
+}
+RESOURCE_CACHE_KINDS = {"model_cache_ref", "session_cache_ref"}
 
 
 class GoalGateError(RuntimeError):
@@ -209,12 +230,75 @@ def load_summary_from_manifest(stage: dict[str, Any], fallback_name: str) -> dic
     return {**summary, "_summary_path": str(path)}
 
 
+def validate_resource_fixture_coverage(summary: dict[str, Any]) -> None:
+    fixture_summary = summary.get("fixture_summary")
+    require(
+        isinstance(fixture_summary, dict),
+        "resource_invariant.summary.fixture_summary must be an object",
+    )
+    scenario_count = fixture_summary.get("scenario_count")
+    require(
+        isinstance(scenario_count, int) and scenario_count >= len(REQUIRED_RESOURCE_SCENARIOS),
+        f"resource_invariant.summary.fixture_summary.scenario_count must be >= {len(REQUIRED_RESOURCE_SCENARIOS)}",
+    )
+    required_scenarios = set(
+        require_string_list(
+            fixture_summary.get("required_scenarios", []),
+            "resource_invariant.summary.fixture_summary.required_scenarios",
+        )
+    )
+    missing = sorted(REQUIRED_RESOURCE_SCENARIOS - required_scenarios)
+    require(not missing, f"resource_invariant.summary.fixture_summary.required_scenarios missing {missing}")
+    trace = summary.get("trace")
+    require(isinstance(trace, dict), "resource_invariant.summary.trace must be an object")
+    trace_scenarios = set(
+        require_string_list(
+            trace.get("scenarios", []),
+            "resource_invariant.summary.trace.scenarios",
+        )
+    )
+    missing_trace = sorted(REQUIRED_RESOURCE_SCENARIOS - trace_scenarios)
+    require(not missing_trace, f"resource_invariant.summary.trace.scenarios missing {missing_trace}")
+
+
+def validate_resource_summary(summary: dict[str, Any]) -> None:
+    resource_summary = summary.get("resource_summary")
+    require(
+        isinstance(resource_summary, dict) and resource_summary,
+        "resource_invariant.summary.resource_summary must be a non-empty object",
+    )
+    resource_kinds = set(resource_summary)
+    missing_kinds = sorted(REQUIRED_RESOURCE_KINDS - resource_kinds)
+    require(not missing_kinds, f"resource_invariant.summary.resource_summary missing resource kinds {missing_kinds}")
+    require(
+        resource_kinds & RESOURCE_CACHE_KINDS,
+        "resource_invariant.summary.resource_summary must include model_cache_ref or session_cache_ref",
+    )
+    for resource_kind, bucket in sorted(resource_summary.items()):
+        require(
+            isinstance(bucket, dict),
+            f"resource_invariant.summary.resource_summary.{resource_kind} must be an object",
+        )
+        for key in ("capacity", "reserved", "committed", "released", "leaked"):
+            value = bucket.get(key)
+            require(
+                isinstance(value, int) and value >= 0,
+                f"resource_invariant.summary.resource_summary.{resource_kind}.{key} must be a non-negative integer",
+            )
+        require(
+            bucket["leaked"] == 0,
+            f"resource_invariant.summary.resource_summary.{resource_kind}.leaked must be 0",
+        )
+
+
 def validate_resource_invariant(root: Path, expected_sha: str) -> dict[str, Any]:
     stage = load_stage_manifest(root, "resource_invariant", "RESOURCE INVARIANT GATE PASS", expected_sha)
     summary = read_json(root / "invariant_report.json")
     require_status_pass(summary, "resource_invariant.summary")
     for key in ("leaked_resources", "underflow_count", "silent_oom_count", "panic_count"):
         require(summary.get(key) == 0, f"resource_invariant.summary.{key} must be 0")
+    validate_resource_fixture_coverage(summary)
+    validate_resource_summary(summary)
     stage["summary"] = {**summary, "_summary_path": str(root / "invariant_report.json")}
     return stage
 
@@ -1059,7 +1143,56 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
         "underflow_count": 0,
         "silent_oom_count": 0,
         "panic_count": 0,
-        "resource_summary": {},
+        "trace": {
+            "source": str(resource / "resource_trace.jsonl"),
+            "events": 72,
+            "scenarios": sorted(REQUIRED_RESOURCE_SCENARIOS),
+            "failures": [],
+            "failure_counts": {},
+        },
+        "fixture_summary": {
+            "scenario_count": len(REQUIRED_RESOURCE_SCENARIOS),
+            "required_scenarios": sorted(REQUIRED_RESOURCE_SCENARIOS),
+            "pass_fixtures": [],
+            "fail_fixtures": [],
+        },
+        "resource_summary": {
+            "backend_workspace": {
+                "capacity": 2,
+                "reserved": 3,
+                "committed": 3,
+                "released": 3,
+                "leaked": 0,
+            },
+            "kv_block": {
+                "capacity": 8,
+                "reserved": 4,
+                "committed": 4,
+                "released": 4,
+                "leaked": 0,
+            },
+            "model_cache_ref": {
+                "capacity": 4,
+                "reserved": 1,
+                "committed": 1,
+                "released": 1,
+                "leaked": 0,
+            },
+            "recurrent_state_slot": {
+                "capacity": 16,
+                "reserved": 1,
+                "committed": 1,
+                "released": 1,
+                "leaked": 0,
+            },
+            "scheduler_admission_slot": {
+                "capacity": 2,
+                "reserved": 2,
+                "committed": 2,
+                "released": 2,
+                "leaked": 0,
+            },
+        },
     }
     write_json(resource / "invariant_report.json", resource_summary)
     write_json(
@@ -1468,6 +1601,48 @@ def run_selftest() -> dict[str, Any]:
         )
         manifest = run_gate(args)
         require((out / "goal_manifest.json").is_file(), "selftest missing goal_manifest.json")
+        bad_resource_coverage = root / "bad-resource-coverage"
+        artifacts_bad_resource_coverage = selftest_artifacts(
+            root / "bad-resource-coverage-fixtures",
+            sha,
+        )
+        bad_resource_report_path = artifacts_bad_resource_coverage["resource"] / "invariant_report.json"
+        bad_resource_report = read_json(bad_resource_report_path)
+        bad_resource_report["fixture_summary"]["required_scenarios"] = [
+            scenario
+            for scenario in bad_resource_report["fixture_summary"]["required_scenarios"]
+            if scenario != "oom_prevented_by_admission"
+        ]
+        bad_resource_report["trace"]["scenarios"] = [
+            scenario
+            for scenario in bad_resource_report["trace"]["scenarios"]
+            if scenario != "oom_prevented_by_admission"
+        ]
+        bad_resource_report["fixture_summary"]["scenario_count"] = len(
+            bad_resource_report["fixture_summary"]["required_scenarios"]
+        )
+        write_json(bad_resource_report_path, bad_resource_report)
+        args_bad_resource_coverage = argparse.Namespace(
+            out=bad_resource_coverage,
+            resource_invariant=artifacts_bad_resource_coverage["resource"],
+            change_impact=artifacts_bad_resource_coverage["change"],
+            product_sentinel=artifacts_bad_resource_coverage["product"],
+            model_contract=artifacts_bad_resource_coverage["model"],
+            support_matrix_contract=artifacts_bad_resource_coverage["support_matrix"],
+            observability_profile=artifacts_bad_resource_coverage["observability"],
+            native_operator=artifacts_bad_resource_coverage["native"],
+            actual_model_regression_summary=artifacts_bad_resource_coverage["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_resource_coverage)
+            raise AssertionError("missing resource invariant scenario unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "resource_invariant.summary.fixture_summary" in str(exc),
+                f"unexpected resource coverage error: {exc}",
+            )
         bad_native = root / "bad-native"
         # Reuse a full artifact set but mutate native source inventory to prove fail-closed behavior.
         artifacts_bad = selftest_artifacts(root / "bad", sha)
