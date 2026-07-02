@@ -141,11 +141,24 @@ def load_contracts(contract_gate_roots: list[Path], expected_sha: str) -> dict[s
             contract_path = resolve_path(path_value, base=root)
             contract = read_json(contract_path)
             require(contract.get("source_git_sha") == expected_sha, f"{contract_id} source_git_sha is stale")
+            contract_model = contract.get("model")
+            require(isinstance(contract_model, dict), f"{contract_id} model must be an object")
+            contract_model_id = contract_model.get("id")
+            require(
+                isinstance(contract_model_id, str) and contract_model_id.strip(),
+                f"{contract_id} model.id missing",
+            )
+            summary_model_id = result.get("model_id")
+            if summary_model_id is not None:
+                require(
+                    summary_model_id == contract_model_id,
+                    f"{contract_id} summary model_id {summary_model_id!r} does not match contract model.id {contract_model_id!r}",
+                )
             contracts[contract_id] = {
                 "contract_id": contract_id,
                 "path": str(contract_path),
                 "data": contract,
-                "model_id": result.get("model_id"),
+                "model_id": contract_model_id,
             }
     return contracts
 
@@ -211,6 +224,7 @@ def validate_model_row(model: dict[str, Any], contracts: dict[str, dict[str, Any
         "model_id": model_id,
         "readme_label": model.get("readme_label"),
         "contract_id": contract_id,
+        "contract_model_id": contract_record["model_id"],
         "contract_path": contract_record["path"],
         "claims": claims,
         "contract_backends": sorted(backends),
@@ -384,6 +398,22 @@ def run_selftest() -> dict[str, Any]:
                 contract_gate=[contract_gate],
             )
         )
+        mismatched_contract_gate = make_contract_gate(root / "mismatched-contract-summary", sha)
+        mismatched_summary_path = mismatched_contract_gate / "model_onboarding_contract_summary.json"
+        mismatched_summary = read_json(mismatched_summary_path)
+        mismatched_summary["contracts"][0]["model_id"] = "Different/Model"
+        write_json(mismatched_summary_path, mismatched_summary)
+        try:
+            run_gate(
+                argparse.Namespace(
+                    out=root / "bad-mismatched-contract-summary",
+                    models_manifest=valid_manifest,
+                    contract_gate=[mismatched_contract_gate],
+                )
+            )
+            raise AssertionError("contract summary model_id mismatch unexpectedly passed")
+        except SupportMatrixError as exc:
+            require("summary model_id" in str(exc), f"unexpected contract summary mismatch failure: {exc}")
         missing_contract_id = make_manifest(
             root / "missing-contract-id",
             [
