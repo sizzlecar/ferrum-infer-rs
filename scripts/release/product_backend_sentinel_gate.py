@@ -257,34 +257,42 @@ def write_blocker_profile_fixture(
                 },
             }
         )
-    events.append(
-        {
-            "schema_version": 1,
-            "event_id": f"evt-{fixture_kind.replace('_', '-')}-blocker",
-            "request_id": "req-fixture",
-            "entrypoint": "run",
+    failure_event = {
+        "schema_version": 1,
+        "event_id": f"evt-{fixture_kind.replace('_', '-')}-blocker",
+        "request_id": "req-fixture",
+        "entrypoint": "run",
+        "backend": "synthetic",
+        "phase": "decode" if fixture_kind != "oom_admission" else "admission",
+        "event_kind": "error",
+        "timestamp": "2026-07-02T00:00:01Z",
+        "status": "failure",
+        "model": "synthetic/no-weight",
+        "error": {
+            "kind": error_kind_for_fixture(fixture_kind),
+            "message": f"synthetic {failure_kind} blocker fixture",
+            "blocking": fixture_kind == "panic_error",
+        },
+        "replay": {
+            "command": "ferrum run synthetic/no-weight",
+            "bundle_dir": bundle_dir,
+        },
+        "attributes": {
+            "first_failure_event": True,
+            "profile_detail": "basic",
+            "profile_schema_fingerprint": "obs-v1",
+        },
+    }
+    if fixture_kind == "panic_error":
+        failure_event["memory"] = {
+            "scope": "process",
             "backend": "synthetic",
-            "phase": "decode" if fixture_kind != "oom_admission" else "admission",
-            "event_kind": "error",
-            "timestamp": "2026-07-02T00:00:01Z",
-            "status": "failure",
-            "model": "synthetic/no-weight",
-            "error": {
-                "kind": error_kind_for_fixture(fixture_kind),
-                "message": f"synthetic {failure_kind} blocker fixture",
-                "blocking": fixture_kind == "panic_error",
-            },
-            "replay": {
-                "command": "ferrum run synthetic/no-weight",
-                "bundle_dir": bundle_dir,
-            },
-            "attributes": {
-                "first_failure_event": True,
-                "profile_detail": "basic",
-                "profile_schema_fingerprint": "obs-v1",
-            },
+            "before_bytes": 2048,
+            "after_bytes": 2048,
+            "current_bytes": 2048,
+            "high_water_bytes": 4096,
         }
-    )
+    events.append(failure_event)
     profile.write_text(
         "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
         encoding="utf-8",
