@@ -39,6 +39,16 @@ PASS_LINE = "PRODUCT BACKEND SENTINEL PASS"
 SELFTEST_PASS_LINE = "PRODUCT BACKEND SENTINEL SELFTEST PASS"
 SCHEMA_VERSION = 1
 REQUIRED_STAGE2_FIXTURES = 12
+REQUIRED_PRODUCT_SCENARIOS = {
+    "run_first_token",
+    "run_multiturn",
+    "serve_chat",
+    "serve_concurrency_quality",
+    "serve_multiturn",
+    "serve_stream",
+    "serve_structured_output",
+    "serve_tool_call",
+}
 
 
 class SentinelError(RuntimeError):
@@ -88,7 +98,31 @@ def manifest_scenarios(manifest: dict[str, Any]) -> list[dict[str, Any]]:
             raise SentinelError(f"manifest.scenarios[{index}].name must be non-empty")
         if not isinstance(scenario.get("type"), str) or not scenario["type"].strip():
             raise SentinelError(f"manifest.scenarios[{index}].type must be non-empty")
+        product_scenarios = scenario.get("product_scenarios", [])
+        if product_scenarios is not None:
+            if not isinstance(product_scenarios, list) or not all(
+                isinstance(item, str) and item.strip() for item in product_scenarios
+            ):
+                raise SentinelError(f"manifest.scenarios[{index}].product_scenarios must be a string array")
     return scenarios
+
+
+def scenario_product_scenarios(scenario: dict[str, Any]) -> list[str]:
+    values = scenario.get("product_scenarios", [])
+    if values is None:
+        return []
+    if not isinstance(values, list):
+        return []
+    return [item for item in values if isinstance(item, str) and item.strip()]
+
+
+def validate_product_scenario_coverage(scenarios: list[dict[str, Any]]) -> list[str]:
+    covered: set[str] = set()
+    for scenario in scenarios:
+        covered.update(scenario_product_scenarios(scenario))
+    missing = sorted(REQUIRED_PRODUCT_SCENARIOS - covered)
+    require(not missing, f"manifest product_scenarios missing required product scenarios: {missing}")
+    return sorted(covered)
 
 
 def git_value(args: list[str], default: str = "unknown") -> str:
@@ -591,6 +625,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         len(scenarios) >= required_count,
         f"manifest must include at least {required_count} stage 2 fixtures",
     )
+    covered_product_scenarios = validate_product_scenario_coverage(scenarios)
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
     manifest_dir = args.manifest.parent
@@ -602,11 +637,19 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         scenario_dir.mkdir(parents=True, exist_ok=True)
         try:
             result = run_scenario(scenario, manifest_dir, scenario_dir)
-            result.update({"name": name, "type": scenario["type"], "status": "pass"})
+            result.update(
+                {
+                    "name": name,
+                    "type": scenario["type"],
+                    "product_scenarios": scenario_product_scenarios(scenario),
+                    "status": "pass",
+                }
+            )
         except Exception as exc:
             result = {
                 "name": name,
                 "type": scenario["type"],
+                "product_scenarios": scenario_product_scenarios(scenario),
                 "status": "fail",
                 "error": str(exc),
             }
@@ -635,6 +678,8 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         "artifact_dir": str(out),
         "scenario_count": len(results),
         "required_stage2_fixture_count": required_count,
+        "required_product_scenarios": sorted(REQUIRED_PRODUCT_SCENARIOS),
+        "product_scenarios": covered_product_scenarios,
         "failed": len(failures),
         "scenarios": results,
         "failure_links": failure_links,
@@ -744,6 +789,28 @@ def run_selftest() -> None:
         if summary.get("scenario_count") != REQUIRED_STAGE2_FIXTURES:
             raise AssertionError(summary)
         validate_failure_links(summary.get("failure_links") or [])
+        bad_manifest_path = temp / "missing-product-scenario.json"
+        bad_manifest = read_json(DEFAULT_MANIFEST)
+        for scenario in bad_manifest["scenarios"]:
+            if isinstance(scenario, dict):
+                scenario["product_scenarios"] = [
+                    item
+                    for item in scenario.get("product_scenarios", [])
+                    if item != "serve_tool_call"
+                ]
+        write_json(bad_manifest_path, bad_manifest)
+        try:
+            run_gate(
+                argparse.Namespace(
+                    manifest=bad_manifest_path,
+                    out=temp / "bad-missing-product-scenario",
+                    actual_smoke=None,
+                    scenario_summary=None,
+                )
+            )
+            raise AssertionError("missing product scenario coverage unexpectedly passed")
+        except SentinelError as exc:
+            require("product_scenarios missing" in str(exc), f"unexpected product scenario error: {exc}")
         scenario_summary = make_scenario_summary_fixture(temp / "scenario-summary-fixture")
         scenario_out = temp / "scenario-out"
         scenario_gate_summary = run_gate(
