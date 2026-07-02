@@ -304,6 +304,7 @@ def validate_passing_profile_summary(summary: dict[str, Any], label: str) -> Non
     request_count = summary.get("request_count")
     if not isinstance(request_count, int) or request_count <= 0:
         raise GateError(f"{label}.request_count must be a positive integer")
+    validate_diagnostic_summary_shape(summary, label)
     for field in PASSING_PROFILE_ZERO_FIELDS:
         value = summary.get(field)
         if not isinstance(value, int) or value != 0:
@@ -320,6 +321,67 @@ def validate_passing_profile_summary(summary: dict[str, Any], label: str) -> Non
             value = command.get(key)
             if not isinstance(value, str) or not value.strip():
                 raise GateError(f"{label}.replay_commands[{index}].{key} must be non-empty")
+
+
+def require_non_negative_int(value: Any, label: str) -> int:
+    if not isinstance(value, int) or value < 0:
+        raise GateError(f"{label} must be a non-negative integer")
+    return value
+
+
+def validate_diagnostic_summary_shape(summary: dict[str, Any], label: str) -> None:
+    latency = summary.get("latency_p50_p95_p99")
+    if not isinstance(latency, dict):
+        raise GateError(f"{label}.latency_p50_p95_p99 must be an object")
+    duration = latency.get("duration_us")
+    if not isinstance(duration, dict):
+        raise GateError(f"{label}.latency_p50_p95_p99.duration_us must be an object")
+    p50 = require_non_negative_int(duration.get("p50"), f"{label}.latency_p50_p95_p99.duration_us.p50")
+    p95 = require_non_negative_int(duration.get("p95"), f"{label}.latency_p50_p95_p99.duration_us.p95")
+    p99 = require_non_negative_int(duration.get("p99"), f"{label}.latency_p50_p95_p99.duration_us.p99")
+    sample_count = require_non_negative_int(
+        duration.get("sample_count"),
+        f"{label}.latency_p50_p95_p99.duration_us.sample_count",
+    )
+    if sample_count <= 0:
+        raise GateError(f"{label}.latency_p50_p95_p99.duration_us.sample_count must be positive")
+    if not (p50 <= p95 <= p99):
+        raise GateError(f"{label}.latency_p50_p95_p99.duration_us percentiles must be ordered")
+
+    memory = summary.get("memory_high_water_bytes")
+    if not isinstance(memory, dict):
+        raise GateError(f"{label}.memory_high_water_bytes must be an object")
+    memory_max = require_non_negative_int(memory.get("max"), f"{label}.memory_high_water_bytes.max")
+    by_backend_scope = memory.get("by_backend_scope")
+    if not isinstance(by_backend_scope, dict) or not by_backend_scope:
+        raise GateError(f"{label}.memory_high_water_bytes.by_backend_scope must be a non-empty object")
+    scope_values: list[int] = []
+    for scope, value in by_backend_scope.items():
+        if not isinstance(scope, str) or not scope.strip():
+            raise GateError(f"{label}.memory_high_water_bytes.by_backend_scope keys must be non-empty")
+        scope_values.append(
+            require_non_negative_int(
+                value,
+                f"{label}.memory_high_water_bytes.by_backend_scope.{scope}",
+            )
+        )
+    if memory_max != max(scope_values):
+        raise GateError(f"{label}.memory_high_water_bytes.max must equal by_backend_scope maximum")
+
+    slow_phases = summary.get("top_slow_phases")
+    if not isinstance(slow_phases, list) or not slow_phases:
+        raise GateError(f"{label}.top_slow_phases must contain at least one timed phase")
+    for index, phase in enumerate(slow_phases):
+        if not isinstance(phase, dict):
+            raise GateError(f"{label}.top_slow_phases[{index}] must be an object")
+        for key in ("event_id", "request_id", "entrypoint", "backend", "phase"):
+            value = phase.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise GateError(f"{label}.top_slow_phases[{index}].{key} must be non-empty")
+        require_non_negative_int(
+            phase.get("duration_us"),
+            f"{label}.top_slow_phases[{index}].duration_us",
+        )
 
 
 def validate_replay_bundles(events_by_path: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
