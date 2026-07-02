@@ -361,6 +361,55 @@ def actual_smoke_result(actual_smoke: Path) -> dict[str, Any]:
     }
 
 
+def scenario_summary_result(summary_path: Path) -> dict[str, Any]:
+    summary = read_json(summary_path)
+    require(summary.get("status") == "pass", f"{summary_path} is not pass")
+    observability = summary.get("observability")
+    if not isinstance(observability, dict) or observability.get("enabled") is not True:
+        raise SentinelError(f"{summary_path}: observability.enabled=true is required")
+    profile_paths = [
+        Path(path)
+        for path in observability.get("profile_paths", [])
+        if isinstance(path, str) and path.strip()
+    ]
+    require(profile_paths, f"{summary_path}: observability.profile_paths is empty")
+    events_by_path = load_and_validate_profiles(profile_paths)
+    profile_summary = summarize_events(profile_paths, events_by_path)
+    require("run" in profile_summary["entrypoints"], "scenario summary missing run profile events")
+    require("serve" in profile_summary["entrypoints"], "scenario summary missing serve profile events")
+    require(
+        len(profile_summary.get("replay_commands", [])) > 0,
+        "scenario summary profile events do not link replay commands",
+    )
+    replay_bundle_summary = validate_replay_bundles(events_by_path)
+    request_dump_dirs = [
+        Path(path)
+        for path in observability.get("request_dump_dirs", [])
+        if isinstance(path, str) and path.strip()
+    ]
+    for request_dump_dir in request_dump_dirs:
+        replay_bundle_summary.extend(validate_bundle_root(request_dump_dir))
+    scheduler_trace_paths = [
+        Path(path)
+        for path in observability.get("scheduler_trace_paths", [])
+        if isinstance(path, str) and path.strip()
+    ]
+    require(scheduler_trace_paths, "scenario summary has no scheduler_trace_paths")
+    for trace in scheduler_trace_paths:
+        report = check_trace(load_jsonl(trace), source=str(trace))
+        require(not report.get("failures"), f"scenario summary resource trace failed: {trace}")
+        require(int(report.get("leaked_resources") or 0) == 0, f"scenario summary resource leak: {trace}")
+        require(int(report.get("underflow_count") or 0) == 0, f"scenario summary resource underflow: {trace}")
+    return {
+        "status": "pass",
+        "scenario_summary": str(summary_path),
+        "entrypoints": profile_summary["entrypoints"],
+        "replay_command_count": len(profile_summary.get("replay_commands", [])),
+        "replay_bundle_count": len(replay_bundle_summary),
+        "scheduler_trace_count": len(scheduler_trace_paths),
+    }
+
+
 def run_scenario(scenario: dict[str, Any], manifest_dir: Path, scenario_dir: Path) -> dict[str, Any]:
     typ = str(scenario["type"])
     if typ == "profile_artifact":
@@ -417,6 +466,10 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     if args.actual_smoke is not None:
         actual_smoke = actual_smoke_result(args.actual_smoke)
         write_json(out / "actual_smoke_result.json", actual_smoke)
+    scenario_summary = None
+    if args.scenario_summary is not None:
+        scenario_summary = scenario_summary_result(args.scenario_summary)
+        write_json(out / "scenario_summary_result.json", scenario_summary)
     status = "fail" if failures else "pass"
     ended_at = int(time.time())
     dirty_files = git_value(["status", "--short"], default="").splitlines()
@@ -431,6 +484,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         "failed": len(failures),
         "scenarios": results,
         "actual_smoke": actual_smoke,
+        "scenario_summary": scenario_summary,
         "git_sha": git_value(["rev-parse", "HEAD"]),
         "git_dirty": bool(dirty_files),
         "dirty_files": dirty_files,
@@ -460,6 +514,64 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     return summary
 
 
+def write_profile_link_fixture(path: Path, *, entrypoint: str, request_id: str, bundle_dir: Path) -> None:
+    event = {
+        "schema_version": 1,
+        "event_id": f"evt-{entrypoint}-scenario-summary",
+        "request_id": request_id,
+        "entrypoint": entrypoint,
+        "backend": "synthetic",
+        "phase": "request_complete",
+        "event_kind": "instant",
+        "timestamp": "2026-07-02T00:00:00Z",
+        "status": "ok",
+        "model": "synthetic/no-weight",
+        "replay": {
+            "command": f"ferrum {entrypoint} synthetic/no-weight",
+            "bundle_dir": str(bundle_dir),
+        },
+        "attributes": {
+            "profile_detail": "basic",
+            "profile_schema_fingerprint": "obs-v1",
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(event, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def make_scenario_summary_fixture(root: Path) -> Path:
+    run_root = root / "scenario-run"
+    serve_root = root / "scenario-serve"
+    make_bundle(run_root / "request_dump")
+    make_bundle(serve_root / "request_dump")
+    write_profile_link_fixture(
+        run_root / "profile.jsonl",
+        entrypoint="run",
+        request_id="req-fixture",
+        bundle_dir=run_root / "request_dump",
+    )
+    write_profile_link_fixture(
+        serve_root / "profile.jsonl",
+        entrypoint="serve",
+        request_id="req-fixture",
+        bundle_dir=serve_root / "request_dump",
+    )
+    trace = REPO_ROOT / "scripts/release/fixtures/resource_invariant/pass/oom_prevented_by_admission.jsonl"
+    summary = {
+        "schema_version": 1,
+        "status": "pass",
+        "observability": {
+            "enabled": True,
+            "profile_paths": [str(run_root / "profile.jsonl"), str(serve_root / "profile.jsonl")],
+            "scheduler_trace_paths": [str(trace)],
+            "request_dump_dirs": [str(run_root / "request_dump"), str(serve_root / "request_dump")],
+        },
+    }
+    path = root / "scenario-summary.json"
+    write_json(path, summary)
+    return path
+
+
 def run_selftest() -> None:
     temp = Path(tempfile.mkdtemp(prefix="ferrum-product-backend-sentinel-"))
     try:
@@ -469,12 +581,25 @@ def run_selftest() -> None:
                 manifest=DEFAULT_MANIFEST,
                 out=out,
                 actual_smoke=None,
+                scenario_summary=None,
             )
         )
         if summary.get("status") != "pass":
             raise AssertionError(summary)
         if summary.get("scenario_count") != REQUIRED_STAGE2_FIXTURES:
             raise AssertionError(summary)
+        scenario_summary = make_scenario_summary_fixture(temp / "scenario-summary-fixture")
+        scenario_out = temp / "scenario-out"
+        scenario_gate_summary = run_gate(
+            argparse.Namespace(
+                manifest=DEFAULT_MANIFEST,
+                out=scenario_out,
+                actual_smoke=None,
+                scenario_summary=scenario_summary,
+            )
+        )
+        if scenario_gate_summary.get("scenario_summary", {}).get("status") != "pass":
+            raise AssertionError(scenario_gate_summary)
     finally:
         shutil.rmtree(temp, ignore_errors=True)
 
@@ -484,6 +609,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--actual-smoke", type=Path)
+    parser.add_argument("--scenario-summary", type=Path)
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
 
