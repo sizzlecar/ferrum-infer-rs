@@ -358,6 +358,30 @@ pub struct RunCommand {
     #[arg(long, value_name = "DIR")]
     pub observability_vertical_slice_out: Option<PathBuf>,
 
+    /// Write product observability profile events to this JSONL path.
+    #[arg(long, value_name = "PATH")]
+    pub profile_jsonl: Option<PathBuf>,
+
+    /// Product observability detail level.
+    #[arg(long, value_enum, default_value_t = crate::observability_product::ProfileDetailArg::Off)]
+    pub profile_detail: crate::observability_product::ProfileDetailArg,
+
+    /// Write product memory profile events to this JSONL path.
+    #[arg(long, value_name = "PATH")]
+    pub memory_profile_jsonl: Option<PathBuf>,
+
+    /// Write scheduler/admission trace events to this JSONL path.
+    #[arg(long, value_name = "PATH")]
+    pub scheduler_trace_jsonl: Option<PathBuf>,
+
+    /// Write a sanitized request/replay bundle to this directory.
+    #[arg(long, value_name = "DIR")]
+    pub request_dump_dir: Option<PathBuf>,
+
+    /// Product observability sampling rate for resource lifecycle events.
+    #[arg(long, default_value_t = crate::observability_product::default_profile_sample_rate())]
+    pub profile_sample_rate: f64,
+
     /// Output format. `text` (default) — streaming text + stats UX.
     /// `jsonl` — one JSON record per event on stdout; used by tests and scripts.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -373,6 +397,30 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         println!(
             "OBSERVABILITY VERTICAL SLICE ARTIFACT: {}",
             out_dir.display()
+        );
+        return Ok(());
+    }
+    let product_observability = crate::observability_product::ProductObservabilityConfig::new(
+        ferrum_types::ProfileEntrypoint::Run,
+        &cmd.model,
+        cmd.profile_jsonl.as_ref(),
+        cmd.profile_detail,
+        cmd.memory_profile_jsonl.as_ref(),
+        cmd.scheduler_trace_jsonl.as_ref(),
+        cmd.request_dump_dir.as_ref(),
+        cmd.profile_sample_rate,
+    );
+    if product_observability.synthetic_no_weight_enabled() {
+        let written = crate::observability_product::write_synthetic_product_observability(
+            &product_observability,
+        )?;
+        println!(
+            "OBSERVABILITY PRODUCT ARTIFACTS: {}",
+            written
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         );
         return Ok(());
     }
@@ -1942,6 +1990,12 @@ mod tests {
             effective_config_json: None,
             decision_trace_jsonl: None,
             observability_vertical_slice_out: None,
+            profile_jsonl: None,
+            profile_detail: crate::observability_product::ProfileDetailArg::Off,
+            memory_profile_jsonl: None,
+            scheduler_trace_jsonl: None,
+            request_dump_dir: None,
+            profile_sample_rate: crate::observability_product::default_profile_sample_rate(),
             output_format: OutputFormat::Text,
         }
     }

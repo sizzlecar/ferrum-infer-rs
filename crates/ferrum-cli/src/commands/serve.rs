@@ -216,9 +216,25 @@ pub struct ServeCommand {
     #[arg(long, value_name = "PATH")]
     pub profile_jsonl: Option<PathBuf>,
 
+    /// Product observability detail level.
+    #[arg(long, value_enum, default_value_t = crate::observability_product::ProfileDetailArg::Off)]
+    pub profile_detail: crate::observability_product::ProfileDetailArg,
+
+    /// Write product memory profile events to this JSONL path.
+    #[arg(long, value_name = "PATH")]
+    pub memory_profile_jsonl: Option<PathBuf>,
+
     /// Write scheduler iteration trace events to this JSONL path.
     #[arg(long, value_name = "PATH")]
     pub scheduler_trace_jsonl: Option<PathBuf>,
+
+    /// Write a sanitized request/replay bundle to this directory.
+    #[arg(long, value_name = "DIR")]
+    pub request_dump_dir: Option<PathBuf>,
+
+    /// Product observability sampling rate for resource lifecycle events.
+    #[arg(long, default_value_t = crate::observability_product::default_profile_sample_rate())]
+    pub profile_sample_rate: f64,
 
     /// Git commit stamped into native structured profile events.
     #[arg(long, value_name = "SHA")]
@@ -294,7 +310,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         decision_trace_jsonl,
         observability_vertical_slice_out,
         profile_jsonl,
+        profile_detail,
+        memory_profile_jsonl,
         scheduler_trace_jsonl,
+        request_dump_dir,
+        profile_sample_rate,
         profile_commit_sha,
         profile_env_hash,
         profile_model,
@@ -316,14 +336,38 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         return Ok(());
     }
 
-    // Print banner
-    print_banner();
-
     // Resolve model
     let model_name = model
         .or(model_option)
         .or(config.models.default_model.clone())
         .unwrap_or_else(|| "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string());
+    let product_observability = crate::observability_product::ProductObservabilityConfig::new(
+        ferrum_types::ProfileEntrypoint::Serve,
+        &model_name,
+        profile_jsonl.as_ref(),
+        profile_detail,
+        memory_profile_jsonl.as_ref(),
+        scheduler_trace_jsonl.as_ref(),
+        request_dump_dir.as_ref(),
+        profile_sample_rate,
+    );
+    if product_observability.synthetic_no_weight_enabled() {
+        let written = crate::observability_product::write_synthetic_product_observability(
+            &product_observability,
+        )?;
+        println!(
+            "OBSERVABILITY PRODUCT ARTIFACTS: {}",
+            written
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        return Ok(());
+    }
+
+    // Print banner
+    print_banner();
 
     // GGUF short-circuit: if the user passed a `.gguf` file path directly OR
     // an alias resolving to a GGUF (e.g. `qwen3:8b-q4_k_m`), look up the
