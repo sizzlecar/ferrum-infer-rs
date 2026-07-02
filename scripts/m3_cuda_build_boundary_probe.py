@@ -25,7 +25,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from validate_cuda_build_summary import ValidationError, validate_summary
 from validate_cuda_build_boundary_manifest import validate_manifest
 
-DEFAULT_FEATURES = "cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin,fa2-source"
+DEFAULT_FEATURES = "cuda,marlin,vllm-paged-attn-v2,vllm-moe-marlin"
 DEFAULT_KERNEL = "crates/ferrum-kernels/kernels/paged_varlen_attention_vllm.cu"
 DEFAULT_CACHE_HITS = [
     "core-ptx:kernels/paged_varlen_attention_vllm.cu",
@@ -33,7 +33,6 @@ DEFAULT_CACHE_HITS = [
     "vllm_marlin",
     "vllm_moe_marlin",
     "vllm_paged_attn",
-    "fa2_source",
 ]
 
 
@@ -213,8 +212,7 @@ def run_self_test() -> None:
             "echo '[cuda-build-summary] artifact=marlin status=cache_hit reason=signature-match elapsed_ms=1 inputs_hash=fnv1a64:0123456789abcdef'\n"
             "echo '[cuda-build-summary] artifact=vllm_marlin status=cache_hit reason=signature-match elapsed_ms=1 inputs_hash=fnv1a64:0123456789abcdef'\n"
             "echo '[cuda-build-summary] artifact=vllm_moe_marlin status=cache_hit reason=signature-match elapsed_ms=1 inputs_hash=fnv1a64:0123456789abcdef'\n"
-            "echo '[cuda-build-summary] artifact=vllm_paged_attn status=cache_hit reason=signature-match elapsed_ms=1 inputs_hash=fnv1a64:0123456789abcdef'\n"
-            "echo '[cuda-build-summary] artifact=fa2_source status=cache_hit reason=signature-match elapsed_ms=1 inputs_hash=fnv1a64:0123456789abcdef'\n",
+            "echo '[cuda-build-summary] artifact=vllm_paged_attn status=cache_hit reason=signature-match elapsed_ms=1 inputs_hash=fnv1a64:0123456789abcdef'\n",
             encoding="utf-8",
         )
         fake_bin.chmod(0o755)

@@ -47,7 +47,7 @@ DEFAULT_SHAREGPT = (
 )
 DEFAULT_DATASET_ID = "w3/ascii-sharegpt-100-seed9271"
 DEFAULT_DATASET_SHA = "58d5721d8389d7ed9ec4b8b2dbd8797faa61641c6ba023dd150a1a9d93c0a01e"
-CUDA_FEATURES = "cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source"
+CUDA_FEATURES = "cuda,vllm-moe-marlin,vllm-paged-attn-v2"
 REQUIRED_CELLS = "1,4,16,32"
 EXPECTED_OUTPUT_LEN = 128
 

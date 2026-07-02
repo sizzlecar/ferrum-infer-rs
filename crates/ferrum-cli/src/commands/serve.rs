@@ -1953,7 +1953,7 @@ fn compiled_kernel_features() -> CompiledKernelFeatures {
         vllm_moe_marlin: cfg!(feature = "vllm-moe-marlin"),
         cuda_graph: cfg!(feature = "cuda"),
         greedy_argmax: cfg!(feature = "cuda") || cfg!(feature = "metal"),
-        fa2_source: cfg!(feature = "fa2-source"),
+        fa2_source: false,
         fa2_direct_ffi: cfg!(feature = "cuda"),
     }
 }

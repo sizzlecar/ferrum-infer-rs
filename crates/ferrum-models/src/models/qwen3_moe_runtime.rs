@@ -65,7 +65,7 @@ impl Qwen3MoeRuntimeEnv {
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
             .collect();
-        let fa2_source = trueish(vars.get("FERRUM_FA2_SOURCE"));
+        let fa2_source = false;
         let fa2_direct_ffi = match vars.get("FERRUM_FA2_DIRECT_FFI").map(String::as_str) {
             Some("0" | "false" | "FALSE" | "off" | "OFF") => false,
             Some("1" | "true" | "TRUE" | "on" | "ON") => true,
@@ -178,13 +178,6 @@ fn positive_usize(vars: &HashMap<String, String>, name: &str) -> Option<usize> {
         .filter(|v| *v > 0)
 }
 
-fn trueish(value: Option<&String>) -> bool {
-    matches!(
-        value.map(String::as_str),
-        Some("1" | "true" | "TRUE" | "on" | "ON")
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,10 +271,10 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_moe_runtime_env_keeps_fa2_source_distinct_from_direct_ffi() {
+    fn qwen3_moe_runtime_env_ignores_removed_fa2_source_path() {
         let env = Qwen3MoeRuntimeEnv::from_env_vars([("FERRUM_FA2_SOURCE", "1")]);
 
-        assert!(env.fa2_source);
+        assert!(!env.fa2_source);
         assert!(!env.fa2_direct_ffi);
     }
 

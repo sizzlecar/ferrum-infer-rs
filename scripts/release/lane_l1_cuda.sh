@@ -39,7 +39,7 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
   exit 2
 fi
 
-CUDA_FEATURES="${CUDA_FEATURES:-cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source}"
+CUDA_FEATURES="${CUDA_FEATURES:-cuda,vllm-moe-marlin,vllm-paged-attn-v2}"
 start_total=$(date +%s)
 
 log() { echo "=== L1-cuda: $* ==="; }

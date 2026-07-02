@@ -638,7 +638,7 @@ log cargo_check_done
 log release_build_start
 set +e
 cargo build --release -p ferrum-cli --bin ferrum \
-  --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source \
+  --features cuda,vllm-moe-marlin,vllm-paged-attn-v2 \
   > "$ART/logs/build.stdout.log" 2> "$ART/logs/build.stderr.log"
 build_rc=$?
 set -e

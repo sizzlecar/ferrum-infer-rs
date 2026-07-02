@@ -5,7 +5,7 @@
   "hf_model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
   "bin": "./target/release/ferrum",
   "build": false,
-  "features": "cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source",
+  "features": "cuda,vllm-moe-marlin,vllm-paged-attn-v2",
   "preset": "m3_qwen3_30b_a3b_int4",
   "port_base": 19000,
   "concurrency_cells": [1, 32],
