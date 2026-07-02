@@ -1,9 +1,9 @@
 use chrono::{Duration, Utc};
 use clap::ValueEnum;
 use ferrum_types::{
-    FerrumError, FerrumProfileEvent, MemorySnapshot, ProfileEntrypoint, ProfileEventKind,
-    ProfileStatus, ReplayReference, ResourceAction, ResourceTraceEvent, Result, SamplingParams,
-    OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+    FerrumError, FerrumProfileEvent, MemorySnapshot, ProfileEntrypoint, ProfileError,
+    ProfileEventKind, ProfileStatus, ReplayReference, ResourceAction, ResourceTraceEvent, Result,
+    SamplingParams, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -64,6 +64,17 @@ pub struct ActualRunObservation {
     pub prompt_chars: usize,
     pub response_chars: usize,
     pub response_text: String,
+    pub memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+}
+
+pub struct ActualRunFailureObservation {
+    pub request_id: String,
+    pub duration_us: u64,
+    pub sampling_params: SamplingParams,
+    pub prompt_token_count: Option<usize>,
+    pub prompt_chars: usize,
+    pub error_kind: String,
+    pub error_message: String,
     pub memory: Option<crate::memory_profile::ProcessMemoryObservation>,
 }
 
@@ -191,6 +202,7 @@ pub fn write_synthetic_product_observability(
                 output_text: Some("synthetic ok"),
                 finish_reason: Some("stop"),
                 failure_kind: None,
+                failure_diagnostics: None,
             },
         )?);
     }
@@ -208,6 +220,19 @@ pub fn write_actual_run_observability(
     let replay_command = replay_command(config);
     let events = actual_run_events(config, observation, &replay_command);
     write_actual_run_artifacts(config, &events, observation, &replay_command)
+}
+
+pub fn write_actual_run_failure_observability(
+    config: &ProductObservabilityConfig,
+    observation: &ActualRunFailureObservation,
+) -> Result<Vec<PathBuf>> {
+    if !config.enabled() {
+        return Ok(Vec::new());
+    }
+    config.validate()?;
+    let replay_command = replay_command(config);
+    let events = actual_run_failure_events(config, observation, &replay_command);
+    write_actual_run_failure_artifacts(config, &events, observation, &replay_command)
 }
 
 pub fn write_actual_serve_startup_observability(
@@ -259,6 +284,42 @@ fn write_actual_run_artifacts(
                 output_text: Some(&observation.response_text),
                 finish_reason: observation.finish_reason.as_deref(),
                 failure_kind: None,
+                failure_diagnostics: None,
+            },
+        )?);
+    }
+    Ok(written)
+}
+
+fn write_actual_run_failure_artifacts(
+    config: &ProductObservabilityConfig,
+    events: &[FerrumProfileEvent],
+    observation: &ActualRunFailureObservation,
+    replay_command: &str,
+) -> Result<Vec<PathBuf>> {
+    let mut written =
+        write_actual_artifacts(config, events, &observation.request_id, replay_command)?;
+    if let Some(dir) = &config.request_dump_dir {
+        written.extend(write_replay_bundle(
+            dir,
+            config,
+            &observation.request_id,
+            replay_command,
+            ReplayBundleData {
+                request: actual_request_dump(config, &observation.request_id, replay_command),
+                prompt_token_ids: None,
+                prompt_token_count: observation.prompt_token_count,
+                prompt_token_unavailable_reason: Some(
+                    "rendered prompt token ids are not retained by run failure observability",
+                ),
+                sampling_params: Some(observation.sampling_params.clone()),
+                backend: "actual",
+                actual_model_smoke: true,
+                output_token_ids: Some(Vec::new()),
+                output_text: Some(""),
+                finish_reason: Some("error"),
+                failure_kind: Some("error"),
+                failure_diagnostics: Some(actual_run_failure_diagnostics(observation)),
             },
         )?);
     }
@@ -315,6 +376,7 @@ fn write_actual_artifacts(
                 output_text: None,
                 finish_reason: None,
                 failure_kind: None,
+                failure_diagnostics: None,
             },
         )?);
     }
@@ -568,6 +630,132 @@ fn actual_run_events(
         json!(observation.response_chars),
     );
     vec![open, reserve, commit, generation, release, close]
+}
+
+fn actual_run_failure_events(
+    config: &ProductObservabilityConfig,
+    observation: &ActualRunFailureObservation,
+    replay_command: &str,
+) -> Vec<FerrumProfileEvent> {
+    let base = Utc::now();
+    let open = actual_resource_event(
+        config,
+        &observation.request_id,
+        "request",
+        &observation.request_id,
+        "request_slot",
+        "request_open",
+        ResourceAction::RequestOpen,
+        base,
+        None,
+        None,
+        None,
+        Some(1),
+        None,
+    );
+    let reserve = actual_resource_event(
+        config,
+        &observation.request_id,
+        "request",
+        &observation.request_id,
+        "request_slot",
+        "request_slot_reserve",
+        ResourceAction::Reserve,
+        base + Duration::microseconds(5),
+        Some(1),
+        Some(1),
+        Some(0),
+        Some(1),
+        None,
+    );
+    let commit = actual_resource_event(
+        config,
+        &observation.request_id,
+        "request",
+        &observation.request_id,
+        "request_slot",
+        "request_slot_commit",
+        ResourceAction::Commit,
+        base + Duration::microseconds(10),
+        Some(1),
+        Some(0),
+        Some(1),
+        Some(1),
+        None,
+    );
+
+    let mut failure = actual_base_event(
+        config,
+        &observation.request_id,
+        "actual_run_generation_failed",
+        ProfileEventKind::Error,
+        base + Duration::microseconds(20),
+    );
+    failure.status = ProfileStatus::Failure;
+    failure.duration_us = Some(observation.duration_us);
+    failure.error = Some(ProfileError {
+        kind: observation.error_kind.clone(),
+        message: observation.error_message.clone(),
+        blocking: true,
+    });
+    failure.replay = Some(ReplayReference {
+        command: replay_command.to_string(),
+        bundle_dir: config
+            .request_dump_dir
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string()),
+    });
+    attach_process_memory(
+        &mut failure,
+        observation.memory.as_ref(),
+        "first_request_failed",
+    );
+    failure
+        .attributes
+        .insert("first_failure_event".to_string(), json!(true));
+    failure
+        .attributes
+        .insert("prompt_chars".to_string(), json!(observation.prompt_chars));
+
+    let release = actual_resource_event(
+        config,
+        &observation.request_id,
+        "request",
+        &observation.request_id,
+        "request_slot",
+        "request_slot_release",
+        ResourceAction::Release,
+        base + Duration::microseconds(30),
+        Some(1),
+        Some(1),
+        Some(0),
+        Some(1),
+        None,
+    );
+
+    let mut close = actual_resource_event(
+        config,
+        &observation.request_id,
+        "request",
+        &observation.request_id,
+        "request_slot",
+        "request_close",
+        ResourceAction::RequestClose,
+        base + Duration::microseconds(40),
+        None,
+        None,
+        None,
+        Some(1),
+        None,
+    );
+    close.replay = Some(ReplayReference {
+        command: replay_command.to_string(),
+        bundle_dir: config
+            .request_dump_dir
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string()),
+    });
+    vec![open, reserve, commit, failure, release, close]
 }
 
 fn actual_serve_startup_events(
@@ -878,6 +1066,7 @@ struct ReplayBundleData<'a> {
     output_text: Option<&'a str>,
     finish_reason: Option<&'a str>,
     failure_kind: Option<&'a str>,
+    failure_diagnostics: Option<serde_json::Value>,
 }
 
 fn write_replay_bundle(
@@ -995,10 +1184,30 @@ fn write_replay_bundle(
         write_json(&path, &value)?;
         written.push(path);
     }
+    if let Some(diagnostics) = data.failure_diagnostics {
+        let path = bundle_dir.join("failure_diagnostics.json");
+        write_json(&path, &diagnostics)?;
+        written.push(path);
+    }
     let output_text_path = bundle_dir.join("output_text.txt");
     fs_write(&output_text_path, output_text_body)?;
     written.push(output_text_path);
     Ok(written)
+}
+
+fn actual_run_failure_diagnostics(observation: &ActualRunFailureObservation) -> serde_json::Value {
+    json!({
+        "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        "request_id": observation.request_id,
+        "failure_kind": "error",
+        "first_failure_event": {
+            "phase": "actual_run_generation_failed",
+            "error_kind": observation.error_kind,
+            "message": observation.error_message
+        },
+        "nearest_request_id": observation.request_id,
+        "log_excerpt": observation.error_message
+    })
 }
 
 fn bad_output_scan(request_id: &str, text: &str, failure_kind: Option<&str>) -> serde_json::Value {
@@ -1320,6 +1529,59 @@ mod tests {
         assert!(bundle_dir.join("output_text.txt").is_file());
         assert!(bundle_dir.join("bad_output_scan.json").is_file());
         assert!(bundle_dir.join("replay.command.json").is_file());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn actual_run_failure_observability_writes_diagnostics_bundle() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-run-failure-observability-{}",
+            Uuid::new_v4().simple()
+        ));
+        let config = ProductObservabilityConfig::new(
+            ProfileEntrypoint::Run,
+            "Qwen/Qwen3-0.6B",
+            Some(&root.join("profile.jsonl")),
+            ProfileDetailArg::Basic,
+            Some(&root.join("memory.jsonl")),
+            Some(&root.join("scheduler.jsonl")),
+            Some(&root.join("request_dump")),
+            1.0,
+        );
+        let request_id = "req-failure-test".to_string();
+        write_actual_run_failure_observability(
+            &config,
+            &ActualRunFailureObservation {
+                request_id: request_id.clone(),
+                duration_us: 42,
+                sampling_params: SamplingParams::greedy(),
+                prompt_token_count: Some(3),
+                prompt_chars: 12,
+                error_kind: "error".to_string(),
+                error_message: "synthetic failure".to_string(),
+                memory: None,
+            },
+        )
+        .unwrap();
+        let profile = fs::read_to_string(root.join("profile.jsonl")).unwrap();
+        assert!(profile.contains("\"status\":\"failure\""));
+        assert!(profile.contains("\"first_failure_event\":true"));
+        let bundle_dir = root.join("request_dump").join(&request_id);
+        assert!(bundle_dir.join("failure_diagnostics.json").is_file());
+        let scan: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(bundle_dir.join("bad_output_scan.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(scan["failure_kind"], "error");
+        let diagnostics: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(bundle_dir.join("failure_diagnostics.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(diagnostics["failure_kind"], "error");
+        assert_eq!(
+            diagnostics["first_failure_event"]["phase"],
+            "actual_run_generation_failed"
+        );
         fs::remove_dir_all(root).ok();
     }
 }

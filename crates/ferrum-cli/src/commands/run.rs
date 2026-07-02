@@ -618,7 +618,34 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             .then(|| memory_sampler.sample())
             .flatten();
         let start = std::time::Instant::now();
-        let response = engine.infer(request).await?;
+        let response = match engine.infer(request).await {
+            Ok(response) => response,
+            Err(err) => {
+                let memory = product_observability
+                    .enabled()
+                    .then(|| memory_sampler.observe(memory_before))
+                    .flatten();
+                let elapsed = start.elapsed().as_secs_f64();
+                if let Err(observability_err) =
+                    crate::observability_product::write_actual_run_failure_observability(
+                        &product_observability,
+                        &crate::observability_product::ActualRunFailureObservation {
+                            request_id: profile_request_id,
+                            duration_us: (elapsed * 1_000_000.0).max(0.0) as u64,
+                            sampling_params: plan.sampling_params.clone(),
+                            prompt_token_count: plan.prompt_tokens,
+                            prompt_chars,
+                            error_kind: "error".to_string(),
+                            error_message: err.to_string(),
+                            memory,
+                        },
+                    )
+                {
+                    eprintln!("failed to write run failure observability: {observability_err}");
+                }
+                return Err(err);
+            }
+        };
         let memory = product_observability
             .enabled()
             .then(|| memory_sampler.observe(memory_before))
