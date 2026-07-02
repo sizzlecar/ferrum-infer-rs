@@ -28,6 +28,13 @@ BULK_SOURCE_ROOTS = [
     REPO_ROOT / "crates/ferrum-kernels/kernels/fa2_source/cutlass",
 ]
 CPP_CUDA_EXTENSIONS = {".c", ".cc", ".cpp", ".cxx", ".cu", ".cuh", ".h", ".hh", ".hpp", ".hxx"}
+BUILD_RS = REPO_ROOT / "crates/ferrum-kernels/build.rs"
+NATIVE_OP_SOURCE_COMPILE_PATTERNS = {
+    "compile_fa2": re.compile(r"\bcompile_[a-z0-9_]*fa2[a-z0-9_]*\s*\(", re.IGNORECASE),
+    "build_fa2": re.compile(r"\bbuild_[a-z0-9_]*fa2[a-z0-9_]*\s*\(", re.IGNORECASE),
+    "fa2_cc_build": re.compile(r"fa2[\s\S]{0,240}cc::Build", re.IGNORECASE),
+    "fa2_nvcc_spawn": re.compile(r"fa2[\s\S]{0,240}Command::new\(&nvcc\)", re.IGNORECASE),
+}
 
 
 class GateError(RuntimeError):
@@ -286,6 +293,37 @@ def find_unregistered_third_party_sources() -> tuple[int, list[str]]:
     return count, samples
 
 
+def native_operator_dev_build_audit() -> dict[str, Any]:
+    try:
+        build_rs = BUILD_RS.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise GateError(f"missing native operator build audit input: {BUILD_RS}") from exc
+    matches: list[dict[str, str]] = []
+    for name, pattern in sorted(NATIVE_OP_SOURCE_COMPILE_PATTERNS.items()):
+        for match in pattern.finditer(build_rs):
+            line = build_rs.count("\n", 0, match.start()) + 1
+            matches.append(
+                {
+                    "pattern": name,
+                    "file": BUILD_RS.relative_to(REPO_ROOT).as_posix(),
+                    "line": str(line),
+                }
+            )
+    obsolete_marker = (
+        "feature fa2-source is obsolete; use a Ferrum native operator artifact for FA2" in build_rs
+        and '"fa2_source"' in build_rs
+        and '"skipped"' in build_rs
+        and "obsolete-native-operator-artifact-required" in build_rs
+    )
+    return {
+        "status": "pass" if not matches and obsolete_marker else "fail",
+        "source_compile_count": len(matches),
+        "source_compile_matches": matches,
+        "fa2_source_feature_behavior": "obsolete_warning_only" if obsolete_marker else "missing_obsolete_marker",
+        "inspected_files": [BUILD_RS.relative_to(REPO_ROOT).as_posix()],
+    }
+
+
 def git_output(args: list[str]) -> str:
     proc = subprocess.run(
         ["git", *args],
@@ -377,6 +415,10 @@ def run_selftest() -> dict[str, Any]:
         else:
             raise GateError(f"resolver mutation {name} was expected to fail closed")
 
+    dev_build_audit = native_operator_dev_build_audit()
+    if dev_build_audit["status"] != "pass":
+        raise GateError("native operator dev-build source compile audit failed")
+
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "pass",
@@ -384,6 +426,7 @@ def run_selftest() -> dict[str, Any]:
         "fail_fixtures": rejected_validation,
         "resolver_fail_closed_cases": rejected_resolution,
         "python_runtime_dependency": "none",
+        "normal_cuda_dev_build": dev_build_audit,
     }
 
 
@@ -401,6 +444,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
 
     bulk_count, bulk_samples = count_bulk_source_files()
     third_party_count, third_party_samples = find_unregistered_third_party_sources()
+    dev_build_audit = native_operator_dev_build_audit()
     if bulk_count:
         raise GateError(
             "native operator artifact gate requires FA2/CUTLASS bulk source removal before PASS; "
@@ -410,6 +454,11 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         raise GateError(
             "native operator artifact gate rejects unregistered crates/**/third_party C++/CUDA source; "
             f"found {third_party_count} files"
+        )
+    if dev_build_audit["status"] != "pass":
+        raise GateError(
+            "native operator artifact gate requires normal CUDA dev build native-op source compile count = 0; "
+            f"found {dev_build_audit['source_compile_count']} hooks"
         )
 
     manifest_summaries: list[dict[str, Any]] = []
@@ -461,6 +510,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
             "count": third_party_count,
             "samples": third_party_samples,
         },
+        "normal_cuda_dev_build": dev_build_audit,
     }
     write_json(out / "native_operator_artifact_summary.json", summary)
     pass_line = f"{PASS_LINE}: {out}"
