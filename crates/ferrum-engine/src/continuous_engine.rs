@@ -20,15 +20,17 @@ use ferrum_kv::cache::prefix::PrefixCache;
 use ferrum_sampler::json_mode::JsonModeProcessor;
 use ferrum_scheduler::implementations::{ContinuousBatchScheduler, RequestPhase};
 use ferrum_types::{
-    DataType, Device, EngineConfig, EngineStatus, FerrumError, FinishReason, InferenceRequest,
-    InferenceResponse, Priority, RequestId, Result, SamplingParams, StreamChunk, TokenId,
-    TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY, PROMPT_TOKENS_METADATA_KEY,
+    DataType, Device, EngineConfig, EngineStatus, FerrumError, FerrumProfileEvent, FinishReason,
+    InferenceRequest, InferenceResponse, Priority, ProfileEntrypoint, ProfileEventKind,
+    ProfileStatus, RequestId, ResourceAction, ResourceTraceEvent, Result, SamplingParams,
+    StreamChunk, TokenId, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_TOKENS_METADATA_KEY,
 };
 use futures::stream::Stream;
 use metrics::{counter, gauge, histogram};
 use parking_lot::{Mutex, RwLock};
 use rand::{rngs::StdRng, SeedableRng};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -84,9 +86,11 @@ struct ContinuousEngineRuntimeConfig {
     kv_capacity: Option<usize>,
     max_model_len: Option<usize>,
     next_batch_prof: bool,
+    profile_entrypoint: Option<ProfileEntrypoint>,
     prefix_cache_enabled: bool,
     rbd_prof: bool,
     scheduler_trace_jsonl: Option<PathBuf>,
+    legacy_scheduler_trace_jsonl: Option<PathBuf>,
     unified_post_prof: bool,
 }
 
@@ -104,9 +108,11 @@ impl ContinuousEngineRuntimeConfig {
             kv_capacity: r.kv_capacity,
             max_model_len: r.max_model_len,
             next_batch_prof: r.next_batch_prof,
+            profile_entrypoint: r.profile_entrypoint,
             prefix_cache_enabled: r.prefix_cache_enabled,
             rbd_prof: r.rbd_prof,
             scheduler_trace_jsonl: r.scheduler_trace_jsonl.clone(),
+            legacy_scheduler_trace_jsonl: r.legacy_scheduler_trace_jsonl.clone(),
             unified_post_prof: r.unified_post_prof,
         }
     }
@@ -130,12 +136,18 @@ impl ContinuousEngineRuntimeConfig {
             kv_capacity: parse_positive_usize_env(&vars, KV_CAPACITY_ENV),
             max_model_len: parse_positive_usize_env(&vars, MAX_MODEL_LEN_ENV),
             next_batch_prof: vars.contains_key(NEXT_BATCH_PROF_ENV),
+            profile_entrypoint: vars
+                .get("FERRUM_PROFILE_ENTRYPOINT")
+                .and_then(|value| ProfileEntrypoint::parse(value)),
             prefix_cache_enabled: vars
                 .get(WHOLE_PROMPT_PREFIX_CACHE_ENV)
                 .is_some_and(|v| v == "1"),
             rbd_prof: vars.contains_key(RBD_PROF_ENV),
             scheduler_trace_jsonl: vars
                 .get("FERRUM_SCHEDULER_TRACE_JSONL")
+                .and_then(|value| ferrum_types::parse_path_env_value(value).ok()),
+            legacy_scheduler_trace_jsonl: vars
+                .get("FERRUM_LEGACY_SCHEDULER_TRACE_JSONL")
                 .and_then(|value| ferrum_types::parse_path_env_value(value).ok()),
             unified_post_prof: vars.contains_key(UNIFIED_POST_PROF_ENV),
         }
@@ -579,7 +591,9 @@ pub struct SequenceState {
     pub input_tokens: Vec<TokenId>,
     pub generated_tokens: Vec<TokenId>,
     pub kv_cache: Option<Arc<dyn KvCacheHandle>>,
+    pub kv_resource_blocks: Option<usize>,
     pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
+    pub recurrent_state_slots: Option<usize>,
     pub sampling_params: SamplingParams,
     pub phase: RequestPhase,
     pub rng: StdRng,
@@ -615,6 +629,7 @@ pub struct SequenceState {
     /// Draft-model KV cache (only populated when engine has speculative
     /// decoding enabled). Allocated + prefilled lazily on the first decode.
     pub draft_kv_cache: Option<Arc<dyn KvCacheHandle>>,
+    pub draft_kv_resource_blocks: Option<usize>,
     /// Resource-manager request id for the draft-model KV allocation.
     ///
     /// Draft KV must not reuse the target request id because KV managers are
@@ -776,7 +791,9 @@ impl SequenceState {
             input_tokens,
             generated_tokens: Vec::new(),
             kv_cache: None,
+            kv_resource_blocks: None,
             recurrent_state: None,
+            recurrent_state_slots: None,
             sampling_params: request.sampling_params,
             phase: RequestPhase::Waiting,
             rng,
@@ -793,6 +810,7 @@ impl SequenceState {
             json_processor,
             regex_processor,
             draft_kv_cache: None,
+            draft_kv_resource_blocks: None,
             draft_kv_request_id: None,
             token_frequencies: HashMap::new(),
             model_cache_id: None,
@@ -1345,7 +1363,9 @@ struct EngineInner {
     prefix_cache: PrefixCache,
     runtime_config: ContinuousEngineRuntimeConfig,
     scheduler_trace_jsonl: Option<Mutex<std::fs::File>>,
+    legacy_scheduler_trace_jsonl: Option<Mutex<std::fs::File>>,
     scheduler_trace_none_streak: AtomicU64,
+    resource_trace_event_counter: AtomicU64,
     // stats
     iteration_count: AtomicU64,
     total_prefill_tokens: AtomicU64,
@@ -1386,6 +1406,343 @@ impl EngineInner {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    fn trace_entrypoint(&self) -> ProfileEntrypoint {
+        self.runtime_config
+            .profile_entrypoint
+            .unwrap_or(ProfileEntrypoint::Synthetic)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn trace_resource_event(
+        &self,
+        request_id: &RequestId,
+        owner_kind: &str,
+        owner_id: &str,
+        resource_kind: &str,
+        phase: &str,
+        action: ResourceAction,
+        amount: Option<i64>,
+        before: Option<i64>,
+        after: Option<i64>,
+        capacity: Option<i64>,
+        reason: Option<String>,
+    ) {
+        let Some(sink) = &self.scheduler_trace_jsonl else {
+            return;
+        };
+        let entrypoint = self.trace_entrypoint();
+        let event_num = self
+            .resource_trace_event_counter
+            .fetch_add(1, Ordering::Relaxed);
+        let mut attributes = BTreeMap::from([
+            (
+                "actual_model_smoke".to_string(),
+                serde_json::json!(matches!(
+                    entrypoint,
+                    ProfileEntrypoint::Run | ProfileEntrypoint::Serve
+                )),
+            ),
+            (
+                "backend_device".to_string(),
+                serde_json::json!(format!("{:?}", self.config.backend.device)),
+            ),
+            (
+                "backend_type".to_string(),
+                serde_json::json!(format!("{:?}", self.config.backend.backend_type)),
+            ),
+            ("diagnostic_only".to_string(), serde_json::json!(false)),
+            ("l0_only".to_string(), serde_json::json!(false)),
+            ("profile_detail".to_string(), serde_json::json!("basic")),
+            (
+                "resource_trace_source".to_string(),
+                serde_json::json!("engine"),
+            ),
+        ]);
+        if let Some(reason) = reason.as_deref() {
+            attributes.insert("resource_reason".to_string(), serde_json::json!(reason));
+        }
+        let event = FerrumProfileEvent {
+            schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            event_id: format!("evt-engine-resource-{event_num}"),
+            request_id: request_id.to_string(),
+            correlation_id: Some(request_id.to_string()),
+            entrypoint,
+            backend: "actual".to_string(),
+            phase: phase.to_string(),
+            event_kind: ProfileEventKind::Resource,
+            timestamp: chrono::Utc::now(),
+            status: ProfileStatus::Ok,
+            model: Some(self.config.model.model_id.to_string()),
+            duration_us: None,
+            memory: None,
+            resource: Some(ResourceTraceEvent {
+                owner_kind: owner_kind.to_string(),
+                owner_id: owner_id.to_string(),
+                resource_kind: resource_kind.to_string(),
+                action,
+                amount,
+                before,
+                after,
+                capacity,
+                reason,
+            }),
+            error: None,
+            replay: None,
+            attributes,
+        };
+        if let Err(error) = event.validate() {
+            warn!("Skipping invalid engine resource trace event: {}", error);
+            return;
+        }
+        let mut line = match serde_json::to_string(&event) {
+            Ok(line) => line,
+            Err(error) => {
+                warn!("Failed to serialize engine resource trace event: {}", error);
+                return;
+            }
+        };
+        line.push('\n');
+        let mut file = sink.lock();
+        if let Err(error) = file.write_all(line.as_bytes()) {
+            warn!("Failed to write engine resource trace event: {}", error);
+            return;
+        }
+    }
+
+    fn resource_amount_i64(amount: usize) -> i64 {
+        amount.min(i64::MAX as usize) as i64
+    }
+
+    fn trace_request_open(&self, request_id: &RequestId) {
+        self.trace_resource_event(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "request_slot",
+            "engine_request_open",
+            ResourceAction::RequestOpen,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    fn trace_request_admitted(&self, request_id: &RequestId) {
+        self.trace_resource_reserve_commit(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "request_slot",
+            "engine_request_slot",
+            1,
+            None,
+        );
+    }
+
+    fn trace_request_rejected(&self, request_id: &RequestId, reason: String) {
+        self.trace_resource_event(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "request_slot",
+            "engine_request_reject",
+            ResourceAction::Reject,
+            None,
+            None,
+            None,
+            Some(Self::resource_amount_i64(
+                self.config.scheduler.max_waiting_requests,
+            )),
+            Some(reason),
+        );
+        self.trace_request_owner_close(request_id);
+    }
+
+    fn trace_request_close(&self, request_id: &RequestId) {
+        self.trace_resource_event(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "request_slot",
+            "engine_request_slot_release",
+            ResourceAction::Release,
+            Some(1),
+            Some(1),
+            Some(0),
+            None,
+            None,
+        );
+        self.trace_request_owner_close(request_id);
+    }
+
+    fn trace_request_owner_close(&self, request_id: &RequestId) {
+        self.trace_resource_event(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "request_slot",
+            "engine_request_close",
+            ResourceAction::RequestClose,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    fn trace_scheduler_defer(&self, request_id: &RequestId, phase: &str, reason: &str) {
+        self.trace_resource_event(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "scheduler_capacity",
+            phase,
+            ResourceAction::Defer,
+            None,
+            None,
+            None,
+            Some(Self::resource_amount_i64(
+                self.config.scheduler.max_running_requests.max(1),
+            )),
+            Some(reason.to_string()),
+        );
+    }
+
+    fn trace_resource_reserve_commit(
+        &self,
+        request_id: &RequestId,
+        owner_kind: &str,
+        owner_id: &str,
+        resource_kind: &str,
+        phase_prefix: &str,
+        amount: usize,
+        capacity: Option<usize>,
+    ) {
+        let amount = Self::resource_amount_i64(amount.max(1));
+        let capacity_i64 = capacity.map(Self::resource_amount_i64);
+        let before = capacity_i64.unwrap_or(amount).max(amount);
+        let after = before.saturating_sub(amount);
+        self.trace_resource_event(
+            request_id,
+            owner_kind,
+            owner_id,
+            resource_kind,
+            &format!("{phase_prefix}_reserve"),
+            ResourceAction::Reserve,
+            Some(amount),
+            Some(before),
+            Some(after),
+            capacity_i64,
+            None,
+        );
+        self.trace_resource_event(
+            request_id,
+            owner_kind,
+            owner_id,
+            resource_kind,
+            &format!("{phase_prefix}_commit"),
+            ResourceAction::Commit,
+            Some(amount),
+            Some(0),
+            Some(amount),
+            capacity_i64,
+            None,
+        );
+    }
+
+    fn trace_resource_release(
+        &self,
+        request_id: &RequestId,
+        owner_kind: &str,
+        owner_id: &str,
+        resource_kind: &str,
+        phase: &str,
+        amount: usize,
+        capacity: Option<usize>,
+    ) {
+        let amount = Self::resource_amount_i64(amount.max(1));
+        self.trace_resource_event(
+            request_id,
+            owner_kind,
+            owner_id,
+            resource_kind,
+            phase,
+            ResourceAction::Release,
+            Some(amount),
+            Some(amount),
+            Some(0),
+            capacity.map(Self::resource_amount_i64),
+            None,
+        );
+    }
+
+    fn kv_resource_blocks_for_tokens(&self, tokens: usize) -> usize {
+        tokens
+            .div_ceil(self.config.kv_cache.block_size.max(1))
+            .max(1)
+    }
+
+    fn trace_kv_allocate(&self, request_id: &RequestId, blocks: usize) {
+        self.trace_resource_reserve_commit(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "kv_block",
+            "engine_kv_block",
+            blocks,
+            Some(self.config.kv_cache.max_blocks),
+        );
+    }
+
+    fn trace_kv_release(&self, request_id: &RequestId, blocks: usize) {
+        self.trace_resource_release(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "kv_block",
+            "engine_kv_block_release",
+            blocks,
+            Some(self.config.kv_cache.max_blocks),
+        );
+    }
+
+    fn trace_recurrent_allocate(
+        &self,
+        request_id: &RequestId,
+        slots: usize,
+        capacity: Option<usize>,
+    ) {
+        self.trace_resource_reserve_commit(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "recurrent_state_slot",
+            "engine_recurrent_state_slot",
+            slots,
+            capacity,
+        );
+    }
+
+    fn trace_recurrent_release(
+        &self,
+        request_id: &RequestId,
+        slots: usize,
+        capacity: Option<usize>,
+    ) {
+        self.trace_resource_release(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "recurrent_state_slot",
+            "engine_recurrent_state_slot_release",
+            slots,
+            capacity,
+        );
+    }
+
     async fn ensure_recurrent_state(
         &self,
         request_id: &RequestId,
@@ -1412,21 +1769,49 @@ impl EngineInner {
             )));
         };
 
-        let handle = manager.allocate(&spec).await?;
+        let before_stats = manager.stats();
+        let slots = spec.max_batch_slots.max(1);
+        let handle = match manager.allocate(&spec).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.trace_resource_event(
+                    request_id,
+                    "request",
+                    &request_id.to_string(),
+                    "recurrent_state_slot",
+                    "engine_recurrent_state_slot_reject",
+                    ResourceAction::Reject,
+                    None,
+                    None,
+                    None,
+                    Some(Self::resource_amount_i64(before_stats.total_batch_slots)),
+                    Some(error.to_string()),
+                );
+                return Err(error);
+            }
+        };
+        let after_stats = manager.stats();
+        self.trace_recurrent_allocate(request_id, slots, Some(after_stats.total_batch_slots));
 
         if let Some(seq) = self.sequences.write().get_mut(request_id) {
             seq.recurrent_state = Some(handle.clone());
+            seq.recurrent_state_slots = Some(slots);
         }
 
         Ok(Some(handle))
     }
 
     async fn release_recurrent_state(&self, request_id: &RequestId) {
-        if let Some(seq) = self.sequences.write().get_mut(request_id) {
+        let released_slots = self.sequences.write().get_mut(request_id).and_then(|seq| {
             seq.recurrent_state = None;
-        }
+            seq.recurrent_state_slots.take()
+        });
         if let Some(manager) = &self.recurrent_state_manager {
+            let capacity = manager.stats().total_batch_slots;
             let _ = manager.deallocate(request_id.clone()).await;
+            if let Some(slots) = released_slots {
+                self.trace_recurrent_release(request_id, slots, Some(capacity));
+            }
         }
     }
 
@@ -1473,6 +1858,16 @@ fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<Mutex<std::fs::Fil
                 );
                 return None;
             }
+        }
+    }
+    if let Err(error) = std::fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                "Failed to clear scheduler trace JSONL {}: {}",
+                path.display(),
+                error
+            );
+            return None;
         }
     }
     match std::fs::OpenOptions::new()
@@ -1582,6 +1977,8 @@ impl ContinuousBatchEngine {
         let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
         let scheduler_trace_jsonl =
             create_scheduler_trace_sink(runtime_config.scheduler_trace_jsonl.as_deref());
+        let legacy_scheduler_trace_jsonl =
+            create_scheduler_trace_sink(runtime_config.legacy_scheduler_trace_jsonl.as_deref());
 
         Self {
             inner: Arc::new(EngineInner {
@@ -1604,7 +2001,9 @@ impl ContinuousBatchEngine {
                 prefix_cache: PrefixCache::new(256, 2),
                 runtime_config,
                 scheduler_trace_jsonl,
+                legacy_scheduler_trace_jsonl,
                 scheduler_trace_none_streak: AtomicU64::new(0),
+                resource_trace_event_counter: AtomicU64::new(0),
                 total_prefill_tokens: AtomicU64::new(0),
                 total_decode_tokens: AtomicU64::new(0),
                 total_preemptions: AtomicU64::new(0),
@@ -1718,7 +2117,13 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         );
 
         // Submit to scheduler
-        self.inner.scheduler.submit(request.clone()).await?;
+        self.inner.trace_request_open(&request_id);
+        if let Err(error) = self.inner.scheduler.submit(request.clone()).await {
+            self.inner
+                .trace_request_rejected(&request_id, error.to_string());
+            return Err(error);
+        }
+        self.inner.trace_request_admitted(&request_id);
 
         // Create sequence state with oneshot channel
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
@@ -1791,7 +2196,13 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         );
 
         // Submit to scheduler
-        self.inner.scheduler.submit(request.clone()).await?;
+        self.inner.trace_request_open(&request_id);
+        if let Err(error) = self.inner.scheduler.submit(request.clone()).await {
+            self.inner
+                .trace_request_rejected(&request_id, error.to_string());
+            return Err(error);
+        }
+        self.inner.trace_request_admitted(&request_id);
 
         // Create sequence state with stream sender
         let mut seq_state = SequenceState::new_with_tokenizer_and_model_vocab_size(

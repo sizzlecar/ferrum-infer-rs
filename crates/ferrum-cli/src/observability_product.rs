@@ -242,7 +242,7 @@ fn write_actual_artifacts(
             .filter(|event| event.resource.is_some())
             .cloned()
             .collect();
-        write_profile_jsonl(path, &scheduler_events)?;
+        append_profile_jsonl(path, &scheduler_events)?;
         written.push(path.clone());
     }
     if let Some(dir) = &config.request_dump_dir {
@@ -940,6 +940,42 @@ fn write_profile_jsonl(path: &Path, events: &[FerrumProfileEvent]) -> Result<()>
         body.push('\n');
     }
     fs_write(path, body)
+}
+
+fn append_profile_jsonl(path: &Path, events: &[FerrumProfileEvent]) -> Result<()> {
+    if events.is_empty() {
+        return Err(FerrumError::internal("profile event set must be non-empty"));
+    }
+    if let Some(parent) = path.parent() {
+        fs_create_dir_all(parent)?;
+    }
+    let mut body = String::new();
+    for event in events {
+        event.validate().map_err(|err| {
+            FerrumError::internal(format!("invalid product observability event: {err}"))
+        })?;
+        body.push_str(&serde_json::to_string(event).map_err(|err| {
+            FerrumError::serialization(format!("failed to serialize profile event: {err}"))
+        })?);
+        body.push('\n');
+    }
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| {
+            FerrumError::internal(format!(
+                "failed to open profile JSONL {} for append: {err}",
+                path.display()
+            ))
+        })?;
+    file.write_all(body.as_bytes()).map_err(|err| {
+        FerrumError::internal(format!(
+            "failed to append profile JSONL {}: {err}",
+            path.display()
+        ))
+    })
 }
 
 fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {

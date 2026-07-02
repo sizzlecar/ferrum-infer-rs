@@ -155,12 +155,15 @@ impl EngineInner {
             stream_sender,
             response_sender,
             has_kv_cache,
+            kv_resource_blocks,
             has_recurrent_state,
+            recurrent_state_slots,
             draft_kv_request_id,
+            draft_kv_resource_blocks,
             model_cache_id,
         ) = {
             let mut sequences = self.sequences.write();
-            if let Some(seq) = sequences.remove(request_id) {
+            if let Some(mut seq) = sequences.remove(request_id) {
                 let text = self
                     .tokenizer
                     .decode(&seq.generated_tokens, true)
@@ -194,16 +197,22 @@ impl EngineInner {
                 };
 
                 let has_kv = seq.kv_cache.is_some();
+                let kv_resource_blocks = seq.kv_resource_blocks.take();
                 let has_recurrent_state = seq.recurrent_state.is_some();
+                let recurrent_state_slots = seq.recurrent_state_slots.take();
                 let draft_kv_request_id = seq.draft_kv_request_id.clone();
+                let draft_kv_resource_blocks = seq.draft_kv_resource_blocks.take();
                 let cache_id = seq.model_cache_id.clone();
                 (
                     response,
                     seq.stream_sender,
                     seq.response_sender,
                     has_kv,
+                    kv_resource_blocks,
                     has_recurrent_state,
+                    recurrent_state_slots,
                     draft_kv_request_id,
+                    draft_kv_resource_blocks,
                     cache_id,
                 )
             } else {
@@ -218,21 +227,32 @@ impl EngineInner {
 
         if has_kv_cache {
             let _ = self.kv_cache.deallocate(request_id.clone()).await;
+            if let Some(blocks) = kv_resource_blocks {
+                self.trace_kv_release(request_id, blocks);
+            }
         }
 
         if let Some(draft_request_id) = draft_kv_request_id {
             let _ = self.kv_cache.deallocate(draft_request_id).await;
+            if let Some(blocks) = draft_kv_resource_blocks {
+                self.trace_kv_release(request_id, blocks);
+            }
         }
 
         if has_recurrent_state {
             if let Some(manager) = &self.recurrent_state_manager {
+                let capacity = manager.stats().total_batch_slots;
                 let _ = manager.deallocate(request_id.clone()).await;
+                if let Some(slots) = recurrent_state_slots {
+                    self.trace_recurrent_release(request_id, slots, Some(capacity));
+                }
             }
         }
 
         self.scheduler
             .complete(request_id.clone(), &response)
             .await?;
+        self.trace_request_close(request_id);
 
         if let Some(tx) = response_sender {
             let _ = tx.send(response.clone());

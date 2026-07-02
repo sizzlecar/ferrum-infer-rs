@@ -453,10 +453,13 @@ impl EngineInner {
                 priority: Priority::Normal,
             };
             let draft_kv_handle = self.kv_cache.allocate(&alloc_request).await?;
+            let draft_kv_resource_blocks = self.kv_resource_blocks_for_tokens(prompt_u32s.len());
+            self.trace_kv_allocate(request_id, draft_kv_resource_blocks);
             let prompt_tensor = match self.tokens_to_tensor(&prompt_u32s) {
                 Ok(tensor) => tensor,
                 Err(e) => {
                     let _ = self.kv_cache.deallocate(draft_kv_request_id).await;
+                    self.trace_kv_release(request_id, draft_kv_resource_blocks);
                     return Err(e);
                 }
             };
@@ -465,6 +468,7 @@ impl EngineInner {
                 Ok(output) => output,
                 Err(e) => {
                     let _ = self.kv_cache.deallocate(draft_kv_request_id).await;
+                    self.trace_kv_release(request_id, draft_kv_resource_blocks);
                     return Err(e);
                 }
             };
@@ -474,6 +478,7 @@ impl EngineInner {
                 if let Some(s) = sequences.get_mut(request_id) {
                     s.draft_kv_cache = Some(kv.clone());
                     s.draft_kv_request_id = Some(draft_kv_request_id);
+                    s.draft_kv_resource_blocks = Some(draft_kv_resource_blocks);
                 }
             }
             kv

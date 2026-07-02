@@ -335,6 +335,22 @@ def validate_profile_group(root: Path, entrypoint: str) -> dict[str, Any]:
                 for key in ("current_bytes", "high_water_bytes"):
                     if not isinstance(memory.get(key), int) or memory[key] <= 0:
                         raise SmokeError(f"{path} memory.{key} must be a positive integer")
+        if label == "scheduler":
+            sources = {
+                (event.get("attributes") or {}).get("resource_trace_source")
+                for event in events
+                if isinstance(event.get("attributes"), dict)
+            }
+            if "engine" not in sources:
+                raise SmokeError(f"{path} must contain engine runtime resource trace events")
+            resource_kinds = {
+                (event.get("resource") or {}).get("resource_kind")
+                for event in events
+                if isinstance(event.get("resource"), dict)
+            }
+            missing = {"request_slot", "kv_block"} - resource_kinds
+            if missing:
+                raise SmokeError(f"{path} missing runtime resource kinds: {sorted(missing)}")
         result[label] = {"path": str(path), "event_count": len(events)}
     request_dump = root / "request_dump/request.json"
     replay = root / "request_dump/replay_command.txt"
