@@ -385,6 +385,30 @@ def validate_replay_index(value: Any, *, artifact_dir: Path, label: str) -> None
         require(bundle_dir.is_dir(), f"{entry_label}.bundle_dir must exist: {bundle_dir}")
 
 
+def artifact_from_reference(path: Path) -> dict[str, Any]:
+    if not path.is_dir():
+        return read_json(path)
+    manifest = read_json(path / "gate.manifest.json")
+    summary_path = None
+    outputs = manifest.get("outputs")
+    if isinstance(outputs, dict):
+        summary_path = outputs.get("summary")
+    if summary_path is None:
+        summary_path = manifest.get("summary")
+    extra: dict[str, Any] = {}
+    if isinstance(summary_path, str) and summary_path.strip():
+        candidate = resolve_path(summary_path, base=path)
+        if candidate.is_file():
+            extra = read_json(candidate)
+    return {
+        **extra,
+        "status": manifest.get("status", extra.get("status")),
+        "git_sha": manifest.get("git_sha", extra.get("git_sha")),
+        "artifact_dir": manifest.get("artifact_dir", extra.get("artifact_dir", str(path))),
+        "pass_line": manifest.get("pass_line", extra.get("pass_line")),
+    }
+
+
 def validate_l2_artifact(
     data: dict[str, Any],
     key: str,
@@ -450,6 +474,34 @@ def validate_l2_artifact(
     )
 
 
+def validate_selected_native_cuda_artifact(
+    selection: dict[str, Any],
+    *,
+    expected_sha: str,
+    summary_path: Path,
+) -> None:
+    raw = selection.get("cuda_artifact")
+    require(
+        isinstance(raw, str) and raw.strip(),
+        "native operator selected path requires cuda_artifact",
+    )
+    artifact_path = resolve_path(raw, base=summary_path.parent)
+    require(
+        artifact_path.exists(),
+        f"actual_model_regression.native_operator_selection.cuda_artifact must exist: {artifact_path}",
+    )
+    artifact = artifact_from_reference(artifact_path)
+    label = "actual_model_regression.native_operator_selection.cuda_artifact"
+    require(artifact.get("status") == "pass", f"{label}.status must be pass")
+    require_git_sha(artifact, label, expected_sha)
+    require(artifact.get("backend") == "cuda", f"{label}.backend must be cuda")
+    require_real_pass_line(artifact.get("pass_line"), label)
+    artifact_dir = artifact.get("artifact_dir")
+    require(isinstance(artifact_dir, str) and artifact_dir.strip(), f"{label}.artifact_dir must be non-empty")
+    resolved_artifact_dir = resolve_path(artifact_dir, base=artifact_path if artifact_path.is_dir() else artifact_path.parent)
+    require(resolved_artifact_dir.is_dir(), f"{label}.artifact_dir must exist: {resolved_artifact_dir}")
+
+
 def find_actual_model_regression_path(args: argparse.Namespace) -> Path | None:
     if args.actual_model_regression_summary is not None:
         if args.actual_model_regression_summary.is_dir():
@@ -492,7 +544,11 @@ def validate_actual_model_regression(args: argparse.Namespace, expected_sha: str
     require(selection.get("status") == "pass", "actual_model_regression.native_operator_selection.status must be pass")
     selected = selection.get("selected")
     if selected is True:
-        require(isinstance(selection.get("cuda_artifact"), str) and selection["cuda_artifact"].strip(), "native operator selected path requires cuda_artifact")
+        validate_selected_native_cuda_artifact(
+            selection,
+            expected_sha=expected_sha,
+            summary_path=path,
+        )
     elif selected is False:
         require(isinstance(selection.get("non_selected_reason"), str) and selection["non_selected_reason"].strip(), "native operator non-selected path requires non_selected_reason")
     else:
@@ -922,6 +978,20 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
         root / "fixtures/cuda-l2/request_dump",
     ):
         path.mkdir(parents=True, exist_ok=True)
+    native_cuda_dir = root / "fixtures/cuda-native-op"
+    native_cuda_dir.mkdir(parents=True, exist_ok=True)
+    native_cuda_artifact = native_cuda_dir / "native_cuda.json"
+    write_json(
+        native_cuda_artifact,
+        {
+            "schema_version": 1,
+            "status": "pass",
+            "backend": "cuda",
+            "git_sha": sha,
+            "artifact_dir": str(native_cuda_dir),
+            "pass_line": "NATIVE OP ARTIFACT PASS: fixtures/cuda-native-op",
+        },
+    )
 
     actual = root / "actual_model_regression_summary.json"
     write_json(
@@ -982,7 +1052,9 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "native_operator_selection": {
                 "status": "pass",
                 "selected": True,
-                "cuda_artifact": "fixtures/cuda-native-op",
+                "cuda_artifact": str(native_cuda_artifact),
+                "cuda_artifact_dir": str(native_cuda_dir),
+                "cuda_artifact_pass_line": "NATIVE OP ARTIFACT PASS: fixtures/cuda-native-op",
             },
         },
     )
@@ -1186,6 +1258,34 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("missing L2 replay bundle unexpectedly passed final gate")
         except GoalGateError as exc:
             require("bundle_dir" in str(exc), f"unexpected replay bundle error: {exc}")
+        bad_native_artifact = root / "bad-native-selection-artifact"
+        artifacts_bad_native_artifact = selftest_artifacts(
+            root / "bad-native-selection-artifact-fixtures",
+            sha,
+        )
+        bad_native_actual = read_json(artifacts_bad_native_artifact["actual"])
+        bad_native_actual["native_operator_selection"]["cuda_artifact"] = str(
+            root / "missing-native-cuda-artifact.json"
+        )
+        write_json(artifacts_bad_native_artifact["actual"], bad_native_actual)
+        args_bad_native_artifact = argparse.Namespace(
+            out=bad_native_artifact,
+            resource_invariant=artifacts_bad_native_artifact["resource"],
+            change_impact=artifacts_bad_native_artifact["change"],
+            product_sentinel=artifacts_bad_native_artifact["product"],
+            model_contract=artifacts_bad_native_artifact["model"],
+            support_matrix_contract=artifacts_bad_native_artifact["support_matrix"],
+            observability_profile=artifacts_bad_native_artifact["observability"],
+            native_operator=artifacts_bad_native_artifact["native"],
+            actual_model_regression_summary=artifacts_bad_native_artifact["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_native_artifact)
+            raise AssertionError("missing selected native CUDA artifact unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require("cuda_artifact" in str(exc), f"unexpected native CUDA artifact error: {exc}")
         return {
             "schema_version": SCHEMA_VERSION,
             "status": "pass",
