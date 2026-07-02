@@ -1,0 +1,285 @@
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "id": "engine-shared-runtime",
+      "path_globs": ["crates/ferrum-engine/src/**"],
+      "domains": ["shared_runtime"],
+      "required_gates": [
+        "unit",
+        "resource_invariant",
+        "backend_boundary",
+        "preset_snapshot",
+        "metal_sentinel",
+        "cuda_sentinel"
+      ],
+      "release_invalidation": [
+        "unit",
+        "resource_invariant",
+        "preset_snapshot",
+        "metal_sentinel",
+        "cuda_sentinel",
+        "metal_full",
+        "cuda_full",
+        "cuda_llama_dense"
+      ],
+      "exceptions": [],
+      "owner": "runtime",
+      "reason": "engine lifecycle and registry changes can affect all product backends"
+    },
+    {
+      "id": "scheduler-shared-runtime",
+      "path_globs": ["crates/ferrum-scheduler/src/**"],
+      "domains": ["shared_runtime"],
+      "required_gates": [
+        "unit",
+        "resource_invariant",
+        "backend_boundary",
+        "preset_snapshot",
+        "metal_sentinel",
+        "cuda_sentinel"
+      ],
+      "release_invalidation": [
+        "unit",
+        "resource_invariant",
+        "preset_snapshot",
+        "metal_sentinel",
+        "cuda_sentinel",
+        "metal_full",
+        "cuda_full",
+        "cuda_llama_dense"
+      ],
+      "exceptions": [],
+      "owner": "runtime",
+      "reason": "scheduler and admission changes can affect resource ownership and all backends"
+    },
+    {
+      "id": "kv-shared-runtime",
+      "path_globs": ["crates/ferrum-kv/src/**"],
+      "domains": ["shared_runtime"],
+      "required_gates": [
+        "unit",
+        "resource_invariant",
+        "backend_boundary",
+        "preset_snapshot",
+        "metal_sentinel",
+        "cuda_sentinel"
+      ],
+      "release_invalidation": [
+        "unit",
+        "resource_invariant",
+        "preset_snapshot",
+        "metal_sentinel",
+        "cuda_sentinel",
+        "metal_full",
+        "cuda_full",
+        "cuda_llama_dense"
+      ],
+      "exceptions": [],
+      "owner": "runtime",
+      "reason": "KV manager changes affect shared cache lifecycle"
+    },
+    {
+      "id": "types-runtime-config-and-presets",
+      "path_globs": [
+        "crates/ferrum-types/src/auto_config.rs",
+        "crates/ferrum-types/src/runtime_config.rs",
+        "crates/ferrum-types/examples/backend_runtime_preset_snapshot.rs"
+      ],
+      "domains": ["shared_runtime", "runtime_preset"],
+      "required_gates": ["unit", "backend_boundary", "preset_snapshot", "metal_sentinel", "cuda_sentinel"],
+      "release_invalidation": [
+        "preset_snapshot",
+        "metal_sentinel",
+        "cuda_sentinel",
+        "metal_full",
+        "cuda_full"
+      ],
+      "exceptions": [],
+      "owner": "runtime",
+      "reason": "runtime preset and config changes select backend behavior"
+    },
+    {
+      "id": "evidence-schema",
+      "path_globs": [
+        "crates/ferrum-types/src/observability_profile.rs",
+        "crates/ferrum-types/src/resource_trace.rs",
+        "crates/ferrum-types/src/native_operator.rs",
+        "scripts/release/analyze_ferrum_profile.py",
+        "scripts/release/schemas/**",
+        "scripts/release/fixtures/**"
+      ],
+      "domains": ["evidence_schema"],
+      "required_gates": ["unit", "profile_analyzer_selftest", "planner_selftest"],
+      "release_invalidation": ["profile_analyzer_selftest", "planner_selftest"],
+      "exceptions": [],
+      "owner": "release",
+      "reason": "shared evidence schemas and fixtures affect downstream validators"
+    },
+    {
+      "id": "model-contract",
+      "path_globs": [
+        "crates/ferrum-interfaces/src/model_executor.rs",
+        "crates/ferrum-models/src/**",
+        "scripts/release/models_manifest.json",
+        "scripts/release/model_release_grade_manifest.py",
+        "scripts/release/model_release_grade_goal_gate.py"
+      ],
+      "domains": ["model_contract"],
+      "required_gates": ["unit", "model_contract", "product_sentinel"],
+      "release_invalidation": ["model_contract", "product_sentinel", "support_matrix"],
+      "exceptions": [],
+      "owner": "models",
+      "reason": "model capabilities, templates, registry, and manifests affect supported model behavior"
+    },
+    {
+      "id": "cuda-backend",
+      "path_globs": [
+        "crates/ferrum-kernels/src/backend/cuda/**",
+        "crates/ferrum-kernels/src/backend/cuda*.rs",
+        "crates/ferrum-kernels/kernels/cuda/**"
+      ],
+      "domains": ["cuda_backend"],
+      "required_gates": ["unit", "backend_boundary", "preset_snapshot", "cuda_sentinel", "metal_boundary_smoke"],
+      "release_invalidation": ["cuda_sentinel", "cuda_full", "cuda_llama_dense"],
+      "exceptions": [],
+      "owner": "cuda",
+      "reason": "CUDA backend-local changes require CUDA sentinel and cheap cross-backend boundary evidence"
+    },
+    {
+      "id": "metal-backend",
+      "path_globs": [
+        "crates/ferrum-kernels/src/backend/metal/**",
+        "crates/ferrum-kernels/src/backend/metal*.rs",
+        "crates/ferrum-kernels/kernels/metal/**"
+      ],
+      "domains": ["metal_backend"],
+      "required_gates": ["unit", "backend_boundary", "preset_snapshot", "metal_sentinel", "cuda_boundary_smoke"],
+      "release_invalidation": ["metal_sentinel", "metal_full"],
+      "exceptions": [],
+      "owner": "metal",
+      "reason": "Metal backend-local changes require Metal sentinel and cheap cross-backend boundary evidence"
+    },
+    {
+      "id": "native-operator",
+      "path_globs": [
+        "crates/ferrum-native-ops/**",
+        "crates/ferrum-kernels/src/native_ops.rs",
+        "scripts/release/native_operator_artifact_gate.py",
+        "scripts/release/fixtures/native_operator/**",
+        "scripts/release/schemas/native_operator_manifest.schema.json"
+      ],
+      "domains": ["native_operator"],
+      "required_gates": ["unit", "native_operator_artifact", "cuda_l1_native_op_smoke"],
+      "release_invalidation": ["native_operator_artifact", "cuda_sentinel", "cuda_full"],
+      "exceptions": [],
+      "owner": "kernels",
+      "reason": "native operator ABI, manifest, and resolver affect external kernel artifact selection"
+    },
+    {
+      "id": "fa2-runtime-selection",
+      "path_globs": [
+        "crates/ferrum-kernels/src/backend/cuda/fa2_source.rs",
+        "crates/ferrum-kernels/kernels/fa2_source/**",
+        "crates/ferrum-kernels/build.rs",
+        "crates/ferrum-models/src/models/qwen3_moe_runtime.rs",
+        "crates/ferrum-kernels/src/backend/cuda/paged.rs"
+      ],
+      "domains": ["cuda_backend", "native_operator"],
+      "required_gates": [
+        "unit",
+        "native_operator_artifact",
+        "cuda_sentinel",
+        "cuda_l1_native_op_smoke"
+      ],
+      "release_invalidation": ["native_operator_artifact", "cuda_sentinel", "cuda_full", "cuda_llama_dense"],
+      "exceptions": [],
+      "owner": "kernels",
+      "reason": "FA2 build/runtime selection must be tied to native operator artifacts and CUDA smoke"
+    },
+    {
+      "id": "cli-run",
+      "path_globs": ["crates/ferrum-cli/src/commands/run.rs"],
+      "domains": ["cli_run"],
+      "required_gates": ["unit", "run_sentinel", "product_sentinel"],
+      "release_invalidation": ["run_sentinel", "product_sentinel"],
+      "exceptions": [],
+      "owner": "cli",
+      "reason": "ferrum run behavior is a product entrypoint"
+    },
+    {
+      "id": "server-api",
+      "path_globs": [
+        "crates/ferrum-cli/src/commands/serve.rs",
+        "crates/ferrum-server/src/**"
+      ],
+      "domains": ["server_api"],
+      "required_gates": ["unit", "serve_sentinel", "bench_serve_correctness", "product_sentinel"],
+      "release_invalidation": ["serve_sentinel", "bench_serve_correctness", "product_sentinel"],
+      "exceptions": [],
+      "owner": "server",
+      "reason": "OpenAI-compatible serving and streaming are product entrypoints"
+    },
+    {
+      "id": "bench-serve",
+      "path_globs": ["crates/ferrum-cli/src/commands/bench_serve.rs"],
+      "domains": ["server_api", "release_gate"],
+      "required_gates": ["unit", "bench_serve_correctness", "release_validator_selftest"],
+      "release_invalidation": ["bench_serve_correctness", "release_validator_selftest"],
+      "exceptions": [],
+      "owner": "bench",
+      "reason": "bench-serve is canonical release throughput client and correctness checker"
+    },
+    {
+      "id": "release-gates",
+      "path_globs": [
+        "scripts/release/**",
+        "scripts/m3_ab_runner.py",
+        "scripts/m3_validate_runner_artifact.py"
+      ],
+      "domains": ["release_gate"],
+      "required_gates": ["unit", "release_validator_selftest"],
+      "release_invalidation": ["release_validator_selftest"],
+      "exceptions": [
+        {
+          "id": "release-doc-fixture-only",
+          "path_globs": ["scripts/release/fixtures/docs_only/**"],
+          "remove_required_gates": ["unit"],
+          "reason": "fixture-only docs examples do not require Rust unit tests"
+        }
+      ],
+      "owner": "release",
+      "reason": "release scripts, validators, configs, and scenarios affect gate behavior"
+    },
+    {
+      "id": "product-scenarios",
+      "path_globs": ["scripts/release/scenarios/**"],
+      "domains": ["release_gate", "server_api", "cli_run"],
+      "required_gates": ["unit", "run_scenarios_selftest", "product_sentinel_dry_run"],
+      "release_invalidation": ["run_scenarios_selftest", "product_sentinel"],
+      "exceptions": [],
+      "owner": "release",
+      "reason": "product scenario manifests directly control run/serve sentinel coverage"
+    },
+    {
+      "id": "workspace-build-config",
+      "path_globs": ["Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "ferrum.toml"],
+      "domains": ["shared_runtime", "release_gate"],
+      "required_gates": ["unit", "backend_boundary", "preset_snapshot", "metal_sentinel", "cuda_sentinel"],
+      "release_invalidation": ["unit", "preset_snapshot", "metal_sentinel", "cuda_sentinel", "metal_full", "cuda_full"],
+      "exceptions": [],
+      "owner": "build",
+      "reason": "workspace, features, dependencies, and defaults can affect all product paths"
+    },
+    {
+      "id": "docs-only",
+      "path_globs": ["docs/**", "README.md", "AGENTS.md"],
+      "domains": ["docs_only"],
+      "required_gates": ["docs_review"],
+      "release_invalidation": [],
+      "exceptions": [],
+      "owner": "docs",
+      "reason": "documentation-only changes do not invalidate existing gates unless referenced scripts/configs also change"
+    }
+  ]
+}
