@@ -307,6 +307,66 @@ impl FerrumError {
                 | Self::Internal { .. }
         )
     }
+
+    /// Stable failure class used by product observability replay bundles.
+    ///
+    /// This intentionally stays smaller than the full error enum because the
+    /// replay validator has different evidence requirements for resource
+    /// failures and generic panic/error failures.
+    pub fn observability_failure_kind(&self) -> &'static str {
+        match self {
+            Self::ResourceExhausted { .. } => "oom_admission",
+            Self::Device { message } if looks_like_oom(message) => "oom",
+            Self::Scheduler { message } if looks_like_admission(message) => "admission",
+            Self::Backend { message } if looks_like_oom(message) => "oom",
+            _ => "error",
+        }
+    }
+
+    /// Stable error-kind label for first-failure-event diagnostics.
+    pub fn observability_error_kind(&self) -> &'static str {
+        match self {
+            Self::Config { .. } => "config",
+            Self::Model { .. } => "model",
+            Self::Tokenizer { .. } => "tokenizer",
+            Self::Backend { .. } => "backend",
+            Self::Device { .. } => "device",
+            Self::Scheduler { .. } => "scheduler",
+            Self::RequestValidation { .. } => "request_validation",
+            Self::ResourceExhausted { .. } => "resource_exhausted",
+            Self::Timeout { .. } => "timeout",
+            Self::Auth { .. } => "auth",
+            Self::RateLimit { .. } => "rate_limit",
+            Self::IO { .. } => "io",
+            Self::Serialization { .. } => "serialization",
+            Self::Network { .. } => "network",
+            Self::Internal { .. } => "internal",
+            Self::Cancelled { .. } => "cancelled",
+            Self::NotFound { .. } => "not_found",
+            Self::AlreadyExists { .. } => "already_exists",
+            Self::PermissionDenied { .. } => "permission_denied",
+            Self::Unsupported { .. } => "unsupported",
+            Self::InvalidFormat { .. } => "invalid_format",
+            Self::InvalidParameter { .. } => "invalid_parameter",
+        }
+    }
+}
+
+fn looks_like_oom(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("out of memory")
+        || normalized.contains("oom")
+        || normalized.contains("cuda error 2")
+        || normalized.contains("cudaerroroutofmemory")
+        || normalized.contains("metal out of memory")
+}
+
+fn looks_like_admission(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("admission")
+        || normalized.contains("capacity")
+        || normalized.contains("resource")
+        || normalized.contains("queue")
 }
 
 /// Conversion from std::io::Error
@@ -320,5 +380,44 @@ impl From<std::io::Error> for FerrumError {
 impl From<serde_json::Error> for FerrumError {
     fn from(err: serde_json::Error) -> Self {
         Self::serialization(format!("{}", err))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observability_failure_kind_classifies_resource_and_oom() {
+        assert_eq!(
+            FerrumError::resource_exhausted("kv capacity exhausted").observability_failure_kind(),
+            "oom_admission"
+        );
+        assert_eq!(
+            FerrumError::device("CUDA out of memory while allocating KV")
+                .observability_failure_kind(),
+            "oom"
+        );
+        assert_eq!(
+            FerrumError::scheduler("admission capacity rejected request")
+                .observability_failure_kind(),
+            "admission"
+        );
+        assert_eq!(
+            FerrumError::internal("stub generation failed").observability_failure_kind(),
+            "error"
+        );
+    }
+
+    #[test]
+    fn observability_error_kind_uses_stable_variant_labels() {
+        assert_eq!(
+            FerrumError::resource_exhausted("slots exhausted").observability_error_kind(),
+            "resource_exhausted"
+        );
+        assert_eq!(
+            FerrumError::invalid_parameter("bad").observability_error_kind(),
+            "invalid_parameter"
+        );
     }
 }

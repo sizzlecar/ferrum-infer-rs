@@ -1083,13 +1083,22 @@ fn write_chat_request_replay_bundle(
 fn write_chat_request_failure_diagnostics(
     state: &AppState,
     request_id: &str,
+    failure_kind: &str,
     phase: &str,
     error_kind: &str,
     message: &str,
+    engine_status: Option<&EngineStatus>,
 ) -> std::result::Result<(), String> {
+    let admission_summary = state
+        .auto_config
+        .as_ref()
+        .map(|config| config.admission_summary_document());
     write_chat_request_failure_diagnostics_at_root(
         state.request_dump_dir.as_ref().map(|root| root.as_path()),
+        admission_summary.as_ref(),
+        engine_status,
         request_id,
+        failure_kind,
         phase,
         error_kind,
         message,
@@ -1098,7 +1107,10 @@ fn write_chat_request_failure_diagnostics(
 
 fn write_chat_request_failure_diagnostics_at_root(
     request_dump_dir: Option<&Path>,
+    admission_summary: Option<&serde_json::Value>,
+    engine_status: Option<&EngineStatus>,
     request_id: &str,
+    failure_kind: &str,
     phase: &str,
     error_kind: &str,
     message: &str,
@@ -1137,7 +1149,7 @@ fn write_chat_request_failure_diagnostics_at_root(
     bad_scan_obj
         .entry("first_bad_text_span".to_string())
         .or_insert(serde_json::Value::Null);
-    bad_scan_obj.insert("failure_kind".to_string(), serde_json::json!("error"));
+    bad_scan_obj.insert("failure_kind".to_string(), serde_json::json!(failure_kind));
     bad_scan_obj.insert("failure_phase".to_string(), serde_json::json!(phase));
     bad_scan_obj.insert("error_kind".to_string(), serde_json::json!(error_kind));
     bad_scan_obj
@@ -1148,11 +1160,97 @@ fn write_chat_request_failure_diagnostics_at_root(
         .or_insert_with(|| serde_json::json!(sha256_hex(b"")));
     write_json_value(&bad_scan_path, &bad_scan)?;
 
-    let diagnostics = serde_json::json!({
+    let diagnostics = if chat_resource_failure_kind(failure_kind) {
+        chat_resource_failure_diagnostics(
+            request_id,
+            failure_kind,
+            phase,
+            error_kind,
+            &message,
+            now.timestamp_millis(),
+            admission_summary,
+            engine_status,
+        )
+    } else {
+        serde_json::json!({
+            "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            "entrypoint": "serve",
+            "request_id": request_id,
+            "failure_kind": failure_kind,
+            "phase": phase,
+            "first_failure_event": {
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "entrypoint": "serve",
+                "request_id": request_id,
+                "phase": phase,
+                "error_kind": error_kind,
+                "message": message,
+                "timestamp_unix_ms": now.timestamp_millis()
+            },
+            "nearest_request_id": request_id,
+            "log_excerpt": format!("{phase}: {message}"),
+            "backtrace_excerpt": null,
+            "nearest_resource_event": null,
+            "nearest_memory_snapshot": null
+        })
+    };
+    write_json_value(&bundle_dir.join("failure_diagnostics.json"), &diagnostics)?;
+    Ok(())
+}
+
+fn chat_resource_failure_diagnostics(
+    request_id: &str,
+    failure_kind: &str,
+    phase: &str,
+    error_kind: &str,
+    message: &str,
+    timestamp_unix_ms: i64,
+    admission_summary: Option<&serde_json::Value>,
+    engine_status: Option<&EngineStatus>,
+) -> serde_json::Value {
+    let resource_kind = chat_resource_kind_for_failure(failure_kind);
+    let memory = engine_status
+        .map(|status| &status.memory_usage)
+        .map(|memory| {
+            let current = memory.used_bytes as i64;
+            let high_water = current.max(0);
+            serde_json::json!({
+                "scope": "serve_failure",
+                "backend": "engine_status",
+                "current_bytes": current.max(0),
+                "high_water_bytes": high_water,
+                "total_bytes": memory.total_bytes,
+                "free_bytes": memory.free_bytes,
+                "gpu_memory_bytes": memory.gpu_memory_bytes,
+                "cpu_memory_bytes": memory.cpu_memory_bytes,
+                "source": "engine_status"
+            })
+        })
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "scope": "serve_failure",
+                "backend": "engine_status",
+                "current_bytes": 0,
+                "high_water_bytes": 0,
+                "source": "not_collected"
+            })
+        });
+    let capacity = chat_failure_capacity(resource_kind, admission_summary, engine_status, message);
+    let needed = capacity
+        .get("needed")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(1)
+        .max(1);
+    let capacity_value = capacity
+        .get("capacity")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0)
+        .max(0);
+    serde_json::json!({
         "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
         "entrypoint": "serve",
         "request_id": request_id,
-        "failure_kind": "error",
+        "failure_kind": failure_kind,
         "phase": phase,
         "first_failure_event": {
             "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
@@ -1161,16 +1259,96 @@ fn write_chat_request_failure_diagnostics_at_root(
             "phase": phase,
             "error_kind": error_kind,
             "message": message,
-            "timestamp_unix_ms": now.timestamp_millis()
+            "timestamp_unix_ms": timestamp_unix_ms
         },
         "nearest_request_id": request_id,
         "log_excerpt": format!("{phase}: {message}"),
-        "backtrace_excerpt": null,
-        "nearest_resource_event": null,
-        "nearest_memory_snapshot": null
-    });
-    write_json_value(&bundle_dir.join("failure_diagnostics.json"), &diagnostics)?;
-    Ok(())
+        "capacity": capacity,
+        "nearest_resource_event": {
+            "owner_kind": "request",
+            "owner_id": request_id,
+            "resource_kind": resource_kind,
+            "action": "reject",
+            "amount": needed,
+            "before": capacity_value,
+            "after": capacity_value,
+            "capacity": capacity_value,
+            "reason": message
+        },
+        "nearest_memory_snapshot": memory
+    })
+}
+
+fn chat_failure_capacity(
+    resource_kind: &str,
+    admission_summary: Option<&serde_json::Value>,
+    engine_status: Option<&EngineStatus>,
+    reason: &str,
+) -> serde_json::Value {
+    if resource_kind == "device_memory" {
+        let (needed, available, capacity) = engine_status
+            .map(|status| {
+                let memory = &status.memory_usage;
+                let used = memory.used_bytes as i64;
+                let available = memory.free_bytes as i64;
+                let capacity = memory.total_bytes as i64;
+                (
+                    used.saturating_add(1).max(1),
+                    available.max(0),
+                    capacity.max(0),
+                )
+            })
+            .unwrap_or((1, 0, 0));
+        return serde_json::json!({
+            "resource_kind": resource_kind,
+            "needed": needed,
+            "available": available,
+            "capacity": capacity,
+            "reason": reason
+        });
+    }
+    let capacity = admission_summary
+        .and_then(|summary| summary.get("effective_max_concurrent"))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().map(|value| value as i64))
+        })
+        .unwrap_or_else(|| {
+            engine_status
+                .map(|status| {
+                    (status.active_requests as i64)
+                        .saturating_add(status.queued_requests as i64)
+                        .saturating_add(1)
+                })
+                .unwrap_or(0)
+        })
+        .max(0);
+    let used = engine_status
+        .map(|status| (status.active_requests as i64).saturating_add(status.queued_requests as i64))
+        .unwrap_or(0)
+        .max(0);
+    serde_json::json!({
+        "resource_kind": resource_kind,
+        "needed": 1,
+        "available": capacity.saturating_sub(used),
+        "capacity": capacity,
+        "reason": reason
+    })
+}
+
+fn chat_resource_failure_kind(failure_kind: &str) -> bool {
+    matches!(
+        failure_kind,
+        "oom" | "prevented_oom" | "admission" | "admission_reject" | "oom_admission"
+    )
+}
+
+fn chat_resource_kind_for_failure(failure_kind: &str) -> &'static str {
+    match failure_kind {
+        "oom" | "prevented_oom" => "device_memory",
+        _ => "admission_capacity",
+    }
 }
 
 fn sanitize_diagnostic_text(message: &str) -> String {
@@ -1350,7 +1528,14 @@ async fn handle_chat_completions_stream(
     let mut stream = match engine.infer_stream(inference_request).await {
         Ok(stream) => stream,
         Err(e) => {
+            let failure_kind = e.observability_failure_kind();
+            let error_kind = e.observability_error_kind();
             let error_message = e.to_string();
+            let engine_status = if chat_resource_failure_kind(failure_kind) {
+                Some(engine.status().await)
+            } else {
+                None
+            };
             error!(
                 "Stream generation failed before first chunk: {}",
                 error_message
@@ -1358,9 +1543,11 @@ async fn handle_chat_completions_stream(
             if let Err(err) = write_chat_request_failure_diagnostics(
                 &state,
                 &replay_request_id,
+                failure_kind,
                 "chat_completions_stream_start",
-                "infer_stream",
+                error_kind,
                 &error_message,
+                engine_status.as_ref(),
             ) {
                 warn!("failed to write chat stream failure diagnostics: {}", err);
             }
@@ -1375,6 +1562,11 @@ async fn handle_chat_completions_stream(
         }
     };
     let request_dump_dir = state.request_dump_dir.clone();
+    let admission_summary = state
+        .auto_config
+        .as_ref()
+        .map(|config| config.admission_summary_document());
+    let diagnostics_engine = engine.clone();
 
     tokio::spawn(async move {
         let mut current_text = String::new();
@@ -1614,13 +1806,23 @@ async fn handle_chat_completions_stream(
                     }
                 }
                 Err(e) => {
+                    let failure_kind = e.observability_failure_kind();
+                    let error_kind = e.observability_error_kind();
                     let error_message = e.to_string();
+                    let engine_status = if chat_resource_failure_kind(failure_kind) {
+                        Some(diagnostics_engine.status().await)
+                    } else {
+                        None
+                    };
                     error!("Stream generation error: {}", error_message);
                     if let Err(err) = write_chat_request_failure_diagnostics_at_root(
                         request_dump_dir.as_ref().map(|root| root.as_path()),
+                        admission_summary.as_ref(),
+                        engine_status.as_ref(),
                         &replay_request_id,
+                        failure_kind,
                         "chat_completions_stream_next",
-                        "stream_chunk",
+                        error_kind,
                         &error_message,
                     ) {
                         warn!(
@@ -1766,14 +1968,23 @@ async fn handle_chat_completions_sync(
             Ok(Json(response).into_response())
         }
         Err(e) => {
+            let failure_kind = e.observability_failure_kind();
+            let error_kind = e.observability_error_kind();
             let error_message = e.to_string();
+            let engine_status = if chat_resource_failure_kind(failure_kind) {
+                Some(engine.status().await)
+            } else {
+                None
+            };
             error!("Generation failed: {}", error_message);
             if let Err(err) = write_chat_request_failure_diagnostics(
                 &state,
                 &replay_request_id,
+                failure_kind,
                 "chat_completions_sync",
-                "infer",
+                error_kind,
                 &error_message,
+                engine_status.as_ref(),
             ) {
                 warn!(
                     "failed to write chat generation failure diagnostics: {}",
@@ -3954,6 +4165,9 @@ mod tests {
     struct FailingLlm {
         config: EngineConfig,
         fail_after_stream_start: bool,
+        infer_failure: ferrum_types::FerrumError,
+        stream_start_failure: ferrum_types::FerrumError,
+        stream_chunk_failure: ferrum_types::FerrumError,
     }
 
     impl FailingLlm {
@@ -3963,12 +4177,29 @@ mod tests {
             Self {
                 config,
                 fail_after_stream_start: false,
+                infer_failure: ferrum_types::FerrumError::internal("stub generation failed"),
+                stream_start_failure: ferrum_types::FerrumError::internal("stub stream failed"),
+                stream_chunk_failure: ferrum_types::FerrumError::internal(
+                    "stub stream chunk failed",
+                ),
             }
         }
 
         fn after_stream_start() -> Self {
             Self {
                 fail_after_stream_start: true,
+                ..Self::new()
+            }
+        }
+
+        fn resource_exhausted() -> Self {
+            let failure = ferrum_types::FerrumError::resource_exhausted(
+                "admission capacity exhausted while reserving request resources",
+            );
+            Self {
+                infer_failure: failure.clone(),
+                stream_start_failure: failure.clone(),
+                stream_chunk_failure: failure,
                 ..Self::new()
             }
         }
@@ -4379,9 +4610,7 @@ mod tests {
             &self,
             _request: InferenceRequest,
         ) -> ferrum_types::Result<InferenceResponse> {
-            Err(ferrum_types::FerrumError::internal(
-                "stub generation failed",
-            ))
+            Err(self.infer_failure.clone())
         }
 
         async fn infer_stream(
@@ -4392,11 +4621,11 @@ mod tests {
         > {
             if self.fail_after_stream_start {
                 let _request_id = request.id;
-                return Ok(Box::pin(stream::iter(vec![Err(
-                    ferrum_types::FerrumError::internal("stub stream chunk failed"),
-                )])));
+                return Ok(Box::pin(stream::iter(vec![Err(self
+                    .stream_chunk_failure
+                    .clone())])));
             }
-            Err(ferrum_types::FerrumError::internal("stub stream failed"))
+            Err(self.stream_start_failure.clone())
         }
     }
 
@@ -4482,6 +4711,17 @@ mod tests {
         AxumServer::from_state(
             AppState::default()
                 .with_llm(Arc::new(FailingLlm::new()))
+                .with_request_dump_dir(Some(request_dump_dir)),
+        )
+        .build_router()
+    }
+
+    fn router_with_resource_exhausted_llm_and_request_dump_dir(
+        request_dump_dir: PathBuf,
+    ) -> Router {
+        AxumServer::from_state(
+            AppState::default()
+                .with_llm(Arc::new(FailingLlm::resource_exhausted()))
                 .with_request_dump_dir(Some(request_dump_dir)),
         )
         .build_router()
@@ -6495,9 +6735,48 @@ mod tests {
         assert_chat_failure_replay_bundle(
             &root,
             "chat_completions_sync",
-            "infer",
+            "internal",
             "stub generation failed",
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn route_chat_resource_failure_writes_resource_replay_diagnostics() {
+        let root = unique_request_dump_dir("chat-resource-failure");
+        let response = post_json(
+            router_with_resource_exhausted_llm_and_request_dump_dir(root.clone()),
+            "/v1/chat/completions",
+            json!({
+                "model": "failing-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::SERVICE_UNAVAILABLE);
+        let bundle = only_replay_bundle(&root);
+        let bad_scan = read_json_file(bundle.join("bad_output_scan.json"));
+        assert_eq!(bad_scan["failure_kind"], "oom_admission");
+        let diagnostics = read_json_file(bundle.join("failure_diagnostics.json"));
+        assert_eq!(diagnostics["failure_kind"], "oom_admission");
+        assert_eq!(
+            diagnostics["first_failure_event"]["error_kind"],
+            "resource_exhausted"
+        );
+        assert_eq!(
+            diagnostics["capacity"]["resource_kind"],
+            "admission_capacity"
+        );
+        assert!(diagnostics["capacity"]["reason"]
+            .as_str()
+            .expect("capacity reason")
+            .contains("admission capacity exhausted"));
+        assert_eq!(
+            diagnostics["nearest_resource_event"]["resource_kind"],
+            "admission_capacity"
+        );
+        assert!(diagnostics["nearest_memory_snapshot"]["current_bytes"].is_number());
+        assert!(diagnostics["nearest_memory_snapshot"]["high_water_bytes"].is_number());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -6537,7 +6816,7 @@ mod tests {
         assert_chat_failure_replay_bundle(
             &root,
             "chat_completions_stream_start",
-            "infer_stream",
+            "internal",
             "stub stream failed",
         );
         let _ = fs::remove_dir_all(root);
@@ -6579,7 +6858,7 @@ mod tests {
         assert_chat_failure_replay_bundle(
             &root,
             "chat_completions_stream_next",
-            "stream_chunk",
+            "internal",
             "stub stream chunk failed",
         );
         let _ = fs::remove_dir_all(root);
