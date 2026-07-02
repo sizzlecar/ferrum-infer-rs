@@ -40,6 +40,16 @@ REPLAY_PATH_FLAGS = {
     "--memory-profile-jsonl": "memory_profile.jsonl",
     "--scheduler-trace-jsonl": "scheduler_trace.jsonl",
 }
+BAD_OUTPUT_FAILURE_KINDS = {"bad_output"}
+RESOURCE_FAILURE_KINDS = {
+    "oom",
+    "prevented_oom",
+    "admission",
+    "admission_reject",
+    "oom_admission",
+}
+PANIC_FAILURE_KINDS = {"panic", "error", "panic_error"}
+KNOWN_FAILURE_KINDS = BAD_OUTPUT_FAILURE_KINDS | RESOURCE_FAILURE_KINDS | PANIC_FAILURE_KINDS
 
 
 class BundleError(RuntimeError):
@@ -136,6 +146,67 @@ def validate_bad_output_scan(path: Path) -> dict[str, Any]:
             raise BundleError(f"{path}.first_bad_text_span is required for bad_output=true")
     if not isinstance(data.get("output_sha256"), str) or len(data["output_sha256"]) != 64:
         raise BundleError(f"{path}.output_sha256 must be a sha256 hex digest")
+    failure_kind = data.get("failure_kind")
+    if failure_kind is not None and (
+        not isinstance(failure_kind, str) or failure_kind not in KNOWN_FAILURE_KINDS
+    ):
+        raise BundleError(f"{path}.failure_kind is unknown: {failure_kind!r}")
+    return data
+
+
+def validate_failure_diagnostics(bundle: Path, request_id: str, bad_scan: dict[str, Any]) -> dict[str, Any] | None:
+    failure_kind = bad_scan.get("failure_kind")
+    if failure_kind is None or failure_kind in BAD_OUTPUT_FAILURE_KINDS:
+        return None
+    path = bundle / "failure_diagnostics.json"
+    if not path.is_file():
+        raise BundleError(f"{path} is required for failure_kind={failure_kind}")
+    data = read_json(path)
+    if data.get("request_id") != request_id:
+        raise BundleError(f"{path}.request_id mismatch")
+    if data.get("failure_kind") != failure_kind:
+        raise BundleError(f"{path}.failure_kind must match bad_output_scan.failure_kind")
+    problems = scan_secrets(data, str(path))
+    if problems:
+        raise BundleError("; ".join(problems))
+
+    if failure_kind in RESOURCE_FAILURE_KINDS:
+        capacity = data.get("capacity")
+        if not isinstance(capacity, dict):
+            raise BundleError(f"{path}.capacity is required for resource failure")
+        for key in ("resource_kind", "needed", "available", "capacity", "reason"):
+            if key not in capacity:
+                raise BundleError(f"{path}.capacity.{key} is required")
+        for key in ("needed", "available", "capacity"):
+            if not isinstance(capacity.get(key), int):
+                raise BundleError(f"{path}.capacity.{key} must be integer")
+        if not isinstance(capacity.get("reason"), str) or not capacity["reason"].strip():
+            raise BundleError(f"{path}.capacity.reason must be non-empty")
+        if not isinstance(data.get("nearest_resource_event"), dict):
+            raise BundleError(f"{path}.nearest_resource_event is required for resource failure")
+        memory = data.get("nearest_memory_snapshot")
+        if not isinstance(memory, dict):
+            raise BundleError(f"{path}.nearest_memory_snapshot is required for resource failure")
+        for key in ("current_bytes", "high_water_bytes"):
+            if not isinstance(memory.get(key), int) or memory[key] < 0:
+                raise BundleError(f"{path}.nearest_memory_snapshot.{key} must be non-negative integer")
+    elif failure_kind in PANIC_FAILURE_KINDS:
+        first_failure = data.get("first_failure_event")
+        if not isinstance(first_failure, dict):
+            raise BundleError(f"{path}.first_failure_event is required for panic/error failure")
+        for key in ("phase", "error_kind"):
+            if not isinstance(first_failure.get(key), str) or not first_failure[key].strip():
+                raise BundleError(f"{path}.first_failure_event.{key} must be non-empty")
+        if not (
+            isinstance(data.get("backtrace_excerpt"), str) and data["backtrace_excerpt"].strip()
+        ) and not (isinstance(data.get("log_excerpt"), str) and data["log_excerpt"].strip()):
+            raise BundleError(f"{path} requires backtrace_excerpt or log_excerpt")
+        if not (
+            isinstance(data.get("nearest_request_id"), str) and data["nearest_request_id"].strip()
+        ) and not (isinstance(data.get("global_failure_id"), str) and data["global_failure_id"].strip()):
+            raise BundleError(f"{path} requires nearest_request_id or global_failure_id")
+    else:
+        raise BundleError(f"{path}: unsupported failure_kind={failure_kind}")
     return data
 
 
@@ -161,6 +232,7 @@ def validate_bundle_dir(bundle: Path) -> dict[str, Any]:
     backend = read_json(bundle / "backend_selection.json")
     replay = read_json(bundle / "replay.command.json")
     bad_scan = validate_bad_output_scan(bundle / "bad_output_scan.json")
+    failure_diagnostics = validate_failure_diagnostics(bundle, request_id, bad_scan)
 
     for label, data in [
         ("prompt_token_ids", prompt_tokens),
@@ -191,6 +263,10 @@ def validate_bundle_dir(bundle: Path) -> dict[str, Any]:
         "entrypoint": request.get("entrypoint"),
         "backend": backend.get("backend"),
         "bad_output": bad_scan["bad_output"],
+        "failure_kind": bad_scan.get("failure_kind"),
+        "failure_diagnostics": str(bundle / "failure_diagnostics.json")
+        if failure_diagnostics is not None
+        else None,
         "prompt_token_count": prompt_tokens.get("token_count"),
         "output_token_count": output_tokens.get("token_count"),
     }
@@ -273,7 +349,15 @@ def execute_replay(bundle: Path, *, out: Path, timeout: int) -> dict[str, Any]:
     }
 
 
-def make_bundle(root: Path, *, bad_output: bool = False, secret: bool = False, missing: str | None = None) -> None:
+def make_bundle(
+    root: Path,
+    *,
+    bad_output: bool = False,
+    failure_kind: str | None = None,
+    secret: bool = False,
+    missing: str | None = None,
+    omit_failure_diagnostics: bool = False,
+) -> None:
     bundle = root / "req-fixture"
     bundle.mkdir(parents=True)
     request = {
@@ -329,6 +413,7 @@ def make_bundle(root: Path, *, bad_output: bool = False, secret: bool = False, m
             "first_bad_text_span": {"byte_start": 0, "byte_end": 5, "reason": "reserved_token"}
             if bad_output
             else None,
+            "failure_kind": failure_kind,
             "output_sha256": "0" * 64,
         },
         "replay.command.json": {
@@ -343,6 +428,53 @@ def make_bundle(root: Path, *, bad_output: bool = False, secret: bool = False, m
     for name, data in files.items():
         if name != missing:
             write_json(bundle / name, data)
+    if failure_kind and failure_kind not in BAD_OUTPUT_FAILURE_KINDS and not omit_failure_diagnostics:
+        if failure_kind in RESOURCE_FAILURE_KINDS:
+            diagnostics = {
+                "schema_version": 1,
+                "request_id": "req-fixture",
+                "failure_kind": failure_kind,
+                "capacity": {
+                    "resource_kind": "kv_block",
+                    "needed": 4,
+                    "available": 1,
+                    "capacity": 8,
+                    "reason": "insufficient_kv_capacity",
+                },
+                "nearest_resource_event": {
+                    "phase": "admission",
+                    "action": "reject",
+                    "resource_kind": "kv_block",
+                    "needed": 4,
+                    "available": 1,
+                },
+                "nearest_memory_snapshot": {
+                    "scope": "device",
+                    "current_bytes": 23_000_000_000,
+                    "high_water_bytes": 23_500_000_000,
+                    "available_bytes": 512_000_000,
+                },
+            }
+        elif failure_kind in PANIC_FAILURE_KINDS:
+            diagnostics = {
+                "schema_version": 1,
+                "request_id": "req-fixture",
+                "failure_kind": failure_kind,
+                "first_failure_event": {
+                    "phase": "decode",
+                    "error_kind": "panic",
+                    "message": "synthetic panic fixture",
+                },
+                "nearest_request_id": "req-fixture",
+                "log_excerpt": "thread panicked at synthetic fixture",
+            }
+        else:
+            diagnostics = {
+                "schema_version": 1,
+                "request_id": "req-fixture",
+                "failure_kind": failure_kind,
+            }
+        write_json(bundle / "failure_diagnostics.json", diagnostics)
     if missing != "output_text.txt":
         (bundle / "output_text.txt").write_text("<unk>\n" if bad_output else "ok\n", encoding="utf-8")
 
@@ -352,7 +484,9 @@ def run_selftest() -> dict[str, Any]:
     try:
         pass_root = temp / "pass"
         make_bundle(pass_root / "normal")
-        make_bundle(pass_root / "bad-output", bad_output=True)
+        make_bundle(pass_root / "bad-output", bad_output=True, failure_kind="bad_output")
+        make_bundle(pass_root / "oom-admission", failure_kind="oom_admission")
+        make_bundle(pass_root / "panic-error", failure_kind="panic_error")
         pass_results = []
         for root in sorted(pass_root.iterdir()):
             pass_results.extend(validate_bundle_root(root))
@@ -361,6 +495,11 @@ def run_selftest() -> dict[str, Any]:
             "secret": {"secret": True},
             "missing-output": {"missing": "output_token_ids.json"},
             "bad-scan": {"bad_output": True},
+            "missing-failure-diagnostics": {
+                "failure_kind": "oom_admission",
+                "omit_failure_diagnostics": True,
+            },
+            "unknown-failure-kind": {"failure_kind": "unknown"},
         }
         fail_results = []
         for name, kwargs in fail_cases.items():
