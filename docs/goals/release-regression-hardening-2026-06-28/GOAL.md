@@ -11,6 +11,7 @@
 - 问题发现太晚，经常到 release 前由人工手测暴露。
 - release 回归像乒乓球，CUDA 修完回归 Metal，Metal 修完又回归 CUDA。
 - 正确性、内存、耗时问题缺少统一 profile/replay artifact，定位常依赖临场日志和人工猜测。
+- 主仓库 vendored 大量 FA2/CUTLASS C++/CUDA 源码，普通开发和 CUDA gate 容易被几十分钟编译拖住，也会让以后接入新算子继续复制同样维护成本。
 
 本目标不能因为“代码改完了”“某个 smoke 过了”就宣称完成。只有最终验证器打印下面这一行，才算完成：
 
@@ -40,6 +41,7 @@ scripts/release/release_regression_hardening_goal_gate.py
 | 乒乓回归 | gate 状态没有显式 invalidation | release candidate manifest 记录每个 lane 的 SHA、dirty、impact domain、失效原因 |
 | 新模型接入质量 | 模型支持靠临场判断和补丁 | 每个新增模型必须有 model onboarding contract，缺合同不得写入支持矩阵 |
 | 定位痛苦 | 正确性/内存/耗时问题缺统一 request/resource/memory/latency 证据 | `run` 和 `serve` 都能产出同一 schema 的 observability profile；100% blocking failure 有 request id、phase、first failure event、memory/resource 快照和 replay command |
+| C++ 编译等待 | `fa2-source` 把大量 FlashAttention/CUTLASS C++ 输入带入 CUDA release build，冷编译可达几十分钟；未来新算子若继续 vendored C++ 会重复该问题 | 主仓库不再保存大体量第三方 C++/CUDA 算子源码；FA2 和未来算子统一走 native operator ABI、artifact manifest、resolver、独立 artifact gate |
 
 ## 非目标
 
@@ -49,6 +51,7 @@ scripts/release/release_regression_hardening_goal_gate.py
 - 不把 cheap sentinel 当作 full release performance evidence。
 - 不用 live vLLM 跑分作为本目标必需项；vLLM 只作为源码/历史行为参考，除非另立性能目标。
 - 不在本目标里扩大付费 GPU 矩阵；需要 CUDA 运行时，优先 cheap smoke，full sweep 仍按现有 G0/release 规则执行。
+- 不在没有替代正确性/性能证据的情况下删除 FA2 功能；本目标删除的是主仓库里的大体量第三方 C++/CUDA 源码和默认源码编译路径，并用 Ferrum native operator artifact 机制承接 FA2 与未来算子。
 
 ## 为什么原版不够
 
@@ -89,6 +92,9 @@ scripts/release/release_regression_hardening_goal_gate.py
 | chrome trace | `crates/ferrum-bench-core/src/trace.rs` | 继续作为 Perfetto/Nsight 友好的时间线输出，但不能代替 JSONL 诊断证据 |
 | server metrics | `crates/ferrum-server/src/traits.rs`、`crates/ferrum-types/src/metrics.rs`、`scripts/release/g1_vllm_migration_gate.py` | Prometheus/health 指标必须和 profile summary 可交叉核对 |
 | runtime memory sizing | `crates/ferrum-cli/src/gpu_mem_autosize.rs`、`crates/ferrum-engine/src/continuous_engine/inner.rs` | startup/profile-run/graph/KV/recurrent/serve 运行期内存快照必须落入统一 memory profile |
+| native operator ABI/resolver | 新增 `crates/ferrum-native-ops` 或等价模块、`crates/ferrum-kernels/src/native_ops.rs`、native artifact manifest schema | 主仓库只保留 ABI、resolver、manifest schema、small shim 和 fixtures，不保存大体量第三方 C++/CUDA 算子源码 |
+| FA2 source migration | `crates/ferrum-kernels/build.rs`、`crates/ferrum-kernels/kernels/fa2_source/`、`crates/ferrum-kernels/src/backend/cuda/fa2_source.rs` | FA2 必须迁移为 native operator artifact；目标完成时主仓库中的 FlashAttention/CUTLASS bulk source 计数为 0 |
+| FA2 runtime selection | `crates/ferrum-types/src/auto_config.rs`、`crates/ferrum-models/src/models/qwen3_moe_runtime.rs`、`crates/ferrum-kernels/src/backend/cuda/paged.rs` | runtime opt-in、native artifact manifest、actual model evidence 必须一致；缺 artifact 时必须显式 fallback/reject，不能 silent fallback |
 
 ## 本地 vLLM 代码对照与 Ferrum 设计映射
 
@@ -194,6 +200,274 @@ vLLM 的可借鉴点不是某个单点 profiler，而是五层闭环：
 - 至少一个失败 fixture 被验证为 fail。
 - 至少一个成功 fixture 被验证为 pass。
 - 文档中的 PASS line 被 validator 精确打印。
+- 阶段实际模型回归要求已满足，且 artifact SHA 不早于本阶段最后一次 backend-visible 代码变更。
+
+## 实际模型回归层级
+
+Synthetic/no-weight gate 只能证明 schema、planner、checker 和失败分类，不证明 Metal/CUDA 实际模型路径可用。每个阶段都必须有实际模型触点，但按层级控制粒度，避免把时间全花在重复验证上。
+
+### 层级定义
+
+| 层级 | 用途 | 模型/后端 | 入口覆盖 | 目标耗时 | 适用时机 |
+|---|---|---|---|---|---|
+| L0 synthetic/no-weight | schema、analyzer、planner、checker、failure fixture | 无真实模型 | 可用 stub/no-weight `run`/`serve` | warm local <= 5 分钟 | 每个 schema/gate PR |
+| L1 actual smoke | 证明当前阶段没有打坏真实模型 product path | repo 维护的轻量实际模型，当前默认 `Qwen/Qwen3-0.6B`；Metal/CUDA 各用已支持格式或该模型合同指定 alias | `ferrum run` + `ferrum serve` nonstream/stream | warm local/已有 pod <= 15 分钟；CUDA paid smoke 目标 <= 30 分钟 | 每个阶段 promotion、shared runtime PR、entrypoint PR |
+| L2 representative backend | 证明代表性架构没有被阶段改动打坏 | Metal: Llama 8B-class dense + Qwen3 8B/MoE GGUF 路径；CUDA: Qwen3-30B-A3B-GPTQ-Int4 + Llama 8B-class dense | `run` + `serve` + stream + basic concurrency | Metal local按 `metal_readme_regression.py` 预算；CUDA 优先 smoke，不重复 full sweep | 阶段完成前、backend adapter/resource/scheduler 改动后 |
+| L3 release full | 官方 release evidence | 现有 G0/release matrix | 完整 G0 要求 | 按 AGENTS/G0 规则 | release candidate |
+
+L1 不是性能证据；它只证明真实模型路径没有立即回归。L2 可以作为阶段完成证据，但仍不能替代 L3 release full。
+
+### 阶段绑定
+
+| 阶段 | L0 | L1 actual smoke | L2 representative backend | 说明 |
+|---|---|---|---|---|
+| 阶段 0 resource invariant | 必须 | 必须，带 resource trace 跑实际模型 `run`/`serve` | 如果改 admission/KV/recurrent 语义，必须 | OOM/slot/KV/recurrent 不能只用 synthetic capacity 证明 |
+| 阶段 1 planner | 必须 | 必须至少执行 planner 产出的一个实际模型 smoke plan | 阶段完成前必须消费最新 L2 artifact manifest 并验证 invalidation | planner 不直接改 runtime，但必须证明计划能驱动真实模型 gate |
+| 阶段 2 product/backend sentinel | 必须 | 必须，每次 sentinel runner 或 scenario schema 改动都要跑 L1 | 必须，阶段完成前覆盖 Metal 和 CUDA 各至少一个代表模型 | sentinel 本身就是提前发现真实模型回归的机制 |
+| 阶段 3 model contract | 必须 | 每个 pilot 合同必须有实际模型 `run`/`serve` artifact | 如果合同声明 Metal/CUDA support，必须有对应后端 L2 或目标模型 artifact | 不能只靠合同 JSON 声明模型支持 |
+| 阶段 4 observability/replay | 必须 | 必须，实际模型 profile/replay artifact 至少覆盖 Metal 和 CUDA | backend memory adapter 完成前必须各有 L2 memory/profile artifact | profile schema 必须证明在真实模型输出、stream 和 memory path 下可用 |
+
+### 粒度规则
+
+- 一个 PR 不应因为改了一个 analyzer fixture 就跑 L2；L0 足够。
+- 一个 PR 如果改了 `run`/`serve`、engine lifecycle、scheduler/admission、KV/recurrent、runtime preset、memory autosize、backend adapter、server streaming，至少需要 L1 actual smoke 或明确说明被同一 PR 的更高层 gate 覆盖。
+- 同一 coherent slice 内只跑一次 L1，不按文件数量重复跑。例如 schema+entrypoint wiring 是一个 slice，scheduler+resource invariant 是一个 slice，CUDA memory adapter 是一个 slice。
+- L2 只在阶段 promotion、backend-visible 语义变化、或多个 L1 failure 指向同一后端风险时运行。
+- L3 只在 release candidate 或明确要求 release evidence 时运行。
+- 任一 L1/L2 actual model gate 失败后停止扩大验证，先保存 artifact、分类失败、修对应 slice；不要继续跑 full sweep 证明已知失败。
+
+### stale artifact 规则
+
+实际模型 artifact 必须记录：
+
+- git SHA。
+- dirty status。
+- backend。
+- model id/path。
+- entrypoints covered。
+- command line。
+- profile/detail level，若启用。
+- PASS line。
+- artifact dir。
+
+如果 artifact 的 git SHA 早于最后一次影响同一 backend/model/entrypoint 的代码变更，该 artifact 自动 stale，不能计入阶段完成。
+
+## Native operator artifact governance
+
+FA2 不能只做短期 build 隔离。本目标要求把大体量 C++/CUDA 算子源码从主仓库移出去，并形成后续所有 native 算子复用的一套模式。
+
+一句话方案：
+
+> Ferrum 主仓库只保留 native operator ABI、Rust resolver、manifest schema、small shim 和 gate fixtures；FA2/CUTLASS/未来第三方 C++/CUDA 算子源码不再 vendored 到 `crates/`，而是通过可校验 native artifact 被链接或加载。
+
+当前仓库负担：
+
+- `crates/ferrum-kernels/kernels/fa2_source/flash_attn/src/` 有 98 个 FlashAttention source/header 输入。
+- `crates/ferrum-kernels/kernels/fa2_source/cutlass/include/` 有 763 个 CUTLASS header/input。
+- 这些输入合计约 647k 行 C++/CUDA/header 内容。
+- `crates/ferrum-kernels/build.rs` 当前只编译 Ferrum FA2 shim 加两个 selected FA2 split-hdim128 fp16 instantiation 到 `libfa2_source.a`，但源码和 header 体量仍然很大。
+- `fa2-source` 已出现在 CUDA release/smoke feature set 中，例如 `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`，因此可能让不关心 FA2 的 CUDA 开发反复支付冷编译成本。
+
+### vLLM 本地构建对照
+
+本节只借鉴本地 vLLM 的 native 扩展治理原则，不引入 Python packaging 依赖。
+
+vLLM 本地源码观察：
+
+- `setup.py` 支持 `VLLM_USE_PRECOMPILED`、`VLLM_PRECOMPILED_WHEEL_LOCATION`、`VLLM_PRECOMPILED_WHEEL_COMMIT`、`VLLM_PRECOMPILED_WHEEL_VARIANT`。
+- vLLM 的 precompiled 模式会从 Python wheel（`.whl`，Python 包格式）中提取已经编好的 native `.so`，例如 `_C.abi3.so`、`_moe_C.abi3.so`、`vllm_flash_attn/_vllm_fa2_C.abi3.so`，然后 `precompiled_build_ext` 跳过本地 C++ extension build。
+- 源码构建时，vLLM 使用 CMake/Ninja、`MAX_JOBS`、`NVCC_THREADS`、sccache/ccache、`FETCHCONTENT_BASE_DIR`、per-file CUDA arch、component target 来控制构建成本。
+- `cmake/external_projects/vllm_flash_attn.cmake` 把 flash-attn 当作独立 external project，并支持 `VLLM_FLASH_ATTN_SRC_DIR` 指向本地源码；FA2/FA3/FA4 也有独立 component。
+
+Ferrum 不能使用 vLLM 的 Python wheel 机制作为依赖。可借鉴的只有原则：
+
+1. 重 native 扩展默认消费已构建产物，不在普通开发路径冷编译。
+2. 源码构建是独立 component/domain，有明确输入 hash、输出 artifact、build summary 和耗时预算。
+3. 运行时选择必须和编译产物 manifest 对齐；未被 runtime 选择的路径不应强制进入普通 CUDA smoke build。
+
+### Ferrum native operator 模式
+
+新增或等价实现一层 native operator 系统：
+
+```text
+crates/ferrum-native-ops/
+  src/abi.rs
+  src/manifest.rs
+  src/resolver.rs
+  src/registry.rs
+
+crates/ferrum-kernels/src/native_ops.rs
+scripts/release/native_operator_artifact_gate.py
+scripts/release/schemas/native_operator_manifest.schema.json
+scripts/release/fixtures/native_operator/
+```
+
+主仓库允许保留：
+
+- Rust FFI 类型、operator trait、resolver 和 registry。
+- 小型 C ABI header 或生成绑定模板，目标是描述 ABI，不携带第三方 kernel 实现。
+- manifest schema、fixture、gate script。
+- Ferrum 自己的 thin shim；如果 shim 需要 C/CUDA，必须保持小规模，并且由 gate 统计行数和编译耗时。
+
+主仓库禁止保留：
+
+- FlashAttention、CUTLASS、Triton、第三方 CUDA/C++ kernel 的大体量源码树。
+- 新算子为了方便直接放入 `crates/**/kernels/<op>/third_party/**`。
+- `.whl`、Python package index、Torch/vLLM runtime、Python import 作为构建或运行依赖。
+- 没有 manifest、没有 sha256、没有 ABI version 的 native binary。
+
+### Native artifact contract
+
+每个 native 算子 artifact 必须是 Ferrum 原生格式，不是 Python wheel。
+
+允许的 artifact 形态：
+
+| Artifact | 用途 | 规则 |
+|---|---|---|
+| `ferrum-native-op-<op>-cuda-sm89-<abi>-<hash>.tar.zst` | 官方或本地 native 算子包 | 包含 native lib、manifest、license、build log digest、source package hash |
+| `libferrum_native_<op>.a` | release/static link path | 默认推荐；最终 binary 不依赖额外 runtime loader |
+| `libferrum_native_<op>.so` | diagnostic/dynamic path | 只用于开发诊断或热切换验证，release 默认不依赖 |
+| `native_operator_manifest.json` | artifact contract | resolver 和 gate 的唯一事实来源 |
+| release tarball embedded native lib | 官方 CUDA release asset | 必须通过 CUDA tarball gate 验证无 Python/Torch/vLLM runtime linkage |
+
+manifest 最小字段：
+
+```json
+{
+  "schema_version": 1,
+  "operator": "fa2",
+  "operator_abi_version": "1",
+  "ferrum_native_abi_version": "1",
+  "backend": "cuda",
+  "cuda_toolkit": "12.4",
+  "cuda_runtime_min": "12.4",
+  "compute_capabilities": ["sm_89"],
+  "source_package": {
+    "kind": "external-archive-or-repo",
+    "revision": "...",
+    "sha256": "..."
+  },
+  "inputs_sha256": "...",
+  "binary_sha256": "...",
+  "linkage": "static",
+  "exports": ["ferrum_native_op_init", "ferrum_native_op_descriptor"],
+  "license_files": [],
+  "build_summary": {
+    "builder_sha": "...",
+    "elapsed_ms": 0,
+    "nvcc_version": "...",
+    "host_compiler": "..."
+  }
+}
+```
+
+兼容键必须使用 CUDA version、runtime ABI、`sm_xx` compute capability、operator ABI、source/input hash、binary sha256。不能用 “RTX” 品牌名作为 artifact 兼容键；`1x RTX 4090` 只描述当前 G0 硬件事实，对应 native artifact key 是 `sm_89`。
+
+### 源码归属
+
+FA2 和未来 native 算子的第三方源码只能存在于主仓库之外：
+
+- 独立 artifact builder 仓库。
+- release artifact source archive。
+- 本地 override path，仅用于 developer 重新构建 artifact。
+
+主仓库中的 manifest 必须记录外部 source package 的 revision 和 sha256。没有 hash 的外部源码不能进入 gate。
+
+如果未来需要引入新的 C++/CUDA 算子，必须先新增 operator manifest 和 artifact gate fixture，不能先把源码目录放进主仓库。
+
+### Build and runtime domains
+
+Native operator 必须从普通 CUDA build domain 中拆出来：
+
+| Domain | Feature/build | 是否编第三方 C++ source | 用途 |
+|---|---|---|---|
+| `cuda-dev` | `cuda,vllm-moe-marlin,vllm-paged-attn-v2` | no | 日常 CUDA smoke、scheduler/resource/model 开发 |
+| `native-op-artifact` | consumes manifest-selected `.a`/`.so` | no | 普通 release candidate fast path |
+| `native-op-source-build` | external builder only, outside main repo | yes, outside main repo | 生成或更新 native artifact |
+| `cuda-release-full` | G0/release lane | no local third-party source compile | 官方 release evidence；只允许消费已校验 artifact |
+
+Planner 规则：
+
+- 如果 diff 不触碰 native operator ABI、manifest、resolver、runtime selection 或 CUDA attention dispatch，不得要求 native operator artifact gate。
+- 如果 diff 只触碰 docs/analyzer/schema，不得触发 native operator source build。
+- 如果 diff 触碰 native operator ABI/manifest/resolver/runtime selection，必须触发 `NATIVE OP ARTIFACT PASS` 和 actual model L1/L2 CUDA smoke。
+- release config 不允许继续依赖 `fa2-source` 作为默认路径；需要 FA2 时必须通过 native artifact manifest。
+- 缺 native artifact 时，runtime 必须显式选择 non-FA2 fallback 或返回清晰 unsupported/error，不能 silent fallback 后继续声称 FA2 evidence。
+
+### Migration plan for FA2
+
+FA2 是第一个 native operator 迁移对象。迁移完成不是“隔离 lane”，而是主仓库删除大体量源码。
+
+步骤：
+
+1. **定义 ABI 和 resolver**：新增 native operator manifest schema、resolver、registry、fixture，不改变现有 runtime 行为。
+2. **产出 FA2 native artifact**：在主仓库外部 builder 产生 `libferrum_native_fa2.a` 和 manifest，至少覆盖当前 CUDA G0 `sm_89`。
+3. **切换 Ferrum 构建**：`build.rs` 不再直接编译 vendored FlashAttention/CUTLASS；改为验证 manifest 并链接 native artifact。
+4. **切换 runtime selection**：FA2 runtime path 只在 manifest 匹配且 actual model smoke 通过时启用；否则显式 fallback/reject。
+5. **删除主仓库 bulk source**：删除或移出 `crates/ferrum-kernels/kernels/fa2_source/flash_attn/` 和 `crates/ferrum-kernels/kernels/fa2_source/cutlass/`。实际删除前按目录清理规则运行 `scripts/release/inventory_tree.py` 并提交 inventory。
+6. **更新 release configs**：CUDA smoke/full 不再依赖本地 `fa2-source` 源码编译；release artifact 记录 native op manifest。
+7. **真实模型验证**：用 Qwen3 MoE/GPTQ 或 Llama dense 覆盖 `ferrum run` 和 `ferrum serve`，证明 artifact path 正确性；性能收益用 same-hardware A/B 决定默认是否启用。
+
+### Native operator artifact gate
+
+新增：
+
+```bash
+python3 scripts/release/native_operator_artifact_gate.py \
+  --out <out_dir>
+```
+
+必需 PASS line：
+
+```text
+NATIVE OP ARTIFACT PASS: <out_dir>
+```
+
+该 gate 必须验证：
+
+- 主仓库内第三方 FA2/CUTLASS bulk source count = 0。
+- `crates/**` 下不存在未登记的大体量第三方 C++/CUDA source tree。
+- `native_operator_manifest.json` 通过 schema 校验。
+- artifact binary sha256、source package sha256、inputs sha256 全部匹配。
+- resolver 在 manifest 缺失、compute capability 不匹配、ABI 不匹配、sha256 不匹配时 fail closed。
+- 普通 `cargo check --workspace --all-targets` 不调用 nvcc 编译 native operator source。
+- release tarball gate 能证明没有 Python/Torch/vLLM runtime linkage。
+- FA2 artifact-selected smoke 覆盖 `ferrum run` 和 `ferrum serve`。
+- 新增一个 dummy native operator fixture，证明以后新算子能复用同一 ABI/manifest/resolver/gate，不需要复制 FA2 专用逻辑。
+
+量化目标：
+
+| 指标 | 目标 |
+|---|---|
+| 主仓库第三方 FA2/CUTLASS bulk source | 0 files under `crates/**/fa2_source/flash_attn` and `crates/**/fa2_source/cutlass` |
+| 普通 CUDA dev build | native operator source compile count = 0 |
+| 非 native-op PR | native operator artifact gate 不触发，除非 planner 证明 runtime selection 被影响 |
+| artifact mismatch | 100% fail before product run starts |
+| future operator onboarding | 新算子只新增 manifest、resolver registry entry、artifact fixture、actual model smoke，不新增独立 build system |
+| Python dependency | 0 `.whl`、0 Python import、0 Torch/vLLM runtime linkage in release gate |
+| actual model correctness | artifact-selected FA2 smoke 必须覆盖 `ferrum run` 和 `ferrum serve` |
+
+### FA2 retention decision
+
+FA2 迁移后仍必须做 retention decision，但决策对象变成“是否默认启用 FA2 native operator”，不是“是否保留主仓库 C++ 源码”。主仓库 C++ bulk source 不因 retention decision 保留。
+
+决策输入：
+
+- 最近一次同硬件 FA2 native artifact vs non-FA2 A/B。
+- c=1/c=4/c=16/c=32 至少两个 concurrency cells，除非 goal 明确只关注一个 shape。
+- correctness 先过，包括 Paris、多轮、stream、bench completion。
+- build cost summary，包括 artifact resolve/link time、source artifact build time、prebuilt reuse。
+- runtime selection summary，说明默认是否选择 FA2 native operator。
+
+决策输出：
+
+| Decision | 条件 | 后续动作 |
+|---|---|---|
+| `keep_native_default` | 正确性全过，收益明确，artifact resolver 稳定 | release full 可默认选择 FA2 native operator，但必须记录 manifest |
+| `keep_native_diagnostic_only` | 有局部收益但正确性/适配风险仍高 | release full 不默认启用，保留显式 diagnostic preset |
+| `drop_fa2_operator` | 收益不足、维护成本高、或长期 stale | 删除 FA2 runtime selection 和 artifact manifest；仍不恢复 vendored source |
+
+在 retention decision 完成前，不允许把 native operator artifact 失败和普通 CUDA correctness failure 混在一起处理；artifact/manifest/ABI 失败应归类为 native operator gate failure。
 
 ## 阶段 0: 资源所有权与事务 invariant
 
@@ -360,7 +634,7 @@ RESOURCE INVARIANT GATE PASS: <out_dir>
 | `oom_prevented_by_admission` | diagnostic/CUDA | 显式 reject/defer 先于 CUDA OOM |
 | `trace_replay_selftest` | validator selftest | JSONL replay 能检测 pass/fail fixture |
 
-阶段 0 不要求真实 4090 才能完成。CUDA OOM fixture 可以先用 synthetic capacity 模拟；真实 CUDA 证据只作为后续 release sentinel 的补充。
+阶段 0 不要求真实 CUDA G0 硬件才能完成；当前 CUDA G0 硬件事实是 1x RTX 4090。CUDA OOM fixture 可以先用 synthetic capacity 模拟；真实 CUDA 证据只作为后续 release sentinel 的补充。
 
 ## 阶段 1: Change-impact classifier 与 gate planner
 
@@ -599,7 +873,7 @@ sentinel 不是性能发布证据。它只回答：
 |---|---|---|---|
 | L0 no-weight | all | runtime preset snapshot cases | 每次 shared/runtime/model/release gate 变更 |
 | L1 local Metal | Metal | 一个小型 dense/chat 模型 | macOS 本地可跑时，Metal/shared/product 变更 |
-| L1 CUDA cheap | CUDA 1x4090 | Qwen3 MoE/GPTQ 或 Llama dense 的最小可用 smoke | CUDA/shared/product 变更，付费前按 GPU policy 声明 |
+| L1 CUDA cheap | CUDA G0 1x RTX 4090 lane | Qwen3 MoE/GPTQ 或 Llama dense 的最小可用 smoke | CUDA/shared/product 变更，付费前按 GPU policy 声明 |
 | L2 full release | Metal/CUDA | 现有 G0 正式矩阵 | 只有 L0/L1 全过后才进入 |
 
 ### Sentinel 与现有 gate 的关系
@@ -1019,6 +1293,29 @@ scripts/release/fixtures/observability_profile/
 }
 ```
 
+### Schema ownership and compatibility
+
+统一 profile schema 是本目标的基础设施，必须有清晰归属，避免后续每接一个模块都改格式。
+
+字段归属：
+
+| 字段区域 | Owner | 修改规则 |
+|---|---|---|
+| top-level envelope | `ferrum-types` | breaking change 必须 bump `schema_version`，同步更新 analyzer、fixtures、阶段 0/4 文档 |
+| `request`/`token`/`stream` | `ferrum-server`、`ferrum-cli`、`ferrum-engine` 共同消费，schema 归 `ferrum-types` | 不能加入入口专有字段；入口差异放 `entrypoint_detail` |
+| `resource` | `ferrum-engine`、`ferrum-kv`、`ferrum-scheduler`、recurrent-state manager 共同消费，schema 归 `ferrum-types` | owner/kind/capacity/reserved/committed/released 字段不可省略 |
+| `memory` | schema 归 `ferrum-types`，采样实现归 backend adapter | CUDA/Metal 专有字段只能放 `backend_detail` |
+| `backend_detail` | backend adapter | 公共 analyzer 不允许依赖该字段才能 PASS |
+| `extensions` | experimental only | 只能出现在 diagnostic artifact；required gate 不能依赖 |
+
+兼容规则：
+
+- `schema_version` 必须是字符串，例如 `ferrum.observability.v1`。
+- breaking change 必须同时保留上一版 fixture，直到所有 product emitters 迁移完成。
+- analyzer 对 unknown top-level field 默认 fail；实验字段只能进 `extensions`。
+- required gate artifact 不允许混用多个 schema version，除非 manifest 显式列出 migration validator PASS。
+- schema 变更 PR 必须包含至少一个 pass fixture、一个 fail fixture、一个旧版本兼容或拒绝 fixture。
+
 ### Memory profile requirements
 
 借鉴 vLLM startup memory profiling，但按 Ferrum 架构扩展到 CUDA/Metal。
@@ -1106,6 +1403,19 @@ request_dumps/
 ```
 
 `request.json` 必须脱敏用户原文；release fixtures 可保存完整 synthetic prompt。真实用户文本默认不写入 artifact，除非 gate 明确使用公开 fixture。
+
+隐私和安全规则：
+
+| 数据 | 默认行为 | 允许例外 |
+|---|---|---|
+| raw user text | 不写入 artifact | 只允许公开 synthetic fixture |
+| prompt token ids | 可写入，但必须记录 tokenizer/model id | 若 token ids 可反推出敏感数据，写 hash 或截断 |
+| output text | bad-output fixture 可写入；真实请求默认写分类和 span/hash | 用户明确提供公开样例时可写全文 |
+| headers | 只保留 trace context、content type、stream flag | auth/cookie/token 一律剔除 |
+| request body | 保存 sanitized body 和 replay body | secret-looking 字段必须 redact |
+| environment | 保存 sanitized env | secrets、tokens、keys 一律不得进入 artifact |
+
+request dump validator 必须扫描常见 secret key 名称和 token-looking value。发现疑似 secret 时，fixture 必须 fail。
 
 Replay 必须支持：
 
@@ -1236,8 +1546,11 @@ OBSERVABILITY PROFILE GATE PASS: <out_dir>
 
 阶段 4 通过标准：
 
+- `OBSERVABILITY VERTICAL SLICE PASS: <out_dir>` artifact 存在并被阶段 4 manifest 引用。
 - 15 个 fixture 全过。
 - `run` 和 `serve` 至少各有一个通过 analyzer 的 artifact。
+- L1 actual smoke profile artifact 至少覆盖 Metal 和 CUDA；若当前机器无法运行某后端，必须引用同 SHA 的远端 artifact，且不允许 stale。
+- backend memory adapter 声称完成前，必须有对应后端 L2 actual model memory/profile artifact。
 - `profile_detail=basic` overhead fixture <= 1% 或在 no-weight/synthetic gate 中证明事件写入路径固定成本满足预算。
 - `observability_profile_summary.json` 存在，并包含：
   - `request_count`
@@ -1257,7 +1570,7 @@ OBSERVABILITY PROFILE GATE PASS: <out_dir>
 
 ## 最终验收
 
-最终 gate 必须聚合五个阶段：
+最终 gate 必须聚合五个质量阶段和 native operator 迁移 gate：
 
 ```bash
 python3 scripts/release/release_regression_hardening_goal_gate.py \
@@ -1266,7 +1579,8 @@ python3 scripts/release/release_regression_hardening_goal_gate.py \
   --change-impact <change_impact_out> \
   --product-sentinel <product_sentinel_out> \
   --model-contract <model_contract_out> \
-  --observability-profile <observability_profile_out>
+  --observability-profile <observability_profile_out> \
+  --native-operator <native_operator_out>
 ```
 
 必需最终 PASS line：
@@ -1278,7 +1592,7 @@ RELEASE_REGRESSION_HARDENING GOAL PASS: <out_dir>
 最终 artifact 必须包含：
 
 - `goal_manifest.json`
-- 五个阶段的 artifact 路径和 PASS line
+- 五个质量阶段和 native operator 迁移 gate 的 artifact 路径和 PASS line
 - git SHA
 - dirty status
 - changed files
@@ -1290,13 +1604,23 @@ RELEASE_REGRESSION_HARDENING GOAL PASS: <out_dir>
 - product scenario summary
 - model contract summary
 - observability profile summary
+- observability vertical slice summary
+- actual model regression summary
+- native operator artifact summary
+- FA2 source removal inventory
 - replay bundle index
 
 最终量化通过标准：
 
 - 5/5 阶段 PASS。
+- `NATIVE OP ARTIFACT PASS: <out_dir>` 被最终 manifest 引用。
+- 每个阶段至少有一个未 stale 的 L1 actual model artifact 或更高层级 artifact。
+- Metal 和 CUDA 各至少一个 L2 actual model artifact 被最终 manifest 引用。
+- 主仓库内第三方 FA2/CUTLASS bulk source count = 0。
+- `fa2-source` 不再是普通 CUDA smoke/release source compile 依赖；FA2 如启用，必须通过 native operator manifest。
 - 0 个 unknown impact domain。
 - 0 个 invalidated-but-counted-as-pass lane。
+- 0 个 stale actual-model artifact 被计入 PASS。
 - 0 个 leaked resources。
 - 0 个 silent fallback。
 - 0 个 product sentinel failed request。
@@ -1311,30 +1635,86 @@ RELEASE_REGRESSION_HARDENING GOAL PASS: <out_dir>
 
 本目标必须先把依赖关系切清楚，避免先做一轮局部重构，后面接 observability、sentinel、model contract 时再推翻。
 
-### 总依赖图
+### 全局依赖图
 
 ```text
-A. shared schema + offline analyzers + fixtures
-   ├── B. resource invariant checker schema
-   ├── C. product run/serve observability flags + sink wiring
-   │     ├── D. engine/scheduler/KV/recurrent instrumentation
-   │     │     ├── E. product/backend sentinel consumes profile artifacts
-   │     │     └── F. request dump + failure replay
-   │     └── G. backend memory adapters: CUDA / Metal / CPU
-   ├── H. change-impact planner consumes changed files + artifact domains
-   └── I. model onboarding contract consumes sentinel + replay + runtime preset artifacts
+M0. Evidence foundation
+    ├── shared artifact manifest
+    ├── shared profile/resource schema
+    ├── offline analyzers
+    └── pass/fail fixtures
 
-J. final goal gate aggregates A-I only after each phase validator has PASS artifacts.
+M1. Planning and native-op foundation
+    ├── change-impact planner consumes artifact domains from M0
+    └── native operator ABI/manifest/resolver consumes artifact manifest from M0
+
+M2. Product observability vertical slice
+    ├── run/serve typed profile wiring consumes M0 schema
+    └── synthetic/no-weight vertical slice produces first real product artifacts
+
+M3. Runtime diagnostics and cheap gates
+    ├── resource invariant checker consumes M0 resource envelope
+    ├── engine/scheduler/KV/recurrent instrumentation consumes M2 wiring
+    ├── request dump/replay consumes M2 request identity
+    ├── product/backend sentinel consumes M2/M3 artifacts and M1 planner
+    └── backend memory adapters consume M0 memory schema and M2 wiring
+
+M4. Native-op FA2 migration
+    ├── FA2 artifact package consumes M1 native-op ABI/resolver
+    ├── build.rs links artifact instead of compiling vendored source
+    ├── runtime selection consumes native-op manifest and sentinel evidence
+    └── repository removes FA2/CUTLASS bulk source after inventory
+
+M5. Model onboarding contract
+    ├── contract validator consumes M1 planner and M3 sentinel/replay
+    └── first real model pilot consumes M3/M4 actual-model artifacts
+
+M6. Final aggregation
+    └── final goal gate aggregates M0-M5 only after each validator has PASS artifacts.
 ```
 
 关键约束：
 
-- A 是根。没有统一 schema、analyzer fixture 和 PASS/FAIL 样例，不允许先大面积改 engine instrumentation。
-- B 和阶段 4 的 resource/memory event envelope 必须在同一 schema 里设计；不能做两套 `resource_trace.jsonl` 与 `profile.jsonl` 语义。
-- C 必须同时覆盖 `ferrum run` 和 `ferrum serve`。只接一个入口会制造新的回归盲区。
-- D 只能填充 A 定义的事件，不允许每个模块自造字段。
-- E 依赖 C/D/F；product sentinel 失败必须能直接链接 profile event 和 replay bundle。
-- I 依赖 E/F；模型合同不应该反向驱动 runtime schema 重构，只能引用已稳定 artifact。
+- M0 是根。没有统一 manifest/schema、analyzer fixture 和 PASS/FAIL 样例，不允许先大面积改 engine instrumentation、FA2 build、model contract。
+- M1 必须早做。planner 不知道 native-op domain，后续删除 FA2 源码就无法自动要求正确 gate。
+- M2 必须先打通 `run` 和 `serve`。只接一个入口会制造新的回归盲区。
+- M3 只能填充 M0/M2 定义的事件，不允许每个模块自造字段。
+- M4 依赖 M1 native-op ABI/resolver。不能先删除 FA2/CUTLASS 源码再临时设计 artifact 格式。
+- M4 的 runtime selection 依赖 M3 sentinel 或等价 actual-model artifact。不能只证明 artifact 能链接就宣称 FA2 可用。
+- M5 依赖 M3/M4 的真实模型 evidence。模型合同不应该反向驱动 runtime schema 重构，只能引用已稳定 artifact。
+- M6 只聚合 PASS artifacts，不承载业务逻辑。
+
+### 里程碑与阻塞关系
+
+| 里程碑 | 必须先完成 | 允许并行 | 阻塞的后续任务 | 禁止提前做 |
+|---|---|---|---|---|
+| M0 Evidence foundation | 无 | schema、fixture、analyzer、manifest schema 可以同 PR | 所有 runtime/profile/native-op/model contract 工作 | 大面积 engine instrumentation、删除 FA2 源码、真实模型 release claim |
+| M1 Planner/native-op foundation | M0 的 artifact manifest 初版 | planner dry-run 与 native-op ABI/resolver 可并行 | M4 FA2 迁移、M6 final aggregation | 修改 release config 默认走新 native-op path |
+| M2 Product vertical slice | M0 profile schema | `run`/`serve` wiring 必须同 WP，不分开 | M3 instrumentation、M3 sentinel、M5 contract | 只接 `run` 或只接 `serve` 后声称完成 |
+| M3 Runtime diagnostics/sentinel | M0 + M2；planner dry-run 可先软依赖 | resource invariant、replay、backend memory adapter 可分 PR | M4 runtime selection、M5 model contract、final L2 promotion | sentinel 解析非结构化日志补 schema 缺口 |
+| M4 Native-op FA2 migration | M1 native-op ABI/resolver；M3 至少 L1 actual smoke | FA2 artifact packaging、build.rs link、runtime selection、inventory 可分 PR | CUDA release configs、FA2 retention decision、final native-op PASS | 在主仓库继续新增第三方 C++ bulk source |
+| M5 Model contract | M3 sentinel/replay；M4 仅当模型声明依赖 native-op | contract schema 和 first pilot 可分 PR | README/support matrix 自动化、final goal gate | 用模型名特判或临时 profile 字段作为合同证据 |
+| M6 Final aggregation | M0-M5 全部 PASS | 无 | release-ready claim | final gate 内重新实现业务判断 |
+
+### Work-package 依赖矩阵
+
+| WP | 主题 | Depends on | Blocks | 可并行对象 |
+|---|---|---|---|---|
+| WP1 | Shared artifact/profile/resource schema | 无 | WP2-WP15 | 无 |
+| WP2 | Planner dry-run and domain rules | WP1 manifest/domain schema | WP8、WP9、WP10、WP15 | WP3 |
+| WP3 | Native operator ABI/manifest/resolver skeleton | WP1 manifest schema | WP10、WP15 | WP2、WP4 |
+| WP4 | Observability vertical slice | WP1 profile schema | WP5-WP9、WP11-WP15 | WP2、WP3 |
+| WP5 | Resource invariant checker | WP1 resource envelope | WP6、WP8、WP15 | WP7 common memory schema |
+| WP6 | Product observability wiring | WP4 | WP7、WP8、WP9、WP11-WP15 | WP5 |
+| WP7 | Backend memory profile adapters | WP1 memory schema + WP4 wiring | WP8、WP11、WP15 | WP5、WP6 |
+| WP8 | Engine/scheduler/KV/recurrent instrumentation | WP5 + WP6 | WP9、WP11、WP12、WP15 | WP7 |
+| WP9 | Request dump/classifier/replay | WP6 + request identity | WP11、WP12、WP13、WP15 | WP8 |
+| WP10 | FA2 native-op artifact migration and source removal | WP2 + WP3 | WP11 CUDA native-op smoke、WP13、WP15 | WP8、WP9 |
+| WP11 | Product/backend sentinel consumes artifacts | WP2 + WP7 + WP8 + WP9；CUDA native-op cases also depend on WP10 | WP12、WP13、WP15 | WP10 non-runtime pieces |
+| WP12 | Model contract schema/validator | WP2 + WP9 + WP11 | WP13、WP15 | WP10 retention evidence |
+| WP13 | First real model contract pilot | WP11 + WP12；native-op models depend on WP10 | WP15 | WP14 |
+| WP14 | L2 representative backend promotion matrix | WP10 + WP11 + affected backend adapters | WP15 | WP13 |
+| WP15 | Final aggregator | WP1-WP14 PASS artifacts | goal completion | 无 |
 
 ### 必须放在一起改
 
@@ -1345,71 +1725,115 @@ J. final goal gate aggregates A-I only after each phase validator has PASS artif
 | `run` + `serve` typed flags/config propagation | release 问题反复出在单入口通过、另一个入口坏；入口配置必须同源 | `--profile-jsonl`、`--profile-detail`、`--memory-profile-jsonl`、`--scheduler-trace-jsonl`、`--request-dump-dir` 两个入口都可用 |
 | Scheduler admission + capacity/defer/reject event semantics | defer/reopen、OOM prevention、resource invariant 是同一状态机，拆开容易出现“等待释放”和“直接 OOM”两套行为 | admission decision event、capacity snapshot、defer/reject/reopen reason、unit fixtures |
 | Request dump + bad-output classifier + replay command | 只有 bad-output 分类没有 replay，定位仍会回到人工日志；只有 replay 没有分类，gate 不能自动拦截 | bad text/stream/schema/tool failure 分类、request dump、engine-level replay command、fixture |
+| Native operator ABI + manifest + resolver fixtures | 只有 manifest 没有 resolver 无法落地；只有 resolver 没有 fail-closed fixture 会引入 silent fallback | ABI version、manifest schema、resolver fail-closed、dummy operator fixture |
+| FA2 artifact link + runtime selection + source removal inventory | 只改 build 不改 runtime 会产生“编了但没用”；只删源码没有 inventory/gate 会破坏目录治理 | `libferrum_native_fa2.*` manifest、runtime selection summary、`inventory_tree.py` artifact、bulk source count = 0 |
 
 ### 必须分开改
 
 | 修改组 | 分开的原因 | 前置依赖 |
 |---|---|---|
-| CUDA memory sampler | 后端细节多，容易把 CUDA 语义漏进公共 schema | A 的 `memory` 公共字段稳定 |
-| Metal memory sampler | Metal 可见内存能力与 CUDA 不同，不能被 CUDA profiling 设计绑死 | A 的 `memory` 公共字段稳定 |
-| Prometheus/OTel/NVTX export | 它们是导出层，不是 hard gate 输入；先做会分散语义来源 | A/C/D 稳定，JSONL analyzer 已通过 |
-| Product sentinel scenario 扩展 | sentinel 应消费已稳定 artifact，而不是边跑场景边定义日志格式 | A/C/D/F |
-| Model contract pilot | 模型合同应引用稳定的 run/serve/replay evidence，不应推动 runtime 重构 | E/F 与 runtime preset snapshot 稳定 |
-| Final aggregator | 只聚合 PASS artifacts，不承载业务逻辑 | A-I 的阶段 gate 都存在 |
+| CUDA memory sampler | 后端细节多，容易把 CUDA 语义漏进公共 schema | WP1 的 `memory` 公共字段稳定，WP4 wiring 已存在 |
+| Metal memory sampler | Metal 可见内存能力与 CUDA 不同，不能被 CUDA profiling 设计绑死 | WP1 的 `memory` 公共字段稳定，WP4 wiring 已存在 |
+| Prometheus/OTel/NVTX export | 它们是导出层，不是 hard gate 输入；先做会分散语义来源 | WP1/WP4/WP8 稳定，JSONL analyzer 已通过 |
+| Product sentinel scenario 扩展 | sentinel 应消费已稳定 artifact，而不是边跑场景边定义日志格式 | WP2/WP7/WP8/WP9 |
+| Model contract pilot | 模型合同应引用稳定的 run/serve/replay evidence，不应推动 runtime 重构 | WP11/WP12 与 runtime preset snapshot 稳定 |
+| Native operator source artifact builder | builder 可以在主仓库外独立演进；主仓库只消费 artifact/manifest | native operator ABI/manifest 稳定 |
+| Final aggregator | 只聚合 PASS artifacts，不承载业务逻辑 | WP1-WP14 的 gate artifacts 都存在 |
 
 ### 防二次重构规则
 
 - 新字段必须先进入 schema fixture，再进入 runtime emitter。
-- 一旦 D 开始接 engine instrumentation，A 的 breaking schema change 必须写 migration note，并同步更新 analyzer、fixtures、阶段 0/4 文档。
+- 一旦 WP8 开始接 engine instrumentation，WP1 的 breaking schema change 必须写 migration note，并同步更新 analyzer、fixtures、阶段 0/4 文档。
 - backend 专有信息只能进入 `backend_detail`；公共 analyzer 需要的字段必须先抽到公共 schema。
 - `run` 和 `serve` 任何一个入口缺 profile wiring，相关 PR 不能声称 product observability 完成。
 - product sentinel 不允许解析非结构化日志来弥补 profile schema 缺字段；缺字段必须回到 A 修 schema。
-- 模型合同不得要求新增临时 profile 字段；需要新证据时先扩展 A，再更新 E/F，最后更新 I。
+- 模型合同不得要求新增临时 profile 字段；需要新证据时先扩展 WP1，再更新 WP9/WP11，最后更新 WP12/WP13。
+
+### 最小可用纵切
+
+为避免再次出现长时间重构但没有可用产物，本目标必须先交付一个最小纵切，再扩大 instrumentation。
+
+最小纵切不要求真实 CUDA/Metal，不要求真实大模型，但必须经过产品入口和离线 analyzer：
+
+```bash
+python3 scripts/release/observability_vertical_slice_gate.py \
+  --out <out_dir>
+```
+
+必需 PASS line：
+
+```text
+OBSERVABILITY VERTICAL SLICE PASS: <out_dir>
+```
+
+最小纵切必须产出：
+
+- 一个 `ferrum run` synthetic/no-weight profile artifact。
+- 一个 `ferrum serve` synthetic/no-weight profile artifact。
+- 一个 pass fixture JSONL。
+- 一个 fail fixture JSONL。
+- 一个 sanitized request dump。
+- 一个 replay command。
+- 一个 `observability_profile_summary.json`。
+- analyzer 输出 first failure event。
+
+最小纵切量化标准：
+
+- artifact 从产品入口产生，不允许只手写 JSONL。
+- `run` 和 `serve` 使用同一个 schema version。
+- analyzer 检测到缺 `request_id`、缺 memory before/after、缺 resource owner 至少三类失败。
+- replay command 在 synthetic/no-weight 下可执行并返回 0。
+- 从 command 开始到 PASS，warm local 环境目标耗时 <= 5 分钟。
+
+在最小纵切 PASS 前，不允许开始大面积改 engine/scheduler/KV/recurrent instrumentation；只允许补 schema、analyzer、fixture、入口 wiring 所需的最小代码。
+
+最小纵切只是 L0 证据。它不能算阶段 4 完成，也不能作为 Metal/CUDA 实际模型回归证据。最小纵切 PASS 后，必须尽快补 L1 actual smoke，避免 profile schema 只适配 synthetic artifact。
 
 ## 执行顺序
 
 推荐顺序：
 
-1. A：先定 shared schema、offline analyzer、fixture，锁住事件语义。
-2. 阶段 1：做 change-impact classifier 和 gate planner，让后续工作不再靠人工选择 gate。
-3. 阶段 0：做资源 invariant，但输入必须复用 A 的 resource event envelope。
-4. C/D/F：接 `run`/`serve` observability wiring、engine/scheduler/KV/recurrent instrumentation、request dump/replay。
-5. 阶段 2：把便宜 product/backend sentinel 接到 planner，并消费 profile/replay artifact。
-6. G：按共享 memory schema 分别补 CUDA/Metal memory sampler。
-7. 阶段 3：把模型接入合同接到 README/support matrix 和 release gate，引用稳定 artifact。
-8. J：最终 aggregator 只聚合各阶段 PASS artifact。
+1. WP1：先定 shared artifact/profile/resource/native-op manifest schema、offline analyzer、fixture，锁住证据格式。
+2. WP2 + WP3：并行做 gate planner dry-run 和 native operator ABI/resolver skeleton。这里不改 runtime 默认行为。
+3. WP4：做最小可用纵切，用 `run` 和 `serve` 产出同 schema artifact，并让 analyzer/replay 跑通。
+4. WP5 + WP6：补 resource invariant checker 和 product observability wiring。`run`/`serve` 继续同源。
+5. WP7 + WP8 + WP9：补 backend memory adapter、engine/scheduler/KV/recurrent instrumentation、request dump/classifier/replay。
+6. WP10：迁移 FA2 到 native operator artifact，并删除主仓库 FA2/CUTLASS bulk source。实际删除前必须有 inventory artifact。
+7. WP11：把 product/backend sentinel 接到 planner，并消费 profile/replay/native-op artifact。
+8. WP12 + WP13：做模型接入合同 schema 和第一个真实模型 pilot。
+9. WP14：跑 L2 representative backend promotion matrix，避免只在最终 release 发现 Metal/CUDA 单边炸。
+10. WP15：final aggregator 只聚合 WP1-WP14 的 PASS artifact。
 
-阶段 1 可以先落地 dry-run，不阻塞开发；一旦 fixture 覆盖完整，再改成 release 候选硬门禁。
+WP2 可以先落地 dry-run，不阻塞开发；一旦 fixture 覆盖完整，再改成 release 候选硬门禁。WP10 不允许抢跑到 WP3 前面，否则会变成“先删源码、后补 ABI”的返工。
 
 ## Work packages
 
 本目标必须拆成小 PR，避免把 release gate、runtime 行为、模型合同和测试架构混在一个 patch。
 
-### WP1: Shared observability/resource schema and analyzer fixtures
+### WP1: Shared evidence schema and analyzer fixtures
+
+Depends on: none.
 
 范围：
 
 - `crates/ferrum-types/src/observability_profile.rs`
 - `crates/ferrum-types/src/resource_trace.rs`
+- shared artifact manifest schema
+- native operator manifest schema draft
 - `scripts/release/analyze_ferrum_profile.py`
-- `scripts/release/fixtures/observability_profile/`
-- synthetic pass/fail JSONL fixtures
-
-要求：
-
-- 先定义公共 envelope，再接任何 runtime emitter。
-- resource、memory、request、latency、token、stream、error 子结构必须一次性设计清楚。
-- analyzer 必须能在没有模型、没有 GPU 的情况下验证 fixture。
+- synthetic pass/fail fixtures
 
 不允许修改 engine/runtime 行为。
 
 完成标准：
 
 - analyzer 自测通过。
-- 所有 schema fixture pass/fail 结果符合预期。
-- 缺 `request_id`、缺 `duration_us`、缺 memory before/after、缺 resource owner 的 fixture 必须 fail。
+- profile/resource/memory/request/native-op manifest fixtures 的 pass/fail 结果符合预期。
+- 缺 `request_id`、缺 `duration_us`、缺 memory before/after、缺 resource owner、缺 native artifact sha256 的 fixture 必须 fail。
 
-### WP2: Planner dry-run
+### WP2: Planner dry-run and domain rules
+
+Depends on: WP1.
 
 范围：
 
@@ -1417,16 +1841,65 @@ J. final goal gate aggregates A-I only after each phase validator has PASS artif
 - `scripts/release/plan_gates.py`
 - planner selftests
 - fixture diffs
+- native-op impact domain 和 invalidation rules
 
 不允许修改 engine/runtime 行为。
 
 完成标准：
 
-- `CHANGE IMPACT GATE PLAN PASS: <out_dir>`
-- 16 个 fixture 全过。
-- 当前工作树能生成 `gate_plan.md`，并清楚列出本 PR 只影响 planner。
+- `CHANGE IMPACT GATE PLAN PASS: <out_dir>`。
+- 至少 16 个 fixture 全过，且包含 native-op ABI、native-op manifest、FA2 runtime selection、docs-only 四类 diff。
+- planner 能读取 L1/L2 actual model artifact manifest，并正确把 stale artifact 标为 invalidated。
 
-### WP3: Resource invariant checker on shared envelope
+### WP3: Native operator ABI and resolver skeleton
+
+Depends on: WP1. Can run parallel with WP2/WP4.
+
+范围：
+
+- `crates/ferrum-native-ops/` 或等价模块。
+- native operator ABI version。
+- manifest parser/validator。
+- resolver fail-closed behavior。
+- dummy native operator fixture。
+
+不允许迁移 FA2，不允许删除 FA2/CUTLASS source。
+
+完成标准：
+
+- manifest 缺失、sha256 不匹配、ABI 不匹配、compute capability 不匹配时 resolver fail closed。
+- dummy operator fixture 证明未来新算子复用同一 ABI/manifest/resolver/gate。
+- 0 个 Python/wheel/Torch/vLLM runtime dependency。
+
+### WP4: Observability vertical slice
+
+Depends on: WP1. Can run parallel with WP2/WP3 after schema stabilizes.
+
+范围：
+
+- `scripts/release/observability_vertical_slice_gate.py`
+- `run` synthetic/no-weight profile artifact。
+- `serve` synthetic/no-weight profile artifact。
+- minimal request dump。
+- minimal replay command。
+- `observability_profile_summary.json`。
+
+要求：
+
+- 只做打通链路所需最小入口 wiring。
+- 不开始大面积 engine/scheduler/KV/recurrent instrumentation。
+- 不引入 CUDA/Metal 专有 memory sampler。
+
+完成标准：
+
+- `OBSERVABILITY VERTICAL SLICE PASS: <out_dir>`。
+- warm local 目标耗时 <= 5 分钟。
+- `run` 和 `serve` artifact 使用同一个 schema version。
+- 明确标记为 L0，不允许作为实际模型回归证据。
+
+### WP5: Resource invariant checker on shared envelope
+
+Depends on: WP1 and WP4.
 
 范围：
 
@@ -1441,7 +1914,9 @@ J. final goal gate aggregates A-I only after each phase validator has PASS artif
 - checker 能发现 leak、underflow、overcommit、defer-with-commit、rollback incomplete。
 - `RESOURCE INVARIANT GATE PASS` 可以在 synthetic fixtures 上通过。
 
-### WP4: Product observability wiring for both entrypoints
+### WP6: Product observability wiring for both entrypoints
+
+Depends on: WP4.
 
 范围：
 
@@ -1457,75 +1932,11 @@ J. final goal gate aggregates A-I only after each phase validator has PASS artif
 - `run` 和 `serve` 都能写出同一 schema 的 empty/no-weight 或 synthetic profile artifact。
 - profile 关闭时产品行为不变。
 - release gate 不依赖 hidden env-only 开关。
+- 至少一个 L1 actual smoke artifact 通过 analyzer，证明 wiring 对真实模型可用。
 
-### WP5: Engine, scheduler, KV, and recurrent instrumentation
+### WP7: Backend memory profile adapters
 
-范围：
-
-- KV manager trace。
-- recurrent-state manager trace。
-- scheduler/admission trace。
-- engine lifecycle trace。
-
-要求先接 unit/integration fixture，再考虑产品 smoke。
-
-完成标准：
-
-- 12/12 阶段 0 场景通过。
-- trace 关闭时现有测试行为不变。
-- trace 打开时 artifact 能离线 replay。
-
-### WP6: Request dump, bad-output classifier, and replay
-
-范围：
-
-- sanitized request dump。
-- prompt/output token id dump。
-- runtime effective config dump。
-- bad text/stream/schema/tool failure classifier。
-- engine-level replay command。
-- serve request replay command。
-
-必须和 classifier 一起交付；不能只 dump、不分类，也不能只分类、不能 replay。
-
-完成标准：
-
-- bad-output、OOM/admission、panic/error synthetic fixtures 都产出 replay bundle。
-- replay command fixture 100% 通过。
-- `OBSERVABILITY PROFILE GATE PASS` 覆盖 replay bundle 校验。
-
-### WP7: Product/backend sentinel manifest consumes profile artifacts
-
-范围：
-
-- `scripts/release/scenarios/product_backend_sentinel.json`
-- `run_scenarios.py` 必要扩展。
-- synthetic bad-output/SSE selftests。
-- profile/replay artifact 引用。
-
-不允许新增第二套 HTTP benchmark 客户端。
-
-完成标准：
-
-- 12 个阶段 2 fixture 全过。
-- `PRODUCT BACKEND SENTINEL PASS` 在 synthetic/no-weight 层可验证。
-- sentinel failure summary 能链接到 profile event id 和 replay command。
-
-### WP8: Sentinel integration with planner
-
-范围：
-
-- planner 输出 required sentinel。
-- release candidate manifest invalidation。
-- sentinel artifact 聚合。
-
-完成标准：
-
-- shared runtime fixture 会要求 Metal + CUDA sentinel。
-- backend-local fixture 不会无脑要求另一端 full gate。
-- 修改已 PASS lane 相关文件会自动 invalidate 该 lane。
-
-### WP9: Backend memory profile adapters
+Depends on: WP1 memory schema and WP4 wiring.
 
 范围：
 
@@ -1545,9 +1956,95 @@ J. final goal gate aggregates A-I only after each phase validator has PASS artif
 
 - `process_start`、`backend_initialized`、`model_loaded`、`profile_run_done`、`cache_allocated`、`first_request_done`、`shutdown` 至少在 synthetic/no-weight fixture 中可验证。
 - `available_kv_or_state_bytes < 0` fixture fail。
-- external memory delta 超阈值 fixture 标记 diagnostic-only。
+- 每个 backend adapter 完成前必须跑该 backend 的 L2 actual model memory/profile artifact。
 
-### WP10: Model contract schema and validator
+### WP8: Engine, scheduler, KV, and recurrent instrumentation
+
+Depends on: WP5 and WP6. Can run parallel with WP7 after common schema is stable.
+
+范围：
+
+- KV manager trace。
+- recurrent-state manager trace。
+- scheduler/admission trace。
+- engine lifecycle trace。
+
+要求先接 unit/integration fixture，再考虑产品 smoke。
+
+完成标准：
+
+- 12/12 阶段 0 场景通过。
+- trace 关闭时现有测试行为不变。
+- trace 打开时 artifact 能离线 replay。
+- shared scheduler/resource/KV/recurrent 语义变化必须有 L1 actual smoke；阶段 promotion 前必须有 L2 representative backend artifact。
+
+### WP9: Request dump, bad-output classifier, and replay
+
+Depends on: WP6. Uses WP8 events when available.
+
+范围：
+
+- sanitized request dump。
+- prompt/output token id dump。
+- runtime effective config dump。
+- bad text/stream/schema/tool failure classifier。
+- engine-level replay command。
+- serve request replay command。
+
+必须和 classifier 一起交付；不能只 dump、不分类，也不能只分类、不能 replay。
+
+完成标准：
+
+- bad-output、OOM/admission、panic/error synthetic fixtures 都产出 replay bundle。
+- replay command fixture 100% 通过。
+- `OBSERVABILITY PROFILE GATE PASS` 覆盖 replay bundle 校验。
+- 至少一个实际模型 normal-output replay smoke 通过；若出现真实 bad-output，必须能生成 replay bundle。
+
+### WP10: FA2 native-op migration and source removal
+
+Depends on: WP2 and WP3. Runtime selection evidence depends on WP11 when actual model smoke is required.
+
+范围：
+
+- 外部 builder 或 source archive 产生 FA2 native artifact。
+- `libferrum_native_fa2.a` 或等价 artifact。
+- `native_operator_manifest.json`。
+- `build.rs` 改为验证 manifest 并链接 artifact。
+- FA2 runtime selection 使用 native-op resolver。
+- 删除或移出主仓库 FA2/CUTLASS bulk source。
+- 删除前运行 `scripts/release/inventory_tree.py`。
+
+完成标准：
+
+- `NATIVE OP ARTIFACT PASS: <out_dir>`。
+- 主仓库内第三方 FA2/CUTLASS bulk source count = 0。
+- 普通 `cargo check --workspace --all-targets` 不调用 nvcc 编译 native operator source。
+- artifact mismatch 在产品运行前 fail closed。
+- release tarball gate 能证明无 Python/Torch/vLLM runtime linkage。
+
+### WP11: Product/backend sentinel consumes artifacts
+
+Depends on: WP2, WP7, WP8, WP9. CUDA native-op scenarios also depend on WP10.
+
+范围：
+
+- `scripts/release/scenarios/product_backend_sentinel.json`
+- `run_scenarios.py` 必要扩展。
+- synthetic bad-output/SSE selftests。
+- profile/replay/native-op artifact 引用。
+
+不允许新增第二套 HTTP benchmark 客户端。
+
+完成标准：
+
+- 12 个阶段 2 fixture 全过。
+- `PRODUCT BACKEND SENTINEL PASS` 在 synthetic/no-weight 层可验证。
+- sentinel failure summary 能链接到 profile event id 和 replay command。
+- L1 actual smoke 是 sentinel PR 的默认 gate；阶段完成前必须有 Metal 和 CUDA 的 L2 representative artifact。
+
+### WP12: Model contract schema and validator
+
+Depends on: WP2, WP9, WP11.
 
 范围：
 
@@ -1561,32 +2058,55 @@ J. final goal gate aggregates A-I only after each phase validator has PASS artif
 
 - 阶段 3 fixture 全过。
 - validator 能拒绝 silent fallback、缺 run/serve artifact、缺能力证据。
-- contract 引用稳定 profile/replay artifact，不新增临时诊断字段。
+- contract 引用稳定 profile/replay/native-op artifact，不新增临时诊断字段。
+- 合同声明的每个 backend support 必须引用未 stale 的实际模型 artifact。
 
-### WP11: First real model contract pilot
+### WP13: First real model contract pilot
+
+Depends on: WP11 and WP12. If the pilot relies on FA2/native-op, also depends on WP10.
 
 范围：
 
 - 选择一个已支持且体积小的模型族做 pilot。
 - 产出合同、template golden、run/serve smoke artifact。
+- 若该模型声明 native-op acceleration，合同必须引用 native-op manifest。
 
 完成标准：
 
 - `MODEL ONBOARDING CONTRACT PASS: <out_dir>`。
 - README/support matrix 引用合同字段，而不是重复手写能力声明。
 
-### WP12: Final aggregator
+### WP14: L2 representative backend promotion matrix
+
+Depends on: WP10 and WP11; also depends on affected backend memory adapters from WP7.
+
+范围：
+
+- Metal L2 representative model artifact。
+- CUDA L2 representative model artifact。
+- FA2 native artifact selected/non-selected summary。
+- actual model regression summary。
+
+完成标准：
+
+- Metal 和 CUDA 各至少一个 L2 actual model artifact。
+- native-op selected path 至少一个 CUDA artifact；如果默认不选择 FA2，必须有 explicit non-selected summary。
+- artifact git SHA 不 stale。
+
+### WP15: Final aggregator
+
+Depends on: WP1-WP14 PASS artifacts.
 
 范围：
 
 - `scripts/release/release_regression_hardening_goal_gate.py`
-- 聚合五阶段 artifacts。
+- 聚合五个质量阶段、native-op gate、L2 promotion matrix。
 - final selftest。
 
 完成标准：
 
 - `RELEASE_REGRESSION_HARDENING GOAL PASS: <out_dir>`。
-- final manifest 能指出每个阶段 artifact 和 PASS line。
+- final manifest 能指出每个阶段 artifact、native-op artifact、L2 artifact 和 PASS line。
 
 ## 每个 PR 的 Definition of Done
 
@@ -1602,6 +2122,8 @@ J. final goal gate aggregates A-I only after each phase validator has PASS artif
 - 是否触碰 shared runtime。
 - 是否需要 CUDA/Metal cross-backend sentinel。
 - 是否新增、修改或消费 observability profile 字段。
+- 是否新增、修改或消费 native operator ABI/manifest/resolver/artifact。
+- 是否新增或删除第三方 C++/CUDA source tree；若删除，必须引用 `inventory_tree.py` artifact。
 - 如果出现 correctness/memory/latency 风险，artifact 是否包含 replay command 或明确说明为什么不需要。
 
 如果 PR 修改了 `crates/` 但 planner 结果是 `docs_only`，PR 必须 fail。
@@ -1614,6 +2136,10 @@ J. final goal gate aggregates A-I only after each phase validator has PASS artif
 
 如果 PR 新增 profile 字段但没有更新 schema fixture、analyzer 和对应阶段文档，PR 必须 fail。
 
+如果 PR 修改 native operator ABI、manifest、resolver、runtime selection 或 FA2/CUDA attention dispatch，但没有 `NATIVE OP ARTIFACT PASS` 计划和 actual model smoke 计划，PR 必须 fail。
+
+如果 PR 在 `crates/` 下新增未登记的大体量第三方 C++/CUDA source tree，PR 必须 fail；新 native 算子必须先走 WP3/WP10 的 manifest/resolver/artifact 模式。
+
 ## 成功后的日常工作流
 
 目标完成后，普通开发流程应该变成：
@@ -1623,6 +2149,7 @@ python3 scripts/release/plan_gates.py --base origin/main --head HEAD --out <out>
 cat <out>/plan/gate_plan.md
 python3 scripts/release/run_gate.py unit --out <out>/unit
 python3 scripts/release/observability_profile_gate.py --out <out>/observability
+python3 scripts/release/native_operator_artifact_gate.py --out <out>/native-op
 python3 scripts/release/release_regression_hardening_goal_gate.py --out <out>/final ...
 ```
 
