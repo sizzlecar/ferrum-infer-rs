@@ -27,6 +27,7 @@ MODEL_RELEASE_GRADE_GOAL_GATE = REPO_ROOT / "scripts/release/model_release_grade
 MODEL_RELEASE_GRADE_MANIFEST = REPO_ROOT / "scripts/release/model_release_grade_manifest.py"
 MODEL_ONBOARDING_CONTRACT_GATE = REPO_ROOT / "scripts/release/model_onboarding_contract_gate.py"
 RELEASE_REGRESSION_HARDENING_GOAL_GATE = REPO_ROOT / "scripts/release/release_regression_hardening_goal_gate.py"
+ACTUAL_MODEL_REGRESSION_SUMMARY_GATE = REPO_ROOT / "scripts/release/actual_model_regression_summary_gate.py"
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from m3_validate_runner_artifact import (  # noqa: E402
@@ -295,6 +296,12 @@ def test_release_regression_hardening_goal_gate_selftest() -> None:
     require("RELEASE_REGRESSION_HARDENING GOAL SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
+def test_actual_model_regression_summary_gate_selftest() -> None:
+    ok = run([sys.executable, str(ACTUAL_MODEL_REGRESSION_SUMMARY_GATE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("ACTUAL MODEL REGRESSION SUMMARY SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
 def test_m3_quality_gate_artifact_validators() -> None:
     with tempfile.TemporaryDirectory(prefix="ferrum-m3-gates-") as tmp:
         root = Path(tmp)
@@ -382,6 +389,7 @@ def main() -> int:
     test_model_release_grade_goal_gate_selftest()
     test_model_release_grade_manifest_selftest()
     test_model_onboarding_contract_gate_selftest()
+    test_actual_model_regression_summary_gate_selftest()
     test_release_regression_hardening_goal_gate_selftest()
     test_m3_quality_gate_artifact_validators()
     print("G0 VALIDATOR SELFTEST PASS")

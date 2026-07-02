@@ -55,6 +55,7 @@ OBSERVABILITY_SUMMARY_FIELDS = {
     "first_failure_event",
     "replay_commands",
 }
+REQUIRED_L2_ENTRYPOINTS = {"run", "serve", "stream", "basic_concurrency"}
 
 
 class GoalGateError(RuntimeError):
@@ -295,13 +296,16 @@ def validate_l2_artifact(data: dict[str, Any], key: str, backend: str, expected_
     artifact_git_sha(artifact, f"actual_model_regression.{key}", expected_sha)
     require(artifact.get("backend") == backend, f"actual_model_regression.{key}.backend must be {backend}")
     entrypoints = set(artifact.get("entrypoints") or [])
-    require({"run", "serve", "stream"} <= entrypoints, f"actual_model_regression.{key}.entrypoints must include run, serve, stream")
+    missing = sorted(REQUIRED_L2_ENTRYPOINTS - entrypoints)
+    require(not missing, f"actual_model_regression.{key}.entrypoints missing {missing}")
     artifact_dir = artifact.get("artifact_dir")
     require(isinstance(artifact_dir, str) and artifact_dir.strip(), f"actual_model_regression.{key}.artifact_dir must be non-empty")
 
 
 def find_actual_model_regression_path(args: argparse.Namespace) -> Path | None:
     if args.actual_model_regression_summary is not None:
+        if args.actual_model_regression_summary.is_dir():
+            return args.actual_model_regression_summary / "actual_model_regression_summary.json"
         return args.actual_model_regression_summary
     for root in [args.product_sentinel, args.observability_profile]:
         for name in [
@@ -319,6 +323,7 @@ def validate_actual_model_regression(args: argparse.Namespace, expected_sha: str
     require(path is not None, "actual model regression summary is required for final PASS")
     summary = read_json(path)
     require_status_pass(summary, "actual_model_regression")
+    require_pass_line(summary, "actual_model_regression", "ACTUAL MODEL REGRESSION SUMMARY PASS")
     require_git_sha(summary, "actual_model_regression", expected_sha)
     validate_l2_artifact(summary, "metal_l2_artifact", "metal", expected_sha)
     validate_l2_artifact(summary, "cuda_l2_artifact", "cuda", expected_sha)
@@ -620,19 +625,20 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "schema_version": 1,
             "status": "pass",
             "git_sha": sha,
+            "pass_line": f"ACTUAL MODEL REGRESSION SUMMARY PASS: {root}",
             "metal_l2_artifact": {
                 "status": "pass",
                 "backend": "metal",
                 "git_sha": sha,
                 "artifact_dir": "fixtures/metal-l2",
-                "entrypoints": ["run", "serve", "stream"],
+                "entrypoints": ["run", "serve", "stream", "basic_concurrency"],
             },
             "cuda_l2_artifact": {
                 "status": "pass",
                 "backend": "cuda",
                 "git_sha": sha,
                 "artifact_dir": "fixtures/cuda-l2",
-                "entrypoints": ["run", "serve", "stream"],
+                "entrypoints": ["run", "serve", "stream", "basic_concurrency"],
             },
             "native_operator_selection": {
                 "status": "pass",
