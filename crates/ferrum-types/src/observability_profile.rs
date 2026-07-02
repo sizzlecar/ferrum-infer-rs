@@ -56,6 +56,12 @@ impl MemorySnapshot {
         if self.before_bytes.is_none() || self.after_bytes.is_none() {
             return Err("memory before_bytes and after_bytes are required".to_string());
         }
+        if self.high_water_bytes.is_none() {
+            return Err("memory high_water_bytes is required".to_string());
+        }
+        if self.available_bytes.is_some_and(|bytes| bytes < 0) {
+            return Err("memory available_bytes must be non-negative".to_string());
+        }
         Ok(())
     }
 }

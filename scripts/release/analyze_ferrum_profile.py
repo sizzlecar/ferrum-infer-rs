@@ -56,14 +56,39 @@ def validate_memory(memory: Any, context: str) -> None:
     if not isinstance(memory, dict):
         raise ValidationError(f"{context}.memory must be an object")
     require_non_empty_string(memory, "scope", f"{context}.memory")
-    for key in ("before_bytes", "after_bytes"):
+    for key in ("before_bytes", "after_bytes", "high_water_bytes"):
         if key not in memory or not isinstance(memory[key], int) or memory[key] < 0:
             raise ValidationError(f"{context}.memory.{key} must be a non-negative integer")
+    available = memory.get("available_bytes")
+    if available is not None and (not isinstance(available, int) or available < 0):
+        raise ValidationError(f"{context}.memory.available_bytes must be a non-negative integer")
 
 
 def validate_profile_event(event: Any, context: str) -> None:
     if not isinstance(event, dict):
         raise ValidationError(f"{context} must be a JSON object")
+    allowed_keys = {
+        "schema_version",
+        "event_id",
+        "request_id",
+        "correlation_id",
+        "entrypoint",
+        "backend",
+        "phase",
+        "event_kind",
+        "timestamp",
+        "status",
+        "model",
+        "duration_us",
+        "memory",
+        "resource",
+        "error",
+        "replay",
+        "attributes",
+    }
+    unknown = set(event) - allowed_keys
+    if unknown:
+        raise ValidationError(f"{context} has unknown top-level fields: {sorted(unknown)}")
     if event.get("schema_version") != 1:
         raise ValidationError(f"{context}.schema_version must be 1")
     require_non_empty_string(event, "event_id", context)
@@ -92,6 +117,9 @@ def validate_profile_event(event: Any, context: str) -> None:
             raise ValidationError(f"{context}.error is required for failure status")
         require_non_empty_string(error, "kind", f"{context}.error")
         require_non_empty_string(error, "message", f"{context}.error")
+        blocking = error.get("blocking")
+        if blocking is not None and not isinstance(blocking, bool):
+            raise ValidationError(f"{context}.error.blocking must be a boolean")
     if "replay" in event:
         replay = event["replay"]
         if not isinstance(replay, dict):
@@ -99,8 +127,92 @@ def validate_profile_event(event: Any, context: str) -> None:
         require_non_empty_string(replay, "command", f"{context}.replay")
 
 
+def event_attributes(event: dict[str, Any]) -> dict[str, Any]:
+    attributes = event.get("attributes", {})
+    if attributes is None:
+        return {}
+    if not isinstance(attributes, dict):
+        raise ValidationError(f"{event.get('event_id', '<unknown>')}.attributes must be an object")
+    return attributes
+
+
+def error_kind(event: dict[str, Any]) -> str:
+    error = event.get("error")
+    if not isinstance(error, dict):
+        return ""
+    kind = error.get("kind")
+    return kind if isinstance(kind, str) else ""
+
+
+def has_capacity_explanation(event: dict[str, Any]) -> bool:
+    resource = event.get("resource")
+    if not isinstance(resource, dict):
+        return False
+    action = resource.get("action")
+    if action not in {"defer", "reject", "capacity_snapshot"}:
+        return False
+    if action in {"defer", "reject"}:
+        return isinstance(resource.get("capacity"), int) and bool(str(resource.get("reason", "")).strip())
+    return isinstance(resource.get("capacity"), int)
+
+
+def validate_profile_semantics(path: Path, events: list[dict[str, Any]]) -> None:
+    schema_fingerprints = {
+        event_attributes(event).get("profile_schema_fingerprint")
+        for event in events
+        if event_attributes(event).get("profile_schema_fingerprint") is not None
+    }
+    if len(schema_fingerprints) > 1:
+        raise ValidationError(f"{path} mixes profile schema fingerprints: {sorted(schema_fingerprints)}")
+
+    for event in events:
+        attrs = event_attributes(event)
+        context = f"{path}:{event.get('event_id', '<unknown>')}"
+        resource = event.get("resource")
+        if isinstance(resource, dict) and resource.get("action") in {"defer", "reject"}:
+            if not has_capacity_explanation(event):
+                raise ValidationError(f"{context} defer/reject requires capacity and reason")
+        if isinstance(attrs.get("resource_leak_count"), int) and attrs["resource_leak_count"] > 0:
+            raise ValidationError(f"{context} reports resource_leak_count={attrs['resource_leak_count']}")
+        profile_detail = attrs.get("profile_detail")
+        diagnostic_only = attrs.get("diagnostic_only")
+        if attrs.get("performance_claim") is True and (
+            profile_detail in {"debug", "full"} or diagnostic_only is True
+        ):
+            raise ValidationError(f"{context} uses diagnostic profile as performance claim")
+        profile_count = attrs.get("profile_completed_requests")
+        prometheus_count = attrs.get("prometheus_completed_requests")
+        if profile_count is not None or prometheus_count is not None:
+            if profile_count != prometheus_count:
+                raise ValidationError(
+                    f"{context} profile/prometheus completed request mismatch: "
+                    f"{profile_count} != {prometheus_count}"
+                )
+
+    failure_events = [event for event in events if event.get("status") == "failure"]
+    capacity_events_by_request: dict[str, bool] = {}
+    for event in events:
+        if has_capacity_explanation(event):
+            capacity_events_by_request[event.get("request_id", "")] = True
+    for event in failure_events:
+        kind = error_kind(event)
+        attrs = event_attributes(event)
+        context = f"{path}:{event.get('event_id', '<unknown>')}"
+        blocking = (event.get("error") or {}).get("blocking") is True
+        if blocking and attrs.get("first_failure_event") is not True:
+            raise ValidationError(f"{context} blocking failure requires first_failure_event=true")
+        if kind in {"bad_output", "bad_text", "missing_done", "duplicate_done", "malformed_sse"}:
+            if "replay" not in event:
+                raise ValidationError(f"{context} correctness failure requires replay command")
+        if kind in {"cuda_oom", "metal_oom", "oom", "silent_oom"}:
+            request_id = event.get("request_id", "")
+            if not capacity_events_by_request.get(request_id):
+                raise ValidationError(f"{context} OOM failure requires admission/defer/reject evidence")
+
+
 def validate_profile_jsonl(path: Path) -> dict[str, Any]:
     events = 0
+    payloads: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as fh:
         for line_no, line in enumerate(fh, start=1):
             line = line.strip()
@@ -112,8 +224,10 @@ def validate_profile_jsonl(path: Path) -> dict[str, Any]:
                 raise ValidationError(f"{path}:{line_no} invalid JSON: {exc}") from exc
             validate_profile_event(payload, f"{path}:{line_no}")
             events += 1
+            payloads.append(payload)
     if events == 0:
         raise ValidationError(f"{path} must contain at least one profile event")
+    validate_profile_semantics(path, payloads)
     return {"path": str(path), "events": events}
 
 
