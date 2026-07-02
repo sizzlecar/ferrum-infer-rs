@@ -254,6 +254,24 @@ def parse_sse(body: str) -> dict[str, Any]:
     }
 
 
+def effective_backend_from_health(health: dict[str, Any]) -> str | None:
+    auto_config = health.get("auto_config")
+    if isinstance(auto_config, dict) and isinstance(auto_config.get("backend"), str):
+        return auto_config["backend"]
+    return None
+
+
+def validate_requested_backend(args: argparse.Namespace, effective_backend: str | None) -> None:
+    requested = args.backend
+    if requested == "auto":
+        return
+    if effective_backend != requested:
+        raise SmokeError(
+            f"requested backend {requested!r} but effective backend is {effective_backend!r}; "
+            "refusing silent backend fallback evidence"
+        )
+
+
 def live_server_replay_bundle_dirs(request_dump_root: Path) -> list[Path]:
     bundles: list[Path] = []
     for path in sorted(request_dump_root.iterdir()):
@@ -340,6 +358,8 @@ def serve_actual(args: argparse.Namespace, out: Path) -> dict[str, Any]:
         )
         try:
             health = wait_health(base_url, args.timeout, proc, server_log)
+            effective_backend = effective_backend_from_health(health)
+            validate_requested_backend(args, effective_backend)
             payload = {
                 "model": args.model,
                 "messages": [{"role": "user", "content": "Reply with OK."}],
@@ -379,6 +399,7 @@ def serve_actual(args: argparse.Namespace, out: Path) -> dict[str, Any]:
             )
             return {
                 "status": "pass",
+                "effective_backend": effective_backend,
                 "health": health,
                 "nonstream_content_preview": content[:200],
                 "stream": sse,
@@ -541,6 +562,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     ferrum_cmd = ferrum_base_cmd(args)
     run_result = run_actual(args, out)
     serve_result = serve_actual(args, out)
+    effective_backend = serve_result.get("effective_backend")
     run_profiles = validate_profile_group(out / "run", "run")
     serve_profiles = validate_profile_group(out / "serve", "serve")
     analyzer = run_analyzer(out, args.timeout)
@@ -562,7 +584,8 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         "ferrum_binary_sha256": binary_sha256(args),
         "model": args.model,
         "requested_backend": args.backend,
-        "backend": args.backend,
+        "backend": effective_backend or args.backend,
+        "effective_backend": effective_backend,
         "profile_detail": profile_detail_from_flags(),
         "actual_model_smoke": True,
         "entrypoints": {
@@ -591,7 +614,8 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
             "pass_line": pass_line,
             "model": args.model,
             "requested_backend": args.backend,
-            "backend": args.backend,
+            "backend": effective_backend or args.backend,
+            "effective_backend": effective_backend,
             "profile_detail": profile_detail_from_flags(),
             "ferrum_command": ferrum_cmd,
             "ferrum_binary_sha256": summary["ferrum_binary_sha256"],
