@@ -27,6 +27,16 @@ class SmokeError(RuntimeError):
     pass
 
 
+class BackendMismatchError(SmokeError):
+    def __init__(self, requested: str, effective: str | None) -> None:
+        self.requested = requested
+        self.effective = effective
+        super().__init__(
+            f"requested backend {requested!r} but effective backend is {effective!r}; "
+            "refusing silent backend fallback evidence"
+        )
+
+
 def git_value(args: list[str], default: str = "unknown") -> str:
     proc = subprocess.run(
         ["git", *args],
@@ -266,10 +276,7 @@ def validate_requested_backend(args: argparse.Namespace, effective_backend: str 
     if requested == "auto":
         return
     if effective_backend != requested:
-        raise SmokeError(
-            f"requested backend {requested!r} but effective backend is {effective_backend!r}; "
-            "refusing silent backend fallback evidence"
-        )
+        raise BackendMismatchError(requested, effective_backend)
 
 
 def live_server_replay_bundle_dirs(request_dump_root: Path) -> list[Path]:
@@ -629,6 +636,89 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     return summary
 
 
+def failure_kind(exc: Exception) -> str:
+    if isinstance(exc, BackendMismatchError):
+        return "backend_mismatch"
+    message = str(exc).lower()
+    if "replay" in message:
+        return "replay_failure"
+    if "stream" in message or "[done]" in message or "sse" in message:
+        return "stream_failure"
+    if "resource" in message or "invariant" in message:
+        return "resource_invariant_failure"
+    if "profile" in message or "analyzer" in message:
+        return "profile_failure"
+    if "server" in message or "health" in message:
+        return "serve_failure"
+    if "run" in message:
+        return "run_failure"
+    return "unknown"
+
+
+def write_failure_artifacts(args: argparse.Namespace, exc: SmokeError) -> None:
+    out = args.out
+    out.mkdir(parents=True, exist_ok=True)
+    dirty_files = git_value(["status", "--short"], default="").splitlines()
+    classification: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "fail",
+        "failure_kind": failure_kind(exc),
+        "error": str(exc),
+        "requested_backend": args.backend,
+        "effective_backend": exc.effective if isinstance(exc, BackendMismatchError) else None,
+        "suspected_domain": "backend_runtime_preset"
+        if isinstance(exc, BackendMismatchError)
+        else "product_observability_l1_smoke",
+        "next_gate": "backend_runtime_preset_snapshot"
+        if isinstance(exc, BackendMismatchError)
+        else "inspect_product_observability_l1_artifact",
+        "do_not_run": ["l2_representative_backend", "release_full"]
+        if isinstance(exc, BackendMismatchError)
+        else ["release_full"],
+    }
+    write_json(out / "failures/failure_classification.json", classification)
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "fail",
+        "gate": "product_observability_l1_smoke",
+        "goal": "release-regression-hardening-2026-06-28",
+        "artifact_dir": str(out),
+        "git_sha": git_value(["rev-parse", "HEAD"]),
+        "git_branch": git_value(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "git_dirty": bool(dirty_files),
+        "dirty_files": dirty_files,
+        "command": sys.argv,
+        "model": args.model,
+        "requested_backend": args.backend,
+        "effective_backend": classification["effective_backend"],
+        "failure_classification": str(out / "failures/failure_classification.json"),
+        "error": str(exc),
+    }
+    write_json(out / "product_observability_l1_smoke_summary.json", summary)
+    write_json(
+        out / "gate.manifest.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "goal": "release-regression-hardening-2026-06-28",
+            "phase": "product_observability_l1_smoke",
+            "status": "fail",
+            "repo_root": str(REPO_ROOT),
+            "git_sha": summary["git_sha"],
+            "git_branch": summary["git_branch"],
+            "git_dirty": summary["git_dirty"],
+            "dirty_files": dirty_files,
+            "command": sys.argv,
+            "artifact_dir": str(out),
+            "pass_line": None,
+            "model": args.model,
+            "requested_backend": args.backend,
+            "effective_backend": classification["effective_backend"],
+            "failure_classification": str(out / "failures/failure_classification.json"),
+            "outputs": {"summary": str(out / "product_observability_l1_smoke_summary.json")},
+        },
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True, type=Path)
@@ -647,6 +737,7 @@ def main() -> int:
         print(f"{PASS_LINE}: {args.out}")
         return 0
     except SmokeError as exc:
+        write_failure_artifacts(args, exc)
         print(f"PRODUCT OBSERVABILITY L1 SMOKE FAIL: {exc}", file=sys.stderr)
         return 1
 
