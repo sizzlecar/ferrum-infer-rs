@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "contract_id": "performance_claim_before_correctness",
+  "source_git_sha": "1111111111111111111111111111111111111111",
+  "model": {
+    "id": "fixture/perf-before-correctness",
+    "family": "qwen3_moe",
+    "architecture": "qwen3_moe",
+    "weight_format": "gptq_int4",
+    "source": "hf"
+  },
+  "facts": {},
+  "runtime_preset": {
+    "selected": "cuda-qwen3-moe-gptq",
+    "rejected_candidates": ["cpu-default"]
+  },
+  "fallback_policy": {
+    "allow_builtin_template_fallback": false,
+    "allow_backend_fallback": false,
+    "allow_attention_fallback": false
+  },
+  "capabilities": {
+    "tool_calling": {
+      "supported": false,
+      "source": "not_validated"
+    }
+  },
+  "backend_support": [
+    {
+      "backend": "cuda",
+      "status": "supported",
+      "selection": {
+        "runtime_preset": "cuda-qwen3-moe-gptq",
+        "scheduler": "continuous",
+        "attention_impl": "paged-attn",
+        "kv_layout": "paged",
+        "kv_dtype": "fp16"
+      },
+      "fallback": {
+        "allowed": false,
+        "actual_backend": "cuda",
+        "actual_attention_impl": "paged-attn",
+        "reason": null
+      },
+      "native_operators": [],
+      "correctness": {
+        "status": "fail"
+      },
+      "performance_claims": [
+        {
+          "kind": "performance",
+          "path": "../artifacts/qwen3_moe/performance.json",
+          "status": "pass",
+          "pass_line": "MODEL PERF PASS: fixture",
+          "git_sha": "1111111111111111111111111111111111111111",
+          "backend": "cuda"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "contract_id": "builtin_template_fallback_allowed",
+  "source_git_sha": "1111111111111111111111111111111111111111",
+  "model": {
+    "id": "fixture/builtin-template",
+    "family": "qwen3_moe",
+    "architecture": "qwen3_moe",
+    "weight_format": "gptq_int4",
+    "source": "hf"
+  },
+  "facts": {
+    "tokenizer_source": "tokenizer_config.json",
+    "chat_template_source": "builtin_chatml",
+    "generation_config_source": "generation_config.json",
+    "token_id_source": "metadata",
+    "eos_token_ids": [1],
+    "bos_token_id": null,
+    "stop_tokens": [],
+    "template_golden": {
+      "kind": "template_golden",
+      "path": "../artifacts/qwen3_moe/template_golden.json",
+      "status": "pass",
+      "pass_line": "W3 L0 TEMPLATE PASS: fixture",
+      "git_sha": "1111111111111111111111111111111111111111"
+    },
+    "template_golden_cases": [
+      "single_turn",
+      "multi_turn",
+      "system_message",
+      "tool_injection",
+      "reasoning_history"
+    ]
+  },
+  "runtime_preset": {
+    "selected": "cuda-qwen3-moe-gptq",
+    "rejected_candidates": ["cpu-default"]
+  },
+  "fallback_policy": {
+    "allow_builtin_template_fallback": true,
+    "allow_backend_fallback": false,
+    "allow_attention_fallback": false
+  },
+  "capabilities": {
+    "tool_calling": {
+      "supported": false,
+      "source": "not_validated"
+    }
+  },
+  "backend_support": []
+}
