@@ -385,6 +385,40 @@ def validate_release_candidate_invalidation(
     )
 
 
+def validate_release_candidate_shape(
+    gate_plan: dict[str, Any],
+    release_candidate: dict[str, Any],
+) -> None:
+    dirty = release_candidate.get("dirty")
+    require(isinstance(dirty, bool), "release_candidate_manifest.dirty must be boolean")
+    require(dirty is False, "release_candidate_manifest.dirty must be false for final PASS")
+    require_string_list(
+        release_candidate.get("changed_files", []),
+        "release_candidate_manifest.changed_files",
+    )
+    release_domains = set(
+        require_string_list(
+            release_candidate.get("impact_domains", []),
+            "release_candidate_manifest.impact_domains",
+        )
+    )
+    plan_domains = set(
+        require_string_list(
+            gate_plan.get("impact_domains", []),
+            "change_impact.gate_plan.impact_domains",
+        )
+    )
+    require(
+        release_domains == plan_domains,
+        "release_candidate_manifest.impact_domains must match change_impact.gate_plan.impact_domains",
+    )
+    reason = release_candidate.get("invalidation_reason")
+    require(
+        isinstance(reason, str) and reason.strip(),
+        "release_candidate_manifest.invalidation_reason must be non-empty",
+    )
+
+
 def candidate_path_variants(raw: str, *, base: Path) -> set[str]:
     variants = {raw}
     path = Path(raw)
@@ -536,6 +570,7 @@ def validate_change_impact(root: Path, expected_sha: str) -> dict[str, Any]:
         isinstance(release_candidate.get("required_gates"), list),
         "release_candidate_manifest.required_gates must be a list",
     )
+    validate_release_candidate_shape(gate_plan, release_candidate)
     validate_release_candidate_invalidation(gate_plan, release_candidate)
     planner_selfcheck = validate_planner_selfcheck(root)
     pass_line = f"CHANGE IMPACT GATE PLAN PASS: {root}"
@@ -1544,6 +1579,9 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "schema_version": 1,
             "status": "pass",
             "head_sha": sha,
+            "dirty": False,
+            "changed_files": [],
+            "impact_domains": ["release_gate"],
             "unknown_files": [],
             "required_gates": release_candidate_required_gates,
         },
@@ -1553,8 +1591,12 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
         {
             "schema_version": 1,
             "head_sha": sha,
+            "dirty": False,
+            "changed_files": [],
+            "impact_domains": ["release_gate"],
             "required_gates": release_candidate_required_gates,
             "invalidated_gates": [],
+            "invalidation_reason": "selftest release gate fixture",
             "satisfied_gates": sorted(REQUIRED_RELEASE_CANDIDATE_STAGE_GATES),
             "artifact_paths": [
                 artifact["artifact_dir"]
@@ -2422,6 +2464,41 @@ def run_selftest() -> dict[str, Any]:
             require(
                 "release_candidate_manifest.satisfied_gates missing final gates" in str(exc),
                 f"unexpected release candidate stage evidence error: {exc}",
+            )
+        bad_release_candidate_dirty = root / "bad-release-candidate-dirty"
+        artifacts_bad_release_candidate_dirty = selftest_artifacts(
+            root / "bad-release-candidate-dirty-fixtures",
+            sha,
+        )
+        bad_release_candidate_dirty_path = (
+            artifacts_bad_release_candidate_dirty["change"] / "release_candidate_manifest.json"
+        )
+        bad_release_candidate_dirty_manifest = read_json(bad_release_candidate_dirty_path)
+        bad_release_candidate_dirty_manifest["dirty"] = True
+        bad_release_candidate_dirty_manifest["changed_files"] = [
+            " M scripts/release/release_regression_hardening_goal_gate.py"
+        ]
+        write_json(bad_release_candidate_dirty_path, bad_release_candidate_dirty_manifest)
+        args_bad_release_candidate_dirty = argparse.Namespace(
+            out=bad_release_candidate_dirty,
+            resource_invariant=artifacts_bad_release_candidate_dirty["resource"],
+            change_impact=artifacts_bad_release_candidate_dirty["change"],
+            product_sentinel=artifacts_bad_release_candidate_dirty["product"],
+            model_contract=artifacts_bad_release_candidate_dirty["model"],
+            support_matrix_contract=artifacts_bad_release_candidate_dirty["support_matrix"],
+            observability_profile=artifacts_bad_release_candidate_dirty["observability"],
+            native_operator=artifacts_bad_release_candidate_dirty["native"],
+            actual_model_regression_summary=artifacts_bad_release_candidate_dirty["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_release_candidate_dirty)
+            raise AssertionError("dirty release candidate manifest unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "release_candidate_manifest.dirty" in str(exc),
+                f"unexpected dirty release candidate error: {exc}",
             )
         bad_planner_selfcheck = root / "bad-planner-selfcheck"
         artifacts_bad_planner_selfcheck = selftest_artifacts(
