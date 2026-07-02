@@ -213,7 +213,7 @@ pub struct RunCommand {
     #[arg(long, default_value = "0.0")]
     pub temperature: f32,
 
-    /// Backend: auto, cpu, metal (default: auto)
+    /// Backend: auto, cpu, metal, cuda (default: auto)
     #[arg(long, default_value = "auto")]
     pub backend: String,
 
@@ -438,7 +438,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
 
     // Select device before model resolution so CPU runs do not materialize
     // GPU/Metal chat-profile defaults such as paged KV.
-    let mut device = select_device(&cmd.backend);
+    let mut device = select_device(&cmd.backend)?;
     let mut gpu_selection =
         crate::gpu_devices::resolve_cuda_gpu_devices(cmd.gpu_devices.as_deref(), &device)?;
     if let Some(selection) = &gpu_selection {
@@ -1752,43 +1752,48 @@ pub fn find_cached_gguf(cache_dir: &PathBuf, repo: &str, filename: &str) -> Opti
     None
 }
 
-pub fn select_device(backend: &str) -> ferrum_types::Device {
-    match backend.to_lowercase().as_str() {
-        "cpu" => ferrum_types::Device::CPU,
+pub fn select_device(backend: &str) -> Result<ferrum_types::Device> {
+    match backend.trim().to_lowercase().as_str() {
+        "cpu" => Ok(ferrum_types::Device::CPU),
         "metal" => {
             #[cfg(all(target_os = "macos", feature = "metal"))]
             {
-                return ferrum_types::Device::Metal;
+                return Ok(ferrum_types::Device::Metal);
             }
-            #[allow(unreachable_code)]
+            #[cfg(not(all(target_os = "macos", feature = "metal")))]
             {
-                eprintln!("Metal not available, falling back to CPU");
-                ferrum_types::Device::CPU
+                Err(FerrumError::config(
+                    "requested backend 'metal' but this ferrum binary was not built with Metal support; use --backend auto/cpu or build with the metal feature",
+                ))
             }
         }
         "cuda" => {
             #[cfg(feature = "cuda")]
             {
-                return ferrum_types::Device::CUDA(0);
+                return Ok(ferrum_types::Device::CUDA(0));
             }
-            #[allow(unreachable_code)]
+            #[cfg(not(feature = "cuda"))]
             {
-                eprintln!("CUDA not available, falling back to CPU");
-                ferrum_types::Device::CPU
+                Err(FerrumError::config(
+                    "requested backend 'cuda' but this ferrum binary was not built with CUDA support; use --backend auto/cpu or build with the cuda feature",
+                ))
             }
         }
-        "auto" | _ => {
+        "auto" => {
             #[cfg(all(target_os = "macos", feature = "metal"))]
             {
-                return ferrum_types::Device::Metal;
+                return Ok(ferrum_types::Device::Metal);
             }
             #[cfg(feature = "cuda")]
             {
-                return ferrum_types::Device::CUDA(0);
+                return Ok(ferrum_types::Device::CUDA(0));
             }
             #[allow(unreachable_code)]
-            ferrum_types::Device::CPU
+            Ok(ferrum_types::Device::CPU)
         }
+        other => Err(FerrumError::config(format!(
+            "unknown backend {other:?}; expected one of: auto, cpu, metal, cuda"
+        ))),
     }
 }
 
@@ -2300,6 +2305,37 @@ mod tests {
         assert!(doc["hardware_capabilities"].is_object());
         assert!(doc["workload_profile"].is_object());
         assert!(doc["decisions"].is_array());
+    }
+
+    #[test]
+    fn unknown_backend_is_rejected() {
+        let err = select_device("not-a-backend").expect_err("unknown backend must fail");
+        assert!(
+            err.to_string().contains("unknown backend"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[test]
+    fn explicit_metal_backend_without_compiled_support_is_rejected() {
+        let err = select_device("metal").expect_err("unsupported explicit Metal must fail");
+        assert!(
+            err.to_string()
+                .contains("requested backend 'metal' but this ferrum binary was not built"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn explicit_cuda_backend_without_compiled_support_is_rejected() {
+        let err = select_device("cuda").expect_err("unsupported explicit CUDA must fail");
+        assert!(
+            err.to_string()
+                .contains("requested backend 'cuda' but this ferrum binary was not built"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -37,6 +37,12 @@ class BackendMismatchError(SmokeError):
         )
 
 
+class BackendUnavailableError(SmokeError):
+    def __init__(self, message: str) -> None:
+        self.requested = requested_backend_from_message(message)
+        super().__init__(message)
+
+
 def git_value(args: list[str], default: str = "unknown") -> str:
     proc = subprocess.run(
         ["git", *args],
@@ -135,6 +141,9 @@ def run_checked(cmd: list[str], *, cwd: Path, timeout: int, log_path: Path, inpu
         },
     )
     if proc.returncode != 0:
+        backend_error = backend_unavailable_message(f"{proc.stdout}\n{proc.stderr}")
+        if backend_error:
+            raise BackendUnavailableError(backend_error)
         raise SmokeError(f"command failed rc={proc.returncode}: {' '.join(cmd)}")
     return proc
 
@@ -219,6 +228,9 @@ def wait_health(
             tail = ""
             if server_log is not None and server_log.is_file():
                 tail = "\n".join(server_log.read_text(encoding="utf-8", errors="replace").splitlines()[-80:])
+            backend_error = backend_unavailable_message(tail)
+            if backend_error:
+                raise BackendUnavailableError(backend_error)
             raise SmokeError(f"server exited before health check rc={proc.returncode}: {tail}")
         try:
             with urllib.request.urlopen(f"{base_url}/health", timeout=5) as resp:
@@ -277,6 +289,21 @@ def validate_requested_backend(args: argparse.Namespace, effective_backend: str 
         return
     if effective_backend != requested:
         raise BackendMismatchError(requested, effective_backend)
+
+
+def backend_unavailable_message(text: str) -> str | None:
+    for line in text.splitlines():
+        line = line.strip()
+        if "requested backend" in line and "not built" in line:
+            return line
+    return None
+
+
+def requested_backend_from_message(message: str) -> str | None:
+    for backend in ("metal", "cuda", "cpu"):
+        if f"requested backend '{backend}'" in message:
+            return backend
+    return None
 
 
 def live_server_replay_bundle_dirs(request_dump_root: Path) -> list[Path]:
@@ -639,6 +666,8 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
 def failure_kind(exc: Exception) -> str:
     if isinstance(exc, BackendMismatchError):
         return "backend_mismatch"
+    if isinstance(exc, BackendUnavailableError):
+        return "backend_unavailable"
     message = str(exc).lower()
     if "replay" in message:
         return "replay_failure"
@@ -664,16 +693,20 @@ def write_failure_artifacts(args: argparse.Namespace, exc: SmokeError) -> None:
         "status": "fail",
         "failure_kind": failure_kind(exc),
         "error": str(exc),
-        "requested_backend": args.backend,
+        "requested_backend": exc.requested if isinstance(exc, BackendUnavailableError) else args.backend,
         "effective_backend": exc.effective if isinstance(exc, BackendMismatchError) else None,
         "suspected_domain": "backend_runtime_preset"
         if isinstance(exc, BackendMismatchError)
+        else "backend_compilation_or_cli_selection"
+        if isinstance(exc, BackendUnavailableError)
         else "product_observability_l1_smoke",
         "next_gate": "backend_runtime_preset_snapshot"
         if isinstance(exc, BackendMismatchError)
+        else "build_feature_or_backend_smoke"
+        if isinstance(exc, BackendUnavailableError)
         else "inspect_product_observability_l1_artifact",
         "do_not_run": ["l2_representative_backend", "release_full"]
-        if isinstance(exc, BackendMismatchError)
+        if isinstance(exc, (BackendMismatchError, BackendUnavailableError))
         else ["release_full"],
     }
     write_json(out / "failures/failure_classification.json", classification)
