@@ -29,12 +29,13 @@
     "duration_us": { "type": "integer", "minimum": 0 },
     "memory": {
       "type": "object",
-      "required": ["scope", "before_bytes", "after_bytes"],
+      "required": ["scope", "before_bytes", "after_bytes", "current_bytes", "high_water_bytes"],
       "properties": {
         "scope": { "type": "string", "minLength": 1 },
         "backend": { "type": "string" },
         "before_bytes": { "type": "integer", "minimum": 0 },
         "after_bytes": { "type": "integer", "minimum": 0 },
+        "current_bytes": { "type": "integer", "minimum": 0 },
         "high_water_bytes": { "type": "integer", "minimum": 0 },
         "available_bytes": { "type": "integer" }
       }

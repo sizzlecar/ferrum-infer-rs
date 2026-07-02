@@ -56,7 +56,7 @@ def validate_memory(memory: Any, context: str) -> None:
     if not isinstance(memory, dict):
         raise ValidationError(f"{context}.memory must be an object")
     require_non_empty_string(memory, "scope", f"{context}.memory")
-    for key in ("before_bytes", "after_bytes", "high_water_bytes"):
+    for key in ("before_bytes", "after_bytes", "current_bytes", "high_water_bytes"):
         if key not in memory or not isinstance(memory[key], int) or memory[key] < 0:
             raise ValidationError(f"{context}.memory.{key} must be a non-negative integer")
     available = memory.get("available_bytes")

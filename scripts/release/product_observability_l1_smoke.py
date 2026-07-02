@@ -320,6 +320,21 @@ def validate_profile_group(root: Path, entrypoint: str) -> dict[str, Any]:
             raise SmokeError(f"{path} actual_model_smoke values are {actual}")
         if {event.get("schema_version") for event in events} != {SCHEMA_VERSION}:
             raise SmokeError(f"{path} schema_version mismatch")
+        if label == "memory":
+            measurements = {
+                (event.get("attributes") or {}).get("memory_measurement")
+                for event in events
+                if isinstance(event.get("attributes"), dict)
+            }
+            if measurements != {"process_rss"}:
+                raise SmokeError(f"{path} memory_measurement values are {measurements}")
+            for event in events:
+                memory = event.get("memory")
+                if not isinstance(memory, dict):
+                    raise SmokeError(f"{path} memory event missing memory object")
+                for key in ("current_bytes", "high_water_bytes"):
+                    if not isinstance(memory.get(key), int) or memory[key] <= 0:
+                        raise SmokeError(f"{path} memory.{key} must be a positive integer")
         result[label] = {"path": str(path), "event_count": len(events)}
     request_dump = root / "request_dump/request.json"
     replay = root / "request_dump/replay_command.txt"

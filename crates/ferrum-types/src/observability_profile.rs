@@ -43,6 +43,8 @@ pub struct MemorySnapshot {
     pub before_bytes: Option<u64>,
     pub after_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub high_water_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_bytes: Option<i64>,
@@ -58,6 +60,9 @@ impl MemorySnapshot {
         }
         if self.high_water_bytes.is_none() {
             return Err("memory high_water_bytes is required".to_string());
+        }
+        if self.current_bytes.is_none() {
+            return Err("memory current_bytes is required".to_string());
         }
         if self.available_bytes.is_some_and(|bytes| bytes < 0) {
             return Err("memory available_bytes must be non-negative".to_string());

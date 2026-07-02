@@ -59,6 +59,7 @@ pub struct ActualRunObservation {
     pub finish_reason: Option<String>,
     pub prompt_chars: usize,
     pub response_chars: usize,
+    pub memory: Option<crate::memory_profile::ProcessMemoryObservation>,
 }
 
 impl ProductObservabilityConfig {
@@ -197,6 +198,7 @@ pub fn write_actual_run_observability(
 pub fn write_actual_serve_startup_observability(
     config: &ProductObservabilityConfig,
     startup_duration_us: u64,
+    startup_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
 ) -> Result<Vec<PathBuf>> {
     if !config.unified_product_profile_enabled() {
         return Ok(Vec::new());
@@ -204,8 +206,13 @@ pub fn write_actual_serve_startup_observability(
     config.validate()?;
     let request_id = format!("serve-startup-{}", Uuid::new_v4().simple());
     let replay_command = replay_command(config);
-    let events =
-        actual_serve_startup_events(config, &request_id, startup_duration_us, &replay_command);
+    let events = actual_serve_startup_events(
+        config,
+        &request_id,
+        startup_duration_us,
+        startup_memory.as_ref(),
+        &replay_command,
+    );
     write_actual_artifacts(config, &events, &request_id, &replay_command)
 }
 
@@ -310,6 +317,7 @@ fn product_events(
         backend: Some(SYNTHETIC_BACKEND.to_string()),
         before_bytes: Some(2048),
         after_bytes: Some(2304),
+        current_bytes: Some(2304),
         high_water_bytes: Some(2304),
         available_bytes: Some(1024 * 1024),
     });
@@ -377,17 +385,11 @@ fn actual_run_events(
         base + Duration::microseconds(10),
     );
     generation.duration_us = Some(observation.duration_us);
-    generation.memory = Some(MemorySnapshot {
-        scope: "process".to_string(),
-        backend: None,
-        before_bytes: Some(0),
-        after_bytes: Some(0),
-        high_water_bytes: Some(0),
-        available_bytes: None,
-    });
-    generation
-        .attributes
-        .insert("memory_measurement".to_string(), json!("not_collected"));
+    attach_process_memory(
+        &mut generation,
+        observation.memory.as_ref(),
+        "first_request_done",
+    );
     generation.attributes.insert(
         "output_tokens".to_string(),
         json!(observation.output_tokens),
@@ -428,6 +430,7 @@ fn actual_serve_startup_events(
     config: &ProductObservabilityConfig,
     request_id: &str,
     startup_duration_us: u64,
+    startup_memory: Option<&crate::memory_profile::ProcessMemoryObservation>,
     replay_command: &str,
 ) -> Vec<FerrumProfileEvent> {
     let base = Utc::now();
@@ -457,17 +460,7 @@ fn actual_serve_startup_events(
         base + Duration::microseconds(10),
     );
     startup.duration_us = Some(startup_duration_us);
-    startup.memory = Some(MemorySnapshot {
-        scope: "process".to_string(),
-        backend: None,
-        before_bytes: Some(0),
-        after_bytes: Some(0),
-        high_water_bytes: Some(0),
-        available_bytes: None,
-    });
-    startup
-        .attributes
-        .insert("memory_measurement".to_string(), json!("not_collected"));
+    attach_process_memory(&mut startup, startup_memory, "model_loaded");
 
     let mut ready = actual_base_event(
         config,
@@ -531,6 +524,42 @@ fn actual_base_event(
     event.backend = "actual".to_string();
     event.attributes = actual_attrs(config);
     event
+}
+
+fn attach_process_memory(
+    event: &mut FerrumProfileEvent,
+    observation: Option<&crate::memory_profile::ProcessMemoryObservation>,
+    stage: &str,
+) {
+    if let Some(observation) = observation {
+        event.memory = Some(observation.to_snapshot("process", Some("actual")));
+        event
+            .attributes
+            .insert("memory_measurement".to_string(), json!("process_rss"));
+        event
+            .attributes
+            .insert("memory_stage".to_string(), json!(stage));
+        event.attributes.insert(
+            "process_memory_source".to_string(),
+            json!(observation.source),
+        );
+    } else {
+        event.memory = Some(MemorySnapshot {
+            scope: "process".to_string(),
+            backend: Some("actual".to_string()),
+            before_bytes: Some(0),
+            after_bytes: Some(0),
+            current_bytes: Some(0),
+            high_water_bytes: Some(0),
+            available_bytes: None,
+        });
+        event
+            .attributes
+            .insert("memory_measurement".to_string(), json!("not_collected"));
+        event
+            .attributes
+            .insert("memory_stage".to_string(), json!(stage));
+    }
 }
 
 fn common_attrs(config: &ProductObservabilityConfig) -> BTreeMap<String, Value> {

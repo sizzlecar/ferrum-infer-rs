@@ -352,6 +352,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         request_dump_dir.as_ref(),
         profile_sample_rate,
     );
+    let memory_sampler = crate::memory_profile::ProcessMemorySampler;
+    let startup_memory_before = product_observability
+        .enabled()
+        .then(|| memory_sampler.sample())
+        .flatten();
     if product_observability.synthetic_no_weight_enabled() {
         let written = crate::observability_product::write_synthetic_product_observability(
             &product_observability,
@@ -964,6 +969,10 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             .as_micros()
             .try_into()
             .unwrap_or(u64::MAX),
+        product_observability
+            .enabled()
+            .then(|| memory_sampler.observe(startup_memory_before))
+            .flatten(),
     )?;
 
     // Create server config
