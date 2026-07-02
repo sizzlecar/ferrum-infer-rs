@@ -77,6 +77,14 @@ REQUIRED_RESOURCE_KINDS = {
     "scheduler_admission_slot",
 }
 RESOURCE_CACHE_KINDS = {"model_cache_ref", "session_cache_ref"}
+REQUIRED_NATIVE_PASS_FIXTURES = {"dummy_manifest.json", "fa2_manifest.json"}
+REQUIRED_NATIVE_RESOLVER_FAIL_CLOSED_CASES = {
+    "abi_mismatch",
+    "binary_sha256_mismatch",
+    "compute_capability_mismatch",
+    "missing_manifest",
+    "operator_mismatch",
+}
 
 
 class GoalGateError(RuntimeError):
@@ -685,7 +693,53 @@ def validate_native_operator(root: Path, expected_sha: str) -> dict[str, Any]:
     require(isinstance(third_party, dict), "native_operator.summary.unregistered_third_party_source must be an object")
     require(bulk.get("count") == 0, "native_operator.summary.bulk_source.count must be 0")
     require(third_party.get("count") == 0, "native_operator.summary.unregistered_third_party_source.count must be 0")
-    require(isinstance(summary.get("manifests"), list) and summary["manifests"], "native_operator.summary.manifests must be non-empty")
+    manifests = summary.get("manifests")
+    require(isinstance(manifests, list) and manifests, "native_operator.summary.manifests must be non-empty")
+    operators = set()
+    for index, manifest in enumerate(manifests):
+        require(isinstance(manifest, dict), f"native_operator.summary.manifests[{index}] must be an object")
+        operator = manifest.get("operator")
+        require(
+            isinstance(operator, str) and operator.strip(),
+            f"native_operator.summary.manifests[{index}].operator must be non-empty",
+        )
+        operators.add(operator)
+        for key in ("backend", "compute_capabilities", "linkage", "binary_sha256", "resolution"):
+            require(
+                key in manifest,
+                f"native_operator.summary.manifests[{index}].{key} is required",
+            )
+    require("fa2" in operators, "native_operator.summary.manifests must include fa2")
+    selftest_summary = summary.get("selftest_summary")
+    require(isinstance(selftest_summary, dict), "native_operator.summary.selftest_summary must be an object")
+    require_status_pass(selftest_summary, "native_operator.summary.selftest_summary")
+    pass_fixtures = set(
+        require_string_list(
+            selftest_summary.get("pass_fixtures", []),
+            "native_operator.summary.selftest_summary.pass_fixtures",
+        )
+    )
+    missing_pass_fixtures = sorted(REQUIRED_NATIVE_PASS_FIXTURES - pass_fixtures)
+    require(
+        not missing_pass_fixtures,
+        f"native_operator.summary.selftest_summary.pass_fixtures missing {missing_pass_fixtures}",
+    )
+    fail_closed_cases = set(
+        require_string_list(
+            selftest_summary.get("resolver_fail_closed_cases", []),
+            "native_operator.summary.selftest_summary.resolver_fail_closed_cases",
+        )
+    )
+    missing_fail_closed = sorted(REQUIRED_NATIVE_RESOLVER_FAIL_CLOSED_CASES - fail_closed_cases)
+    require(
+        not missing_fail_closed,
+        "native_operator.summary.selftest_summary.resolver_fail_closed_cases missing "
+        + str(missing_fail_closed),
+    )
+    require(
+        selftest_summary.get("python_runtime_dependency") == "none",
+        "native_operator.summary.selftest_summary.python_runtime_dependency must be none",
+    )
     stage["summary"] = summary
     stage["fa2_source_removal_inventory"] = {
         "bulk_source": bulk,
@@ -1477,7 +1531,37 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "schema_version": 1,
             "status": "pass",
             "gate": "native_operator_artifact",
-            "manifests": [{"operator": "fa2", "backend": "cuda"}],
+            "manifests": [
+                {
+                    "manifest": "fixtures/fa2_manifest.json",
+                    "operator": "fa2",
+                    "backend": "cuda",
+                    "compute_capabilities": ["sm_89"],
+                    "linkage": "static",
+                    "binary_artifact": "fixtures/libferrum_native_fa2.a",
+                    "binary_sha256": "c" * 64,
+                    "resolution": {
+                        "operator": "fa2",
+                        "backend": "cuda",
+                        "linkage": "static",
+                        "binary_sha256": "c" * 64,
+                    },
+                }
+            ],
+            "selftest_summary": {
+                "schema_version": 1,
+                "status": "pass",
+                "pass_fixtures": ["dummy_manifest.json", "fa2_manifest.json"],
+                "fail_fixtures": ["missing_binary_sha256.json"],
+                "resolver_fail_closed_cases": [
+                    "abi_mismatch",
+                    "binary_sha256_mismatch",
+                    "compute_capability_mismatch",
+                    "missing_manifest",
+                    "operator_mismatch",
+                ],
+                "python_runtime_dependency": "none",
+            },
             "bulk_source": {"count": 0, "samples": []},
             "unregistered_third_party_source": {"count": 0, "samples": []},
         },
@@ -1667,6 +1751,38 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("bulk source regression unexpectedly passed final gate")
         except GoalGateError as exc:
             require("bulk_source.count" in str(exc), f"unexpected bulk source error: {exc}")
+        bad_native_selftest = root / "bad-native-selftest"
+        artifacts_bad_native_selftest = selftest_artifacts(
+            root / "bad-native-selftest-fixtures",
+            sha,
+        )
+        bad_native_selftest_summary_path = (
+            artifacts_bad_native_selftest["native"] / "native_operator_artifact_summary.json"
+        )
+        bad_native_selftest_summary = read_json(bad_native_selftest_summary_path)
+        bad_native_selftest_summary["selftest_summary"]["pass_fixtures"] = ["fa2_manifest.json"]
+        write_json(bad_native_selftest_summary_path, bad_native_selftest_summary)
+        args_bad_native_selftest = argparse.Namespace(
+            out=bad_native_selftest,
+            resource_invariant=artifacts_bad_native_selftest["resource"],
+            change_impact=artifacts_bad_native_selftest["change"],
+            product_sentinel=artifacts_bad_native_selftest["product"],
+            model_contract=artifacts_bad_native_selftest["model"],
+            support_matrix_contract=artifacts_bad_native_selftest["support_matrix"],
+            observability_profile=artifacts_bad_native_selftest["observability"],
+            native_operator=artifacts_bad_native_selftest["native"],
+            actual_model_regression_summary=artifacts_bad_native_selftest["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_native_selftest)
+            raise AssertionError("missing native-op dummy fixture unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "native_operator.summary.selftest_summary.pass_fixtures" in str(exc),
+                f"unexpected native-op selftest error: {exc}",
+            )
         bad_product = root / "bad-product"
         artifacts_bad_product = selftest_artifacts(root / "bad-product-fixtures", sha)
         bad_product_summary = read_json(
