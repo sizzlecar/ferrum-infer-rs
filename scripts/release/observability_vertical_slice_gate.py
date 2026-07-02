@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""Run and validate Ferrum's L0 observability vertical slice."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PASS_LINE = "OBSERVABILITY VERTICAL SLICE PASS"
+SELFTEST_PASS_LINE = "OBSERVABILITY VERTICAL SLICE SELFTEST PASS"
+SCHEMA_VERSION = 1
+
+
+class GateError(RuntimeError):
+    pass
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise GateError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise GateError(f"{path} must be a JSON object")
+    return data
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def run_checked(cmd: list[str], *, cwd: Path, log_path: Path, timeout: int) -> dict[str, Any]:
+    proc = subprocess.run(
+        cmd,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log = {
+        "cmd": cmd,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }
+    write_json(log_path, log)
+    if proc.returncode != 0:
+        raise GateError(f"command failed with exit {proc.returncode}: {' '.join(cmd)}")
+    return log
+
+
+def ferrum_command(args: argparse.Namespace, subcommand: str, out_dir: Path) -> list[str]:
+    cli_args = [
+        subcommand,
+        "synthetic/no-weight",
+        "--observability-vertical-slice-out",
+        str(out_dir),
+    ]
+    if args.ferrum_bin:
+        return [str(args.ferrum_bin), *cli_args]
+    return ["cargo", "run", "--quiet", "-p", "ferrum-cli", "--", *cli_args]
+
+
+def read_profile_events(path: Path) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise GateError(f"{path}:{line_no} invalid JSONL event: {exc}") from exc
+        if not isinstance(event, dict):
+            raise GateError(f"{path}:{line_no} must be a JSON object")
+        events.append(event)
+    if not events:
+        raise GateError(f"{path} must contain profile events")
+    return events
+
+
+def validate_entrypoint_artifact(root: Path, entrypoint: str) -> dict[str, Any]:
+    profile = root / "profile.jsonl"
+    request_dump = root / "request_dump" / "request.json"
+    replay_command = root / "replay_command.txt"
+    summary_path = root / "observability_profile_summary.json"
+    required = [profile, request_dump, replay_command, summary_path]
+    for path in required:
+        if not path.is_file():
+            raise GateError(f"missing {entrypoint} artifact: {path}")
+
+    events = read_profile_events(profile)
+    schema_versions = {event.get("schema_version") for event in events}
+    entrypoints = {event.get("entrypoint") for event in events}
+    if schema_versions != {SCHEMA_VERSION}:
+        raise GateError(f"{profile} has schema versions {sorted(schema_versions)}")
+    if entrypoints != {entrypoint}:
+        raise GateError(f"{profile} has entrypoints {sorted(entrypoints)}")
+    if not any("replay" in event for event in events):
+        raise GateError(f"{profile} must contain a replay reference")
+
+    request = load_json(request_dump)
+    summary = load_json(summary_path)
+    if request.get("schema_version") != SCHEMA_VERSION:
+        raise GateError(f"{request_dump}.schema_version must be {SCHEMA_VERSION}")
+    if request.get("entrypoint") != entrypoint:
+        raise GateError(f"{request_dump}.entrypoint must be {entrypoint}")
+    if summary.get("schema_version") != SCHEMA_VERSION:
+        raise GateError(f"{summary_path}.schema_version must be {SCHEMA_VERSION}")
+    if summary.get("entrypoint") != entrypoint:
+        raise GateError(f"{summary_path}.entrypoint must be {entrypoint}")
+    if not summary.get("l0_only"):
+        raise GateError(f"{summary_path}.l0_only must be true")
+    if not replay_command.read_text(encoding="utf-8").strip():
+        raise GateError(f"{replay_command} must be non-empty")
+
+    return {
+        "entrypoint": entrypoint,
+        "schema_version": SCHEMA_VERSION,
+        "profile_jsonl": str(profile),
+        "event_count": len(events),
+        "request_dump": str(request_dump),
+        "replay_command": replay_command.read_text(encoding="utf-8").strip(),
+        "summary": str(summary_path),
+    }
+
+
+def run_analyzer(args: argparse.Namespace, out: Path) -> dict[str, Any]:
+    analyzer_out = out / "analyzer"
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "scripts/release/analyze_ferrum_profile.py"),
+        "--profile-jsonl",
+        str(out / "run/profile.jsonl"),
+        "--profile-jsonl",
+        str(out / "serve/profile.jsonl"),
+        "--out",
+        str(analyzer_out),
+    ]
+    log = run_checked(
+        cmd,
+        cwd=REPO_ROOT,
+        log_path=out / "logs/analyzer.json",
+        timeout=args.timeout,
+    )
+    if "FERRUM PROFILE ANALYZER PASS" not in log["stdout"]:
+        raise GateError("profile analyzer did not print its PASS line")
+    return {"out": str(analyzer_out), "stdout": log["stdout"]}
+
+
+def run_gate(args: argparse.Namespace) -> dict[str, Any]:
+    out = args.out
+    out.mkdir(parents=True, exist_ok=True)
+    run_checked(
+        ferrum_command(args, "run", out / "run"),
+        cwd=REPO_ROOT,
+        log_path=out / "logs/run_cli.json",
+        timeout=args.timeout,
+    )
+    run_checked(
+        ferrum_command(args, "serve", out / "serve"),
+        cwd=REPO_ROOT,
+        log_path=out / "logs/serve_cli.json",
+        timeout=args.timeout,
+    )
+    run_summary = validate_entrypoint_artifact(out / "run", "run")
+    serve_summary = validate_entrypoint_artifact(out / "serve", "serve")
+    analyzer = run_analyzer(args, out)
+    if run_summary["schema_version"] != serve_summary["schema_version"]:
+        raise GateError("run and serve schema versions differ")
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "gate": "observability_vertical_slice",
+        "status": "pass",
+        "l0_only": True,
+        "same_schema_version": True,
+        "entrypoints": {
+            "run": run_summary,
+            "serve": serve_summary,
+        },
+        "analyzer": analyzer,
+    }
+    write_json(out / "observability_profile_summary.json", summary)
+    write_json(
+        out / "observability_vertical_slice_manifest.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "status": "pass",
+            "artifact_dir": str(out),
+            "pass_line": f"{PASS_LINE}: {out}",
+            "summary": str(out / "observability_profile_summary.json"),
+        },
+    )
+    return summary
+
+
+def run_self_test() -> None:
+    with tempfile.TemporaryDirectory(prefix="ferrum-observability-gate-selftest-") as tmp:
+        root = Path(tmp)
+        for entrypoint in ("run", "serve"):
+            entry_dir = root / entrypoint
+            (entry_dir / "request_dump").mkdir(parents=True)
+            (entry_dir / "profile.jsonl").write_text(
+                json.dumps(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "event_id": f"evt-{entrypoint}",
+                        "request_id": f"req-{entrypoint}",
+                        "entrypoint": entrypoint,
+                        "backend": "synthetic",
+                        "phase": "request_complete",
+                        "event_kind": "instant",
+                        "timestamp": "2026-07-02T00:00:00Z",
+                        "status": "diagnostic_only",
+                        "model": "synthetic/no-weight",
+                        "replay": {"command": f"ferrum {entrypoint} synthetic/no-weight"},
+                        "attributes": {},
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            write_json(
+                entry_dir / "request_dump/request.json",
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "entrypoint": entrypoint,
+                    "request_id": f"req-{entrypoint}",
+                    "l0_only": True,
+                    "sanitized": True,
+                },
+            )
+            (entry_dir / "replay_command.txt").write_text(
+                f"ferrum {entrypoint} synthetic/no-weight\n",
+                encoding="utf-8",
+            )
+            write_json(
+                entry_dir / "observability_profile_summary.json",
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "entrypoint": entrypoint,
+                    "l0_only": True,
+                    "status": "pass",
+                },
+            )
+            validate_entrypoint_artifact(entry_dir, entrypoint)
+    print(SELFTEST_PASS_LINE)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--ferrum-bin", type=Path)
+    parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+    if not args.self_test and args.out is None:
+        parser.error("--out is required unless --self-test is set")
+    return args
+
+
+def main() -> int:
+    args = parse_args()
+    if args.self_test:
+        run_self_test()
+        return 0
+    run_gate(args)
+    print(f"{PASS_LINE}: {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
