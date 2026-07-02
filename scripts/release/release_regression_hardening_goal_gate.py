@@ -144,6 +144,16 @@ def require_git_sha(data: dict[str, Any], label: str, expected_sha: str) -> str:
     return value
 
 
+def require_clean_manifest(data: dict[str, Any], label: str) -> None:
+    require(
+        isinstance(data.get("git_dirty"), bool),
+        f"{label}.git_dirty must be boolean",
+    )
+    dirty_files = require_string_list(data.get("dirty_files", []), f"{label}.dirty_files")
+    require(data["git_dirty"] is False, f"{label}.git_dirty must be false for final PASS")
+    require(not dirty_files, f"{label}.dirty_files must be empty for final PASS")
+
+
 def require_real_pass_line(value: Any, label: str) -> str:
     require(isinstance(value, str) and " PASS:" in value, f"{label}.pass_line must be a gate PASS line")
     prefix = value.split(":", 1)[0].upper()
@@ -173,6 +183,7 @@ def load_stage_manifest(root: Path, label: str, pass_prefix: str, expected_sha: 
     require_status_pass(manifest, f"{label}.manifest")
     pass_line = require_pass_line(manifest, f"{label}.manifest", pass_prefix)
     require_git_sha(manifest, f"{label}.manifest", expected_sha)
+    require_clean_manifest(manifest, f"{label}.manifest")
     return {
         "label": label,
         "artifact_dir": str(root),
@@ -778,6 +789,7 @@ def make_gate_manifest(root: Path, prefix: str, sha: str, summary_name: str, sum
             "pass_line": f"{prefix}: {root}",
             "git_sha": sha,
             "git_dirty": False,
+            "dirty_files": [],
             "outputs": {"summary": str(root / summary_name)},
             "summary": str(root / summary_name),
         },
@@ -806,6 +818,8 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "artifact_dir": str(resource),
             "pass_line": f"RESOURCE INVARIANT GATE PASS: {resource}",
             "git_sha": sha,
+            "git_dirty": False,
+            "dirty_files": [],
             "invariant_report": str(resource / "invariant_report.json"),
         },
     )
@@ -1143,6 +1157,31 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("missing product failure links unexpectedly passed final gate")
         except GoalGateError as exc:
             require("failure_links missing" in str(exc), f"unexpected product sentinel error: {exc}")
+        bad_dirty_stage = root / "bad-dirty-stage"
+        artifacts_bad_dirty_stage = selftest_artifacts(root / "bad-dirty-stage-fixtures", sha)
+        bad_dirty_manifest_path = artifacts_bad_dirty_stage["product"] / "gate.manifest.json"
+        bad_dirty_manifest = read_json(bad_dirty_manifest_path)
+        bad_dirty_manifest["git_dirty"] = True
+        bad_dirty_manifest["dirty_files"] = [" M scripts/release/product_backend_sentinel_gate.py"]
+        write_json(bad_dirty_manifest_path, bad_dirty_manifest)
+        args_bad_dirty_stage = argparse.Namespace(
+            out=bad_dirty_stage,
+            resource_invariant=artifacts_bad_dirty_stage["resource"],
+            change_impact=artifacts_bad_dirty_stage["change"],
+            product_sentinel=artifacts_bad_dirty_stage["product"],
+            model_contract=artifacts_bad_dirty_stage["model"],
+            support_matrix_contract=artifacts_bad_dirty_stage["support_matrix"],
+            observability_profile=artifacts_bad_dirty_stage["observability"],
+            native_operator=artifacts_bad_dirty_stage["native"],
+            actual_model_regression_summary=artifacts_bad_dirty_stage["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_dirty_stage)
+            raise AssertionError("dirty stage artifact unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require("git_dirty" in str(exc), f"unexpected dirty stage error: {exc}")
         missing_actual = argparse.Namespace(
             **{
                 **args.__dict__,

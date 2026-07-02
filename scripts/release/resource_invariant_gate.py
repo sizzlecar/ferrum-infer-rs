@@ -453,12 +453,15 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         raise GateError("panic_count must be 0")
     report_path = out / "invariant_report.json"
     write_json(report_path, report)
+    dirty_files = git_value(["status", "--short"]).splitlines()
     manifest = {
         "schema_version": 1,
         "status": "pass",
         "artifact_dir": str(out),
         "pass_line": f"{PASS_LINE}: {out}",
         "git_sha": git_value(["rev-parse", "HEAD"]),
+        "git_dirty": bool(dirty_files),
+        "dirty_files": dirty_files,
         "dirty_status": git_value(["status", "--short"]),
         "commands": [
             f"{sys.executable} scripts/release/resource_invariant_gate.py --out {out}",
