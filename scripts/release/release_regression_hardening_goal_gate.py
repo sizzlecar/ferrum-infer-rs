@@ -219,6 +219,59 @@ def validate_resource_invariant(root: Path, expected_sha: str) -> dict[str, Any]
     return stage
 
 
+def validate_release_candidate_invalidation(
+    gate_plan: dict[str, Any],
+    release_candidate: dict[str, Any],
+) -> None:
+    impact_domains = require_string_list(gate_plan.get("impact_domains", []), "change_impact.gate_plan.impact_domains")
+    require("unknown" not in impact_domains, "change_impact.gate_plan.impact_domains must not contain unknown")
+    invalidated_gates = set(
+        require_string_list(
+            release_candidate.get("invalidated_gates", []),
+            "release_candidate_manifest.invalidated_gates",
+        )
+    )
+    satisfied_gates = set(
+        require_string_list(
+            release_candidate.get("satisfied_gates", []),
+            "release_candidate_manifest.satisfied_gates",
+        )
+    )
+    overlap = sorted(invalidated_gates & satisfied_gates)
+    require(not overlap, f"release_candidate_manifest counts invalidated gates as satisfied: {overlap}")
+
+    artifact_paths = set(
+        require_string_list(
+            release_candidate.get("artifact_paths", []),
+            "release_candidate_manifest.artifact_paths",
+        )
+    )
+    pass_lines = set(
+        require_string_list(
+            release_candidate.get("pass_lines", []),
+            "release_candidate_manifest.pass_lines",
+        )
+    )
+    stale_artifacts = release_candidate.get("stale_artifacts", [])
+    require(isinstance(stale_artifacts, list), "release_candidate_manifest.stale_artifacts must be a list")
+    counted_stale: list[str] = []
+    for index, artifact in enumerate(stale_artifacts):
+        require(isinstance(artifact, dict), f"release_candidate_manifest.stale_artifacts[{index}] must be an object")
+        artifact_id = str(artifact.get("id") or artifact.get("gate") or artifact.get("artifact_dir") or f"stale-{index}")
+        if artifact_id in satisfied_gates or f"artifact:{artifact_id}" in satisfied_gates:
+            counted_stale.append(artifact_id)
+        artifact_dir = artifact.get("artifact_dir")
+        if isinstance(artifact_dir, str) and artifact_dir in artifact_paths:
+            counted_stale.append(artifact_id)
+        pass_line = artifact.get("pass_line")
+        if isinstance(pass_line, str) and pass_line in pass_lines:
+            counted_stale.append(artifact_id)
+    require(
+        not counted_stale,
+        f"release_candidate_manifest counts stale artifacts as pass evidence: {sorted(set(counted_stale))}",
+    )
+
+
 def validate_change_impact(root: Path, expected_sha: str) -> dict[str, Any]:
     gate_plan = read_json(root / "gate_plan.json")
     require_status_pass(gate_plan, "change_impact.gate_plan")
@@ -236,6 +289,7 @@ def validate_change_impact(root: Path, expected_sha: str) -> dict[str, Any]:
         isinstance(release_candidate.get("required_gates"), list),
         "release_candidate_manifest.required_gates must be a list",
     )
+    validate_release_candidate_invalidation(gate_plan, release_candidate)
     pass_line = f"CHANGE IMPACT GATE PLAN PASS: {root}"
     return {
         "label": "change_impact",
@@ -843,6 +897,10 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "head_sha": sha,
             "required_gates": ["unit"],
             "invalidated_gates": [],
+            "satisfied_gates": [],
+            "artifact_paths": [],
+            "pass_lines": [],
+            "stale_artifacts": [],
         },
     )
 
@@ -1182,6 +1240,70 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("dirty stage artifact unexpectedly passed final gate")
         except GoalGateError as exc:
             require("git_dirty" in str(exc), f"unexpected dirty stage error: {exc}")
+        bad_invalidated_counted = root / "bad-invalidated-counted"
+        artifacts_bad_invalidated_counted = selftest_artifacts(
+            root / "bad-invalidated-counted-fixtures",
+            sha,
+        )
+        bad_release_candidate_path = (
+            artifacts_bad_invalidated_counted["change"] / "release_candidate_manifest.json"
+        )
+        bad_release_candidate = read_json(bad_release_candidate_path)
+        bad_release_candidate["invalidated_gates"] = ["product_sentinel"]
+        bad_release_candidate["satisfied_gates"] = ["product_sentinel"]
+        write_json(bad_release_candidate_path, bad_release_candidate)
+        args_bad_invalidated_counted = argparse.Namespace(
+            out=bad_invalidated_counted,
+            resource_invariant=artifacts_bad_invalidated_counted["resource"],
+            change_impact=artifacts_bad_invalidated_counted["change"],
+            product_sentinel=artifacts_bad_invalidated_counted["product"],
+            model_contract=artifacts_bad_invalidated_counted["model"],
+            support_matrix_contract=artifacts_bad_invalidated_counted["support_matrix"],
+            observability_profile=artifacts_bad_invalidated_counted["observability"],
+            native_operator=artifacts_bad_invalidated_counted["native"],
+            actual_model_regression_summary=artifacts_bad_invalidated_counted["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_invalidated_counted)
+            raise AssertionError("invalidated-but-satisfied gate unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require("invalidated" in str(exc), f"unexpected invalidated gate error: {exc}")
+        bad_stale_counted = root / "bad-stale-counted"
+        artifacts_bad_stale_counted = selftest_artifacts(root / "bad-stale-counted-fixtures", sha)
+        bad_stale_release_candidate_path = (
+            artifacts_bad_stale_counted["change"] / "release_candidate_manifest.json"
+        )
+        bad_stale_release_candidate = read_json(bad_stale_release_candidate_path)
+        stale_artifact = {
+            "id": "old-product-sentinel",
+            "gate": "product_sentinel",
+            "artifact_dir": "docs/release/old-product-sentinel",
+            "pass_line": "PRODUCT BACKEND SENTINEL PASS: docs/release/old-product-sentinel",
+        }
+        bad_stale_release_candidate["stale_artifacts"] = [stale_artifact]
+        bad_stale_release_candidate["artifact_paths"] = [stale_artifact["artifact_dir"]]
+        bad_stale_release_candidate["pass_lines"] = [stale_artifact["pass_line"]]
+        write_json(bad_stale_release_candidate_path, bad_stale_release_candidate)
+        args_bad_stale_counted = argparse.Namespace(
+            out=bad_stale_counted,
+            resource_invariant=artifacts_bad_stale_counted["resource"],
+            change_impact=artifacts_bad_stale_counted["change"],
+            product_sentinel=artifacts_bad_stale_counted["product"],
+            model_contract=artifacts_bad_stale_counted["model"],
+            support_matrix_contract=artifacts_bad_stale_counted["support_matrix"],
+            observability_profile=artifacts_bad_stale_counted["observability"],
+            native_operator=artifacts_bad_stale_counted["native"],
+            actual_model_regression_summary=artifacts_bad_stale_counted["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_stale_counted)
+            raise AssertionError("stale artifact counted as pass unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require("stale artifacts" in str(exc), f"unexpected stale-counted error: {exc}")
         missing_actual = argparse.Namespace(
             **{
                 **args.__dict__,
