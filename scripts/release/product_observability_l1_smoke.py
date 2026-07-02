@@ -367,6 +367,30 @@ def run_analyzer(out: Path, timeout: int) -> dict[str, Any]:
     return {"profiles": [str(profile) for profile in profiles], "out": str(out / "analyzer")}
 
 
+def run_resource_invariant(out: Path, timeout: int) -> dict[str, Any]:
+    traces = [
+        out / "run/scheduler_trace.jsonl",
+        out / "serve/scheduler_trace.jsonl",
+    ]
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "scripts/release/resource_invariant_gate.py"),
+        "--out",
+        str(out / "resource_invariant"),
+    ]
+    for trace in traces:
+        cmd.extend(["--trace-jsonl", str(trace)])
+    proc = run_checked(
+        cmd,
+        cwd=REPO_ROOT,
+        timeout=timeout,
+        log_path=out / "logs/resource_invariant.json",
+    )
+    if "RESOURCE INVARIANT GATE PASS" not in proc.stdout:
+        raise SmokeError("resource invariant gate did not print PASS")
+    return {"traces": [str(trace) for trace in traces], "out": str(out / "resource_invariant")}
+
+
 def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
@@ -375,6 +399,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     run_profiles = validate_profile_group(out / "run", "run")
     serve_profiles = validate_profile_group(out / "serve", "serve")
     analyzer = run_analyzer(out, args.timeout)
+    resource_invariant = run_resource_invariant(out, args.timeout)
     summary = {
         "schema_version": SCHEMA_VERSION,
         "status": "pass",
@@ -387,6 +412,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
             "serve": {"product": serve_result, "profiles": serve_profiles},
         },
         "analyzer": analyzer,
+        "resource_invariant": resource_invariant,
     }
     write_json(out / "product_observability_l1_smoke_summary.json", summary)
     write_json(
@@ -400,6 +426,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
             "backend": args.backend,
             "summary": str(out / "product_observability_l1_smoke_summary.json"),
             "profile_paths": analyzer["profiles"],
+            "resource_invariant": resource_invariant,
         },
     )
     return summary

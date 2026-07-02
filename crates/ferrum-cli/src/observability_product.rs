@@ -266,50 +266,58 @@ fn product_events(
     replay_command: &str,
 ) -> Vec<FerrumProfileEvent> {
     let base = Utc::now();
-    let mut open = base_event(
+    let open = resource_event(
         config,
         request_id,
+        "request",
+        request_id,
+        "request_slot",
         "request_open",
-        ProfileEventKind::Resource,
+        ResourceAction::RequestOpen,
         base,
+        None,
+        None,
+        None,
+        Some(1),
+        None,
     );
-    open.resource = Some(ResourceTraceEvent {
-        owner_kind: "request".to_string(),
-        owner_id: request_id.to_string(),
-        resource_kind: "request_slot".to_string(),
-        action: ResourceAction::RequestOpen,
-        amount: None,
-        before: None,
-        after: None,
-        capacity: Some(1),
-        reason: None,
-    });
-
-    let mut scheduler = base_event(
+    let reserve = resource_event(
         config,
         request_id,
-        "scheduler_admission",
-        ProfileEventKind::Resource,
+        "request",
+        request_id,
+        "request_slot",
+        "request_slot_reserve",
+        ResourceAction::Reserve,
         base + Duration::microseconds(10),
+        Some(1),
+        Some(1),
+        Some(0),
+        Some(1),
+        None,
     );
-    scheduler.resource = Some(ResourceTraceEvent {
-        owner_kind: "request".to_string(),
-        owner_id: request_id.to_string(),
-        resource_kind: "scheduler_admission_slot".to_string(),
-        action: ResourceAction::Reserve,
-        amount: Some(1),
-        before: Some(1),
-        after: Some(0),
-        capacity: Some(1),
-        reason: None,
-    });
+    let commit = resource_event(
+        config,
+        request_id,
+        "request",
+        request_id,
+        "request_slot",
+        "request_slot_commit",
+        ResourceAction::Commit,
+        base + Duration::microseconds(20),
+        Some(1),
+        Some(0),
+        Some(1),
+        Some(1),
+        None,
+    );
 
     let mut prefill = base_event(
         config,
         request_id,
         "synthetic_prefill",
         ProfileEventKind::TimedSpan,
-        base + Duration::microseconds(20),
+        base + Duration::microseconds(30),
     );
     prefill.duration_us = Some(160);
     prefill.memory = Some(MemorySnapshot {
@@ -326,30 +334,54 @@ fn product_events(
         .attributes
         .insert("input_tokens".to_string(), json!(8));
 
-    let mut complete = base_event(
+    let release = resource_event(
         config,
         request_id,
-        "request_complete",
-        ProfileEventKind::Instant,
-        base + Duration::microseconds(190),
+        "request",
+        request_id,
+        "request_slot",
+        "request_slot_release",
+        ResourceAction::Release,
+        base + Duration::microseconds(180),
+        Some(1),
+        Some(1),
+        Some(0),
+        Some(1),
+        None,
     );
-    complete.status = if config.profile_detail.diagnostic_only() {
+
+    let mut close = resource_event(
+        config,
+        request_id,
+        "request",
+        request_id,
+        "request_slot",
+        "request_close",
+        ResourceAction::RequestClose,
+        base + Duration::microseconds(190),
+        None,
+        None,
+        None,
+        Some(1),
+        None,
+    );
+    close.status = if config.profile_detail.diagnostic_only() {
         ProfileStatus::DiagnosticOnly
     } else {
         ProfileStatus::Ok
     };
-    complete.replay = Some(ReplayReference {
+    close.replay = Some(ReplayReference {
         command: replay_command.to_string(),
         bundle_dir: config
             .request_dump_dir
             .as_ref()
             .map(|path| path.to_string_lossy().to_string()),
     });
-    complete.attributes.extend(common_attrs(config));
-    complete
+    close.attributes.extend(common_attrs(config));
+    close
         .attributes
         .insert("response_text".to_string(), json!("synthetic ok"));
-    vec![open, scheduler, prefill, complete]
+    vec![open, reserve, commit, prefill, release, close]
 }
 
 fn actual_run_events(
@@ -358,31 +390,58 @@ fn actual_run_events(
     replay_command: &str,
 ) -> Vec<FerrumProfileEvent> {
     let base = Utc::now();
-    let mut open = actual_base_event(
+    let open = actual_resource_event(
         config,
         &observation.request_id,
+        "request",
+        &observation.request_id,
+        "request_slot",
         "request_open",
-        ProfileEventKind::Resource,
+        ResourceAction::RequestOpen,
         base,
+        None,
+        None,
+        None,
+        Some(1),
+        None,
     );
-    open.resource = Some(ResourceTraceEvent {
-        owner_kind: "request".to_string(),
-        owner_id: observation.request_id.clone(),
-        resource_kind: "request_slot".to_string(),
-        action: ResourceAction::RequestOpen,
-        amount: None,
-        before: None,
-        after: None,
-        capacity: Some(1),
-        reason: None,
-    });
+    let reserve = actual_resource_event(
+        config,
+        &observation.request_id,
+        "request",
+        &observation.request_id,
+        "request_slot",
+        "request_slot_reserve",
+        ResourceAction::Reserve,
+        base + Duration::microseconds(5),
+        Some(1),
+        Some(1),
+        Some(0),
+        Some(1),
+        None,
+    );
+    let commit = actual_resource_event(
+        config,
+        &observation.request_id,
+        "request",
+        &observation.request_id,
+        "request_slot",
+        "request_slot_commit",
+        ResourceAction::Commit,
+        base + Duration::microseconds(10),
+        Some(1),
+        Some(0),
+        Some(1),
+        Some(1),
+        None,
+    );
 
     let mut generation = actual_base_event(
         config,
         &observation.request_id,
         "actual_run_generation",
         ProfileEventKind::TimedSpan,
-        base + Duration::microseconds(10),
+        base + Duration::microseconds(20),
     );
     generation.duration_us = Some(observation.duration_us);
     attach_process_memory(
@@ -402,12 +461,36 @@ fn actual_run_events(
         json!(observation.finish_reason.as_deref().unwrap_or("unknown")),
     );
 
-    let mut close = actual_base_event(
+    let release = actual_resource_event(
         config,
         &observation.request_id,
-        "request_complete",
-        ProfileEventKind::Instant,
-        base + Duration::microseconds(20),
+        "request",
+        &observation.request_id,
+        "request_slot",
+        "request_slot_release",
+        ResourceAction::Release,
+        base + Duration::microseconds(30),
+        Some(1),
+        Some(1),
+        Some(0),
+        Some(1),
+        None,
+    );
+
+    let mut close = actual_resource_event(
+        config,
+        &observation.request_id,
+        "request",
+        &observation.request_id,
+        "request_slot",
+        "request_close",
+        ResourceAction::RequestClose,
+        base + Duration::microseconds(40),
+        None,
+        None,
+        None,
+        Some(1),
+        None,
     );
     close.replay = Some(ReplayReference {
         command: replay_command.to_string(),
@@ -423,7 +506,7 @@ fn actual_run_events(
         "response_chars".to_string(),
         json!(observation.response_chars),
     );
-    vec![open, generation, close]
+    vec![open, reserve, commit, generation, release, close]
 }
 
 fn actual_serve_startup_events(
@@ -434,40 +517,90 @@ fn actual_serve_startup_events(
     replay_command: &str,
 ) -> Vec<FerrumProfileEvent> {
     let base = Utc::now();
-    let mut open = actual_base_event(
+    let open = actual_resource_event(
         config,
         request_id,
+        "server",
+        request_id,
+        "startup_slot",
         "server_startup_open",
-        ProfileEventKind::Resource,
+        ResourceAction::RequestOpen,
         base,
+        None,
+        None,
+        None,
+        Some(1),
+        None,
     );
-    open.resource = Some(ResourceTraceEvent {
-        owner_kind: "server".to_string(),
-        owner_id: request_id.to_string(),
-        resource_kind: "startup_slot".to_string(),
-        action: ResourceAction::RequestOpen,
-        amount: None,
-        before: None,
-        after: None,
-        capacity: Some(1),
-        reason: None,
-    });
+    let reserve = actual_resource_event(
+        config,
+        request_id,
+        "server",
+        request_id,
+        "startup_slot",
+        "server_startup_reserve",
+        ResourceAction::Reserve,
+        base + Duration::microseconds(5),
+        Some(1),
+        Some(1),
+        Some(0),
+        Some(1),
+        None,
+    );
+    let commit = actual_resource_event(
+        config,
+        request_id,
+        "server",
+        request_id,
+        "startup_slot",
+        "server_startup_commit",
+        ResourceAction::Commit,
+        base + Duration::microseconds(10),
+        Some(1),
+        Some(0),
+        Some(1),
+        Some(1),
+        None,
+    );
     let mut startup = actual_base_event(
         config,
         request_id,
         "actual_serve_startup",
         ProfileEventKind::TimedSpan,
-        base + Duration::microseconds(10),
+        base + Duration::microseconds(20),
     );
     startup.duration_us = Some(startup_duration_us);
     attach_process_memory(&mut startup, startup_memory, "model_loaded");
 
-    let mut ready = actual_base_event(
+    let release = actual_resource_event(
         config,
         request_id,
+        "server",
+        request_id,
+        "startup_slot",
+        "server_startup_release",
+        ResourceAction::Release,
+        base + Duration::microseconds(30),
+        Some(1),
+        Some(1),
+        Some(0),
+        Some(1),
+        None,
+    );
+    let mut ready = actual_resource_event(
+        config,
+        request_id,
+        "server",
+        request_id,
+        "startup_slot",
         "server_ready_for_requests",
-        ProfileEventKind::Instant,
-        base + Duration::microseconds(20),
+        ResourceAction::RequestClose,
+        base + Duration::microseconds(40),
+        None,
+        None,
+        None,
+        Some(1),
+        None,
     );
     ready.replay = Some(ReplayReference {
         command: replay_command.to_string(),
@@ -476,7 +609,7 @@ fn actual_serve_startup_events(
             .as_ref()
             .map(|path| path.to_string_lossy().to_string()),
     });
-    vec![open, startup, ready]
+    vec![open, reserve, commit, startup, release, ready]
 }
 
 fn base_event(
@@ -521,6 +654,79 @@ fn actual_base_event(
     timestamp: chrono::DateTime<Utc>,
 ) -> FerrumProfileEvent {
     let mut event = base_event(config, request_id, phase, event_kind, timestamp);
+    event.backend = "actual".to_string();
+    event.attributes = actual_attrs(config);
+    event
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resource_event(
+    config: &ProductObservabilityConfig,
+    request_id: &str,
+    owner_kind: &str,
+    owner_id: &str,
+    resource_kind: &str,
+    phase: &str,
+    action: ResourceAction,
+    timestamp: chrono::DateTime<Utc>,
+    amount: Option<i64>,
+    before: Option<i64>,
+    after: Option<i64>,
+    capacity: Option<i64>,
+    reason: Option<&str>,
+) -> FerrumProfileEvent {
+    let mut event = base_event(
+        config,
+        request_id,
+        phase,
+        ProfileEventKind::Resource,
+        timestamp,
+    );
+    event.resource = Some(ResourceTraceEvent {
+        owner_kind: owner_kind.to_string(),
+        owner_id: owner_id.to_string(),
+        resource_kind: resource_kind.to_string(),
+        action,
+        amount,
+        before,
+        after,
+        capacity,
+        reason: reason.map(str::to_string),
+    });
+    event
+}
+
+#[allow(clippy::too_many_arguments)]
+fn actual_resource_event(
+    config: &ProductObservabilityConfig,
+    request_id: &str,
+    owner_kind: &str,
+    owner_id: &str,
+    resource_kind: &str,
+    phase: &str,
+    action: ResourceAction,
+    timestamp: chrono::DateTime<Utc>,
+    amount: Option<i64>,
+    before: Option<i64>,
+    after: Option<i64>,
+    capacity: Option<i64>,
+    reason: Option<&str>,
+) -> FerrumProfileEvent {
+    let mut event = resource_event(
+        config,
+        request_id,
+        owner_kind,
+        owner_id,
+        resource_kind,
+        phase,
+        action,
+        timestamp,
+        amount,
+        before,
+        after,
+        capacity,
+        reason,
+    );
     event.backend = "actual".to_string();
     event.attributes = actual_attrs(config);
     event

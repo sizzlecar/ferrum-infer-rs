@@ -417,12 +417,25 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     trace_report = validate_trace_file(trace_path)
     if trace_report["failures"]:
         raise GateError(f"combined pass trace failed: {trace_report['failures']}")
+    external_reports = []
+    for path in args.trace_jsonl:
+        external_report = validate_trace_file(path)
+        if external_report["failures"]:
+            raise GateError(f"external trace failed: {path}: {external_report['failures']}")
+        if external_report["leaked_resources"] != 0:
+            raise GateError(f"external trace leaked resources: {path}")
+        if external_report["underflow_count"] != 0:
+            raise GateError(f"external trace has release underflow: {path}")
+        if external_report["unclosed_owner_count"] != 0:
+            raise GateError(f"external trace has unclosed owners: {path}")
+        external_reports.append(external_report)
     if fixture_summary["scenario_count"] != len(REQUIRED_PASS_SCENARIOS):
         raise GateError("not all required pass scenarios were covered")
     report = {
         "schema_version": 1,
         "status": "pass",
         "trace": trace_report,
+        "external_traces": external_reports,
         "fixture_summary": fixture_summary,
         "leaked_resources": trace_report["leaked_resources"],
         "underflow_count": trace_report["underflow_count"],
@@ -452,6 +465,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
             f"{sys.executable} scripts/release/resource_invariant_gate.py --self-test",
         ],
         "resource_trace": str(trace_path),
+        "external_trace_jsonl": [str(path) for path in args.trace_jsonl],
         "invariant_report": str(report_path),
     }
     write_json(out / "gate.manifest.json", manifest)
@@ -460,7 +474,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
 
 def run_self_test(root: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="ferrum-resource-invariant-selftest-") as tmp:
-        args = argparse.Namespace(out=Path(tmp), fixtures=root)
+        args = argparse.Namespace(out=Path(tmp), fixtures=root, trace_jsonl=[])
         run_gate(args)
     print(SELFTEST_PASS_LINE)
 
@@ -469,6 +483,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path)
     parser.add_argument("--fixtures", type=Path, default=DEFAULT_FIXTURES)
+    parser.add_argument("--trace-jsonl", action="append", type=Path, default=[])
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if not args.self_test and args.out is None:
