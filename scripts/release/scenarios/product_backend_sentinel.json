@@ -6,6 +6,10 @@
     {
       "name": "run_profile_replay_reference",
       "type": "profile_artifact",
+      "product_scenarios": [
+        "run_multiturn",
+        "run_first_token"
+      ],
       "profile_jsonl": [
         "scripts/release/fixtures/observability_profile/pass/run_success_basic_profile.jsonl"
       ],
@@ -17,6 +21,10 @@
     {
       "name": "serve_nonstream_profile_replay_reference",
       "type": "profile_artifact",
+      "product_scenarios": [
+        "serve_chat",
+        "serve_multiturn"
+      ],
       "profile_jsonl": [
         "scripts/release/fixtures/observability_profile/pass/serve_nonstream_success_basic_profile.jsonl"
       ],
@@ -28,6 +36,9 @@
     {
       "name": "serve_stream_profile_replay_reference",
       "type": "profile_artifact",
+      "product_scenarios": [
+        "serve_stream"
+      ],
       "profile_jsonl": [
         "scripts/release/fixtures/observability_profile/pass/serve_stream_success_basic_profile.jsonl"
       ],
@@ -38,7 +49,10 @@
     },
     {
       "name": "profile_replay_bundle_link",
-      "type": "profile_replay_link"
+      "type": "profile_replay_link",
+      "product_scenarios": [
+        "serve_concurrency_quality"
+      ]
     },
     {
       "name": "resource_oom_prevented_by_admission",
@@ -48,6 +62,9 @@
     {
       "name": "replay_bad_output_blocker",
       "type": "replay_bundle",
+      "product_scenarios": [
+        "serve_structured_output"
+      ],
       "fixture_kind": "bad_output"
     },
     {
@@ -63,6 +80,9 @@
     {
       "name": "native_operator_manifest_reference",
       "type": "native_op_manifest",
+      "product_scenarios": [
+        "serve_tool_call"
+      ],
       "manifest": "scripts/release/fixtures/native_operator/pass/dummy_manifest.json",
       "operator": "dummy",
       "backend": "cuda",

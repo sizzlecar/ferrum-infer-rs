@@ -97,6 +97,16 @@ REQUIRED_PRODUCT_SENTINEL_SCENARIO_TYPES = {
     "resource_trace",
     "sse_fixture",
 }
+REQUIRED_PRODUCT_SCENARIOS = {
+    "run_first_token",
+    "run_multiturn",
+    "serve_chat",
+    "serve_concurrency_quality",
+    "serve_multiturn",
+    "serve_stream",
+    "serve_structured_output",
+    "serve_tool_call",
+}
 REQUIRED_RELEASE_CANDIDATE_STAGE_GATES = {
     "actual_model_regression",
     "model_contract",
@@ -604,6 +614,7 @@ def validate_product_scenario_coverage(summary: dict[str, Any]) -> None:
         "product_sentinel.summary.scenarios length must match scenario_count",
     )
     scenario_types: set[str] = set()
+    product_scenarios: set[str] = set()
     for index, scenario in enumerate(scenarios):
         require(
             isinstance(scenario, dict),
@@ -619,10 +630,44 @@ def validate_product_scenario_coverage(summary: dict[str, Any]) -> None:
             f"product_sentinel.summary.scenarios[{index}].type must be non-empty",
         )
         scenario_types.add(scenario_type)
+        values = scenario.get("product_scenarios", [])
+        require(
+            isinstance(values, list),
+            f"product_sentinel.summary.scenarios[{index}].product_scenarios must be a list",
+        )
+        for value in values:
+            require(
+                isinstance(value, str) and value.strip(),
+                f"product_sentinel.summary.scenarios[{index}].product_scenarios entries must be non-empty",
+            )
+            product_scenarios.add(value)
     missing_types = sorted(REQUIRED_PRODUCT_SENTINEL_SCENARIO_TYPES - scenario_types)
     require(
         not missing_types,
         f"product_sentinel.summary.scenarios missing scenario types {missing_types}",
+    )
+    declared_required = set(
+        require_string_list(
+            summary.get("required_product_scenarios", []),
+            "product_sentinel.summary.required_product_scenarios",
+        )
+    )
+    require(
+        REQUIRED_PRODUCT_SCENARIOS <= declared_required,
+        "product_sentinel.summary.required_product_scenarios missing "
+        + str(sorted(REQUIRED_PRODUCT_SCENARIOS - declared_required)),
+    )
+    summary_product_scenarios = set(
+        require_string_list(
+            summary.get("product_scenarios", []),
+            "product_sentinel.summary.product_scenarios",
+        )
+    )
+    product_scenarios.update(summary_product_scenarios)
+    missing_product_scenarios = sorted(REQUIRED_PRODUCT_SCENARIOS - product_scenarios)
+    require(
+        not missing_product_scenarios,
+        f"product_sentinel.summary.product_scenarios missing {missing_product_scenarios}",
     )
 
 
@@ -1663,18 +1708,48 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
 
     product = root / "product"
     product_scenarios = [
-        {"name": "profile_run_serve", "type": "profile_artifact", "status": "pass"},
-        {"name": "profile_replay_link", "type": "profile_replay_link", "status": "pass"},
+        {
+            "name": "profile_run_serve",
+            "type": "profile_artifact",
+            "product_scenarios": ["run_multiturn", "run_first_token", "serve_chat"],
+            "status": "pass",
+        },
+        {
+            "name": "profile_replay_link",
+            "type": "profile_replay_link",
+            "product_scenarios": ["serve_concurrency_quality"],
+            "status": "pass",
+        },
         {"name": "resource_trace", "type": "resource_trace", "status": "pass"},
         {"name": "replay_normal", "type": "replay_bundle", "status": "pass"},
-        {"name": "replay_bad_output", "type": "replay_bundle", "status": "pass"},
+        {
+            "name": "replay_bad_output",
+            "type": "replay_bundle",
+            "product_scenarios": ["serve_structured_output"],
+            "status": "pass",
+        },
         {"name": "replay_oom_admission", "type": "replay_bundle", "status": "pass"},
         {"name": "replay_panic_error", "type": "replay_bundle", "status": "pass"},
-        {"name": "serve_stream_done_once_pass", "type": "sse_fixture", "status": "pass"},
+        {
+            "name": "serve_stream_done_once_pass",
+            "type": "sse_fixture",
+            "product_scenarios": ["serve_stream"],
+            "status": "pass",
+        },
         {"name": "serve_stream_missing_done_fail", "type": "sse_fixture", "status": "pass"},
         {"name": "serve_stream_duplicate_done_fail", "type": "sse_fixture", "status": "pass"},
-        {"name": "serve_stream_malformed_json_fail", "type": "sse_fixture", "status": "pass"},
-        {"name": "native_op_manifest", "type": "native_op_manifest", "status": "pass"},
+        {
+            "name": "serve_stream_malformed_json_fail",
+            "type": "sse_fixture",
+            "product_scenarios": ["serve_multiturn"],
+            "status": "pass",
+        },
+        {
+            "name": "native_op_manifest",
+            "type": "native_op_manifest",
+            "product_scenarios": ["serve_tool_call"],
+            "status": "pass",
+        },
     ]
     make_gate_manifest(
         product,
@@ -1688,6 +1763,8 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "failed": 0,
             "scenario_count": len(product_scenarios),
             "required_stage2_fixture_count": 12,
+            "required_product_scenarios": sorted(REQUIRED_PRODUCT_SCENARIOS),
+            "product_scenarios": sorted(REQUIRED_PRODUCT_SCENARIOS),
             "scenarios": product_scenarios,
             "failure_links": [
                 {
@@ -2276,6 +2353,49 @@ def run_selftest() -> dict[str, Any]:
             require(
                 "product_sentinel.summary.scenarios[0].status" in str(exc),
                 f"unexpected product scenario error: {exc}",
+            )
+        bad_product_required_scenario = root / "bad-product-required-scenario"
+        artifacts_bad_product_required_scenario = selftest_artifacts(
+            root / "bad-product-required-scenario-fixtures",
+            sha,
+        )
+        bad_product_required_summary_path = (
+            artifacts_bad_product_required_scenario["product"] / "product_backend_sentinel_summary.json"
+        )
+        bad_product_required_summary = read_json(bad_product_required_summary_path)
+        bad_product_required_summary["product_scenarios"] = [
+            value
+            for value in bad_product_required_summary["product_scenarios"]
+            if value != "serve_tool_call"
+        ]
+        for scenario in bad_product_required_summary["scenarios"]:
+            if isinstance(scenario, dict):
+                scenario["product_scenarios"] = [
+                    value
+                    for value in scenario.get("product_scenarios", [])
+                    if value != "serve_tool_call"
+                ]
+        write_json(bad_product_required_summary_path, bad_product_required_summary)
+        args_bad_product_required_scenario = argparse.Namespace(
+            out=bad_product_required_scenario,
+            resource_invariant=artifacts_bad_product_required_scenario["resource"],
+            change_impact=artifacts_bad_product_required_scenario["change"],
+            product_sentinel=artifacts_bad_product_required_scenario["product"],
+            model_contract=artifacts_bad_product_required_scenario["model"],
+            support_matrix_contract=artifacts_bad_product_required_scenario["support_matrix"],
+            observability_profile=artifacts_bad_product_required_scenario["observability"],
+            native_operator=artifacts_bad_product_required_scenario["native"],
+            actual_model_regression_summary=artifacts_bad_product_required_scenario["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_product_required_scenario)
+            raise AssertionError("missing required product sentinel scenario unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "product_sentinel.summary.product_scenarios missing" in str(exc),
+                f"unexpected required product scenario error: {exc}",
             )
         bad_support_contract_link = root / "bad-support-contract-link"
         artifacts_bad_support_contract_link = selftest_artifacts(
