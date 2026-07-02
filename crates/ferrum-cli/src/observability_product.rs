@@ -2,10 +2,11 @@ use chrono::{Duration, Utc};
 use clap::ValueEnum;
 use ferrum_types::{
     FerrumError, FerrumProfileEvent, MemorySnapshot, ProfileEntrypoint, ProfileEventKind,
-    ProfileStatus, ReplayReference, ResourceAction, ResourceTraceEvent, Result,
+    ProfileStatus, ReplayReference, ResourceAction, ResourceTraceEvent, Result, SamplingParams,
     OBSERVABILITY_PROFILE_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -54,11 +55,15 @@ pub struct ProductObservabilityConfig {
 pub struct ActualRunObservation {
     pub request_id: String,
     pub duration_us: u64,
+    pub sampling_params: SamplingParams,
+    pub prompt_token_count: Option<usize>,
     pub output_tokens: usize,
+    pub output_token_ids: Vec<u32>,
     pub chunk_count: usize,
     pub finish_reason: Option<String>,
     pub prompt_chars: usize,
     pub response_chars: usize,
+    pub response_text: String,
     pub memory: Option<crate::memory_profile::ProcessMemoryObservation>,
 }
 
@@ -169,15 +174,25 @@ pub fn write_synthetic_product_observability(
     }
     if let Some(dir) = &config.request_dump_dir {
         fs_create_dir_all(dir)?;
-        let request_path = dir.join("request.json");
-        let replay_path = dir.join("replay_command.txt");
-        write_json(
-            &request_path,
-            &request_dump(config, &request_id, &replay_command),
-        )?;
-        fs_write(&replay_path, format!("{replay_command}\n"))?;
-        written.push(request_path);
-        written.push(replay_path);
+        written.extend(write_replay_bundle(
+            dir,
+            config,
+            &request_id,
+            &replay_command,
+            ReplayBundleData {
+                request: request_dump(config, &request_id, &replay_command),
+                prompt_token_ids: Some(vec![101, 202, 303, 404]),
+                prompt_token_count: Some(4),
+                prompt_token_unavailable_reason: None,
+                sampling_params: Some(SamplingParams::greedy()),
+                backend: SYNTHETIC_BACKEND,
+                actual_model_smoke: false,
+                output_token_ids: Some(vec![909, 808]),
+                output_text: Some("synthetic ok"),
+                finish_reason: Some("stop"),
+                failure_kind: None,
+            },
+        )?);
     }
     Ok(written)
 }
@@ -192,7 +207,7 @@ pub fn write_actual_run_observability(
     config.validate()?;
     let replay_command = replay_command(config);
     let events = actual_run_events(config, observation, &replay_command);
-    write_actual_artifacts(config, &events, &observation.request_id, &replay_command)
+    write_actual_run_artifacts(config, &events, observation, &replay_command)
 }
 
 pub fn write_actual_serve_startup_observability(
@@ -214,6 +229,40 @@ pub fn write_actual_serve_startup_observability(
         &replay_command,
     );
     write_actual_artifacts(config, &events, &request_id, &replay_command)
+}
+
+fn write_actual_run_artifacts(
+    config: &ProductObservabilityConfig,
+    events: &[FerrumProfileEvent],
+    observation: &ActualRunObservation,
+    replay_command: &str,
+) -> Result<Vec<PathBuf>> {
+    let mut written =
+        write_actual_artifacts(config, events, &observation.request_id, replay_command)?;
+    if let Some(dir) = &config.request_dump_dir {
+        written.extend(write_replay_bundle(
+            dir,
+            config,
+            &observation.request_id,
+            replay_command,
+            ReplayBundleData {
+                request: actual_request_dump(config, &observation.request_id, replay_command),
+                prompt_token_ids: None,
+                prompt_token_count: observation.prompt_token_count,
+                prompt_token_unavailable_reason: Some(
+                    "rendered prompt token ids are not retained by run one-shot in WP9 L0",
+                ),
+                sampling_params: Some(observation.sampling_params.clone()),
+                backend: "actual",
+                actual_model_smoke: true,
+                output_token_ids: Some(observation.output_token_ids.clone()),
+                output_text: Some(&observation.response_text),
+                finish_reason: observation.finish_reason.as_deref(),
+                failure_kind: None,
+            },
+        )?);
+    }
+    Ok(written)
 }
 
 fn write_actual_artifacts(
@@ -247,15 +296,27 @@ fn write_actual_artifacts(
     }
     if let Some(dir) = &config.request_dump_dir {
         fs_create_dir_all(dir)?;
-        let request_path = dir.join("request.json");
-        let replay_path = dir.join("replay_command.txt");
-        write_json(
-            &request_path,
-            &actual_request_dump(config, request_id, replay_command),
-        )?;
-        fs_write(&replay_path, format!("{replay_command}\n"))?;
-        written.push(request_path);
-        written.push(replay_path);
+        written.extend(write_replay_bundle(
+            dir,
+            config,
+            request_id,
+            replay_command,
+            ReplayBundleData {
+                request: actual_request_dump(config, request_id, replay_command),
+                prompt_token_ids: None,
+                prompt_token_count: None,
+                prompt_token_unavailable_reason: Some(
+                    "startup or non-run request has no rendered prompt token dump in WP9 L0",
+                ),
+                sampling_params: None,
+                backend: "actual",
+                actual_model_smoke: true,
+                output_token_ids: Some(Vec::new()),
+                output_text: None,
+                finish_reason: None,
+                failure_kind: None,
+            },
+        )?);
     }
     Ok(written)
 }
@@ -805,6 +866,204 @@ fn actual_attrs(config: &ProductObservabilityConfig) -> BTreeMap<String, Value> 
     ])
 }
 
+struct ReplayBundleData<'a> {
+    request: serde_json::Value,
+    prompt_token_ids: Option<Vec<u32>>,
+    prompt_token_count: Option<usize>,
+    prompt_token_unavailable_reason: Option<&'a str>,
+    sampling_params: Option<SamplingParams>,
+    backend: &'a str,
+    actual_model_smoke: bool,
+    output_token_ids: Option<Vec<u32>>,
+    output_text: Option<&'a str>,
+    finish_reason: Option<&'a str>,
+    failure_kind: Option<&'a str>,
+}
+
+fn write_replay_bundle(
+    root: &Path,
+    config: &ProductObservabilityConfig,
+    request_id: &str,
+    replay_command: &str,
+    data: ReplayBundleData<'_>,
+) -> Result<Vec<PathBuf>> {
+    fs_create_dir_all(root)?;
+    let bundle_dir = root.join(request_id);
+    fs_create_dir_all(&bundle_dir)?;
+    let mut written = Vec::new();
+
+    let request_path = root.join("request.json");
+    let replay_path = root.join("replay_command.txt");
+    write_json(&request_path, &data.request)?;
+    fs_write(&replay_path, format!("{replay_command}\n"))?;
+    written.push(request_path);
+    written.push(replay_path);
+
+    let prompt_token_count = data
+        .prompt_token_count
+        .or_else(|| data.prompt_token_ids.as_ref().map(Vec::len));
+    let output_token_count = data.output_token_ids.as_ref().map(Vec::len).unwrap_or(0);
+    let prompt_tokens = json!({
+        "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        "request_id": request_id,
+        "model": config.model,
+        "tokenizer_or_model": config.model,
+        "token_ids": data.prompt_token_ids,
+        "token_count": prompt_token_count,
+        "unavailable_reason": data.prompt_token_unavailable_reason,
+        "sanitized": true
+    });
+    let output_text = data.output_text.unwrap_or("");
+    let output_scan = bad_output_scan(request_id, output_text, data.failure_kind);
+    let sampling_unavailable_reason = if data.sampling_params.is_some() {
+        Value::Null
+    } else {
+        json!("sampling params unavailable for this replay bundle kind in WP9 L0")
+    };
+    let output_text_body = if data.actual_model_smoke && config.model != SYNTHETIC_MODEL {
+        format!(
+            "[redacted actual output]\nsha256={}\nchars={}\n",
+            sha256_hex(output_text.as_bytes()),
+            output_text.chars().count()
+        )
+    } else {
+        format!("{output_text}\n")
+    };
+    let files = [
+        ("request.json", data.request),
+        ("prompt_token_ids.json", prompt_tokens),
+        (
+            "sampling_params.json",
+            json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "sampling_params": data.sampling_params,
+                "unavailable_reason": sampling_unavailable_reason
+            }),
+        ),
+        (
+            "runtime_effective_config.json",
+            json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "entrypoint": entrypoint_label(config.entrypoint),
+                "profile_detail": config.profile_detail.as_str(),
+                "profile_sample_rate": config.profile_sample_rate,
+                "profile_jsonl": config.profile_jsonl.as_ref().map(|path| path.to_string_lossy().to_string()),
+                "memory_profile_jsonl": config.memory_profile_jsonl.as_ref().map(|path| path.to_string_lossy().to_string()),
+                "scheduler_trace_jsonl": config.scheduler_trace_jsonl.as_ref().map(|path| path.to_string_lossy().to_string()),
+                "request_dump_dir": Some(root.to_string_lossy().to_string()),
+                "sanitized": true
+            }),
+        ),
+        (
+            "backend_selection.json",
+            json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "backend": data.backend,
+                "model": config.model,
+                "actual_model_smoke": data.actual_model_smoke
+            }),
+        ),
+        (
+            "output_token_ids.json",
+            json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "token_ids": data.output_token_ids.unwrap_or_default(),
+                "token_count": output_token_count,
+                "finish_reason": data.finish_reason
+            }),
+        ),
+        ("bad_output_scan.json", output_scan),
+        (
+            "replay.command.json",
+            json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "entrypoint": entrypoint_label(config.entrypoint),
+                "command": replay_command,
+                "argv": replay_command_args(config),
+                "bundle_dir": bundle_dir.to_string_lossy(),
+                "sanitized": true
+            }),
+        ),
+    ];
+    for (name, value) in files {
+        let path = bundle_dir.join(name);
+        write_json(&path, &value)?;
+        written.push(path);
+    }
+    let output_text_path = bundle_dir.join("output_text.txt");
+    fs_write(&output_text_path, output_text_body)?;
+    written.push(output_text_path);
+    Ok(written)
+}
+
+fn bad_output_scan(request_id: &str, text: &str, failure_kind: Option<&str>) -> serde_json::Value {
+    let mut reasons = Vec::new();
+    let mut first_span: Option<serde_json::Value> = None;
+    for (needle, reason) in [
+        ("<unk>", "reserved_token"),
+        ("[PAD", "reserved_token"),
+        ("<pad>", "reserved_token"),
+        ("<|endoftext|>", "reserved_token"),
+        ("<|im_start|>", "reserved_token"),
+        ("<|im_end|>", "reserved_token"),
+        ("<|reserved_special_token", "reserved_token"),
+    ] {
+        if let Some(index) = text.find(needle) {
+            reasons.push(reason);
+            first_span.get_or_insert_with(|| {
+                json!({
+                    "byte_start": index,
+                    "byte_end": index + needle.len(),
+                    "text": needle,
+                    "reason": reason
+                })
+            });
+        }
+    }
+    if let Some(index) = first_mojibake_index(text) {
+        reasons.push("mojibake");
+        first_span.get_or_insert_with(|| {
+            json!({
+                "byte_start": index,
+                "byte_end": index + 1,
+                "reason": "mojibake"
+            })
+        });
+    }
+    reasons.sort_unstable();
+    reasons.dedup();
+    let bad_output = !reasons.is_empty();
+    json!({
+        "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        "request_id": request_id,
+        "bad_output": bad_output,
+        "bad_text_count": if bad_output { 1 } else { 0 },
+        "reasons": reasons,
+        "first_bad_text_span": first_span,
+        "failure_kind": failure_kind,
+        "output_chars": text.chars().count(),
+        "output_sha256": sha256_hex(text.as_bytes())
+    })
+}
+
+fn first_mojibake_index(text: &str) -> Option<usize> {
+    ["\u{00c3}\u{00a9}", "\u{00c2}\u{00a9}", "\u{00e2}\u{20ac}"]
+        .iter()
+        .filter_map(|needle| text.find(needle))
+        .min()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 fn request_dump(
     config: &ProductObservabilityConfig,
     request_id: &str,
@@ -882,6 +1141,14 @@ fn actual_request_dump(
 }
 
 fn replay_command(config: &ProductObservabilityConfig) -> String {
+    replay_command_args(config)
+        .iter()
+        .map(|part| shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn replay_command_args(config: &ProductObservabilityConfig) -> Vec<String> {
     let mut parts = vec![
         "cargo".to_string(),
         "run".to_string(),
@@ -912,10 +1179,6 @@ fn replay_command(config: &ProductObservabilityConfig) -> String {
         config.request_dump_dir.as_ref(),
     );
     parts
-        .iter()
-        .map(|part| shell_quote(part))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn push_path_arg(parts: &mut Vec<String>, flag: &str, path: Option<&PathBuf>) {
@@ -1037,12 +1300,26 @@ mod tests {
             1.0,
         );
         let written = write_synthetic_product_observability(&config).unwrap();
-        assert_eq!(written.len(), 5);
+        assert!(written.len() >= 14);
         assert!(root.join("profile.jsonl").is_file());
         assert!(root.join("memory.jsonl").is_file());
         assert!(root.join("scheduler.jsonl").is_file());
         assert!(root.join("request_dump/request.json").is_file());
         assert!(root.join("request_dump/replay_command.txt").is_file());
+        let request_dump_root = root.join("request_dump");
+        let bundle_dir = fs::read_dir(&request_dump_root)
+            .unwrap()
+            .flatten()
+            .find_map(|entry| entry.path().is_dir().then_some(entry.path()))
+            .expect("request-id replay bundle directory should exist");
+        assert!(bundle_dir.join("prompt_token_ids.json").is_file());
+        assert!(bundle_dir.join("sampling_params.json").is_file());
+        assert!(bundle_dir.join("runtime_effective_config.json").is_file());
+        assert!(bundle_dir.join("backend_selection.json").is_file());
+        assert!(bundle_dir.join("output_token_ids.json").is_file());
+        assert!(bundle_dir.join("output_text.txt").is_file());
+        assert!(bundle_dir.join("bad_output_scan.json").is_file());
+        assert!(bundle_dir.join("replay.command.json").is_file());
         fs::remove_dir_all(root).ok();
     }
 }

@@ -602,7 +602,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             id: RequestId(Uuid::new_v4()),
             model_id: ferrum_types::ModelId(model_id.clone()),
             prompt: plan.prompt,
-            sampling_params: plan.sampling_params,
+            sampling_params: plan.sampling_params.clone(),
             stream: false,
             priority: Priority::Normal,
             client_id: None,
@@ -624,6 +624,11 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             .then(|| memory_sampler.observe(memory_before))
             .flatten();
         let tokens = response.tokens.len();
+        let output_token_ids = response
+            .tokens
+            .iter()
+            .map(|token| token.get())
+            .collect::<Vec<_>>();
         let content = display_response_text(&response.text);
         let chunk_count = usize::from(!content.is_empty());
         let finish_reason = Some(response.finish_reason);
@@ -664,11 +669,15 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             &crate::observability_product::ActualRunObservation {
                 request_id: profile_request_id,
                 duration_us: (elapsed * 1_000_000.0).max(0.0) as u64,
+                sampling_params: plan.sampling_params.clone(),
+                prompt_token_count: plan.prompt_tokens,
                 output_tokens: tokens,
+                output_token_ids,
                 chunk_count,
                 finish_reason: finish_reason.map(finish_reason_str).map(str::to_string),
                 prompt_chars,
                 response_chars: content.chars().count(),
+                response_text: content.clone(),
                 memory,
             },
         )?;

@@ -407,6 +407,33 @@ def run_resource_invariant(out: Path, timeout: int) -> dict[str, Any]:
     return {"traces": [str(trace) for trace in traces], "out": str(out / "resource_invariant")}
 
 
+def run_replay_bundle_gate(out: Path, timeout: int) -> dict[str, Any]:
+    bundles = [
+        out / "run/request_dump",
+        out / "serve/request_dump",
+    ]
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "scripts/release/request_replay_bundle_gate.py"),
+        "--out",
+        str(out / "request_replay_bundle"),
+        "--execute-replay",
+        "--timeout",
+        str(timeout),
+    ]
+    for bundle in bundles:
+        cmd.extend(["--bundle-dir", str(bundle)])
+    proc = run_checked(
+        cmd,
+        cwd=REPO_ROOT,
+        timeout=timeout,
+        log_path=out / "logs/request_replay_bundle.json",
+    )
+    if "REQUEST REPLAY BUNDLE PASS" not in proc.stdout:
+        raise SmokeError("request replay bundle gate did not print PASS")
+    return {"bundles": [str(bundle) for bundle in bundles], "out": str(out / "request_replay_bundle")}
+
+
 def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
@@ -416,6 +443,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     serve_profiles = validate_profile_group(out / "serve", "serve")
     analyzer = run_analyzer(out, args.timeout)
     resource_invariant = run_resource_invariant(out, args.timeout)
+    replay_bundle = run_replay_bundle_gate(out, args.timeout)
     summary = {
         "schema_version": SCHEMA_VERSION,
         "status": "pass",
@@ -429,6 +457,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         },
         "analyzer": analyzer,
         "resource_invariant": resource_invariant,
+        "request_replay_bundle": replay_bundle,
     }
     write_json(out / "product_observability_l1_smoke_summary.json", summary)
     write_json(
@@ -443,6 +472,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
             "summary": str(out / "product_observability_l1_smoke_summary.json"),
             "profile_paths": analyzer["profiles"],
             "resource_invariant": resource_invariant,
+            "request_replay_bundle": replay_bundle,
         },
     )
     return summary
