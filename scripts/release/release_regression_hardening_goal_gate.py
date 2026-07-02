@@ -959,6 +959,10 @@ def validate_native_operator(root: Path, expected_sha: str) -> dict[str, Any]:
     require(isinstance(third_party, dict), "native_operator.summary.unregistered_third_party_source must be an object")
     require(bulk.get("count") == 0, "native_operator.summary.bulk_source.count must be 0")
     require(third_party.get("count") == 0, "native_operator.summary.unregistered_third_party_source.count must be 0")
+    validate_native_dev_build_audit(
+        summary.get("normal_cuda_dev_build"),
+        "native_operator.summary.normal_cuda_dev_build",
+    )
     manifests = summary.get("manifests")
     require(isinstance(manifests, list) and manifests, "native_operator.summary.manifests must be non-empty")
     operators = set()
@@ -1006,12 +1010,33 @@ def validate_native_operator(root: Path, expected_sha: str) -> dict[str, Any]:
         selftest_summary.get("python_runtime_dependency") == "none",
         "native_operator.summary.selftest_summary.python_runtime_dependency must be none",
     )
+    validate_native_dev_build_audit(
+        selftest_summary.get("normal_cuda_dev_build"),
+        "native_operator.summary.selftest_summary.normal_cuda_dev_build",
+    )
     stage["summary"] = summary
     stage["fa2_source_removal_inventory"] = {
         "bulk_source": bulk,
         "unregistered_third_party_source": third_party,
     }
     return stage
+
+
+def validate_native_dev_build_audit(value: Any, label: str) -> None:
+    require(isinstance(value, dict), f"{label} must be an object")
+    require(value.get("status") == "pass", f"{label}.status must be pass")
+    require(value.get("source_compile_count") == 0, f"{label}.source_compile_count must be 0")
+    matches = value.get("source_compile_matches")
+    require(isinstance(matches, list) and not matches, f"{label}.source_compile_matches must be empty")
+    require(
+        value.get("fa2_source_feature_behavior") == "obsolete_warning_only",
+        f"{label}.fa2_source_feature_behavior must be obsolete_warning_only",
+    )
+    inspected_files = require_string_list(value.get("inspected_files", []), f"{label}.inspected_files")
+    require(
+        "crates/ferrum-kernels/build.rs" in inspected_files,
+        f"{label}.inspected_files must include crates/ferrum-kernels/build.rs",
+    )
 
 
 def artifact_git_sha(artifact: dict[str, Any], label: str, expected_sha: str) -> None:
@@ -1917,9 +1942,23 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
                     "operator_mismatch",
                 ],
                 "python_runtime_dependency": "none",
+                "normal_cuda_dev_build": {
+                    "status": "pass",
+                    "source_compile_count": 0,
+                    "source_compile_matches": [],
+                    "fa2_source_feature_behavior": "obsolete_warning_only",
+                    "inspected_files": ["crates/ferrum-kernels/build.rs"],
+                },
             },
             "bulk_source": {"count": 0, "samples": []},
             "unregistered_third_party_source": {"count": 0, "samples": []},
+            "normal_cuda_dev_build": {
+                "status": "pass",
+                "source_compile_count": 0,
+                "source_compile_matches": [],
+                "fa2_source_feature_behavior": "obsolete_warning_only",
+                "inspected_files": ["crates/ferrum-kernels/build.rs"],
+            },
         },
     )
 
@@ -2138,6 +2177,45 @@ def run_selftest() -> dict[str, Any]:
             require(
                 "native_operator.summary.selftest_summary.pass_fixtures" in str(exc),
                 f"unexpected native-op selftest error: {exc}",
+            )
+        bad_native_dev_build = root / "bad-native-dev-build"
+        artifacts_bad_native_dev_build = selftest_artifacts(
+            root / "bad-native-dev-build-fixtures",
+            sha,
+        )
+        bad_native_dev_build_summary_path = (
+            artifacts_bad_native_dev_build["native"] / "native_operator_artifact_summary.json"
+        )
+        bad_native_dev_build_summary = read_json(bad_native_dev_build_summary_path)
+        bad_native_dev_build_summary["normal_cuda_dev_build"]["source_compile_count"] = 1
+        bad_native_dev_build_summary["normal_cuda_dev_build"]["source_compile_matches"] = [
+            {
+                "pattern": "compile_fa2",
+                "file": "crates/ferrum-kernels/build.rs",
+                "line": "275",
+            }
+        ]
+        write_json(bad_native_dev_build_summary_path, bad_native_dev_build_summary)
+        args_bad_native_dev_build = argparse.Namespace(
+            out=bad_native_dev_build,
+            resource_invariant=artifacts_bad_native_dev_build["resource"],
+            change_impact=artifacts_bad_native_dev_build["change"],
+            product_sentinel=artifacts_bad_native_dev_build["product"],
+            model_contract=artifacts_bad_native_dev_build["model"],
+            support_matrix_contract=artifacts_bad_native_dev_build["support_matrix"],
+            observability_profile=artifacts_bad_native_dev_build["observability"],
+            native_operator=artifacts_bad_native_dev_build["native"],
+            actual_model_regression_summary=artifacts_bad_native_dev_build["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_native_dev_build)
+            raise AssertionError("native-op source compile audit regression unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "normal_cuda_dev_build.source_compile_count" in str(exc),
+                f"unexpected native-op dev-build audit error: {exc}",
             )
         bad_product = root / "bad-product"
         artifacts_bad_product = selftest_artifacts(root / "bad-product-fixtures", sha)
