@@ -222,6 +222,63 @@ def parse_sse(body: str) -> dict[str, Any]:
     }
 
 
+def live_server_replay_bundle_dirs(request_dump_root: Path) -> list[Path]:
+    bundles: list[Path] = []
+    for path in sorted(request_dump_root.iterdir()):
+        replay_path = path / "replay.command.json"
+        if not replay_path.is_file():
+            continue
+        replay = json.loads(replay_path.read_text(encoding="utf-8"))
+        if replay.get("requires_running_server") is True:
+            bundles.append(path)
+    return bundles
+
+
+def run_live_server_replay_bundle_gate(
+    base_url: str,
+    request_dump_root: Path,
+    out: Path,
+    timeout: int,
+) -> dict[str, Any]:
+    bundles = live_server_replay_bundle_dirs(request_dump_root)
+    if not bundles:
+        raise SmokeError(f"no live-server replay bundles found under {request_dump_root}")
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "scripts/release/request_replay_bundle_gate.py"),
+        "--out",
+        str(out / "serve_live_replay_bundle"),
+        "--execute-replay",
+        "--live-server-base-url",
+        base_url,
+        "--timeout",
+        str(timeout),
+    ]
+    for bundle in bundles:
+        cmd.extend(["--bundle-dir", str(bundle)])
+    proc = run_checked(
+        cmd,
+        cwd=REPO_ROOT,
+        timeout=timeout,
+        log_path=out / "logs/serve_live_replay_bundle.json",
+    )
+    if "REQUEST REPLAY BUNDLE PASS" not in proc.stdout:
+        raise SmokeError("live-server request replay bundle gate did not print PASS")
+    summary_path = out / "serve_live_replay_bundle/request_replay_bundle_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if summary.get("replay_execution_count") != len(bundles):
+        raise SmokeError(
+            "live-server replay execution count mismatch: "
+            f"{summary.get('replay_execution_count')} != {len(bundles)}"
+        )
+    return {
+        "out": str(out / "serve_live_replay_bundle"),
+        "bundles": [str(bundle) for bundle in bundles],
+        "bundle_count": len(bundles),
+        "replay_execution_count": summary.get("replay_execution_count"),
+    }
+
+
 def serve_actual(args: argparse.Namespace, out: Path) -> dict[str, Any]:
     root = out / "serve"
     port = free_port()
@@ -282,11 +339,18 @@ def serve_actual(args: argparse.Namespace, out: Path) -> dict[str, Any]:
                 raise SmokeError("serve stream emitted no content")
             if sse["malformed"] != 0:
                 raise SmokeError(f"serve stream malformed SSE JSON count={sse['malformed']}")
+            live_replay = run_live_server_replay_bundle_gate(
+                base_url,
+                root / "request_dump",
+                out,
+                args.timeout,
+            )
             return {
                 "status": "pass",
                 "health": health,
                 "nonstream_content_preview": content[:200],
                 "stream": sse,
+                "live_replay": live_replay,
             }
         finally:
             proc.terminate()
