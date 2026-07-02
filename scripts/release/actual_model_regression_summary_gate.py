@@ -254,13 +254,22 @@ def validate_native_operator_selection(
     if selected:
         require(cuda_artifact is not None, "native operator selected path requires --native-operator-cuda-artifact")
         artifact = load_artifact(cuda_artifact)
-        require(artifact.get("status") == "pass", "native_operator_selection.cuda_artifact.status must be pass")
-        require_git_sha(artifact, "native_operator_selection.cuda_artifact", expected_sha)
-        require(artifact.get("backend") == "cuda", "native_operator_selection.cuda_artifact.backend must be cuda")
+        label = "native_operator_selection.cuda_artifact"
+        require(artifact.get("status") == "pass", f"{label}.status must be pass")
+        require_git_sha(artifact, label, expected_sha)
+        require(artifact.get("backend") == "cuda", f"{label}.backend must be cuda")
+        pass_line = pass_line_is_real(artifact.get("pass_line"), label)
+        artifact_dir = resolve_artifact_dir(
+            require_string(artifact, "artifact_dir", label),
+            artifact_source=cuda_artifact,
+            label=label,
+        )
         return {
             "status": "pass",
             "selected": True,
-            "cuda_artifact": str(cuda_artifact),
+            "cuda_artifact": str(cuda_artifact.resolve()),
+            "cuda_artifact_dir": artifact_dir,
+            "cuda_artifact_pass_line": pass_line,
             "git_sha": artifact["git_sha"],
         }
     require(
@@ -395,6 +404,8 @@ def make_l2_artifact(
 
 
 def make_native_artifact(root: Path, sha: str) -> Path:
+    artifact_dir = root / "native_cuda_artifact"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
     path = root / "native_cuda.json"
     write_json(
         path,
@@ -403,7 +414,7 @@ def make_native_artifact(root: Path, sha: str) -> Path:
             "status": "pass",
             "backend": "cuda",
             "git_sha": sha,
-            "artifact_dir": "fixtures/native-cuda",
+            "artifact_dir": str(artifact_dir),
             "pass_line": "NATIVE OP ARTIFACT PASS: fixtures/native-cuda",
         },
     )
@@ -616,6 +627,26 @@ def run_selftest() -> dict[str, Any]:
                 "cuda_artifact" in message or "cuda-artifact" in message,
                 f"unexpected native selection failure: {exc}",
             )
+        bad_native_dir = root / "bad_native_dir.json"
+        bad_native_data = read_json(native)
+        bad_native_data["artifact_dir"] = str(root / "missing-native-artifact-dir")
+        write_json(bad_native_dir, bad_native_data)
+        try:
+            run_gate(
+                argparse.Namespace(
+                    out=root / "bad-native-artifact-dir",
+                    git_sha=sha,
+                    metal_l2_artifact=metal,
+                    cuda_l2_artifact=cuda,
+                    native_operator_selected=True,
+                    native_operator_not_selected=False,
+                    native_operator_cuda_artifact=bad_native_dir,
+                    native_operator_non_selected_reason=None,
+                )
+            )
+            raise AssertionError("selected native operator with missing artifact_dir unexpectedly passed")
+        except ActualModelGateError as exc:
+            require("artifact_dir" in str(exc), f"unexpected native artifact_dir failure: {exc}")
         return {"schema_version": SCHEMA_VERSION, "status": "pass"}
 
 
