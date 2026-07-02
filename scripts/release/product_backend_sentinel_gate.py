@@ -178,6 +178,106 @@ def profile_replay_link_result(scenario_dir: Path) -> dict[str, Any]:
     }
 
 
+def error_kind_for_fixture(fixture_kind: str) -> str:
+    if fixture_kind == "bad_output":
+        return "bad_text"
+    if fixture_kind == "oom_admission":
+        return "oom"
+    if fixture_kind == "panic_error":
+        return "panic"
+    return "none"
+
+
+def write_blocker_profile_fixture(
+    profile: Path,
+    *,
+    fixture_kind: str,
+    failure_kind: str,
+    bundle_dir: str,
+) -> None:
+    events = []
+    if fixture_kind == "oom_admission":
+        events.append(
+            {
+                "schema_version": 1,
+                "event_id": "evt-oom-admission-capacity",
+                "request_id": "req-fixture",
+                "entrypoint": "run",
+                "backend": "synthetic",
+                "phase": "admission",
+                "event_kind": "instant",
+                "timestamp": "2026-07-02T00:00:00Z",
+                "status": "ok",
+                "model": "synthetic/no-weight",
+                "resource": {
+                    "owner_kind": "request",
+                    "owner_id": "req-fixture",
+                    "resource_kind": "kv_block",
+                    "action": "reject",
+                    "capacity": 8,
+                    "reason": "insufficient_kv_capacity",
+                },
+                "attributes": {
+                    "profile_detail": "basic",
+                    "profile_schema_fingerprint": "obs-v1",
+                },
+            }
+        )
+    events.append(
+        {
+            "schema_version": 1,
+            "event_id": f"evt-{fixture_kind.replace('_', '-')}-blocker",
+            "request_id": "req-fixture",
+            "entrypoint": "run",
+            "backend": "synthetic",
+            "phase": "decode" if fixture_kind != "oom_admission" else "admission",
+            "event_kind": "error",
+            "timestamp": "2026-07-02T00:00:01Z",
+            "status": "failure",
+            "model": "synthetic/no-weight",
+            "error": {
+                "kind": error_kind_for_fixture(fixture_kind),
+                "message": f"synthetic {failure_kind} blocker fixture",
+                "blocking": fixture_kind == "panic_error",
+            },
+            "replay": {
+                "command": "ferrum run synthetic/no-weight",
+                "bundle_dir": bundle_dir,
+            },
+            "attributes": {
+                "first_failure_event": True,
+                "profile_detail": "basic",
+                "profile_schema_fingerprint": "obs-v1",
+            },
+        }
+    )
+    profile.write_text(
+        "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+
+def failure_link_from_blocker(
+    *,
+    scenario_name: str | None,
+    fixture_kind: str,
+    profile: Path,
+    command: dict[str, Any],
+    bundle: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "scenario_name": scenario_name,
+        "fixture_kind": fixture_kind,
+        "failure_kind": bundle.get("failure_kind"),
+        "profile_path": str(profile),
+        "profile_event_id": command.get("event_id"),
+        "request_id": command.get("request_id"),
+        "replay_command": command.get("command"),
+        "bundle_dir": str((profile.parent / str(command.get("bundle_dir") or "")).resolve()),
+        "failure_diagnostics": bundle.get("failure_diagnostics"),
+    }
+
+
 def resource_trace_result(scenario: dict[str, Any], manifest_dir: Path) -> dict[str, Any]:
     path_value = scenario.get("trace_jsonl")
     if not isinstance(path_value, str) or not path_value.strip():
@@ -215,6 +315,28 @@ def replay_bundle_result(scenario: dict[str, Any], scenario_dir: Path) -> dict[s
     make_bundle(bundle_root, **kwargs)
     bundles = validate_bundle_root(bundle_root)
     require(bundles, "replay fixture produced no bundles")
+    failure_link = None
+    if fixture_kind != "normal":
+        profile = scenario_dir / "profile.jsonl"
+        write_blocker_profile_fixture(
+            profile,
+            fixture_kind=fixture_kind,
+            failure_kind=fixture_kind,
+            bundle_dir="bundle",
+        )
+        events_by_path = load_and_validate_profiles([profile])
+        profile_summary = summarize_events([profile], events_by_path)
+        replay_bundles = validate_replay_bundles(events_by_path)
+        commands = profile_summary.get("replay_commands", [])
+        require(commands, f"{fixture_kind} blocker profile did not produce a replay command")
+        require(replay_bundles, f"{fixture_kind} blocker profile did not validate replay bundle")
+        failure_link = failure_link_from_blocker(
+            scenario_name=scenario.get("name"),
+            fixture_kind=fixture_kind,
+            profile=profile,
+            command=commands[0],
+            bundle=bundles[0],
+        )
     return {
         "status": "pass",
         "fixture_kind": fixture_kind,
@@ -223,6 +345,7 @@ def replay_bundle_result(scenario: dict[str, Any], scenario_dir: Path) -> dict[s
         "failure_kinds": sorted(
             {str(bundle.get("failure_kind")) for bundle in bundles if bundle.get("failure_kind")}
         ),
+        "failure_link": failure_link,
     }
 
 
@@ -410,6 +533,34 @@ def scenario_summary_result(summary_path: Path) -> dict[str, Any]:
     }
 
 
+def collect_failure_links(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    links = []
+    for result in results:
+        link = result.get("failure_link")
+        if isinstance(link, dict):
+            links.append(link)
+    return links
+
+
+def validate_failure_links(failure_links: list[dict[str, Any]]) -> None:
+    required = {"bad_output", "oom_admission", "panic_error"}
+    seen: set[str] = set()
+    for index, link in enumerate(failure_links):
+        context = f"failure_links[{index}]"
+        failure_kind = link.get("failure_kind")
+        require(isinstance(failure_kind, str) and failure_kind.strip(), f"{context}.failure_kind is required")
+        seen.add(failure_kind)
+        for key in ("profile_event_id", "request_id", "replay_command", "bundle_dir"):
+            require(isinstance(link.get(key), str) and link[key].strip(), f"{context}.{key} is required")
+        if failure_kind != "bad_output":
+            require(
+                isinstance(link.get("failure_diagnostics"), str) and link["failure_diagnostics"].strip(),
+                f"{context}.failure_diagnostics is required for {failure_kind}",
+            )
+    missing = sorted(required - seen)
+    require(not missing, f"failure_links missing required blocker classes: {missing}")
+
+
 def run_scenario(scenario: dict[str, Any], manifest_dir: Path, scenario_dir: Path) -> dict[str, Any]:
     typ = str(scenario["type"])
     if typ == "profile_artifact":
@@ -470,6 +621,9 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     if args.scenario_summary is not None:
         scenario_summary = scenario_summary_result(args.scenario_summary)
         write_json(out / "scenario_summary_result.json", scenario_summary)
+    failure_links = collect_failure_links(results)
+    if not failures:
+        validate_failure_links(failure_links)
     status = "fail" if failures else "pass"
     ended_at = int(time.time())
     dirty_files = git_value(["status", "--short"], default="").splitlines()
@@ -483,6 +637,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         "required_stage2_fixture_count": required_count,
         "failed": len(failures),
         "scenarios": results,
+        "failure_links": failure_links,
         "actual_smoke": actual_smoke,
         "scenario_summary": scenario_summary,
         "git_sha": git_value(["rev-parse", "HEAD"]),
@@ -588,6 +743,7 @@ def run_selftest() -> None:
             raise AssertionError(summary)
         if summary.get("scenario_count") != REQUIRED_STAGE2_FIXTURES:
             raise AssertionError(summary)
+        validate_failure_links(summary.get("failure_links") or [])
         scenario_summary = make_scenario_summary_fixture(temp / "scenario-summary-fixture")
         scenario_out = temp / "scenario-out"
         scenario_gate_summary = run_gate(
@@ -600,6 +756,7 @@ def run_selftest() -> None:
         )
         if scenario_gate_summary.get("scenario_summary", {}).get("status") != "pass":
             raise AssertionError(scenario_gate_summary)
+        validate_failure_links(scenario_gate_summary.get("failure_links") or [])
     finally:
         shutil.rmtree(temp, ignore_errors=True)
 

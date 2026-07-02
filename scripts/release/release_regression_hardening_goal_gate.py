@@ -219,6 +219,30 @@ def validate_product_sentinel(root: Path, expected_sha: str) -> dict[str, Any]:
     require(summary.get("failed") == 0, "product_sentinel.summary.failed must be 0")
     required = summary.get("required_stage2_fixture_count")
     require(isinstance(required, int) and required >= 12, "product_sentinel.summary must cover >=12 stage-2 fixtures")
+    failure_links = summary.get("failure_links")
+    require(isinstance(failure_links, list), "product_sentinel.summary.failure_links must be a list")
+    required_failure_kinds = {"bad_output", "oom_admission", "panic_error"}
+    seen_failure_kinds = set()
+    for index, link in enumerate(failure_links):
+        require(isinstance(link, dict), f"product_sentinel.summary.failure_links[{index}] must be an object")
+        failure_kind = link.get("failure_kind")
+        require(
+            isinstance(failure_kind, str) and failure_kind.strip(),
+            f"product_sentinel.summary.failure_links[{index}].failure_kind must be non-empty",
+        )
+        seen_failure_kinds.add(failure_kind)
+        for key in ("profile_event_id", "request_id", "replay_command", "bundle_dir"):
+            require(
+                isinstance(link.get(key), str) and link[key].strip(),
+                f"product_sentinel.summary.failure_links[{index}].{key} must be non-empty",
+            )
+        if failure_kind != "bad_output":
+            require(
+                isinstance(link.get("failure_diagnostics"), str) and link["failure_diagnostics"].strip(),
+                f"product_sentinel.summary.failure_links[{index}].failure_diagnostics must be non-empty",
+            )
+    missing = sorted(required_failure_kinds - seen_failure_kinds)
+    require(not missing, f"product_sentinel.summary.failure_links missing {missing}")
     stage["summary"] = summary
     return stage
 
@@ -560,6 +584,32 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "scenario_count": 12,
             "required_stage2_fixture_count": 12,
             "scenarios": [],
+            "failure_links": [
+                {
+                    "failure_kind": "bad_output",
+                    "profile_event_id": "evt-bad-output-blocker",
+                    "request_id": "req-fixture",
+                    "replay_command": "ferrum run synthetic/no-weight",
+                    "bundle_dir": "fixtures/bad-output",
+                    "failure_diagnostics": None,
+                },
+                {
+                    "failure_kind": "oom_admission",
+                    "profile_event_id": "evt-oom-admission-blocker",
+                    "request_id": "req-fixture",
+                    "replay_command": "ferrum run synthetic/no-weight",
+                    "bundle_dir": "fixtures/oom-admission",
+                    "failure_diagnostics": "fixtures/oom-admission/failure_diagnostics.json",
+                },
+                {
+                    "failure_kind": "panic_error",
+                    "profile_event_id": "evt-panic-error-blocker",
+                    "request_id": "req-fixture",
+                    "replay_command": "ferrum run synthetic/no-weight",
+                    "bundle_dir": "fixtures/panic-error",
+                    "failure_diagnostics": "fixtures/panic-error/failure_diagnostics.json",
+                },
+            ],
         },
     )
 
@@ -747,6 +797,34 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("bulk source regression unexpectedly passed final gate")
         except GoalGateError as exc:
             require("bulk_source.count" in str(exc), f"unexpected bulk source error: {exc}")
+        bad_product = root / "bad-product"
+        artifacts_bad_product = selftest_artifacts(root / "bad-product-fixtures", sha)
+        bad_product_summary = read_json(
+            artifacts_bad_product["product"] / "product_backend_sentinel_summary.json"
+        )
+        bad_product_summary["failure_links"] = []
+        write_json(
+            artifacts_bad_product["product"] / "product_backend_sentinel_summary.json",
+            bad_product_summary,
+        )
+        args_bad_product = argparse.Namespace(
+            out=bad_product,
+            resource_invariant=artifacts_bad_product["resource"],
+            change_impact=artifacts_bad_product["change"],
+            product_sentinel=artifacts_bad_product["product"],
+            model_contract=artifacts_bad_product["model"],
+            support_matrix_contract=artifacts_bad_product["support_matrix"],
+            observability_profile=artifacts_bad_product["observability"],
+            native_operator=artifacts_bad_product["native"],
+            actual_model_regression_summary=artifacts_bad_product["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_product)
+            raise AssertionError("missing product failure links unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require("failure_links missing" in str(exc), f"unexpected product sentinel error: {exc}")
         missing_actual = argparse.Namespace(
             **{
                 **args.__dict__,
