@@ -1,0 +1,4 @@
+{"scenario":"capacity_overcommit","owner_kind":"request","owner_id":"req-overcommit-1","resource_kind":"request_slot","action":"request_open","capacity":2}
+{"scenario":"capacity_overcommit","owner_kind":"request","owner_id":"req-overcommit-2","resource_kind":"request_slot","action":"request_open","capacity":2}
+{"scenario":"capacity_overcommit","owner_kind":"request","owner_id":"req-overcommit-1","resource_kind":"kv_block","action":"reserve","amount":1,"before":1,"after":0,"capacity":1}
+{"scenario":"capacity_overcommit","owner_kind":"request","owner_id":"req-overcommit-2","resource_kind":"kv_block","action":"reserve","amount":1,"before":0,"after":-1,"capacity":1}

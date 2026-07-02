@@ -1,0 +1,4 @@
+{"scenario":"oom_prevented_by_admission","owner_kind":"request","owner_id":"req-oom-prevented","resource_kind":"request_slot","action":"request_open","capacity":1}
+{"scenario":"oom_prevented_by_admission","owner_kind":"request","owner_id":"req-oom-prevented","resource_kind":"backend_workspace","action":"capacity_snapshot","capacity":0}
+{"scenario":"oom_prevented_by_admission","owner_kind":"request","owner_id":"req-oom-prevented","resource_kind":"backend_workspace","action":"reject","reason":"admission_prevented_cuda_oom","capacity":0}
+{"scenario":"oom_prevented_by_admission","owner_kind":"request","owner_id":"req-oom-prevented","resource_kind":"request_slot","action":"request_close","capacity":1}

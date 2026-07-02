@@ -1,0 +1,3 @@
+{"scenario":"release_underflow","owner_kind":"request","owner_id":"req-underflow","resource_kind":"request_slot","action":"request_open","capacity":1}
+{"scenario":"release_underflow","owner_kind":"request","owner_id":"req-underflow","resource_kind":"kv_block","action":"release","amount":1,"before":4,"after":5,"capacity":4}
+{"scenario":"release_underflow","owner_kind":"request","owner_id":"req-underflow","resource_kind":"request_slot","action":"request_close","capacity":1}

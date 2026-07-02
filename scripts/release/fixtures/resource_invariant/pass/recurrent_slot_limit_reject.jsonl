@@ -1,0 +1,4 @@
+{"scenario":"recurrent_slot_limit_reject","owner_kind":"request","owner_id":"req-recurrent-reject","resource_kind":"request_slot","action":"request_open","capacity":1}
+{"scenario":"recurrent_slot_limit_reject","owner_kind":"request","owner_id":"req-recurrent-reject","resource_kind":"recurrent_state_slot","action":"capacity_snapshot","capacity":0}
+{"scenario":"recurrent_slot_limit_reject","owner_kind":"request","owner_id":"req-recurrent-reject","resource_kind":"recurrent_state_slot","action":"reject","reason":"recurrent_state_slot_exhausted","capacity":0}
+{"scenario":"recurrent_slot_limit_reject","owner_kind":"request","owner_id":"req-recurrent-reject","resource_kind":"request_slot","action":"request_close","capacity":1}

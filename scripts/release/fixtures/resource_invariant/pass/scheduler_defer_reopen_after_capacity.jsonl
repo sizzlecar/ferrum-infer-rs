@@ -1,0 +1,8 @@
+{"scenario":"scheduler_defer_reopen_after_capacity","owner_kind":"request","owner_id":"req-defer","resource_kind":"request_slot","action":"request_open","capacity":1}
+{"scenario":"scheduler_defer_reopen_after_capacity","owner_kind":"request","owner_id":"req-defer","resource_kind":"scheduler_admission_slot","action":"capacity_snapshot","capacity":0}
+{"scenario":"scheduler_defer_reopen_after_capacity","owner_kind":"request","owner_id":"req-defer","resource_kind":"scheduler_admission_slot","action":"defer","reason":"admission_capacity_wait","capacity":0}
+{"scenario":"scheduler_defer_reopen_after_capacity","owner_kind":"request","owner_id":"req-defer","resource_kind":"scheduler_admission_slot","action":"capacity_snapshot","capacity":1}
+{"scenario":"scheduler_defer_reopen_after_capacity","owner_kind":"request","owner_id":"req-defer","resource_kind":"scheduler_admission_slot","action":"reserve","amount":1,"before":1,"after":0,"capacity":1}
+{"scenario":"scheduler_defer_reopen_after_capacity","owner_kind":"request","owner_id":"req-defer","resource_kind":"scheduler_admission_slot","action":"commit","amount":1,"before":0,"after":0,"capacity":1}
+{"scenario":"scheduler_defer_reopen_after_capacity","owner_kind":"request","owner_id":"req-defer","resource_kind":"scheduler_admission_slot","action":"release","amount":1,"before":0,"after":1,"capacity":1}
+{"scenario":"scheduler_defer_reopen_after_capacity","owner_kind":"request","owner_id":"req-defer","resource_kind":"request_slot","action":"request_close","capacity":1}
