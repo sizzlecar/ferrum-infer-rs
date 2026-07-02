@@ -246,6 +246,7 @@ fn timed_event(
         backend: Some(SYNTHETIC_BACKEND.to_string()),
         before_bytes: Some(before_bytes),
         after_bytes: Some(after_bytes),
+        current_bytes: Some(after_bytes),
         high_water_bytes: Some(high_water_bytes),
         available_bytes: Some(1024 * 1024),
     });

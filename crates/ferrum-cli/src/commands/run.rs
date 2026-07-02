@@ -612,8 +612,17 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             metadata,
         };
         let profile_request_id = request.id.to_string();
+        let memory_sampler = crate::memory_profile::ProcessMemorySampler;
+        let memory_before = product_observability
+            .enabled()
+            .then(|| memory_sampler.sample())
+            .flatten();
         let start = std::time::Instant::now();
         let response = engine.infer(request).await?;
+        let memory = product_observability
+            .enabled()
+            .then(|| memory_sampler.observe(memory_before))
+            .flatten();
         let tokens = response.tokens.len();
         let content = display_response_text(&response.text);
         let chunk_count = usize::from(!content.is_empty());
@@ -660,6 +669,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 finish_reason: finish_reason.map(finish_reason_str).map(str::to_string),
                 prompt_chars,
                 response_chars: content.chars().count(),
+                memory,
             },
         )?;
         engine.shutdown().await?;
