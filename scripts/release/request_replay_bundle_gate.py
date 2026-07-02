@@ -307,12 +307,113 @@ def rewrite_replay_argv(argv: list[str], replay_out: Path) -> list[str]:
     return rewritten
 
 
-def execute_replay(bundle: Path, *, out: Path, timeout: int) -> dict[str, Any]:
+def rewrite_live_server_argv(argv: list[str], live_server_base_url: str) -> list[str]:
+    rewritten = list(argv)
+    for index, item in enumerate(rewritten):
+        for base in ("http://127.0.0.1:8000", "http://localhost:8000"):
+            if item.startswith(base):
+                rewritten[index] = live_server_base_url.rstrip("/") + item[len(base) :]
+                break
+    return rewritten
+
+
+def parse_sse(body: str) -> dict[str, int]:
+    done_count = 0
+    content_chunks = 0
+    malformed = 0
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:") :].strip()
+        if payload == "[DONE]":
+            done_count += 1
+            continue
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            malformed += 1
+            continue
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            delta = choices[0].get("delta") or {}
+            if isinstance(delta, dict) and delta.get("content"):
+                content_chunks += 1
+    return {
+        "done_count": done_count,
+        "content_chunks": content_chunks,
+        "malformed": malformed,
+    }
+
+
+def validate_live_server_response(bundle: Path, stdout: str) -> dict[str, Any]:
+    request = read_json(bundle / "request.json")
+    stream = bool(request.get("stream"))
+    if stream:
+        sse = parse_sse(stdout)
+        if sse["done_count"] != 1:
+            raise BundleError(f"{bundle}: live replay expected one [DONE], got {sse['done_count']}")
+        if sse["content_chunks"] < 1:
+            raise BundleError(f"{bundle}: live replay stream emitted no content chunks")
+        if sse["malformed"] != 0:
+            raise BundleError(f"{bundle}: live replay stream malformed SSE count={sse['malformed']}")
+        return {"mode": "stream", **sse}
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise BundleError(f"{bundle}: live replay nonstream response is invalid JSON: {exc}") from exc
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise BundleError(f"{bundle}: live replay response missing choices")
+    message = choices[0].get("message") or {}
+    if not isinstance(message, dict) or not str(message.get("content") or "").strip():
+        raise BundleError(f"{bundle}: live replay nonstream content is empty")
+    return {"mode": "nonstream", "choice_count": len(choices)}
+
+
+def execute_replay(
+    bundle: Path,
+    *,
+    out: Path,
+    timeout: int,
+    live_server_base_url: str | None = None,
+) -> dict[str, Any]:
     replay = read_json(bundle / "replay.command.json")
     argv = replay.get("argv")
     if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
         raise BundleError(f"{bundle / 'replay.command.json'}.argv must be a string array")
     if "synthetic/no-weight" not in argv and replay.get("requires_running_server") is True:
+        if live_server_base_url:
+            replay_out = out / "executed_replays" / safe_path_part(bundle.name)
+            replay_out.mkdir(parents=True, exist_ok=True)
+            rewritten = rewrite_live_server_argv(argv, live_server_base_url)
+            proc = subprocess.run(
+                rewritten,
+                cwd=REPO_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+            )
+            log = {
+                "bundle_dir": str(bundle),
+                "cmd": rewritten,
+                "returncode": proc.returncode,
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+            }
+            write_json(replay_out / "replay_execution.json", log)
+            if proc.returncode != 0:
+                raise BundleError(f"{bundle}: live replay command failed with exit {proc.returncode}")
+            response_summary = validate_live_server_response(bundle, proc.stdout)
+            log["response_summary"] = response_summary
+            write_json(replay_out / "replay_execution.json", log)
+            return {
+                "source_bundle_dir": str(bundle),
+                "status": "executed_live_server",
+                "artifact_dir": str(replay_out),
+                "response_summary": response_summary,
+            }
         return {
             "source_bundle_dir": str(bundle),
             "status": "skipped_requires_running_server",
@@ -343,6 +444,7 @@ def execute_replay(bundle: Path, *, out: Path, timeout: int) -> dict[str, Any]:
     generated = validate_bundle_root(generated_root)
     return {
         "source_bundle_dir": str(bundle),
+        "status": "executed_synthetic",
         "artifact_dir": str(replay_out),
         "generated_bundle_count": len(generated),
         "generated_bundles": generated,
@@ -534,6 +636,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path)
     parser.add_argument("--bundle-dir", action="append", type=Path, default=[])
     parser.add_argument("--execute-replay", action="store_true")
+    parser.add_argument("--live-server-base-url")
     parser.add_argument("--timeout", type=int, default=300)
     return parser.parse_args()
 
@@ -561,7 +664,12 @@ def main() -> int:
         if args.execute_replay:
             for bundle in bundle_paths:
                 replay_executions.append(
-                    execute_replay(bundle, out=args.out, timeout=args.timeout)
+                    execute_replay(
+                        bundle,
+                        out=args.out,
+                        timeout=args.timeout,
+                        live_server_base_url=args.live_server_base_url,
+                    )
                 )
         summary = {
             "schema_version": SCHEMA_VERSION,
