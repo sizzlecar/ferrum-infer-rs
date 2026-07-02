@@ -448,12 +448,14 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
 
+    selftest_summary = run_selftest()
     dirty_files = git_output(["status", "--short"]).splitlines()
     summary = {
         "schema_version": SCHEMA_VERSION,
         "status": "pass",
         "gate": "native_operator_artifact",
         "manifests": manifest_summaries,
+        "selftest_summary": selftest_summary,
         "bulk_source": {"count": bulk_count, "samples": bulk_samples},
         "unregistered_third_party_source": {
             "count": third_party_count,
