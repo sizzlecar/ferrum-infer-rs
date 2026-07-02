@@ -15,6 +15,7 @@ pub mod config;
 pub mod gpu_devices;
 pub mod gpu_mem_autosize;
 pub mod layer_split_pipeline;
+pub mod observability_vertical_slice;
 pub mod runtime_env;
 pub mod source_resolver;
 pub mod utils;

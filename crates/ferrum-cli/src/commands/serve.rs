@@ -208,6 +208,10 @@ pub struct ServeCommand {
     #[arg(long, value_name = "PATH")]
     pub decision_trace_jsonl: Option<PathBuf>,
 
+    /// Generate a synthetic/no-weight observability vertical-slice artifact and exit.
+    #[arg(long, value_name = "DIR")]
+    pub observability_vertical_slice_out: Option<PathBuf>,
+
     /// Write native structured profile events to this JSONL path.
     #[arg(long, value_name = "PATH")]
     pub profile_jsonl: Option<PathBuf>,
@@ -288,6 +292,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         runtime_preset,
         effective_config_json,
         decision_trace_jsonl,
+        observability_vertical_slice_out,
         profile_jsonl,
         scheduler_trace_jsonl,
         profile_commit_sha,
@@ -298,6 +303,18 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         lora,
         lora_model_id_template,
     } = cmd;
+
+    if let Some(out_dir) = observability_vertical_slice_out.as_ref() {
+        crate::observability_vertical_slice::write_observability_vertical_slice(
+            ferrum_types::ProfileEntrypoint::Serve,
+            out_dir,
+        )?;
+        println!(
+            "OBSERVABILITY VERTICAL SLICE ARTIFACT: {}",
+            out_dir.display()
+        );
+        return Ok(());
+    }
 
     // Print banner
     print_banner();

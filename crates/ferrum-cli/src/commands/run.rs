@@ -354,6 +354,10 @@ pub struct RunCommand {
     #[arg(long)]
     pub decision_trace_jsonl: Option<PathBuf>,
 
+    /// Generate a synthetic/no-weight observability vertical-slice artifact and exit.
+    #[arg(long, value_name = "DIR")]
+    pub observability_vertical_slice_out: Option<PathBuf>,
+
     /// Output format. `text` (default) — streaming text + stats UX.
     /// `jsonl` — one JSON record per event on stdout; used by tests and scripts.
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
@@ -361,6 +365,18 @@ pub struct RunCommand {
 }
 
 pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
+    if let Some(out_dir) = cmd.observability_vertical_slice_out.as_ref() {
+        crate::observability_vertical_slice::write_observability_vertical_slice(
+            ferrum_types::ProfileEntrypoint::Run,
+            out_dir,
+        )?;
+        println!(
+            "OBSERVABILITY VERTICAL SLICE ARTIFACT: {}",
+            out_dir.display()
+        );
+        return Ok(());
+    }
+
     // Resolve graph-clean Qwen3-MoE defaults as typed entries first, then
     // materialize them only for legacy backend readers.
     let moe_graph_defaults = crate::runtime_env::moe_graph_default_entries(
@@ -1925,6 +1941,7 @@ mod tests {
             kv_max_blocks: None,
             effective_config_json: None,
             decision_trace_jsonl: None,
+            observability_vertical_slice_out: None,
             output_format: OutputFormat::Text,
         }
     }
