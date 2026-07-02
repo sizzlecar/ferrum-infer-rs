@@ -121,6 +121,17 @@ def pass_line_is_real(value: Any, label: str) -> str:
     return value
 
 
+def validate_backend_resolution(artifact: dict[str, Any], label: str, backend: str) -> tuple[str, str]:
+    requested = require_string(artifact, "requested_backend", label)
+    effective = require_string(artifact, "effective_backend", label)
+    require(effective == backend, f"{label}.effective_backend must be {backend}")
+    require(
+        requested == "auto" or requested == effective,
+        f"{label}.requested_backend {requested!r} does not match effective_backend {effective!r}",
+    )
+    return requested, effective
+
+
 def artifact_from_dir(path: Path) -> dict[str, Any]:
     manifest = read_json(path / "gate.manifest.json")
     summary_path = manifest.get("summary")
@@ -160,6 +171,7 @@ def validate_l2_artifact(
     require(artifact.get("status") == "pass", f"{label}.status must be pass")
     require_git_sha(artifact, label, expected_sha)
     require(artifact.get("backend") == backend, f"{label}.backend must be {backend}")
+    requested_backend, effective_backend = validate_backend_resolution(artifact, label, backend)
     entrypoints = set(artifact.get("entrypoints") or [])
     missing = sorted(REQUIRED_ENTRYPOINTS - entrypoints)
     require(not missing, f"{label}.entrypoints missing {missing}")
@@ -182,6 +194,8 @@ def validate_l2_artifact(
     return {
         "status": "pass",
         "backend": backend,
+        "requested_backend": requested_backend,
+        "effective_backend": effective_backend,
         "git_sha": artifact["git_sha"],
         "git_dirty": artifact["git_dirty"],
         "dirty_files": dirty_files,
@@ -314,6 +328,8 @@ def make_l2_artifact(
             "schema_version": 1,
             "status": "pass",
             "backend": backend,
+            "requested_backend": backend,
+            "effective_backend": backend,
             "git_sha": sha,
             "git_dirty": False,
             "dirty_files": [],
@@ -472,6 +488,27 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("dirty artifact unexpectedly passed")
         except ActualModelGateError as exc:
             require("git_dirty" in str(exc), f"unexpected dirty failure: {exc}")
+        fallback = make_l2_artifact(root, backend="metal", sha=sha, suffix="backend_fallback")
+        fallback_data = read_json(fallback)
+        fallback_data["requested_backend"] = "metal"
+        fallback_data["effective_backend"] = "cpu"
+        write_json(fallback, fallback_data)
+        try:
+            run_gate(
+                argparse.Namespace(
+                    out=root / "bad-backend-fallback",
+                    git_sha=sha,
+                    metal_l2_artifact=fallback,
+                    cuda_l2_artifact=cuda,
+                    native_operator_selected=False,
+                    native_operator_not_selected=True,
+                    native_operator_cuda_artifact=None,
+                    native_operator_non_selected_reason="fixture",
+                )
+            )
+            raise AssertionError("backend fallback artifact unexpectedly passed")
+        except ActualModelGateError as exc:
+            require("effective_backend" in str(exc), f"unexpected backend fallback failure: {exc}")
         try:
             run_gate(
                 argparse.Namespace(
