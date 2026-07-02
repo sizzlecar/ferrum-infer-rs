@@ -353,11 +353,30 @@ def artifact_git_sha(artifact: dict[str, Any], label: str, expected_sha: str) ->
     require_git_sha(artifact, label, expected_sha)
 
 
+def validate_backend_resolution(artifact: dict[str, Any], label: str, backend: str) -> None:
+    requested = artifact.get("requested_backend")
+    effective = artifact.get("effective_backend")
+    require(
+        isinstance(requested, str) and requested.strip(),
+        f"{label}.requested_backend must be non-empty",
+    )
+    require(
+        isinstance(effective, str) and effective.strip(),
+        f"{label}.effective_backend must be non-empty",
+    )
+    require(effective == backend, f"{label}.effective_backend must be {backend}")
+    require(
+        requested == "auto" or requested == effective,
+        f"{label}.requested_backend {requested!r} does not match effective_backend {effective!r}",
+    )
+
+
 def validate_l2_artifact(data: dict[str, Any], key: str, backend: str, expected_sha: str) -> None:
     artifact = data.get(key)
     require(isinstance(artifact, dict), f"actual_model_regression.{key} must be an object")
     artifact_git_sha(artifact, f"actual_model_regression.{key}", expected_sha)
     require(artifact.get("backend") == backend, f"actual_model_regression.{key}.backend must be {backend}")
+    validate_backend_resolution(artifact, f"actual_model_regression.{key}", backend)
     entrypoints = set(artifact.get("entrypoints") or [])
     missing = sorted(REQUIRED_L2_ENTRYPOINTS - entrypoints)
     require(not missing, f"actual_model_regression.{key}.entrypoints missing {missing}")
@@ -867,6 +886,8 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "metal_l2_artifact": {
                 "status": "pass",
                 "backend": "metal",
+                "requested_backend": "metal",
+                "effective_backend": "metal",
                 "git_sha": sha,
                 "git_dirty": False,
                 "dirty_files": [],
@@ -889,6 +910,8 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "cuda_l2_artifact": {
                 "status": "pass",
                 "backend": "cuda",
+                "requested_backend": "cuda",
+                "effective_backend": "cuda",
                 "git_sha": sha,
                 "git_dirty": False,
                 "dirty_files": [],
@@ -1038,6 +1061,30 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("dirty actual-model artifact unexpectedly passed final gate")
         except GoalGateError as exc:
             require("git_dirty" in str(exc), f"unexpected dirty actual-model error: {exc}")
+        bad_backend = root / "bad-backend"
+        artifacts_bad_backend = selftest_artifacts(root / "bad-backend-fixtures", sha)
+        bad_backend_actual = read_json(artifacts_bad_backend["actual"])
+        bad_backend_actual["metal_l2_artifact"]["requested_backend"] = "metal"
+        bad_backend_actual["metal_l2_artifact"]["effective_backend"] = "cpu"
+        write_json(artifacts_bad_backend["actual"], bad_backend_actual)
+        args_bad_backend = argparse.Namespace(
+            out=bad_backend,
+            resource_invariant=artifacts_bad_backend["resource"],
+            change_impact=artifacts_bad_backend["change"],
+            product_sentinel=artifacts_bad_backend["product"],
+            model_contract=artifacts_bad_backend["model"],
+            support_matrix_contract=artifacts_bad_backend["support_matrix"],
+            observability_profile=artifacts_bad_backend["observability"],
+            native_operator=artifacts_bad_backend["native"],
+            actual_model_regression_summary=artifacts_bad_backend["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_backend)
+            raise AssertionError("backend fallback actual-model artifact unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require("effective_backend" in str(exc), f"unexpected backend mismatch error: {exc}")
         return {
             "schema_version": SCHEMA_VERSION,
             "status": "pass",
