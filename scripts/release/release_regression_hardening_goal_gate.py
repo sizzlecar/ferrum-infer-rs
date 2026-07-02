@@ -776,6 +776,70 @@ def require_zero_count(summary: dict[str, Any], field: str, label: str) -> None:
     )
 
 
+def require_non_negative_int(value: Any, label: str) -> int:
+    require(isinstance(value, int) and value >= 0, f"{label} must be a non-negative integer")
+    return value
+
+
+def validate_observability_diagnostic_shape(summary: dict[str, Any], label: str) -> None:
+    latency = summary.get("latency_p50_p95_p99")
+    require(isinstance(latency, dict), f"{label}.latency_p50_p95_p99 must be an object")
+    duration = latency.get("duration_us")
+    require(
+        isinstance(duration, dict),
+        f"{label}.latency_p50_p95_p99.duration_us must be an object",
+    )
+    p50 = require_non_negative_int(duration.get("p50"), f"{label}.latency_p50_p95_p99.duration_us.p50")
+    p95 = require_non_negative_int(duration.get("p95"), f"{label}.latency_p50_p95_p99.duration_us.p95")
+    p99 = require_non_negative_int(duration.get("p99"), f"{label}.latency_p50_p95_p99.duration_us.p99")
+    sample_count = require_non_negative_int(
+        duration.get("sample_count"),
+        f"{label}.latency_p50_p95_p99.duration_us.sample_count",
+    )
+    require(sample_count > 0, f"{label}.latency_p50_p95_p99.duration_us.sample_count must be positive")
+    require(p50 <= p95 <= p99, f"{label}.latency_p50_p95_p99.duration_us percentiles must be ordered")
+
+    memory = summary.get("memory_high_water_bytes")
+    require(isinstance(memory, dict), f"{label}.memory_high_water_bytes must be an object")
+    memory_max = require_non_negative_int(memory.get("max"), f"{label}.memory_high_water_bytes.max")
+    by_backend_scope = memory.get("by_backend_scope")
+    require(
+        isinstance(by_backend_scope, dict) and by_backend_scope,
+        f"{label}.memory_high_water_bytes.by_backend_scope must be a non-empty object",
+    )
+    scope_values: list[int] = []
+    for scope, value in sorted(by_backend_scope.items()):
+        require(
+            isinstance(scope, str) and scope.strip(),
+            f"{label}.memory_high_water_bytes.by_backend_scope keys must be non-empty",
+        )
+        scope_values.append(
+            require_non_negative_int(
+                value,
+                f"{label}.memory_high_water_bytes.by_backend_scope.{scope}",
+            )
+        )
+    require(memory_max == max(scope_values), f"{label}.memory_high_water_bytes.max must equal by_backend_scope maximum")
+
+    slow_phases = summary.get("top_slow_phases")
+    require(
+        isinstance(slow_phases, list) and slow_phases,
+        f"{label}.top_slow_phases must contain at least one timed phase",
+    )
+    for index, phase in enumerate(slow_phases):
+        require(isinstance(phase, dict), f"{label}.top_slow_phases[{index}] must be an object")
+        for key in ("event_id", "request_id", "entrypoint", "backend", "phase"):
+            value = phase.get(key)
+            require(
+                isinstance(value, str) and value.strip(),
+                f"{label}.top_slow_phases[{index}].{key} must be non-empty",
+            )
+        require_non_negative_int(
+            phase.get("duration_us"),
+            f"{label}.top_slow_phases[{index}].duration_us",
+        )
+
+
 def validate_replay_commands(value: Any, label: str) -> None:
     require(isinstance(value, list) and value, f"{label} must contain at least one replay command")
     for index, command in enumerate(value):
@@ -798,6 +862,7 @@ def validate_observability_profile(root: Path, expected_sha: str) -> dict[str, A
         isinstance(request_count, int) and request_count > 0,
         "observability_profile.summary.request_count must be a positive integer",
     )
+    validate_observability_diagnostic_shape(summary, "observability_profile.summary")
     for field in (
         "failed_count",
         "corrupted_count",
@@ -1675,10 +1740,24 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "bad_text_count": 0,
             "oom_prevented_count": 0,
             "silent_oom_count": 0,
-            "latency_p50_p95_p99": {"p50": 1, "p95": 1, "p99": 1},
-            "memory_high_water_bytes": {"cpu:process": 1},
+            "latency_p50_p95_p99": {
+                "duration_us": {"p50": 10, "p95": 20, "p99": 30, "sample_count": 2}
+            },
+            "memory_high_water_bytes": {
+                "max": 2048,
+                "by_backend_scope": {"synthetic:process": 2048},
+            },
             "resource_leak_count": 0,
-            "top_slow_phases": [],
+            "top_slow_phases": [
+                {
+                    "event_id": "evt-serve-complete",
+                    "request_id": "req-serve-fixture",
+                    "entrypoint": "serve",
+                    "backend": "synthetic",
+                    "phase": "request_complete",
+                    "duration_us": 30,
+                }
+            ],
             "first_failure_event": None,
             "replay_commands": [
                 {
@@ -2135,6 +2214,40 @@ def run_selftest() -> dict[str, Any]:
             require(
                 "observability_vertical_slice.manifest.git_dirty" in str(exc),
                 f"unexpected dirty vertical slice error: {exc}",
+            )
+        bad_observability_shape = root / "bad-observability-shape"
+        artifacts_bad_observability_shape = selftest_artifacts(
+            root / "bad-observability-shape-fixtures",
+            sha,
+        )
+        bad_observability_shape_summary_path = (
+            artifacts_bad_observability_shape["observability"] / "observability_profile_summary.json"
+        )
+        bad_observability_shape_summary = read_json(bad_observability_shape_summary_path)
+        bad_observability_shape_summary["latency_p50_p95_p99"]["duration_us"][
+            "sample_count"
+        ] = 0
+        write_json(bad_observability_shape_summary_path, bad_observability_shape_summary)
+        args_bad_observability_shape = argparse.Namespace(
+            out=bad_observability_shape,
+            resource_invariant=artifacts_bad_observability_shape["resource"],
+            change_impact=artifacts_bad_observability_shape["change"],
+            product_sentinel=artifacts_bad_observability_shape["product"],
+            model_contract=artifacts_bad_observability_shape["model"],
+            support_matrix_contract=artifacts_bad_observability_shape["support_matrix"],
+            observability_profile=artifacts_bad_observability_shape["observability"],
+            native_operator=artifacts_bad_observability_shape["native"],
+            actual_model_regression_summary=artifacts_bad_observability_shape["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_observability_shape)
+            raise AssertionError("observability summary with no latency samples unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "latency_p50_p95_p99.duration_us.sample_count" in str(exc),
+                f"unexpected observability shape error: {exc}",
             )
         bad_invalidated_counted = root / "bad-invalidated-counted"
         artifacts_bad_invalidated_counted = selftest_artifacts(
