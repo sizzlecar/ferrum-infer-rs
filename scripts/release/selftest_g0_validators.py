@@ -25,6 +25,7 @@ LAYER_SPLIT_PERF_ORCHESTRATOR = REPO_ROOT / "scripts/release/run_layer_split_per
 LLAMA33_SOURCE_GATE = REPO_ROOT / "scripts/release/g0_cuda_llama33_70b_4bit_2x4090_gate.py"
 MODEL_RELEASE_GRADE_GOAL_GATE = REPO_ROOT / "scripts/release/model_release_grade_goal_gate.py"
 MODEL_RELEASE_GRADE_MANIFEST = REPO_ROOT / "scripts/release/model_release_grade_manifest.py"
+MODEL_ONBOARDING_CONTRACT_GATE = REPO_ROOT / "scripts/release/model_onboarding_contract_gate.py"
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from m3_validate_runner_artifact import (  # noqa: E402
@@ -281,6 +282,12 @@ def test_model_release_grade_manifest_selftest() -> None:
     require("MODEL RELEASE GRADE MANIFEST SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
+def test_model_onboarding_contract_gate_selftest() -> None:
+    ok = run([sys.executable, str(MODEL_ONBOARDING_CONTRACT_GATE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("MODEL ONBOARDING CONTRACT SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
 def test_m3_quality_gate_artifact_validators() -> None:
     with tempfile.TemporaryDirectory(prefix="ferrum-m3-gates-") as tmp:
         root = Path(tmp)
@@ -367,6 +374,7 @@ def main() -> int:
     test_llama33_source_gate_selftest()
     test_model_release_grade_goal_gate_selftest()
     test_model_release_grade_manifest_selftest()
+    test_model_onboarding_contract_gate_selftest()
     test_m3_quality_gate_artifact_validators()
     print("G0 VALIDATOR SELFTEST PASS")
     return 0

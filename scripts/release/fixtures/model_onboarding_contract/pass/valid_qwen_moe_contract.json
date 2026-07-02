@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "contract_id": "valid_qwen_moe_contract",
+  "source_git_sha": "1111111111111111111111111111111111111111",
+  "model": {
+    "id": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+    "family": "qwen3_moe",
+    "architecture": "qwen3_moe",
+    "weight_format": "gptq_int4",
+    "source": "hf"
+  },
+  "facts": {
+    "tokenizer_source": "tokenizer_config.json",
+    "chat_template_source": "tokenizer_config.json",
+    "generation_config_source": "generation_config.json",
+    "token_id_source": "generation_config",
+    "eos_token_ids": [151645],
+    "bos_token_id": null,
+    "stop_tokens": ["<|im_end|>"],
+    "template_golden": {
+      "kind": "template_golden",
+      "path": "../artifacts/qwen3_moe/template_golden.json",
+      "status": "pass",
+      "pass_line": "W3 L0 TEMPLATE PASS: fixtures/qwen3_moe/template",
+      "git_sha": "1111111111111111111111111111111111111111"
+    },
+    "template_golden_cases": [
+      "single_turn",
+      "multi_turn",
+      "system_message",
+      "tool_injection",
+      "reasoning_history"
+    ]
+  },
+  "runtime_preset": {
+    "selected": "cuda-qwen3-moe-gptq",
+    "rejected_candidates": ["metal-default", "cpu-default"]
+  },
+  "fallback_policy": {
+    "allow_builtin_template_fallback": false,
+    "allow_backend_fallback": false,
+    "allow_attention_fallback": false
+  },
+  "capabilities": {
+    "tool_calling": {
+      "supported": true,
+      "source": "chat_template",
+      "artifact": {
+        "kind": "tool_call",
+        "path": "../artifacts/qwen3_moe/tool_call.json",
+        "status": "pass",
+        "pass_line": "W3 L4 AGENT PASS: fixtures/qwen3_moe/tool",
+        "git_sha": "1111111111111111111111111111111111111111"
+      }
+    },
+    "structured_output": {
+      "supported": true,
+      "source": "server_guided_decode",
+      "artifact": {
+        "kind": "structured_schema",
+        "path": "../artifacts/qwen3_moe/structured_schema.json",
+        "status": "pass",
+        "pass_line": "W3 L4 AGENT PASS: fixtures/qwen3_moe/schema",
+        "git_sha": "1111111111111111111111111111111111111111"
+      }
+    },
+    "reasoning": {
+      "supported": false,
+      "source": "metadata"
+    }
+  },
+  "backend_support": [
+    {
+      "backend": "cuda",
+      "status": "supported",
+      "hardware": "1x RTX 4090",
+      "selection": {
+        "runtime_preset": "cuda-qwen3-moe-gptq",
+        "scheduler": "continuous",
+        "attention_impl": "vllm-paged-attn-v2",
+        "kv_layout": "paged",
+        "kv_dtype": "fp16",
+        "recurrent_state_max_slots": 64
+      },
+      "fallback": {
+        "allowed": false,
+        "actual_backend": "cuda",
+        "actual_attention_impl": "vllm-paged-attn-v2",
+        "reason": null
+      },
+      "native_operators": ["fa2"],
+      "correctness": {
+        "status": "pass",
+        "run_artifact": {
+          "kind": "run_smoke",
+          "path": "../artifacts/qwen3_moe/run_smoke.json",
+          "status": "pass",
+          "pass_line": "BACKEND REGRESSION SMOKE PASS: fixtures/qwen3_moe/run",
+          "git_sha": "1111111111111111111111111111111111111111",
+          "entrypoint": "run",
+          "backend": "cuda"
+        },
+        "serve_artifact": {
+          "kind": "serve_smoke",
+          "path": "../artifacts/qwen3_moe/serve_smoke.json",
+          "status": "pass",
+          "pass_line": "BACKEND REGRESSION SMOKE PASS: fixtures/qwen3_moe/serve",
+          "git_sha": "1111111111111111111111111111111111111111",
+          "entrypoint": "serve",
+          "backend": "cuda"
+        },
+        "profile_artifact": {
+          "kind": "profile",
+          "path": "../artifacts/qwen3_moe/profile.jsonl",
+          "status": "pass",
+          "pass_line": "OBSERVABILITY PROFILE GATE PASS: fixtures/qwen3_moe/profile",
+          "git_sha": "1111111111111111111111111111111111111111",
+          "backend": "cuda"
+        },
+        "replay_artifact": {
+          "kind": "replay",
+          "path": "../artifacts/qwen3_moe/replay.json",
+          "status": "pass",
+          "pass_line": "REQUEST REPLAY BUNDLE PASS: fixtures/qwen3_moe/replay",
+          "git_sha": "1111111111111111111111111111111111111111",
+          "backend": "cuda"
+        },
+        "preset_snapshot": {
+          "kind": "preset_snapshot",
+          "path": "../artifacts/qwen3_moe/preset_snapshot.json",
+          "status": "pass",
+          "pass_line": "BACKEND PRESET SNAPSHOT PASS: fixtures/qwen3_moe/preset",
+          "git_sha": "1111111111111111111111111111111111111111",
+          "backend": "cuda"
+        },
+        "tool_call_artifact": {
+          "kind": "tool_call",
+          "path": "../artifacts/qwen3_moe/tool_call.json",
+          "status": "pass",
+          "pass_line": "W3 L4 AGENT PASS: fixtures/qwen3_moe/tool",
+          "git_sha": "1111111111111111111111111111111111111111",
+          "backend": "cuda"
+        },
+        "structured_output_artifact": {
+          "kind": "structured_schema",
+          "path": "../artifacts/qwen3_moe/structured_schema.json",
+          "status": "pass",
+          "pass_line": "W3 L4 AGENT PASS: fixtures/qwen3_moe/schema",
+          "git_sha": "1111111111111111111111111111111111111111",
+          "backend": "cuda"
+        },
+        "native_operator_artifact": {
+          "kind": "native_operator",
+          "path": "../artifacts/qwen3_moe/native_operator.json",
+          "status": "pass",
+          "pass_line": "NATIVE OP ARTIFACT PASS: fixtures/qwen3_moe/native",
+          "git_sha": "1111111111111111111111111111111111111111",
+          "backend": "cuda"
+        }
+      },
+      "performance_claims": [
+        {
+          "kind": "performance",
+          "path": "../artifacts/qwen3_moe/performance.json",
+          "status": "pass",
+          "pass_line": "MODEL PERF PASS: fixtures/qwen3_moe/perf",
+          "git_sha": "1111111111111111111111111111111111111111",
+          "backend": "cuda"
+        }
+      ]
+    }
+  ]
+}

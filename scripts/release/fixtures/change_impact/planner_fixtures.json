@@ -29,7 +29,33 @@
       "id": "model_executor_contract",
       "changed_files": ["crates/ferrum-interfaces/src/model_executor.rs"],
       "expect_domains": ["model_contract"],
-      "expect_required_gates": ["model_contract", "product_sentinel"]
+      "expect_required_gates": [
+        "model_onboarding_contract_selftest",
+        "model_contract",
+        "product_sentinel"
+      ]
+    },
+    {
+      "id": "model_onboarding_contract_gate",
+      "changed_files": ["scripts/release/model_onboarding_contract_gate.py"],
+      "expect_domains": ["model_contract", "release_gate"],
+      "expect_required_gates": [
+        "model_onboarding_contract_selftest",
+        "model_contract",
+        "release_validator_selftest"
+      ]
+    },
+    {
+      "id": "model_onboarding_contract_fixture",
+      "changed_files": [
+        "scripts/release/fixtures/model_onboarding_contract/pass/valid_qwen_moe_contract.json"
+      ],
+      "expect_domains": ["evidence_schema", "model_contract", "release_gate"],
+      "expect_required_gates": [
+        "model_onboarding_contract_selftest",
+        "model_contract",
+        "profile_analyzer_selftest"
+      ]
     },
     {
       "id": "registry_dispatch",

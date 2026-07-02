@@ -121,13 +121,27 @@
       "path_globs": [
         "crates/ferrum-interfaces/src/model_executor.rs",
         "crates/ferrum-models/src/**",
+        "docs/goals/model-contracts/**",
         "scripts/release/models_manifest.json",
+        "scripts/release/model_onboarding_contract.schema.json",
+        "scripts/release/model_onboarding_contract_gate.py",
+        "scripts/release/fixtures/model_onboarding_contract/**",
         "scripts/release/model_release_grade_manifest.py",
         "scripts/release/model_release_grade_goal_gate.py"
       ],
       "domains": ["model_contract"],
-      "required_gates": ["unit", "model_contract", "product_sentinel"],
-      "release_invalidation": ["model_contract", "product_sentinel", "support_matrix"],
+      "required_gates": [
+        "unit",
+        "model_onboarding_contract_selftest",
+        "model_contract",
+        "product_sentinel"
+      ],
+      "release_invalidation": [
+        "model_onboarding_contract_selftest",
+        "model_contract",
+        "product_sentinel",
+        "support_matrix"
+      ],
       "exceptions": [],
       "owner": "models",
       "reason": "model capabilities, templates, registry, and manifests affect supported model behavior"
