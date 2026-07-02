@@ -159,6 +159,31 @@ def load_artifact(path: Path) -> dict[str, Any]:
     return read_json(path)
 
 
+def resolve_artifact_dir(raw: str, *, artifact_source: Path, label: str) -> str:
+    base = artifact_source if artifact_source.is_dir() else artifact_source.parent
+    path = resolve_path(raw, base=base)
+    require(path.is_dir(), f"{label}.artifact_dir must exist and be a directory: {path}")
+    return str(path)
+
+
+def validate_replay_index(value: Any, *, artifact_dir: str, label: str) -> list[dict[str, Any]]:
+    require(isinstance(value, list), f"{label}.replay_bundle_index must be a list when present")
+    entries: list[dict[str, Any]] = []
+    base = Path(artifact_dir)
+    for index, entry in enumerate(value):
+        entry_label = f"{label}.replay_bundle_index[{index}]"
+        require(isinstance(entry, dict), f"{entry_label} must be an object")
+        for key in ("request_id", "replay_command", "bundle_dir"):
+            require(
+                isinstance(entry.get(key), str) and entry[key].strip(),
+                f"{entry_label}.{key} must be non-empty",
+            )
+        bundle_dir = resolve_path(entry["bundle_dir"], base=base)
+        require(bundle_dir.is_dir(), f"{entry_label}.bundle_dir must exist: {bundle_dir}")
+        entries.append({**entry, "bundle_dir": str(bundle_dir)})
+    return entries
+
+
 def validate_l2_artifact(
     path: Path,
     *,
@@ -175,7 +200,11 @@ def validate_l2_artifact(
     entrypoints = set(artifact.get("entrypoints") or [])
     missing = sorted(REQUIRED_ENTRYPOINTS - entrypoints)
     require(not missing, f"{label}.entrypoints missing {missing}")
-    artifact_dir = require_string(artifact, "artifact_dir", label)
+    artifact_dir = resolve_artifact_dir(
+        require_string(artifact, "artifact_dir", label),
+        artifact_source=path,
+        label=label,
+    )
     pass_line = pass_line_is_real(artifact.get("pass_line"), label)
     model_id = require_string(artifact, "model_id", label)
     architecture = require_string(artifact, "architecture", label)
@@ -189,8 +218,11 @@ def validate_l2_artifact(
     command = normalize_command(artifact.get("command") or artifact.get("command_line"), f"{label}.command")
     profile_detail = artifact.get("profile_detail") or artifact.get("observability_profile_detail")
     require(isinstance(profile_detail, str) and profile_detail.strip(), f"{label}.profile_detail must be non-empty")
-    replay_index = artifact.get("replay_bundle_index", [])
-    require(isinstance(replay_index, list), f"{label}.replay_bundle_index must be a list when present")
+    replay_index = validate_replay_index(
+        artifact.get("replay_bundle_index", []),
+        artifact_dir=artifact_dir,
+        label=label,
+    )
     return {
         "status": "pass",
         "backend": backend,
@@ -321,6 +353,9 @@ def make_l2_artifact(
     suffix: str = "l2",
     entrypoints: list[str] | None = None,
 ) -> Path:
+    artifact_dir = root / f"{backend}_{suffix}_artifact"
+    request_dump_dir = artifact_dir / "request_dump"
+    request_dump_dir.mkdir(parents=True, exist_ok=True)
     path = root / f"{backend}_{suffix}.json"
     write_json(
         path,
@@ -333,7 +368,7 @@ def make_l2_artifact(
             "git_sha": sha,
             "git_dirty": False,
             "dirty_files": [],
-            "artifact_dir": f"fixtures/{backend}-l2",
+            "artifact_dir": str(artifact_dir),
             "pass_line": f"{backend.upper()} L2 ACTUAL MODEL PASS: fixtures/{backend}-l2",
             "model_id": f"fixture/{backend}-model",
             "architecture": "llama_dense" if backend == "metal" else "qwen3_moe",
@@ -351,7 +386,7 @@ def make_l2_artifact(
                     "request_id": f"req-{backend}-fixture",
                     "entrypoint": "run",
                     "replay_command": f"ferrum run fixture/{backend}-model",
-                    "bundle_dir": f"fixtures/{backend}-l2/request_dump",
+                    "bundle_dir": str(request_dump_dir),
                 }
             ],
         },
@@ -509,6 +544,58 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("backend fallback artifact unexpectedly passed")
         except ActualModelGateError as exc:
             require("effective_backend" in str(exc), f"unexpected backend fallback failure: {exc}")
+        missing_artifact_dir = make_l2_artifact(
+            root,
+            backend="metal",
+            sha=sha,
+            suffix="missing_artifact_dir",
+        )
+        missing_artifact_dir_data = read_json(missing_artifact_dir)
+        missing_artifact_dir_data["artifact_dir"] = str(root / "does-not-exist")
+        write_json(missing_artifact_dir, missing_artifact_dir_data)
+        try:
+            run_gate(
+                argparse.Namespace(
+                    out=root / "bad-missing-artifact-dir",
+                    git_sha=sha,
+                    metal_l2_artifact=missing_artifact_dir,
+                    cuda_l2_artifact=cuda,
+                    native_operator_selected=False,
+                    native_operator_not_selected=True,
+                    native_operator_cuda_artifact=None,
+                    native_operator_non_selected_reason="fixture",
+                )
+            )
+            raise AssertionError("missing artifact_dir unexpectedly passed")
+        except ActualModelGateError as exc:
+            require("artifact_dir" in str(exc), f"unexpected missing artifact_dir failure: {exc}")
+        missing_replay_bundle = make_l2_artifact(
+            root,
+            backend="metal",
+            sha=sha,
+            suffix="missing_replay_bundle",
+        )
+        missing_replay_bundle_data = read_json(missing_replay_bundle)
+        missing_replay_bundle_data["replay_bundle_index"][0]["bundle_dir"] = str(
+            root / "missing-replay-bundle"
+        )
+        write_json(missing_replay_bundle, missing_replay_bundle_data)
+        try:
+            run_gate(
+                argparse.Namespace(
+                    out=root / "bad-missing-replay-bundle",
+                    git_sha=sha,
+                    metal_l2_artifact=missing_replay_bundle,
+                    cuda_l2_artifact=cuda,
+                    native_operator_selected=False,
+                    native_operator_not_selected=True,
+                    native_operator_cuda_artifact=None,
+                    native_operator_non_selected_reason="fixture",
+                )
+            )
+            raise AssertionError("missing replay bundle unexpectedly passed")
+        except ActualModelGateError as exc:
+            require("bundle_dir" in str(exc), f"unexpected missing replay bundle failure: {exc}")
         try:
             run_gate(
                 argparse.Namespace(
