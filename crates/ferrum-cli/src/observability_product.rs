@@ -73,6 +73,7 @@ pub struct ActualRunFailureObservation {
     pub sampling_params: SamplingParams,
     pub prompt_token_count: Option<usize>,
     pub prompt_chars: usize,
+    pub failure_kind: String,
     pub error_kind: String,
     pub error_message: String,
     pub memory: Option<crate::memory_profile::ProcessMemoryObservation>,
@@ -318,7 +319,7 @@ fn write_actual_run_failure_artifacts(
                 output_token_ids: Some(Vec::new()),
                 output_text: Some(""),
                 finish_reason: Some("error"),
-                failure_kind: Some("error"),
+                failure_kind: Some(observation.failure_kind.as_str()),
                 failure_diagnostics: Some(actual_run_failure_diagnostics(observation)),
             },
         )?);
@@ -1196,10 +1197,13 @@ fn write_replay_bundle(
 }
 
 fn actual_run_failure_diagnostics(observation: &ActualRunFailureObservation) -> serde_json::Value {
+    if resource_failure_kind(&observation.failure_kind) {
+        return actual_run_resource_failure_diagnostics(observation);
+    }
     json!({
         "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
         "request_id": observation.request_id,
-        "failure_kind": "error",
+        "failure_kind": observation.failure_kind,
         "first_failure_event": {
             "phase": "actual_run_generation_failed",
             "error_kind": observation.error_kind,
@@ -1208,6 +1212,88 @@ fn actual_run_failure_diagnostics(observation: &ActualRunFailureObservation) -> 
         "nearest_request_id": observation.request_id,
         "log_excerpt": observation.error_message
     })
+}
+
+fn actual_run_resource_failure_diagnostics(
+    observation: &ActualRunFailureObservation,
+) -> serde_json::Value {
+    let memory_current = observation
+        .memory
+        .as_ref()
+        .map(|memory| memory.current_bytes as i64)
+        .unwrap_or(0)
+        .max(0);
+    let memory_high_water = observation
+        .memory
+        .as_ref()
+        .map(|memory| memory.high_water_bytes as i64)
+        .unwrap_or(memory_current);
+    let resource_kind = resource_kind_for_failure(&observation.failure_kind);
+    let needed = if resource_kind == "device_memory" {
+        memory_current.saturating_add(1).max(1)
+    } else {
+        observation
+            .prompt_token_count
+            .and_then(|tokens| i64::try_from(tokens).ok())
+            .unwrap_or(1)
+            .max(1)
+    };
+    let capacity = if resource_kind == "device_memory" {
+        memory_high_water.max(memory_current)
+    } else {
+        0
+    };
+    json!({
+        "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        "request_id": observation.request_id,
+        "failure_kind": observation.failure_kind,
+        "first_failure_event": {
+            "phase": "actual_run_generation_failed",
+            "error_kind": observation.error_kind,
+            "message": observation.error_message
+        },
+        "nearest_request_id": observation.request_id,
+        "log_excerpt": observation.error_message,
+        "capacity": {
+            "resource_kind": resource_kind,
+            "needed": needed,
+            "available": 0,
+            "capacity": capacity,
+            "reason": observation.error_message
+        },
+        "nearest_resource_event": {
+            "owner_kind": "request",
+            "owner_id": observation.request_id,
+            "resource_kind": resource_kind,
+            "action": "reject",
+            "amount": needed,
+            "before": 0,
+            "after": 0,
+            "capacity": capacity,
+            "reason": observation.error_message
+        },
+        "nearest_memory_snapshot": {
+            "scope": "actual_run_failure",
+            "backend": "process",
+            "current_bytes": memory_current,
+            "high_water_bytes": memory_high_water.max(memory_current),
+            "source": observation.memory.as_ref().map(|memory| memory.source).unwrap_or("not_collected")
+        }
+    })
+}
+
+fn resource_failure_kind(failure_kind: &str) -> bool {
+    matches!(
+        failure_kind,
+        "oom" | "prevented_oom" | "admission" | "admission_reject" | "oom_admission"
+    )
+}
+
+fn resource_kind_for_failure(failure_kind: &str) -> &'static str {
+    match failure_kind {
+        "oom" | "prevented_oom" => "device_memory",
+        _ => "admission_capacity",
+    }
 }
 
 fn bad_output_scan(request_id: &str, text: &str, failure_kind: Option<&str>) -> serde_json::Value {
@@ -1557,6 +1643,7 @@ mod tests {
                 sampling_params: SamplingParams::greedy(),
                 prompt_token_count: Some(3),
                 prompt_chars: 12,
+                failure_kind: "error".to_string(),
                 error_kind: "error".to_string(),
                 error_message: "synthetic failure".to_string(),
                 memory: None,
@@ -1581,6 +1668,68 @@ mod tests {
         assert_eq!(
             diagnostics["first_failure_event"]["phase"],
             "actual_run_generation_failed"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn actual_run_resource_failure_observability_writes_resource_diagnostics() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-observability-resource-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config = ProductObservabilityConfig::new(
+            ProfileEntrypoint::Run,
+            "Qwen/Qwen3-0.6B",
+            Some(&root.join("profile.jsonl")),
+            ProfileDetailArg::Basic,
+            Some(&root.join("memory.jsonl")),
+            Some(&root.join("scheduler.jsonl")),
+            Some(&root.join("request_dump")),
+            1.0,
+        );
+        let request_id = "req-resource-failure-test".to_string();
+        write_actual_run_failure_observability(
+            &config,
+            &ActualRunFailureObservation {
+                request_id: request_id.clone(),
+                duration_us: 42,
+                sampling_params: SamplingParams::greedy(),
+                prompt_token_count: Some(1024),
+                prompt_chars: 128,
+                failure_kind: "oom_admission".to_string(),
+                error_kind: "resource_exhausted".to_string(),
+                error_message: "Resource exhausted: recurrent state capacity exhausted".to_string(),
+                memory: Some(crate::memory_profile::ProcessMemoryObservation {
+                    before_bytes: 1024,
+                    after_bytes: 2048,
+                    current_bytes: 2048,
+                    high_water_bytes: 4096,
+                    source: "test",
+                }),
+            },
+        )
+        .unwrap();
+        let bundle_dir = root.join("request_dump").join(&request_id);
+        let scan: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(bundle_dir.join("bad_output_scan.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(scan["failure_kind"], "oom_admission");
+        let diagnostics: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(bundle_dir.join("failure_diagnostics.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(diagnostics["failure_kind"], "oom_admission");
+        assert_eq!(
+            diagnostics["capacity"]["resource_kind"],
+            "admission_capacity"
+        );
+        assert_eq!(diagnostics["nearest_resource_event"]["action"], "reject");
+        assert_eq!(
+            diagnostics["nearest_memory_snapshot"]["current_bytes"],
+            2048
         );
         fs::remove_dir_all(root).ok();
     }
