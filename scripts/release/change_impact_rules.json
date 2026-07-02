@@ -253,11 +253,38 @@
       "reason": "release scripts, validators, configs, and scenarios affect gate behavior"
     },
     {
+      "id": "product-backend-sentinel",
+      "path_globs": [
+        "scripts/release/product_backend_sentinel_gate.py",
+        "scripts/release/scenarios/product_backend_sentinel.json"
+      ],
+      "domains": ["release_gate", "server_api", "cli_run", "evidence_schema"],
+      "required_gates": [
+        "unit",
+        "product_backend_sentinel_selftest",
+        "product_backend_sentinel_dry_run",
+        "planner_selftest"
+      ],
+      "release_invalidation": ["product_backend_sentinel", "product_sentinel"],
+      "exceptions": [],
+      "owner": "release",
+      "reason": "WP11 sentinel consumes product profile, resource, replay, and native-op artifacts"
+    },
+    {
       "id": "product-scenarios",
       "path_globs": ["scripts/release/scenarios/**"],
       "domains": ["release_gate", "server_api", "cli_run"],
-      "required_gates": ["unit", "run_scenarios_selftest", "product_sentinel_dry_run"],
-      "release_invalidation": ["run_scenarios_selftest", "product_sentinel"],
+      "required_gates": [
+        "unit",
+        "run_scenarios_selftest",
+        "product_backend_sentinel_selftest",
+        "product_sentinel_dry_run"
+      ],
+      "release_invalidation": [
+        "run_scenarios_selftest",
+        "product_backend_sentinel",
+        "product_sentinel"
+      ],
       "exceptions": [],
       "owner": "release",
       "reason": "product scenario manifests directly control run/serve sentinel coverage"
