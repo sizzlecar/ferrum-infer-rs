@@ -179,6 +179,7 @@ def build_snapshot(case: dict[str, Any]) -> dict[str, Any]:
     decisions = decision_map(effective)
     required_decisions = {
         "attention_decode_backend",
+        "fa2_native_operator_runtime_selection",
         "moe_graph_policy",
         "moe_implementation",
         "prefix_cache_policy",
