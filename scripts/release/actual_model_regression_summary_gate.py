@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from request_replay_bundle_gate import BundleError, make_bundle, validate_bundle_root
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PASS_LINE = "ACTUAL MODEL REGRESSION SUMMARY PASS"
@@ -184,6 +185,11 @@ def validate_replay_index(value: Any, *, artifact_dir: str, label: str) -> list[
             )
         bundle_dir = resolve_path(entry["bundle_dir"], base=base)
         require(bundle_dir.is_dir(), f"{entry_label}.bundle_dir must exist: {bundle_dir}")
+        try:
+            replay_bundles = validate_bundle_root(bundle_dir)
+        except BundleError as exc:
+            raise ActualModelGateError(f"{entry_label}.bundle_dir is not a valid replay bundle: {exc}") from exc
+        require(replay_bundles, f"{entry_label}.bundle_dir must contain at least one replay bundle")
         entries.append({**entry, "bundle_dir": str(bundle_dir)})
     return entries
 
@@ -373,7 +379,7 @@ def make_l2_artifact(
 ) -> Path:
     artifact_dir = root / f"{backend}_{suffix}_artifact"
     request_dump_dir = artifact_dir / "request_dump"
-    request_dump_dir.mkdir(parents=True, exist_ok=True)
+    make_bundle(request_dump_dir)
     path = root / f"{backend}_{suffix}.json"
     write_json(
         path,

@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from request_replay_bundle_gate import BundleError, make_bundle, validate_bundle_root
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GOAL = "release-regression-hardening-2026-06-28"
@@ -1141,6 +1142,11 @@ def validate_replay_index(value: Any, *, artifact_dir: Path, label: str) -> None
             )
         bundle_dir = resolve_path(entry["bundle_dir"], base=artifact_dir)
         require(bundle_dir.is_dir(), f"{entry_label}.bundle_dir must exist: {bundle_dir}")
+        try:
+            replay_bundles = validate_bundle_root(bundle_dir)
+        except BundleError as exc:
+            raise GoalGateError(f"{entry_label}.bundle_dir is not a valid replay bundle: {exc}") from exc
+        require(replay_bundles, f"{entry_label}.bundle_dir must contain at least one replay bundle")
 
 
 def artifact_from_reference(path: Path) -> dict[str, Any]:
@@ -2067,7 +2073,7 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
         root / "fixtures/metal-l2/request_dump",
         root / "fixtures/cuda-l2/request_dump",
     ):
-        path.mkdir(parents=True, exist_ok=True)
+        make_bundle(path)
     native_cuda_dir = root / "fixtures/cuda-native-op"
     native_cuda_dir.mkdir(parents=True, exist_ok=True)
     native_cuda_artifact = native_cuda_dir / "native_cuda.json"
