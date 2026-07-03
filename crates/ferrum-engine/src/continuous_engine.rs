@@ -2350,6 +2350,13 @@ impl EngineInner {
                 serde_json::json!(underflow_amount),
             );
         }
+        if matches!(action, ResourceAction::Defer) {
+            attributes.insert(
+                "scheduler_snapshot".to_string(),
+                serde_json::to_value(self.scheduler.trace_snapshot())
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
         let timestamp = chrono::Utc::now();
         let mut shape =
             BTreeMap::from([("resource_amount".to_string(), serde_json::json!(amount))]);
