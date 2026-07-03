@@ -337,6 +337,26 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub fa2_direct_ffi_shim: Option<String>,
 
+    /// Ferrum native FA2 operator manifest path, equivalent to
+    /// `FERRUM_FA2_NATIVE_MANIFEST`.
+    #[serde(default)]
+    pub fa2_native_manifest: Option<String>,
+
+    /// Ferrum native FA2 operator artifact path, equivalent to
+    /// `FERRUM_FA2_NATIVE_ARTIFACT`.
+    #[serde(default)]
+    pub fa2_native_artifact: Option<String>,
+
+    /// Ferrum native FA2 source package sha256 pin, equivalent to
+    /// `FERRUM_FA2_NATIVE_SOURCE_SHA256`.
+    #[serde(default)]
+    pub fa2_native_source_sha256: Option<String>,
+
+    /// Ferrum native FA2 input tree sha256 pin, equivalent to
+    /// `FERRUM_FA2_NATIVE_INPUTS_SHA256`.
+    #[serde(default)]
+    pub fa2_native_inputs_sha256: Option<String>,
+
     /// Requested max model length, equivalent to `FERRUM_MAX_MODEL_LEN`.
     #[serde(default)]
     pub max_model_len: Option<usize>,
@@ -464,6 +484,26 @@ impl RuntimeCliConfig {
             &mut entries,
             "FERRUM_FA2_DIRECT_FFI_SHIM",
             self.fa2_direct_ffi_shim.as_deref(),
+        );
+        push_string_entry(
+            &mut entries,
+            "FERRUM_FA2_NATIVE_MANIFEST",
+            self.fa2_native_manifest.as_deref(),
+        );
+        push_string_entry(
+            &mut entries,
+            "FERRUM_FA2_NATIVE_ARTIFACT",
+            self.fa2_native_artifact.as_deref(),
+        );
+        push_string_entry(
+            &mut entries,
+            "FERRUM_FA2_NATIVE_SOURCE_SHA256",
+            self.fa2_native_source_sha256.as_deref(),
+        );
+        push_string_entry(
+            &mut entries,
+            "FERRUM_FA2_NATIVE_INPUTS_SHA256",
+            self.fa2_native_inputs_sha256.as_deref(),
         );
         push_usize_entry(&mut entries, "FERRUM_MAX_MODEL_LEN", self.max_model_len);
         push_usize_entry(
@@ -731,12 +771,20 @@ mod tests {
             fa2_source: Some(true),
             fa2_direct_ffi: Some(false),
             fa2_direct_ffi_shim: Some("/tmp/libferrum_fa2_shim.so".to_string()),
+            fa2_native_manifest: Some("/tmp/native/fa2/native_operator_manifest.json".to_string()),
+            fa2_native_artifact: Some("/tmp/native/fa2/libferrum_native_fa2.a".to_string()),
+            fa2_native_source_sha256: Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ),
+            fa2_native_inputs_sha256: Some(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            ),
             max_model_len: Some(4096),
             moe_batch_threshold: Some(4),
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 36);
+        assert_eq!(entries.len(), 40);
         let entry = |key: &str| {
             entries
                 .iter()
@@ -819,6 +867,22 @@ mod tests {
         assert_eq!(
             entry("FERRUM_FA2_DIRECT_FFI_SHIM").effective_value,
             "/tmp/libferrum_fa2_shim.so"
+        );
+        assert_eq!(
+            entry("FERRUM_FA2_NATIVE_MANIFEST").effective_value,
+            "/tmp/native/fa2/native_operator_manifest.json"
+        );
+        assert_eq!(
+            entry("FERRUM_FA2_NATIVE_ARTIFACT").effective_value,
+            "/tmp/native/fa2/libferrum_native_fa2.a"
+        );
+        assert_eq!(
+            entry("FERRUM_FA2_NATIVE_SOURCE_SHA256").effective_value,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            entry("FERRUM_FA2_NATIVE_INPUTS_SHA256").effective_value,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
         assert_eq!(entry("FERRUM_MAX_MODEL_LEN").effective_value, "4096");
         assert_eq!(entry("FERRUM_MOE_BATCH_THRESHOLD").effective_value, "4");
