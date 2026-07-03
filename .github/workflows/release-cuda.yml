@@ -60,11 +60,9 @@ jobs:
         with:
           ref: ${{ github.ref }}
 
-      - name: Verify vendored FA2 source for fa2-source build
+      - name: Verify native operator source boundary
         run: |
-          test -f crates/ferrum-kernels/kernels/fa2_source/flash_attn/src/flash.h
-          test -f crates/ferrum-kernels/kernels/fa2_source/cutlass/include/cute/tensor.hpp
-          test -f crates/ferrum-kernels/kernels/fa2_source/cutlass/include/cutlass/cutlass.h
+          python3 scripts/release/native_operator_artifact_gate.py --self-test
 
       - name: Resolve version and CUDA target
         id: version
@@ -106,7 +104,7 @@ jobs:
           export PATH="$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH"
           export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
           cargo build --release -p ferrum-cli --bin ferrum \
-            --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source
+            --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
 
       - name: Strip binary
         run: strip target/release/ferrum
@@ -132,7 +130,7 @@ jobs:
           Tag: ${{ steps.version.outputs.tag }}
           CUDA toolkit image: nvidia/cuda:12.6.0-devel-ubuntu22.04
           CUDA_COMPUTE_CAP: ${{ steps.version.outputs.cuda_compute_cap }}
-          Cargo features: cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source
+          Cargo features: cuda,vllm-moe-marlin,vllm-paged-attn-v2
 
           This package does not bundle NVIDIA driver/runtime libraries.
           Install a compatible NVIDIA driver, CUDA runtime, and NCCL runtime on the target host.
