@@ -170,6 +170,59 @@ def has_capacity_explanation(event: dict[str, Any]) -> bool:
     return isinstance(resource.get("capacity"), int)
 
 
+def validate_chat_completion_profile_event(event_attrs: dict[str, Any], context: str) -> None:
+    validate_request_token_latency_summary(
+        event_attrs,
+        context,
+        allowed_token_sources={"usage", "generated_tokens"},
+    )
+    if event_attrs.get("stream") is True:
+        for key in ("ttft_us", "itl_us_avg"):
+            value = event_attrs.get(key)
+            if not isinstance(value, int) or value < 0:
+                raise ValidationError(
+                    f"{context} streaming chat completion requires attributes.{key}"
+                )
+
+
+def validate_run_generation_profile_event(event_attrs: dict[str, Any], context: str) -> None:
+    validate_request_token_latency_summary(
+        event_attrs,
+        context,
+        allowed_token_sources={"rendered_prompt_and_generated_tokens"},
+    )
+
+
+def validate_request_token_latency_summary(
+    event_attrs: dict[str, Any],
+    context: str,
+    *,
+    allowed_token_sources: set[str],
+) -> None:
+    for key in (
+        "completion_token_count",
+        "e2e_duration_us",
+        "output_token_count",
+        "prompt_token_count",
+        "total_token_count",
+    ):
+        value = event_attrs.get(key)
+        if not isinstance(value, int) or value < 0:
+            raise ValidationError(f"{context} requires non-negative integer attributes.{key}")
+    if event_attrs["e2e_duration_us"] <= 0:
+        raise ValidationError(f"{context} attributes.e2e_duration_us must be positive")
+    if event_attrs["total_token_count"] < event_attrs["completion_token_count"]:
+        raise ValidationError(
+            f"{context} attributes.total_token_count must cover completion_token_count"
+        )
+    token_count_source = event_attrs.get("token_count_source")
+    if token_count_source not in allowed_token_sources:
+        allowed = ", ".join(sorted(allowed_token_sources))
+        raise ValidationError(
+            f"{context} attributes.token_count_source must be one of: {allowed}"
+        )
+
+
 def validate_profile_semantics(path: Path, events: list[dict[str, Any]]) -> None:
     schema_fingerprints = {
         event_attributes(event).get("profile_schema_fingerprint")
@@ -208,6 +261,19 @@ def validate_profile_semantics(path: Path, events: list[dict[str, Any]]) -> None
                     f"{context} profile/prometheus completed request mismatch: "
                     f"{profile_count} != {prometheus_count}"
                 )
+        if (
+            event.get("entrypoint") == "serve"
+            and event.get("status") == "ok"
+            and str(event.get("phase", "")).startswith("chat_completions_")
+            and str(event.get("phase", "")).endswith("_complete")
+        ):
+            validate_chat_completion_profile_event(attrs, context)
+        if (
+            event.get("entrypoint") == "run"
+            and event.get("status") == "ok"
+            and event.get("phase") == "actual_run_generation"
+        ):
+            validate_run_generation_profile_event(attrs, context)
 
     failure_events = [event for event in events if event.get("status") == "failure"]
     capacity_events_by_request: dict[str, bool] = {}
@@ -283,6 +349,8 @@ def validate_native_manifest(path: Path) -> dict[str, Any]:
     exports = data.get("exports")
     if not isinstance(exports, list) or "ferrum_native_op_init" not in exports:
         raise ValidationError(f"{path}.exports must include ferrum_native_op_init")
+    if "ferrum_native_op_descriptor" not in exports:
+        raise ValidationError(f"{path}.exports must include ferrum_native_op_descriptor")
     return {"path": str(path), "operator": data["operator"], "backend": backend}
 
 
