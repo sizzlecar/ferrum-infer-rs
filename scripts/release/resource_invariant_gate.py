@@ -162,6 +162,7 @@ def normalize_event(event: dict[str, Any], context: str) -> dict[str, Any]:
     before = optional_int(event, "before", context)
     after = optional_int(event, "after", context)
     capacity = optional_int(event, "capacity", context)
+    underflow_amount = optional_int(event, "underflow_amount", context)
     error_kind = optional_non_empty_string(event, "error_kind", context)
     message = optional_non_empty_string(event, "message", context)
     resource_error_kind = optional_non_empty_string(event, "resource_error_kind", context)
@@ -170,6 +171,17 @@ def normalize_event(event: dict[str, Any], context: str) -> dict[str, Any]:
             raise GateError(f"{context}.{action} requires amount, before, and after")
         if amount < 0:
             raise GateError(f"{context}.{action}.amount must be non-negative")
+    if underflow_amount is not None:
+        if underflow_amount <= 0:
+            raise GateError(f"{context}.underflow_amount must be positive when set")
+        if action not in {"release", "rollback"}:
+            raise GateError(f"{context}.underflow_amount is only valid for release/rollback")
+        expected_underflow = max((amount or 0) - (before or 0), 0)
+        if underflow_amount != expected_underflow:
+            raise GateError(
+                f"{context}.underflow_amount={underflow_amount} does not match "
+                f"amount-before={expected_underflow}"
+            )
     if action in TERMINAL_EXPLICIT_ACTIONS:
         non_empty_string(event, "reason", context)
     if action == "capacity_snapshot" and capacity is None:

@@ -2336,6 +2336,20 @@ impl EngineInner {
         if let Some(reason) = reason.as_deref() {
             attributes.insert("resource_reason".to_string(), serde_json::json!(reason));
         }
+        let underflow_amount = match (action, amount, before) {
+            (ResourceAction::Release | ResourceAction::Rollback, Some(amount), Some(before))
+                if amount > before =>
+            {
+                Some(amount.saturating_sub(before))
+            }
+            _ => None,
+        };
+        if let Some(underflow_amount) = underflow_amount {
+            attributes.insert(
+                "resource_underflow_amount".to_string(),
+                serde_json::json!(underflow_amount),
+            );
+        }
         let timestamp = chrono::Utc::now();
         let mut shape =
             BTreeMap::from([("resource_amount".to_string(), serde_json::json!(amount))]);
@@ -2369,6 +2383,7 @@ impl EngineInner {
                 before,
                 after,
                 capacity,
+                underflow_amount,
                 reason,
                 error_kind: None,
                 message: None,

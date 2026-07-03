@@ -31,6 +31,8 @@ pub struct ResourceTraceEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underflow_amount: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
@@ -63,6 +65,9 @@ impl ResourceTraceEvent {
             .is_some_and(str::is_empty)
         {
             return Err("resource resource_error_kind must be non-empty when set".to_string());
+        }
+        if self.underflow_amount.is_some_and(|amount| amount <= 0) {
+            return Err("resource underflow_amount must be positive when set".to_string());
         }
         match self.action {
             ResourceAction::Reserve
@@ -109,6 +114,7 @@ mod tests {
             before: Some(4),
             after: Some(3),
             capacity: Some(4),
+            underflow_amount: None,
             reason: None,
             error_kind: None,
             message: None,
@@ -136,6 +142,7 @@ mod tests {
             before: None,
             after: None,
             capacity: None,
+            underflow_amount: None,
             reason: None,
             error_kind: Some("cuda_oom".to_string()),
             message: Some("CUDA out of memory".to_string()),
@@ -144,6 +151,29 @@ mod tests {
         event.validate().unwrap();
 
         event.error_kind = Some(String::new());
+        assert!(event.validate().is_err());
+    }
+
+    #[test]
+    fn lifecycle_event_allows_positive_underflow_amount_only() {
+        let mut event = ResourceTraceEvent {
+            owner_kind: "request".to_string(),
+            owner_id: "req-underflow".to_string(),
+            resource_kind: "kv_block".to_string(),
+            action: ResourceAction::Release,
+            amount: Some(2),
+            before: Some(1),
+            after: Some(-1),
+            capacity: Some(4),
+            underflow_amount: Some(1),
+            reason: None,
+            error_kind: None,
+            message: None,
+            resource_error_kind: None,
+        };
+        event.validate().unwrap();
+
+        event.underflow_amount = Some(0);
         assert!(event.validate().is_err());
     }
 }

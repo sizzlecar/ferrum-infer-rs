@@ -45,6 +45,7 @@ pub(crate) struct ResourceLedgerTransition {
     pub(crate) before: i64,
     pub(crate) after: i64,
     pub(crate) capacity: Option<i64>,
+    pub(crate) underflow_amount: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -82,6 +83,7 @@ impl ResourceLifecycleLedger {
             before,
             after,
             capacity: state.capacity,
+            underflow_amount: None,
         }
     }
 
@@ -102,6 +104,7 @@ impl ResourceLifecycleLedger {
             before,
             after,
             capacity: state.capacity,
+            underflow_amount: None,
         }
     }
 
@@ -122,6 +125,7 @@ impl ResourceLifecycleLedger {
             before,
             after,
             capacity: state.capacity,
+            underflow_amount: (amount > before).then_some(amount - before),
         }
     }
 
@@ -143,6 +147,7 @@ impl ResourceLifecycleLedger {
             before,
             after,
             capacity: state.capacity,
+            underflow_amount: (amount > before).then_some(amount - before),
         }
     }
 
@@ -176,7 +181,8 @@ mod tests {
             ResourceLedgerTransition {
                 before: 0,
                 after: 4,
-                capacity: Some(16)
+                capacity: Some(16),
+                underflow_amount: None
             }
         );
 
@@ -186,7 +192,8 @@ mod tests {
             ResourceLedgerTransition {
                 before: 0,
                 after: 4,
-                capacity: Some(16)
+                capacity: Some(16),
+                underflow_amount: None
             }
         );
 
@@ -196,7 +203,8 @@ mod tests {
             ResourceLedgerTransition {
                 before: 4,
                 after: 2,
-                capacity: Some(16)
+                capacity: Some(16),
+                underflow_amount: None
             }
         );
 
@@ -206,7 +214,8 @@ mod tests {
             ResourceLedgerTransition {
                 before: 2,
                 after: 0,
-                capacity: Some(16)
+                capacity: Some(16),
+                underflow_amount: None
             }
         );
     }
@@ -223,7 +232,36 @@ mod tests {
             ResourceLedgerTransition {
                 before: 3,
                 after: 0,
-                capacity: Some(8)
+                capacity: Some(8),
+                underflow_amount: None
+            }
+        );
+    }
+
+    #[test]
+    fn release_and_rollback_report_underflow_in_transition() {
+        let mut ledger = ResourceLifecycleLedger::default();
+
+        let release = ledger.release("request", "req-1", "kv_block", 2, Some(4));
+        assert_eq!(
+            release,
+            ResourceLedgerTransition {
+                before: 0,
+                after: -2,
+                capacity: Some(4),
+                underflow_amount: Some(2)
+            }
+        );
+
+        ledger.reserve("request", "req-2", "kv_block", 1, Some(4));
+        let rollback = ledger.rollback("request", "req-2", "kv_block", 2, None);
+        assert_eq!(
+            rollback,
+            ResourceLedgerTransition {
+                before: 1,
+                after: -1,
+                capacity: Some(4),
+                underflow_amount: Some(1)
             }
         );
     }
