@@ -569,6 +569,48 @@ def run_resource_invariant(out: Path, timeout: int) -> dict[str, Any]:
     return {"traces": [str(trace) for trace in traces], "out": str(out / "resource_invariant")}
 
 
+def validate_replay_execution_summary(summary: dict[str, Any], *, label: str) -> dict[str, Any]:
+    if summary.get("status") != "pass":
+        raise SmokeError(f"{label}.status must be pass")
+    bundle_count = summary.get("bundle_count")
+    replay_execution_count = summary.get("replay_execution_count")
+    replay_execution_skipped_count = summary.get("replay_execution_skipped_count")
+    for key, value in [
+        ("bundle_count", bundle_count),
+        ("replay_execution_count", replay_execution_count),
+        ("replay_execution_skipped_count", replay_execution_skipped_count),
+    ]:
+        if not isinstance(value, int) or value < 0:
+            raise SmokeError(f"{label}.{key} must be a non-negative integer")
+    if bundle_count <= 0:
+        raise SmokeError(f"{label}.bundle_count must be positive")
+    if replay_execution_count <= 0:
+        raise SmokeError(f"{label} did not execute any offline replay")
+    if replay_execution_skipped_count >= bundle_count:
+        raise SmokeError(f"{label} skipped all replay bundles")
+    replay_executions = summary.get("replay_executions")
+    if not isinstance(replay_executions, list):
+        raise SmokeError(f"{label}.replay_executions must be a list")
+    skipped = [
+        item
+        for item in replay_executions
+        if isinstance(item, dict) and item.get("status") == "skipped_requires_running_server"
+    ]
+    if len(skipped) != replay_execution_skipped_count:
+        raise SmokeError(
+            f"{label}.replay_execution_skipped_count does not match skipped replay records"
+        )
+    for item in skipped:
+        source = str(item.get("source_bundle_dir") or "").replace("\\", "/")
+        if "/run/request_dump/" in source or source.endswith("/run/request_dump"):
+            raise SmokeError(f"{label} skipped run replay bundle: {source}")
+    return {
+        "bundle_count": bundle_count,
+        "replay_execution_count": replay_execution_count,
+        "replay_execution_skipped_count": replay_execution_skipped_count,
+    }
+
+
 def run_replay_bundle_gate(out: Path, timeout: int) -> dict[str, Any]:
     bundles = [
         out / "run/request_dump",
@@ -593,7 +635,15 @@ def run_replay_bundle_gate(out: Path, timeout: int) -> dict[str, Any]:
     )
     if "REQUEST REPLAY BUNDLE PASS" not in proc.stdout:
         raise SmokeError("request replay bundle gate did not print PASS")
-    return {"bundles": [str(bundle) for bundle in bundles], "out": str(out / "request_replay_bundle")}
+    summary_path = out / "request_replay_bundle/request_replay_bundle_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    replay_counts = validate_replay_execution_summary(summary, label=str(summary_path))
+    return {
+        "bundles": [str(bundle) for bundle in bundles],
+        "out": str(out / "request_replay_bundle"),
+        "summary": str(summary_path),
+        **replay_counts,
+    }
 
 
 def run_gate(args: argparse.Namespace) -> dict[str, Any]:
@@ -1087,6 +1137,72 @@ def run_selftest_in_root(root: Path, out: Path | None = None) -> dict[str, Any]:
     if malformed_sse["malformed"] != 1 or malformed_sse["done_count"] != 1:
         raise SmokeError(f"unexpected malformed SSE parse result: {malformed_sse}")
 
+    replay_summary_pass = validate_replay_execution_summary(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "status": "pass",
+            "bundle_count": 2,
+            "execute_replay": True,
+            "replay_execution_count": 1,
+            "replay_execution_skipped_count": 1,
+            "replay_executions": [
+                {
+                    "source_bundle_dir": str(work / "run/request_dump/req-run-selftest"),
+                    "status": "executed_synthetic",
+                },
+                {
+                    "source_bundle_dir": str(work / "serve/request_dump/req-serve-selftest"),
+                    "status": "skipped_requires_running_server",
+                },
+            ],
+        },
+        label="selftest.replay_summary_pass",
+    )
+    all_skipped_replay_error = assert_raises(
+        lambda: validate_replay_execution_summary(
+            {
+                "status": "pass",
+                "bundle_count": 2,
+                "replay_execution_count": 0,
+                "replay_execution_skipped_count": 2,
+                "replay_executions": [
+                    {
+                        "source_bundle_dir": str(work / "serve/request_dump/req-a"),
+                        "status": "skipped_requires_running_server",
+                    },
+                    {
+                        "source_bundle_dir": str(work / "serve/request_dump/req-b"),
+                        "status": "skipped_requires_running_server",
+                    },
+                ],
+            },
+            label="selftest.replay_summary_all_skipped",
+        ),
+        "did not execute any offline replay",
+    )
+    skipped_run_replay_error = assert_raises(
+        lambda: validate_replay_execution_summary(
+            {
+                "status": "pass",
+                "bundle_count": 2,
+                "replay_execution_count": 1,
+                "replay_execution_skipped_count": 1,
+                "replay_executions": [
+                    {
+                        "source_bundle_dir": str(work / "run/request_dump/req-run-selftest"),
+                        "status": "skipped_requires_running_server",
+                    },
+                    {
+                        "source_bundle_dir": str(work / "serve/request_dump/req-serve-selftest"),
+                        "status": "executed_synthetic",
+                    },
+                ],
+            },
+            label="selftest.replay_summary_run_skipped",
+        ),
+        "skipped run replay bundle",
+    )
+
     failure_cases = {
         "backend_mismatch": BackendMismatchError("cuda", "metal"),
         "backend_unavailable": BackendUnavailableError("requested backend 'cuda' is not built"),
@@ -1141,9 +1257,14 @@ def run_selftest_in_root(root: Path, out: Path | None = None) -> dict[str, Any]:
         "analyzer": analyzer,
         "resource_invariant": resource_invariant,
         "replay_bundle_count": len(replay_bundles),
+        "replay_summary_validation": replay_summary_pass,
         "sse": sse,
         "failure_kinds": failure_kinds,
-        "negative_cases": {"bad_profile": bad_profile_error},
+        "negative_cases": {
+            "bad_profile": bad_profile_error,
+            "all_skipped_replay": all_skipped_replay_error,
+            "skipped_run_replay": skipped_run_replay_error,
+        },
     }
     if summary["replay_bundle_count"] != 2:
         raise SmokeError(f"expected 2 replay bundles, got {summary['replay_bundle_count']}")
