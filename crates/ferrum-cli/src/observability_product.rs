@@ -98,6 +98,7 @@ pub struct ActualMemoryStageObservation {
     pub stage: String,
     pub duration_us: Option<u64>,
     pub memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+    pub attributes: BTreeMap<String, Value>,
 }
 
 impl ActualMemoryStageObservation {
@@ -112,7 +113,34 @@ impl ActualMemoryStageObservation {
             stage: stage.into(),
             duration_us,
             memory,
+            attributes: BTreeMap::new(),
         }
+    }
+
+    pub fn with_attribute(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.attributes.insert(key.into(), value);
+        self
+    }
+
+    pub fn with_engine_cache_status(mut self, status: &ferrum_types::EngineStatus) -> Self {
+        let memory = &status.memory_usage;
+        self.attributes.extend([
+            (
+                "kv_cache_total_bytes".to_string(),
+                json!(memory.total_bytes),
+            ),
+            ("kv_cache_used_bytes".to_string(), json!(memory.used_bytes)),
+            ("kv_cache_free_bytes".to_string(), json!(memory.free_bytes)),
+            (
+                "cache_memory_bytes".to_string(),
+                json!(memory.cache_memory_bytes),
+            ),
+            (
+                "available_kv_or_state_bytes".to_string(),
+                json!(memory.free_bytes),
+            ),
+        ]);
+        self
     }
 }
 
@@ -866,6 +894,7 @@ fn actual_memory_stage_events(
             );
             event.duration_us = stage.duration_us;
             attach_process_memory(&mut event, stage.memory.as_ref(), &stage.stage);
+            event.attributes.extend(stage.attributes.clone());
             event
         })
         .collect()
@@ -880,7 +909,16 @@ fn actual_serve_startup_events(
     replay_command: &str,
 ) -> Vec<FerrumProfileEvent> {
     let base = Utc::now();
-    let mut events = actual_memory_stage_events(config, request_id, memory_stages, base);
+    let cache_stage_index = memory_stages
+        .iter()
+        .position(|stage| stage.stage == "cache_allocated")
+        .unwrap_or(memory_stages.len());
+    let mut events = actual_memory_stage_events(
+        config,
+        request_id,
+        &memory_stages[..cache_stage_index],
+        base,
+    );
     let open = actual_resource_event(
         config,
         request_id,
@@ -935,6 +973,13 @@ fn actual_serve_startup_events(
     );
     startup.duration_us = Some(startup_duration_us);
     attach_process_memory(&mut startup, startup_memory, "model_loaded");
+    events.extend([open, reserve, commit, startup]);
+    events.extend(actual_memory_stage_events(
+        config,
+        request_id,
+        &memory_stages[cache_stage_index..],
+        base + Duration::microseconds(21),
+    ));
 
     let release = actual_resource_event(
         config,
@@ -973,7 +1018,7 @@ fn actual_serve_startup_events(
             .as_ref()
             .map(|path| path.to_string_lossy().to_string()),
     });
-    events.extend([open, reserve, commit, startup, release, ready]);
+    events.extend([release, ready]);
     events
 }
 

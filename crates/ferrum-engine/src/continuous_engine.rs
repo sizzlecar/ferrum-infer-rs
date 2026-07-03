@@ -3434,20 +3434,33 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
 impl InferenceEngine for ContinuousBatchEngine {
     async fn status(&self) -> EngineStatus {
         let metrics = self.inner.scheduler.metrics();
+        let kv_stats = self.inner.kv_cache.stats();
+        let total_bytes = kv_stats.total_memory_bytes;
+        let used_bytes = kv_stats.used_memory_bytes;
+        let free_bytes = total_bytes.saturating_sub(used_bytes);
+        let mut memory_usage = ferrum_types::MemoryUsage {
+            total_bytes,
+            used_bytes,
+            free_bytes,
+            gpu_memory_bytes: self
+                .inner
+                .config
+                .backend
+                .device
+                .is_gpu()
+                .then_some(used_bytes),
+            cpu_memory_bytes: matches!(self.inner.config.backend.device, Device::CPU)
+                .then_some(used_bytes),
+            cache_memory_bytes: used_bytes,
+            utilization_percent: 0.0,
+        };
+        memory_usage.calculate_utilization();
         EngineStatus {
             is_ready: self.inner.is_running.load(Ordering::SeqCst),
             loaded_models: vec![self.inner.config.model.model_id.clone()],
             active_requests: metrics.running_requests,
             queued_requests: metrics.waiting_requests,
-            memory_usage: ferrum_types::MemoryUsage {
-                total_bytes: 0,
-                used_bytes: 0,
-                free_bytes: 0,
-                gpu_memory_bytes: None,
-                cpu_memory_bytes: None,
-                cache_memory_bytes: 0,
-                utilization_percent: 0.0,
-            },
+            memory_usage,
             uptime_seconds: 0,
             last_heartbeat: chrono::Utc::now(),
             version: env!("CARGO_PKG_VERSION").to_string(),

@@ -2370,6 +2370,54 @@ async fn engine_allocates_and_deallocates_model_declared_recurrent_state() {
 }
 
 #[tokio::test]
+async fn engine_status_reports_kv_cache_memory_from_manager_stats() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(64, &[]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache = Arc::new(MockKvCacheManager::new(128));
+    kv_cache
+        .allocate(&AllocationRequest {
+            request_id: RequestId::new(),
+            initial_tokens: 17,
+            max_sequence_length: 32,
+            num_layers: 1,
+            num_heads: 1,
+            head_dim: 1,
+            device: Device::CPU,
+            dtype: DataType::FP16,
+            priority: Priority::Normal,
+        })
+        .await
+        .unwrap();
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(MockModelExecutor::instant(64));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let engine = ContinuousBatchEngine::new(
+        config,
+        scheduler,
+        tokenizer,
+        sampler,
+        kv_cache,
+        executor,
+        tensor_factory,
+    );
+
+    let status = engine.status().await;
+
+    assert_eq!(status.memory_usage.total_bytes, 128 * 16 * 1024);
+    assert_eq!(status.memory_usage.used_bytes, 2 * 16 * 1024);
+    assert_eq!(status.memory_usage.cache_memory_bytes, 2 * 16 * 1024);
+    assert_eq!(
+        status.memory_usage.free_bytes,
+        status.memory_usage.total_bytes - status.memory_usage.used_bytes
+    );
+    assert_eq!(status.memory_usage.cpu_memory_bytes, Some(2 * 16 * 1024));
+    assert_eq!(status.memory_usage.gpu_memory_bytes, None);
+    assert!(status.memory_usage.utilization_percent > 0.0);
+}
+
+#[tokio::test]
 async fn engine_allocates_and_deallocates_llm_executor_declared_recurrent_state() {
     let scheduler = Arc::new(ContinuousBatchScheduler::new(
         ferrum_types::SchedulerConfig::default(),
