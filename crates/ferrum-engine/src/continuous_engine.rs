@@ -711,6 +711,23 @@ struct SequencePhysicalResources {
     model_cache_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SequenceDecodeResources {
+    seq_id: String,
+    kv_cache: Arc<dyn KvCacheHandle>,
+    recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
+    last_token: TokenId,
+    pos_offset: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SequencePrefillResources {
+    kv_cache: Option<Arc<dyn KvCacheHandle>>,
+    kv_resource_blocks: Option<usize>,
+    recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
+    prefill_tokens_processed: usize,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ModelCacheRefUpdate {
     released: Option<String>,
@@ -1057,6 +1074,48 @@ impl SequenceState {
             .len()
             .saturating_add(self.generated_tokens.len())
             .saturating_sub(1)
+    }
+
+    fn decode_resources(&self, request_id: &RequestId) -> Option<SequenceDecodeResources> {
+        Some(SequenceDecodeResources {
+            seq_id: self.decode_model_cache_id_or_request_id(request_id),
+            kv_cache: self.kv_cache.clone()?,
+            recurrent_state: self.recurrent_state.clone(),
+            last_token: self
+                .generated_tokens
+                .last()
+                .copied()
+                .unwrap_or(TokenId::new(0)),
+            pos_offset: self.decode_model_kv_len_after_last_generated_token(),
+        })
+    }
+
+    fn ready_decode_resources(&self, request_id: &RequestId) -> Option<SequenceDecodeResources> {
+        if !self.prefill_complete || self.generated_tokens.is_empty() {
+            return None;
+        }
+        self.decode_resources(request_id)
+    }
+
+    fn is_preemptible_decode_candidate(&self) -> bool {
+        self.prefill_complete && self.kv_cache.is_some()
+    }
+
+    fn prefill_resources(&self) -> SequencePrefillResources {
+        SequencePrefillResources {
+            kv_cache: self.kv_cache.clone(),
+            kv_resource_blocks: self.kv_resource_blocks,
+            recurrent_state: self.recurrent_state.clone(),
+            prefill_tokens_processed: self.prefill_tokens_processed,
+        }
+    }
+
+    fn recurrent_state_handle(&self) -> Option<Arc<dyn RecurrentStateHandle>> {
+        self.recurrent_state.clone()
+    }
+
+    fn draft_kv_cache_handle(&self) -> Option<Arc<dyn KvCacheHandle>> {
+        self.draft_kv_cache.clone()
     }
 
     fn commit_decode_step_physical_resources(&mut self, kv_cache: Arc<dyn KvCacheHandle>) {
@@ -2572,7 +2631,7 @@ impl EngineInner {
             .sequences
             .read()
             .get(request_id)
-            .and_then(|seq| seq.recurrent_state.clone())
+            .and_then(SequenceState::recurrent_state_handle)
         {
             return Ok(RecurrentStateAdmission::existing(existing));
         }
