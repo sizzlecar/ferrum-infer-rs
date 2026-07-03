@@ -155,6 +155,15 @@ def validate_entrypoint_artifact(root: Path, entrypoint: str) -> dict[str, Any]:
         raise GateError(f"{entrypoint} replay bundle validation failed: {exc}") from exc
     if not replay_bundles:
         raise GateError(f"{request_dump_root} must contain at least one replay bundle")
+    missing_engine_replay = [
+        bundle.get("bundle_dir", "<unknown>")
+        for bundle in replay_bundles
+        if not isinstance(bundle.get("engine_replay"), dict)
+    ]
+    if missing_engine_replay:
+        raise GateError(
+            f"{entrypoint} replay bundles missing engine_replay: {missing_engine_replay}"
+        )
 
     return {
         "entrypoint": entrypoint,
@@ -327,6 +336,18 @@ def write_selftest_replay_bundle(entry_dir: Path, entrypoint: str) -> None:
         "--request-dump-dir",
         str(request_dump),
     ]
+    engine_replay_argv = [
+        "cargo",
+        "run",
+        "-p",
+        "ferrum-cli",
+        "--",
+        "replay-bundle",
+        str(bundle),
+        "--out",
+        str(bundle / "engine_replay"),
+        "--json",
+    ]
     request = {
         "schema_version": SCHEMA_VERSION,
         "entrypoint": entrypoint,
@@ -387,6 +408,12 @@ def write_selftest_replay_bundle(entry_dir: Path, entrypoint: str) -> None:
             "command": " ".join(replay_argv),
             "argv": replay_argv,
             "bundle_dir": str(bundle),
+            "engine_replay": {
+                "mode": "bundle_offline",
+                "requires_http_server": False,
+                "command": " ".join(engine_replay_argv),
+                "argv": engine_replay_argv,
+            },
             "sanitized": True,
         },
     }

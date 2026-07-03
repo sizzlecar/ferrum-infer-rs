@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from request_replay_bundle_gate import BundleError, validate_bundle_root
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GOAL = "release-regression-hardening-2026-06-28"
@@ -165,6 +167,7 @@ def validate_entrypoint(root: Path, entrypoint: str, detail: str) -> dict[str, A
         raise GateError(f"{request_dump}.profile_detail must be {detail}")
     if not replay.read_text(encoding="utf-8").strip():
         raise GateError(f"{replay} must be non-empty")
+    replay_bundles = validate_entrypoint_replay_bundles(root / "request_dump", entrypoint)
     return {
         "entrypoint": entrypoint,
         "schema_version": SCHEMA_VERSION,
@@ -173,6 +176,39 @@ def validate_entrypoint(root: Path, entrypoint: str, detail: str) -> dict[str, A
         "artifacts": summaries,
         "request_dump": str(request_dump),
         "replay_command": replay.read_text(encoding="utf-8").strip(),
+        "replay_bundles": replay_bundles,
+    }
+
+
+def validate_entrypoint_replay_bundles(request_dump_root: Path, entrypoint: str) -> dict[str, Any]:
+    try:
+        bundles = validate_bundle_root(request_dump_root)
+    except BundleError as exc:
+        raise GateError(f"{request_dump_root} replay bundle validation failed: {exc}") from exc
+    if not bundles:
+        raise GateError(f"{request_dump_root} must contain at least one replay bundle")
+    missing_engine_replay = [
+        bundle.get("bundle_dir", "<unknown>")
+        for bundle in bundles
+        if not isinstance(bundle.get("engine_replay"), dict)
+    ]
+    if missing_engine_replay:
+        raise GateError(
+            f"{request_dump_root} replay bundles missing engine_replay: {missing_engine_replay}"
+        )
+    wrong_entrypoint = [
+        bundle.get("bundle_dir", "<unknown>")
+        for bundle in bundles
+        if bundle.get("entrypoint") != entrypoint
+    ]
+    if wrong_entrypoint:
+        raise GateError(
+            f"{request_dump_root} replay bundles have wrong entrypoint for {entrypoint}: {wrong_entrypoint}"
+        )
+    return {
+        "bundle_count": len(bundles),
+        "engine_replay_count": len(bundles),
+        "bundle_dirs": [str(bundle.get("bundle_dir")) for bundle in bundles],
     }
 
 
@@ -354,8 +390,111 @@ def run_self_test() -> None:
             "ferrum run synthetic/no-weight\n",
             encoding="utf-8",
         )
+        write_selftest_replay_bundle(entry / "request_dump", "run")
         validate_entrypoint(entry, "run", "basic")
     print(SELFTEST_PASS_LINE)
+
+
+def write_selftest_replay_bundle(request_dump_root: Path, entrypoint: str) -> None:
+    request_id = f"req-{entrypoint}"
+    bundle = request_dump_root / request_id
+    bundle.mkdir(parents=True, exist_ok=True)
+    replay_argv = [
+        "cargo",
+        "run",
+        "-p",
+        "ferrum-cli",
+        "--",
+        entrypoint,
+        "synthetic/no-weight",
+        "--profile-detail",
+        "basic",
+        "--request-dump-dir",
+        str(request_dump_root),
+    ]
+    engine_replay_argv = [
+        "cargo",
+        "run",
+        "-p",
+        "ferrum-cli",
+        "--",
+        "replay-bundle",
+        str(bundle),
+        "--out",
+        str(bundle / "engine_replay"),
+        "--json",
+    ]
+    files: dict[str, Any] = {
+        "request.json": {
+            "schema_version": SCHEMA_VERSION,
+            "entrypoint": entrypoint,
+            "request_id": request_id,
+            "model": "synthetic/no-weight",
+            "backend": "synthetic",
+            "sanitized": True,
+        },
+        "prompt_token_ids.json": {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "token_ids": [101, 202],
+            "token_count": 2,
+            "sanitized": True,
+        },
+        "sampling_params.json": {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "sampling_params": {"max_tokens": 4, "temperature": 0.0},
+        },
+        "runtime_effective_config.json": {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "entrypoint": entrypoint,
+            "profile_detail": "basic",
+            "request_dump_dir": str(request_dump_root),
+            "sanitized": True,
+        },
+        "backend_selection.json": {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "backend": "synthetic",
+            "model": "synthetic/no-weight",
+        },
+        "output_token_ids.json": {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "token_ids": [909, 808],
+            "token_count": 2,
+            "finish_reason": "stop",
+        },
+        "bad_output_scan.json": {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "bad_output": False,
+            "bad_text_count": 0,
+            "reasons": [],
+            "first_bad_text_span": None,
+            "failure_kind": None,
+            "output_sha256": "0" * 64,
+        },
+        "replay.command.json": {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "entrypoint": entrypoint,
+            "command": " ".join(replay_argv),
+            "argv": replay_argv,
+            "bundle_dir": str(bundle),
+            "engine_replay": {
+                "mode": "bundle_offline",
+                "requires_http_server": False,
+                "command": " ".join(engine_replay_argv),
+                "argv": engine_replay_argv,
+            },
+            "sanitized": True,
+        },
+    }
+    for name, data in files.items():
+        write_json(bundle / name, data)
+    (bundle / "output_text.txt").write_text("synthetic ok\n", encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:

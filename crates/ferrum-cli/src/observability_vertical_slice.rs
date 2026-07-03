@@ -380,13 +380,15 @@ fn write_replay_bundle(
     bundle_dir: &Path,
     entrypoint: ProfileEntrypoint,
     request_id: &str,
-    replay_command: &str,
+    replay_command_text: &str,
     replay_args: &[String],
     request: &serde_json::Value,
     out_dir: &Path,
     request_dump_dir: &Path,
 ) -> Result<()> {
     let output_text = "synthetic ok";
+    let engine_replay_args = engine_replay_command_args(bundle_dir);
+    let engine_replay_command = replay_command(&engine_replay_args);
     let files = [
         ("request.json", request.clone()),
         (
@@ -465,9 +467,15 @@ fn write_replay_bundle(
                 "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
                 "request_id": request_id,
                 "entrypoint": entrypoint_label(entrypoint),
-                "command": replay_command,
+                "command": replay_command_text,
                 "argv": replay_args,
                 "bundle_dir": bundle_dir.to_string_lossy(),
+                "engine_replay": {
+                    "mode": "bundle_offline",
+                    "requires_http_server": false,
+                    "command": engine_replay_command,
+                    "argv": engine_replay_args
+                },
                 "sanitized": true
             }),
         ),
@@ -519,6 +527,24 @@ fn replay_command_args(
             .to_string(),
         "--request-dump-dir".to_string(),
         request_dump_dir.to_string_lossy().to_string(),
+    ]
+}
+
+fn engine_replay_command_args(bundle_dir: &Path) -> Vec<String> {
+    vec![
+        "cargo".to_string(),
+        "run".to_string(),
+        "-p".to_string(),
+        "ferrum-cli".to_string(),
+        "--".to_string(),
+        "replay-bundle".to_string(),
+        bundle_dir.to_string_lossy().to_string(),
+        "--out".to_string(),
+        bundle_dir
+            .join("engine_replay")
+            .to_string_lossy()
+            .to_string(),
+        "--json".to_string(),
     ]
 }
 
@@ -639,6 +665,9 @@ mod tests {
         .unwrap();
         let argv = replay["argv"].as_array().unwrap();
         assert!(argv.iter().any(|part| part == "--request-dump-dir"));
+        let engine_argv = replay["engine_replay"]["argv"].as_array().unwrap();
+        assert!(engine_argv.iter().any(|part| part == "replay-bundle"));
+        assert_eq!(replay["engine_replay"]["requires_http_server"], false);
         let profile = fs::read_to_string(root.join("profile.jsonl")).unwrap();
         assert!(profile.contains("\"entrypoint\":\"run\""));
         assert!(profile.contains("\"replay\""));
