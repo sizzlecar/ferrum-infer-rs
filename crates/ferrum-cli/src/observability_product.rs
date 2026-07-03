@@ -948,6 +948,14 @@ fn resource_event(
         before,
         after,
         capacity,
+        underflow_amount: match (action, amount, before) {
+            (ResourceAction::Release | ResourceAction::Rollback, Some(amount), Some(before))
+                if amount > before =>
+            {
+                Some(amount.saturating_sub(before))
+            }
+            _ => None,
+        },
         reason: reason.map(str::to_string),
         error_kind: None,
         message: None,
