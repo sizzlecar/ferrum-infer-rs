@@ -121,9 +121,10 @@ impl EngineInner {
         } // skip_prefix_cache
 
         // ── Cache miss (or prefix cache skipped) — full prefill ─────────
-        let initial_recurrent_state = self
-            .ensure_recurrent_state(request_id, recurrent_state_spec)
+        let mut recurrent_admission = self
+            .prepare_recurrent_state(request_id, recurrent_state_spec)
             .await?;
+        let initial_recurrent_state = recurrent_admission.handle();
         let model_info = self.model_executor.info();
         let alloc_request = AllocationRequest {
             request_id: request_id.clone(),
@@ -159,12 +160,12 @@ impl EngineInner {
                     {
                         Ok(lease) => lease,
                         Err(e) => {
-                            self.release_recurrent_state(request_id).await;
+                            recurrent_admission.release_fresh(self).await;
                             return Err(e);
                         }
                     }
                 } else {
-                    self.release_recurrent_state(request_id).await;
+                    recurrent_admission.release_fresh(self).await;
                     return Err(FerrumError::resource_exhausted(
                         "No blocks available and no request to preempt",
                     ));
@@ -202,7 +203,7 @@ impl EngineInner {
                     Ok(tensor) => tensor,
                     Err(e) => {
                         kv_lease.release(self).await;
-                        self.release_recurrent_state(request_id).await;
+                        recurrent_admission.release_fresh(self).await;
                         return Err(e);
                     }
                 };
@@ -216,7 +217,7 @@ impl EngineInner {
                     Ok(out) => out,
                     Err(e) => {
                         kv_lease.release(self).await;
-                        self.release_recurrent_state(request_id).await;
+                        recurrent_admission.release_fresh(self).await;
                         return Err(e);
                     }
                 };
@@ -242,7 +243,7 @@ impl EngineInner {
                     Ok(tensor) => tensor,
                     Err(e) => {
                         kv_lease.release(self).await;
-                        self.release_recurrent_state(request_id).await;
+                        recurrent_admission.release_fresh(self).await;
                         return Err(e);
                     }
                 }
@@ -259,7 +260,7 @@ impl EngineInner {
                 Ok(out) => out,
                 Err(e) => {
                     kv_lease.release(self).await;
-                    self.release_recurrent_state(request_id).await;
+                    recurrent_admission.release_fresh(self).await;
                     return Err(e);
                 }
             }
@@ -296,7 +297,10 @@ impl EngineInner {
             seq.recurrent_state = prefill_output
                 .recurrent_state
                 .clone()
-                .or_else(|| initial_recurrent_state.clone());
+                .or_else(|| recurrent_admission.handle());
+            if let Some(slots) = recurrent_admission.fresh_slots() {
+                seq.recurrent_state_slots = Some(slots);
+            }
             seq.prefill_complete = true;
             seq.phase = RequestPhase::Decoding;
             Ok::<TokenId, FerrumError>(token)
@@ -305,12 +309,13 @@ impl EngineInner {
             Ok(token) => token,
             Err(e) => {
                 kv_lease.release(self).await;
-                self.release_recurrent_state(request_id).await;
+                recurrent_admission.release_fresh(self).await;
                 return Err(e);
             }
         };
         let (_committed_request_id, committed_kv_resource_blocks) = kv_lease.into_committed_parts();
         debug_assert_eq!(committed_kv_resource_blocks, kv_resource_blocks);
+        recurrent_admission.commit_fresh();
 
         self.scheduler.mark_prefill_complete(request_id, num_tokens);
         self.total_prefill_tokens
@@ -478,7 +483,9 @@ impl EngineInner {
                     }
                 }
             };
-            let recurrent_state = match self.ensure_recurrent_state(rid, recurrent_state_spec).await
+            let recurrent_state = match self
+                .prepare_recurrent_state(rid, recurrent_state_spec)
+                .await
             {
                 Ok(state) => state,
                 Err(e) => {
@@ -522,7 +529,7 @@ impl EngineInner {
             let input = PrefillInput::new(tensor)
                 .with_kv_cache(kv)
                 .with_metadata(pending.metadata.clone());
-            inputs.push(if let Some(state) = pending.recurrent_state.clone() {
+            inputs.push(if let Some(state) = pending.recurrent_state.handle() {
                 input.with_recurrent_state(state)
             } else {
                 input
@@ -580,7 +587,10 @@ impl EngineInner {
                 seq.recurrent_state = prefill_output
                     .recurrent_state
                     .clone()
-                    .or_else(|| pending.recurrent_state.clone());
+                    .or_else(|| pending.recurrent_state.handle());
+                if let Some(slots) = pending.recurrent_state.fresh_slots() {
+                    seq.recurrent_state_slots = Some(slots);
+                }
                 seq.prefill_complete = true;
                 seq.phase = RequestPhase::Decoding;
                 Ok::<Option<TokenId>, FerrumError>(Some(token))
@@ -600,6 +610,7 @@ impl EngineInner {
             };
             let committed_kv_resource_blocks = pending.commit_kv()?;
             debug_assert_eq!(committed_kv_resource_blocks, kv_resource_blocks);
+            pending.recurrent_state.commit_fresh();
             let num_tokens = pending.input_tokens.len();
             self.scheduler.mark_prefill_complete(&rid, num_tokens);
             self.total_prefill_tokens
