@@ -6,11 +6,14 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+from request_replay_bundle_gate import BundleError, make_bundle, validate_bundle_root
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -140,6 +143,56 @@ def normalize_command_file(path: Path) -> str:
     return str(path)
 
 
+def safe_path_part(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "bundle"
+
+
+def materialize_replay_bundle_index(replay_roots: list[Path], out: Path) -> list[dict[str, Any]]:
+    require(replay_roots, "at least one --replay-bundle is required for L2 actual model evidence")
+    replay_out = out / "replay_bundles"
+    replay_out.mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, Any]] = []
+    for root_index, replay_root in enumerate(replay_roots):
+        try:
+            bundles = validate_bundle_root(replay_root)
+        except BundleError as exc:
+            raise L2ArtifactError(f"{replay_root}: invalid replay bundle: {exc}") from exc
+        require(bundles, f"{replay_root}: replay bundle root must contain at least one bundle")
+        for bundle_index, bundle in enumerate(bundles):
+            request_id = str(bundle.get("request_id") or f"request-{root_index}-{bundle_index}")
+            entrypoint = str(bundle.get("entrypoint") or "unknown")
+            source_bundle = Path(str(bundle["bundle_dir"])).resolve()
+            dest = replay_out / (
+                f"{root_index:02d}_{bundle_index:02d}_"
+                f"{safe_path_part(entrypoint)}_{safe_path_part(request_id)}"
+            )
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(source_bundle, dest)
+            try:
+                copied = validate_bundle_root(dest)
+            except BundleError as exc:
+                raise L2ArtifactError(f"{dest}: copied replay bundle is invalid: {exc}") from exc
+            require(copied, f"{dest}: copied replay bundle root must contain at least one bundle")
+            replay = read_json(dest / "replay.command.json")
+            command = replay.get("command")
+            require(
+                isinstance(command, str) and command.strip(),
+                f"{dest / 'replay.command.json'}.command must be non-empty",
+            )
+            copied_bundle = copied[0]
+            entries.append(
+                {
+                    "request_id": str(copied_bundle.get("request_id") or request_id),
+                    "entrypoint": str(copied_bundle.get("entrypoint") or entrypoint),
+                    "replay_command": command,
+                    "bundle_dir": str(dest),
+                    "source_bundle_dir": str(source_bundle),
+                }
+            )
+    return entries
+
+
 def metal_l2(args: argparse.Namespace, source: Path, source_manifest: dict[str, Any], expected_sha: str) -> dict[str, Any]:
     summary_path = source / "metal-readme" / "summary.json"
     summary = read_json(summary_path)
@@ -249,6 +302,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         normalized = metal_l2(args, source, source_manifest, expected_sha)
     else:
         normalized = cuda_l2(args, source, source_manifest, expected_sha)
+    replay_bundle_index = materialize_replay_bundle_index(args.replay_bundle, out)
 
     current_dirty = git_value(["status", "--short"], default="").splitlines()
     pass_line = f"{backend.upper()} {PASS_LINE_SUFFIX}: {out}"
@@ -270,7 +324,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         "entrypoints": normalized["entrypoints"],
         "command": normalized["command"],
         "profile_detail": args.profile_detail,
-        "replay_bundle_index": [],
+        "replay_bundle_index": replay_bundle_index,
         "source_artifact": str(source),
         "source_pass_line": source_manifest.get("pass_line"),
         "source_summary": normalized["source_summary"],
@@ -383,6 +437,10 @@ def run_selftest() -> dict[str, Any]:
         root = Path(tmp)
         metal_source = make_metal_source(root / "metal-source", sha)
         cuda_source = make_cuda_source(root / "cuda-source", sha)
+        metal_replay = root / "metal-replay"
+        cuda_replay = root / "cuda-replay"
+        make_bundle(metal_replay, entrypoint="run")
+        make_bundle(cuda_replay, entrypoint="serve", serve_replay=True)
         metal = run_gate(
             argparse.Namespace(
                 out=root / "metal-out",
@@ -393,6 +451,7 @@ def run_selftest() -> dict[str, Any]:
                 model_id=None,
                 architecture=None,
                 profile_detail="release-gate",
+                replay_bundle=[metal_replay],
             )
         )
         cuda = run_gate(
@@ -405,6 +464,7 @@ def run_selftest() -> dict[str, Any]:
                 model_id=None,
                 architecture=None,
                 profile_detail="release-gate",
+                replay_bundle=[cuda_replay],
             )
         )
         require(metal["backend"] == "metal", "metal normalization failed")
@@ -448,6 +508,7 @@ def run_selftest() -> dict[str, Any]:
                     model_id=None,
                     architecture=None,
                     profile_detail="release-gate",
+                    replay_bundle=[cuda_replay],
                 )
             )
             raise AssertionError("stale source artifact unexpectedly passed")
@@ -469,6 +530,7 @@ def run_selftest() -> dict[str, Any]:
                     model_id=None,
                     architecture=None,
                     profile_detail="release-gate",
+                    replay_bundle=[metal_replay],
                 )
             )
             raise AssertionError("broken metal stream unexpectedly passed")
@@ -488,6 +550,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id")
     parser.add_argument("--architecture")
     parser.add_argument("--profile-detail", default="release-gate")
+    parser.add_argument("--replay-bundle", type=Path, action="append", default=[])
     return parser.parse_args()
 
 

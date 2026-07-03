@@ -173,6 +173,7 @@ def resolve_artifact_dir(raw: str, *, artifact_source: Path, label: str) -> str:
 
 def validate_replay_index(value: Any, *, artifact_dir: str, label: str) -> list[dict[str, Any]]:
     require(isinstance(value, list), f"{label}.replay_bundle_index must be a list when present")
+    require(value, f"{label}.replay_bundle_index must contain at least one replay bundle")
     entries: list[dict[str, Any]] = []
     base = Path(artifact_dir)
     for index, entry in enumerate(value):
