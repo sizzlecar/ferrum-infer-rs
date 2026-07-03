@@ -675,14 +675,39 @@ pub struct SequenceState {
     pub streamed_text_len: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SequenceKvAllocation {
+    request_id: RequestId,
+    blocks: Option<usize>,
+}
+
+impl SequenceKvAllocation {
+    fn new(request_id: RequestId, blocks: Option<usize>) -> Self {
+        Self {
+            request_id,
+            blocks: blocks.map(|blocks| blocks.max(1)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SequenceRecurrentAllocation {
+    slots: Option<usize>,
+}
+
+impl SequenceRecurrentAllocation {
+    fn new(slots: Option<usize>) -> Self {
+        Self {
+            slots: slots.map(|slots| slots.max(1)),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct SequencePhysicalResources {
-    had_kv_cache: bool,
-    kv_resource_blocks: Option<usize>,
-    draft_kv_request_id: Option<RequestId>,
-    draft_kv_resource_blocks: Option<usize>,
-    had_recurrent_state: bool,
-    recurrent_state_slots: Option<usize>,
+    kv_allocation: Option<SequenceKvAllocation>,
+    draft_kv_allocation: Option<SequenceKvAllocation>,
+    recurrent_state_allocation: Option<SequenceRecurrentAllocation>,
     model_cache_id: Option<String>,
 }
 
@@ -887,16 +912,52 @@ impl SequenceState {
     }
 
     fn take_physical_resources(&mut self) -> SequencePhysicalResources {
+        let has_kv_cache = self.kv_cache.take().is_some();
+        let has_recurrent_state = self.recurrent_state.take().is_some();
+        let has_draft_kv_cache = self.draft_kv_cache.take().is_some();
+        let kv_blocks = self.kv_resource_blocks.take();
+        let draft_request_id = self.draft_kv_request_id.take();
+        let draft_blocks = self.draft_kv_resource_blocks.take();
+        let draft_kv_allocation = match (has_draft_kv_cache, draft_request_id, draft_blocks) {
+            (_, Some(request_id), blocks) => Some(SequenceKvAllocation::new(request_id, blocks)),
+            (false, None, None) => None,
+            (true, None, blocks) => {
+                let message = "draft KV allocation metadata is incomplete";
+                warn!(
+                    request_id = %self.request_id,
+                    draft_request_id = ?Option::<RequestId>::None,
+                    draft_kv_resource_blocks = ?blocks,
+                    "{message}"
+                );
+                #[cfg(test)]
+                if !std::thread::panicking() {
+                    panic!("{message}");
+                }
+                None
+            }
+            (false, None, Some(blocks)) => {
+                let message = "draft KV allocation metadata is incomplete";
+                warn!(
+                    request_id = %self.request_id,
+                    draft_request_id = ?Option::<RequestId>::None,
+                    draft_kv_resource_blocks = ?Some(blocks),
+                    "{message}"
+                );
+                #[cfg(test)]
+                if !std::thread::panicking() {
+                    panic!("{message}");
+                }
+                None
+            }
+        };
         let resources = SequencePhysicalResources {
-            had_kv_cache: self.kv_cache.take().is_some(),
-            kv_resource_blocks: self.kv_resource_blocks.take(),
-            draft_kv_request_id: self.draft_kv_request_id.take(),
-            draft_kv_resource_blocks: self.draft_kv_resource_blocks.take(),
-            had_recurrent_state: self.recurrent_state.take().is_some(),
-            recurrent_state_slots: self.recurrent_state_slots.take(),
+            kv_allocation: has_kv_cache
+                .then(|| SequenceKvAllocation::new(self.request_id.clone(), kv_blocks)),
+            draft_kv_allocation,
+            recurrent_state_allocation: has_recurrent_state
+                .then(|| SequenceRecurrentAllocation::new(self.recurrent_state_slots.take())),
             model_cache_id: self.model_cache_id.take(),
         };
-        let _ = self.draft_kv_cache.take();
         resources
     }
 
@@ -2429,24 +2490,20 @@ impl EngineInner {
         if let Some(cache_id) = resources.model_cache_id {
             self.release_model_cache_ref(request_id, &cache_id);
         }
-        if resources.had_kv_cache {
+        if let Some(kv_allocation) = resources.kv_allocation {
+            self.release_kv_allocation(request_id, kv_allocation.request_id, kv_allocation.blocks)
+                .await;
+        }
+        if let Some(draft_kv_allocation) = resources.draft_kv_allocation {
             self.release_kv_allocation(
                 request_id,
-                request_id.clone(),
-                resources.kv_resource_blocks,
+                draft_kv_allocation.request_id,
+                draft_kv_allocation.blocks,
             )
             .await;
         }
-        if let Some(draft_request_id) = resources.draft_kv_request_id {
-            self.release_kv_allocation(
-                request_id,
-                draft_request_id,
-                resources.draft_kv_resource_blocks,
-            )
-            .await;
-        }
-        if resources.had_recurrent_state {
-            self.release_recurrent_allocation(request_id, resources.recurrent_state_slots)
+        if let Some(recurrent_allocation) = resources.recurrent_state_allocation {
+            self.release_recurrent_allocation(request_id, recurrent_allocation.slots)
                 .await;
         }
     }
