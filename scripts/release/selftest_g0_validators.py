@@ -18,6 +18,7 @@ RELEASE_BINARY_GATE = REPO_ROOT / "scripts/release/release_binary_gate.py"
 RUN_GATE = REPO_ROOT / "scripts/release/run_gate.py"
 RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
 PRODUCT_BACKEND_SENTINEL_GATE = REPO_ROOT / "scripts/release/product_backend_sentinel_gate.py"
+PRODUCT_OBSERVABILITY_L1_SMOKE = REPO_ROOT / "scripts/release/product_observability_l1_smoke.py"
 BACKEND_RUNTIME_GOAL_GATE = REPO_ROOT / "scripts/release/backend_runtime_preset_goal_gate.py"
 LLAMA33_GOAL_GATE = REPO_ROOT / "scripts/release/llama33_70b_4bit_2x4090_goal_gate.py"
 LAYER_SPLIT_PERF_GOAL_GATE = REPO_ROOT / "scripts/release/layer_split_perf_goal_gate.py"
@@ -240,6 +241,12 @@ def test_product_backend_sentinel_selftest() -> None:
     require("PRODUCT BACKEND SENTINEL SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
+def test_product_observability_l1_smoke_selftest() -> None:
+    ok = run([sys.executable, str(PRODUCT_OBSERVABILITY_L1_SMOKE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("PRODUCT OBSERVABILITY L1 SMOKE SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
 def test_backend_runtime_goal_gate_selftest() -> None:
     ok = run([sys.executable, str(BACKEND_RUNTIME_GOAL_GATE), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -388,6 +395,7 @@ def main() -> int:
     test_run_gate_selftest()
     test_run_scenarios_selftest()
     test_product_backend_sentinel_selftest()
+    test_product_observability_l1_smoke_selftest()
     test_backend_runtime_goal_gate_selftest()
     test_llama33_goal_gate_selftest()
     test_layer_split_perf_goal_gate_selftest()
