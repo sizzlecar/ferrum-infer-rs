@@ -5016,7 +5016,20 @@ mod tests {
             sha256_hex(expected_output_text.as_bytes())
         )));
         assert!(output_text.contains(&format!("chars={}", expected_output_text.chars().count())));
-        assert!(bundle.join("replay.command.json").is_file());
+
+        let replay_body = read_json_file(bundle.join("replay_body.json"));
+        assert_eq!(replay_body["messages"][0]["role"], "user");
+        assert_eq!(replay_body["messages"][0]["content"], "[redacted]");
+        assert_eq!(replay_body["messages"][0]["content_redacted"], true);
+
+        let replay = read_json_file(bundle.join("replay.command.json"));
+        assert_eq!(replay["requires_running_server"], true);
+        let argv = replay["argv"].as_array().expect("replay argv");
+        assert!(argv.iter().any(|item| item == "--data-binary"));
+        assert!(argv.iter().any(|item| {
+            item.as_str()
+                .is_some_and(|value| value.starts_with('@') && value.ends_with("replay_body.json"))
+        }));
     }
 
     fn router_with_capturing_llm_and_template(
