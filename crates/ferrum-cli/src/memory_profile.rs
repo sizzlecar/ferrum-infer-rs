@@ -31,7 +31,7 @@ impl ProcessMemorySampler {
 }
 
 impl ProcessMemoryObservation {
-    fn from_samples(before: Option<ProcessMemorySample>, after: ProcessMemorySample) -> Self {
+    pub fn from_samples(before: Option<ProcessMemorySample>, after: ProcessMemorySample) -> Self {
         let before_bytes = before
             .as_ref()
             .map(|sample| sample.current_bytes)
@@ -50,6 +50,10 @@ impl ProcessMemoryObservation {
             high_water_bytes,
             source: after.source,
         }
+    }
+
+    pub fn from_sample(sample: ProcessMemorySample) -> Self {
+        Self::from_samples(Some(sample.clone()), sample)
     }
 
     pub fn to_snapshot(&self, scope: impl Into<String>, backend: Option<&str>) -> MemorySnapshot {

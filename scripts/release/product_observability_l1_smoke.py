@@ -25,6 +25,13 @@ SELFTEST_PASS_LINE = "PRODUCT OBSERVABILITY L1 SMOKE SELFTEST PASS"
 MODEL_DEFAULT = "Qwen/Qwen3-0.6B"
 SCHEMA_VERSION = 1
 SYNTHETIC_RUNTIME_PRESET_HASH = "sha256:6c3b8d2c431c47cf612289b02a8c631c894f34f532508fc58841e572aedaa7bc"
+REQUIRED_RUN_MEMORY_STAGES = {
+    "process_start",
+    "backend_initialized",
+    "model_loaded",
+    "first_request_done",
+    "shutdown",
+}
 
 
 class SmokeError(RuntimeError):
@@ -524,6 +531,17 @@ def validate_profile_group(root: Path, entrypoint: str) -> dict[str, Any]:
             }
             if measurements != {"process_rss"}:
                 raise SmokeError(f"{path} memory_measurement values are {measurements}")
+            memory_stages = {
+                (event.get("attributes") or {}).get("memory_stage")
+                for event in events
+                if isinstance(event.get("attributes"), dict)
+            }
+            if entrypoint == "run":
+                missing_stages = REQUIRED_RUN_MEMORY_STAGES - memory_stages
+                if missing_stages:
+                    raise SmokeError(
+                        f"{path} missing run memory stages: {sorted(missing_stages)}"
+                    )
             for event in events:
                 memory = event.get("memory")
                 if not isinstance(memory, dict):
@@ -548,6 +566,10 @@ def validate_profile_group(root: Path, entrypoint: str) -> dict[str, Any]:
             if missing:
                 raise SmokeError(f"{path} missing runtime resource kinds: {sorted(missing)}")
         result[label] = {"path": str(path), "event_count": len(events)}
+        if label == "memory":
+            result[label]["memory_stages"] = sorted(
+                stage for stage in memory_stages if isinstance(stage, str)
+            )
     request_dump = root / "request_dump/request.json"
     replay = root / "request_dump/replay_command.txt"
     if not request_dump.is_file() or not replay.is_file():
@@ -1102,19 +1124,30 @@ def write_selftest_profile_group(out: Path, entrypoint: str) -> None:
         "high_water_bytes": 4096,
         "available_bytes": 8192,
     }
-    write_jsonl(
-        root / "memory_profile.jsonl",
-        [
+    if entrypoint == "run":
+        memory_events = [
+            selftest_profile_event(
+                entrypoint=entrypoint,
+                event_id=f"evt-{entrypoint}-memory-{stage}",
+                phase=f"memory_{stage}",
+                duration_us=10,
+                memory=memory,
+                attributes={"memory_measurement": "process_rss", "memory_stage": stage},
+            )
+            for stage in sorted(REQUIRED_RUN_MEMORY_STAGES)
+        ]
+    else:
+        memory_events = [
             selftest_profile_event(
                 entrypoint=entrypoint,
                 event_id=f"evt-{entrypoint}-memory",
                 phase="memory_sample",
                 duration_us=10,
                 memory=memory,
-                attributes={"memory_measurement": "process_rss"},
+                attributes={"memory_measurement": "process_rss", "memory_stage": "model_loaded"},
             )
-        ],
-    )
+        ]
+    write_jsonl(root / "memory_profile.jsonl", memory_events)
     scheduler_events = [
         selftest_profile_event(
             entrypoint=entrypoint,
