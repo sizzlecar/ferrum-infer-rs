@@ -25,7 +25,8 @@ use ferrum_types::{
     InferenceRequest, InferenceResponse, Priority, ProfileEntrypoint, ProfileEventKind,
     ProfileStatus, RequestId, ResourceAction, ResourceTraceEvent, Result, SamplingParams,
     StreamChunk, TokenId, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
-    OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_TOKENS_METADATA_KEY,
+    ENGINE_RUNTIME_TRACE_PRESET_HASH, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+    PROMPT_TOKENS_METADATA_KEY,
 };
 use futures::stream::Stream;
 use metrics::{counter, gauge, histogram};
@@ -1992,16 +1993,26 @@ impl EngineInner {
         if let Some(reason) = reason.as_deref() {
             attributes.insert("resource_reason".to_string(), serde_json::json!(reason));
         }
+        let timestamp = chrono::Utc::now();
+        let mut shape =
+            BTreeMap::from([("resource_amount".to_string(), serde_json::json!(amount))]);
+        if let Some(capacity) = capacity {
+            shape.insert("resource_capacity".to_string(), serde_json::json!(capacity));
+        }
         let event = FerrumProfileEvent {
             schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            ts_unix_nanos: timestamp
+                .timestamp_nanos_opt()
+                .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000),
             event_id: format!("evt-engine-resource-{event_num}"),
             request_id: request_id.to_string(),
             correlation_id: Some(request_id.to_string()),
             entrypoint,
             backend: "actual".to_string(),
+            runtime_preset_hash: ENGINE_RUNTIME_TRACE_PRESET_HASH.to_string(),
             phase: phase.to_string(),
             event_kind: ProfileEventKind::Resource,
-            timestamp: chrono::Utc::now(),
+            timestamp,
             status: ProfileStatus::Ok,
             model: Some(self.config.model.model_id.to_string()),
             duration_us: None,
@@ -2022,6 +2033,17 @@ impl EngineInner {
             }),
             error: None,
             replay: None,
+            shape,
+            backend_detail: Some(BTreeMap::from([
+                (
+                    "backend_device".to_string(),
+                    serde_json::json!(format!("{:?}", self.config.backend.device)),
+                ),
+                (
+                    "backend_type".to_string(),
+                    serde_json::json!(format!("{:?}", self.config.backend.backend_type)),
+                ),
+            ])),
             attributes,
         };
         if let Err(error) = event.validate() {

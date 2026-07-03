@@ -24,6 +24,7 @@ PASS_LINE = "PRODUCT OBSERVABILITY L1 SMOKE PASS"
 SELFTEST_PASS_LINE = "PRODUCT OBSERVABILITY L1 SMOKE SELFTEST PASS"
 MODEL_DEFAULT = "Qwen/Qwen3-0.6B"
 SCHEMA_VERSION = 1
+SYNTHETIC_RUNTIME_PRESET_HASH = "sha256:6c3b8d2c431c47cf612289b02a8c631c894f34f532508fc58841e572aedaa7bc"
 
 
 class SmokeError(RuntimeError):
@@ -827,16 +828,19 @@ def selftest_profile_event(
 ) -> dict[str, Any]:
     event: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
+        "ts_unix_nanos": 1783036800000000000,
         "event_id": event_id,
         "request_id": f"req-{entrypoint}-selftest",
         "correlation_id": f"corr-{entrypoint}-selftest",
         "entrypoint": entrypoint,
         "backend": "synthetic",
+        "runtime_preset_hash": SYNTHETIC_RUNTIME_PRESET_HASH,
         "phase": phase,
         "event_kind": event_kind,
         "timestamp": "2026-07-03T00:00:00Z",
         "status": "ok",
         "model": "synthetic/no-weight",
+        "shape": {"batch_size": 1},
         "attributes": {
             "actual_model_smoke": True,
             "profile_detail": "basic",

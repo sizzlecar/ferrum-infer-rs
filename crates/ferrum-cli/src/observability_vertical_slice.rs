@@ -2,7 +2,7 @@ use chrono::{Duration, Utc};
 use ferrum_types::{
     FerrumError, FerrumProfileEvent, MemorySnapshot, ProfileEntrypoint, ProfileEventKind,
     ProfileStatus, ReplayReference, ResourceAction, ResourceTraceEvent, Result,
-    OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+    OBSERVABILITY_PROFILE_SCHEMA_VERSION, SYNTHETIC_RUNTIME_PRESET_HASH,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -244,11 +244,15 @@ fn base_event(
 ) -> FerrumProfileEvent {
     FerrumProfileEvent {
         schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        ts_unix_nanos: timestamp
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000),
         event_id: format!("evt-{}-{phase}", entrypoint_label(entrypoint)),
         request_id: request_id.to_string(),
         correlation_id: Some(format!("corr-{}", entrypoint_label(entrypoint))),
         entrypoint,
         backend: SYNTHETIC_BACKEND.to_string(),
+        runtime_preset_hash: SYNTHETIC_RUNTIME_PRESET_HASH.to_string(),
         phase: phase.to_string(),
         event_kind,
         timestamp,
@@ -259,6 +263,8 @@ fn base_event(
         resource: None,
         error: None,
         replay: None,
+        shape: BTreeMap::from([("batch_size".to_string(), json!(1))]),
+        backend_detail: None,
         attributes: BTreeMap::new(),
     }
 }
