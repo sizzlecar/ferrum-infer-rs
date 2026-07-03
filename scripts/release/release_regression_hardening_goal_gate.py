@@ -1276,10 +1276,11 @@ def validate_native_operator(root: Path, expected_sha: str) -> dict[str, Any]:
                 f"native_operator.summary.manifests[{index}].binary_validation.matched_exports",
             )
         )
-        require(
-            "ferrum_native_op_init" in required_exports,
-            f"native_operator.summary.manifests[{index}].binary_validation.required_exports must include ferrum_native_op_init",
-        )
+        for export in ("ferrum_native_op_init", "ferrum_native_op_descriptor"):
+            require(
+                export in required_exports,
+                f"native_operator.summary.manifests[{index}].binary_validation.required_exports must include {export}",
+            )
         missing_matched = sorted(set(required_exports) - matched_exports)
         require(
             not missing_matched,
