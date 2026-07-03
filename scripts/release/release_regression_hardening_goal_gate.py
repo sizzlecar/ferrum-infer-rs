@@ -782,6 +782,11 @@ def validate_product_actual_smoke_summary(
         isinstance(replay_bundle_count, int) and replay_bundle_count > 0,
         "product_sentinel.summary.actual_smoke.replay_bundle_count must be positive",
     )
+    profile_replay_bundle_count = actual_smoke.get("profile_replay_bundle_count")
+    require(
+        isinstance(profile_replay_bundle_count, int) and profile_replay_bundle_count > 0,
+        "product_sentinel.summary.actual_smoke.profile_replay_bundle_count must be positive",
+    )
     offline_replay_execution_count = actual_smoke.get("offline_replay_execution_count")
     offline_replay_skipped_count = actual_smoke.get("offline_replay_skipped_count")
     live_replay_execution_count = actual_smoke.get("live_replay_execution_count")
@@ -843,6 +848,30 @@ def validate_product_actual_smoke_summary(
                 isinstance(value, str) and value.strip(),
                 f"product_sentinel.summary.actual_smoke.profile_groups.{entrypoint}.{key} must be non-empty",
             )
+    profile_replay_links = actual_smoke.get("profile_replay_links")
+    require(
+        isinstance(profile_replay_links, list) and profile_replay_links,
+        "product_sentinel.summary.actual_smoke.profile_replay_links must be a non-empty list",
+    )
+    replay_link_entrypoints: set[str] = set()
+    for index, link in enumerate(profile_replay_links):
+        require(
+            isinstance(link, dict),
+            f"product_sentinel.summary.actual_smoke.profile_replay_links[{index}] must be an object",
+        )
+        for key in ("profile_event_id", "request_id", "entrypoint", "replay_command", "bundle_dir"):
+            value = link.get(key)
+            require(
+                isinstance(value, str) and value.strip(),
+                f"product_sentinel.summary.actual_smoke.profile_replay_links[{index}].{key} must be non-empty",
+            )
+        replay_link_entrypoints.add(str(link.get("entrypoint")))
+    missing_replay_link_entrypoints = sorted({"run", "serve"} - replay_link_entrypoints)
+    require(
+        not missing_replay_link_entrypoints,
+        "product_sentinel.summary.actual_smoke.profile_replay_links missing entrypoints "
+        f"{missing_replay_link_entrypoints}",
+    )
 
 
 def validate_product_sentinel(root: Path, expected_sha: str) -> dict[str, Any]:
@@ -2135,6 +2164,25 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
                 "profile_detail": "basic",
                 "entrypoints": ["run", "serve"],
                 "profile_groups": product_profile_groups,
+                "profile_replay_links": [
+                    {
+                        "profile_path": str(product_actual_smoke / "run/profile.jsonl"),
+                        "profile_event_id": "evt-run-profile-replay-link",
+                        "request_id": "req-run-fixture",
+                        "entrypoint": "run",
+                        "replay_command": "ferrum run fixture/actual-model",
+                        "bundle_dir": str(product_actual_smoke / "run/request_dump"),
+                    },
+                    {
+                        "profile_path": str(product_actual_smoke / "serve/profile.jsonl"),
+                        "profile_event_id": "evt-serve-profile-replay-link",
+                        "request_id": "req-serve-fixture",
+                        "entrypoint": "serve",
+                        "replay_command": "ferrum serve fixture/actual-model",
+                        "bundle_dir": str(product_actual_smoke / "serve/request_dump"),
+                    },
+                ],
+                "profile_replay_bundle_count": 2,
                 "replay_bundle_count": 2,
                 "offline_replay_execution_count": 1,
                 "offline_replay_skipped_count": 1,
@@ -2832,6 +2880,43 @@ def run_selftest() -> dict[str, Any]:
             require(
                 "product_sentinel.summary.actual_smoke" in str(exc),
                 f"unexpected product actual-smoke error: {exc}",
+            )
+        bad_product_actual_replay_links = root / "bad-product-actual-replay-links"
+        artifacts_bad_product_actual_replay_links = selftest_artifacts(
+            root / "bad-product-actual-replay-links-fixtures",
+            sha,
+        )
+        bad_product_actual_replay_links_summary_path = (
+            artifacts_bad_product_actual_replay_links["product"] / "product_backend_sentinel_summary.json"
+        )
+        bad_product_actual_replay_links_summary = read_json(
+            bad_product_actual_replay_links_summary_path
+        )
+        bad_product_actual_replay_links_summary["actual_smoke"].pop("profile_replay_links", None)
+        write_json(
+            bad_product_actual_replay_links_summary_path,
+            bad_product_actual_replay_links_summary,
+        )
+        args_bad_product_actual_replay_links = argparse.Namespace(
+            out=bad_product_actual_replay_links,
+            resource_invariant=artifacts_bad_product_actual_replay_links["resource"],
+            change_impact=artifacts_bad_product_actual_replay_links["change"],
+            product_sentinel=artifacts_bad_product_actual_replay_links["product"],
+            model_contract=artifacts_bad_product_actual_replay_links["model"],
+            support_matrix_contract=artifacts_bad_product_actual_replay_links["support_matrix"],
+            observability_profile=artifacts_bad_product_actual_replay_links["observability"],
+            native_operator=artifacts_bad_product_actual_replay_links["native"],
+            actual_model_regression_summary=artifacts_bad_product_actual_replay_links["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_product_actual_replay_links)
+            raise AssertionError("missing product actual-smoke replay links unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "profile_replay_links" in str(exc),
+                f"unexpected product actual replay links error: {exc}",
             )
         bad_product_scenario = root / "bad-product-scenario"
         artifacts_bad_product_scenario = selftest_artifacts(
