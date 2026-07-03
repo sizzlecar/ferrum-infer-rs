@@ -24,7 +24,7 @@ use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngin
 use ferrum_types::{
     EngineMetrics, EngineStatus, FerrumConfigBuilder, FerrumError as Error, FinishReason,
     InferenceRequest, InferenceResponse, ModelId, Priority, RequestId, ResolvedFerrumConfig,
-    RuntimeConfigSnapshot, SamplingParams, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY,
+    RuntimeConfigSnapshot, SamplingParams, TokenId, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY,
     DEFAULT_MAX_TOKENS_METADATA_KEY, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
@@ -1105,6 +1105,49 @@ fn write_chat_request_failure_diagnostics(
     )
 }
 
+fn write_chat_request_completion_replay_bundle(
+    request_dump_dir: Option<&Path>,
+    request_id: &str,
+    output_text: &str,
+    output_token_ids: &[TokenId],
+    finish_reason: Option<&str>,
+) -> std::result::Result<(), String> {
+    let Some(root) = request_dump_dir else {
+        return Ok(());
+    };
+    let bundle_dir = root.join(request_id);
+    fs::create_dir_all(&bundle_dir).map_err(|err| err.to_string())?;
+    let token_ids = output_token_ids
+        .iter()
+        .map(|token| token.get())
+        .collect::<Vec<_>>();
+    write_json_value(
+        &bundle_dir.join("output_token_ids.json"),
+        &serde_json::json!({
+            "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            "request_id": request_id,
+            "token_ids": token_ids,
+            "token_count": output_token_ids.len(),
+            "finish_reason": finish_reason,
+            "unavailable_reason": null
+        }),
+    )?;
+    write_json_value(
+        &bundle_dir.join("bad_output_scan.json"),
+        &bad_output_scan_json(request_id, output_text, None),
+    )?;
+    fs::write(
+        bundle_dir.join("output_text.txt"),
+        format!(
+            "[redacted actual output]\nsha256={}\nchars={}\n",
+            sha256_hex(output_text.as_bytes()),
+            output_text.chars().count()
+        ),
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 fn write_chat_request_failure_diagnostics_at_root(
     request_dump_dir: Option<&Path>,
     admission_summary: Option<&serde_json::Value>,
@@ -1486,6 +1529,81 @@ fn write_json_value(path: &Path, value: &serde_json::Value) -> std::result::Resu
     fs::write(path, [bytes, b"\n".to_vec()].concat()).map_err(|err| err.to_string())
 }
 
+fn bad_output_scan_json(
+    request_id: &str,
+    text: &str,
+    failure_kind: Option<&str>,
+) -> serde_json::Value {
+    let mut reasons = Vec::new();
+    let mut first_span: Option<serde_json::Value> = None;
+    for (needle, reason) in [
+        ("<unk>", "reserved_token"),
+        ("[PAD", "reserved_token"),
+        ("<pad>", "reserved_token"),
+        ("<|endoftext|>", "reserved_token"),
+        ("<|im_start|>", "reserved_token"),
+        ("<|im_end|>", "reserved_token"),
+        ("<|reserved_special_token", "reserved_token"),
+        ("\u{fffd}", "invalid_utf8"),
+    ] {
+        if let Some(index) = text.find(needle) {
+            reasons.push(reason);
+            first_span.get_or_insert_with(|| {
+                serde_json::json!({
+                    "byte_start": index,
+                    "byte_end": index + needle.len(),
+                    "text": needle,
+                    "reason": reason
+                })
+            });
+        }
+    }
+    if let Some(index) = first_mojibake_index(text) {
+        reasons.push("mojibake");
+        first_span.get_or_insert_with(|| {
+            serde_json::json!({
+                "byte_start": index,
+                "byte_end": index + 1,
+                "reason": "mojibake"
+            })
+        });
+    }
+    reasons.sort_unstable();
+    reasons.dedup();
+    let bad_output = !reasons.is_empty();
+    serde_json::json!({
+        "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        "request_id": request_id,
+        "bad_output": bad_output,
+        "bad_text_count": if bad_output { 1 } else { 0 },
+        "reasons": reasons,
+        "first_bad_text_span": first_span,
+        "failure_kind": failure_kind,
+        "output_chars": text.chars().count(),
+        "output_sha256": sha256_hex(text.as_bytes())
+    })
+}
+
+fn first_mojibake_index(text: &str) -> Option<usize> {
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '\u{00c2}' | '\u{00c3}' => {
+                if chars.peek().is_some_and(|(_, next)| !next.is_ascii()) {
+                    return Some(index);
+                }
+            }
+            '\u{00e2}' => {
+                if chars.peek().is_some_and(|(_, next)| *next == '\u{20ac}') {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -1570,12 +1688,16 @@ async fn handle_chat_completions_stream(
 
     tokio::spawn(async move {
         let mut current_text = String::new();
+        let mut output_token_ids = Vec::new();
         let mut sent_reasoning_len = 0usize;
         let mut sent_content_len = 0usize;
 
         while let Some(result) = stream.next().await {
             match result {
                 Ok(chunk) => {
+                    if let Some(token) = chunk.token {
+                        output_token_ids.push(token);
+                    }
                     if !chunk.text.is_empty() {
                         current_text.push_str(&chunk.text);
 
@@ -1755,6 +1877,11 @@ async fn handle_chat_completions_stream(
                         // `KeyError: 'delta'` on the client side
                         // and the request is reported as failed
                         // despite returning a 200 with content.
+                        let final_finish_reason = structured_chat_response
+                            .as_ref()
+                            .and_then(|response| response.finish_reason.clone())
+                            .or_else(|| chunk.finish_reason.as_ref().map(finish_reason_to_string))
+                            .or(Some("length".to_string()));
                         let final_chunk = ChatCompletionsResponse {
                             id: request_id.clone(),
                             object: "chat.completion.chunk".to_string(),
@@ -1772,13 +1899,7 @@ async fn handle_chat_completions_stream(
                                     tool_call_id: None,
                                     function_call: None,
                                 }),
-                                finish_reason: structured_chat_response
-                                    .as_ref()
-                                    .and_then(|response| response.finish_reason.clone())
-                                    .or_else(|| {
-                                        chunk.finish_reason.as_ref().map(finish_reason_to_string)
-                                    })
-                                    .or(Some("length".to_string())),
+                                finish_reason: final_finish_reason.clone(),
                             }],
                             usage: None,
                         };
@@ -1787,6 +1908,15 @@ async fn handle_chat_completions_stream(
                             .json_data(&final_chunk)
                             .unwrap_or_else(|_| Event::default().data("error"));
                         let _ = tx.send(Ok(final_event));
+                        if let Err(err) = write_chat_request_completion_replay_bundle(
+                            request_dump_dir.as_ref().map(|root| root.as_path()),
+                            &replay_request_id,
+                            &parsed_final.content,
+                            &output_token_ids,
+                            final_finish_reason.as_deref(),
+                        ) {
+                            warn!("failed to write chat stream replay bundle: {}", err);
+                        }
                         if include_stream_usage && usage.is_some() {
                             let usage_chunk = ChatCompletionsResponse {
                                 id: request_id.clone(),
@@ -1877,6 +2007,7 @@ async fn handle_chat_completions_sync(
         Ok(output) => {
             let InferenceResponse {
                 text: output_text,
+                tokens,
                 finish_reason,
                 usage,
                 api_response,
@@ -1948,6 +2079,15 @@ async fn handle_chat_completions_sync(
                 ));
             }
             validate_strict_json_schema_response(&openai_request, &message.content)?;
+            if let Err(err) = write_chat_request_completion_replay_bundle(
+                state.request_dump_dir.as_ref().map(|root| root.as_path()),
+                &replay_request_id,
+                &message.content,
+                &tokens,
+                Some(&openai_finish_reason),
+            ) {
+                warn!("failed to write chat completion replay bundle: {}", err);
+            }
             state
                 .cache
                 .update_session(session_context, message.clone(), &CachePolicy::current());
@@ -4678,8 +4818,29 @@ mod tests {
         AxumServer::from_llm(Arc::new(StubLlm::new(text))).build_router()
     }
 
+    fn router_with_stub_and_request_dump_dir(text: &str, request_dump_dir: PathBuf) -> Router {
+        AxumServer::from_state(
+            AppState::default()
+                .with_llm(Arc::new(StubLlm::new(text)))
+                .with_request_dump_dir(Some(request_dump_dir)),
+        )
+        .build_router()
+    }
+
     fn router_with_stub_stream_chunks(chunks: &[&str]) -> Router {
         AxumServer::from_llm(Arc::new(StubLlm::with_stream_chunks(chunks))).build_router()
+    }
+
+    fn router_with_stub_stream_chunks_and_request_dump_dir(
+        chunks: &[&str],
+        request_dump_dir: PathBuf,
+    ) -> Router {
+        AxumServer::from_state(
+            AppState::default()
+                .with_llm(Arc::new(StubLlm::with_stream_chunks(chunks)))
+                .with_request_dump_dir(Some(request_dump_dir)),
+        )
+        .build_router()
     }
 
     fn router_with_stub_separate_final_stream_chunk(chunks: &[&str]) -> Router {
@@ -4813,6 +4974,48 @@ mod tests {
             .as_str()
             .expect("log excerpt")
             .contains(expected_message));
+        assert!(bundle.join("replay.command.json").is_file());
+    }
+
+    fn assert_chat_success_replay_bundle(
+        root: &Path,
+        expected_token_ids: &[u32],
+        expected_finish_reason: &str,
+        expected_output_text: &str,
+    ) {
+        let bundle = only_replay_bundle(root);
+        let request = read_json_file(bundle.join("request.json"));
+        let request_id = request["request_id"]
+            .as_str()
+            .expect("request id")
+            .to_string();
+        let output_tokens = read_json_file(bundle.join("output_token_ids.json"));
+        assert_eq!(output_tokens["request_id"], request_id);
+        assert_eq!(output_tokens["token_ids"], json!(expected_token_ids));
+        assert_eq!(output_tokens["token_count"], expected_token_ids.len());
+        assert_eq!(output_tokens["finish_reason"], expected_finish_reason);
+        assert!(output_tokens["unavailable_reason"].is_null());
+
+        let bad_scan = read_json_file(bundle.join("bad_output_scan.json"));
+        assert_eq!(bad_scan["request_id"], request_id);
+        assert_eq!(bad_scan["bad_output"], false);
+        assert_eq!(bad_scan["failure_kind"], serde_json::Value::Null);
+        assert_eq!(
+            bad_scan["output_chars"],
+            expected_output_text.chars().count()
+        );
+        assert_eq!(
+            bad_scan["output_sha256"],
+            sha256_hex(expected_output_text.as_bytes())
+        );
+
+        let output_text = fs::read_to_string(bundle.join("output_text.txt")).unwrap();
+        assert!(output_text.contains("[redacted actual output]"));
+        assert!(output_text.contains(&format!(
+            "sha256={}",
+            sha256_hex(expected_output_text.as_bytes())
+        )));
+        assert!(output_text.contains(&format!("chars={}", expected_output_text.chars().count())));
         assert!(bundle.join("replay.command.json").is_file());
     }
 
@@ -6777,6 +6980,67 @@ mod tests {
         );
         assert!(diagnostics["nearest_memory_snapshot"]["current_bytes"].is_number());
         assert!(diagnostics["nearest_memory_snapshot"]["high_water_bytes"].is_number());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn route_chat_sync_success_updates_replay_output_tokens() {
+        let root = unique_request_dump_dir("chat-sync-success-output");
+        let response = post_json(
+            router_with_stub_and_request_dump_dir("OK", root.clone()),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["message"]["content"], "OK");
+        assert_chat_success_replay_bundle(&root, &[11, 12], "stop", "OK");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn route_chat_stream_success_updates_replay_output_tokens() {
+        let root = unique_request_dump_dir("chat-stream-success-output");
+        let response = post_json(
+            router_with_stub_stream_chunks_and_request_dump_dir(&["O", "K"], root.clone()),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "body: {body}");
+        assert_chat_success_replay_bundle(&root, &[11, 12], "stop", "OK");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn route_chat_sync_bad_output_updates_replay_classifier() {
+        let root = unique_request_dump_dir("chat-sync-bad-output");
+        let response = post_json(
+            router_with_stub_and_request_dump_dir("<unk>", root.clone()),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let _ = response_json(response).await;
+        let bundle = only_replay_bundle(&root);
+        let bad_scan = read_json_file(bundle.join("bad_output_scan.json"));
+        assert_eq!(bad_scan["bad_output"], true);
+        assert_eq!(bad_scan["reasons"], json!(["reserved_token"]));
+        assert_eq!(bad_scan["first_bad_text_span"]["reason"], "reserved_token");
         let _ = fs::remove_dir_all(root);
     }
 
