@@ -93,6 +93,7 @@ def validate_profile_event(event: Any, context: str) -> None:
         raise ValidationError(f"{context}.schema_version must be 1")
     require_non_empty_string(event, "event_id", context)
     require_non_empty_string(event, "request_id", context)
+    require_non_empty_string(event, "correlation_id", context)
     require_non_empty_string(event, "backend", context)
     require_non_empty_string(event, "phase", context)
     require_non_empty_string(event, "timestamp", context)

@@ -235,6 +235,7 @@ def run_self_test() -> None:
                         "schema_version": SCHEMA_VERSION,
                         "event_id": f"evt-{entrypoint}",
                         "request_id": f"req-{entrypoint}",
+                        "correlation_id": f"corr-{entrypoint}",
                         "entrypoint": entrypoint,
                         "backend": "synthetic",
                         "phase": "request_complete",

@@ -1,1 +1,1 @@
-{"schema_version":1,"event_id":"evt-missing-duration","request_id":"req-1","entrypoint":"serve","backend":"synthetic","phase":"decode","event_kind":"timed_span","timestamp":"2026-07-02T00:00:00Z","status":"ok","model":"synthetic/no-weight","attributes":{}}
+{"schema_version":1,"event_id":"evt-missing-duration","request_id":"req-1","correlation_id":"corr-req-1","entrypoint":"serve","backend":"synthetic","phase":"decode","event_kind":"timed_span","timestamp":"2026-07-02T00:00:00Z","status":"ok","model":"synthetic/no-weight","attributes":{}}
