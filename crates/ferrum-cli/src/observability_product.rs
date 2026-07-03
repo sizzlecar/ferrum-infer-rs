@@ -856,6 +856,9 @@ fn base_event(
 ) -> FerrumProfileEvent {
     FerrumProfileEvent {
         schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        ts_unix_nanos: timestamp
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000),
         event_id: format!(
             "evt-product-{}-{phase}",
             entrypoint_label(config.entrypoint)
@@ -867,6 +870,7 @@ fn base_event(
         )),
         entrypoint: config.entrypoint,
         backend: SYNTHETIC_BACKEND.to_string(),
+        runtime_preset_hash: runtime_preset_hash(config),
         phase: phase.to_string(),
         event_kind,
         timestamp,
@@ -877,6 +881,8 @@ fn base_event(
         resource: None,
         error: None,
         replay: None,
+        shape: default_event_shape(),
+        backend_detail: None,
         attributes: common_attrs(config),
     }
 }
@@ -892,6 +898,22 @@ fn actual_base_event(
     event.backend = "actual".to_string();
     event.attributes = actual_attrs(config);
     event
+}
+
+fn runtime_preset_hash(config: &ProductObservabilityConfig) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(config.entrypoint.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(config.model.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(config.profile_detail.as_str().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(config.profile_sample_rate.to_string().as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn default_event_shape() -> BTreeMap<String, Value> {
+    BTreeMap::from([("batch_size".to_string(), json!(1))])
 }
 
 #[allow(clippy::too_many_arguments)]

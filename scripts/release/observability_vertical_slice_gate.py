@@ -253,11 +253,13 @@ def run_self_test() -> None:
                 json.dumps(
                     {
                         "schema_version": SCHEMA_VERSION,
+                        "ts_unix_nanos": 1782950400000000000,
                         "event_id": f"evt-{entrypoint}",
                         "request_id": f"req-{entrypoint}",
                         "correlation_id": f"corr-{entrypoint}",
                         "entrypoint": entrypoint,
                         "backend": "synthetic",
+                        "runtime_preset_hash": "sha256:6c3b8d2c431c47cf612289b02a8c631c894f34f532508fc58841e572aedaa7bc",
                         "phase": "request_complete",
                         "event_kind": "instant",
                         "timestamp": "2026-07-02T00:00:00Z",
@@ -267,6 +269,7 @@ def run_self_test() -> None:
                             "command": f"ferrum {entrypoint} synthetic/no-weight",
                             "bundle_dir": str(entry_dir / "request_dump"),
                         },
+                        "shape": {"batch_size": 1},
                         "attributes": {},
                     },
                     sort_keys=True,

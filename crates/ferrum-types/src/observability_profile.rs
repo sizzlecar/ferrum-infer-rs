@@ -9,6 +9,10 @@ use std::path::PathBuf;
 
 pub const OBSERVABILITY_PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_OBSERVABILITY_PROFILE_SAMPLE_RATE: f64 = 0.01;
+pub const SYNTHETIC_RUNTIME_PRESET_HASH: &str =
+    "sha256:6c3b8d2c431c47cf612289b02a8c631c894f34f532508fc58841e572aedaa7bc";
+pub const ENGINE_RUNTIME_TRACE_PRESET_HASH: &str =
+    "sha256:30c1be62aa61858deca261ebcbfb4115918c1d6d0466f7ad5ffd7bc8d901e782";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -249,12 +253,14 @@ impl ReplayReference {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FerrumProfileEvent {
     pub schema_version: u32,
+    pub ts_unix_nanos: i64,
     pub event_id: String,
     pub request_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
     pub entrypoint: ProfileEntrypoint,
     pub backend: String,
+    pub runtime_preset_hash: String,
     pub phase: String,
     pub event_kind: ProfileEventKind,
     pub timestamp: DateTime<Utc>,
@@ -272,6 +278,10 @@ pub struct FerrumProfileEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay: Option<ReplayReference>,
     #[serde(default)]
+    pub shape: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_detail: Option<BTreeMap<String, Value>>,
+    #[serde(default)]
     pub attributes: BTreeMap<String, Value>,
 }
 
@@ -281,6 +291,9 @@ impl FerrumProfileEvent {
             return Err(format!(
                 "schema_version must be {OBSERVABILITY_PROFILE_SCHEMA_VERSION}"
             ));
+        }
+        if self.ts_unix_nanos <= 0 {
+            return Err("ts_unix_nanos must be positive".to_string());
         }
         if self.event_id.trim().is_empty() {
             return Err("event_id must be non-empty".to_string());
@@ -298,8 +311,14 @@ impl FerrumProfileEvent {
         if self.backend.trim().is_empty() {
             return Err("backend must be non-empty".to_string());
         }
+        if self.runtime_preset_hash.trim().is_empty() {
+            return Err("runtime_preset_hash must be non-empty".to_string());
+        }
         if self.phase.trim().is_empty() {
             return Err("phase must be non-empty".to_string());
+        }
+        if self.shape.is_empty() {
+            return Err("shape must contain at least one field".to_string());
         }
         if self.event_kind == ProfileEventKind::TimedSpan && self.duration_us.is_none() {
             return Err("duration_us is required for timed_span events".to_string());
@@ -330,11 +349,15 @@ mod tests {
     fn base_event() -> FerrumProfileEvent {
         FerrumProfileEvent {
             schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            ts_unix_nanos: Utc::now()
+                .timestamp_nanos_opt()
+                .expect("test timestamp should fit i64 nanos"),
             event_id: "evt-1".to_string(),
             request_id: "req-1".to_string(),
             correlation_id: Some("corr-1".to_string()),
             entrypoint: ProfileEntrypoint::Synthetic,
             backend: "synthetic".to_string(),
+            runtime_preset_hash: SYNTHETIC_RUNTIME_PRESET_HASH.to_string(),
             phase: "request".to_string(),
             event_kind: ProfileEventKind::TimedSpan,
             timestamp: Utc::now(),
@@ -345,6 +368,8 @@ mod tests {
             resource: None,
             error: None,
             replay: None,
+            shape: BTreeMap::from([("batch_size".to_string(), Value::from(1))]),
+            backend_detail: None,
             attributes: BTreeMap::new(),
         }
     }
@@ -364,6 +389,14 @@ mod tests {
         let mut missing_correlation = base_event();
         missing_correlation.correlation_id = None;
         assert!(missing_correlation.validate().is_err());
+
+        let mut missing_runtime_preset = base_event();
+        missing_runtime_preset.runtime_preset_hash.clear();
+        assert!(missing_runtime_preset.validate().is_err());
+
+        let mut missing_shape = base_event();
+        missing_shape.shape.clear();
+        assert!(missing_shape.validate().is_err());
     }
 
     #[test]

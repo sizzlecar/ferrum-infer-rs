@@ -69,11 +69,13 @@ def validate_profile_event(event: Any, context: str) -> None:
         raise ValidationError(f"{context} must be a JSON object")
     allowed_keys = {
         "schema_version",
+        "ts_unix_nanos",
         "event_id",
         "request_id",
         "correlation_id",
         "entrypoint",
         "backend",
+        "runtime_preset_hash",
         "phase",
         "event_kind",
         "timestamp",
@@ -84,6 +86,8 @@ def validate_profile_event(event: Any, context: str) -> None:
         "resource",
         "error",
         "replay",
+        "shape",
+        "backend_detail",
         "attributes",
     }
     unknown = set(event) - allowed_keys
@@ -91,12 +95,21 @@ def validate_profile_event(event: Any, context: str) -> None:
         raise ValidationError(f"{context} has unknown top-level fields: {sorted(unknown)}")
     if event.get("schema_version") != 1:
         raise ValidationError(f"{context}.schema_version must be 1")
+    if not isinstance(event.get("ts_unix_nanos"), int) or event["ts_unix_nanos"] <= 0:
+        raise ValidationError(f"{context}.ts_unix_nanos must be a positive integer")
     require_non_empty_string(event, "event_id", context)
     require_non_empty_string(event, "request_id", context)
     require_non_empty_string(event, "correlation_id", context)
     require_non_empty_string(event, "backend", context)
+    require_non_empty_string(event, "runtime_preset_hash", context)
     require_non_empty_string(event, "phase", context)
     require_non_empty_string(event, "timestamp", context)
+    shape = event.get("shape")
+    if not isinstance(shape, dict) or not shape:
+        raise ValidationError(f"{context}.shape must be a non-empty object")
+    backend_detail = event.get("backend_detail")
+    if backend_detail is not None and not isinstance(backend_detail, dict):
+        raise ValidationError(f"{context}.backend_detail must be an object when set")
     event_kind = require_non_empty_string(event, "event_kind", context)
     status = require_non_empty_string(event, "status", context)
     if require_non_empty_string(event, "entrypoint", context) not in {

@@ -38,6 +38,7 @@ DEFAULT_MANIFEST = REPO_ROOT / "scripts/release/scenarios/product_backend_sentin
 PASS_LINE = "PRODUCT BACKEND SENTINEL PASS"
 SELFTEST_PASS_LINE = "PRODUCT BACKEND SENTINEL SELFTEST PASS"
 SCHEMA_VERSION = 1
+SYNTHETIC_RUNTIME_PRESET_HASH = "sha256:6c3b8d2c431c47cf612289b02a8c631c894f34f532508fc58841e572aedaa7bc"
 REQUIRED_STAGE2_FIXTURES = 12
 REQUIRED_PRODUCT_SCENARIOS = {
     "run_first_token",
@@ -204,11 +205,13 @@ def profile_replay_link_result(scenario_dir: Path) -> dict[str, Any]:
     profile = scenario_dir / "profile.jsonl"
     event = {
         "schema_version": 1,
+        "ts_unix_nanos": 1782950400000000000,
         "event_id": "evt-profile-replay-link",
         "request_id": "req-fixture",
         "correlation_id": "corr-fixture",
         "entrypoint": "run",
         "backend": "synthetic",
+        "runtime_preset_hash": SYNTHETIC_RUNTIME_PRESET_HASH,
         "phase": "request_complete",
         "event_kind": "instant",
         "timestamp": "2026-07-02T00:00:00Z",
@@ -218,6 +221,7 @@ def profile_replay_link_result(scenario_dir: Path) -> dict[str, Any]:
             "command": "ferrum run synthetic/no-weight",
             "bundle_dir": "request_dump",
         },
+        "shape": {"batch_size": 1},
         "attributes": {
             "profile_detail": "basic",
             "profile_schema_fingerprint": "obs-v1",
@@ -263,11 +267,13 @@ def write_blocker_profile_fixture(
         events.append(
             {
                 "schema_version": 1,
+                "ts_unix_nanos": 1782950400000000000,
                 "event_id": "evt-oom-admission-capacity",
                 "request_id": "req-fixture",
                 "correlation_id": "corr-fixture",
                 "entrypoint": "run",
                 "backend": "synthetic",
+                "runtime_preset_hash": SYNTHETIC_RUNTIME_PRESET_HASH,
                 "phase": "admission",
                 "event_kind": "instant",
                 "timestamp": "2026-07-02T00:00:00Z",
@@ -281,6 +287,7 @@ def write_blocker_profile_fixture(
                     "capacity": 8,
                     "reason": "insufficient_kv_capacity",
                 },
+                "shape": {"batch_size": 1, "needed_kv_blocks": 9},
                 "attributes": {
                     "profile_detail": "basic",
                     "profile_schema_fingerprint": "obs-v1",
@@ -289,11 +296,13 @@ def write_blocker_profile_fixture(
         )
     failure_event = {
         "schema_version": 1,
+        "ts_unix_nanos": 1782950400000000001,
         "event_id": f"evt-{fixture_kind.replace('_', '-')}-blocker",
         "request_id": "req-fixture",
         "correlation_id": "corr-fixture",
         "entrypoint": "run",
         "backend": "synthetic",
+        "runtime_preset_hash": SYNTHETIC_RUNTIME_PRESET_HASH,
         "phase": "decode" if fixture_kind != "oom_admission" else "admission",
         "event_kind": "error",
         "timestamp": "2026-07-02T00:00:01Z",
@@ -308,6 +317,7 @@ def write_blocker_profile_fixture(
             "command": "ferrum run synthetic/no-weight",
             "bundle_dir": bundle_dir,
         },
+        "shape": {"batch_size": 1},
         "attributes": {
             "first_failure_event": True,
             "profile_detail": "basic",
@@ -978,11 +988,13 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
 def write_profile_link_fixture(path: Path, *, entrypoint: str, request_id: str, bundle_dir: Path) -> None:
     event = {
         "schema_version": 1,
+        "ts_unix_nanos": 1782950400000000000,
         "event_id": f"evt-{entrypoint}-scenario-summary",
         "request_id": request_id,
         "correlation_id": f"corr-{entrypoint}",
         "entrypoint": entrypoint,
         "backend": "synthetic",
+        "runtime_preset_hash": SYNTHETIC_RUNTIME_PRESET_HASH,
         "phase": "request_complete",
         "event_kind": "instant",
         "timestamp": "2026-07-02T00:00:00Z",
@@ -992,6 +1004,7 @@ def write_profile_link_fixture(path: Path, *, entrypoint: str, request_id: str, 
             "command": f"ferrum {entrypoint} synthetic/no-weight",
             "bundle_dir": str(bundle_dir),
         },
+        "shape": {"batch_size": 1},
         "attributes": {
             "profile_detail": "basic",
             "profile_schema_fingerprint": "obs-v1",
@@ -1047,16 +1060,19 @@ def actual_smoke_profile_event(
 ) -> dict[str, Any]:
     event: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
+        "ts_unix_nanos": 1782950400000000000,
         "event_id": event_id,
         "request_id": request_id,
         "correlation_id": f"corr-{entrypoint}",
         "entrypoint": entrypoint,
         "backend": "metal",
+        "runtime_preset_hash": "sha256:6c3b8d2c431c47cf612289b02a8c631c894f34f532508fc58841e572aedaa7bc",
         "phase": phase,
         "event_kind": event_kind,
         "timestamp": "2026-07-02T00:00:00Z",
         "status": "ok",
         "model": "fixture/actual-model",
+        "shape": {"batch_size": 1},
         "attributes": {
             "actual_model_smoke": True,
             "profile_detail": "basic",
