@@ -532,9 +532,23 @@ impl EngineInner {
             }
             return self.process_batch_legacy_split(batch).await;
         }
+        let workspace_request_ids: Vec<RequestId> = prefill_meta
+            .iter()
+            .map(|work| work.rid.clone())
+            .chain(decode_meta.iter().cloned())
+            .collect();
+        let workspace_lease = self.acquire_backend_workspace_lease(
+            workspace_request_ids,
+            "engine_unified_workspace",
+            "engine_unified_workspace_release",
+        );
         let results = match self.model_executor.unified_decode(&unified).await {
-            Ok(r) => r,
+            Ok(r) => {
+                workspace_lease.release();
+                r
+            }
             Err(e) => {
+                drop(workspace_lease);
                 if is_resource_exhausted_error(&e) {
                     warn!(
                         "Unified forward resource exhausted: {}; deferring prefills",

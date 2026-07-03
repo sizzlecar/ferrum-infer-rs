@@ -1873,6 +1873,9 @@ async fn scheduler_trace_jsonl_resource_events_balance_successful_infer() {
     assert!(saw("model_cache_ref", ResourceAction::Reserve));
     assert!(saw("model_cache_ref", ResourceAction::Commit));
     assert!(saw("model_cache_ref", ResourceAction::Release));
+    assert!(saw("backend_workspace", ResourceAction::Reserve));
+    assert!(saw("backend_workspace", ResourceAction::Commit));
+    assert!(saw("backend_workspace", ResourceAction::Release));
 
     let _ = std::fs::remove_file(trace_path);
 }
@@ -2799,6 +2802,9 @@ async fn process_batch_releases_kv_and_recurrent_state_when_model_admission_fail
     assert!(saw("recurrent_state_slot", ResourceAction::Reserve));
     assert!(saw("recurrent_state_slot", ResourceAction::Commit));
     assert!(saw("recurrent_state_slot", ResourceAction::Release));
+    assert!(saw("backend_workspace", ResourceAction::Reserve));
+    assert!(saw("backend_workspace", ResourceAction::Commit));
+    assert!(saw("backend_workspace", ResourceAction::Release));
     let _ = std::fs::remove_file(trace_path);
 
     let sequences = engine.inner.sequences.read();
@@ -3389,8 +3395,12 @@ async fn process_batch_unified_reserve_resource_exhausted_defers_existing_kv_pre
 
 #[tokio::test]
 async fn process_batch_unified_forward_resource_exhausted_defers_existing_kv_prefill() {
+    let trace_path = resource_trace_temp_path("unified-forward-resource-exhausted");
+    let _ = std::fs::remove_file(&trace_path);
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
+    config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
+    config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Synthetic);
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
@@ -3465,6 +3475,7 @@ async fn process_batch_unified_forward_resource_exhausted_defers_existing_kv_pre
         .write()
         .insert(request_id.clone(), sequence);
 
+    engine.inner.trace_model_cache_ref_acquire(&request_id);
     engine.inner.process_batch(&batch).await.unwrap();
 
     let deferred = scheduler.trace_snapshot();
@@ -3481,6 +3492,16 @@ async fn process_batch_unified_forward_resource_exhausted_defers_existing_kv_pre
     let recurrent_stats = recurrent_manager.stats();
     assert_eq!(recurrent_stats.active_states, 0);
     assert_eq!(recurrent_stats.used_batch_slots, 0);
+    let resources = assert_engine_resource_trace_balanced(&trace_path);
+    let saw = |kind: &str, action: ResourceAction| {
+        resources
+            .iter()
+            .any(|resource| resource.resource_kind == kind && resource.action == action)
+    };
+    assert!(saw("backend_workspace", ResourceAction::Reserve));
+    assert!(saw("backend_workspace", ResourceAction::Commit));
+    assert!(saw("backend_workspace", ResourceAction::Release));
+    let _ = std::fs::remove_file(trace_path);
 
     let sequences = engine.inner.sequences.read();
     let sequence = sequences
