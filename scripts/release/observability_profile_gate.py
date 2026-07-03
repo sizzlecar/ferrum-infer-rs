@@ -149,6 +149,13 @@ def validate_gate_semantics(path: Path, events: list[dict[str, Any]]) -> None:
                     f"{context} profile/prometheus completed request mismatch: "
                     f"{profile_count} != {prometheus_count}"
                 )
+        if (
+            event.get("entrypoint") == "serve"
+            and event.get("status") == "ok"
+            and str(event.get("phase", "")).startswith("chat_completions_")
+            and str(event.get("phase", "")).endswith("_complete")
+        ):
+            validate_chat_completion_profile_event(event_attrs, context)
 
     capacity_by_request = capacity_events(events)
     for event in events:
@@ -166,6 +173,33 @@ def validate_gate_semantics(path: Path, events: list[dict[str, Any]]) -> None:
             raise GateError(f"{context} correctness failure requires replay command")
         if kind in OOM_KINDS and str(event.get("request_id", "")) not in capacity_by_request:
             raise GateError(f"{context} OOM failure requires admission/defer/reject evidence")
+
+
+def validate_chat_completion_profile_event(event_attrs: dict[str, Any], context: str) -> None:
+    for key in (
+        "completion_token_count",
+        "e2e_duration_us",
+        "output_token_count",
+        "prompt_token_count",
+        "total_token_count",
+    ):
+        value = event_attrs.get(key)
+        if not isinstance(value, int) or value < 0:
+            raise GateError(f"{context} requires non-negative integer attributes.{key}")
+    if event_attrs["e2e_duration_us"] <= 0:
+        raise GateError(f"{context} attributes.e2e_duration_us must be positive")
+    if event_attrs["total_token_count"] < event_attrs["completion_token_count"]:
+        raise GateError(
+            f"{context} attributes.total_token_count must cover completion_token_count"
+        )
+    token_count_source = event_attrs.get("token_count_source")
+    if token_count_source not in {"usage", "generated_tokens"}:
+        raise GateError(f"{context} attributes.token_count_source must be usage or generated_tokens")
+    if event_attrs.get("stream") is True:
+        for key in ("ttft_us", "itl_us_avg"):
+            value = event_attrs.get(key)
+            if not isinstance(value, int) or value < 0:
+                raise GateError(f"{context} streaming chat completion requires attributes.{key}")
 
 
 def event_summary(event: dict[str, Any]) -> dict[str, Any]:
