@@ -415,8 +415,8 @@ fn product_events(
         ResourceAction::Reserve,
         base + Duration::microseconds(10),
         Some(1),
-        Some(1),
         Some(0),
+        Some(1),
         Some(1),
         None,
     );
@@ -539,8 +539,8 @@ fn actual_run_events(
         ResourceAction::Reserve,
         base + Duration::microseconds(5),
         Some(1),
-        Some(1),
         Some(0),
+        Some(1),
         Some(1),
         None,
     );
@@ -664,8 +664,8 @@ fn actual_run_failure_events(
         ResourceAction::Reserve,
         base + Duration::microseconds(5),
         Some(1),
-        Some(1),
         Some(0),
+        Some(1),
         Some(1),
         None,
     );
@@ -792,8 +792,8 @@ fn actual_serve_startup_events(
         ResourceAction::Reserve,
         base + Duration::microseconds(5),
         Some(1),
-        Some(1),
         Some(0),
+        Some(1),
         Some(1),
         None,
     );

@@ -1,5 +1,5 @@
 {"scenario":"serve_client_disconnect_cleans_up","owner_kind":"request","owner_id":"req-disconnect","resource_kind":"request_slot","action":"request_open","capacity":1}
-{"scenario":"serve_client_disconnect_cleans_up","owner_kind":"request","owner_id":"req-disconnect","resource_kind":"session_cache_ref","action":"reserve","amount":1,"before":16,"after":15,"capacity":16}
-{"scenario":"serve_client_disconnect_cleans_up","owner_kind":"request","owner_id":"req-disconnect","resource_kind":"session_cache_ref","action":"commit","amount":1,"before":15,"after":15,"capacity":16}
-{"scenario":"serve_client_disconnect_cleans_up","owner_kind":"request","owner_id":"req-disconnect","resource_kind":"session_cache_ref","action":"rollback","amount":1,"before":15,"after":16,"capacity":16,"reason":"client_disconnect"}
+{"scenario":"serve_client_disconnect_cleans_up","owner_kind":"request","owner_id":"req-disconnect","resource_kind":"session_cache_ref","action":"reserve","amount":1,"before":0,"after":1,"capacity":16}
+{"scenario":"serve_client_disconnect_cleans_up","owner_kind":"request","owner_id":"req-disconnect","resource_kind":"session_cache_ref","action":"commit","amount":1,"before":0,"after":1,"capacity":16}
+{"scenario":"serve_client_disconnect_cleans_up","owner_kind":"request","owner_id":"req-disconnect","resource_kind":"session_cache_ref","action":"rollback","amount":1,"before":1,"after":0,"capacity":16,"reason":"client_disconnect"}
 {"scenario":"serve_client_disconnect_cleans_up","owner_kind":"request","owner_id":"req-disconnect","resource_kind":"request_slot","action":"request_close","capacity":1}

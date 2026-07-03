@@ -1,10 +1,10 @@
 {"scenario":"mixed_batch_partial_failure","owner_kind":"request","owner_id":"req-batch-ok","resource_kind":"request_slot","action":"request_open","capacity":2}
 {"scenario":"mixed_batch_partial_failure","owner_kind":"request","owner_id":"req-batch-fail","resource_kind":"request_slot","action":"request_open","capacity":2}
-{"scenario":"mixed_batch_partial_failure","owner_kind":"request","owner_id":"req-batch-ok","resource_kind":"backend_workspace","action":"reserve","amount":1,"before":2,"after":1,"capacity":2}
-{"scenario":"mixed_batch_partial_failure","owner_kind":"request","owner_id":"req-batch-ok","resource_kind":"backend_workspace","action":"commit","amount":1,"before":1,"after":1,"capacity":2}
-{"scenario":"mixed_batch_partial_failure","owner_kind":"request","owner_id":"req-batch-fail","resource_kind":"backend_workspace","action":"reserve","amount":1,"before":1,"after":0,"capacity":2}
-{"scenario":"mixed_batch_partial_failure","owner_kind":"request","owner_id":"req-batch-fail","resource_kind":"backend_workspace","action":"commit","amount":1,"before":0,"after":0,"capacity":2}
-{"scenario":"mixed_batch_partial_failure","owner_kind":"request","owner_id":"req-batch-ok","resource_kind":"backend_workspace","action":"release","amount":1,"before":0,"after":1,"capacity":2}
-{"scenario":"mixed_batch_partial_failure","owner_kind":"request","owner_id":"req-batch-fail","resource_kind":"backend_workspace","action":"rollback","amount":1,"before":1,"after":2,"capacity":2,"reason":"batch_member_failed"}
+{"scenario":"mixed_batch_partial_failure","owner_kind":"request","owner_id":"req-batch-ok","resource_kind":"backend_workspace","action":"reserve","amount":1,"before":0,"after":1,"capacity":2}
+{"scenario":"mixed_batch_partial_failure","owner_kind":"request","owner_id":"req-batch-ok","resource_kind":"backend_workspace","action":"commit","amount":1,"before":0,"after":1,"capacity":2}
+{"scenario":"mixed_batch_partial_failure","owner_kind":"request","owner_id":"req-batch-fail","resource_kind":"backend_workspace","action":"reserve","amount":1,"before":0,"after":1,"capacity":2}
+{"scenario":"mixed_batch_partial_failure","owner_kind":"request","owner_id":"req-batch-fail","resource_kind":"backend_workspace","action":"commit","amount":1,"before":0,"after":1,"capacity":2}
+{"scenario":"mixed_batch_partial_failure","owner_kind":"request","owner_id":"req-batch-ok","resource_kind":"backend_workspace","action":"release","amount":1,"before":1,"after":0,"capacity":2}
+{"scenario":"mixed_batch_partial_failure","owner_kind":"request","owner_id":"req-batch-fail","resource_kind":"backend_workspace","action":"rollback","amount":1,"before":1,"after":0,"capacity":2,"reason":"batch_member_failed"}
 {"scenario":"mixed_batch_partial_failure","owner_kind":"request","owner_id":"req-batch-ok","resource_kind":"request_slot","action":"request_close","capacity":2}
 {"scenario":"mixed_batch_partial_failure","owner_kind":"request","owner_id":"req-batch-fail","resource_kind":"request_slot","action":"request_close","capacity":2}

@@ -40,6 +40,7 @@ EXPECTED_FAIL_KINDS = {
     "capacity_overcommit",
     "defer_with_committed_resource",
     "rollback_incomplete",
+    "transition_mismatch",
 }
 
 LIFECYCLE_ACTIONS = {"reserve", "commit", "release", "rollback"}
@@ -178,6 +179,44 @@ def outstanding_by_resource(states: dict[tuple[str, str, str], ResourceState], k
     return sum(state.outstanding for (_, _, resource_kind), state in states.items() if resource_kind == kind)
 
 
+def committed_outstanding(state: ResourceState) -> int:
+    return state.committed - state.cleaned
+
+
+def expected_transition(state: ResourceState, action: str, amount: int) -> tuple[int, int] | None:
+    if action == "reserve":
+        before = state.outstanding
+        return before, before + amount
+    if action == "commit":
+        before = committed_outstanding(state)
+        return before, before + amount
+    if action == "release":
+        before = committed_outstanding(state)
+        return before, before - amount
+    if action == "rollback":
+        before = state.outstanding
+        return before, before - amount
+    return None
+
+
+def check_transition(
+    failures: list[dict[str, Any]], event: dict[str, Any], state: ResourceState, amount: int
+) -> None:
+    expected = expected_transition(state, event["action"], amount)
+    if expected is None:
+        return
+    expected_before, expected_after = expected
+    if event["before"] != expected_before or event["after"] != expected_after:
+        failures.append(
+            failure(
+                "transition_mismatch",
+                event,
+                f"expected before={expected_before} after={expected_after}, "
+                f"got before={event['before']} after={event['after']}",
+            )
+        )
+
+
 def check_trace(events: list[dict[str, Any]], *, source: str) -> dict[str, Any]:
     states: dict[tuple[str, str, str], ResourceState] = defaultdict(ResourceState)
     owner_open: set[tuple[str, str]] = set()
@@ -199,6 +238,7 @@ def check_trace(events: list[dict[str, Any]], *, source: str) -> dict[str, Any]:
 
         action = event["action"]
         amount = event["amount"] or 0
+        check_transition(failures, event, state, amount)
         if action == "request_open":
             owner_open.add(owner)
         elif action == "reserve":

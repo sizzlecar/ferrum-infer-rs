@@ -133,12 +133,29 @@ fn synthetic_events(
             resource_kind: "kv_block".to_string(),
             action: ResourceAction::Reserve,
             amount: Some(1),
-            before: Some(4),
-            after: Some(3),
+            before: Some(0),
+            after: Some(1),
             capacity: Some(4),
             reason: None,
         },
         base + Duration::microseconds(10),
+    );
+    let commit = resource_event(
+        entrypoint,
+        request_id,
+        "kv_commit",
+        ResourceTraceEvent {
+            owner_kind: "request".to_string(),
+            owner_id: request_id.to_string(),
+            resource_kind: "kv_block".to_string(),
+            action: ResourceAction::Commit,
+            amount: Some(1),
+            before: Some(0),
+            after: Some(1),
+            capacity: Some(4),
+            reason: None,
+        },
+        base + Duration::microseconds(15),
     );
     let prefill = timed_event(
         entrypoint,
@@ -172,8 +189,8 @@ fn synthetic_events(
             resource_kind: "kv_block".to_string(),
             action: ResourceAction::Release,
             amount: Some(1),
-            before: Some(3),
-            after: Some(4),
+            before: Some(1),
+            after: Some(0),
             capacity: Some(4),
             reason: None,
         },
@@ -195,7 +212,15 @@ fn synthetic_events(
         ("l0_only", json!(true)),
         ("response_text", json!("synthetic ok")),
     ]);
-    vec![request_open, reserve, prefill, decode, release, complete]
+    vec![
+        request_open,
+        reserve,
+        commit,
+        prefill,
+        decode,
+        release,
+        complete,
+    ]
 }
 
 fn base_event(
