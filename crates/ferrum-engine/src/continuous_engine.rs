@@ -800,6 +800,85 @@ struct SequenceCompletionResources {
     request_slot: Option<RequestSlotLease>,
 }
 
+#[derive(Debug, Default)]
+#[must_use = "unified prefill owned resources must be released or committed"]
+struct UnifiedPrefillOwnedResources {
+    kv_allocation: Option<SequenceKvAllocation>,
+    recurrent_state_allocation: Option<SequenceRecurrentAllocation>,
+}
+
+impl UnifiedPrefillOwnedResources {
+    fn with_fresh_kv(mut self, request_id: RequestId, blocks: usize) -> Self {
+        self.kv_allocation = Some(SequenceKvAllocation::new(request_id, Some(blocks)));
+        self
+    }
+
+    fn with_fresh_recurrent_state(mut self, slots: usize) -> Self {
+        self.recurrent_state_allocation = Some(SequenceRecurrentAllocation::new(Some(slots)));
+        self
+    }
+
+    fn commit(&mut self) {
+        self.kv_allocation = None;
+        self.recurrent_state_allocation = None;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.kv_allocation.is_none() && self.recurrent_state_allocation.is_none()
+    }
+
+    async fn release(&mut self, engine: &EngineInner, owner_request_id: &RequestId) {
+        if let Some(kv_allocation) = self.kv_allocation.take() {
+            engine
+                .release_kv_allocation(
+                    owner_request_id,
+                    kv_allocation.request_id,
+                    kv_allocation.blocks,
+                )
+                .await;
+        }
+        if let Some(recurrent_allocation) = self.recurrent_state_allocation.take() {
+            let sequence_slots = engine
+                .sequences
+                .write()
+                .get_mut(owner_request_id)
+                .and_then(SequenceState::take_recurrent_state_allocation);
+            if sequence_slots != recurrent_allocation.slots {
+                warn!(
+                    request_id = %owner_request_id,
+                    sequence_slots = ?sequence_slots,
+                    owned_slots = ?recurrent_allocation.slots,
+                    "unified prefill recurrent ownership metadata differed from sequence state"
+                );
+            }
+            engine
+                .release_recurrent_allocation(
+                    owner_request_id,
+                    recurrent_allocation.slots.or(sequence_slots),
+                )
+                .await;
+        }
+    }
+}
+
+impl Drop for UnifiedPrefillOwnedResources {
+    fn drop(&mut self) {
+        if self.is_empty() {
+            return;
+        }
+        let message = "unified prefill resources dropped without explicit release or commit";
+        warn!(
+            kv_allocation = ?self.kv_allocation,
+            recurrent_state_allocation = ?self.recurrent_state_allocation,
+            "{message}"
+        );
+        #[cfg(test)]
+        if !std::thread::panicking() {
+            panic!("{message}");
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SequenceDecodeResources {
     seq_id: String,
@@ -2845,16 +2924,6 @@ impl EngineInner {
         }
 
         Ok(handle)
-    }
-
-    async fn release_recurrent_state(&self, request_id: &RequestId) {
-        let released_slots = self
-            .sequences
-            .write()
-            .get_mut(request_id)
-            .and_then(SequenceState::take_recurrent_state_allocation);
-        self.release_recurrent_allocation(request_id, released_slots)
-            .await;
     }
 
     fn performance_breakdown(&self) -> ferrum_types::PerformanceBreakdown {

@@ -1524,6 +1524,12 @@ fn sequence_state_drop_with_owned_request_slot_panics_in_tests() {
 }
 
 #[test]
+#[should_panic(expected = "unified prefill resources dropped without explicit release or commit")]
+fn unified_prefill_owned_resources_drop_without_release_or_commit_panics_in_tests() {
+    let _resources = UnifiedPrefillOwnedResources::default().with_fresh_kv(RequestId::new(), 1);
+}
+
+#[test]
 fn sequence_take_completion_resources_moves_request_slot_and_physical_resources_together() {
     let engine = test_continuous_engine();
     let request = policy_request();
