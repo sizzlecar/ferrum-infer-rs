@@ -162,7 +162,13 @@ pub struct ContinuousSchedulerTraceSnapshot {
     pub admitted_total: u64,
     pub capacity_deferred_total: u64,
     pub capacity_backpressure_admit_limit: Option<usize>,
+    pub decode_capacity_backpressure_admit_limit: Option<usize>,
     pub capacity_blocked_waiting_len: usize,
+    pub capacity_release_epoch: u64,
+    pub capacity_mixed_recompute_epoch: u64,
+    pub capacity_mixed_recompute_blocked_until_epoch: u64,
+    pub capacity_mixed_recompute_required_blocks_per_slot: Option<usize>,
+    pub capacity_mixed_recompute_observed_free_blocks: Option<usize>,
 }
 
 /// Continuous batching scheduler
@@ -381,7 +387,29 @@ impl ContinuousBatchScheduler {
             admitted_total: self.admitted_counter.load(Ordering::Relaxed),
             capacity_deferred_total: self.capacity_deferred_counter.load(Ordering::Relaxed),
             capacity_backpressure_admit_limit: self.capacity_backpressure_admit_limit(),
+            decode_capacity_backpressure_admit_limit: self.decode_capacity_backpressure_limit(),
             capacity_blocked_waiting_len: self.capacity_blocked_waiting_len(),
+            capacity_release_epoch: self.capacity_release_epoch.load(Ordering::Relaxed),
+            capacity_mixed_recompute_epoch: self
+                .capacity_mixed_recompute_epoch
+                .load(Ordering::Relaxed),
+            capacity_mixed_recompute_blocked_until_epoch: self
+                .capacity_mixed_recompute_blocked_until_epoch
+                .load(Ordering::Relaxed),
+            capacity_mixed_recompute_required_blocks_per_slot: match self
+                .capacity_mixed_recompute_required_blocks_per_slot
+                .load(Ordering::Relaxed)
+            {
+                0 => None,
+                value => Some(value),
+            },
+            capacity_mixed_recompute_observed_free_blocks: match self
+                .capacity_mixed_recompute_observed_free_blocks
+                .load(Ordering::Relaxed)
+            {
+                usize::MAX => None,
+                value => Some(value),
+            },
         }
     }
 
@@ -1949,6 +1977,15 @@ mod tests {
         assert_eq!(before.waiting_queue_len, 1);
         assert_eq!(before.active_len, 0);
         assert_eq!(before.admitted_total, 0);
+        assert_eq!(before.capacity_release_epoch, 0);
+        assert_eq!(before.capacity_mixed_recompute_epoch, 0);
+        assert_eq!(before.capacity_mixed_recompute_blocked_until_epoch, 0);
+        assert_eq!(
+            before.capacity_mixed_recompute_required_blocks_per_slot,
+            None
+        );
+        assert_eq!(before.capacity_mixed_recompute_observed_free_blocks, None);
+        assert_eq!(before.decode_capacity_backpressure_admit_limit, None);
         assert_eq!(
             scheduler.trace_phase(&request_id),
             Some(RequestPhase::Waiting)
@@ -2690,6 +2727,19 @@ mod tests {
             Some(0),
             Some(1),
         );
+        let blocked_snapshot = scheduler.trace_snapshot();
+        assert_eq!(
+            blocked_snapshot.capacity_mixed_recompute_required_blocks_per_slot,
+            Some(4)
+        );
+        assert_eq!(
+            blocked_snapshot.capacity_mixed_recompute_observed_free_blocks,
+            Some(0)
+        );
+        assert_eq!(
+            blocked_snapshot.capacity_mixed_recompute_blocked_until_epoch,
+            blocked_snapshot.capacity_mixed_recompute_epoch + 1
+        );
         assert!(scheduler.defer_prefill_to_waiting(&first_ids[0]));
 
         assert!(scheduler.defer_decode_to_waiting_for_capacity(&first_ids[2], 4));
@@ -2721,6 +2771,15 @@ mod tests {
         );
 
         scheduler.record_capacity_deferred_mixed_recompute_kv_capacity_snapshot(5);
+        let reopened_snapshot = scheduler.trace_snapshot();
+        assert_eq!(
+            reopened_snapshot.capacity_mixed_recompute_observed_free_blocks,
+            Some(5)
+        );
+        assert!(
+            reopened_snapshot.capacity_mixed_recompute_epoch
+                >= reopened_snapshot.capacity_mixed_recompute_blocked_until_epoch
+        );
         let after_enough_free = scheduler.create_iteration_batch(hint).unwrap();
         let after_enough_ids: HashSet<RequestId> = after_enough_free
             .requests

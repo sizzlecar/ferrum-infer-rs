@@ -254,7 +254,7 @@ fn resource_trace_temp_path(label: &str) -> PathBuf {
     ))
 }
 
-fn assert_engine_resource_trace_balanced(path: &Path) -> Vec<ResourceTraceEvent> {
+fn read_engine_profile_events(path: &Path) -> Vec<FerrumProfileEvent> {
     let contents = std::fs::read_to_string(path).unwrap_or_else(|error| {
         panic!("failed to read resource trace {}: {error}", path.display())
     });
@@ -264,37 +264,41 @@ fn assert_engine_resource_trace_balanced(path: &Path) -> Vec<ResourceTraceEvent>
         path.display()
     );
 
+    contents
+        .lines()
+        .enumerate()
+        .filter_map(|(line_no, line)| {
+            if line.trim().is_empty() {
+                return None;
+            }
+            let event: FerrumProfileEvent = serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!(
+                    "line {} in {} is not a FerrumProfileEvent: {error}\n{line}",
+                    line_no + 1,
+                    path.display()
+                )
+            });
+            event.validate().unwrap_or_else(|error| {
+                panic!(
+                    "line {} in {} failed profile validation: {error}\n{line}",
+                    line_no + 1,
+                    path.display()
+                )
+            });
+            Some(event)
+        })
+        .collect()
+}
+
+fn assert_engine_resource_trace_balanced(path: &Path) -> Vec<ResourceTraceEvent> {
     let mut states: HashMap<(String, String, String), TestResourceTraceState> = HashMap::new();
     let mut resources = Vec::new();
 
-    for (line_no, line) in contents.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: FerrumProfileEvent = serde_json::from_str(line).unwrap_or_else(|error| {
-            panic!(
-                "line {} in {} is not a FerrumProfileEvent: {error}\n{line}",
-                line_no + 1,
-                path.display()
-            )
-        });
-        event.validate().unwrap_or_else(|error| {
-            panic!(
-                "line {} in {} failed profile validation: {error}\n{line}",
-                line_no + 1,
-                path.display()
-            )
-        });
+    for event in read_engine_profile_events(path) {
         let Some(resource) = event.resource else {
             continue;
         };
-        resource.validate().unwrap_or_else(|error| {
-            panic!(
-                "line {} in {} failed resource validation: {error}\n{line}",
-                line_no + 1,
-                path.display()
-            )
-        });
+        resource.validate().unwrap();
         let key = (
             resource.owner_kind.clone(),
             resource.owner_id.clone(),
@@ -3669,6 +3673,41 @@ async fn process_batch_unified_forward_resource_exhausted_defers_existing_kv_pre
     assert!(saw("backend_workspace", ResourceAction::Reserve));
     assert!(saw("backend_workspace", ResourceAction::Commit));
     assert!(saw("backend_workspace", ResourceAction::Release));
+    let profile_events = read_engine_profile_events(&trace_path);
+    let defer_event = profile_events
+        .iter()
+        .find(|event| {
+            event
+                .resource
+                .as_ref()
+                .is_some_and(|resource| resource.action == ResourceAction::Defer)
+        })
+        .expect("capacity defer event should be traced");
+    let scheduler_snapshot = defer_event
+        .attributes
+        .get("scheduler_snapshot")
+        .and_then(serde_json::Value::as_object)
+        .expect("defer event should include scheduler snapshot");
+    assert_eq!(
+        scheduler_snapshot
+            .get("waiting_queue_len")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        scheduler_snapshot
+            .get("capacity_deferred_total")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert!(
+        scheduler_snapshot.contains_key("capacity_release_epoch"),
+        "scheduler snapshot must expose release epoch"
+    );
+    assert!(
+        scheduler_snapshot.contains_key("capacity_mixed_recompute_epoch"),
+        "scheduler snapshot must expose mixed recompute epoch"
+    );
     let _ = std::fs::remove_file(trace_path);
 
     let sequences = engine.inner.sequences.read();
