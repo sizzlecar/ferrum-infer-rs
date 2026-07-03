@@ -206,17 +206,10 @@ impl EngineInner {
                     )?
                 };
                 seq.generated_tokens.push(token);
-                let cache_id = seq
-                    .model_cache_id
-                    .clone()
-                    .unwrap_or_else(|| rid.to_string());
-                let kv_len = seq
-                    .input_tokens
-                    .len()
-                    .saturating_add(seq.generated_tokens.len())
-                    .saturating_sub(1);
-                seq.kv_cache = Some(self.make_model_kv_handle_with_seq(cache_id, kv_len));
-                seq.tokens_this_iteration += 1;
+                let cache_id = seq.decode_model_cache_id_or_request_id(rid);
+                let kv_len = seq.decode_model_kv_len_after_last_generated_token();
+                let model_kv = self.make_model_kv_handle_with_seq(cache_id, kv_len);
+                seq.commit_decode_step_physical_resources(model_kv);
                 // pos_offset is sourced from SequenceState bookkeeping
                 // (see process_batch_unified). The engine-side KV handle's
                 // sequence_length is not used for position tracking
@@ -356,12 +349,13 @@ impl EngineInner {
                 )?
             };
             seq.generated_tokens.push(token);
-            seq.kv_cache = Some(decode_output.kv_cache.clone());
-            seq.recurrent_state = decode_output
-                .recurrent_state
-                .clone()
-                .or(input_recurrent_state);
-            seq.tokens_this_iteration += 1;
+            seq.commit_decode_step_physical_resources(decode_output.kv_cache.clone());
+            seq.commit_decode_recurrent_state(
+                decode_output
+                    .recurrent_state
+                    .clone()
+                    .or(input_recurrent_state),
+            );
             token
         };
 
@@ -626,8 +620,10 @@ impl EngineInner {
         {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.get_mut(request_id) {
-                seq.kv_cache = Some(target_kv_aligned);
-                seq.draft_kv_cache = Some(draft_kv_aligned);
+                seq.commit_speculative_decode_physical_resources(
+                    target_kv_aligned,
+                    draft_kv_aligned,
+                );
             }
         }
         let _ = last_emitted;
