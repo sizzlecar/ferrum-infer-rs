@@ -512,6 +512,7 @@
       "cuda": true,
       "cuda_graph": true,
       "fa2_direct_ffi": false,
+      "fa2_native_operator_artifact": false,
       "fa2_source": false,
       "greedy_argmax": true,
       "vllm_moe_marlin": true,

@@ -3,6 +3,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use ferrum_native_ops::{NativeOperatorResolveRequest, NativeOperatorResolver};
+use ferrum_types::{
+    resolve_native_operator_manifest, NativeOperatorBackend, NativeOperatorLinkage,
+    NativeOperatorRequirement,
+};
+
+const FA2_NATIVE_MANIFEST_ENV: &str = "FERRUM_FA2_NATIVE_MANIFEST";
+const FA2_NATIVE_ARTIFACT_ENV: &str = "FERRUM_FA2_NATIVE_ARTIFACT";
+const FA2_NATIVE_SOURCE_SHA256_ENV: &str = "FERRUM_FA2_NATIVE_SOURCE_SHA256";
+const FA2_NATIVE_INPUTS_SHA256_ENV: &str = "FERRUM_FA2_NATIVE_INPUTS_SHA256";
+const FA2_NATIVE_ARTIFACT_COMPILE_ENV: &str = "FERRUM_FA2_NATIVE_ARTIFACT_COMPILE";
+const NATIVE_OP_ARTIFACT_FEATURE_ENV: &str = "CARGO_FEATURE_NATIVE_OP_ARTIFACT";
+
 const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/fused_add_rms_norm.cu",
     "kernels/fused_silu_mul.cu",
@@ -101,6 +114,200 @@ fn emit_cuda_build_summary(
 elapsed_ms={} inputs_hash={}",
         elapsed.as_millis(),
         signature_hash(signature)
+    );
+}
+
+fn optional_non_empty_env(key: &str) -> Option<String> {
+    println!("cargo:rerun-if-env-changed={key}");
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn required_native_env(key: &str, value: Option<String>) -> String {
+    value.unwrap_or_else(|| {
+        panic!("{key} is required when configuring an FA2 native operator artifact")
+    })
+}
+
+fn normalize_compute_capability(raw: &str) -> String {
+    let value = raw.trim();
+    if let Some(rest) = value.strip_prefix("sm_") {
+        return format!("sm_{}", rest.replace('.', ""));
+    }
+    format!("sm_{}", value.replace('.', ""))
+}
+
+fn native_static_link_name(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "native operator artifact has no UTF-8 file name: {}",
+                path.display()
+            )
+        });
+    let Some(stripped) = name
+        .strip_prefix("lib")
+        .and_then(|name| name.strip_suffix(".a"))
+    else {
+        panic!(
+            "static native operator artifact must be named lib<name>.a, got {}",
+            path.display()
+        );
+    };
+    if stripped.is_empty() {
+        panic!(
+            "static native operator artifact link name is empty: {}",
+            path.display()
+        );
+    }
+    stripped.to_string()
+}
+
+fn native_dynamic_link_name(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "native operator artifact has no UTF-8 file name: {}",
+                path.display()
+            )
+        });
+    if let Some(stripped) = name
+        .strip_prefix("lib")
+        .and_then(|name| name.strip_suffix(".dylib"))
+    {
+        if !stripped.is_empty() {
+            return stripped.to_string();
+        }
+    }
+    if let Some(rest) = name.strip_prefix("lib") {
+        if let Some((stripped, _version)) = rest.split_once(".so") {
+            if !stripped.is_empty() {
+                return stripped.to_string();
+            }
+        }
+    }
+    panic!(
+        "dynamic native operator artifact must be named lib<name>.so* or lib<name>.dylib, got {}",
+        path.display()
+    );
+}
+
+fn link_fa2_native_operator_artifact() {
+    let start = Instant::now();
+    let feature_enabled = env::var_os(NATIVE_OP_ARTIFACT_FEATURE_ENV).is_some();
+    println!("cargo:rerun-if-env-changed={NATIVE_OP_ARTIFACT_FEATURE_ENV}");
+
+    let manifest = optional_non_empty_env(FA2_NATIVE_MANIFEST_ENV);
+    let artifact = optional_non_empty_env(FA2_NATIVE_ARTIFACT_ENV);
+    let source_sha256 = optional_non_empty_env(FA2_NATIVE_SOURCE_SHA256_ENV);
+    let inputs_sha256 = optional_non_empty_env(FA2_NATIVE_INPUTS_SHA256_ENV);
+    let configured = manifest.is_some() || artifact.is_some();
+    let pinned_without_artifact =
+        (source_sha256.is_some() || inputs_sha256.is_some()) && !configured;
+
+    if !feature_enabled {
+        if configured || pinned_without_artifact {
+            panic!(
+                "FA2 native operator artifact build config requires --features native-op-artifact"
+            );
+        }
+        println!("cargo:rustc-env={FA2_NATIVE_ARTIFACT_COMPILE_ENV}=not_configured");
+        return;
+    }
+    if !configured {
+        if pinned_without_artifact {
+            panic!(
+                "FA2 native operator sha256 pins require {FA2_NATIVE_MANIFEST_ENV} and {FA2_NATIVE_ARTIFACT_ENV}"
+            );
+        }
+        println!("cargo:rustc-env={FA2_NATIVE_ARTIFACT_COMPILE_ENV}=not_configured");
+        emit_cuda_build_summary(
+            "fa2_native_operator",
+            "skipped",
+            "native-op-artifact-feature-enabled-without-manifest",
+            start.elapsed(),
+            "fa2-native-operator=not-configured",
+        );
+        return;
+    }
+
+    let manifest = PathBuf::from(required_native_env(FA2_NATIVE_MANIFEST_ENV, manifest));
+    let artifact = PathBuf::from(required_native_env(FA2_NATIVE_ARTIFACT_ENV, artifact));
+    println!("cargo:rerun-if-changed={}", manifest.display());
+    println!("cargo:rerun-if-changed={}", artifact.display());
+
+    let compute_capability = normalize_compute_capability(
+        &env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| detect_cuda_compute_cap()),
+    );
+    let request = NativeOperatorResolveRequest::new(
+        "fa2",
+        NativeOperatorBackend::Cuda,
+        manifest.clone(),
+        artifact.clone(),
+    )
+    .with_compute_capability(compute_capability.clone());
+    let resolved = NativeOperatorResolver
+        .resolve(&request)
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to resolve FA2 native operator artifact manifest={} artifact={}: {err}",
+                manifest.display(),
+                artifact.display()
+            )
+        });
+    let mut requirement = NativeOperatorRequirement::cuda("fa2", compute_capability);
+    requirement.source_package_sha256 = source_sha256;
+    requirement.inputs_sha256 = inputs_sha256;
+    requirement.binary_sha256 = Some(resolved.artifact_sha256.clone());
+    resolve_native_operator_manifest(Some(&resolved.manifest), &requirement).unwrap_or_else(|err| {
+        panic!(
+            "FA2 native operator artifact does not satisfy build requirement manifest={} artifact={}: {err}",
+            manifest.display(),
+            artifact.display()
+        )
+    });
+
+    let parent = resolved
+        .artifact_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    println!("cargo:rustc-link-search=native={}", parent.display());
+    match resolved.manifest.linkage {
+        NativeOperatorLinkage::Static => {
+            println!(
+                "cargo:rustc-link-lib=static={}",
+                native_static_link_name(&resolved.artifact_path)
+            );
+        }
+        NativeOperatorLinkage::Dynamic => {
+            println!(
+                "cargo:rustc-link-lib=dylib={}",
+                native_dynamic_link_name(&resolved.artifact_path)
+            );
+        }
+    }
+    println!("cargo:rustc-env={FA2_NATIVE_ARTIFACT_COMPILE_ENV}=linked");
+    println!(
+        "cargo:rustc-env=FERRUM_FA2_NATIVE_ARTIFACT_BINARY_SHA256={}",
+        resolved.artifact_sha256
+    );
+    emit_cuda_build_summary(
+        "fa2_native_operator",
+        "linked",
+        "manifest-validated-artifact-linked",
+        start.elapsed(),
+        &format!(
+            "manifest={}:artifact={}:binary_sha256={}",
+            resolved.manifest_path.display(),
+            resolved.artifact_path.display(),
+            resolved.artifact_sha256
+        ),
     );
 }
 
@@ -224,6 +431,7 @@ fn emit_cuda_static_link(
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    link_fa2_native_operator_artifact();
 
     // Link Accelerate framework on macOS (provides cblas_sgemm, vDSP_*)
     if env::consts::OS == "macos" {

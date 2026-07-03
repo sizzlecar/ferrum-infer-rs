@@ -17,6 +17,14 @@ use ferrum_types::{
 
 pub const FA2_NATIVE_OPERATOR: &str = "fa2";
 
+pub fn compiled_fa2_native_operator_artifact_linked() -> bool {
+    option_env!("FERRUM_FA2_NATIVE_ARTIFACT_COMPILE") == Some("linked")
+}
+
+pub fn compiled_fa2_native_operator_artifact_state() -> &'static str {
+    option_env!("FERRUM_FA2_NATIVE_ARTIFACT_COMPILE").unwrap_or("not_configured")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeOperatorArtifactSpec {
     pub operator: String,

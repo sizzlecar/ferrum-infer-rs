@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ferrum_kernels::native_ops::{
+    compiled_fa2_native_operator_artifact_linked, compiled_fa2_native_operator_artifact_state,
     resolve_cuda_fa2_native_operator, NativeOperatorArtifactSpec, FA2_NATIVE_OPERATOR,
 };
 use ferrum_native_ops::{NativeOperatorArtifactFormat, NativeOperatorResolveError};
@@ -153,6 +154,15 @@ fn spec(fixture: &NativeOpFixture) -> NativeOperatorArtifactSpec {
         .with_source_package_sha256(fixture.source_package_sha256.clone())
         .with_inputs_sha256(fixture.inputs_sha256.clone())
         .with_binary_sha256(fixture.artifact_sha256.clone())
+}
+
+#[test]
+fn normal_test_build_does_not_report_fa2_native_artifact_linked() {
+    assert!(!compiled_fa2_native_operator_artifact_linked());
+    assert_eq!(
+        compiled_fa2_native_operator_artifact_state(),
+        "not_configured"
+    );
 }
 
 #[test]
