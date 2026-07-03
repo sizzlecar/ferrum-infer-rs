@@ -40,6 +40,12 @@ SELFTEST_PASS_LINE = "PRODUCT BACKEND SENTINEL SELFTEST PASS"
 SCHEMA_VERSION = 1
 SYNTHETIC_RUNTIME_PRESET_HASH = "sha256:6c3b8d2c431c47cf612289b02a8c631c894f34f532508fc58841e572aedaa7bc"
 REQUIRED_STAGE2_FIXTURES = 12
+REQUIRED_ACTUAL_ENGINE_RESOURCE_KINDS = {
+    "backend_workspace",
+    "kv_block",
+    "model_cache_ref",
+    "request_slot",
+}
 REQUIRED_PRODUCT_SCENARIOS = {
     "run_first_token",
     "run_multiturn",
@@ -629,7 +635,7 @@ def validate_actual_smoke_profile_groups(
                     for event in events
                     if isinstance(event.get("resource"), dict)
                 }
-                missing = {"request_slot", "kv_block"} - resource_kinds
+                missing = REQUIRED_ACTUAL_ENGINE_RESOURCE_KINDS - resource_kinds
                 require(not missing, f"{path} missing runtime resource kinds: {sorted(missing)}")
             group[label] = {"path": str(path), "event_count": len(events)}
         request_dump = root / "request_dump/request.json"
@@ -1193,6 +1199,102 @@ def write_actual_smoke_entrypoint(root: Path, entrypoint: str) -> None:
         actual_smoke_profile_event(
             entrypoint=entrypoint,
             request_id=request_id,
+            event_id=f"evt-{entrypoint}-workspace-reserve",
+            phase="backend_workspace_reserve",
+            resource={
+                "owner_kind": "request",
+                "owner_id": request_id,
+                "resource_kind": "backend_workspace",
+                "action": "reserve",
+                "amount": 1,
+                "before": 0,
+                "after": 1,
+                "capacity": 1,
+            },
+        ),
+        actual_smoke_profile_event(
+            entrypoint=entrypoint,
+            request_id=request_id,
+            event_id=f"evt-{entrypoint}-workspace-commit",
+            phase="backend_workspace_commit",
+            resource={
+                "owner_kind": "request",
+                "owner_id": request_id,
+                "resource_kind": "backend_workspace",
+                "action": "commit",
+                "amount": 1,
+                "before": 0,
+                "after": 1,
+                "capacity": 1,
+            },
+        ),
+        actual_smoke_profile_event(
+            entrypoint=entrypoint,
+            request_id=request_id,
+            event_id=f"evt-{entrypoint}-workspace-release",
+            phase="backend_workspace_release",
+            resource={
+                "owner_kind": "request",
+                "owner_id": request_id,
+                "resource_kind": "backend_workspace",
+                "action": "release",
+                "amount": 1,
+                "before": 1,
+                "after": 0,
+                "capacity": 1,
+            },
+        ),
+        actual_smoke_profile_event(
+            entrypoint=entrypoint,
+            request_id=request_id,
+            event_id=f"evt-{entrypoint}-model-cache-reserve",
+            phase="model_cache_ref_reserve",
+            resource={
+                "owner_kind": "request",
+                "owner_id": request_id,
+                "resource_kind": "model_cache_ref",
+                "action": "reserve",
+                "amount": 1,
+                "before": 0,
+                "after": 1,
+                "capacity": 1,
+            },
+        ),
+        actual_smoke_profile_event(
+            entrypoint=entrypoint,
+            request_id=request_id,
+            event_id=f"evt-{entrypoint}-model-cache-commit",
+            phase="model_cache_ref_commit",
+            resource={
+                "owner_kind": "request",
+                "owner_id": request_id,
+                "resource_kind": "model_cache_ref",
+                "action": "commit",
+                "amount": 1,
+                "before": 0,
+                "after": 1,
+                "capacity": 1,
+            },
+        ),
+        actual_smoke_profile_event(
+            entrypoint=entrypoint,
+            request_id=request_id,
+            event_id=f"evt-{entrypoint}-model-cache-release",
+            phase="model_cache_ref_release",
+            resource={
+                "owner_kind": "request",
+                "owner_id": request_id,
+                "resource_kind": "model_cache_ref",
+                "action": "release",
+                "amount": 1,
+                "before": 1,
+                "after": 0,
+                "capacity": 1,
+            },
+        ),
+        actual_smoke_profile_event(
+            entrypoint=entrypoint,
+            request_id=request_id,
             event_id=f"evt-{entrypoint}-kv-release",
             phase="kv_release",
             resource={
@@ -1367,6 +1469,40 @@ def run_selftest() -> None:
         )
         if actual_gate_summary.get("actual_smoke", {}).get("status") != "pass":
             raise AssertionError(actual_gate_summary)
+        missing_resource_smoke = make_actual_smoke_fixture(
+            temp / "missing-engine-resource-smoke",
+            sha=head,
+        )
+        for trace_path in [
+            missing_resource_smoke / "run/scheduler_trace.jsonl",
+            missing_resource_smoke / "serve/scheduler_trace.jsonl",
+        ]:
+            events = [
+                json.loads(line)
+                for line in trace_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            events = [
+                event
+                for event in events
+                if (event.get("resource") or {}).get("resource_kind") != "backend_workspace"
+            ]
+            write_jsonl(trace_path, events)
+        try:
+            run_gate(
+                argparse.Namespace(
+                    manifest=DEFAULT_MANIFEST,
+                    out=temp / "bad-missing-engine-resource-smoke",
+                    actual_smoke=missing_resource_smoke,
+                    scenario_summary=None,
+                )
+            )
+            raise AssertionError("actual smoke missing engine resource unexpectedly passed")
+        except SentinelError as exc:
+            require(
+                "missing runtime resource kinds" in str(exc),
+                f"unexpected missing engine resource error: {exc}",
+            )
         stale_smoke = make_actual_smoke_fixture(temp / "stale-smoke", sha="0" * 40)
         try:
             run_gate(
