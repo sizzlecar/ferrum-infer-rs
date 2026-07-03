@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "contract_id": "mismatched_artifact_pass_line",
+  "source_git_sha": "1111111111111111111111111111111111111111",
+  "model": {
+    "id": "fixture/mismatched-artifact-pass-line",
+    "family": "llama",
+    "architecture": "llama_dense",
+    "weight_format": "bf16",
+    "source": "hf"
+  },
+  "facts": {
+    "tokenizer_source": "tokenizer_config.json",
+    "chat_template_source": "tokenizer_config.json",
+    "generation_config_source": "generation_config.json",
+    "token_id_source": "metadata",
+    "eos_token_ids": [128001],
+    "bos_token_id": 128000,
+    "stop_tokens": ["<|eot_id|>"],
+    "template_golden": {
+      "kind": "template_golden",
+      "path": "../artifacts/llama_dense/template_golden.json",
+      "status": "pass",
+      "pass_line": "W3 L0 TEMPLATE PASS: fixtures/llama_dense/template",
+      "git_sha": "1111111111111111111111111111111111111111"
+    },
+    "template_golden_cases": [
+      "single_turn",
+      "multi_turn",
+      "system_message",
+      "tool_injection",
+      "reasoning_history"
+    ]
+  },
+  "runtime_preset": {
+    "selected": "cuda-llama-dense",
+    "rejected_candidates": ["metal-default", "cpu-default"]
+  },
+  "fallback_policy": {
+    "allow_builtin_template_fallback": false,
+    "allow_backend_fallback": false,
+    "allow_attention_fallback": false
+  },
+  "capabilities": {
+    "tool_calling": {
+      "supported": false,
+      "source": "not_validated"
+    },
+    "structured_output": {
+      "supported": false,
+      "source": "not_validated"
+    }
+  },
+  "backend_support": [
+    {
+      "backend": "cuda",
+      "status": "supported",
+      "selection": {
+        "runtime_preset": "cuda-llama-dense",
+        "scheduler": "continuous",
+        "attention_impl": "paged-attn",
+        "kv_layout": "paged",
+        "kv_dtype": "fp16",
+        "recurrent_state_max_slots": null
+      },
+      "fallback": {
+        "allowed": false,
+        "actual_backend": "cuda",
+        "actual_attention_impl": "paged-attn",
+        "reason": null
+      },
+      "native_operators": [],
+      "correctness": {
+        "status": "pass",
+        "run_artifact": {
+          "kind": "run_smoke",
+          "path": "../artifacts/llama_dense/run_smoke.json",
+          "status": "pass",
+          "pass_line": "OBSERVABILITY PROFILE GATE PASS: fixtures/llama_dense/profile",
+          "git_sha": "1111111111111111111111111111111111111111",
+          "entrypoint": "run",
+          "backend": "cuda"
+        },
+        "serve_artifact": {
+          "kind": "serve_smoke",
+          "path": "../artifacts/llama_dense/serve_smoke.json",
+          "status": "pass",
+          "pass_line": "BACKEND REGRESSION SMOKE PASS: fixtures/llama_dense/serve",
+          "git_sha": "1111111111111111111111111111111111111111",
+          "entrypoint": "serve",
+          "backend": "cuda"
+        },
+        "profile_artifact": {
+          "kind": "profile",
+          "path": "../artifacts/llama_dense/profile.jsonl",
+          "status": "pass",
+          "pass_line": "OBSERVABILITY PROFILE GATE PASS: fixtures/llama_dense/profile",
+          "git_sha": "1111111111111111111111111111111111111111",
+          "backend": "cuda"
+        },
+        "replay_artifact": {
+          "kind": "replay",
+          "path": "../artifacts/llama_dense/replay.json",
+          "status": "pass",
+          "pass_line": "REQUEST REPLAY BUNDLE PASS: fixtures/llama_dense/replay",
+          "git_sha": "1111111111111111111111111111111111111111",
+          "backend": "cuda"
+        },
+        "preset_snapshot": {
+          "kind": "preset_snapshot",
+          "path": "../artifacts/llama_dense/preset_snapshot.json",
+          "status": "pass",
+          "pass_line": "BACKEND PRESET SNAPSHOT PASS: fixtures/llama_dense/preset",
+          "git_sha": "1111111111111111111111111111111111111111",
+          "backend": "cuda"
+        }
+      },
+      "performance_claims": []
+    }
+  ]
+}

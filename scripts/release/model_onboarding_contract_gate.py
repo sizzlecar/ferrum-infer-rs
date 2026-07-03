@@ -74,10 +74,24 @@ ARTIFACT_KEYS = {
     "backend",
     "impact_domains",
 }
+ARTIFACT_PASS_LINE_PREFIXES = {
+    "design_doc": ("DESIGN DOC PASS",),
+    "native_operator": ("NATIVE OP ARTIFACT PASS",),
+    "performance": ("MODEL PERF PASS",),
+    "preset_snapshot": ("BACKEND PRESET SNAPSHOT PASS",),
+    "profile": ("OBSERVABILITY PROFILE GATE PASS",),
+    "replay": ("REQUEST REPLAY BUNDLE PASS",),
+    "run_smoke": ("BACKEND REGRESSION SMOKE PASS", "PRODUCT OBSERVABILITY L1 SMOKE PASS"),
+    "serve_smoke": ("BACKEND REGRESSION SMOKE PASS", "PRODUCT OBSERVABILITY L1 SMOKE PASS"),
+    "structured_schema": ("W3 L4 AGENT PASS",),
+    "template_golden": ("W3 L0 TEMPLATE PASS",),
+    "tool_call": ("W3 L4 AGENT PASS",),
+}
 EXPECTED_FAIL_MARKERS = {
     "builtin_template_fallback_allowed.json": "fallback_policy.allow_builtin_template_fallback",
     "cuda_claim_without_cuda_artifact.json": "backend_support[0].correctness.run_artifact",
     "missing_chat_template_source.json": "facts.chat_template_source",
+    "mismatched_artifact_pass_line.json": "pass_line must start with one of",
     "missing_run_artifact.json": "backend_support[0].correctness.run_artifact",
     "missing_serve_artifact.json": "backend_support[0].correctness.serve_artifact",
     "native_operator_claim_without_artifact.json": "native_operator_artifact",
@@ -507,6 +521,12 @@ def validate_artifact(
             problems.append(f"{label}.pass_line must contain a gate PASS line")
         if "SELFTEST" in upper or "SELF-TEST" in upper:
             problems.append(f"{label}.pass_line must not be self-test evidence")
+        if kind is not None:
+            prefixes = ARTIFACT_PASS_LINE_PREFIXES.get(kind)
+            if prefixes is not None and not any(pass_line.startswith(f"{prefix}:") for prefix in prefixes):
+                problems.append(
+                    f"{label}.pass_line must start with one of {sorted(prefixes)} for kind {kind!r}"
+                )
     if expected_backend is not None:
         backend = artifact.get("backend")
         if backend != expected_backend:
