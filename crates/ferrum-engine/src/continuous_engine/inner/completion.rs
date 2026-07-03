@@ -161,6 +161,7 @@ impl EngineInner {
             draft_kv_request_id,
             draft_kv_resource_blocks,
             model_cache_id,
+            request_slot,
         ) = {
             let mut sequences = self.sequences.write();
             if let Some(mut seq) = sequences.remove(request_id) {
@@ -203,6 +204,7 @@ impl EngineInner {
                 let draft_kv_request_id = seq.draft_kv_request_id.clone();
                 let draft_kv_resource_blocks = seq.draft_kv_resource_blocks.take();
                 let cache_id = seq.model_cache_id.clone();
+                let request_slot = seq.request_slot.take();
                 (
                     response,
                     seq.stream_sender,
@@ -214,6 +216,7 @@ impl EngineInner {
                     draft_kv_request_id,
                     draft_kv_resource_blocks,
                     cache_id,
+                    request_slot,
                 )
             } else {
                 return Ok(());
@@ -240,10 +243,11 @@ impl EngineInner {
                 .await;
         }
 
-        self.scheduler
-            .complete(request_id.clone(), &response)
-            .await?;
-        self.trace_request_close(request_id);
+        let scheduler_complete = self.scheduler.complete(request_id.clone(), &response).await;
+        if let Some(request_slot) = request_slot {
+            request_slot.close(self);
+        }
+        scheduler_complete?;
 
         if let Some(tx) = response_sender {
             let _ = tx.send(response.clone());
