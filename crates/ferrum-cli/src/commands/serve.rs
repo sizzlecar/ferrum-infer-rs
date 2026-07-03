@@ -841,6 +841,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         })
         .collect();
 
+    let mut cache_allocated_status = None;
     let server = match arch_for_dispatch {
         Some(ferrum_models::Architecture::Clip) => {
             println!("{}", "Initializing CLIP embedding engine...".dimmed());
@@ -959,6 +960,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
             let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
                 Arc::from(ferrum_engine::create_default_engine(engine_config).await?);
+            if product_memory_enabled {
+                cache_allocated_status = Some(engine.status().await);
+            }
             AxumServer::from_llm(engine).with_prompt_template(
                 crate::source_resolver::load_model_chat_template(&source.local_path),
             )
@@ -979,6 +983,13 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         .as_micros()
         .try_into()
         .unwrap_or(u64::MAX);
+    let cache_allocated_sample = product_memory_enabled
+        .then(|| memory_sampler.sample())
+        .flatten();
+    let cache_allocated_memory = serve_process_memory_observation_between(
+        model_loaded_sample.clone(),
+        cache_allocated_sample.clone(),
+    );
     let server = if lora_server_models.is_empty() {
         server
     } else {
@@ -992,6 +1003,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             product_memory_enabled,
             process_start_memory.clone(),
             backend_initialized_memory.clone(),
+            cache_allocated_memory.clone(),
+            cache_allocated_status.clone(),
         ),
     )?;
 
@@ -1110,9 +1123,20 @@ fn actual_serve_startup_memory_stages(
     enabled: bool,
     process_start_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
     backend_initialized_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+    cache_allocated_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+    cache_allocated_status: Option<ferrum_types::EngineStatus>,
 ) -> Vec<crate::observability_product::ActualMemoryStageObservation> {
     if !enabled {
         return Vec::new();
+    }
+    let mut cache_allocated = crate::observability_product::ActualMemoryStageObservation::new(
+        "actual_serve_cache_allocated",
+        "cache_allocated",
+        None,
+        cache_allocated_memory,
+    );
+    if let Some(status) = cache_allocated_status.as_ref() {
+        cache_allocated = cache_allocated.with_engine_cache_status(status);
     }
     vec![
         crate::observability_product::ActualMemoryStageObservation::new(
@@ -1127,6 +1151,7 @@ fn actual_serve_startup_memory_stages(
             None,
             backend_initialized_memory,
         ),
+        cache_allocated,
     ]
 }
 

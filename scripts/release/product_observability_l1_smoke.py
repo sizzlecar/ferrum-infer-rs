@@ -29,6 +29,7 @@ REQUIRED_RUN_MEMORY_STAGES = {
     "process_start",
     "backend_initialized",
     "model_loaded",
+    "cache_allocated",
     "first_request_done",
     "shutdown",
 }
@@ -36,6 +37,7 @@ REQUIRED_SERVE_MEMORY_STAGES = {
     "process_start",
     "backend_initialized",
     "model_loaded",
+    "cache_allocated",
     "first_request_done",
     "shutdown",
 }
@@ -562,6 +564,19 @@ def validate_profile_group(root: Path, entrypoint: str) -> dict[str, Any]:
                 for key in ("current_bytes", "high_water_bytes"):
                     if not isinstance(memory.get(key), int) or memory[key] <= 0:
                         raise SmokeError(f"{path} memory.{key} must be a positive integer")
+                attrs = event.get("attributes") or {}
+                if attrs.get("memory_stage") == "cache_allocated":
+                    for key in (
+                        "kv_cache_total_bytes",
+                        "kv_cache_used_bytes",
+                        "kv_cache_free_bytes",
+                        "cache_memory_bytes",
+                        "available_kv_or_state_bytes",
+                    ):
+                        if not isinstance(attrs.get(key), int) or attrs[key] < 0:
+                            raise SmokeError(
+                                f"{path} cache_allocated event requires non-negative {key}"
+                            )
         if label == "scheduler":
             sources = {
                 (event.get("attributes") or {}).get("resource_trace_source")
@@ -1140,6 +1155,23 @@ def write_selftest_profile_group(out: Path, entrypoint: str) -> None:
     required_stages = (
         REQUIRED_RUN_MEMORY_STAGES if entrypoint == "run" else REQUIRED_SERVE_MEMORY_STAGES
     )
+    def memory_stage_attrs(stage: str) -> dict[str, Any]:
+        attrs: dict[str, Any] = {
+            "memory_measurement": "process_rss",
+            "memory_stage": stage,
+        }
+        if stage == "cache_allocated":
+            attrs.update(
+                {
+                    "kv_cache_total_bytes": 8192,
+                    "kv_cache_used_bytes": 2048,
+                    "kv_cache_free_bytes": 6144,
+                    "cache_memory_bytes": 2048,
+                    "available_kv_or_state_bytes": 6144,
+                }
+            )
+        return attrs
+
     memory_events = [
         selftest_profile_event(
             entrypoint=entrypoint,
@@ -1147,7 +1179,7 @@ def write_selftest_profile_group(out: Path, entrypoint: str) -> None:
             phase=f"memory_{stage}",
             duration_us=10,
             memory=memory,
-            attributes={"memory_measurement": "process_rss", "memory_stage": stage},
+            attributes=memory_stage_attrs(stage),
         )
         for stage in sorted(required_stages)
     ]

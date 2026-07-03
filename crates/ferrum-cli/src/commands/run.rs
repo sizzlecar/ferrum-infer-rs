@@ -631,6 +631,18 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .as_micros()
         .try_into()
         .unwrap_or(u64::MAX);
+    let cache_allocated_status = if product_memory_enabled {
+        Some(engine.status().await)
+    } else {
+        None
+    };
+    let cache_allocated_sample = product_memory_enabled
+        .then(|| memory_sampler.sample())
+        .flatten();
+    let cache_allocated_memory = process_memory_observation_between(
+        model_loaded_sample.clone(),
+        cache_allocated_sample.clone(),
+    );
     eprintln!(
         "{}",
         format!(
@@ -707,6 +719,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                                 backend_initialized_memory.clone(),
                                 model_loaded_memory.clone(),
                                 model_loaded_duration_us,
+                                cache_allocated_memory.clone(),
+                                cache_allocated_status.clone(),
                                 None,
                             ),
                         },
@@ -796,6 +810,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     backend_initialized_memory.clone(),
                     model_loaded_memory.clone(),
                     model_loaded_duration_us,
+                    cache_allocated_memory.clone(),
+                    cache_allocated_status.clone(),
                     shutdown_memory,
                 ),
             },
@@ -1080,10 +1096,21 @@ fn actual_run_memory_stages(
     backend_initialized_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
     model_loaded_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
     model_loaded_duration_us: u64,
+    cache_allocated_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+    cache_allocated_status: Option<ferrum_types::EngineStatus>,
     shutdown_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
 ) -> Vec<crate::observability_product::ActualMemoryStageObservation> {
     if !enabled {
         return Vec::new();
+    }
+    let mut cache_allocated = crate::observability_product::ActualMemoryStageObservation::new(
+        "actual_run_cache_allocated",
+        "cache_allocated",
+        None,
+        cache_allocated_memory,
+    );
+    if let Some(status) = cache_allocated_status.as_ref() {
+        cache_allocated = cache_allocated.with_engine_cache_status(status);
     }
     vec![
         crate::observability_product::ActualMemoryStageObservation::new(
@@ -1104,6 +1131,7 @@ fn actual_run_memory_stages(
             Some(model_loaded_duration_us),
             model_loaded_memory,
         ),
+        cache_allocated,
         crate::observability_product::ActualMemoryStageObservation::new(
             "actual_run_shutdown",
             "shutdown",
