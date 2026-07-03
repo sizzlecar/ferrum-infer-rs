@@ -40,6 +40,7 @@ REPLAY_PATH_FLAGS = {
     "--memory-profile-jsonl": "memory_profile.jsonl",
     "--scheduler-trace-jsonl": "scheduler_trace.jsonl",
 }
+HTTP_BODY_FLAGS = {"--data-binary", "--data", "-d"}
 BAD_OUTPUT_FAILURE_KINDS = {"bad_output"}
 RESOURCE_FAILURE_KINDS = {
     "oom",
@@ -154,6 +155,51 @@ def validate_bad_output_scan(path: Path) -> dict[str, Any]:
     return data
 
 
+def validate_serve_replay_command(bundle: Path, request: dict[str, Any], replay: dict[str, Any]) -> dict[str, Any] | None:
+    is_serve_replay = request.get("entrypoint") == "serve" and (
+        request.get("backend") == "actual" or replay.get("requires_running_server") is True
+    )
+    if not is_serve_replay:
+        return None
+    if replay.get("requires_running_server") is not True:
+        raise BundleError(f"{bundle / 'replay.command.json'}.requires_running_server must be true for serve request replay")
+    replay_body_path = bundle / "replay_body.json"
+    if not replay_body_path.is_file():
+        raise BundleError(f"{replay_body_path} is required for serve request replay")
+    replay_body = read_json(replay_body_path)
+    problems = scan_secrets(replay_body, str(replay_body_path))
+    if problems:
+        raise BundleError("; ".join(problems))
+
+    http = request.get("http")
+    if not isinstance(http, dict):
+        raise BundleError(f"{bundle / 'request.json'}.http is required for serve request replay")
+    if http.get("path") != "/v1/chat/completions":
+        raise BundleError(f"{bundle / 'request.json'}.http.path must be /v1/chat/completions")
+    if http.get("method") != "POST":
+        raise BundleError(f"{bundle / 'request.json'}.http.method must be POST")
+
+    argv = replay.get("argv")
+    if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
+        raise BundleError(f"{bundle / 'replay.command.json'}.argv must be a string array")
+    if not any(item.endswith("/v1/chat/completions") for item in argv):
+        raise BundleError(f"{bundle / 'replay.command.json'}.argv must target /v1/chat/completions")
+    body_arg = None
+    for index, item in enumerate(argv[:-1]):
+        if item in HTTP_BODY_FLAGS:
+            body_arg = argv[index + 1]
+            break
+    if body_arg is None:
+        raise BundleError(f"{bundle / 'replay.command.json'}.argv must include a body flag")
+    if not body_arg.startswith("@") or Path(body_arg[1:]).name != "replay_body.json":
+        raise BundleError(f"{bundle / 'replay.command.json'}.argv body flag must reference @replay_body.json")
+    return {
+        "replay_body": str(replay_body_path),
+        "http_path": http.get("path"),
+        "body_arg": body_arg,
+    }
+
+
 def validate_failure_diagnostics(bundle: Path, request_id: str, bad_scan: dict[str, Any]) -> dict[str, Any] | None:
     failure_kind = bad_scan.get("failure_kind")
     if failure_kind is None or failure_kind in BAD_OUTPUT_FAILURE_KINDS:
@@ -240,6 +286,7 @@ def validate_bundle_dir(bundle: Path) -> dict[str, Any]:
     backend = read_json(bundle / "backend_selection.json")
     replay = read_json(bundle / "replay.command.json")
     bad_scan = validate_bad_output_scan(bundle / "bad_output_scan.json")
+    serve_replay = validate_serve_replay_command(bundle, request, replay)
     failure_diagnostics = validate_failure_diagnostics(bundle, request_id, bad_scan)
 
     for label, data in [
@@ -275,6 +322,7 @@ def validate_bundle_dir(bundle: Path) -> dict[str, Any]:
         "failure_diagnostics": str(bundle / "failure_diagnostics.json")
         if failure_diagnostics is not None
         else None,
+        "serve_replay": serve_replay,
         "prompt_token_count": prompt_tokens.get("token_count"),
         "output_token_count": output_tokens.get("token_count"),
     }
@@ -315,13 +363,16 @@ def rewrite_replay_argv(argv: list[str], replay_out: Path) -> list[str]:
     return rewritten
 
 
-def rewrite_live_server_argv(argv: list[str], live_server_base_url: str) -> list[str]:
+def rewrite_live_server_argv(argv: list[str], live_server_base_url: str, bundle: Path) -> list[str]:
     rewritten = list(argv)
     for index, item in enumerate(rewritten):
         for base in ("http://127.0.0.1:8000", "http://localhost:8000"):
             if item.startswith(base):
                 rewritten[index] = live_server_base_url.rstrip("/") + item[len(base) :]
                 break
+        if index > 0 and rewritten[index - 1] in HTTP_BODY_FLAGS and item.startswith("@"):
+            if Path(item[1:]).name == "replay_body.json":
+                rewritten[index] = f"@{bundle / 'replay_body.json'}"
     return rewritten
 
 
@@ -394,7 +445,7 @@ def execute_replay(
         if live_server_base_url:
             replay_out = out / "executed_replays" / safe_path_part(bundle.name)
             replay_out.mkdir(parents=True, exist_ok=True)
-            rewritten = rewrite_live_server_argv(argv, live_server_base_url)
+            rewritten = rewrite_live_server_argv(argv, live_server_base_url, bundle)
             proc = subprocess.run(
                 rewritten,
                 cwd=REPO_ROOT,
@@ -462,6 +513,8 @@ def execute_replay(
 def make_bundle(
     root: Path,
     *,
+    entrypoint: str = "run",
+    serve_replay: bool = False,
     bad_output: bool = False,
     failure_kind: str | None = None,
     secret: bool = False,
@@ -472,15 +525,47 @@ def make_bundle(
     bundle.mkdir(parents=True)
     request = {
         "schema_version": 1,
-        "entrypoint": "run",
+        "entrypoint": entrypoint,
         "request_id": "req-fixture",
         "model": "synthetic/no-weight",
-        "backend": "synthetic",
+        "backend": "actual" if serve_replay else "synthetic",
         "sanitized": True,
         "prompt": "public fixture",
     }
+    if serve_replay:
+        request["stream"] = False
+        request["http"] = {
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": {"content-type": "application/json"},
+            "body": {
+                "model": "synthetic/no-weight",
+                "messages": [{"role": "user", "content": "[redacted]"}],
+                "stream": False,
+            },
+        }
     if secret:
         request["authorization"] = "Bearer sk-thisShouldFail1234567890"
+    replay_body = {
+        "model": "synthetic/no-weight",
+        "messages": [{"role": "user", "content": "[redacted]"}],
+        "stream": False,
+    }
+    replay_argv = ["ferrum", "run", "synthetic/no-weight"]
+    replay_command = "ferrum run synthetic/no-weight"
+    if serve_replay:
+        replay_argv = [
+            "curl",
+            "-sS",
+            "-X",
+            "POST",
+            "http://127.0.0.1:8000/v1/chat/completions",
+            "-H",
+            "content-type: application/json",
+            "--data-binary",
+            f"@{root / 'req-fixture' / 'replay_body.json'}",
+        ]
+        replay_command = " ".join(replay_argv)
     files: dict[str, Any] = {
         "request.json": request,
         "prompt_token_ids.json": {
@@ -529,15 +614,18 @@ def make_bundle(
         "replay.command.json": {
             "schema_version": 1,
             "request_id": "req-fixture",
-            "entrypoint": "run",
-            "command": "ferrum run synthetic/no-weight",
-            "argv": ["ferrum", "run", "synthetic/no-weight"],
+            "entrypoint": entrypoint,
+            "command": replay_command,
+            "argv": replay_argv,
+            "requires_running_server": True if serve_replay else None,
             "sanitized": True,
         },
     }
     for name, data in files.items():
         if name != missing:
             write_json(bundle / name, data)
+    if serve_replay:
+        write_json(bundle / "replay_body.json", replay_body)
     if failure_kind and failure_kind not in BAD_OUTPUT_FAILURE_KINDS and not omit_failure_diagnostics:
         if failure_kind in RESOURCE_FAILURE_KINDS:
             diagnostics = {
@@ -597,9 +685,24 @@ def run_selftest() -> dict[str, Any]:
         make_bundle(pass_root / "bad-output", bad_output=True, failure_kind="bad_output")
         make_bundle(pass_root / "oom-admission", failure_kind="oom_admission")
         make_bundle(pass_root / "panic-error", failure_kind="panic_error")
+        make_bundle(pass_root / "serve-live", entrypoint="serve", serve_replay=True)
         pass_results = []
         for root in sorted(pass_root.iterdir()):
             pass_results.extend(validate_bundle_root(root))
+        rewritten = rewrite_live_server_argv(
+            [
+                "curl",
+                "http://127.0.0.1:8000/v1/chat/completions",
+                "--data-binary",
+                "@/stale/path/replay_body.json",
+            ],
+            "http://127.0.0.1:9876",
+            pass_root / "serve-live" / "req-fixture",
+        )
+        if rewritten[1] != "http://127.0.0.1:9876/v1/chat/completions":
+            raise BundleError(f"live replay base URL rewrite failed: {rewritten}")
+        if rewritten[3] != f"@{pass_root / 'serve-live' / 'req-fixture' / 'replay_body.json'}":
+            raise BundleError(f"live replay body path rewrite failed: {rewritten}")
 
         fail_cases = {
             "secret": {"secret": True},
@@ -645,6 +748,33 @@ def run_selftest() -> dict[str, Any]:
             fail_results.append({"case": "actual-run-missing-prompt-ids", "error": str(exc)})
         else:
             raise BundleError("selftest fail case actual-run-missing-prompt-ids unexpectedly passed")
+
+        root = temp / "fail" / "serve-missing-replay-body"
+        make_bundle(root, entrypoint="serve", serve_replay=True)
+        (root / "req-fixture" / "replay_body.json").unlink()
+        try:
+            validate_bundle_root(root)
+        except BundleError as exc:
+            fail_results.append({"case": "serve-missing-replay-body", "error": str(exc)})
+        else:
+            raise BundleError("selftest fail case serve-missing-replay-body unexpectedly passed")
+
+        root = temp / "fail" / "serve-missing-body-flag"
+        make_bundle(root, entrypoint="serve", serve_replay=True)
+        replay_path = root / "req-fixture" / "replay.command.json"
+        replay = read_json(replay_path)
+        replay["argv"] = [
+            "curl",
+            "-sS",
+            "http://127.0.0.1:8000/v1/chat/completions",
+        ]
+        write_json(replay_path, replay)
+        try:
+            validate_bundle_root(root)
+        except BundleError as exc:
+            fail_results.append({"case": "serve-missing-body-flag", "error": str(exc)})
+        else:
+            raise BundleError("selftest fail case serve-missing-body-flag unexpectedly passed")
         return {
             "schema_version": SCHEMA_VERSION,
             "status": "pass",
