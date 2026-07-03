@@ -1442,6 +1442,7 @@ def validate_backend_resolution(artifact: dict[str, Any], label: str, backend: s
 
 def validate_replay_index(value: Any, *, artifact_dir: Path, label: str) -> None:
     require(isinstance(value, list), f"{label}.replay_bundle_index must be a list")
+    require(value, f"{label}.replay_bundle_index must contain at least one replay bundle")
     for index, entry in enumerate(value):
         entry_label = f"{label}.replay_bundle_index[{index}]"
         require(isinstance(entry, dict), f"{entry_label} must be an object")
