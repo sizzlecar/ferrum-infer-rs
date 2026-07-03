@@ -16,6 +16,73 @@ use ferrum_models::{DecoderOnlyLLM, LlmExecutor, LlmRuntimeConfig};
 use ferrum_testkit::{MockKvCacheManager, MockModelExecutor, MockTensor, MockTensorFactory};
 use std::time::Duration;
 
+#[derive(Debug, Clone)]
+struct TestRecurrentStateHandle {
+    request_id: RequestId,
+    slots: usize,
+}
+
+impl TestRecurrentStateHandle {
+    fn new(request_id: RequestId, slots: usize) -> Self {
+        Self {
+            request_id,
+            slots: slots.max(1),
+        }
+    }
+}
+
+impl ferrum_interfaces::RecurrentStateHandle for TestRecurrentStateHandle {
+    fn request_id(&self) -> RequestId {
+        self.request_id.clone()
+    }
+
+    fn device(&self) -> Device {
+        Device::CPU
+    }
+
+    fn num_layers(&self) -> usize {
+        1
+    }
+
+    fn state_bytes(&self) -> usize {
+        self.slots * std::mem::size_of::<f32>()
+    }
+
+    fn clone_handle(
+        &self,
+    ) -> ferrum_types::Result<Arc<dyn ferrum_interfaces::RecurrentStateHandle>> {
+        Ok(Arc::new(self.clone()))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn stats(&self) -> ferrum_interfaces::RecurrentStateHandleStats {
+        ferrum_interfaces::RecurrentStateHandleStats {
+            memory_bytes: self.state_bytes(),
+            state_tensors: 1,
+            batch_slots: self.slots,
+            last_access: Instant::now(),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        true
+    }
+
+    fn cache_id(&self) -> String {
+        format!("test-recurrent-state-{}", self.request_id)
+    }
+}
+
+fn test_recurrent_state_handle(
+    request_id: RequestId,
+    slots: usize,
+) -> Arc<dyn ferrum_interfaces::RecurrentStateHandle> {
+    Arc::new(TestRecurrentStateHandle::new(request_id, slots))
+}
+
 struct PolicyTokenizer {
     vocab_size: usize,
     special: ferrum_types::SpecialTokens,
@@ -1517,7 +1584,7 @@ async fn sequence_take_physical_resources_for_recompute_clears_owned_resources()
     assert!(sequence.kv_resource_blocks.is_none());
     assert!(sequence.draft_kv.is_none());
     assert!(sequence.recurrent_state.is_none());
-    assert!(sequence.recurrent_state_slots.is_none());
+    assert!(sequence.recurrent_state_slots().is_none());
     assert!(sequence.model_cache_id.is_none());
     assert!(!sequence.prefill_complete);
     assert_eq!(sequence.phase, RequestPhase::Waiting);
@@ -1622,7 +1689,7 @@ fn sequence_prefill_commit_helpers_keep_resource_metadata_together() {
     assert!(sequence.kv_cache.is_some());
     assert_eq!(sequence.kv_resource_blocks, Some(4));
     assert!(sequence.recurrent_state.is_none());
-    assert!(sequence.recurrent_state_slots.is_none());
+    assert!(sequence.recurrent_state_slots().is_none());
     assert!(sequence.prefill_complete);
     assert_eq!(sequence.phase, RequestPhase::Decoding);
 
@@ -1648,7 +1715,8 @@ fn sequence_prefill_chunk_commit_tracks_partial_and_final_state() {
         2,
     ));
     let partial_cache_id = partial_kv.cache_id();
-    sequence.recurrent_state_slots = Some(3);
+    let recurrent_state = test_recurrent_state_handle(request_id.clone(), 3);
+    sequence.commit_recurrent_state_admission(recurrent_state, 3);
     sequence.commit_prefill_chunk_physical_resources(partial_kv, Some(2), None, 1, false);
 
     assert_eq!(
@@ -1658,7 +1726,7 @@ fn sequence_prefill_chunk_commit_tracks_partial_and_final_state() {
     assert!(sequence.kv_cache.is_some());
     assert_eq!(sequence.kv_resource_blocks, Some(2));
     assert!(sequence.recurrent_state.is_none());
-    assert!(sequence.recurrent_state_slots.is_none());
+    assert!(sequence.recurrent_state_slots().is_none());
     assert_eq!(sequence.prefill_tokens_processed, 1);
     assert!(!sequence.prefill_complete);
     assert_eq!(sequence.phase, RequestPhase::Prefilling);
@@ -1712,10 +1780,11 @@ fn sequence_decode_commit_helpers_keep_resource_metadata_together() {
     assert_eq!(decode_resources.last_token, TokenId::new(7));
     assert_eq!(decode_resources.pos_offset, 2);
 
-    sequence.recurrent_state_slots = Some(1);
+    let recurrent_state = test_recurrent_state_handle(request_id.clone(), 1);
+    sequence.commit_recurrent_state_admission(recurrent_state, 1);
     sequence.commit_decode_recurrent_state(None);
     assert!(sequence.recurrent_state.is_none());
-    assert!(sequence.recurrent_state_slots.is_none());
+    assert!(sequence.recurrent_state_slots().is_none());
 
     let target_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
         request_id.clone(),
@@ -1758,12 +1827,12 @@ async fn sequence_recurrent_admission_helpers_keep_handle_and_slots_together() {
 
     sequence.commit_recurrent_state_admission(recurrent_state, 1);
     assert!(sequence.recurrent_state.is_some());
-    assert_eq!(sequence.recurrent_state_slots, Some(1));
+    assert_eq!(sequence.recurrent_state_slots(), Some(1));
 
     let slots = sequence.take_recurrent_state_allocation();
     assert_eq!(slots, Some(1));
     assert!(sequence.recurrent_state.is_none());
-    assert!(sequence.recurrent_state_slots.is_none());
+    assert!(sequence.recurrent_state_slots().is_none());
 }
 
 #[test]
@@ -2151,7 +2220,7 @@ async fn process_batch_unified_defers_prefill_for_recurrent_state_capacity() {
     victim_seq.prefill_complete = true;
     victim_seq.prefill_tokens_processed = 1;
     victim_seq.kv_cache = Some(victim_kv);
-    victim_seq.recurrent_state = Some(victim_recurrent_state);
+    victim_seq.commit_recurrent_state_admission(victim_recurrent_state, 1);
     victim_seq.model_cache_id = Some("victim-cache".to_string());
     victim_seq.phase = RequestPhase::Decoding;
     {
@@ -3914,7 +3983,7 @@ async fn process_batch_unified_decode_postprocess_error_releases_recurrent_state
     sequence.prefill_complete = true;
     sequence.prefill_tokens_processed = 1;
     sequence.kv_cache = Some(kv);
-    sequence.recurrent_state = Some(recurrent_state);
+    sequence.commit_recurrent_state_admission(recurrent_state, 1);
     sequence.model_cache_id = Some("decode-cache".to_string());
     sequence.phase = RequestPhase::Decoding;
     engine
@@ -4003,7 +4072,7 @@ async fn process_batch_single_decode_resource_exhausted_keeps_recurrent_state_wa
     sequence.prefill_complete = true;
     sequence.prefill_tokens_processed = 1;
     sequence.kv_cache = Some(kv);
-    sequence.recurrent_state = Some(recurrent_state);
+    sequence.commit_recurrent_state_admission(recurrent_state, 1);
     sequence.model_cache_id = Some("decode-cache".to_string());
     sequence.phase = RequestPhase::Decoding;
     engine
@@ -4104,7 +4173,7 @@ async fn process_batch_unified_decode_resource_exhausted_keeps_recurrent_state_w
     sequence.prefill_complete = true;
     sequence.prefill_tokens_processed = 1;
     sequence.kv_cache = Some(kv);
-    sequence.recurrent_state = Some(recurrent_state);
+    sequence.commit_recurrent_state_admission(recurrent_state, 1);
     sequence.model_cache_id = Some("decode-cache".to_string());
     sequence.phase = RequestPhase::Decoding;
     engine
