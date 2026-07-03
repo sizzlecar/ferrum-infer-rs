@@ -10,15 +10,18 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
+from request_replay_bundle_gate import BundleError, validate_bundle_root
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PASS_LINE = "PRODUCT OBSERVABILITY L1 SMOKE PASS"
+SELFTEST_PASS_LINE = "PRODUCT OBSERVABILITY L1 SMOKE SELFTEST PASS"
 MODEL_DEFAULT = "Qwen/Qwen3-0.6B"
 SCHEMA_VERSION = 1
 
@@ -90,6 +93,14 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not events:
         raise SmokeError(f"{path} must contain at least one event")
     return events
+
+
+def write_jsonl(path: Path, events: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+        encoding="utf-8",
+    )
 
 
 def ferrum_base_cmd(args: argparse.Namespace) -> list[str]:
@@ -752,25 +763,439 @@ def write_failure_artifacts(args: argparse.Namespace, exc: SmokeError) -> None:
     )
 
 
+def selftest_profile_event(
+    *,
+    entrypoint: str,
+    event_id: str,
+    phase: str,
+    event_kind: str = "timed_span",
+    duration_us: int | None = 100,
+    memory: dict[str, Any] | None = None,
+    resource: dict[str, Any] | None = None,
+    replay: dict[str, Any] | None = None,
+    attributes: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "event_id": event_id,
+        "request_id": f"req-{entrypoint}-selftest",
+        "correlation_id": f"corr-{entrypoint}-selftest",
+        "entrypoint": entrypoint,
+        "backend": "synthetic",
+        "phase": phase,
+        "event_kind": event_kind,
+        "timestamp": "2026-07-03T00:00:00Z",
+        "status": "ok",
+        "model": "synthetic/no-weight",
+        "attributes": {
+            "actual_model_smoke": True,
+            "profile_detail": "basic",
+            "profile_schema_fingerprint": "obs-v1",
+            **(attributes or {}),
+        },
+    }
+    if duration_us is not None:
+        event["duration_us"] = duration_us
+    if memory is not None:
+        event["memory"] = memory
+    if resource is not None:
+        event["resource"] = resource
+    if replay is not None:
+        event["replay"] = replay
+    return event
+
+
+def selftest_resource(
+    action: str,
+    resource_kind: str,
+    *,
+    amount: int | None = None,
+    before: int | None = None,
+    after: int | None = None,
+    capacity: int | None = None,
+) -> dict[str, Any]:
+    resource: dict[str, Any] = {
+        "owner_kind": "request",
+        "owner_id": "req-selftest",
+        "resource_kind": resource_kind,
+        "action": action,
+    }
+    if amount is not None:
+        resource["amount"] = amount
+    if before is not None:
+        resource["before"] = before
+    if after is not None:
+        resource["after"] = after
+    if capacity is not None:
+        resource["capacity"] = capacity
+    return resource
+
+
+def write_selftest_replay_bundle(root: Path, *, entrypoint: str, request_id: str) -> None:
+    bundle = root / request_id
+    bundle.mkdir(parents=True, exist_ok=True)
+    output_text = "OK\n"
+    command = f"ferrum {entrypoint} synthetic/no-weight --request-dump-dir {root}"
+    common = {
+        "schema_version": SCHEMA_VERSION,
+        "request_id": request_id,
+        "sanitized": True,
+    }
+    write_json(
+        bundle / "request.json",
+        {
+            **common,
+            "entrypoint": entrypoint,
+            "model": "synthetic/no-weight",
+            "backend": "synthetic",
+            "messages": [{"role": "user", "content": "Reply OK."}],
+        },
+    )
+    write_json(
+        bundle / "prompt_token_ids.json",
+        {**common, "token_ids": [1, 2, 3], "token_count": 3},
+    )
+    write_json(
+        bundle / "sampling_params.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "sampling_params": {"temperature": 0.0, "max_tokens": 4},
+            "sanitized": True,
+        },
+    )
+    write_json(
+        bundle / "runtime_effective_config.json",
+        {**common, "entrypoint": entrypoint, "profile_detail": "basic"},
+    )
+    write_json(
+        bundle / "backend_selection.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "backend": "synthetic",
+            "model": "synthetic/no-weight",
+        },
+    )
+    write_json(
+        bundle / "output_token_ids.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "token_ids": [4, 5],
+            "token_count": 2,
+            "finish_reason": "stop",
+        },
+    )
+    write_json(
+        bundle / "bad_output_scan.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "bad_output": False,
+            "bad_text_count": 0,
+            "reasons": [],
+            "first_bad_text_span": None,
+            "failure_kind": None,
+            "output_sha256": hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
+        },
+    )
+    write_json(
+        bundle / "replay.command.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "entrypoint": entrypoint,
+            "command": command,
+            "argv": [
+                "ferrum",
+                entrypoint,
+                "synthetic/no-weight",
+                "--request-dump-dir",
+                str(root),
+            ],
+            "sanitized": True,
+        },
+    )
+    (bundle / "output_text.txt").write_text(output_text, encoding="utf-8")
+
+
+def write_selftest_profile_group(out: Path, entrypoint: str) -> None:
+    root = out / entrypoint
+    request_id = f"req-{entrypoint}-selftest"
+    request_dump_root = root / "request_dump"
+    replay = {"command": f"ferrum {entrypoint} synthetic/no-weight", "bundle_dir": str(request_dump_root)}
+    write_jsonl(
+        root / "profile.jsonl",
+        [
+            selftest_profile_event(
+                entrypoint=entrypoint,
+                event_id=f"evt-{entrypoint}-latency",
+                phase="decode",
+                duration_us=1234,
+                replay=replay,
+                attributes={"finish_reason": "stop", "output_tokens": 2},
+            )
+        ],
+    )
+    memory = {
+        "scope": "process",
+        "before_bytes": 1024,
+        "after_bytes": 2048,
+        "current_bytes": 2048,
+        "high_water_bytes": 4096,
+        "available_bytes": 8192,
+    }
+    write_jsonl(
+        root / "memory_profile.jsonl",
+        [
+            selftest_profile_event(
+                entrypoint=entrypoint,
+                event_id=f"evt-{entrypoint}-memory",
+                phase="memory_sample",
+                duration_us=10,
+                memory=memory,
+                attributes={"memory_measurement": "process_rss"},
+            )
+        ],
+    )
+    scheduler_events = [
+        selftest_profile_event(
+            entrypoint=entrypoint,
+            event_id=f"evt-{entrypoint}-request-open",
+            phase="admission",
+            event_kind="instant",
+            duration_us=None,
+            resource=selftest_resource("request_open", "request_slot"),
+            attributes={"resource_trace_source": "engine"},
+        ),
+        selftest_profile_event(
+            entrypoint=entrypoint,
+            event_id=f"evt-{entrypoint}-slot-reserve",
+            phase="admission",
+            resource=selftest_resource(
+                "reserve", "request_slot", amount=1, before=0, after=1, capacity=4
+            ),
+            attributes={"resource_trace_source": "engine"},
+        ),
+        selftest_profile_event(
+            entrypoint=entrypoint,
+            event_id=f"evt-{entrypoint}-slot-commit",
+            phase="prefill",
+            resource=selftest_resource(
+                "commit", "request_slot", amount=1, before=0, after=1, capacity=4
+            ),
+            attributes={"resource_trace_source": "engine"},
+        ),
+        selftest_profile_event(
+            entrypoint=entrypoint,
+            event_id=f"evt-{entrypoint}-kv-reserve",
+            phase="prefill",
+            resource=selftest_resource(
+                "reserve", "kv_block", amount=1, before=0, after=1, capacity=16
+            ),
+            attributes={"resource_trace_source": "engine"},
+        ),
+        selftest_profile_event(
+            entrypoint=entrypoint,
+            event_id=f"evt-{entrypoint}-kv-commit",
+            phase="decode",
+            resource=selftest_resource(
+                "commit", "kv_block", amount=1, before=0, after=1, capacity=16
+            ),
+            attributes={"resource_trace_source": "engine"},
+        ),
+        selftest_profile_event(
+            entrypoint=entrypoint,
+            event_id=f"evt-{entrypoint}-kv-release",
+            phase="request_complete",
+            resource=selftest_resource(
+                "release", "kv_block", amount=1, before=1, after=0, capacity=16
+            ),
+            attributes={"resource_trace_source": "engine"},
+        ),
+        selftest_profile_event(
+            entrypoint=entrypoint,
+            event_id=f"evt-{entrypoint}-slot-release",
+            phase="request_complete",
+            resource=selftest_resource(
+                "release", "request_slot", amount=1, before=1, after=0, capacity=4
+            ),
+            attributes={"resource_trace_source": "engine"},
+        ),
+        selftest_profile_event(
+            entrypoint=entrypoint,
+            event_id=f"evt-{entrypoint}-request-close",
+            phase="request_complete",
+            event_kind="instant",
+            duration_us=None,
+            resource=selftest_resource("request_close", "request_slot"),
+            attributes={"resource_trace_source": "engine"},
+        ),
+    ]
+    write_jsonl(root / "scheduler_trace.jsonl", scheduler_events)
+    write_json(
+        request_dump_root / "request.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "entrypoint": entrypoint,
+            "request_id": request_id,
+            "model": "synthetic/no-weight",
+            "backend": "synthetic",
+            "actual_model_smoke": True,
+            "sanitized": True,
+        },
+    )
+    (request_dump_root / "replay_command.txt").write_text(
+        f"ferrum {entrypoint} synthetic/no-weight\n",
+        encoding="utf-8",
+    )
+    write_selftest_replay_bundle(request_dump_root, entrypoint=entrypoint, request_id=request_id)
+
+
+def assert_raises(fn, expected: str) -> str:
+    try:
+        fn()
+    except Exception as exc:  # noqa: BLE001 - self-test reports exact validator failure.
+        text = str(exc)
+        if expected not in text:
+            raise SmokeError(f"expected error containing {expected!r}, got {text!r}") from exc
+        return text
+    raise SmokeError(f"expected failure containing {expected!r}")
+
+
+def run_selftest_in_root(root: Path, out: Path | None = None) -> dict[str, Any]:
+    work = root / "artifact"
+    write_selftest_profile_group(work, "run")
+    write_selftest_profile_group(work, "serve")
+    run_profiles = validate_profile_group(work / "run", "run")
+    serve_profiles = validate_profile_group(work / "serve", "serve")
+    analyzer = run_analyzer(work, 60)
+    resource_invariant = run_resource_invariant(work, 60)
+    replay_bundles = []
+    for bundle_root in [work / "run/request_dump", work / "serve/request_dump"]:
+        replay_bundles.extend(validate_bundle_root(bundle_root))
+
+    sse = parse_sse(
+        'data: {"choices":[{"delta":{"content":"O"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"K"}}],"usage":{"completion_tokens":2}}\n\n'
+        "data: [DONE]\n\n"
+    )
+    if sse != {"done_count": 1, "content_chunks": 2, "usage_chunks": 1, "malformed": 0}:
+        raise SmokeError(f"unexpected SSE parse result: {sse}")
+    malformed_sse = parse_sse("data: {not json}\n\ndata: [DONE]\n\n")
+    if malformed_sse["malformed"] != 1 or malformed_sse["done_count"] != 1:
+        raise SmokeError(f"unexpected malformed SSE parse result: {malformed_sse}")
+
+    failure_cases = {
+        "backend_mismatch": BackendMismatchError("cuda", "metal"),
+        "backend_unavailable": BackendUnavailableError("requested backend 'cuda' is not built"),
+        "replay_failure": SmokeError("replay bundle validation failed"),
+        "stream_failure": SmokeError("serve stream expected one [DONE], got 0"),
+        "resource_invariant_failure": SmokeError("resource invariant gate did not print PASS"),
+        "profile_failure": SmokeError("profile analyzer did not print PASS"),
+        "serve_failure": SmokeError("server did not become healthy"),
+        "run_failure": SmokeError("ferrum run did not emit an assistant JSONL event"),
+    }
+    failure_kinds = {name: failure_kind(exc) for name, exc in failure_cases.items()}
+    for expected, actual in failure_kinds.items():
+        if actual != expected:
+            raise SmokeError(f"failure_kind({expected}) returned {actual}")
+
+    bad_profile = root / "bad-profile"
+    write_selftest_profile_group(bad_profile, "run")
+    events = read_jsonl(bad_profile / "run/profile.jsonl")
+    events[0]["attributes"]["actual_model_smoke"] = False
+    write_jsonl(bad_profile / "run/profile.jsonl", events)
+    bad_profile_error = assert_raises(
+        lambda: validate_profile_group(bad_profile / "run", "run"),
+        "actual_model_smoke",
+    )
+
+    failure_out = root / "failure-artifact"
+    failure_args = argparse.Namespace(
+        out=failure_out,
+        model=MODEL_DEFAULT,
+        backend="cuda",
+        ferrum_bin=None,
+        timeout=60,
+        max_tokens=8,
+    )
+    write_failure_artifacts(
+        failure_args,
+        BackendMismatchError("cuda", "metal"),
+    )
+    classification = json.loads(
+        (failure_out / "failures/failure_classification.json").read_text(encoding="utf-8")
+    )
+    if classification.get("failure_kind") != "backend_mismatch":
+        raise SmokeError(f"unexpected failure classification: {classification}")
+    if classification.get("do_not_run") != ["l2_representative_backend", "release_full"]:
+        raise SmokeError(f"unexpected do_not_run classification: {classification}")
+
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "pass",
+        "run_profiles": run_profiles,
+        "serve_profiles": serve_profiles,
+        "analyzer": analyzer,
+        "resource_invariant": resource_invariant,
+        "replay_bundle_count": len(replay_bundles),
+        "sse": sse,
+        "failure_kinds": failure_kinds,
+        "negative_cases": {"bad_profile": bad_profile_error},
+    }
+    if summary["replay_bundle_count"] != 2:
+        raise SmokeError(f"expected 2 replay bundles, got {summary['replay_bundle_count']}")
+    if out is not None:
+        write_json(out / "product_observability_l1_smoke_selftest.json", summary)
+    return summary
+
+
+def run_selftest(out: Path | None = None) -> dict[str, Any]:
+    if out is not None:
+        out.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="selftest-work-", dir=out))
+        return run_selftest_in_root(root, out)
+
+    with tempfile.TemporaryDirectory(prefix="ferrum-product-observability-l1-selftest-") as tmp:
+        root = Path(tmp)
+        return run_selftest_in_root(root, out=None)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--out", type=Path)
     parser.add_argument("--model", default=MODEL_DEFAULT)
     parser.add_argument("--backend", default="auto")
     parser.add_argument("--ferrum-bin", type=Path)
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--max-tokens", type=int, default=8)
-    return parser.parse_args()
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+    if not args.self_test and args.out is None:
+        parser.error("--out is required unless --self-test is set")
+    return args
 
 
 def main() -> int:
     args = parse_args()
     try:
-        run_gate(args)
-        print(f"{PASS_LINE}: {args.out}")
+        if args.self_test:
+            run_selftest(args.out)
+            print(SELFTEST_PASS_LINE)
+        else:
+            run_gate(args)
+            print(f"{PASS_LINE}: {args.out}")
         return 0
     except SmokeError as exc:
-        write_failure_artifacts(args, exc)
+        if args.out is not None:
+            write_failure_artifacts(args, exc)
+        print(f"PRODUCT OBSERVABILITY L1 SMOKE FAIL: {exc}", file=sys.stderr)
+        return 1
+    except BundleError as exc:
+        if args.out is not None:
+            write_failure_artifacts(args, SmokeError(str(exc)))
         print(f"PRODUCT OBSERVABILITY L1 SMOKE FAIL: {exc}", file=sys.stderr)
         return 1
 
