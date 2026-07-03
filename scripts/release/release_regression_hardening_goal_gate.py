@@ -100,6 +100,10 @@ REQUIRED_NATIVE_RESOLVER_FAIL_CLOSED_CASES = {
     "missing_manifest",
     "operator_mismatch",
 }
+REQUIRED_NATIVE_NORMAL_GATE_FIXTURE_REJECTIONS = {
+    "fixture_manifest_path",
+    "fixture_source_package",
+}
 REQUIRED_PRODUCT_SENTINEL_SCENARIO_TYPES = {
     "native_op_manifest",
     "profile_artifact",
@@ -1190,11 +1194,68 @@ def validate_native_operator(root: Path, expected_sha: str) -> dict[str, Any]:
             f"native_operator.summary.manifests[{index}].operator must be non-empty",
         )
         operators.add(operator)
-        for key in ("backend", "compute_capabilities", "linkage", "binary_sha256", "resolution"):
+        for key in (
+            "backend",
+            "compute_capabilities",
+            "linkage",
+            "source_package",
+            "inputs_sha256",
+            "binary_artifact",
+            "binary_sha256",
+            "resolution",
+        ):
             require(
                 key in manifest,
                 f"native_operator.summary.manifests[{index}].{key} is required",
             )
+        manifest_path = manifest.get("manifest")
+        require(
+            isinstance(manifest_path, str) and manifest_path.strip(),
+            f"native_operator.summary.manifests[{index}].manifest must be non-empty",
+        )
+        require(
+            not native_fixture_reference(manifest_path),
+            f"native_operator.summary.manifests[{index}].manifest must not reference fixtures",
+        )
+        binary_artifact = manifest.get("binary_artifact")
+        require(
+            isinstance(binary_artifact, str) and binary_artifact.strip(),
+            f"native_operator.summary.manifests[{index}].binary_artifact must be non-empty",
+        )
+        require(
+            not native_fixture_reference(binary_artifact),
+            f"native_operator.summary.manifests[{index}].binary_artifact must not reference fixtures",
+        )
+        source_package = manifest.get("source_package")
+        require(
+            isinstance(source_package, dict),
+            f"native_operator.summary.manifests[{index}].source_package must be an object",
+        )
+        for source_key in ("kind", "revision", "sha256"):
+            require(
+                isinstance(source_package.get(source_key), str)
+                and source_package[source_key].strip(),
+                f"native_operator.summary.manifests[{index}].source_package.{source_key} must be non-empty",
+            )
+        require(
+            not native_fixture_marker(source_package.get("kind"))
+            and not native_fixture_marker(source_package.get("revision")),
+            f"native_operator.summary.manifests[{index}].source_package must not use fixture metadata",
+        )
+        require(
+            SHA256_RE.match(source_package["sha256"]),
+            f"native_operator.summary.manifests[{index}].source_package.sha256 must be a sha256",
+        )
+        inputs_sha256 = manifest.get("inputs_sha256")
+        binary_sha256 = manifest.get("binary_sha256")
+        require(
+            isinstance(inputs_sha256, str) and SHA256_RE.match(inputs_sha256),
+            f"native_operator.summary.manifests[{index}].inputs_sha256 must be a sha256",
+        )
+        require(
+            isinstance(binary_sha256, str) and SHA256_RE.match(binary_sha256),
+            f"native_operator.summary.manifests[{index}].binary_sha256 must be a sha256",
+        )
     require("fa2" in operators, "native_operator.summary.manifests must include fa2")
     selftest_summary = summary.get("selftest_summary")
     require(isinstance(selftest_summary, dict), "native_operator.summary.selftest_summary must be an object")
@@ -1221,6 +1282,20 @@ def validate_native_operator(root: Path, expected_sha: str) -> dict[str, Any]:
         not missing_fail_closed,
         "native_operator.summary.selftest_summary.resolver_fail_closed_cases missing "
         + str(missing_fail_closed),
+    )
+    fixture_rejections = set(
+        require_string_list(
+            selftest_summary.get("normal_gate_fixture_rejections", []),
+            "native_operator.summary.selftest_summary.normal_gate_fixture_rejections",
+        )
+    )
+    missing_fixture_rejections = sorted(
+        REQUIRED_NATIVE_NORMAL_GATE_FIXTURE_REJECTIONS - fixture_rejections
+    )
+    require(
+        not missing_fixture_rejections,
+        "native_operator.summary.selftest_summary.normal_gate_fixture_rejections missing "
+        + str(missing_fixture_rejections),
     )
     require(
         selftest_summary.get("python_runtime_dependency") == "none",
@@ -1253,6 +1328,24 @@ def validate_native_dev_build_audit(value: Any, label: str) -> None:
         "crates/ferrum-kernels/build.rs" in inspected_files,
         f"{label}.inspected_files must include crates/ferrum-kernels/build.rs",
     )
+
+
+def native_fixture_reference(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.replace("\\", "/").strip().lower()
+    return (
+        normalized.startswith("fixtures/")
+        or "/fixtures/" in normalized
+        or "scripts/release/fixtures/" in normalized
+    )
+
+
+def native_fixture_marker(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower()
+    return normalized in {"fixture", "fixtures"} or normalized.startswith("fixture-")
 
 
 def artifact_git_sha(artifact: dict[str, Any], label: str, expected_sha: str) -> None:
@@ -2206,12 +2299,18 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "gate": "native_operator_artifact",
             "manifests": [
                 {
-                    "manifest": "fixtures/fa2_manifest.json",
+                    "manifest": "native-artifacts/fa2/native_operator_manifest.json",
                     "operator": "fa2",
                     "backend": "cuda",
                     "compute_capabilities": ["sm_89"],
                     "linkage": "static",
-                    "binary_artifact": "fixtures/libferrum_native_fa2.a",
+                    "source_package": {
+                        "kind": "external_archive",
+                        "revision": "fa2-test-revision",
+                        "sha256": "a" * 64,
+                    },
+                    "inputs_sha256": "b" * 64,
+                    "binary_artifact": "native-artifacts/fa2/libferrum_native_fa2.a",
                     "binary_sha256": "c" * 64,
                     "resolution": {
                         "operator": "fa2",
@@ -2232,6 +2331,10 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
                     "compute_capability_mismatch",
                     "missing_manifest",
                     "operator_mismatch",
+                ],
+                "normal_gate_fixture_rejections": [
+                    "fixture_manifest_path",
+                    "fixture_source_package",
                 ],
                 "python_runtime_dependency": "none",
                 "normal_cuda_dev_build": {
@@ -2505,6 +2608,39 @@ def run_selftest() -> dict[str, Any]:
             require(
                 "native_operator.summary.selftest_summary.pass_fixtures" in str(exc),
                 f"unexpected native-op selftest error: {exc}",
+            )
+        bad_native_fixture_artifact = root / "bad-native-fixture-artifact"
+        artifacts_bad_native_fixture_artifact = selftest_artifacts(
+            root / "bad-native-fixture-artifact-fixtures",
+            sha,
+        )
+        bad_native_fixture_summary_path = (
+            artifacts_bad_native_fixture_artifact["native"]
+            / "native_operator_artifact_summary.json"
+        )
+        bad_native_fixture_summary = read_json(bad_native_fixture_summary_path)
+        bad_native_fixture_summary["manifests"][0]["manifest"] = "fixtures/fa2_manifest.json"
+        write_json(bad_native_fixture_summary_path, bad_native_fixture_summary)
+        args_bad_native_fixture_artifact = argparse.Namespace(
+            out=bad_native_fixture_artifact,
+            resource_invariant=artifacts_bad_native_fixture_artifact["resource"],
+            change_impact=artifacts_bad_native_fixture_artifact["change"],
+            product_sentinel=artifacts_bad_native_fixture_artifact["product"],
+            model_contract=artifacts_bad_native_fixture_artifact["model"],
+            support_matrix_contract=artifacts_bad_native_fixture_artifact["support_matrix"],
+            observability_profile=artifacts_bad_native_fixture_artifact["observability"],
+            native_operator=artifacts_bad_native_fixture_artifact["native"],
+            actual_model_regression_summary=artifacts_bad_native_fixture_artifact["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_native_fixture_artifact)
+            raise AssertionError("fixture native-op artifact unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "must not reference fixtures" in str(exc),
+                f"unexpected native-op fixture artifact error: {exc}",
             )
         bad_native_dev_build = root / "bad-native-dev-build"
         artifacts_bad_native_dev_build = selftest_artifacts(
