@@ -5,17 +5,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+GOAL = "release-regression-hardening-2026-06-28"
 PASS_LINE = "PRODUCT OBSERVABILITY WIRING PASS"
 SELFTEST_PASS_LINE = "PRODUCT OBSERVABILITY WIRING SELFTEST PASS"
 SCHEMA_VERSION = 1
+SECRET_ENV_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "AUTH", "CREDENTIAL", "KEY")
+SAFE_ENV_NAMES = {"CI", "CARGO_HOME", "HF_HOME", "HOME", "PATH", "RUSTFLAGS", "RUST_BACKTRACE", "RUST_LOG"}
+SAFE_ENV_PREFIXES = ("CARGO_", "FERRUM_", "HF_", "RUST_")
 
 
 class GateError(RuntimeError):
@@ -32,6 +38,34 @@ def load_json(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise GateError(f"{path} must contain a JSON object")
     return data
+
+
+def git_value(args: list[str], default: str = "unknown") -> str:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return default
+    return proc.stdout.strip() or default
+
+
+def git_status_short() -> list[str]:
+    return [line for line in git_value(["status", "--short"], default="").splitlines() if line.strip()]
+
+
+def sanitized_env() -> dict[str, str]:
+    safe: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if any(marker in key.upper() for marker in SECRET_ENV_MARKERS):
+            continue
+        if key in SAFE_ENV_NAMES or any(key.startswith(prefix) for prefix in SAFE_ENV_PREFIXES):
+            safe[key] = value
+    return dict(sorted(safe.items()))
 
 
 def run_checked(cmd: list[str], *, log_path: Path, timeout: int) -> dict[str, Any]:
@@ -146,10 +180,8 @@ def run_analyzer(out: Path, timeout: int) -> dict[str, Any]:
     profile_paths = [
         out / "run/profile.jsonl",
         out / "run/memory_profile.jsonl",
-        out / "run/scheduler_trace.jsonl",
         out / "serve/profile.jsonl",
         out / "serve/memory_profile.jsonl",
-        out / "serve/scheduler_trace.jsonl",
     ]
     cmd = [
         sys.executable,
@@ -164,9 +196,34 @@ def run_analyzer(out: Path, timeout: int) -> dict[str, Any]:
     return {"out": str(out / "analyzer"), "profiles": [str(path) for path in profile_paths]}
 
 
+def run_resource_invariant(out: Path, timeout: int) -> dict[str, Any]:
+    trace_paths = [
+        out / "run/scheduler_trace.jsonl",
+        out / "serve/scheduler_trace.jsonl",
+    ]
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "scripts/release/resource_invariant_gate.py"),
+        "--out",
+        str(out / "resource_invariant"),
+    ]
+    for path in trace_paths:
+        cmd.extend(["--trace-jsonl", str(path)])
+    log = run_checked(cmd, log_path=out / "logs/resource_invariant.json", timeout=timeout)
+    if "RESOURCE INVARIANT GATE PASS" not in log["stdout"]:
+        raise GateError("resource invariant gate did not print PASS")
+    return {
+        "out": str(out / "resource_invariant"),
+        "traces": [str(path) for path in trace_paths],
+    }
+
+
 def run_gate(args: argparse.Namespace) -> dict[str, Any]:
+    started_at = int(time.time())
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
+    (out / "failures").mkdir(exist_ok=True)
+    (out / "diagnostics").mkdir(exist_ok=True)
     run_checked(
         ferrum_command(args, "run", out / "run"),
         log_path=out / "logs/run_cli.json",
@@ -180,34 +237,90 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     run_summary = validate_entrypoint(out / "run", "run", args.profile_detail)
     serve_summary = validate_entrypoint(out / "serve", "serve", args.profile_detail)
     analyzer = run_analyzer(out, args.timeout)
+    resource_invariant = run_resource_invariant(out, args.timeout)
+    dirty_files = git_status_short()
+    pass_line = f"{PASS_LINE}: {out}"
     summary = {
         "schema_version": SCHEMA_VERSION,
+        "goal": GOAL,
         "status": "pass",
         "gate": "product_observability_wiring",
         "l0_only": True,
+        "artifact_dir": str(out),
+        "pass_line": pass_line,
+        "git_sha": git_value(["rev-parse", "HEAD"]),
+        "git_branch": git_value(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "git_dirty": bool(dirty_files),
+        "dirty_files": dirty_files,
+        "command": sys.argv,
         "entrypoints": {
             "run": run_summary,
             "serve": serve_summary,
         },
         "analyzer": analyzer,
+        "resource_invariant": resource_invariant,
         "l1_actual_smoke": {
             "status": "not_run_in_l0_gate",
             "reason": "WP6 typed wiring slice only; actual model smoke remains required before WP6 completion",
         },
     }
     write_json(out / "product_observability_wiring_summary.json", summary)
+    ended_at = int(time.time())
     write_json(
         out / "gate.manifest.json",
         {
             "schema_version": SCHEMA_VERSION,
+            "goal": GOAL,
+            "phase": "product_observability_wiring",
             "status": "pass",
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "duration_sec": ended_at - started_at,
+            "repo_root": str(REPO_ROOT),
+            "git_sha": summary["git_sha"],
+            "git_branch": summary["git_branch"],
+            "git_dirty": summary["git_dirty"],
+            "dirty_files": dirty_files,
+            "command": sys.argv,
             "artifact_dir": str(out),
-            "pass_line": f"{PASS_LINE}: {out}",
+            "pass_line": pass_line,
             "profile_detail": args.profile_detail,
             "profile_paths": analyzer["profiles"],
+            "resource_trace_paths": resource_invariant["traces"],
+            "inputs": {
+                "ferrum_bin": str(args.ferrum_bin) if args.ferrum_bin else None,
+                "profile_detail": args.profile_detail,
+                "timeout": args.timeout,
+            },
+            "outputs": {
+                "summary": str(out / "product_observability_wiring_summary.json"),
+                "run_profile": str(out / "run/profile.jsonl"),
+                "run_memory": str(out / "run/memory_profile.jsonl"),
+                "run_scheduler": str(out / "run/scheduler_trace.jsonl"),
+                "serve_profile": str(out / "serve/profile.jsonl"),
+                "serve_memory": str(out / "serve/memory_profile.jsonl"),
+                "serve_scheduler": str(out / "serve/scheduler_trace.jsonl"),
+                "resource_invariant": resource_invariant["out"],
+            },
             "summary": str(out / "product_observability_wiring_summary.json"),
+            "validation_summary": {
+                "l0_only": True,
+                "entrypoints": ["run", "serve"],
+                "profile_detail": args.profile_detail,
+                "run_profile_event_count": run_summary["artifacts"]["profile"]["event_count"],
+                "serve_profile_event_count": serve_summary["artifacts"]["profile"]["event_count"],
+                "analyzer_out": analyzer["out"],
+                "resource_invariant_out": resource_invariant["out"],
+            },
         },
     )
+    (out / "pass_line.txt").write_text(pass_line + "\n", encoding="utf-8")
+    (out / "command.log").write_text(" ".join(sys.argv) + "\n", encoding="utf-8")
+    (out / "git_status.txt").write_text(
+        "\n".join(dirty_files) + ("\n" if dirty_files else ""),
+        encoding="utf-8",
+    )
+    write_json(out / "sanitized_env.json", sanitized_env())
     return summary
 
 

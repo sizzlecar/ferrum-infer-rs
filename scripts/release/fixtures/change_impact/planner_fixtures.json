@@ -42,6 +42,7 @@
       "expect_domains": ["cli_run", "server_api", "evidence_schema"],
       "expect_required_gates": [
         "profile_analyzer_selftest",
+        "product_observability_wiring",
         "product_backend_sentinel_selftest",
         "observability_profile",
         "product_sentinel"
@@ -53,9 +54,22 @@
       "expect_domains": ["cli_run", "server_api", "evidence_schema"],
       "expect_required_gates": [
         "profile_analyzer_selftest",
+        "product_observability_wiring",
         "product_backend_sentinel_selftest",
         "observability_profile",
         "product_sentinel"
+      ]
+    },
+    {
+      "id": "product_observability_wiring_gate",
+      "changed_files": ["scripts/release/product_observability_wiring_gate.py"],
+      "expect_domains": ["release_gate", "cli_run", "server_api", "evidence_schema"],
+      "expect_required_gates": [
+        "profile_analyzer_selftest",
+        "product_observability_wiring_selftest",
+        "product_observability_wiring",
+        "planner_selftest",
+        "release_validator_selftest"
       ]
     },
     {
