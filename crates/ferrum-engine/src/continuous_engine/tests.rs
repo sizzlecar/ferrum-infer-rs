@@ -1493,8 +1493,8 @@ async fn sequence_take_physical_resources_for_recompute_clears_owned_resources()
         device: Device::CPU,
         max_batch_slots: 1,
     };
-    sequence.recurrent_state = Some(recurrent_manager.allocate(&recurrent_spec).await.unwrap());
-    sequence.recurrent_state_slots = Some(1);
+    let recurrent_state = recurrent_manager.allocate(&recurrent_spec).await.unwrap();
+    sequence.commit_recurrent_state_admission(recurrent_state, 1);
 
     let resources = sequence.take_physical_resources_for_recompute();
 
@@ -1663,6 +1663,35 @@ fn sequence_decode_commit_helpers_keep_resource_metadata_together() {
     sequence.commit_speculative_decode_physical_resources(target_kv, draft_kv);
     assert!(sequence.kv_cache.is_some());
     assert!(sequence.draft_kv_cache.is_some());
+}
+
+#[tokio::test]
+async fn sequence_recurrent_admission_helpers_keep_handle_and_slots_together() {
+    let request = policy_request();
+    let request_id = request.id.clone();
+    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
+    let recurrent_manager = InMemoryRecurrentStateManager::new(InMemoryRecurrentStateConfig {
+        total_memory_bytes: 8,
+        total_batch_slots: 1,
+    });
+    let recurrent_spec = RecurrentStateSpec {
+        request_id,
+        num_layers: 1,
+        tensors: vec![RecurrentStateTensorSpec::new(0, "state", vec![1])],
+        dtype: DataType::FP32,
+        device: Device::CPU,
+        max_batch_slots: 1,
+    };
+    let recurrent_state = recurrent_manager.allocate(&recurrent_spec).await.unwrap();
+
+    sequence.commit_recurrent_state_admission(recurrent_state, 1);
+    assert!(sequence.recurrent_state.is_some());
+    assert_eq!(sequence.recurrent_state_slots, Some(1));
+
+    let slots = sequence.take_recurrent_state_allocation();
+    assert_eq!(slots, Some(1));
+    assert!(sequence.recurrent_state.is_none());
+    assert!(sequence.recurrent_state_slots.is_none());
 }
 
 #[test]

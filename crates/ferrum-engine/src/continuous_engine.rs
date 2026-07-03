@@ -989,6 +989,20 @@ impl SequenceState {
         }
     }
 
+    fn commit_recurrent_state_admission(
+        &mut self,
+        recurrent_state: Arc<dyn RecurrentStateHandle>,
+        slots: usize,
+    ) {
+        self.recurrent_state = Some(recurrent_state);
+        self.recurrent_state_slots = Some(slots);
+    }
+
+    fn take_recurrent_state_allocation(&mut self) -> Option<usize> {
+        self.recurrent_state = None;
+        self.recurrent_state_slots.take()
+    }
+
     fn commit_speculative_decode_physical_resources(
         &mut self,
         target_kv_cache: Arc<dyn KvCacheHandle>,
@@ -2366,12 +2380,17 @@ impl EngineInner {
         let mut admission = self.prepare_recurrent_state(request_id, spec).await?;
         let handle = admission.handle();
         if let Some(slots) = admission.fresh_slots() {
+            let Some(handle) = handle.clone() else {
+                admission.release_fresh(self).await;
+                return Err(FerrumError::internal(format!(
+                    "missing recurrent state handle while committing recurrent slots for {request_id}"
+                )));
+            };
             let mut found = false;
             {
                 let mut sequences = self.sequences.write();
                 if let Some(seq) = sequences.get_mut(request_id) {
-                    seq.recurrent_state = handle.clone();
-                    seq.recurrent_state_slots = Some(slots);
+                    seq.commit_recurrent_state_admission(handle, slots);
                     found = true;
                 }
             }
@@ -2389,10 +2408,11 @@ impl EngineInner {
     }
 
     async fn release_recurrent_state(&self, request_id: &RequestId) {
-        let released_slots = self.sequences.write().get_mut(request_id).and_then(|seq| {
-            seq.recurrent_state = None;
-            seq.recurrent_state_slots.take()
-        });
+        let released_slots = self
+            .sequences
+            .write()
+            .get_mut(request_id)
+            .and_then(SequenceState::take_recurrent_state_allocation);
         self.release_recurrent_allocation(request_id, released_slots)
             .await;
     }
