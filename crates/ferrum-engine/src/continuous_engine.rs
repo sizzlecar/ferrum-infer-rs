@@ -592,10 +592,10 @@ pub struct SequenceState {
     pub original_request: InferenceRequest,
     pub input_tokens: Vec<TokenId>,
     pub generated_tokens: Vec<TokenId>,
-    pub kv_cache: Option<Arc<dyn KvCacheHandle>>,
-    pub kv_resource_blocks: Option<usize>,
-    pub recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
-    pub recurrent_state_slots: Option<usize>,
+    kv_cache: Option<Arc<dyn KvCacheHandle>>,
+    kv_resource_blocks: Option<usize>,
+    recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
+    recurrent_state_slots: Option<usize>,
     pub sampling_params: SamplingParams,
     pub phase: RequestPhase,
     pub rng: StdRng,
@@ -631,18 +631,18 @@ pub struct SequenceState {
     pub regex_processor: Option<Arc<ferrum_sampler::guided::RegexGuidedProcessor>>,
     /// Draft-model KV cache (only populated when engine has speculative
     /// decoding enabled). Allocated + prefilled lazily on the first decode.
-    pub draft_kv_cache: Option<Arc<dyn KvCacheHandle>>,
-    pub draft_kv_resource_blocks: Option<usize>,
+    draft_kv_cache: Option<Arc<dyn KvCacheHandle>>,
+    draft_kv_resource_blocks: Option<usize>,
     /// Resource-manager request id for the draft-model KV allocation.
     ///
     /// Draft KV must not reuse the target request id because KV managers are
     /// keyed by `RequestId`; a second allocation under the same key can
     /// replace the target handle while leaving resource counters/blocks alive.
-    pub draft_kv_request_id: Option<RequestId>,
+    draft_kv_request_id: Option<RequestId>,
     /// Token frequency counts for repetition penalty.
     pub token_frequencies: HashMap<TokenId, usize>,
     /// Model executor's KV cache key for this sequence (for cleanup on completion).
-    pub model_cache_id: Option<String>,
+    model_cache_id: Option<String>,
     /// Single-token stop ids: model's EOS + any `stop_sequences` that encode to
     /// exactly one token. Checked against the last generated token each step
     /// — replaces the old "token id near top of vocab = EOS" placeholder. Built
