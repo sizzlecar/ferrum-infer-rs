@@ -158,7 +158,8 @@ def validate_bad_output_scan(path: Path) -> dict[str, Any]:
 def validate_serve_replay_command(bundle: Path, request: dict[str, Any], replay: dict[str, Any]) -> dict[str, Any] | None:
     http = request.get("http")
     is_serve_replay = request.get("entrypoint") == "serve" and (
-        isinstance(http, dict) or replay.get("requires_running_server") is True
+        replay.get("requires_running_server") is True
+        or (request.get("backend") == "actual" and isinstance(http, dict))
     )
     if not is_serve_replay:
         return None
@@ -793,6 +794,17 @@ def run_selftest() -> dict[str, Any]:
         startup_request["actual_model_smoke"] = True
         startup_request["http"] = None
         write_json(serve_startup_request, startup_request)
+        make_bundle(pass_root / "serve-synthetic-http", entrypoint="serve")
+        serve_synthetic_request = pass_root / "serve-synthetic-http" / "req-fixture" / "request.json"
+        synthetic_request = read_json(serve_synthetic_request)
+        synthetic_request["backend"] = "synthetic"
+        synthetic_request["http"] = {
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": {"content-type": "application/json"},
+            "body": {"model": "synthetic/no-weight", "messages": []},
+        }
+        write_json(serve_synthetic_request, synthetic_request)
         pass_results = []
         for root in sorted(pass_root.iterdir()):
             pass_results.extend(validate_bundle_root(root))
