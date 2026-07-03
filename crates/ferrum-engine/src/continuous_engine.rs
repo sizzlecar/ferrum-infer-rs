@@ -592,8 +592,7 @@ pub struct SequenceState {
     pub original_request: InferenceRequest,
     pub input_tokens: Vec<TokenId>,
     pub generated_tokens: Vec<TokenId>,
-    kv_cache: Option<Arc<dyn KvCacheHandle>>,
-    kv_resource_blocks: Option<usize>,
+    model_kv: Option<SequenceModelKvState>,
     recurrent_state: Option<SequenceRecurrentState>,
     pub sampling_params: SamplingParams,
     pub phase: RequestPhase,
@@ -680,6 +679,33 @@ impl SequenceKvAllocation {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SequenceModelKvState {
+    cache: Arc<dyn KvCacheHandle>,
+    resource_blocks: Option<usize>,
+}
+
+impl SequenceModelKvState {
+    fn new(cache: Arc<dyn KvCacheHandle>, resource_blocks: Option<usize>) -> Self {
+        Self {
+            cache,
+            resource_blocks: resource_blocks.map(|blocks| blocks.max(1)),
+        }
+    }
+
+    fn handle(&self) -> Arc<dyn KvCacheHandle> {
+        self.cache.clone()
+    }
+
+    fn resource_blocks(&self) -> Option<usize> {
+        self.resource_blocks
+    }
+
+    fn allocation(self, request_id: RequestId) -> SequenceKvAllocation {
+        SequenceKvAllocation::new(request_id, self.resource_blocks)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SequenceRecurrentAllocation {
     slots: Option<usize>,
@@ -760,6 +786,17 @@ struct SequencePrefillResources {
     kv_resource_blocks: Option<usize>,
     recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
     prefill_tokens_processed: usize,
+}
+
+#[cfg(test)]
+impl SequencePrefillResources {
+    fn kv_cache_handle(&self) -> Option<Arc<dyn KvCacheHandle>> {
+        self.kv_cache.clone()
+    }
+
+    fn kv_resource_blocks(&self) -> Option<usize> {
+        self.kv_resource_blocks
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -886,8 +923,7 @@ impl SequenceState {
             original_request: request.clone(),
             input_tokens,
             generated_tokens: Vec::new(),
-            kv_cache: None,
-            kv_resource_blocks: None,
+            model_kv: None,
             recurrent_state: None,
             sampling_params: request.sampling_params,
             phase: RequestPhase::Waiting,
@@ -960,12 +996,12 @@ impl SequenceState {
     }
 
     fn take_physical_resources(&mut self) -> SequencePhysicalResources {
-        let has_kv_cache = self.kv_cache.take().is_some();
-        let kv_blocks = self.kv_resource_blocks.take();
         let draft_kv_allocation = self.draft_kv.take().map(SequenceDraftKvState::allocation);
         let resources = SequencePhysicalResources {
-            kv_allocation: has_kv_cache
-                .then(|| SequenceKvAllocation::new(self.request_id.clone(), kv_blocks)),
+            kv_allocation: self
+                .model_kv
+                .take()
+                .map(|state| state.allocation(self.request_id.clone())),
             draft_kv_allocation,
             recurrent_state_allocation: self
                 .recurrent_state
@@ -996,14 +1032,21 @@ impl SequenceState {
         }
     }
 
+    fn install_model_kv(
+        &mut self,
+        kv_cache: Arc<dyn KvCacheHandle>,
+        kv_resource_blocks: Option<usize>,
+    ) -> ModelCacheRefUpdate {
+        let model_cache_update = self.replace_model_cache_id(kv_cache.cache_id());
+        self.model_kv = Some(SequenceModelKvState::new(kv_cache, kv_resource_blocks));
+        model_cache_update
+    }
+
     fn install_model_kv_without_owned_blocks(
         &mut self,
         kv_cache: Arc<dyn KvCacheHandle>,
     ) -> ModelCacheRefUpdate {
-        let model_cache_update = self.replace_model_cache_id(kv_cache.cache_id());
-        self.kv_cache = Some(kv_cache);
-        self.kv_resource_blocks = None;
-        model_cache_update
+        self.install_model_kv(kv_cache, None)
     }
 
     fn commit_cached_prefill_physical_resources(
@@ -1025,9 +1068,7 @@ impl SequenceState {
         recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
         recurrent_state_slots: Option<usize>,
     ) -> ModelCacheRefUpdate {
-        let model_cache_update = self.replace_model_cache_id(kv_cache.cache_id());
-        self.kv_cache = Some(kv_cache);
-        self.kv_resource_blocks = Some(kv_resource_blocks);
+        let model_cache_update = self.install_model_kv(kv_cache, Some(kv_resource_blocks));
         self.recurrent_state =
             recurrent_state.map(|state| SequenceRecurrentState::new(state, recurrent_state_slots));
         self.prefill_complete = true;
@@ -1043,9 +1084,7 @@ impl SequenceState {
         prefill_tokens_processed: usize,
         is_final_chunk: bool,
     ) -> ModelCacheRefUpdate {
-        let model_cache_update = self.replace_model_cache_id(kv_cache.cache_id());
-        self.kv_cache = Some(kv_cache);
-        self.kv_resource_blocks = kv_resource_blocks;
+        let model_cache_update = self.install_model_kv(kv_cache, kv_resource_blocks);
         let existing_slots = self.recurrent_state.as_ref().and_then(|state| state.slots);
         self.recurrent_state =
             recurrent_state.map(|state| SequenceRecurrentState::new(state, existing_slots));
@@ -1075,7 +1114,7 @@ impl SequenceState {
     fn decode_resources(&self, request_id: &RequestId) -> Option<SequenceDecodeResources> {
         Some(SequenceDecodeResources {
             seq_id: self.decode_model_cache_id_or_request_id(request_id),
-            kv_cache: self.kv_cache.clone()?,
+            kv_cache: self.model_kv.as_ref()?.handle(),
             recurrent_state: self
                 .recurrent_state
                 .as_ref()
@@ -1097,13 +1136,16 @@ impl SequenceState {
     }
 
     fn is_preemptible_decode_candidate(&self) -> bool {
-        self.prefill_complete && self.kv_cache.is_some()
+        self.prefill_complete && self.model_kv.is_some()
     }
 
     fn prefill_resources(&self) -> SequencePrefillResources {
         SequencePrefillResources {
-            kv_cache: self.kv_cache.clone(),
-            kv_resource_blocks: self.kv_resource_blocks,
+            kv_cache: self.model_kv.as_ref().map(SequenceModelKvState::handle),
+            kv_resource_blocks: self
+                .model_kv
+                .as_ref()
+                .and_then(SequenceModelKvState::resource_blocks),
             recurrent_state: self
                 .recurrent_state
                 .as_ref()
@@ -1126,8 +1168,24 @@ impl SequenceState {
         self.draft_kv.as_ref().map(|draft| draft.cache.clone())
     }
 
+    fn kv_cache_handle(&self) -> Option<Arc<dyn KvCacheHandle>> {
+        self.model_kv.as_ref().map(SequenceModelKvState::handle)
+    }
+
+    fn kv_resource_blocks(&self) -> Option<usize> {
+        self.model_kv
+            .as_ref()
+            .and_then(SequenceModelKvState::resource_blocks)
+    }
+
+    #[cfg(test)]
+    fn clear_model_kv_for_test(&mut self) {
+        self.model_kv = None;
+    }
+
     fn commit_decode_step_physical_resources(&mut self, kv_cache: Arc<dyn KvCacheHandle>) {
-        self.kv_cache = Some(kv_cache);
+        let existing_blocks = self.kv_resource_blocks();
+        self.model_kv = Some(SequenceModelKvState::new(kv_cache, existing_blocks));
         self.tokens_this_iteration += 1;
     }
 
@@ -1157,7 +1215,8 @@ impl SequenceState {
         target_kv_cache: Arc<dyn KvCacheHandle>,
         draft_kv_cache: Arc<dyn KvCacheHandle>,
     ) {
-        self.kv_cache = Some(target_kv_cache);
+        let existing_blocks = self.kv_resource_blocks();
+        self.model_kv = Some(SequenceModelKvState::new(target_kv_cache, existing_blocks));
         if let Some(draft) = &mut self.draft_kv {
             draft.cache = draft_kv_cache;
         } else {
@@ -1601,8 +1660,8 @@ impl Drop for SequenceState {
             let message = "sequence state dropped with owned request slot";
             warn!(
                 request_id = %self.request_id,
-                has_kv_cache = self.kv_cache.is_some(),
-                kv_resource_blocks = ?self.kv_resource_blocks,
+                has_kv_cache = self.model_kv.is_some(),
+                kv_resource_blocks = ?self.kv_resource_blocks(),
                 has_recurrent_state = self.recurrent_state.is_some(),
                 recurrent_state_slots = ?self.recurrent_state_slots(),
                 has_draft_kv = self.draft_kv.is_some(),

@@ -215,7 +215,7 @@ impl EngineInner {
     ///   lifetime and are deallocated on preemption/completion.
     /// - model/executor cache ids track the actual model-side KV contents.
     ///
-    /// `SequenceState.kv_cache` must carry the second identity because the
+    /// `SequenceState` model-KV state must carry the second identity because the
     /// fallback single-request decode path downcasts it to
     /// `GenericKvCacheHandle`. Unified CUDA paths don't read the handle body,
     /// but keeping this invariant prevents resource-pressure fallbacks from
@@ -253,7 +253,7 @@ impl EngineInner {
             .filter(|rid| {
                 sequences.get(*rid).is_some_and(|seq| {
                     seq.prefill_complete
-                        && seq.kv_cache.is_some()
+                        && seq.kv_cache_handle().is_some()
                         && !seq.generated_tokens.is_empty()
                 })
             })
