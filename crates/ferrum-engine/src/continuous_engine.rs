@@ -1400,11 +1400,116 @@ impl Drop for KvAllocationLease {
     }
 }
 
+#[must_use = "recurrent-state leases must be consumed by release().await or commit()"]
+struct RecurrentStateLease {
+    request_id: RequestId,
+    handle: Arc<dyn RecurrentStateHandle>,
+    slots: usize,
+    capacity: Option<usize>,
+    armed: bool,
+}
+
+impl RecurrentStateLease {
+    fn new(
+        request_id: RequestId,
+        handle: Arc<dyn RecurrentStateHandle>,
+        slots: usize,
+        capacity: Option<usize>,
+    ) -> Self {
+        Self {
+            request_id,
+            handle,
+            slots,
+            capacity,
+            armed: true,
+        }
+    }
+
+    fn handle(&self) -> Arc<dyn RecurrentStateHandle> {
+        self.handle.clone()
+    }
+
+    fn slots(&self) -> usize {
+        self.slots
+    }
+
+    async fn release(mut self, engine: &EngineInner) {
+        engine
+            .release_recurrent_allocation(&self.request_id, Some(self.slots))
+            .await;
+        self.armed = false;
+    }
+
+    fn commit(mut self) -> usize {
+        self.armed = false;
+        self.slots
+    }
+}
+
+impl Drop for RecurrentStateLease {
+    fn drop(&mut self) {
+        if self.armed {
+            warn!(
+                request_id = %self.request_id,
+                slots = self.slots,
+                capacity = ?self.capacity,
+                "recurrent-state lease dropped without explicit commit or async release"
+            );
+        }
+    }
+}
+
+struct RecurrentStateAdmission {
+    handle: Option<Arc<dyn RecurrentStateHandle>>,
+    lease: Option<RecurrentStateLease>,
+}
+
+impl RecurrentStateAdmission {
+    fn none() -> Self {
+        Self {
+            handle: None,
+            lease: None,
+        }
+    }
+
+    fn existing(handle: Arc<dyn RecurrentStateHandle>) -> Self {
+        Self {
+            handle: Some(handle),
+            lease: None,
+        }
+    }
+
+    fn fresh(lease: RecurrentStateLease) -> Self {
+        Self {
+            handle: Some(lease.handle()),
+            lease: Some(lease),
+        }
+    }
+
+    fn handle(&self) -> Option<Arc<dyn RecurrentStateHandle>> {
+        self.handle.clone()
+    }
+
+    fn fresh_slots(&self) -> Option<usize> {
+        self.lease.as_ref().map(RecurrentStateLease::slots)
+    }
+
+    fn commit_fresh(&mut self) -> Option<usize> {
+        self.lease.take().map(RecurrentStateLease::commit)
+    }
+
+    async fn release_fresh(&mut self, engine: &EngineInner) {
+        if let Some(lease) = self.lease.take() {
+            lease.release(engine).await;
+        }
+    }
+}
+
 struct PendingBatchPrefill {
     request_id: RequestId,
     input_tokens: Vec<TokenId>,
     kv_lease: Option<KvAllocationLease>,
-    recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
+    recurrent_state: RecurrentStateAdmission,
     metadata: HashMap<String, serde_json::Value>,
     can_use_prefix_cache: bool,
 }
@@ -1414,7 +1519,7 @@ impl PendingBatchPrefill {
         request_id: RequestId,
         input_tokens: Vec<TokenId>,
         kv_lease: KvAllocationLease,
-        recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
+        recurrent_state: RecurrentStateAdmission,
         metadata: HashMap<String, serde_json::Value>,
         can_use_prefix_cache: bool,
     ) -> Self {
@@ -1455,7 +1560,7 @@ impl PendingBatchPrefill {
         if let Some(lease) = self.kv_lease.take() {
             lease.release(engine).await;
         }
-        engine.release_recurrent_state(&self.request_id).await;
+        self.recurrent_state.release_fresh(engine).await;
     }
 }
 
@@ -1945,22 +2050,22 @@ impl EngineInner {
         }
     }
 
-    async fn ensure_recurrent_state(
+    async fn prepare_recurrent_state(
         &self,
         request_id: &RequestId,
         spec: Option<ferrum_interfaces::RecurrentStateSpec>,
-    ) -> Result<Option<Arc<dyn RecurrentStateHandle>>> {
+    ) -> Result<RecurrentStateAdmission> {
         if let Some(existing) = self
             .sequences
             .read()
             .get(request_id)
             .and_then(|seq| seq.recurrent_state.clone())
         {
-            return Ok(Some(existing));
+            return Ok(RecurrentStateAdmission::existing(existing));
         }
 
         let Some(spec) = spec else {
-            return Ok(None);
+            return Ok(RecurrentStateAdmission::none());
         };
 
         debug_assert_eq!(&spec.request_id, request_id);
@@ -1994,13 +2099,42 @@ impl EngineInner {
         };
         let after_stats = manager.stats();
         self.trace_recurrent_allocate(request_id, slots, Some(after_stats.total_batch_slots));
+        Ok(RecurrentStateAdmission::fresh(RecurrentStateLease::new(
+            request_id.clone(),
+            handle,
+            slots,
+            Some(after_stats.total_batch_slots),
+        )))
+    }
 
-        if let Some(seq) = self.sequences.write().get_mut(request_id) {
-            seq.recurrent_state = Some(handle.clone());
-            seq.recurrent_state_slots = Some(slots);
+    async fn ensure_recurrent_state(
+        &self,
+        request_id: &RequestId,
+        spec: Option<ferrum_interfaces::RecurrentStateSpec>,
+    ) -> Result<Option<Arc<dyn RecurrentStateHandle>>> {
+        let mut admission = self.prepare_recurrent_state(request_id, spec).await?;
+        let handle = admission.handle();
+        if let Some(slots) = admission.fresh_slots() {
+            let mut found = false;
+            {
+                let mut sequences = self.sequences.write();
+                if let Some(seq) = sequences.get_mut(request_id) {
+                    seq.recurrent_state = handle.clone();
+                    seq.recurrent_state_slots = Some(slots);
+                    found = true;
+                }
+            }
+            if found {
+                admission.commit_fresh();
+            } else {
+                admission.release_fresh(self).await;
+                return Err(FerrumError::internal(format!(
+                    "sequence not found while committing recurrent state for {request_id}"
+                )));
+            }
         }
 
-        Ok(Some(handle))
+        Ok(handle)
     }
 
     async fn release_recurrent_state(&self, request_id: &RequestId) {
