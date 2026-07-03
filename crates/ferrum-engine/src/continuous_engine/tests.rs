@@ -1700,14 +1700,19 @@ fn sequence_decode_commit_helpers_keep_resource_metadata_together() {
         1,
         3,
     ));
+    let draft_request_id = RequestId::new();
     let draft_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-        RequestId::new(),
+        draft_request_id.clone(),
         1,
         3,
     ));
-    sequence.commit_speculative_decode_physical_resources(target_kv, draft_kv);
+    sequence.commit_speculative_decode_physical_resources(target_kv, draft_kv.clone());
     assert!(sequence.kv_cache.is_some());
     assert!(sequence.draft_kv_cache.is_some());
+
+    sequence.commit_draft_kv_allocation(draft_kv, draft_request_id.clone(), 0);
+    assert_eq!(sequence.draft_kv_request_id, Some(draft_request_id));
+    assert_eq!(sequence.draft_kv_resource_blocks, Some(1));
 }
 
 #[tokio::test]

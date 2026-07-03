@@ -1098,6 +1098,17 @@ impl SequenceState {
         self.draft_kv_cache = Some(draft_kv_cache);
     }
 
+    fn commit_draft_kv_allocation(
+        &mut self,
+        draft_kv_cache: Arc<dyn KvCacheHandle>,
+        draft_request_id: RequestId,
+        draft_resource_blocks: usize,
+    ) {
+        self.draft_kv_cache = Some(draft_kv_cache);
+        self.draft_kv_request_id = Some(draft_request_id);
+        self.draft_kv_resource_blocks = Some(draft_resource_blocks.max(1));
+    }
+
     pub fn model_decode_logits_policy(&self) -> LogitsReturnPolicy {
         if !self.can_use_model_greedy_argmax() {
             return LogitsReturnPolicy::FullLogits;

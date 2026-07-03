@@ -504,9 +504,11 @@ impl EngineInner {
             {
                 let mut sequences = self.sequences.write();
                 if let Some(s) = sequences.get_mut(request_id) {
-                    s.draft_kv_cache = Some(kv.clone());
-                    s.draft_kv_request_id = Some(draft_kv_request_id);
-                    s.draft_kv_resource_blocks = Some(draft_kv_resource_blocks);
+                    s.commit_draft_kv_allocation(
+                        kv.clone(),
+                        draft_kv_request_id,
+                        draft_kv_resource_blocks,
+                    );
                 }
             }
             kv
