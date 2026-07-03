@@ -279,6 +279,46 @@ def parse_operator_value(items: list[str], flag: str) -> dict[str, str]:
     return out
 
 
+def is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def fixture_marker(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower()
+    return normalized in {"fixture", "fixtures"} or normalized.startswith("fixture-")
+
+
+def reject_fixture_release_inputs(
+    *,
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    artifact_path: Path,
+) -> None:
+    if is_relative_to(manifest_path, DEFAULT_FIXTURES):
+        raise GateError(
+            f"{manifest_path}: normal native operator artifact gate must not use fixture manifests"
+        )
+    if is_relative_to(artifact_path, DEFAULT_FIXTURES):
+        raise GateError(
+            f"{manifest_path}: normal native operator artifact gate must not use fixture binaries"
+        )
+    if artifact_path.suffix.lower() == ".whl":
+        raise GateError(f"{manifest_path}: native operator artifact must not be a Python wheel")
+    source_package = manifest.get("source_package")
+    if isinstance(source_package, dict) and (
+        fixture_marker(source_package.get("kind")) or fixture_marker(source_package.get("revision"))
+    ):
+        raise GateError(
+            f"{manifest_path}: normal native operator artifact gate must not use fixture source_package metadata"
+        )
+
+
 def count_bulk_source_files() -> tuple[int, list[str]]:
     samples: list[str] = []
     count = 0
@@ -483,6 +523,29 @@ def run_selftest() -> dict[str, Any]:
     release_config_audit = native_operator_release_config_audit()
     if release_config_audit["status"] != "pass":
         raise GateError("native operator release-config audit failed")
+    fixture_release_rejections: list[str] = []
+    for label, manifest_path, artifact_path in [
+        (
+            "fixture_manifest_path",
+            pass_dir / "fa2_manifest.json",
+            DEFAULT_FIXTURES / "artifacts/fa2/libferrum_native_fa2.a",
+        ),
+        (
+            "fixture_source_package",
+            REPO_ROOT / "external/native/fa2_manifest.json",
+            REPO_ROOT / "external/native/libferrum_native_fa2.a",
+        ),
+    ]:
+        try:
+            reject_fixture_release_inputs(
+                manifest_path=manifest_path,
+                manifest=fa2_fixture,
+                artifact_path=artifact_path,
+            )
+        except GateError:
+            fixture_release_rejections.append(label)
+        else:
+            raise GateError(f"normal gate fixture rejection {label} unexpectedly passed")
     bad_release_config = release_config_audit_from_texts(
         {
             "bad-release.yml": (
@@ -500,6 +563,7 @@ def run_selftest() -> dict[str, Any]:
         "pass_fixtures": resolved,
         "fail_fixtures": rejected_validation,
         "resolver_fail_closed_cases": rejected_resolution,
+        "normal_gate_fixture_rejections": fixture_release_rejections,
         "python_runtime_dependency": "none",
         "bulk_source": {"count": bulk_count, "samples": bulk_samples},
         "unregistered_third_party_source": {
@@ -556,6 +620,11 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         artifact_path = binary_artifacts.get(operator)
         if artifact_path is None:
             raise GateError(f"{path}: missing --binary-artifact {operator}=<path>")
+        reject_fixture_release_inputs(
+            manifest_path=path,
+            manifest=manifest,
+            artifact_path=artifact_path,
+        )
         if not artifact_path.is_file():
             raise GateError(f"{path}: binary artifact does not exist: {artifact_path}")
         binary_sha256 = sha256_file(artifact_path)
@@ -579,6 +648,8 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
                 "backend": manifest["backend"],
                 "compute_capabilities": manifest["compute_capabilities"],
                 "linkage": manifest["linkage"],
+                "source_package": manifest["source_package"],
+                "inputs_sha256": manifest["inputs_sha256"],
                 "binary_artifact": str(artifact_path),
                 "binary_sha256": binary_sha256,
                 "resolution": resolution,
