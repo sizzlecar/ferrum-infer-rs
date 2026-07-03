@@ -1442,6 +1442,40 @@ fn test_continuous_engine_with_config(config: EngineConfig) -> ContinuousBatchEn
 }
 
 #[test]
+#[should_panic(expected = "KV allocation lease dropped without explicit commit or async release")]
+fn kv_allocation_lease_drop_without_consumption_panics_in_tests() {
+    let request_id = RequestId::new();
+    let handle: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        request_id.clone(),
+        1,
+        1,
+    ));
+
+    let _lease = KvAllocationLease::new(request_id.clone(), request_id, handle, 1);
+}
+
+#[tokio::test]
+#[should_panic(expected = "recurrent-state lease dropped without explicit commit or async release")]
+async fn recurrent_state_lease_drop_without_consumption_panics_in_tests() {
+    let request_id = RequestId::new();
+    let manager = InMemoryRecurrentStateManager::new(InMemoryRecurrentStateConfig {
+        total_memory_bytes: 8,
+        total_batch_slots: 1,
+    });
+    let spec = RecurrentStateSpec {
+        request_id: request_id.clone(),
+        num_layers: 1,
+        tensors: vec![RecurrentStateTensorSpec::new(0, "state", vec![1])],
+        dtype: DataType::FP32,
+        device: Device::CPU,
+        max_batch_slots: 1,
+    };
+    let handle = manager.allocate(&spec).await.unwrap();
+
+    let _lease = RecurrentStateLease::new(request_id, handle, 1, Some(1));
+}
+
+#[test]
 fn model_kv_handle_with_seq_is_executor_decode_handle() {
     let engine = test_continuous_engine();
 

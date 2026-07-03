@@ -1390,12 +1390,17 @@ impl KvAllocationLease {
 impl Drop for KvAllocationLease {
     fn drop(&mut self) {
         if self.armed {
+            let message = "KV allocation lease dropped without explicit commit or async release";
             warn!(
                 owner_request_id = %self.owner_request_id,
                 allocation_request_id = %self.allocation_request_id,
                 blocks = self.blocks,
-                "KV allocation lease dropped without explicit commit or async release"
+                "{message}"
             );
+            #[cfg(test)]
+            if !std::thread::panicking() {
+                panic!("{message}");
+            }
         }
     }
 }
@@ -1449,12 +1454,17 @@ impl RecurrentStateLease {
 impl Drop for RecurrentStateLease {
     fn drop(&mut self) {
         if self.armed {
+            let message = "recurrent-state lease dropped without explicit commit or async release";
             warn!(
                 request_id = %self.request_id,
                 slots = self.slots,
                 capacity = ?self.capacity,
-                "recurrent-state lease dropped without explicit commit or async release"
+                "{message}"
             );
+            #[cfg(test)]
+            if !std::thread::panicking() {
+                panic!("{message}");
+            }
         }
     }
 }
