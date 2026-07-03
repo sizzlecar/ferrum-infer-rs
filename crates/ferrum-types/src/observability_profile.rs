@@ -170,6 +170,13 @@ impl FerrumProfileEvent {
         if self.request_id.trim().is_empty() {
             return Err("request_id must be non-empty".to_string());
         }
+        if self
+            .correlation_id
+            .as_ref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err("correlation_id must be non-empty".to_string());
+        }
         if self.backend.trim().is_empty() {
             return Err("backend must be non-empty".to_string());
         }
@@ -207,7 +214,7 @@ mod tests {
             schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
             event_id: "evt-1".to_string(),
             request_id: "req-1".to_string(),
-            correlation_id: None,
+            correlation_id: Some("corr-1".to_string()),
             entrypoint: ProfileEntrypoint::Synthetic,
             backend: "synthetic".to_string(),
             phase: "request".to_string(),
@@ -235,5 +242,9 @@ mod tests {
         let mut missing_request = base_event();
         missing_request.request_id.clear();
         assert!(missing_request.validate().is_err());
+
+        let mut missing_correlation = base_event();
+        missing_correlation.correlation_id = None;
+        assert!(missing_correlation.validate().is_err());
     }
 }
