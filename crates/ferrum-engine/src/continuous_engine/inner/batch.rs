@@ -178,9 +178,8 @@ impl EngineInner {
             metadata: std::collections::HashMap<String, serde_json::Value>,
             logits_policy: LogitsReturnPolicy,
             can_use_prefix_cache: bool,
-            fresh_kv: bool,
             kv_resource_blocks: Option<usize>,
-            fresh_recurrent: bool,
+            owned_resources: UnifiedPrefillOwnedResources,
             chunk_start: usize,
             chunk_len: usize,
             is_final_chunk: bool,
@@ -284,6 +283,13 @@ impl EngineInner {
             }
 
             let had_recurrent_state = existing_recurrent_state.is_some();
+            let fresh_recurrent_slots = if had_recurrent_state {
+                None
+            } else {
+                recurrent_state_spec
+                    .as_ref()
+                    .map(|spec| spec.max_batch_slots.max(1))
+            };
             let recurrent_state =
                 match self.ensure_recurrent_state(rid, recurrent_state_spec).await {
                     Ok(state) => state,
@@ -305,10 +311,15 @@ impl EngineInner {
                     }
                 }
                 .or(existing_recurrent_state);
-            let fresh_recurrent = !had_recurrent_state && recurrent_state.is_some();
+            let mut owned_resources = UnifiedPrefillOwnedResources::default();
+            if recurrent_state.is_some() {
+                if let Some(slots) = fresh_recurrent_slots {
+                    owned_resources = owned_resources.with_fresh_recurrent_state(slots);
+                }
+            }
 
-            let (kv_handle, fresh_kv, kv_resource_blocks) = if let Some(kv) = existing_kv {
-                (kv, false, existing_kv_resource_blocks)
+            let (kv_handle, kv_resource_blocks) = if let Some(kv) = existing_kv {
+                (kv, existing_kv_resource_blocks)
             } else {
                 // Allocate KV pages for a fresh prefill. This is waiting-request
                 // admission, so capacity failure should defer the prefill rather
@@ -331,14 +342,15 @@ impl EngineInner {
                     Ok(lease) => lease,
                     Err(e) => {
                         warn!("Unified prefill alloc deferred for {}: {}", rid, e);
-                        self.release_recurrent_state(rid).await;
+                        owned_resources.release(self, rid).await;
                         self.defer_prefill_for_capacity(rid).await;
                         continue;
                     }
                 };
                 let allocated = lease.handle();
                 let (_allocation_request_id, blocks) = lease.into_committed_parts();
-                (allocated, true, Some(blocks))
+                owned_resources = owned_resources.with_fresh_kv(rid.clone(), blocks);
+                (allocated, Some(blocks))
             };
             let remaining = num_tokens - chunk_start;
             let chunk_len = [
@@ -366,9 +378,8 @@ impl EngineInner {
                 metadata,
                 logits_policy,
                 can_use_prefix_cache,
-                fresh_kv,
                 kv_resource_blocks,
-                fresh_recurrent,
+                owned_resources,
                 chunk_start,
                 chunk_len,
                 is_final_chunk,
@@ -473,15 +484,8 @@ impl EngineInner {
                             .defer_capacity_deferred_mixed_recompute_until_release();
                     }
                 }
-                for work in &prefill_meta {
-                    if work.fresh_kv {
-                        self.release_kv_allocation(
-                            &work.rid,
-                            work.rid.clone(),
-                            work.kv_resource_blocks,
-                        )
-                        .await;
-                    }
+                for work in &mut prefill_meta {
+                    work.owned_resources.release(self, &work.rid).await;
                     self.defer_prefill_for_capacity(&work.rid).await;
                 }
                 if mixed_decode_prefill {
@@ -499,18 +503,8 @@ impl EngineInner {
                 }
                 return Ok(());
             }
-            for work in &prefill_meta {
-                if work.fresh_kv {
-                    self.release_kv_allocation(
-                        &work.rid,
-                        work.rid.clone(),
-                        work.kv_resource_blocks,
-                    )
-                    .await;
-                }
-                if work.fresh_recurrent {
-                    self.release_recurrent_state(&work.rid).await;
-                }
+            for work in &mut prefill_meta {
+                work.owned_resources.release(self, &work.rid).await;
             }
             return self.process_batch_legacy_split(batch).await;
         }
@@ -536,15 +530,8 @@ impl EngineInner {
                         "Unified forward resource exhausted: {}; deferring prefills",
                         e
                     );
-                    for work in &prefill_meta {
-                        if work.fresh_kv {
-                            self.release_kv_allocation(
-                                &work.rid,
-                                work.rid.clone(),
-                                work.kv_resource_blocks,
-                            )
-                            .await;
-                        }
+                    for work in &mut prefill_meta {
+                        work.owned_resources.release(self, &work.rid).await;
                         self.defer_prefill_for_capacity(&work.rid).await;
                     }
                     if !decode_meta.is_empty() {
@@ -561,18 +548,8 @@ impl EngineInner {
                 // request_id, double-counting `active_caches` (only one
                 // of the two pairs ever gets deallocated by
                 // `complete_request`). Found via paged_attention_test.
-                for work in &prefill_meta {
-                    if work.fresh_kv {
-                        self.release_kv_allocation(
-                            &work.rid,
-                            work.rid.clone(),
-                            work.kv_resource_blocks,
-                        )
-                        .await;
-                    }
-                    if work.fresh_recurrent {
-                        self.release_recurrent_state(&work.rid).await;
-                    }
+                for work in &mut prefill_meta {
+                    work.owned_resources.release(self, &work.rid).await;
                 }
                 return self.process_batch_legacy_split(batch).await;
             }
@@ -586,18 +563,8 @@ impl EngineInner {
             .zip(t_unified_model_done)
             .map(|(t0, t1)| t1.duration_since(t0).as_micros() as u64);
         if results.len() != unified.items.len() {
-            for work in &prefill_meta {
-                if work.fresh_kv {
-                    self.release_kv_allocation(
-                        &work.rid,
-                        work.rid.clone(),
-                        work.kv_resource_blocks,
-                    )
-                    .await;
-                }
-                if work.fresh_recurrent {
-                    self.release_recurrent_state(&work.rid).await;
-                }
+            for work in &mut prefill_meta {
+                work.owned_resources.release(self, &work.rid).await;
             }
             return Err(FerrumError::internal(format!(
                 "unified_decode returned {} results for {} items",
@@ -616,7 +583,7 @@ impl EngineInner {
         let mut t_decode_stream_us: u64 = 0;
         let mut t_decode_stop_us: u64 = 0;
         let mut t_decode_complete_us: u64 = 0;
-        for (i, work) in prefill_meta.into_iter().enumerate() {
+        for (i, mut work) in prefill_meta.into_iter().enumerate() {
             let logits_vec = match &results[i] {
                 Some(l) => l.clone(),
                 None if !work.is_final_chunk => {
@@ -639,6 +606,7 @@ impl EngineInner {
                             .unwrap_or_default()
                     };
                     self.apply_model_cache_ref_update(&work.rid, model_cache_update);
+                    work.owned_resources.commit();
                     self.scheduler.mark_prefill_chunk_processed(
                         &work.rid,
                         work.input_tokens.len(),
@@ -648,17 +616,7 @@ impl EngineInner {
                 }
                 None => {
                     warn!("Unified prefill result missing for {}", work.rid);
-                    if work.fresh_kv {
-                        self.release_kv_allocation(
-                            &work.rid,
-                            work.rid.clone(),
-                            work.kv_resource_blocks,
-                        )
-                        .await;
-                    }
-                    if work.fresh_recurrent {
-                        self.release_recurrent_state(&work.rid).await;
-                    }
+                    work.owned_resources.release(self, &work.rid).await;
                     self.complete_request(&work.rid, FinishReason::Error)
                         .await?;
                     continue;
@@ -710,29 +668,23 @@ impl EngineInner {
             let (first_token, queue_to_first_token_us, model_cache_update) =
                 match first_token_result {
                     Ok(Some(value)) => value,
-                    Ok(None) => continue,
+                    Ok(None) => {
+                        work.owned_resources.release(self, &work.rid).await;
+                        continue;
+                    }
                     Err(e) => {
                         warn!(
                             "Unified prefill post-process failed for {}: {}",
                             work.rid, e
                         );
-                        if work.fresh_kv {
-                            self.release_kv_allocation(
-                                &work.rid,
-                                work.rid.clone(),
-                                work.kv_resource_blocks,
-                            )
-                            .await;
-                        }
-                        if work.fresh_recurrent {
-                            self.release_recurrent_state(&work.rid).await;
-                        }
+                        work.owned_resources.release(self, &work.rid).await;
                         self.complete_request(&work.rid, FinishReason::Error)
                             .await?;
                         continue;
                     }
                 };
             self.apply_model_cache_ref_update(&work.rid, model_cache_update);
+            work.owned_resources.commit();
             self.scheduler.mark_prefill_complete(&work.rid, num_tokens);
             self.total_prefill_tokens
                 .fetch_add(num_tokens as u64, Ordering::Relaxed);
