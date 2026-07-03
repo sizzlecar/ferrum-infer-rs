@@ -29,6 +29,7 @@ REQUIRED_RUN_MEMORY_STAGES = {
     "process_start",
     "backend_initialized",
     "model_loaded",
+    "profile_run_done",
     "cache_allocated",
     "first_request_done",
     "shutdown",
@@ -37,6 +38,7 @@ REQUIRED_SERVE_MEMORY_STAGES = {
     "process_start",
     "backend_initialized",
     "model_loaded",
+    "profile_run_done",
     "cache_allocated",
     "first_request_done",
     "shutdown",
@@ -577,6 +579,23 @@ def validate_profile_group(root: Path, entrypoint: str) -> dict[str, Any]:
                             raise SmokeError(
                                 f"{path} cache_allocated event requires non-negative {key}"
                             )
+                if attrs.get("memory_stage") == "profile_run_done":
+                    if not isinstance(attrs.get("profile_run_executed"), bool):
+                        raise SmokeError(
+                            f"{path} profile_run_done event requires boolean profile_run_executed"
+                        )
+                    if not isinstance(attrs.get("profile_run_status"), str) or not attrs[
+                        "profile_run_status"
+                    ].strip():
+                        raise SmokeError(
+                            f"{path} profile_run_done event requires profile_run_status"
+                        )
+                    if not isinstance(attrs.get("profile_run_source"), str) or not attrs[
+                        "profile_run_source"
+                    ].strip():
+                        raise SmokeError(
+                            f"{path} profile_run_done event requires profile_run_source"
+                        )
         if label == "scheduler":
             sources = {
                 (event.get("attributes") or {}).get("resource_trace_source")
@@ -1168,6 +1187,14 @@ def write_selftest_profile_group(out: Path, entrypoint: str) -> None:
                     "kv_cache_free_bytes": 6144,
                     "cache_memory_bytes": 2048,
                     "available_kv_or_state_bytes": 6144,
+                }
+            )
+        if stage == "profile_run_done":
+            attrs.update(
+                {
+                    "profile_run_executed": False,
+                    "profile_run_status": "not_configured",
+                    "profile_run_source": "selftest_fixture",
                 }
             )
         return attrs
