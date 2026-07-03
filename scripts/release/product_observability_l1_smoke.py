@@ -36,6 +36,7 @@ REQUIRED_SERVE_MEMORY_STAGES = {
     "process_start",
     "backend_initialized",
     "model_loaded",
+    "first_request_done",
     "shutdown",
 }
 

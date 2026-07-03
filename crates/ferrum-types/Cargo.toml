@@ -28,6 +28,7 @@ smallvec = "1.11"
 
 # Random number generation
 rand = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 syn = { version = "2", features = ["full"] }

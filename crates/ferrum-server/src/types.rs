@@ -164,6 +164,10 @@ pub struct ServerConfig {
     /// Optional product observability profile JSONL sink for request lifecycle events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_jsonl: Option<PathBuf>,
+
+    /// Optional product observability memory profile JSONL sink for request memory events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_profile_jsonl: Option<PathBuf>,
 }
 
 /// API version
@@ -412,6 +416,7 @@ impl Default for ServerConfig {
             api_version: ApiVersion::V1,
             request_dump_dir: None,
             profile_jsonl: None,
+            memory_profile_jsonl: None,
         }
     }
 }
