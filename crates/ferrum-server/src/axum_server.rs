@@ -962,6 +962,7 @@ fn write_chat_request_replay_bundle(
     let sanitized_body = sanitized_chat_request_body(openai_request);
     let replay_body_path = bundle_dir.join("replay_body.json");
     write_json_value(&replay_body_path, &sanitized_body)?;
+    let engine_replay_argv = replay_bundle_argv(&bundle_dir);
 
     let request = serde_json::json!({
         "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
@@ -1062,6 +1063,12 @@ fn write_chat_request_replay_bundle(
                 "argv": replay_curl_argv(&bundle_dir),
                 "bundle_dir": bundle_dir.to_string_lossy(),
                 "requires_running_server": true,
+                "engine_replay": {
+                    "mode": "bundle_offline",
+                    "requires_http_server": false,
+                    "command": shell_command(&engine_replay_argv),
+                    "argv": engine_replay_argv
+                },
                 "sanitized": true
             }),
         ),
@@ -1506,8 +1513,29 @@ fn replay_curl_argv(bundle_dir: &Path) -> Vec<String> {
 }
 
 fn replay_curl_command(bundle_dir: &Path) -> String {
-    replay_curl_argv(bundle_dir)
-        .iter()
+    shell_command(&replay_curl_argv(bundle_dir))
+}
+
+fn replay_bundle_argv(bundle_dir: &Path) -> Vec<String> {
+    vec![
+        "cargo".to_string(),
+        "run".to_string(),
+        "-p".to_string(),
+        "ferrum-cli".to_string(),
+        "--".to_string(),
+        "replay-bundle".to_string(),
+        bundle_dir.to_string_lossy().to_string(),
+        "--out".to_string(),
+        bundle_dir
+            .join("engine_replay")
+            .to_string_lossy()
+            .to_string(),
+        "--json".to_string(),
+    ]
+}
+
+fn shell_command(argv: &[String]) -> String {
+    argv.iter()
         .map(|part| shell_quote(part))
         .collect::<Vec<_>>()
         .join(" ")
@@ -5030,6 +5058,11 @@ mod tests {
             item.as_str()
                 .is_some_and(|value| value.starts_with('@') && value.ends_with("replay_body.json"))
         }));
+        assert_eq!(replay["engine_replay"]["requires_http_server"], false);
+        let engine_argv = replay["engine_replay"]["argv"]
+            .as_array()
+            .expect("engine replay argv");
+        assert!(engine_argv.iter().any(|item| item == "replay-bundle"));
     }
 
     fn router_with_capturing_llm_and_template(
