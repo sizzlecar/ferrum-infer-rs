@@ -829,6 +829,10 @@ impl FerrumConfigBuilder {
             fa2_native_manifest.as_ref(),
             fa2_native_artifact.as_ref(),
         ));
+        decisions.push(self.fa2_native_runtime_selection_decision(
+            fa2_native_manifest.as_ref(),
+            fa2_native_artifact.as_ref(),
+        ));
         decisions.push(
             self.attention_decode_decision(use_vllm_paged_attn.clone(), vllm_v1_short.clone()),
         );
@@ -1790,6 +1794,50 @@ impl FerrumConfigBuilder {
                     (
                         "not_configured",
                         "typed FA2 native operator manifest/artifact is present",
+                    ),
+                ],
+            ),
+            vec![
+                RuntimeConfigEffect::Correctness,
+                RuntimeConfigEffect::Performance,
+            ],
+        )
+    }
+
+    fn fa2_native_runtime_selection_decision(
+        &self,
+        manifest: Option<&ResolvedValue<String>>,
+        artifact: Option<&ResolvedValue<String>>,
+    ) -> AutoConfigDecision {
+        let configured = manifest.is_some() && artifact.is_some();
+        let selected = if configured {
+            "not_selected"
+        } else {
+            "not_configured"
+        };
+        let (source, source_key) = manifest
+            .map(|manifest| (manifest.source, manifest.source_key.clone()))
+            .unwrap_or((AutoConfigSource::Default, None));
+        self.decision(
+            "fa2_native_operator_runtime_selection",
+            selected,
+            source,
+            source_key,
+            ["selected", "not_selected", "not_configured"],
+            self.rejected_except(
+                selected,
+                [
+                    (
+                        "selected",
+                        "FA2 native runtime dispatch requires artifact-selected actual model smoke and retention evidence",
+                    ),
+                    (
+                        "not_selected",
+                        "typed FA2 native operator manifest/artifact is present",
+                    ),
+                    (
+                        "not_configured",
+                        "no typed FA2 native operator manifest/artifact was configured",
                     ),
                 ],
             ),
@@ -3098,6 +3146,10 @@ mod tests {
             .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
             .collect();
         assert_eq!(decisions["fa2_native_operator_artifact"], "configured");
+        assert_eq!(
+            decisions["fa2_native_operator_runtime_selection"],
+            "not_selected"
+        );
         assert_ne!(decisions["attention_prefill_mixed_backend"], "fa2_native");
         assert!(resolved
             .runtime_config
@@ -3105,6 +3157,25 @@ mod tests {
             .iter()
             .any(|entry| entry.key == FA2_NATIVE_MANIFEST_KEY
                 && entry.source == RuntimeConfigSource::Env));
+    }
+
+    #[test]
+    fn fa2_native_runtime_selection_is_explicit_when_not_configured() {
+        let resolved = m3(&[], CompiledKernelFeatures::m3_fast_path_without_fa2())
+            .resolve()
+            .unwrap();
+        let decision = resolved
+            .decisions
+            .iter()
+            .find(|decision| decision.selection == "fa2_native_operator_runtime_selection")
+            .unwrap();
+        assert_eq!(decision.selected, "not_configured");
+        assert!(decision.rejected.iter().any(|candidate| {
+            candidate.value == "selected"
+                && candidate
+                    .reason
+                    .contains("artifact-selected actual model smoke")
+        }));
     }
 
     #[test]

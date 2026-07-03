@@ -192,6 +192,32 @@
     },
     {
       "affects": [
+        "correctness",
+        "performance"
+      ],
+      "candidates": [
+        "selected",
+        "not_selected",
+        "not_configured"
+      ],
+      "rejected": [
+        {
+          "reason": "FA2 native runtime dispatch requires artifact-selected actual model smoke and retention evidence",
+          "value": "selected"
+        },
+        {
+          "reason": "typed FA2 native operator manifest/artifact is present",
+          "value": "not_selected"
+        }
+      ],
+      "schema_version": 1,
+      "selected": "not_configured",
+      "selection": "fa2_native_operator_runtime_selection",
+      "source": "default",
+      "source_key": null
+    },
+    {
+      "affects": [
         "performance"
       ],
       "candidates": [
