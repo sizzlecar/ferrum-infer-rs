@@ -1448,6 +1448,21 @@ def run_selftest_in_root(root: Path, out: Path | None = None) -> dict[str, Any]:
         lambda: validate_profile_group(bad_profile / "run", "run"),
         "actual_model_smoke",
     )
+    bad_memory_profile = root / "bad-memory-profile"
+    write_selftest_profile_group(bad_memory_profile, "run")
+    memory_events = read_jsonl(bad_memory_profile / "run/memory_profile.jsonl")
+    for event in memory_events:
+        attrs = event.get("attributes") or {}
+        if attrs.get("memory_stage") == "cache_allocated":
+            attrs["available_kv_or_state_bytes"] = -1
+            break
+    else:
+        raise SmokeError("selftest fixture did not include cache_allocated memory stage")
+    write_jsonl(bad_memory_profile / "run/memory_profile.jsonl", memory_events)
+    bad_available_kv_error = assert_raises(
+        lambda: validate_profile_group(bad_memory_profile / "run", "run"),
+        "available_kv_or_state_bytes",
+    )
 
     failure_out = root / "failure-artifact"
     failure_args = argparse.Namespace(
@@ -1519,6 +1534,7 @@ def run_selftest_in_root(root: Path, out: Path | None = None) -> dict[str, Any]:
         "local_snapshot_identity": local_snapshot_identity,
         "negative_cases": {
             "bad_profile": bad_profile_error,
+            "negative_available_kv_or_state_bytes": bad_available_kv_error,
             "all_skipped_replay": all_skipped_replay_error,
             "skipped_run_replay": skipped_run_replay_error,
             "missing_engine_replay": missing_engine_replay_error,
