@@ -694,11 +694,117 @@ def validate_product_scenario_coverage(summary: dict[str, Any]) -> None:
     )
 
 
+def validate_product_actual_smoke_summary(
+    summary: dict[str, Any],
+    expected_sha: str,
+    *,
+    stage_dir: Path,
+) -> None:
+    actual_smoke = summary.get("actual_smoke")
+    require(
+        isinstance(actual_smoke, dict),
+        "product_sentinel.summary.actual_smoke must be an object",
+    )
+    require(actual_smoke.get("status") == "pass", "product_sentinel.summary.actual_smoke.status must be pass")
+    require_git_sha(actual_smoke, "product_sentinel.summary.actual_smoke", expected_sha)
+    require(
+        actual_smoke.get("git_dirty") is False,
+        "product_sentinel.summary.actual_smoke.git_dirty must be false",
+    )
+    require_real_pass_line(
+        actual_smoke.get("pass_line"),
+        "product_sentinel.summary.actual_smoke",
+    )
+    actual_smoke_path_value = actual_smoke.get("actual_smoke")
+    require(
+        isinstance(actual_smoke_path_value, str) and actual_smoke_path_value.strip(),
+        "product_sentinel.summary.actual_smoke.actual_smoke must be non-empty",
+    )
+    actual_smoke_path = resolve_path(actual_smoke_path_value, base=stage_dir)
+    require(
+        actual_smoke_path.is_dir(),
+        f"product_sentinel.summary.actual_smoke.actual_smoke must exist: {actual_smoke_path}",
+    )
+    for key in ("model", "requested_backend", "effective_backend", "profile_detail"):
+        value = actual_smoke.get(key)
+        require(
+            isinstance(value, str) and value.strip(),
+            f"product_sentinel.summary.actual_smoke.{key} must be non-empty",
+        )
+    replay_bundle_count = actual_smoke.get("replay_bundle_count")
+    require(
+        isinstance(replay_bundle_count, int) and replay_bundle_count > 0,
+        "product_sentinel.summary.actual_smoke.replay_bundle_count must be positive",
+    )
+    offline_replay_execution_count = actual_smoke.get("offline_replay_execution_count")
+    offline_replay_skipped_count = actual_smoke.get("offline_replay_skipped_count")
+    live_replay_execution_count = actual_smoke.get("live_replay_execution_count")
+    require(
+        isinstance(offline_replay_execution_count, int) and offline_replay_execution_count > 0,
+        "product_sentinel.summary.actual_smoke.offline_replay_execution_count must be positive",
+    )
+    require(
+        isinstance(offline_replay_skipped_count, int) and offline_replay_skipped_count >= 0,
+        "product_sentinel.summary.actual_smoke.offline_replay_skipped_count must be non-negative",
+    )
+    require(
+        offline_replay_skipped_count < replay_bundle_count,
+        "product_sentinel.summary.actual_smoke.offline replay must not skip all bundles",
+    )
+    require(
+        isinstance(live_replay_execution_count, int) and live_replay_execution_count > 0,
+        "product_sentinel.summary.actual_smoke.live_replay_execution_count must be positive",
+    )
+    entrypoints = set(require_string_list(
+        actual_smoke.get("entrypoints", []),
+        "product_sentinel.summary.actual_smoke.entrypoints",
+    ))
+    missing_entrypoints = sorted({"run", "serve"} - entrypoints)
+    require(
+        not missing_entrypoints,
+        f"product_sentinel.summary.actual_smoke.entrypoints missing {missing_entrypoints}",
+    )
+    profile_groups = actual_smoke.get("profile_groups")
+    require(
+        isinstance(profile_groups, dict),
+        "product_sentinel.summary.actual_smoke.profile_groups must be an object",
+    )
+    for entrypoint in ("run", "serve"):
+        group = profile_groups.get(entrypoint)
+        require(
+            isinstance(group, dict),
+            f"product_sentinel.summary.actual_smoke.profile_groups.{entrypoint} must be an object",
+        )
+        for label in ("profile", "memory", "scheduler"):
+            item = group.get(label)
+            require(
+                isinstance(item, dict),
+                f"product_sentinel.summary.actual_smoke.profile_groups.{entrypoint}.{label} must be an object",
+            )
+            path = item.get("path")
+            event_count = item.get("event_count")
+            require(
+                isinstance(path, str) and path.strip(),
+                f"product_sentinel.summary.actual_smoke.profile_groups.{entrypoint}.{label}.path must be non-empty",
+            )
+            require(
+                isinstance(event_count, int) and event_count > 0,
+                f"product_sentinel.summary.actual_smoke.profile_groups.{entrypoint}.{label}.event_count must be positive",
+            )
+        for key in ("request_dump", "replay_command"):
+            value = group.get(key)
+            require(
+                isinstance(value, str) and value.strip(),
+                f"product_sentinel.summary.actual_smoke.profile_groups.{entrypoint}.{key} must be non-empty",
+            )
+
+
 def validate_product_sentinel(root: Path, expected_sha: str) -> dict[str, Any]:
     stage = load_stage_manifest(root, "product_sentinel", "PRODUCT BACKEND SENTINEL PASS", expected_sha)
     summary = load_summary_from_manifest(stage, "product_backend_sentinel_summary.json")
     require(summary.get("failed") == 0, "product_sentinel.summary.failed must be 0")
     validate_product_scenario_coverage(summary)
+    validate_product_actual_smoke_summary(summary, expected_sha, stage_dir=root)
     failure_links = summary.get("failure_links")
     require(isinstance(failure_links, list), "product_sentinel.summary.failure_links must be a list")
     required_failure_kinds = {"bad_output", "oom_admission", "panic_error"}
@@ -1737,6 +1843,20 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
     )
 
     product = root / "product"
+    product_actual_smoke = product / "actual-smoke"
+    product_actual_smoke.mkdir(parents=True, exist_ok=True)
+    product_profile_groups = {}
+    for entrypoint in ("run", "serve"):
+        entry_dir = product_actual_smoke / entrypoint
+        request_dump = entry_dir / "request_dump"
+        request_dump.mkdir(parents=True, exist_ok=True)
+        product_profile_groups[entrypoint] = {
+            "profile": {"path": str(entry_dir / "profile.jsonl"), "event_count": 1},
+            "memory": {"path": str(entry_dir / "memory_profile.jsonl"), "event_count": 1},
+            "scheduler": {"path": str(entry_dir / "scheduler_trace.jsonl"), "event_count": 4},
+            "request_dump": str(request_dump / "request.json"),
+            "replay_command": f"ferrum {entrypoint} fixture/actual-model",
+        }
     product_scenarios = [
         {
             "name": "profile_run_serve",
@@ -1822,6 +1942,23 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
                     "failure_diagnostics": "fixtures/panic-error/failure_diagnostics.json",
                 },
             ],
+            "actual_smoke": {
+                "status": "pass",
+                "actual_smoke": str(product_actual_smoke),
+                "git_sha": sha,
+                "git_dirty": False,
+                "pass_line": f"PRODUCT OBSERVABILITY L1 SMOKE PASS: {product_actual_smoke}",
+                "model": "fixture/actual-model",
+                "requested_backend": "metal",
+                "effective_backend": "metal",
+                "profile_detail": "basic",
+                "entrypoints": ["run", "serve"],
+                "profile_groups": product_profile_groups,
+                "replay_bundle_count": 2,
+                "offline_replay_execution_count": 1,
+                "offline_replay_skipped_count": 1,
+                "live_replay_execution_count": 1,
+            },
         },
     )
 
@@ -2352,6 +2489,38 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("missing product failure links unexpectedly passed final gate")
         except GoalGateError as exc:
             require("failure_links missing" in str(exc), f"unexpected product sentinel error: {exc}")
+        bad_product_actual_smoke = root / "bad-product-actual-smoke"
+        artifacts_bad_product_actual_smoke = selftest_artifacts(
+            root / "bad-product-actual-smoke-fixtures",
+            sha,
+        )
+        bad_product_actual_smoke_summary_path = (
+            artifacts_bad_product_actual_smoke["product"] / "product_backend_sentinel_summary.json"
+        )
+        bad_product_actual_smoke_summary = read_json(bad_product_actual_smoke_summary_path)
+        bad_product_actual_smoke_summary.pop("actual_smoke", None)
+        write_json(bad_product_actual_smoke_summary_path, bad_product_actual_smoke_summary)
+        args_bad_product_actual_smoke = argparse.Namespace(
+            out=bad_product_actual_smoke,
+            resource_invariant=artifacts_bad_product_actual_smoke["resource"],
+            change_impact=artifacts_bad_product_actual_smoke["change"],
+            product_sentinel=artifacts_bad_product_actual_smoke["product"],
+            model_contract=artifacts_bad_product_actual_smoke["model"],
+            support_matrix_contract=artifacts_bad_product_actual_smoke["support_matrix"],
+            observability_profile=artifacts_bad_product_actual_smoke["observability"],
+            native_operator=artifacts_bad_product_actual_smoke["native"],
+            actual_model_regression_summary=artifacts_bad_product_actual_smoke["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_product_actual_smoke)
+            raise AssertionError("missing product actual-smoke unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "product_sentinel.summary.actual_smoke" in str(exc),
+                f"unexpected product actual-smoke error: {exc}",
+            )
         bad_product_scenario = root / "bad-product-scenario"
         artifacts_bad_product_scenario = selftest_artifacts(
             root / "bad-product-scenario-fixtures",
