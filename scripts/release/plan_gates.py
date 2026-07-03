@@ -6,16 +6,32 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+GOAL = "release-regression-hardening-2026-06-28"
 DEFAULT_RULES = REPO_ROOT / "scripts/release/change_impact_rules.json"
 DEFAULT_FIXTURES = REPO_ROOT / "scripts/release/fixtures/change_impact/planner_fixtures.json"
 PASS_LINE = "CHANGE IMPACT GATE PLAN PASS"
 SELFTEST_PASS_LINE = "CHANGE IMPACT GATE PLAN SELFTEST PASS"
+FINAL_STAGE_GATES = {
+    "actual_model_regression",
+    "model_contract",
+    "native_operator",
+    "observability_profile",
+    "product_sentinel",
+    "resource_invariant",
+    "support_matrix_contract",
+}
+SECRET_ENV_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "AUTH", "CREDENTIAL", "KEY")
+SAFE_ENV_NAMES = {"CI", "CARGO_HOME", "HF_HOME", "HOME", "PATH", "RUSTFLAGS", "RUST_BACKTRACE", "RUST_LOG"}
+SAFE_ENV_PREFIXES = ("CARGO_", "FERRUM_", "HF_", "RUST_")
 
 
 class PlannerError(RuntimeError):
@@ -43,6 +59,27 @@ def run_git(args: list[str]) -> str:
     return proc.stdout
 
 
+def git_value(args: list[str], default: str = "unknown") -> str:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return default
+    return proc.stdout.strip() or default
+
+
+def resolve_git_rev(value: str) -> str:
+    if not value:
+        return value
+    resolved = git_value(["rev-parse", value], default="")
+    return resolved or value
+
+
 def git_changed_files(base: str, head: str) -> list[str]:
     out = run_git(["diff", "--name-only", f"{base}..{head}"])
     return sorted(line.strip() for line in out.splitlines() if line.strip())
@@ -50,6 +87,20 @@ def git_changed_files(base: str, head: str) -> list[str]:
 
 def git_dirty() -> bool:
     return bool(run_git(["status", "--short"]).strip())
+
+
+def git_dirty_files() -> list[str]:
+    return [line for line in run_git(["status", "--short"]).splitlines() if line.strip()]
+
+
+def sanitized_env() -> dict[str, str]:
+    safe: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if any(marker in key.upper() for marker in SECRET_ENV_MARKERS):
+            continue
+        if key in SAFE_ENV_NAMES or any(key.startswith(prefix) for prefix in SAFE_ENV_PREFIXES):
+            safe[key] = value
+    return dict(sorted(safe.items()))
 
 
 def normalize_changed_files(files: list[str]) -> list[str]:
@@ -129,6 +180,59 @@ def artifact_id(artifact: dict[str, Any], index: int) -> str:
     return str(raw)
 
 
+def stage_spec(value: str) -> tuple[str, Path]:
+    if "=" not in value:
+        raise PlannerError("--stage-artifact entries must use GATE=ARTIFACT_DIR")
+    gate, raw_path = value.split("=", 1)
+    gate = gate.strip()
+    if not gate:
+        raise PlannerError("--stage-artifact gate name must be non-empty")
+    if gate not in FINAL_STAGE_GATES:
+        raise PlannerError(f"--stage-artifact gate must be one of {sorted(FINAL_STAGE_GATES)}: {gate}")
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = (REPO_ROOT / path).resolve()
+    return gate, path
+
+
+def read_stage_manifest(artifact_dir: Path) -> dict[str, Any]:
+    manifest_path = artifact_dir / "gate.manifest.json"
+    if not manifest_path.exists():
+        raise PlannerError(f"{artifact_dir}: missing gate.manifest.json")
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise PlannerError(f"{manifest_path}: expected JSON object")
+    return data
+
+
+def normalize_stage_artifact(value: str, head_sha: str) -> dict[str, Any]:
+    gate, artifact_dir = stage_spec(value)
+    if not artifact_dir.is_dir():
+        raise PlannerError(f"{artifact_dir}: stage artifact directory does not exist")
+    manifest = read_stage_manifest(artifact_dir)
+    pass_line = str(manifest.get("pass_line") or "")
+    if " PASS:" not in pass_line:
+        raise PlannerError(f"{artifact_dir}: gate.manifest.json pass_line must contain ' PASS:'")
+    git_sha = str(manifest.get("git_sha") or "")
+    artifact_dirty = bool(manifest.get("git_dirty"))
+    artifact = {
+        "id": gate,
+        "gate": gate,
+        "artifact_dir": str(artifact_dir),
+        "pass_line": pass_line,
+        "git_sha": git_sha,
+        "git_dirty": artifact_dirty,
+        "impact_domains": list(manifest.get("impact_domains") or []),
+        "strict_current": True,
+        "manifest": str(artifact_dir / "gate.manifest.json"),
+    }
+    if git_sha != head_sha:
+        artifact["stale_reason"] = "stage artifact git_sha does not match planned head"
+    if artifact_dirty:
+        artifact["stale_reason"] = "stage artifact was produced from a dirty tree"
+    return artifact
+
+
 def stale_artifact_invalidations(
     previous_artifacts: list[dict[str, Any]],
     impact_domains: set[str],
@@ -143,8 +247,14 @@ def stale_artifact_invalidations(
         artifact_domains = set(str(item) for item in artifact.get("impact_domains", []) if item)
         intersects = bool(artifact_domains & impact_domains)
         artifact_sha = str(artifact.get("git_sha") or "")
+        artifact_dirty = bool(artifact.get("git_dirty"))
+        strict_current = bool(artifact.get("strict_current"))
         aid = artifact_id(artifact, index)
-        if intersects and artifact_sha != head_sha:
+        if (strict_current and artifact_sha != head_sha) or (strict_current and artifact_dirty):
+            invalidated.append(f"artifact:{aid}")
+            reason = artifact.get("stale_reason") or "strict stage artifact is not current"
+            stale.append({**artifact, "id": aid, "stale_reason": reason})
+        elif intersects and artifact_sha != head_sha:
             invalidated.append(f"artifact:{aid}")
             stale.append({**artifact, "id": aid, "stale_reason": "impact domain changed after artifact"})
         else:
@@ -160,6 +270,7 @@ def plan_from_files(
     dirty: bool,
     rules: list[dict[str, Any]],
     previous_artifacts: list[dict[str, Any]] | None = None,
+    required_gate_overrides: set[str] | None = None,
 ) -> dict[str, Any]:
     changed_files = normalize_changed_files(changed_files)
     impact_domains: set[str] = set()
@@ -207,6 +318,7 @@ def plan_from_files(
         impact_domains,
         head_sha,
     )
+    required_gates.update(required_gate_overrides or set())
     invalidated.update(artifact_invalidations)
     status = "fail" if unknown_files else "pass"
     return {
@@ -303,6 +415,75 @@ def write_outputs(out: Path, plan: dict[str, Any], selfcheck: dict[str, Any] | N
     )
 
 
+def write_standard_artifact_files(
+    out: Path,
+    *,
+    plan: dict[str, Any],
+    selfcheck: dict[str, Any] | None,
+    started_at: int,
+    ended_at: int,
+    pass_line: str,
+    command: list[str],
+    rules: Path,
+    fixtures: Path,
+) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "failures").mkdir(exist_ok=True)
+    (out / "diagnostics").mkdir(exist_ok=True)
+    dirty_files = git_dirty_files()
+    (out / "pass_line.txt").write_text(pass_line + "\n", encoding="utf-8")
+    (out / "command.log").write_text(" ".join(command) + "\n", encoding="utf-8")
+    (out / "git_status.txt").write_text(run_git(["status", "--short"]), encoding="utf-8")
+    (out / "sanitized_env.json").write_text(
+        json.dumps(sanitized_env(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "schema_version": 1,
+        "goal": GOAL,
+        "phase": "change_impact",
+        "status": plan["status"],
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_sec": ended_at - started_at,
+        "repo_root": str(REPO_ROOT),
+        "git_sha": plan["head_sha"],
+        "git_branch": git_value(["rev-parse", "--abbrev-ref", "HEAD"]),
+        "git_dirty": bool(dirty_files),
+        "dirty_files": dirty_files,
+        "command": command,
+        "artifact_dir": str(out),
+        "pass_line": pass_line,
+        "inputs": {
+            "rules": str(rules),
+            "fixtures": str(fixtures),
+            "base_sha": plan["base_sha"],
+            "head_sha": plan["head_sha"],
+            "changed_files": plan["changed_files"],
+            "previous_artifact_count": len(plan["previous_artifacts"]),
+        },
+        "outputs": {
+            "gate_plan": str(out / "gate_plan.json"),
+            "gate_plan_markdown": str(out / "gate_plan.md"),
+            "release_candidate_manifest": str(out / "release_candidate_manifest.json"),
+            "planner_selfcheck": str(out / "planner_selfcheck.json"),
+            "changed_files": str(out / "changed_files.json"),
+        },
+        "validation_summary": {
+            "impact_domains": plan["impact_domains"],
+            "required_gates": plan["required_gates"],
+            "unknown_file_count": len(plan["unknown_files"]),
+            "stale_artifact_count": len(plan["stale_artifacts"]),
+            "satisfied_artifact_count": len(plan["satisfied_artifacts"]),
+            "planner_selfcheck_status": (selfcheck or {}).get("status", "not_run"),
+        },
+    }
+    (out / "gate.manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def assert_contains(label: str, actual: list[str], expected: list[str]) -> list[str]:
     missing = sorted(set(expected) - set(actual))
     return [f"{label} missing expected values: {missing}"] if missing else []
@@ -336,7 +517,11 @@ def run_selftest(rules: list[dict[str, Any]], fixtures_path: Path) -> dict[str, 
             dirty=False,
             rules=rules,
             previous_artifacts=list(fixture.get("previous_artifacts") or []),
+            required_gate_overrides=FINAL_STAGE_GATES
+            if fixture.get("require_final_stage_gates")
+            else set(),
         )
+        release_candidate = release_candidate_manifest(plan)
         fixture_failures: list[str] = []
         expected_status = fixture.get("expect_status", "pass")
         if plan["status"] != expected_status:
@@ -364,6 +549,16 @@ def run_selftest(rules: list[dict[str, Any]], fixtures_path: Path) -> dict[str, 
             plan["invalidated_previous_gates"],
             list(fixture.get("expect_invalidated_contains") or []),
         )
+        fixture_failures += assert_contains(
+            "satisfied_gates",
+            release_candidate["satisfied_gates"],
+            list(fixture.get("expect_satisfied_gates") or []),
+        )
+        if "expect_artifact_path_count" in fixture:
+            actual_count = len(release_candidate["artifact_paths"])
+            expected_count = int(fixture["expect_artifact_path_count"])
+            if actual_count != expected_count:
+                fixture_failures.append(f"artifact_paths count {actual_count} != {expected_count}")
         if fixture_failures:
             failures.extend(f"{fid}: {failure}" for failure in fixture_failures)
         fixture_results.append(
@@ -404,6 +599,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head")
     parser.add_argument("--changed-file", action="append", default=[])
     parser.add_argument("--previous-artifact", action="append", type=Path, default=[])
+    parser.add_argument(
+        "--stage-artifact",
+        action="append",
+        default=[],
+        help="final goal stage evidence as GATE=ARTIFACT_DIR; reads ARTIFACT_DIR/gate.manifest.json",
+    )
+    parser.add_argument(
+        "--require-final-stage-gates",
+        action="store_true",
+        help="force the final goal stage gates into required_gates for release candidate aggregation",
+    )
     parser.add_argument("--rules", type=Path, default=DEFAULT_RULES)
     parser.add_argument("--fixtures", type=Path, default=DEFAULT_FIXTURES)
     parser.add_argument("--out", type=Path)
@@ -412,21 +618,34 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    started_at = int(time.time())
     args = parse_args()
     rules = load_rules(args.rules)
     if args.self_test:
         selfcheck = run_selftest(rules, args.fixtures)
         if args.out:
+            plan = plan_from_files(
+                changed_files=[],
+                base_sha="self-test",
+                head_sha="self-test",
+                dirty=False,
+                rules=rules,
+            )
             write_outputs(
                 args.out,
-                plan_from_files(
-                    changed_files=[],
-                    base_sha="self-test",
-                    head_sha="self-test",
-                    dirty=False,
-                    rules=rules,
-                ),
+                plan,
                 selfcheck,
+            )
+            write_standard_artifact_files(
+                args.out,
+                plan=plan,
+                selfcheck=selfcheck,
+                started_at=started_at,
+                ended_at=int(time.time()),
+                pass_line=f"{SELFTEST_PASS_LINE}: {args.out}",
+                command=sys.argv,
+                rules=args.rules,
+                fixtures=args.fixtures,
             )
         if selfcheck["status"] != "pass":
             raise PlannerError("\n".join(selfcheck["failures"]))
@@ -436,28 +655,43 @@ def main() -> int:
 
     if args.changed_file:
         changed_files = normalize_changed_files(args.changed_file)
-        base_sha = args.base or "manual-base"
-        head_sha = args.head or "manual-head"
+        base_sha = resolve_git_rev(args.base) if args.base else "manual-base"
+        head_sha = resolve_git_rev(args.head) if args.head else "manual-head"
     else:
         if not args.base or not args.head:
             raise PlannerError("provide --base and --head, or one or more --changed-file entries")
         changed_files = git_changed_files(args.base, args.head)
-        base_sha = args.base
-        head_sha = args.head
+        base_sha = resolve_git_rev(args.base)
+        head_sha = resolve_git_rev(args.head)
+    previous_artifacts = load_previous_artifacts(args.previous_artifact)
+    previous_artifacts.extend(normalize_stage_artifact(value, head_sha) for value in args.stage_artifact)
     plan = plan_from_files(
         changed_files=changed_files,
         base_sha=base_sha,
         head_sha=head_sha,
         dirty=git_dirty(),
         rules=rules,
-        previous_artifacts=load_previous_artifacts(args.previous_artifact),
+        previous_artifacts=previous_artifacts,
+        required_gate_overrides=FINAL_STAGE_GATES if args.require_final_stage_gates else set(),
     )
     if args.out is None:
         raise PlannerError("--out is required for non-self-test runs")
     write_outputs(args.out, plan)
+    pass_line = f"{PASS_LINE}: {args.out}"
+    write_standard_artifact_files(
+        args.out,
+        plan=plan,
+        selfcheck=None,
+        started_at=started_at,
+        ended_at=int(time.time()),
+        pass_line=pass_line,
+        command=sys.argv,
+        rules=args.rules,
+        fixtures=args.fixtures,
+    )
     if plan["status"] != "pass":
         raise PlannerError(f"gate plan failed: unknown_files={plan['unknown_files']}")
-    print(f"{PASS_LINE}: {args.out}")
+    print(pass_line)
     return 0
 
 
