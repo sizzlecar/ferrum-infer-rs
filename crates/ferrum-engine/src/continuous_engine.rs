@@ -794,6 +794,12 @@ impl SequencePhysicalResources {
     }
 }
 
+#[derive(Debug, Default)]
+struct SequenceCompletionResources {
+    physical: SequencePhysicalResources,
+    request_slot: Option<RequestSlotLease>,
+}
+
 #[derive(Debug, Clone)]
 struct SequenceDecodeResources {
     seq_id: String,
@@ -1047,6 +1053,13 @@ impl SequenceState {
         self.phase = RequestPhase::Waiting;
         self.tokens_this_iteration = 0;
         resources
+    }
+
+    fn take_completion_resources(&mut self) -> SequenceCompletionResources {
+        SequenceCompletionResources {
+            physical: self.take_physical_resources(),
+            request_slot: self.request_slot.take(),
+        }
     }
 
     fn model_cache_ref_update_for(&self, cache_id: &str) -> ModelCacheRefUpdate {

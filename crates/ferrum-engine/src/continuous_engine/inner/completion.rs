@@ -150,7 +150,7 @@ impl EngineInner {
         request_id: &RequestId,
         finish_reason: FinishReason,
     ) -> Result<()> {
-        let (response, stream_sender, response_sender, physical_resources, request_slot) = {
+        let (response, stream_sender, response_sender, completion_resources) = {
             let mut sequences = self.sequences.write();
             if let Some(mut seq) = sequences.remove(request_id) {
                 let text = self
@@ -185,25 +185,23 @@ impl EngineInner {
                     api_response,
                 };
 
-                let physical_resources = seq.take_physical_resources();
-                let request_slot = seq.request_slot.take();
+                let completion_resources = seq.take_completion_resources();
                 (
                     response,
                     seq.stream_sender.take(),
                     seq.response_sender.take(),
-                    physical_resources,
-                    request_slot,
+                    completion_resources,
                 )
             } else {
                 return Ok(());
             }
         };
 
-        self.release_sequence_physical_resources(request_id, physical_resources)
+        self.release_sequence_physical_resources(request_id, completion_resources.physical)
             .await;
 
         let scheduler_complete = self.scheduler.complete(request_id.clone(), &response).await;
-        if let Some(request_slot) = request_slot {
+        if let Some(request_slot) = completion_resources.request_slot {
             request_slot.close(self);
         }
         scheduler_complete?;

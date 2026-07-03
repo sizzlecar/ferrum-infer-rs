@@ -1523,6 +1523,45 @@ fn sequence_state_drop_with_owned_request_slot_panics_in_tests() {
     sequence.request_slot = Some(RequestSlotLease::open(&engine.inner, request.id));
 }
 
+#[test]
+fn sequence_take_completion_resources_moves_request_slot_and_physical_resources_together() {
+    let engine = test_continuous_engine();
+    let request = policy_request();
+    let request_id = request.id.clone();
+    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
+    let model_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        request_id.clone(),
+        1,
+        1,
+    ));
+    let model_cache_id = model_kv.cache_id();
+    sequence.install_model_kv(model_kv, Some(2));
+
+    let mut request_slot = RequestSlotLease::open(&engine.inner, request_id.clone());
+    request_slot.admit(&engine.inner);
+    sequence.request_slot = Some(request_slot);
+
+    let completion_resources = sequence.take_completion_resources();
+
+    assert_eq!(
+        completion_resources.physical.kv_allocation,
+        Some(SequenceKvAllocation::new(request_id.clone(), Some(2)))
+    );
+    assert_eq!(
+        completion_resources.physical.model_cache_id(),
+        Some(model_cache_id.as_str())
+    );
+    assert!(completion_resources.request_slot.is_some());
+    assert!(sequence.kv_cache_handle().is_none());
+    assert!(sequence.model_cache_id().is_none());
+    assert!(sequence.request_slot.is_none());
+
+    completion_resources
+        .request_slot
+        .expect("request slot")
+        .close(&engine.inner);
+}
+
 #[tokio::test]
 async fn sequence_take_physical_resources_for_recompute_clears_owned_resources() {
     let request = policy_request();
