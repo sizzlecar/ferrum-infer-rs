@@ -248,10 +248,7 @@ impl EngineInner {
                             Some(self.tokenizer.as_ref()),
                         )?;
                         seq.generated_tokens.push(token);
-                        seq.model_cache_id = Some(cloned_kv.cache_id());
-                        seq.kv_cache = Some(cloned_kv);
-                        seq.prefill_complete = true;
-                        seq.phase = RequestPhase::Decoding;
+                        seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
                         token
                     };
                     self.scheduler.mark_prefill_complete(rid, num_tokens);
@@ -631,13 +628,13 @@ impl EngineInner {
                     {
                         let mut sequences = self.sequences.write();
                         if let Some(seq) = sequences.get_mut(&work.rid) {
-                            seq.model_cache_id = Some(cache_id);
-                            seq.kv_cache = Some(model_kv);
-                            seq.kv_resource_blocks = work.kv_resource_blocks;
-                            seq.recurrent_state = unified.items[i].recurrent_state.clone();
-                            seq.prefill_tokens_processed =
-                                work.chunk_start.saturating_add(work.chunk_len);
-                            seq.phase = RequestPhase::Prefilling;
+                            seq.commit_prefill_chunk_physical_resources(
+                                model_kv,
+                                work.kv_resource_blocks,
+                                unified.items[i].recurrent_state.clone(),
+                                work.chunk_start.saturating_add(work.chunk_len),
+                                false,
+                            );
                         }
                     }
                     self.scheduler.mark_prefill_chunk_processed(
@@ -695,13 +692,13 @@ impl EngineInner {
                     )?
                 };
                 seq.generated_tokens.push(token);
-                seq.model_cache_id = Some(cache_id.clone());
-                seq.kv_cache = Some(model_kv);
-                seq.kv_resource_blocks = work.kv_resource_blocks;
-                seq.recurrent_state = unified.items[i].recurrent_state.clone();
-                seq.prefill_tokens_processed = num_tokens;
-                seq.prefill_complete = true;
-                seq.phase = RequestPhase::Decoding;
+                seq.commit_prefill_chunk_physical_resources(
+                    model_kv,
+                    work.kv_resource_blocks,
+                    unified.items[i].recurrent_state.clone(),
+                    num_tokens,
+                    true,
+                );
                 Ok::<Option<(TokenId, u64)>, FerrumError>(Some((
                     token,
                     seq.start_time.elapsed().as_micros() as u64,

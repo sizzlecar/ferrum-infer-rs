@@ -908,6 +908,17 @@ impl SequenceState {
         self.kv_resource_blocks = None;
     }
 
+    fn commit_cached_prefill_physical_resources(
+        &mut self,
+        kv_cache: Arc<dyn KvCacheHandle>,
+        prefill_tokens_processed: usize,
+    ) {
+        self.install_model_kv_without_owned_blocks(kv_cache);
+        self.prefill_tokens_processed = prefill_tokens_processed;
+        self.prefill_complete = true;
+        self.phase = RequestPhase::Decoding;
+    }
+
     fn commit_prefill_physical_resources(
         &mut self,
         kv_cache: Arc<dyn KvCacheHandle>,
@@ -922,6 +933,31 @@ impl SequenceState {
         self.recurrent_state_slots = recurrent_state_slots;
         self.prefill_complete = true;
         self.phase = RequestPhase::Decoding;
+    }
+
+    fn commit_prefill_chunk_physical_resources(
+        &mut self,
+        kv_cache: Arc<dyn KvCacheHandle>,
+        kv_resource_blocks: Option<usize>,
+        recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
+        prefill_tokens_processed: usize,
+        is_final_chunk: bool,
+    ) {
+        self.model_cache_id = Some(kv_cache.cache_id());
+        self.kv_cache = Some(kv_cache);
+        self.kv_resource_blocks = kv_resource_blocks;
+        let has_recurrent_state = recurrent_state.is_some();
+        self.recurrent_state = recurrent_state;
+        if !has_recurrent_state {
+            self.recurrent_state_slots = None;
+        }
+        self.prefill_tokens_processed = prefill_tokens_processed;
+        self.prefill_complete = is_final_chunk;
+        self.phase = if is_final_chunk {
+            RequestPhase::Decoding
+        } else {
+            RequestPhase::Prefilling
+        };
     }
 
     pub fn model_decode_logits_policy(&self) -> LogitsReturnPolicy {

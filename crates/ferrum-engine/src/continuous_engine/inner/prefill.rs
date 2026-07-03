@@ -91,9 +91,7 @@ impl EngineInner {
                         Some(self.tokenizer.as_ref()),
                     )?;
                     seq.generated_tokens.push(token);
-                    seq.install_model_kv_without_owned_blocks(cloned_kv);
-                    seq.prefill_complete = true;
-                    seq.phase = RequestPhase::Decoding;
+                    seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
                     token
                 };
 
@@ -425,10 +423,7 @@ impl EngineInner {
                             Some(self.tokenizer.as_ref()),
                         )?;
                         seq.generated_tokens.push(token);
-                        seq.model_cache_id = Some(cloned_kv.cache_id());
-                        seq.kv_cache = Some(cloned_kv);
-                        seq.prefill_complete = true;
-                        seq.phase = RequestPhase::Decoding;
+                        seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
                         token
                     };
                     self.scheduler.mark_prefill_complete(rid, num_tokens);
