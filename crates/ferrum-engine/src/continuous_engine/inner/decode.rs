@@ -452,14 +452,19 @@ impl EngineInner {
                 dtype: model_info.dtype,
                 priority: Priority::Normal,
             };
-            let draft_kv_handle = self.kv_cache.allocate(&alloc_request).await?;
-            let draft_kv_resource_blocks = self.kv_resource_blocks_for_tokens(prompt_u32s.len());
-            self.trace_kv_allocate(request_id, draft_kv_resource_blocks);
+            let draft_kv_lease = self
+                .allocate_kv_lease(
+                    request_id,
+                    draft_kv_request_id.clone(),
+                    &alloc_request,
+                    prompt_u32s.len(),
+                )
+                .await?;
+            let draft_kv_handle = draft_kv_lease.handle();
             let prompt_tensor = match self.tokens_to_tensor(&prompt_u32s) {
                 Ok(tensor) => tensor,
                 Err(e) => {
-                    let _ = self.kv_cache.deallocate(draft_kv_request_id).await;
-                    self.trace_kv_release(request_id, draft_kv_resource_blocks);
+                    draft_kv_lease.release(self).await;
                     return Err(e);
                 }
             };
@@ -467,12 +472,13 @@ impl EngineInner {
             let pfx_out = match draft_exec.prefill(&pfx).await {
                 Ok(output) => output,
                 Err(e) => {
-                    let _ = self.kv_cache.deallocate(draft_kv_request_id).await;
-                    self.trace_kv_release(request_id, draft_kv_resource_blocks);
+                    draft_kv_lease.release(self).await;
                     return Err(e);
                 }
             };
             let kv = pfx_out.kv_cache.clone();
+            let (draft_kv_request_id, draft_kv_resource_blocks) =
+                draft_kv_lease.into_committed_parts();
             {
                 let mut sequences = self.sequences.write();
                 if let Some(s) = sequences.get_mut(request_id) {

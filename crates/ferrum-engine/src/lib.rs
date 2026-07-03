@@ -55,6 +55,7 @@ pub mod parallel;
 pub mod pipeline;
 pub mod recurrent_state;
 pub mod registry;
+pub(crate) mod resource_lifecycle;
 pub mod speculative;
 pub mod tensor_factory;
 pub mod transcription_engine;

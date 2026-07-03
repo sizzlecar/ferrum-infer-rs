@@ -137,15 +137,27 @@ impl EngineInner {
             priority: Priority::Normal,
         };
 
-        // Try allocation, preempting if necessary
-        let kv_handle = match self.kv_cache.allocate(&alloc_request).await {
-            Ok(h) => h,
+        // Try allocation, preempting if necessary. The lease owns the backend
+        // allocation until the sequence state accepts it below.
+        let kv_lease = match self
+            .allocate_kv_lease(request_id, request_id.clone(), &alloc_request, num_tokens)
+            .await
+        {
+            Ok(lease) => lease,
             Err(_) => {
                 // OOM — try to free blocks by preempting a victim
                 if self.preempt_victim(request_id).await {
                     // Retry after preemption
-                    match self.kv_cache.allocate(&alloc_request).await {
-                        Ok(h) => h,
+                    match self
+                        .allocate_kv_lease(
+                            request_id,
+                            request_id.clone(),
+                            &alloc_request,
+                            num_tokens,
+                        )
+                        .await
+                    {
+                        Ok(lease) => lease,
                         Err(e) => {
                             self.release_recurrent_state(request_id).await;
                             return Err(e);
@@ -159,8 +171,8 @@ impl EngineInner {
                 }
             }
         };
-        let kv_resource_blocks = self.kv_resource_blocks_for_tokens(num_tokens);
-        self.trace_kv_allocate(request_id, kv_resource_blocks);
+        let kv_handle = kv_lease.handle();
+        let kv_resource_blocks = kv_lease.blocks();
 
         // Opt-in chunked prefill: `FERRUM_CHUNKED_PREFILL=<chunk_size>` splits
         // the prompt into sequential chunks and runs `prefill` per chunk.
@@ -189,8 +201,7 @@ impl EngineInner {
                 let chunk_tensor = match self.tokens_to_tensor(&chunk_ids) {
                     Ok(tensor) => tensor,
                     Err(e) => {
-                        let _ = self.kv_cache.deallocate(request_id.clone()).await;
-                        self.trace_kv_release(request_id, kv_resource_blocks);
+                        kv_lease.release(self).await;
                         self.release_recurrent_state(request_id).await;
                         return Err(e);
                     }
@@ -204,8 +215,7 @@ impl EngineInner {
                 let out = match self.model_executor.prefill(&input).await {
                     Ok(out) => out,
                     Err(e) => {
-                        let _ = self.kv_cache.deallocate(request_id.clone()).await;
-                        self.trace_kv_release(request_id, kv_resource_blocks);
+                        kv_lease.release(self).await;
                         self.release_recurrent_state(request_id).await;
                         return Err(e);
                     }
@@ -231,8 +241,7 @@ impl EngineInner {
                 match self.tokens_to_tensor(&token_u32s) {
                     Ok(tensor) => tensor,
                     Err(e) => {
-                        let _ = self.kv_cache.deallocate(request_id.clone()).await;
-                        self.trace_kv_release(request_id, kv_resource_blocks);
+                        kv_lease.release(self).await;
                         self.release_recurrent_state(request_id).await;
                         return Err(e);
                     }
@@ -249,8 +258,7 @@ impl EngineInner {
             match self.model_executor.prefill(&prefill_input).await {
                 Ok(out) => out,
                 Err(e) => {
-                    let _ = self.kv_cache.deallocate(request_id.clone()).await;
-                    self.trace_kv_release(request_id, kv_resource_blocks);
+                    kv_lease.release(self).await;
                     self.release_recurrent_state(request_id).await;
                     return Err(e);
                 }
@@ -296,12 +304,13 @@ impl EngineInner {
         let first_token = match first_token_result {
             Ok(token) => token,
             Err(e) => {
-                let _ = self.kv_cache.deallocate(request_id.clone()).await;
-                self.trace_kv_release(request_id, kv_resource_blocks);
+                kv_lease.release(self).await;
                 self.release_recurrent_state(request_id).await;
                 return Err(e);
             }
         };
+        let (_committed_request_id, committed_kv_resource_blocks) = kv_lease.into_committed_parts();
+        debug_assert_eq!(committed_kv_resource_blocks, kv_resource_blocks);
 
         self.scheduler.mark_prefill_complete(request_id, num_tokens);
         self.total_prefill_tokens
@@ -364,15 +373,7 @@ impl EngineInner {
         // ── Phase 1a: per-request setup (prefix cache → tokens → kv alloc) ──
         // After this loop, `to_prefill` holds only requests that need a real
         // model call. Prefix cache hits + immediate stops are handled inline.
-        let mut to_prefill: Vec<(
-            RequestId,
-            Vec<TokenId>,
-            Arc<dyn ferrum_interfaces::KvCacheHandle>,
-            Option<Arc<dyn ferrum_interfaces::RecurrentStateHandle>>,
-            std::collections::HashMap<String, serde_json::Value>,
-            bool,
-            usize,
-        )> = Vec::new();
+        let mut to_prefill: Vec<PendingBatchPrefill> = Vec::new();
 
         let model_info = self.model_executor.info();
         // Prefix cache defaults OFF on every backend. The `clone_handle`
@@ -454,12 +455,18 @@ impl EngineInner {
                 dtype: model_info.dtype,
                 priority: Priority::Normal,
             };
-            let kv_handle = match self.kv_cache.allocate(&alloc_request).await {
-                Ok(h) => h,
+            let kv_lease = match self
+                .allocate_kv_lease(rid, rid.clone(), &alloc_request, num_tokens)
+                .await
+            {
+                Ok(lease) => lease,
                 Err(_) => {
                     if self.preempt_victim(rid).await {
-                        match self.kv_cache.allocate(&alloc_request).await {
-                            Ok(h) => h,
+                        match self
+                            .allocate_kv_lease(rid, rid.clone(), &alloc_request, num_tokens)
+                            .await
+                        {
+                            Ok(lease) => lease,
                             Err(e) => {
                                 warn!("Prefill alloc deferred for {} after preempt: {}", rid, e);
                                 continue;
@@ -471,15 +478,12 @@ impl EngineInner {
                     }
                 }
             };
-            let kv_resource_blocks = self.kv_resource_blocks_for_tokens(num_tokens);
-            self.trace_kv_allocate(rid, kv_resource_blocks);
             let recurrent_state = match self.ensure_recurrent_state(rid, recurrent_state_spec).await
             {
                 Ok(state) => state,
                 Err(e) => {
                     warn!("Recurrent-state alloc failed for {}: {}", rid, e);
-                    let _ = self.kv_cache.deallocate(rid.clone()).await;
-                    self.trace_kv_release(rid, kv_resource_blocks);
+                    kv_lease.release(self).await;
                     if is_resource_exhausted_error(&e) {
                         continue;
                     }
@@ -487,14 +491,13 @@ impl EngineInner {
                     continue;
                 }
             };
-            to_prefill.push((
+            to_prefill.push(PendingBatchPrefill::new(
                 rid.clone(),
                 input_tokens,
-                kv_handle,
+                kv_lease,
                 recurrent_state,
                 metadata,
                 can_use_prefix_cache,
-                kv_resource_blocks,
             ));
         }
 
@@ -504,23 +507,22 @@ impl EngineInner {
 
         // ── Phase 1b: ONE batched model_executor.batch_prefill call ──
         let mut inputs: Vec<PrefillInput> = Vec::with_capacity(to_prefill.len());
-        for (_, tokens, kv, recurrent_state, metadata, _, _) in &to_prefill {
-            let token_u32s: Vec<u32> = tokens.iter().map(|t| t.get()).collect();
+        for pending in &to_prefill {
+            let token_u32s: Vec<u32> = pending.input_tokens.iter().map(|t| t.get()).collect();
             let tensor = match self.tokens_to_tensor(&token_u32s) {
                 Ok(tensor) => tensor,
                 Err(e) => {
-                    for (rid, _, _, _, _, _, kv_resource_blocks) in &to_prefill {
-                        let _ = self.kv_cache.deallocate(rid.clone()).await;
-                        self.trace_kv_release(rid, *kv_resource_blocks);
-                        self.release_recurrent_state(rid).await;
+                    for pending in &mut to_prefill {
+                        pending.release_resources(self).await;
                     }
                     return Err(e);
                 }
             };
+            let kv = pending.kv_handle()?;
             let input = PrefillInput::new(tensor)
-                .with_kv_cache(kv.clone())
-                .with_metadata(metadata.clone());
-            inputs.push(if let Some(state) = recurrent_state.clone() {
+                .with_kv_cache(kv)
+                .with_metadata(pending.metadata.clone());
+            inputs.push(if let Some(state) = pending.recurrent_state.clone() {
                 input.with_recurrent_state(state)
             } else {
                 input
@@ -530,19 +532,15 @@ impl EngineInner {
         let outputs = match self.model_executor.batch_prefill(&inputs).await {
             Ok(outputs) => outputs,
             Err(e) => {
-                for (rid, _, _, _, _, _, kv_resource_blocks) in &to_prefill {
-                    let _ = self.kv_cache.deallocate(rid.clone()).await;
-                    self.trace_kv_release(rid, *kv_resource_blocks);
-                    self.release_recurrent_state(rid).await;
+                for pending in &mut to_prefill {
+                    pending.release_resources(self).await;
                 }
                 return Err(e);
             }
         };
         if outputs.len() != to_prefill.len() {
-            for (rid, _, _, _, _, _, kv_resource_blocks) in &to_prefill {
-                let _ = self.kv_cache.deallocate(rid.clone()).await;
-                self.trace_kv_release(rid, *kv_resource_blocks);
-                self.release_recurrent_state(rid).await;
+            for pending in &mut to_prefill {
+                pending.release_resources(self).await;
             }
             return Err(FerrumError::internal(format!(
                 "batch_prefill returned {} outputs for {} inputs",
@@ -552,23 +550,21 @@ impl EngineInner {
         }
 
         // ── Phase 1c: per-item post-process (sample, update seq, stream, stop) ──
-        for (
-            (rid, input_tokens, _, recurrent_state, _, can_use_prefix_cache, kv_resource_blocks),
-            prefill_output,
-        ) in to_prefill.iter().zip(outputs.iter())
-        {
+        for (pending, prefill_output) in to_prefill.iter_mut().zip(outputs.iter()) {
+            let rid = pending.request_id.clone();
+            let kv_resource_blocks = pending.kv_resource_blocks()?;
             let first_token_result = (|| {
                 let last_logits = prefill_output.last_token_logits()?;
                 let logits_vec = last_logits.to_vec_f32()?;
-                if *can_use_prefix_cache {
+                if pending.can_use_prefix_cache {
                     let _ = self.prefix_cache.store_prefix(
-                        input_tokens,
+                        &pending.input_tokens,
                         prefill_output.kv_cache.clone(),
                         logits_vec.clone(),
                     );
                 }
                 let mut sequences = self.sequences.write();
-                let Some(seq) = sequences.get_mut(rid) else {
+                let Some(seq) = sequences.get_mut(&rid) else {
                     return Ok(None);
                 };
                 seq.reset_guided_processors()?;
@@ -580,39 +576,42 @@ impl EngineInner {
                 seq.generated_tokens.push(token);
                 seq.model_cache_id = Some(prefill_output.kv_cache.cache_id());
                 seq.kv_cache = Some(prefill_output.kv_cache.clone());
-                seq.kv_resource_blocks = Some(*kv_resource_blocks);
+                seq.kv_resource_blocks = Some(kv_resource_blocks);
                 seq.recurrent_state = prefill_output
                     .recurrent_state
                     .clone()
-                    .or_else(|| recurrent_state.clone());
+                    .or_else(|| pending.recurrent_state.clone());
                 seq.prefill_complete = true;
                 seq.phase = RequestPhase::Decoding;
                 Ok::<Option<TokenId>, FerrumError>(Some(token))
             })();
             let first_token = match first_token_result {
                 Ok(Some(token)) => token,
-                Ok(None) => continue,
+                Ok(None) => {
+                    pending.release_resources(self).await;
+                    continue;
+                }
                 Err(e) => {
                     warn!("Batch prefill post-process failed for {}: {}", rid, e);
-                    let _ = self.kv_cache.deallocate(rid.clone()).await;
-                    self.trace_kv_release(rid, *kv_resource_blocks);
-                    self.release_recurrent_state(rid).await;
-                    self.complete_request(rid, FinishReason::Error).await?;
+                    pending.release_resources(self).await;
+                    self.complete_request(&rid, FinishReason::Error).await?;
                     continue;
                 }
             };
-            let num_tokens = input_tokens.len();
-            self.scheduler.mark_prefill_complete(rid, num_tokens);
+            let committed_kv_resource_blocks = pending.commit_kv()?;
+            debug_assert_eq!(committed_kv_resource_blocks, kv_resource_blocks);
+            let num_tokens = pending.input_tokens.len();
+            self.scheduler.mark_prefill_complete(&rid, num_tokens);
             self.total_prefill_tokens
                 .fetch_add(num_tokens as u64, Ordering::Relaxed);
             counter!("ferrum.engine.prefill_tokens_total").increment(num_tokens as u64);
             counter!("ferrum.engine.prefills_total").increment(1);
-            let stop_reason = self.stop_reason_for_request(rid);
+            let stop_reason = self.stop_reason_for_request(&rid);
             if self.should_stream_generated_token(stop_reason) {
-                self.send_stream_update(rid, first_token).await;
+                self.send_stream_update(&rid, first_token).await;
             }
             if let Some(reason) = stop_reason {
-                self.complete_request(rid, reason).await?;
+                self.complete_request(&rid, reason).await?;
             }
         }
         Ok(())
