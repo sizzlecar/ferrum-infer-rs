@@ -629,16 +629,7 @@ pub struct SequenceState {
     pub json_processor: Option<Arc<JsonModeProcessor>>,
     /// Regex-guided hard-mask processor (active when response_format is Regex).
     pub regex_processor: Option<Arc<ferrum_sampler::guided::RegexGuidedProcessor>>,
-    /// Draft-model KV cache (only populated when engine has speculative
-    /// decoding enabled). Allocated + prefilled lazily on the first decode.
-    draft_kv_cache: Option<Arc<dyn KvCacheHandle>>,
-    draft_kv_resource_blocks: Option<usize>,
-    /// Resource-manager request id for the draft-model KV allocation.
-    ///
-    /// Draft KV must not reuse the target request id because KV managers are
-    /// keyed by `RequestId`; a second allocation under the same key can
-    /// replace the target handle while leaving resource counters/blocks alive.
-    draft_kv_request_id: Option<RequestId>,
+    draft_kv: Option<SequenceDraftKvState>,
     /// Token frequency counts for repetition penalty.
     pub token_frequencies: HashMap<TokenId, usize>,
     /// Model executor's KV cache key for this sequence (for cleanup on completion).
@@ -700,6 +691,27 @@ impl SequenceRecurrentAllocation {
         Self {
             slots: slots.map(|slots| slots.max(1)),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SequenceDraftKvState {
+    cache: Arc<dyn KvCacheHandle>,
+    request_id: RequestId,
+    resource_blocks: usize,
+}
+
+impl SequenceDraftKvState {
+    fn new(cache: Arc<dyn KvCacheHandle>, request_id: RequestId, resource_blocks: usize) -> Self {
+        Self {
+            cache,
+            request_id,
+            resource_blocks: resource_blocks.max(1),
+        }
+    }
+
+    fn allocation(self) -> SequenceKvAllocation {
+        SequenceKvAllocation::new(self.request_id, Some(self.resource_blocks))
     }
 }
 
@@ -872,9 +884,7 @@ impl SequenceState {
             preemption_count: 0,
             json_processor,
             regex_processor,
-            draft_kv_cache: None,
-            draft_kv_resource_blocks: None,
-            draft_kv_request_id: None,
+            draft_kv: None,
             token_frequencies: HashMap::new(),
             model_cache_id: None,
             stop_token_ids,
@@ -931,42 +941,8 @@ impl SequenceState {
     fn take_physical_resources(&mut self) -> SequencePhysicalResources {
         let has_kv_cache = self.kv_cache.take().is_some();
         let has_recurrent_state = self.recurrent_state.take().is_some();
-        let has_draft_kv_cache = self.draft_kv_cache.take().is_some();
         let kv_blocks = self.kv_resource_blocks.take();
-        let draft_request_id = self.draft_kv_request_id.take();
-        let draft_blocks = self.draft_kv_resource_blocks.take();
-        let draft_kv_allocation = match (has_draft_kv_cache, draft_request_id, draft_blocks) {
-            (_, Some(request_id), blocks) => Some(SequenceKvAllocation::new(request_id, blocks)),
-            (false, None, None) => None,
-            (true, None, blocks) => {
-                let message = "draft KV allocation metadata is incomplete";
-                warn!(
-                    request_id = %self.request_id,
-                    draft_request_id = ?Option::<RequestId>::None,
-                    draft_kv_resource_blocks = ?blocks,
-                    "{message}"
-                );
-                #[cfg(test)]
-                if !std::thread::panicking() {
-                    panic!("{message}");
-                }
-                None
-            }
-            (false, None, Some(blocks)) => {
-                let message = "draft KV allocation metadata is incomplete";
-                warn!(
-                    request_id = %self.request_id,
-                    draft_request_id = ?Option::<RequestId>::None,
-                    draft_kv_resource_blocks = ?Some(blocks),
-                    "{message}"
-                );
-                #[cfg(test)]
-                if !std::thread::panicking() {
-                    panic!("{message}");
-                }
-                None
-            }
-        };
+        let draft_kv_allocation = self.draft_kv.take().map(SequenceDraftKvState::allocation);
         let resources = SequencePhysicalResources {
             kv_allocation: has_kv_cache
                 .then(|| SequenceKvAllocation::new(self.request_id.clone(), kv_blocks)),
@@ -1115,7 +1091,7 @@ impl SequenceState {
     }
 
     fn draft_kv_cache_handle(&self) -> Option<Arc<dyn KvCacheHandle>> {
-        self.draft_kv_cache.clone()
+        self.draft_kv.as_ref().map(|draft| draft.cache.clone())
     }
 
     fn commit_decode_step_physical_resources(&mut self, kv_cache: Arc<dyn KvCacheHandle>) {
@@ -1154,7 +1130,16 @@ impl SequenceState {
         draft_kv_cache: Arc<dyn KvCacheHandle>,
     ) {
         self.kv_cache = Some(target_kv_cache);
-        self.draft_kv_cache = Some(draft_kv_cache);
+        if let Some(draft) = &mut self.draft_kv {
+            draft.cache = draft_kv_cache;
+        } else {
+            let message = "draft KV cache updated without owned allocation metadata";
+            warn!(request_id = %self.request_id, "{message}");
+            #[cfg(test)]
+            if !std::thread::panicking() {
+                panic!("{message}");
+            }
+        }
     }
 
     fn commit_draft_kv_allocation(
@@ -1163,9 +1148,11 @@ impl SequenceState {
         draft_request_id: RequestId,
         draft_resource_blocks: usize,
     ) {
-        self.draft_kv_cache = Some(draft_kv_cache);
-        self.draft_kv_request_id = Some(draft_request_id);
-        self.draft_kv_resource_blocks = Some(draft_resource_blocks.max(1));
+        self.draft_kv = Some(SequenceDraftKvState::new(
+            draft_kv_cache,
+            draft_request_id,
+            draft_resource_blocks,
+        ));
     }
 
     pub fn model_decode_logits_policy(&self) -> LogitsReturnPolicy {
@@ -1590,8 +1577,8 @@ impl Drop for SequenceState {
                 kv_resource_blocks = ?self.kv_resource_blocks,
                 has_recurrent_state = self.recurrent_state.is_some(),
                 recurrent_state_slots = ?self.recurrent_state_slots,
-                has_draft_kv_cache = self.draft_kv_cache.is_some(),
-                draft_kv_resource_blocks = ?self.draft_kv_resource_blocks,
+                has_draft_kv = self.draft_kv.is_some(),
+                draft_kv_resource_blocks = ?self.draft_kv.as_ref().map(|draft| draft.resource_blocks),
                 "{message}"
             );
             #[cfg(test)]
