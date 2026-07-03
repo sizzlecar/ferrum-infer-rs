@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from request_replay_bundle_gate import BundleError, validate_bundle_root
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PASS_LINE = "OBSERVABILITY VERTICAL SLICE PASS"
@@ -105,7 +107,8 @@ def read_profile_events(path: Path) -> list[dict[str, Any]]:
 
 def validate_entrypoint_artifact(root: Path, entrypoint: str) -> dict[str, Any]:
     profile = root / "profile.jsonl"
-    request_dump = root / "request_dump" / "request.json"
+    request_dump_root = root / "request_dump"
+    request_dump = request_dump_root / "request.json"
     replay_command = root / "replay_command.txt"
     summary_path = root / "observability_profile_summary.json"
     required = [profile, request_dump, replay_command, summary_path]
@@ -137,6 +140,21 @@ def validate_entrypoint_artifact(root: Path, entrypoint: str) -> dict[str, Any]:
         raise GateError(f"{summary_path}.l0_only must be true")
     if not replay_command.read_text(encoding="utf-8").strip():
         raise GateError(f"{replay_command} must be non-empty")
+    replay_refs = [
+        event["replay"]
+        for event in events
+        if isinstance(event.get("replay"), dict)
+    ]
+    for index, replay in enumerate(replay_refs):
+        bundle_dir = replay.get("bundle_dir")
+        if not isinstance(bundle_dir, str) or not bundle_dir.strip():
+            raise GateError(f"{profile} replay[{index}].bundle_dir must be non-empty")
+    try:
+        replay_bundles = validate_bundle_root(request_dump_root)
+    except BundleError as exc:
+        raise GateError(f"{entrypoint} replay bundle validation failed: {exc}") from exc
+    if not replay_bundles:
+        raise GateError(f"{request_dump_root} must contain at least one replay bundle")
 
     return {
         "entrypoint": entrypoint,
@@ -144,7 +162,9 @@ def validate_entrypoint_artifact(root: Path, entrypoint: str) -> dict[str, Any]:
         "profile_jsonl": str(profile),
         "event_count": len(events),
         "request_dump": str(request_dump),
+        "request_dump_dir": str(request_dump_root),
         "replay_command": replay_command.read_text(encoding="utf-8").strip(),
+        "replay_bundles": replay_bundles,
         "summary": str(summary_path),
     }
 
@@ -243,7 +263,10 @@ def run_self_test() -> None:
                         "timestamp": "2026-07-02T00:00:00Z",
                         "status": "diagnostic_only",
                         "model": "synthetic/no-weight",
-                        "replay": {"command": f"ferrum {entrypoint} synthetic/no-weight"},
+                        "replay": {
+                            "command": f"ferrum {entrypoint} synthetic/no-weight",
+                            "bundle_dir": str(entry_dir / "request_dump"),
+                        },
                         "attributes": {},
                     },
                     sort_keys=True,
@@ -258,6 +281,8 @@ def run_self_test() -> None:
                     "entrypoint": entrypoint,
                     "request_id": f"req-{entrypoint}",
                     "l0_only": True,
+                    "model": "synthetic/no-weight",
+                    "backend": "synthetic",
                     "sanitized": True,
                 },
             )
@@ -265,6 +290,7 @@ def run_self_test() -> None:
                 f"ferrum {entrypoint} synthetic/no-weight\n",
                 encoding="utf-8",
             )
+            write_selftest_replay_bundle(entry_dir, entrypoint)
             write_json(
                 entry_dir / "observability_profile_summary.json",
                 {
@@ -276,6 +302,94 @@ def run_self_test() -> None:
             )
             validate_entrypoint_artifact(entry_dir, entrypoint)
     print(SELFTEST_PASS_LINE)
+
+
+def write_selftest_replay_bundle(entry_dir: Path, entrypoint: str) -> None:
+    request_id = f"req-{entrypoint}"
+    request_dump = entry_dir / "request_dump"
+    bundle = request_dump / request_id
+    output_text = "synthetic ok"
+    replay_argv = [
+        "cargo",
+        "run",
+        "-p",
+        "ferrum-cli",
+        "--",
+        entrypoint,
+        "synthetic/no-weight",
+        "--profile-detail",
+        "basic",
+        "--profile-jsonl",
+        str(entry_dir / "profile.jsonl"),
+        "--request-dump-dir",
+        str(request_dump),
+    ]
+    request = {
+        "schema_version": SCHEMA_VERSION,
+        "entrypoint": entrypoint,
+        "request_id": request_id,
+        "model": "synthetic/no-weight",
+        "backend": "synthetic",
+        "l0_only": True,
+        "sanitized": True,
+    }
+    files: dict[str, Any] = {
+        "request.json": request,
+        "prompt_token_ids.json": {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "token_ids": [101, 202],
+            "token_count": 2,
+            "sanitized": True,
+        },
+        "sampling_params.json": {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "sampling_params": {"max_tokens": 4, "temperature": 0.0},
+        },
+        "runtime_effective_config.json": {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "entrypoint": entrypoint,
+            "request_dump_dir": str(request_dump),
+            "sanitized": True,
+        },
+        "backend_selection.json": {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "backend": "synthetic",
+            "model": "synthetic/no-weight",
+        },
+        "output_token_ids.json": {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "token_ids": [909, 808],
+            "token_count": 2,
+            "finish_reason": "stop",
+        },
+        "bad_output_scan.json": {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "bad_output": False,
+            "bad_text_count": 0,
+            "reasons": [],
+            "first_bad_text_span": None,
+            "failure_kind": None,
+            "output_sha256": hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
+        },
+        "replay.command.json": {
+            "schema_version": SCHEMA_VERSION,
+            "request_id": request_id,
+            "entrypoint": entrypoint,
+            "command": " ".join(replay_argv),
+            "argv": replay_argv,
+            "bundle_dir": str(bundle),
+            "sanitized": True,
+        },
+    }
+    for name, data in files.items():
+        write_json(bundle / name, data)
+    (bundle / "output_text.txt").write_text(output_text + "\n", encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:

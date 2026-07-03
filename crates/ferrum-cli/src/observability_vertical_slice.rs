@@ -6,6 +6,7 @@ use ferrum_types::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -23,23 +24,43 @@ pub fn write_observability_vertical_slice(
         entrypoint_label(entrypoint),
         Uuid::new_v4().simple()
     );
-    let bundle_dir = out_dir.to_string_lossy().to_string();
-    let replay_command = replay_command(entrypoint, out_dir);
     let request_dump_dir = out_dir.join("request_dump");
+    let bundle_dir = request_dump_dir.join(&request_id);
+    let replay_args = replay_command_args(entrypoint, out_dir, &request_dump_dir);
+    let replay_command = replay_command(&replay_args);
     fs_create_dir_all(&request_dump_dir)?;
+    fs_create_dir_all(&bundle_dir)?;
 
     let request_dump_path = request_dump_dir.join("request.json");
     let replay_command_path = out_dir.join("replay_command.txt");
+    let request_dump_replay_command_path = request_dump_dir.join("replay_command.txt");
     let profile_path = out_dir.join("profile.jsonl");
     let summary_path = out_dir.join("observability_profile_summary.json");
 
-    write_json(
-        &request_dump_path,
-        &request_dump(entrypoint, &request_id, &replay_command),
-    )?;
+    let request = request_dump(entrypoint, &request_id, &replay_command);
+    write_json(&request_dump_path, &request)?;
     fs_write(&replay_command_path, format!("{replay_command}\n"))?;
+    fs_write(
+        &request_dump_replay_command_path,
+        format!("{replay_command}\n"),
+    )?;
+    write_replay_bundle(
+        &bundle_dir,
+        entrypoint,
+        &request_id,
+        &replay_command,
+        &replay_args,
+        &request,
+        out_dir,
+        &request_dump_dir,
+    )?;
 
-    let events = synthetic_events(entrypoint, &request_id, &replay_command, &bundle_dir);
+    let events = synthetic_events(
+        entrypoint,
+        &request_id,
+        &replay_command,
+        &request_dump_dir.to_string_lossy(),
+    );
     write_profile_jsonl(&profile_path, &events)?;
 
     let summary = json!({
@@ -69,6 +90,8 @@ pub fn write_observability_vertical_slice(
         "first_failure_event": null,
         "profile_jsonl": profile_path.to_string_lossy(),
         "request_dump": request_dump_path.to_string_lossy(),
+        "request_dump_dir": request_dump_dir.to_string_lossy(),
+        "replay_bundle_dir": bundle_dir.to_string_lossy(),
         "replay_command": replay_command,
         "replay_command_path": replay_command_path.to_string_lossy()
     });
@@ -305,25 +328,164 @@ fn request_dump(
     }
 }
 
-fn replay_command(entrypoint: ProfileEntrypoint, out_dir: &Path) -> String {
-    match entrypoint {
-        ProfileEntrypoint::Run => format!(
-            "cargo run -p ferrum-cli -- run {} --observability-vertical-slice-out {}",
-            SYNTHETIC_MODEL,
-            shell_quote(&out_dir.to_string_lossy())
+#[allow(clippy::too_many_arguments)]
+fn write_replay_bundle(
+    bundle_dir: &Path,
+    entrypoint: ProfileEntrypoint,
+    request_id: &str,
+    replay_command: &str,
+    replay_args: &[String],
+    request: &serde_json::Value,
+    out_dir: &Path,
+    request_dump_dir: &Path,
+) -> Result<()> {
+    let output_text = "synthetic ok";
+    let files = [
+        ("request.json", request.clone()),
+        (
+            "prompt_token_ids.json",
+            json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "model": SYNTHETIC_MODEL,
+                "tokenizer_or_model": SYNTHETIC_MODEL,
+                "token_ids": [101, 202, 303, 404],
+                "token_count": 4,
+                "sanitized": true
+            }),
         ),
-        ProfileEntrypoint::Serve => format!(
-            "cargo run -p ferrum-cli -- serve {} --observability-vertical-slice-out {}",
-            SYNTHETIC_MODEL,
-            shell_quote(&out_dir.to_string_lossy())
+        (
+            "sampling_params.json",
+            json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "sampling_params": {"max_tokens": 4, "temperature": 0.0},
+                "unavailable_reason": null
+            }),
         ),
-        other => format!(
-            "ferrum {} {} --observability-vertical-slice-out {}",
-            entrypoint_label(other),
-            SYNTHETIC_MODEL,
-            shell_quote(&out_dir.to_string_lossy())
+        (
+            "runtime_effective_config.json",
+            json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "entrypoint": entrypoint_label(entrypoint),
+                "profile_detail": "basic",
+                "profile_sample_rate": 1.0,
+                "profile_jsonl": out_dir.join("profile.jsonl").to_string_lossy(),
+                "memory_profile_jsonl": out_dir.join("memory_profile.jsonl").to_string_lossy(),
+                "scheduler_trace_jsonl": out_dir.join("scheduler_trace.jsonl").to_string_lossy(),
+                "request_dump_dir": request_dump_dir.to_string_lossy(),
+                "sanitized": true
+            }),
         ),
+        (
+            "backend_selection.json",
+            json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "backend": SYNTHETIC_BACKEND,
+                "model": SYNTHETIC_MODEL,
+                "l0_only": true
+            }),
+        ),
+        (
+            "output_token_ids.json",
+            json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "token_ids": [909, 808],
+                "token_count": 2,
+                "finish_reason": "stop"
+            }),
+        ),
+        (
+            "bad_output_scan.json",
+            json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "bad_output": false,
+                "bad_text_count": 0,
+                "reasons": [],
+                "first_bad_text_span": null,
+                "failure_kind": null,
+                "output_chars": output_text.chars().count(),
+                "output_sha256": sha256_hex(output_text.as_bytes())
+            }),
+        ),
+        (
+            "replay.command.json",
+            json!({
+                "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+                "request_id": request_id,
+                "entrypoint": entrypoint_label(entrypoint),
+                "command": replay_command,
+                "argv": replay_args,
+                "bundle_dir": bundle_dir.to_string_lossy(),
+                "sanitized": true
+            }),
+        ),
+    ];
+    for (name, value) in files {
+        write_json(&bundle_dir.join(name), &value)?;
     }
+    fs_write(
+        bundle_dir.join("output_text.txt").as_path(),
+        format!("{output_text}\n"),
+    )?;
+    Ok(())
+}
+
+fn replay_command_args(
+    entrypoint: ProfileEntrypoint,
+    out_dir: &Path,
+    request_dump_dir: &Path,
+) -> Vec<String> {
+    let subcommand = match entrypoint {
+        ProfileEntrypoint::Run => "run",
+        ProfileEntrypoint::Serve => "serve",
+        ProfileEntrypoint::BenchServe => "bench-serve",
+        ProfileEntrypoint::Synthetic => "run",
+    };
+    vec![
+        "cargo".to_string(),
+        "run".to_string(),
+        "-p".to_string(),
+        "ferrum-cli".to_string(),
+        "--".to_string(),
+        subcommand.to_string(),
+        SYNTHETIC_MODEL.to_string(),
+        "--profile-detail".to_string(),
+        "basic".to_string(),
+        "--profile-sample-rate".to_string(),
+        "1".to_string(),
+        "--profile-jsonl".to_string(),
+        out_dir.join("profile.jsonl").to_string_lossy().to_string(),
+        "--memory-profile-jsonl".to_string(),
+        out_dir
+            .join("memory_profile.jsonl")
+            .to_string_lossy()
+            .to_string(),
+        "--scheduler-trace-jsonl".to_string(),
+        out_dir
+            .join("scheduler_trace.jsonl")
+            .to_string_lossy()
+            .to_string(),
+        "--request-dump-dir".to_string(),
+        request_dump_dir.to_string_lossy().to_string(),
+    ]
+}
+
+fn replay_command(args: &[String]) -> String {
+    args.iter()
+        .map(|part| shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 fn shell_quote(value: &str) -> String {
@@ -406,6 +568,30 @@ mod tests {
         assert!(root.join("request_dump/request.json").is_file());
         assert!(root.join("replay_command.txt").is_file());
         assert!(root.join("observability_profile_summary.json").is_file());
+        let bundle_dir = fs::read_dir(root.join("request_dump"))
+            .unwrap()
+            .flatten()
+            .find_map(|entry| entry.path().is_dir().then_some(entry.path()))
+            .expect("request replay bundle directory should exist");
+        for name in [
+            "request.json",
+            "prompt_token_ids.json",
+            "sampling_params.json",
+            "runtime_effective_config.json",
+            "backend_selection.json",
+            "output_token_ids.json",
+            "output_text.txt",
+            "bad_output_scan.json",
+            "replay.command.json",
+        ] {
+            assert!(bundle_dir.join(name).is_file(), "missing {name}");
+        }
+        let replay: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(bundle_dir.join("replay.command.json")).unwrap(),
+        )
+        .unwrap();
+        let argv = replay["argv"].as_array().unwrap();
+        assert!(argv.iter().any(|part| part == "--request-dump-dir"));
         let profile = fs::read_to_string(root.join("profile.jsonl")).unwrap();
         assert!(profile.contains("\"entrypoint\":\"run\""));
         assert!(profile.contains("\"replay\""));
