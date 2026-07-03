@@ -1449,6 +1449,15 @@ fn request_slot_lease_drop_without_consumption_panics_in_tests() {
 }
 
 #[test]
+#[should_panic(expected = "sequence state dropped with owned request slot")]
+fn sequence_state_drop_with_owned_request_slot_panics_in_tests() {
+    let engine = test_continuous_engine();
+    let request = policy_request();
+    let mut sequence = SequenceState::new(request.clone(), vec![TokenId::new(1)]);
+    sequence.request_slot = Some(RequestSlotLease::open(&engine.inner, request.id));
+}
+
+#[test]
 #[should_panic(expected = "KV allocation lease dropped without explicit commit or async release")]
 fn kv_allocation_lease_drop_without_consumption_panics_in_tests() {
     let request_id = RequestId::new();
