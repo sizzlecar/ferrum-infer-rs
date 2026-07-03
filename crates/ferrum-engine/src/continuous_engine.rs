@@ -818,7 +818,7 @@ impl UnifiedPrefillOwnedResources {
         self
     }
 
-    fn commit(&mut self) {
+    fn commit(mut self) {
         self.kv_allocation = None;
         self.recurrent_state_allocation = None;
     }
@@ -827,7 +827,7 @@ impl UnifiedPrefillOwnedResources {
         self.kv_allocation.is_none() && self.recurrent_state_allocation.is_none()
     }
 
-    async fn release(&mut self, engine: &EngineInner, owner_request_id: &RequestId) {
+    async fn release(mut self, engine: &EngineInner, owner_request_id: &RequestId) {
         if let Some(kv_allocation) = self.kv_allocation.take() {
             engine
                 .release_kv_allocation(

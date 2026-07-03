@@ -342,7 +342,9 @@ impl EngineInner {
                     Ok(lease) => lease,
                     Err(e) => {
                         warn!("Unified prefill alloc deferred for {}: {}", rid, e);
-                        owned_resources.release(self, rid).await;
+                        std::mem::take(&mut owned_resources)
+                            .release(self, rid)
+                            .await;
                         self.defer_prefill_for_capacity(rid).await;
                         continue;
                     }
@@ -485,7 +487,9 @@ impl EngineInner {
                     }
                 }
                 for work in &mut prefill_meta {
-                    work.owned_resources.release(self, &work.rid).await;
+                    std::mem::take(&mut work.owned_resources)
+                        .release(self, &work.rid)
+                        .await;
                     self.defer_prefill_for_capacity(&work.rid).await;
                 }
                 if mixed_decode_prefill {
@@ -504,7 +508,9 @@ impl EngineInner {
                 return Ok(());
             }
             for work in &mut prefill_meta {
-                work.owned_resources.release(self, &work.rid).await;
+                std::mem::take(&mut work.owned_resources)
+                    .release(self, &work.rid)
+                    .await;
             }
             return self.process_batch_legacy_split(batch).await;
         }
@@ -531,7 +537,9 @@ impl EngineInner {
                         e
                     );
                     for work in &mut prefill_meta {
-                        work.owned_resources.release(self, &work.rid).await;
+                        std::mem::take(&mut work.owned_resources)
+                            .release(self, &work.rid)
+                            .await;
                         self.defer_prefill_for_capacity(&work.rid).await;
                     }
                     if !decode_meta.is_empty() {
@@ -549,7 +557,9 @@ impl EngineInner {
                 // of the two pairs ever gets deallocated by
                 // `complete_request`). Found via paged_attention_test.
                 for work in &mut prefill_meta {
-                    work.owned_resources.release(self, &work.rid).await;
+                    std::mem::take(&mut work.owned_resources)
+                        .release(self, &work.rid)
+                        .await;
                 }
                 return self.process_batch_legacy_split(batch).await;
             }
@@ -564,7 +574,9 @@ impl EngineInner {
             .map(|(t0, t1)| t1.duration_since(t0).as_micros() as u64);
         if results.len() != unified.items.len() {
             for work in &mut prefill_meta {
-                work.owned_resources.release(self, &work.rid).await;
+                std::mem::take(&mut work.owned_resources)
+                    .release(self, &work.rid)
+                    .await;
             }
             return Err(FerrumError::internal(format!(
                 "unified_decode returned {} results for {} items",
@@ -606,7 +618,7 @@ impl EngineInner {
                             .unwrap_or_default()
                     };
                     self.apply_model_cache_ref_update(&work.rid, model_cache_update);
-                    work.owned_resources.commit();
+                    std::mem::take(&mut work.owned_resources).commit();
                     self.scheduler.mark_prefill_chunk_processed(
                         &work.rid,
                         work.input_tokens.len(),
@@ -616,7 +628,9 @@ impl EngineInner {
                 }
                 None => {
                     warn!("Unified prefill result missing for {}", work.rid);
-                    work.owned_resources.release(self, &work.rid).await;
+                    std::mem::take(&mut work.owned_resources)
+                        .release(self, &work.rid)
+                        .await;
                     self.complete_request(&work.rid, FinishReason::Error)
                         .await?;
                     continue;
@@ -669,7 +683,9 @@ impl EngineInner {
                 match first_token_result {
                     Ok(Some(value)) => value,
                     Ok(None) => {
-                        work.owned_resources.release(self, &work.rid).await;
+                        std::mem::take(&mut work.owned_resources)
+                            .release(self, &work.rid)
+                            .await;
                         continue;
                     }
                     Err(e) => {
@@ -677,14 +693,16 @@ impl EngineInner {
                             "Unified prefill post-process failed for {}: {}",
                             work.rid, e
                         );
-                        work.owned_resources.release(self, &work.rid).await;
+                        std::mem::take(&mut work.owned_resources)
+                            .release(self, &work.rid)
+                            .await;
                         self.complete_request(&work.rid, FinishReason::Error)
                             .await?;
                         continue;
                     }
                 };
             self.apply_model_cache_ref_update(&work.rid, model_cache_update);
-            work.owned_resources.commit();
+            std::mem::take(&mut work.owned_resources).commit();
             self.scheduler.mark_prefill_complete(&work.rid, num_tokens);
             self.total_prefill_tokens
                 .fetch_add(num_tokens as u64, Ordering::Relaxed);
