@@ -1530,6 +1530,16 @@ fn unified_prefill_owned_resources_drop_without_release_or_commit_panics_in_test
 }
 
 #[test]
+fn unified_prefill_owned_resources_commit_consumes_transaction() {
+    let mut resources = UnifiedPrefillOwnedResources::default().with_fresh_kv(RequestId::new(), 1);
+    assert!(!resources.is_empty());
+
+    std::mem::take(&mut resources).commit();
+
+    assert!(resources.is_empty());
+}
+
+#[test]
 fn sequence_take_completion_resources_moves_request_slot_and_physical_resources_together() {
     let engine = test_continuous_engine();
     let request = policy_request();
