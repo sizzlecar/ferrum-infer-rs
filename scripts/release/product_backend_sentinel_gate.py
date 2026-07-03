@@ -513,6 +513,47 @@ def native_op_manifest_result(scenario: dict[str, Any], manifest_dir: Path) -> d
     return {"status": "pass", "manifest": str(path), "resolution": resolution}
 
 
+def validate_actual_smoke_offline_replay_summary(
+    summary: dict[str, Any],
+    *,
+    label: str,
+) -> dict[str, int]:
+    require(summary.get("status") == "pass", f"{label}.status must be pass")
+    counts: dict[str, int] = {}
+    for key in ("bundle_count", "replay_execution_count", "replay_execution_skipped_count"):
+        value = summary.get(key)
+        require(isinstance(value, int) and value >= 0, f"{label}.{key} must be a non-negative integer")
+        counts[key] = value
+    require(counts["bundle_count"] > 0, f"{label}.bundle_count must be positive")
+    require(
+        counts["replay_execution_count"] > 0,
+        f"{label} did not execute any offline replay",
+    )
+    require(
+        counts["replay_execution_skipped_count"] < counts["bundle_count"],
+        f"{label} skipped all replay bundles",
+    )
+    replay_executions = summary.get("replay_executions")
+    require(isinstance(replay_executions, list), f"{label}.replay_executions must be a list")
+    skipped = [
+        item
+        for item in replay_executions
+        if isinstance(item, dict) and item.get("status") == "skipped_requires_running_server"
+    ]
+    require(
+        len(skipped) == counts["replay_execution_skipped_count"],
+        f"{label}.replay_execution_skipped_count does not match skipped replay records",
+    )
+    for item in skipped:
+        source = str(item.get("source_bundle_dir") or "").replace("\\", "/")
+        require(source, f"{label}.skipped source_bundle_dir is required")
+        require(
+            "/run/request_dump/" not in source and not source.endswith("/run/request_dump"),
+            f"{label} skipped run replay bundle: {source}",
+        )
+    return counts
+
+
 def actual_smoke_result(actual_smoke: Path) -> dict[str, Any]:
     require(actual_smoke.is_dir(), f"actual smoke artifact must be a directory: {actual_smoke}")
     manifest_path = actual_smoke / "gate.manifest.json"
@@ -603,6 +644,36 @@ def actual_smoke_result(actual_smoke: Path) -> dict[str, Any]:
         int(live_summary.get("replay_execution_skipped_count") or 0) == 0,
         "actual smoke live replay skipped requests",
     )
+    offline_summary_path = actual_smoke / "request_replay_bundle/request_replay_bundle_summary.json"
+    offline_summary = read_json(offline_summary_path)
+    offline_replay = validate_actual_smoke_offline_replay_summary(
+        offline_summary,
+        label=str(offline_summary_path),
+    )
+    summary_replay = summary.get("request_replay_bundle")
+    require(
+        isinstance(summary_replay, dict),
+        f"{summary_path}.request_replay_bundle must be an object",
+    )
+    summary_replay_path = Path(
+        require_non_empty_string(
+            summary_replay.get("summary"),
+            f"{summary_path}.request_replay_bundle.summary",
+        )
+    )
+    if not summary_replay_path.is_absolute():
+        summary_replay_path = (actual_smoke / summary_replay_path).resolve()
+    else:
+        summary_replay_path = summary_replay_path.resolve()
+    require(
+        summary_replay_path == offline_summary_path.resolve(),
+        f"{summary_path}.request_replay_bundle.summary must match offline replay summary",
+    )
+    for key, value in offline_replay.items():
+        require(
+            summary_replay.get(key) == value,
+            f"{summary_path}.request_replay_bundle.{key} must match offline summary",
+        )
     return {
         "status": "pass",
         "actual_smoke": str(actual_smoke),
@@ -615,6 +686,8 @@ def actual_smoke_result(actual_smoke: Path) -> dict[str, Any]:
         "profile_detail": summary.get("profile_detail"),
         "entrypoints": profile_summary["entrypoints"],
         "replay_bundle_count": len(replay_bundle_summary),
+        "offline_replay_execution_count": offline_replay["replay_execution_count"],
+        "offline_replay_skipped_count": offline_replay["replay_execution_skipped_count"],
         "live_replay_execution_count": live_summary.get("replay_execution_count"),
     }
 
@@ -1039,6 +1112,27 @@ def make_actual_smoke_fixture(root: Path, *, sha: str, dirty: bool = False) -> P
     root.mkdir(parents=True, exist_ok=True)
     write_actual_smoke_entrypoint(root / "run", "run")
     write_actual_smoke_entrypoint(root / "serve", "serve")
+    offline_replay = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "pass",
+        "bundle_count": 2,
+        "execute_replay": True,
+        "replay_execution_count": 1,
+        "replay_execution_skipped_count": 1,
+        "replay_executions": [
+            {
+                "source_bundle_dir": str(root / "run/request_dump/req-fixture"),
+                "status": "executed_synthetic",
+                "artifact_dir": str(root / "request_replay_bundle/executed_replays/req-run"),
+            },
+            {
+                "source_bundle_dir": str(root / "serve/request_dump/req-fixture"),
+                "status": "skipped_requires_running_server",
+                "reason": "offline replay execution only runs synthetic/no-weight commands",
+            },
+        ],
+    }
+    write_json(root / "request_replay_bundle/request_replay_bundle_summary.json", offline_replay)
     live_replay = {
         "schema_version": SCHEMA_VERSION,
         "status": "pass",
@@ -1062,6 +1156,13 @@ def make_actual_smoke_fixture(root: Path, *, sha: str, dirty: bool = False) -> P
         "effective_backend": "metal",
         "profile_detail": "basic",
         "actual_model_smoke": True,
+        "request_replay_bundle": {
+            "out": str(root / "request_replay_bundle"),
+            "summary": str(root / "request_replay_bundle/request_replay_bundle_summary.json"),
+            "bundle_count": offline_replay["bundle_count"],
+            "replay_execution_count": offline_replay["replay_execution_count"],
+            "replay_execution_skipped_count": offline_replay["replay_execution_skipped_count"],
+        },
     }
     write_json(root / "product_observability_l1_smoke_summary.json", summary)
     write_json(
@@ -1173,6 +1274,34 @@ def run_selftest() -> None:
             raise AssertionError("dirty actual smoke unexpectedly passed")
         except SentinelError as exc:
             require("git_dirty" in str(exc), f"unexpected dirty actual smoke error: {exc}")
+        skipped_smoke = make_actual_smoke_fixture(temp / "skipped-smoke", sha=head)
+        skipped_summary_path = skipped_smoke / "request_replay_bundle/request_replay_bundle_summary.json"
+        skipped_summary = read_json(skipped_summary_path)
+        skipped_summary["replay_execution_count"] = 0
+        skipped_summary["replay_execution_skipped_count"] = skipped_summary["bundle_count"]
+        skipped_summary["replay_executions"] = [
+            {
+                "source_bundle_dir": str(skipped_smoke / "run/request_dump/req-fixture"),
+                "status": "skipped_requires_running_server",
+            },
+            {
+                "source_bundle_dir": str(skipped_smoke / "serve/request_dump/req-fixture"),
+                "status": "skipped_requires_running_server",
+            },
+        ]
+        write_json(skipped_summary_path, skipped_summary)
+        try:
+            run_gate(
+                argparse.Namespace(
+                    manifest=DEFAULT_MANIFEST,
+                    out=temp / "bad-skipped-smoke",
+                    actual_smoke=skipped_smoke,
+                    scenario_summary=None,
+                )
+            )
+            raise AssertionError("all-skipped actual smoke replay unexpectedly passed")
+        except SentinelError as exc:
+            require("did not execute any offline replay" in str(exc), f"unexpected replay error: {exc}")
     finally:
         shutil.rmtree(temp, ignore_errors=True)
 
