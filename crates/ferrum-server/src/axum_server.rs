@@ -23,11 +23,12 @@ use axum::{
 use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
 use ferrum_types::{
     EngineMetrics, EngineStatus, FerrumConfigBuilder, FerrumError as Error, FerrumProfileEvent,
-    FinishReason, InferenceRequest, InferenceResponse, ModelId, Priority, ProfileEntrypoint,
-    ProfileError, ProfileEventKind, ProfileStatus, ReplayReference, RequestId,
-    ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent, RuntimeConfigSnapshot,
-    SamplingParams, TokenId, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY,
-    DEFAULT_MAX_TOKENS_METADATA_KEY, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+    FinishReason, InferenceRequest, InferenceResponse, ModelId, Priority, ProcessMemoryObservation,
+    ProcessMemorySample, ProcessMemorySampler, ProfileEntrypoint, ProfileError, ProfileEventKind,
+    ProfileStatus, ReplayReference, RequestId, ResolvedFerrumConfig, ResourceAction,
+    ResourceTraceEvent, RuntimeConfigSnapshot, SamplingParams, TokenId, TokenUsage,
+    DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    OBSERVABILITY_PROFILE_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -35,7 +36,10 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Instant,
 };
 use tokio::sync::mpsc;
@@ -223,6 +227,8 @@ pub struct AppState {
     pub lora_registry: Arc<LoraModelRegistry>,
     pub request_dump_dir: Option<Arc<PathBuf>>,
     pub profile_jsonl: Option<Arc<PathBuf>>,
+    pub memory_profile_jsonl: Option<Arc<PathBuf>>,
+    pub first_request_memory_recorded: Arc<AtomicBool>,
     cache: Arc<CacheRuntimeState>,
 }
 
@@ -355,6 +361,11 @@ impl AppState {
 
     pub fn with_profile_jsonl(mut self, profile_jsonl: Option<PathBuf>) -> Self {
         self.profile_jsonl = profile_jsonl.map(Arc::new);
+        self
+    }
+
+    pub fn with_memory_profile_jsonl(mut self, memory_profile_jsonl: Option<PathBuf>) -> Self {
+        self.memory_profile_jsonl = memory_profile_jsonl.map(Arc::new);
         self
     }
 
@@ -825,7 +836,8 @@ impl HttpServer for AxumServer {
             self.state
                 .clone()
                 .with_request_dump_dir(config.request_dump_dir.clone())
-                .with_profile_jsonl(config.profile_jsonl.clone()),
+                .with_profile_jsonl(config.profile_jsonl.clone())
+                .with_memory_profile_jsonl(config.memory_profile_jsonl.clone()),
         );
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
@@ -1320,6 +1332,125 @@ fn write_chat_request_profile_event(
         backend_detail: None,
         attributes,
     };
+    append_profile_event(path.as_path(), &event)
+}
+
+fn maybe_write_first_request_memory_stage(
+    state: &AppState,
+    request_id: &str,
+    model: &str,
+    stream: bool,
+    started_at: Instant,
+    before: Option<ProcessMemorySample>,
+) -> std::result::Result<(), String> {
+    if state.profile_jsonl.is_none() && state.memory_profile_jsonl.is_none() {
+        return Ok(());
+    }
+    if state
+        .first_request_memory_recorded
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(());
+    }
+    let after = ProcessMemorySampler.sample();
+    let memory = after.map(|after| ProcessMemoryObservation::from_samples(before, after));
+    let timestamp = chrono::Utc::now();
+    let mut attributes = BTreeMap::from([
+        ("actual_model_smoke".to_string(), serde_json::json!(true)),
+        ("diagnostic_only".to_string(), serde_json::json!(false)),
+        (
+            "endpoint".to_string(),
+            serde_json::json!("/v1/chat/completions"),
+        ),
+        ("l0_only".to_string(), serde_json::json!(false)),
+        (
+            "memory_stage".to_string(),
+            serde_json::json!("first_request_done"),
+        ),
+        ("profile_detail".to_string(), serde_json::json!("basic")),
+        ("stream".to_string(), serde_json::json!(stream)),
+    ]);
+    let memory_snapshot = if let Some(memory) = &memory {
+        attributes.insert(
+            "memory_measurement".to_string(),
+            serde_json::json!("process_rss"),
+        );
+        attributes.insert(
+            "process_memory_source".to_string(),
+            serde_json::json!(memory.source),
+        );
+        memory.to_snapshot("process", Some("actual"))
+    } else {
+        attributes.insert(
+            "memory_measurement".to_string(),
+            serde_json::json!("not_collected"),
+        );
+        ferrum_types::MemorySnapshot {
+            scope: "process".to_string(),
+            backend: Some("actual".to_string()),
+            before_bytes: Some(0),
+            after_bytes: Some(0),
+            current_bytes: Some(0),
+            high_water_bytes: Some(0),
+            available_bytes: None,
+        }
+    };
+    let replay = state.request_dump_dir.as_ref().map(|root| {
+        let bundle_dir = root.join(request_id);
+        ReplayReference {
+            command: replay_curl_command(&bundle_dir),
+            bundle_dir: Some(root.to_string_lossy().to_string()),
+        }
+    });
+    let event = FerrumProfileEvent {
+        schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        ts_unix_nanos: timestamp
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000),
+        event_id: format!("evt-server-chat-memory-first-request-{request_id}"),
+        request_id: request_id.to_string(),
+        correlation_id: Some(request_id.to_string()),
+        entrypoint: ProfileEntrypoint::Serve,
+        backend: "actual".to_string(),
+        runtime_preset_hash: state
+            .auto_config
+            .as_ref()
+            .map(ResolvedFerrumConfig::runtime_env_hash)
+            .unwrap_or_else(|| format!("sha256:{}", sha256_hex(b"serve-profile"))),
+        phase: "actual_serve_first_request_done".to_string(),
+        event_kind: ProfileEventKind::Memory,
+        timestamp,
+        status: ProfileStatus::Ok,
+        model: Some(model.to_string()),
+        duration_us: Some(elapsed_us_since(started_at)),
+        memory: Some(memory_snapshot),
+        resource: None,
+        error: None,
+        replay,
+        shape: BTreeMap::from([("batch_size".to_string(), serde_json::json!(1))]),
+        backend_detail: None,
+        attributes,
+    };
+    if let Some(path) = &state.profile_jsonl {
+        append_profile_event(path.as_path(), &event)?;
+    }
+    if let Some(path) = &state.memory_profile_jsonl {
+        append_profile_event(path.as_path(), &event)?;
+    }
+    Ok(())
+}
+
+fn request_memory_sample_before(state: &AppState) -> Option<ProcessMemorySample> {
+    (state.profile_jsonl.is_some() || state.memory_profile_jsonl.is_some())
+        .then(|| ProcessMemorySampler.sample())
+        .flatten()
+}
+
+fn append_profile_event(
+    path: &Path,
+    event: &FerrumProfileEvent,
+) -> std::result::Result<(), String> {
     event.validate().map_err(|err| err.to_string())?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
@@ -1327,7 +1458,7 @@ fn write_chat_request_profile_event(
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path.as_path())
+        .open(path)
         .map_err(|err| err.to_string())?;
     let line = serde_json::to_string(&event).map_err(|err| err.to_string())?;
     file.write_all(line.as_bytes())
@@ -1863,6 +1994,7 @@ async fn handle_chat_completions_stream(
     let replay_request_id = inference_request.id.to_string();
     let profile_request_model = openai_request.model.clone();
     let profile_started_at = Instant::now();
+    let request_memory_before = request_memory_sample_before(&state);
     let mut stream = match engine.infer_stream(inference_request).await {
         Ok(stream) => stream,
         Err(e) => {
@@ -2178,6 +2310,16 @@ async fn handle_chat_completions_stream(
                         ) {
                             warn!("failed to write chat stream profile event: {}", err);
                         }
+                        if let Err(err) = maybe_write_first_request_memory_stage(
+                            &profile_state,
+                            &replay_request_id,
+                            &profile_request_model,
+                            true,
+                            profile_started_at,
+                            request_memory_before,
+                        ) {
+                            warn!("failed to write chat stream memory profile event: {}", err);
+                        }
                         if include_stream_usage && usage.is_some() {
                             let usage_chunk = ChatCompletionsResponse {
                                 id: request_id.clone(),
@@ -2285,6 +2427,7 @@ async fn handle_chat_completions_sync(
     let replay_request_id = inference_request.id.to_string();
     let profile_request_model = openai_request.model.clone();
     let profile_started_at = Instant::now();
+    let request_memory_before = request_memory_sample_before(&state);
     match engine.infer(inference_request).await {
         Ok(output) => {
             let InferenceResponse {
@@ -2426,6 +2569,16 @@ async fn handle_chat_completions_sync(
                 None,
             ) {
                 warn!("failed to write chat sync profile event: {}", err);
+            }
+            if let Err(err) = maybe_write_first_request_memory_stage(
+                &state,
+                &replay_request_id,
+                &profile_request_model,
+                false,
+                profile_started_at,
+                request_memory_before,
+            ) {
+                warn!("failed to write chat sync memory profile event: {}", err);
             }
             state
                 .cache
@@ -7439,8 +7592,11 @@ mod tests {
         let _ = response_json(response).await;
 
         let events = read_profile_events(&profile);
-        assert_eq!(events.len(), 1, "events: {events:#?}");
-        let event = &events[0];
+        assert_eq!(events.len(), 2, "events: {events:#?}");
+        let event = events
+            .iter()
+            .find(|event| event["phase"] == "chat_completions_sync_complete")
+            .expect("sync completion profile event");
         assert_eq!(
             event["schema_version"],
             OBSERVABILITY_PROFILE_SCHEMA_VERSION
@@ -7472,6 +7628,22 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("replay_body.json"));
+        let memory_event = events
+            .iter()
+            .find(|event| event["phase"] == "actual_serve_first_request_done")
+            .expect("first request memory profile event");
+        assert_eq!(memory_event["event_kind"], "memory");
+        assert_eq!(
+            memory_event["attributes"]["memory_stage"],
+            "first_request_done"
+        );
+        assert_eq!(
+            memory_event["attributes"]["memory_measurement"],
+            "process_rss"
+        );
+        assert!(memory_event["memory"]["current_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0));
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_file(profile);
     }
@@ -7519,8 +7691,11 @@ mod tests {
         assert!(body.contains("data: [DONE]"), "body: {body}");
 
         let events = read_profile_events(&profile);
-        assert_eq!(events.len(), 1, "events: {events:#?}");
-        let event = &events[0];
+        assert_eq!(events.len(), 2, "events: {events:#?}");
+        let event = events
+            .iter()
+            .find(|event| event["phase"] == "chat_completions_stream_complete")
+            .expect("stream completion profile event");
         assert_eq!(
             event["schema_version"],
             OBSERVABILITY_PROFILE_SCHEMA_VERSION
@@ -7550,6 +7725,22 @@ mod tests {
             event["replay"]["bundle_dir"].as_str(),
             Some(root.to_string_lossy().as_ref())
         );
+        let memory_event = events
+            .iter()
+            .find(|event| event["phase"] == "actual_serve_first_request_done")
+            .expect("first request memory profile event");
+        assert_eq!(memory_event["event_kind"], "memory");
+        assert_eq!(
+            memory_event["attributes"]["memory_stage"],
+            "first_request_done"
+        );
+        assert_eq!(
+            memory_event["attributes"]["memory_measurement"],
+            "process_rss"
+        );
+        assert!(memory_event["memory"]["current_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0));
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_file(profile);
     }
