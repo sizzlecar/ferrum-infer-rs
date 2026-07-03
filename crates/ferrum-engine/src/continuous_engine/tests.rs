@@ -1457,6 +1457,67 @@ fn sequence_state_drop_with_owned_request_slot_panics_in_tests() {
     sequence.request_slot = Some(RequestSlotLease::open(&engine.inner, request.id));
 }
 
+#[tokio::test]
+async fn sequence_take_physical_resources_for_recompute_clears_owned_resources() {
+    let request = policy_request();
+    let request_id = request.id.clone();
+    let draft_request_id = RequestId::new();
+    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
+    sequence.kv_cache = Some(Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        request_id.clone(),
+        1,
+        1,
+    )));
+    sequence.kv_resource_blocks = Some(2);
+    sequence.draft_kv_cache = Some(Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        draft_request_id.clone(),
+        1,
+        1,
+    )));
+    sequence.draft_kv_request_id = Some(draft_request_id.clone());
+    sequence.draft_kv_resource_blocks = Some(3);
+    sequence.model_cache_id = Some("model-cache".to_string());
+    sequence.prefill_complete = true;
+    sequence.phase = RequestPhase::Decoding;
+    sequence.tokens_this_iteration = 4;
+
+    let recurrent_manager = InMemoryRecurrentStateManager::new(InMemoryRecurrentStateConfig {
+        total_memory_bytes: 8,
+        total_batch_slots: 1,
+    });
+    let recurrent_spec = RecurrentStateSpec {
+        request_id: request_id.clone(),
+        num_layers: 1,
+        tensors: vec![RecurrentStateTensorSpec::new(0, "state", vec![1])],
+        dtype: DataType::FP32,
+        device: Device::CPU,
+        max_batch_slots: 1,
+    };
+    sequence.recurrent_state = Some(recurrent_manager.allocate(&recurrent_spec).await.unwrap());
+    sequence.recurrent_state_slots = Some(1);
+
+    let resources = sequence.take_physical_resources_for_recompute();
+
+    assert!(resources.had_kv_cache);
+    assert_eq!(resources.kv_resource_blocks, Some(2));
+    assert_eq!(resources.draft_kv_request_id, Some(draft_request_id));
+    assert_eq!(resources.draft_kv_resource_blocks, Some(3));
+    assert!(resources.had_recurrent_state);
+    assert_eq!(resources.recurrent_state_slots, Some(1));
+    assert_eq!(resources.model_cache_id.as_deref(), Some("model-cache"));
+    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.kv_resource_blocks.is_none());
+    assert!(sequence.draft_kv_cache.is_none());
+    assert!(sequence.draft_kv_request_id.is_none());
+    assert!(sequence.draft_kv_resource_blocks.is_none());
+    assert!(sequence.recurrent_state.is_none());
+    assert!(sequence.recurrent_state_slots.is_none());
+    assert!(sequence.model_cache_id.is_none());
+    assert!(!sequence.prefill_complete);
+    assert_eq!(sequence.phase, RequestPhase::Waiting);
+    assert_eq!(sequence.tokens_this_iteration, 0);
+}
+
 #[test]
 #[should_panic(expected = "KV allocation lease dropped without explicit commit or async release")]
 fn kv_allocation_lease_drop_without_consumption_panics_in_tests() {

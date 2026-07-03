@@ -674,6 +674,17 @@ pub struct SequenceState {
     pub streamed_text_len: usize,
 }
 
+#[derive(Debug, Default)]
+struct SequencePhysicalResources {
+    had_kv_cache: bool,
+    kv_resource_blocks: Option<usize>,
+    draft_kv_request_id: Option<RequestId>,
+    draft_kv_resource_blocks: Option<usize>,
+    had_recurrent_state: bool,
+    recurrent_state_slots: Option<usize>,
+    model_cache_id: Option<String>,
+}
+
 impl SequenceState {
     pub fn new(request: InferenceRequest, input_tokens: Vec<TokenId>) -> Self {
         Self::new_with_tokenizer(request, input_tokens, None)
@@ -866,6 +877,29 @@ impl SequenceState {
             serde_json::json!(self.prefill_context_len()),
         );
         metadata
+    }
+
+    fn take_physical_resources(&mut self) -> SequencePhysicalResources {
+        let resources = SequencePhysicalResources {
+            had_kv_cache: self.kv_cache.take().is_some(),
+            kv_resource_blocks: self.kv_resource_blocks.take(),
+            draft_kv_request_id: self.draft_kv_request_id.take(),
+            draft_kv_resource_blocks: self.draft_kv_resource_blocks.take(),
+            had_recurrent_state: self.recurrent_state.take().is_some(),
+            recurrent_state_slots: self.recurrent_state_slots.take(),
+            model_cache_id: self.model_cache_id.take(),
+        };
+        let _ = self.draft_kv_cache.take();
+        resources
+    }
+
+    fn take_physical_resources_for_recompute(&mut self) -> SequencePhysicalResources {
+        let resources = self.take_physical_resources();
+        self.prefill_complete = false;
+        self.prefill_tokens_processed = 0;
+        self.phase = RequestPhase::Waiting;
+        self.tokens_this_iteration = 0;
+        resources
     }
 
     pub fn model_decode_logits_policy(&self) -> LogitsReturnPolicy {
@@ -2094,6 +2128,36 @@ impl EngineInner {
         let _ = self.kv_cache.deallocate(allocation_request_id).await;
         if let Some(blocks) = blocks {
             self.trace_kv_release(owner_request_id, blocks);
+        }
+    }
+
+    async fn release_sequence_physical_resources(
+        &self,
+        request_id: &RequestId,
+        resources: SequencePhysicalResources,
+    ) {
+        if let Some(cache_id) = resources.model_cache_id {
+            self.model_executor.release_cache(&cache_id);
+        }
+        if resources.had_kv_cache {
+            self.release_kv_allocation(
+                request_id,
+                request_id.clone(),
+                resources.kv_resource_blocks,
+            )
+            .await;
+        }
+        if let Some(draft_request_id) = resources.draft_kv_request_id {
+            self.release_kv_allocation(
+                request_id,
+                draft_request_id,
+                resources.draft_kv_resource_blocks,
+            )
+            .await;
+        }
+        if resources.had_recurrent_state {
+            self.release_recurrent_allocation(request_id, resources.recurrent_state_slots)
+                .await;
         }
     }
 
