@@ -1,20 +1,21 @@
 use chrono::{Duration, Utc};
 use clap::ValueEnum;
 use ferrum_types::{
-    FerrumError, FerrumProfileEvent, MemorySnapshot, ProfileEntrypoint, ProfileError,
-    ProfileEventKind, ProfileStatus, ReplayReference, ResourceAction, ResourceTraceEvent, Result,
-    SamplingParams, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+    FerrumError, FerrumObservabilityConfig, FerrumProfileEvent, MemorySnapshot,
+    ObservabilityProfileDetail, ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus,
+    ReplayReference, ResourceAction, ResourceTraceEvent, Result, SamplingParams,
+    DEFAULT_OBSERVABILITY_PROFILE_SAMPLE_RATE, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const SYNTHETIC_MODEL: &str = "synthetic/no-weight";
 const SYNTHETIC_BACKEND: &str = "synthetic";
-const DEFAULT_PROFILE_SAMPLE_RATE: f64 = 0.01;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum ProfileDetailArg {
@@ -34,22 +35,30 @@ impl ProfileDetailArg {
             Self::Full => "full",
         }
     }
+}
 
-    fn diagnostic_only(self) -> bool {
-        matches!(self, Self::Debug | Self::Full)
+impl From<ProfileDetailArg> for ObservabilityProfileDetail {
+    fn from(value: ProfileDetailArg) -> Self {
+        match value {
+            ProfileDetailArg::Off => Self::Off,
+            ProfileDetailArg::Basic => Self::Basic,
+            ProfileDetailArg::Debug => Self::Debug,
+            ProfileDetailArg::Full => Self::Full,
+        }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct ProductObservabilityConfig {
-    pub entrypoint: ProfileEntrypoint,
-    pub model: String,
-    pub profile_jsonl: Option<PathBuf>,
-    pub profile_detail: ProfileDetailArg,
-    pub memory_profile_jsonl: Option<PathBuf>,
-    pub scheduler_trace_jsonl: Option<PathBuf>,
-    pub request_dump_dir: Option<PathBuf>,
-    pub profile_sample_rate: f64,
+    pub core: FerrumObservabilityConfig,
+}
+
+impl Deref for ProductObservabilityConfig {
+    type Target = FerrumObservabilityConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
 }
 
 pub struct ActualRunObservation {
@@ -92,62 +101,38 @@ impl ProductObservabilityConfig {
         profile_sample_rate: f64,
     ) -> Self {
         Self {
-            entrypoint,
-            model: model.into(),
-            profile_jsonl: profile_jsonl.cloned(),
-            profile_detail,
-            memory_profile_jsonl: memory_profile_jsonl.cloned(),
-            scheduler_trace_jsonl: scheduler_trace_jsonl.cloned(),
-            request_dump_dir: request_dump_dir.cloned(),
-            profile_sample_rate,
+            core: FerrumObservabilityConfig::new(
+                entrypoint,
+                model,
+                profile_jsonl.cloned(),
+                profile_detail.into(),
+                memory_profile_jsonl.cloned(),
+                scheduler_trace_jsonl.cloned(),
+                request_dump_dir.cloned(),
+                profile_sample_rate,
+            ),
         }
     }
 
     pub fn enabled(&self) -> bool {
-        self.profile_detail != ProfileDetailArg::Off
-            || self.profile_jsonl.is_some()
-            || self.memory_profile_jsonl.is_some()
-            || self.scheduler_trace_jsonl.is_some()
-            || self.request_dump_dir.is_some()
+        self.core.enabled()
     }
 
     pub fn synthetic_no_weight_enabled(&self) -> bool {
-        self.enabled() && self.model == SYNTHETIC_MODEL
+        self.core.synthetic_no_weight_enabled()
     }
 
     pub fn unified_product_profile_enabled(&self) -> bool {
-        self.enabled()
-            && (self.profile_detail != ProfileDetailArg::Off
-                || self.memory_profile_jsonl.is_some()
-                || self.scheduler_trace_jsonl.is_some()
-                || self.request_dump_dir.is_some())
+        self.core.unified_product_profile_enabled()
     }
 
     fn validate(&self) -> Result<()> {
-        if !self.profile_sample_rate.is_finite()
-            || self.profile_sample_rate < 0.0
-            || self.profile_sample_rate > 1.0
-        {
-            return Err(FerrumError::invalid_parameter(
-                "--profile-sample-rate must be between 0.0 and 1.0",
-            ));
-        }
-        if self.enabled()
-            && self.profile_jsonl.is_none()
-            && self.memory_profile_jsonl.is_none()
-            && self.scheduler_trace_jsonl.is_none()
-            && self.request_dump_dir.is_none()
-        {
-            return Err(FerrumError::invalid_parameter(
-                "observability profile detail requires at least one artifact path",
-            ));
-        }
-        Ok(())
+        self.core.validate().map_err(FerrumError::invalid_parameter)
     }
 }
 
 pub fn default_profile_sample_rate() -> f64 {
-    DEFAULT_PROFILE_SAMPLE_RATE
+    DEFAULT_OBSERVABILITY_PROFILE_SAMPLE_RATE
 }
 
 pub fn write_synthetic_product_observability(
