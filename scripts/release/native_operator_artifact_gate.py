@@ -182,6 +182,8 @@ def validate_manifest(manifest: dict[str, Any], *, context: str) -> dict[str, An
     exports = require_string_list(manifest, "exports", context)
     if "ferrum_native_op_init" not in exports:
         raise GateError(f"{context}.exports must include ferrum_native_op_init")
+    if "ferrum_native_op_descriptor" not in exports:
+        raise GateError(f"{context}.exports must include ferrum_native_op_descriptor")
     require_string_list(manifest, "license_files", context)
 
     build_summary = manifest.get("build_summary")

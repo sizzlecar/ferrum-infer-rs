@@ -46,7 +46,10 @@
     "exports": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 },
-      "contains": { "const": "ferrum_native_op_init" }
+      "allOf": [
+        { "contains": { "const": "ferrum_native_op_init" } },
+        { "contains": { "const": "ferrum_native_op_descriptor" } }
+      ]
     },
     "license_files": {
       "type": "array",

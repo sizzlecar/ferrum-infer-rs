@@ -3,12 +3,15 @@
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use ferrum_types::{NativeOperatorBackend, NativeOperatorManifest};
+use ferrum_types::{NativeOperatorBackend, NativeOperatorLinkage, NativeOperatorManifest};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::abi::{FERRUM_NATIVE_ABI_VERSION, FERRUM_NATIVE_OP_INIT_SYMBOL};
+use crate::abi::{
+    FERRUM_NATIVE_ABI_VERSION, FERRUM_NATIVE_OP_DESCRIPTOR_SYMBOL, FERRUM_NATIVE_OP_INIT_SYMBOL,
+};
 use crate::manifest::load_manifest;
 
 pub type Result<T> = std::result::Result<T, NativeOperatorResolveError>;
@@ -45,6 +48,24 @@ pub enum NativeOperatorResolveError {
     ArtifactRead { path: PathBuf, source: io::Error },
     #[error("native operator artifact sha256 mismatch: expected {expected}, got {actual}")]
     ArtifactSha256Mismatch { expected: String, actual: String },
+    #[error("native operator artifact suffix mismatch for {path}: linkage={linkage:?}")]
+    ArtifactSuffixMismatch {
+        path: PathBuf,
+        linkage: NativeOperatorLinkage,
+    },
+    #[error("native operator static archive is empty: {0}")]
+    ArtifactArchiveEmpty(PathBuf),
+    #[error(
+        "native operator artifact tool failed: tool={tool} path={path} status={status} stderr={stderr}"
+    )]
+    ArtifactToolFailed {
+        tool: String,
+        path: PathBuf,
+        status: String,
+        stderr: String,
+    },
+    #[error("native operator artifact missing required exports in {path}: {missing:?}")]
+    ArtifactMissingExports { path: PathBuf, missing: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +112,21 @@ pub struct ResolvedNativeOperator {
     pub manifest_path: PathBuf,
     pub artifact_path: PathBuf,
     pub artifact_sha256: String,
+    pub binary_validation: NativeOperatorBinaryValidation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeOperatorArtifactFormat {
+    StaticArchive,
+    DynamicLibrary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeOperatorBinaryValidation {
+    pub format: NativeOperatorArtifactFormat,
+    pub archive_members: Vec<String>,
+    pub required_exports: Vec<String>,
+    pub matched_exports: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -149,6 +185,15 @@ impl NativeOperatorResolver {
                 "exports must include {FERRUM_NATIVE_OP_INIT_SYMBOL}"
             )));
         }
+        if !manifest
+            .exports
+            .iter()
+            .any(|export| export == FERRUM_NATIVE_OP_DESCRIPTOR_SYMBOL)
+        {
+            return Err(NativeOperatorResolveError::ManifestInvalid(format!(
+                "exports must include {FERRUM_NATIVE_OP_DESCRIPTOR_SYMBOL}"
+            )));
+        }
         if let Some(expected) = &request.compute_capability {
             if !manifest
                 .compute_capabilities
@@ -168,11 +213,14 @@ impl NativeOperatorResolver {
                 actual: artifact_sha256,
             });
         }
+        let binary_validation =
+            validate_binary_artifact(&request.artifact_path, manifest.linkage, &manifest.exports)?;
         Ok(ResolvedNativeOperator {
             manifest,
             manifest_path: request.manifest_path.clone(),
             artifact_path: request.artifact_path.clone(),
             artifact_sha256,
+            binary_validation,
         })
     }
 }
@@ -198,6 +246,134 @@ fn file_sha256(path: &Path) -> Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validate_binary_artifact(
+    path: &Path,
+    linkage: NativeOperatorLinkage,
+    exports: &[String],
+) -> Result<NativeOperatorBinaryValidation> {
+    let (format, archive_members) = match linkage {
+        NativeOperatorLinkage::Static => {
+            if path.extension().and_then(|extension| extension.to_str()) != Some("a") {
+                return Err(NativeOperatorResolveError::ArtifactSuffixMismatch {
+                    path: path.to_path_buf(),
+                    linkage,
+                });
+            }
+            let output = run_artifact_tool("ar", &["t"], path)?;
+            let members = output
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            if members.is_empty() {
+                return Err(NativeOperatorResolveError::ArtifactArchiveEmpty(
+                    path.to_path_buf(),
+                ));
+            }
+            (NativeOperatorArtifactFormat::StaticArchive, members)
+        }
+        NativeOperatorLinkage::Dynamic => {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            let suffix_ok = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension == "dylib" || extension == "so")
+                || name.contains(".so.");
+            if !suffix_ok {
+                return Err(NativeOperatorResolveError::ArtifactSuffixMismatch {
+                    path: path.to_path_buf(),
+                    linkage,
+                });
+            }
+            (NativeOperatorArtifactFormat::DynamicLibrary, Vec::new())
+        }
+    };
+
+    let nm_output = run_artifact_tool("nm", &["-g"], path)?;
+    let defined_symbols = collect_defined_symbols(&nm_output);
+    let missing = exports
+        .iter()
+        .filter(|export| !defined_symbols.contains(export.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(NativeOperatorResolveError::ArtifactMissingExports {
+            path: path.to_path_buf(),
+            missing,
+        });
+    }
+
+    Ok(NativeOperatorBinaryValidation {
+        format,
+        archive_members,
+        required_exports: exports.to_vec(),
+        matched_exports: exports.to_vec(),
+    })
+}
+
+fn run_artifact_tool(program: &str, args: &[&str], path: &Path) -> Result<String> {
+    let output = Command::new(program)
+        .args(args)
+        .arg(path)
+        .output()
+        .map_err(|source| NativeOperatorResolveError::ArtifactRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .chars()
+            .take(1000)
+            .collect::<String>();
+        return Err(NativeOperatorResolveError::ArtifactToolFailed {
+            tool: program.to_string(),
+            path: path.to_path_buf(),
+            status: output.status.to_string(),
+            stderr,
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn collect_defined_symbols(nm_output: &str) -> std::collections::BTreeSet<String> {
+    let mut symbols = std::collections::BTreeSet::new();
+    for raw_line in nm_output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.ends_with(':') {
+            continue;
+        }
+        let parts = line.split_whitespace().collect::<Vec<_>>();
+        if parts.len() < 2 {
+            continue;
+        }
+        let mut symbol_type = None;
+        let mut symbol = None;
+        if parts.len() >= 3 && parts[parts.len() - 2].len() == 1 {
+            symbol_type = parts.get(parts.len() - 2).copied();
+            symbol = parts.last().copied();
+        } else if parts[0].len() == 1 {
+            symbol_type = parts.first().copied();
+            symbol = parts.last().copied();
+        }
+        let (Some(symbol_type), Some(symbol)) = (symbol_type, symbol) else {
+            continue;
+        };
+        if symbol_type.eq_ignore_ascii_case("u") {
+            continue;
+        }
+        symbols.insert(symbol.to_string());
+        if let Some(stripped) = symbol.strip_prefix('_') {
+            symbols.insert(stripped.to_string());
+        }
+    }
+    symbols
 }
 
 #[cfg(test)]
@@ -254,7 +430,13 @@ mod tests {
         TestDir(dir)
     }
 
-    fn write_manifest(path: &Path, binary_sha256: String, abi: &str, caps: Vec<String>) {
+    fn write_manifest(
+        path: &Path,
+        binary_sha256: String,
+        abi: &str,
+        caps: Vec<String>,
+        exports: Vec<String>,
+    ) {
         let manifest = NativeOperatorManifest {
             schema_version: NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
             operator: "dummy".to_string(),
@@ -272,7 +454,7 @@ mod tests {
             inputs_sha256: digest('b'),
             binary_sha256,
             linkage: NativeOperatorLinkage::Static,
-            exports: vec![FERRUM_NATIVE_OP_INIT_SYMBOL.to_string()],
+            exports,
             license_files: vec!["LICENSE".to_string()],
             build_summary: NativeOperatorBuildSummary {
                 builder_sha: "fixture-builder".to_string(),
@@ -284,17 +466,52 @@ mod tests {
         fs::write(path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
     }
 
+    fn required_exports() -> Vec<String> {
+        vec![
+            FERRUM_NATIVE_OP_INIT_SYMBOL.to_string(),
+            FERRUM_NATIVE_OP_DESCRIPTOR_SYMBOL.to_string(),
+        ]
+    }
+
+    fn write_static_archive(dir: &Path, include_descriptor: bool) -> PathBuf {
+        let source = dir.join("native_op.c");
+        let mut source_text = String::from("int ferrum_native_op_init(void) { return 0; }\n");
+        if include_descriptor {
+            source_text
+                .push_str("const char *ferrum_native_op_descriptor(void) { return \"dummy\"; }\n");
+        }
+        fs::write(&source, source_text).unwrap();
+        let object = dir.join("native_op.o");
+        let archive = dir.join("libferrum_native_dummy.a");
+        let cc_status = Command::new("cc")
+            .arg("-c")
+            .arg(&source)
+            .arg("-o")
+            .arg(&object)
+            .status()
+            .unwrap();
+        assert!(cc_status.success());
+        let ar_status = Command::new("ar")
+            .arg("rcs")
+            .arg(&archive)
+            .arg(&object)
+            .status()
+            .unwrap();
+        assert!(ar_status.success());
+        archive
+    }
+
     fn fixture() -> TestFixture {
         let dir = temp_dir("resolver");
-        let artifact = dir.path().join("libferrum_native_dummy.a");
-        let bytes = b"dummy native operator artifact";
-        fs::write(&artifact, bytes).unwrap();
+        let artifact = write_static_archive(dir.path(), true);
+        let bytes = fs::read(&artifact).unwrap();
         let manifest = dir.path().join("native_operator_manifest.json");
         write_manifest(
             &manifest,
-            digest_bytes(bytes),
+            digest_bytes(&bytes),
             FERRUM_NATIVE_ABI_VERSION,
             vec!["sm_89".to_string()],
+            required_exports(),
         );
         TestFixture {
             _dir: dir,
@@ -316,6 +533,14 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.manifest.operator, "dummy");
         assert_eq!(resolved.artifact_path, fixture.artifact);
+        assert_eq!(
+            resolved.binary_validation.format,
+            NativeOperatorArtifactFormat::StaticArchive
+        );
+        assert_eq!(
+            resolved.binary_validation.required_exports,
+            required_exports()
+        );
     }
 
     #[test]
@@ -356,9 +581,10 @@ mod tests {
         let abi_manifest = fixture._dir.path().join("abi_mismatch.json");
         write_manifest(
             &abi_manifest,
-            digest_bytes(b"dummy native operator artifact"),
+            digest_bytes(&fs::read(&fixture.artifact).unwrap()),
             "999",
             vec!["sm_89".to_string()],
+            required_exports(),
         );
         let err = NativeOperatorResolver
             .resolve(&request(&abi_manifest, &fixture.artifact))
@@ -376,9 +602,10 @@ mod tests {
         let cap_manifest = fixture._dir.path().join("cap_mismatch.json");
         write_manifest(
             &cap_manifest,
-            digest_bytes(b"dummy native operator artifact"),
+            digest_bytes(&fs::read(&fixture.artifact).unwrap()),
             FERRUM_NATIVE_ABI_VERSION,
             vec!["sm_80".to_string()],
+            required_exports(),
         );
         let err = NativeOperatorResolver
             .resolve(&request(&cap_manifest, &fixture.artifact))
@@ -404,5 +631,76 @@ mod tests {
             err,
             NativeOperatorResolveError::PythonWheelArtifact(_)
         ));
+    }
+
+    #[test]
+    fn rejects_text_file_even_when_hash_matches() {
+        let dir = temp_dir("text-artifact");
+        let artifact = dir.path().join("libferrum_native_dummy.a");
+        let bytes = b"not an archive";
+        fs::write(&artifact, bytes).unwrap();
+        let manifest = dir.path().join("native_operator_manifest.json");
+        write_manifest(
+            &manifest,
+            digest_bytes(bytes),
+            FERRUM_NATIVE_ABI_VERSION,
+            vec!["sm_89".to_string()],
+            required_exports(),
+        );
+
+        let err = NativeOperatorResolver
+            .resolve(&request(&manifest, &artifact))
+            .unwrap_err();
+        assert!(
+            matches!(err, NativeOperatorResolveError::ArtifactToolFailed { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_archive_missing_declared_export() {
+        let dir = temp_dir("missing-export");
+        let artifact = write_static_archive(dir.path(), false);
+        let bytes = fs::read(&artifact).unwrap();
+        let manifest = dir.path().join("native_operator_manifest.json");
+        write_manifest(
+            &manifest,
+            digest_bytes(&bytes),
+            FERRUM_NATIVE_ABI_VERSION,
+            vec!["sm_89".to_string()],
+            required_exports(),
+        );
+
+        let err = NativeOperatorResolver
+            .resolve(&request(&manifest, &artifact))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NativeOperatorResolveError::ArtifactMissingExports { .. }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_manifest_without_descriptor_export() {
+        let fixture = fixture();
+        let manifest = fixture._dir.path().join("missing_descriptor.json");
+        write_manifest(
+            &manifest,
+            digest_bytes(&fs::read(&fixture.artifact).unwrap()),
+            FERRUM_NATIVE_ABI_VERSION,
+            vec!["sm_89".to_string()],
+            vec![FERRUM_NATIVE_OP_INIT_SYMBOL.to_string()],
+        );
+
+        let err = NativeOperatorResolver
+            .resolve(&request(&manifest, &fixture.artifact))
+            .unwrap_err();
+        assert!(
+            matches!(err, NativeOperatorResolveError::ManifestInvalid(_)),
+            "{err:?}"
+        );
     }
 }

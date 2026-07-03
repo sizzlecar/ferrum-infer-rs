@@ -131,6 +131,13 @@ impl NativeOperatorManifest {
         {
             return Err("exports must include ferrum_native_op_init".to_string());
         }
+        if !self
+            .exports
+            .iter()
+            .any(|export| export == "ferrum_native_op_descriptor")
+        {
+            return Err("exports must include ferrum_native_op_descriptor".to_string());
+        }
         Ok(())
     }
 }
@@ -260,7 +267,10 @@ mod tests {
             inputs_sha256: digest('b'),
             binary_sha256: digest('c'),
             linkage: NativeOperatorLinkage::Static,
-            exports: vec!["ferrum_native_op_init".to_string()],
+            exports: vec![
+                "ferrum_native_op_init".to_string(),
+                "ferrum_native_op_descriptor".to_string(),
+            ],
             license_files: vec!["LICENSE".to_string()],
             build_summary: NativeOperatorBuildSummary {
                 builder_sha: "builder".to_string(),
