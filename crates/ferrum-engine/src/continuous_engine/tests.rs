@@ -145,6 +145,163 @@ fn policy_request() -> InferenceRequest {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct TestResourceTraceState {
+    reserved: i64,
+    committed: i64,
+    released: i64,
+    rolled_back: i64,
+}
+
+impl TestResourceTraceState {
+    fn outstanding_reserved(&self) -> i64 {
+        self.reserved - self.released - self.rolled_back
+    }
+
+    fn outstanding_committed(&self) -> i64 {
+        self.committed - self.released - self.rolled_back
+    }
+
+    fn assert_zero_outstanding(&self, key: &(String, String, String)) {
+        assert_eq!(
+            self.outstanding_reserved(),
+            0,
+            "resource {key:?} closed with outstanding reserved state: {self:?}"
+        );
+        assert_eq!(
+            self.outstanding_committed(),
+            0,
+            "resource {key:?} closed with outstanding committed state: {self:?}"
+        );
+    }
+}
+
+fn resource_trace_temp_path(label: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock should be after UNIX_EPOCH")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "ferrum-engine-{label}-{}-{nanos}.jsonl",
+        std::process::id()
+    ))
+}
+
+fn assert_engine_resource_trace_balanced(path: &Path) -> Vec<ResourceTraceEvent> {
+    let contents = std::fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!("failed to read resource trace {}: {error}", path.display())
+    });
+    assert!(
+        !contents.trim().is_empty(),
+        "resource trace {} should not be empty",
+        path.display()
+    );
+
+    let mut states: HashMap<(String, String, String), TestResourceTraceState> = HashMap::new();
+    let mut resources = Vec::new();
+
+    for (line_no, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: FerrumProfileEvent = serde_json::from_str(line).unwrap_or_else(|error| {
+            panic!(
+                "line {} in {} is not a FerrumProfileEvent: {error}\n{line}",
+                line_no + 1,
+                path.display()
+            )
+        });
+        event.validate().unwrap_or_else(|error| {
+            panic!(
+                "line {} in {} failed profile validation: {error}\n{line}",
+                line_no + 1,
+                path.display()
+            )
+        });
+        let Some(resource) = event.resource else {
+            continue;
+        };
+        resource.validate().unwrap_or_else(|error| {
+            panic!(
+                "line {} in {} failed resource validation: {error}\n{line}",
+                line_no + 1,
+                path.display()
+            )
+        });
+        let key = (
+            resource.owner_kind.clone(),
+            resource.owner_id.clone(),
+            resource.resource_kind.clone(),
+        );
+        match resource.action {
+            ResourceAction::Reserve => {
+                let amount = resource.amount.expect("reserve amount");
+                let state = states.entry(key).or_default();
+                assert!(amount > 0, "reserve amount must be positive: {resource:?}");
+                assert_eq!(resource.before, Some(state.outstanding_reserved()));
+                state.reserved += amount;
+                assert_eq!(resource.after, Some(state.outstanding_reserved()));
+            }
+            ResourceAction::Commit => {
+                let amount = resource.amount.expect("commit amount");
+                let state = states.entry(key).or_default();
+                assert!(amount > 0, "commit amount must be positive: {resource:?}");
+                assert_eq!(resource.before, Some(state.outstanding_committed()));
+                state.committed += amount;
+                assert_eq!(resource.after, Some(state.outstanding_committed()));
+            }
+            ResourceAction::Release => {
+                let amount = resource.amount.expect("release amount");
+                let state = states.entry(key).or_default();
+                assert!(amount > 0, "release amount must be positive: {resource:?}");
+                let before = state.outstanding_committed();
+                assert!(
+                    amount <= before,
+                    "release underflow for {resource:?}; state before release: {state:?}"
+                );
+                assert_eq!(resource.before, Some(before));
+                state.released += amount;
+                assert_eq!(resource.after, Some(state.outstanding_committed()));
+            }
+            ResourceAction::Rollback => {
+                let amount = resource.amount.expect("rollback amount");
+                let state = states.entry(key).or_default();
+                assert!(amount > 0, "rollback amount must be positive: {resource:?}");
+                let before = state.outstanding_reserved();
+                assert!(
+                    amount <= before,
+                    "rollback underflow for {resource:?}; state before rollback: {state:?}"
+                );
+                assert_eq!(resource.before, Some(before));
+                state.rolled_back += amount;
+                assert_eq!(resource.after, Some(state.outstanding_reserved()));
+            }
+            ResourceAction::RequestClose => {
+                let owner_kind = resource.owner_kind.clone();
+                let owner_id = resource.owner_id.clone();
+                for (state_key, state) in states
+                    .iter()
+                    .filter(|(state_key, _)| state_key.0 == owner_kind && state_key.1 == owner_id)
+                {
+                    state.assert_zero_outstanding(state_key);
+                }
+                states.retain(|state_key, _| state_key.0 != owner_kind || state_key.1 != owner_id);
+            }
+            ResourceAction::RequestOpen
+            | ResourceAction::Defer
+            | ResourceAction::Reject
+            | ResourceAction::CapacitySnapshot => {}
+        }
+        resources.push(resource);
+    }
+
+    for (key, state) in &states {
+        state.assert_zero_outstanding(key);
+    }
+
+    resources
+}
+
 struct RecurrentSpecExecutor {
     inner: MockModelExecutor,
 }
@@ -1259,7 +1416,10 @@ fn performance_breakdown_reports_engine_timing_counters() {
 }
 
 fn test_continuous_engine() -> ContinuousBatchEngine {
-    let config = EngineConfig::default();
+    test_continuous_engine_with_config(EngineConfig::default())
+}
+
+fn test_continuous_engine_with_config(config: EngineConfig) -> ContinuousBatchEngine {
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
@@ -1388,6 +1548,43 @@ async fn scheduler_trace_plan_stats_reports_request_details() {
     assert_eq!(request_stats.prefill_tokens_processed, Some(1));
     assert_eq!(request_stats.prefill_tokens_remaining_before, Some(3));
     assert_eq!(request_stats.is_final_prefill_chunk, Some(true));
+}
+
+#[tokio::test]
+async fn scheduler_trace_jsonl_resource_events_balance_successful_infer() {
+    let trace_path = resource_trace_temp_path("successful-infer");
+    let _ = std::fs::remove_file(&trace_path);
+    let mut config = EngineConfig::default();
+    config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
+    config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Run);
+    config.kv_cache.max_blocks = 128;
+    let engine = test_continuous_engine_with_config(config);
+
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 1;
+    let request_id = request.id.clone();
+    let response = engine.infer(request).await.unwrap();
+
+    assert_eq!(response.request_id, request_id);
+    assert_eq!(response.finish_reason, FinishReason::Length);
+
+    let resources = assert_engine_resource_trace_balanced(&trace_path);
+    let saw = |kind: &str, action: ResourceAction| {
+        resources
+            .iter()
+            .any(|resource| resource.resource_kind == kind && resource.action == action)
+    };
+
+    assert!(saw("request_slot", ResourceAction::RequestOpen));
+    assert!(saw("request_slot", ResourceAction::Reserve));
+    assert!(saw("request_slot", ResourceAction::Commit));
+    assert!(saw("request_slot", ResourceAction::Release));
+    assert!(saw("request_slot", ResourceAction::RequestClose));
+    assert!(saw("kv_block", ResourceAction::Reserve));
+    assert!(saw("kv_block", ResourceAction::Commit));
+    assert!(saw("kv_block", ResourceAction::Release));
+
+    let _ = std::fs::remove_file(trace_path);
 }
 
 #[test]
@@ -2243,8 +2440,12 @@ async fn process_batch_unified_kv_defer_moves_active_prefill_back_to_waiting() {
 
 #[tokio::test]
 async fn process_batch_releases_kv_and_recurrent_state_when_model_admission_fails() {
+    let trace_path = resource_trace_temp_path("model-admission-failure");
+    let _ = std::fs::remove_file(&trace_path);
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
+    config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
+    config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Synthetic);
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
@@ -2296,6 +2497,19 @@ async fn process_batch_releases_kv_and_recurrent_state_when_model_admission_fail
     assert!(recurrent_stats.allocation_count >= 2);
     assert_eq!(recurrent_stats.active_states, 0);
     assert_eq!(recurrent_stats.used_batch_slots, 0);
+    let resources = assert_engine_resource_trace_balanced(&trace_path);
+    let saw = |kind: &str, action: ResourceAction| {
+        resources
+            .iter()
+            .any(|resource| resource.resource_kind == kind && resource.action == action)
+    };
+    assert!(saw("kv_block", ResourceAction::Reserve));
+    assert!(saw("kv_block", ResourceAction::Commit));
+    assert!(saw("kv_block", ResourceAction::Release));
+    assert!(saw("recurrent_state_slot", ResourceAction::Reserve));
+    assert!(saw("recurrent_state_slot", ResourceAction::Commit));
+    assert!(saw("recurrent_state_slot", ResourceAction::Release));
+    let _ = std::fs::remove_file(trace_path);
 
     let sequences = engine.inner.sequences.read();
     let sequence = sequences
