@@ -1519,6 +1519,46 @@ async fn sequence_take_physical_resources_for_recompute_clears_owned_resources()
 }
 
 #[test]
+fn sequence_prefill_commit_helpers_keep_resource_metadata_together() {
+    let request = policy_request();
+    let request_id = request.id.clone();
+    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
+    let model_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        request_id.clone(),
+        1,
+        1,
+    ));
+    let model_cache_id = model_kv.cache_id();
+
+    sequence.install_model_kv_without_owned_blocks(model_kv.clone());
+    assert!(sequence.kv_cache.is_some());
+    assert_eq!(
+        sequence.model_cache_id.as_deref(),
+        Some(model_cache_id.as_str())
+    );
+    assert!(sequence.kv_resource_blocks.is_none());
+
+    let owned_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        request_id.clone(),
+        1,
+        2,
+    ));
+    let owned_cache_id = owned_kv.cache_id();
+    sequence.commit_prefill_physical_resources(owned_kv.clone(), 4, None, None);
+
+    assert_eq!(
+        sequence.model_cache_id.as_deref(),
+        Some(owned_cache_id.as_str())
+    );
+    assert!(sequence.kv_cache.is_some());
+    assert_eq!(sequence.kv_resource_blocks, Some(4));
+    assert!(sequence.recurrent_state.is_none());
+    assert!(sequence.recurrent_state_slots.is_none());
+    assert!(sequence.prefill_complete);
+    assert_eq!(sequence.phase, RequestPhase::Decoding);
+}
+
+#[test]
 #[should_panic(expected = "KV allocation lease dropped without explicit commit or async release")]
 fn kv_allocation_lease_drop_without_consumption_panics_in_tests() {
     let request_id = RequestId::new();

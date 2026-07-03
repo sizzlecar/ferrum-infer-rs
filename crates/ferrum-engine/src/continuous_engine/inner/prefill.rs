@@ -91,8 +91,7 @@ impl EngineInner {
                         Some(self.tokenizer.as_ref()),
                     )?;
                     seq.generated_tokens.push(token);
-                    seq.model_cache_id = Some(cloned_kv.cache_id());
-                    seq.kv_cache = Some(cloned_kv);
+                    seq.install_model_kv_without_owned_blocks(cloned_kv);
                     seq.prefill_complete = true;
                     seq.phase = RequestPhase::Decoding;
                     token
@@ -291,18 +290,16 @@ impl EngineInner {
                 Some(self.tokenizer.as_ref()),
             )?;
             seq.generated_tokens.push(token);
-            seq.model_cache_id = Some(prefill_output.kv_cache.cache_id());
-            seq.kv_cache = Some(prefill_output.kv_cache.clone());
-            seq.kv_resource_blocks = Some(kv_resource_blocks);
-            seq.recurrent_state = prefill_output
+            let recurrent_state = prefill_output
                 .recurrent_state
                 .clone()
                 .or_else(|| recurrent_admission.handle());
-            if let Some(slots) = recurrent_admission.fresh_slots() {
-                seq.recurrent_state_slots = Some(slots);
-            }
-            seq.prefill_complete = true;
-            seq.phase = RequestPhase::Decoding;
+            seq.commit_prefill_physical_resources(
+                prefill_output.kv_cache.clone(),
+                kv_resource_blocks,
+                recurrent_state,
+                recurrent_admission.fresh_slots(),
+            );
             Ok::<TokenId, FerrumError>(token)
         })();
         let first_token = match first_token_result {
@@ -581,18 +578,16 @@ impl EngineInner {
                     Some(self.tokenizer.as_ref()),
                 )?;
                 seq.generated_tokens.push(token);
-                seq.model_cache_id = Some(prefill_output.kv_cache.cache_id());
-                seq.kv_cache = Some(prefill_output.kv_cache.clone());
-                seq.kv_resource_blocks = Some(kv_resource_blocks);
-                seq.recurrent_state = prefill_output
+                let recurrent_state = prefill_output
                     .recurrent_state
                     .clone()
                     .or_else(|| pending.recurrent_state.handle());
-                if let Some(slots) = pending.recurrent_state.fresh_slots() {
-                    seq.recurrent_state_slots = Some(slots);
-                }
-                seq.prefill_complete = true;
-                seq.phase = RequestPhase::Decoding;
+                seq.commit_prefill_physical_resources(
+                    prefill_output.kv_cache.clone(),
+                    kv_resource_blocks,
+                    recurrent_state,
+                    pending.recurrent_state.fresh_slots(),
+                );
                 Ok::<Option<TokenId>, FerrumError>(Some(token))
             })();
             let first_token = match first_token_result {
