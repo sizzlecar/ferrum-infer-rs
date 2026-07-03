@@ -655,6 +655,64 @@ def validate_actual_smoke_profile_groups(
     return groups
 
 
+def collect_profile_replay_links(
+    events_by_path: dict[str, list[dict[str, Any]]],
+    *,
+    required_entrypoints: set[str],
+    label: str,
+) -> list[dict[str, Any]]:
+    links: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for profile_path, events in events_by_path.items():
+        profile_parent = Path(profile_path).parent
+        for event in events:
+            replay = event.get("replay")
+            if not isinstance(replay, dict):
+                continue
+            command = replay.get("command")
+            bundle_dir = replay.get("bundle_dir")
+            entrypoint = event.get("entrypoint")
+            event_id = event.get("event_id")
+            request_id = event.get("request_id")
+            for key, value in [
+                ("event_id", event_id),
+                ("request_id", request_id),
+                ("entrypoint", entrypoint),
+                ("replay.command", command),
+                ("replay.bundle_dir", bundle_dir),
+            ]:
+                require(
+                    isinstance(value, str) and value.strip(),
+                    f"{label} replay link {key} must be a non-empty string",
+                )
+            bundle_path = Path(str(bundle_dir))
+            if not bundle_path.is_absolute():
+                bundle_path = (profile_parent / bundle_path).resolve()
+            key = (
+                str(event_id),
+                str(request_id),
+                str(entrypoint),
+                str(bundle_path),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append(
+                {
+                    "profile_path": profile_path,
+                    "profile_event_id": event_id,
+                    "request_id": request_id,
+                    "entrypoint": entrypoint,
+                    "replay_command": command,
+                    "bundle_dir": str(bundle_path),
+                }
+            )
+    covered = {str(link.get("entrypoint")) for link in links}
+    missing = sorted(required_entrypoints - covered)
+    require(not missing, f"{label} missing replay links for entrypoints: {missing}")
+    return links
+
+
 def actual_smoke_result(actual_smoke: Path) -> dict[str, Any]:
     require(actual_smoke.is_dir(), f"actual smoke artifact must be a directory: {actual_smoke}")
     manifest_path = actual_smoke / "gate.manifest.json"
@@ -727,6 +785,16 @@ def actual_smoke_result(actual_smoke: Path) -> dict[str, Any]:
     profile_summary = summarize_events(profile_paths, events_by_path)
     require("run" in profile_summary["entrypoints"], "actual smoke missing run profile events")
     require("serve" in profile_summary["entrypoints"], "actual smoke missing serve profile events")
+    profile_replay_links = collect_profile_replay_links(
+        events_by_path,
+        required_entrypoints={"run", "serve"},
+        label="actual smoke profile",
+    )
+    profile_replay_bundle_summary = validate_replay_bundles(events_by_path)
+    require(
+        profile_replay_bundle_summary,
+        "actual smoke profile replay links did not validate any replay bundle",
+    )
     replay_bundle_summary = []
     for bundle_root in [actual_smoke / "run/request_dump", actual_smoke / "serve/request_dump"]:
         replay_bundle_summary.extend(validate_bundle_root(bundle_root))
@@ -788,6 +856,8 @@ def actual_smoke_result(actual_smoke: Path) -> dict[str, Any]:
         "profile_detail": summary.get("profile_detail"),
         "entrypoints": profile_summary["entrypoints"],
         "profile_groups": profile_groups,
+        "profile_replay_links": profile_replay_links,
+        "profile_replay_bundle_count": len(profile_replay_bundle_summary),
         "replay_bundle_count": len(replay_bundle_summary),
         "offline_replay_execution_count": offline_replay["replay_execution_count"],
         "offline_replay_skipped_count": offline_replay["replay_execution_skipped_count"],
@@ -1557,6 +1627,33 @@ def run_selftest() -> None:
             raise AssertionError("all-skipped actual smoke replay unexpectedly passed")
         except SentinelError as exc:
             require("did not execute any offline replay" in str(exc), f"unexpected replay error: {exc}")
+        missing_replay_link_smoke = make_actual_smoke_fixture(
+            temp / "missing-replay-link-smoke",
+            sha=head,
+        )
+        missing_replay_profile_path = missing_replay_link_smoke / "run/profile.jsonl"
+        missing_replay_profile_events = [
+            json.loads(line)
+            for line in missing_replay_profile_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        missing_replay_profile_events[0].pop("replay", None)
+        write_jsonl(missing_replay_profile_path, missing_replay_profile_events)
+        try:
+            run_gate(
+                argparse.Namespace(
+                    manifest=DEFAULT_MANIFEST,
+                    out=temp / "bad-missing-replay-link-smoke",
+                    actual_smoke=missing_replay_link_smoke,
+                    scenario_summary=None,
+                )
+            )
+            raise AssertionError("actual smoke missing profile replay link unexpectedly passed")
+        except SentinelError as exc:
+            require(
+                "missing replay links" in str(exc),
+                f"unexpected missing replay link error: {exc}",
+            )
         bad_profile_smoke = make_actual_smoke_fixture(temp / "bad-profile-smoke", sha=head)
         bad_profile_path = bad_profile_smoke / "run/profile.jsonl"
         bad_profile_events = [
