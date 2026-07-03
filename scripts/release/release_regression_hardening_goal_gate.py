@@ -1202,6 +1202,7 @@ def validate_native_operator(root: Path, expected_sha: str) -> dict[str, Any]:
             "inputs_sha256",
             "binary_artifact",
             "binary_sha256",
+            "binary_validation",
             "resolution",
         ):
             require(
@@ -1256,6 +1257,34 @@ def validate_native_operator(root: Path, expected_sha: str) -> dict[str, Any]:
             isinstance(binary_sha256, str) and SHA256_RE.match(binary_sha256),
             f"native_operator.summary.manifests[{index}].binary_sha256 must be a sha256",
         )
+        binary_validation = manifest.get("binary_validation")
+        require(
+            isinstance(binary_validation, dict),
+            f"native_operator.summary.manifests[{index}].binary_validation must be an object",
+        )
+        require(
+            binary_validation.get("status") == "pass",
+            f"native_operator.summary.manifests[{index}].binary_validation.status must be pass",
+        )
+        required_exports = require_string_list(
+            binary_validation.get("required_exports", []),
+            f"native_operator.summary.manifests[{index}].binary_validation.required_exports",
+        )
+        matched_exports = set(
+            require_string_list(
+                binary_validation.get("matched_exports", []),
+                f"native_operator.summary.manifests[{index}].binary_validation.matched_exports",
+            )
+        )
+        require(
+            "ferrum_native_op_init" in required_exports,
+            f"native_operator.summary.manifests[{index}].binary_validation.required_exports must include ferrum_native_op_init",
+        )
+        missing_matched = sorted(set(required_exports) - matched_exports)
+        require(
+            not missing_matched,
+            f"native_operator.summary.manifests[{index}].binary_validation.matched_exports missing {missing_matched}",
+        )
     require("fa2" in operators, "native_operator.summary.manifests must include fa2")
     selftest_summary = summary.get("selftest_summary")
     require(isinstance(selftest_summary, dict), "native_operator.summary.selftest_summary must be an object")
@@ -1297,6 +1326,16 @@ def validate_native_operator(root: Path, expected_sha: str) -> dict[str, Any]:
         "native_operator.summary.selftest_summary.normal_gate_fixture_rejections missing "
         + str(missing_fixture_rejections),
     )
+    binary_validation = selftest_summary.get("binary_validation")
+    require(
+        isinstance(binary_validation, dict),
+        "native_operator.summary.selftest_summary.binary_validation must be an object",
+    )
+    for key in ("static_archive_exports", "text_file_rejected", "missing_export_rejected"):
+        require(
+            binary_validation.get(key) == "pass",
+            f"native_operator.summary.selftest_summary.binary_validation.{key} must be pass",
+        )
     require(
         selftest_summary.get("python_runtime_dependency") == "none",
         "native_operator.summary.selftest_summary.python_runtime_dependency must be none",
@@ -2312,6 +2351,20 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
                     "inputs_sha256": "b" * 64,
                     "binary_artifact": "native-artifacts/fa2/libferrum_native_fa2.a",
                     "binary_sha256": "c" * 64,
+                    "binary_validation": {
+                        "status": "pass",
+                        "format": "static_archive",
+                        "format_tool": "ar",
+                        "archive_members": ["native_op.o"],
+                        "required_exports": [
+                            "ferrum_native_op_init",
+                            "ferrum_native_op_descriptor",
+                        ],
+                        "matched_exports": [
+                            "ferrum_native_op_descriptor",
+                            "ferrum_native_op_init",
+                        ],
+                    },
                     "resolution": {
                         "operator": "fa2",
                         "backend": "cuda",
@@ -2336,6 +2389,11 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
                     "fixture_manifest_path",
                     "fixture_source_package",
                 ],
+                "binary_validation": {
+                    "static_archive_exports": "pass",
+                    "text_file_rejected": "pass",
+                    "missing_export_rejected": "pass",
+                },
                 "python_runtime_dependency": "none",
                 "normal_cuda_dev_build": {
                     "status": "pass",
@@ -2641,6 +2699,39 @@ def run_selftest() -> dict[str, Any]:
             require(
                 "must not reference fixtures" in str(exc),
                 f"unexpected native-op fixture artifact error: {exc}",
+            )
+        bad_native_binary_validation = root / "bad-native-binary-validation"
+        artifacts_bad_native_binary_validation = selftest_artifacts(
+            root / "bad-native-binary-validation-fixtures",
+            sha,
+        )
+        bad_native_binary_summary_path = (
+            artifacts_bad_native_binary_validation["native"]
+            / "native_operator_artifact_summary.json"
+        )
+        bad_native_binary_summary = read_json(bad_native_binary_summary_path)
+        bad_native_binary_summary["manifests"][0].pop("binary_validation")
+        write_json(bad_native_binary_summary_path, bad_native_binary_summary)
+        args_bad_native_binary_validation = argparse.Namespace(
+            out=bad_native_binary_validation,
+            resource_invariant=artifacts_bad_native_binary_validation["resource"],
+            change_impact=artifacts_bad_native_binary_validation["change"],
+            product_sentinel=artifacts_bad_native_binary_validation["product"],
+            model_contract=artifacts_bad_native_binary_validation["model"],
+            support_matrix_contract=artifacts_bad_native_binary_validation["support_matrix"],
+            observability_profile=artifacts_bad_native_binary_validation["observability"],
+            native_operator=artifacts_bad_native_binary_validation["native"],
+            actual_model_regression_summary=artifacts_bad_native_binary_validation["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_native_binary_validation)
+            raise AssertionError("native-op missing binary_validation unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "binary_validation" in str(exc),
+                f"unexpected native-op binary_validation error: {exc}",
             )
         bad_native_dev_build = root / "bad-native-dev-build"
         artifacts_bad_native_dev_build = selftest_artifacts(
