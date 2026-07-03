@@ -320,6 +320,12 @@ def plan_from_files(
     )
     required_gates.update(required_gate_overrides or set())
     invalidated.update(artifact_invalidations)
+    satisfied_gate_names = {
+        str(artifact.get("gate"))
+        for artifact in satisfied_artifacts
+        if isinstance(artifact.get("gate"), str) and artifact.get("gate")
+    }
+    invalidated.difference_update(satisfied_gate_names)
     status = "fail" if unknown_files else "pass"
     return {
         "schema_version": 1,
