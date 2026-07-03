@@ -175,6 +175,23 @@ def slug(value: str) -> str:
     return normalized or "model"
 
 
+def canonical_model_id(value: str) -> str:
+    """Normalize local HF snapshot paths into stable model ids.
+
+    Actual model smoke gates often run from a local snapshot directory such as
+    ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/<rev>.  Model
+    onboarding contracts must name the model, not the machine-local cache path.
+    """
+    raw = value.strip()
+    normalized = raw.replace("\\", "/")
+    match = re.search(r"(?:^|/)models--([^/]+)(?:/snapshots/|$)", normalized)
+    if match:
+        parts = [part for part in match.group(1).split("--") if part]
+        if len(parts) >= 2:
+            return "/".join(parts[:2])
+    return raw
+
+
 def artifact_ref(
     *,
     kind: str,
@@ -262,7 +279,16 @@ def generate_contract_from_actual_smoke(args: argparse.Namespace, out: Path) -> 
     require_generated(smoke_manifest.get("git_dirty") is False, "actual smoke must be clean git evidence")
     git_sha = str(smoke_manifest.get("git_sha") or "")
     require_generated(GIT_SHA_RE.match(git_sha) is not None, "actual smoke git_sha must be a 40-character SHA")
-    model_id = str(smoke_manifest.get("model") or smoke_summary.get("model") or "")
+    model_id = canonical_model_id(
+        str(
+            args.actual_smoke_model_id
+            or smoke_manifest.get("model_id")
+            or smoke_summary.get("model_id")
+            or smoke_manifest.get("model")
+            or smoke_summary.get("model")
+            or ""
+        )
+    )
     require_generated(bool(model_id.strip()), "actual smoke model missing")
     backend = str(smoke_manifest.get("effective_backend") or smoke_manifest.get("backend") or "")
     require_generated(backend in {"cpu", "cuda", "metal"}, f"actual smoke backend unsupported: {backend!r}")
@@ -851,7 +877,7 @@ def make_actual_smoke_contract_fixture(root: Path) -> Path:
     smoke_summary = {
         "schema_version": 1,
         "status": "pass",
-        "model": "Qwen/Qwen3-0.6B",
+        "model": "/cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/abc123",
         "entrypoints": {
             "serve": {
                 "product": {
@@ -872,7 +898,7 @@ def make_actual_smoke_contract_fixture(root: Path) -> Path:
             "status": "pass",
             "git_sha": sha,
             "git_dirty": False,
-            "model": "Qwen/Qwen3-0.6B",
+            "model": "/cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/abc123",
             "backend": "metal",
             "effective_backend": "metal",
             "pass_line": f"PRODUCT OBSERVABILITY L1 SMOKE PASS: {smoke}",
@@ -915,6 +941,7 @@ def make_actual_smoke_contract_fixture(root: Path) -> Path:
 
     args = argparse.Namespace(
         actual_smoke=smoke,
+        actual_smoke_model_id=None,
         actual_smoke_template_artifact=template / "w3_l0_template.json",
         actual_smoke_profile_gate=profile,
         actual_smoke_preset_snapshot=preset / "summary.json",
@@ -974,6 +1001,8 @@ def run_selftest(fixtures: Path = DEFAULT_FIXTURES) -> dict[str, Any]:
         results.append(result)
         if result["status"] != "pass":
             failures.append(f"generated actual-smoke contract expected pass: {result['problems']}")
+        if result.get("model_id") != "Qwen/Qwen3-0.6B":
+            failures.append(f"generated actual-smoke contract used unstable model id: {result.get('model_id')}")
     if failures:
         raise ContractError("\n".join(failures))
     return {
@@ -1038,6 +1067,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fixtures", type=Path, default=DEFAULT_FIXTURES)
     parser.add_argument("--contract", type=Path, action="append", default=[])
     parser.add_argument("--actual-smoke", type=Path)
+    parser.add_argument(
+        "--actual-smoke-model-id",
+        help="stable model id to record when --actual-smoke was run from a local path",
+    )
     parser.add_argument("--actual-smoke-template-artifact", type=Path)
     parser.add_argument("--actual-smoke-profile-gate", type=Path)
     parser.add_argument("--actual-smoke-preset-snapshot", type=Path)

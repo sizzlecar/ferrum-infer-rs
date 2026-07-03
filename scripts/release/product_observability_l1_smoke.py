@@ -131,6 +131,29 @@ def profile_detail_from_flags() -> str:
     return "basic"
 
 
+def canonical_model_id(value: str) -> str:
+    raw = value.strip()
+    normalized = raw.replace("\\", "/")
+    marker = "models--"
+    if marker in normalized:
+        component = normalized.split(marker, 1)[1].split("/", 1)[0]
+        parts = [part for part in component.split("--") if part]
+        if len(parts) >= 2:
+            return "/".join(parts[:2])
+    return raw
+
+
+def model_identity(args: argparse.Namespace) -> dict[str, Any]:
+    model_id = args.model_id or canonical_model_id(args.model)
+    identity: dict[str, Any] = {
+        "model": args.model,
+        "model_id": model_id,
+    }
+    if args.model != model_id:
+        identity["model_path"] = args.model
+    return identity
+
+
 def reject_synthetic_model_for_actual_smoke(args: argparse.Namespace) -> None:
     if args.model != "synthetic/no-weight":
         return
@@ -706,6 +729,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     pass_line = f"{PASS_LINE}: {out}"
     command = sys.argv
     ferrum_cmd = ferrum_base_cmd(args)
+    model_fields = model_identity(args)
     run_result = run_actual(args, out)
     serve_result = serve_actual(args, out)
     effective_backend = serve_result.get("effective_backend")
@@ -728,7 +752,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         "command": command,
         "ferrum_command": ferrum_cmd,
         "ferrum_binary_sha256": binary_sha256(args),
-        "model": args.model,
+        **model_fields,
         "requested_backend": args.backend,
         "backend": effective_backend or args.backend,
         "effective_backend": effective_backend,
@@ -758,7 +782,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
             "command": command,
             "artifact_dir": str(out),
             "pass_line": pass_line,
-            "model": args.model,
+            **model_fields,
             "requested_backend": args.backend,
             "backend": effective_backend or args.backend,
             "effective_backend": effective_backend,
@@ -803,6 +827,7 @@ def write_failure_artifacts(args: argparse.Namespace, exc: SmokeError) -> None:
     out.mkdir(parents=True, exist_ok=True)
     dirty_files = git_value(["status", "--short"], default="").splitlines()
     kind = failure_kind(exc)
+    model_fields = model_identity(args)
     classification: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "status": "fail",
@@ -842,7 +867,7 @@ def write_failure_artifacts(args: argparse.Namespace, exc: SmokeError) -> None:
         "git_dirty": bool(dirty_files),
         "dirty_files": dirty_files,
         "command": sys.argv,
-        "model": args.model,
+        **model_fields,
         "requested_backend": args.backend,
         "effective_backend": classification["effective_backend"],
         "failure_classification": str(out / "failures/failure_classification.json"),
@@ -864,7 +889,7 @@ def write_failure_artifacts(args: argparse.Namespace, exc: SmokeError) -> None:
             "command": sys.argv,
             "artifact_dir": str(out),
             "pass_line": None,
-            "model": args.model,
+            **model_fields,
             "requested_backend": args.backend,
             "effective_backend": classification["effective_backend"],
             "failure_classification": str(out / "failures/failure_classification.json"),
@@ -1332,6 +1357,7 @@ def run_selftest_in_root(root: Path, out: Path | None = None) -> dict[str, Any]:
     failure_args = argparse.Namespace(
         out=failure_out,
         model=MODEL_DEFAULT,
+        model_id=None,
         backend="cuda",
         ferrum_bin=None,
         timeout=60,
@@ -1352,6 +1378,7 @@ def run_selftest_in_root(root: Path, out: Path | None = None) -> dict[str, Any]:
     synthetic_failure_args = argparse.Namespace(
         out=synthetic_failure_out,
         model="synthetic/no-weight",
+        model_id=None,
         backend="auto",
         ferrum_bin=None,
         timeout=60,
@@ -1371,6 +1398,17 @@ def run_selftest_in_root(root: Path, out: Path | None = None) -> dict[str, Any]:
     if synthetic_classification.get("next_gate") != "product_observability_wiring_gate":
         raise SmokeError(f"unexpected synthetic next_gate: {synthetic_classification}")
 
+    local_snapshot_identity = model_identity(
+        argparse.Namespace(
+            model="/cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/abc123",
+            model_id=None,
+        )
+    )
+    if local_snapshot_identity.get("model_id") != "Qwen/Qwen3-0.6B":
+        raise SmokeError(f"unstable HF snapshot model_id: {local_snapshot_identity}")
+    if local_snapshot_identity.get("model_path") is None:
+        raise SmokeError(f"HF snapshot path was not retained as model_path: {local_snapshot_identity}")
+
     summary = {
         "schema_version": SCHEMA_VERSION,
         "status": "pass",
@@ -1382,6 +1420,7 @@ def run_selftest_in_root(root: Path, out: Path | None = None) -> dict[str, Any]:
         "replay_summary_validation": replay_summary_pass,
         "sse": sse,
         "failure_kinds": failure_kinds,
+        "local_snapshot_identity": local_snapshot_identity,
         "negative_cases": {
             "bad_profile": bad_profile_error,
             "all_skipped_replay": all_skipped_replay_error,
@@ -1411,6 +1450,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path)
     parser.add_argument("--model", default=MODEL_DEFAULT)
+    parser.add_argument("--model-id", help="stable model id when --model is a local snapshot path")
     parser.add_argument("--backend", default="auto")
     parser.add_argument("--ferrum-bin", type=Path)
     parser.add_argument("--timeout", type=int, default=900)
