@@ -2637,6 +2637,29 @@ impl EngineInner {
         );
     }
 
+    fn trace_resource_release_failure(
+        &self,
+        request_id: &RequestId,
+        resource_kind: &str,
+        phase: &str,
+        capacity: Option<usize>,
+        reason: String,
+    ) {
+        self.trace_resource_event(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            resource_kind,
+            phase,
+            ResourceAction::Reject,
+            None,
+            None,
+            None,
+            capacity.map(Self::resource_amount_i64),
+            Some(reason),
+        );
+    }
+
     fn kv_resource_blocks_for_tokens(&self, tokens: usize) -> usize {
         tokens
             .div_ceil(self.config.kv_cache.block_size.max(1))
@@ -2780,9 +2803,33 @@ impl EngineInner {
         allocation_request_id: RequestId,
         blocks: Option<usize>,
     ) {
-        let _ = self.kv_cache.deallocate(allocation_request_id).await;
-        if let Some(blocks) = blocks {
-            self.trace_kv_release(owner_request_id, blocks);
+        match self
+            .kv_cache
+            .deallocate(allocation_request_id.clone())
+            .await
+        {
+            Ok(()) => {
+                if let Some(blocks) = blocks {
+                    self.trace_kv_release(owner_request_id, blocks);
+                }
+            }
+            Err(error) => {
+                warn!(
+                    owner_request_id = %owner_request_id,
+                    allocation_request_id = %allocation_request_id,
+                    error = %error,
+                    "KV allocation release failed"
+                );
+                if blocks.is_some() {
+                    self.trace_resource_release_failure(
+                        owner_request_id,
+                        "kv_block",
+                        "engine_kv_block_release_failed",
+                        Some(self.config.kv_cache.max_blocks),
+                        format!("kv release failed for {allocation_request_id}: {error}"),
+                    );
+                }
+            }
         }
     }
 
@@ -2849,9 +2896,28 @@ impl EngineInner {
     async fn release_recurrent_allocation(&self, request_id: &RequestId, slots: Option<usize>) {
         if let Some(manager) = &self.recurrent_state_manager {
             let capacity = manager.stats().total_batch_slots;
-            let _ = manager.deallocate(request_id.clone()).await;
-            if let Some(slots) = slots {
-                self.trace_recurrent_release(request_id, slots, Some(capacity));
+            match manager.deallocate(request_id.clone()).await {
+                Ok(()) => {
+                    if let Some(slots) = slots {
+                        self.trace_recurrent_release(request_id, slots, Some(capacity));
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        request_id = %request_id,
+                        error = %error,
+                        "Recurrent-state release failed"
+                    );
+                    if slots.is_some() {
+                        self.trace_resource_release_failure(
+                            request_id,
+                            "recurrent_state_slot",
+                            "engine_recurrent_state_slot_release_failed",
+                            Some(capacity),
+                            format!("recurrent-state release failed for {request_id}: {error}"),
+                        );
+                    }
+                }
             }
         }
     }
