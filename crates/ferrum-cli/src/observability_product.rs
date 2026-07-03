@@ -122,6 +122,20 @@ impl ActualMemoryStageObservation {
         self
     }
 
+    pub fn with_profile_run_status(
+        mut self,
+        executed: bool,
+        status: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        self.attributes.extend([
+            ("profile_run_executed".to_string(), json!(executed)),
+            ("profile_run_status".to_string(), json!(status.into())),
+            ("profile_run_source".to_string(), json!(source.into())),
+        ]);
+        self
+    }
+
     pub fn with_engine_cache_status(mut self, status: &ferrum_types::EngineStatus) -> Self {
         let memory = &status.memory_usage;
         self.attributes.extend([
@@ -579,10 +593,15 @@ fn actual_run_events(
     replay_command: &str,
 ) -> Vec<FerrumProfileEvent> {
     let base = Utc::now();
+    let shutdown_stage_index = observation
+        .memory_stages
+        .iter()
+        .position(|stage| stage.stage == "shutdown")
+        .unwrap_or(observation.memory_stages.len());
     let mut events = actual_memory_stage_events(
         config,
         &observation.request_id,
-        &observation.memory_stages,
+        &observation.memory_stages[..shutdown_stage_index],
         base,
     );
     let open = actual_resource_event(
@@ -739,6 +758,12 @@ fn actual_run_events(
         json!(observation.response_chars),
     );
     events.extend([open, reserve, commit, generation, release, close]);
+    events.extend(actual_memory_stage_events(
+        config,
+        &observation.request_id,
+        &observation.memory_stages[shutdown_stage_index..],
+        base + Duration::microseconds(50),
+    ));
     events
 }
 
@@ -748,10 +773,15 @@ fn actual_run_failure_events(
     replay_command: &str,
 ) -> Vec<FerrumProfileEvent> {
     let base = Utc::now();
+    let shutdown_stage_index = observation
+        .memory_stages
+        .iter()
+        .position(|stage| stage.stage == "shutdown")
+        .unwrap_or(observation.memory_stages.len());
     let mut events = actual_memory_stage_events(
         config,
         &observation.request_id,
-        &observation.memory_stages,
+        &observation.memory_stages[..shutdown_stage_index],
         base,
     );
     let open = actual_resource_event(
@@ -872,6 +902,12 @@ fn actual_run_failure_events(
             .map(|path| path.to_string_lossy().to_string()),
     });
     events.extend([open, reserve, commit, failure, release, close]);
+    events.extend(actual_memory_stage_events(
+        config,
+        &observation.request_id,
+        &observation.memory_stages[shutdown_stage_index..],
+        base + Duration::microseconds(50),
+    ));
     events
 }
 
@@ -909,14 +945,14 @@ fn actual_serve_startup_events(
     replay_command: &str,
 ) -> Vec<FerrumProfileEvent> {
     let base = Utc::now();
-    let cache_stage_index = memory_stages
+    let post_model_loaded_index = memory_stages
         .iter()
-        .position(|stage| stage.stage == "cache_allocated")
+        .position(|stage| matches!(stage.stage.as_str(), "profile_run_done" | "cache_allocated"))
         .unwrap_or(memory_stages.len());
     let mut events = actual_memory_stage_events(
         config,
         request_id,
-        &memory_stages[..cache_stage_index],
+        &memory_stages[..post_model_loaded_index],
         base,
     );
     let open = actual_resource_event(
@@ -977,7 +1013,7 @@ fn actual_serve_startup_events(
     events.extend(actual_memory_stage_events(
         config,
         request_id,
-        &memory_stages[cache_stage_index..],
+        &memory_stages[post_model_loaded_index..],
         base + Duration::microseconds(21),
     ));
 
@@ -1922,6 +1958,87 @@ mod tests {
     }
 
     #[test]
+    fn actual_serve_startup_memory_orders_model_profile_and_cache_stages() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-serve-memory-order-{}",
+            Uuid::new_v4().simple()
+        ));
+        let config = ProductObservabilityConfig::new(
+            ProfileEntrypoint::Serve,
+            "Qwen/Qwen3-0.6B",
+            Some(&root.join("profile.jsonl")),
+            ProfileDetailArg::Basic,
+            Some(&root.join("memory.jsonl")),
+            Some(&root.join("scheduler.jsonl")),
+            Some(&root.join("request_dump")),
+            1.0,
+        );
+        let memory = crate::memory_profile::ProcessMemoryObservation {
+            before_bytes: 100,
+            after_bytes: 200,
+            current_bytes: 200,
+            high_water_bytes: 240,
+            source: "test",
+        };
+        write_actual_serve_startup_observability(
+            &config,
+            42,
+            Some(memory.clone()),
+            vec![
+                ActualMemoryStageObservation::new(
+                    "actual_serve_process_start",
+                    "process_start",
+                    None,
+                    Some(memory.clone()),
+                ),
+                ActualMemoryStageObservation::new(
+                    "actual_serve_backend_initialized",
+                    "backend_initialized",
+                    None,
+                    Some(memory.clone()),
+                ),
+                ActualMemoryStageObservation::new(
+                    "actual_serve_profile_run_done",
+                    "profile_run_done",
+                    None,
+                    Some(memory.clone()),
+                )
+                .with_profile_run_status(false, "not_configured", "test"),
+                ActualMemoryStageObservation::new(
+                    "actual_serve_cache_allocated",
+                    "cache_allocated",
+                    None,
+                    Some(memory),
+                )
+                .with_attribute("available_kv_or_state_bytes", json!(0)),
+            ],
+        )
+        .unwrap();
+        let memory_profile = fs::read_to_string(root.join("memory.jsonl")).unwrap();
+        let memory_stages = memory_profile
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter_map(|event| {
+                event["attributes"]["memory_stage"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            memory_stages,
+            vec![
+                "process_start",
+                "backend_initialized",
+                "model_loaded",
+                "profile_run_done",
+                "cache_allocated"
+            ]
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn actual_run_failure_observability_writes_diagnostics_bundle() {
         let root = std::env::temp_dir().join(format!(
             "ferrum-run-failure-observability-{}",
@@ -2010,18 +2127,32 @@ mod tests {
                 response_chars: 2,
                 response_text: "OK".to_string(),
                 memory: None,
-                memory_stages: vec![ActualMemoryStageObservation::new(
-                    "actual_run_process_start",
-                    "process_start",
-                    None,
-                    Some(crate::memory_profile::ProcessMemoryObservation {
-                        before_bytes: 100,
-                        after_bytes: 100,
-                        current_bytes: 100,
-                        high_water_bytes: 120,
-                        source: "test",
-                    }),
-                )],
+                memory_stages: vec![
+                    ActualMemoryStageObservation::new(
+                        "actual_run_process_start",
+                        "process_start",
+                        None,
+                        Some(crate::memory_profile::ProcessMemoryObservation {
+                            before_bytes: 100,
+                            after_bytes: 100,
+                            current_bytes: 100,
+                            high_water_bytes: 120,
+                            source: "test",
+                        }),
+                    ),
+                    ActualMemoryStageObservation::new(
+                        "actual_run_shutdown",
+                        "shutdown",
+                        None,
+                        Some(crate::memory_profile::ProcessMemoryObservation {
+                            before_bytes: 200,
+                            after_bytes: 220,
+                            current_bytes: 220,
+                            high_water_bytes: 240,
+                            source: "test",
+                        }),
+                    ),
+                ],
             },
         )
         .unwrap();
@@ -2062,6 +2193,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(memory_stages.contains(&"process_start".to_string()));
         assert!(memory_stages.contains(&"first_request_done".to_string()));
+        let first_request_index = memory_stages
+            .iter()
+            .position(|stage| stage == "first_request_done")
+            .expect("first_request_done stage");
+        let shutdown_index = memory_stages
+            .iter()
+            .position(|stage| stage == "shutdown")
+            .expect("shutdown stage");
+        assert!(first_request_index < shutdown_index);
         fs::remove_dir_all(root).ok();
     }
 

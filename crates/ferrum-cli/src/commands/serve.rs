@@ -983,11 +983,20 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         .as_micros()
         .try_into()
         .unwrap_or(u64::MAX);
+    let profile_run_done_sample = product_memory_enabled
+        .then(|| memory_sampler.sample())
+        .flatten();
+    let profile_run_done_memory = serve_process_memory_observation_between(
+        model_loaded_sample.clone(),
+        profile_run_done_sample.clone(),
+    );
     let cache_allocated_sample = product_memory_enabled
         .then(|| memory_sampler.sample())
         .flatten();
     let cache_allocated_memory = serve_process_memory_observation_between(
-        model_loaded_sample.clone(),
+        profile_run_done_sample
+            .clone()
+            .or_else(|| model_loaded_sample.clone()),
         cache_allocated_sample.clone(),
     );
     let server = if lora_server_models.is_empty() {
@@ -1003,6 +1012,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             product_memory_enabled,
             process_start_memory.clone(),
             backend_initialized_memory.clone(),
+            profile_run_done_memory.clone(),
             cache_allocated_memory.clone(),
             cache_allocated_status.clone(),
         ),
@@ -1123,12 +1133,24 @@ fn actual_serve_startup_memory_stages(
     enabled: bool,
     process_start_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
     backend_initialized_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+    profile_run_done_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
     cache_allocated_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
     cache_allocated_status: Option<ferrum_types::EngineStatus>,
 ) -> Vec<crate::observability_product::ActualMemoryStageObservation> {
     if !enabled {
         return Vec::new();
     }
+    let profile_run_done = crate::observability_product::ActualMemoryStageObservation::new(
+        "actual_serve_profile_run_done",
+        "profile_run_done",
+        None,
+        profile_run_done_memory,
+    )
+    .with_profile_run_status(
+        false,
+        "not_configured",
+        "product_basic_profile_does_not_execute_extra_warmup",
+    );
     let mut cache_allocated = crate::observability_product::ActualMemoryStageObservation::new(
         "actual_serve_cache_allocated",
         "cache_allocated",
@@ -1151,6 +1173,7 @@ fn actual_serve_startup_memory_stages(
             None,
             backend_initialized_memory,
         ),
+        profile_run_done,
         cache_allocated,
     ]
 }
