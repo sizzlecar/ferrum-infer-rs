@@ -253,6 +253,7 @@ pub fn write_actual_serve_startup_observability(
     config: &ProductObservabilityConfig,
     startup_duration_us: u64,
     startup_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+    memory_stages: Vec<ActualMemoryStageObservation>,
 ) -> Result<Vec<PathBuf>> {
     if !config.unified_product_profile_enabled() {
         return Ok(Vec::new());
@@ -265,9 +266,32 @@ pub fn write_actual_serve_startup_observability(
         &request_id,
         startup_duration_us,
         startup_memory.as_ref(),
+        &memory_stages,
         &replay_command,
     );
     write_actual_artifacts(config, &events, &request_id, &replay_command)
+}
+
+pub fn append_actual_serve_memory_stage_observability(
+    config: &ProductObservabilityConfig,
+    stage: ActualMemoryStageObservation,
+) -> Result<Vec<PathBuf>> {
+    if !config.unified_product_profile_enabled() {
+        return Ok(Vec::new());
+    }
+    config.validate()?;
+    let request_id = format!("serve-memory-{}", Uuid::new_v4().simple());
+    let events = actual_memory_stage_events(config, &request_id, &[stage], Utc::now());
+    let mut written = Vec::new();
+    if let Some(path) = &config.profile_jsonl {
+        append_profile_jsonl(path, &events)?;
+        written.push(path.clone());
+    }
+    if let Some(path) = &config.memory_profile_jsonl {
+        append_profile_jsonl(path, &events)?;
+        written.push(path.clone());
+    }
+    Ok(written)
 }
 
 fn write_actual_run_artifacts(
@@ -852,9 +876,11 @@ fn actual_serve_startup_events(
     request_id: &str,
     startup_duration_us: u64,
     startup_memory: Option<&crate::memory_profile::ProcessMemoryObservation>,
+    memory_stages: &[ActualMemoryStageObservation],
     replay_command: &str,
 ) -> Vec<FerrumProfileEvent> {
     let base = Utc::now();
+    let mut events = actual_memory_stage_events(config, request_id, memory_stages, base);
     let open = actual_resource_event(
         config,
         request_id,
@@ -947,7 +973,8 @@ fn actual_serve_startup_events(
             .as_ref()
             .map(|path| path.to_string_lossy().to_string()),
     });
-    vec![open, reserve, commit, startup, release, ready]
+    events.extend([open, reserve, commit, startup, release, ready]);
+    events
 }
 
 fn base_event(
@@ -1772,6 +1799,80 @@ mod tests {
         let engine_argv = replay["engine_replay"]["argv"].as_array().unwrap();
         assert!(engine_argv.iter().any(|item| item == "replay-bundle"));
         assert_eq!(replay["engine_replay"]["requires_http_server"], false);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn actual_serve_memory_stage_observability_appends_shutdown() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-serve-memory-observability-{}",
+            Uuid::new_v4().simple()
+        ));
+        let config = ProductObservabilityConfig::new(
+            ProfileEntrypoint::Serve,
+            "Qwen/Qwen3-0.6B",
+            Some(&root.join("profile.jsonl")),
+            ProfileDetailArg::Basic,
+            Some(&root.join("memory.jsonl")),
+            Some(&root.join("scheduler.jsonl")),
+            Some(&root.join("request_dump")),
+            1.0,
+        );
+        let memory = crate::memory_profile::ProcessMemoryObservation {
+            before_bytes: 100,
+            after_bytes: 200,
+            current_bytes: 200,
+            high_water_bytes: 240,
+            source: "test",
+        };
+        write_actual_serve_startup_observability(
+            &config,
+            42,
+            Some(memory.clone()),
+            vec![
+                ActualMemoryStageObservation::new(
+                    "actual_serve_process_start",
+                    "process_start",
+                    None,
+                    Some(memory.clone()),
+                ),
+                ActualMemoryStageObservation::new(
+                    "actual_serve_backend_initialized",
+                    "backend_initialized",
+                    None,
+                    Some(memory.clone()),
+                ),
+            ],
+        )
+        .unwrap();
+        append_actual_serve_memory_stage_observability(
+            &config,
+            ActualMemoryStageObservation::new(
+                "actual_serve_shutdown",
+                "shutdown",
+                None,
+                Some(memory),
+            ),
+        )
+        .unwrap();
+        let profile = fs::read_to_string(root.join("profile.jsonl")).unwrap();
+        assert!(profile.contains("\"phase\":\"actual_serve_startup\""));
+        assert!(profile.contains("\"phase\":\"actual_serve_shutdown\""));
+        let memory_profile = fs::read_to_string(root.join("memory.jsonl")).unwrap();
+        let memory_stages = memory_profile
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter_map(|event| {
+                event["attributes"]["memory_stage"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert!(memory_stages.contains(&"process_start".to_string()));
+        assert!(memory_stages.contains(&"backend_initialized".to_string()));
+        assert!(memory_stages.contains(&"model_loaded".to_string()));
+        assert!(memory_stages.contains(&"shutdown".to_string()));
         fs::remove_dir_all(root).ok();
     }
 

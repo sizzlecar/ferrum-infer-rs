@@ -32,6 +32,12 @@ REQUIRED_RUN_MEMORY_STAGES = {
     "first_request_done",
     "shutdown",
 }
+REQUIRED_SERVE_MEMORY_STAGES = {
+    "process_start",
+    "backend_initialized",
+    "model_loaded",
+    "shutdown",
+}
 
 
 class SmokeError(RuntimeError):
@@ -541,6 +547,12 @@ def validate_profile_group(root: Path, entrypoint: str) -> dict[str, Any]:
                 if missing_stages:
                     raise SmokeError(
                         f"{path} missing run memory stages: {sorted(missing_stages)}"
+                    )
+            if entrypoint == "serve":
+                missing_stages = REQUIRED_SERVE_MEMORY_STAGES - memory_stages
+                if missing_stages:
+                    raise SmokeError(
+                        f"{path} missing serve memory stages: {sorted(missing_stages)}"
                     )
             for event in events:
                 memory = event.get("memory")
@@ -1124,29 +1136,20 @@ def write_selftest_profile_group(out: Path, entrypoint: str) -> None:
         "high_water_bytes": 4096,
         "available_bytes": 8192,
     }
-    if entrypoint == "run":
-        memory_events = [
-            selftest_profile_event(
-                entrypoint=entrypoint,
-                event_id=f"evt-{entrypoint}-memory-{stage}",
-                phase=f"memory_{stage}",
-                duration_us=10,
-                memory=memory,
-                attributes={"memory_measurement": "process_rss", "memory_stage": stage},
-            )
-            for stage in sorted(REQUIRED_RUN_MEMORY_STAGES)
-        ]
-    else:
-        memory_events = [
-            selftest_profile_event(
-                entrypoint=entrypoint,
-                event_id=f"evt-{entrypoint}-memory",
-                phase="memory_sample",
-                duration_us=10,
-                memory=memory,
-                attributes={"memory_measurement": "process_rss", "memory_stage": "model_loaded"},
-            )
-        ]
+    required_stages = (
+        REQUIRED_RUN_MEMORY_STAGES if entrypoint == "run" else REQUIRED_SERVE_MEMORY_STAGES
+    )
+    memory_events = [
+        selftest_profile_event(
+            entrypoint=entrypoint,
+            event_id=f"evt-{entrypoint}-memory-{stage}",
+            phase=f"memory_{stage}",
+            duration_us=10,
+            memory=memory,
+            attributes={"memory_measurement": "process_rss", "memory_stage": stage},
+        )
+        for stage in sorted(required_stages)
+    ]
     write_jsonl(root / "memory_profile.jsonl", memory_events)
     scheduler_events = [
         selftest_profile_event(

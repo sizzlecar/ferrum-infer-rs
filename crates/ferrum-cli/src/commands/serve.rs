@@ -353,10 +353,13 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         profile_sample_rate,
     );
     let memory_sampler = crate::memory_profile::ProcessMemorySampler;
-    let startup_memory_before = product_observability
-        .enabled()
+    let product_memory_enabled = product_observability.enabled();
+    let process_start_sample = product_memory_enabled
         .then(|| memory_sampler.sample())
         .flatten();
+    let process_start_memory = process_start_sample
+        .clone()
+        .map(crate::memory_profile::ProcessMemoryObservation::from_sample);
     if product_observability.synthetic_no_weight_enabled() {
         let written = crate::observability_product::write_synthetic_product_observability(
             &product_observability,
@@ -387,6 +390,13 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             selection.selected_distributed_strategy
         );
     }
+    let backend_initialized_sample = product_memory_enabled
+        .then(|| memory_sampler.sample())
+        .flatten();
+    let backend_initialized_memory = serve_process_memory_observation_between(
+        process_start_sample.clone(),
+        backend_initialized_sample.clone(),
+    );
 
     // Print banner
     print_banner();
@@ -955,6 +965,20 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         }
     }
     .with_auto_config(startup_auto_config);
+    let model_loaded_sample = product_memory_enabled
+        .then(|| memory_sampler.sample())
+        .flatten();
+    let model_loaded_memory = serve_process_memory_observation_between(
+        backend_initialized_sample
+            .clone()
+            .or_else(|| process_start_sample.clone()),
+        model_loaded_sample.clone(),
+    );
+    let model_loaded_duration_us = serve_start
+        .elapsed()
+        .as_micros()
+        .try_into()
+        .unwrap_or(u64::MAX);
     let server = if lora_server_models.is_empty() {
         server
     } else {
@@ -962,15 +986,13 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     };
     crate::observability_product::write_actual_serve_startup_observability(
         &product_observability,
-        serve_start
-            .elapsed()
-            .as_micros()
-            .try_into()
-            .unwrap_or(u64::MAX),
-        product_observability
-            .enabled()
-            .then(|| memory_sampler.observe(startup_memory_before))
-            .flatten(),
+        model_loaded_duration_us,
+        model_loaded_memory.clone(),
+        actual_serve_startup_memory_stages(
+            product_memory_enabled,
+            process_start_memory.clone(),
+            backend_initialized_memory.clone(),
+        ),
     )?;
 
     // Create server config
@@ -1015,7 +1037,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 eprintln!("{} Server error: {}", "Error:".red().bold(), e);
             }
         }
-        _ = signal::ctrl_c() => {
+        _ = serve_shutdown_signal() => {
             println!();
             println!("{}", "Shutting down...".yellow());
         }
@@ -1029,8 +1051,79 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // ctrl_c-driven shutdown (matches bench / bench-serve exit paths).
     ferrum_bench_core::trace::flush_global_trace();
     ferrum_bench_core::flush_global_profile();
+    let shutdown_after = product_memory_enabled
+        .then(|| memory_sampler.sample())
+        .flatten();
+    let shutdown_memory = serve_process_memory_observation_between(
+        model_loaded_sample
+            .clone()
+            .or_else(|| backend_initialized_sample.clone())
+            .or_else(|| process_start_sample.clone()),
+        shutdown_after,
+    );
+    crate::observability_product::append_actual_serve_memory_stage_observability(
+        &product_observability,
+        crate::observability_product::ActualMemoryStageObservation::new(
+            "actual_serve_shutdown",
+            "shutdown",
+            None,
+            shutdown_memory,
+        ),
+    )?;
 
     Ok(())
+}
+
+async fn serve_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal::ctrl_c().await;
+    }
+}
+
+fn serve_process_memory_observation_between(
+    before: Option<crate::memory_profile::ProcessMemorySample>,
+    after: Option<crate::memory_profile::ProcessMemorySample>,
+) -> Option<crate::memory_profile::ProcessMemoryObservation> {
+    after.map(|after| crate::memory_profile::ProcessMemoryObservation::from_samples(before, after))
+}
+
+fn actual_serve_startup_memory_stages(
+    enabled: bool,
+    process_start_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+    backend_initialized_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+) -> Vec<crate::observability_product::ActualMemoryStageObservation> {
+    if !enabled {
+        return Vec::new();
+    }
+    vec![
+        crate::observability_product::ActualMemoryStageObservation::new(
+            "actual_serve_process_start",
+            "process_start",
+            None,
+            process_start_memory,
+        ),
+        crate::observability_product::ActualMemoryStageObservation::new(
+            "actual_serve_backend_initialized",
+            "backend_initialized",
+            None,
+            backend_initialized_memory,
+        ),
+    ]
 }
 
 fn print_banner() {
