@@ -64,7 +64,10 @@
         "before": { "type": "integer" },
         "after": { "type": "integer" },
         "capacity": { "type": "integer" },
-        "reason": { "type": "string" }
+        "reason": { "type": "string" },
+        "error_kind": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "resource_error_kind": { "type": "string", "minLength": 1 }
       }
     },
     "error": {

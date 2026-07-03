@@ -236,7 +236,7 @@ impl EngineInner {
                     .filter(|(prefix_id, _, _)| prefix_id.len() == input_tokens.len());
                 if let Some((_, cached_kv, cached_logits)) = hit {
                     let cloned_kv = cached_kv.clone_handle()?;
-                    let first_token = {
+                    let (first_token, model_cache_update) = {
                         let mut sequences = self.sequences.write();
                         let Some(seq) = sequences.get_mut(rid) else {
                             continue;
@@ -248,9 +248,11 @@ impl EngineInner {
                             Some(self.tokenizer.as_ref()),
                         )?;
                         seq.generated_tokens.push(token);
-                        seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
-                        token
+                        let model_cache_update =
+                            seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
+                        (token, model_cache_update)
                     };
+                    self.apply_model_cache_ref_update(rid, model_cache_update);
                     self.scheduler.mark_prefill_complete(rid, num_tokens);
                     self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
                     counter!("ferrum.engine.prefix_cache_hits").increment(1);
@@ -625,18 +627,22 @@ impl EngineInner {
                     let cache_id = unified.items[i].seq_id.clone();
                     let kv_len = work.chunk_start.saturating_add(work.chunk_len);
                     let model_kv = self.make_model_kv_handle_with_seq(cache_id.clone(), kv_len);
-                    {
+                    let model_cache_update = {
                         let mut sequences = self.sequences.write();
-                        if let Some(seq) = sequences.get_mut(&work.rid) {
-                            seq.commit_prefill_chunk_physical_resources(
-                                model_kv,
-                                work.kv_resource_blocks,
-                                unified.items[i].recurrent_state.clone(),
-                                work.chunk_start.saturating_add(work.chunk_len),
-                                false,
-                            );
-                        }
-                    }
+                        sequences
+                            .get_mut(&work.rid)
+                            .map(|seq| {
+                                seq.commit_prefill_chunk_physical_resources(
+                                    model_kv,
+                                    work.kv_resource_blocks,
+                                    unified.items[i].recurrent_state.clone(),
+                                    work.chunk_start.saturating_add(work.chunk_len),
+                                    false,
+                                )
+                            })
+                            .unwrap_or_default()
+                    };
+                    self.apply_model_cache_ref_update(&work.rid, model_cache_update);
                     self.scheduler.mark_prefill_chunk_processed(
                         &work.rid,
                         work.input_tokens.len(),
@@ -692,42 +698,45 @@ impl EngineInner {
                     )?
                 };
                 seq.generated_tokens.push(token);
-                seq.commit_prefill_chunk_physical_resources(
+                let model_cache_update = seq.commit_prefill_chunk_physical_resources(
                     model_kv,
                     work.kv_resource_blocks,
                     unified.items[i].recurrent_state.clone(),
                     num_tokens,
                     true,
                 );
-                Ok::<Option<(TokenId, u64)>, FerrumError>(Some((
+                Ok::<Option<(TokenId, u64, ModelCacheRefUpdate)>, FerrumError>(Some((
                     token,
                     seq.start_time.elapsed().as_micros() as u64,
+                    model_cache_update,
                 )))
             })();
-            let (first_token, queue_to_first_token_us) = match first_token_result {
-                Ok(Some(value)) => value,
-                Ok(None) => continue,
-                Err(e) => {
-                    warn!(
-                        "Unified prefill post-process failed for {}: {}",
-                        work.rid, e
-                    );
-                    if work.fresh_kv {
-                        self.release_kv_allocation(
-                            &work.rid,
-                            work.rid.clone(),
-                            work.kv_resource_blocks,
-                        )
-                        .await;
+            let (first_token, queue_to_first_token_us, model_cache_update) =
+                match first_token_result {
+                    Ok(Some(value)) => value,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        warn!(
+                            "Unified prefill post-process failed for {}: {}",
+                            work.rid, e
+                        );
+                        if work.fresh_kv {
+                            self.release_kv_allocation(
+                                &work.rid,
+                                work.rid.clone(),
+                                work.kv_resource_blocks,
+                            )
+                            .await;
+                        }
+                        if work.fresh_recurrent {
+                            self.release_recurrent_state(&work.rid).await;
+                        }
+                        self.complete_request(&work.rid, FinishReason::Error)
+                            .await?;
+                        continue;
                     }
-                    if work.fresh_recurrent {
-                        self.release_recurrent_state(&work.rid).await;
-                    }
-                    self.complete_request(&work.rid, FinishReason::Error)
-                        .await?;
-                    continue;
-                }
-            };
+                };
+            self.apply_model_cache_ref_update(&work.rid, model_cache_update);
             self.scheduler.mark_prefill_complete(&work.rid, num_tokens);
             self.total_prefill_tokens
                 .fetch_add(num_tokens as u64, Ordering::Relaxed);

@@ -942,6 +942,9 @@ fn resource_event(
         after,
         capacity,
         reason: reason.map(str::to_string),
+        error_kind: None,
+        message: None,
+        resource_error_kind: None,
     });
     event
 }
