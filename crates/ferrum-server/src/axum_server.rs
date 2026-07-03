@@ -38,7 +38,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     time::Instant,
 };
@@ -59,6 +59,7 @@ const DEFAULT_GUIDED_TOOL_ARGUMENT_STRING_MAX_LENGTH: u64 = 128;
 const INITIAL_STRUCTURED_CALL_FORBIDDEN_TOKEN_TEXTS: &[&str] =
     &["<|im_end|>", "<|endoftext|>", "<|eot_id|>", "</s>"];
 const FERRUM_SESSION_HEADER: &str = "x-ferrum-session";
+static PROFILE_JSONL_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct CachePolicy {
@@ -1449,6 +1450,12 @@ fn append_profile_event(
     event: &FerrumProfileEvent,
 ) -> std::result::Result<(), String> {
     event.validate().map_err(|err| err.to_string())?;
+    let line = serde_json::to_string(&event).map_err(|err| err.to_string())?;
+    let body = format!("{line}\n");
+    let _guard = PROFILE_JSONL_FILE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|err| format!("profile JSONL file lock poisoned: {err}"))?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
@@ -1457,9 +1464,8 @@ fn append_profile_event(
         .append(true)
         .open(path)
         .map_err(|err| err.to_string())?;
-    let line = serde_json::to_string(&event).map_err(|err| err.to_string())?;
-    file.write_all(line.as_bytes())
-        .and_then(|_| file.write_all(b"\n"))
+    file.write_all(body.as_bytes())
+        .and_then(|_| file.flush())
         .map_err(|err| err.to_string())?;
     Ok(())
 }
@@ -7645,6 +7651,57 @@ mod tests {
         assert!(memory_event["memory"]["current_bytes"]
             .as_u64()
             .is_some_and(|bytes| bytes > 0));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(profile);
+    }
+
+    #[tokio::test]
+    async fn route_chat_sync_profile_jsonl_is_parseable_under_concurrent_requests() {
+        let root = unique_request_dump_dir("chat-sync-profile-concurrent");
+        let profile = unique_profile_jsonl("chat-sync-profile-concurrent");
+        let app = router_with_stub_request_dump_and_profile("OK", root.clone(), profile.clone());
+
+        let mut handles = Vec::new();
+        for request_index in 0..8 {
+            let app = app.clone();
+            handles.push(tokio::spawn(async move {
+                let response = post_json(
+                    app,
+                    "/v1/chat/completions",
+                    json!({
+                        "model": "stub-model",
+                        "messages": [{"role": "user", "content": format!("hello {request_index}")}]
+                    }),
+                )
+                .await;
+                assert_eq!(response.status(), AxumStatusCode::OK);
+                let body = response_json(response).await;
+                assert_eq!(body["choices"][0]["message"]["content"], "OK");
+            }));
+        }
+
+        for handle in handles {
+            handle.await.expect("concurrent request task");
+        }
+
+        let raw = fs::read_to_string(&profile).expect("profile jsonl");
+        let mut completion_events = 0usize;
+        for (line_index, line) in raw
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .enumerate()
+        {
+            let event: Value = serde_json::from_str(line).unwrap_or_else(|err| {
+                panic!(
+                    "profile line {} invalid JSON: {err}: {line}",
+                    line_index + 1
+                )
+            });
+            if event["phase"] == "chat_completions_sync_complete" {
+                completion_events += 1;
+            }
+        }
+        assert_eq!(completion_events, 8);
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_file(profile);
     }

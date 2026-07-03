@@ -12,10 +12,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 const SYNTHETIC_MODEL: &str = "synthetic/no-weight";
 const SYNTHETIC_BACKEND: &str = "synthetic";
+static PROFILE_JSONL_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum ProfileDetailArg {
@@ -1753,28 +1755,24 @@ fn push_path_arg(parts: &mut Vec<String>, flag: &str, path: Option<&PathBuf>) {
 }
 
 fn write_profile_jsonl(path: &Path, events: &[FerrumProfileEvent]) -> Result<()> {
-    if events.is_empty() {
-        return Err(FerrumError::internal("profile event set must be non-empty"));
-    }
-    let mut body = String::new();
-    for event in events {
-        event.validate().map_err(|err| {
-            FerrumError::internal(format!("invalid product observability event: {err}"))
-        })?;
-        body.push_str(&serde_json::to_string(event).map_err(|err| {
-            FerrumError::serialization(format!("failed to serialize profile event: {err}"))
-        })?);
-        body.push('\n');
-    }
+    let body = serialize_profile_jsonl_events(events)?;
+    let _guard = profile_jsonl_file_lock()
+        .lock()
+        .map_err(|err| FerrumError::internal(format!("profile JSONL file lock poisoned: {err}")))?;
     fs_write(path, body)
 }
 
 fn append_profile_jsonl(path: &Path, events: &[FerrumProfileEvent]) -> Result<()> {
+    let body = serialize_profile_jsonl_events(events)?;
+    let _guard = profile_jsonl_file_lock()
+        .lock()
+        .map_err(|err| FerrumError::internal(format!("profile JSONL file lock poisoned: {err}")))?;
+    append_profile_jsonl_body(path, &body)
+}
+
+fn serialize_profile_jsonl_events(events: &[FerrumProfileEvent]) -> Result<String> {
     if events.is_empty() {
         return Err(FerrumError::internal("profile event set must be non-empty"));
-    }
-    if let Some(parent) = path.parent() {
-        fs_create_dir_all(parent)?;
     }
     let mut body = String::new();
     for event in events {
@@ -1785,6 +1783,17 @@ fn append_profile_jsonl(path: &Path, events: &[FerrumProfileEvent]) -> Result<()
             FerrumError::serialization(format!("failed to serialize profile event: {err}"))
         })?);
         body.push('\n');
+    }
+    Ok(body)
+}
+
+fn profile_jsonl_file_lock() -> &'static Mutex<()> {
+    PROFILE_JSONL_FILE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn append_profile_jsonl_body(path: &Path, body: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs_create_dir_all(parent)?;
     }
     use std::io::Write as _;
     let mut file = std::fs::OpenOptions::new()
@@ -1800,6 +1809,12 @@ fn append_profile_jsonl(path: &Path, events: &[FerrumProfileEvent]) -> Result<()
     file.write_all(body.as_bytes()).map_err(|err| {
         FerrumError::internal(format!(
             "failed to append profile JSONL {}: {err}",
+            path.display()
+        ))
+    })?;
+    file.flush().map_err(|err| {
+        FerrumError::internal(format!(
+            "failed to flush profile JSONL {}: {err}",
             path.display()
         ))
     })
@@ -1965,6 +1980,62 @@ mod tests {
         assert!(memory_stages.contains(&"backend_initialized".to_string()));
         assert!(memory_stages.contains(&"model_loaded".to_string()));
         assert!(memory_stages.contains(&"shutdown".to_string()));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn profile_jsonl_append_is_parseable_under_concurrent_writers() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-profile-concurrent-append-{}",
+            Uuid::new_v4().simple()
+        ));
+        let path = root.join("profile.jsonl");
+        let config = ProductObservabilityConfig::new(
+            ProfileEntrypoint::Serve,
+            "Qwen/Qwen3-0.6B",
+            Some(&path),
+            ProfileDetailArg::Basic,
+            None,
+            None,
+            Some(&root.join("request_dump")),
+            1.0,
+        );
+
+        let mut handles = Vec::new();
+        for writer in 0..8 {
+            let path = path.clone();
+            let config = config.clone();
+            handles.push(std::thread::spawn(move || {
+                for seq in 0..32 {
+                    let request_id = format!("req-{writer}-{seq}");
+                    let mut event = actual_base_event(
+                        &config,
+                        &request_id,
+                        "chat_completions_sync_complete",
+                        ProfileEventKind::TimedSpan,
+                        Utc::now(),
+                    );
+                    event.event_id = format!("evt-{writer}-{seq}");
+                    event.correlation_id = Some(format!("corr-{writer}-{seq}"));
+                    event.duration_us = Some(1);
+                    event.attributes.insert("writer".to_string(), json!(writer));
+                    event.attributes.insert("seq".to_string(), json!(seq));
+                    append_profile_jsonl(&path, &[event]).unwrap();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let profile = fs::read_to_string(&path).unwrap();
+        let mut parsed = 0usize;
+        for line in profile.lines().filter(|line| !line.trim().is_empty()) {
+            serde_json::from_str::<serde_json::Value>(line).unwrap();
+            parsed += 1;
+        }
+        assert_eq!(parsed, 8 * 32);
         fs::remove_dir_all(root).ok();
     }
 

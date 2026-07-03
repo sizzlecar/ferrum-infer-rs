@@ -127,6 +127,15 @@ def infer_metal_architecture(model: dict[str, Any]) -> str:
     return "llama_dense"
 
 
+def infer_product_architecture(model_id: str, backend: str) -> str:
+    text = model_id.lower()
+    if "qwen3" in text and "moe" in text:
+        return "qwen3_moe"
+    if "qwen3" in text and backend == "metal":
+        return "qwen3"
+    return "llama_dense"
+
+
 def passed(value: Any) -> bool:
     return isinstance(value, dict) and value.get("passed") is True
 
@@ -239,6 +248,84 @@ def metal_l2(args: argparse.Namespace, source: Path, source_manifest: dict[str, 
     }
 
 
+def product_observability_l1_l2(
+    args: argparse.Namespace,
+    source: Path,
+    source_manifest: dict[str, Any],
+    backend: str,
+) -> dict[str, Any]:
+    summary_raw = None
+    outputs = source_manifest.get("outputs")
+    if isinstance(outputs, dict):
+        summary_raw = outputs.get("summary")
+    if summary_raw is None:
+        summary_raw = source_manifest.get("summary")
+    summary_path = (
+        Path(summary_raw)
+        if isinstance(summary_raw, str) and summary_raw.strip()
+        else source / "product_observability_l1_smoke_summary.json"
+    )
+    if not summary_path.is_absolute():
+        summary_path = source / summary_path
+    summary = read_json(summary_path)
+    require(summary.get("status") == "pass", f"{summary_path}.status must be pass")
+    require(
+        summary.get("actual_model_smoke") is True,
+        f"{summary_path}.actual_model_smoke must be true",
+    )
+    require(summary.get("effective_backend") == backend, f"{summary_path}.effective_backend must be {backend}")
+    entrypoints = summary.get("entrypoints")
+    require(isinstance(entrypoints, dict), f"{summary_path}.entrypoints must be an object")
+    run = entrypoints.get("run")
+    serve = entrypoints.get("serve")
+    require(isinstance(run, dict), f"{summary_path}.entrypoints.run must be an object")
+    require(isinstance(serve, dict), f"{summary_path}.entrypoints.serve must be an object")
+    run_product = run.get("product")
+    serve_product = serve.get("product")
+    require(isinstance(run_product, dict), f"{summary_path}.entrypoints.run.product must be an object")
+    require(isinstance(serve_product, dict), f"{summary_path}.entrypoints.serve.product must be an object")
+    require(run_product.get("status") == "pass", f"{summary_path}.entrypoints.run.product.status must be pass")
+    require(serve_product.get("status") == "pass", f"{summary_path}.entrypoints.serve.product.status must be pass")
+    stream = serve_product.get("stream")
+    require(isinstance(stream, dict), f"{summary_path}.entrypoints.serve.product.stream must be an object")
+    require(stream.get("done_count") == 1, f"{summary_path}.stream.done_count must be 1")
+    require(
+        isinstance(stream.get("content_chunks"), int) and stream["content_chunks"] > 0,
+        f"{summary_path}.stream.content_chunks must be positive",
+    )
+    require(stream.get("malformed") == 0, f"{summary_path}.stream.malformed must be 0")
+    basic_concurrency = serve_product.get("basic_concurrency")
+    require(
+        isinstance(basic_concurrency, dict),
+        f"{summary_path}.entrypoints.serve.product.basic_concurrency must be present for L2",
+    )
+    require(basic_concurrency.get("status") == "pass", f"{summary_path}.basic_concurrency.status must be pass")
+    cells = basic_concurrency.get("cells")
+    require(isinstance(cells, list) and cells, f"{summary_path}.basic_concurrency.cells must be non-empty")
+    for index, cell in enumerate(cells):
+        require(isinstance(cell, dict), f"{summary_path}.basic_concurrency.cells[{index}] must be an object")
+        require(cell.get("passed") is True, f"{summary_path}.basic_concurrency.cells[{index}].passed must be true")
+
+    model_id = args.model_id or str(summary.get("model_id") or summary.get("model") or "actual-model")
+    architecture = args.architecture or infer_product_architecture(model_id, backend)
+    require(architecture in ALLOWED_ARCHITECTURES[backend], f"{backend} architecture {architecture!r} is not allowed")
+    commands = summary.get("command") or []
+    return {
+        "source_summary": str(summary_path),
+        "model_key": args.model_key or model_id,
+        "model_id": model_id,
+        "architecture": architecture,
+        "entrypoints": REQUIRED_ENTRYPOINTS,
+        "command": commands if isinstance(commands, list) else [str(commands)],
+        "checks": {
+            "run": "pass",
+            "serve": "pass",
+            "stream": "pass",
+            "basic_concurrency": basic_concurrency,
+        },
+    }
+
+
 def cuda_l2(args: argparse.Namespace, source: Path, source_manifest: dict[str, Any], expected_sha: str) -> dict[str, Any]:
     gate = read_json(source / "gate.json")
     require(gate.get("status") == "pass", "cuda gate.json.status must be pass")
@@ -298,7 +385,10 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     source_manifest = load_source_manifest(source, expected_sha=expected_sha)
     backend = args.backend
     require(backend in {"cuda", "metal"}, "--backend must be cuda or metal")
-    if backend == "metal":
+    source_pass_line = str(source_manifest.get("pass_line") or "")
+    if source_pass_line.startswith("PRODUCT OBSERVABILITY L1 SMOKE PASS:"):
+        normalized = product_observability_l1_l2(args, source, source_manifest, backend)
+    elif backend == "metal":
         normalized = metal_l2(args, source, source_manifest, expected_sha)
     else:
         normalized = cuda_l2(args, source, source_manifest, expected_sha)
@@ -431,6 +521,66 @@ def make_cuda_source(root: Path, sha: str) -> Path:
     return root
 
 
+def make_product_l1_source(root: Path, sha: str, *, include_concurrency: bool = True) -> Path:
+    write_json(
+        root / "gate.manifest.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "status": "pass",
+            "phase": "product_observability_l1_smoke",
+            "artifact_dir": str(root),
+            "pass_line": f"PRODUCT OBSERVABILITY L1 SMOKE PASS: {root}",
+            "git_sha": sha,
+            "git_dirty": False,
+            "dirty_files": [],
+            "command": ["scripts/release/product_observability_l1_smoke.py", "--out", str(root)],
+            "outputs": {"summary": str(root / "product_observability_l1_smoke_summary.json")},
+        },
+    )
+    serve_product: dict[str, Any] = {
+        "status": "pass",
+        "stream": {"done_count": 1, "content_chunks": 1, "usage_chunks": 1, "malformed": 0},
+    }
+    if include_concurrency:
+        serve_product["basic_concurrency"] = {
+            "status": "pass",
+            "cells": [
+                {
+                    "concurrency": 2,
+                    "requests": 2,
+                    "status_200": 2,
+                    "json_ok": 2,
+                    "content_nonempty": 2,
+                    "forbidden_count": 0,
+                    "crosstalk": 0,
+                    "passed": True,
+                }
+            ],
+        }
+    write_json(
+        root / "product_observability_l1_smoke_summary.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "status": "pass",
+            "gate": "product_observability_l1_smoke",
+            "artifact_dir": str(root),
+            "pass_line": f"PRODUCT OBSERVABILITY L1 SMOKE PASS: {root}",
+            "git_sha": sha,
+            "git_dirty": False,
+            "dirty_files": [],
+            "model_id": "Qwen/Qwen3-0.6B",
+            "effective_backend": "metal",
+            "actual_model_smoke": True,
+            "command": ["ferrum", "run", "Qwen/Qwen3-0.6B"],
+            "entrypoints": {
+                "run": {"product": {"status": "pass"}},
+                "serve": {"product": serve_product},
+            },
+        },
+    )
+    return root
+
+
 def run_selftest() -> dict[str, Any]:
     sha = head_sha()
     with tempfile.TemporaryDirectory(prefix="ferrum-l2-actual-model-") as tmp:
@@ -469,6 +619,21 @@ def run_selftest() -> dict[str, Any]:
         )
         require(metal["backend"] == "metal", "metal normalization failed")
         require(cuda["backend"] == "cuda", "cuda normalization failed")
+        product_source = make_product_l1_source(root / "product-l1-source", sha)
+        product = run_gate(
+            argparse.Namespace(
+                out=root / "product-l1-out",
+                source_artifact=product_source,
+                backend="metal",
+                git_sha=sha,
+                model_key=None,
+                model_id=None,
+                architecture=None,
+                profile_detail="release-gate",
+                replay_bundle=[metal_replay],
+            )
+        )
+        require(product["checks"]["basic_concurrency"]["status"] == "pass", "product L1 L2 concurrency failed")
         summary_out = root / "actual-model-summary"
         summary_proc = subprocess.run(
             [
@@ -536,6 +701,28 @@ def run_selftest() -> dict[str, Any]:
             raise AssertionError("broken metal stream unexpectedly passed")
         except L2ArtifactError as exc:
             require("stream" in str(exc), f"unexpected stream failure: {exc}")
+        missing_concurrency = make_product_l1_source(
+            root / "product-l1-missing-concurrency",
+            sha,
+            include_concurrency=False,
+        )
+        try:
+            run_gate(
+                argparse.Namespace(
+                    out=root / "product-l1-missing-concurrency-out",
+                    source_artifact=missing_concurrency,
+                    backend="metal",
+                    git_sha=sha,
+                    model_key=None,
+                    model_id=None,
+                    architecture=None,
+                    profile_detail="release-gate",
+                    replay_bundle=[metal_replay],
+                )
+            )
+            raise AssertionError("product L1 without basic concurrency unexpectedly passed")
+        except L2ArtifactError as exc:
+            require("basic_concurrency" in str(exc), f"unexpected missing concurrency failure: {exc}")
     return {"status": "pass"}
 
 
