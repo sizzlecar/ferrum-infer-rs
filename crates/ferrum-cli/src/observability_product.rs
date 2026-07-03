@@ -564,6 +564,43 @@ fn actual_run_events(
         "output_tokens".to_string(),
         json!(observation.output_tokens),
     );
+    generation.attributes.insert(
+        "output_token_count".to_string(),
+        json!(observation.output_tokens),
+    );
+    generation.attributes.insert(
+        "completion_token_count".to_string(),
+        json!(observation.output_tokens),
+    );
+    generation.attributes.insert(
+        "e2e_duration_us".to_string(),
+        json!(observation.duration_us),
+    );
+    if let Some(prompt_token_count) = observation.prompt_token_count {
+        generation
+            .attributes
+            .insert("prompt_token_count".to_string(), json!(prompt_token_count));
+        generation.attributes.insert(
+            "total_token_count".to_string(),
+            json!(prompt_token_count.saturating_add(observation.output_tokens)),
+        );
+        generation.attributes.insert(
+            "token_count_source".to_string(),
+            json!("rendered_prompt_and_generated_tokens"),
+        );
+    } else {
+        generation.attributes.insert(
+            "total_token_count".to_string(),
+            json!(observation.output_tokens),
+        );
+        generation
+            .attributes
+            .insert("token_count_source".to_string(), json!("generated_tokens"));
+        generation.attributes.insert(
+            "prompt_token_unavailable_reason".to_string(),
+            json!("run rendered prompt token count was unavailable"),
+        );
+    }
     generation
         .attributes
         .insert("chunk_count".to_string(), json!(observation.chunk_count));
@@ -1773,6 +1810,22 @@ mod tests {
         assert_eq!(prompt_tokens["token_ids"], serde_json::json!([7, 8, 9]));
         assert_eq!(prompt_tokens["token_count"], 3);
         assert!(prompt_tokens["unavailable_reason"].is_null());
+        let profile = fs::read_to_string(root.join("profile.jsonl")).unwrap();
+        let generation = profile
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["phase"] == "actual_run_generation")
+            .expect("actual run generation event");
+        assert_eq!(generation["attributes"]["prompt_token_count"], 3);
+        assert_eq!(generation["attributes"]["completion_token_count"], 2);
+        assert_eq!(generation["attributes"]["output_token_count"], 2);
+        assert_eq!(generation["attributes"]["total_token_count"], 5);
+        assert_eq!(
+            generation["attributes"]["token_count_source"],
+            "rendered_prompt_and_generated_tokens"
+        );
+        assert_eq!(generation["attributes"]["e2e_duration_us"], 42);
         fs::remove_dir_all(root).ok();
     }
 

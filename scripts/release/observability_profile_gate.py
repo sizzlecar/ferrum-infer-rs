@@ -156,6 +156,12 @@ def validate_gate_semantics(path: Path, events: list[dict[str, Any]]) -> None:
             and str(event.get("phase", "")).endswith("_complete")
         ):
             validate_chat_completion_profile_event(event_attrs, context)
+        if (
+            event.get("entrypoint") == "run"
+            and event.get("status") == "ok"
+            and event.get("phase") == "actual_run_generation"
+        ):
+            validate_run_generation_profile_event(event_attrs, context)
 
     capacity_by_request = capacity_events(events)
     for event in events:
@@ -176,6 +182,32 @@ def validate_gate_semantics(path: Path, events: list[dict[str, Any]]) -> None:
 
 
 def validate_chat_completion_profile_event(event_attrs: dict[str, Any], context: str) -> None:
+    validate_request_token_latency_summary(
+        event_attrs,
+        context,
+        allowed_token_sources={"usage", "generated_tokens"},
+    )
+    if event_attrs.get("stream") is True:
+        for key in ("ttft_us", "itl_us_avg"):
+            value = event_attrs.get(key)
+            if not isinstance(value, int) or value < 0:
+                raise GateError(f"{context} streaming chat completion requires attributes.{key}")
+
+
+def validate_run_generation_profile_event(event_attrs: dict[str, Any], context: str) -> None:
+    validate_request_token_latency_summary(
+        event_attrs,
+        context,
+        allowed_token_sources={"rendered_prompt_and_generated_tokens"},
+    )
+
+
+def validate_request_token_latency_summary(
+    event_attrs: dict[str, Any],
+    context: str,
+    *,
+    allowed_token_sources: set[str],
+) -> None:
     for key in (
         "completion_token_count",
         "e2e_duration_us",
@@ -193,13 +225,9 @@ def validate_chat_completion_profile_event(event_attrs: dict[str, Any], context:
             f"{context} attributes.total_token_count must cover completion_token_count"
         )
     token_count_source = event_attrs.get("token_count_source")
-    if token_count_source not in {"usage", "generated_tokens"}:
-        raise GateError(f"{context} attributes.token_count_source must be usage or generated_tokens")
-    if event_attrs.get("stream") is True:
-        for key in ("ttft_us", "itl_us_avg"):
-            value = event_attrs.get(key)
-            if not isinstance(value, int) or value < 0:
-                raise GateError(f"{context} streaming chat completion requires attributes.{key}")
+    if token_count_source not in allowed_token_sources:
+        allowed = ", ".join(sorted(allowed_token_sources))
+        raise GateError(f"{context} attributes.token_count_source must be one of: {allowed}")
 
 
 def event_summary(event: dict[str, Any]) -> dict[str, Any]:
