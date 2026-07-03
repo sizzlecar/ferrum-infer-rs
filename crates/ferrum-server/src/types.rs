@@ -160,6 +160,10 @@ pub struct ServerConfig {
     /// Optional sanitized request/replay bundle output directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_dump_dir: Option<PathBuf>,
+
+    /// Optional product observability profile JSONL sink for request lifecycle events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_jsonl: Option<PathBuf>,
 }
 
 /// API version
@@ -407,6 +411,7 @@ impl Default for ServerConfig {
             auth: None,
             api_version: ApiVersion::V1,
             request_dump_dir: None,
+            profile_jsonl: None,
         }
     }
 }

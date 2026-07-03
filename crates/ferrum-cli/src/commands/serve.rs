@@ -805,7 +805,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let native_profile_jsonl = if product_observability.unified_product_profile_enabled() {
         None
     } else {
-        profile_jsonl
+        profile_jsonl.clone()
     };
     configure_profile_sink(
         native_profile_jsonl,
@@ -978,6 +978,10 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         host: host.clone(),
         port,
         request_dump_dir: request_dump_dir.clone(),
+        profile_jsonl: product_observability
+            .unified_product_profile_enabled()
+            .then(|| profile_jsonl.clone())
+            .flatten(),
         ..Default::default()
     };
 
