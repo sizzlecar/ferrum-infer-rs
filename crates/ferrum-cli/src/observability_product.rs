@@ -65,6 +65,7 @@ pub struct ActualRunObservation {
     pub request_id: String,
     pub duration_us: u64,
     pub sampling_params: SamplingParams,
+    pub prompt_token_ids: Option<Vec<u32>>,
     pub prompt_token_count: Option<usize>,
     pub output_tokens: usize,
     pub output_token_ids: Vec<u32>,
@@ -80,6 +81,7 @@ pub struct ActualRunFailureObservation {
     pub request_id: String,
     pub duration_us: u64,
     pub sampling_params: SamplingParams,
+    pub prompt_token_ids: Option<Vec<u32>>,
     pub prompt_token_count: Option<usize>,
     pub prompt_chars: usize,
     pub failure_kind: String,
@@ -258,10 +260,10 @@ fn write_actual_run_artifacts(
             replay_command,
             ReplayBundleData {
                 request: actual_request_dump(config, &observation.request_id, replay_command),
-                prompt_token_ids: None,
+                prompt_token_ids: observation.prompt_token_ids.clone(),
                 prompt_token_count: observation.prompt_token_count,
-                prompt_token_unavailable_reason: Some(
-                    "rendered prompt token ids are not retained by run one-shot in WP9 L0",
+                prompt_token_unavailable_reason: observation.prompt_token_ids.is_none().then_some(
+                    "rendered prompt token ids were unavailable for run one-shot observability",
                 ),
                 sampling_params: Some(observation.sampling_params.clone()),
                 backend: "actual",
@@ -293,10 +295,10 @@ fn write_actual_run_failure_artifacts(
             replay_command,
             ReplayBundleData {
                 request: actual_request_dump(config, &observation.request_id, replay_command),
-                prompt_token_ids: None,
+                prompt_token_ids: observation.prompt_token_ids.clone(),
                 prompt_token_count: observation.prompt_token_count,
-                prompt_token_unavailable_reason: Some(
-                    "rendered prompt token ids are not retained by run failure observability",
+                prompt_token_unavailable_reason: observation.prompt_token_ids.is_none().then_some(
+                    "rendered prompt token ids were unavailable for run failure observability",
                 ),
                 sampling_params: Some(observation.sampling_params.clone()),
                 backend: "actual",
@@ -1659,6 +1661,7 @@ mod tests {
                 request_id: request_id.clone(),
                 duration_us: 42,
                 sampling_params: SamplingParams::greedy(),
+                prompt_token_ids: Some(vec![11, 22, 33]),
                 prompt_token_count: Some(3),
                 prompt_chars: 12,
                 failure_kind: "error".to_string(),
@@ -1691,6 +1694,53 @@ mod tests {
     }
 
     #[test]
+    fn actual_run_observability_writes_prompt_token_ids() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-run-observability-{}",
+            Uuid::new_v4().simple()
+        ));
+        let config = ProductObservabilityConfig::new(
+            ProfileEntrypoint::Run,
+            "Qwen/Qwen3-0.6B",
+            Some(&root.join("profile.jsonl")),
+            ProfileDetailArg::Basic,
+            Some(&root.join("memory.jsonl")),
+            Some(&root.join("scheduler.jsonl")),
+            Some(&root.join("request_dump")),
+            1.0,
+        );
+        let request_id = "req-run-test".to_string();
+        write_actual_run_observability(
+            &config,
+            &ActualRunObservation {
+                request_id: request_id.clone(),
+                duration_us: 42,
+                sampling_params: SamplingParams::greedy(),
+                prompt_token_ids: Some(vec![7, 8, 9]),
+                prompt_token_count: Some(3),
+                output_tokens: 2,
+                output_token_ids: vec![10, 11],
+                chunk_count: 1,
+                finish_reason: Some("stop".to_string()),
+                prompt_chars: 12,
+                response_chars: 2,
+                response_text: "OK".to_string(),
+                memory: None,
+            },
+        )
+        .unwrap();
+        let bundle_dir = root.join("request_dump").join(&request_id);
+        let prompt_tokens: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(bundle_dir.join("prompt_token_ids.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(prompt_tokens["token_ids"], serde_json::json!([7, 8, 9]));
+        assert_eq!(prompt_tokens["token_count"], 3);
+        assert!(prompt_tokens["unavailable_reason"].is_null());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn actual_run_resource_failure_observability_writes_resource_diagnostics() {
         let root = std::env::temp_dir().join(format!(
             "ferrum-observability-resource-failure-{}",
@@ -1714,7 +1764,8 @@ mod tests {
                 request_id: request_id.clone(),
                 duration_us: 42,
                 sampling_params: SamplingParams::greedy(),
-                prompt_token_count: Some(1024),
+                prompt_token_ids: Some(vec![1, 2, 3, 4]),
+                prompt_token_count: Some(4),
                 prompt_chars: 128,
                 failure_kind: "oom_admission".to_string(),
                 error_kind: "resource_exhausted".to_string(),

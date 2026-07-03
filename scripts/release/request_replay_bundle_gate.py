@@ -225,7 +225,15 @@ def validate_bundle_dir(bundle: Path) -> dict[str, Any]:
     if secret_problems:
         raise BundleError("; ".join(secret_problems))
 
-    prompt_tokens = validate_token_dump(bundle / "prompt_token_ids.json", allow_unavailable=True)
+    actual_run_prompt_required = (
+        request.get("entrypoint") == "run"
+        and request.get("backend") == "actual"
+        and request.get("actual_model_smoke") is True
+    )
+    prompt_tokens = validate_token_dump(
+        bundle / "prompt_token_ids.json",
+        allow_unavailable=not actual_run_prompt_required,
+    )
     output_tokens = validate_token_dump(bundle / "output_token_ids.json", allow_unavailable=False)
     sampling = read_json(bundle / "sampling_params.json")
     runtime_config = read_json(bundle / "runtime_effective_config.json")
@@ -618,6 +626,25 @@ def run_selftest() -> dict[str, Any]:
                 fail_results.append({"case": name, "error": str(exc)})
             else:
                 raise BundleError(f"selftest fail case {name} unexpectedly passed")
+
+        root = temp / "fail" / "actual-run-missing-prompt-ids"
+        make_bundle(root)
+        bundle = root / "req-fixture"
+        request = read_json(bundle / "request.json")
+        request["backend"] = "actual"
+        request["actual_model_smoke"] = True
+        write_json(bundle / "request.json", request)
+        prompt_tokens = read_json(bundle / "prompt_token_ids.json")
+        prompt_tokens["token_ids"] = None
+        prompt_tokens["token_count"] = None
+        prompt_tokens["unavailable_reason"] = "regression fixture"
+        write_json(bundle / "prompt_token_ids.json", prompt_tokens)
+        try:
+            validate_bundle_root(root)
+        except BundleError as exc:
+            fail_results.append({"case": "actual-run-missing-prompt-ids", "error": str(exc)})
+        else:
+            raise BundleError("selftest fail case actual-run-missing-prompt-ids unexpectedly passed")
         return {
             "schema_version": SCHEMA_VERSION,
             "status": "pass",
