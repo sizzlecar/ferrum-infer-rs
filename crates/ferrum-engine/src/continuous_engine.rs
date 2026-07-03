@@ -630,8 +630,6 @@ pub struct SequenceState {
     draft_kv: Option<SequenceDraftKvState>,
     /// Token frequency counts for repetition penalty.
     pub token_frequencies: HashMap<TokenId, usize>,
-    /// Model executor's KV cache key for this sequence (for cleanup on completion).
-    model_cache_id: Option<String>,
     /// Single-token stop ids: model's EOS + any `stop_sequences` that encode to
     /// exactly one token. Checked against the last generated token each step
     /// — replaces the old "token id near top of vocab = EOS" placeholder. Built
@@ -683,13 +681,24 @@ impl SequenceKvAllocation {
 struct SequenceModelKvState {
     cache: Arc<dyn KvCacheHandle>,
     resource_blocks: Option<usize>,
+    model_cache_id: String,
 }
 
 impl SequenceModelKvState {
     fn new(cache: Arc<dyn KvCacheHandle>, resource_blocks: Option<usize>) -> Self {
+        let model_cache_id = cache.cache_id();
+        Self::new_with_model_cache_id(cache, resource_blocks, model_cache_id)
+    }
+
+    fn new_with_model_cache_id(
+        cache: Arc<dyn KvCacheHandle>,
+        resource_blocks: Option<usize>,
+        model_cache_id: String,
+    ) -> Self {
         Self {
             cache,
             resource_blocks: resource_blocks.map(|blocks| blocks.max(1)),
+            model_cache_id,
         }
     }
 
@@ -701,8 +710,15 @@ impl SequenceModelKvState {
         self.resource_blocks
     }
 
-    fn allocation(self, request_id: RequestId) -> SequenceKvAllocation {
-        SequenceKvAllocation::new(request_id, self.resource_blocks)
+    fn model_cache_id(&self) -> &str {
+        &self.model_cache_id
+    }
+
+    fn into_physical_resources(self, request_id: RequestId) -> (SequenceKvAllocation, String) {
+        (
+            SequenceKvAllocation::new(request_id, self.resource_blocks),
+            self.model_cache_id,
+        )
     }
 }
 
@@ -769,6 +785,13 @@ struct SequencePhysicalResources {
     draft_kv_allocation: Option<SequenceKvAllocation>,
     recurrent_state_allocation: Option<SequenceRecurrentAllocation>,
     model_cache_id: Option<String>,
+}
+
+#[cfg(test)]
+impl SequencePhysicalResources {
+    fn model_cache_id(&self) -> Option<&str> {
+        self.model_cache_id.as_deref()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -943,7 +966,6 @@ impl SequenceState {
             regex_processor,
             draft_kv: None,
             token_frequencies: HashMap::new(),
-            model_cache_id: None,
             stop_token_ids,
             forbidden_token_ids,
             initial_forbidden_token_ids,
@@ -996,18 +1018,24 @@ impl SequenceState {
     }
 
     fn take_physical_resources(&mut self) -> SequencePhysicalResources {
+        let (kv_allocation, model_cache_id) = self
+            .model_kv
+            .take()
+            .map(|state| {
+                let (kv_allocation, model_cache_id) =
+                    state.into_physical_resources(self.request_id.clone());
+                (Some(kv_allocation), Some(model_cache_id))
+            })
+            .unwrap_or((None, None));
         let draft_kv_allocation = self.draft_kv.take().map(SequenceDraftKvState::allocation);
         let resources = SequencePhysicalResources {
-            kv_allocation: self
-                .model_kv
-                .take()
-                .map(|state| state.allocation(self.request_id.clone())),
+            kv_allocation,
             draft_kv_allocation,
             recurrent_state_allocation: self
                 .recurrent_state
                 .take()
                 .map(SequenceRecurrentState::allocation),
-            model_cache_id: self.model_cache_id.take(),
+            model_cache_id,
         };
         resources
     }
@@ -1021,14 +1049,21 @@ impl SequenceState {
         resources
     }
 
-    fn replace_model_cache_id(&mut self, cache_id: String) -> ModelCacheRefUpdate {
-        if self.model_cache_id.as_deref() == Some(cache_id.as_str()) {
+    fn model_cache_ref_update_for(&self, cache_id: &str) -> ModelCacheRefUpdate {
+        if self
+            .model_kv
+            .as_ref()
+            .is_some_and(|state| state.model_cache_id() == cache_id)
+        {
             return ModelCacheRefUpdate::default();
         }
-        let released = self.model_cache_id.replace(cache_id.clone());
+        let released = self
+            .model_kv
+            .as_ref()
+            .map(|state| state.model_cache_id().to_string());
         ModelCacheRefUpdate {
             released,
-            acquired: Some(cache_id),
+            acquired: Some(cache_id.to_string()),
         }
     }
 
@@ -1037,8 +1072,13 @@ impl SequenceState {
         kv_cache: Arc<dyn KvCacheHandle>,
         kv_resource_blocks: Option<usize>,
     ) -> ModelCacheRefUpdate {
-        let model_cache_update = self.replace_model_cache_id(kv_cache.cache_id());
-        self.model_kv = Some(SequenceModelKvState::new(kv_cache, kv_resource_blocks));
+        let model_cache_id = kv_cache.cache_id();
+        let model_cache_update = self.model_cache_ref_update_for(&model_cache_id);
+        self.model_kv = Some(SequenceModelKvState::new_with_model_cache_id(
+            kv_cache,
+            kv_resource_blocks,
+            model_cache_id,
+        ));
         model_cache_update
     }
 
@@ -1099,8 +1139,8 @@ impl SequenceState {
     }
 
     fn decode_model_cache_id_or_request_id(&self, request_id: &RequestId) -> String {
-        self.model_cache_id
-            .clone()
+        self.model_cache_id()
+            .map(str::to_string)
             .unwrap_or_else(|| request_id.to_string())
     }
 
@@ -1176,6 +1216,12 @@ impl SequenceState {
         self.model_kv
             .as_ref()
             .and_then(SequenceModelKvState::resource_blocks)
+    }
+
+    fn model_cache_id(&self) -> Option<&str> {
+        self.model_kv
+            .as_ref()
+            .map(SequenceModelKvState::model_cache_id)
     }
 
     #[cfg(test)]
