@@ -1469,13 +1469,15 @@ async fn sequence_take_physical_resources_for_recompute_clears_owned_resources()
         1,
     )));
     sequence.kv_resource_blocks = Some(2);
-    sequence.draft_kv_cache = Some(Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+    sequence.commit_draft_kv_allocation(
+        Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+            draft_request_id.clone(),
+            1,
+            1,
+        )),
         draft_request_id.clone(),
-        1,
-        1,
-    )));
-    sequence.draft_kv_request_id = Some(draft_request_id.clone());
-    sequence.draft_kv_resource_blocks = Some(3);
+        3,
+    );
     sequence.model_cache_id = Some("model-cache".to_string());
     sequence.prefill_complete = true;
     sequence.phase = RequestPhase::Decoding;
@@ -1513,9 +1515,7 @@ async fn sequence_take_physical_resources_for_recompute_clears_owned_resources()
     assert_eq!(resources.model_cache_id.as_deref(), Some("model-cache"));
     assert!(sequence.kv_cache.is_none());
     assert!(sequence.kv_resource_blocks.is_none());
-    assert!(sequence.draft_kv_cache.is_none());
-    assert!(sequence.draft_kv_request_id.is_none());
-    assert!(sequence.draft_kv_resource_blocks.is_none());
+    assert!(sequence.draft_kv.is_none());
     assert!(sequence.recurrent_state.is_none());
     assert!(sequence.recurrent_state_slots.is_none());
     assert!(sequence.model_cache_id.is_none());
@@ -1554,13 +1554,20 @@ fn sequence_take_physical_resources_keeps_manager_handle_without_trace_blocks() 
 }
 
 #[test]
-#[should_panic(expected = "draft KV allocation metadata is incomplete")]
-fn sequence_take_physical_resources_rejects_incomplete_draft_kv_metadata() {
+#[should_panic(expected = "draft KV cache updated without owned allocation metadata")]
+fn sequence_speculative_decode_commit_rejects_draft_kv_without_allocation_metadata() {
     let request = policy_request();
+    let request_id = request.id.clone();
     let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
+    let target_kv: Arc<dyn KvCacheHandle> =
+        Arc::new(ferrum_testkit::MockKvCacheHandle::new(request_id, 1, 1));
+    let draft_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        RequestId::new(),
+        1,
+        1,
+    ));
 
-    sequence.draft_kv_resource_blocks = Some(3);
-    let _ = sequence.take_physical_resources();
+    sequence.commit_speculative_decode_physical_resources(target_kv, draft_kv);
 }
 
 #[test]
@@ -1721,13 +1728,12 @@ fn sequence_decode_commit_helpers_keep_resource_metadata_together() {
         1,
         3,
     ));
-    sequence.commit_speculative_decode_physical_resources(target_kv, draft_kv.clone());
+    sequence.commit_draft_kv_allocation(draft_kv.clone(), draft_request_id.clone(), 0);
+    sequence.commit_speculative_decode_physical_resources(target_kv, draft_kv);
     assert!(sequence.kv_cache.is_some());
-    assert!(sequence.draft_kv_cache.is_some());
-
-    sequence.commit_draft_kv_allocation(draft_kv, draft_request_id.clone(), 0);
-    assert_eq!(sequence.draft_kv_request_id, Some(draft_request_id));
-    assert_eq!(sequence.draft_kv_resource_blocks, Some(1));
+    let draft = sequence.draft_kv.as_ref().expect("draft kv state");
+    assert_eq!(draft.request_id, draft_request_id);
+    assert_eq!(draft.resource_blocks, 1);
     assert!(sequence.draft_kv_cache_handle().is_some());
 }
 
