@@ -554,6 +554,91 @@ def validate_actual_smoke_offline_replay_summary(
     return counts
 
 
+def validate_actual_smoke_profile_groups(
+    actual_smoke: Path,
+    events_by_path: dict[str, list[dict[str, Any]]],
+) -> dict[str, dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    for entrypoint in ("run", "serve"):
+        root = actual_smoke / entrypoint
+        paths = {
+            "profile": root / "profile.jsonl",
+            "memory": root / "memory_profile.jsonl",
+            "scheduler": root / "scheduler_trace.jsonl",
+        }
+        group: dict[str, Any] = {}
+        for label, path in paths.items():
+            events = events_by_path.get(str(path))
+            require(events is not None and len(events) > 0, f"{path} must contain events")
+            entrypoints = {event.get("entrypoint") for event in events}
+            require(entrypoints == {entrypoint}, f"{path} entrypoints are {entrypoints!r}")
+            actual_values = {
+                (event.get("attributes") or {}).get("actual_model_smoke")
+                for event in events
+                if isinstance(event.get("attributes"), dict)
+            }
+            require(
+                actual_values == {True},
+                f"{path} actual_model_smoke values are {actual_values!r}",
+            )
+            require(
+                {event.get("schema_version") for event in events} == {SCHEMA_VERSION},
+                f"{path} schema_version mismatch",
+            )
+            if label == "memory":
+                measurements = {
+                    (event.get("attributes") or {}).get("memory_measurement")
+                    for event in events
+                    if isinstance(event.get("attributes"), dict)
+                }
+                require(
+                    measurements == {"process_rss"},
+                    f"{path} memory_measurement values are {measurements}",
+                )
+                for event in events:
+                    memory = event.get("memory")
+                    require(isinstance(memory, dict), f"{path} memory event missing memory object")
+                    for key in ("current_bytes", "high_water_bytes"):
+                        value = memory.get(key)
+                        require(
+                            isinstance(value, int) and value > 0,
+                            f"{path} memory.{key} must be a positive integer",
+                        )
+            if label == "scheduler":
+                sources = {
+                    (event.get("attributes") or {}).get("resource_trace_source")
+                    for event in events
+                    if isinstance(event.get("attributes"), dict)
+                }
+                require(
+                    "engine" in sources,
+                    f"{path} must contain engine runtime resource trace events",
+                )
+                resource_kinds = {
+                    (event.get("resource") or {}).get("resource_kind")
+                    for event in events
+                    if isinstance(event.get("resource"), dict)
+                }
+                missing = {"request_slot", "kv_block"} - resource_kinds
+                require(not missing, f"{path} missing runtime resource kinds: {sorted(missing)}")
+            group[label] = {"path": str(path), "event_count": len(events)}
+        request_dump = root / "request_dump/request.json"
+        replay = root / "request_dump/replay_command.txt"
+        require(request_dump.is_file(), f"{request_dump} is required")
+        require(replay.is_file(), f"{replay} is required")
+        request = read_json(request_dump)
+        require(
+            request.get("actual_model_smoke") is True,
+            f"{request_dump}.actual_model_smoke must be true",
+        )
+        replay_command = replay.read_text(encoding="utf-8").strip()
+        require(replay_command, f"{replay} must be non-empty")
+        group["request_dump"] = str(request_dump)
+        group["replay_command"] = replay_command
+        groups[entrypoint] = group
+    return groups
+
+
 def actual_smoke_result(actual_smoke: Path) -> dict[str, Any]:
     require(actual_smoke.is_dir(), f"actual smoke artifact must be a directory: {actual_smoke}")
     manifest_path = actual_smoke / "gate.manifest.json"
@@ -622,6 +707,7 @@ def actual_smoke_result(actual_smoke: Path) -> dict[str, Any]:
         actual_smoke / "serve/scheduler_trace.jsonl",
     ]
     events_by_path = load_and_validate_profiles(profile_paths)
+    profile_groups = validate_actual_smoke_profile_groups(actual_smoke, events_by_path)
     profile_summary = summarize_events(profile_paths, events_by_path)
     require("run" in profile_summary["entrypoints"], "actual smoke missing run profile events")
     require("serve" in profile_summary["entrypoints"], "actual smoke missing serve profile events")
@@ -685,6 +771,7 @@ def actual_smoke_result(actual_smoke: Path) -> dict[str, Any]:
         "effective_backend": summary.get("effective_backend"),
         "profile_detail": summary.get("profile_detail"),
         "entrypoints": profile_summary["entrypoints"],
+        "profile_groups": profile_groups,
         "replay_bundle_count": len(replay_bundle_summary),
         "offline_replay_execution_count": offline_replay["replay_execution_count"],
         "offline_replay_skipped_count": offline_replay["replay_execution_skipped_count"],
@@ -1002,6 +1089,22 @@ def write_actual_smoke_entrypoint(root: Path, entrypoint: str) -> None:
     request_id = f"req-{entrypoint}"
     request_dump = root / "request_dump"
     make_bundle(request_dump)
+    write_json(
+        request_dump / "request.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "entrypoint": entrypoint,
+            "request_id": request_id,
+            "model": "fixture/actual-model",
+            "backend": "actual",
+            "actual_model_smoke": True,
+            "sanitized": True,
+        },
+    )
+    (request_dump / "replay_command.txt").write_text(
+        f"ferrum {entrypoint} fixture/actual-model\n",
+        encoding="utf-8",
+    )
     profile = actual_smoke_profile_event(
         entrypoint=entrypoint,
         request_id=request_id,
@@ -1302,6 +1405,27 @@ def run_selftest() -> None:
             raise AssertionError("all-skipped actual smoke replay unexpectedly passed")
         except SentinelError as exc:
             require("did not execute any offline replay" in str(exc), f"unexpected replay error: {exc}")
+        bad_profile_smoke = make_actual_smoke_fixture(temp / "bad-profile-smoke", sha=head)
+        bad_profile_path = bad_profile_smoke / "run/profile.jsonl"
+        bad_profile_events = [
+            json.loads(line)
+            for line in bad_profile_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        bad_profile_events[0]["attributes"]["actual_model_smoke"] = False
+        write_jsonl(bad_profile_path, bad_profile_events)
+        try:
+            run_gate(
+                argparse.Namespace(
+                    manifest=DEFAULT_MANIFEST,
+                    out=temp / "bad-profile-smoke-out",
+                    actual_smoke=bad_profile_smoke,
+                    scenario_summary=None,
+                )
+            )
+            raise AssertionError("actual smoke with non-actual profile unexpectedly passed")
+        except SentinelError as exc:
+            require("actual_model_smoke values" in str(exc), f"unexpected profile smoke error: {exc}")
     finally:
         shutil.rmtree(temp, ignore_errors=True)
 
