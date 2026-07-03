@@ -1498,12 +1498,18 @@ async fn sequence_take_physical_resources_for_recompute_clears_owned_resources()
 
     let resources = sequence.take_physical_resources_for_recompute();
 
-    assert!(resources.had_kv_cache);
-    assert_eq!(resources.kv_resource_blocks, Some(2));
-    assert_eq!(resources.draft_kv_request_id, Some(draft_request_id));
-    assert_eq!(resources.draft_kv_resource_blocks, Some(3));
-    assert!(resources.had_recurrent_state);
-    assert_eq!(resources.recurrent_state_slots, Some(1));
+    assert_eq!(
+        resources.kv_allocation,
+        Some(SequenceKvAllocation::new(request_id.clone(), Some(2)))
+    );
+    assert_eq!(
+        resources.draft_kv_allocation,
+        Some(SequenceKvAllocation::new(draft_request_id, Some(3)))
+    );
+    assert_eq!(
+        resources.recurrent_state_allocation,
+        Some(SequenceRecurrentAllocation::new(Some(1)))
+    );
     assert_eq!(resources.model_cache_id.as_deref(), Some("model-cache"));
     assert!(sequence.kv_cache.is_none());
     assert!(sequence.kv_resource_blocks.is_none());
@@ -1516,6 +1522,45 @@ async fn sequence_take_physical_resources_for_recompute_clears_owned_resources()
     assert!(!sequence.prefill_complete);
     assert_eq!(sequence.phase, RequestPhase::Waiting);
     assert_eq!(sequence.tokens_this_iteration, 0);
+}
+
+#[test]
+fn sequence_take_physical_resources_keeps_manager_handle_without_trace_blocks() {
+    let request = policy_request();
+    let request_id = request.id.clone();
+    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
+    let model_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        request_id.clone(),
+        1,
+        1,
+    ));
+    let model_cache_id = model_kv.cache_id();
+
+    sequence.install_model_kv_without_owned_blocks(model_kv);
+    let resources = sequence.take_physical_resources();
+
+    assert_eq!(
+        resources.kv_allocation,
+        Some(SequenceKvAllocation::new(request_id, None))
+    );
+    assert!(resources.draft_kv_allocation.is_none());
+    assert!(resources.recurrent_state_allocation.is_none());
+    assert_eq!(
+        resources.model_cache_id.as_deref(),
+        Some(model_cache_id.as_str())
+    );
+    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.kv_resource_blocks.is_none());
+}
+
+#[test]
+#[should_panic(expected = "draft KV allocation metadata is incomplete")]
+fn sequence_take_physical_resources_rejects_incomplete_draft_kv_metadata() {
+    let request = policy_request();
+    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
+
+    sequence.draft_kv_resource_blocks = Some(3);
+    let _ = sequence.take_physical_resources();
 }
 
 #[test]
