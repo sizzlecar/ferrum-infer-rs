@@ -1139,6 +1139,8 @@ fn write_replay_bundle(
     } else {
         format!("{output_text}\n")
     };
+    let engine_replay_args = engine_replay_command_args(&bundle_dir);
+    let engine_replay_command = replay_command_from_args(&engine_replay_args);
     let files = [
         ("request.json", data.request),
         ("prompt_token_ids.json", prompt_tokens),
@@ -1196,6 +1198,12 @@ fn write_replay_bundle(
                 "command": replay_command,
                 "argv": replay_command_args(config),
                 "bundle_dir": bundle_dir.to_string_lossy(),
+                "engine_replay": {
+                    "mode": "bundle_offline",
+                    "requires_http_server": false,
+                    "command": engine_replay_command,
+                    "argv": engine_replay_args
+                },
                 "sanitized": true
             }),
         ),
@@ -1456,8 +1464,11 @@ fn actual_request_dump(
 }
 
 fn replay_command(config: &ProductObservabilityConfig) -> String {
-    replay_command_args(config)
-        .iter()
+    replay_command_from_args(&replay_command_args(config))
+}
+
+fn replay_command_from_args(args: &[String]) -> String {
+    args.iter()
         .map(|part| shell_quote(part))
         .collect::<Vec<_>>()
         .join(" ")
@@ -1494,6 +1505,24 @@ fn replay_command_args(config: &ProductObservabilityConfig) -> Vec<String> {
         config.request_dump_dir.as_ref(),
     );
     parts
+}
+
+fn engine_replay_command_args(bundle_dir: &Path) -> Vec<String> {
+    vec![
+        "cargo".to_string(),
+        "run".to_string(),
+        "-p".to_string(),
+        "ferrum-cli".to_string(),
+        "--".to_string(),
+        "replay-bundle".to_string(),
+        bundle_dir.to_string_lossy().to_string(),
+        "--out".to_string(),
+        bundle_dir
+            .join("engine_replay")
+            .to_string_lossy()
+            .to_string(),
+        "--json".to_string(),
+    ]
 }
 
 fn push_path_arg(parts: &mut Vec<String>, flag: &str, path: Option<&PathBuf>) {
@@ -1635,6 +1664,13 @@ mod tests {
         assert!(bundle_dir.join("output_text.txt").is_file());
         assert!(bundle_dir.join("bad_output_scan.json").is_file());
         assert!(bundle_dir.join("replay.command.json").is_file());
+        let replay: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(bundle_dir.join("replay.command.json")).unwrap(),
+        )
+        .unwrap();
+        let engine_argv = replay["engine_replay"]["argv"].as_array().unwrap();
+        assert!(engine_argv.iter().any(|item| item == "replay-bundle"));
+        assert_eq!(replay["engine_replay"]["requires_http_server"], false);
         fs::remove_dir_all(root).ok();
     }
 

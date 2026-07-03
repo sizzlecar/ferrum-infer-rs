@@ -200,6 +200,31 @@ def validate_serve_replay_command(bundle: Path, request: dict[str, Any], replay:
     }
 
 
+def validate_engine_replay_command(bundle: Path, replay: dict[str, Any]) -> dict[str, Any] | None:
+    engine_replay = replay.get("engine_replay")
+    if engine_replay is None:
+        return None
+    if not isinstance(engine_replay, dict):
+        raise BundleError(f"{bundle / 'replay.command.json'}.engine_replay must be an object")
+    if engine_replay.get("requires_http_server") is not False:
+        raise BundleError(
+            f"{bundle / 'replay.command.json'}.engine_replay.requires_http_server must be false"
+        )
+    argv = engine_replay.get("argv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
+        raise BundleError(f"{bundle / 'replay.command.json'}.engine_replay.argv must be a non-empty string array")
+    if "replay-bundle" not in argv:
+        raise BundleError(f"{bundle / 'replay.command.json'}.engine_replay.argv must invoke replay-bundle")
+    command = engine_replay.get("command")
+    if not isinstance(command, str) or not command.strip():
+        raise BundleError(f"{bundle / 'replay.command.json'}.engine_replay.command must be non-empty")
+    return {
+        "command": command,
+        "argv": argv,
+        "mode": engine_replay.get("mode"),
+    }
+
+
 def validate_failure_diagnostics(bundle: Path, request_id: str, bad_scan: dict[str, Any]) -> dict[str, Any] | None:
     failure_kind = bad_scan.get("failure_kind")
     if failure_kind is None or failure_kind in BAD_OUTPUT_FAILURE_KINDS:
@@ -287,6 +312,7 @@ def validate_bundle_dir(bundle: Path) -> dict[str, Any]:
     replay = read_json(bundle / "replay.command.json")
     bad_scan = validate_bad_output_scan(bundle / "bad_output_scan.json")
     serve_replay = validate_serve_replay_command(bundle, request, replay)
+    engine_replay = validate_engine_replay_command(bundle, replay)
     failure_diagnostics = validate_failure_diagnostics(bundle, request_id, bad_scan)
 
     for label, data in [
@@ -323,6 +349,7 @@ def validate_bundle_dir(bundle: Path) -> dict[str, Any]:
         if failure_diagnostics is not None
         else None,
         "serve_replay": serve_replay,
+        "engine_replay": engine_replay,
         "prompt_token_count": prompt_tokens.get("token_count"),
         "output_token_count": output_tokens.get("token_count"),
     }
@@ -360,6 +387,33 @@ def rewrite_replay_argv(argv: list[str], replay_out: Path) -> list[str]:
         index += 1
     if not saw_request_dump:
         raise BundleError("executable replay argv must include --request-dump-dir")
+    return rewritten
+
+
+def rewrite_engine_replay_argv(argv: list[str], bundle: Path, replay_out: Path) -> list[str]:
+    rewritten = list(argv)
+    try:
+        replay_index = rewritten.index("replay-bundle")
+    except ValueError as exc:
+        raise BundleError("engine replay argv must include replay-bundle") from exc
+    if replay_index + 1 >= len(rewritten):
+        raise BundleError("engine replay argv missing bundle path")
+    rewritten[replay_index + 1] = str(bundle)
+    index = 0
+    saw_out = False
+    while index < len(rewritten):
+        if rewritten[index] == "--out":
+            if index + 1 >= len(rewritten):
+                raise BundleError("engine replay argv --out missing path value")
+            rewritten[index + 1] = str(replay_out / "engine_replay")
+            saw_out = True
+            index += 2
+            continue
+        index += 1
+    if not saw_out:
+        rewritten.extend(["--out", str(replay_out / "engine_replay")])
+    if "--json" not in rewritten:
+        rewritten.append("--json")
     return rewritten
 
 
@@ -441,6 +495,34 @@ def execute_replay(
     argv = replay.get("argv")
     if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
         raise BundleError(f"{bundle / 'replay.command.json'}.argv must be a string array")
+    engine_replay = validate_engine_replay_command(bundle, replay)
+    if engine_replay is not None and replay.get("requires_running_server") is not True:
+        replay_out = out / "executed_replays" / safe_path_part(bundle.name)
+        replay_out.mkdir(parents=True, exist_ok=True)
+        rewritten = rewrite_engine_replay_argv(engine_replay["argv"], bundle, replay_out)
+        proc = subprocess.run(
+            rewritten,
+            cwd=REPO_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+        log = {
+            "bundle_dir": str(bundle),
+            "cmd": rewritten,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+        }
+        write_json(replay_out / "replay_execution.json", log)
+        if proc.returncode != 0:
+            raise BundleError(f"{bundle}: engine replay command failed with exit {proc.returncode}")
+        return {
+            "source_bundle_dir": str(bundle),
+            "status": "executed_engine_replay",
+            "artifact_dir": str(replay_out),
+        }
     if "synthetic/no-weight" not in argv and replay.get("requires_running_server") is True:
         if live_server_base_url:
             replay_out = out / "executed_replays" / safe_path_part(bundle.name)
@@ -553,6 +635,18 @@ def make_bundle(
     }
     replay_argv = ["ferrum", "run", "synthetic/no-weight"]
     replay_command = "ferrum run synthetic/no-weight"
+    engine_replay_argv = [
+        "cargo",
+        "run",
+        "-p",
+        "ferrum-cli",
+        "--",
+        "replay-bundle",
+        str(root / "req-fixture"),
+        "--out",
+        str(root / "req-fixture" / "engine_replay"),
+        "--json",
+    ]
     if serve_replay:
         replay_argv = [
             "curl",
@@ -618,6 +712,12 @@ def make_bundle(
             "command": replay_command,
             "argv": replay_argv,
             "requires_running_server": True if serve_replay else None,
+            "engine_replay": {
+                "mode": "bundle_offline",
+                "requires_http_server": False,
+                "command": " ".join(engine_replay_argv),
+                "argv": engine_replay_argv,
+            },
             "sanitized": True,
         },
     }
@@ -703,6 +803,27 @@ def run_selftest() -> dict[str, Any]:
             raise BundleError(f"live replay base URL rewrite failed: {rewritten}")
         if rewritten[3] != f"@{pass_root / 'serve-live' / 'req-fixture' / 'replay_body.json'}":
             raise BundleError(f"live replay body path rewrite failed: {rewritten}")
+        engine_rewritten = rewrite_engine_replay_argv(
+            [
+                "cargo",
+                "run",
+                "-p",
+                "ferrum-cli",
+                "--",
+                "replay-bundle",
+                "/stale/bundle",
+                "--out",
+                "/stale/out",
+            ],
+            pass_root / "normal" / "req-fixture",
+            temp / "engine-replay-out",
+        )
+        if engine_rewritten[6] != str(pass_root / "normal" / "req-fixture"):
+            raise BundleError(f"engine replay bundle path rewrite failed: {engine_rewritten}")
+        if engine_rewritten[8] != str(temp / "engine-replay-out" / "engine_replay"):
+            raise BundleError(f"engine replay out path rewrite failed: {engine_rewritten}")
+        if "--json" not in engine_rewritten:
+            raise BundleError(f"engine replay argv rewrite must force --json: {engine_rewritten}")
 
         fail_cases = {
             "secret": {"secret": True},

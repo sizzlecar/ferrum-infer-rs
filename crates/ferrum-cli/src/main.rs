@@ -45,6 +45,9 @@ enum Commands {
     /// (apples-to-apples vs `vllm bench serve --dataset-name random`)
     BenchServe(bench_serve::BenchServeCommand),
 
+    /// Validate and replay a request replay bundle without starting HTTP.
+    ReplayBundle(replay_bundle::ReplayBundleCommand),
+
     /// Generate text embeddings using BERT models
     #[command(visible_alias = "e")]
     Embed(embed::EmbedCommand),
@@ -97,6 +100,7 @@ async fn main() {
         Commands::Run(cmd) => run::execute(cmd, config).await,
         Commands::Bench(cmd) => bench::execute(cmd, config).await,
         Commands::BenchServe(cmd) => bench_serve::execute(cmd, config).await,
+        Commands::ReplayBundle(cmd) => replay_bundle::execute(cmd, config).await,
         Commands::Embed(cmd) => embed::execute(cmd, config).await,
         Commands::Transcribe(cmd) => transcribe::execute(cmd, config).await,
         Commands::Tts(cmd) => tts::execute(cmd, config).await,
