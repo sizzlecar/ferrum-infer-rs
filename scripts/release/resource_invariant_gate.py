@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +21,19 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_FIXTURES = REPO_ROOT / "scripts/release/fixtures/resource_invariant"
 PASS_LINE = "RESOURCE INVARIANT GATE PASS"
 SELFTEST_PASS_LINE = "RESOURCE INVARIANT GATE SELFTEST PASS"
+GOAL = "release-regression-hardening-2026-06-28"
+PHASE = "resource_invariant"
+SECRET_ENV_MARKERS = ("TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL")
+SAFE_ENV_NAMES = {
+    "CI",
+    "GITHUB_ACTIONS",
+    "GITHUB_REF",
+    "GITHUB_SHA",
+    "RUSTFLAGS",
+    "RUST_BACKTRACE",
+    "CARGO_TERM_COLOR",
+}
+SAFE_ENV_PREFIXES = ("FERRUM_", "CARGO_", "RUST_", "CUDA_", "METAL_", "HF_")
 
 REQUIRED_PASS_SCENARIOS = {
     "kv_allocate_release_success",
@@ -483,9 +499,36 @@ def git_value(args: list[str]) -> str:
     return proc.stdout.strip()
 
 
+def iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def command_line() -> list[str]:
+    return [sys.executable, *sys.argv]
+
+
+def sanitized_env_summary() -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key, value in sorted(os.environ.items()):
+        if not (key in SAFE_ENV_NAMES or any(key.startswith(prefix) for prefix in SAFE_ENV_PREFIXES)):
+            continue
+        if any(marker in key.upper() for marker in SECRET_ENV_MARKERS):
+            out[key] = "<redacted>"
+        elif len(value) > 512:
+            out[key] = f"{value[:512]}...<truncated>"
+        else:
+            out[key] = value
+    return out
+
+
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
 
 
 def write_combined_trace(out: Path, fixture_root: Path) -> Path:
@@ -498,8 +541,12 @@ def write_combined_trace(out: Path, fixture_root: Path) -> Path:
 
 
 def run_gate(args: argparse.Namespace) -> dict[str, Any]:
+    started_at = iso_now()
+    start = time.monotonic()
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
+    (out / "failures").mkdir(exist_ok=True)
+    (out / "diagnostics").mkdir(exist_ok=True)
     fixture_summary = run_fixture_selftest(args.fixtures)
     trace_path = write_combined_trace(out, args.fixtures)
     trace_report = validate_trace_file(trace_path)
@@ -541,23 +588,86 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         raise GateError("panic_count must be 0")
     report_path = out / "invariant_report.json"
     write_json(report_path, report)
+    pass_line = f"{PASS_LINE}: {out}"
     dirty_files = git_value(["status", "--short"]).splitlines()
+    git_status = git_value(["status", "--short"])
+    branch = git_value(["rev-parse", "--abbrev-ref", "HEAD"])
+    ended_at = iso_now()
+    duration_sec = time.monotonic() - start
+    sanitized_env = sanitized_env_summary()
+    command_log = "\n".join(
+        [
+            "resource invariant gate",
+            f"command: {' '.join(command_line())}",
+            f"repo_root: {REPO_ROOT}",
+            f"fixtures: {args.fixtures}",
+            f"out: {out}",
+            f"trace_jsonl: {[str(path) for path in args.trace_jsonl]}",
+            f"started_at: {started_at}",
+            f"ended_at: {ended_at}",
+            f"duration_sec: {duration_sec:.3f}",
+            f"status: pass",
+            f"pass_line: {pass_line}",
+            "",
+        ]
+    )
+    write_text(out / "command.log", command_log)
+    write_text(out / "git_status.txt", git_status + ("\n" if git_status else ""))
+    write_json(out / "sanitized_env.json", sanitized_env)
+    write_text(out / "pass_line.txt", pass_line + "\n")
     manifest = {
         "schema_version": 1,
+        "goal": GOAL,
+        "phase": PHASE,
         "status": "pass",
         "artifact_dir": str(out),
-        "pass_line": f"{PASS_LINE}: {out}",
+        "pass_line": pass_line,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_sec": duration_sec,
+        "repo_root": str(REPO_ROOT),
         "git_sha": git_value(["rev-parse", "HEAD"]),
+        "git_branch": branch,
         "git_dirty": bool(dirty_files),
         "dirty_files": dirty_files,
-        "dirty_status": git_value(["status", "--short"]),
+        "dirty_status": git_status,
+        "command": command_line(),
         "commands": [
             f"{sys.executable} scripts/release/resource_invariant_gate.py --out {out}",
             f"{sys.executable} scripts/release/resource_invariant_gate.py --self-test",
         ],
+        "command_log": str(out / "command.log"),
+        "git_status": str(out / "git_status.txt"),
+        "sanitized_env": sanitized_env,
+        "sanitized_env_path": str(out / "sanitized_env.json"),
         "resource_trace": str(trace_path),
         "external_trace_jsonl": [str(path) for path in args.trace_jsonl],
         "invariant_report": str(report_path),
+        "inputs": {
+            "fixtures": str(args.fixtures),
+            "trace_jsonl": [str(path) for path in args.trace_jsonl],
+        },
+        "outputs": {
+            "resource_trace": str(trace_path),
+            "summary": str(report_path),
+            "invariant_report": str(report_path),
+            "command_log": str(out / "command.log"),
+            "git_status": str(out / "git_status.txt"),
+            "sanitized_env": str(out / "sanitized_env.json"),
+            "pass_line": str(out / "pass_line.txt"),
+            "failures_dir": str(out / "failures"),
+            "diagnostics_dir": str(out / "diagnostics"),
+        },
+        "validation_summary": {
+            "scenario_count": fixture_summary["scenario_count"],
+            "required_scenario_count": len(REQUIRED_PASS_SCENARIOS),
+            "fail_fixture_count": len(fixture_summary["fail_fixtures"]),
+            "external_trace_count": len(external_reports),
+            "leaked_resources": report["leaked_resources"],
+            "underflow_count": report["underflow_count"],
+            "silent_oom_count": report["silent_oom_count"],
+            "panic_count": report["panic_count"],
+        },
     }
     write_json(out / "gate.manifest.json", manifest)
     return report
