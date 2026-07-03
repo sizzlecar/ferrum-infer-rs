@@ -15,6 +15,11 @@ const FA2_NATIVE_SOURCE_SHA256_ENV: &str = "FERRUM_FA2_NATIVE_SOURCE_SHA256";
 const FA2_NATIVE_INPUTS_SHA256_ENV: &str = "FERRUM_FA2_NATIVE_INPUTS_SHA256";
 const FA2_NATIVE_ARTIFACT_COMPILE_ENV: &str = "FERRUM_FA2_NATIVE_ARTIFACT_COMPILE";
 const NATIVE_OP_ARTIFACT_FEATURE_ENV: &str = "CARGO_FEATURE_NATIVE_OP_ARTIFACT";
+const COMPILED_FA2_NATIVE_MANIFEST_ENV: &str = "FERRUM_COMPILED_FA2_NATIVE_MANIFEST";
+const COMPILED_FA2_NATIVE_ARTIFACT_ENV: &str = "FERRUM_COMPILED_FA2_NATIVE_ARTIFACT";
+const COMPILED_FA2_NATIVE_SOURCE_SHA256_ENV: &str = "FERRUM_COMPILED_FA2_NATIVE_SOURCE_SHA256";
+const COMPILED_FA2_NATIVE_INPUTS_SHA256_ENV: &str = "FERRUM_COMPILED_FA2_NATIVE_INPUTS_SHA256";
+const COMPILED_FA2_NATIVE_BINARY_SHA256_ENV: &str = "FERRUM_COMPILED_FA2_NATIVE_BINARY_SHA256";
 
 const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/fused_add_rms_norm.cu",
@@ -294,7 +299,23 @@ fn link_fa2_native_operator_artifact() {
     }
     println!("cargo:rustc-env={FA2_NATIVE_ARTIFACT_COMPILE_ENV}=linked");
     println!(
-        "cargo:rustc-env=FERRUM_FA2_NATIVE_ARTIFACT_BINARY_SHA256={}",
+        "cargo:rustc-env={COMPILED_FA2_NATIVE_MANIFEST_ENV}={}",
+        resolved.manifest_path.display()
+    );
+    println!(
+        "cargo:rustc-env={COMPILED_FA2_NATIVE_ARTIFACT_ENV}={}",
+        resolved.artifact_path.display()
+    );
+    println!(
+        "cargo:rustc-env={COMPILED_FA2_NATIVE_SOURCE_SHA256_ENV}={}",
+        resolved.manifest.source_package.sha256
+    );
+    println!(
+        "cargo:rustc-env={COMPILED_FA2_NATIVE_INPUTS_SHA256_ENV}={}",
+        resolved.manifest.inputs_sha256
+    );
+    println!(
+        "cargo:rustc-env={COMPILED_FA2_NATIVE_BINARY_SHA256_ENV}={}",
         resolved.artifact_sha256
     );
     emit_cuda_build_summary(
