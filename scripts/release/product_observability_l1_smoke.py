@@ -131,6 +131,16 @@ def profile_detail_from_flags() -> str:
     return "basic"
 
 
+def reject_synthetic_model_for_actual_smoke(args: argparse.Namespace) -> None:
+    if args.model != "synthetic/no-weight":
+        return
+    raise SmokeError(
+        "synthetic/no-weight is an L0 product observability wiring fixture, not an actual model "
+        "smoke; run scripts/release/product_observability_wiring_gate.py for synthetic run/serve "
+        "wiring evidence"
+    )
+
+
 def run_checked(cmd: list[str], *, cwd: Path, timeout: int, log_path: Path, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
     proc = subprocess.run(
         cmd,
@@ -650,6 +660,7 @@ def run_replay_bundle_gate(out: Path, timeout: int) -> dict[str, Any]:
 def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
+    reject_synthetic_model_for_actual_smoke(args)
     dirty_files = git_value(["status", "--short"], default="").splitlines()
     git_sha = git_value(["rev-parse", "HEAD"])
     git_branch = git_value(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -731,6 +742,8 @@ def failure_kind(exc: Exception) -> str:
     if isinstance(exc, BackendUnavailableError):
         return "backend_unavailable"
     message = str(exc).lower()
+    if "synthetic/no-weight" in message or "not an actual model smoke" in message:
+        return "not_actual_model"
     if "replay" in message:
         return "replay_failure"
     if "stream" in message or "[done]" in message or "sse" in message:
@@ -750,24 +763,31 @@ def write_failure_artifacts(args: argparse.Namespace, exc: SmokeError) -> None:
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
     dirty_files = git_value(["status", "--short"], default="").splitlines()
+    kind = failure_kind(exc)
     classification: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "status": "fail",
-        "failure_kind": failure_kind(exc),
+        "failure_kind": kind,
         "error": str(exc),
         "requested_backend": exc.requested if isinstance(exc, BackendUnavailableError) else args.backend,
         "effective_backend": exc.effective if isinstance(exc, BackendMismatchError) else None,
-        "suspected_domain": "backend_runtime_preset"
+        "suspected_domain": "goal_stage_selection"
+        if kind == "not_actual_model"
+        else "backend_runtime_preset"
         if isinstance(exc, BackendMismatchError)
         else "backend_compilation_or_cli_selection"
         if isinstance(exc, BackendUnavailableError)
         else "product_observability_l1_smoke",
-        "next_gate": "backend_runtime_preset_snapshot"
+        "next_gate": "product_observability_wiring_gate"
+        if kind == "not_actual_model"
+        else "backend_runtime_preset_snapshot"
         if isinstance(exc, BackendMismatchError)
         else "build_feature_or_backend_smoke"
         if isinstance(exc, BackendUnavailableError)
         else "inspect_product_observability_l1_artifact",
-        "do_not_run": ["l2_representative_backend", "release_full"]
+        "do_not_run": ["actual_model_regression", "l2_representative_backend", "release_full"]
+        if kind == "not_actual_model"
+        else ["l2_representative_backend", "release_full"]
         if isinstance(exc, (BackendMismatchError, BackendUnavailableError))
         else ["release_full"],
     }
@@ -1216,6 +1236,7 @@ def run_selftest_in_root(root: Path, out: Path | None = None) -> dict[str, Any]:
         "profile_failure": SmokeError("profile analyzer did not print PASS"),
         "serve_failure": SmokeError("server did not become healthy"),
         "run_failure": SmokeError("ferrum run did not emit an assistant JSONL event"),
+        "not_actual_model": SmokeError("synthetic/no-weight is not an actual model smoke"),
     }
     failure_kinds = {name: failure_kind(exc) for name, exc in failure_cases.items()}
     for expected, actual in failure_kinds.items():
@@ -1252,6 +1273,28 @@ def run_selftest_in_root(root: Path, out: Path | None = None) -> dict[str, Any]:
         raise SmokeError(f"unexpected failure classification: {classification}")
     if classification.get("do_not_run") != ["l2_representative_backend", "release_full"]:
         raise SmokeError(f"unexpected do_not_run classification: {classification}")
+    synthetic_failure_out = root / "synthetic-failure-artifact"
+    synthetic_failure_args = argparse.Namespace(
+        out=synthetic_failure_out,
+        model="synthetic/no-weight",
+        backend="auto",
+        ferrum_bin=None,
+        timeout=60,
+        max_tokens=8,
+    )
+    write_failure_artifacts(
+        synthetic_failure_args,
+        SmokeError("synthetic/no-weight is not an actual model smoke"),
+    )
+    synthetic_classification = json.loads(
+        (synthetic_failure_out / "failures/failure_classification.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    if synthetic_classification.get("failure_kind") != "not_actual_model":
+        raise SmokeError(f"unexpected synthetic failure classification: {synthetic_classification}")
+    if synthetic_classification.get("next_gate") != "product_observability_wiring_gate":
+        raise SmokeError(f"unexpected synthetic next_gate: {synthetic_classification}")
 
     summary = {
         "schema_version": SCHEMA_VERSION,

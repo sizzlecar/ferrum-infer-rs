@@ -126,12 +126,14 @@
       "required_gates": [
         "unit",
         "profile_analyzer_selftest",
+        "product_observability_wiring",
         "product_backend_sentinel_selftest",
         "observability_profile",
         "product_sentinel"
       ],
       "release_invalidation": [
         "profile_analyzer_selftest",
+        "product_observability_wiring",
         "observability_profile",
         "product_sentinel",
         "run_sentinel",
@@ -271,6 +273,27 @@
       "exceptions": [],
       "owner": "bench",
       "reason": "bench-serve is canonical release throughput client and correctness checker"
+    },
+    {
+      "id": "product-observability-wiring-gate",
+      "path_globs": ["scripts/release/product_observability_wiring_gate.py"],
+      "domains": ["release_gate", "cli_run", "server_api", "evidence_schema"],
+      "required_gates": [
+        "unit",
+        "profile_analyzer_selftest",
+        "product_observability_wiring_selftest",
+        "product_observability_wiring",
+        "planner_selftest"
+      ],
+      "release_invalidation": [
+        "profile_analyzer_selftest",
+        "product_observability_wiring",
+        "observability_profile",
+        "product_sentinel"
+      ],
+      "exceptions": [],
+      "owner": "release",
+      "reason": "WP6 product observability wiring gate validates typed run/serve profile and replay artifacts"
     },
     {
       "id": "release-gates",
