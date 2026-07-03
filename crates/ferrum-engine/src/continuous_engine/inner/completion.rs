@@ -150,19 +150,7 @@ impl EngineInner {
         request_id: &RequestId,
         finish_reason: FinishReason,
     ) -> Result<()> {
-        let (
-            response,
-            stream_sender,
-            response_sender,
-            has_kv_cache,
-            kv_resource_blocks,
-            has_recurrent_state,
-            recurrent_state_slots,
-            draft_kv_request_id,
-            draft_kv_resource_blocks,
-            model_cache_id,
-            request_slot,
-        ) = {
+        let (response, stream_sender, response_sender, physical_resources, request_slot) = {
             let mut sequences = self.sequences.write();
             if let Some(mut seq) = sequences.remove(request_id) {
                 let text = self
@@ -197,26 +185,13 @@ impl EngineInner {
                     api_response,
                 };
 
-                let has_kv = seq.kv_cache.take().is_some();
-                let kv_resource_blocks = seq.kv_resource_blocks.take();
-                let has_recurrent_state = seq.recurrent_state.take().is_some();
-                let recurrent_state_slots = seq.recurrent_state_slots.take();
-                let draft_kv_request_id = seq.draft_kv_request_id.take();
-                let draft_kv_resource_blocks = seq.draft_kv_resource_blocks.take();
-                let _draft_kv_cache = seq.draft_kv_cache.take();
-                let cache_id = seq.model_cache_id.take();
+                let physical_resources = seq.take_physical_resources();
                 let request_slot = seq.request_slot.take();
                 (
                     response,
                     seq.stream_sender.take(),
                     seq.response_sender.take(),
-                    has_kv,
-                    kv_resource_blocks,
-                    has_recurrent_state,
-                    recurrent_state_slots,
-                    draft_kv_request_id,
-                    draft_kv_resource_blocks,
-                    cache_id,
+                    physical_resources,
                     request_slot,
                 )
             } else {
@@ -224,25 +199,8 @@ impl EngineInner {
             }
         };
 
-        // Release model executor's KV cache for this sequence (frees GPU memory).
-        if let Some(ref cache_id) = model_cache_id {
-            self.model_executor.release_cache(cache_id);
-        }
-
-        if has_kv_cache {
-            self.release_kv_allocation(request_id, request_id.clone(), kv_resource_blocks)
-                .await;
-        }
-
-        if let Some(draft_request_id) = draft_kv_request_id {
-            self.release_kv_allocation(request_id, draft_request_id, draft_kv_resource_blocks)
-                .await;
-        }
-
-        if has_recurrent_state {
-            self.release_recurrent_allocation(request_id, recurrent_state_slots)
-                .await;
-        }
+        self.release_sequence_physical_resources(request_id, physical_resources)
+            .await;
 
         let scheduler_complete = self.scheduler.complete(request_id.clone(), &response).await;
         if let Some(request_slot) = request_slot {

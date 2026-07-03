@@ -954,58 +954,17 @@ impl EngineInner {
     // ── preemption ──────────────────────────────────────────────────────
 
     async fn defer_prefill_for_capacity(&self, request_id: &RequestId) {
-        let (
-            had_kv_cache,
-            kv_resource_blocks,
-            draft_kv_request_id,
-            draft_kv_resource_blocks,
-            had_recurrent_state,
-            model_cache_id,
-        ) = {
+        let physical_resources = {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.get_mut(request_id) {
-                let had_kv_cache = seq.kv_cache.is_some();
-                let kv_resource_blocks = seq.kv_resource_blocks.take();
-                let draft_kv_request_id = seq.draft_kv_request_id.clone();
-                let draft_kv_resource_blocks = seq.draft_kv_resource_blocks.take();
-                let had_recurrent_state = seq.recurrent_state.is_some();
-                let model_cache_id = seq.model_cache_id.clone();
-                seq.kv_cache = None;
-                seq.draft_kv_cache = None;
-                seq.draft_kv_request_id = None;
-                seq.recurrent_state = None;
-                seq.model_cache_id = None;
-                seq.prefill_complete = false;
-                seq.prefill_tokens_processed = 0;
-                seq.phase = RequestPhase::Waiting;
-                seq.tokens_this_iteration = 0;
-                (
-                    had_kv_cache,
-                    kv_resource_blocks,
-                    draft_kv_request_id,
-                    draft_kv_resource_blocks,
-                    had_recurrent_state,
-                    model_cache_id,
-                )
+                seq.take_physical_resources_for_recompute()
             } else {
-                (false, None, None, None, false, None)
+                SequencePhysicalResources::default()
             }
         };
 
-        if let Some(cache_id) = model_cache_id {
-            self.model_executor.release_cache(&cache_id);
-        }
-        if had_kv_cache {
-            self.release_kv_allocation(request_id, request_id.clone(), kv_resource_blocks)
-                .await;
-        }
-        if let Some(draft_request_id) = draft_kv_request_id {
-            self.release_kv_allocation(request_id, draft_request_id, draft_kv_resource_blocks)
-                .await;
-        }
-        if had_recurrent_state {
-            self.release_recurrent_state(request_id).await;
-        }
+        self.release_sequence_physical_resources(request_id, physical_resources)
+            .await;
         self.scheduler.defer_prefill_to_waiting(request_id);
         self.trace_scheduler_defer(
             request_id,
@@ -1021,44 +980,14 @@ impl EngineInner {
         attempted_decode_width: usize,
         observed_free_blocks: Option<usize>,
     ) -> bool {
-        let (
-            found,
-            had_kv_cache,
-            kv_resource_blocks,
-            draft_kv_request_id,
-            draft_kv_resource_blocks,
-            had_recurrent_state,
-            model_cache_id,
-        ) = {
+        let (found, physical_resources) = {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.get_mut(request_id) {
-                let had_kv_cache = seq.kv_cache.is_some();
-                let kv_resource_blocks = seq.kv_resource_blocks.take();
-                let draft_kv_request_id = seq.draft_kv_request_id.clone();
-                let draft_kv_resource_blocks = seq.draft_kv_resource_blocks.take();
-                let had_recurrent_state = seq.recurrent_state.is_some();
-                let model_cache_id = seq.model_cache_id.clone();
-                seq.kv_cache = None;
-                seq.draft_kv_cache = None;
-                seq.draft_kv_request_id = None;
-                seq.recurrent_state = None;
-                seq.model_cache_id = None;
-                seq.prefill_complete = false;
-                seq.prefill_tokens_processed = 0;
-                seq.phase = RequestPhase::Waiting;
-                seq.tokens_this_iteration = 0;
+                let physical_resources = seq.take_physical_resources_for_recompute();
                 seq.preemption_count += 1;
-                (
-                    true,
-                    had_kv_cache,
-                    kv_resource_blocks,
-                    draft_kv_request_id,
-                    draft_kv_resource_blocks,
-                    had_recurrent_state,
-                    model_cache_id,
-                )
+                (true, physical_resources)
             } else {
-                (false, false, None, None, None, false, None)
+                (false, SequencePhysicalResources::default())
             }
         };
 
@@ -1066,20 +995,8 @@ impl EngineInner {
             return false;
         }
 
-        if let Some(cache_id) = model_cache_id {
-            self.model_executor.release_cache(&cache_id);
-        }
-        if had_kv_cache {
-            self.release_kv_allocation(request_id, request_id.clone(), kv_resource_blocks)
-                .await;
-        }
-        if let Some(draft_request_id) = draft_kv_request_id {
-            self.release_kv_allocation(request_id, draft_request_id, draft_kv_resource_blocks)
-                .await;
-        }
-        if had_recurrent_state {
-            self.release_recurrent_state(request_id).await;
-        }
+        self.release_sequence_physical_resources(request_id, physical_resources)
+            .await;
 
         let moved = self
             .scheduler
@@ -1148,64 +1065,23 @@ impl EngineInner {
 
         info!("Preempting request {} to free KV blocks", victim_id);
 
-        // Free model executor's KV cache for this sequence
-        {
-            let sequences = self.sequences.read();
-            if let Some(seq) = sequences.get(&victim_id) {
-                if let Some(ref cache_id) = seq.model_cache_id {
-                    self.model_executor.release_cache(cache_id);
-                }
-            }
-        }
-
-        // Free KV cache manager blocks
-        let (kv_resource_blocks, draft_kv_request_id, draft_kv_resource_blocks, had_recurrent) = {
-            let sequences = self.sequences.read();
-            if let Some(seq) = sequences.get(&victim_id) {
-                (
-                    seq.kv_resource_blocks,
-                    seq.draft_kv_request_id.clone(),
-                    seq.draft_kv_resource_blocks,
-                    seq.recurrent_state.is_some(),
-                )
-            } else {
-                (None, None, None, false)
-            }
-        };
-
-        self.release_kv_allocation(&victim_id, victim_id.clone(), kv_resource_blocks)
-            .await;
-        if let Some(draft_request_id) = draft_kv_request_id {
-            self.release_kv_allocation(&victim_id, draft_request_id, draft_kv_resource_blocks)
-                .await;
-        }
-
-        if had_recurrent {
-            self.release_recurrent_state(&victim_id).await;
-        }
-
         // Reset only physical model state. Keep generated_tokens, RNG,
         // token-frequency, and stream offsets intact; those are logical
         // request state and are needed to continue without replaying output
         // to the client after KV recompute.
-        {
+        let physical_resources = {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.get_mut(&victim_id) {
-                seq.kv_cache = None;
-                seq.kv_resource_blocks = None;
-                seq.draft_kv_cache = None;
-                seq.draft_kv_request_id = None;
-                seq.draft_kv_resource_blocks = None;
-                seq.recurrent_state = None;
-                seq.recurrent_state_slots = None;
-                seq.model_cache_id = None;
-                seq.prefill_complete = false;
-                seq.prefill_tokens_processed = 0;
-                seq.phase = RequestPhase::Waiting;
-                seq.tokens_this_iteration = 0;
+                let physical_resources = seq.take_physical_resources_for_recompute();
                 seq.preemption_count += 1;
+                physical_resources
+            } else {
+                SequencePhysicalResources::default()
             }
-        }
+        };
+
+        self.release_sequence_physical_resources(&victim_id, physical_resources)
+            .await;
 
         // Cancel in scheduler and re-submit so it goes back to waiting queue
         let _ = self.scheduler.cancel(victim_id.clone()).await;
