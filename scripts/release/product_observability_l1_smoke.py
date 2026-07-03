@@ -114,6 +114,48 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return events
 
 
+def validate_engine_request_close_summaries(events: list[dict[str, Any]], path: Path) -> None:
+    close_events = []
+    for event in events:
+        attrs = event.get("attributes") or {}
+        resource = event.get("resource") or {}
+        if (
+            isinstance(attrs, dict)
+            and isinstance(resource, dict)
+            and attrs.get("actual_model_smoke") is True
+            and attrs.get("resource_trace_source") == "engine"
+            and resource.get("action") == "request_close"
+        ):
+            close_events.append(event)
+    if not close_events:
+        raise SmokeError(f"{path} actual engine resource trace must include request_close")
+    for event in close_events:
+        attrs = event.get("attributes") or {}
+        summary = attrs.get("resource_owner_close_summary")
+        if not isinstance(summary, list):
+            raise SmokeError(f"{path} request_close missing resource_owner_close_summary")
+        outstanding_count = attrs.get("resource_owner_outstanding_count")
+        if not isinstance(outstanding_count, int) or outstanding_count < 0:
+            raise SmokeError(f"{path} request_close missing resource_owner_outstanding_count")
+        outstanding = [
+            item
+            for item in summary
+            if isinstance(item, dict)
+            and (
+                int(item.get("outstanding_reserved", 0)) > 0
+                or int(item.get("outstanding_committed", 0)) > 0
+            )
+        ]
+        if outstanding_count != len(outstanding):
+            raise SmokeError(
+                f"{path} request_close outstanding count does not match close summary"
+            )
+        if outstanding_count == 0 and event.get("status") != "ok":
+            raise SmokeError(f"{path} clean request_close must have status ok")
+        if outstanding_count > 0 and event.get("status") != "failure":
+            raise SmokeError(f"{path} outstanding request_close must have status failure")
+
+
 def write_jsonl(path: Path, events: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -612,6 +654,7 @@ def validate_profile_group(root: Path, entrypoint: str) -> dict[str, Any]:
             missing = {"request_slot", "kv_block"} - resource_kinds
             if missing:
                 raise SmokeError(f"{path} missing runtime resource kinds: {sorted(missing)}")
+            validate_engine_request_close_summaries(events, path)
         result[label] = {"path": str(path), "event_count": len(events)}
         if label == "memory":
             result[label]["memory_stages"] = sorted(
@@ -1038,6 +1081,35 @@ def selftest_resource(
     return resource
 
 
+def selftest_resource_close_summary_attrs() -> dict[str, Any]:
+    return {
+        "resource_owner_close_summary": [
+            {
+                "resource_kind": "kv_block",
+                "reserved": 1,
+                "committed": 1,
+                "released": 1,
+                "rolled_back": 0,
+                "outstanding_reserved": 0,
+                "outstanding_committed": 0,
+                "capacity": 16,
+            },
+            {
+                "resource_kind": "request_slot",
+                "reserved": 1,
+                "committed": 1,
+                "released": 1,
+                "rolled_back": 0,
+                "outstanding_reserved": 0,
+                "outstanding_committed": 0,
+                "capacity": 4,
+            },
+        ],
+        "resource_owner_outstanding_count": 0,
+        "resource_owner_outstanding_kinds": [],
+    }
+
+
 def write_selftest_replay_bundle(root: Path, *, entrypoint: str, request_id: str) -> None:
     bundle = root / request_id
     bundle.mkdir(parents=True, exist_ok=True)
@@ -1282,7 +1354,10 @@ def write_selftest_profile_group(out: Path, entrypoint: str) -> None:
             event_kind="instant",
             duration_us=None,
             resource=selftest_resource("request_close", "request_slot"),
-            attributes={"resource_trace_source": "engine"},
+            attributes={
+                "resource_trace_source": "engine",
+                **selftest_resource_close_summary_attrs(),
+            },
         ),
     ]
     write_jsonl(root / "scheduler_trace.jsonl", scheduler_events)
@@ -1448,6 +1523,21 @@ def run_selftest_in_root(root: Path, out: Path | None = None) -> dict[str, Any]:
         lambda: validate_profile_group(bad_profile / "run", "run"),
         "actual_model_smoke",
     )
+    bad_close_summary = root / "bad-close-summary"
+    write_selftest_profile_group(bad_close_summary, "run")
+    scheduler_events = read_jsonl(bad_close_summary / "run/scheduler_trace.jsonl")
+    for event in scheduler_events:
+        resource = event.get("resource") or {}
+        if isinstance(resource, dict) and resource.get("action") == "request_close":
+            event["attributes"].pop("resource_owner_close_summary", None)
+            break
+    else:
+        raise SmokeError("selftest fixture did not include request_close")
+    write_jsonl(bad_close_summary / "run/scheduler_trace.jsonl", scheduler_events)
+    bad_close_summary_error = assert_raises(
+        lambda: validate_profile_group(bad_close_summary / "run", "run"),
+        "resource_owner_close_summary",
+    )
     bad_memory_profile = root / "bad-memory-profile"
     write_selftest_profile_group(bad_memory_profile, "run")
     memory_events = read_jsonl(bad_memory_profile / "run/memory_profile.jsonl")
@@ -1534,6 +1624,7 @@ def run_selftest_in_root(root: Path, out: Path | None = None) -> dict[str, Any]:
         "local_snapshot_identity": local_snapshot_identity,
         "negative_cases": {
             "bad_profile": bad_profile_error,
+            "missing_request_close_summary": bad_close_summary_error,
             "negative_available_kv_or_state_bytes": bad_available_kv_error,
             "all_skipped_replay": all_skipped_replay_error,
             "skipped_run_replay": skipped_run_replay_error,

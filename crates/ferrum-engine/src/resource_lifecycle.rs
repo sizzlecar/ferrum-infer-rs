@@ -40,6 +40,18 @@ impl ResourceLedgerState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResourceOwnerCloseSummary {
+    pub(crate) resource_kind: String,
+    pub(crate) reserved: i64,
+    pub(crate) committed: i64,
+    pub(crate) released: i64,
+    pub(crate) rolled_back: i64,
+    pub(crate) outstanding_reserved: i64,
+    pub(crate) outstanding_committed: i64,
+    pub(crate) capacity: Option<i64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ResourceLedgerTransition {
     pub(crate) before: i64,
@@ -54,6 +66,30 @@ pub(crate) struct ResourceLifecycleLedger {
 }
 
 impl ResourceLifecycleLedger {
+    pub(crate) fn owner_close_summary(
+        &self,
+        owner_kind: &str,
+        owner_id: &str,
+    ) -> Vec<ResourceOwnerCloseSummary> {
+        let mut summary: Vec<_> = self
+            .states
+            .iter()
+            .filter(|(key, _state)| key.owner_kind == owner_kind && key.owner_id == owner_id)
+            .map(|(key, state)| ResourceOwnerCloseSummary {
+                resource_kind: key.resource_kind.clone(),
+                reserved: state.reserved,
+                committed: state.committed,
+                released: state.released,
+                rolled_back: state.rolled_back,
+                outstanding_reserved: state.outstanding_reserved(),
+                outstanding_committed: state.outstanding_committed(),
+                capacity: state.capacity,
+            })
+            .collect();
+        summary.sort_by(|left, right| left.resource_kind.cmp(&right.resource_kind));
+        summary
+    }
+
     pub(crate) fn close_owner(&mut self, owner_kind: &str, owner_id: &str) -> usize {
         let before = self.states.len();
         self.states
@@ -280,5 +316,45 @@ mod tests {
         assert_eq!(ledger.close_owner("request", "req-1"), 0);
         assert_eq!(ledger.close_owner("request", "req-2"), 1);
         assert_eq!(ledger.state_count(), 0);
+    }
+
+    #[test]
+    fn owner_close_summary_reports_outstanding_state_before_close() {
+        let mut ledger = ResourceLifecycleLedger::default();
+
+        ledger.reserve("request", "req-1", "kv_block", 2, Some(8));
+        ledger.commit("request", "req-1", "kv_block", 2, None);
+        ledger.reserve("request", "req-1", "recurrent_state_slot", 1, Some(4));
+        ledger.release("request", "req-1", "kv_block", 1, None);
+
+        let summary = ledger.owner_close_summary("request", "req-1");
+        assert_eq!(
+            summary,
+            vec![
+                ResourceOwnerCloseSummary {
+                    resource_kind: "kv_block".to_string(),
+                    reserved: 2,
+                    committed: 2,
+                    released: 1,
+                    rolled_back: 0,
+                    outstanding_reserved: 1,
+                    outstanding_committed: 1,
+                    capacity: Some(8),
+                },
+                ResourceOwnerCloseSummary {
+                    resource_kind: "recurrent_state_slot".to_string(),
+                    reserved: 1,
+                    committed: 0,
+                    released: 0,
+                    rolled_back: 0,
+                    outstanding_reserved: 1,
+                    outstanding_committed: 0,
+                    capacity: Some(4),
+                },
+            ]
+        );
+
+        assert_eq!(ledger.close_owner("request", "req-1"), 2);
+        assert!(ledger.owner_close_summary("request", "req-1").is_empty());
     }
 }
