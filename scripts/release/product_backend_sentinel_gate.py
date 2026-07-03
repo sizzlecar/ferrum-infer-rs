@@ -92,6 +92,51 @@ def require(condition: bool, message: str) -> None:
         raise SentinelError(message)
 
 
+def validate_engine_request_close_summaries(events: list[dict[str, Any]], path: Path) -> None:
+    close_events = []
+    for event in events:
+        attrs = event.get("attributes") or {}
+        resource = event.get("resource") or {}
+        if (
+            isinstance(attrs, dict)
+            and isinstance(resource, dict)
+            and attrs.get("actual_model_smoke") is True
+            and attrs.get("resource_trace_source") == "engine"
+            and resource.get("action") == "request_close"
+        ):
+            close_events.append(event)
+    require(close_events, f"{path} actual engine resource trace must include request_close")
+    for event in close_events:
+        attrs = event.get("attributes") or {}
+        summary = attrs.get("resource_owner_close_summary")
+        require(isinstance(summary, list), f"{path} request_close missing resource_owner_close_summary")
+        outstanding_count = attrs.get("resource_owner_outstanding_count")
+        require(
+            isinstance(outstanding_count, int) and outstanding_count >= 0,
+            f"{path} request_close missing resource_owner_outstanding_count",
+        )
+        outstanding = [
+            item
+            for item in summary
+            if isinstance(item, dict)
+            and (
+                int(item.get("outstanding_reserved", 0)) > 0
+                or int(item.get("outstanding_committed", 0)) > 0
+            )
+        ]
+        require(
+            outstanding_count == len(outstanding),
+            f"{path} request_close outstanding count does not match close summary",
+        )
+        if outstanding_count == 0:
+            require(event.get("status") == "ok", f"{path} clean request_close must have status ok")
+        else:
+            require(
+                event.get("status") == "failure",
+                f"{path} outstanding request_close must have status failure",
+            )
+
+
 def require_non_empty_string(value: Any, label: str) -> str:
     require(isinstance(value, str) and value.strip(), f"{label} must be a non-empty string")
     return str(value)
@@ -637,6 +682,7 @@ def validate_actual_smoke_profile_groups(
                 }
                 missing = REQUIRED_ACTUAL_ENGINE_RESOURCE_KINDS - resource_kinds
                 require(not missing, f"{path} missing runtime resource kinds: {sorted(missing)}")
+                validate_engine_request_close_summaries(events, path)
             group[label] = {"path": str(path), "event_count": len(events)}
         request_dump = root / "request_dump/request.json"
         replay = root / "request_dump/replay_command.txt"
@@ -1169,6 +1215,45 @@ def actual_smoke_profile_event(
     return event
 
 
+def actual_smoke_close_summary_attrs() -> dict[str, Any]:
+    return {
+        "resource_owner_close_summary": [
+            {
+                "resource_kind": "kv_block",
+                "reserved": 1,
+                "committed": 1,
+                "released": 1,
+                "rolled_back": 0,
+                "outstanding_reserved": 0,
+                "outstanding_committed": 0,
+                "capacity": 1,
+            },
+            {
+                "resource_kind": "model_cache_ref",
+                "reserved": 1,
+                "committed": 1,
+                "released": 1,
+                "rolled_back": 0,
+                "outstanding_reserved": 0,
+                "outstanding_committed": 0,
+                "capacity": 1,
+            },
+            {
+                "resource_kind": "request_slot",
+                "reserved": 1,
+                "committed": 1,
+                "released": 1,
+                "rolled_back": 0,
+                "outstanding_reserved": 0,
+                "outstanding_committed": 0,
+                "capacity": 1,
+            },
+        ],
+        "resource_owner_outstanding_count": 0,
+        "resource_owner_outstanding_kinds": [],
+    }
+
+
 def write_jsonl(path: Path, events: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -1394,6 +1479,9 @@ def write_actual_smoke_entrypoint(root: Path, entrypoint: str) -> None:
     ]
     for event in resource_events:
         event["attributes"]["resource_trace_source"] = "engine"
+        resource = event.get("resource") or {}
+        if isinstance(resource, dict) and resource.get("action") == "request_close":
+            event["attributes"].update(actual_smoke_close_summary_attrs())
     write_jsonl(root / "profile.jsonl", [profile])
     write_jsonl(root / "memory_profile.jsonl", [memory])
     write_jsonl(root / "scheduler_trace.jsonl", resource_events)
@@ -1675,6 +1763,36 @@ def run_selftest() -> None:
             raise AssertionError("actual smoke with non-actual profile unexpectedly passed")
         except SentinelError as exc:
             require("actual_model_smoke values" in str(exc), f"unexpected profile smoke error: {exc}")
+        bad_close_summary_smoke = make_actual_smoke_fixture(temp / "bad-close-summary-smoke", sha=head)
+        bad_close_path = bad_close_summary_smoke / "run/scheduler_trace.jsonl"
+        bad_close_events = [
+            json.loads(line)
+            for line in bad_close_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        for event in bad_close_events:
+            resource = event.get("resource") or {}
+            if isinstance(resource, dict) and resource.get("action") == "request_close":
+                event["attributes"].pop("resource_owner_close_summary", None)
+                break
+        else:
+            raise AssertionError("actual smoke fixture did not include request_close")
+        write_jsonl(bad_close_path, bad_close_events)
+        try:
+            run_gate(
+                argparse.Namespace(
+                    manifest=DEFAULT_MANIFEST,
+                    out=temp / "bad-close-summary-smoke-out",
+                    actual_smoke=bad_close_summary_smoke,
+                    scenario_summary=None,
+                )
+            )
+            raise AssertionError("actual smoke missing close summary unexpectedly passed")
+        except (SentinelError, ProfileGateError) as exc:
+            require(
+                "resource_owner_close_summary" in str(exc),
+                f"unexpected missing close summary error: {exc}",
+            )
     finally:
         shutil.rmtree(temp, ignore_errors=True)
 

@@ -2119,6 +2119,75 @@ async fn recurrent_release_failure_traces_reject_without_successful_release() {
     let _ = std::fs::remove_file(trace_path);
 }
 
+#[test]
+fn request_owner_close_event_reports_outstanding_resources() {
+    let trace_path = resource_trace_temp_path("request-owner-close-outstanding");
+    let _ = std::fs::remove_file(&trace_path);
+    let mut config = EngineConfig::default();
+    config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
+
+    let engine = test_continuous_engine_with_config(config);
+    let request_id = RequestId::new();
+
+    engine.inner.trace_request_open(&request_id);
+    engine.inner.trace_request_admitted(&request_id);
+    engine.inner.trace_request_owner_close(&request_id);
+
+    let events = read_engine_profile_events(&trace_path);
+    let close = events
+        .iter()
+        .find(|event| {
+            event
+                .resource
+                .as_ref()
+                .is_some_and(|resource| resource.action == ResourceAction::RequestClose)
+        })
+        .expect("request close event should be present");
+
+    assert_eq!(close.status, ProfileStatus::Failure);
+    assert_eq!(
+        close.error.as_ref().map(|error| error.kind.as_str()),
+        Some("resource_owner_close_outstanding")
+    );
+    assert_eq!(
+        close
+            .resource
+            .as_ref()
+            .and_then(|resource| resource.resource_error_kind.as_deref()),
+        Some("resource_leak")
+    );
+    assert_eq!(
+        close
+            .attributes
+            .get("resource_owner_outstanding_count")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    let summary = close
+        .attributes
+        .get("resource_owner_close_summary")
+        .and_then(serde_json::Value::as_array)
+        .expect("close summary should be an array");
+    assert!(
+        summary.iter().any(|item| {
+            item.get("resource_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("request_slot")
+                && item
+                    .get("outstanding_reserved")
+                    .and_then(serde_json::Value::as_i64)
+                    == Some(1)
+                && item
+                    .get("outstanding_committed")
+                    .and_then(serde_json::Value::as_i64)
+                    == Some(1)
+        }),
+        "close summary must identify the leaked request_slot: {summary:?}"
+    );
+
+    let _ = std::fs::remove_file(trace_path);
+}
+
 #[tokio::test]
 #[should_panic(expected = "recurrent-state lease dropped without explicit commit or async release")]
 async fn recurrent_state_lease_drop_without_consumption_panics_in_tests() {

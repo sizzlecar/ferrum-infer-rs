@@ -162,6 +162,7 @@ def validate_gate_semantics(path: Path, events: list[dict[str, Any]]) -> None:
             and event.get("phase") == "actual_run_generation"
         ):
             validate_run_generation_profile_event(event_attrs, context)
+        validate_resource_owner_close_summary(event, event_attrs, context)
 
     capacity_by_request = capacity_events(events)
     for event in events:
@@ -179,6 +180,82 @@ def validate_gate_semantics(path: Path, events: list[dict[str, Any]]) -> None:
             raise GateError(f"{context} correctness failure requires replay command")
         if kind in OOM_KINDS and str(event.get("request_id", "")) not in capacity_by_request:
             raise GateError(f"{context} OOM failure requires admission/defer/reject evidence")
+
+
+def validate_resource_owner_close_summary(
+    event: dict[str, Any],
+    event_attrs: dict[str, Any],
+    context: str,
+) -> None:
+    resource = event.get("resource")
+    if not isinstance(resource, dict) or resource.get("action") != "request_close":
+        return
+    if event_attrs.get("resource_trace_source") != "engine":
+        return
+    if event_attrs.get("actual_model_smoke") is not True:
+        return
+
+    summary = event_attrs.get("resource_owner_close_summary")
+    if not isinstance(summary, list):
+        raise GateError(f"{context} actual engine request_close requires resource_owner_close_summary")
+    outstanding_count = event_attrs.get("resource_owner_outstanding_count")
+    if not isinstance(outstanding_count, int) or outstanding_count < 0:
+        raise GateError(
+            f"{context} actual engine request_close requires non-negative resource_owner_outstanding_count"
+        )
+    outstanding_kinds = event_attrs.get("resource_owner_outstanding_kinds")
+    if not isinstance(outstanding_kinds, list):
+        raise GateError(
+            f"{context} actual engine request_close requires resource_owner_outstanding_kinds list"
+        )
+    for index, item in enumerate(summary):
+        if not isinstance(item, dict):
+            raise GateError(f"{context}.resource_owner_close_summary[{index}] must be an object")
+        resource_kind = item.get("resource_kind")
+        if not isinstance(resource_kind, str) or not resource_kind.strip():
+            raise GateError(
+                f"{context}.resource_owner_close_summary[{index}].resource_kind must be non-empty"
+            )
+        for key in (
+            "reserved",
+            "committed",
+            "released",
+            "rolled_back",
+            "outstanding_reserved",
+            "outstanding_committed",
+        ):
+            if not isinstance(item.get(key), int):
+                raise GateError(
+                    f"{context}.resource_owner_close_summary[{index}].{key} must be an integer"
+                )
+        if item.get("capacity") is not None and not isinstance(item.get("capacity"), int):
+            raise GateError(
+                f"{context}.resource_owner_close_summary[{index}].capacity must be integer or null"
+            )
+    computed_outstanding = [
+        item
+        for item in summary
+        if isinstance(item, dict)
+        and (
+            int(item.get("outstanding_reserved", 0)) > 0
+            or int(item.get("outstanding_committed", 0)) > 0
+        )
+    ]
+    if outstanding_count != len(computed_outstanding):
+        raise GateError(
+            f"{context} resource_owner_outstanding_count={outstanding_count} "
+            f"does not match summary outstanding entries={len(computed_outstanding)}"
+        )
+    if outstanding_count == 0 and event.get("status") != "ok":
+        raise GateError(f"{context} clean request_close must have status=ok")
+    if outstanding_count > 0:
+        error = event.get("error")
+        if event.get("status") != "failure" or not isinstance(error, dict):
+            raise GateError(f"{context} outstanding request_close must be a failure event")
+        if error.get("blocking") is not True:
+            raise GateError(f"{context} outstanding request_close must be blocking")
+        if (resource.get("resource_error_kind") or "") != "resource_leak":
+            raise GateError(f"{context} outstanding request_close must set resource_error_kind=resource_leak")
 
 
 def validate_chat_completion_profile_event(event_attrs: dict[str, Any], context: str) -> None:

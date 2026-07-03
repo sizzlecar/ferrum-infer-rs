@@ -5,7 +5,9 @@
 //! can submit requests concurrently — an `iteration_lock` serializes the
 //! actual engine steps so each batch is processed exactly once.
 
-use crate::resource_lifecycle::{ResourceLedgerTransition, ResourceLifecycleLedger};
+use crate::resource_lifecycle::{
+    ResourceLedgerTransition, ResourceLifecycleLedger, ResourceOwnerCloseSummary,
+};
 use async_trait::async_trait;
 use ferrum_bench_core::{global_profile, profile_fields_from_json};
 use ferrum_interfaces::{
@@ -22,9 +24,9 @@ use ferrum_sampler::json_mode::JsonModeProcessor;
 use ferrum_scheduler::implementations::{ContinuousBatchScheduler, RequestPhase};
 use ferrum_types::{
     DataType, Device, EngineConfig, EngineStatus, FerrumError, FerrumProfileEvent, FinishReason,
-    InferenceRequest, InferenceResponse, Priority, ProfileEntrypoint, ProfileEventKind,
-    ProfileStatus, RequestId, ResourceAction, ResourceTraceEvent, Result, SamplingParams,
-    StreamChunk, TokenId, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    InferenceRequest, InferenceResponse, Priority, ProfileEntrypoint, ProfileError,
+    ProfileEventKind, ProfileStatus, RequestId, ResourceAction, ResourceTraceEvent, Result,
+    SamplingParams, StreamChunk, TokenId, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
     ENGINE_RUNTIME_TRACE_PRESET_HASH, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
     PROMPT_TOKENS_METADATA_KEY,
 };
@@ -2430,6 +2432,178 @@ impl EngineInner {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn trace_resource_event_with_close_summary(
+        &self,
+        request_id: &RequestId,
+        owner_kind: &str,
+        owner_id: &str,
+        resource_kind: &str,
+        phase: &str,
+        action: ResourceAction,
+        close_summary: &[ResourceOwnerCloseSummary],
+        status: ProfileStatus,
+        message: Option<String>,
+    ) {
+        let Some(sink) = &self.scheduler_trace_jsonl else {
+            return;
+        };
+        let entrypoint = self.trace_entrypoint();
+        let event_num = self
+            .resource_trace_event_counter
+            .fetch_add(1, Ordering::Relaxed);
+        let outstanding: Vec<_> = close_summary
+            .iter()
+            .filter(|item| item.outstanding_reserved > 0 || item.outstanding_committed > 0)
+            .collect();
+        let close_summary_json: Vec<_> = close_summary
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "resource_kind": item.resource_kind,
+                    "reserved": item.reserved,
+                    "committed": item.committed,
+                    "released": item.released,
+                    "rolled_back": item.rolled_back,
+                    "outstanding_reserved": item.outstanding_reserved,
+                    "outstanding_committed": item.outstanding_committed,
+                    "capacity": item.capacity,
+                })
+            })
+            .collect();
+        let outstanding_kinds: Vec<_> = outstanding
+            .iter()
+            .map(|item| item.resource_kind.clone())
+            .collect();
+        let mut attributes = BTreeMap::from([
+            (
+                "actual_model_smoke".to_string(),
+                serde_json::json!(matches!(
+                    entrypoint,
+                    ProfileEntrypoint::Run | ProfileEntrypoint::Serve
+                )),
+            ),
+            (
+                "backend_device".to_string(),
+                serde_json::json!(format!("{:?}", self.config.backend.device)),
+            ),
+            (
+                "backend_type".to_string(),
+                serde_json::json!(format!("{:?}", self.config.backend.backend_type)),
+            ),
+            ("diagnostic_only".to_string(), serde_json::json!(false)),
+            ("l0_only".to_string(), serde_json::json!(false)),
+            ("profile_detail".to_string(), serde_json::json!("basic")),
+            (
+                "resource_owner_close_summary".to_string(),
+                serde_json::Value::Array(close_summary_json),
+            ),
+            (
+                "resource_owner_outstanding_count".to_string(),
+                serde_json::json!(outstanding.len()),
+            ),
+            (
+                "resource_owner_outstanding_kinds".to_string(),
+                serde_json::json!(outstanding_kinds),
+            ),
+            (
+                "resource_trace_source".to_string(),
+                serde_json::json!("engine"),
+            ),
+        ]);
+        if let Some(message) = message.as_deref() {
+            attributes.insert(
+                "resource_close_error".to_string(),
+                serde_json::json!(message),
+            );
+        }
+        let timestamp = chrono::Utc::now();
+        let error = message.as_ref().map(|message| ProfileError {
+            kind: "resource_owner_close_outstanding".to_string(),
+            message: message.clone(),
+            blocking: true,
+        });
+        let resource_error_kind = error.as_ref().map(|_| "resource_leak".to_string());
+        let mut shape = BTreeMap::from([("resource_amount".to_string(), serde_json::Value::Null)]);
+        shape.insert(
+            "resource_owner_outstanding_count".to_string(),
+            serde_json::json!(outstanding.len()),
+        );
+        let event = FerrumProfileEvent {
+            schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            ts_unix_nanos: timestamp
+                .timestamp_nanos_opt()
+                .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000),
+            event_id: format!("evt-engine-resource-{event_num}"),
+            request_id: request_id.to_string(),
+            correlation_id: Some(request_id.to_string()),
+            entrypoint,
+            backend: "actual".to_string(),
+            runtime_preset_hash: ENGINE_RUNTIME_TRACE_PRESET_HASH.to_string(),
+            phase: phase.to_string(),
+            event_kind: ProfileEventKind::Resource,
+            timestamp,
+            status,
+            model: Some(self.config.model.model_id.to_string()),
+            duration_us: None,
+            memory: None,
+            resource: Some(ResourceTraceEvent {
+                owner_kind: owner_kind.to_string(),
+                owner_id: owner_id.to_string(),
+                resource_kind: resource_kind.to_string(),
+                action,
+                amount: None,
+                before: None,
+                after: None,
+                capacity: None,
+                underflow_amount: None,
+                reason: None,
+                error_kind: error.as_ref().map(|error| error.kind.clone()),
+                message: error.as_ref().map(|error| error.message.clone()),
+                resource_error_kind,
+            }),
+            error,
+            replay: None,
+            shape,
+            backend_detail: Some(BTreeMap::from([
+                (
+                    "backend_device".to_string(),
+                    serde_json::json!(format!("{:?}", self.config.backend.device)),
+                ),
+                (
+                    "backend_type".to_string(),
+                    serde_json::json!(format!("{:?}", self.config.backend.backend_type)),
+                ),
+            ])),
+            attributes,
+        };
+        if let Err(error) = event.validate() {
+            warn!(
+                "Skipping invalid engine resource close trace event: {}",
+                error
+            );
+            return;
+        }
+        let mut line = match serde_json::to_string(&event) {
+            Ok(line) => line,
+            Err(error) => {
+                warn!(
+                    "Failed to serialize engine resource close trace event: {}",
+                    error
+                );
+                return;
+            }
+        };
+        line.push('\n');
+        let mut file = sink.lock();
+        if let Err(error) = file.write_all(line.as_bytes()) {
+            warn!(
+                "Failed to write engine resource close trace event: {}",
+                error
+            );
+        }
+    }
+
     fn resource_amount_i64(amount: usize) -> i64 {
         amount.min(i64::MAX as usize) as i64
     }
@@ -2521,24 +2695,73 @@ impl EngineInner {
     }
 
     fn trace_request_owner_close(&self, request_id: &RequestId) {
-        self.trace_resource_event(
+        let owner_id = request_id.to_string();
+        if self.scheduler_trace_jsonl.is_none() {
+            self.trace_resource_event(
+                request_id,
+                "request",
+                &owner_id,
+                "request_slot",
+                "engine_request_close",
+                ResourceAction::RequestClose,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            return;
+        }
+
+        let summary = {
+            let mut lifecycle = self.resource_lifecycle.lock();
+            let summary = lifecycle.owner_close_summary("request", &owner_id);
+            lifecycle.close_owner("request", &owner_id);
+            summary
+        };
+        self.trace_request_owner_close_with_summary(request_id, &summary);
+    }
+
+    fn trace_request_owner_close_with_summary(
+        &self,
+        request_id: &RequestId,
+        summary: &[ResourceOwnerCloseSummary],
+    ) {
+        let outstanding: Vec<_> = summary
+            .iter()
+            .filter(|item| item.outstanding_reserved > 0 || item.outstanding_committed > 0)
+            .collect();
+        let close_status = if outstanding.is_empty() {
+            ProfileStatus::Ok
+        } else {
+            ProfileStatus::Failure
+        };
+        let message = if outstanding.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "request closed with outstanding resources: {}",
+                outstanding
+                    .iter()
+                    .map(|item| format!(
+                        "{} reserved={} committed={}",
+                        item.resource_kind, item.outstanding_reserved, item.outstanding_committed
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        };
+        self.trace_resource_event_with_close_summary(
             request_id,
             "request",
             &request_id.to_string(),
             "request_slot",
             "engine_request_close",
             ResourceAction::RequestClose,
-            None,
-            None,
-            None,
-            None,
-            None,
+            summary,
+            close_status,
+            message,
         );
-        if self.scheduler_trace_jsonl.is_some() {
-            self.resource_lifecycle
-                .lock()
-                .close_owner("request", &request_id.to_string());
-        }
     }
 
     fn trace_scheduler_defer(&self, request_id: &RequestId, phase: &str, reason: &str) {
