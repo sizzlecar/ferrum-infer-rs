@@ -40,11 +40,15 @@ EXPECTED_FAIL_KINDS = {
     "capacity_overcommit",
     "defer_with_committed_resource",
     "rollback_incomplete",
+    "silent_cuda_oom",
+    "panic_after_resource_error",
     "transition_mismatch",
 }
 
 LIFECYCLE_ACTIONS = {"reserve", "commit", "release", "rollback"}
 TERMINAL_EXPLICIT_ACTIONS = {"reject", "defer"}
+OOM_ERROR_KINDS = {"cuda_oom", "metal_oom", "oom", "silent_oom"}
+PANIC_ERROR_KINDS = {"panic", "panic_error", "panic_after_resource_error"}
 
 
 class GateError(RuntimeError):
@@ -112,6 +116,15 @@ def optional_int(event: dict[str, Any], key: str, context: str) -> int | None:
     return value
 
 
+def optional_non_empty_string(event: dict[str, Any], key: str, context: str) -> str | None:
+    if key not in event or event[key] is None:
+        return None
+    value = event[key]
+    if not isinstance(value, str) or not value.strip():
+        raise GateError(f"{context}.{key} must be a non-empty string when set")
+    return value
+
+
 def normalize_event(event: dict[str, Any], context: str) -> dict[str, Any]:
     action = non_empty_string(event, "action", context)
     if action not in {
@@ -133,6 +146,9 @@ def normalize_event(event: dict[str, Any], context: str) -> dict[str, Any]:
     before = optional_int(event, "before", context)
     after = optional_int(event, "after", context)
     capacity = optional_int(event, "capacity", context)
+    error_kind = optional_non_empty_string(event, "error_kind", context)
+    message = optional_non_empty_string(event, "message", context)
+    resource_error_kind = optional_non_empty_string(event, "resource_error_kind", context)
     if action in LIFECYCLE_ACTIONS:
         if amount is None or before is None or after is None:
             raise GateError(f"{context}.{action} requires amount, before, and after")
@@ -152,6 +168,9 @@ def normalize_event(event: dict[str, Any], context: str) -> dict[str, Any]:
         "before": before,
         "after": after,
         "capacity": capacity,
+        "error_kind": error_kind,
+        "message": message,
+        "resource_error_kind": resource_error_kind,
     }
 
 
@@ -181,6 +200,17 @@ def outstanding_by_resource(states: dict[tuple[str, str, str], ResourceState], k
 
 def committed_outstanding(state: ResourceState) -> int:
     return state.committed - state.cleaned
+
+
+def owner_has_explicit_terminal(
+    states: dict[tuple[str, str, str], ResourceState],
+    owner: tuple[str, str],
+) -> bool:
+    return any(
+        any(action in TERMINAL_EXPLICIT_ACTIONS for action in state.actions)
+        for (owner_kind, owner_id, _resource_kind), state in states.items()
+        if (owner_kind, owner_id) == owner
+    )
 
 
 def expected_transition(state: ResourceState, action: str, amount: int) -> tuple[int, int] | None:
@@ -308,6 +338,24 @@ def check_trace(events: list[dict[str, Any]], *, source: str) -> dict[str, Any]:
             owner_open.discard(owner)
         elif action == "capacity_snapshot":
             pass
+
+        error_kind = event.get("error_kind")
+        if error_kind in OOM_ERROR_KINDS and not owner_has_explicit_terminal(states, owner):
+            failures.append(
+                failure(
+                    "silent_cuda_oom",
+                    event,
+                    "OOM surfaced without an earlier explicit defer/reject admission event",
+                )
+            )
+        if error_kind in PANIC_ERROR_KINDS and event.get("resource_error_kind"):
+            failures.append(
+                failure(
+                    "panic_after_resource_error",
+                    event,
+                    f"panic surfaced after resource error {event['resource_error_kind']}",
+                )
+            )
 
         capacity = state.capacity
         if capacity is not None:

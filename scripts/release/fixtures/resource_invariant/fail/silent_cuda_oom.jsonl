@@ -1,0 +1,2 @@
+{"scenario":"silent_cuda_oom","owner_kind":"request","owner_id":"req-silent-oom","resource_kind":"request_slot","action":"request_open","capacity":1}
+{"scenario":"silent_cuda_oom","owner_kind":"request","owner_id":"req-silent-oom","resource_kind":"backend_workspace","action":"request_close","capacity":1,"error_kind":"cuda_oom","message":"CUDA out of memory before admission reject/defer"}

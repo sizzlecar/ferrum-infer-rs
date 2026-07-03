@@ -32,6 +32,12 @@ pub struct ResourceTraceEvent {
     pub capacity: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_error_kind: Option<String>,
 }
 
 impl ResourceTraceEvent {
@@ -44,6 +50,19 @@ impl ResourceTraceEvent {
         }
         if self.resource_kind.trim().is_empty() {
             return Err("resource_kind must be non-empty".to_string());
+        }
+        if self.error_kind.as_deref().is_some_and(str::is_empty) {
+            return Err("resource error_kind must be non-empty when set".to_string());
+        }
+        if self.message.as_deref().is_some_and(str::is_empty) {
+            return Err("resource message must be non-empty when set".to_string());
+        }
+        if self
+            .resource_error_kind
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err("resource resource_error_kind must be non-empty when set".to_string());
         }
         match self.action {
             ResourceAction::Reserve
@@ -91,6 +110,9 @@ mod tests {
             after: Some(3),
             capacity: Some(4),
             reason: None,
+            error_kind: None,
+            message: None,
+            resource_error_kind: None,
         };
         event.validate().unwrap();
 
@@ -101,5 +123,27 @@ mod tests {
         let mut missing_after = event;
         missing_after.after = None;
         assert!(missing_after.validate().is_err());
+    }
+
+    #[test]
+    fn lifecycle_event_allows_failure_diagnostics_when_non_empty() {
+        let mut event = ResourceTraceEvent {
+            owner_kind: "request".to_string(),
+            owner_id: "req-oom".to_string(),
+            resource_kind: "backend_workspace".to_string(),
+            action: ResourceAction::RequestClose,
+            amount: None,
+            before: None,
+            after: None,
+            capacity: None,
+            reason: None,
+            error_kind: Some("cuda_oom".to_string()),
+            message: Some("CUDA out of memory".to_string()),
+            resource_error_kind: Some("kv_capacity_exhausted".to_string()),
+        };
+        event.validate().unwrap();
+
+        event.error_kind = Some(String::new());
+        assert!(event.validate().is_err());
     }
 }

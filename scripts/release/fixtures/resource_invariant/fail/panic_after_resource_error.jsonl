@@ -1,0 +1,3 @@
+{"scenario":"panic_after_resource_error","owner_kind":"request","owner_id":"req-resource-panic","resource_kind":"request_slot","action":"request_open","capacity":1}
+{"scenario":"panic_after_resource_error","owner_kind":"request","owner_id":"req-resource-panic","resource_kind":"kv_block","action":"capacity_snapshot","capacity":0}
+{"scenario":"panic_after_resource_error","owner_kind":"request","owner_id":"req-resource-panic","resource_kind":"kv_block","action":"request_close","capacity":0,"error_kind":"panic","resource_error_kind":"kv_capacity_exhausted","message":"panic after KV capacity error"}
