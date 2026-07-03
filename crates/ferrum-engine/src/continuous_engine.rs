@@ -604,6 +604,7 @@ pub struct SequenceState {
     pub prefill_tokens_processed: usize,
     pub stream_sender: Option<mpsc::Sender<Result<StreamChunk>>>,
     pub response_sender: Option<tokio::sync::oneshot::Sender<InferenceResponse>>,
+    request_slot: Option<RequestSlotLease>,
     pub start_time: Instant,
     /// Wall-clock `Instant` at which the first SSE chunk was actually
     /// sent to the client stream. Populated lazily by `send_stream_update`
@@ -802,6 +803,7 @@ impl SequenceState {
             prefill_tokens_processed: 0,
             stream_sender: None,
             response_sender: None,
+            request_slot: None,
             start_time: Instant::now(),
             first_emit_at: None,
             last_emit_at: None,
@@ -1336,6 +1338,63 @@ fn force_only_token(logits: &mut [f32], token: usize) {
 // ────────────────────────────────────────────────────────────────────────────
 // Engine inner – shared via Arc so we can spawn tasks
 // ────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+#[must_use = "request slot leases must be consumed by reject() or close()"]
+struct RequestSlotLease {
+    request_id: RequestId,
+    admitted: bool,
+    armed: bool,
+}
+
+impl RequestSlotLease {
+    fn open(engine: &EngineInner, request_id: RequestId) -> Self {
+        engine.trace_request_open(&request_id);
+        Self {
+            request_id,
+            admitted: false,
+            armed: true,
+        }
+    }
+
+    fn admit(&mut self, engine: &EngineInner) {
+        if !self.admitted {
+            engine.trace_request_admitted(&self.request_id);
+            self.admitted = true;
+        }
+    }
+
+    fn reject(mut self, engine: &EngineInner, reason: String) {
+        engine.trace_request_rejected(&self.request_id, reason);
+        self.armed = false;
+    }
+
+    fn close(mut self, engine: &EngineInner) {
+        if self.admitted {
+            engine.trace_request_close(&self.request_id);
+        } else {
+            engine.trace_request_owner_close(&self.request_id);
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for RequestSlotLease {
+    fn drop(&mut self) {
+        if self.armed {
+            let message = "request slot lease dropped without explicit reject or close";
+            warn!(
+                request_id = %self.request_id,
+                admitted = self.admitted,
+                "{message}"
+            );
+            #[cfg(test)]
+            if !std::thread::panicking() {
+                panic!("{message}");
+            }
+        }
+    }
+}
 
 #[must_use = "KV allocation leases must be consumed by release().await or into_committed_parts()"]
 struct KvAllocationLease {
@@ -2459,13 +2518,12 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         );
 
         // Submit to scheduler
-        self.inner.trace_request_open(&request_id);
+        let mut request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
         if let Err(error) = self.inner.scheduler.submit(request.clone()).await {
-            self.inner
-                .trace_request_rejected(&request_id, error.to_string());
+            request_slot.reject(&self.inner, error.to_string());
             return Err(error);
         }
-        self.inner.trace_request_admitted(&request_id);
+        request_slot.admit(&self.inner);
 
         // Create sequence state with oneshot channel
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
@@ -2476,6 +2534,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
             Some(self.inner.model_executor.info().vocab_size),
         );
         seq_state.response_sender = Some(resp_tx);
+        seq_state.request_slot = Some(request_slot);
         self.inner
             .sequences
             .write()
@@ -2538,13 +2597,12 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         );
 
         // Submit to scheduler
-        self.inner.trace_request_open(&request_id);
+        let mut request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
         if let Err(error) = self.inner.scheduler.submit(request.clone()).await {
-            self.inner
-                .trace_request_rejected(&request_id, error.to_string());
+            request_slot.reject(&self.inner, error.to_string());
             return Err(error);
         }
-        self.inner.trace_request_admitted(&request_id);
+        request_slot.admit(&self.inner);
 
         // Create sequence state with stream sender
         let mut seq_state = SequenceState::new_with_tokenizer_and_model_vocab_size(
@@ -2554,6 +2612,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
             Some(self.inner.model_executor.info().vocab_size),
         );
         seq_state.stream_sender = Some(tx);
+        seq_state.request_slot = Some(request_slot);
         self.inner
             .sequences
             .write()

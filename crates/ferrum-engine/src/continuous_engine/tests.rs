@@ -1442,6 +1442,13 @@ fn test_continuous_engine_with_config(config: EngineConfig) -> ContinuousBatchEn
 }
 
 #[test]
+#[should_panic(expected = "request slot lease dropped without explicit reject or close")]
+fn request_slot_lease_drop_without_consumption_panics_in_tests() {
+    let engine = test_continuous_engine();
+    let _lease = RequestSlotLease::open(&engine.inner, RequestId::new());
+}
+
+#[test]
 #[should_panic(expected = "KV allocation lease dropped without explicit commit or async release")]
 fn kv_allocation_lease_drop_without_consumption_panics_in_tests() {
     let request_id = RequestId::new();
