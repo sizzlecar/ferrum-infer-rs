@@ -1174,7 +1174,9 @@ fn write_chat_request_profile_event(
     stream: bool,
     phase: &str,
     started_at: Instant,
+    first_token_latency_us: Option<u64>,
     output_token_count: usize,
+    usage: Option<&TokenUsage>,
     finish_reason: Option<&str>,
     error: Option<ProfileError>,
 ) -> std::result::Result<(), String> {
@@ -1187,12 +1189,17 @@ fn write_chat_request_profile_event(
     } else {
         ProfileStatus::Ok
     };
+    let duration_us = elapsed_us_since(started_at);
     let mut attributes = BTreeMap::from([
         ("actual_model_smoke".to_string(), serde_json::json!(true)),
         ("diagnostic_only".to_string(), serde_json::json!(false)),
         (
             "endpoint".to_string(),
             serde_json::json!("/v1/chat/completions"),
+        ),
+        (
+            "e2e_duration_us".to_string(),
+            serde_json::json!(duration_us),
         ),
         ("l0_only".to_string(), serde_json::json!(false)),
         ("profile_detail".to_string(), serde_json::json!("basic")),
@@ -1202,6 +1209,52 @@ fn write_chat_request_profile_event(
             serde_json::json!(output_token_count),
         ),
     ]);
+    if let Some(usage) = usage {
+        attributes.insert(
+            "prompt_token_count".to_string(),
+            serde_json::json!(usage.prompt_tokens),
+        );
+        attributes.insert(
+            "completion_token_count".to_string(),
+            serde_json::json!(usage.completion_tokens),
+        );
+        attributes.insert(
+            "total_token_count".to_string(),
+            serde_json::json!(usage.total_tokens),
+        );
+        attributes.insert("token_count_source".to_string(), serde_json::json!("usage"));
+    } else {
+        attributes.insert(
+            "completion_token_count".to_string(),
+            serde_json::json!(output_token_count),
+        );
+        attributes.insert(
+            "total_token_count".to_string(),
+            serde_json::json!(output_token_count),
+        );
+        attributes.insert(
+            "token_count_source".to_string(),
+            serde_json::json!("generated_tokens"),
+        );
+    }
+    if let Some(ttft_us) = first_token_latency_us {
+        attributes.insert("ttft_us".to_string(), serde_json::json!(ttft_us));
+        if output_token_count > 1 {
+            attributes.insert(
+                "itl_us_avg".to_string(),
+                serde_json::json!(
+                    duration_us.saturating_sub(ttft_us) / (output_token_count - 1) as u64
+                ),
+            );
+        } else {
+            attributes.insert("itl_us_avg".to_string(), serde_json::json!(0_u64));
+        }
+    } else if stream && status == ProfileStatus::Ok {
+        attributes.insert(
+            "ttft_unavailable_reason".to_string(),
+            serde_json::json!("stream emitted no measured output token before completion"),
+        );
+    }
     if let Some(reason) = finish_reason {
         attributes.insert("finish_reason".to_string(), serde_json::json!(reason));
     }
@@ -1258,14 +1311,7 @@ fn write_chat_request_profile_event(
         timestamp,
         status,
         model: Some(model.to_string()),
-        duration_us: Some(
-            started_at
-                .elapsed()
-                .as_micros()
-                .max(1)
-                .try_into()
-                .unwrap_or(u64::MAX),
-        ),
+        duration_us: Some(duration_us),
         memory: None,
         resource,
         error,
@@ -1288,6 +1334,15 @@ fn write_chat_request_profile_event(
         .and_then(|_| file.write_all(b"\n"))
         .map_err(|err| err.to_string())?;
     Ok(())
+}
+
+fn elapsed_us_since(started_at: Instant) -> u64 {
+    started_at
+        .elapsed()
+        .as_micros()
+        .max(1)
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn write_chat_request_failure_diagnostics_at_root(
@@ -1821,7 +1876,9 @@ async fn handle_chat_completions_stream(
                 true,
                 "chat_completions_stream_start",
                 profile_started_at,
+                None,
                 0,
+                None,
                 Some("error"),
                 Some(ProfileError {
                     kind: error_kind.to_string(),
@@ -1872,12 +1929,18 @@ async fn handle_chat_completions_stream(
     tokio::spawn(async move {
         let mut current_text = String::new();
         let mut output_token_ids = Vec::new();
+        let mut first_token_latency_us = None;
         let mut sent_reasoning_len = 0usize;
         let mut sent_content_len = 0usize;
 
         while let Some(result) = stream.next().await {
             match result {
                 Ok(chunk) => {
+                    if first_token_latency_us.is_none()
+                        && (chunk.token.is_some() || !chunk.text.is_empty())
+                    {
+                        first_token_latency_us = Some(elapsed_us_since(profile_started_at));
+                    }
                     if let Some(token) = chunk.token {
                         output_token_ids.push(token);
                     }
@@ -2107,7 +2170,9 @@ async fn handle_chat_completions_stream(
                             true,
                             "chat_completions_stream_complete",
                             profile_started_at,
+                            first_token_latency_us,
                             output_token_ids.len(),
+                            chunk.usage.as_ref(),
                             final_finish_reason.as_deref(),
                             None,
                         ) {
@@ -2148,7 +2213,9 @@ async fn handle_chat_completions_stream(
                         true,
                         "chat_completions_stream_next",
                         profile_started_at,
+                        first_token_latency_us,
                         output_token_ids.len(),
+                        None,
                         Some("error"),
                         Some(ProfileError {
                             kind: error_kind.to_string(),
@@ -2295,7 +2362,9 @@ async fn handle_chat_completions_sync(
                     false,
                     "chat_completions_sync_tool_choice",
                     profile_started_at,
+                    None,
                     tokens.len(),
+                    Some(&usage),
                     Some("error"),
                     Some(ProfileError {
                         kind: "required_tool_failure".to_string(),
@@ -2320,7 +2389,9 @@ async fn handle_chat_completions_sync(
                     false,
                     "chat_completions_sync_strict_schema",
                     profile_started_at,
+                    None,
                     tokens.len(),
+                    Some(&usage),
                     Some("error"),
                     Some(ProfileError {
                         kind: "strict_schema_failure".to_string(),
@@ -2348,7 +2419,9 @@ async fn handle_chat_completions_sync(
                 false,
                 "chat_completions_sync_complete",
                 profile_started_at,
+                None,
                 tokens.len(),
+                Some(&usage),
                 Some(&openai_finish_reason),
                 None,
             ) {
@@ -2390,7 +2463,9 @@ async fn handle_chat_completions_sync(
                 false,
                 "chat_completions_sync",
                 profile_started_at,
+                None,
                 0,
+                None,
                 Some("error"),
                 Some(ProfileError {
                     kind: error_kind.to_string(),
@@ -7377,8 +7452,18 @@ mod tests {
         assert_eq!(event["attributes"]["actual_model_smoke"], true);
         assert_eq!(event["attributes"]["stream"], false);
         assert_eq!(event["attributes"]["output_token_count"], 2);
+        assert_eq!(event["attributes"]["prompt_token_count"], 7);
+        assert_eq!(event["attributes"]["completion_token_count"], 2);
+        assert_eq!(event["attributes"]["total_token_count"], 9);
+        assert_eq!(event["attributes"]["token_count_source"], "usage");
         assert_eq!(event["attributes"]["finish_reason"], "stop");
         assert!(event["duration_us"].as_u64().unwrap_or_default() > 0);
+        assert!(
+            event["attributes"]["e2e_duration_us"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+        );
         assert_eq!(
             event["replay"]["bundle_dir"].as_str(),
             Some(root.to_string_lossy().as_ref())
@@ -7447,8 +7532,20 @@ mod tests {
         assert_eq!(event["attributes"]["actual_model_smoke"], true);
         assert_eq!(event["attributes"]["stream"], true);
         assert_eq!(event["attributes"]["output_token_count"], 2);
+        assert_eq!(event["attributes"]["prompt_token_count"], 5);
+        assert_eq!(event["attributes"]["completion_token_count"], 1);
+        assert_eq!(event["attributes"]["total_token_count"], 6);
+        assert_eq!(event["attributes"]["token_count_source"], "usage");
         assert_eq!(event["attributes"]["finish_reason"], "stop");
         assert!(event["duration_us"].as_u64().unwrap_or_default() > 0);
+        assert!(
+            event["attributes"]["e2e_duration_us"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+        );
+        assert!(event["attributes"]["ttft_us"].as_u64().is_some());
+        assert!(event["attributes"]["itl_us_avg"].as_u64().is_some());
         assert_eq!(
             event["replay"]["bundle_dir"].as_str(),
             Some(root.to_string_lossy().as_ref())
