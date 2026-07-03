@@ -85,6 +85,34 @@ def require(condition: bool, message: str) -> None:
         raise SentinelError(message)
 
 
+def require_non_empty_string(value: Any, label: str) -> str:
+    require(isinstance(value, str) and value.strip(), f"{label} must be a non-empty string")
+    return str(value)
+
+
+def require_string_list(value: Any, label: str) -> list[str]:
+    require(isinstance(value, list), f"{label} must be a list")
+    require(all(isinstance(item, str) for item in value), f"{label} entries must be strings")
+    return list(value)
+
+
+def require_pass_line_for_dir(value: Any, *, expected_prefix: str, expected_dir: Path, label: str) -> str:
+    pass_line = require_non_empty_string(value, label)
+    require(pass_line.startswith(f"{expected_prefix}: "), f"{label} must start with {expected_prefix}:")
+    raw_path = pass_line.split(":", 1)[1].strip()
+    require(raw_path, f"{label} must include an artifact directory")
+    actual = Path(raw_path)
+    if not actual.is_absolute():
+        actual = (REPO_ROOT / actual).resolve()
+    else:
+        actual = actual.resolve()
+    require(
+        actual == expected_dir.resolve(),
+        f"{label} artifact dir {actual} does not match {expected_dir.resolve()}",
+    )
+    return pass_line
+
+
 def manifest_scenarios(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     if manifest.get("schema_version") != SCHEMA_VERSION:
         raise SentinelError(f"manifest.schema_version must be {SCHEMA_VERSION}")
@@ -486,9 +514,64 @@ def native_op_manifest_result(scenario: dict[str, Any], manifest_dir: Path) -> d
 
 
 def actual_smoke_result(actual_smoke: Path) -> dict[str, Any]:
+    require(actual_smoke.is_dir(), f"actual smoke artifact must be a directory: {actual_smoke}")
+    manifest_path = actual_smoke / "gate.manifest.json"
+    manifest = read_json(manifest_path)
+    require(manifest.get("status") == "pass", f"{manifest_path}.status must be pass")
+    require(
+        manifest.get("phase") == "product_observability_l1_smoke",
+        f"{manifest_path}.phase must be product_observability_l1_smoke",
+    )
+    pass_line = require_pass_line_for_dir(
+        manifest.get("pass_line"),
+        expected_prefix="PRODUCT OBSERVABILITY L1 SMOKE PASS",
+        expected_dir=actual_smoke,
+        label=f"{manifest_path}.pass_line",
+    )
+    expected_sha = git_value(["rev-parse", "HEAD"])
+    git_sha = require_non_empty_string(manifest.get("git_sha"), f"{manifest_path}.git_sha")
+    require(git_sha == expected_sha, f"{manifest_path}.git_sha {git_sha} is stale vs HEAD {expected_sha}")
+    require(
+        manifest.get("git_dirty") is False,
+        f"{manifest_path}.git_dirty must be false for actual smoke evidence",
+    )
+    dirty_files = require_string_list(manifest.get("dirty_files", []), f"{manifest_path}.dirty_files")
+    require(not dirty_files, f"{manifest_path}.dirty_files must be empty for actual smoke evidence")
+
     summary_path = actual_smoke / "product_observability_l1_smoke_summary.json"
     summary = read_json(summary_path)
     require(summary.get("status") == "pass", f"{summary_path} is not pass")
+    require(
+        summary.get("pass_line") == pass_line,
+        f"{summary_path}.pass_line must match manifest pass_line",
+    )
+    require(
+        summary.get("git_sha") == git_sha,
+        f"{summary_path}.git_sha must match manifest git_sha",
+    )
+    require(
+        summary.get("git_dirty") is False,
+        f"{summary_path}.git_dirty must be false for actual smoke evidence",
+    )
+    require(
+        require_string_list(summary.get("dirty_files", []), f"{summary_path}.dirty_files") == [],
+        f"{summary_path}.dirty_files must be empty for actual smoke evidence",
+    )
+    summary_artifact_dir = Path(
+        require_non_empty_string(summary.get("artifact_dir"), f"{summary_path}.artifact_dir")
+    )
+    if not summary_artifact_dir.is_absolute():
+        summary_artifact_dir = (REPO_ROOT / summary_artifact_dir).resolve()
+    else:
+        summary_artifact_dir = summary_artifact_dir.resolve()
+    require(
+        summary_artifact_dir == actual_smoke.resolve(),
+        f"{summary_path}.artifact_dir must match actual smoke directory",
+    )
+    require(
+        summary.get("actual_model_smoke") is True,
+        f"{summary_path}.actual_model_smoke must be true",
+    )
     profile_paths = [
         actual_smoke / "run/profile.jsonl",
         actual_smoke / "run/memory_profile.jsonl",
@@ -523,6 +606,13 @@ def actual_smoke_result(actual_smoke: Path) -> dict[str, Any]:
     return {
         "status": "pass",
         "actual_smoke": str(actual_smoke),
+        "git_sha": git_sha,
+        "git_dirty": False,
+        "pass_line": pass_line,
+        "model": summary.get("model"),
+        "requested_backend": summary.get("requested_backend"),
+        "effective_backend": summary.get("effective_backend"),
+        "profile_detail": summary.get("profile_detail"),
         "entrypoints": profile_summary["entrypoints"],
         "replay_bundle_count": len(replay_bundle_summary),
         "live_replay_execution_count": live_summary.get("replay_execution_count"),
@@ -784,6 +874,214 @@ def make_scenario_summary_fixture(root: Path) -> Path:
     return path
 
 
+def actual_smoke_profile_event(
+    *,
+    entrypoint: str,
+    request_id: str,
+    event_id: str,
+    phase: str,
+    event_kind: str = "instant",
+    resource: dict[str, Any] | None = None,
+    memory: dict[str, Any] | None = None,
+    replay_bundle_dir: Path | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "event_id": event_id,
+        "request_id": request_id,
+        "correlation_id": f"corr-{entrypoint}",
+        "entrypoint": entrypoint,
+        "backend": "metal",
+        "phase": phase,
+        "event_kind": event_kind,
+        "timestamp": "2026-07-02T00:00:00Z",
+        "status": "ok",
+        "model": "fixture/actual-model",
+        "attributes": {
+            "actual_model_smoke": True,
+            "profile_detail": "basic",
+            "profile_schema_fingerprint": "obs-v1",
+        },
+    }
+    if resource is not None:
+        event["resource"] = resource
+    if memory is not None:
+        event["memory"] = memory
+        event["duration_us"] = 100
+        event["attributes"]["memory_measurement"] = "process_rss"
+    if replay_bundle_dir is not None:
+        event["replay"] = {
+            "command": f"ferrum {entrypoint} fixture/actual-model",
+            "bundle_dir": str(replay_bundle_dir),
+        }
+    return event
+
+
+def write_jsonl(path: Path, events: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+
+def write_actual_smoke_entrypoint(root: Path, entrypoint: str) -> None:
+    request_id = f"req-{entrypoint}"
+    request_dump = root / "request_dump"
+    make_bundle(request_dump)
+    profile = actual_smoke_profile_event(
+        entrypoint=entrypoint,
+        request_id=request_id,
+        event_id=f"evt-{entrypoint}-complete",
+        phase="request_complete",
+        replay_bundle_dir=request_dump,
+    )
+    memory = actual_smoke_profile_event(
+        entrypoint=entrypoint,
+        request_id=request_id,
+        event_id=f"evt-{entrypoint}-memory",
+        phase="first_request_done",
+        event_kind="timed_span",
+        memory={
+            "scope": "process",
+            "backend": "metal",
+            "before_bytes": 1024,
+            "after_bytes": 2048,
+            "current_bytes": 2048,
+            "high_water_bytes": 4096,
+            "available_bytes": 8192,
+        },
+    )
+    resource_events = [
+        actual_smoke_profile_event(
+            entrypoint=entrypoint,
+            request_id=request_id,
+            event_id=f"evt-{entrypoint}-open",
+            phase="request_open",
+            resource={
+                "owner_kind": "request",
+                "owner_id": request_id,
+                "resource_kind": "request_slot",
+                "action": "request_open",
+                "capacity": 1,
+            },
+        ),
+        actual_smoke_profile_event(
+            entrypoint=entrypoint,
+            request_id=request_id,
+            event_id=f"evt-{entrypoint}-kv-reserve",
+            phase="kv_reserve",
+            resource={
+                "owner_kind": "request",
+                "owner_id": request_id,
+                "resource_kind": "kv_block",
+                "action": "reserve",
+                "amount": 1,
+                "before": 1,
+                "after": 0,
+                "capacity": 1,
+            },
+        ),
+        actual_smoke_profile_event(
+            entrypoint=entrypoint,
+            request_id=request_id,
+            event_id=f"evt-{entrypoint}-kv-commit",
+            phase="kv_commit",
+            resource={
+                "owner_kind": "request",
+                "owner_id": request_id,
+                "resource_kind": "kv_block",
+                "action": "commit",
+                "amount": 1,
+                "before": 0,
+                "after": 1,
+                "capacity": 1,
+            },
+        ),
+        actual_smoke_profile_event(
+            entrypoint=entrypoint,
+            request_id=request_id,
+            event_id=f"evt-{entrypoint}-kv-release",
+            phase="kv_release",
+            resource={
+                "owner_kind": "request",
+                "owner_id": request_id,
+                "resource_kind": "kv_block",
+                "action": "release",
+                "amount": 1,
+                "before": 0,
+                "after": 1,
+                "capacity": 1,
+            },
+        ),
+        actual_smoke_profile_event(
+            entrypoint=entrypoint,
+            request_id=request_id,
+            event_id=f"evt-{entrypoint}-close",
+            phase="request_close",
+            resource={
+                "owner_kind": "request",
+                "owner_id": request_id,
+                "resource_kind": "request_slot",
+                "action": "request_close",
+                "capacity": 1,
+            },
+        ),
+    ]
+    for event in resource_events:
+        event["attributes"]["resource_trace_source"] = "engine"
+    write_jsonl(root / "profile.jsonl", [profile])
+    write_jsonl(root / "memory_profile.jsonl", [memory])
+    write_jsonl(root / "scheduler_trace.jsonl", resource_events)
+
+
+def make_actual_smoke_fixture(root: Path, *, sha: str, dirty: bool = False) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    write_actual_smoke_entrypoint(root / "run", "run")
+    write_actual_smoke_entrypoint(root / "serve", "serve")
+    live_replay = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "pass",
+        "replay_execution_count": 1,
+        "replay_execution_skipped_count": 0,
+    }
+    write_json(root / "serve_live_replay_bundle/request_replay_bundle_summary.json", live_replay)
+    pass_line = f"PRODUCT OBSERVABILITY L1 SMOKE PASS: {root}"
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "pass",
+        "gate": "product_observability_l1_smoke",
+        "artifact_dir": str(root),
+        "pass_line": pass_line,
+        "git_sha": sha,
+        "git_dirty": dirty,
+        "dirty_files": ["dirty-fixture"] if dirty else [],
+        "model": "fixture/actual-model",
+        "requested_backend": "metal",
+        "backend": "metal",
+        "effective_backend": "metal",
+        "profile_detail": "basic",
+        "actual_model_smoke": True,
+    }
+    write_json(root / "product_observability_l1_smoke_summary.json", summary)
+    write_json(
+        root / "gate.manifest.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "goal": "release-regression-hardening-2026-06-28",
+            "phase": "product_observability_l1_smoke",
+            "status": "pass",
+            "git_sha": sha,
+            "git_dirty": dirty,
+            "dirty_files": ["dirty-fixture"] if dirty else [],
+            "artifact_dir": str(root),
+            "pass_line": pass_line,
+            "summary": str(root / "product_observability_l1_smoke_summary.json"),
+        },
+    )
+    return root
+
+
 def run_selftest() -> None:
     temp = Path(tempfile.mkdtemp(prefix="ferrum-product-backend-sentinel-"))
     try:
@@ -836,6 +1134,45 @@ def run_selftest() -> None:
         if scenario_gate_summary.get("scenario_summary", {}).get("status") != "pass":
             raise AssertionError(scenario_gate_summary)
         validate_failure_links(scenario_gate_summary.get("failure_links") or [])
+        head = git_value(["rev-parse", "HEAD"])
+        actual_smoke = make_actual_smoke_fixture(temp / "actual-smoke", sha=head)
+        actual_out = temp / "actual-out"
+        actual_gate_summary = run_gate(
+            argparse.Namespace(
+                manifest=DEFAULT_MANIFEST,
+                out=actual_out,
+                actual_smoke=actual_smoke,
+                scenario_summary=None,
+            )
+        )
+        if actual_gate_summary.get("actual_smoke", {}).get("status") != "pass":
+            raise AssertionError(actual_gate_summary)
+        stale_smoke = make_actual_smoke_fixture(temp / "stale-smoke", sha="0" * 40)
+        try:
+            run_gate(
+                argparse.Namespace(
+                    manifest=DEFAULT_MANIFEST,
+                    out=temp / "bad-stale-smoke",
+                    actual_smoke=stale_smoke,
+                    scenario_summary=None,
+                )
+            )
+            raise AssertionError("stale actual smoke unexpectedly passed")
+        except SentinelError as exc:
+            require("stale vs HEAD" in str(exc), f"unexpected stale actual smoke error: {exc}")
+        dirty_smoke = make_actual_smoke_fixture(temp / "dirty-smoke", sha=head, dirty=True)
+        try:
+            run_gate(
+                argparse.Namespace(
+                    manifest=DEFAULT_MANIFEST,
+                    out=temp / "bad-dirty-smoke",
+                    actual_smoke=dirty_smoke,
+                    scenario_summary=None,
+                )
+            )
+            raise AssertionError("dirty actual smoke unexpectedly passed")
+        except SentinelError as exc:
+            require("git_dirty" in str(exc), f"unexpected dirty actual smoke error: {exc}")
     finally:
         shutil.rmtree(temp, ignore_errors=True)
 
