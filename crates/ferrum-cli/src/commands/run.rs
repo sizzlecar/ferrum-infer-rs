@@ -126,6 +126,7 @@ fn has_unclosed_thinking_block(prompt: &str) -> bool {
 struct RunPromptPlan {
     prompt: String,
     sampling_params: SamplingParams,
+    prompt_token_ids: Option<Vec<u32>>,
     prompt_tokens: Option<usize>,
     kv_capacity: Option<usize>,
     dropped_history_messages: usize,
@@ -133,9 +134,17 @@ struct RunPromptPlan {
     max_tokens_clamped_from: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+struct RunPromptTokenization {
+    token_ids: Option<Vec<u32>>,
+    token_count: Option<usize>,
+}
+
 struct RunBudget {
     tokenizer: Option<tokenizers::Tokenizer>,
     kv_capacity: Option<usize>,
+    #[cfg(test)]
+    prompt_token_id_mapper: Option<fn(&str) -> Vec<u32>>,
     #[cfg(test)]
     prompt_token_counter: Option<fn(&str) -> usize>,
 }
@@ -152,19 +161,43 @@ impl RunBudget {
             tokenizer,
             kv_capacity,
             #[cfg(test)]
+            prompt_token_id_mapper: None,
+            #[cfg(test)]
             prompt_token_counter: None,
         }
     }
 
-    fn prompt_tokens(&self, prompt: &str) -> Option<usize> {
+    fn prompt_tokenization(&self, prompt: &str) -> RunPromptTokenization {
+        #[cfg(test)]
+        if let Some(mapper) = self.prompt_token_id_mapper {
+            let token_ids = mapper(prompt);
+            return RunPromptTokenization {
+                token_count: Some(token_ids.len()),
+                token_ids: Some(token_ids),
+            };
+        }
         #[cfg(test)]
         if let Some(counter) = self.prompt_token_counter {
-            return Some(counter(prompt));
+            return RunPromptTokenization {
+                token_ids: None,
+                token_count: Some(counter(prompt)),
+            };
         }
-        self.tokenizer
+        if let Some(encoding) = self
+            .tokenizer
             .as_ref()
             .and_then(|tok| tok.encode(prompt, true).ok())
-            .map(|encoding| encoding.len())
+        {
+            let token_ids = encoding.get_ids().to_vec();
+            return RunPromptTokenization {
+                token_count: Some(token_ids.len()),
+                token_ids: Some(token_ids),
+            };
+        }
+        RunPromptTokenization {
+            token_ids: None,
+            token_count: None,
+        }
     }
 }
 
@@ -633,6 +666,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                             request_id: profile_request_id,
                             duration_us: (elapsed * 1_000_000.0).max(0.0) as u64,
                             sampling_params: plan.sampling_params.clone(),
+                            prompt_token_ids: plan.prompt_token_ids.clone(),
                             prompt_token_count: plan.prompt_tokens,
                             prompt_chars,
                             failure_kind: err.observability_failure_kind().to_string(),
@@ -698,6 +732,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 request_id: profile_request_id,
                 duration_us: (elapsed * 1_000_000.0).max(0.0) as u64,
                 sampling_params: plan.sampling_params.clone(),
+                prompt_token_ids: plan.prompt_token_ids.clone(),
                 prompt_token_count: plan.prompt_tokens,
                 output_tokens: tokens,
                 output_token_ids,
@@ -1227,7 +1262,8 @@ fn build_run_prompt_plan(
             model_template,
             chat_template_options,
         )?;
-        let prompt_tokens = budget.prompt_tokens(&prompt);
+        let prompt_tokenization = budget.prompt_tokenization(&prompt);
+        let prompt_tokens = prompt_tokenization.token_count;
         if !fits_kv_budget(&base_sampling, prompt_tokens, budget.kv_capacity) {
             return Err(FerrumError::invalid_request(format!(
                 "This model context is limited to {} tokens, but this turn needs {} input tokens + {} output tokens. Reduce --max-tokens, use /clear, or shorten the prompt.",
@@ -1240,6 +1276,7 @@ fn build_run_prompt_plan(
         return Ok(RunPromptPlan {
             prompt,
             sampling_params: base_sampling,
+            prompt_token_ids: prompt_tokenization.token_ids,
             prompt_tokens,
             kv_capacity: budget.kv_capacity,
             dropped_history_messages: 0,
@@ -1258,12 +1295,14 @@ fn build_run_prompt_plan(
             model_template,
             chat_template_options,
         )?;
-        let prompt_tokens = budget.prompt_tokens(&prompt);
+        let prompt_tokenization = budget.prompt_tokenization(&prompt);
+        let prompt_tokens = prompt_tokenization.token_count;
 
         let Some(kv_capacity) = budget.kv_capacity else {
             return Ok(RunPromptPlan {
                 prompt,
                 sampling_params: base_sampling,
+                prompt_token_ids: prompt_tokenization.token_ids,
                 prompt_tokens,
                 kv_capacity: None,
                 dropped_history_messages: history_start,
@@ -1275,6 +1314,7 @@ fn build_run_prompt_plan(
             return Ok(RunPromptPlan {
                 prompt,
                 sampling_params: base_sampling,
+                prompt_token_ids: prompt_tokenization.token_ids,
                 prompt_tokens: None,
                 kv_capacity: Some(kv_capacity),
                 dropped_history_messages: history_start,
@@ -1300,6 +1340,7 @@ fn build_run_prompt_plan(
             return Ok(RunPromptPlan {
                 prompt,
                 sampling_params,
+                prompt_token_ids: prompt_tokenization.token_ids,
                 prompt_tokens: Some(prompt_tokens),
                 kv_capacity: Some(kv_capacity),
                 dropped_history_messages: history_start,
@@ -2091,7 +2132,23 @@ mod tests {
         RunBudget {
             tokenizer: None,
             kv_capacity: Some(kv_capacity),
+            prompt_token_id_mapper: None,
             prompt_token_counter: Some(|prompt| prompt.split_whitespace().count()),
+        }
+    }
+
+    fn mapped_token_budget(kv_capacity: usize) -> RunBudget {
+        RunBudget {
+            tokenizer: None,
+            kv_capacity: Some(kv_capacity),
+            prompt_token_id_mapper: Some(|prompt| {
+                prompt
+                    .split_whitespace()
+                    .enumerate()
+                    .map(|(index, _)| (index + 1) as u32)
+                    .collect()
+            }),
+            prompt_token_counter: None,
         }
     }
 
@@ -2498,6 +2555,31 @@ mod tests {
         assert!(prompt_tokens < 64);
         assert_eq!(plan.max_tokens_clamped_from, Some(1024));
         assert_eq!(plan.sampling_params.max_tokens, 64 - prompt_tokens);
+    }
+
+    #[test]
+    fn run_prompt_plan_retains_prompt_token_ids_for_observability() {
+        let cmd = test_run_cmd();
+        let budget = mapped_token_budget(64);
+        let options = default_template_options();
+        let plan = build_run_prompt_plan(
+            &[],
+            "demo prompt",
+            None,
+            "tinyllama",
+            None,
+            &options,
+            &cmd,
+            &budget,
+        )
+        .unwrap();
+
+        let token_ids = plan
+            .prompt_token_ids
+            .as_ref()
+            .expect("prompt token ids should be retained");
+        assert_eq!(plan.prompt_tokens, Some(token_ids.len()));
+        assert!(!token_ids.is_empty());
     }
 
     #[test]
