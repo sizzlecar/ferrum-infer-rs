@@ -1280,6 +1280,28 @@ impl SequenceState {
     }
 }
 
+impl Drop for SequenceState {
+    fn drop(&mut self) {
+        if self.request_slot.is_some() {
+            let message = "sequence state dropped with owned request slot";
+            warn!(
+                request_id = %self.request_id,
+                has_kv_cache = self.kv_cache.is_some(),
+                kv_resource_blocks = ?self.kv_resource_blocks,
+                has_recurrent_state = self.recurrent_state.is_some(),
+                recurrent_state_slots = ?self.recurrent_state_slots,
+                has_draft_kv_cache = self.draft_kv_cache.is_some(),
+                draft_kv_resource_blocks = ?self.draft_kv_resource_blocks,
+                "{message}"
+            );
+            #[cfg(test)]
+            if !std::thread::panicking() {
+                panic!("{message}");
+            }
+        }
+    }
+}
+
 fn describe_token_for_log(
     tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
     token: TokenId,

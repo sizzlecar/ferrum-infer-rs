@@ -197,18 +197,19 @@ impl EngineInner {
                     api_response,
                 };
 
-                let has_kv = seq.kv_cache.is_some();
+                let has_kv = seq.kv_cache.take().is_some();
                 let kv_resource_blocks = seq.kv_resource_blocks.take();
-                let has_recurrent_state = seq.recurrent_state.is_some();
+                let has_recurrent_state = seq.recurrent_state.take().is_some();
                 let recurrent_state_slots = seq.recurrent_state_slots.take();
-                let draft_kv_request_id = seq.draft_kv_request_id.clone();
+                let draft_kv_request_id = seq.draft_kv_request_id.take();
                 let draft_kv_resource_blocks = seq.draft_kv_resource_blocks.take();
-                let cache_id = seq.model_cache_id.clone();
+                let _draft_kv_cache = seq.draft_kv_cache.take();
+                let cache_id = seq.model_cache_id.take();
                 let request_slot = seq.request_slot.take();
                 (
                     response,
-                    seq.stream_sender,
-                    seq.response_sender,
+                    seq.stream_sender.take(),
+                    seq.response_sender.take(),
                     has_kv,
                     kv_resource_blocks,
                     has_recurrent_state,
