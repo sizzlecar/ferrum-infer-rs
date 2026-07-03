@@ -506,6 +506,7 @@
       "cuda": false,
       "cuda_graph": false,
       "fa2_direct_ffi": false,
+      "fa2_native_operator_artifact": false,
       "fa2_source": false,
       "greedy_argmax": false,
       "vllm_moe_marlin": false,

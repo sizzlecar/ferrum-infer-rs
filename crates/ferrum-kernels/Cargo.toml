@@ -23,6 +23,8 @@ metal = { version = "0.31", optional = true }
 
 [build-dependencies]
 bindgen_cuda = "0.1.6"
+ferrum-native-ops = { workspace = true }
+ferrum-types = { workspace = true }
 
 [dev-dependencies]
 sha2 = "0.10"
@@ -54,6 +56,9 @@ vllm-paged-attn-v2 = ["cuda"]  # vLLM paged_attention_v2 port (2026-05-12).
 fa2-source = ["cuda"]  # Backward-compatible obsolete alias. It no longer
                         # compiles vendored FlashAttention/CUTLASS source;
                         # FA2 must come from a Ferrum native operator artifact.
+native-op-artifact = ["cuda"]  # Enables build.rs consumption of explicit
+                        # Ferrum native operator manifests/artifacts. With no
+                        # manifest configured this does not link anything.
 tensor-parallel = ["cuda"]  # Kept as alias for backward compat; cuda already includes NCCL
 # Use triton-rs-compiled PTX in place of hand-written .cu kernels.
 # Requires `cuda` (we still launch via cudarc) and pre-generated PTX files

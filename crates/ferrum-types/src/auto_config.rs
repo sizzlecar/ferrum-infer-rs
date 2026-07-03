@@ -154,6 +154,7 @@ pub struct CompiledKernelFeatures {
     pub greedy_argmax: bool,
     pub fa2_source: bool,
     pub fa2_direct_ffi: bool,
+    pub fa2_native_operator_artifact: bool,
 }
 
 impl Default for CompiledKernelFeatures {
@@ -166,6 +167,7 @@ impl Default for CompiledKernelFeatures {
             greedy_argmax: false,
             fa2_source: false,
             fa2_direct_ffi: false,
+            fa2_native_operator_artifact: false,
         }
     }
 }
@@ -180,12 +182,20 @@ impl CompiledKernelFeatures {
             greedy_argmax: true,
             fa2_source: false,
             fa2_direct_ffi: false,
+            fa2_native_operator_artifact: false,
         }
     }
 
     pub fn m3_fast_path_with_source_fa2() -> Self {
         Self {
             fa2_source: true,
+            ..Self::m3_fast_path_without_fa2()
+        }
+    }
+
+    pub fn m3_fast_path_with_native_fa2_artifact() -> Self {
+        Self {
+            fa2_native_operator_artifact: true,
             ..Self::m3_fast_path_without_fa2()
         }
     }
@@ -1343,6 +1353,12 @@ impl FerrumConfigBuilder {
             return self.invalid(
                 FA2_NATIVE_MANIFEST_KEY,
                 "FA2 native operator artifacts require CUDA backend",
+            );
+        }
+        if configured && !self.hardware.compiled_features.fa2_native_operator_artifact {
+            return self.invalid(
+                FA2_NATIVE_MANIFEST_KEY,
+                "FA2 native operator artifact config requires a binary built with a validated native operator artifact",
             );
         }
         if configured && fa2_source {
@@ -3006,7 +3022,7 @@ mod tests {
                     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 ),
             ],
-            CompiledKernelFeatures::m3_fast_path_without_fa2(),
+            CompiledKernelFeatures::m3_fast_path_with_native_fa2_artifact(),
         )
         .resolve()
         .unwrap();
@@ -3062,6 +3078,23 @@ mod tests {
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             )],
             FA2_NATIVE_INPUTS_SHA256_KEY,
+        );
+    }
+
+    #[test]
+    fn fa2_native_artifact_requires_linked_binary_capability() {
+        expect_invalid_key(
+            &[
+                (
+                    FA2_NATIVE_MANIFEST_KEY,
+                    "/tmp/native/fa2/native_operator_manifest.json",
+                ),
+                (
+                    FA2_NATIVE_ARTIFACT_KEY,
+                    "/tmp/native/fa2/libferrum_native_fa2.a",
+                ),
+            ],
+            FA2_NATIVE_MANIFEST_KEY,
         );
     }
 

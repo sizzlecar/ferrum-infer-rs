@@ -458,11 +458,21 @@ def native_operator_dev_build_audit() -> dict[str, Any]:
         and '"skipped"' in build_rs
         and "obsolete-native-operator-artifact-required" in build_rs
     )
+    artifact_link_marker = (
+        "CARGO_FEATURE_NATIVE_OP_ARTIFACT" in build_rs
+        and "FERRUM_FA2_NATIVE_MANIFEST" in build_rs
+        and "FERRUM_FA2_NATIVE_ARTIFACT" in build_rs
+        and "NativeOperatorResolver" in build_rs
+        and "manifest-validated-artifact-linked" in build_rs
+        and "cargo:rustc-link-lib" in build_rs
+        and "FERRUM_FA2_NATIVE_ARTIFACT_COMPILE" in build_rs
+    )
     return {
-        "status": "pass" if not matches and obsolete_marker else "fail",
+        "status": "pass" if not matches and obsolete_marker and artifact_link_marker else "fail",
         "source_compile_count": len(matches),
         "source_compile_matches": matches,
         "fa2_source_feature_behavior": "obsolete_warning_only" if obsolete_marker else "missing_obsolete_marker",
+        "native_artifact_link_behavior": "manifest_validated_link" if artifact_link_marker else "missing_native_artifact_link_marker",
         "inspected_files": [BUILD_RS.relative_to(REPO_ROOT).as_posix()],
     }
 

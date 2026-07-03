@@ -1958,6 +1958,8 @@ fn compiled_kernel_features() -> CompiledKernelFeatures {
         greedy_argmax: cfg!(feature = "cuda") || cfg!(feature = "metal"),
         fa2_source: false,
         fa2_direct_ffi: cfg!(feature = "cuda"),
+        fa2_native_operator_artifact:
+            ferrum_kernels::native_ops::compiled_fa2_native_operator_artifact_linked(),
     }
 }
 
