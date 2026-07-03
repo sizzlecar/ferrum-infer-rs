@@ -160,7 +160,21 @@ impl EngineInner {
 
         let prof = self.runtime_config.rbd_prof;
         let t_decode = if prof { Some(Instant::now()) } else { None };
-        let results = self.model_executor.unified_decode(&batch).await?;
+        let workspace_lease = self.acquire_backend_workspace_lease(
+            rids.clone(),
+            "engine_batch_decode_workspace",
+            "engine_batch_decode_workspace_release",
+        );
+        let results = match self.model_executor.unified_decode(&batch).await {
+            Ok(results) => {
+                workspace_lease.release();
+                results
+            }
+            Err(error) => {
+                drop(workspace_lease);
+                return Err(error);
+            }
+        };
         if results.len() != rids.len() {
             return Err(FerrumError::internal(format!(
                 "unified_decode returned {} results for {} requests",
@@ -329,7 +343,21 @@ impl EngineInner {
         };
 
         let input_recurrent_state = decode_input.recurrent_state.clone();
-        let decode_output = self.model_executor.decode(&decode_input).await?;
+        let workspace_lease = self.acquire_backend_workspace_lease(
+            vec![request_id.clone()],
+            "engine_decode_workspace",
+            "engine_decode_workspace_release",
+        );
+        let decode_output = match self.model_executor.decode(&decode_input).await {
+            Ok(output) => {
+                workspace_lease.release();
+                output
+            }
+            Err(error) => {
+                drop(workspace_lease);
+                return Err(error);
+            }
+        };
         let logits_vec = decode_output.logits.to_vec_f32()?;
 
         let next_token = {

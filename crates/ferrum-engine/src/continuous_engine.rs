@@ -1764,6 +1764,49 @@ impl RecurrentStateAdmission {
     }
 }
 
+#[must_use = "backend workspace leases must be released or dropped to close the trace lifecycle"]
+struct BackendWorkspaceLease<'a> {
+    engine: &'a EngineInner,
+    request_ids: Vec<RequestId>,
+    release_phase: &'static str,
+    armed: bool,
+}
+
+impl<'a> BackendWorkspaceLease<'a> {
+    fn new(
+        engine: &'a EngineInner,
+        request_ids: Vec<RequestId>,
+        phase_prefix: &'static str,
+        release_phase: &'static str,
+    ) -> Self {
+        engine.trace_backend_workspace_acquire_many(&request_ids, phase_prefix);
+        Self {
+            engine,
+            request_ids,
+            release_phase,
+            armed: true,
+        }
+    }
+
+    fn release(mut self) {
+        self.release_now();
+        self.armed = false;
+    }
+
+    fn release_now(&self) {
+        self.engine
+            .trace_backend_workspace_release_many(&self.request_ids, self.release_phase);
+    }
+}
+
+impl Drop for BackendWorkspaceLease<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.release_now();
+        }
+    }
+}
+
 struct PendingBatchPrefill {
     request_id: RequestId,
     input_tokens: Vec<TokenId>,
@@ -2278,6 +2321,55 @@ impl EngineInner {
             1,
             None,
         );
+    }
+
+    fn backend_workspace_capacity(&self) -> Option<usize> {
+        Some(self.config.scheduler.max_running_requests.max(1))
+    }
+
+    fn trace_backend_workspace_acquire(&self, request_id: &RequestId, phase_prefix: &str) {
+        self.trace_resource_reserve_commit(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "backend_workspace",
+            phase_prefix,
+            1,
+            self.backend_workspace_capacity(),
+        );
+    }
+
+    fn trace_backend_workspace_release(&self, request_id: &RequestId, phase: &str) {
+        self.trace_resource_release(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "backend_workspace",
+            phase,
+            1,
+            self.backend_workspace_capacity(),
+        );
+    }
+
+    fn trace_backend_workspace_acquire_many(&self, request_ids: &[RequestId], phase_prefix: &str) {
+        for request_id in request_ids {
+            self.trace_backend_workspace_acquire(request_id, phase_prefix);
+        }
+    }
+
+    fn trace_backend_workspace_release_many(&self, request_ids: &[RequestId], phase: &str) {
+        for request_id in request_ids {
+            self.trace_backend_workspace_release(request_id, phase);
+        }
+    }
+
+    fn acquire_backend_workspace_lease(
+        &self,
+        request_ids: Vec<RequestId>,
+        phase_prefix: &'static str,
+        release_phase: &'static str,
+    ) -> BackendWorkspaceLease<'_> {
+        BackendWorkspaceLease::new(self, request_ids, phase_prefix, release_phase)
     }
 
     fn apply_model_cache_ref_update(&self, request_id: &RequestId, update: ModelCacheRefUpdate) {

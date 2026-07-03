@@ -212,9 +212,18 @@ impl EngineInner {
                 if let Some(state) = current_recurrent_state.clone() {
                     input = input.with_recurrent_state(state);
                 }
+                let workspace_lease = self.acquire_backend_workspace_lease(
+                    vec![request_id.clone()],
+                    "engine_prefill_workspace",
+                    "engine_prefill_workspace_release",
+                );
                 let out = match self.model_executor.prefill(&input).await {
-                    Ok(out) => out,
+                    Ok(out) => {
+                        workspace_lease.release();
+                        out
+                    }
                     Err(e) => {
+                        drop(workspace_lease);
                         kv_lease.release(self).await;
                         recurrent_admission.release_fresh(self).await;
                         return Err(e);
@@ -255,9 +264,18 @@ impl EngineInner {
             } else {
                 prefill_input
             };
+            let workspace_lease = self.acquire_backend_workspace_lease(
+                vec![request_id.clone()],
+                "engine_prefill_workspace",
+                "engine_prefill_workspace_release",
+            );
             match self.model_executor.prefill(&prefill_input).await {
-                Ok(out) => out,
+                Ok(out) => {
+                    workspace_lease.release();
+                    out
+                }
                 Err(e) => {
+                    drop(workspace_lease);
                     kv_lease.release(self).await;
                     recurrent_admission.release_fresh(self).await;
                     return Err(e);
@@ -509,6 +527,10 @@ impl EngineInner {
             return Ok(());
         }
 
+        let workspace_request_ids: Vec<RequestId> = to_prefill
+            .iter()
+            .map(|pending| pending.request_id.clone())
+            .collect();
         // ── Phase 1b: ONE batched model_executor.batch_prefill call ──
         let mut inputs: Vec<PrefillInput> = Vec::with_capacity(to_prefill.len());
         for pending in &to_prefill {
@@ -533,9 +555,18 @@ impl EngineInner {
             });
         }
 
+        let workspace_lease = self.acquire_backend_workspace_lease(
+            workspace_request_ids,
+            "engine_batch_prefill_workspace",
+            "engine_batch_prefill_workspace_release",
+        );
         let outputs = match self.model_executor.batch_prefill(&inputs).await {
-            Ok(outputs) => outputs,
+            Ok(outputs) => {
+                workspace_lease.release();
+                outputs
+            }
             Err(e) => {
+                drop(workspace_lease);
                 for pending in &mut to_prefill {
                     pending.release_resources(self).await;
                 }
