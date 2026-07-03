@@ -18,6 +18,11 @@
       "readme_label": "Qwen3 dense (0.6B \u2013 8B)",
       "modality": "llm",
       "representative_model": "Qwen/Qwen3-0.6B",
+      "contract_id": "qwen3-0-6b-metal-l1",
+      "contract_scope": "pilot",
+      "contract_validated_claims": [
+        "metal"
+      ],
       "metal": true,
       "cuda": true,
       "int4_gptq": true,

@@ -20,11 +20,17 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODELS_MANIFEST = REPO_ROOT / "scripts/release/models_manifest.json"
-PASS_LINE = "SUPPORT MATRIX CONTRACT PASS"
+FULL_PASS_LINE = "SUPPORT MATRIX CONTRACT PASS"
+PILOT_PASS_LINE = "SUPPORT MATRIX CONTRACT PILOT PASS"
 SELFTEST_PASS_LINE = "SUPPORT MATRIX CONTRACT SELFTEST PASS"
 SCHEMA_VERSION = 1
 GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 SUPPORT_KEYS = ["metal", "cuda", "int4_gptq", "tensor_parallel"]
+SCOPES = ["full", "pilot"]
+PASS_LINE_BY_SCOPE = {
+    "full": FULL_PASS_LINE,
+    "pilot": PILOT_PASS_LINE,
+}
 
 
 class SupportMatrixError(RuntimeError):
@@ -202,7 +208,39 @@ def validate_tensor_parallel_claim(model: dict[str, Any], contract_id: str) -> s
     return str(artifact.get("pass_line"))
 
 
-def validate_model_row(model: dict[str, Any], contracts: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def pilot_validated_claims(model: dict[str, Any]) -> list[str]:
+    value = model.get("contract_validated_claims")
+    require(
+        isinstance(value, list) and value,
+        f"model {model.get('id')} contract_scope=pilot requires non-empty contract_validated_claims",
+    )
+    claims: list[str] = []
+    for index, raw in enumerate(value):
+        require(
+            isinstance(raw, str) and raw in SUPPORT_KEYS,
+            f"model {model.get('id')}.contract_validated_claims[{index}] must be one of {SUPPORT_KEYS}",
+        )
+        require(raw not in claims, f"model {model.get('id')}.contract_validated_claims contains duplicate {raw}")
+        claims.append(raw)
+    return claims
+
+
+def rows_for_scope(models: list[dict[str, Any]], scope: str) -> list[dict[str, Any]]:
+    if scope == "full":
+        return models
+    if scope == "pilot":
+        rows = [model for model in models if model.get("contract_scope") == "pilot"]
+        require(rows, "models_manifest contains no contract_scope=pilot rows")
+        return rows
+    raise SupportMatrixError(f"unknown scope {scope!r}")
+
+
+def validate_model_row(
+    model: dict[str, Any],
+    contracts: dict[str, dict[str, Any]],
+    *,
+    scope: str,
+) -> dict[str, Any]:
     model_id = str(model.get("id"))
     contract_id = model.get("contract_id")
     require(isinstance(contract_id, str) and contract_id.strip(), f"model {model_id} missing contract_id")
@@ -211,14 +249,27 @@ def validate_model_row(model: dict[str, Any], contracts: dict[str, dict[str, Any
     contract = contract_record["data"]
     backends = contract_backends(contract)
     claims = {key: claim_enabled(model.get(key)) for key in SUPPORT_KEYS}
-    if claims["metal"]:
+    if scope == "pilot":
+        validated_claims = pilot_validated_claims(model)
+        representative = model.get("representative_model")
+        require(
+            isinstance(representative, str) and representative == contract_record["model_id"],
+            f"model {model_id} pilot contract must target representative_model {representative!r}",
+        )
+    else:
+        validated_claims = list(SUPPORT_KEYS)
+    if scope == "pilot":
+        for key in validated_claims:
+            require(claims[key], f"model {model_id} contract_validated_claims includes disabled claim {key}")
+
+    if "metal" in validated_claims and claims["metal"]:
         require("metal" in backends, f"model {model_id} claims metal but contract {contract_id} lacks metal backend")
-    if claims["cuda"]:
+    if "cuda" in validated_claims and claims["cuda"]:
         require("cuda" in backends, f"model {model_id} claims cuda but contract {contract_id} lacks cuda backend")
-    if claims["int4_gptq"]:
+    if "int4_gptq" in validated_claims and claims["int4_gptq"]:
         require("gptq" in contract_weight_format(contract), f"model {model_id} claims int4_gptq but contract {contract_id} is not GPTQ")
     tensor_parallel_pass_line = None
-    if claims["tensor_parallel"]:
+    if "tensor_parallel" in validated_claims and claims["tensor_parallel"]:
         tensor_parallel_pass_line = validate_tensor_parallel_claim(model, contract_id)
     return {
         "model_id": model_id,
@@ -227,6 +278,9 @@ def validate_model_row(model: dict[str, Any], contracts: dict[str, dict[str, Any
         "contract_model_id": contract_record["model_id"],
         "contract_path": contract_record["path"],
         "claims": claims,
+        "validated_claims": validated_claims,
+        "unvalidated_claims": sorted(key for key, enabled in claims.items() if enabled and key not in validated_claims),
+        "contract_scope": model.get("contract_scope") or "full",
         "contract_backends": sorted(backends),
         "contract_weight_format": contract_weight_format(contract),
         "tensor_parallel_pass_line": tensor_parallel_pass_line,
@@ -239,16 +293,19 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     expected_sha = head_sha()
     manifest = load_models_manifest(args.models_manifest)
     contracts = load_contracts(args.contract_gate, expected_sha)
-    rows = [validate_model_row(model, contracts) for model in manifest["models"]]
+    selected_models = rows_for_scope(manifest["models"], args.scope)
+    rows = [validate_model_row(model, contracts, scope=args.scope) for model in selected_models]
     dirty_files = git_value(["status", "--short"], default="").splitlines()
-    pass_line = f"{PASS_LINE}: {out}"
+    pass_line = f"{PASS_LINE_BY_SCOPE[args.scope]}: {out}"
     summary = {
         "schema_version": SCHEMA_VERSION,
         "status": "pass",
-        "gate": "support_matrix_contract",
+        "gate": "support_matrix_contract" if args.scope == "full" else "support_matrix_contract_pilot",
+        "scope": args.scope,
         "git_sha": expected_sha,
         "models_manifest": str(args.models_manifest),
         "contract_gate_count": len(args.contract_gate),
+        "manifest_row_count": len(manifest["models"]),
         "row_count": len(rows),
         "rows": rows,
         "pass_line": pass_line,
@@ -259,7 +316,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         {
             "schema_version": SCHEMA_VERSION,
             "goal": "release-regression-hardening-2026-06-28",
-            "phase": "support_matrix_contract",
+            "phase": "support_matrix_contract" if args.scope == "full" else "support_matrix_contract_pilot",
             "status": "pass",
             "repo_root": str(REPO_ROOT),
             "git_sha": expected_sha,
@@ -396,8 +453,80 @@ def run_selftest() -> dict[str, Any]:
                 out=root / "out-valid",
                 models_manifest=valid_manifest,
                 contract_gate=[contract_gate],
+                scope="full",
             )
         )
+        pilot_manifest = make_manifest(
+            root / "pilot",
+            [
+                {
+                    "id": "llama-family",
+                    "readme_label": "LLaMA",
+                    "representative_model": "meta-llama/Llama-3.1-8B-Instruct",
+                    "contract_id": "llama-dense-contract",
+                    "contract_scope": "pilot",
+                    "contract_validated_claims": ["metal"],
+                    "metal": True,
+                    "cuda": True,
+                    "int4_gptq": True,
+                    "tensor_parallel": False,
+                }
+            ],
+        )
+        pilot_summary = run_gate(
+            argparse.Namespace(
+                out=root / "out-pilot",
+                models_manifest=pilot_manifest,
+                contract_gate=[contract_gate],
+                scope="pilot",
+            )
+        )
+        require(pilot_summary["scope"] == "pilot", "pilot summary scope must be pilot")
+        require(
+            pilot_summary["rows"][0]["unvalidated_claims"] == ["cuda", "int4_gptq"],
+            f"unexpected pilot unvalidated_claims: {pilot_summary['rows'][0]['unvalidated_claims']}",
+        )
+        try:
+            run_gate(
+                argparse.Namespace(
+                    out=root / "bad-pilot-as-full",
+                    models_manifest=pilot_manifest,
+                    contract_gate=[contract_gate],
+                    scope="full",
+                )
+            )
+            raise AssertionError("pilot manifest unexpectedly passed full scope")
+        except SupportMatrixError as exc:
+            require("int4_gptq" in str(exc), f"unexpected pilot-as-full failure: {exc}")
+        pilot_bad_representative = make_manifest(
+            root / "pilot-bad-representative",
+            [
+                {
+                    "id": "llama-family",
+                    "readme_label": "LLaMA",
+                    "representative_model": "Different/Model",
+                    "contract_id": "llama-dense-contract",
+                    "contract_scope": "pilot",
+                    "contract_validated_claims": ["metal"],
+                    "metal": True,
+                    "cuda": False,
+                    "int4_gptq": False,
+                    "tensor_parallel": False,
+                }
+            ],
+        )
+        try:
+            run_gate(
+                argparse.Namespace(
+                    out=root / "bad-pilot-representative",
+                    models_manifest=pilot_bad_representative,
+                    contract_gate=[contract_gate],
+                    scope="pilot",
+                )
+            )
+            raise AssertionError("pilot representative mismatch unexpectedly passed")
+        except SupportMatrixError as exc:
+            require("representative_model" in str(exc), f"unexpected pilot representative failure: {exc}")
         mismatched_contract_gate = make_contract_gate(root / "mismatched-contract-summary", sha)
         mismatched_summary_path = mismatched_contract_gate / "model_onboarding_contract_summary.json"
         mismatched_summary = read_json(mismatched_summary_path)
@@ -409,6 +538,7 @@ def run_selftest() -> dict[str, Any]:
                     out=root / "bad-mismatched-contract-summary",
                     models_manifest=valid_manifest,
                     contract_gate=[mismatched_contract_gate],
+                    scope="full",
                 )
             )
             raise AssertionError("contract summary model_id mismatch unexpectedly passed")
@@ -433,6 +563,7 @@ def run_selftest() -> dict[str, Any]:
                     out=root / "bad-missing-contract-id",
                     models_manifest=missing_contract_id,
                     contract_gate=[contract_gate],
+                    scope="full",
                 )
             )
             raise AssertionError("missing contract_id unexpectedly passed")
@@ -458,6 +589,7 @@ def run_selftest() -> dict[str, Any]:
                     out=root / "bad-metal-without-backend",
                     models_manifest=metal_without_backend,
                     contract_gate=[contract_gate],
+                    scope="full",
                 )
             )
             raise AssertionError("metal claim without backend unexpectedly passed")
@@ -483,6 +615,7 @@ def run_selftest() -> dict[str, Any]:
                     out=root / "bad-int4-without-gptq",
                     models_manifest=int4_without_gptq,
                     contract_gate=[contract_gate],
+                    scope="full",
                 )
             )
             raise AssertionError("int4 claim without GPTQ contract unexpectedly passed")
@@ -497,6 +630,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path)
     parser.add_argument("--models-manifest", type=Path, default=DEFAULT_MODELS_MANIFEST)
     parser.add_argument("--contract-gate", type=Path, action="append", default=[])
+    parser.add_argument("--scope", choices=SCOPES, default="full")
     return parser.parse_args()
 
 
