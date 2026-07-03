@@ -156,8 +156,9 @@ def validate_bad_output_scan(path: Path) -> dict[str, Any]:
 
 
 def validate_serve_replay_command(bundle: Path, request: dict[str, Any], replay: dict[str, Any]) -> dict[str, Any] | None:
+    http = request.get("http")
     is_serve_replay = request.get("entrypoint") == "serve" and (
-        request.get("backend") == "actual" or replay.get("requires_running_server") is True
+        isinstance(http, dict) or replay.get("requires_running_server") is True
     )
     if not is_serve_replay:
         return None
@@ -171,7 +172,6 @@ def validate_serve_replay_command(bundle: Path, request: dict[str, Any], replay:
     if problems:
         raise BundleError("; ".join(problems))
 
-    http = request.get("http")
     if not isinstance(http, dict):
         raise BundleError(f"{bundle / 'request.json'}.http is required for serve request replay")
     if http.get("path") != "/v1/chat/completions":
@@ -786,6 +786,13 @@ def run_selftest() -> dict[str, Any]:
         make_bundle(pass_root / "oom-admission", failure_kind="oom_admission")
         make_bundle(pass_root / "panic-error", failure_kind="panic_error")
         make_bundle(pass_root / "serve-live", entrypoint="serve", serve_replay=True)
+        make_bundle(pass_root / "serve-startup", entrypoint="serve")
+        serve_startup_request = pass_root / "serve-startup" / "req-fixture" / "request.json"
+        startup_request = read_json(serve_startup_request)
+        startup_request["backend"] = "actual"
+        startup_request["actual_model_smoke"] = True
+        startup_request["http"] = None
+        write_json(serve_startup_request, startup_request)
         pass_results = []
         for root in sorted(pass_root.iterdir()):
             pass_results.extend(validate_bundle_root(root))
