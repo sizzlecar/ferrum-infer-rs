@@ -532,9 +532,43 @@ def validate_profile_group(root: Path, entrypoint: str) -> dict[str, Any]:
     request = json.loads(request_dump.read_text(encoding="utf-8"))
     if request.get("actual_model_smoke") is not True:
         raise SmokeError(f"{request_dump} must mark actual_model_smoke=true")
+    replay_bundles = validate_request_dump_replay_bundles(root / "request_dump", entrypoint)
     result["request_dump"] = str(request_dump)
     result["replay_command"] = replay.read_text(encoding="utf-8").strip()
+    result["replay_bundles"] = replay_bundles
     return result
+
+
+def validate_request_dump_replay_bundles(request_dump_root: Path, entrypoint: str) -> dict[str, Any]:
+    try:
+        bundles = validate_bundle_root(request_dump_root)
+    except BundleError as exc:
+        raise SmokeError(f"{request_dump_root} replay bundle validation failed: {exc}") from exc
+    if not bundles:
+        raise SmokeError(f"{request_dump_root} must contain at least one replay bundle")
+    missing_engine_replay = [
+        bundle.get("bundle_dir", "<unknown>")
+        for bundle in bundles
+        if not isinstance(bundle.get("engine_replay"), dict)
+    ]
+    if missing_engine_replay:
+        raise SmokeError(
+            f"{request_dump_root} replay bundles missing engine_replay: {missing_engine_replay}"
+        )
+    wrong_entrypoint = [
+        bundle.get("bundle_dir", "<unknown>")
+        for bundle in bundles
+        if bundle.get("entrypoint") != entrypoint
+    ]
+    if wrong_entrypoint:
+        raise SmokeError(
+            f"{request_dump_root} replay bundles have wrong entrypoint for {entrypoint}: {wrong_entrypoint}"
+        )
+    return {
+        "bundle_count": len(bundles),
+        "engine_replay_count": len(bundles),
+        "bundle_dirs": [str(bundle.get("bundle_dir")) for bundle in bundles],
+    }
 
 
 def run_analyzer(out: Path, timeout: int) -> dict[str, Any]:
@@ -600,6 +634,13 @@ def validate_replay_execution_summary(summary: dict[str, Any], *, label: str) ->
     replay_executions = summary.get("replay_executions")
     if not isinstance(replay_executions, list):
         raise SmokeError(f"{label}.replay_executions must be a list")
+    engine_replays = [
+        item
+        for item in replay_executions
+        if isinstance(item, dict) and item.get("status") == "executed_engine_replay"
+    ]
+    if not engine_replays:
+        raise SmokeError(f"{label} did not execute any engine replay bundle")
     skipped = [
         item
         for item in replay_executions
@@ -908,6 +949,18 @@ def write_selftest_replay_bundle(root: Path, *, entrypoint: str, request_id: str
     bundle.mkdir(parents=True, exist_ok=True)
     output_text = "OK\n"
     command = f"ferrum {entrypoint} synthetic/no-weight --request-dump-dir {root}"
+    engine_replay_argv = [
+        "cargo",
+        "run",
+        "-p",
+        "ferrum-cli",
+        "--",
+        "replay-bundle",
+        str(bundle),
+        "--out",
+        str(bundle / "engine_replay"),
+        "--json",
+    ]
     common = {
         "schema_version": SCHEMA_VERSION,
         "request_id": request_id,
@@ -986,6 +1039,12 @@ def write_selftest_replay_bundle(root: Path, *, entrypoint: str, request_id: str
                 "--request-dump-dir",
                 str(root),
             ],
+            "engine_replay": {
+                "mode": "bundle_offline",
+                "requires_http_server": False,
+                "command": " ".join(engine_replay_argv),
+                "argv": engine_replay_argv,
+            },
             "sanitized": True,
         },
     )
@@ -1170,7 +1229,7 @@ def run_selftest_in_root(root: Path, out: Path | None = None) -> dict[str, Any]:
             "replay_executions": [
                 {
                     "source_bundle_dir": str(work / "run/request_dump/req-run-selftest"),
-                    "status": "executed_synthetic",
+                    "status": "executed_engine_replay",
                 },
                 {
                     "source_bundle_dir": str(work / "serve/request_dump/req-serve-selftest"),
@@ -1216,13 +1275,31 @@ def run_selftest_in_root(root: Path, out: Path | None = None) -> dict[str, Any]:
                     },
                     {
                         "source_bundle_dir": str(work / "serve/request_dump/req-serve-selftest"),
-                        "status": "executed_synthetic",
+                        "status": "executed_engine_replay",
                     },
                 ],
             },
             label="selftest.replay_summary_run_skipped",
         ),
         "skipped run replay bundle",
+    )
+    missing_engine_replay_error = assert_raises(
+        lambda: validate_replay_execution_summary(
+            {
+                "status": "pass",
+                "bundle_count": 1,
+                "replay_execution_count": 1,
+                "replay_execution_skipped_count": 0,
+                "replay_executions": [
+                    {
+                        "source_bundle_dir": str(work / "run/request_dump/req-run-selftest"),
+                        "status": "executed_synthetic",
+                    }
+                ],
+            },
+            label="selftest.replay_summary_missing_engine",
+        ),
+        "did not execute any engine replay bundle",
     )
 
     failure_cases = {
@@ -1309,6 +1386,7 @@ def run_selftest_in_root(root: Path, out: Path | None = None) -> dict[str, Any]:
             "bad_profile": bad_profile_error,
             "all_skipped_replay": all_skipped_replay_error,
             "skipped_run_replay": skipped_run_replay_error,
+            "missing_engine_replay": missing_engine_replay_error,
         },
     }
     if summary["replay_bundle_count"] != 2:
