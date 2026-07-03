@@ -541,10 +541,8 @@ def run_analyzer(out: Path, timeout: int) -> dict[str, Any]:
     profiles = [
         out / "run/profile.jsonl",
         out / "run/memory_profile.jsonl",
-        out / "run/scheduler_trace.jsonl",
         out / "serve/profile.jsonl",
         out / "serve/memory_profile.jsonl",
-        out / "serve/scheduler_trace.jsonl",
     ]
     cmd = [sys.executable, str(REPO_ROOT / "scripts/release/analyze_ferrum_profile.py")]
     for profile in profiles:
