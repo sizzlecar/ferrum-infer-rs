@@ -14,6 +14,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,16 @@ REQUIRED_SERVE_MEMORY_STAGES = {
     "first_request_done",
     "shutdown",
 }
+FORBIDDEN_OUTPUT_TEXT = [
+    "<unk>",
+    "[PAD]",
+    "<|assistant|>",
+    "<|tool|>",
+    "<|start_header_id|>",
+    "<|end_header_id|>",
+    "<|reserved_special_token_",
+    "classname=",
+]
 
 
 class SmokeError(RuntimeError):
@@ -381,6 +392,132 @@ def parse_sse(body: str) -> dict[str, Any]:
     }
 
 
+def parse_cells(raw: str) -> list[int]:
+    try:
+        cells = [int(part.strip()) for part in raw.split(",") if part.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected comma-separated positive integers") from exc
+    if not cells or any(cell <= 0 for cell in cells):
+        raise argparse.ArgumentTypeError("expected comma-separated positive integers")
+    return cells
+
+
+def forbidden_output_marker(text: str) -> str | None:
+    for marker in FORBIDDEN_OUTPUT_TEXT:
+        if marker in text:
+            return marker
+    return None
+
+
+def run_basic_concurrency(
+    *,
+    base_url: str,
+    model: str,
+    out: Path,
+    cells: list[int],
+    timeout: int,
+    max_tokens: int,
+) -> dict[str, Any] | None:
+    if not cells:
+        return None
+    root = out / "basic_concurrency"
+    root.mkdir(parents=True, exist_ok=True)
+    result: dict[str, Any] = {"status": "pass", "cells": []}
+    errors: list[str] = []
+    for concurrency in cells:
+        def call(index: int) -> dict[str, Any]:
+            marker = f"ferrum-basic-c{concurrency:02d}-{index:02d}"
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"Reply with OK for request marker {marker}.",
+                    }
+                ],
+                "temperature": 0,
+                "max_tokens": max_tokens,
+            }
+            status, body = http_json(f"{base_url}/v1/chat/completions", payload, timeout)
+            content = ""
+            json_ok = False
+            finish_reason = None
+            try:
+                data = json.loads(body)
+                json_ok = True
+                if status == 200:
+                    choice = data["choices"][0]
+                    finish_reason = choice.get("finish_reason")
+                    content = str((choice.get("message") or {}).get("content") or "").strip()
+            except Exception:
+                content = body[:500]
+            return {
+                "i": index,
+                "status": status,
+                "json_ok": json_ok,
+                "content_nonempty": bool(content),
+                "finish_reason": finish_reason,
+                "forbidden_text": forbidden_output_marker(f"{body}\n{content}"),
+                "marker": marker,
+                "content_head": content[:200],
+            }
+
+        rows: list[dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(call, index) for index in range(concurrency)]
+            for future in as_completed(futures):
+                rows.append(future.result())
+        rows.sort(key=lambda row: int(row.get("i") or 0))
+        markers = {int(row["i"]): str(row["marker"]) for row in rows}
+        crosstalk = 0
+        for row in rows:
+            text = str(row.get("content_head") or "")
+            for other_i, marker in markers.items():
+                if other_i != row["i"] and marker in text:
+                    crosstalk += 1
+        status_200 = sum(1 for row in rows if row.get("status") == 200)
+        json_ok = sum(1 for row in rows if row.get("json_ok") is True)
+        content_nonempty = sum(1 for row in rows if row.get("content_nonempty") is True)
+        forbidden_count = sum(1 for row in rows if row.get("forbidden_text"))
+        cell = {
+            "concurrency": concurrency,
+            "requests": concurrency,
+            "status_200": status_200,
+            "json_ok": json_ok,
+            "content_nonempty": content_nonempty,
+            "forbidden_count": forbidden_count,
+            "crosstalk": crosstalk,
+            "passed": (
+                status_200 == concurrency
+                and json_ok == concurrency
+                and content_nonempty == concurrency
+                and forbidden_count == 0
+                and crosstalk == 0
+            ),
+            "rows": rows,
+        }
+        write_json(root / f"c{concurrency}.json", cell)
+        result["cells"].append({key: value for key, value in cell.items() if key != "rows"})
+        if not cell["passed"]:
+            errors.append(
+                f"c={concurrency} status_200={status_200}/{concurrency} "
+                f"json_ok={json_ok}/{concurrency} content_nonempty={content_nonempty}/{concurrency} "
+                f"forbidden={forbidden_count} crosstalk={crosstalk}"
+            )
+    if errors:
+        result["status"] = "fail"
+        result["errors"] = errors
+    write_json(root / "basic_concurrency_summary.json", result)
+    if errors:
+        raise SmokeError("; ".join(errors))
+    return {
+        "status": "pass",
+        "out": str(root),
+        "summary": str(root / "basic_concurrency_summary.json"),
+        "cells": result["cells"],
+    }
+
+
 def effective_backend_from_health(health: dict[str, Any]) -> str | None:
     auto_config = health.get("auto_config")
     if isinstance(auto_config, dict) and isinstance(auto_config.get("backend"), str):
@@ -530,6 +667,14 @@ def serve_actual(args: argparse.Namespace, out: Path) -> dict[str, Any]:
                 raise SmokeError("serve stream emitted no content")
             if sse["malformed"] != 0:
                 raise SmokeError(f"serve stream malformed SSE JSON count={sse['malformed']}")
+            basic_concurrency = run_basic_concurrency(
+                base_url=base_url,
+                model=args.model,
+                out=out,
+                cells=args.basic_concurrency_cells,
+                timeout=args.timeout,
+                max_tokens=args.max_tokens,
+            )
             live_replay = run_live_server_replay_bundle_gate(
                 base_url,
                 root / "request_dump",
@@ -542,6 +687,7 @@ def serve_actual(args: argparse.Namespace, out: Path) -> dict[str, Any]:
                 "health": health,
                 "nonstream_content_preview": content[:200],
                 "stream": sse,
+                "basic_concurrency": basic_concurrency,
                 "live_replay": live_replay,
             }
         finally:
@@ -1658,6 +1804,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ferrum-bin", type=Path)
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--max-tokens", type=int, default=8)
+    parser.add_argument("--basic-concurrency-cells", type=parse_cells, default=[])
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if not args.self_test and args.out is None:
