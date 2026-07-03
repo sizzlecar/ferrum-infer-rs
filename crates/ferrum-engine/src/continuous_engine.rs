@@ -902,6 +902,28 @@ impl SequenceState {
         resources
     }
 
+    fn install_model_kv_without_owned_blocks(&mut self, kv_cache: Arc<dyn KvCacheHandle>) {
+        self.model_cache_id = Some(kv_cache.cache_id());
+        self.kv_cache = Some(kv_cache);
+        self.kv_resource_blocks = None;
+    }
+
+    fn commit_prefill_physical_resources(
+        &mut self,
+        kv_cache: Arc<dyn KvCacheHandle>,
+        kv_resource_blocks: usize,
+        recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
+        recurrent_state_slots: Option<usize>,
+    ) {
+        self.model_cache_id = Some(kv_cache.cache_id());
+        self.kv_cache = Some(kv_cache);
+        self.kv_resource_blocks = Some(kv_resource_blocks);
+        self.recurrent_state = recurrent_state;
+        self.recurrent_state_slots = recurrent_state_slots;
+        self.prefill_complete = true;
+        self.phase = RequestPhase::Decoding;
+    }
+
     pub fn model_decode_logits_policy(&self) -> LogitsReturnPolicy {
         if !self.can_use_model_greedy_argmax() {
             return LogitsReturnPolicy::FullLogits;
