@@ -112,10 +112,22 @@ jobs:
           OUT_ROOT="$(mktemp -d)"
           MODEL_DIR="$MODEL_DIR" OUT_ROOT="$OUT_ROOT/fa-layout" BIN=/bin/echo \
             VALIDATE_ONLY=1 bash scripts/m3_fa_layout_varlen_ab.sh
-          MODEL_DIR="$MODEL_DIR" OUT_ROOT="$OUT_ROOT/fa2-source" BIN=/bin/echo \
-            FA2_SOURCE=1 VALIDATE_ONLY=1 bash scripts/m3_fa2_direct_ffi_ab.sh
-          MODEL_DIR="$MODEL_DIR" OUT_ROOT="$OUT_ROOT/fa2-source-allcells" BIN=/bin/echo \
-            FA2_SOURCE=1 VALIDATE_ONLY=1 bash scripts/m3_fa2_source_allcells_ab.sh
+          if MODEL_DIR="$MODEL_DIR" OUT_ROOT="$OUT_ROOT/native-op-obsolete-source" BIN=/bin/echo \
+            FA2_SOURCE=1 VALIDATE_ONLY=1 bash scripts/m3_fa2_direct_ffi_ab.sh; then
+            echo "removed source-linked FA2 path unexpectedly passed" >&2
+            exit 1
+          else
+            rc=$?
+            test "$rc" -eq 2
+          fi
+          if MODEL_DIR="$MODEL_DIR" OUT_ROOT="$OUT_ROOT/native-op-obsolete-allcells" BIN=/bin/echo \
+            FA2_SOURCE=1 VALIDATE_ONLY=1 bash scripts/m3_fa2_source_allcells_ab.sh; then
+            echo "removed source-linked FA2 all-cells path unexpectedly passed" >&2
+            exit 1
+          else
+            rc=$?
+            test "$rc" -eq 2
+          fi
           MODEL_DIR="$MODEL_DIR" OUT_ROOT="$OUT_ROOT/attn-v1" BIN=/bin/echo \
             VALIDATE_ONLY=1 bash scripts/m3_attn_v1_ab.sh
           MODEL_DIR="$MODEL_DIR" OUT_ROOT="$OUT_ROOT/prefill-first" BIN=/bin/echo \

@@ -33,6 +33,7 @@ CPP_CUDA_EXTENSIONS = {".c", ".cc", ".cpp", ".cxx", ".cu", ".cuh", ".h", ".hh", 
 BUILD_RS = REPO_ROOT / "crates/ferrum-kernels/build.rs"
 RELEASE_CONFIG_AUDIT_FILES = [
     REPO_ROOT / "AGENTS.md",
+    REPO_ROOT / ".github/workflows/ci.yml",
     REPO_ROOT / ".github/workflows/release-cuda.yml",
     REPO_ROOT / "scripts/release/g0_source_gate.sh",
     REPO_ROOT / "scripts/release/run_gate.py",
