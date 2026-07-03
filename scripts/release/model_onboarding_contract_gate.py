@@ -13,6 +13,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +90,18 @@ EXPECTED_FAIL_MARKERS = {
     "unknown_architecture_without_design_doc.json": "model.design_doc",
 }
 
+TEMPLATE_CASE_MAP = {
+    "single": "single_turn",
+    "single_turn": "single_turn",
+    "multi_turn": "multi_turn",
+    "system": "system_message",
+    "system_message": "system_message",
+    "tools": "tool_injection",
+    "tool_injection": "tool_injection",
+    "think_history": "reasoning_history",
+    "reasoning_history": "reasoning_history",
+}
+
 
 class ContractError(RuntimeError):
     pass
@@ -150,6 +163,261 @@ def no_extra_keys(value: dict[str, Any], allowed: set[str], label: str, problems
     extra = sorted(set(value) - allowed)
     if extra:
         problems.append(f"{label} unexpected keys: {', '.join(extra)}")
+
+
+def require_generated(condition: bool, message: str) -> None:
+    if not condition:
+        raise ContractError(message)
+
+
+def slug(value: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9]+", "-", value.strip().lower()).strip("-")
+    return normalized or "model"
+
+
+def artifact_ref(
+    *,
+    kind: str,
+    path: Path,
+    pass_line: str,
+    git_sha: str,
+    backend: str | None = None,
+    entrypoint: str | None = None,
+) -> dict[str, Any]:
+    artifact: dict[str, Any] = {
+        "kind": kind,
+        "path": str(path),
+        "status": "pass",
+        "pass_line": pass_line,
+        "git_sha": git_sha,
+    }
+    if backend is not None:
+        artifact["backend"] = backend
+    if entrypoint is not None:
+        artifact["entrypoint"] = entrypoint
+    return artifact
+
+
+def read_manifest_summary(root: Path, summary_name: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    manifest = read_json(root / "gate.manifest.json")
+    outputs = manifest.get("outputs")
+    summary_path: Path | None = None
+    if isinstance(outputs, dict) and isinstance(outputs.get("summary"), str):
+        summary_path = Path(outputs["summary"])
+    if summary_path is None:
+        summary_path = root / summary_name
+    if not summary_path.is_absolute():
+        summary_path = (root / summary_path).resolve()
+    return manifest, read_json(summary_path)
+
+
+def template_cases(template_artifact: dict[str, Any]) -> list[str]:
+    golden = template_artifact.get("chat_template_golden")
+    require_generated(isinstance(golden, dict), "template artifact missing chat_template_golden")
+    raw_cases = golden.get("case_names")
+    require_generated(isinstance(raw_cases, list) and raw_cases, "template artifact case_names missing")
+    cases = sorted({TEMPLATE_CASE_MAP.get(str(case), str(case)) for case in raw_cases})
+    missing = sorted(REQUIRED_TEMPLATE_CASES - set(cases))
+    require_generated(not missing, f"template artifact missing required contract cases: {missing}")
+    return cases
+
+
+def special_token_facts(template_artifact: dict[str, Any]) -> dict[str, Any]:
+    special = template_artifact.get("special_tokens")
+    require_generated(isinstance(special, dict), "template artifact missing special_tokens")
+    eos = special.get("eos_token_id")
+    eos_ids = eos if isinstance(eos, list) else [eos]
+    eos_ids = [item for item in eos_ids if isinstance(item, int) and not isinstance(item, bool)]
+    require_generated(eos_ids, "template artifact missing eos_token_id")
+    bos = special.get("bos_token_id")
+    bos_token_id = bos if isinstance(bos, int) and not isinstance(bos, bool) else None
+    stop_tokens = []
+    eos_token = special.get("eos_token")
+    if isinstance(eos_token, str) and eos_token:
+        stop_tokens.append(eos_token)
+    return {
+        "eos_token_ids": eos_ids,
+        "bos_token_id": bos_token_id,
+        "stop_tokens": stop_tokens,
+        "token_id_source": str(special.get("source") or "generation_config"),
+    }
+
+
+def generate_contract_from_actual_smoke(args: argparse.Namespace, out: Path) -> Path | None:
+    if args.actual_smoke is None:
+        return None
+    required = {
+        "--actual-smoke-template-artifact": args.actual_smoke_template_artifact,
+        "--actual-smoke-profile-gate": args.actual_smoke_profile_gate,
+        "--actual-smoke-preset-snapshot": args.actual_smoke_preset_snapshot,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ContractError(f"--actual-smoke requires {', '.join(missing)}")
+
+    smoke_root = args.actual_smoke.resolve()
+    smoke_manifest, smoke_summary = read_manifest_summary(smoke_root, "product_observability_l1_smoke_summary.json")
+    require_generated(smoke_manifest.get("status") == "pass", "actual smoke manifest must be pass")
+    require_generated(smoke_summary.get("status") == "pass", "actual smoke summary must be pass")
+    require_generated(smoke_manifest.get("git_dirty") is False, "actual smoke must be clean git evidence")
+    git_sha = str(smoke_manifest.get("git_sha") or "")
+    require_generated(GIT_SHA_RE.match(git_sha) is not None, "actual smoke git_sha must be a 40-character SHA")
+    model_id = str(smoke_manifest.get("model") or smoke_summary.get("model") or "")
+    require_generated(bool(model_id.strip()), "actual smoke model missing")
+    backend = str(smoke_manifest.get("effective_backend") or smoke_manifest.get("backend") or "")
+    require_generated(backend in {"cpu", "cuda", "metal"}, f"actual smoke backend unsupported: {backend!r}")
+
+    template_path = args.actual_smoke_template_artifact.resolve()
+    template_artifact = read_json(template_path)
+    template_pass_line = str(template_artifact.get("pass_line") or "")
+    require_generated(template_artifact.get("status") == "pass", "template artifact must be pass")
+    require_generated(template_pass_line.startswith("W3 L0 TEMPLATE PASS:"), "template artifact must carry W3 L0 TEMPLATE PASS")
+    cases = template_cases(template_artifact)
+    token_facts = special_token_facts(template_artifact)
+
+    profile_root = args.actual_smoke_profile_gate.resolve()
+    profile_manifest = read_json(profile_root / "gate.manifest.json")
+    profile_pass_line = str(profile_manifest.get("pass_line") or "")
+    require_generated(profile_manifest.get("status") == "pass", "profile gate manifest must be pass")
+    require_generated(profile_pass_line.startswith("OBSERVABILITY PROFILE GATE PASS:"), "profile gate must carry OBSERVABILITY PROFILE GATE PASS")
+
+    replay_manifest = read_json(smoke_root / "request_replay_bundle/gate.manifest.json")
+    replay_pass_line = str(replay_manifest.get("pass_line") or "")
+    require_generated(replay_manifest.get("status") == "pass", "request replay bundle manifest must be pass")
+    require_generated(replay_pass_line.startswith("REQUEST REPLAY BUNDLE PASS:"), "replay artifact must carry REQUEST REPLAY BUNDLE PASS")
+
+    preset_path = args.actual_smoke_preset_snapshot.resolve()
+    preset = read_json(preset_path)
+    require_generated(preset.get("status") == "pass", "preset snapshot artifact must be pass")
+    preset_pass_line = f"BACKEND PRESET SNAPSHOT PASS: {preset_path.parent}"
+
+    run_log = smoke_root / "logs/run.json"
+    serve_response = smoke_root / "serve_nonstream.json"
+    require_generated(run_log.is_file(), f"actual smoke run log missing: {run_log}")
+    require_generated(serve_response.is_file(), f"actual smoke serve response missing: {serve_response}")
+
+    selection = (smoke_summary.get("entrypoints") or {}).get("serve", {}).get("product", {})
+    health = selection.get("health") if isinstance(selection, dict) else {}
+    admission = (health or {}).get("admission") if isinstance(health, dict) else {}
+    scheduler = "unknown"
+    if isinstance(admission, dict) and isinstance(admission.get("scheduler_policy"), str):
+        scheduler = admission["scheduler_policy"]
+    runtime_preset = args.actual_smoke_runtime_preset or f"{backend}-{slug(model_id)}-l1"
+    attention_impl = args.actual_smoke_attention_impl or "legacy_paged_varlen+legacy_paged_decode"
+    kv_layout = args.actual_smoke_kv_layout or "paged"
+    kv_dtype = args.actual_smoke_kv_dtype or "fp16"
+
+    contract_id = args.actual_smoke_contract_id or f"{slug(model_id)}-{backend}-l1"
+    family = args.actual_smoke_family or slug(model_id.rsplit("/", 1)[-1])
+    architecture = args.actual_smoke_architecture or family
+    weight_format = args.actual_smoke_weight_format or "unknown"
+    source = args.actual_smoke_source or "hf"
+
+    contract = {
+        "schema_version": SCHEMA_VERSION,
+        "contract_id": contract_id,
+        "source_git_sha": git_sha,
+        "model": {
+            "id": model_id,
+            "family": family,
+            "architecture": architecture,
+            "weight_format": weight_format,
+            "source": source,
+        },
+        "facts": {
+            "tokenizer_source": "tokenizer.json",
+            "chat_template_source": "tokenizer_config.json/chat_template fixture",
+            "generation_config_source": "generation_config.json",
+            "token_id_source": token_facts["token_id_source"],
+            "eos_token_ids": token_facts["eos_token_ids"],
+            "bos_token_id": token_facts["bos_token_id"],
+            "stop_tokens": token_facts["stop_tokens"],
+            "template_golden": artifact_ref(
+                kind="template_golden",
+                path=template_path,
+                pass_line=template_pass_line,
+                git_sha=git_sha,
+            ),
+            "template_golden_cases": cases,
+        },
+        "runtime_preset": {
+            "selected": runtime_preset,
+            "rejected_candidates": args.actual_smoke_rejected_candidate or ["cpu-default", "cuda-default"],
+        },
+        "fallback_policy": {
+            "allow_builtin_template_fallback": False,
+            "allow_backend_fallback": False,
+            "allow_attention_fallback": False,
+        },
+        "capabilities": {
+            "tool_calling": {"supported": False, "source": "not_validated_by_l1_smoke"},
+            "structured_output": {"supported": False, "source": "not_validated_by_l1_smoke"},
+            "reasoning": {"supported": False, "source": "metadata"},
+        },
+        "backend_support": [
+            {
+                "backend": backend,
+                "status": "supported",
+                "selection": {
+                    "runtime_preset": runtime_preset,
+                    "scheduler": scheduler,
+                    "attention_impl": attention_impl,
+                    "kv_layout": kv_layout,
+                    "kv_dtype": kv_dtype,
+                    "recurrent_state_max_slots": None,
+                },
+                "fallback": {
+                    "allowed": False,
+                    "actual_backend": backend,
+                    "actual_attention_impl": attention_impl,
+                    "reason": None,
+                },
+                "correctness": {
+                    "status": "pass",
+                    "run_artifact": artifact_ref(
+                        kind="run_smoke",
+                        path=run_log,
+                        pass_line=str(smoke_manifest.get("pass_line")),
+                        git_sha=git_sha,
+                        backend=backend,
+                        entrypoint="run",
+                    ),
+                    "serve_artifact": artifact_ref(
+                        kind="serve_smoke",
+                        path=serve_response,
+                        pass_line=str(smoke_manifest.get("pass_line")),
+                        git_sha=git_sha,
+                        backend=backend,
+                        entrypoint="serve",
+                    ),
+                    "profile_artifact": artifact_ref(
+                        kind="profile",
+                        path=profile_root / "gate.manifest.json",
+                        pass_line=profile_pass_line,
+                        git_sha=git_sha,
+                        backend=backend,
+                    ),
+                    "replay_artifact": artifact_ref(
+                        kind="replay",
+                        path=smoke_root / "request_replay_bundle/gate.manifest.json",
+                        pass_line=replay_pass_line,
+                        git_sha=git_sha,
+                        backend=backend,
+                    ),
+                    "preset_snapshot": artifact_ref(
+                        kind="preset_snapshot",
+                        path=preset_path,
+                        pass_line=preset_pass_line,
+                        git_sha=git_sha,
+                        backend=backend,
+                    ),
+                },
+            }
+        ],
+    }
+    contract_path = out / "generated_contracts" / f"{contract_id}.json"
+    write_json(contract_path, contract)
+    return contract_path
 
 
 def scan_forbidden_keys(value: Any, label: str, problems: list[str]) -> None:
@@ -563,6 +831,107 @@ def validate_contract_path(path: Path) -> dict[str, Any]:
     }
 
 
+def make_actual_smoke_contract_fixture(root: Path) -> Path:
+    sha = "1" * 40
+    smoke = root / "actual-smoke"
+    smoke.mkdir(parents=True)
+    (smoke / "logs").mkdir()
+    write_json(smoke / "logs/run.json", {"status": "pass", "entrypoint": "run"})
+    write_json(smoke / "serve_nonstream.json", {"status": "pass", "entrypoint": "serve"})
+    replay = smoke / "request_replay_bundle"
+    replay.mkdir()
+    write_json(
+        replay / "gate.manifest.json",
+        {
+            "schema_version": 1,
+            "status": "pass",
+            "pass_line": f"REQUEST REPLAY BUNDLE PASS: {replay}",
+        },
+    )
+    smoke_summary = {
+        "schema_version": 1,
+        "status": "pass",
+        "model": "Qwen/Qwen3-0.6B",
+        "entrypoints": {
+            "serve": {
+                "product": {
+                    "health": {
+                        "admission": {
+                            "scheduler_policy": "prefill_first_until_active:4+prefill_step_chunk:512"
+                        }
+                    }
+                }
+            }
+        },
+    }
+    write_json(smoke / "product_observability_l1_smoke_summary.json", smoke_summary)
+    write_json(
+        smoke / "gate.manifest.json",
+        {
+            "schema_version": 1,
+            "status": "pass",
+            "git_sha": sha,
+            "git_dirty": False,
+            "model": "Qwen/Qwen3-0.6B",
+            "backend": "metal",
+            "effective_backend": "metal",
+            "pass_line": f"PRODUCT OBSERVABILITY L1 SMOKE PASS: {smoke}",
+            "outputs": {"summary": str(smoke / "product_observability_l1_smoke_summary.json")},
+        },
+    )
+
+    profile = root / "profile"
+    profile.mkdir()
+    write_json(
+        profile / "gate.manifest.json",
+        {
+            "schema_version": 1,
+            "status": "pass",
+            "pass_line": f"OBSERVABILITY PROFILE GATE PASS: {profile}",
+        },
+    )
+    template = root / "template"
+    template.mkdir()
+    write_json(
+        template / "w3_l0_template.json",
+        {
+            "schema_version": 1,
+            "status": "pass",
+            "pass_line": f"W3 L0 TEMPLATE PASS: {template}",
+            "chat_template_golden": {
+                "case_names": ["single", "system", "multi_turn", "tools", "think_history"]
+            },
+            "special_tokens": {
+                "source": "generation_config",
+                "eos_token_id": [151645, 151643],
+                "bos_token_id": 151643,
+                "eos_token": "<|im_end|>",
+            },
+        },
+    )
+    preset = root / "preset"
+    preset.mkdir()
+    write_json(preset / "summary.json", {"schema_version": 1, "status": "pass"})
+
+    args = argparse.Namespace(
+        actual_smoke=smoke,
+        actual_smoke_template_artifact=template / "w3_l0_template.json",
+        actual_smoke_profile_gate=profile,
+        actual_smoke_preset_snapshot=preset / "summary.json",
+        actual_smoke_contract_id="qwen3-0-6b-metal-l1",
+        actual_smoke_family="qwen3_dense",
+        actual_smoke_architecture="qwen3",
+        actual_smoke_weight_format="safetensors_dense",
+        actual_smoke_source="hf",
+        actual_smoke_runtime_preset="metal-qwen3-dense-l1",
+        actual_smoke_attention_impl="legacy_paged_varlen+legacy_paged_decode",
+        actual_smoke_kv_layout="paged",
+        actual_smoke_kv_dtype="fp16",
+        actual_smoke_rejected_candidate=["cpu-default"],
+    )
+    return generate_contract_from_actual_smoke(args, root / "generated")
+
+
 def load_schema() -> dict[str, Any]:
     schema = read_json(SCHEMA_PATH)
     if schema.get("title") != "Ferrum model onboarding contract":
@@ -598,6 +967,13 @@ def run_selftest(fixtures: Path = DEFAULT_FIXTURES) -> dict[str, Any]:
         marker = EXPECTED_FAIL_MARKERS.get(path.name)
         if marker and not any(marker in problem for problem in result["problems"]):
             failures.append(f"{path.name} did not fail with marker {marker!r}: {result['problems']}")
+    with tempfile.TemporaryDirectory(prefix="ferrum-model-contract-actual-smoke-") as tmp:
+        generated_root = Path(tmp)
+        generated_contract = make_actual_smoke_contract_fixture(generated_root)
+        result = validate_contract_path(generated_contract)
+        results.append(result)
+        if result["status"] != "pass":
+            failures.append(f"generated actual-smoke contract expected pass: {result['problems']}")
     if failures:
         raise ContractError("\n".join(failures))
     return {
@@ -611,15 +987,19 @@ def run_selftest(fixtures: Path = DEFAULT_FIXTURES) -> dict[str, Any]:
 
 def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     load_schema()
-    if not args.contract:
+    generated_contract = generate_contract_from_actual_smoke(args, args.out)
+    contracts = [*args.contract]
+    if generated_contract is not None:
+        contracts.append(generated_contract)
+    if not contracts:
         raise ContractError("at least one --contract is required")
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
-    results = [validate_contract_path(path) for path in args.contract]
+    results = [validate_contract_path(path) for path in contracts]
     failures = [result for result in results if result["status"] != "pass"]
     if failures:
         raise ContractError(json.dumps(failures, indent=2, sort_keys=True))
-    dirty_files = git_output(["status", "--short"]).splitlines()
+    dirty_files = git_output(["status", "--short"], default="").splitlines()
     pass_line = f"{PASS_LINE}: {out}"
     summary = {
         "schema_version": SCHEMA_VERSION,
@@ -657,6 +1037,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--fixtures", type=Path, default=DEFAULT_FIXTURES)
     parser.add_argument("--contract", type=Path, action="append", default=[])
+    parser.add_argument("--actual-smoke", type=Path)
+    parser.add_argument("--actual-smoke-template-artifact", type=Path)
+    parser.add_argument("--actual-smoke-profile-gate", type=Path)
+    parser.add_argument("--actual-smoke-preset-snapshot", type=Path)
+    parser.add_argument("--actual-smoke-contract-id")
+    parser.add_argument("--actual-smoke-family")
+    parser.add_argument("--actual-smoke-architecture")
+    parser.add_argument("--actual-smoke-weight-format")
+    parser.add_argument("--actual-smoke-source", choices=["hf", "gguf", "local", "synthetic"])
+    parser.add_argument("--actual-smoke-runtime-preset")
+    parser.add_argument("--actual-smoke-attention-impl")
+    parser.add_argument("--actual-smoke-kv-layout")
+    parser.add_argument("--actual-smoke-kv-dtype")
+    parser.add_argument("--actual-smoke-rejected-candidate", action="append")
     parser.add_argument("--out", type=Path)
     return parser.parse_args()
 
