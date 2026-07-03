@@ -685,6 +685,12 @@ struct SequencePhysicalResources {
     model_cache_id: Option<String>,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ModelCacheRefUpdate {
+    released: Option<String>,
+    acquired: Option<String>,
+}
+
 impl SequenceState {
     pub fn new(request: InferenceRequest, input_tokens: Vec<TokenId>) -> Self {
         Self::new_with_tokenizer(request, input_tokens, None)
@@ -902,21 +908,37 @@ impl SequenceState {
         resources
     }
 
-    fn install_model_kv_without_owned_blocks(&mut self, kv_cache: Arc<dyn KvCacheHandle>) {
-        self.model_cache_id = Some(kv_cache.cache_id());
+    fn replace_model_cache_id(&mut self, cache_id: String) -> ModelCacheRefUpdate {
+        if self.model_cache_id.as_deref() == Some(cache_id.as_str()) {
+            return ModelCacheRefUpdate::default();
+        }
+        let released = self.model_cache_id.replace(cache_id.clone());
+        ModelCacheRefUpdate {
+            released,
+            acquired: Some(cache_id),
+        }
+    }
+
+    fn install_model_kv_without_owned_blocks(
+        &mut self,
+        kv_cache: Arc<dyn KvCacheHandle>,
+    ) -> ModelCacheRefUpdate {
+        let model_cache_update = self.replace_model_cache_id(kv_cache.cache_id());
         self.kv_cache = Some(kv_cache);
         self.kv_resource_blocks = None;
+        model_cache_update
     }
 
     fn commit_cached_prefill_physical_resources(
         &mut self,
         kv_cache: Arc<dyn KvCacheHandle>,
         prefill_tokens_processed: usize,
-    ) {
-        self.install_model_kv_without_owned_blocks(kv_cache);
+    ) -> ModelCacheRefUpdate {
+        let model_cache_update = self.install_model_kv_without_owned_blocks(kv_cache);
         self.prefill_tokens_processed = prefill_tokens_processed;
         self.prefill_complete = true;
         self.phase = RequestPhase::Decoding;
+        model_cache_update
     }
 
     fn commit_prefill_physical_resources(
@@ -925,14 +947,15 @@ impl SequenceState {
         kv_resource_blocks: usize,
         recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
         recurrent_state_slots: Option<usize>,
-    ) {
-        self.model_cache_id = Some(kv_cache.cache_id());
+    ) -> ModelCacheRefUpdate {
+        let model_cache_update = self.replace_model_cache_id(kv_cache.cache_id());
         self.kv_cache = Some(kv_cache);
         self.kv_resource_blocks = Some(kv_resource_blocks);
         self.recurrent_state = recurrent_state;
         self.recurrent_state_slots = recurrent_state_slots;
         self.prefill_complete = true;
         self.phase = RequestPhase::Decoding;
+        model_cache_update
     }
 
     fn commit_prefill_chunk_physical_resources(
@@ -942,8 +965,8 @@ impl SequenceState {
         recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
         prefill_tokens_processed: usize,
         is_final_chunk: bool,
-    ) {
-        self.model_cache_id = Some(kv_cache.cache_id());
+    ) -> ModelCacheRefUpdate {
+        let model_cache_update = self.replace_model_cache_id(kv_cache.cache_id());
         self.kv_cache = Some(kv_cache);
         self.kv_resource_blocks = kv_resource_blocks;
         let has_recurrent_state = recurrent_state.is_some();
@@ -958,6 +981,7 @@ impl SequenceState {
         } else {
             RequestPhase::Prefilling
         };
+        model_cache_update
     }
 
     fn decode_model_cache_id_or_request_id(&self, request_id: &RequestId) -> String {
@@ -1949,6 +1973,9 @@ impl EngineInner {
                 after,
                 capacity,
                 reason,
+                error_kind: None,
+                message: None,
+                resource_error_kind: None,
             }),
             error: None,
             replay: None,
@@ -2229,6 +2256,45 @@ impl EngineInner {
         );
     }
 
+    fn trace_model_cache_ref_acquire(&self, request_id: &RequestId) {
+        self.trace_resource_reserve_commit(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "model_cache_ref",
+            "engine_model_cache_ref",
+            1,
+            None,
+        );
+    }
+
+    fn trace_model_cache_ref_release(&self, request_id: &RequestId) {
+        self.trace_resource_release(
+            request_id,
+            "request",
+            &request_id.to_string(),
+            "model_cache_ref",
+            "engine_model_cache_ref_release",
+            1,
+            None,
+        );
+    }
+
+    fn apply_model_cache_ref_update(&self, request_id: &RequestId, update: ModelCacheRefUpdate) {
+        if let Some(cache_id) = update.released {
+            self.model_executor.release_cache(&cache_id);
+            self.trace_model_cache_ref_release(request_id);
+        }
+        if update.acquired.is_some() {
+            self.trace_model_cache_ref_acquire(request_id);
+        }
+    }
+
+    fn release_model_cache_ref(&self, request_id: &RequestId, cache_id: &str) {
+        self.model_executor.release_cache(cache_id);
+        self.trace_model_cache_ref_release(request_id);
+    }
+
     async fn release_kv_allocation(
         &self,
         owner_request_id: &RequestId,
@@ -2247,7 +2313,7 @@ impl EngineInner {
         resources: SequencePhysicalResources,
     ) {
         if let Some(cache_id) = resources.model_cache_id {
-            self.model_executor.release_cache(&cache_id);
+            self.release_model_cache_ref(request_id, &cache_id);
         }
         if resources.had_kv_cache {
             self.release_kv_allocation(

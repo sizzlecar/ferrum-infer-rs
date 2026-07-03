@@ -120,6 +120,9 @@ fn synthetic_events(
             after: None,
             capacity: Some(1),
             reason: None,
+            error_kind: None,
+            message: None,
+            resource_error_kind: None,
         },
         base,
     );
@@ -137,6 +140,9 @@ fn synthetic_events(
             after: Some(1),
             capacity: Some(4),
             reason: None,
+            error_kind: None,
+            message: None,
+            resource_error_kind: None,
         },
         base + Duration::microseconds(10),
     );
@@ -154,6 +160,9 @@ fn synthetic_events(
             after: Some(1),
             capacity: Some(4),
             reason: None,
+            error_kind: None,
+            message: None,
+            resource_error_kind: None,
         },
         base + Duration::microseconds(15),
     );
@@ -193,6 +202,9 @@ fn synthetic_events(
             after: Some(0),
             capacity: Some(4),
             reason: None,
+            error_kind: None,
+            message: None,
+            resource_error_kind: None,
         },
         base + Duration::microseconds(340),
     );

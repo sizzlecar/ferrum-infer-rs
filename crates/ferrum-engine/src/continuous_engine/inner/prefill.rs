@@ -79,7 +79,7 @@ impl EngineInner {
 
                 let cloned_kv = cached_kv.clone_handle()?;
 
-                let first_token = {
+                let (first_token, model_cache_update) = {
                     let mut sequences = self.sequences.write();
                     let seq = sequences
                         .get_mut(request_id)
@@ -91,9 +91,11 @@ impl EngineInner {
                         Some(self.tokenizer.as_ref()),
                     )?;
                     seq.generated_tokens.push(token);
-                    seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
-                    token
+                    let model_cache_update =
+                        seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
+                    (token, model_cache_update)
                 };
+                self.apply_model_cache_ref_update(request_id, model_cache_update);
 
                 self.scheduler.mark_prefill_complete(request_id, num_tokens);
                 self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -292,22 +294,23 @@ impl EngineInner {
                 .recurrent_state
                 .clone()
                 .or_else(|| recurrent_admission.handle());
-            seq.commit_prefill_physical_resources(
+            let model_cache_update = seq.commit_prefill_physical_resources(
                 prefill_output.kv_cache.clone(),
                 kv_resource_blocks,
                 recurrent_state,
                 recurrent_admission.fresh_slots(),
             );
-            Ok::<TokenId, FerrumError>(token)
+            Ok::<(TokenId, ModelCacheRefUpdate), FerrumError>((token, model_cache_update))
         })();
-        let first_token = match first_token_result {
-            Ok(token) => token,
+        let (first_token, model_cache_update) = match first_token_result {
+            Ok(value) => value,
             Err(e) => {
                 kv_lease.release(self).await;
                 recurrent_admission.release_fresh(self).await;
                 return Err(e);
             }
         };
+        self.apply_model_cache_ref_update(request_id, model_cache_update);
         let (_committed_request_id, committed_kv_resource_blocks) = kv_lease.into_committed_parts();
         debug_assert_eq!(committed_kv_resource_blocks, kv_resource_blocks);
         recurrent_admission.commit_fresh();
@@ -411,7 +414,7 @@ impl EngineInner {
                     .filter(|(prefix_id, _, _)| prefix_id.len() == input_tokens.len());
                 if let Some((_, cached_kv, cached_logits)) = hit {
                     let cloned_kv = cached_kv.clone_handle()?;
-                    let first_token = {
+                    let (first_token, model_cache_update) = {
                         let mut sequences = self.sequences.write();
                         let Some(seq) = sequences.get_mut(rid) else {
                             continue;
@@ -423,9 +426,11 @@ impl EngineInner {
                             Some(self.tokenizer.as_ref()),
                         )?;
                         seq.generated_tokens.push(token);
-                        seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
-                        token
+                        let model_cache_update =
+                            seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
+                        (token, model_cache_update)
                     };
+                    self.apply_model_cache_ref_update(rid, model_cache_update);
                     self.scheduler.mark_prefill_complete(rid, num_tokens);
                     self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
                     counter!("ferrum.engine.prefix_cache_hits").increment(1);
@@ -577,16 +582,19 @@ impl EngineInner {
                     .recurrent_state
                     .clone()
                     .or_else(|| pending.recurrent_state.handle());
-                seq.commit_prefill_physical_resources(
+                let model_cache_update = seq.commit_prefill_physical_resources(
                     prefill_output.kv_cache.clone(),
                     kv_resource_blocks,
                     recurrent_state,
                     pending.recurrent_state.fresh_slots(),
                 );
-                Ok::<Option<TokenId>, FerrumError>(Some(token))
+                Ok::<Option<(TokenId, ModelCacheRefUpdate)>, FerrumError>(Some((
+                    token,
+                    model_cache_update,
+                )))
             })();
-            let first_token = match first_token_result {
-                Ok(Some(token)) => token,
+            let (first_token, model_cache_update) = match first_token_result {
+                Ok(Some(value)) => value,
                 Ok(None) => {
                     pending.release_resources(self).await;
                     continue;
@@ -598,6 +606,7 @@ impl EngineInner {
                     continue;
                 }
             };
+            self.apply_model_cache_ref_update(&rid, model_cache_update);
             let committed_kv_resource_blocks = pending.commit_kv()?;
             debug_assert_eq!(committed_kv_resource_blocks, kv_resource_blocks);
             pending.recurrent_state.commit_fresh();

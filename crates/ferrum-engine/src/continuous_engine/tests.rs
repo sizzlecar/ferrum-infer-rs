@@ -1870,6 +1870,9 @@ async fn scheduler_trace_jsonl_resource_events_balance_successful_infer() {
     assert!(saw("kv_block", ResourceAction::Reserve));
     assert!(saw("kv_block", ResourceAction::Commit));
     assert!(saw("kv_block", ResourceAction::Release));
+    assert!(saw("model_cache_ref", ResourceAction::Reserve));
+    assert!(saw("model_cache_ref", ResourceAction::Commit));
+    assert!(saw("model_cache_ref", ResourceAction::Release));
 
     let _ = std::fs::remove_file(trace_path);
 }
