@@ -986,6 +986,10 @@ fn write_chat_request_replay_bundle(
     let replay_body_path = bundle_dir.join("replay_body.json");
     write_json_value(&replay_body_path, &sanitized_body)?;
     let engine_replay_argv = replay_bundle_argv(&bundle_dir);
+    let output_text_body = format!(
+        "[server request replay emitted before response]\nsha256={}\nchars=0\n",
+        sha256_hex(b"")
+    );
 
     let request = serde_json::json!({
         "schema_version": OBSERVABILITY_PROFILE_SCHEMA_VERSION,
@@ -1073,7 +1077,8 @@ fn write_chat_request_replay_bundle(
                 "first_bad_text_span": null,
                 "failure_kind": null,
                 "output_chars": 0,
-                "output_sha256": sha256_hex(b"")
+                "classified_output_sha256": sha256_hex(b""),
+                "output_sha256": sha256_hex(output_text_body.as_bytes())
             }),
         ),
         (
@@ -1099,14 +1104,8 @@ fn write_chat_request_replay_bundle(
     for (name, value) in files {
         write_json_value(&bundle_dir.join(name), &value)?;
     }
-    fs::write(
-        bundle_dir.join("output_text.txt"),
-        format!(
-            "[server request replay emitted before response]\nsha256={}\nchars=0\n",
-            sha256_hex(b"")
-        ),
-    )
-    .map_err(|err| err.to_string())?;
+    fs::write(bundle_dir.join("output_text.txt"), output_text_body)
+        .map_err(|err| err.to_string())?;
     Ok(())
 }
 
@@ -1151,6 +1150,11 @@ fn write_chat_request_completion_replay_bundle(
         .iter()
         .map(|token| token.get())
         .collect::<Vec<_>>();
+    let output_text_body = format!(
+        "[redacted actual output]\nsha256={}\nchars={}\n",
+        sha256_hex(output_text.as_bytes()),
+        output_text.chars().count()
+    );
     write_json_value(
         &bundle_dir.join("output_token_ids.json"),
         &serde_json::json!({
@@ -1164,17 +1168,10 @@ fn write_chat_request_completion_replay_bundle(
     )?;
     write_json_value(
         &bundle_dir.join("bad_output_scan.json"),
-        &bad_output_scan_json(request_id, output_text, None),
+        &bad_output_scan_json(request_id, output_text, None, output_text_body.as_bytes()),
     )?;
-    fs::write(
-        bundle_dir.join("output_text.txt"),
-        format!(
-            "[redacted actual output]\nsha256={}\nchars={}\n",
-            sha256_hex(output_text.as_bytes()),
-            output_text.chars().count()
-        ),
-    )
-    .map_err(|err| err.to_string())?;
+    fs::write(bundle_dir.join("output_text.txt"), output_text_body)
+        .map_err(|err| err.to_string())?;
     Ok(())
 }
 
@@ -1882,6 +1879,7 @@ fn bad_output_scan_json(
     request_id: &str,
     text: &str,
     failure_kind: Option<&str>,
+    output_artifact_bytes: &[u8],
 ) -> serde_json::Value {
     let mut reasons = Vec::new();
     let mut first_span: Option<serde_json::Value> = None;
@@ -1929,7 +1927,8 @@ fn bad_output_scan_json(
         "first_bad_text_span": first_span,
         "failure_kind": failure_kind,
         "output_chars": text.chars().count(),
-        "output_sha256": sha256_hex(text.as_bytes())
+        "classified_output_sha256": sha256_hex(text.as_bytes()),
+        "output_sha256": sha256_hex(output_artifact_bytes)
     })
 }
 
@@ -5560,11 +5559,13 @@ mod tests {
             expected_output_text.chars().count()
         );
         assert_eq!(
-            bad_scan["output_sha256"],
+            bad_scan["classified_output_sha256"],
             sha256_hex(expected_output_text.as_bytes())
         );
 
-        let output_text = fs::read_to_string(bundle.join("output_text.txt")).unwrap();
+        let output_text_bytes = fs::read(bundle.join("output_text.txt")).unwrap();
+        assert_eq!(bad_scan["output_sha256"], sha256_hex(&output_text_bytes));
+        let output_text = String::from_utf8(output_text_bytes).unwrap();
         assert!(output_text.contains("[redacted actual output]"));
         assert!(output_text.contains(&format!(
             "sha256={}",

@@ -325,7 +325,14 @@ mod tests {
         );
         write_json(
             &bundle.join("bad_output_scan.json"),
-            json!({"schema_version": 1, "request_id": request_id, "bad_output": false, "reasons": [], "output_sha256": "0".repeat(64)}),
+            json!({
+                "schema_version": 1,
+                "request_id": request_id,
+                "bad_output": false,
+                "reasons": [],
+                "classified_output_sha256": "2689367b205c16ce32ed4200942b8b8b1e262dfc70d9bc9fbc77c49699a4f1df",
+                "output_sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22"
+            }),
         );
         write_json(
             &bundle.join("replay.command.json"),

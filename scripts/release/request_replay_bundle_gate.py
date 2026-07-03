@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -335,9 +336,15 @@ def validate_bundle_dir(bundle: Path) -> dict[str, Any]:
     if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
         raise BundleError(f"{bundle / 'replay.command.json'}.argv must be a non-empty string array")
     non_empty_string(replay, "command", str(bundle / "replay.command.json"))
-    output_text = (bundle / "output_text.txt").read_text(encoding="utf-8", errors="replace")
+    output_bytes = (bundle / "output_text.txt").read_bytes()
+    output_text = output_bytes.decode("utf-8", errors="replace")
     if SECRET_VALUE_RE.search(output_text):
         raise BundleError(f"{bundle / 'output_text.txt'} contains token-looking value")
+    output_sha256 = hashlib.sha256(output_bytes).hexdigest()
+    if bad_scan["output_sha256"] != output_sha256:
+        raise BundleError(
+            f"{bundle / 'bad_output_scan.json'}.output_sha256 does not match output_text.txt"
+        )
 
     return {
         "bundle_dir": str(bundle),
@@ -629,6 +636,7 @@ def make_bundle(
         }
     if secret:
         request["authorization"] = "Bearer sk-thisShouldFail1234567890"
+    output_text = "<unk>\n" if bad_output else "ok\n"
     replay_body = {
         "model": "synthetic/no-weight",
         "messages": [{"role": "user", "content": "[redacted]"}],
@@ -704,7 +712,7 @@ def make_bundle(
             if bad_output
             else None,
             "failure_kind": failure_kind,
-            "output_sha256": "0" * 64,
+            "output_sha256": hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
         },
         "replay.command.json": {
             "schema_version": 1,
@@ -775,7 +783,7 @@ def make_bundle(
             }
         write_json(bundle / "failure_diagnostics.json", diagnostics)
     if missing != "output_text.txt":
-        (bundle / "output_text.txt").write_text("<unk>\n" if bad_output else "ok\n", encoding="utf-8")
+        (bundle / "output_text.txt").write_text(output_text, encoding="utf-8")
 
 
 def run_selftest() -> dict[str, Any]:
@@ -915,6 +923,16 @@ def run_selftest() -> dict[str, Any]:
             fail_results.append({"case": "serve-missing-body-flag", "error": str(exc)})
         else:
             raise BundleError("selftest fail case serve-missing-body-flag unexpectedly passed")
+
+        root = temp / "fail" / "output-hash-mismatch"
+        make_bundle(root)
+        (root / "req-fixture" / "output_text.txt").write_text("changed output\n", encoding="utf-8")
+        try:
+            validate_bundle_root(root)
+        except BundleError as exc:
+            fail_results.append({"case": "output-hash-mismatch", "error": str(exc)})
+        else:
+            raise BundleError("selftest fail case output-hash-mismatch unexpectedly passed")
         return {
             "schema_version": SCHEMA_VERSION,
             "status": "pass",
