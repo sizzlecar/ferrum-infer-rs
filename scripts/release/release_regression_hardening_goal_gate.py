@@ -75,6 +75,16 @@ REQUIRED_RESOURCE_SCENARIOS = {
     "oom_prevented_by_admission",
     "trace_replay_selftest",
 }
+REQUIRED_RESOURCE_FAIL_KINDS = {
+    "resource_leak",
+    "release_underflow",
+    "capacity_overcommit",
+    "defer_with_committed_resource",
+    "rollback_incomplete",
+    "silent_cuda_oom",
+    "panic_after_resource_error",
+    "transition_mismatch",
+}
 REQUIRED_RESOURCE_KINDS = {
     "backend_workspace",
     "kv_block",
@@ -289,6 +299,38 @@ def validate_resource_fixture_coverage(summary: dict[str, Any]) -> None:
     )
     missing = sorted(REQUIRED_RESOURCE_SCENARIOS - required_scenarios)
     require(not missing, f"resource_invariant.summary.fixture_summary.required_scenarios missing {missing}")
+    fail_fixtures = fixture_summary.get("fail_fixtures")
+    require(
+        isinstance(fail_fixtures, list) and fail_fixtures,
+        "resource_invariant.summary.fixture_summary.fail_fixtures must be a non-empty list",
+    )
+    covered_fail_kinds: set[str] = set()
+    for index, fixture in enumerate(fail_fixtures):
+        require(
+            isinstance(fixture, dict),
+            f"resource_invariant.summary.fixture_summary.fail_fixtures[{index}] must be an object",
+        )
+        failure_counts = fixture.get("failure_counts")
+        require(
+            isinstance(failure_counts, dict) and failure_counts,
+            f"resource_invariant.summary.fixture_summary.fail_fixtures[{index}].failure_counts must be non-empty",
+        )
+        for kind, count in failure_counts.items():
+            require(
+                isinstance(kind, str) and kind.strip(),
+                f"resource_invariant.summary.fixture_summary.fail_fixtures[{index}].failure_counts key must be non-empty",
+            )
+            require(
+                isinstance(count, int) and count >= 0,
+                f"resource_invariant.summary.fixture_summary.fail_fixtures[{index}].failure_counts.{kind} must be non-negative",
+            )
+            if count > 0:
+                covered_fail_kinds.add(kind)
+    missing_fail_kinds = sorted(REQUIRED_RESOURCE_FAIL_KINDS - covered_fail_kinds)
+    require(
+        not missing_fail_kinds,
+        f"resource_invariant.summary.fixture_summary.fail_fixtures missing failure kinds {missing_fail_kinds}",
+    )
     trace = summary.get("trace")
     require(isinstance(trace, dict), "resource_invariant.summary.trace must be an object")
     trace_scenarios = set(
@@ -1689,7 +1731,13 @@ def selftest_artifacts(root: Path, sha: str) -> dict[str, Path]:
             "scenario_count": len(REQUIRED_RESOURCE_SCENARIOS),
             "required_scenarios": sorted(REQUIRED_RESOURCE_SCENARIOS),
             "pass_fixtures": [],
-            "fail_fixtures": [],
+            "fail_fixtures": [
+                {
+                    "source": f"{kind}.jsonl",
+                    "failure_counts": {kind: 1},
+                }
+                for kind in sorted(REQUIRED_RESOURCE_FAIL_KINDS)
+            ],
         },
         "resource_summary": {
             "backend_workspace": {
@@ -2365,6 +2413,42 @@ def run_selftest() -> dict[str, Any]:
             require(
                 "resource_invariant.summary.fixture_summary" in str(exc),
                 f"unexpected resource coverage error: {exc}",
+            )
+        bad_resource_fail_coverage = root / "bad-resource-fail-coverage"
+        artifacts_bad_resource_fail_coverage = selftest_artifacts(
+            root / "bad-resource-fail-coverage-fixtures",
+            sha,
+        )
+        bad_resource_fail_report_path = (
+            artifacts_bad_resource_fail_coverage["resource"] / "invariant_report.json"
+        )
+        bad_resource_fail_report = read_json(bad_resource_fail_report_path)
+        bad_resource_fail_report["fixture_summary"]["fail_fixtures"] = [
+            fixture
+            for fixture in bad_resource_fail_report["fixture_summary"]["fail_fixtures"]
+            if "silent_cuda_oom" not in fixture.get("failure_counts", {})
+        ]
+        write_json(bad_resource_fail_report_path, bad_resource_fail_report)
+        args_bad_resource_fail_coverage = argparse.Namespace(
+            out=bad_resource_fail_coverage,
+            resource_invariant=artifacts_bad_resource_fail_coverage["resource"],
+            change_impact=artifacts_bad_resource_fail_coverage["change"],
+            product_sentinel=artifacts_bad_resource_fail_coverage["product"],
+            model_contract=artifacts_bad_resource_fail_coverage["model"],
+            support_matrix_contract=artifacts_bad_resource_fail_coverage["support_matrix"],
+            observability_profile=artifacts_bad_resource_fail_coverage["observability"],
+            native_operator=artifacts_bad_resource_fail_coverage["native"],
+            actual_model_regression_summary=artifacts_bad_resource_fail_coverage["actual"],
+            binary_sha256=None,
+            require_clean=False,
+        )
+        try:
+            run_gate(args_bad_resource_fail_coverage)
+            raise AssertionError("missing resource invariant fail fixture unexpectedly passed final gate")
+        except GoalGateError as exc:
+            require(
+                "fail_fixtures missing failure kinds" in str(exc),
+                f"unexpected resource fail fixture coverage error: {exc}",
             )
         bad_native = root / "bad-native"
         # Reuse a full artifact set but mutate native source inventory to prove fail-closed behavior.
