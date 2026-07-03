@@ -5,6 +5,7 @@
 //! can submit requests concurrently — an `iteration_lock` serializes the
 //! actual engine steps so each batch is processed exactly once.
 
+use crate::resource_lifecycle::{ResourceLedgerTransition, ResourceLifecycleLedger};
 use async_trait::async_trait;
 use ferrum_bench_core::{global_profile, profile_fields_from_json};
 use ferrum_interfaces::{
@@ -1336,6 +1337,128 @@ fn force_only_token(logits: &mut [f32], token: usize) {
 // Engine inner – shared via Arc so we can spawn tasks
 // ────────────────────────────────────────────────────────────────────────────
 
+#[must_use = "KV allocation leases must be consumed by release().await or into_committed_parts()"]
+struct KvAllocationLease {
+    owner_request_id: RequestId,
+    allocation_request_id: RequestId,
+    handle: Arc<dyn KvCacheHandle>,
+    blocks: usize,
+    armed: bool,
+}
+
+impl KvAllocationLease {
+    fn new(
+        owner_request_id: RequestId,
+        allocation_request_id: RequestId,
+        handle: Arc<dyn KvCacheHandle>,
+        blocks: usize,
+    ) -> Self {
+        Self {
+            owner_request_id,
+            allocation_request_id,
+            handle,
+            blocks,
+            armed: true,
+        }
+    }
+
+    fn handle(&self) -> Arc<dyn KvCacheHandle> {
+        self.handle.clone()
+    }
+
+    fn blocks(&self) -> usize {
+        self.blocks
+    }
+
+    async fn release(mut self, engine: &EngineInner) {
+        engine
+            .release_kv_allocation(
+                &self.owner_request_id,
+                self.allocation_request_id.clone(),
+                Some(self.blocks),
+            )
+            .await;
+        self.armed = false;
+    }
+
+    fn into_committed_parts(mut self) -> (RequestId, usize) {
+        self.armed = false;
+        (self.allocation_request_id.clone(), self.blocks)
+    }
+}
+
+impl Drop for KvAllocationLease {
+    fn drop(&mut self) {
+        if self.armed {
+            warn!(
+                owner_request_id = %self.owner_request_id,
+                allocation_request_id = %self.allocation_request_id,
+                blocks = self.blocks,
+                "KV allocation lease dropped without explicit commit or async release"
+            );
+        }
+    }
+}
+
+struct PendingBatchPrefill {
+    request_id: RequestId,
+    input_tokens: Vec<TokenId>,
+    kv_lease: Option<KvAllocationLease>,
+    recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
+    metadata: HashMap<String, serde_json::Value>,
+    can_use_prefix_cache: bool,
+}
+
+impl PendingBatchPrefill {
+    fn new(
+        request_id: RequestId,
+        input_tokens: Vec<TokenId>,
+        kv_lease: KvAllocationLease,
+        recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
+        metadata: HashMap<String, serde_json::Value>,
+        can_use_prefix_cache: bool,
+    ) -> Self {
+        Self {
+            request_id,
+            input_tokens,
+            kv_lease: Some(kv_lease),
+            recurrent_state,
+            metadata,
+            can_use_prefix_cache,
+        }
+    }
+
+    fn kv_handle(&self) -> Result<Arc<dyn KvCacheHandle>> {
+        self.kv_lease
+            .as_ref()
+            .map(KvAllocationLease::handle)
+            .ok_or_else(|| FerrumError::internal("batch prefill KV lease already consumed"))
+    }
+
+    fn kv_resource_blocks(&self) -> Result<usize> {
+        self.kv_lease
+            .as_ref()
+            .map(KvAllocationLease::blocks)
+            .ok_or_else(|| FerrumError::internal("batch prefill KV lease already consumed"))
+    }
+
+    fn commit_kv(&mut self) -> Result<usize> {
+        let lease = self
+            .kv_lease
+            .take()
+            .ok_or_else(|| FerrumError::internal("batch prefill KV lease already consumed"))?;
+        let (_allocation_request_id, blocks) = lease.into_committed_parts();
+        Ok(blocks)
+    }
+
+    async fn release_resources(&mut self, engine: &EngineInner) {
+        if let Some(lease) = self.kv_lease.take() {
+            lease.release(engine).await;
+        }
+        engine.release_recurrent_state(&self.request_id).await;
+    }
+}
+
 struct EngineInner {
     config: EngineConfig,
     scheduler: Arc<ContinuousBatchScheduler>,
@@ -1365,6 +1488,7 @@ struct EngineInner {
     scheduler_trace_jsonl: Option<Mutex<std::fs::File>>,
     legacy_scheduler_trace_jsonl: Option<Mutex<std::fs::File>>,
     scheduler_trace_none_streak: AtomicU64,
+    resource_lifecycle: Mutex<ResourceLifecycleLedger>,
     resource_trace_event_counter: AtomicU64,
     // stats
     iteration_count: AtomicU64,
@@ -1513,6 +1637,32 @@ impl EngineInner {
         amount.min(i64::MAX as usize) as i64
     }
 
+    fn trace_lifecycle_resource_event(
+        &self,
+        request_id: &RequestId,
+        owner_kind: &str,
+        owner_id: &str,
+        resource_kind: &str,
+        phase: &str,
+        action: ResourceAction,
+        amount: i64,
+        transition: ResourceLedgerTransition,
+    ) {
+        self.trace_resource_event(
+            request_id,
+            owner_kind,
+            owner_id,
+            resource_kind,
+            phase,
+            action,
+            Some(amount),
+            Some(transition.before),
+            Some(transition.after),
+            transition.capacity,
+            None,
+        );
+    }
+
     fn trace_request_open(&self, request_id: &RequestId) {
         self.trace_resource_event(
             request_id,
@@ -1561,17 +1711,13 @@ impl EngineInner {
     }
 
     fn trace_request_close(&self, request_id: &RequestId) {
-        self.trace_resource_event(
+        self.trace_resource_release(
             request_id,
             "request",
             &request_id.to_string(),
             "request_slot",
             "engine_request_slot_release",
-            ResourceAction::Release,
-            Some(1),
-            Some(1),
-            Some(0),
-            None,
+            1,
             None,
         );
         self.trace_request_owner_close(request_id);
@@ -1591,6 +1737,11 @@ impl EngineInner {
             None,
             None,
         );
+        if self.scheduler_trace_jsonl.is_some() {
+            self.resource_lifecycle
+                .lock()
+                .close_owner("request", &request_id.to_string());
+        }
     }
 
     fn trace_scheduler_defer(&self, request_id: &RequestId, phase: &str, reason: &str) {
@@ -1621,35 +1772,38 @@ impl EngineInner {
         amount: usize,
         capacity: Option<usize>,
     ) {
+        if self.scheduler_trace_jsonl.is_none() {
+            return;
+        }
         let amount = Self::resource_amount_i64(amount.max(1));
         let capacity_i64 = capacity.map(Self::resource_amount_i64);
-        let before = capacity_i64.unwrap_or(amount).max(amount);
-        let after = before.saturating_sub(amount);
-        self.trace_resource_event(
+        let (reserve, commit) = {
+            let mut lifecycle = self.resource_lifecycle.lock();
+            let reserve =
+                lifecycle.reserve(owner_kind, owner_id, resource_kind, amount, capacity_i64);
+            let commit =
+                lifecycle.commit(owner_kind, owner_id, resource_kind, amount, capacity_i64);
+            (reserve, commit)
+        };
+        self.trace_lifecycle_resource_event(
             request_id,
             owner_kind,
             owner_id,
             resource_kind,
             &format!("{phase_prefix}_reserve"),
             ResourceAction::Reserve,
-            Some(amount),
-            Some(before),
-            Some(after),
-            capacity_i64,
-            None,
+            amount,
+            reserve,
         );
-        self.trace_resource_event(
+        self.trace_lifecycle_resource_event(
             request_id,
             owner_kind,
             owner_id,
             resource_kind,
             &format!("{phase_prefix}_commit"),
             ResourceAction::Commit,
-            Some(amount),
-            Some(0),
-            Some(amount),
-            capacity_i64,
-            None,
+            amount,
+            commit,
         );
     }
 
@@ -1663,19 +1817,26 @@ impl EngineInner {
         amount: usize,
         capacity: Option<usize>,
     ) {
+        if self.scheduler_trace_jsonl.is_none() {
+            return;
+        }
         let amount = Self::resource_amount_i64(amount.max(1));
-        self.trace_resource_event(
+        let transition = self.resource_lifecycle.lock().release(
+            owner_kind,
+            owner_id,
+            resource_kind,
+            amount,
+            capacity.map(Self::resource_amount_i64),
+        );
+        self.trace_lifecycle_resource_event(
             request_id,
             owner_kind,
             owner_id,
             resource_kind,
             phase,
             ResourceAction::Release,
-            Some(amount),
-            Some(amount),
-            Some(0),
-            capacity.map(Self::resource_amount_i64),
-            None,
+            amount,
+            transition,
         );
     }
 
@@ -1697,6 +1858,25 @@ impl EngineInner {
         );
     }
 
+    async fn allocate_kv_lease(
+        &self,
+        owner_request_id: &RequestId,
+        allocation_request_id: RequestId,
+        request: &AllocationRequest,
+        tokens: usize,
+    ) -> Result<KvAllocationLease> {
+        debug_assert_eq!(allocation_request_id, request.request_id);
+        let handle = self.kv_cache.allocate(request).await?;
+        let blocks = self.kv_resource_blocks_for_tokens(tokens);
+        self.trace_kv_allocate(owner_request_id, blocks);
+        Ok(KvAllocationLease::new(
+            owner_request_id.clone(),
+            allocation_request_id,
+            handle,
+            blocks,
+        ))
+    }
+
     fn trace_kv_release(&self, request_id: &RequestId, blocks: usize) {
         self.trace_resource_release(
             request_id,
@@ -1707,6 +1887,18 @@ impl EngineInner {
             blocks,
             Some(self.config.kv_cache.max_blocks),
         );
+    }
+
+    async fn release_kv_allocation(
+        &self,
+        owner_request_id: &RequestId,
+        allocation_request_id: RequestId,
+        blocks: Option<usize>,
+    ) {
+        let _ = self.kv_cache.deallocate(allocation_request_id).await;
+        if let Some(blocks) = blocks {
+            self.trace_kv_release(owner_request_id, blocks);
+        }
     }
 
     fn trace_recurrent_allocate(
@@ -1741,6 +1933,16 @@ impl EngineInner {
             slots,
             capacity,
         );
+    }
+
+    async fn release_recurrent_allocation(&self, request_id: &RequestId, slots: Option<usize>) {
+        if let Some(manager) = &self.recurrent_state_manager {
+            let capacity = manager.stats().total_batch_slots;
+            let _ = manager.deallocate(request_id.clone()).await;
+            if let Some(slots) = slots {
+                self.trace_recurrent_release(request_id, slots, Some(capacity));
+            }
+        }
     }
 
     async fn ensure_recurrent_state(
@@ -1806,13 +2008,8 @@ impl EngineInner {
             seq.recurrent_state = None;
             seq.recurrent_state_slots.take()
         });
-        if let Some(manager) = &self.recurrent_state_manager {
-            let capacity = manager.stats().total_batch_slots;
-            let _ = manager.deallocate(request_id.clone()).await;
-            if let Some(slots) = released_slots {
-                self.trace_recurrent_release(request_id, slots, Some(capacity));
-            }
-        }
+        self.release_recurrent_allocation(request_id, released_slots)
+            .await;
     }
 
     fn performance_breakdown(&self) -> ferrum_types::PerformanceBreakdown {
@@ -2003,6 +2200,7 @@ impl ContinuousBatchEngine {
                 scheduler_trace_jsonl,
                 legacy_scheduler_trace_jsonl,
                 scheduler_trace_none_streak: AtomicU64::new(0),
+                resource_lifecycle: Mutex::new(ResourceLifecycleLedger::default()),
                 resource_trace_event_counter: AtomicU64::new(0),
                 total_prefill_tokens: AtomicU64::new(0),
                 total_decode_tokens: AtomicU64::new(0),

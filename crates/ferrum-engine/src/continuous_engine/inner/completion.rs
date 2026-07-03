@@ -226,27 +226,18 @@ impl EngineInner {
         }
 
         if has_kv_cache {
-            let _ = self.kv_cache.deallocate(request_id.clone()).await;
-            if let Some(blocks) = kv_resource_blocks {
-                self.trace_kv_release(request_id, blocks);
-            }
+            self.release_kv_allocation(request_id, request_id.clone(), kv_resource_blocks)
+                .await;
         }
 
         if let Some(draft_request_id) = draft_kv_request_id {
-            let _ = self.kv_cache.deallocate(draft_request_id).await;
-            if let Some(blocks) = draft_kv_resource_blocks {
-                self.trace_kv_release(request_id, blocks);
-            }
+            self.release_kv_allocation(request_id, draft_request_id, draft_kv_resource_blocks)
+                .await;
         }
 
         if has_recurrent_state {
-            if let Some(manager) = &self.recurrent_state_manager {
-                let capacity = manager.stats().total_batch_slots;
-                let _ = manager.deallocate(request_id.clone()).await;
-                if let Some(slots) = recurrent_state_slots {
-                    self.trace_recurrent_release(request_id, slots, Some(capacity));
-                }
-            }
+            self.release_recurrent_allocation(request_id, recurrent_state_slots)
+                .await;
         }
 
         self.scheduler

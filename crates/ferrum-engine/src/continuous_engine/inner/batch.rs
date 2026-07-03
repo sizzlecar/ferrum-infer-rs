@@ -324,8 +324,11 @@ impl EngineInner {
                     dtype: model_info.dtype,
                     priority: Priority::Normal,
                 };
-                let allocated = match self.kv_cache.allocate(&alloc_request).await {
-                    Ok(h) => h,
+                let lease = match self
+                    .allocate_kv_lease(rid, rid.clone(), &alloc_request, num_tokens)
+                    .await
+                {
+                    Ok(lease) => lease,
                     Err(e) => {
                         warn!("Unified prefill alloc deferred for {}: {}", rid, e);
                         self.release_recurrent_state(rid).await;
@@ -333,8 +336,8 @@ impl EngineInner {
                         continue;
                     }
                 };
-                let blocks = self.kv_resource_blocks_for_tokens(num_tokens);
-                self.trace_kv_allocate(rid, blocks);
+                let allocated = lease.handle();
+                let (_allocation_request_id, blocks) = lease.into_committed_parts();
                 (allocated, true, Some(blocks))
             };
             let remaining = num_tokens - chunk_start;
@@ -491,10 +494,12 @@ impl EngineInner {
                 }
                 for work in &prefill_meta {
                     if work.fresh_kv {
-                        let _ = self.kv_cache.deallocate(work.rid.clone()).await;
-                        if let Some(blocks) = work.kv_resource_blocks {
-                            self.trace_kv_release(&work.rid, blocks);
-                        }
+                        self.release_kv_allocation(
+                            &work.rid,
+                            work.rid.clone(),
+                            work.kv_resource_blocks,
+                        )
+                        .await;
                     }
                     self.defer_prefill_for_capacity(&work.rid).await;
                 }
@@ -515,10 +520,12 @@ impl EngineInner {
             }
             for work in &prefill_meta {
                 if work.fresh_kv {
-                    let _ = self.kv_cache.deallocate(work.rid.clone()).await;
-                    if let Some(blocks) = work.kv_resource_blocks {
-                        self.trace_kv_release(&work.rid, blocks);
-                    }
+                    self.release_kv_allocation(
+                        &work.rid,
+                        work.rid.clone(),
+                        work.kv_resource_blocks,
+                    )
+                    .await;
                 }
                 if work.fresh_recurrent {
                     self.release_recurrent_state(&work.rid).await;
@@ -536,10 +543,12 @@ impl EngineInner {
                     );
                     for work in &prefill_meta {
                         if work.fresh_kv {
-                            let _ = self.kv_cache.deallocate(work.rid.clone()).await;
-                            if let Some(blocks) = work.kv_resource_blocks {
-                                self.trace_kv_release(&work.rid, blocks);
-                            }
+                            self.release_kv_allocation(
+                                &work.rid,
+                                work.rid.clone(),
+                                work.kv_resource_blocks,
+                            )
+                            .await;
                         }
                         self.defer_prefill_for_capacity(&work.rid).await;
                     }
@@ -559,10 +568,12 @@ impl EngineInner {
                 // `complete_request`). Found via paged_attention_test.
                 for work in &prefill_meta {
                     if work.fresh_kv {
-                        let _ = self.kv_cache.deallocate(work.rid.clone()).await;
-                        if let Some(blocks) = work.kv_resource_blocks {
-                            self.trace_kv_release(&work.rid, blocks);
-                        }
+                        self.release_kv_allocation(
+                            &work.rid,
+                            work.rid.clone(),
+                            work.kv_resource_blocks,
+                        )
+                        .await;
                     }
                     if work.fresh_recurrent {
                         self.release_recurrent_state(&work.rid).await;
@@ -582,10 +593,12 @@ impl EngineInner {
         if results.len() != unified.items.len() {
             for work in &prefill_meta {
                 if work.fresh_kv {
-                    let _ = self.kv_cache.deallocate(work.rid.clone()).await;
-                    if let Some(blocks) = work.kv_resource_blocks {
-                        self.trace_kv_release(&work.rid, blocks);
-                    }
+                    self.release_kv_allocation(
+                        &work.rid,
+                        work.rid.clone(),
+                        work.kv_resource_blocks,
+                    )
+                    .await;
                 }
                 if work.fresh_recurrent {
                     self.release_recurrent_state(&work.rid).await;
@@ -637,10 +650,12 @@ impl EngineInner {
                 None => {
                     warn!("Unified prefill result missing for {}", work.rid);
                     if work.fresh_kv {
-                        let _ = self.kv_cache.deallocate(work.rid.clone()).await;
-                        if let Some(blocks) = work.kv_resource_blocks {
-                            self.trace_kv_release(&work.rid, blocks);
-                        }
+                        self.release_kv_allocation(
+                            &work.rid,
+                            work.rid.clone(),
+                            work.kv_resource_blocks,
+                        )
+                        .await;
                     }
                     if work.fresh_recurrent {
                         self.release_recurrent_state(&work.rid).await;
@@ -701,10 +716,12 @@ impl EngineInner {
                         work.rid, e
                     );
                     if work.fresh_kv {
-                        let _ = self.kv_cache.deallocate(work.rid.clone()).await;
-                        if let Some(blocks) = work.kv_resource_blocks {
-                            self.trace_kv_release(&work.rid, blocks);
-                        }
+                        self.release_kv_allocation(
+                            &work.rid,
+                            work.rid.clone(),
+                            work.kv_resource_blocks,
+                        )
+                        .await;
                     }
                     if work.fresh_recurrent {
                         self.release_recurrent_state(&work.rid).await;
@@ -979,16 +996,12 @@ impl EngineInner {
             self.model_executor.release_cache(&cache_id);
         }
         if had_kv_cache {
-            let _ = self.kv_cache.deallocate(request_id.clone()).await;
-            if let Some(blocks) = kv_resource_blocks {
-                self.trace_kv_release(request_id, blocks);
-            }
+            self.release_kv_allocation(request_id, request_id.clone(), kv_resource_blocks)
+                .await;
         }
         if let Some(draft_request_id) = draft_kv_request_id {
-            let _ = self.kv_cache.deallocate(draft_request_id).await;
-            if let Some(blocks) = draft_kv_resource_blocks {
-                self.trace_kv_release(request_id, blocks);
-            }
+            self.release_kv_allocation(request_id, draft_request_id, draft_kv_resource_blocks)
+                .await;
         }
         if had_recurrent_state {
             self.release_recurrent_state(request_id).await;
@@ -1057,16 +1070,12 @@ impl EngineInner {
             self.model_executor.release_cache(&cache_id);
         }
         if had_kv_cache {
-            let _ = self.kv_cache.deallocate(request_id.clone()).await;
-            if let Some(blocks) = kv_resource_blocks {
-                self.trace_kv_release(request_id, blocks);
-            }
+            self.release_kv_allocation(request_id, request_id.clone(), kv_resource_blocks)
+                .await;
         }
         if let Some(draft_request_id) = draft_kv_request_id {
-            let _ = self.kv_cache.deallocate(draft_request_id).await;
-            if let Some(blocks) = draft_kv_resource_blocks {
-                self.trace_kv_release(request_id, blocks);
-            }
+            self.release_kv_allocation(request_id, draft_request_id, draft_kv_resource_blocks)
+                .await;
         }
         if had_recurrent_state {
             self.release_recurrent_state(request_id).await;
@@ -1164,15 +1173,11 @@ impl EngineInner {
             }
         };
 
-        let _ = self.kv_cache.deallocate(victim_id.clone()).await;
-        if let Some(blocks) = kv_resource_blocks {
-            self.trace_kv_release(&victim_id, blocks);
-        }
+        self.release_kv_allocation(&victim_id, victim_id.clone(), kv_resource_blocks)
+            .await;
         if let Some(draft_request_id) = draft_kv_request_id {
-            let _ = self.kv_cache.deallocate(draft_request_id).await;
-            if let Some(blocks) = draft_kv_resource_blocks {
-                self.trace_kv_release(&victim_id, blocks);
-            }
+            self.release_kv_allocation(&victim_id, draft_request_id, draft_kv_resource_blocks)
+                .await;
         }
 
         if had_recurrent {
