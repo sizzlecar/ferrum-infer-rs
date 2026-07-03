@@ -205,13 +205,14 @@ impl EngineInner {
                 let Some(seq) = sequences.get(rid) else {
                     continue;
                 };
+                let resources = seq.prefill_resources();
                 (
                     seq.prefill_context_tokens(),
                     seq.prefill_context_len(),
-                    seq.kv_cache.clone(),
-                    seq.kv_resource_blocks,
-                    seq.recurrent_state.clone(),
-                    seq.prefill_tokens_processed,
+                    resources.kv_cache,
+                    resources.kv_resource_blocks,
+                    resources.recurrent_state,
+                    resources.prefill_tokens_processed,
                     seq.model_decode_metadata(),
                     if skip_prefix_cache {
                         seq.model_decode_logits_policy()
@@ -403,34 +404,15 @@ impl EngineInner {
                 let Some(seq) = sequences.get(rid) else {
                     continue;
                 };
-                let Some(kv) = seq.kv_cache.clone() else {
+                let Some(resources) = seq.ready_decode_resources(rid) else {
                     continue;
                 };
-                let last_token = seq
-                    .generated_tokens
-                    .last()
-                    .copied()
-                    .unwrap_or(TokenId::new(0));
-                // pos_offset = position of the NEW token in the K/V cache.
-                // It must increment by 1 every decode step. Source of truth
-                // is the engine's own bookkeeping: input prompt + tokens
-                // generated so far (the last one is the one we're about to
-                // decode, so its slot is `len - 1` past the prompt). NOT
-                // `kv.block_table().sequence_length` — that field is set
-                // once at allocate() time and `make_kv_handle_with_seq`
-                // doesn't actually update Paged/Default handles, so reading
-                // it leaves every decode step at the same position.
-                let pos_offset = seq.input_tokens.len() + seq.generated_tokens.len() - 1;
-                let seq_id = seq
-                    .model_cache_id
-                    .clone()
-                    .unwrap_or_else(|| rid.to_string());
                 unified.items.push(UnifiedBatchItem {
-                    seq_id,
-                    q_tokens: vec![last_token.get()],
-                    kv_cache: kv,
-                    recurrent_state: seq.recurrent_state.clone(),
-                    pos_offset,
+                    seq_id: resources.seq_id,
+                    q_tokens: vec![resources.last_token.get()],
+                    kv_cache: resources.kv_cache,
+                    recurrent_state: resources.recurrent_state,
+                    pos_offset: resources.pos_offset,
                     is_final_chunk: true,
                     metadata: seq.model_decode_metadata(),
                     logits_policy: seq.model_decode_logits_policy(),
@@ -1058,9 +1040,7 @@ impl EngineInner {
             let sequences = self.sequences.read();
             sequences
                 .iter()
-                .filter(|(id, s)| {
-                    !exclude_ids.contains(*id) && s.prefill_complete && s.kv_cache.is_some()
-                })
+                .filter(|(id, s)| !exclude_ids.contains(*id) && s.is_preemptible_decode_candidate())
                 .min_by(|(_, a), (_, b)| {
                     // Lowest priority first, then fewest generated tokens
                     a.sampling_params

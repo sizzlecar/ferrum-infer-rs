@@ -111,39 +111,15 @@ impl EngineInner {
                 let Some(seq) = sequences.get(rid) else {
                     continue;
                 };
-                if !seq.prefill_complete || seq.generated_tokens.is_empty() {
-                    continue;
-                }
-                let Some(kv_cache) = seq.kv_cache.clone() else {
+                let Some(resources) = seq.ready_decode_resources(rid) else {
                     continue;
                 };
-                let last_token = seq
-                    .generated_tokens
-                    .last()
-                    .copied()
-                    .unwrap_or(TokenId::new(0));
-                // pos_offset = position of the NEW token. Compute from
-                // engine bookkeeping (see process_batch_unified for why
-                // `kv_cache.block_table().sequence_length` is not reliable
-                // — Paged/Default handles never increment it).
-                let pos_offset = seq.input_tokens.len() + seq.generated_tokens.len() - 1;
-                // Use the model-side cache_id (set in `run_prefill_inner`
-                // from `prefill_output.kv_cache.cache_id()`), NOT the
-                // engine's request_id. The model's `kv_caches` is keyed
-                // by the executor-generated id (e.g. "llm-cache-N"); using
-                // the request_id (UUID) makes `ensure_kv` allocate a
-                // fresh cache + 128 paged blocks for every decode iter,
-                // exhausting the pool within ~60 prompts.
-                let seq_id = seq
-                    .model_cache_id
-                    .clone()
-                    .unwrap_or_else(|| rid.to_string());
                 batch.items.push(UnifiedBatchItem {
-                    seq_id,
-                    q_tokens: vec![last_token.get()],
-                    kv_cache,
-                    recurrent_state: seq.recurrent_state.clone(),
-                    pos_offset,
+                    seq_id: resources.seq_id,
+                    q_tokens: vec![resources.last_token.get()],
+                    kv_cache: resources.kv_cache,
+                    recurrent_state: resources.recurrent_state,
+                    pos_offset: resources.pos_offset,
                     is_final_chunk: true,
                     metadata: seq.model_decode_metadata(),
                     logits_policy: seq.model_decode_logits_policy(),
@@ -320,22 +296,15 @@ impl EngineInner {
             let seq = sequences
                 .get(request_id)
                 .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
-            let kv_cache = seq
-                .kv_cache
-                .as_ref()
-                .ok_or_else(|| FerrumError::internal("No KV cache"))?
-                .clone();
-            let recurrent_state = seq.recurrent_state.clone();
-            let last_token = seq
-                .generated_tokens
-                .last()
-                .copied()
-                .unwrap_or(TokenId::new(0));
-            let tensor = self.tokens_to_tensor(&[last_token.get()])?;
-            let input = ferrum_interfaces::model_executor::DecodeInput::new(tensor, kv_cache)
-                .with_metadata(seq.model_decode_metadata())
-                .with_logits_policy(seq.model_decode_logits_policy());
-            if let Some(state) = recurrent_state {
+            let resources = seq
+                .decode_resources(request_id)
+                .ok_or_else(|| FerrumError::internal("No KV cache"))?;
+            let tensor = self.tokens_to_tensor(&[resources.last_token.get()])?;
+            let input =
+                ferrum_interfaces::model_executor::DecodeInput::new(tensor, resources.kv_cache)
+                    .with_metadata(seq.model_decode_metadata())
+                    .with_logits_policy(seq.model_decode_logits_policy());
+            if let Some(state) = resources.recurrent_state {
                 input.with_recurrent_state(state)
             } else {
                 input
@@ -444,7 +413,7 @@ impl EngineInner {
             let sequences = self.sequences.read();
             sequences
                 .get(request_id)
-                .and_then(|s| s.draft_kv_cache.clone())
+                .and_then(SequenceState::draft_kv_cache_handle)
         };
         let draft_kv = if let Some(kv) = draft_kv_ready {
             kv

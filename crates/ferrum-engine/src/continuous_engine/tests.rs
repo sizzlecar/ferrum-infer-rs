@@ -1618,6 +1618,15 @@ fn sequence_prefill_commit_helpers_keep_resource_metadata_together() {
     assert!(sequence.recurrent_state_slots.is_none());
     assert!(sequence.prefill_complete);
     assert_eq!(sequence.phase, RequestPhase::Decoding);
+
+    let resources = sequence.prefill_resources();
+    assert!(resources.kv_cache.is_some());
+    assert_eq!(resources.kv_resource_blocks, Some(4));
+    assert!(resources.recurrent_state.is_none());
+    assert_eq!(
+        resources.prefill_tokens_processed,
+        sequence.prefill_tokens_processed
+    );
 }
 
 #[test]
@@ -1689,6 +1698,12 @@ fn sequence_decode_commit_helpers_keep_resource_metadata_together() {
     assert!(sequence.kv_cache.is_some());
     assert_eq!(sequence.tokens_this_iteration, 1);
     assert_eq!(sequence.model_cache_id.as_deref(), Some("model-cache"));
+    let decode_resources = sequence
+        .decode_resources(&request_id)
+        .expect("decode resources");
+    assert_eq!(decode_resources.seq_id, "model-cache");
+    assert_eq!(decode_resources.last_token, TokenId::new(7));
+    assert_eq!(decode_resources.pos_offset, 2);
 
     sequence.recurrent_state_slots = Some(1);
     sequence.commit_decode_recurrent_state(None);
@@ -1713,6 +1728,7 @@ fn sequence_decode_commit_helpers_keep_resource_metadata_together() {
     sequence.commit_draft_kv_allocation(draft_kv, draft_request_id.clone(), 0);
     assert_eq!(sequence.draft_kv_request_id, Some(draft_request_id));
     assert_eq!(sequence.draft_kv_resource_blocks, Some(1));
+    assert!(sequence.draft_kv_cache_handle().is_some());
 }
 
 #[tokio::test]
