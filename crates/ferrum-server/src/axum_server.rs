@@ -22,17 +22,21 @@ use axum::{
 };
 use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
 use ferrum_types::{
-    EngineMetrics, EngineStatus, FerrumConfigBuilder, FerrumError as Error, FinishReason,
-    InferenceRequest, InferenceResponse, ModelId, Priority, RequestId, ResolvedFerrumConfig,
-    RuntimeConfigSnapshot, SamplingParams, TokenId, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY,
+    EngineMetrics, EngineStatus, FerrumConfigBuilder, FerrumError as Error, FerrumProfileEvent,
+    FinishReason, InferenceRequest, InferenceResponse, ModelId, Priority, ProfileEntrypoint,
+    ProfileError, ProfileEventKind, ProfileStatus, ReplayReference, RequestId,
+    ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent, RuntimeConfigSnapshot,
+    SamplingParams, TokenId, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY,
     DEFAULT_MAX_TOKENS_METADATA_KEY, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
@@ -218,6 +222,7 @@ pub struct AppState {
     pub prompt_template: Option<Arc<ModelChatTemplate>>,
     pub lora_registry: Arc<LoraModelRegistry>,
     pub request_dump_dir: Option<Arc<PathBuf>>,
+    pub profile_jsonl: Option<Arc<PathBuf>>,
     cache: Arc<CacheRuntimeState>,
 }
 
@@ -345,6 +350,11 @@ impl AppState {
 
     pub fn with_request_dump_dir(mut self, request_dump_dir: Option<PathBuf>) -> Self {
         self.request_dump_dir = request_dump_dir.map(Arc::new);
+        self
+    }
+
+    pub fn with_profile_jsonl(mut self, profile_jsonl: Option<PathBuf>) -> Self {
+        self.profile_jsonl = profile_jsonl.map(Arc::new);
         self
     }
 
@@ -814,7 +824,8 @@ impl HttpServer for AxumServer {
         let app = self.build_router_with_state(
             self.state
                 .clone()
-                .with_request_dump_dir(config.request_dump_dir.clone()),
+                .with_request_dump_dir(config.request_dump_dir.clone())
+                .with_profile_jsonl(config.profile_jsonl.clone()),
         );
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
@@ -1152,6 +1163,130 @@ fn write_chat_request_completion_replay_bundle(
         ),
     )
     .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_chat_request_profile_event(
+    state: &AppState,
+    request_id: &str,
+    model: &str,
+    stream: bool,
+    phase: &str,
+    started_at: Instant,
+    output_token_count: usize,
+    finish_reason: Option<&str>,
+    error: Option<ProfileError>,
+) -> std::result::Result<(), String> {
+    let Some(path) = state.profile_jsonl.as_ref() else {
+        return Ok(());
+    };
+    let timestamp = chrono::Utc::now();
+    let status = if error.is_some() {
+        ProfileStatus::Failure
+    } else {
+        ProfileStatus::Ok
+    };
+    let mut attributes = BTreeMap::from([
+        ("actual_model_smoke".to_string(), serde_json::json!(true)),
+        ("diagnostic_only".to_string(), serde_json::json!(false)),
+        (
+            "endpoint".to_string(),
+            serde_json::json!("/v1/chat/completions"),
+        ),
+        ("l0_only".to_string(), serde_json::json!(false)),
+        ("profile_detail".to_string(), serde_json::json!("basic")),
+        ("stream".to_string(), serde_json::json!(stream)),
+        (
+            "output_token_count".to_string(),
+            serde_json::json!(output_token_count),
+        ),
+    ]);
+    if let Some(reason) = finish_reason {
+        attributes.insert("finish_reason".to_string(), serde_json::json!(reason));
+    }
+    if status == ProfileStatus::Failure {
+        attributes.insert("first_failure_event".to_string(), serde_json::json!(true));
+    }
+
+    let replay = state.request_dump_dir.as_ref().map(|root| {
+        let bundle_dir = root.join(request_id);
+        ReplayReference {
+            command: replay_curl_command(&bundle_dir),
+            bundle_dir: Some(root.to_string_lossy().to_string()),
+        }
+    });
+    let resource = error.as_ref().map(|error| ResourceTraceEvent {
+        owner_kind: "request".to_string(),
+        owner_id: request_id.to_string(),
+        resource_kind: "chat_request".to_string(),
+        action: ResourceAction::Reject,
+        amount: None,
+        before: None,
+        after: None,
+        capacity: Some(1),
+        underflow_amount: None,
+        reason: Some(error.message.clone()),
+        error_kind: Some(error.kind.clone()),
+        message: Some(error.message.clone()),
+        resource_error_kind: Some(error.kind.clone()),
+    });
+    let event = FerrumProfileEvent {
+        schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+        ts_unix_nanos: timestamp
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000),
+        event_id: format!(
+            "evt-server-chat-{}-{request_id}",
+            if stream { "stream" } else { "sync" }
+        ),
+        request_id: request_id.to_string(),
+        correlation_id: Some(request_id.to_string()),
+        entrypoint: ProfileEntrypoint::Serve,
+        backend: "actual".to_string(),
+        runtime_preset_hash: state
+            .auto_config
+            .as_ref()
+            .map(ResolvedFerrumConfig::runtime_env_hash)
+            .unwrap_or_else(|| format!("sha256:{}", sha256_hex(b"serve-profile"))),
+        phase: phase.to_string(),
+        event_kind: if status == ProfileStatus::Failure {
+            ProfileEventKind::Error
+        } else {
+            ProfileEventKind::TimedSpan
+        },
+        timestamp,
+        status,
+        model: Some(model.to_string()),
+        duration_us: Some(
+            started_at
+                .elapsed()
+                .as_micros()
+                .max(1)
+                .try_into()
+                .unwrap_or(u64::MAX),
+        ),
+        memory: None,
+        resource,
+        error,
+        replay,
+        shape: BTreeMap::from([("batch_size".to_string(), serde_json::json!(1))]),
+        backend_detail: None,
+        attributes,
+    };
+    event.validate().map_err(|err| err.to_string())?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path.as_path())
+        .map_err(|err| err.to_string())?;
+    let line = serde_json::to_string(&event).map_err(|err| err.to_string())?;
+    file.write_all(line.as_bytes())
+        .and_then(|_| file.write_all(b"\n"))
+        .map_err(|err| err.to_string())?;
     Ok(())
 }
 
@@ -1671,12 +1806,31 @@ async fn handle_chat_completions_stream(
     // the parser must know generation starts mid-think.
     let started_in_think = has_unclosed_thinking_block(&inference_request.prompt);
     let replay_request_id = inference_request.id.to_string();
+    let profile_request_model = openai_request.model.clone();
+    let profile_started_at = Instant::now();
     let mut stream = match engine.infer_stream(inference_request).await {
         Ok(stream) => stream,
         Err(e) => {
             let failure_kind = e.observability_failure_kind();
             let error_kind = e.observability_error_kind();
             let error_message = e.to_string();
+            if let Err(err) = write_chat_request_profile_event(
+                &state,
+                &replay_request_id,
+                &profile_request_model,
+                true,
+                "chat_completions_stream_start",
+                profile_started_at,
+                0,
+                Some("error"),
+                Some(ProfileError {
+                    kind: error_kind.to_string(),
+                    message: error_message.clone(),
+                    blocking: true,
+                }),
+            ) {
+                warn!("failed to write chat stream failure profile event: {}", err);
+            }
             let engine_status = if chat_resource_failure_kind(failure_kind) {
                 Some(engine.status().await)
             } else {
@@ -1713,6 +1867,7 @@ async fn handle_chat_completions_stream(
         .as_ref()
         .map(|config| config.admission_summary_document());
     let diagnostics_engine = engine.clone();
+    let profile_state = state.clone();
 
     tokio::spawn(async move {
         let mut current_text = String::new();
@@ -1945,6 +2100,19 @@ async fn handle_chat_completions_stream(
                         ) {
                             warn!("failed to write chat stream replay bundle: {}", err);
                         }
+                        if let Err(err) = write_chat_request_profile_event(
+                            &profile_state,
+                            &replay_request_id,
+                            &profile_request_model,
+                            true,
+                            "chat_completions_stream_complete",
+                            profile_started_at,
+                            output_token_ids.len(),
+                            final_finish_reason.as_deref(),
+                            None,
+                        ) {
+                            warn!("failed to write chat stream profile event: {}", err);
+                        }
                         if include_stream_usage && usage.is_some() {
                             let usage_chunk = ChatCompletionsResponse {
                                 id: request_id.clone(),
@@ -1973,6 +2141,23 @@ async fn handle_chat_completions_stream(
                         None
                     };
                     error!("Stream generation error: {}", error_message);
+                    if let Err(err) = write_chat_request_profile_event(
+                        &profile_state,
+                        &replay_request_id,
+                        &profile_request_model,
+                        true,
+                        "chat_completions_stream_next",
+                        profile_started_at,
+                        output_token_ids.len(),
+                        Some("error"),
+                        Some(ProfileError {
+                            kind: error_kind.to_string(),
+                            message: error_message.clone(),
+                            blocking: true,
+                        }),
+                    ) {
+                        warn!("failed to write chat stream chunk profile event: {}", err);
+                    }
                     if let Err(err) = write_chat_request_failure_diagnostics_at_root(
                         request_dump_dir.as_ref().map(|root| root.as_path()),
                         admission_summary.as_ref(),
@@ -2031,6 +2216,8 @@ async fn handle_chat_completions_sync(
     // R1-distill-style templates open the think block inside the prompt.
     let started_in_think = has_unclosed_thinking_block(&inference_request.prompt);
     let replay_request_id = inference_request.id.to_string();
+    let profile_request_model = openai_request.model.clone();
+    let profile_started_at = Instant::now();
     match engine.infer(inference_request).await {
         Ok(output) => {
             let InferenceResponse {
@@ -2101,12 +2288,50 @@ async fn handle_chat_completions_sync(
                     &parsed.content,
                     parsed.reasoning.as_deref(),
                 );
+                if let Err(err) = write_chat_request_profile_event(
+                    &state,
+                    &replay_request_id,
+                    &profile_request_model,
+                    false,
+                    "chat_completions_sync_tool_choice",
+                    profile_started_at,
+                    tokens.len(),
+                    Some("error"),
+                    Some(ProfileError {
+                        kind: "required_tool_failure".to_string(),
+                        message: "model output did not satisfy required tool_choice".to_string(),
+                        blocking: true,
+                    }),
+                ) {
+                    warn!("failed to write chat tool-choice profile event: {}", err);
+                }
                 return Err(ServerError::invalid_request(
                     "model output did not satisfy required tool_choice",
                     Some("tool_choice"),
                 ));
             }
-            validate_strict_json_schema_response(&openai_request, &message.content)?;
+            if let Err(error) =
+                validate_strict_json_schema_response(&openai_request, &message.content)
+            {
+                if let Err(err) = write_chat_request_profile_event(
+                    &state,
+                    &replay_request_id,
+                    &profile_request_model,
+                    false,
+                    "chat_completions_sync_strict_schema",
+                    profile_started_at,
+                    tokens.len(),
+                    Some("error"),
+                    Some(ProfileError {
+                        kind: "strict_schema_failure".to_string(),
+                        message: format!("{error:?}"),
+                        blocking: true,
+                    }),
+                ) {
+                    warn!("failed to write chat strict-schema profile event: {}", err);
+                }
+                return Err(error);
+            }
             if let Err(err) = write_chat_request_completion_replay_bundle(
                 state.request_dump_dir.as_ref().map(|root| root.as_path()),
                 &replay_request_id,
@@ -2115,6 +2340,19 @@ async fn handle_chat_completions_sync(
                 Some(&openai_finish_reason),
             ) {
                 warn!("failed to write chat completion replay bundle: {}", err);
+            }
+            if let Err(err) = write_chat_request_profile_event(
+                &state,
+                &replay_request_id,
+                &profile_request_model,
+                false,
+                "chat_completions_sync_complete",
+                profile_started_at,
+                tokens.len(),
+                Some(&openai_finish_reason),
+                None,
+            ) {
+                warn!("failed to write chat sync profile event: {}", err);
             }
             state
                 .cache
@@ -2145,6 +2383,23 @@ async fn handle_chat_completions_sync(
                 None
             };
             error!("Generation failed: {}", error_message);
+            if let Err(err) = write_chat_request_profile_event(
+                &state,
+                &replay_request_id,
+                &profile_request_model,
+                false,
+                "chat_completions_sync",
+                profile_started_at,
+                0,
+                Some("error"),
+                Some(ProfileError {
+                    kind: error_kind.to_string(),
+                    message: error_message.clone(),
+                    blocking: true,
+                }),
+            ) {
+                warn!("failed to write chat sync failure profile event: {}", err);
+            }
             if let Err(err) = write_chat_request_failure_diagnostics(
                 &state,
                 &replay_request_id,
@@ -4855,6 +5110,20 @@ mod tests {
         .build_router()
     }
 
+    fn router_with_stub_request_dump_and_profile(
+        text: &str,
+        request_dump_dir: PathBuf,
+        profile_jsonl: PathBuf,
+    ) -> Router {
+        AxumServer::from_state(
+            AppState::default()
+                .with_llm(Arc::new(StubLlm::new(text)))
+                .with_request_dump_dir(Some(request_dump_dir))
+                .with_profile_jsonl(Some(profile_jsonl)),
+        )
+        .build_router()
+    }
+
     fn router_with_stub_stream_chunks(chunks: &[&str]) -> Router {
         AxumServer::from_llm(Arc::new(StubLlm::with_stream_chunks(chunks))).build_router()
     }
@@ -4867,6 +5136,20 @@ mod tests {
             AppState::default()
                 .with_llm(Arc::new(StubLlm::with_stream_chunks(chunks)))
                 .with_request_dump_dir(Some(request_dump_dir)),
+        )
+        .build_router()
+    }
+
+    fn router_with_stub_stream_request_dump_and_profile(
+        chunks: &[&str],
+        request_dump_dir: PathBuf,
+        profile_jsonl: PathBuf,
+    ) -> Router {
+        AxumServer::from_state(
+            AppState::default()
+                .with_llm(Arc::new(StubLlm::with_stream_chunks(chunks)))
+                .with_request_dump_dir(Some(request_dump_dir))
+                .with_profile_jsonl(Some(profile_jsonl)),
         )
         .build_router()
     }
@@ -4944,6 +5227,13 @@ mod tests {
         path
     }
 
+    fn unique_profile_jsonl(test_name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ferrum-server-{test_name}-{}.jsonl",
+            Uuid::new_v4()
+        ))
+    }
+
     fn only_replay_bundle(root: &Path) -> PathBuf {
         let mut dirs = fs::read_dir(root)
             .expect("read request dump dir")
@@ -4969,6 +5259,15 @@ mod tests {
         serde_json::from_str(&text).unwrap_or_else(|err| {
             panic!("failed to parse {}: {}", path.display(), err);
         })
+    }
+
+    fn read_profile_events(path: &Path) -> Vec<Value> {
+        let text = fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {}", path.display(), err));
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<Value>(line).expect("profile event json"))
+            .collect()
     }
 
     fn assert_chat_failure_replay_bundle(
@@ -7049,6 +7348,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_chat_sync_success_writes_product_profile_event() {
+        let root = unique_request_dump_dir("chat-sync-profile");
+        let profile = unique_profile_jsonl("chat-sync-profile");
+        let response = post_json(
+            router_with_stub_request_dump_and_profile("OK", root.clone(), profile.clone()),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let _ = response_json(response).await;
+
+        let events = read_profile_events(&profile);
+        assert_eq!(events.len(), 1, "events: {events:#?}");
+        let event = &events[0];
+        assert_eq!(
+            event["schema_version"],
+            OBSERVABILITY_PROFILE_SCHEMA_VERSION
+        );
+        assert_eq!(event["entrypoint"], "serve");
+        assert_eq!(event["event_kind"], "timed_span");
+        assert_eq!(event["status"], "ok");
+        assert_eq!(event["phase"], "chat_completions_sync_complete");
+        assert_eq!(event["attributes"]["actual_model_smoke"], true);
+        assert_eq!(event["attributes"]["stream"], false);
+        assert_eq!(event["attributes"]["output_token_count"], 2);
+        assert_eq!(event["attributes"]["finish_reason"], "stop");
+        assert!(event["duration_us"].as_u64().unwrap_or_default() > 0);
+        assert_eq!(
+            event["replay"]["bundle_dir"].as_str(),
+            Some(root.to_string_lossy().as_ref())
+        );
+        assert!(event["replay"]["command"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("replay_body.json"));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(profile);
+    }
+
+    #[tokio::test]
     async fn route_chat_stream_success_updates_replay_output_tokens() {
         let root = unique_request_dump_dir("chat-stream-success-output");
         let response = post_json(
@@ -7066,6 +7409,52 @@ mod tests {
         assert!(body.contains("data: [DONE]"), "body: {body}");
         assert_chat_success_replay_bundle(&root, &[11, 12], "stop", "OK");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn route_chat_stream_success_writes_product_profile_event() {
+        let root = unique_request_dump_dir("chat-stream-profile");
+        let profile = unique_profile_jsonl("chat-stream-profile");
+        let response = post_json(
+            router_with_stub_stream_request_dump_and_profile(
+                &["O", "K"],
+                root.clone(),
+                profile.clone(),
+            ),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "body: {body}");
+
+        let events = read_profile_events(&profile);
+        assert_eq!(events.len(), 1, "events: {events:#?}");
+        let event = &events[0];
+        assert_eq!(
+            event["schema_version"],
+            OBSERVABILITY_PROFILE_SCHEMA_VERSION
+        );
+        assert_eq!(event["entrypoint"], "serve");
+        assert_eq!(event["event_kind"], "timed_span");
+        assert_eq!(event["status"], "ok");
+        assert_eq!(event["phase"], "chat_completions_stream_complete");
+        assert_eq!(event["attributes"]["actual_model_smoke"], true);
+        assert_eq!(event["attributes"]["stream"], true);
+        assert_eq!(event["attributes"]["output_token_count"], 2);
+        assert_eq!(event["attributes"]["finish_reason"], "stop");
+        assert!(event["duration_us"].as_u64().unwrap_or_default() > 0);
+        assert_eq!(
+            event["replay"]["bundle_dir"].as_str(),
+            Some(root.to_string_lossy().as_ref())
+        );
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(profile);
     }
 
     #[tokio::test]
