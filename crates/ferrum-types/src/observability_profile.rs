@@ -5,8 +5,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 pub const OBSERVABILITY_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const DEFAULT_OBSERVABILITY_PROFILE_SAMPLE_RATE: f64 = 0.01;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +56,122 @@ pub enum ProfileStatus {
     Ok,
     Failure,
     DiagnosticOnly,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservabilityProfileDetail {
+    #[default]
+    Off,
+    Basic,
+    Debug,
+    Full,
+}
+
+impl ObservabilityProfileDetail {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "basic" => Some(Self::Basic),
+            "debug" => Some(Self::Debug),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Basic => "basic",
+            Self::Debug => "debug",
+            Self::Full => "full",
+        }
+    }
+
+    pub fn diagnostic_only(self) -> bool {
+        matches!(self, Self::Debug | Self::Full)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FerrumObservabilityConfig {
+    pub entrypoint: ProfileEntrypoint,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_jsonl: Option<PathBuf>,
+    pub profile_detail: ObservabilityProfileDetail,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_profile_jsonl: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_trace_jsonl: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_dump_dir: Option<PathBuf>,
+    pub profile_sample_rate: f64,
+}
+
+impl FerrumObservabilityConfig {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        entrypoint: ProfileEntrypoint,
+        model: impl Into<String>,
+        profile_jsonl: Option<PathBuf>,
+        profile_detail: ObservabilityProfileDetail,
+        memory_profile_jsonl: Option<PathBuf>,
+        scheduler_trace_jsonl: Option<PathBuf>,
+        request_dump_dir: Option<PathBuf>,
+        profile_sample_rate: f64,
+    ) -> Self {
+        Self {
+            entrypoint,
+            model: model.into(),
+            profile_jsonl,
+            profile_detail,
+            memory_profile_jsonl,
+            scheduler_trace_jsonl,
+            request_dump_dir,
+            profile_sample_rate,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.profile_detail != ObservabilityProfileDetail::Off
+            || self.profile_jsonl.is_some()
+            || self.memory_profile_jsonl.is_some()
+            || self.scheduler_trace_jsonl.is_some()
+            || self.request_dump_dir.is_some()
+    }
+
+    pub fn synthetic_no_weight_enabled(&self) -> bool {
+        self.enabled() && self.model == "synthetic/no-weight"
+    }
+
+    pub fn unified_product_profile_enabled(&self) -> bool {
+        self.enabled()
+            && (self.profile_detail != ObservabilityProfileDetail::Off
+                || self.memory_profile_jsonl.is_some()
+                || self.scheduler_trace_jsonl.is_some()
+                || self.request_dump_dir.is_some())
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !self.profile_sample_rate.is_finite()
+            || self.profile_sample_rate < 0.0
+            || self.profile_sample_rate > 1.0
+        {
+            return Err("profile_sample_rate must be between 0.0 and 1.0".to_string());
+        }
+        if self.enabled()
+            && self.profile_jsonl.is_none()
+            && self.memory_profile_jsonl.is_none()
+            && self.scheduler_trace_jsonl.is_none()
+            && self.request_dump_dir.is_none()
+        {
+            return Err(
+                "observability profile detail requires at least one artifact path".to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,5 +364,47 @@ mod tests {
         let mut missing_correlation = base_event();
         missing_correlation.correlation_id = None;
         assert!(missing_correlation.validate().is_err());
+    }
+
+    #[test]
+    fn observability_config_requires_artifact_path_when_detail_enabled() {
+        let config = FerrumObservabilityConfig::new(
+            ProfileEntrypoint::Run,
+            "synthetic/no-weight",
+            None,
+            ObservabilityProfileDetail::Basic,
+            None,
+            None,
+            None,
+            DEFAULT_OBSERVABILITY_PROFILE_SAMPLE_RATE,
+        );
+        assert!(config.enabled());
+        assert!(config.synthetic_no_weight_enabled());
+        assert!(config.validate().is_err());
+
+        let with_artifact = FerrumObservabilityConfig::new(
+            ProfileEntrypoint::Serve,
+            "synthetic/no-weight",
+            Some(PathBuf::from("profile.jsonl")),
+            ObservabilityProfileDetail::Basic,
+            None,
+            None,
+            None,
+            DEFAULT_OBSERVABILITY_PROFILE_SAMPLE_RATE,
+        );
+        assert!(with_artifact.validate().is_ok());
+        assert!(with_artifact.unified_product_profile_enabled());
+
+        let invalid_sample_rate = FerrumObservabilityConfig::new(
+            ProfileEntrypoint::Run,
+            "model",
+            Some(PathBuf::from("profile.jsonl")),
+            ObservabilityProfileDetail::Off,
+            None,
+            None,
+            None,
+            1.1,
+        );
+        assert!(invalid_sample_rate.validate().is_err());
     }
 }
