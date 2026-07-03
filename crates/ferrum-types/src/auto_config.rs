@@ -4,8 +4,8 @@
 //! env bundles with validated model/hardware/workload driven selections.
 
 use crate::{
-    parse_bool_env_value, parse_usize_env_value, RuntimeConfigEffect, RuntimeConfigEntry,
-    RuntimeConfigSnapshot, RuntimeConfigSource,
+    is_sha256_digest, parse_bool_env_value, parse_usize_env_value, RuntimeConfigEffect,
+    RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -17,6 +17,10 @@ pub const QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET: &str =
 const DEFAULT_KV_BLOCK_SIZE_TOKENS: usize = 16;
 const DEFAULT_KV_BLOCKS: usize = 2048;
 const GIB: u64 = 1024 * 1024 * 1024;
+const FA2_NATIVE_MANIFEST_KEY: &str = "FERRUM_FA2_NATIVE_MANIFEST";
+const FA2_NATIVE_ARTIFACT_KEY: &str = "FERRUM_FA2_NATIVE_ARTIFACT";
+const FA2_NATIVE_SOURCE_SHA256_KEY: &str = "FERRUM_FA2_NATIVE_SOURCE_SHA256";
+const FA2_NATIVE_INPUTS_SHA256_KEY: &str = "FERRUM_FA2_NATIVE_INPUTS_SHA256";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
@@ -646,6 +650,10 @@ impl FerrumConfigBuilder {
                 AutoConfigSource::Default
             },
         )?;
+        let fa2_native_manifest = self.optional_string_value(FA2_NATIVE_MANIFEST_KEY)?;
+        let fa2_native_artifact = self.optional_string_value(FA2_NATIVE_ARTIFACT_KEY)?;
+        let fa2_native_source_sha256 = self.optional_string_value(FA2_NATIVE_SOURCE_SHA256_KEY)?;
+        let fa2_native_inputs_sha256 = self.optional_string_value(FA2_NATIVE_INPUTS_SHA256_KEY)?;
         let vllm_v1_short = self.bool_value(
             "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
             use_vllm_paged_attn.value && self.model.head_dim.unwrap_or(128) <= 128,
@@ -747,6 +755,14 @@ impl FerrumConfigBuilder {
             shim_present,
             vllm_v1_short.value,
         )?;
+        self.validate_fa2_native_artifact(
+            fa2_native_manifest.as_ref(),
+            fa2_native_artifact.as_ref(),
+            fa2_native_source_sha256.as_ref(),
+            fa2_native_inputs_sha256.as_ref(),
+            fa2_source.value,
+            fa2_direct_ffi.value,
+        )?;
         self.validate_moe(
             vllm_moe.value,
             device_route.value,
@@ -775,6 +791,10 @@ impl FerrumConfigBuilder {
             fa_layout,
             fa2_source,
             fa2_direct_ffi,
+        ));
+        decisions.push(self.fa2_native_artifact_decision(
+            fa2_native_manifest.as_ref(),
+            fa2_native_artifact.as_ref(),
         ));
         decisions.push(
             self.attention_decode_decision(use_vllm_paged_attn.clone(), vllm_v1_short.clone()),
@@ -1190,6 +1210,26 @@ impl FerrumConfigBuilder {
         }
     }
 
+    fn optional_string_value(
+        &self,
+        key: &str,
+    ) -> Result<Option<ResolvedValue<String>>, AutoConfigError> {
+        match self.entry(key) {
+            Some(entry) if entry.effective_value.trim().is_empty() => {
+                Err(AutoConfigError::InvalidOverride {
+                    key: key.to_string(),
+                    reason: "must be non-empty".to_string(),
+                })
+            }
+            Some(entry) => Ok(Some(ResolvedValue {
+                value: entry.effective_value.clone(),
+                source: auto_config_source_from_runtime(entry.source),
+                source_key: Some(key.to_string()),
+            })),
+            None => Ok(None),
+        }
+    }
+
     fn validate_attention(
         &self,
         use_vllm_paged_attn: bool,
@@ -1257,6 +1297,64 @@ impl FerrumConfigBuilder {
             return self.invalid(
                 "FERRUM_VLLM_PAGED_ATTN_V1_SHORT",
                 "short-context v1 requires vLLM paged attention",
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_fa2_native_artifact(
+        &self,
+        manifest: Option<&ResolvedValue<String>>,
+        artifact: Option<&ResolvedValue<String>>,
+        source_sha256: Option<&ResolvedValue<String>>,
+        inputs_sha256: Option<&ResolvedValue<String>>,
+        fa2_source: bool,
+        fa2_direct_ffi: bool,
+    ) -> Result<(), AutoConfigError> {
+        let configured = manifest.is_some() || artifact.is_some();
+        if manifest.is_some() != artifact.is_some() {
+            let key = if manifest.is_none() {
+                FA2_NATIVE_MANIFEST_KEY
+            } else {
+                FA2_NATIVE_ARTIFACT_KEY
+            };
+            return self.invalid(
+                key,
+                "FA2 native operator manifest and artifact must be configured together",
+            );
+        }
+        for (key, value) in [
+            (FA2_NATIVE_SOURCE_SHA256_KEY, source_sha256),
+            (FA2_NATIVE_INPUTS_SHA256_KEY, inputs_sha256),
+        ] {
+            if let Some(value) = value {
+                if !is_sha256_digest(&value.value) {
+                    return self.invalid(key, "must be a lowercase hex sha256 digest");
+                }
+                if !configured {
+                    return self.invalid(
+                        key,
+                        "sha256 pins require FA2 native operator manifest and artifact",
+                    );
+                }
+            }
+        }
+        if configured && !self.is_cuda_backend() {
+            return self.invalid(
+                FA2_NATIVE_MANIFEST_KEY,
+                "FA2 native operator artifacts require CUDA backend",
+            );
+        }
+        if configured && fa2_source {
+            return self.unsupported(
+                "attention_prefill_mixed_backend",
+                "FA2 native operator artifact cannot be combined with removed source-linked FA2",
+            );
+        }
+        if configured && fa2_direct_ffi {
+            return self.unsupported(
+                "attention_prefill_mixed_backend",
+                "FA2 native operator artifact and diagnostic direct FFI shim cannot both own the prefill path",
             );
         }
         Ok(())
@@ -1577,6 +1675,46 @@ impl FerrumConfigBuilder {
             vec![
                 RuntimeConfigEffect::Performance,
                 RuntimeConfigEffect::Memory,
+            ],
+        )
+    }
+
+    fn fa2_native_artifact_decision(
+        &self,
+        manifest: Option<&ResolvedValue<String>>,
+        artifact: Option<&ResolvedValue<String>>,
+    ) -> AutoConfigDecision {
+        let configured = manifest.is_some() && artifact.is_some();
+        let selected = if configured {
+            "configured"
+        } else {
+            "not_configured"
+        };
+        let (source, source_key) = manifest
+            .map(|manifest| (manifest.source, manifest.source_key.clone()))
+            .unwrap_or((AutoConfigSource::Default, None));
+        self.decision(
+            "fa2_native_operator_artifact",
+            selected,
+            source,
+            source_key,
+            ["configured", "not_configured"],
+            self.rejected_except(
+                selected,
+                [
+                    (
+                        "configured",
+                        "no typed FA2 native operator manifest/artifact was configured",
+                    ),
+                    (
+                        "not_configured",
+                        "typed FA2 native operator manifest/artifact is present",
+                    ),
+                ],
+            ),
+            vec![
+                RuntimeConfigEffect::Correctness,
+                RuntimeConfigEffect::Performance,
             ],
         )
     }
@@ -2845,6 +2983,106 @@ mod tests {
     #[test]
     fn source_fa2_is_rejected_when_not_compiled() {
         expect_invalid_key(&[("FERRUM_FA2_SOURCE", "1")], "FERRUM_FA2_SOURCE");
+    }
+
+    #[test]
+    fn fa2_native_artifact_typed_config_is_recorded_without_selecting_runtime_path() {
+        let resolved = m3(
+            &[
+                (
+                    FA2_NATIVE_MANIFEST_KEY,
+                    "/tmp/native/fa2/native_operator_manifest.json",
+                ),
+                (
+                    FA2_NATIVE_ARTIFACT_KEY,
+                    "/tmp/native/fa2/libferrum_native_fa2.a",
+                ),
+                (
+                    FA2_NATIVE_SOURCE_SHA256_KEY,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ),
+                (
+                    FA2_NATIVE_INPUTS_SHA256_KEY,
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                ),
+            ],
+            CompiledKernelFeatures::m3_fast_path_without_fa2(),
+        )
+        .resolve()
+        .unwrap();
+
+        let decisions: BTreeMap<_, _> = resolved
+            .decisions
+            .iter()
+            .map(|decision| (decision.selection.as_str(), decision.selected.as_str()))
+            .collect();
+        assert_eq!(decisions["fa2_native_operator_artifact"], "configured");
+        assert_ne!(decisions["attention_prefill_mixed_backend"], "fa2_native");
+        assert!(resolved
+            .runtime_config
+            .entries
+            .iter()
+            .any(|entry| entry.key == FA2_NATIVE_MANIFEST_KEY
+                && entry.source == RuntimeConfigSource::Env));
+    }
+
+    #[test]
+    fn fa2_native_artifact_requires_manifest_artifact_pair_and_valid_pins() {
+        expect_invalid_key(
+            &[(
+                FA2_NATIVE_MANIFEST_KEY,
+                "/tmp/native/fa2/native_operator_manifest.json",
+            )],
+            FA2_NATIVE_ARTIFACT_KEY,
+        );
+        expect_invalid_key(
+            &[(
+                FA2_NATIVE_ARTIFACT_KEY,
+                "/tmp/native/fa2/libferrum_native_fa2.a",
+            )],
+            FA2_NATIVE_MANIFEST_KEY,
+        );
+        expect_invalid_key(
+            &[
+                (
+                    FA2_NATIVE_MANIFEST_KEY,
+                    "/tmp/native/fa2/native_operator_manifest.json",
+                ),
+                (
+                    FA2_NATIVE_ARTIFACT_KEY,
+                    "/tmp/native/fa2/libferrum_native_fa2.a",
+                ),
+                (FA2_NATIVE_SOURCE_SHA256_KEY, "not-a-sha"),
+            ],
+            FA2_NATIVE_SOURCE_SHA256_KEY,
+        );
+        expect_invalid_key(
+            &[(
+                FA2_NATIVE_INPUTS_SHA256_KEY,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )],
+            FA2_NATIVE_INPUTS_SHA256_KEY,
+        );
+    }
+
+    #[test]
+    fn fa2_native_artifact_requires_cuda_backend() {
+        let hardware =
+            cpu_hardware_with_features(CompiledKernelFeatures::m3_fast_path_without_fa2());
+        expect_invalid_key_with_hardware(
+            &[
+                (
+                    FA2_NATIVE_MANIFEST_KEY,
+                    "/tmp/native/fa2/native_operator_manifest.json",
+                ),
+                (
+                    FA2_NATIVE_ARTIFACT_KEY,
+                    "/tmp/native/fa2/libferrum_native_fa2.a",
+                ),
+            ],
+            FA2_NATIVE_MANIFEST_KEY,
+            hardware,
+        );
     }
 
     #[test]

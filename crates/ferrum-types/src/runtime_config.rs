@@ -241,6 +241,8 @@ fn infer_effects(key: &str) -> Vec<RuntimeConfigEffect> {
     if key.contains("PREFIX_CACHE")
         || key.contains("MODEL_PATH")
         || key.contains("MODEL_LEN")
+        || key.contains("NATIVE")
+        || key.contains("ARTIFACT")
         || key.contains("SPEC_")
         || key.contains("REF_")
         || key.contains("DTYPE")
@@ -319,6 +321,7 @@ mod tests {
     fn snapshot_is_sorted_and_classified() {
         let snapshot = RuntimeConfigSnapshot::from_env_vars([
             ("OTHER_ENV", "ignored"),
+            ("FERRUM_FA2_NATIVE_ARTIFACT", "/tmp/libferrum_native_fa2.a"),
             ("FERRUM_PREFIX_CACHE", "1"),
             ("FERRUM_MOE_GRAPH", "1"),
         ]);
@@ -327,12 +330,25 @@ mod tests {
             .iter()
             .map(|entry| entry.key.as_str())
             .collect();
-        assert_eq!(keys, vec!["FERRUM_MOE_GRAPH", "FERRUM_PREFIX_CACHE"]);
+        assert_eq!(
+            keys,
+            vec![
+                "FERRUM_FA2_NATIVE_ARTIFACT",
+                "FERRUM_MOE_GRAPH",
+                "FERRUM_PREFIX_CACHE"
+            ]
+        );
         assert_eq!(snapshot.entries[0].source, RuntimeConfigSource::Env);
+        assert!(snapshot.entries[0]
+            .affects
+            .contains(&RuntimeConfigEffect::Correctness));
         assert!(snapshot.entries[0]
             .affects
             .contains(&RuntimeConfigEffect::Performance));
         assert!(snapshot.entries[1]
+            .affects
+            .contains(&RuntimeConfigEffect::Performance));
+        assert!(snapshot.entries[2]
             .affects
             .contains(&RuntimeConfigEffect::Correctness));
     }
