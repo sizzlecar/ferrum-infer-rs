@@ -1332,7 +1332,7 @@ async fn process_batch_unified_co_batches_active_decode_with_fresh_prefill_chunk
     decode_seq.generated_tokens.push(TokenId::new(6));
     decode_seq.prefill_complete = true;
     decode_seq.prefill_tokens_processed = 1;
-    decode_seq.kv_cache = Some(decode_kv);
+    decode_seq.install_model_kv_without_owned_blocks(decode_kv);
     decode_seq.model_cache_id = Some("decode-cache".to_string());
     decode_seq.phase = RequestPhase::Decoding;
     {
@@ -1530,12 +1530,14 @@ async fn sequence_take_physical_resources_for_recompute_clears_owned_resources()
     let request_id = request.id.clone();
     let draft_request_id = RequestId::new();
     let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
-    sequence.kv_cache = Some(Arc::new(ferrum_testkit::MockKvCacheHandle::new(
-        request_id.clone(),
-        1,
-        1,
-    )));
-    sequence.kv_resource_blocks = Some(2);
+    sequence.install_model_kv(
+        Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+            request_id.clone(),
+            1,
+            1,
+        )),
+        Some(2),
+    );
     sequence.commit_draft_kv_allocation(
         Arc::new(ferrum_testkit::MockKvCacheHandle::new(
             draft_request_id.clone(),
@@ -1580,8 +1582,8 @@ async fn sequence_take_physical_resources_for_recompute_clears_owned_resources()
         Some(SequenceRecurrentAllocation::new(Some(1)))
     );
     assert_eq!(resources.model_cache_id.as_deref(), Some("model-cache"));
-    assert!(sequence.kv_cache.is_none());
-    assert!(sequence.kv_resource_blocks.is_none());
+    assert!(sequence.kv_cache_handle().is_none());
+    assert!(sequence.kv_resource_blocks().is_none());
     assert!(sequence.draft_kv.is_none());
     assert!(sequence.recurrent_state.is_none());
     assert!(sequence.recurrent_state_slots().is_none());
@@ -1616,8 +1618,8 @@ fn sequence_take_physical_resources_keeps_manager_handle_without_trace_blocks() 
         resources.model_cache_id.as_deref(),
         Some(model_cache_id.as_str())
     );
-    assert!(sequence.kv_cache.is_none());
-    assert!(sequence.kv_resource_blocks.is_none());
+    assert!(sequence.kv_cache_handle().is_none());
+    assert!(sequence.kv_resource_blocks().is_none());
 }
 
 #[test]
@@ -1650,12 +1652,12 @@ fn sequence_prefill_commit_helpers_keep_resource_metadata_together() {
     let model_cache_id = model_kv.cache_id();
 
     sequence.install_model_kv_without_owned_blocks(model_kv.clone());
-    assert!(sequence.kv_cache.is_some());
+    assert!(sequence.kv_cache_handle().is_some());
     assert_eq!(
         sequence.model_cache_id.as_deref(),
         Some(model_cache_id.as_str())
     );
-    assert!(sequence.kv_resource_blocks.is_none());
+    assert!(sequence.kv_resource_blocks().is_none());
 
     let cached_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
         RequestId::new(),
@@ -1668,8 +1670,8 @@ fn sequence_prefill_commit_helpers_keep_resource_metadata_together() {
         sequence.model_cache_id.as_deref(),
         Some(cached_cache_id.as_str())
     );
-    assert!(sequence.kv_cache.is_some());
-    assert_eq!(sequence.kv_resource_blocks, None);
+    assert!(sequence.kv_cache_handle().is_some());
+    assert_eq!(sequence.kv_resource_blocks(), None);
     assert_eq!(sequence.prefill_tokens_processed, 1);
     assert!(sequence.prefill_complete);
     assert_eq!(sequence.phase, RequestPhase::Decoding);
@@ -1686,16 +1688,16 @@ fn sequence_prefill_commit_helpers_keep_resource_metadata_together() {
         sequence.model_cache_id.as_deref(),
         Some(owned_cache_id.as_str())
     );
-    assert!(sequence.kv_cache.is_some());
-    assert_eq!(sequence.kv_resource_blocks, Some(4));
+    assert!(sequence.kv_cache_handle().is_some());
+    assert_eq!(sequence.kv_resource_blocks(), Some(4));
     assert!(sequence.recurrent_state.is_none());
     assert!(sequence.recurrent_state_slots().is_none());
     assert!(sequence.prefill_complete);
     assert_eq!(sequence.phase, RequestPhase::Decoding);
 
     let resources = sequence.prefill_resources();
-    assert!(resources.kv_cache.is_some());
-    assert_eq!(resources.kv_resource_blocks, Some(4));
+    assert!(resources.kv_cache_handle().is_some());
+    assert_eq!(resources.kv_resource_blocks(), Some(4));
     assert!(resources.recurrent_state.is_none());
     assert_eq!(
         resources.prefill_tokens_processed,
@@ -1723,8 +1725,8 @@ fn sequence_prefill_chunk_commit_tracks_partial_and_final_state() {
         sequence.model_cache_id.as_deref(),
         Some(partial_cache_id.as_str())
     );
-    assert!(sequence.kv_cache.is_some());
-    assert_eq!(sequence.kv_resource_blocks, Some(2));
+    assert!(sequence.kv_cache_handle().is_some());
+    assert_eq!(sequence.kv_resource_blocks(), Some(2));
     assert!(sequence.recurrent_state.is_none());
     assert!(sequence.recurrent_state_slots().is_none());
     assert_eq!(sequence.prefill_tokens_processed, 1);
@@ -1740,7 +1742,7 @@ fn sequence_prefill_chunk_commit_tracks_partial_and_final_state() {
         sequence.model_cache_id.as_deref(),
         Some(final_cache_id.as_str())
     );
-    assert_eq!(sequence.kv_resource_blocks, None);
+    assert_eq!(sequence.kv_resource_blocks(), None);
     assert_eq!(sequence.prefill_tokens_processed, 2);
     assert!(sequence.prefill_complete);
     assert_eq!(sequence.phase, RequestPhase::Decoding);
@@ -1770,7 +1772,7 @@ fn sequence_decode_commit_helpers_keep_resource_metadata_together() {
         2,
     ));
     sequence.commit_decode_step_physical_resources(decode_kv);
-    assert!(sequence.kv_cache.is_some());
+    assert!(sequence.kv_cache_handle().is_some());
     assert_eq!(sequence.tokens_this_iteration, 1);
     assert_eq!(sequence.model_cache_id.as_deref(), Some("model-cache"));
     let decode_resources = sequence
@@ -1799,7 +1801,7 @@ fn sequence_decode_commit_helpers_keep_resource_metadata_together() {
     ));
     sequence.commit_draft_kv_allocation(draft_kv.clone(), draft_request_id.clone(), 0);
     sequence.commit_speculative_decode_physical_resources(target_kv, draft_kv);
-    assert!(sequence.kv_cache.is_some());
+    assert!(sequence.kv_cache_handle().is_some());
     let draft = sequence.draft_kv.as_ref().expect("draft kv state");
     assert_eq!(draft.request_id, draft_request_id);
     assert_eq!(draft.resource_blocks, 1);
@@ -1899,13 +1901,12 @@ fn decode_ready_request_ids_skip_preempted_sequences_without_kv() {
     let mut ready_seq = SequenceState::new(ready_request, vec![TokenId::new(1)]);
     ready_seq.generated_tokens.push(TokenId::new(2));
     ready_seq.prefill_complete = true;
-    ready_seq.kv_cache = Some(ready_kv);
+    ready_seq.install_model_kv_without_owned_blocks(ready_kv);
     ready_seq.model_cache_id = Some("ready-cache".to_string());
 
     let mut preempted_seq = SequenceState::new(preempted_request, vec![TokenId::new(1)]);
     preempted_seq.generated_tokens.push(TokenId::new(2));
     preempted_seq.prefill_complete = false;
-    preempted_seq.kv_cache = None;
     preempted_seq.model_cache_id = None;
 
     {
@@ -2219,7 +2220,7 @@ async fn process_batch_unified_defers_prefill_for_recurrent_state_capacity() {
     victim_seq.generated_tokens.push(TokenId::new(6));
     victim_seq.prefill_complete = true;
     victim_seq.prefill_tokens_processed = 1;
-    victim_seq.kv_cache = Some(victim_kv);
+    victim_seq.install_model_kv_without_owned_blocks(victim_kv);
     victim_seq.commit_recurrent_state_admission(victim_recurrent_state, 1);
     victim_seq.model_cache_id = Some("victim-cache".to_string());
     victim_seq.phase = RequestPhase::Decoding;
@@ -2256,7 +2257,7 @@ async fn process_batch_unified_defers_prefill_for_recurrent_state_capacity() {
         .get(&victim_id)
         .expect("decode request should stay active while prefill waits");
     assert!(victim.prefill_complete);
-    assert!(victim.kv_cache.is_some());
+    assert!(victim.kv_cache_handle().is_some());
     assert!(victim.recurrent_state.is_some());
     assert_eq!(victim.generated_tokens, vec![TokenId::new(6)]);
     assert_eq!(victim.preemption_count, 0);
@@ -2265,7 +2266,7 @@ async fn process_batch_unified_defers_prefill_for_recurrent_state_capacity() {
         .get(&fresh_id)
         .expect("fresh request should remain queued for retry");
     assert!(!fresh.prefill_complete);
-    assert!(fresh.kv_cache.is_none());
+    assert!(fresh.kv_cache_handle().is_none());
     assert!(fresh.recurrent_state.is_none());
 }
 
@@ -2328,7 +2329,7 @@ async fn process_batch_unified_releases_recurrent_state_when_kv_alloc_defers() {
         .get(&request_id)
         .expect("deferred request should remain queued");
     assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.kv_cache_handle().is_none());
     assert!(sequence.recurrent_state.is_none());
 }
 
@@ -2395,7 +2396,7 @@ async fn process_batch_unified_kv_defer_does_not_preempt_decode_for_fresh_prefil
     decode_seq.generated_tokens.push(TokenId::new(6));
     decode_seq.prefill_complete = true;
     decode_seq.prefill_tokens_processed = 1;
-    decode_seq.kv_cache = Some(decode_kv);
+    decode_seq.install_model_kv_without_owned_blocks(decode_kv);
     decode_seq.phase = RequestPhase::Decoding;
     engine
         .inner
@@ -2432,14 +2433,14 @@ async fn process_batch_unified_kv_defer_does_not_preempt_decode_for_fresh_prefil
         .get(&decode_id)
         .expect("decode victim should remain active");
     assert!(decode.prefill_complete);
-    assert!(decode.kv_cache.is_some());
+    assert!(decode.kv_cache_handle().is_some());
     assert_eq!(decode.preemption_count, 0);
 
     let fresh = sequences
         .get(&fresh_id)
         .expect("deferred fresh request should remain in sequence state");
     assert!(!fresh.prefill_complete);
-    assert!(fresh.kv_cache.is_none());
+    assert!(fresh.kv_cache_handle().is_none());
     assert_eq!(kv_cache.active_count(), 1);
 }
 
@@ -2531,7 +2532,7 @@ async fn process_batch_unified_reserve_defer_requeues_decode_for_recompute() {
         sequence.generated_tokens.push(token);
         sequence.prefill_complete = true;
         sequence.prefill_tokens_processed = 1;
-        sequence.kv_cache = Some(kv);
+        sequence.install_model_kv_without_owned_blocks(kv);
         sequence.model_cache_id = Some(cache_id.to_string());
         sequence.phase = RequestPhase::Decoding;
         engine.inner.sequences.write().insert(request_id, sequence);
@@ -2573,7 +2574,7 @@ async fn process_batch_unified_reserve_defer_requeues_decode_for_recompute() {
             .expect("decode request should remain available for recompute");
         assert_eq!(decode.phase, RequestPhase::Waiting);
         assert!(!decode.prefill_complete);
-        assert!(decode.kv_cache.is_none());
+        assert!(decode.kv_cache_handle().is_none());
         assert!(decode.model_cache_id.is_none());
         assert_eq!(decode.generated_tokens, vec![token]);
         assert_eq!(decode.preemption_count, 1);
@@ -2587,7 +2588,7 @@ async fn process_batch_unified_reserve_defer_requeues_decode_for_recompute() {
         .expect("deferred fresh request should remain in sequence state");
     assert_eq!(fresh.phase, RequestPhase::Waiting);
     assert!(!fresh.prefill_complete);
-    assert!(fresh.kv_cache.is_none());
+    assert!(fresh.kv_cache_handle().is_none());
     assert_eq!(kv_cache.active_count(), 0);
 }
 
@@ -2657,7 +2658,7 @@ async fn process_batch_unified_structured_pressure_reopens_capacity_recompute_ne
         sequence.generated_tokens.push(TokenId::new(6));
         sequence.prefill_complete = true;
         sequence.prefill_tokens_processed = 1;
-        sequence.kv_cache = Some(kv);
+        sequence.install_model_kv_without_owned_blocks(kv);
         sequence.model_cache_id = Some(format!("decode-cache-{}", request.id));
         sequence.phase = RequestPhase::Decoding;
         engine
@@ -2673,7 +2674,7 @@ async fn process_batch_unified_structured_pressure_reopens_capacity_recompute_ne
         let sequence = sequences
             .get_mut(&recompute_id)
             .expect("recompute sequence should exist");
-        sequence.kv_cache = None;
+        sequence.clear_model_kv_for_test();
         sequence.model_cache_id = None;
         sequence.prefill_complete = false;
         sequence.prefill_tokens_processed = 0;
@@ -2773,7 +2774,7 @@ async fn process_batch_unified_capacity_defer_releases_existing_kv() {
         Some(tokenizer),
         Some(64),
     );
-    sequence.kv_cache = Some(allocated_kv);
+    sequence.install_model_kv_without_owned_blocks(allocated_kv);
     sequence.model_cache_id = Some("existing-cache".to_string());
     sequence.prefill_tokens_processed = 1;
     sequence.phase = RequestPhase::Prefilling;
@@ -2801,7 +2802,7 @@ async fn process_batch_unified_capacity_defer_releases_existing_kv() {
             .get(&request_id)
             .expect("deferred request should remain available for retry");
         assert_eq!(sequence.phase, RequestPhase::Waiting);
-        assert!(sequence.kv_cache.is_none());
+        assert!(sequence.kv_cache_handle().is_none());
         assert!(sequence.recurrent_state.is_none());
     }
 }
@@ -2868,7 +2869,7 @@ async fn process_batch_unified_kv_defer_moves_active_prefill_back_to_waiting() {
         .expect("deferred request should remain in sequence state");
     assert_eq!(sequence.phase, RequestPhase::Waiting);
     assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.kv_cache_handle().is_none());
     assert!(sequence.recurrent_state.is_none());
 }
 
@@ -2953,7 +2954,7 @@ async fn process_batch_releases_kv_and_recurrent_state_when_model_admission_fail
         .get(&request_id)
         .expect("failed request should remain available for retry");
     assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.kv_cache_handle().is_none());
     assert!(sequence.recurrent_state.is_none());
 }
 
@@ -3081,7 +3082,7 @@ async fn process_batch_batch_prefill_len_mismatch_releases_kv_and_recurrent_stat
         .get(&request_id)
         .expect("deferred fallback request should remain available for retry");
     assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.kv_cache_handle().is_none());
     assert!(sequence.recurrent_state.is_none());
 }
 
@@ -3317,7 +3318,7 @@ async fn process_batch_speculative_draft_tensor_error_releases_target_and_draft_
     sequence.generated_tokens.push(TokenId::new(6));
     sequence.prefill_complete = true;
     sequence.prefill_tokens_processed = 1;
-    sequence.kv_cache = Some(target_kv);
+    sequence.install_model_kv_without_owned_blocks(target_kv);
     sequence.phase = RequestPhase::Decoding;
     engine
         .inner
@@ -3419,7 +3420,7 @@ async fn process_batch_unified_reserve_resource_exhausted_defers_without_fallbac
         .get(&request_id)
         .expect("failed request should remain available for retry");
     assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.kv_cache_handle().is_none());
     assert!(sequence.recurrent_state.is_none());
 }
 
@@ -3492,7 +3493,7 @@ async fn process_batch_unified_reserve_resource_exhausted_defers_existing_kv_pre
         Some(tokenizer),
         Some(64),
     );
-    sequence.kv_cache = Some(allocated_kv);
+    sequence.install_model_kv_without_owned_blocks(allocated_kv);
     sequence.model_cache_id = Some("existing-cache".to_string());
     sequence.prefill_tokens_processed = 1;
     sequence.phase = RequestPhase::Prefilling;
@@ -3525,7 +3526,7 @@ async fn process_batch_unified_reserve_resource_exhausted_defers_existing_kv_pre
         .expect("deferred request should remain available for retry");
     assert_eq!(sequence.phase, RequestPhase::Waiting);
     assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.kv_cache_handle().is_none());
     assert!(sequence.recurrent_state.is_none());
     assert!(sequence.model_cache_id.is_none());
     assert_eq!(
@@ -3606,7 +3607,7 @@ async fn process_batch_unified_forward_resource_exhausted_defers_existing_kv_pre
         Some(tokenizer),
         Some(64),
     );
-    sequence.kv_cache = Some(allocated_kv);
+    sequence.install_model_kv_without_owned_blocks(allocated_kv);
     sequence.model_cache_id = Some("existing-cache".to_string());
     sequence.prefill_tokens_processed = 1;
     sequence.phase = RequestPhase::Prefilling;
@@ -3650,7 +3651,7 @@ async fn process_batch_unified_forward_resource_exhausted_defers_existing_kv_pre
         .expect("deferred request should remain available for retry");
     assert_eq!(sequence.phase, RequestPhase::Waiting);
     assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.kv_cache_handle().is_none());
     assert!(sequence.recurrent_state.is_none());
     assert!(sequence.model_cache_id.is_none());
     assert_eq!(
@@ -3721,7 +3722,7 @@ async fn process_batch_unified_forward_failure_then_fallback_kv_defer_releases_r
         .get(&request_id)
         .expect("deferred request should remain available for retry");
     assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.kv_cache_handle().is_none());
     assert!(sequence.recurrent_state.is_none());
 }
 
@@ -3790,7 +3791,7 @@ async fn process_batch_unified_result_len_mismatch_releases_recurrent_state() {
         .get(&request_id)
         .expect("failed request should remain inspectable");
     assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.kv_cache_handle().is_none());
     assert!(sequence.recurrent_state.is_none());
 }
 
@@ -3982,7 +3983,7 @@ async fn process_batch_unified_decode_postprocess_error_releases_recurrent_state
     sequence.generated_tokens.push(TokenId::new(6));
     sequence.prefill_complete = true;
     sequence.prefill_tokens_processed = 1;
-    sequence.kv_cache = Some(kv);
+    sequence.install_model_kv_without_owned_blocks(kv);
     sequence.commit_recurrent_state_admission(recurrent_state, 1);
     sequence.model_cache_id = Some("decode-cache".to_string());
     sequence.phase = RequestPhase::Decoding;
@@ -4071,7 +4072,7 @@ async fn process_batch_single_decode_resource_exhausted_keeps_recurrent_state_wa
     sequence.generated_tokens.push(TokenId::new(6));
     sequence.prefill_complete = true;
     sequence.prefill_tokens_processed = 1;
-    sequence.kv_cache = Some(kv);
+    sequence.install_model_kv_without_owned_blocks(kv);
     sequence.commit_recurrent_state_admission(recurrent_state, 1);
     sequence.model_cache_id = Some("decode-cache".to_string());
     sequence.phase = RequestPhase::Decoding;
@@ -4097,7 +4098,7 @@ async fn process_batch_single_decode_resource_exhausted_keeps_recurrent_state_wa
         .get(&request_id)
         .expect("resource-exhausted decode should remain queued");
     assert!(sequence.prefill_complete);
-    assert!(sequence.kv_cache.is_some());
+    assert!(sequence.kv_cache_handle().is_some());
     assert!(sequence.recurrent_state.is_some());
     assert_eq!(sequence.generated_tokens, vec![TokenId::new(6)]);
     assert_eq!(recurrent_manager.stats().active_states, 1);
@@ -4172,7 +4173,7 @@ async fn process_batch_unified_decode_resource_exhausted_keeps_recurrent_state_w
     sequence.generated_tokens.push(TokenId::new(6));
     sequence.prefill_complete = true;
     sequence.prefill_tokens_processed = 1;
-    sequence.kv_cache = Some(kv);
+    sequence.install_model_kv_without_owned_blocks(kv);
     sequence.commit_recurrent_state_admission(recurrent_state, 1);
     sequence.model_cache_id = Some("decode-cache".to_string());
     sequence.phase = RequestPhase::Decoding;
@@ -4205,7 +4206,7 @@ async fn process_batch_unified_decode_resource_exhausted_keeps_recurrent_state_w
         .expect("resource-exhausted unified decode should remain queued");
     assert_eq!(sequence.phase, RequestPhase::Waiting);
     assert!(!sequence.prefill_complete);
-    assert!(sequence.kv_cache.is_none());
+    assert!(sequence.kv_cache_handle().is_none());
     assert!(sequence.recurrent_state.is_none());
     assert!(sequence.model_cache_id.is_none());
     assert_eq!(sequence.generated_tokens, vec![TokenId::new(6)]);

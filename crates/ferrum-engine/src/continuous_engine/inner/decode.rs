@@ -490,10 +490,8 @@ impl EngineInner {
                 .get(request_id)
                 .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
             let kv = seq
-                .kv_cache
-                .as_ref()
-                .ok_or_else(|| FerrumError::internal("No target KV"))?
-                .clone();
+                .kv_cache_handle()
+                .ok_or_else(|| FerrumError::internal("No target KV"))?;
             let last = seq
                 .generated_tokens
                 .last()
