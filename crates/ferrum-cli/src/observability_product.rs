@@ -1333,7 +1333,6 @@ fn write_replay_bundle(
         "sanitized": true
     });
     let output_text = data.output_text.unwrap_or("");
-    let output_scan = bad_output_scan(request_id, output_text, data.failure_kind);
     let sampling_unavailable_reason = if data.sampling_params.is_some() {
         Value::Null
     } else {
@@ -1348,6 +1347,12 @@ fn write_replay_bundle(
     } else {
         format!("{output_text}\n")
     };
+    let output_scan = bad_output_scan(
+        request_id,
+        output_text,
+        data.failure_kind,
+        output_text_body.as_bytes(),
+    );
     let engine_replay_args = engine_replay_command_args(&bundle_dir);
     let engine_replay_command = replay_command_from_args(&engine_replay_args);
     let files = [
@@ -1533,7 +1538,12 @@ fn resource_kind_for_failure(failure_kind: &str) -> &'static str {
     }
 }
 
-fn bad_output_scan(request_id: &str, text: &str, failure_kind: Option<&str>) -> serde_json::Value {
+fn bad_output_scan(
+    request_id: &str,
+    text: &str,
+    failure_kind: Option<&str>,
+    output_artifact_bytes: &[u8],
+) -> serde_json::Value {
     let mut reasons = Vec::new();
     let mut first_span: Option<serde_json::Value> = None;
     for (needle, reason) in [
@@ -1579,7 +1589,8 @@ fn bad_output_scan(request_id: &str, text: &str, failure_kind: Option<&str>) -> 
         "first_bad_text_span": first_span,
         "failure_kind": failure_kind,
         "output_chars": text.chars().count(),
-        "output_sha256": sha256_hex(text.as_bytes())
+        "classified_output_sha256": sha256_hex(text.as_bytes()),
+        "output_sha256": sha256_hex(output_artifact_bytes)
     })
 }
 
@@ -2164,6 +2175,18 @@ mod tests {
         assert_eq!(prompt_tokens["token_ids"], serde_json::json!([7, 8, 9]));
         assert_eq!(prompt_tokens["token_count"], 3);
         assert!(prompt_tokens["unavailable_reason"].is_null());
+        let output_text_bytes = fs::read(bundle_dir.join("output_text.txt")).unwrap();
+        let output_text = String::from_utf8(output_text_bytes.clone()).unwrap();
+        assert!(output_text.starts_with("[redacted actual output]\n"));
+        let scan: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(bundle_dir.join("bad_output_scan.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            scan["output_sha256"],
+            sha256_hex(output_text_bytes.as_slice())
+        );
+        assert_eq!(scan["classified_output_sha256"], sha256_hex(b"OK"));
         let profile = fs::read_to_string(root.join("profile.jsonl")).unwrap();
         let generation = profile
             .lines()
