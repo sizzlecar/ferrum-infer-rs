@@ -17,12 +17,31 @@ use ferrum_types::{
 
 pub const FA2_NATIVE_OPERATOR: &str = "fa2";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledFa2NativeOperatorArtifact {
+    pub manifest_path: &'static str,
+    pub artifact_path: &'static str,
+    pub source_package_sha256: &'static str,
+    pub inputs_sha256: &'static str,
+    pub binary_sha256: &'static str,
+}
+
 pub fn compiled_fa2_native_operator_artifact_linked() -> bool {
     option_env!("FERRUM_FA2_NATIVE_ARTIFACT_COMPILE") == Some("linked")
 }
 
 pub fn compiled_fa2_native_operator_artifact_state() -> &'static str {
     option_env!("FERRUM_FA2_NATIVE_ARTIFACT_COMPILE").unwrap_or("not_configured")
+}
+
+pub fn compiled_fa2_native_operator_artifact() -> Option<CompiledFa2NativeOperatorArtifact> {
+    Some(CompiledFa2NativeOperatorArtifact {
+        manifest_path: option_env!("FERRUM_COMPILED_FA2_NATIVE_MANIFEST")?,
+        artifact_path: option_env!("FERRUM_COMPILED_FA2_NATIVE_ARTIFACT")?,
+        source_package_sha256: option_env!("FERRUM_COMPILED_FA2_NATIVE_SOURCE_SHA256")?,
+        inputs_sha256: option_env!("FERRUM_COMPILED_FA2_NATIVE_INPUTS_SHA256")?,
+        binary_sha256: option_env!("FERRUM_COMPILED_FA2_NATIVE_BINARY_SHA256")?,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

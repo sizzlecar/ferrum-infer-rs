@@ -466,6 +466,8 @@ def native_operator_dev_build_audit() -> dict[str, Any]:
         and "manifest-validated-artifact-linked" in build_rs
         and "cargo:rustc-link-lib" in build_rs
         and "FERRUM_FA2_NATIVE_ARTIFACT_COMPILE" in build_rs
+        and "FERRUM_COMPILED_FA2_NATIVE_MANIFEST" in build_rs
+        and "FERRUM_COMPILED_FA2_NATIVE_BINARY_SHA256" in build_rs
     )
     return {
         "status": "pass" if not matches and obsolete_marker and artifact_link_marker else "fail",

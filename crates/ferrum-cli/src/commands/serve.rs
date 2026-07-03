@@ -8,10 +8,10 @@ use ferrum_bench_core::{ProfileMetadata, ProfileSinkConfig};
 use ferrum_models::source::ModelFormat;
 use ferrum_server::{AxumServer, HttpServer, ServerConfig};
 use ferrum_types::{
-    CompiledKernelFeatures, FerrumConfigBuilder, HardwareCapabilities, ModelCapabilities,
-    MoeCapabilities, ResolvedFerrumConfig, Result, RuntimeConfigEntry, RuntimeConfigSnapshot,
-    RuntimeConfigSource, WorkloadProfile, M3_QWEN3_30B_A3B_INT4_PRESET,
-    QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET,
+    CompiledKernelFeatures, CompiledNativeOperatorArtifact, FerrumConfigBuilder,
+    HardwareCapabilities, ModelCapabilities, MoeCapabilities, ResolvedFerrumConfig, Result,
+    RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource, WorkloadProfile,
+    M3_QWEN3_30B_A3B_INT4_PRESET, QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET,
 };
 use std::path::Path;
 use std::path::PathBuf;
@@ -1950,6 +1950,7 @@ fn infer_sm_count_from_gpu_name(name: &str) -> Option<u32> {
 }
 
 fn compiled_kernel_features() -> CompiledKernelFeatures {
+    let fa2_native = ferrum_kernels::native_ops::compiled_fa2_native_operator_artifact();
     CompiledKernelFeatures {
         cuda: cfg!(feature = "cuda"),
         vllm_paged_attn: cfg!(feature = "vllm-paged-attn-v2"),
@@ -1958,8 +1959,16 @@ fn compiled_kernel_features() -> CompiledKernelFeatures {
         greedy_argmax: cfg!(feature = "cuda") || cfg!(feature = "metal"),
         fa2_source: false,
         fa2_direct_ffi: cfg!(feature = "cuda"),
-        fa2_native_operator_artifact:
-            ferrum_kernels::native_ops::compiled_fa2_native_operator_artifact_linked(),
+        fa2_native_operator_artifact: fa2_native.is_some(),
+        fa2_native_operator_artifact_metadata: fa2_native.map(|artifact| {
+            CompiledNativeOperatorArtifact {
+                manifest_path: artifact.manifest_path.to_string(),
+                artifact_path: artifact.artifact_path.to_string(),
+                source_package_sha256: artifact.source_package_sha256.to_string(),
+                inputs_sha256: artifact.inputs_sha256.to_string(),
+                binary_sha256: artifact.binary_sha256.to_string(),
+            }
+        }),
     }
 }
 

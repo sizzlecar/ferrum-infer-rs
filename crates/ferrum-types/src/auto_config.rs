@@ -146,6 +146,15 @@ impl HardwareCapabilities {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompiledNativeOperatorArtifact {
+    pub manifest_path: String,
+    pub artifact_path: String,
+    pub source_package_sha256: String,
+    pub inputs_sha256: String,
+    pub binary_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledKernelFeatures {
     pub cuda: bool,
     pub vllm_paged_attn: bool,
@@ -155,6 +164,8 @@ pub struct CompiledKernelFeatures {
     pub fa2_source: bool,
     pub fa2_direct_ffi: bool,
     pub fa2_native_operator_artifact: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fa2_native_operator_artifact_metadata: Option<CompiledNativeOperatorArtifact>,
 }
 
 impl Default for CompiledKernelFeatures {
@@ -168,6 +179,7 @@ impl Default for CompiledKernelFeatures {
             fa2_source: false,
             fa2_direct_ffi: false,
             fa2_native_operator_artifact: false,
+            fa2_native_operator_artifact_metadata: None,
         }
     }
 }
@@ -183,6 +195,7 @@ impl CompiledKernelFeatures {
             fa2_source: false,
             fa2_direct_ffi: false,
             fa2_native_operator_artifact: false,
+            fa2_native_operator_artifact_metadata: None,
         }
     }
 
@@ -196,6 +209,16 @@ impl CompiledKernelFeatures {
     pub fn m3_fast_path_with_native_fa2_artifact() -> Self {
         Self {
             fa2_native_operator_artifact: true,
+            fa2_native_operator_artifact_metadata: Some(CompiledNativeOperatorArtifact {
+                manifest_path: "/tmp/native/fa2/native_operator_manifest.json".to_string(),
+                artifact_path: "/tmp/native/fa2/libferrum_native_fa2.a".to_string(),
+                source_package_sha256:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                inputs_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+                binary_sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    .to_string(),
+            }),
             ..Self::m3_fast_path_without_fa2()
         }
     }
@@ -1360,6 +1383,48 @@ impl FerrumConfigBuilder {
                 FA2_NATIVE_MANIFEST_KEY,
                 "FA2 native operator artifact config requires a binary built with a validated native operator artifact",
             );
+        }
+        if configured {
+            let metadata = self
+                .hardware
+                .compiled_features
+                .fa2_native_operator_artifact_metadata
+                .as_ref()
+                .ok_or_else(|| AutoConfigError::InvalidOverride {
+                    key: FA2_NATIVE_MANIFEST_KEY.to_string(),
+                    reason: "FA2 native operator artifact capability is missing build metadata"
+                        .to_string(),
+                })?;
+            let manifest = manifest.expect("configured manifest is present");
+            let artifact = artifact.expect("configured artifact is present");
+            if manifest.value != metadata.manifest_path {
+                return self.invalid(
+                    FA2_NATIVE_MANIFEST_KEY,
+                    "FA2 native operator manifest does not match the artifact linked into this binary",
+                );
+            }
+            if artifact.value != metadata.artifact_path {
+                return self.invalid(
+                    FA2_NATIVE_ARTIFACT_KEY,
+                    "FA2 native operator artifact does not match the artifact linked into this binary",
+                );
+            }
+            if let Some(source_sha256) = source_sha256 {
+                if source_sha256.value != metadata.source_package_sha256 {
+                    return self.invalid(
+                        FA2_NATIVE_SOURCE_SHA256_KEY,
+                        "FA2 native operator source_package sha256 does not match the artifact linked into this binary",
+                    );
+                }
+            }
+            if let Some(inputs_sha256) = inputs_sha256 {
+                if inputs_sha256.value != metadata.inputs_sha256 {
+                    return self.invalid(
+                        FA2_NATIVE_INPUTS_SHA256_KEY,
+                        "FA2 native operator inputs sha256 does not match the artifact linked into this binary",
+                    );
+                }
+            }
         }
         if configured && fa2_source {
             return self.unsupported(
@@ -3095,6 +3160,104 @@ mod tests {
                 ),
             ],
             FA2_NATIVE_MANIFEST_KEY,
+        );
+    }
+
+    #[test]
+    fn fa2_native_artifact_requires_linked_binary_metadata() {
+        let mut features = CompiledKernelFeatures::m3_fast_path_without_fa2();
+        features.fa2_native_operator_artifact = true;
+
+        let err = m3(
+            &[
+                (
+                    FA2_NATIVE_MANIFEST_KEY,
+                    "/tmp/native/fa2/native_operator_manifest.json",
+                ),
+                (
+                    FA2_NATIVE_ARTIFACT_KEY,
+                    "/tmp/native/fa2/libferrum_native_fa2.a",
+                ),
+            ],
+            features,
+        )
+        .resolve()
+        .unwrap_err();
+        match err {
+            AutoConfigError::InvalidOverride { key, reason } => {
+                assert_eq!(key, FA2_NATIVE_MANIFEST_KEY);
+                assert!(reason.contains("missing build metadata"));
+            }
+            other => panic!("expected invalid override, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fa2_native_artifact_must_match_linked_binary_metadata() {
+        let features = CompiledKernelFeatures::m3_fast_path_with_native_fa2_artifact();
+        expect_invalid_key_with_features(
+            &[
+                (
+                    FA2_NATIVE_MANIFEST_KEY,
+                    "/tmp/native/fa2/other_manifest.json",
+                ),
+                (
+                    FA2_NATIVE_ARTIFACT_KEY,
+                    "/tmp/native/fa2/libferrum_native_fa2.a",
+                ),
+            ],
+            FA2_NATIVE_MANIFEST_KEY,
+            features.clone(),
+        );
+        expect_invalid_key_with_features(
+            &[
+                (
+                    FA2_NATIVE_MANIFEST_KEY,
+                    "/tmp/native/fa2/native_operator_manifest.json",
+                ),
+                (
+                    FA2_NATIVE_ARTIFACT_KEY,
+                    "/tmp/native/fa2/libferrum_native_other.a",
+                ),
+            ],
+            FA2_NATIVE_ARTIFACT_KEY,
+            features.clone(),
+        );
+        expect_invalid_key_with_features(
+            &[
+                (
+                    FA2_NATIVE_MANIFEST_KEY,
+                    "/tmp/native/fa2/native_operator_manifest.json",
+                ),
+                (
+                    FA2_NATIVE_ARTIFACT_KEY,
+                    "/tmp/native/fa2/libferrum_native_fa2.a",
+                ),
+                (
+                    FA2_NATIVE_SOURCE_SHA256_KEY,
+                    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                ),
+            ],
+            FA2_NATIVE_SOURCE_SHA256_KEY,
+            features.clone(),
+        );
+        expect_invalid_key_with_features(
+            &[
+                (
+                    FA2_NATIVE_MANIFEST_KEY,
+                    "/tmp/native/fa2/native_operator_manifest.json",
+                ),
+                (
+                    FA2_NATIVE_ARTIFACT_KEY,
+                    "/tmp/native/fa2/libferrum_native_fa2.a",
+                ),
+                (
+                    FA2_NATIVE_INPUTS_SHA256_KEY,
+                    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                ),
+            ],
+            FA2_NATIVE_INPUTS_SHA256_KEY,
+            features,
         );
     }
 
