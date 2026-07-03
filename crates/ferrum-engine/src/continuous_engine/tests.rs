@@ -1538,6 +1538,23 @@ fn sequence_prefill_commit_helpers_keep_resource_metadata_together() {
     );
     assert!(sequence.kv_resource_blocks.is_none());
 
+    let cached_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        RequestId::new(),
+        1,
+        2,
+    ));
+    let cached_cache_id = cached_kv.cache_id();
+    sequence.commit_cached_prefill_physical_resources(cached_kv, 1);
+    assert_eq!(
+        sequence.model_cache_id.as_deref(),
+        Some(cached_cache_id.as_str())
+    );
+    assert!(sequence.kv_cache.is_some());
+    assert_eq!(sequence.kv_resource_blocks, None);
+    assert_eq!(sequence.prefill_tokens_processed, 1);
+    assert!(sequence.prefill_complete);
+    assert_eq!(sequence.phase, RequestPhase::Decoding);
+
     let owned_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
         request_id.clone(),
         1,
@@ -1554,6 +1571,48 @@ fn sequence_prefill_commit_helpers_keep_resource_metadata_together() {
     assert_eq!(sequence.kv_resource_blocks, Some(4));
     assert!(sequence.recurrent_state.is_none());
     assert!(sequence.recurrent_state_slots.is_none());
+    assert!(sequence.prefill_complete);
+    assert_eq!(sequence.phase, RequestPhase::Decoding);
+}
+
+#[test]
+fn sequence_prefill_chunk_commit_tracks_partial_and_final_state() {
+    let request = policy_request();
+    let request_id = request.id.clone();
+    let mut sequence = SequenceState::new(request, vec![TokenId::new(1), TokenId::new(2)]);
+
+    let partial_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        RequestId::new(),
+        1,
+        2,
+    ));
+    let partial_cache_id = partial_kv.cache_id();
+    sequence.recurrent_state_slots = Some(3);
+    sequence.commit_prefill_chunk_physical_resources(partial_kv, Some(2), None, 1, false);
+
+    assert_eq!(
+        sequence.model_cache_id.as_deref(),
+        Some(partial_cache_id.as_str())
+    );
+    assert!(sequence.kv_cache.is_some());
+    assert_eq!(sequence.kv_resource_blocks, Some(2));
+    assert!(sequence.recurrent_state.is_none());
+    assert!(sequence.recurrent_state_slots.is_none());
+    assert_eq!(sequence.prefill_tokens_processed, 1);
+    assert!(!sequence.prefill_complete);
+    assert_eq!(sequence.phase, RequestPhase::Prefilling);
+
+    let final_kv: Arc<dyn KvCacheHandle> =
+        Arc::new(ferrum_testkit::MockKvCacheHandle::new(request_id, 1, 4));
+    let final_cache_id = final_kv.cache_id();
+    sequence.commit_prefill_chunk_physical_resources(final_kv, None, None, 2, true);
+
+    assert_eq!(
+        sequence.model_cache_id.as_deref(),
+        Some(final_cache_id.as_str())
+    );
+    assert_eq!(sequence.kv_resource_blocks, None);
+    assert_eq!(sequence.prefill_tokens_processed, 2);
     assert!(sequence.prefill_complete);
     assert_eq!(sequence.phase, RequestPhase::Decoding);
 }
