@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,20 @@ BULK_SOURCE_ROOTS = [
 ]
 CPP_CUDA_EXTENSIONS = {".c", ".cc", ".cpp", ".cxx", ".cu", ".cuh", ".h", ".hh", ".hpp", ".hxx"}
 BUILD_RS = REPO_ROOT / "crates/ferrum-kernels/build.rs"
+RELEASE_CONFIG_AUDIT_FILES = [
+    REPO_ROOT / "AGENTS.md",
+    REPO_ROOT / ".github/workflows/release-cuda.yml",
+    REPO_ROOT / "scripts/release/g0_source_gate.sh",
+    REPO_ROOT / "scripts/release/run_gate.py",
+]
+RELEASE_CONFIG_AUDIT_GLOBS = [
+    REPO_ROOT / "scripts/release/configs",
+]
+RELEASE_CONFIG_FORBIDDEN_PATTERNS = {
+    "release_build_feature_fa2_source": re.compile(r"cuda[,\w-]*,fa2-source|fa2-source[,\w-]*", re.IGNORECASE),
+    "vendored_flash_attn_probe": re.compile(r"fa2_source/flash_attn|flash_attn/src", re.IGNORECASE),
+    "vendored_cutlass_probe": re.compile(r"fa2_source/cutlass|cutlass/include", re.IGNORECASE),
+}
 NATIVE_OP_SOURCE_COMPILE_PATTERNS = {
     "compile_fa2": re.compile(r"\bcompile_[a-z0-9_]*fa2[a-z0-9_]*\s*\(", re.IGNORECASE),
     "build_fa2": re.compile(r"\bbuild_[a-z0-9_]*fa2[a-z0-9_]*\s*\(", re.IGNORECASE),
@@ -324,6 +339,41 @@ def native_operator_dev_build_audit() -> dict[str, Any]:
     }
 
 
+def release_config_audit_from_texts(texts: dict[str, str]) -> dict[str, Any]:
+    matches: list[dict[str, str]] = []
+    for label, text in sorted(texts.items()):
+        for pattern_name, pattern in sorted(RELEASE_CONFIG_FORBIDDEN_PATTERNS.items()):
+            for match in pattern.finditer(text):
+                line = text.count("\n", 0, match.start()) + 1
+                matches.append(
+                    {
+                        "pattern": pattern_name,
+                        "file": label,
+                        "line": str(line),
+                        "match": match.group(0),
+                    }
+                )
+    return {
+        "status": "pass" if not matches else "fail",
+        "forbidden_reference_count": len(matches),
+        "forbidden_references": matches,
+        "inspected_files": sorted(texts),
+    }
+
+
+def native_operator_release_config_audit() -> dict[str, Any]:
+    texts: dict[str, str] = {}
+    files = list(RELEASE_CONFIG_AUDIT_FILES)
+    for root in RELEASE_CONFIG_AUDIT_GLOBS:
+        if root.is_dir():
+            files.extend(sorted(path for path in root.rglob("*") if path.is_file()))
+    for path in files:
+        if not path.exists():
+            continue
+        texts[path.relative_to(REPO_ROOT).as_posix()] = path.read_text(encoding="utf-8")
+    return release_config_audit_from_texts(texts)
+
+
 def git_output(args: list[str]) -> str:
     proc = subprocess.run(
         ["git", *args],
@@ -418,6 +468,31 @@ def run_selftest() -> dict[str, Any]:
     dev_build_audit = native_operator_dev_build_audit()
     if dev_build_audit["status"] != "pass":
         raise GateError("native operator dev-build source compile audit failed")
+    bulk_count, bulk_samples = count_bulk_source_files()
+    if bulk_count:
+        raise GateError(
+            "native operator self-test requires FA2/CUTLASS bulk source count = 0; "
+            f"found {bulk_count}: {bulk_samples}"
+        )
+    third_party_count, third_party_samples = find_unregistered_third_party_sources()
+    if third_party_count:
+        raise GateError(
+            "native operator self-test rejects unregistered crates/**/third_party C++/CUDA source; "
+            f"found {third_party_count}: {third_party_samples}"
+        )
+    release_config_audit = native_operator_release_config_audit()
+    if release_config_audit["status"] != "pass":
+        raise GateError("native operator release-config audit failed")
+    bad_release_config = release_config_audit_from_texts(
+        {
+            "bad-release.yml": (
+                "cargo build --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source\n"
+                "test -f crates/ferrum-kernels/kernels/fa2_source/flash_attn/src/flash.h\n"
+            )
+        }
+    )
+    if bad_release_config["status"] != "fail":
+        raise GateError("native operator release-config audit failed to reject bad fixture")
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -426,13 +501,20 @@ def run_selftest() -> dict[str, Any]:
         "fail_fixtures": rejected_validation,
         "resolver_fail_closed_cases": rejected_resolution,
         "python_runtime_dependency": "none",
+        "bulk_source": {"count": bulk_count, "samples": bulk_samples},
+        "unregistered_third_party_source": {
+            "count": third_party_count,
+            "samples": third_party_samples,
+        },
         "normal_cuda_dev_build": dev_build_audit,
+        "release_config": release_config_audit,
     }
 
 
 def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     if not args.manifest:
         raise GateError("normal native operator artifact gate requires at least one --manifest")
+    started_at = datetime.now(timezone.utc)
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
     binary_artifacts = {
@@ -445,6 +527,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     bulk_count, bulk_samples = count_bulk_source_files()
     third_party_count, third_party_samples = find_unregistered_third_party_sources()
     dev_build_audit = native_operator_dev_build_audit()
+    release_config_audit = native_operator_release_config_audit()
     if bulk_count:
         raise GateError(
             "native operator artifact gate requires FA2/CUTLASS bulk source removal before PASS; "
@@ -459,6 +542,11 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         raise GateError(
             "native operator artifact gate requires normal CUDA dev build native-op source compile count = 0; "
             f"found {dev_build_audit['source_compile_count']} hooks"
+        )
+    if release_config_audit["status"] != "pass":
+        raise GateError(
+            "native operator artifact gate requires release CUDA configs to avoid fa2-source and vendored FA2 probes; "
+            f"found {release_config_audit['forbidden_reference_count']} references"
         )
 
     manifest_summaries: list[dict[str, Any]] = []
@@ -511,9 +599,18 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
             "samples": third_party_samples,
         },
         "normal_cuda_dev_build": dev_build_audit,
+        "release_config": release_config_audit,
     }
     write_json(out / "native_operator_artifact_summary.json", summary)
     pass_line = f"{PASS_LINE}: {out}"
+    ended_at = datetime.now(timezone.utc)
+    (out / "pass_line.txt").write_text(pass_line + "\n", encoding="utf-8")
+    (out / "command.log").write_text(" ".join(sys.argv) + "\n", encoding="utf-8")
+    (out / "git_status.txt").write_text(
+        git_output(["status", "--short", "--branch"]) + "\n",
+        encoding="utf-8",
+    )
+    write_json(out / "sanitized_env.json", {"schema_version": SCHEMA_VERSION, "env": {}})
     write_json(
         out / "gate.manifest.json",
         {
@@ -521,6 +618,9 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
             "goal": "release-regression-hardening-2026-06-28",
             "phase": "native_operator_artifact",
             "status": "pass",
+            "started_at": started_at.isoformat(),
+            "ended_at": ended_at.isoformat(),
+            "duration_sec": (ended_at - started_at).total_seconds(),
             "repo_root": str(REPO_ROOT),
             "git_sha": git_output(["rev-parse", "HEAD"]),
             "git_branch": git_output(["rev-parse", "--abbrev-ref", "HEAD"]),
@@ -531,6 +631,10 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
             "pass_line": pass_line,
             "outputs": {
                 "summary": str(out / "native_operator_artifact_summary.json"),
+                "pass_line": str(out / "pass_line.txt"),
+                "command_log": str(out / "command.log"),
+                "git_status": str(out / "git_status.txt"),
+                "sanitized_env": str(out / "sanitized_env.json"),
             },
             "validation_summary": summary,
         },

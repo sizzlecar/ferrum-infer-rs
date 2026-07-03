@@ -37,7 +37,7 @@
 - `cargo clippy --workspace --all-targets -- -A warnings` — advisory lint pass matching CI behavior.
 - `cargo run -p ferrum-cli -- list` — run the CLI crate locally; swap `list` for `pull`, `run`, `serve`, `bench-serve`, etc.
 - macOS Metal test build: `cargo build --release -p ferrum-cli --features metal --tests`.
-- CUDA release build: `cargo build --release -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`.
+- CUDA release build: `cargo build --release -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2`.
 
 ## Active G0 Gate Scripts
 
@@ -141,7 +141,7 @@ Lane rules:
   - Runs `scripts/release/validate_metal_readme_regression.py`.
   - Use this for source releases on macOS and for changes touching CLI/server/model/tokenizer/runtime defaults that can affect Metal.
 - `cuda-smoke`
-  - Builds the CUDA release binary with `cuda,vllm-moe-marlin,vllm-paged-attn-v2,fa2-source`.
+  - Builds the CUDA release binary with `cuda,vllm-moe-marlin,vllm-paged-attn-v2`.
   - Expands `scripts/release/configs/g0_cuda4090_smoke.json`.
   - Runs `scripts/m3_ab_runner.py` and `scripts/m3_validate_runner_artifact.py`.
   - Use this for CUDA release candidates and backend-adjacent smoke validation.
