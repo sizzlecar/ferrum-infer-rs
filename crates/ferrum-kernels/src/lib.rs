@@ -15,6 +15,7 @@ pub fn configure_native_profile_sink(
 }
 
 pub mod backend;
+pub mod native_ops;
 
 pub mod linear;
 pub use linear::{Linear, LinearMetadata, LinearProjectionRole};

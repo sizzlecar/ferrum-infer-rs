@@ -1438,11 +1438,13 @@ dependencies = [
  "cudarc 0.19.4",
  "ferrum-bench-core",
  "ferrum-interfaces",
+ "ferrum-native-ops",
  "ferrum-types",
  "half",
  "metal 0.31.0",
  "rayon",
  "serde_json",
+ "sha2",
  "tracing",
 ]
 
