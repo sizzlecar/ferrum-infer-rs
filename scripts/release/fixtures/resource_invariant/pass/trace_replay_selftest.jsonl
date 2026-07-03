@@ -1,5 +1,5 @@
 {"scenario":"trace_replay_selftest","owner_kind":"request","owner_id":"req-trace-replay","resource_kind":"request_slot","action":"request_open","capacity":1}
-{"scenario":"trace_replay_selftest","owner_kind":"request","owner_id":"req-trace-replay","resource_kind":"model_cache_ref","action":"reserve","amount":1,"before":4,"after":3,"capacity":4}
-{"scenario":"trace_replay_selftest","owner_kind":"request","owner_id":"req-trace-replay","resource_kind":"model_cache_ref","action":"commit","amount":1,"before":3,"after":3,"capacity":4}
-{"scenario":"trace_replay_selftest","owner_kind":"request","owner_id":"req-trace-replay","resource_kind":"model_cache_ref","action":"release","amount":1,"before":3,"after":4,"capacity":4}
+{"scenario":"trace_replay_selftest","owner_kind":"request","owner_id":"req-trace-replay","resource_kind":"model_cache_ref","action":"reserve","amount":1,"before":0,"after":1,"capacity":4}
+{"scenario":"trace_replay_selftest","owner_kind":"request","owner_id":"req-trace-replay","resource_kind":"model_cache_ref","action":"commit","amount":1,"before":0,"after":1,"capacity":4}
+{"scenario":"trace_replay_selftest","owner_kind":"request","owner_id":"req-trace-replay","resource_kind":"model_cache_ref","action":"release","amount":1,"before":1,"after":0,"capacity":4}
 {"scenario":"trace_replay_selftest","owner_kind":"request","owner_id":"req-trace-replay","resource_kind":"request_slot","action":"request_close","capacity":1}

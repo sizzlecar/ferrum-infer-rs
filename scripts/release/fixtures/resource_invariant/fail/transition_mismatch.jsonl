@@ -1,0 +1,5 @@
+{"scenario":"transition_mismatch","owner_kind":"request","owner_id":"req-transition-mismatch","resource_kind":"request_slot","action":"request_open","capacity":1}
+{"scenario":"transition_mismatch","owner_kind":"request","owner_id":"req-transition-mismatch","resource_kind":"kv_block","action":"reserve","amount":1,"before":0,"after":2,"capacity":4}
+{"scenario":"transition_mismatch","owner_kind":"request","owner_id":"req-transition-mismatch","resource_kind":"kv_block","action":"commit","amount":1,"before":0,"after":1,"capacity":4}
+{"scenario":"transition_mismatch","owner_kind":"request","owner_id":"req-transition-mismatch","resource_kind":"kv_block","action":"release","amount":1,"before":1,"after":0,"capacity":4}
+{"scenario":"transition_mismatch","owner_kind":"request","owner_id":"req-transition-mismatch","resource_kind":"request_slot","action":"request_close","capacity":1}

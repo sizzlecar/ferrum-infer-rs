@@ -125,6 +125,7 @@ impl ResourceLifecycleLedger {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn rollback(
         &mut self,
         owner_kind: &str,
