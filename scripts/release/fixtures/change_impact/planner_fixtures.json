@@ -191,6 +191,13 @@
       "forbid_required_gates": ["cuda_l1_native_op_smoke"]
     },
     {
+      "id": "kernel_native_ops_adapter",
+      "changed_files": ["crates/ferrum-kernels/src/native_ops.rs"],
+      "expect_domains": ["native_operator"],
+      "expect_required_gates": ["native_operator_artifact_selftest", "planner_selftest"],
+      "forbid_required_gates": ["cuda_l1_native_op_smoke"]
+    },
+    {
       "id": "native_op_types",
       "changed_files": ["crates/ferrum-types/src/native_operator.rs"],
       "expect_domains": ["evidence_schema", "native_operator"],
