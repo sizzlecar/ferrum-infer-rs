@@ -37,6 +37,28 @@
       ]
     },
     {
+      "id": "cli_product_observability",
+      "changed_files": ["crates/ferrum-cli/src/observability_product.rs"],
+      "expect_domains": ["cli_run", "server_api", "evidence_schema"],
+      "expect_required_gates": [
+        "profile_analyzer_selftest",
+        "product_backend_sentinel_selftest",
+        "observability_profile",
+        "product_sentinel"
+      ]
+    },
+    {
+      "id": "cli_observability_vertical_slice",
+      "changed_files": ["crates/ferrum-cli/src/observability_vertical_slice.rs"],
+      "expect_domains": ["cli_run", "server_api", "evidence_schema"],
+      "expect_required_gates": [
+        "profile_analyzer_selftest",
+        "product_backend_sentinel_selftest",
+        "observability_profile",
+        "product_sentinel"
+      ]
+    },
+    {
       "id": "model_onboarding_contract_gate",
       "changed_files": ["scripts/release/model_onboarding_contract_gate.py"],
       "expect_domains": ["model_contract", "release_gate"],
@@ -196,6 +218,82 @@
       ],
       "expect_domains": ["shared_runtime"],
       "expect_invalidated_contains": ["artifact:old-metal-l1"]
+    },
+    {
+      "id": "final_stage_artifact_linkage",
+      "changed_files": ["scripts/release/plan_gates.py"],
+      "require_final_stage_gates": true,
+      "previous_artifacts": [
+        {
+          "id": "actual_model_regression",
+          "gate": "actual_model_regression",
+          "git_sha": "fixture-head",
+          "artifact_dir": "docs/release/goal/actual",
+          "pass_line": "ACTUAL MODEL REGRESSION SUMMARY PASS: docs/release/goal/actual"
+        },
+        {
+          "id": "model_contract",
+          "gate": "model_contract",
+          "git_sha": "fixture-head",
+          "artifact_dir": "docs/release/goal/model",
+          "pass_line": "MODEL ONBOARDING CONTRACT PASS: docs/release/goal/model"
+        },
+        {
+          "id": "native_operator",
+          "gate": "native_operator",
+          "git_sha": "fixture-head",
+          "artifact_dir": "docs/release/goal/native",
+          "pass_line": "NATIVE OP ARTIFACT PASS: docs/release/goal/native"
+        },
+        {
+          "id": "observability_profile",
+          "gate": "observability_profile",
+          "git_sha": "fixture-head",
+          "artifact_dir": "docs/release/goal/observability",
+          "pass_line": "OBSERVABILITY PROFILE GATE PASS: docs/release/goal/observability"
+        },
+        {
+          "id": "product_sentinel",
+          "gate": "product_sentinel",
+          "git_sha": "fixture-head",
+          "artifact_dir": "docs/release/goal/product",
+          "pass_line": "PRODUCT BACKEND SENTINEL PASS: docs/release/goal/product"
+        },
+        {
+          "id": "resource_invariant",
+          "gate": "resource_invariant",
+          "git_sha": "fixture-head",
+          "artifact_dir": "docs/release/goal/resource",
+          "pass_line": "RESOURCE INVARIANT GATE PASS: docs/release/goal/resource"
+        },
+        {
+          "id": "support_matrix_contract",
+          "gate": "support_matrix_contract",
+          "git_sha": "fixture-head",
+          "artifact_dir": "docs/release/goal/support-matrix",
+          "pass_line": "SUPPORT MATRIX CONTRACT PASS: docs/release/goal/support-matrix"
+        }
+      ],
+      "expect_domains": ["release_gate"],
+      "expect_required_gates": [
+        "actual_model_regression",
+        "model_contract",
+        "native_operator",
+        "observability_profile",
+        "product_sentinel",
+        "resource_invariant",
+        "support_matrix_contract"
+      ],
+      "expect_satisfied_gates": [
+        "actual_model_regression",
+        "model_contract",
+        "native_operator",
+        "observability_profile",
+        "product_sentinel",
+        "resource_invariant",
+        "support_matrix_contract"
+      ],
+      "expect_artifact_path_count": 7
     }
   ]
 }

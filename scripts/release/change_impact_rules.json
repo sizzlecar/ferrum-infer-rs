@@ -117,6 +117,31 @@
       "reason": "shared evidence schemas and fixtures affect downstream validators"
     },
     {
+      "id": "cli-product-observability",
+      "path_globs": [
+        "crates/ferrum-cli/src/observability_product.rs",
+        "crates/ferrum-cli/src/observability_vertical_slice.rs"
+      ],
+      "domains": ["cli_run", "server_api", "evidence_schema"],
+      "required_gates": [
+        "unit",
+        "profile_analyzer_selftest",
+        "product_backend_sentinel_selftest",
+        "observability_profile",
+        "product_sentinel"
+      ],
+      "release_invalidation": [
+        "profile_analyzer_selftest",
+        "observability_profile",
+        "product_sentinel",
+        "run_sentinel",
+        "serve_sentinel"
+      ],
+      "exceptions": [],
+      "owner": "cli",
+      "reason": "product observability wiring feeds shared run/serve profile, memory, resource, and replay artifacts"
+    },
+    {
       "id": "model-contract",
       "path_globs": [
         "crates/ferrum-interfaces/src/model_executor.rs",
