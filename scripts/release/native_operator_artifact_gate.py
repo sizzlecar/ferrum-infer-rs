@@ -9,6 +9,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -267,6 +268,90 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def run_tool(command: list[str], *, context: str) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        stdout = proc.stdout[-2000:]
+        stderr = proc.stderr[-2000:]
+        raise GateError(
+            f"{context}: {' '.join(command)} failed rc={proc.returncode}\n"
+            f"stdout:\n{stdout}\nstderr:\n{stderr}"
+        )
+    return proc
+
+
+def collect_defined_symbols(nm_output: str) -> set[str]:
+    symbols: set[str] = set()
+    for raw_line in nm_output.splitlines():
+        line = raw_line.strip()
+        if not line or line.endswith(":"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        symbol_type: str | None = None
+        symbol: str | None = None
+        if len(parts) >= 3 and len(parts[-2]) == 1 and parts[-2].isalpha():
+            symbol_type = parts[-2]
+            symbol = parts[-1]
+        elif len(parts[0]) == 1 and parts[0].isalpha():
+            symbol_type = parts[0]
+            symbol = parts[-1]
+        if symbol_type is None or symbol is None or symbol_type.upper() == "U":
+            continue
+        symbols.add(symbol)
+        if symbol.startswith("_"):
+            symbols.add(symbol[1:])
+    return symbols
+
+
+def validate_binary_artifact(
+    *,
+    artifact_path: Path,
+    linkage: str,
+    exports: list[str],
+    context: str,
+) -> dict[str, Any]:
+    if linkage == "static":
+        if artifact_path.suffix != ".a":
+            raise GateError(f"{context}: static native operator artifact must use .a")
+        archive_members = run_tool(["ar", "t", str(artifact_path)], context=f"{context}.ar")
+        members = [line.strip() for line in archive_members.stdout.splitlines() if line.strip()]
+        if not members:
+            raise GateError(f"{context}: static native operator archive must contain objects")
+        format_kind = "static_archive"
+        format_tool = "ar"
+    elif linkage == "dynamic":
+        if artifact_path.suffix not in {".so", ".dylib"} and ".so" not in artifact_path.name:
+            raise GateError(f"{context}: dynamic native operator artifact must use .so or .dylib")
+        members = []
+        format_kind = "dynamic_library"
+        format_tool = "path_suffix"
+    else:
+        raise GateError(f"{context}: unsupported native operator linkage {linkage!r}")
+
+    nm = run_tool(["nm", "-g", str(artifact_path)], context=f"{context}.nm")
+    defined_symbols = collect_defined_symbols(nm.stdout)
+    missing = sorted(export for export in exports if export not in defined_symbols)
+    if missing:
+        raise GateError(f"{context}: native operator artifact missing exports: {missing}")
+    return {
+        "status": "pass",
+        "format": format_kind,
+        "format_tool": format_tool,
+        "archive_members": members,
+        "required_exports": exports,
+        "matched_exports": sorted(exports),
+    }
+
+
 def parse_operator_value(items: list[str], flag: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for item in items:
@@ -428,6 +513,71 @@ def git_output(args: list[str]) -> str:
     return proc.stdout.strip()
 
 
+def write_test_static_archive(root: Path, *, include_descriptor: bool) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    source = root / "native_op.c"
+    lines = [
+        "int ferrum_native_op_init(void) { return 0; }",
+    ]
+    if include_descriptor:
+        lines.append('const char *ferrum_native_op_descriptor(void) { return "fixture"; }')
+    source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    obj = root / "native_op.o"
+    archive = root / "libferrum_native_fa2.a"
+    run_tool(["cc", "-c", str(source), "-o", str(obj)], context="selftest.cc")
+    run_tool(["ar", "rcs", str(archive), str(obj)], context="selftest.ar")
+    return archive
+
+
+def binary_validation_selftest() -> dict[str, str]:
+    required_exports = ["ferrum_native_op_init", "ferrum_native_op_descriptor"]
+    with tempfile.TemporaryDirectory(prefix="ferrum-native-op-binary-") as tmp:
+        root = Path(tmp)
+        good_archive = write_test_static_archive(root / "good", include_descriptor=True)
+        validate_binary_artifact(
+            artifact_path=good_archive,
+            linkage="static",
+            exports=required_exports,
+            context="selftest.good_archive",
+        )
+
+        text_file = root / "not-a-library.a"
+        text_file.write_text("not a native library\n", encoding="utf-8")
+        try:
+            validate_binary_artifact(
+                artifact_path=text_file,
+                linkage="static",
+                exports=required_exports,
+                context="selftest.text_file",
+            )
+        except GateError:
+            text_file_status = "pass"
+        else:
+            raise GateError("binary validation selftest expected text file rejection")
+
+        missing_export_archive = write_test_static_archive(
+            root / "missing-export",
+            include_descriptor=False,
+        )
+        try:
+            validate_binary_artifact(
+                artifact_path=missing_export_archive,
+                linkage="static",
+                exports=required_exports,
+                context="selftest.missing_export",
+            )
+        except GateError:
+            missing_export_status = "pass"
+        else:
+            raise GateError("binary validation selftest expected missing export rejection")
+
+    return {
+        "static_archive_exports": "pass",
+        "text_file_rejected": text_file_status,
+        "missing_export_rejected": missing_export_status,
+    }
+
+
 def run_selftest() -> dict[str, Any]:
     pass_dir = DEFAULT_FIXTURES / "pass"
     fail_dir = DEFAULT_FIXTURES / "fail"
@@ -523,6 +673,7 @@ def run_selftest() -> dict[str, Any]:
     release_config_audit = native_operator_release_config_audit()
     if release_config_audit["status"] != "pass":
         raise GateError("native operator release-config audit failed")
+    binary_validation = binary_validation_selftest()
     fixture_release_rejections: list[str] = []
     for label, manifest_path, artifact_path in [
         (
@@ -564,6 +715,7 @@ def run_selftest() -> dict[str, Any]:
         "fail_fixtures": rejected_validation,
         "resolver_fail_closed_cases": rejected_resolution,
         "normal_gate_fixture_rejections": fixture_release_rejections,
+        "binary_validation": binary_validation,
         "python_runtime_dependency": "none",
         "bulk_source": {"count": bulk_count, "samples": bulk_samples},
         "unregistered_third_party_source": {
@@ -627,6 +779,12 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         )
         if not artifact_path.is_file():
             raise GateError(f"{path}: binary artifact does not exist: {artifact_path}")
+        binary_validation = validate_binary_artifact(
+            artifact_path=artifact_path,
+            linkage=str(manifest["linkage"]),
+            exports=[str(export) for export in manifest["exports"]],
+            context=str(path),
+        )
         binary_sha256 = sha256_file(artifact_path)
         requirement = ResolverRequirement(
             operator=operator,
@@ -652,6 +810,7 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
                 "inputs_sha256": manifest["inputs_sha256"],
                 "binary_artifact": str(artifact_path),
                 "binary_sha256": binary_sha256,
+                "binary_validation": binary_validation,
                 "resolution": resolution,
             }
         )
