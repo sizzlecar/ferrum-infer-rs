@@ -437,6 +437,30 @@ impl FirstAllocateThenFailKvCacheManager {
     }
 }
 
+struct FailingDeallocateKvCacheManager {
+    inner: MockKvCacheManager,
+}
+
+impl FailingDeallocateKvCacheManager {
+    fn new(total_blocks: usize) -> Self {
+        Self {
+            inner: MockKvCacheManager::new(total_blocks),
+        }
+    }
+}
+
+struct FailingDeallocateRecurrentStateManager {
+    inner: InMemoryRecurrentStateManager,
+}
+
+impl FailingDeallocateRecurrentStateManager {
+    fn new(config: InMemoryRecurrentStateConfig) -> Self {
+        Self {
+            inner: InMemoryRecurrentStateManager::new(config),
+        }
+    }
+}
+
 struct RecurrentSpecLlm {
     config: LlmRuntimeConfig,
 }
@@ -1115,6 +1139,80 @@ impl KvCacheManager for FirstAllocateThenFailKvCacheManager {
 
     fn list_handles(&self) -> Vec<(RequestId, Arc<dyn KvCacheHandle>)> {
         self.inner.list_handles()
+    }
+}
+
+#[async_trait::async_trait]
+impl KvCacheManager for FailingDeallocateKvCacheManager {
+    async fn allocate(&self, request: &AllocationRequest) -> Result<Arc<dyn KvCacheHandle>> {
+        self.inner.allocate(request).await
+    }
+
+    async fn extend(&self, handle: &mut dyn KvCacheHandle, additional_tokens: usize) -> Result<()> {
+        self.inner.extend(handle, additional_tokens).await
+    }
+
+    async fn deallocate(&self, request_id: RequestId) -> Result<()> {
+        Err(FerrumError::internal(format!(
+            "synthetic KV release failure for {request_id}"
+        )))
+    }
+
+    fn can_allocate(&self, request: &AllocationRequest) -> bool {
+        self.inner.can_allocate(request)
+    }
+
+    fn stats(&self) -> CacheManagerStats {
+        self.inner.stats()
+    }
+
+    async fn gc(&self) -> Result<CacheGcStats> {
+        self.inner.gc().await
+    }
+
+    fn set_pressure_callback(&self, callback: Box<dyn Fn(MemoryPressure) + Send + Sync>) {
+        self.inner.set_pressure_callback(callback);
+    }
+
+    fn get_handle(&self, request_id: RequestId) -> Option<Arc<dyn KvCacheHandle>> {
+        self.inner.get_handle(request_id)
+    }
+
+    fn list_handles(&self) -> Vec<(RequestId, Arc<dyn KvCacheHandle>)> {
+        self.inner.list_handles()
+    }
+}
+
+#[async_trait::async_trait]
+impl RecurrentStateManager for FailingDeallocateRecurrentStateManager {
+    async fn allocate(&self, spec: &RecurrentStateSpec) -> Result<Arc<dyn RecurrentStateHandle>> {
+        self.inner.allocate(spec).await
+    }
+
+    async fn deallocate(&self, request_id: RequestId) -> Result<()> {
+        Err(FerrumError::internal(format!(
+            "synthetic recurrent-state release failure for {request_id}"
+        )))
+    }
+
+    fn can_allocate(&self, spec: &RecurrentStateSpec) -> bool {
+        self.inner.can_allocate(spec)
+    }
+
+    fn get_handle(&self, request_id: RequestId) -> Option<Arc<dyn RecurrentStateHandle>> {
+        self.inner.get_handle(request_id)
+    }
+
+    fn list_handles(&self) -> Vec<(RequestId, Arc<dyn RecurrentStateHandle>)> {
+        self.inner.list_handles()
+    }
+
+    fn stats(&self) -> ferrum_interfaces::RecurrentStateManagerStats {
+        self.inner.stats()
+    }
+
+    async fn reset(&self) -> Result<()> {
+        self.inner.reset().await
     }
 }
 
@@ -1887,6 +1985,138 @@ fn kv_allocation_lease_drop_without_consumption_panics_in_tests() {
     ));
 
     let _lease = KvAllocationLease::new(request_id.clone(), request_id, handle, 1);
+}
+
+#[tokio::test]
+async fn kv_release_failure_traces_reject_without_successful_release() {
+    let trace_path = resource_trace_temp_path("kv-release-failure");
+    let _ = std::fs::remove_file(&trace_path);
+    let mut config = EngineConfig::default();
+    config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
+
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> =
+        Arc::new(FailingDeallocateKvCacheManager::new(256));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(ferrum_testkit::MockTensorFactory);
+    let model_executor: Arc<dyn ModelExecutor + Send + Sync> =
+        Arc::new(ferrum_testkit::MockModelExecutor::instant(128));
+    let engine = ContinuousBatchEngine::new(
+        config,
+        scheduler,
+        tokenizer,
+        sampler,
+        kv_cache,
+        model_executor,
+        tensor_factory,
+    );
+
+    let request_id = RequestId::new();
+    engine.inner.trace_kv_allocate(&request_id, 2);
+    engine
+        .inner
+        .release_kv_allocation(&request_id, request_id.clone(), Some(2))
+        .await;
+
+    let resources: Vec<_> = read_engine_profile_events(&trace_path)
+        .into_iter()
+        .filter_map(|event| event.resource)
+        .collect();
+    assert!(
+        !resources
+            .iter()
+            .any(|resource| resource.resource_kind == "kv_block"
+                && resource.action == ResourceAction::Release),
+        "failed deallocate must not be traced as a successful release: {resources:?}"
+    );
+    let reject = resources
+        .iter()
+        .find(|resource| {
+            resource.resource_kind == "kv_block" && resource.action == ResourceAction::Reject
+        })
+        .expect("failed KV release should be traced as resource reject");
+    assert!(
+        reject
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("kv release failed")),
+        "reject reason should explain release failure: {reject:?}"
+    );
+    let _ = std::fs::remove_file(trace_path);
+}
+
+#[tokio::test]
+async fn recurrent_release_failure_traces_reject_without_successful_release() {
+    let trace_path = resource_trace_temp_path("recurrent-release-failure");
+    let _ = std::fs::remove_file(&trace_path);
+    let mut config = EngineConfig::default();
+    config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
+
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> =
+        Arc::new(ferrum_testkit::MockKvCacheManager::new(256));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(ferrum_testkit::MockTensorFactory);
+    let model_executor: Arc<dyn ModelExecutor + Send + Sync> =
+        Arc::new(ferrum_testkit::MockModelExecutor::instant(128));
+    let recurrent_manager: Arc<dyn RecurrentStateManager + Send + Sync> = Arc::new(
+        FailingDeallocateRecurrentStateManager::new(InMemoryRecurrentStateConfig {
+            total_memory_bytes: 8,
+            total_batch_slots: 1,
+        }),
+    );
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler,
+        tokenizer,
+        sampler,
+        kv_cache,
+        model_executor,
+        tensor_factory,
+        None,
+        None,
+        Some(recurrent_manager),
+    );
+
+    let request_id = RequestId::new();
+    engine
+        .inner
+        .trace_recurrent_allocate(&request_id, 1, Some(1));
+    engine
+        .inner
+        .release_recurrent_allocation(&request_id, Some(1))
+        .await;
+
+    let resources: Vec<_> = read_engine_profile_events(&trace_path)
+        .into_iter()
+        .filter_map(|event| event.resource)
+        .collect();
+    assert!(
+        !resources
+            .iter()
+            .any(|resource| resource.resource_kind == "recurrent_state_slot"
+                && resource.action == ResourceAction::Release),
+        "failed recurrent deallocate must not be traced as a successful release: {resources:?}"
+    );
+    let reject = resources
+        .iter()
+        .find(|resource| {
+            resource.resource_kind == "recurrent_state_slot"
+                && resource.action == ResourceAction::Reject
+        })
+        .expect("failed recurrent release should be traced as resource reject");
+    assert!(
+        reject
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("recurrent-state release failed")),
+        "reject reason should explain release failure: {reject:?}"
+    );
+    let _ = std::fs::remove_file(trace_path);
 }
 
 #[tokio::test]
