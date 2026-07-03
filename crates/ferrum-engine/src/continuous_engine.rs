@@ -960,6 +960,44 @@ impl SequenceState {
         };
     }
 
+    fn decode_model_cache_id_or_request_id(&self, request_id: &RequestId) -> String {
+        self.model_cache_id
+            .clone()
+            .unwrap_or_else(|| request_id.to_string())
+    }
+
+    fn decode_model_kv_len_after_last_generated_token(&self) -> usize {
+        self.input_tokens
+            .len()
+            .saturating_add(self.generated_tokens.len())
+            .saturating_sub(1)
+    }
+
+    fn commit_decode_step_physical_resources(&mut self, kv_cache: Arc<dyn KvCacheHandle>) {
+        self.kv_cache = Some(kv_cache);
+        self.tokens_this_iteration += 1;
+    }
+
+    fn commit_decode_recurrent_state(
+        &mut self,
+        recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
+    ) {
+        let has_recurrent_state = recurrent_state.is_some();
+        self.recurrent_state = recurrent_state;
+        if !has_recurrent_state {
+            self.recurrent_state_slots = None;
+        }
+    }
+
+    fn commit_speculative_decode_physical_resources(
+        &mut self,
+        target_kv_cache: Arc<dyn KvCacheHandle>,
+        draft_kv_cache: Arc<dyn KvCacheHandle>,
+    ) {
+        self.kv_cache = Some(target_kv_cache);
+        self.draft_kv_cache = Some(draft_kv_cache);
+    }
+
     pub fn model_decode_logits_policy(&self) -> LogitsReturnPolicy {
         if !self.can_use_model_greedy_argmax() {
             return LogitsReturnPolicy::FullLogits;

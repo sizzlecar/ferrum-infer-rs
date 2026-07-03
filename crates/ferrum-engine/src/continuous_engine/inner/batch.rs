@@ -809,17 +809,10 @@ impl EngineInner {
                     )?
                 };
                 seq.generated_tokens.push(token);
-                let cache_id = seq
-                    .model_cache_id
-                    .clone()
-                    .unwrap_or_else(|| rid.to_string());
-                let kv_len = seq
-                    .input_tokens
-                    .len()
-                    .saturating_add(seq.generated_tokens.len())
-                    .saturating_sub(1);
-                seq.kv_cache = Some(self.make_model_kv_handle_with_seq(cache_id, kv_len));
-                seq.tokens_this_iteration += 1;
+                let cache_id = seq.decode_model_cache_id_or_request_id(&rid);
+                let kv_len = seq.decode_model_kv_len_after_last_generated_token();
+                let model_kv = self.make_model_kv_handle_with_seq(cache_id, kv_len);
+                seq.commit_decode_step_physical_resources(model_kv);
                 // pos_offset is sourced from SequenceState bookkeeping above
                 // (`input_tokens.len() + generated_tokens.len() - 1`); the
                 // engine-side KV handle's `sequence_length` field is no

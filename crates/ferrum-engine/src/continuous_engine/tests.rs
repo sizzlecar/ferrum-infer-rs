@@ -1618,6 +1618,54 @@ fn sequence_prefill_chunk_commit_tracks_partial_and_final_state() {
 }
 
 #[test]
+fn sequence_decode_commit_helpers_keep_resource_metadata_together() {
+    let request = policy_request();
+    let request_id = request.id.clone();
+    let mut sequence = SequenceState::new(request, vec![TokenId::new(1), TokenId::new(2)]);
+
+    assert_eq!(
+        sequence.decode_model_cache_id_or_request_id(&request_id),
+        request_id.to_string()
+    );
+    sequence.model_cache_id = Some("model-cache".to_string());
+    sequence.generated_tokens.push(TokenId::new(7));
+    assert_eq!(
+        sequence.decode_model_cache_id_or_request_id(&request_id),
+        "model-cache"
+    );
+    assert_eq!(sequence.decode_model_kv_len_after_last_generated_token(), 2);
+
+    let decode_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        request_id.clone(),
+        1,
+        2,
+    ));
+    sequence.commit_decode_step_physical_resources(decode_kv);
+    assert!(sequence.kv_cache.is_some());
+    assert_eq!(sequence.tokens_this_iteration, 1);
+    assert_eq!(sequence.model_cache_id.as_deref(), Some("model-cache"));
+
+    sequence.recurrent_state_slots = Some(1);
+    sequence.commit_decode_recurrent_state(None);
+    assert!(sequence.recurrent_state.is_none());
+    assert!(sequence.recurrent_state_slots.is_none());
+
+    let target_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        request_id.clone(),
+        1,
+        3,
+    ));
+    let draft_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        RequestId::new(),
+        1,
+        3,
+    ));
+    sequence.commit_speculative_decode_physical_resources(target_kv, draft_kv);
+    assert!(sequence.kv_cache.is_some());
+    assert!(sequence.draft_kv_cache.is_some());
+}
+
+#[test]
 #[should_panic(expected = "KV allocation lease dropped without explicit commit or async release")]
 fn kv_allocation_lease_drop_without_consumption_panics_in_tests() {
     let request_id = RequestId::new();
