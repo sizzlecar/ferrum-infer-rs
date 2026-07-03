@@ -443,6 +443,14 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         cmd.request_dump_dir.as_ref(),
         cmd.profile_sample_rate,
     );
+    let memory_sampler = crate::memory_profile::ProcessMemorySampler;
+    let product_memory_enabled = product_observability.enabled();
+    let process_start_sample = product_memory_enabled
+        .then(|| memory_sampler.sample())
+        .flatten();
+    let process_start_memory = process_start_sample
+        .clone()
+        .map(crate::memory_profile::ProcessMemoryObservation::from_sample);
     if product_observability.synthetic_no_weight_enabled() {
         let written = crate::observability_product::write_synthetic_product_observability(
             &product_observability,
@@ -483,6 +491,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             selection.selected_distributed_strategy
         );
     }
+    let backend_initialized_sample = product_memory_enabled
+        .then(|| memory_sampler.sample())
+        .flatten();
+    let backend_initialized_memory = process_memory_observation_between(
+        process_start_sample.clone(),
+        backend_initialized_sample.clone(),
+    );
     let mut startup_cli_runtime_entries =
         run_startup_cli_runtime_entries(&cmd, gpu_selection.as_ref());
     materialize_run_cli_runtime_entries(&startup_cli_runtime_entries);
@@ -602,6 +617,20 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
     apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
     let engine = ferrum_engine::create_default_engine(engine_config).await?;
+    let model_loaded_sample = product_memory_enabled
+        .then(|| memory_sampler.sample())
+        .flatten();
+    let model_loaded_memory = process_memory_observation_between(
+        backend_initialized_sample
+            .clone()
+            .or_else(|| process_start_sample.clone()),
+        model_loaded_sample.clone(),
+    );
+    let model_loaded_duration_us = load_start
+        .elapsed()
+        .as_micros()
+        .try_into()
+        .unwrap_or(u64::MAX);
     eprintln!(
         "{}",
         format!(
@@ -645,7 +674,6 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             metadata,
         };
         let profile_request_id = request.id.to_string();
-        let memory_sampler = crate::memory_profile::ProcessMemorySampler;
         let memory_before = product_observability
             .enabled()
             .then(|| memory_sampler.sample())
@@ -654,10 +682,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         let response = match engine.infer(request).await {
             Ok(response) => response,
             Err(err) => {
-                let memory = product_observability
-                    .enabled()
-                    .then(|| memory_sampler.observe(memory_before))
+                let memory_after = product_memory_enabled
+                    .then(|| memory_sampler.sample())
                     .flatten();
+                let memory = process_memory_observation_between(memory_before, memory_after);
                 let elapsed = start.elapsed().as_secs_f64();
                 if let Err(observability_err) =
                     crate::observability_product::write_actual_run_failure_observability(
@@ -673,6 +701,14 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                             error_kind: err.observability_error_kind().to_string(),
                             error_message: err.to_string(),
                             memory,
+                            memory_stages: actual_run_memory_stages(
+                                product_memory_enabled,
+                                process_start_memory.clone(),
+                                backend_initialized_memory.clone(),
+                                model_loaded_memory.clone(),
+                                model_loaded_duration_us,
+                                None,
+                            ),
                         },
                     )
                 {
@@ -681,10 +717,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 return Err(err);
             }
         };
-        let memory = product_observability
-            .enabled()
-            .then(|| memory_sampler.observe(memory_before))
+        let memory_after = product_memory_enabled
+            .then(|| memory_sampler.sample())
             .flatten();
+        let memory = process_memory_observation_between(memory_before, memory_after.clone());
         let tokens = response.tokens.len();
         let output_token_ids = response
             .tokens
@@ -726,6 +762,18 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 );
             }
         }
+        let shutdown_result = engine.shutdown().await;
+        let shutdown_after = product_memory_enabled
+            .then(|| memory_sampler.sample())
+            .flatten();
+        let shutdown_memory = process_memory_observation_between(
+            memory_after
+                .clone()
+                .or_else(|| model_loaded_sample.clone())
+                .or_else(|| backend_initialized_sample.clone())
+                .or_else(|| process_start_sample.clone()),
+            shutdown_after,
+        );
         crate::observability_product::write_actual_run_observability(
             &product_observability,
             &crate::observability_product::ActualRunObservation {
@@ -742,9 +790,17 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 response_chars: content.chars().count(),
                 response_text: content.clone(),
                 memory,
+                memory_stages: actual_run_memory_stages(
+                    product_memory_enabled,
+                    process_start_memory.clone(),
+                    backend_initialized_memory.clone(),
+                    model_loaded_memory.clone(),
+                    model_loaded_duration_us,
+                    shutdown_memory,
+                ),
             },
         )?;
-        engine.shutdown().await?;
+        shutdown_result?;
         return Ok(());
     }
 
@@ -1009,6 +1065,52 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     }
     engine.shutdown().await?;
     Ok(())
+}
+
+fn process_memory_observation_between(
+    before: Option<crate::memory_profile::ProcessMemorySample>,
+    after: Option<crate::memory_profile::ProcessMemorySample>,
+) -> Option<crate::memory_profile::ProcessMemoryObservation> {
+    after.map(|after| crate::memory_profile::ProcessMemoryObservation::from_samples(before, after))
+}
+
+fn actual_run_memory_stages(
+    enabled: bool,
+    process_start_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+    backend_initialized_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+    model_loaded_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+    model_loaded_duration_us: u64,
+    shutdown_memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+) -> Vec<crate::observability_product::ActualMemoryStageObservation> {
+    if !enabled {
+        return Vec::new();
+    }
+    vec![
+        crate::observability_product::ActualMemoryStageObservation::new(
+            "actual_run_process_start",
+            "process_start",
+            None,
+            process_start_memory,
+        ),
+        crate::observability_product::ActualMemoryStageObservation::new(
+            "actual_run_backend_initialized",
+            "backend_initialized",
+            None,
+            backend_initialized_memory,
+        ),
+        crate::observability_product::ActualMemoryStageObservation::new(
+            "actual_run_model_loaded",
+            "model_loaded",
+            Some(model_loaded_duration_us),
+            model_loaded_memory,
+        ),
+        crate::observability_product::ActualMemoryStageObservation::new(
+            "actual_run_shutdown",
+            "shutdown",
+            None,
+            shutdown_memory,
+        ),
+    ]
 }
 
 #[cfg(unix)]

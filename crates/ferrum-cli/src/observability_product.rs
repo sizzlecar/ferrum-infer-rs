@@ -75,6 +75,7 @@ pub struct ActualRunObservation {
     pub response_chars: usize,
     pub response_text: String,
     pub memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+    pub memory_stages: Vec<ActualMemoryStageObservation>,
 }
 
 pub struct ActualRunFailureObservation {
@@ -88,6 +89,31 @@ pub struct ActualRunFailureObservation {
     pub error_kind: String,
     pub error_message: String,
     pub memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+    pub memory_stages: Vec<ActualMemoryStageObservation>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActualMemoryStageObservation {
+    pub phase: String,
+    pub stage: String,
+    pub duration_us: Option<u64>,
+    pub memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+}
+
+impl ActualMemoryStageObservation {
+    pub fn new(
+        phase: impl Into<String>,
+        stage: impl Into<String>,
+        duration_us: Option<u64>,
+        memory: Option<crate::memory_profile::ProcessMemoryObservation>,
+    ) -> Self {
+        Self {
+            phase: phase.into(),
+            stage: stage.into(),
+            duration_us,
+            memory,
+        }
+    }
 }
 
 impl ProductObservabilityConfig {
@@ -501,6 +527,12 @@ fn actual_run_events(
     replay_command: &str,
 ) -> Vec<FerrumProfileEvent> {
     let base = Utc::now();
+    let mut events = actual_memory_stage_events(
+        config,
+        &observation.request_id,
+        &observation.memory_stages,
+        base,
+    );
     let open = actual_resource_event(
         config,
         &observation.request_id,
@@ -654,7 +686,8 @@ fn actual_run_events(
         "response_chars".to_string(),
         json!(observation.response_chars),
     );
-    vec![open, reserve, commit, generation, release, close]
+    events.extend([open, reserve, commit, generation, release, close]);
+    events
 }
 
 fn actual_run_failure_events(
@@ -663,6 +696,12 @@ fn actual_run_failure_events(
     replay_command: &str,
 ) -> Vec<FerrumProfileEvent> {
     let base = Utc::now();
+    let mut events = actual_memory_stage_events(
+        config,
+        &observation.request_id,
+        &observation.memory_stages,
+        base,
+    );
     let open = actual_resource_event(
         config,
         &observation.request_id,
@@ -780,7 +819,32 @@ fn actual_run_failure_events(
             .as_ref()
             .map(|path| path.to_string_lossy().to_string()),
     });
-    vec![open, reserve, commit, failure, release, close]
+    events.extend([open, reserve, commit, failure, release, close]);
+    events
+}
+
+fn actual_memory_stage_events(
+    config: &ProductObservabilityConfig,
+    request_id: &str,
+    stages: &[ActualMemoryStageObservation],
+    base: chrono::DateTime<Utc>,
+) -> Vec<FerrumProfileEvent> {
+    stages
+        .iter()
+        .enumerate()
+        .map(|(index, stage)| {
+            let mut event = actual_base_event(
+                config,
+                request_id,
+                &stage.phase,
+                ProfileEventKind::Memory,
+                base + Duration::microseconds(index as i64),
+            );
+            event.duration_us = stage.duration_us;
+            attach_process_memory(&mut event, stage.memory.as_ref(), &stage.stage);
+            event
+        })
+        .collect()
 }
 
 fn actual_serve_startup_events(
@@ -1741,6 +1805,7 @@ mod tests {
                 error_kind: "error".to_string(),
                 error_message: "synthetic failure".to_string(),
                 memory: None,
+                memory_stages: Vec::new(),
             },
         )
         .unwrap();
@@ -1799,6 +1864,18 @@ mod tests {
                 response_chars: 2,
                 response_text: "OK".to_string(),
                 memory: None,
+                memory_stages: vec![ActualMemoryStageObservation::new(
+                    "actual_run_process_start",
+                    "process_start",
+                    None,
+                    Some(crate::memory_profile::ProcessMemoryObservation {
+                        before_bytes: 100,
+                        after_bytes: 100,
+                        current_bytes: 100,
+                        high_water_bytes: 120,
+                        source: "test",
+                    }),
+                )],
             },
         )
         .unwrap();
@@ -1826,6 +1903,19 @@ mod tests {
             "rendered_prompt_and_generated_tokens"
         );
         assert_eq!(generation["attributes"]["e2e_duration_us"], 42);
+        let memory_profile = fs::read_to_string(root.join("memory.jsonl")).unwrap();
+        let memory_stages = memory_profile
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter_map(|event| {
+                event["attributes"]["memory_stage"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert!(memory_stages.contains(&"process_start".to_string()));
+        assert!(memory_stages.contains(&"first_request_done".to_string()));
         fs::remove_dir_all(root).ok();
     }
 
@@ -1866,6 +1956,7 @@ mod tests {
                     high_water_bytes: 4096,
                     source: "test",
                 }),
+                memory_stages: Vec::new(),
             },
         )
         .unwrap();
