@@ -125,6 +125,25 @@ pub trait Backend: Send + Sync + Sized + 'static {
         true
     }
 
+    /// Whether this backend implements the fused per-item batched Q/K/V
+    /// normalization and RoPE kernel used by the Llama-family batched decode
+    /// path.
+    fn supports_qk_norm_rope_batched_per_item() -> bool {
+        false
+    }
+
+    /// Whether this backend implements batched KV-cache append across multiple
+    /// independent per-request caches.
+    fn supports_kv_cache_append_batched_per_cache() -> bool {
+        false
+    }
+
+    /// Whether this backend implements batched decode attention across multiple
+    /// independent per-request caches.
+    fn supports_flash_attention_batched_per_cache() -> bool {
+        false
+    }
+
     // Graph capability moved to the `BackendGraph` supertrait at the end
     // of this file. CUDA implements its overrides; Metal/CPU inherit
     // unsupported defaults via empty `impl BackendGraph for X {}` blocks.

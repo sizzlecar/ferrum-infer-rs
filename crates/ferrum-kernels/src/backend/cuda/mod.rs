@@ -615,6 +615,19 @@ impl Backend for CudaBackend {
     fn make_timer() -> Self::Timer {
         crate::backend::timer::CudaTimer::new()
     }
+
+    fn supports_qk_norm_rope_batched_per_item() -> bool {
+        true
+    }
+
+    fn supports_kv_cache_append_batched_per_cache() -> bool {
+        true
+    }
+
+    fn supports_flash_attention_batched_per_cache() -> bool {
+        true
+    }
+
     // type GptqStore: removed in Phase C step 4e. GptqStoreCuda is
     // now a private (crate-internal) detail of CudaMarlinExpertStack.
 
