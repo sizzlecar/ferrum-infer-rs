@@ -1105,52 +1105,62 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         } else {
             None
         };
-        let q_batched = B::qk_norm_rope_batched_per_item(
-            ctx,
-            &self.scratch.q_buf,
-            q_norm_w,
-            rope_cos,
-            rope_sin,
-            &mut self.scratch.q_normed_batched,
-            &self.scratch.batch_positions,
-            m,
-            nh,
-            hd,
-            eps,
-            qk_mode,
-        );
-        let k_batched = B::qk_norm_rope_batched_per_item(
-            ctx,
-            &self.scratch.k_buf,
-            k_norm_w,
-            rope_cos,
-            rope_sin,
-            &mut self.scratch.k_normed_batched,
-            &self.scratch.batch_positions,
-            m,
-            nkv,
-            hd,
-            eps,
-            qk_mode,
-        );
-        // V's "qk_norm_rope" runs in mode=0 (transpose-only). For
-        // tokens-per-item=1 in batched decode this is a memcpy — kept
-        // for layout-equivalence with the per-item path. Cheap.
-        let v_batched = B::qk_norm_rope_batched_per_item(
-            ctx,
-            &self.scratch.v_buf,
-            dummy_w,
-            rope_cos,
-            rope_sin,
-            &mut self.scratch.v_normed_batched,
-            &self.scratch.batch_positions,
-            m,
-            nkv,
-            hd,
-            eps,
-            0,
-        );
-        let use_batched_qkr = q_batched.is_ok() && k_batched.is_ok() && v_batched.is_ok();
+        let mut q_batched_err = None;
+        let mut k_batched_err = None;
+        let mut v_batched_err = None;
+        let use_batched_qkr = if B::supports_qk_norm_rope_batched_per_item() {
+            let q_batched = B::qk_norm_rope_batched_per_item(
+                ctx,
+                &self.scratch.q_buf,
+                q_norm_w,
+                rope_cos,
+                rope_sin,
+                &mut self.scratch.q_normed_batched,
+                &self.scratch.batch_positions,
+                m,
+                nh,
+                hd,
+                eps,
+                qk_mode,
+            );
+            let k_batched = B::qk_norm_rope_batched_per_item(
+                ctx,
+                &self.scratch.k_buf,
+                k_norm_w,
+                rope_cos,
+                rope_sin,
+                &mut self.scratch.k_normed_batched,
+                &self.scratch.batch_positions,
+                m,
+                nkv,
+                hd,
+                eps,
+                qk_mode,
+            );
+            // V's "qk_norm_rope" runs in mode=0 (transpose-only). For
+            // tokens-per-item=1 in batched decode this is a memcpy — kept
+            // for layout-equivalence with the per-item path. Cheap.
+            let v_batched = B::qk_norm_rope_batched_per_item(
+                ctx,
+                &self.scratch.v_buf,
+                dummy_w,
+                rope_cos,
+                rope_sin,
+                &mut self.scratch.v_normed_batched,
+                &self.scratch.batch_positions,
+                m,
+                nkv,
+                hd,
+                eps,
+                0,
+            );
+            q_batched_err = q_batched.as_ref().err().map(|e| e.to_string());
+            k_batched_err = k_batched.as_ref().err().map(|e| e.to_string());
+            v_batched_err = v_batched.as_ref().err().map(|e| e.to_string());
+            q_batched.is_ok() && k_batched.is_ok() && v_batched.is_ok()
+        } else {
+            false
+        };
         if let Some(t0) = _t_qkr_contig {
             B::sync(ctx);
             QKR_TIME_US.fetch_add(
@@ -1167,13 +1177,13 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             use std::sync::atomic::{AtomicBool, Ordering};
             static REPORTED: AtomicBool = AtomicBool::new(false);
             if !REPORTED.swap(true, Ordering::Relaxed) {
-                eprintln!(
+                tracing::debug!(
                     "[batched-qkr] first batched_decode call: m={} use_batched_qkr={} (q={:?} k={:?} v={:?})",
                     m,
                     use_batched_qkr,
-                    q_batched.as_ref().err().map(|e| e.to_string()),
-                    k_batched.as_ref().err().map(|e| e.to_string()),
-                    v_batched.as_ref().err().map(|e| e.to_string()),
+                    q_batched_err,
+                    k_batched_err,
+                    v_batched_err,
                 );
             }
         }
@@ -1191,7 +1201,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         } else {
             None
         };
-        if use_batched_qkr {
+        if use_batched_qkr && B::supports_kv_cache_append_batched_per_cache() {
             let mut k_caches_ref: Vec<&B::Buffer> = Vec::with_capacity(m);
             let mut v_caches_ref: Vec<&B::Buffer> = Vec::with_capacity(m);
             let mut pre_append_lens: Vec<u32> = Vec::with_capacity(m);
@@ -1245,7 +1255,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 use std::sync::atomic::{AtomicBool, Ordering};
                 static REPORTED_KV: AtomicBool = AtomicBool::new(false);
                 if !REPORTED_KV.swap(true, Ordering::Relaxed) {
-                    eprintln!(
+                    tracing::debug!(
                         "[batched-kv-append] first call: m={} ok={} k_err={:?} v_err={:?}",
                         m,
                         batched_kv_append_ok,
@@ -1484,22 +1494,28 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             } else {
                 None
             };
-            let batched_attn_res = B::flash_attention_batched_per_cache(
-                ctx,
-                &self.scratch.q_normed_batched,
-                &k_caches_ref,
-                &v_caches_ref,
-                &self.scratch.batch_kv_lens_post,
-                &mut self.scratch.attn_flat,
-                nh,
-                nkv,
-                hd,
-                scale,
-                max_kv,
-                capacity_for_kernel,
-                layer_window,
-                li,
-            );
+            let mut batched_attn_ok = false;
+            let mut batched_attn_err = None;
+            if B::supports_flash_attention_batched_per_cache() {
+                let batched_attn_res = B::flash_attention_batched_per_cache(
+                    ctx,
+                    &self.scratch.q_normed_batched,
+                    &k_caches_ref,
+                    &v_caches_ref,
+                    &self.scratch.batch_kv_lens_post,
+                    &mut self.scratch.attn_flat,
+                    nh,
+                    nkv,
+                    hd,
+                    scale,
+                    max_kv,
+                    capacity_for_kernel,
+                    layer_window,
+                    li,
+                );
+                batched_attn_ok = batched_attn_res.is_ok();
+                batched_attn_err = batched_attn_res.as_ref().err().map(|e| e.to_string());
+            }
             if let Some(t0) = _t_attn {
                 B::sync(ctx);
                 ATTN_TIME_US.fetch_add(
@@ -1513,15 +1529,15 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 use std::sync::atomic::{AtomicBool, Ordering};
                 static REPORTED_ATTN: AtomicBool = AtomicBool::new(false);
                 if !REPORTED_ATTN.swap(true, Ordering::Relaxed) {
-                    eprintln!(
+                    tracing::debug!(
                         "[batched-attn] first call: m={} ok={} err={:?}",
                         m,
-                        batched_attn_res.is_ok(),
-                        batched_attn_res.as_ref().err().map(|e| e.to_string()),
+                        batched_attn_ok,
+                        batched_attn_err,
                     );
                 }
             }
-            if batched_attn_res.is_err() {
+            if !batched_attn_ok {
                 // Per-item flash_attn fallback for backends that
                 // implement the batched qkr but not the batched attn.
                 for (i, (cache_id, _, pos)) in batch.iter().enumerate() {
