@@ -1,0 +1,301 @@
+{
+  "schema_version": 1,
+  "catalog_id": "runtime-vnext-0.8.0-g00-legacy-correctness-expectations",
+  "source_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394",
+  "status_vocabulary": {
+    "pass": "The frozen legacy case is required to satisfy the case oracle.",
+    "known-fail": "The case must reproduce the pinned failure_class; an unexpected pass is rejected.",
+    "blocked": "The product command must reproduce the pinned non-executable failure_class.",
+    "discovery-required": "Only --discover may run this case. Discovery never emits the canonical PASS line and cannot enter a formal scenario report."
+  },
+  "resolution_policy": {
+    "selector_order": ["scenario_id", "variant", "preset"],
+    "wildcard": "*",
+    "coverage": "Every generated case in all six primary model/backend lanes must resolve to exactly one most-specific rule.",
+    "formal_rule": "Canonical collection rejects a lane while any resolved case is discovery-required.",
+    "amendment_rule": "A discovery observation must be reviewed in an independent commit that replaces discovery-required with pass, known-fail, or blocked before formal collection is rerun.",
+    "mismatch_rule": "Unexpected fail, unexpected pass, failure-class drift, missing coverage, or ambiguous equal-specificity rules are hard failures."
+  },
+  "blocked_lane_policy": {
+    "allowed_lane_failure_classes": {
+      "m1-qwen35-4b/metal": "legacy-model-backend-unsupported",
+      "m2-qwen35-35b-a3b/metal": "legacy-model-backend-unsupported"
+    },
+    "forbidden_lanes": [
+      "m1-qwen35-4b/cuda",
+      "m2-qwen35-35b-a3b/cuda",
+      "m3-qwen3-30b-a3b/cuda",
+      "m3-qwen3-30b-a3b/metal"
+    ],
+    "rule": "Blocked is allowed only for the two frozen legacy Metal lanes that have explicit unsupported-backend evidence. CUDA lanes must execute discovery and then formal correctness cases; blocked cannot substitute for product execution."
+  },
+  "lanes": {
+    "m1-qwen35-4b/cuda": {
+      "rules": [
+        {
+          "selector": {"scenario_id": "*", "variant": "*", "preset": "*"},
+          "expected_status": "discovery-required",
+          "failure_class": "unobserved-frozen-legacy-product-behavior",
+          "downstream_goal": "G08A",
+          "owner": "qwen35-dense-migration",
+          "evidence_basis": "MODEL_MATRIX.md states that CUDA product code exists but no formal real-model product artifact is available.",
+          "next_action": "Run --discover on the pinned 1x RTX 4090 lane and amend every observed case expectation."
+        },
+        {
+          "selector": {"scenario_id": "C01", "variant": "*", "preset": "*"},
+          "expected_status": "pass",
+          "failure_class": null,
+          "downstream_goal": "G08A",
+          "owner": "qwen35-dense-migration",
+          "evidence_basis": "qwen35_config_test and qwen35_dense_config_flattens_text_config_without_llama_fallback pass against official Qwen3.5 metadata.",
+          "next_action": "Reproduce the config/template checks with the frozen product binary."
+        }
+      ]
+    },
+    "m1-qwen35-4b/metal": {
+      "rules": [
+        {
+          "selector": {"scenario_id": "*", "variant": "*", "preset": "*"},
+          "expected_status": "blocked",
+          "failure_class": "legacy-model-backend-unsupported",
+          "downstream_goal": "G08A",
+          "owner": "qwen35-dense-metal",
+          "evidence_basis": "MODEL_MATRIX.md and G00_BASELINE.md explicitly classify Qwen3.5-4B Metal as currently unsupported.",
+          "next_action": "Implement and validate the new Metal lane in G08A; do not fabricate a legacy baseline."
+        }
+      ]
+    },
+    "m2-qwen35-35b-a3b/cuda": {
+      "rules": [
+        {
+          "selector": {"scenario_id": "*", "variant": "*", "preset": "*"},
+          "expected_status": "discovery-required",
+          "failure_class": "unobserved-frozen-legacy-product-behavior",
+          "downstream_goal": "G08B",
+          "owner": "qwen35-moe-migration",
+          "evidence_basis": "Historical W3 artifacts predate the frozen G00 case corpus and do not prove every C01-C21 case at cff4c477.",
+          "next_action": "Run --discover on the pinned 1x RTX 4090 lane and amend every unresolved case expectation."
+        },
+        {
+          "selector": {"scenario_id": "C01", "variant": "*", "preset": "*"},
+          "expected_status": "pass",
+          "failure_class": null,
+          "downstream_goal": "G08B",
+          "owner": "qwen35-moe-migration",
+          "evidence_basis": "W3 L0 TEMPLATE PASS and official config probes cover Qwen3.5-35B-A3B metadata and template semantics.",
+          "next_action": "Reproduce with the frozen binary and pinned metadata."
+        },
+        {
+          "selector": {"scenario_id": "C02", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "expected_status": "pass",
+          "failure_class": null,
+          "downstream_goal": "G08B",
+          "owner": "qwen35-moe-migration",
+          "evidence_basis": "W3 L2 QUANTIZED PASS includes actual-model known-answer product cases through run and serve.",
+          "next_action": "Reproduce the larger G00 deterministic corpus."
+        },
+        {
+          "selector": {"scenario_id": "C05", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "expected_status": "pass",
+          "failure_class": null,
+          "downstream_goal": "G08B",
+          "owner": "qwen35-moe-migration",
+          "evidence_basis": "W3 real-product and L3 artifacts include successful non-stream OpenAI chat responses.",
+          "next_action": "Reproduce the G00 known-answer corpus."
+        },
+        {
+          "selector": {"scenario_id": "C06", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "expected_status": "pass",
+          "failure_class": null,
+          "downstream_goal": "G08B",
+          "owner": "qwen35-moe-migration",
+          "evidence_basis": "W3 L3 BEHAVIOR artifacts cover stream/non-stream consistency, one DONE marker, and usage.",
+          "next_action": "Reproduce all G00 stream cases."
+        },
+        {
+          "selector": {"scenario_id": "C10", "variant": "required-tool", "preset": "*"},
+          "expected_status": "discovery-required",
+          "failure_class": "expanded-thinking-tool-contract-not-observed",
+          "downstream_goal": "G08B",
+          "owner": "qwen35-moe-migration",
+          "evidence_basis": "W3 L4 AGENT PASS preserves diagnostic evidence for the legacy temperature-zero, enable_thinking=false required-tool path, but it does not prove either generated P_NO_THINKING/P_THINKING case set.",
+          "next_action": "Run discovery for both frozen thinking presets; retain the old temperature-zero result only as diagnostic evidence until an exact generated case is observed."
+        },
+        {
+          "selector": {"scenario_id": "C14", "variant": "*", "preset": "*"},
+          "expected_status": "discovery-required",
+          "failure_class": "expanded-thinking-schema-contract-not-observed",
+          "downstream_goal": "G08B",
+          "owner": "qwen35-moe-migration",
+          "evidence_basis": "W3 L4 AGENT PASS preserves diagnostic evidence for twenty legacy temperature-zero, enable_thinking=false strict-schema cases; it does not prove the generated 50-case non-thinking and 20-case thinking matrix.",
+          "next_action": "Run discovery for every generated preset/constraint case; keep the legacy twenty-case result as diagnostic evidence only."
+        },
+        {
+          "selector": {"scenario_id": "C18", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "expected_status": "pass",
+          "failure_class": null,
+          "downstream_goal": "G08B",
+          "owner": "qwen35-moe-migration",
+          "evidence_basis": "W3 L5 CONCURRENCY PASS covers actual-model c1/c4/c16/c32 completion and error gates.",
+          "next_action": "Reproduce with typed admission and observed max-active evidence."
+        }
+      ]
+    },
+    "m2-qwen35-35b-a3b/metal": {
+      "rules": [
+        {
+          "selector": {"scenario_id": "*", "variant": "*", "preset": "*"},
+          "expected_status": "blocked",
+          "failure_class": "legacy-model-backend-unsupported",
+          "downstream_goal": "G08B",
+          "owner": "qwen35-moe-metal",
+          "evidence_basis": "MODEL_MATRIX.md and G00_BASELINE.md explicitly classify Qwen3.5-35B-A3B Metal as currently unsupported.",
+          "next_action": "Implement and validate the new Metal lane in G08B; do not fabricate a legacy baseline."
+        }
+      ]
+    },
+    "m3-qwen3-30b-a3b/cuda": {
+      "rules": [
+        {
+          "selector": {"scenario_id": "*", "variant": "*", "preset": "*"},
+          "expected_status": "discovery-required",
+          "failure_class": "g00-case-contract-not-previously-observed",
+          "downstream_goal": "G08C",
+          "owner": "qwen3-moe-migration",
+          "evidence_basis": "Existing G0 CUDA gates prove a required subset, not the complete new C01-C21 corpus.",
+          "next_action": "Run --discover for uncovered cases and amend the catalog before formal collection."
+        },
+        {
+          "selector": {"scenario_id": "C02", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "expected_status": "pass",
+          "failure_class": null,
+          "downstream_goal": "G08C",
+          "owner": "qwen3-moe-migration",
+          "evidence_basis": "g0_cuda4090_full paris correctness gate and actual Qwen3-30B product artifacts.",
+          "next_action": "Reproduce the expanded deterministic corpus."
+        },
+        {
+          "selector": {"scenario_id": "C03", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "expected_status": "pass",
+          "failure_class": null,
+          "downstream_goal": "G08C",
+          "owner": "qwen3-moe-migration",
+          "evidence_basis": "g0_cuda4090_full requires both two-round and three-round multi-turn Paris gates.",
+          "next_action": "Reproduce ten independent three-round groups."
+        },
+        {
+          "selector": {"scenario_id": "C05", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "expected_status": "pass",
+          "failure_class": null,
+          "downstream_goal": "G08C",
+          "owner": "qwen3-moe-migration",
+          "evidence_basis": "g0_cuda4090_full validates non-stream chat before performance.",
+          "next_action": "Reproduce the G00 known-answer corpus."
+        },
+        {
+          "selector": {"scenario_id": "C10", "variant": "required-tool", "preset": "*"},
+          "expected_status": "discovery-required",
+          "failure_class": "expanded-thinking-tool-contract-not-observed",
+          "downstream_goal": "G08C",
+          "owner": "qwen3-moe-migration",
+          "evidence_basis": "g0_cuda4090_full preserves diagnostic evidence for the legacy temperature-zero/model-default tool_call_regression, but it does not prove generated P_NO_THINKING/P_THINKING required-tool cases.",
+          "next_action": "Run discovery for the generated hard-thinking preset cases; retain the legacy temperature-zero/model-default result as diagnostic evidence only."
+        },
+        {
+          "selector": {"scenario_id": "C18", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "expected_status": "pass",
+          "failure_class": null,
+          "downstream_goal": "G08C",
+          "owner": "qwen3-moe-migration",
+          "evidence_basis": "g0_cuda4090_full requires concurrency quality and c1/c4/c16/c32 coverage.",
+          "next_action": "Reproduce with typed admission and observed max-active evidence."
+        }
+      ]
+    },
+    "m3-qwen3-30b-a3b/metal": {
+      "rules": [
+        {
+          "selector": {"scenario_id": "*", "variant": "*", "preset": "*"},
+          "expected_status": "discovery-required",
+          "failure_class": "g00-case-contract-not-previously-observed",
+          "downstream_goal": "G08C",
+          "owner": "qwen3-moe-migration",
+          "evidence_basis": "Metal README gate proves a required subset, not the complete new C01-C21 corpus.",
+          "next_action": "Run --discover for uncovered cases and amend the catalog before formal collection."
+        },
+        {
+          "selector": {"scenario_id": "C02", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "expected_status": "pass",
+          "failure_class": null,
+          "downstream_goal": "G08C",
+          "owner": "qwen3-moe-migration",
+          "evidence_basis": "validate_metal_readme_regression requires Qwen3-30B run and serve correctness.",
+          "next_action": "Reproduce the expanded deterministic corpus."
+        },
+        {
+          "selector": {"scenario_id": "C03", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "expected_status": "pass",
+          "failure_class": null,
+          "downstream_goal": "G08C",
+          "owner": "qwen3-moe-migration",
+          "evidence_basis": "Metal README regression requires run JSONL multi-turn correctness.",
+          "next_action": "Reproduce ten independent three-round groups."
+        },
+        {
+          "selector": {"scenario_id": "C04", "variant": "long-output", "preset": "P_DETERMINISTIC"},
+          "expected_status": "discovery-required",
+          "failure_class": "expanded-512-token-run-contract-not-observed",
+          "downstream_goal": "G08C",
+          "owner": "qwen3-moe-migration",
+          "evidence_basis": "Metal README regression preserves diagnostic evidence for a max_tokens=256 text-mode multi-turn smoke; it does not prove three runs that each emit at least 512 output tokens.",
+          "next_action": "Run discovery for the explicit >=512-token cases; retain the old 256-token-cap smoke as diagnostic evidence only."
+        },
+        {
+          "selector": {"scenario_id": "C05", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "expected_status": "pass",
+          "failure_class": null,
+          "downstream_goal": "G08C",
+          "owner": "qwen3-moe-migration",
+          "evidence_basis": "Metal README regression requires non-stream serve correctness.",
+          "next_action": "Reproduce the G00 known-answer corpus."
+        },
+        {
+          "selector": {"scenario_id": "C06", "variant": "stream", "preset": "P_DETERMINISTIC"},
+          "expected_status": "discovery-required",
+          "failure_class": "expanded-stream-equivalence-contract-not-observed",
+          "downstream_goal": "G08C",
+          "owner": "qwen3-moe-migration",
+          "evidence_basis": "Metal README regression preserves diagnostic evidence for stream output, multiple chunks, and one DONE marker; it does not prove twenty prompt-paired stream/non-stream content, finish-reason, and usage equivalence cases.",
+          "next_action": "Run discovery for the complete paired C05/C06 matrix; retain the old stream framing result as diagnostic evidence only."
+        },
+        {
+          "selector": {"scenario_id": "C07", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "expected_status": "discovery-required",
+          "failure_class": "stateful-six-by-five-contract-not-observed",
+          "downstream_goal": "G08C",
+          "owner": "qwen3-moe-migration",
+          "evidence_basis": "Metal README regression preserves diagnostic evidence for six independent one-turn sanity requests; it does not prove six conversations with five history-carrying rounds each.",
+          "next_action": "Run discovery for six five-round history-carrying loops; retain the old stateless sanity result as diagnostic evidence only."
+        },
+        {
+          "selector": {"scenario_id": "C10", "variant": "required-tool", "preset": "*"},
+          "expected_status": "discovery-required",
+          "failure_class": "expanded-thinking-tool-contract-not-observed",
+          "downstream_goal": "G08C",
+          "owner": "qwen3-moe-migration",
+          "evidence_basis": "Metal README regression preserves diagnostic evidence for the legacy temperature-zero/model-default openai_tool_call_regression; it does not prove generated P_NO_THINKING/P_THINKING required-tool cases.",
+          "next_action": "Run discovery for generated hard-thinking preset cases; retain the legacy temperature-zero/model-default result as diagnostic evidence only."
+        },
+        {
+          "selector": {"scenario_id": "C18", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "expected_status": "pass",
+          "failure_class": null,
+          "downstream_goal": "G08C",
+          "owner": "qwen3-moe-migration",
+          "evidence_basis": "Metal README regression covers c1/c4/c16 quality and completion cells.",
+          "next_action": "Reproduce with typed admission and observed max-active evidence."
+        }
+      ]
+    }
+  }
+}

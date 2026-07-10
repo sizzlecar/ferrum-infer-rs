@@ -1,0 +1,978 @@
+{
+  "schema_version": 1,
+  "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394",
+  "candidate_identity": "path+symbol",
+  "candidate_count": 101,
+  "reviewed_count": 101,
+  "unresolved_count": 0,
+  "classification_counts": {
+    "scaffolding-owned": 46,
+    "excluded-math": 25,
+    "excluded-parser": 0,
+    "excluded-weights": 0,
+    "excluded-other": 30
+  },
+  "decisions": [
+    "scaffolding-owned",
+    "excluded-math",
+    "excluded-parser",
+    "excluded-weights",
+    "excluded-other"
+  ],
+  "reviews": [
+    {
+      "path": "crates/ferrum-models/src/common/llm.rs",
+      "symbol": "decode_batch",
+      "line_hints": [175],
+      "classification": "scaffolding-owned",
+      "reason": "Default per-request decode loop in the shared model contract; this is repeated batch orchestration, not a model equation.",
+      "owner": "ferrum-models/common::DecoderOnlyLLM",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/common/llm.rs",
+      "symbol": "decode_batch_with_full_logits",
+      "line_hints": [182],
+      "classification": "scaffolding-owned",
+      "reason": "Shared logits-policy adapter delegates to the batch path and carries no model math.",
+      "owner": "ferrum-models/common::DecoderOnlyLLM",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/common/llm.rs",
+      "symbol": "decode_batch_with_logits_policy",
+      "line_hints": [190],
+      "classification": "scaffolding-owned",
+      "reason": "Shared policy-to-decode dispatch adapter; it selects an execution path rather than defining an operation.",
+      "owner": "ferrum-models/common::DecoderOnlyLLM",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/executor/llm_executor.rs",
+      "symbol": "batch_decode",
+      "line_hints": [721],
+      "classification": "scaffolding-owned",
+      "reason": "Prepares request metadata, performs admission, locks the model, dispatches the batch, and rebuilds outputs.",
+      "owner": "ferrum-models/executor::LlmExecutor",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/executor/llm_executor.rs",
+      "symbol": "batch_decode_forwards_logits_policy_to_unified_model",
+      "line_hints": [1691],
+      "classification": "excluded-other",
+      "reason": "Unit test for batch policy forwarding under the file's cfg(test) module.",
+      "owner": "ferrum-models/executor tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/executor/llm_executor.rs",
+      "symbol": "batch_prefill",
+      "line_hints": [411],
+      "classification": "scaffolding-owned",
+      "reason": "Builds batch cache identities and continuations, chooses unified versus fallback execution, and packages outputs.",
+      "owner": "ferrum-models/executor::LlmExecutor",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/executor/llm_executor.rs",
+      "symbol": "batch_prefill_falls_back_after_unified_unsupported",
+      "line_hints": [1491],
+      "classification": "excluded-other",
+      "reason": "Unit test for the unified-to-serial fallback under the file's cfg(test) module.",
+      "owner": "ferrum-models/executor tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/executor/llm_executor.rs",
+      "symbol": "decode_batch_with_full_logits",
+      "line_hints": [1251],
+      "classification": "excluded-other",
+      "reason": "Mock model method used only by the file's cfg(test) recording executor.",
+      "owner": "ferrum-models/executor tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/executor/llm_executor.rs",
+      "symbol": "metadata_kv_admission_target_len",
+      "line_hints": [123],
+      "classification": "scaffolding-owned",
+      "reason": "Extracts a request admission target from metadata for scheduler and KV resource control.",
+      "owner": "ferrum-models/executor::LlmExecutor",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family.rs",
+      "symbol": "decode_batch",
+      "line_hints": [4930],
+      "classification": "scaffolding-owned",
+      "reason": "Llama family trait adapter selects the model's batched decode implementation.",
+      "owner": "ferrum-models/models::llama_family",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family.rs",
+      "symbol": "decode_batch_stats_snapshot_records_shape_and_fallbacks",
+      "line_hints": [5302],
+      "classification": "excluded-other",
+      "reason": "Unit test in the file's cfg(test) module; it validates observability counters.",
+      "owner": "ferrum-models/models::llama_family tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family.rs",
+      "symbol": "decode_batch_with_full_logits",
+      "line_hints": [4934],
+      "classification": "scaffolding-owned",
+      "reason": "Llama family adapter forwards output-shape policy to the internal decode loop.",
+      "owner": "ferrum-models/models::llama_family",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family.rs",
+      "symbol": "decode_batch_with_logits_policy",
+      "line_hints": [4942],
+      "classification": "scaffolding-owned",
+      "reason": "Llama family adapter routes typed logits policy to the internal batch execution path.",
+      "owner": "ferrum-models/models::llama_family",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family.rs",
+      "symbol": "enable_paged_batch",
+      "line_hints": [1616],
+      "classification": "scaffolding-owned",
+      "reason": "Lazily allocates and records buffers required by paged batch dispatch.",
+      "owner": "ferrum-models/models::llama_family scratch",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family.rs",
+      "symbol": "ensure_batch_logits",
+      "line_hints": [1468],
+      "classification": "scaffolding-owned",
+      "reason": "Capacity-management helper for reusable batched logits scratch storage.",
+      "owner": "ferrum-models/models::llama_family scratch",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family.rs",
+      "symbol": "paged_kv_reservation_admission_hint_fails_without_allocating_future_blocks",
+      "line_hints": [5643],
+      "classification": "excluded-other",
+      "reason": "Unit test for KV admission behavior in the file's cfg(test) module.",
+      "owner": "ferrum-models/models::llama_family tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family.rs",
+      "symbol": "prefill_scratch_keeps_batch_logits_lazy",
+      "line_hints": [5921],
+      "classification": "excluded-other",
+      "reason": "Unit test for lazy scratch allocation in the file's cfg(test) module.",
+      "owner": "ferrum-models/models::llama_family tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family.rs",
+      "symbol": "sandwich_legacy_batched_decode_requires_device_shadow_and_layer_schedule",
+      "line_hints": [5416],
+      "classification": "excluded-other",
+      "reason": "Unit test for a backend capability predicate in the file's cfg(test) module.",
+      "owner": "ferrum-models/models::llama_family tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family.rs",
+      "symbol": "supports_sandwich_legacy_batched_decode",
+      "line_hints": [1003],
+      "classification": "scaffolding-owned",
+      "reason": "Combines model layout and backend capabilities to admit the legacy batched path.",
+      "owner": "ferrum-models/models::llama_family",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "batched_decode_graph_allows_device_shadow_not_host_shadow",
+      "line_hints": [576],
+      "classification": "excluded-other",
+      "reason": "Unit test for graph admission under the file's cfg(test) module.",
+      "owner": "ferrum-models/models::llama_family batched tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "batched_decode_graph_key",
+      "line_hints": [226],
+      "classification": "scaffolding-owned",
+      "reason": "Builds the execution-cache identity for batched CUDA graph selection.",
+      "owner": "ferrum-models/models::llama_family graph runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "batched_decode_graph_key_separates_device_shadow",
+      "line_hints": [583],
+      "classification": "excluded-other",
+      "reason": "Unit test for graph cache key separation under the file's cfg(test) module.",
+      "owner": "ferrum-models/models::llama_family batched tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "batched_decode_graph_replay_log_is_power_of_two",
+      "line_hints": [594],
+      "classification": "excluded-other",
+      "reason": "Unit test for sparse graph replay logging under the file's cfg(test) module.",
+      "owner": "ferrum-models/models::llama_family batched tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "batched_graph_capture_is_disabled_by_syncing_diagnostics",
+      "line_hints": [560],
+      "classification": "excluded-other",
+      "reason": "Unit test for runtime graph configuration under the file's cfg(test) module.",
+      "owner": "ferrum-models/models::llama_family batched tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "bump_local_batched_decode_kv_lengths",
+      "line_hints": [732],
+      "classification": "scaffolding-owned",
+      "reason": "Applies the post-decode KV state transition across local pipeline layers.",
+      "owner": "ferrum-models/models::llama_family batched runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "decode_batch_internal",
+      "line_hints": [3091],
+      "classification": "scaffolding-owned",
+      "reason": "Model-family decode-loop adapter selecting the default logits return mode.",
+      "owner": "ferrum-models/models::llama_family batched runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "decode_batch_internal_with_full_logits",
+      "line_hints": [3095],
+      "classification": "scaffolding-owned",
+      "reason": "Model-family output-policy adapter for the repeated batched decode loop.",
+      "owner": "ferrum-models/models::llama_family batched runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "decode_batch_internal_with_logits_policy",
+      "line_hints": [3108],
+      "classification": "scaffolding-owned",
+      "reason": "Validates compatible per-request policies and chooses full-logits or argmax execution.",
+      "owner": "ferrum-models/models::llama_family batched runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "decode_batch_internal_with_logits_return",
+      "line_hints": [3166],
+      "classification": "scaffolding-owned",
+      "reason": "Owns the family-specific batch admission, fallbacks, scratch lifecycle, graph dispatch, KV update, and result assembly around layer math.",
+      "owner": "ferrum-models/models::llama_family batched runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "decode_stage_hidden_from_host_batch",
+      "line_hints": [3816],
+      "classification": "excluded-math",
+      "reason": "Implements a pipeline-stage transformer program from hidden states through local layers; bridge timing does not change its mathematical program ownership.",
+      "owner": "ferrum-models/models::llama_family pipeline program",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "decode_stage_tokens_to_hidden_batch",
+      "line_hints": [3766],
+      "classification": "excluded-math",
+      "reason": "Implements embedding plus local transformer layers for a pipeline stage, which is a real model program.",
+      "owner": "ferrum-models/models::llama_family pipeline program",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "forward_layer_batched_decode",
+      "line_hints": [743],
+      "classification": "excluded-math",
+      "reason": "Defines the actual attention and transformer-layer operation sequence for batched decode.",
+      "owner": "ferrum-models/models::llama_family math",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "forward_layer_batched_decode_post_attn",
+      "line_hints": [1604],
+      "classification": "excluded-math",
+      "reason": "Defines the output projection, residual, normalization, and MLP portion of a transformer layer.",
+      "owner": "ferrum-models/models::llama_family math",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "llama_batched_runtime_config_parses_startup_knobs",
+      "line_hints": [511],
+      "classification": "excluded-other",
+      "reason": "Unit test for legacy environment parsing under the file's cfg(test) module.",
+      "owner": "ferrum-models/models::llama_family batched tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "llama_batched_runtime_config_preserves_opt_out_values",
+      "line_hints": [537],
+      "classification": "excluded-other",
+      "reason": "Unit test for legacy environment opt-out values under the file's cfg(test) module.",
+      "owner": "ferrum-models/models::llama_family batched tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "logits_from_hidden_batch",
+      "line_hints": [3888],
+      "classification": "excluded-math",
+      "reason": "Runs final normalization and the language-model head projection over hidden rows, a true model operation.",
+      "owner": "ferrum-models/models::llama_family pipeline program",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "prepare_batched_decode_stage",
+      "line_hints": [707],
+      "classification": "scaffolding-owned",
+      "reason": "Ensures KV and scratch capacity, materializes positions, and uploads batch metadata before model operations.",
+      "owner": "ferrum-models/models::llama_family batched runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "record_batched_graph_replay",
+      "line_hints": [240],
+      "classification": "scaffolding-owned",
+      "reason": "Execution-runtime observability for graph replay count and shape identity.",
+      "owner": "ferrum-models/models::llama_family graph runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "should_log_batched_graph_replay_count",
+      "line_hints": [236],
+      "classification": "scaffolding-owned",
+      "reason": "Throttles execution-runtime graph replay telemetry and contains no model math.",
+      "owner": "ferrum-models/models::llama_family graph runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "should_use_batched_decode_graph",
+      "line_hints": [222],
+      "classification": "scaffolding-owned",
+      "reason": "Admits or rejects the graph execution backend from runtime capability state.",
+      "owner": "ferrum-models/models::llama_family graph runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "unified_graph_capture_admission_caps_cached_shape_count",
+      "line_hints": [635],
+      "classification": "excluded-other",
+      "reason": "Unit test for graph cache admission under the file's cfg(test) module.",
+      "owner": "ferrum-models/models::llama_family batched tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_forward_batched.rs",
+      "symbol": "unified_graph_capture_admission_rejects_mixed_prefill_batches",
+      "line_hints": [622],
+      "classification": "excluded-other",
+      "reason": "Unit test for graph capture admission under the file's cfg(test) module.",
+      "owner": "ferrum-models/models::llama_family batched tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_pipeline.rs",
+      "symbol": "decode_batch",
+      "line_hints": [1004],
+      "classification": "scaffolding-owned",
+      "reason": "Pipeline model adapter selects the typed full-logits batch path.",
+      "owner": "ferrum-models/models::llama_family_pipeline",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_pipeline.rs",
+      "symbol": "decode_batch_overlapped_two_stage",
+      "line_hints": [760],
+      "classification": "scaffolding-owned",
+      "reason": "Splits a batch into microbatches and coordinates queues, devices, ordering, bridges, and timings across two stages.",
+      "owner": "ferrum-models/models::llama_family_pipeline",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_pipeline.rs",
+      "symbol": "decode_batch_sequential_internal",
+      "line_hints": [686],
+      "classification": "scaffolding-owned",
+      "reason": "Coordinates device placement, stage transfers, timing, and ordered result assembly for a batch.",
+      "owner": "ferrum-models/models::llama_family_pipeline",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_pipeline.rs",
+      "symbol": "decode_batch_with_full_logits",
+      "line_hints": [1008],
+      "classification": "scaffolding-owned",
+      "reason": "Handles empty and singleton fallbacks and dispatches batch versus overlapped pipeline scheduling.",
+      "owner": "ferrum-models/models::llama_family_pipeline",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_pipeline.rs",
+      "symbol": "decode_microbatch_size",
+      "line_hints": [663],
+      "classification": "scaffolding-owned",
+      "reason": "Scheduler policy selecting microbatch size for pipeline execution mode.",
+      "owner": "ferrum-models/models::llama_family_pipeline",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_pipeline.rs",
+      "symbol": "decode_stage_hidden_from_host_batch",
+      "line_hints": [134, 163],
+      "classification": "excluded-math",
+      "reason": "The trait contract and KvInt8 implementation define a pipeline-stage transformer program over hidden states; both declarations are aggregated by path+symbol.",
+      "owner": "ferrum-models/models::llama_family_pipeline program",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_pipeline.rs",
+      "symbol": "decode_stage_tokens_to_hidden_batch",
+      "line_hints": [129, 151],
+      "classification": "excluded-math",
+      "reason": "The trait contract and KvInt8 implementation define token embedding and local layer evaluation; both declarations are aggregated by path+symbol.",
+      "owner": "ferrum-models/models::llama_family_pipeline program",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_pipeline.rs",
+      "symbol": "logits_from_hidden_batch",
+      "line_hints": [140, 192],
+      "classification": "excluded-math",
+      "reason": "The trait contract and KvInt8 implementation define language-model head evaluation; both declarations are aggregated by path+symbol.",
+      "owner": "ferrum-models/models::llama_family_pipeline program",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_pipeline.rs",
+      "symbol": "pipeline_batch_mode_uses_stage_batch_without_overlap",
+      "line_hints": [1502],
+      "classification": "excluded-other",
+      "reason": "Unit test for pipeline scheduling mode under the file's cfg(test) module.",
+      "owner": "ferrum-models/models::llama_family_pipeline tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_pipeline.rs",
+      "symbol": "pipeline_decode_batch_matches_full_model_and_preserves_order",
+      "line_hints": [1306],
+      "classification": "excluded-other",
+      "reason": "Unit correctness test under the file's cfg(test) module.",
+      "owner": "ferrum-models/models::llama_family_pipeline tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/llama_family_pipeline.rs",
+      "symbol": "pipeline_overlapped_mode_keeps_small_batches_whole",
+      "line_hints": [1441],
+      "classification": "excluded-other",
+      "reason": "Unit test for pipeline microbatch policy under the file's cfg(test) module.",
+      "owner": "ferrum-models/models::llama_family_pipeline tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "decode_batch",
+      "line_hints": [4360],
+      "classification": "scaffolding-owned",
+      "reason": "Qwen3.5 model-contract adapter selects the family batch decode path.",
+      "owner": "ferrum-models/models::qwen35 runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "decode_batch_with_full_logits",
+      "line_hints": [4364],
+      "classification": "scaffolding-owned",
+      "reason": "Qwen3.5 output-policy and singleton-fallback adapter around stateful batch execution.",
+      "owner": "ferrum-models/models::qwen35 runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "decode_batch_with_logits_policy",
+      "line_hints": [4386],
+      "classification": "scaffolding-owned",
+      "reason": "Converts shared per-request policy to Qwen3.5 execution policy and dispatches the batch.",
+      "owner": "ferrum-models/models::qwen35 runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "forward_stateful_decode_batch",
+      "line_hints": [2877],
+      "classification": "scaffolding-owned",
+      "reason": "Selects the legacy output mode for Qwen3.5 stateful batch decode.",
+      "owner": "ferrum-models/models::qwen35 runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "forward_stateful_decode_batch_taken",
+      "line_hints": [2952],
+      "classification": "excluded-math",
+      "reason": "Runs embedding, every hybrid attention layer, final normalization, and the model head after state ownership is already established.",
+      "owner": "ferrum-models/models::qwen35 program",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "forward_stateful_decode_batch_with_logits_return",
+      "line_hints": [2887],
+      "classification": "scaffolding-owned",
+      "reason": "Validates unique request state and positions, transfers state ownership around execution, and commits or rolls back token state.",
+      "owner": "ferrum-models/models::qwen35 runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "forward_stateful_paged_prefill_batch_with_logits_return",
+      "line_hints": [2320],
+      "classification": "scaffolding-owned",
+      "reason": "Performs paged-KV admission and mode checks, moves sequence state into the batch operation, and commits state on success.",
+      "owner": "ferrum-models/models::qwen35 runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "forward_stateful_prefill_batch",
+      "line_hints": [2264],
+      "classification": "scaffolding-owned",
+      "reason": "Mode adapter dispatching a fresh prefill batch with a typed logits-return policy.",
+      "owner": "ferrum-models/models::qwen35 runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "forward_stateful_prefill_batch_taken",
+      "line_hints": [2437],
+      "classification": "excluded-math",
+      "reason": "Constructs the packed token representation and executes Qwen3.5 embedding, hybrid layers, normalization, and head for the batch.",
+      "owner": "ferrum-models/models::qwen35 program",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "forward_stateful_prefill_batch_with_logits_return",
+      "line_hints": [2274],
+      "classification": "scaffolding-owned",
+      "reason": "Typed adapter selecting fresh-only paged prefill execution.",
+      "owner": "ferrum-models/models::qwen35 runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "forward_stateful_prefill_continuation_batch",
+      "line_hints": [2286],
+      "classification": "scaffolding-owned",
+      "reason": "Mode adapter dispatching continuation prefill with full logits.",
+      "owner": "ferrum-models/models::qwen35 runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "forward_stateful_prefill_continuation_batch_with_logits_return",
+      "line_hints": [2296],
+      "classification": "scaffolding-owned",
+      "reason": "Typed adapter selecting continuation-only paged prefill execution.",
+      "owner": "ferrum-models/models::qwen35 runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "forward_stateful_prefill_mixed_batch_with_logits_return",
+      "line_hints": [2308],
+      "classification": "scaffolding-owned",
+      "reason": "Typed adapter selecting mixed fresh-and-continuation paged prefill execution.",
+      "owner": "ferrum-models/models::qwen35 runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "qwen35_full_attention_decode_batch_layer_backend",
+      "line_hints": [9108],
+      "classification": "excluded-math",
+      "reason": "Defines the full-attention decode layer operation, including projections, RoPE, KV attention, residual, and MLP.",
+      "owner": "ferrum-models/models::qwen35 math",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "qwen35_full_attention_prefill_batch_layer_backend",
+      "line_hints": [8716],
+      "classification": "excluded-math",
+      "reason": "Defines the full-attention prefill layer program over packed batch tokens.",
+      "owner": "ferrum-models/models::qwen35 math",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "qwen35_linear_attention_decode_batch_layer_backend",
+      "line_hints": [7446],
+      "classification": "excluded-math",
+      "reason": "Defines the recurrent linear-attention decode layer and its backend operation selection.",
+      "owner": "ferrum-models/models::qwen35 math",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "qwen35_linear_attention_decode_batch_layer_backend_packed_scratch",
+      "line_hints": [7240],
+      "classification": "excluded-math",
+      "reason": "Defines the packed recurrent-state linear-attention and MLP layer computation.",
+      "owner": "ferrum-models/models::qwen35 math",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "qwen35_linear_attention_prefill_batch_layer_backend",
+      "line_hints": [8327],
+      "classification": "excluded-math",
+      "reason": "Defines the packed linear-attention prefill layer and recurrent-state updates.",
+      "owner": "ferrum-models/models::qwen35 math",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "qwen35_unified_forward_requires_paged_kv_for_fresh_batch_prefill",
+      "line_hints": [13962],
+      "classification": "excluded-other",
+      "reason": "Unit test for paged-KV fallback behavior in the file's cfg(test) module.",
+      "owner": "ferrum-models/models::qwen35 tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen35.rs",
+      "symbol": "used_batch_slots_locked",
+      "line_hints": [11081],
+      "classification": "scaffolding-owned",
+      "reason": "Aggregates model-owned recurrent-state admission usage under the manager lock.",
+      "owner": "ferrum-models/models::qwen35 state manager",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen3_moe/api.rs",
+      "symbol": "decode_batch",
+      "line_hints": [89],
+      "classification": "scaffolding-owned",
+      "reason": "Qwen3 MoE contract adapter selects the batch path and default logits behavior.",
+      "owner": "ferrum-models/models::qwen3_moe runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen3_moe/api.rs",
+      "symbol": "decode_batch_with_full_logits",
+      "line_hints": [93],
+      "classification": "scaffolding-owned",
+      "reason": "Chooses optimized versus per-item execution from runtime policy, batch threshold, and output policy.",
+      "owner": "ferrum-models/models::qwen3_moe runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs",
+      "symbol": "decode_batch_internal",
+      "line_hints": [17],
+      "classification": "scaffolding-owned",
+      "reason": "Model-family adapter selecting the default batched output policy.",
+      "owner": "ferrum-models/models::qwen3_moe batched runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs",
+      "symbol": "decode_batch_internal_with_full_logits",
+      "line_hints": [21],
+      "classification": "scaffolding-owned",
+      "reason": "Owns repeated batch admission, KV and scratch setup, graph execution control, layer-loop dispatch, state finalization, and output assembly around model operations.",
+      "owner": "ferrum-models/models::qwen3_moe batched runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs",
+      "symbol": "forward_layer_batched_decode",
+      "line_hints": [512],
+      "classification": "excluded-math",
+      "reason": "Defines the attention, residual, and MoE transformer-layer computation for batched decode.",
+      "owner": "ferrum-models/models::qwen3_moe math",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs",
+      "symbol": "populate_paged_batch_scratch_decode",
+      "line_hints": [436],
+      "classification": "scaffolding-owned",
+      "reason": "Gathers and uploads batch metadata and applies the KV-length state transition before graph capture.",
+      "owner": "ferrum-models/models::qwen3_moe batched runtime",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen3_moe/forward_layer.rs",
+      "symbol": "moe_forward_batched_prefill",
+      "line_hints": [606],
+      "classification": "excluded-math",
+      "reason": "Thin model-program wrapper invoking the batched MoE feed-forward operation with layer dimensions and weights.",
+      "owner": "ferrum-models/models::qwen3_moe math",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen3_moe/load.rs",
+      "symbol": "batched_graph_failed",
+      "line_hints": [362],
+      "classification": "excluded-other",
+      "reason": "Read-only test helper explicitly documented as unsuitable for production branching.",
+      "owner": "ferrum-models/models::qwen3_moe test support",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen3_moe/load.rs",
+      "symbol": "batched_graph_keys_seen",
+      "line_hints": [369],
+      "classification": "excluded-other",
+      "reason": "Read-only captured-key test helper explicitly documented as test support.",
+      "owner": "ferrum-models/models::qwen3_moe test support",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen3_moe/load.rs",
+      "symbol": "batched_graph_warmup",
+      "line_hints": [355],
+      "classification": "excluded-other",
+      "reason": "Read-only graph warmup counter explicitly documented as a test helper.",
+      "owner": "ferrum-models/models::qwen3_moe test support",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen3_moe/scratch.rs",
+      "symbol": "enable_batched_decode_scratch",
+      "line_hints": [441],
+      "classification": "scaffolding-owned",
+      "reason": "Lazily allocates reusable per-item buffers required by batched decode dispatch.",
+      "owner": "ferrum-models/models::qwen3_moe scratch",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/models/qwen3_moe/scratch.rs",
+      "symbol": "enable_paged_batch",
+      "line_hints": [404],
+      "classification": "scaffolding-owned",
+      "reason": "Lazily allocates and records buffers for paged batch metadata and attention dispatch.",
+      "owner": "ferrum-models/models::qwen3_moe scratch",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/moe/dispatch.rs",
+      "symbol": "gemv_down_batched",
+      "line_hints": [534],
+      "classification": "excluded-math",
+      "reason": "Dispatches the down-projection expert GEMV, a concrete MoE mathematical operation.",
+      "owner": "ferrum-models/moe math",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/moe/dispatch.rs",
+      "symbol": "gemv_gate_batched",
+      "line_hints": [478],
+      "classification": "excluded-math",
+      "reason": "Dispatches the gate-projection expert GEMV, a concrete MoE mathematical operation.",
+      "owner": "ferrum-models/moe math",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/moe/dispatch.rs",
+      "symbol": "gemv_gate_up_silu_batched_fused",
+      "line_hints": [563],
+      "classification": "excluded-math",
+      "reason": "Dispatches fused gate, up projection, and SiLU multiplication for MoE experts.",
+      "owner": "ferrum-models/moe math",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/moe/dispatch.rs",
+      "symbol": "gemv_moe_id_batched",
+      "line_hints": [2430],
+      "classification": "excluded-other",
+      "reason": "Unimplemented CPU trait stub inside the file's cfg(test) module.",
+      "owner": "ferrum-models/moe dispatch tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/moe/dispatch.rs",
+      "symbol": "gemv_moe_id_gate_up_silu_batched",
+      "line_hints": [2444],
+      "classification": "excluded-other",
+      "reason": "Unimplemented CPU trait stub inside the file's cfg(test) module.",
+      "owner": "ferrum-models/moe dispatch tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/moe/dispatch.rs",
+      "symbol": "gemv_up_batched",
+      "line_hints": [506],
+      "classification": "excluded-math",
+      "reason": "Dispatches the up-projection expert GEMV, a concrete MoE mathematical operation.",
+      "owner": "ferrum-models/moe math",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/moe/forward.rs",
+      "symbol": "moe_forward_batched_decode_impl",
+      "line_hints": [511],
+      "classification": "excluded-math",
+      "reason": "Defines routing, expert projections, activation, weighted combination, and residual updates for batched MoE decode.",
+      "owner": "ferrum-models/moe math",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/moe/forward.rs",
+      "symbol": "moe_forward_batched_prefill_impl",
+      "line_hints": [283],
+      "classification": "excluded-math",
+      "reason": "Defines routing, expert matrix operations, activation, and weighted combination for batched MoE prefill.",
+      "owner": "ferrum-models/moe math",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/moe/router.rs",
+      "symbol": "batch",
+      "line_hints": [50],
+      "classification": "excluded-math",
+      "reason": "Reports the row cardinality of the MoE routing result, part of the router's mathematical data model.",
+      "owner": "ferrum-models/moe router",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/src/moe/router.rs",
+      "symbol": "batch_top_k_pair_count",
+      "line_hints": [57],
+      "classification": "excluded-math",
+      "reason": "Derives the routing-result pair cardinality used by the router's batch shape calculation.",
+      "owner": "ferrum-models/moe router",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/tests/executor_common_test.rs",
+      "symbol": "tensor_to_tokens_handles_batched",
+      "line_hints": [63],
+      "classification": "excluded-other",
+      "reason": "Integration test helper and assertion; the entire file is test code.",
+      "owner": "ferrum-models integration tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/tests/llama_gguf_metal_batched_decode.rs",
+      "symbol": "llama31_8b_metal_batched_decode_matches_sequential_decode",
+      "line_hints": [73],
+      "classification": "excluded-other",
+      "reason": "Metal integration regression test; the entire file is test code.",
+      "owner": "ferrum-models integration tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/tests/moe_dispatch_test.rs",
+      "symbol": "moe_forward_handles_batch_with_independent_routing",
+      "line_hints": [171],
+      "classification": "excluded-other",
+      "reason": "MoE integration correctness test; the entire file is test code.",
+      "owner": "ferrum-models integration tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/tests/moe_router_test.rs",
+      "symbol": "batch_dim_routes_each_row_independently",
+      "line_hints": [57],
+      "classification": "excluded-other",
+      "reason": "MoE router integration correctness test; the entire file is test code.",
+      "owner": "ferrum-models integration tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/tests/qwen35_config_test.rs",
+      "symbol": "rejects_zero_recurrent_state_batch_slots",
+      "line_hints": [359],
+      "classification": "excluded-other",
+      "reason": "Qwen3.5 configuration integration test; the entire file is test code.",
+      "owner": "ferrum-models integration tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "path": "crates/ferrum-models/tests/qwen3_moe_model_test.rs",
+      "symbol": "run_batched_decode_step",
+      "line_hints": [329],
+      "classification": "excluded-other",
+      "reason": "Test-only helper that drives two prefills and one batched decode; the entire file is test code.",
+      "owner": "ferrum-models integration tests",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    }
+  ],
+  "large_native_content_root_count": 4,
+  "large_native_content_root_reviewed_count": 4,
+  "large_native_content_root_unresolved_count": 0,
+  "large_native_content_roots": [
+    {
+      "tree_key": "path:crates/ferrum-kernels/kernels",
+      "content_root_sha256": "32d008130c1950b2676ee9738e4a5564b63dd56c8574a846f618c488dd4f7acc",
+      "origin_classification": "project-owned",
+      "aggregation_decision": "content-root:path:crates/ferrum-kernels/kernels",
+      "counted_build_input_count": 1,
+      "reason": "Ferrum-owned CUDA kernel translation units share one crate kernel source root; the analyzer threshold is triggered by 40 translation units.",
+      "owner": "ferrum-kernels",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "tree_key": "path:scripts",
+      "content_root_sha256": "853135c13bf93f9f3c6372d5899d7cb3ac90bd30a3072d7fdd2a47401622bdc0",
+      "origin_classification": "project-owned",
+      "aggregation_decision": "content-root:path:scripts",
+      "counted_build_input_count": 1,
+      "reason": "Ten Ferrum-owned standalone CUDA graph and split-K probes live directly under scripts and form one diagnostics content root.",
+      "owner": "release/performance diagnostics",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "tree_key": "path:scripts/microbenches",
+      "content_root_sha256": "b22459aab1cf3fa7eebf0075e71ebf34974d8c1e5e555025217cdd8816c049b1",
+      "origin_classification": "project-owned",
+      "aggregation_decision": "content-root:path:scripts/microbenches",
+      "counted_build_input_count": 1,
+      "reason": "Twenty-four Ferrum-owned CUDA/C++ microbench translation units share the scripts/microbenches diagnostics source root.",
+      "owner": "release/performance microbenches",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    },
+    {
+      "tree_key": "upstream:vllm",
+      "content_root_sha256": "6e7693d5b6fa2dd8a87c945668d91f3b309ced034fa2f0a047f6599bee7e330c",
+      "origin_classification": "upstream-vendored",
+      "aggregation_decision": "content-root:upstream:vllm",
+      "counted_build_input_count": 1,
+      "reason": "The current tree's vLLM attention and Marlin directories are one upstream-family content root by analyzer identity; no upstream revision is asserted because the scanned source does not encode one.",
+      "owner": "ferrum-kernels upstream vLLM integration",
+      "reviewed_at_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394"
+    }
+  ]
+}

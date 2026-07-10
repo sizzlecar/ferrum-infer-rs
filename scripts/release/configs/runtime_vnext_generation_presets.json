@@ -1,0 +1,223 @@
+{
+  "schema_version": 1,
+  "catalog_id": "runtime-vnext-0.8.0-generation-presets",
+  "model_catalog_id": "runtime-vnext-0.8.0-models",
+  "seed": 9271,
+  "models": {
+    "m1-qwen35-4b": {
+      "metadata_repo": "Qwen/Qwen3.5-4B",
+      "metadata_revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+      "evidence": {
+        "README.md": "1406be1b6b8fd8a6545870da516912804756593628a1d0fb0a7965211e82a7bb",
+        "config.json": "ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670",
+        "tokenizer_config.json": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8"
+      },
+      "presets": {
+        "P_DETERMINISTIC": {
+          "temperature": 0.0,
+          "top_p": 1.0,
+          "top_k": 0,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repetition_penalty": 1.0,
+          "seed": 9271,
+          "max_tokens": 1024,
+          "stop": [],
+          "eos_token_ids": [248046, 248044],
+          "enable_thinking": false,
+          "template_kwargs": {"enable_thinking": false},
+          "source": "goal-defined deterministic diagnostic"
+        },
+        "P_NO_THINKING": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repetition_penalty": 1.0,
+          "seed": 9271,
+          "max_tokens": 1024,
+          "stop": [],
+          "eos_token_ids": [248046, 248044],
+          "enable_thinking": false,
+          "template_kwargs": {"enable_thinking": false},
+          "source": "pinned model card general non-thinking recommendation"
+        },
+        "P_THINKING": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repetition_penalty": 1.0,
+          "seed": 9271,
+          "max_tokens": 1024,
+          "stop": [],
+          "eos_token_ids": [248046, 248044],
+          "enable_thinking": true,
+          "template_kwargs": {"enable_thinking": true},
+          "source": "pinned model card general thinking recommendation"
+        },
+        "P_OFFICIAL_DEFAULT": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repetition_penalty": 1.0,
+          "seed": 9271,
+          "max_tokens": 1024,
+          "stop": [],
+          "eos_token_ids": [248046, 248044],
+          "enable_thinking": "model-default",
+          "template_kwargs": {},
+          "source": "pinned model card default thinking recommendation"
+        }
+      }
+    },
+    "m2-qwen35-35b-a3b": {
+      "metadata_repo": "Qwen/Qwen3.5-35B-A3B",
+      "metadata_revision": "59d61f3ce65a6d9863b86d2e96597125219dc754",
+      "evidence": {
+        "README.md": "71c3bbc2eadadd5980bbdbb15df958c27d42ede24821015602a021109aacf492",
+        "config.json": "5e4d7f74fec2f360eb9cfbfcd6ec0c4c76e684d3a11caaed259d9fd9bfbc7944",
+        "generation_config.json": "4f25002776b741773666203dcea8f54619f177ace3ae483d311102092a4658e0",
+        "tokenizer_config.json": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8"
+      },
+      "presets": {
+        "P_DETERMINISTIC": {
+          "temperature": 0.0,
+          "top_p": 1.0,
+          "top_k": 0,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repetition_penalty": 1.0,
+          "seed": 9271,
+          "max_tokens": 1024,
+          "stop": [],
+          "eos_token_ids": [248046, 248044],
+          "enable_thinking": false,
+          "template_kwargs": {"enable_thinking": false},
+          "source": "goal-defined deterministic diagnostic"
+        },
+        "P_NO_THINKING": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repetition_penalty": 1.0,
+          "seed": 9271,
+          "max_tokens": 1024,
+          "stop": [],
+          "eos_token_ids": [248046, 248044],
+          "enable_thinking": false,
+          "template_kwargs": {"enable_thinking": false},
+          "source": "pinned model card general non-thinking recommendation"
+        },
+        "P_THINKING": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repetition_penalty": 1.0,
+          "seed": 9271,
+          "max_tokens": 1024,
+          "stop": [],
+          "eos_token_ids": [248046, 248044],
+          "enable_thinking": true,
+          "template_kwargs": {"enable_thinking": true},
+          "source": "pinned model card general thinking recommendation"
+        },
+        "P_OFFICIAL_DEFAULT": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 1.5,
+          "repetition_penalty": 1.0,
+          "seed": 9271,
+          "max_tokens": 1024,
+          "stop": [],
+          "eos_token_ids": [248046, 248044],
+          "enable_thinking": "model-default",
+          "template_kwargs": {},
+          "source": "pinned generation config plus model card default thinking recommendation"
+        }
+      }
+    },
+    "m3-qwen3-30b-a3b": {
+      "metadata_repo": "Qwen/Qwen3-30B-A3B",
+      "metadata_revision": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+      "evidence": {
+        "README.md": "1897b7cdf7b5f45ae847b87f9b416d4635fe73228e0daac669a4e1f3e5948858",
+        "config.json": "2850ddb3bf7aecad20b611e2d44f3077fc8193f4827c93beddd4c02ad63c2297",
+        "generation_config.json": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2",
+        "tokenizer_config.json": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+      },
+      "presets": {
+        "P_DETERMINISTIC": {
+          "temperature": 0.0,
+          "top_p": 1.0,
+          "top_k": 0,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repetition_penalty": 1.0,
+          "seed": 9271,
+          "max_tokens": 1024,
+          "stop": [],
+          "eos_token_ids": [151645, 151643],
+          "enable_thinking": false,
+          "template_kwargs": {"enable_thinking": false},
+          "source": "goal-defined deterministic diagnostic"
+        },
+        "P_NO_THINKING": {
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repetition_penalty": 1.0,
+          "seed": 9271,
+          "max_tokens": 1024,
+          "stop": [],
+          "eos_token_ids": [151645, 151643],
+          "enable_thinking": false,
+          "template_kwargs": {"enable_thinking": false},
+          "source": "pinned model card non-thinking recommendation"
+        },
+        "P_THINKING": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repetition_penalty": 1.0,
+          "seed": 9271,
+          "max_tokens": 1024,
+          "stop": [],
+          "eos_token_ids": [151645, 151643],
+          "enable_thinking": true,
+          "template_kwargs": {"enable_thinking": true},
+          "source": "pinned generation config and model card thinking recommendation"
+        },
+        "P_OFFICIAL_DEFAULT": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repetition_penalty": 1.0,
+          "seed": 9271,
+          "max_tokens": 1024,
+          "stop": [],
+          "eos_token_ids": [151645, 151643],
+          "enable_thinking": "model-default",
+          "template_kwargs": {},
+          "source": "pinned generation config default thinking recommendation"
+        }
+      }
+    }
+  }
+}
