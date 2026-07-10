@@ -16,6 +16,14 @@ METAL_VALIDATOR = REPO_ROOT / "scripts/release/validate_metal_readme_regression.
 SUMMARY_VALIDATOR = REPO_ROOT / "scripts/release/g0_release_summary.py"
 RELEASE_BINARY_GATE = REPO_ROOT / "scripts/release/release_binary_gate.py"
 RUN_GATE = REPO_ROOT / "scripts/release/run_gate.py"
+RUNTIME_VNEXT_BASELINE_GATE = REPO_ROOT / "scripts/release/runtime_vnext_baseline_gate.py"
+RUNTIME_VNEXT_INVENTORY = REPO_ROOT / "scripts/release/runtime_vnext_inventory.py"
+RUNTIME_VNEXT_MODEL_RESOLVER = REPO_ROOT / "scripts/release/runtime_vnext_model_resolver.py"
+RUNTIME_VNEXT_HARDWARE_PROBE = REPO_ROOT / "scripts/release/runtime_vnext_hardware_probe.py"
+RUNTIME_VNEXT_BUILD_TIMING = REPO_ROOT / "scripts/release/runtime_vnext_build_timing.py"
+RUNTIME_VNEXT_BASELINE_SCENARIOS = REPO_ROOT / "scripts/release/runtime_vnext_baseline_scenarios.py"
+RUNTIME_VNEXT_RESOURCE_SAMPLER = REPO_ROOT / "scripts/release/runtime_vnext_resource_sampler.py"
+RUNTIME_VNEXT_G00A_CHECKPOINT = REPO_ROOT / "scripts/release/runtime_vnext_g00a_checkpoint.py"
 RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
 PRODUCT_BACKEND_SENTINEL_GATE = REPO_ROOT / "scripts/release/product_backend_sentinel_gate.py"
 PRODUCT_OBSERVABILITY_L1_SMOKE = REPO_ROOT / "scripts/release/product_observability_l1_smoke.py"
@@ -31,6 +39,16 @@ RELEASE_REGRESSION_HARDENING_GOAL_GATE = REPO_ROOT / "scripts/release/release_re
 ACTUAL_MODEL_REGRESSION_SUMMARY_GATE = REPO_ROOT / "scripts/release/actual_model_regression_summary_gate.py"
 L2_ACTUAL_MODEL_ARTIFACT_GATE = REPO_ROOT / "scripts/release/l2_actual_model_artifact_gate.py"
 SUPPORT_MATRIX_CONTRACT_GATE = REPO_ROOT / "scripts/release/support_matrix_contract_gate.py"
+RUNTIME_VNEXT_BASELINE_FAST_SELFTEST_PASS = (
+    "FERRUM RUNTIME VNEXT G00 BASELINE FAST SELFTEST PASS"
+)
+RUNTIME_VNEXT_BASELINE_SELFTEST_SUMMARY_PREFIX = (
+    "FERRUM RUNTIME VNEXT G00 BASELINE SELFTEST SUMMARY:"
+)
+RUNTIME_VNEXT_BASELINE_MUTATION_COUNT = 95
+RUNTIME_VNEXT_BASELINE_MUTATION_MATRIX_SHA256 = (
+    "c70d1af0c8b49c63147d2a23e3bd5421179079ca7b4bc3eab5922d8cb53bab88"
+)
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from m3_validate_runner_artifact import (  # noqa: E402
@@ -230,6 +248,101 @@ def test_run_gate_selftest() -> None:
     require("FERRUM RUN GATE SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
+def test_runtime_vnext_baseline_gate_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_BASELINE_GATE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    lines = ok.stdout.splitlines()
+    require(lines.count(RUNTIME_VNEXT_BASELINE_FAST_SELFTEST_PASS) == 1, ok.stdout)
+    summaries = [
+        line.removeprefix(RUNTIME_VNEXT_BASELINE_SELFTEST_SUMMARY_PREFIX).strip()
+        for line in lines
+        if line.startswith(RUNTIME_VNEXT_BASELINE_SELFTEST_SUMMARY_PREFIX)
+    ]
+    require(len(summaries) == 1, ok.stdout)
+    try:
+        summary = json.loads(summaries[0])
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"invalid Runtime vNext FAST self-test summary: {exc}") from exc
+    require(summary.get("schema_version") == 1, str(summary))
+    require(summary.get("mode") == "fast", str(summary))
+    require(
+        summary.get("mutation_assertion_count")
+        == summary.get("expected_mutation_assertion_count")
+        == RUNTIME_VNEXT_BASELINE_MUTATION_COUNT,
+        str(summary),
+    )
+    mutation_names = summary.get("mutation_names")
+    require(
+        isinstance(mutation_names, list)
+        and len(mutation_names) == RUNTIME_VNEXT_BASELINE_MUTATION_COUNT
+        and all(isinstance(name, str) and name for name in mutation_names)
+        and len(set(mutation_names)) == len(mutation_names),
+        str(summary),
+    )
+    mutation_matrix_sha256 = hashlib.sha256(
+        json.dumps(
+            mutation_names,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    require(
+        mutation_matrix_sha256 == RUNTIME_VNEXT_BASELINE_MUTATION_MATRIX_SHA256,
+        str(summary),
+    )
+    validator_counts = summary.get("validator_counts")
+    require(
+        isinstance(validator_counts, dict)
+        and validator_counts.get("root-integration", 0) > 0
+        and all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in validator_counts.values())
+        and sum(validator_counts.values()) == RUNTIME_VNEXT_BASELINE_MUTATION_COUNT,
+        str(summary),
+    )
+
+
+def test_runtime_vnext_inventory_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_INVENTORY), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("RUNTIME VNEXT INVENTORY SELF-TEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_runtime_vnext_model_resolver_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_MODEL_RESOLVER), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("RUNTIME VNEXT MODEL RESOLUTION SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_runtime_vnext_hardware_probe_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_HARDWARE_PROBE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("RUNTIME VNEXT HARDWARE PROBE SELF-TEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_runtime_vnext_build_timing_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_BUILD_TIMING), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("RUNTIME VNEXT BUILD TIMING SELF-TEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_runtime_vnext_baseline_scenarios_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_BASELINE_SCENARIOS), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_runtime_vnext_resource_sampler_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_RESOURCE_SAMPLER), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("FERRUM RUNTIME VNEXT RESOURCE SAMPLER SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
+def test_runtime_vnext_g00a_checkpoint_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_G00A_CHECKPOINT), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("FERRUM RUNTIME VNEXT G00A FACT CHECKPOINT SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
 def test_run_scenarios_selftest() -> None:
     ok = run([sys.executable, str(RUN_SCENARIOS), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -399,6 +512,14 @@ def main() -> int:
     test_metal_validator()
     test_summary_validator()
     test_release_binary_gate_staged_asset_path()
+    test_runtime_vnext_baseline_gate_selftest()
+    test_runtime_vnext_inventory_selftest()
+    test_runtime_vnext_model_resolver_selftest()
+    test_runtime_vnext_hardware_probe_selftest()
+    test_runtime_vnext_build_timing_selftest()
+    test_runtime_vnext_baseline_scenarios_selftest()
+    test_runtime_vnext_resource_sampler_selftest()
+    test_runtime_vnext_g00a_checkpoint_selftest()
     test_run_gate_selftest()
     test_run_scenarios_selftest()
     test_product_backend_sentinel_selftest()

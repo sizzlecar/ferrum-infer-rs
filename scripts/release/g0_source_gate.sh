@@ -30,6 +30,14 @@ run_unit() {
     scripts/release/backend_runtime_preset_snapshot.py \
     scripts/release/openai_concurrency_quality_regression.py \
     scripts/release/openai_tool_call_regression.py \
+    scripts/release/runtime_vnext_baseline_gate.py \
+    scripts/release/runtime_vnext_inventory.py \
+    scripts/release/runtime_vnext_model_resolver.py \
+    scripts/release/runtime_vnext_hardware_probe.py \
+    scripts/release/runtime_vnext_build_timing.py \
+    scripts/release/runtime_vnext_baseline_scenarios.py \
+    scripts/release/runtime_vnext_resource_sampler.py \
+    scripts/release/runtime_vnext_g00a_checkpoint.py \
     scripts/release/run_gate.py \
     scripts/release/run_scenarios.py \
     scripts/release/selftest_g0_validators.py \
