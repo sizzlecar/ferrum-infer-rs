@@ -1,0 +1,636 @@
+{
+  "schema_version": 1,
+  "catalog_id": "runtime-vnext-0.8.0-models",
+  "source_document": "docs/goals/runtime-vnext-0.8.0-2026-07-10/MODEL_MATRIX.md",
+  "generated_from_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394",
+  "revision_policy": {
+    "applies_to": "every revision or semantic_revision object whose status is resolution_required",
+    "required_form": "full immutable Hugging Face commit hash",
+    "resolution": "Resolve the named repo through the Hugging Face revision API, persist the returned full commit, download only from that commit, and record SHA256, byte size, and LFS OID when present for every selected file in the G00 models.lock.json artifact.",
+    "expected_file_identity_rule": "When a file selector declares expected_size_bytes or expected_sha256, live resolution and every downstream lock must equal the declared value; for an LFS file expected_sha256 must equal the Hugging Face tree lfs.oid.",
+    "moving_revision_rule": "main, latest, tags that can move, and local cache paths without an immutable snapshot component are rejected.",
+    "mismatch_rule": "A missing pinned commit, changed file, or SHA mismatch is a hard failure and requires a reviewed goal amendment; do not substitute another quantization."
+  },
+  "hardware_policies": {
+    "cuda-g0-1x-rtx4090": {
+      "accelerator": "NVIDIA RTX 4090",
+      "count": 1,
+      "requirements": [
+        "same host, driver, CUDA runtime, and power policy for compared implementations",
+        "record nvidia-smi, nvcc, VRAM, binary SHA256, runtime config, and observed active concurrency",
+        "reconcile paid instance inventory before start and stop or record bounded cache retention after evidence collection"
+      ]
+    },
+    "metal-reference-m1-max-32gb": {
+      "accelerator": "Apple M1 Max Metal",
+      "count": 1,
+      "minimum_unified_memory_gib": 32,
+      "requirements": [
+        "use one fixed machine for all formal Metal comparisons",
+        "M2 uses the pinned Q4_K_S file so the 32 GiB host retains runtime headroom",
+        "record chip, OS, power mode, thermal state, memory, swap, binary SHA256, and runtime config",
+        "reject a measured cell when active swap grows"
+      ]
+    }
+  },
+  "models": [
+    {
+      "id": "M1-CUDA",
+      "model_id": "M1",
+      "role": "primary_dense_hybrid_canary",
+      "backend": "cuda",
+      "repo": "Qwen/Qwen3.5-4B",
+      "revision": {
+        "status": "pinned",
+        "value": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+        "evidence": "docs/goals/runtime-vnext-0.8.0-2026-07-10/MODEL_MATRIX.md"
+      },
+      "files": [
+        {"path": "config.json", "required": true},
+        {"path": "tokenizer_config.json", "required": true},
+        {"path": "tokenizer.json", "required": true},
+        {"glob": "*.safetensors", "required": true},
+        {"path": "model.safetensors.index.json", "required_if_sharded": true}
+      ],
+      "format": "bf16_safetensors",
+      "reference": {
+        "semantic_repo": "Qwen/Qwen3.5-4B",
+        "semantic_revision": {"status": "same_as_weight_revision"},
+        "required_semantic_files": ["README.md", "config.json", "tokenizer_config.json", "tokenizer.json"],
+        "semantic_file_sha256": {
+          "README.md": "1406be1b6b8fd8a6545870da516912804756593628a1d0fb0a7965211e82a7bb",
+          "config.json": "ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670",
+          "tokenizer_config.json": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8",
+          "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+        },
+        "generation_config_source": {
+          "source": "semantic_source",
+          "path": "generation_config.json",
+          "policy": "absent"
+        },
+        "chat_template_source": {
+          "source": "semantic_source",
+          "path": "tokenizer_config.json",
+          "json_pointer": "/chat_template",
+          "container_sha256": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8",
+          "content_sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+        },
+        "external_engine": "vllm_language_model_only",
+        "local_evidence": "docs/goals/model-coverage-2026-06-12/artifacts/w3_hf_config_probe_20260617T131209Z_f97c1d6f/w3_hf_config_probe_manifest.json"
+      },
+      "hardware_policy": "cuda-g0-1x-rtx4090"
+    },
+    {
+      "id": "M1-METAL",
+      "model_id": "M1",
+      "role": "primary_dense_hybrid_canary",
+      "backend": "metal",
+      "repo": "unsloth/Qwen3.5-4B-GGUF",
+      "revision": {
+        "status": "pinned",
+        "value": "e87f176479d0855a907a41277aca2f8ee7a09523",
+        "evidence": "docs/goals/runtime-vnext-0.8.0-2026-07-10/MODEL_MATRIX.md"
+      },
+      "files": [
+        {"path": "Qwen3.5-4B-Q4_K_M.gguf", "required": true}
+      ],
+      "format": "gguf_q4_k_m",
+      "reference": {
+        "semantic_repo": "Qwen/Qwen3.5-4B",
+        "semantic_revision": {"status": "pinned", "value": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"},
+        "required_semantic_files": ["README.md", "config.json", "tokenizer_config.json", "tokenizer.json"],
+        "semantic_file_sha256": {
+          "README.md": "1406be1b6b8fd8a6545870da516912804756593628a1d0fb0a7965211e82a7bb",
+          "config.json": "ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670",
+          "tokenizer_config.json": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8",
+          "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+        },
+        "generation_config_source": {
+          "source": "semantic_source",
+          "path": "generation_config.json",
+          "policy": "absent"
+        },
+        "chat_template_source": {
+          "source": "semantic_source",
+          "path": "tokenizer_config.json",
+          "json_pointer": "/chat_template",
+          "container_sha256": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8",
+          "content_sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+        },
+        "external_engine": "llama.cpp_same_gguf",
+        "oracle_rule": "llama.cpp is an end-to-end quantized cross-check, not the sole semantic oracle"
+      },
+      "hardware_policy": "metal-reference-m1-max-32gb"
+    },
+    {
+      "id": "M2-CUDA",
+      "model_id": "M2",
+      "role": "primary_hybrid_moe_stress",
+      "backend": "cuda",
+      "repo": "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4",
+      "revision": {
+        "status": "pinned",
+        "value": "3af5ca2972faf6de1fd6f4efc4d8d319ca751e8b",
+        "evidence": "docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_vllm_h256_smoke_178d76fa_20260619T180824Z/lane_contract.json"
+      },
+      "files": [
+        {"path": "config.json", "required": true},
+        {"path": "generation_config.json", "required": true},
+        {"path": "tokenizer_config.json", "required": true},
+        {"path": "tokenizer.json", "required": true},
+        {"glob": "*.safetensors", "required": true},
+        {"path": "model.safetensors.index.json", "required_if_sharded": true}
+      ],
+      "format": "gptq_int4_moe_wna16",
+      "reference": {
+        "semantic_repo": "Qwen/Qwen3.5-35B-A3B",
+        "semantic_revision": {"status": "pinned", "value": "59d61f3ce65a6d9863b86d2e96597125219dc754"},
+        "required_semantic_files": ["README.md", "config.json", "generation_config.json", "tokenizer_config.json", "tokenizer.json"],
+        "semantic_file_sha256": {
+          "README.md": "71c3bbc2eadadd5980bbdbb15df958c27d42ede24821015602a021109aacf492",
+          "config.json": "5e4d7f74fec2f360eb9cfbfcd6ec0c4c76e684d3a11caaed259d9fd9bfbc7944",
+          "generation_config.json": "4f25002776b741773666203dcea8f54619f177ace3ae483d311102092a4658e0",
+          "tokenizer_config.json": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8",
+          "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+        },
+        "generation_config_source": {
+          "source": "semantic_source",
+          "path": "generation_config.json",
+          "policy": "required",
+          "content_sha256": "4f25002776b741773666203dcea8f54619f177ace3ae483d311102092a4658e0"
+        },
+        "chat_template_source": {
+          "source": "semantic_source",
+          "path": "tokenizer_config.json",
+          "json_pointer": "/chat_template",
+          "container_sha256": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8",
+          "content_sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+        },
+        "quantization_config_source": "weight config.json.quantization_config",
+        "external_engine": "vllm_language_model_only_moe_wna16"
+      },
+      "hardware_policy": "cuda-g0-1x-rtx4090"
+    },
+    {
+      "id": "M2-METAL",
+      "model_id": "M2",
+      "role": "primary_hybrid_moe_stress",
+      "backend": "metal",
+      "repo": "unsloth/Qwen3.5-35B-A3B-GGUF",
+      "revision": {
+        "status": "pinned",
+        "value": "bc014a17be43adabd7066b7a86075ff935c6a4e2",
+        "evidence": "docs/goals/runtime-vnext-0.8.0-2026-07-10/MODEL_MATRIX.md"
+      },
+      "files": [
+        {
+          "path": "Qwen3.5-35B-A3B-Q4_K_S.gguf",
+          "required": true,
+          "expected_size_bytes": 20673845888,
+          "expected_sha256": "ee93ceffed5ce4df8b09bcbaf59a286d531025a1ebde9cf204c74e800c47d57e"
+        }
+      ],
+      "format": "gguf_q4_k_s",
+      "reference": {
+        "semantic_repo": "Qwen/Qwen3.5-35B-A3B",
+        "semantic_revision": {"status": "pinned", "value": "59d61f3ce65a6d9863b86d2e96597125219dc754"},
+        "required_semantic_files": ["README.md", "config.json", "generation_config.json", "tokenizer_config.json", "tokenizer.json"],
+        "semantic_file_sha256": {
+          "README.md": "71c3bbc2eadadd5980bbdbb15df958c27d42ede24821015602a021109aacf492",
+          "config.json": "5e4d7f74fec2f360eb9cfbfcd6ec0c4c76e684d3a11caaed259d9fd9bfbc7944",
+          "generation_config.json": "4f25002776b741773666203dcea8f54619f177ace3ae483d311102092a4658e0",
+          "tokenizer_config.json": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8",
+          "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+        },
+        "generation_config_source": {
+          "source": "semantic_source",
+          "path": "generation_config.json",
+          "policy": "required",
+          "content_sha256": "4f25002776b741773666203dcea8f54619f177ace3ae483d311102092a4658e0"
+        },
+        "chat_template_source": {
+          "source": "semantic_source",
+          "path": "tokenizer_config.json",
+          "json_pointer": "/chat_template",
+          "container_sha256": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8",
+          "content_sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+        },
+        "external_engine": "llama.cpp_same_gguf",
+        "oracle_rule": "llama.cpp is an end-to-end quantized cross-check, not the sole semantic oracle"
+      },
+      "hardware_policy": "metal-reference-m1-max-32gb"
+    },
+    {
+      "id": "M3-CUDA",
+      "model_id": "M3",
+      "role": "primary_mature_moe_control",
+      "backend": "cuda",
+      "repo": "Qwen/Qwen3-30B-A3B-GPTQ-Int4",
+      "revision": {
+        "status": "pinned",
+        "value": "9b534e4318b7ebc3c961a839f13eb18b1833f441",
+        "evidence": "scripts/release/configs/g0_cuda4090_full.json"
+      },
+      "files": [
+        {"path": "config.json", "required": true},
+        {"path": "generation_config.json", "required": true},
+        {"path": "tokenizer_config.json", "required": true},
+        {"path": "tokenizer.json", "required": true},
+        {"glob": "*.safetensors", "required": true},
+        {"path": "model.safetensors.index.json", "required_if_sharded": true},
+        {"glob": "*quantize*config*.json", "required": true}
+      ],
+      "format": "gptq_int4",
+      "reference": {
+        "semantic_repo": "Qwen/Qwen3-30B-A3B",
+        "semantic_revision": {"status": "pinned", "value": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"},
+        "required_semantic_files": ["README.md", "config.json", "generation_config.json", "tokenizer_config.json", "tokenizer.json"],
+        "semantic_file_sha256": {
+          "README.md": "1897b7cdf7b5f45ae847b87f9b416d4635fe73228e0daac669a4e1f3e5948858",
+          "config.json": "2850ddb3bf7aecad20b611e2d44f3077fc8193f4827c93beddd4c02ad63c2297",
+          "generation_config.json": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2",
+          "tokenizer_config.json": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+          "tokenizer.json": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+        },
+        "generation_config_source": {
+          "source": "semantic_source",
+          "path": "generation_config.json",
+          "policy": "required",
+          "content_sha256": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2"
+        },
+        "chat_template_source": {
+          "source": "semantic_source",
+          "path": "tokenizer_config.json",
+          "json_pointer": "/chat_template",
+          "container_sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+          "content_sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"
+        },
+        "external_engine": "vllm"
+      },
+      "hardware_policy": "cuda-g0-1x-rtx4090"
+    },
+    {
+      "id": "M3-METAL",
+      "model_id": "M3",
+      "role": "primary_mature_moe_control",
+      "backend": "metal",
+      "repo": "Qwen/Qwen3-30B-A3B-GGUF",
+      "revision": {
+        "status": "resolution_required",
+        "value": null,
+        "evidence": "docs/goals/runtime-vnext-0.8.0-2026-07-10/MODEL_MATRIX.md"
+      },
+      "files": [
+        {"path": "Qwen3-30B-A3B-Q4_K_M.gguf", "required": true}
+      ],
+      "format": "gguf_q4_k_m",
+      "reference": {
+        "semantic_repo": "Qwen/Qwen3-30B-A3B",
+        "semantic_revision": {"status": "pinned", "value": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"},
+        "required_semantic_files": ["README.md", "config.json", "generation_config.json", "tokenizer_config.json", "tokenizer.json"],
+        "semantic_file_sha256": {
+          "README.md": "1897b7cdf7b5f45ae847b87f9b416d4635fe73228e0daac669a4e1f3e5948858",
+          "config.json": "2850ddb3bf7aecad20b611e2d44f3077fc8193f4827c93beddd4c02ad63c2297",
+          "generation_config.json": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2",
+          "tokenizer_config.json": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+          "tokenizer.json": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+        },
+        "generation_config_source": {
+          "source": "semantic_source",
+          "path": "generation_config.json",
+          "policy": "required",
+          "content_sha256": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2"
+        },
+        "chat_template_source": {
+          "source": "semantic_source",
+          "path": "tokenizer_config.json",
+          "json_pointer": "/chat_template",
+          "container_sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+          "content_sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"
+        },
+        "external_engine": "llama.cpp_same_gguf"
+      },
+      "hardware_policy": "metal-reference-m1-max-32gb"
+    },
+    {
+      "id": "S1-QWEN3-CODER-CUDA",
+      "model_id": "Qwen3-Coder-30B-A3B-Instruct",
+      "role": "supplemental_agent_tool_bug_kill",
+      "backend": "cuda",
+      "repo": "jart25/Qwen3-Coder-30B-A3B-Instruct-Int4-gptq",
+      "revision": {
+        "status": "resolution_required",
+        "value": null,
+        "evidence": "docs/goals/model-coverage-2026-06-12/w1_matrix.json"
+      },
+      "files": [
+        {"path": "config.json", "required": true},
+        {"glob": "*.safetensors", "required": true},
+        {"path": "model.safetensors.index.json", "required_if_sharded": true},
+        {"glob": "*quantize*config*.json", "required": true}
+      ],
+      "format": "gptq_int4_community_quant",
+      "reference": {
+        "semantic_repo": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        "semantic_revision": {"status": "pinned", "value": "b2cff646eb4bb1d68355c01b18ae02e7cf42d120"},
+        "required_semantic_files": ["README.md", "config.json", "generation_config.json", "tokenizer_config.json", "tokenizer.json"],
+        "semantic_file_sha256": {
+          "README.md": "98e8f0e00f2d6c7f1743fc4ef2b6297dcc57bec73d71f36588aed984370ac3f3",
+          "config.json": "e2c8d8eea39471785cd93379d8b48241ad7dcda299013155dd02526e34a0de62",
+          "generation_config.json": "c99723ab3ba28630d26ae23def77603b540a46924895af5cf234740d3b27b51d",
+          "tokenizer_config.json": "60f6e8cb15c98dd07300a3cc465ea662de245d2095e4245616af21b2324db3fc",
+          "tokenizer.json": "19564a48c4f71a2a1b937cce34c737a1e662b171c5f5d7edf641a15cd896f07d"
+        },
+        "generation_config_source": {
+          "source": "semantic_source",
+          "path": "generation_config.json",
+          "policy": "required",
+          "content_sha256": "c99723ab3ba28630d26ae23def77603b540a46924895af5cf234740d3b27b51d"
+        },
+        "chat_template_source": {
+          "source": "semantic_source",
+          "path": "tokenizer_config.json",
+          "json_pointer": "/chat_template",
+          "container_sha256": "60f6e8cb15c98dd07300a3cc465ea662de245d2095e4245616af21b2324db3fc",
+          "content_sha256": "5a38bfa05833266240066aedc497decc9b00cc0d3e3b8cceea98cf530196ab06"
+        },
+        "external_engine": "vllm"
+      },
+      "hardware_policy": "cuda-g0-1x-rtx4090"
+    },
+    {
+      "id": "S1-QWEN3-CODER-METAL",
+      "model_id": "Qwen3-Coder-30B-A3B-Instruct",
+      "role": "supplemental_agent_tool_bug_kill",
+      "backend": "metal",
+      "repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+      "revision": {
+        "status": "resolution_required",
+        "value": null,
+        "evidence": "docs/goals/model-coverage-2026-06-12/w1_matrix.json"
+      },
+      "files": [
+        {"path": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf", "required": true}
+      ],
+      "format": "gguf_q4_k_m",
+      "reference": {
+        "semantic_repo": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        "semantic_revision": {"status": "pinned", "value": "b2cff646eb4bb1d68355c01b18ae02e7cf42d120"},
+        "required_semantic_files": ["README.md", "config.json", "generation_config.json", "tokenizer_config.json", "tokenizer.json"],
+        "semantic_file_sha256": {
+          "README.md": "98e8f0e00f2d6c7f1743fc4ef2b6297dcc57bec73d71f36588aed984370ac3f3",
+          "config.json": "e2c8d8eea39471785cd93379d8b48241ad7dcda299013155dd02526e34a0de62",
+          "generation_config.json": "c99723ab3ba28630d26ae23def77603b540a46924895af5cf234740d3b27b51d",
+          "tokenizer_config.json": "60f6e8cb15c98dd07300a3cc465ea662de245d2095e4245616af21b2324db3fc",
+          "tokenizer.json": "19564a48c4f71a2a1b937cce34c737a1e662b171c5f5d7edf641a15cd896f07d"
+        },
+        "generation_config_source": {
+          "source": "semantic_source",
+          "path": "generation_config.json",
+          "policy": "required",
+          "content_sha256": "c99723ab3ba28630d26ae23def77603b540a46924895af5cf234740d3b27b51d"
+        },
+        "chat_template_source": {
+          "source": "semantic_source",
+          "path": "tokenizer_config.json",
+          "json_pointer": "/chat_template",
+          "container_sha256": "60f6e8cb15c98dd07300a3cc465ea662de245d2095e4245616af21b2324db3fc",
+          "content_sha256": "5a38bfa05833266240066aedc497decc9b00cc0d3e3b8cceea98cf530196ab06"
+        },
+        "external_engine": "llama.cpp_same_gguf"
+      },
+      "hardware_policy": "metal-reference-m1-max-32gb"
+    },
+    {
+      "id": "S2-DEEPSEEK-R1-QWEN3-8B-CUDA",
+      "model_id": "DeepSeek-R1-0528-Qwen3-8B",
+      "role": "supplemental_reasoning_template_control",
+      "backend": "cuda",
+      "repo": "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+      "revision": {
+        "status": "pinned",
+        "value": "6e8885a6ff5c1dc5201574c8fd700323f23c25fa",
+        "evidence": "docs/goals/model-coverage-2026-06-12/w1_matrix.json"
+      },
+      "files": [
+        {"path": "config.json", "required": true},
+        {"path": "tokenizer_config.json", "required": true},
+        {"path": "tokenizer.json", "required": true},
+        {"glob": "*.safetensors", "required": true},
+        {"path": "model.safetensors.index.json", "required_if_sharded": true}
+      ],
+      "format": "bf16_safetensors",
+      "reference": {
+        "semantic_repo": "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+        "semantic_revision": {"status": "same_as_weight_revision"},
+        "required_semantic_files": ["README.md", "config.json", "tokenizer_config.json", "tokenizer.json"],
+        "semantic_file_sha256": {
+          "README.md": "ee003a09ddabff67a5b0d2394bea65c6ce523e4994f3208d6a58613e27834d8a",
+          "config.json": "1b1cbbba841c180e94192f7a25d2d97e21498fc1a0a0b4785942158af5eee183",
+          "tokenizer_config.json": "78872f2c1f0a5fb79d5872dbacb4c83991ef416315a25f34659e6a7c34108027",
+          "tokenizer.json": "47d3a3ffb1ff38eb6a22f8a2d207306bfa3ea2499ff70df4baeaa559bf7453c7"
+        },
+        "generation_config_source": {
+          "source": "semantic_source",
+          "path": "generation_config.json",
+          "policy": "absent"
+        },
+        "chat_template_source": {
+          "source": "semantic_source",
+          "path": "tokenizer_config.json",
+          "json_pointer": "/chat_template",
+          "container_sha256": "78872f2c1f0a5fb79d5872dbacb4c83991ef416315a25f34659e6a7c34108027",
+          "content_sha256": "53671bac29bcb3e1f95f51b8c77d85a6011b66dc38bd23dce64eef04384a976b"
+        },
+        "external_engine": "vllm"
+      },
+      "hardware_policy": "cuda-g0-1x-rtx4090"
+    },
+    {
+      "id": "S2-DEEPSEEK-R1-QWEN3-8B-METAL",
+      "model_id": "DeepSeek-R1-0528-Qwen3-8B",
+      "role": "supplemental_reasoning_template_control",
+      "backend": "metal",
+      "repo": "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
+      "revision": {
+        "status": "resolution_required",
+        "value": null,
+        "evidence": "docs/goals/model-coverage-2026-06-12/w1_matrix.json"
+      },
+      "files": [
+        {"path": "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf", "required": true}
+      ],
+      "format": "gguf_q4_k_m",
+      "reference": {
+        "semantic_repo": "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+        "semantic_revision": {"status": "pinned", "value": "6e8885a6ff5c1dc5201574c8fd700323f23c25fa"},
+        "required_semantic_files": ["README.md", "config.json", "tokenizer_config.json", "tokenizer.json"],
+        "semantic_file_sha256": {
+          "README.md": "ee003a09ddabff67a5b0d2394bea65c6ce523e4994f3208d6a58613e27834d8a",
+          "config.json": "1b1cbbba841c180e94192f7a25d2d97e21498fc1a0a0b4785942158af5eee183",
+          "tokenizer_config.json": "78872f2c1f0a5fb79d5872dbacb4c83991ef416315a25f34659e6a7c34108027",
+          "tokenizer.json": "47d3a3ffb1ff38eb6a22f8a2d207306bfa3ea2499ff70df4baeaa559bf7453c7"
+        },
+        "generation_config_source": {
+          "source": "semantic_source",
+          "path": "generation_config.json",
+          "policy": "absent"
+        },
+        "chat_template_source": {
+          "source": "semantic_source",
+          "path": "tokenizer_config.json",
+          "json_pointer": "/chat_template",
+          "container_sha256": "78872f2c1f0a5fb79d5872dbacb4c83991ef416315a25f34659e6a7c34108027",
+          "content_sha256": "53671bac29bcb3e1f95f51b8c77d85a6011b66dc38bd23dce64eef04384a976b"
+        },
+        "external_engine": "llama.cpp_same_gguf"
+      },
+      "hardware_policy": "metal-reference-m1-max-32gb"
+    },
+    {
+      "id": "S3-LLAMA31-8B-CUDA",
+      "model_id": "Llama-3.1-8B-Instruct",
+      "role": "supplemental_release_policy_dense_control",
+      "backend": "cuda",
+      "repo": "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
+      "revision": {
+        "status": "pinned",
+        "value": "f184d2b18e2b7c257af79aa0bc53ef3ee505caa2",
+        "evidence": "docs/release/g0/0.7.7/cuda-llama-dense/bench-serve.command.json"
+      },
+      "files": [
+        {"path": "config.json", "required": true},
+        {"glob": "*.safetensors", "required": true},
+        {"path": "model.safetensors.index.json", "required_if_sharded": true},
+        {"glob": "*quantize*config*.json", "required": true}
+      ],
+      "format": "gptq_int4",
+      "reference": {
+        "semantic_repo": "NousResearch/Meta-Llama-3.1-8B-Instruct",
+        "semantic_revision": {"status": "pinned", "value": "d10aef7999a2b5ba950ab3974312feeedbfe0b77"},
+        "required_semantic_files": ["README.md", "config.json", "generation_config.json", "tokenizer.json"],
+        "semantic_file_sha256": {
+          "README.md": "ebf2d72071c75f9c9c089b66acd85a566f253c96941def6cd7800ffc4b4fe588",
+          "config.json": "29e4c210b0d6ac178b16b2a255a568bdb23b581e50ca1ef6a6d071dd85704e6e",
+          "generation_config.json": "189fb0c0d7fd8a527db217c0a60a0e013f0394cd8800f9697a666a9e75e5f7fd",
+          "tokenizer.json": "79e3e522635f3171300913bb421464a87de6222182a0570b9b2ccba2a964b2b4"
+        },
+        "generation_config_source": {
+          "source": "semantic_source",
+          "path": "generation_config.json",
+          "policy": "required",
+          "content_sha256": "189fb0c0d7fd8a527db217c0a60a0e013f0394cd8800f9697a666a9e75e5f7fd"
+        },
+        "official_upstream": {
+          "repo": "meta-llama/Llama-3.1-8B-Instruct",
+          "revision": {"status": "pinned", "value": "0e9e39f249a16976918f6564b8830bc894c89659"},
+          "required_gated": true,
+          "blob_oid_match_files": ["config.json", "generation_config.json", "tokenizer.json"],
+          "expected_git_oids": {
+            "config.json": "0bb6fd75b3ad2fe988565929f329945262c2814e",
+            "generation_config.json": "cc7276afd599de091142c6ed3005faf8a74aa257",
+            "tokenizer.json": "5cc5f00a5b203e90a27a3bd60d1ec393b07971e8"
+          },
+          "expected_content_sha256": {
+            "config.json": "29e4c210b0d6ac178b16b2a255a568bdb23b581e50ca1ef6a6d071dd85704e6e",
+            "generation_config.json": "189fb0c0d7fd8a527db217c0a60a0e013f0394cd8800f9697a666a9e75e5f7fd",
+            "tokenizer.json": "79e3e522635f3171300913bb421464a87de6222182a0570b9b2ccba2a964b2b4"
+          },
+          "expected_size_bytes": {
+            "config.json": 855,
+            "generation_config.json": 184,
+            "tokenizer.json": 9085657
+          },
+          "access_note": "official repo is gated; public mirror bytes must match official Git blob OIDs"
+        },
+        "tokenizer_repo": "unsloth/Meta-Llama-3.1-8B-Instruct",
+        "tokenizer_revision": {"status": "pinned", "value": "a2856192dd7c25b842431f39c179a6c2c2f627d1"},
+        "required_tokenizer_files": ["tokenizer_config.json", "tokenizer.json"],
+        "tokenizer_file_sha256": {
+          "tokenizer_config.json": "4d18eae3017839b17cb3598f589b62ec212652d183582ee0fc33a4f1e8b3da67",
+          "tokenizer.json": "6b9e4e7fb171f92fd137b777cc2714bf87d11576700a1dcd7a399e7bbe39537b"
+        },
+        "chat_template_source": {
+          "source": "tokenizer_source",
+          "path": "tokenizer_config.json",
+          "json_pointer": "/chat_template",
+          "container_sha256": "4d18eae3017839b17cb3598f589b62ec212652d183582ee0fc33a4f1e8b3da67",
+          "content_sha256": "e10ca381b1ccc5cf9db52e371f3b6651576caee0a630b452e2816b2d404d4b65"
+        },
+        "external_engine": "vllm"
+      },
+      "hardware_policy": "cuda-g0-1x-rtx4090"
+    },
+    {
+      "id": "S3-LLAMA31-8B-METAL",
+      "model_id": "Llama-3.1-8B-Instruct",
+      "role": "supplemental_release_policy_dense_control",
+      "backend": "metal",
+      "repo": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+      "revision": {
+        "status": "resolution_required",
+        "value": null,
+        "evidence": "docs/goals/runtime-vnext-0.8.0-2026-07-10/MODEL_MATRIX.md"
+      },
+      "files": [
+        {"path": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", "required": true}
+      ],
+      "format": "gguf_q4_k_m",
+      "reference": {
+        "semantic_repo": "NousResearch/Meta-Llama-3.1-8B-Instruct",
+        "semantic_revision": {"status": "pinned", "value": "d10aef7999a2b5ba950ab3974312feeedbfe0b77"},
+        "required_semantic_files": ["README.md", "config.json", "generation_config.json", "tokenizer.json"],
+        "semantic_file_sha256": {
+          "README.md": "ebf2d72071c75f9c9c089b66acd85a566f253c96941def6cd7800ffc4b4fe588",
+          "config.json": "29e4c210b0d6ac178b16b2a255a568bdb23b581e50ca1ef6a6d071dd85704e6e",
+          "generation_config.json": "189fb0c0d7fd8a527db217c0a60a0e013f0394cd8800f9697a666a9e75e5f7fd",
+          "tokenizer.json": "79e3e522635f3171300913bb421464a87de6222182a0570b9b2ccba2a964b2b4"
+        },
+        "generation_config_source": {
+          "source": "semantic_source",
+          "path": "generation_config.json",
+          "policy": "required",
+          "content_sha256": "189fb0c0d7fd8a527db217c0a60a0e013f0394cd8800f9697a666a9e75e5f7fd"
+        },
+        "official_upstream": {
+          "repo": "meta-llama/Llama-3.1-8B-Instruct",
+          "revision": {"status": "pinned", "value": "0e9e39f249a16976918f6564b8830bc894c89659"},
+          "required_gated": true,
+          "blob_oid_match_files": ["config.json", "generation_config.json", "tokenizer.json"],
+          "expected_git_oids": {
+            "config.json": "0bb6fd75b3ad2fe988565929f329945262c2814e",
+            "generation_config.json": "cc7276afd599de091142c6ed3005faf8a74aa257",
+            "tokenizer.json": "5cc5f00a5b203e90a27a3bd60d1ec393b07971e8"
+          },
+          "expected_content_sha256": {
+            "config.json": "29e4c210b0d6ac178b16b2a255a568bdb23b581e50ca1ef6a6d071dd85704e6e",
+            "generation_config.json": "189fb0c0d7fd8a527db217c0a60a0e013f0394cd8800f9697a666a9e75e5f7fd",
+            "tokenizer.json": "79e3e522635f3171300913bb421464a87de6222182a0570b9b2ccba2a964b2b4"
+          },
+          "expected_size_bytes": {
+            "config.json": 855,
+            "generation_config.json": 184,
+            "tokenizer.json": 9085657
+          },
+          "access_note": "official repo is gated; public mirror bytes must match official Git blob OIDs"
+        },
+        "tokenizer_repo": "unsloth/Meta-Llama-3.1-8B-Instruct",
+        "tokenizer_revision": {"status": "pinned", "value": "a2856192dd7c25b842431f39c179a6c2c2f627d1"},
+        "required_tokenizer_files": ["tokenizer_config.json", "tokenizer.json"],
+        "tokenizer_file_sha256": {
+          "tokenizer_config.json": "4d18eae3017839b17cb3598f589b62ec212652d183582ee0fc33a4f1e8b3da67",
+          "tokenizer.json": "6b9e4e7fb171f92fd137b777cc2714bf87d11576700a1dcd7a399e7bbe39537b"
+        },
+        "chat_template_source": {
+          "source": "tokenizer_source",
+          "path": "tokenizer_config.json",
+          "json_pointer": "/chat_template",
+          "container_sha256": "4d18eae3017839b17cb3598f589b62ec212652d183582ee0fc33a4f1e8b3da67",
+          "content_sha256": "e10ca381b1ccc5cf9db52e371f3b6651576caee0a630b452e2816b2d404d4b65"
+        },
+        "external_engine": "llama.cpp_same_gguf"
+      },
+      "hardware_policy": "metal-reference-m1-max-32gb"
+    }
+  ]
+}

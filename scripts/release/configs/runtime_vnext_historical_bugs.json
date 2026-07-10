@@ -1,0 +1,523 @@
+{
+  "schema_version": 1,
+  "catalog_id": "runtime-vnext-0.8.0-historical-bugs",
+  "baseline_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394",
+  "source_document": "docs/goals/runtime-vnext-0.8.0-2026-07-10/G02_TEST_EVIDENCE.md",
+  "prior_catalog": "docs/goals/test-architecture-2026-06-10/historical_bugs.json",
+  "family_count": 15,
+  "concrete_case_count": 28,
+  "evidence_status_vocabulary": {
+    "bound": "A historical fix or record and a current reproducer path are both identified.",
+    "partial": "Some source evidence exists, but the original failing artifact or an isolated mutation fixture is still missing.",
+    "gap": "The goal names the failure but the repository does not contain enough evidence to claim a reproducible historical case."
+  },
+  "rules": [
+    "Every commit SHA must resolve in this repository.",
+    "Every repository-relative artifact and reproducer path must exist in the audited worktree; the G00 gate must additionally bind their content hashes to its candidate SHA.",
+    "A current passing regression test is not an original historical failure artifact.",
+    "G00 PASS requires every partial or gap case to be upgraded with a frozen failing input and mutation or revert patch."
+  ],
+  "families": [
+    {
+      "id": "H01",
+      "title": "run/serve auto-config was not materialized and selected the CUDA MoE slow path",
+      "cases": [
+        {
+          "id": "H01.1",
+          "title": "ferrum run failed to select the capability-gated vLLM-Marlin MoE path",
+          "commits": [
+            {"sha": "3b324562622144ea1501c8d16c99fb71f9fbb688", "relation": "fix"}
+          ],
+          "historical_artifacts": ["docs/status/auto-config-2026-05-30.md"],
+          "reproducer_paths": ["crates/ferrum-types/src/auto_config.rs", "crates/ferrum-cli/src/commands/run.rs"],
+          "failure_class": "silent_slow_path_config_drift",
+          "entrypoints": ["run"],
+          "backends": ["cuda"],
+          "downstream_goals": ["G05", "G09"],
+          "evidence_status": "bound"
+        },
+        {
+          "id": "H01.2",
+          "title": "resolved serve MoE selectors were not materialized for legacy runtime readers",
+          "commits": [
+            {"sha": "a7a41d971ffde626475861b0960a5888ae600dad", "relation": "fix"}
+          ],
+          "historical_artifacts": ["docs/status/auto-config-2026-05-30.md"],
+          "reproducer_paths": ["crates/ferrum-types/src/auto_config.rs", "crates/ferrum-cli/src/commands/serve.rs"],
+          "failure_class": "silent_slow_path_config_drift",
+          "entrypoints": ["serve"],
+          "backends": ["cuda"],
+          "downstream_goals": ["G05", "G09"],
+          "evidence_status": "bound"
+        }
+      ]
+    },
+    {
+      "id": "H02",
+      "title": "serve/run default drift caused context exhaustion, swap pressure, or hangs",
+      "cases": [
+        {
+          "id": "H02.1",
+          "title": "chat defaults exhausted KV capacity near turn four",
+          "commits": [
+            {"sha": "69c7d05e6446067c81f9b0a8ef1d60e4c26d5f8f", "relation": "fix"}
+          ],
+          "historical_artifacts": [],
+          "reproducer_paths": ["crates/ferrum-cli/src/gpu_mem_autosize.rs", "crates/ferrum-engine/tests/tiny_stack.rs"],
+          "failure_class": "context_capacity_exhaustion",
+          "entrypoints": ["run"],
+          "backends": ["cuda", "metal"],
+          "downstream_goals": ["G04", "G05"],
+          "evidence_status": "partial",
+          "gap": "The fix commit is known, but the original turn-four failure artifact is not checked in."
+        },
+        {
+          "id": "H02.2",
+          "title": "GGUF run defaults could hang",
+          "commits": [
+            {"sha": "7fb268d47d4f58ea152a977643c77d96c7254f3b", "relation": "fix"}
+          ],
+          "historical_artifacts": [],
+          "reproducer_paths": ["crates/ferrum-cli/tests/chat_pty.rs", "crates/ferrum-cli/src/commands/run.rs"],
+          "failure_class": "product_entrypoint_hang",
+          "entrypoints": ["run"],
+          "backends": ["metal"],
+          "downstream_goals": ["G05"],
+          "evidence_status": "partial",
+          "gap": "The fix commit is known, but the original hung process log is not checked in."
+        },
+        {
+          "id": "H02.3",
+          "title": "Metal defaults admitted a run while the host was under swap pressure",
+          "commits": [],
+          "historical_artifacts": ["docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-30b-a3b-run-serve-fix-20260602/summary.json"],
+          "reproducer_paths": ["scripts/metal_readme_regression.py"],
+          "failure_class": "swap_pressure_regression",
+          "entrypoints": ["run", "serve"],
+          "backends": ["metal"],
+          "downstream_goals": ["G04", "G09"],
+          "evidence_status": "gap",
+          "gap": "The saved summary proves swap was monitored, not the original default-induced failure; no precise source commit or failing artifact is present."
+        }
+      ]
+    },
+    {
+      "id": "H03",
+      "title": "UTF-8/BPE token handling produced mojibake outside the SSE framing layer",
+      "cases": [
+        {
+          "id": "H03.1",
+          "title": "replacement-character mojibake token was eligible for sampling",
+          "commits": [
+            {"sha": "888294c6cd337916b82760f414c8b9cb7ed0e645", "relation": "fix"}
+          ],
+          "historical_artifacts": ["docs/bench/release-failure-regression-2026-06-02/summary.md"],
+          "reproducer_paths": ["crates/ferrum-engine/src/continuous_engine/tests.rs"],
+          "failure_class": "invalid_utf8_mojibake_output",
+          "entrypoints": ["run", "serve"],
+          "backends": ["cuda", "metal"],
+          "downstream_goals": ["G02", "G05"],
+          "evidence_status": "bound"
+        }
+      ]
+    },
+    {
+      "id": "H04",
+      "title": "streaming emitted U+FFFD for a multi-token UTF-8 sequence",
+      "cases": [
+        {
+          "id": "H04.1",
+          "title": "single-token incremental decode flushed an incomplete UTF-8 sequence",
+          "commits": [
+            {"sha": "b5299eecd0032d318f40a13b77da745250d95a87", "relation": "fix"}
+          ],
+          "historical_artifacts": ["docs/bench/release-failure-regression-2026-06-02/metal-qwen30-serve-verdict.json"],
+          "reproducer_paths": ["crates/ferrum-engine/src/continuous_engine/tests.rs", "crates/ferrum-cli/tests/server_smoke.rs"],
+          "failure_class": "stream_partial_utf8_replacement",
+          "entrypoints": ["serve"],
+          "backends": ["cuda", "metal"],
+          "downstream_goals": ["G02", "G05"],
+          "evidence_status": "bound"
+        }
+      ]
+    },
+    {
+      "id": "H05",
+      "title": "EOS or text stop handling leaked output or failed to terminate",
+      "cases": [
+        {
+          "id": "H05.1",
+          "title": "model EOS did not terminate the chat sequence correctly",
+          "commits": [
+            {"sha": "34c57c2b0635a56a7d16a37efcdd5f94e853f8f9", "relation": "fix"}
+          ],
+          "historical_artifacts": ["docs/goals/test-architecture-2026-06-10/historical_bugs.json"],
+          "reproducer_paths": ["docs/goals/test-architecture-2026-06-10/patches/hb-01.patch", "crates/ferrum-engine/tests/tiny_stack.rs"],
+          "failure_class": "eos_not_terminated",
+          "entrypoints": ["run", "serve"],
+          "backends": ["cpu", "cuda", "metal"],
+          "downstream_goals": ["G02", "G05"],
+          "evidence_status": "bound"
+        },
+        {
+          "id": "H05.2",
+          "title": "trailing stop sentinel leaked into the OpenAI response",
+          "commits": [
+            {"sha": "3fcd4b5df59920feea689886b51785301f3dd5e7", "relation": "fix"}
+          ],
+          "historical_artifacts": ["docs/goals/test-architecture-2026-06-10/historical_bugs.json"],
+          "reproducer_paths": ["crates/ferrum-cli/tests/server_smoke.rs"],
+          "failure_class": "stop_sequence_text_leak",
+          "entrypoints": ["serve"],
+          "backends": ["cpu", "cuda", "metal"],
+          "downstream_goals": ["G02", "G05"],
+          "evidence_status": "bound"
+        },
+        {
+          "id": "H05.3",
+          "title": "stop text embedded inside a composite token was not detected",
+          "commits": [
+            {"sha": "2a3a6132ae34ec93451b373178ed9a1e70e22ed4", "relation": "fix"}
+          ],
+          "historical_artifacts": ["docs/goals/test-architecture-2026-06-10/historical_bugs.json"],
+          "reproducer_paths": ["docs/goals/test-architecture-2026-06-10/patches/hb-02.patch", "crates/ferrum-engine/tests/tiny_stack.rs"],
+          "failure_class": "composite_token_stop_missed",
+          "entrypoints": ["run", "serve"],
+          "backends": ["cpu", "cuda", "metal"],
+          "downstream_goals": ["G02", "G05"],
+          "evidence_status": "bound"
+        }
+      ]
+    },
+    {
+      "id": "H06",
+      "title": "decode position offset was wrong after the engine swap",
+      "cases": [
+        {
+          "id": "H06.1",
+          "title": "multi-turn decode used the wrong position offset",
+          "commits": [
+            {"sha": "34c57c2b0635a56a7d16a37efcdd5f94e853f8f9", "relation": "fix"}
+          ],
+          "historical_artifacts": ["docs/goals/test-architecture-2026-06-10/historical_bugs.json"],
+          "reproducer_paths": ["docs/goals/test-architecture-2026-06-10/patches/hb-01.patch", "crates/ferrum-models/tests/qwen3_logit_dump_native.rs"],
+          "failure_class": "decode_position_offset_drift",
+          "entrypoints": ["run", "serve"],
+          "backends": ["cuda", "metal"],
+          "downstream_goals": ["G02", "G03", "G05"],
+          "evidence_status": "bound"
+        }
+      ]
+    },
+    {
+      "id": "H07",
+      "title": "CUDA graph keys or slots reused incompatible state",
+      "cases": [
+        {
+          "id": "H07.1",
+          "title": "MoE graph cache keyed by padded rather than actual batch size corrupted c32 output",
+          "commits": [
+            {"sha": "db7e529322eba6a6e9aae13a10207ddd5ff28f8e", "relation": "fix"}
+          ],
+          "historical_artifacts": ["docs/bench/v0.2-cuda/status-2026-05-05-full-cuda-graph.md"],
+          "reproducer_paths": ["crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs"],
+          "failure_class": "cuda_graph_padded_key_corruption",
+          "entrypoints": ["run", "serve"],
+          "backends": ["cuda"],
+          "downstream_goals": ["G02", "G03", "G08C"],
+          "evidence_status": "partial",
+          "gap": "The fix and historical graph report exist, but no checked-in minimal mutation fixture isolates this exact key regression."
+        },
+        {
+          "id": "H07.2",
+          "title": "release reset a captured graph and left a stale replay slot",
+          "commits": [
+            {"sha": "e4236366a631d9af14c5007c406222e694660e24", "relation": "fix"}
+          ],
+          "historical_artifacts": ["docs/bench/v0.2-cuda/status-2026-05-05-full-cuda-graph.md"],
+          "reproducer_paths": ["crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs"],
+          "failure_class": "cuda_graph_stale_slot_replay",
+          "entrypoints": ["run", "serve"],
+          "backends": ["cuda"],
+          "downstream_goals": ["G02", "G03", "G08C"],
+          "evidence_status": "partial",
+          "gap": "The fix commit exists; a standalone current mutation patch is still required."
+        }
+      ]
+    },
+    {
+      "id": "H08",
+      "title": "paged batch scratch was not initialized after reallocation",
+      "cases": [
+        {
+          "id": "H08.1",
+          "title": "ensure_scratch growth left paged_batch buffers uninitialized",
+          "commits": [
+            {"sha": "4701cc8445c7091d329c045f4ac7b595cef94349", "relation": "fix"}
+          ],
+          "historical_artifacts": ["docs/goals/test-architecture-2026-06-10/historical_bugs.json"],
+          "reproducer_paths": ["docs/goals/test-architecture-2026-06-10/patches/hb-08.patch", "crates/ferrum-models/src/models/qwen3_moe/scratch.rs"],
+          "failure_class": "uninitialized_scratch_after_growth",
+          "entrypoints": ["run", "serve"],
+          "backends": ["cuda", "metal"],
+          "downstream_goals": ["G02", "G03", "G08C"],
+          "evidence_status": "partial",
+          "gap": "The prior catalog exempted the CPU mutation because the tiny executor did not drive the real paged batch path; G00 still needs a real-path replay fixture."
+        }
+      ]
+    },
+    {
+      "id": "H09",
+      "title": "Metal dispatched a CUDA-only varlen primitive",
+      "cases": [
+        {
+          "id": "H09.1",
+          "title": "Qwen3 MoE lacked per-item fallback when varlen QKV was unsupported",
+          "commits": [
+            {"sha": "fbdfcfe273d3c020e0191dde831eb3682db77972", "relation": "fix"}
+          ],
+          "historical_artifacts": ["docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen30-fbdfcfe-c16-20260601/summary.json"],
+          "reproducer_paths": ["docs/goals/test-architecture-2026-06-10/patches/hb-07.patch", "crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs"],
+          "failure_class": "unsupported_backend_primitive_dispatch",
+          "entrypoints": ["run", "serve"],
+          "backends": ["metal"],
+          "downstream_goals": ["G02", "G03", "G08C"],
+          "evidence_status": "bound"
+        }
+      ]
+    },
+    {
+      "id": "H10",
+      "title": "shared default dtype converted a CUDA f16 residual to f32",
+      "cases": [
+        {
+          "id": "H10.1",
+          "title": "host scale_inplace fallback changed the CUDA residual buffer dtype",
+          "commits": [
+            {"sha": "86633c2df3d657ae0ddd0ac421f8fb6ae674cc3d", "relation": "fix"}
+          ],
+          "historical_artifacts": ["docs/goals/model-coverage-2026-06-12/STATUS.md"],
+          "reproducer_paths": ["crates/ferrum-kernels/src/backend/cuda/mod.rs", "crates/ferrum-models/src/models/llama_family.rs"],
+          "failure_class": "backend_dtype_contract_violation",
+          "entrypoints": ["run", "serve"],
+          "backends": ["cuda"],
+          "downstream_goals": ["G02", "G03"],
+          "evidence_status": "partial",
+          "gap": "The source fix is precise, but the repository has no isolated CUDA scale_inplace dtype regression fixture."
+        }
+      ]
+    },
+    {
+      "id": "H11",
+      "title": "Metal head_dim=256 accumulator overflowed or produced NaN",
+      "cases": [
+        {
+          "id": "H11.1",
+          "title": "Metal flash attention accumulator overflowed at head_dim 256",
+          "commits": [
+            {"sha": "234d0df8ade083ce4f61cae8238cf64da5190343", "relation": "fix"}
+          ],
+          "historical_artifacts": ["docs/goals/model-coverage-2026-06-12/artifacts/gemma3_l1/README.md"],
+          "reproducer_paths": ["crates/ferrum-kernels/tests/gemma3_metal_ops_test.rs"],
+          "failure_class": "metal_accumulator_overflow_nan",
+          "entrypoints": ["run", "serve"],
+          "backends": ["metal"],
+          "downstream_goals": ["G02", "G03"],
+          "evidence_status": "bound"
+        }
+      ]
+    },
+    {
+      "id": "H12",
+      "title": "KV and admission resource transactions did not close under pressure",
+      "cases": [
+        {
+          "id": "H12.1",
+          "title": "capacity exhaustion surfaced as a panic instead of classified ResourceExhausted",
+          "commits": [
+            {"sha": "3cf3bf6b6a91e9b9e210c846172000ecaed19f81", "relation": "fix"}
+          ],
+          "historical_artifacts": ["docs/bench/v0.2-cuda/status-2026-05-05-chunked-prefill.md"],
+          "reproducer_paths": ["crates/ferrum-engine/src/continuous_engine/tests.rs", "scripts/release/resource_invariant_gate.py"],
+          "failure_class": "unclassified_capacity_oom_or_panic",
+          "entrypoints": ["run", "serve"],
+          "backends": ["cuda", "metal"],
+          "downstream_goals": ["G02", "G04"],
+          "evidence_status": "bound"
+        },
+        {
+          "id": "H12.2",
+          "title": "capacity-deferred work was immediately re-admitted without progress",
+          "commits": [
+            {"sha": "2203a9cd9c0b1244705c756c6c204235638c8477", "relation": "fix"},
+            {"sha": "7476295db6f4c5510d83328e450440b2aec1d8cf", "relation": "followup_fix"}
+          ],
+          "historical_artifacts": ["docs/goals/model-coverage-2026-06-12/STATUS.md"],
+          "reproducer_paths": ["crates/ferrum-engine/src/continuous_engine/tests.rs"],
+          "failure_class": "capacity_defer_requeue_loop",
+          "entrypoints": ["serve"],
+          "backends": ["cuda"],
+          "downstream_goals": ["G02", "G04"],
+          "evidence_status": "partial",
+          "gap": "The generic scheduler contract and fix commits are bound, while the real-model c32 livelock artifact is owned by H15.1 to avoid counting the same concrete failure twice."
+        },
+        {
+          "id": "H12.3",
+          "title": "partial paged KV allocation was not rolled back",
+          "commits": [
+            {"sha": "d62b18cfe877a2b260a5ddab3bfa4772a45cb7ff", "relation": "fix"}
+          ],
+          "historical_artifacts": ["docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_paged_kv_rollback_c32_d62b18cf_20260624T175240Z/perf/bench_summary.json"],
+          "reproducer_paths": ["crates/ferrum-kv/src/managers/paged.rs", "scripts/release/resource_invariant_gate.py"],
+          "failure_class": "partial_allocation_rollback_leak",
+          "entrypoints": ["run", "serve"],
+          "backends": ["cuda", "metal"],
+          "downstream_goals": ["G02", "G04"],
+          "evidence_status": "bound"
+        },
+        {
+          "id": "H12.4",
+          "title": "capacity defer retained an existing KV handle and prevented resource closure",
+          "commits": [
+            {"sha": "b8116dc498e7fad50263d0dc580daf38194cb74e", "relation": "fix"},
+            {"sha": "16e8ee6ba2d4a9ecf3243f45052fbb0c17225682", "relation": "related_prefill_rollback_fix"}
+          ],
+          "historical_artifacts": ["docs/goals/model-coverage-2026-06-12/STATUS.md"],
+          "reproducer_paths": ["crates/ferrum-engine/src/continuous_engine/tests.rs", "scripts/release/resource_invariant_gate.py"],
+          "failure_class": "resource_release_not_closed",
+          "entrypoints": ["serve"],
+          "backends": ["cuda"],
+          "downstream_goals": ["G02", "G04"],
+          "evidence_status": "partial",
+          "gap": "The fix and local closure test exist, but the b8116dc4 real-model run still ended in a different no-progress failure and therefore is not claimed as release-closure proof here."
+        }
+      ]
+    },
+    {
+      "id": "H13",
+      "title": "SSE completion or usage terminators were missing or duplicated",
+      "cases": [
+        {
+          "id": "H13.1",
+          "title": "stream omitted data: [DONE]",
+          "commits": [
+            {"sha": "9d81ed9f95c1a5fb8f683b5db80e9b39f5b49abc", "relation": "regression_contract"}
+          ],
+          "historical_artifacts": [],
+          "reproducer_paths": ["crates/ferrum-cli/tests/server_smoke.rs", "crates/ferrum-cli/tests/vllm_migration_compat.rs"],
+          "failure_class": "sse_done_missing",
+          "entrypoints": ["serve"],
+          "backends": ["cuda", "metal"],
+          "downstream_goals": ["G02", "G05"],
+          "evidence_status": "gap",
+          "gap": "Only the current positive contract is checked in; no original missing-DONE artifact or fix commit is identified."
+        },
+        {
+          "id": "H13.2",
+          "title": "stream emitted data: [DONE] more than once",
+          "commits": [
+            {"sha": "9d81ed9f95c1a5fb8f683b5db80e9b39f5b49abc", "relation": "regression_contract"}
+          ],
+          "historical_artifacts": [],
+          "reproducer_paths": ["crates/ferrum-cli/tests/vllm_migration_compat.rs"],
+          "failure_class": "sse_done_duplicate",
+          "entrypoints": ["serve"],
+          "backends": ["cuda", "metal"],
+          "downstream_goals": ["G02", "G05"],
+          "evidence_status": "gap",
+          "gap": "Only the current exact-count assertion is checked in; no original duplicate-DONE artifact or fix commit is identified."
+        },
+        {
+          "id": "H13.3",
+          "title": "include_usage stream omitted the final usage chunk",
+          "commits": [
+            {"sha": "36e3dc2b787fd57198ef174356dee470be555a3e", "relation": "regression_contract"}
+          ],
+          "historical_artifacts": [],
+          "reproducer_paths": ["crates/ferrum-cli/tests/server_openai_compat.rs", "crates/ferrum-cli/tests/vllm_migration_compat.rs"],
+          "failure_class": "stream_usage_missing",
+          "entrypoints": ["serve"],
+          "backends": ["cuda", "metal"],
+          "downstream_goals": ["G02", "G05"],
+          "evidence_status": "gap",
+          "gap": "Only the current positive include_usage contract is checked in; no original failing artifact is identified."
+        },
+        {
+          "id": "H13.4",
+          "title": "include_usage stream emitted more than one usage chunk",
+          "commits": [
+            {"sha": "36e3dc2b787fd57198ef174356dee470be555a3e", "relation": "regression_contract"}
+          ],
+          "historical_artifacts": [],
+          "reproducer_paths": ["crates/ferrum-cli/tests/vllm_migration_compat.rs"],
+          "failure_class": "stream_usage_duplicate",
+          "entrypoints": ["serve"],
+          "backends": ["cuda", "metal"],
+          "downstream_goals": ["G02", "G05"],
+          "evidence_status": "gap",
+          "gap": "Only the current exact-count assertion is checked in; no original duplicate-usage artifact is identified."
+        }
+      ]
+    },
+    {
+      "id": "H14",
+      "title": "Qwen3-Coder CUDA generated EOS as the first token and returned an empty answer",
+      "cases": [
+        {
+          "id": "H14.1",
+          "title": "Qwen3-Coder-30B GPTQ chat returned an empty CUDA answer",
+          "commits": [
+            {"sha": "eacfb09d94c162757a172a12f331cefa0e6d5016", "relation": "historical_record"}
+          ],
+          "historical_artifacts": ["docs/goals/model-coverage-2026-06-12/w1_matrix.json"],
+          "reproducer_paths": ["scripts/model_coverage_smoke.sh", "scripts/pod_w1_single_gates.sh"],
+          "failure_class": "first_token_eos_empty_answer",
+          "entrypoints": ["run", "serve"],
+          "backends": ["cuda"],
+          "downstream_goals": ["G02", "G05", "G08"],
+          "evidence_status": "partial",
+          "gap": "The open-issue record and harness exist, but no accepted fix commit or minimized first-token logits artifact is checked in."
+        }
+      ]
+    },
+    {
+      "id": "H15",
+      "title": "Qwen3.5 c32 recurrent/KV pressure caused livelock or unsafe state reuse",
+      "cases": [
+        {
+          "id": "H15.1",
+          "title": "capacity-deferred recompute retried without progress at c32",
+          "commits": [
+            {"sha": "2203a9cd9c0b1244705c756c6c204235638c8477", "relation": "fix"},
+            {"sha": "7476295db6f4c5510d83328e450440b2aec1d8cf", "relation": "followup_fix"}
+          ],
+          "historical_artifacts": ["docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_capacity_backpressure_c32_2203a9cd_20260624T173154Z/perf/bench_summary.json"],
+          "reproducer_paths": ["crates/ferrum-engine/src/continuous_engine/tests.rs", "scripts/release/w3_qwen35_vast_c32_diagnostic.py"],
+          "failure_class": "scheduler_livelock_no_progress",
+          "entrypoints": ["serve"],
+          "backends": ["cuda"],
+          "downstream_goals": ["G02", "G04", "G08B"],
+          "evidence_status": "bound",
+          "related_case_ids": ["H12.2"],
+          "relation_note": "H12.2 owns the backend-independent defer/re-admit contract; H15.1 owns the distinct real Qwen3.5 c32 no-progress projection."
+        },
+        {
+          "id": "H15.2",
+          "title": "recurrent state or KV ownership survived fallback and could be reused by another request",
+          "commits": [
+            {"sha": "d57ff68ad3b0ea47d3156c753f58594cead010f8", "relation": "fix"},
+            {"sha": "0a57ff9686111ebd34aee13849f24e32f5b7f164", "relation": "related_slot_key_fix"}
+          ],
+          "historical_artifacts": ["docs/goals/model-coverage-2026-06-12/STATUS.md"],
+          "reproducer_paths": ["crates/ferrum-engine/src/continuous_engine/tests.rs", "scripts/release/resource_invariant_gate.py"],
+          "failure_class": "recurrent_or_kv_state_wrong_request_reuse",
+          "entrypoints": ["run", "serve"],
+          "backends": ["cuda"],
+          "downstream_goals": ["G02", "G04", "G08B"],
+          "evidence_status": "partial",
+          "gap": "The ownership fixes and current tests exist, but a frozen real c32 wrong-reuse output artifact is not identified."
+        }
+      ]
+    }
+  ]
+}
