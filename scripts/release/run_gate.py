@@ -12,6 +12,7 @@ import argparse
 import base64
 import binascii
 import copy
+import fnmatch
 import hashlib
 import json
 import os
@@ -71,6 +72,9 @@ ENV_ALLOW_KEYS = (
 SECRET_KEY_FRAGMENTS = ("TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+SAFETENSORS_SHARD_RE = re.compile(
+    r"-(\d{5,6})-of-(\d{5,6})\.safetensors$"
+)
 VNEXT_FROZEN_LEGACY_SHA = "cff4c47765ef3259b8a04890187d99c60da86394"
 VNEXT_G00_FULL_SELFTEST_PASS = (
     "FERRUM RUNTIME VNEXT G00 BASELINE FULL SELFTEST PASS"
@@ -78,8 +82,8 @@ VNEXT_G00_FULL_SELFTEST_PASS = (
 VNEXT_G00_SELFTEST_SUMMARY_PREFIX = (
     "FERRUM RUNTIME VNEXT G00 BASELINE SELFTEST SUMMARY:"
 )
-VNEXT_G00_REDTEAM_MUTATION_COUNT = 95
-VNEXT_G00_REDTEAM_MUTATION_MATRIX_SHA256 = "c70d1af0c8b49c63147d2a23e3bd5421179079ca7b4bc3eab5922d8cb53bab88"
+VNEXT_G00_REDTEAM_MUTATION_COUNT = 102
+VNEXT_G00_REDTEAM_MUTATION_MATRIX_SHA256 = "097f6af783d6b77311fea7853955a68e36f27867f4cc65e5627fa32feecfd99b"
 VNEXT_G00_REDTEAM_MUTATION_NAMES = (
     "dirty",
     "stale",
@@ -93,6 +97,13 @@ VNEXT_G00_REDTEAM_MUTATION_NAMES = (
     "model-resolution-resolver-sha",
     "model-resolution-shard-index",
     "model-resolution-expected-sha-non-lfs",
+    "model-resolution-extra-metadata-request",
+    "model-resolution-lfs-tree-classification",
+    "model-resolution-extra-source-request",
+    "model-resolution-sha-source-enum",
+    "model-resolution-model-url-shape",
+    "model-resolution-official-tree-binding",
+    "model-resolution-license-duplicate",
     "hardware-derived-fingerprint",
     "hardware-probe-command",
     "hardware-probe-raw-derivation",
@@ -456,6 +467,98 @@ def binary_pass_line(lane: str, out_dir: Path) -> str:
 def require_gate(condition: bool, message: str) -> None:
     if not condition:
         raise GateError(message)
+
+
+def validate_safetensors_shard_paths(paths: set[str], label: str) -> bool:
+    shards = sorted(path for path in paths if path.endswith(".safetensors"))
+    matches = [(path, SAFETENSORS_SHARD_RE.search(path)) for path in shards]
+    sharded = len(shards) > 1 or any(match is not None for _, match in matches)
+    if not sharded:
+        return False
+    require_gate(shards, f"{label} sharded safetensors set is empty")
+    require_gate(
+        all(match is not None for _, match in matches),
+        f"{label} sharded safetensors path lacks canonical numbering",
+    )
+    numbered = [
+        (int(match.group(1)), int(match.group(2)), len(match.group(1)), len(match.group(2)))
+        for _, match in matches
+        if match is not None
+    ]
+    require_gate(
+        len({number_width for _, _, number_width, _ in numbered}) == 1,
+        f"{label} sharded safetensors number width differs",
+    )
+    require_gate(
+        len({total_width for _, _, _, total_width in numbered}) == 1,
+        f"{label} sharded safetensors total width differs",
+    )
+    totals = {total for _, total, _, _ in numbered}
+    require_gate(len(totals) == 1, f"{label} safetensors shards disagree on total count")
+    total = totals.pop()
+    require_gate(total == len(numbered), f"{label} safetensors shard count differs from numbered total")
+    require_gate(
+        {number for number, _, _, _ in numbered} == set(range(1, total + 1)),
+        f"{label} safetensors shard numbering is incomplete",
+    )
+    return True
+
+
+def validate_catalog_weight_paths(
+    catalog_lane: dict[str, Any],
+    paths: set[str],
+    label: str,
+) -> bool:
+    sharded = validate_safetensors_shard_paths(paths, label)
+    selectors = require_list(catalog_lane.get("files"), f"{label}.catalog.files")
+    conditional_paths = {
+        str(selector["path"])
+        for selector in selectors
+        if isinstance(selector, dict)
+        and selector.get("required_if_sharded") is True
+        and "path" in selector
+    }
+    require_gate(
+        sharded or paths.isdisjoint(conditional_paths),
+        f"{label} unsharded model contains a conditional weight file",
+    )
+    active_selectors: list[dict[str, Any]] = []
+    for index, raw in enumerate(selectors):
+        selector = require_object(raw, f"{label}.catalog.files[{index}]")
+        active = selector.get("required") is True or (
+            selector.get("required_if_sharded") is True and sharded
+        )
+        if not active:
+            continue
+        active_selectors.append(selector)
+        if "path" in selector:
+            expected = require_string(
+                selector.get("path"),
+                f"{label}.catalog.files[{index}].path",
+            )
+            require_gate(expected in paths, f"{label} missing required weight file {expected}")
+        elif "glob" in selector:
+            pattern = require_string(
+                selector.get("glob"),
+                f"{label}.catalog.files[{index}].glob",
+            )
+            require_gate(
+                any(fnmatch.fnmatchcase(path, pattern) for path in paths),
+                f"{label} missing required weight glob {pattern}",
+            )
+        else:
+            raise GateError(f"{label}.catalog.files[{index}] needs path or glob")
+    for path in paths:
+        selected = any(
+            ("path" in selector and selector["path"] == path)
+            or (
+                "glob" in selector
+                and fnmatch.fnmatchcase(path, str(selector["glob"]))
+            )
+            for selector in active_selectors
+        )
+        require_gate(selected, f"{label} contains an unselected weight file: {path}")
+    return sharded
 
 
 def require_object(value: Any, label: str) -> dict[str, Any]:
@@ -1029,19 +1132,40 @@ def validate_vnext_g00a_provenance(
     resolution_policy = require_object(resolution.get("policy"), "vnext-g00a model resolution policy")
     require_gate(resolution_policy.get("transport") == "network_huggingface_https", "vnext-g00a model resolution transport mismatch")
     require_gate(resolution_policy.get("raw_response_body_kinds") == ["model-info", "repo-tree"], "vnext-g00a raw response body policy mismatch")
+    require_gate(
+        resolution_policy.get("lfs_metadata_download")
+        == {
+            "allowed_suffixes": [".safetensors.index.json"],
+            "max_bytes": 32 * 1024 * 1024,
+            "selector_requirement": "weight_source_exact_path_required_if_sharded",
+            "sha256_must_match_lfs_oid": True,
+        },
+        "vnext-g00a LFS metadata download policy mismatch",
+    )
     requests = require_list(resolution.get("requests"), "vnext-g00a model resolution requests")
     require_gate(requests, "vnext-g00a model resolution has no live request provenance")
     request_lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    expected_request_keys: set[tuple[str, str]] = set()
+    expected_metadata_urls: set[str] = set()
     for request_index, raw in enumerate(requests):
         request = require_object(raw, f"vnext-g00a model resolution requests[{request_index}]")
         require_gate(request.get("method") == "GET", f"vnext-g00a request method mismatch at {request_index}")
         kind = require_string(request.get("kind"), f"vnext-g00a request[{request_index}].kind")
+        require_gate(
+            kind in {"model-info", "repo-tree", "metadata-file"},
+            f"vnext-g00a request kind mismatch at {request_index}: {kind}",
+        )
         url = require_string(request.get("url"), f"vnext-g00a request[{request_index}].url")
         require_gate(url.startswith("https://huggingface.co/"), f"vnext-g00a request URL mismatch at {request_index}")
         status = request.get("status")
         require_gate(isinstance(status, int) and not isinstance(status, bool) and 200 <= status < 300, f"vnext-g00a request status mismatch at {request_index}")
         response_bytes = request.get("response_bytes")
         require_gate(isinstance(response_bytes, int) and not isinstance(response_bytes, bool) and response_bytes > 0, f"vnext-g00a request size mismatch at {request_index}")
+        if kind == "metadata-file":
+            require_gate(
+                response_bytes <= 32 * 1024 * 1024,
+                f"vnext-g00a metadata response exceeds download limit at {request_index}",
+            )
         require_sha256(request.get("response_sha256"), f"vnext-g00a request[{request_index}].response_sha256")
         key = (kind, url)
         require_gate(key not in request_lookup, f"vnext-g00a duplicate request provenance: {kind} {url}")
@@ -1054,12 +1178,40 @@ def validate_vnext_g00a_provenance(
     def validate_live_source_response(raw_source: Any, label: str) -> None:
         source = require_object(raw_source, label)
         model_url = require_string(source.get("model_request_url"), f"{label}.model_request_url")
+        requested_revision = require_object(
+            source.get("requested_revision"),
+            f"{label}.requested_revision",
+        )
+        requested_status = requested_revision.get("status")
+        require_gate(
+            requested_status in {"pinned", "resolution_required", "same_as_weight_revision"},
+            f"{label}.requested_revision.status is invalid",
+        )
+        if requested_status == "resolution_required":
+            require_gate(
+                requested_revision.get("value") is None,
+                f"{label}.requested_revision.value must be null when resolution is required",
+            )
+        else:
+            require_gate(
+                requested_revision.get("value") == source.get("revision"),
+                f"{label}.requested_revision.value differs from the resolved revision",
+            )
+        expected_model_url = f"https://huggingface.co/api/models/{source['repo']}"
+        if requested_status != "resolution_required":
+            expected_model_url += f"/revision/{source['revision']}"
+        require_gate(
+            model_url == expected_model_url,
+            f"{label}.model_request_url is not canonical for its requested revision",
+        )
+        expected_request_keys.add(("model-info", model_url))
         model_request = require_object(request_lookup.get(("model-info", model_url)), f"{label} model request")
         model_body = require_object(decoded_request_body(model_request, f"{label} model request"), f"{label} model response")
         require_gate(model_body.get("sha") == source.get("revision"), f"{label} model response revision mismatch")
         tree_entries: dict[str, dict[str, Any]] = {}
         for tree_url_raw in require_list(source.get("tree_request_urls"), f"{label}.tree_request_urls"):
             tree_url = require_string(tree_url_raw, f"{label}.tree_request_url")
+            expected_request_keys.add(("repo-tree", tree_url))
             tree_request = require_object(request_lookup.get(("repo-tree", tree_url)), f"{label} tree request")
             tree_body = require_list(decoded_request_body(tree_request, f"{label} tree request"), f"{label} tree response")
             for entry_index, raw_entry in enumerate(tree_body):
@@ -1070,22 +1222,86 @@ def validate_vnext_g00a_provenance(
                 require_gate(not Path(path).is_absolute() and ".." not in Path(path).parts, f"{label} unsafe tree path: {path}")
                 require_gate(path not in tree_entries, f"{label} duplicate tree path: {path}")
                 tree_entries[path] = entry
+        primary_files = require_list(source.get("files"), f"{label}.files")
         license_files = require_list(require_object(source.get("license"), f"{label}.license").get("files"), f"{label}.license.files")
-        for file_index, raw_file in enumerate([*require_list(source.get("files"), f"{label}.files"), *license_files]):
+        primary_paths = {
+            require_string(require_object(row, f"{label}.file").get("path"), f"{label}.file.path")
+            for row in primary_files
+        }
+        license_paths = {
+            require_string(require_object(row, f"{label}.license.file").get("path"), f"{label}.license.file.path")
+            for row in license_files
+        }
+        require_gate(
+            len(primary_paths) == len(primary_files),
+            f"{label}.files contains duplicate paths",
+        )
+        require_gate(
+            len(license_paths) == len(license_files),
+            f"{label}.license.files contains duplicate paths",
+        )
+        require_gate(
+            primary_paths.isdisjoint(license_paths),
+            f"{label}.files and license.files contain duplicate paths",
+        )
+        allowed_license_basenames = {
+            "copying",
+            "license",
+            "license.md",
+            "license.txt",
+            "notice",
+            "notice.txt",
+        }
+        require_gate(
+            all(Path(path).name.lower() in allowed_license_basenames for path in license_paths),
+            f"{label}.license.files contains a non-license path",
+        )
+        for file_index, raw_file in enumerate([*primary_files, *license_files]):
             file_row = require_object(raw_file, f"{label}.file[{file_index}]")
             path = require_string(file_row.get("path"), f"{label}.file[{file_index}].path")
             tree_entry = require_object(tree_entries.get(path), f"{label} tree fact {path}")
             require_gate(tree_entry.get("oid") == file_row.get("git_oid"), f"{label} tree Git OID mismatch: {path}")
             require_gate(tree_entry.get("size") == file_row.get("size_bytes"), f"{label} tree size mismatch: {path}")
-            if file_row.get("sha256_source") == "hugging_face_lfs_oid":
+            identity_source = require_string(
+                file_row.get("sha256_source"),
+                f"{label} file SHA256 source {path}",
+            )
+            require_gate(
+                identity_source in {"downloaded_content", "hugging_face_lfs_oid"},
+                f"{label} file SHA256 source is invalid: {path}",
+            )
+            if identity_source == "hugging_face_lfs_oid":
                 lfs = require_object(tree_entry.get("lfs"), f"{label} tree LFS fact {path}")
                 lfs_oid = require_string(lfs.get("oid"), f"{label} tree LFS OID {path}").lower()
                 if lfs_oid.startswith("sha256:"):
                     lfs_oid = lfs_oid.removeprefix("sha256:")
                 require_gate(lfs_oid == file_row.get("sha256"), f"{label} tree LFS SHA256 mismatch: {path}")
                 require_gate(lfs.get("size") == file_row.get("size_bytes"), f"{label} tree LFS size mismatch: {path}")
+                if path.endswith(".safetensors.index.json"):
+                    require_gate(file_row.get("size_bytes") <= 32 * 1024 * 1024, f"{label} LFS index exceeds metadata limit: {path}")
+                    content_url = require_string(file_row.get("content_request_url"), f"{label} LFS index URL {path}")
+                    expected_url = f"https://huggingface.co/{source['repo']}/resolve/{source['revision']}/{path}"
+                    require_gate(file_row.get("lfs_metadata_downloaded") is True and content_url == expected_url, f"{label} LFS index download evidence mismatch: {path}")
+                    expected_metadata_urls.add(content_url)
+                    expected_request_keys.add(("metadata-file", content_url))
+                    content_request = require_object(request_lookup.get(("metadata-file", content_url)), f"{label} LFS index request {path}")
+                    require_gate(content_request.get("response_sha256") == file_row.get("sha256"), f"{label} LFS index SHA256 mismatch: {path}")
+                    require_gate(content_request.get("response_bytes") == file_row.get("size_bytes"), f"{label} LFS index size mismatch: {path}")
+                else:
+                    require_gate("content_request_url" not in file_row and "lfs_metadata_downloaded" not in file_row, f"{label} non-index LFS file has download evidence: {path}")
             else:
+                require_gate(
+                    tree_entry.get("lfs") is None,
+                    f"{label} downloaded metadata is LFS-backed in the authoritative tree: {path}",
+                )
+                require_gate(
+                    "lfs_oid" not in file_row
+                    and "lfs_metadata_downloaded" not in file_row,
+                    f"{label} downloaded metadata carries LFS identity or flags: {path}",
+                )
                 content_url = require_string(file_row.get("content_request_url"), f"{label} metadata URL {path}")
+                expected_metadata_urls.add(content_url)
+                expected_request_keys.add(("metadata-file", content_url))
                 content_request = require_object(request_lookup.get(("metadata-file", content_url)), f"{label} metadata request {path}")
                 require_gate(content_request.get("response_sha256") == file_row.get("sha256"), f"{label} metadata SHA256 mismatch: {path}")
                 require_gate(content_request.get("response_bytes") == file_row.get("size_bytes"), f"{label} metadata size mismatch: {path}")
@@ -1106,8 +1322,13 @@ def validate_vnext_g00a_provenance(
     resolved_by_id = {require_string(require_object(row, "vnext-g00a resolved lane").get("catalog_lane_id"), "vnext-g00a resolved lane id"): row for row in resolved_lanes}
     locked_by_id = {require_string(require_object(row, "vnext-g00a locked lane").get("catalog_lane_id"), "vnext-g00a locked lane id"): row for row in locked_lanes}
     require_gate(len(input_by_id) == 12 and len(resolved_by_id) == 12 and set(input_by_id) == set(resolved_by_id) == set(locked_by_id), "vnext-g00a model lane identity mismatch")
+    models_catalog = read_json_object(root / "models.catalog.json", "vnext-g00a models catalog")
+    catalog_lanes_by_id = {
+        require_string(require_object(row, "vnext-g00a catalog lane").get("id"), "vnext-g00a catalog lane id"): row
+        for row in require_list(models_catalog.get("models"), "vnext-g00a models catalog lanes")
+    }
     expected_weight_identity_count = validate_vnext_catalog_expected_weight_facts(
-        read_json_object(root / "models.catalog.json", "vnext-g00a models catalog"),
+        models_catalog,
         resolved_by_id,
     )
     expected_pairs = {(model_id, backend) for model_id in VNEXT_RESOLUTION_MODEL_IDS.values() for backend in ("cuda", "metal")}
@@ -1116,11 +1337,254 @@ def validate_vnext_g00a_provenance(
         locked_lane = require_object(locked_by_id[lane_id], f"vnext-g00a locked lane {lane_id}")
         resolved_lane = require_object(resolved_by_id[lane_id], f"vnext-g00a resolved lane {lane_id}")
         input_lane = require_object(input_by_id[lane_id], f"vnext-g00a input lane {lane_id}")
+        catalog_lane = require_object(catalog_lanes_by_id.get(lane_id), f"vnext-g00a catalog lane {lane_id}")
+        catalog_reference = require_object(
+            catalog_lane.get("reference"),
+            f"vnext-g00a catalog lane {lane_id}.reference",
+        )
+        weight_revision_rule = require_object(
+            catalog_lane.get("revision"),
+            f"vnext-g00a catalog lane {lane_id}.revision",
+        )
+        expected_requested_revisions: dict[str, dict[str, Any]] = {
+            "weight_source": {
+                "status": weight_revision_rule.get("status"),
+                "value": weight_revision_rule.get("value"),
+            }
+        }
+        semantic_revision_rule = require_object(
+            catalog_reference.get("semantic_revision"),
+            f"vnext-g00a catalog lane {lane_id}.reference.semantic_revision",
+        )
+        expected_requested_revisions["semantic_source"] = (
+            copy.deepcopy(expected_requested_revisions["weight_source"])
+            if semantic_revision_rule.get("status") == "same_as_weight_revision"
+            else {
+                "status": semantic_revision_rule.get("status"),
+                "value": semantic_revision_rule.get("value"),
+            }
+        )
+        if catalog_reference.get("tokenizer_repo") is not None:
+            tokenizer_revision_rule = require_object(
+                catalog_reference.get("tokenizer_revision"),
+                f"vnext-g00a catalog lane {lane_id}.reference.tokenizer_revision",
+            )
+            expected_requested_revisions["tokenizer_source"] = {
+                "status": tokenizer_revision_rule.get("status"),
+                "value": tokenizer_revision_rule.get("value"),
+            }
+        allowed_lfs_index_paths = {
+            str(selector["path"])
+            for selector in require_list(catalog_lane.get("files"), f"vnext-g00a catalog lane {lane_id}.files")
+            if isinstance(selector, dict)
+            and selector.get("required_if_sharded") is True
+            and "path" in selector
+            and str(selector["path"]).endswith(".safetensors.index.json")
+        }
+        resolved_weight = require_object(resolved_lane.get("weight_source"), f"vnext-g00a live {lane_id}.weight_source")
+        resolved_weight_paths = {
+            require_string(require_object(row, f"vnext-g00a live {lane_id}.weight file").get("path"), f"vnext-g00a live {lane_id}.weight path")
+            for row in require_list(resolved_weight.get("files"), f"vnext-g00a live {lane_id}.weight files")
+        }
+        sharded_weight = validate_catalog_weight_paths(
+            catalog_lane,
+            resolved_weight_paths,
+            f"vnext-g00a live {lane_id}.weight_source",
+        )
         for source_name in ("weight_source", "semantic_source", "tokenizer_source"):
             if resolved_lane.get(source_name) is not None:
+                resolved_source = require_object(resolved_lane.get(source_name), f"vnext-g00a live {lane_id}.{source_name}")
+                require_gate(
+                    resolved_source.get("requested_revision")
+                    == expected_requested_revisions.get(source_name),
+                    f"vnext-g00a live {lane_id}.{source_name}.requested_revision differs from catalog",
+                )
+                source_rows = [
+                    *require_list(resolved_source.get("files"), f"vnext-g00a live {lane_id}.{source_name}.files"),
+                    *require_list(require_object(resolved_source.get("license"), f"vnext-g00a live {lane_id}.{source_name}.license").get("files"), f"vnext-g00a live {lane_id}.{source_name}.license.files"),
+                ]
+                for raw_file in source_rows:
+                    file_row = require_object(raw_file, f"vnext-g00a live {lane_id}.{source_name} file")
+                    if file_row.get("lfs_metadata_downloaded") is True:
+                        require_gate(
+                            source_name == "weight_source"
+                            and sharded_weight
+                            and file_row.get("path") in allowed_lfs_index_paths,
+                            f"vnext-g00a LFS metadata download is outside exact weight index selectors: {lane_id}.{source_name}",
+                        )
                 validate_live_source_response(
                     resolved_lane.get(source_name),
                     f"vnext-g00a live {lane_id}.{source_name}",
+                )
+        official_rule_raw = catalog_reference.get("official_upstream")
+        official_raw = resolved_lane.get("official_upstream")
+        require_gate(
+            (official_rule_raw is None) == (official_raw is None),
+            f"vnext-g00a live {lane_id}.official_upstream catalog presence mismatch",
+        )
+        if official_rule_raw is not None:
+            official_rule = require_object(
+                official_rule_raw,
+                f"vnext-g00a catalog lane {lane_id}.official_upstream",
+            )
+            official = require_object(
+                official_raw,
+                f"vnext-g00a live {lane_id}.official_upstream",
+            )
+            official_revision = require_string(
+                require_object(
+                    official_rule.get("revision"),
+                    f"vnext-g00a catalog lane {lane_id}.official_upstream.revision",
+                ).get("value"),
+                f"vnext-g00a catalog lane {lane_id}.official_upstream.revision.value",
+            )
+            official_repo = require_string(
+                official_rule.get("repo"),
+                f"vnext-g00a catalog lane {lane_id}.official_upstream.repo",
+            )
+            require_gate(
+                official.get("repo") == official_repo
+                and official.get("revision") == official_revision,
+                f"vnext-g00a live {lane_id}.official_upstream repo/revision mismatch",
+            )
+            require_gate(
+                official_rule.get("required_gated") is True
+                and official.get("gated") not in {None, False},
+                f"vnext-g00a live {lane_id}.official_upstream gated evidence mismatch",
+            )
+            require_gate(
+                official.get("access_note") == official_rule.get("access_note")
+                and official.get("verification_method")
+                == "mirror_content_sha256_and_official_git_blob_oid",
+                f"vnext-g00a live {lane_id}.official_upstream verification policy mismatch",
+            )
+            semantic_source = require_object(
+                resolved_lane.get("semantic_source"),
+                f"vnext-g00a live {lane_id}.semantic_source",
+            )
+            require_gate(
+                official.get("mirror_repo") == semantic_source.get("repo")
+                and official.get("mirror_revision") == semantic_source.get("revision"),
+                f"vnext-g00a live {lane_id}.official_upstream mirror source mismatch",
+            )
+            official_model_url = require_string(
+                official.get("model_request_url"),
+                f"vnext-g00a live {lane_id}.official_upstream.model_request_url",
+            )
+            require_gate(
+                official_model_url
+                == f"https://huggingface.co/api/models/{official_repo}/revision/{official_revision}",
+                f"vnext-g00a live {lane_id}.official_upstream model URL mismatch",
+            )
+            expected_request_keys.add(("model-info", official_model_url))
+            official_model_request = require_object(
+                request_lookup.get(("model-info", official_model_url)),
+                f"vnext-g00a live {lane_id}.official_upstream model request",
+            )
+            official_model_body = require_object(
+                decoded_request_body(
+                    official_model_request,
+                    f"vnext-g00a live {lane_id}.official_upstream model request",
+                ),
+                f"vnext-g00a live {lane_id}.official_upstream model response",
+            )
+            require_gate(
+                official_model_body.get("sha") == official.get("revision"),
+                f"vnext-g00a live {lane_id}.official_upstream model response revision mismatch",
+            )
+            official_tree_entries: dict[str, dict[str, Any]] = {}
+            for official_tree_url_raw in require_list(
+                official.get("tree_request_urls"),
+                f"vnext-g00a live {lane_id}.official_upstream.tree_request_urls",
+            ):
+                official_tree_url = require_string(
+                    official_tree_url_raw,
+                    f"vnext-g00a live {lane_id}.official_upstream.tree_request_url",
+                )
+                expected_request_keys.add(("repo-tree", official_tree_url))
+                require_gate(
+                    official_tree_url.startswith(
+                        f"https://huggingface.co/api/models/{official_repo}/tree/{official_revision}?"
+                    ),
+                    f"vnext-g00a live {lane_id}.official_upstream tree URL mismatch",
+                )
+                official_tree_request = require_object(
+                    request_lookup.get(("repo-tree", official_tree_url)),
+                    f"vnext-g00a live {lane_id}.official_upstream tree request",
+                )
+                official_tree_body = require_list(
+                    decoded_request_body(
+                        official_tree_request,
+                        f"vnext-g00a live {lane_id}.official_upstream tree request",
+                    ),
+                    f"vnext-g00a live {lane_id}.official_upstream tree response",
+                )
+                for tree_index, tree_raw in enumerate(official_tree_body):
+                    tree_row = require_object(
+                        tree_raw,
+                        f"vnext-g00a live {lane_id}.official_upstream tree response[{tree_index}]",
+                    )
+                    if tree_row.get("type") not in {"file", None}:
+                        continue
+                    tree_path = require_string(
+                        tree_row.get("path"),
+                        f"vnext-g00a live {lane_id}.official_upstream tree response[{tree_index}].path",
+                    )
+                    require_gate(
+                        not Path(tree_path).is_absolute()
+                        and ".." not in Path(tree_path).parts
+                        and tree_path not in official_tree_entries,
+                        f"vnext-g00a live {lane_id}.official_upstream tree path is unsafe or duplicate: {tree_path}",
+                    )
+                    official_tree_entries[tree_path] = tree_row
+            expected_match_paths = require_list(
+                official_rule.get("blob_oid_match_files"),
+                f"vnext-g00a catalog lane {lane_id}.official_upstream.blob_oid_match_files",
+            )
+            expected_oids = require_object(
+                official_rule.get("expected_git_oids"),
+                f"vnext-g00a catalog lane {lane_id}.official_upstream.expected_git_oids",
+            )
+            expected_hashes = require_object(
+                official_rule.get("expected_content_sha256"),
+                f"vnext-g00a catalog lane {lane_id}.official_upstream.expected_content_sha256",
+            )
+            expected_sizes = require_object(
+                official_rule.get("expected_size_bytes"),
+                f"vnext-g00a catalog lane {lane_id}.official_upstream.expected_size_bytes",
+            )
+            matches = require_list(
+                official.get("mirror_blob_oid_matches"),
+                f"vnext-g00a live {lane_id}.official_upstream.mirror_blob_oid_matches",
+            )
+            require_gate(
+                [row.get("path") if isinstance(row, dict) else None for row in matches]
+                == expected_match_paths,
+                f"vnext-g00a live {lane_id}.official_upstream match path matrix mismatch",
+            )
+            for match_raw in matches:
+                match = require_object(
+                    match_raw,
+                    f"vnext-g00a live {lane_id}.official_upstream match",
+                )
+                match_path = require_string(
+                    match.get("path"),
+                    f"vnext-g00a live {lane_id}.official_upstream match.path",
+                )
+                require_gate(
+                    match.get("git_oid") == expected_oids.get(match_path)
+                    and match.get("content_sha256") == expected_hashes.get(match_path)
+                    and match.get("size_bytes") == expected_sizes.get(match_path),
+                    f"vnext-g00a live {lane_id}.official_upstream catalog match mismatch for {match_path}",
+                )
+                tree_row = require_object(
+                    official_tree_entries.get(match_path),
+                    f"vnext-g00a live {lane_id}.official_upstream tree fact {match_path}",
+                )
+                require_gate(
+                    tree_row.get("oid") == match.get("git_oid")
+                    and tree_row.get("size") == match.get("size_bytes"),
+                    f"vnext-g00a live {lane_id}.official_upstream tree identity mismatch for {match_path}",
                 )
         pair = (
             require_string(locked_lane.get("model_id"), f"vnext-g00a locked lane {lane_id}.model_id"),
@@ -1146,6 +1610,17 @@ def validate_vnext_g00a_provenance(
             require_gate(locked_lane.get(field) == resolved_lane.get(field), f"vnext-g00a resolved field drift: {lane_id}.{field}")
             require_gate(input_lane.get(field) == resolved_lane.get(field), f"vnext-g00a input/live field drift: {lane_id}.{field}")
     require_gate(actual_pairs == expected_pairs, "vnext-g00a exact six-model CUDA/Metal matrix mismatch")
+    actual_metadata_urls = {
+        url for kind, url in request_lookup if kind == "metadata-file"
+    }
+    require_gate(
+        actual_metadata_urls == expected_metadata_urls,
+        "vnext-g00a metadata request provenance differs from selected metadata files",
+    )
+    require_gate(
+        set(request_lookup) == expected_request_keys,
+        "vnext-g00a network request provenance differs from selected sources and files",
+    )
 
     return {
         "kind": "vnext-g00a",
@@ -2437,7 +2912,12 @@ def make_selftest_vnext_g00a_artifact(root: Path) -> LaneCommand:
         for backend in ("cuda", "metal"):
             lane_id = f"{model_key}-{backend}"
             seed = f"{lane_id}:weight_source"
-            selector: dict[str, Any] = {"path": "weight_source.bin", "required": True}
+            primary_weight_path = (
+                "model-00001-of-00001.safetensors"
+                if lane_id == "m2-qwen35-35b-a3b-cuda"
+                else "weight_source.bin"
+            )
+            selector: dict[str, Any] = {"path": primary_weight_path, "required": True}
             if lane_id == expected_identity_lane:
                 selector.update(
                     {
@@ -2445,7 +2925,52 @@ def make_selftest_vnext_g00a_artifact(root: Path) -> LaneCommand:
                         "expected_sha256": hashlib.sha256(f"file:{seed}".encode("utf-8")).hexdigest(),
                     }
                 )
-            selftest_catalog_lanes.append({"files": [selector], "id": lane_id})
+            selectors = [selector]
+            if lane_id == "m2-qwen35-35b-a3b-cuda":
+                selectors.append(
+                    {
+                        "path": "model.safetensors.index.json",
+                        "required_if_sharded": True,
+                    }
+                )
+            weight_revision = hashlib.sha1(
+                f"revision:{lane_id}:weight_source".encode("utf-8")
+            ).hexdigest()
+            semantic_revision = hashlib.sha1(
+                f"revision:{lane_id}:semantic_source".encode("utf-8")
+            ).hexdigest()
+            reference: dict[str, Any] = {
+                "semantic_revision": {
+                    "status": "pinned",
+                    "value": semantic_revision,
+                }
+            }
+            if model_key == "llama31-8b-compat":
+                reference["tokenizer_repo"] = f"fixture/{lane_id}-tokenizer-source"
+                reference["tokenizer_revision"] = {
+                    "status": "pinned",
+                    "value": hashlib.sha1(
+                        f"revision:{lane_id}:tokenizer_source".encode("utf-8")
+                    ).hexdigest(),
+                }
+            catalog_lane: dict[str, Any] = {
+                "files": selectors,
+                "id": lane_id,
+                "reference": reference,
+                "revision": {"status": "pinned", "value": weight_revision},
+            }
+            if model_key == "llama31-8b-compat":
+                reference["official_upstream"] = {
+                    "access_note": "selftest gated upstream",
+                    "blob_oid_match_files": ["config.json"],
+                    "expected_content_sha256": {"config.json": "6" * 64},
+                    "expected_git_oids": {"config.json": "5" * 40},
+                    "expected_size_bytes": {"config.json": 128},
+                    "repo": "meta-llama/Llama-3.1-8B-Instruct",
+                    "required_gated": True,
+                    "revision": {"status": "pinned", "value": "4" * 40},
+                }
+            selftest_catalog_lanes.append(catalog_lane)
     selftest_catalog_lanes.sort(key=lambda row: row["id"])
     require_selftest(len(selftest_catalog_lanes) == 12, "G00a selftest catalog must contain 12 lanes")
     catalog_payloads = {
@@ -2520,7 +3045,11 @@ def make_selftest_vnext_g00a_artifact(root: Path) -> LaneCommand:
         seed = f"{lane_id}:{source_name}"
         repo = f"fixture/{lane_id.lower()}-{source_name.replace('_', '-')}"
         revision = hashlib.sha1(f"revision:{seed}".encode("utf-8")).hexdigest()
-        file_path = f"{source_name}.bin"
+        file_path = (
+            "model-00001-of-00001.safetensors"
+            if lane_id == "m2-qwen35-35b-a3b-cuda" and source_name == "weight_source"
+            else f"{source_name}.bin"
+        )
         file_sha = hashlib.sha256(f"file:{seed}".encode("utf-8")).hexdigest()
         file_size = 1024 + len(seed)
         git_oid = hashlib.sha1(f"git-oid:{seed}".encode("utf-8")).hexdigest()
@@ -2532,6 +3061,7 @@ def make_selftest_vnext_g00a_artifact(root: Path) -> LaneCommand:
             "sha256_source": "hugging_face_lfs_oid",
             "size_bytes": file_size,
         }
+        file_rows = [file_row]
         model_url = f"https://huggingface.co/api/models/{repo}/revision/{revision}"
         tree_url = f"https://huggingface.co/api/models/{repo}/tree/{revision}?recursive=true&expand=true"
         requests[("model-info", model_url)] = selftest_g00a_response_request(
@@ -2539,21 +3069,57 @@ def make_selftest_vnext_g00a_artifact(root: Path) -> LaneCommand:
             model_url,
             {"id": repo, "sha": revision},
         )
+        tree_rows = [
+            {
+                "lfs": {"oid": f"sha256:{file_sha}", "size": file_size},
+                "oid": git_oid,
+                "path": file_path,
+                "size": file_size,
+                "type": "file",
+            }
+        ]
+        if lane_id == "m2-qwen35-35b-a3b-cuda" and source_name == "weight_source":
+            index_path = "model.safetensors.index.json"
+            index_sha = hashlib.sha256(f"index:{seed}".encode("utf-8")).hexdigest()
+            index_size = 4096
+            index_git_oid = hashlib.sha1(f"index-git:{seed}".encode("utf-8")).hexdigest()
+            index_url = f"https://huggingface.co/{repo}/resolve/{revision}/{index_path}"
+            file_rows.append(
+                {
+                    "content_request_url": index_url,
+                    "git_oid": index_git_oid,
+                    "lfs_metadata_downloaded": True,
+                    "lfs_oid": index_sha,
+                    "path": index_path,
+                    "sha256": index_sha,
+                    "sha256_source": "hugging_face_lfs_oid",
+                    "size_bytes": index_size,
+                }
+            )
+            tree_rows.append(
+                {
+                    "lfs": {"oid": f"sha256:{index_sha}", "size": index_size},
+                    "oid": index_git_oid,
+                    "path": index_path,
+                    "size": index_size,
+                    "type": "file",
+                }
+            )
+            requests[("metadata-file", index_url)] = {
+                "kind": "metadata-file",
+                "method": "GET",
+                "response_bytes": index_size,
+                "response_sha256": index_sha,
+                "status": 200,
+                "url": index_url,
+            }
         requests[("repo-tree", tree_url)] = selftest_g00a_response_request(
             "repo-tree",
             tree_url,
-            [
-                {
-                    "lfs": {"oid": f"sha256:{file_sha}", "size": file_size},
-                    "oid": git_oid,
-                    "path": file_path,
-                    "size": file_size,
-                    "type": "file",
-                }
-            ],
+            tree_rows,
         )
         return {
-            "files": [file_row],
+            "files": file_rows,
             "gated": False,
             "license": {"files": [], "hugging_face_id": "apache-2.0"},
             "model_request_url": model_url,
@@ -2561,6 +3127,48 @@ def make_selftest_vnext_g00a_artifact(root: Path) -> LaneCommand:
             "requested_revision": {"status": "pinned", "value": revision},
             "revision": revision,
             "tree_request_urls": [tree_url],
+        }
+
+    def official_upstream_source(semantic: dict[str, Any]) -> dict[str, Any]:
+        repo = "meta-llama/Llama-3.1-8B-Instruct"
+        revision = "4" * 40
+        model_url = f"https://huggingface.co/api/models/{repo}/revision/{revision}"
+        tree_url = f"https://huggingface.co/api/models/{repo}/tree/{revision}?recursive=true&expand=true"
+        requests[("model-info", model_url)] = selftest_g00a_response_request(
+            "model-info",
+            model_url,
+            {"id": repo, "sha": revision, "gated": "manual"},
+        )
+        requests[("repo-tree", tree_url)] = selftest_g00a_response_request(
+            "repo-tree",
+            tree_url,
+            [
+                {
+                    "oid": "5" * 40,
+                    "path": "config.json",
+                    "size": 128,
+                    "type": "file",
+                }
+            ],
+        )
+        return {
+            "access_note": "selftest gated upstream",
+            "gated": "manual",
+            "mirror_blob_oid_matches": [
+                {
+                    "content_sha256": "6" * 64,
+                    "git_oid": "5" * 40,
+                    "path": "config.json",
+                    "size_bytes": 128,
+                }
+            ],
+            "mirror_repo": semantic["repo"],
+            "mirror_revision": semantic["revision"],
+            "model_request_url": model_url,
+            "repo": repo,
+            "revision": revision,
+            "tree_request_urls": [tree_url],
+            "verification_method": "mirror_content_sha256_and_official_git_blob_oid",
         }
 
     lanes: list[dict[str, Any]] = []
@@ -2590,11 +3198,7 @@ def make_selftest_vnext_g00a_artifact(root: Path) -> LaneCommand:
                     "hardware_policy": f"{backend}-selftest",
                     "model_id": VNEXT_RESOLUTION_MODEL_IDS[model_key],
                     "official_upstream": (
-                        {
-                            "repo": "meta-llama/Llama-3.1-8B-Instruct",
-                            "revision": "4" * 40,
-                            "verification_method": "selftest",
-                        }
+                        official_upstream_source(semantic)
                         if model_key == "llama31-8b-compat"
                         else None
                     ),
@@ -2623,6 +3227,12 @@ def make_selftest_vnext_g00a_artifact(root: Path) -> LaneCommand:
         "catalog_sha256": models_catalog_sha,
         "lanes": copy.deepcopy(lanes),
         "policy": {
+            "lfs_metadata_download": {
+                "allowed_suffixes": [".safetensors.index.json"],
+                "max_bytes": 32 * 1024 * 1024,
+                "selector_requirement": "weight_source_exact_path_required_if_sharded",
+                "sha256_must_match_lfs_oid": True,
+            },
             "raw_response_body_kinds": ["model-info", "repo-tree"],
             "transport": "network_huggingface_https",
         },
@@ -2889,6 +3499,123 @@ def mutate_g00a_raw_tree_body(root: Path) -> None:
     write_selftest_json(path, doc)
 
 
+def mutate_g00a_missing_lfs_index_evidence(root: Path) -> None:
+    path = root / "model-resolution.json"
+    doc = read_json_object(path, "G00a missing LFS index evidence mutation")
+    lane = next(
+        row for row in doc["lanes"]
+        if row["catalog_lane_id"] == "m2-qwen35-35b-a3b-cuda"
+    )
+    index_file = next(
+        row for row in lane["weight_source"]["files"]
+        if row["path"] == "model.safetensors.index.json"
+    )
+    index_file.pop("content_request_url")
+    write_selftest_json(path, doc)
+
+
+def mutate_g00a_extra_metadata_request(
+    root: Path,
+    *,
+    oversized: bool = False,
+    kind: str = "metadata-file",
+) -> None:
+    path = root / "model-resolution.json"
+    doc = read_json_object(path, "G00a extra metadata request mutation")
+    doc["requests"].append(
+        {
+            "kind": kind,
+            "method": "GET",
+            "response_bytes": 32 * 1024 * 1024 + 1 if oversized else 1024,
+            "response_sha256": "9" * 64,
+            "status": 200,
+            "url": "https://huggingface.co/fixture/forged/resolve/" + "8" * 40 + "/model.safetensors",
+        }
+    )
+    write_selftest_json(path, doc)
+
+
+def mutate_g00a_extra_model_request(root: Path) -> None:
+    path = root / "model-resolution.json"
+    doc = read_json_object(path, "G00a extra model request mutation")
+    url = "https://huggingface.co/api/models/fixture/unselected/revision/" + "8" * 40
+    doc["requests"].append(
+        selftest_g00a_response_request(
+            "model-info",
+            url,
+            {"id": "fixture/unselected", "sha": "8" * 40},
+        )
+    )
+    write_selftest_json(path, doc)
+
+
+def mutate_g00a_lfs_tree_as_downloaded(root: Path) -> None:
+    path = root / "model-resolution.json"
+    doc = read_json_object(path, "G00a LFS tree misclassification mutation")
+    lane = next(
+        row for row in doc["lanes"]
+        if row["catalog_lane_id"] == "m2-qwen35-35b-a3b-cuda"
+    )
+    index_file = next(
+        row for row in lane["weight_source"]["files"]
+        if row["path"] == "model.safetensors.index.json"
+    )
+    index_file["sha256_source"] = "downloaded_content"
+    index_file.pop("lfs_oid")
+    index_file.pop("lfs_metadata_downloaded")
+    write_selftest_json(path, doc)
+
+
+def mutate_g00a_official_tree_empty(root: Path) -> None:
+    path = root / "model-resolution.json"
+    doc = read_json_object(path, "G00a official tree mutation")
+    official = next(
+        lane["official_upstream"]
+        for lane in doc["lanes"]
+        if lane.get("official_upstream") is not None
+    )
+    tree_url = official["tree_request_urls"][0]
+    request = next(
+        row
+        for row in doc["requests"]
+        if row["kind"] == "repo-tree" and row["url"] == tree_url
+    )
+    set_selftest_g00a_response_body(request, [])
+    write_selftest_json(path, doc)
+
+
+def mutate_g00a_license_duplicate(root: Path) -> None:
+    path = root / "model-resolution.json"
+    doc = read_json_object(path, "G00a license duplicate mutation")
+    lane = next(
+        row for row in doc["lanes"]
+        if row["catalog_lane_id"] == "m2-qwen35-35b-a3b-cuda"
+    )
+    index_file = next(
+        row for row in lane["weight_source"]["files"]
+        if row["path"] == "model.safetensors.index.json"
+    )
+    lane["weight_source"]["license"]["files"].append(copy.deepcopy(index_file))
+    write_selftest_json(path, doc)
+
+
+def mutate_g00a_requested_revision_status(root: Path) -> None:
+    path = root / "model-resolution.json"
+    doc = read_json_object(path, "G00a requested revision mutation")
+    source = doc["lanes"][0]["weight_source"]
+    old_url = source["model_request_url"]
+    new_url = f"https://huggingface.co/api/models/{source['repo']}"
+    source["requested_revision"] = {"status": "resolution_required", "value": None}
+    source["model_request_url"] = new_url
+    request = next(
+        row
+        for row in doc["requests"]
+        if row["kind"] == "model-info" and row["url"] == old_url
+    )
+    request["url"] = new_url
+    write_selftest_json(path, doc)
+
+
 def make_selftest_release_summary_artifact(root: Path) -> None:
     for rel in [
         "source-unit/unit.gate.json",
@@ -2945,6 +3672,53 @@ def make_selftest_completion_manifest(path: Path) -> None:
 
 def self_test() -> int:
     this_script = Path(__file__).resolve()
+    require_selftest(
+        validate_safetensors_shard_paths(
+            {
+                "model-00001-of-000002.safetensors",
+                "model-00002-of-000002.safetensors",
+            },
+            "valid shard fixture",
+        ),
+        "valid 5/6-width shard fixture was not detected as sharded",
+    )
+    for paths, needle in (
+        (
+            {"model-00001-of-00003.safetensors", "model-00002-of-00003.safetensors"},
+            "shard count differs",
+        ),
+        (
+            {"model-a.safetensors", "model-b.safetensors"},
+            "lacks canonical numbering",
+        ),
+    ):
+        try:
+            validate_safetensors_shard_paths(paths, "invalid shard fixture")
+        except GateError as exc:
+            require_selftest(needle in str(exc), f"invalid shard fixture rejected unexpectedly: {exc}")
+        else:
+            raise AssertionError(f"invalid shard fixture unexpectedly passed: {sorted(paths)}")
+    try:
+        validate_catalog_weight_paths(
+            {
+                "files": [
+                    {"glob": "*", "required": True},
+                    {
+                        "path": "model.safetensors.index.json",
+                        "required_if_sharded": True,
+                    },
+                ]
+            },
+            {"model.safetensors", "model.safetensors.index.json"},
+            "unsharded conditional fixture",
+        )
+    except GateError as exc:
+        require_selftest(
+            "unsharded model contains a conditional weight file" in str(exc),
+            f"unsharded conditional fixture rejected unexpectedly: {exc}",
+        )
+    else:
+        raise AssertionError("unsharded conditional index unexpectedly passed")
     with tempfile.TemporaryDirectory(prefix="ferrum-run-gate-selftest-") as tmp:
         root = Path(tmp)
 
@@ -3115,6 +3889,60 @@ def self_test() -> int:
             "raw-tree-body",
             mutate_g00a_raw_tree_body,
             "tree lfs sha256 mismatch",
+        )
+        expect_g00a_provenance_reject(
+            g00a_provenance_root,
+            "missing-lfs-index-evidence",
+            mutate_g00a_missing_lfs_index_evidence,
+            "lfs index url",
+        )
+        expect_g00a_provenance_reject(
+            g00a_provenance_root,
+            "extra-metadata-request",
+            lambda case: mutate_g00a_extra_metadata_request(case),
+            "metadata request provenance differs",
+        )
+        expect_g00a_provenance_reject(
+            g00a_provenance_root,
+            "oversized-metadata-request",
+            lambda case: mutate_g00a_extra_metadata_request(case, oversized=True),
+            "metadata response exceeds download limit",
+        )
+        expect_g00a_provenance_reject(
+            g00a_provenance_root,
+            "unknown-request-kind",
+            lambda case: mutate_g00a_extra_metadata_request(case, kind="weight-file"),
+            "request kind mismatch",
+        )
+        expect_g00a_provenance_reject(
+            g00a_provenance_root,
+            "extra-model-request",
+            mutate_g00a_extra_model_request,
+            "network request provenance differs from selected sources and files",
+        )
+        expect_g00a_provenance_reject(
+            g00a_provenance_root,
+            "lfs-tree-as-downloaded",
+            mutate_g00a_lfs_tree_as_downloaded,
+            "downloaded metadata is LFS-backed in the authoritative tree",
+        )
+        expect_g00a_provenance_reject(
+            g00a_provenance_root,
+            "official-tree-empty",
+            mutate_g00a_official_tree_empty,
+            "official_upstream tree fact",
+        )
+        expect_g00a_provenance_reject(
+            g00a_provenance_root,
+            "license-duplicate",
+            mutate_g00a_license_duplicate,
+            "files and license.files contain duplicate paths",
+        )
+        expect_g00a_provenance_reject(
+            g00a_provenance_root,
+            "requested-revision-status",
+            mutate_g00a_requested_revision_status,
+            "requested_revision differs from catalog",
         )
         expect_g00a_provenance_reject(
             g00a_provenance_root,
