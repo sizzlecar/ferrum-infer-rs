@@ -22,8 +22,8 @@ use chrono::Utc;
 use clap::Args;
 use colored::*;
 use ferrum_bench_core::{
-    compute_metrics, BenchReport, Env, OutputTokenCountSource, RequestRecord, RunRecord, Scenario,
-    Slo,
+    compute_metrics, BenchReport, Env, ItlEvidenceSource, OutputTokenCountSource,
+    QualityIssueCounts, RequestItlEvidence, RequestRecord, RunRecord, Scenario, Slo,
 };
 use ferrum_types::{InferenceRequest, Priority, RequestId, Result, SamplingParams};
 use futures::StreamExt;
@@ -94,7 +94,39 @@ pub struct BenchCommand {
     pub commit_sha: Option<String>,
 }
 
+fn validate_command(cmd: &BenchCommand) -> Result<()> {
+    if cmd.n_repeats == 0 {
+        return Err(ferrum_types::FerrumError::model("--n-repeats must be > 0"));
+    }
+    if cmd.rounds == 0 {
+        return Err(ferrum_types::FerrumError::model("--rounds must be > 0"));
+    }
+    if cmd.concurrency == 0 {
+        return Err(ferrum_types::FerrumError::model(
+            "--concurrency must be > 0",
+        ));
+    }
+    measured_request_count(cmd)?;
+    if cmd.goodput.is_some_and(|slo| !slo.is_valid()) {
+        return Err(ferrum_types::FerrumError::model(
+            "--goodput values must be positive finite numbers",
+        ));
+    }
+    Ok(())
+}
+
+fn measured_request_count(cmd: &BenchCommand) -> Result<u32> {
+    let count = cmd
+        .rounds
+        .checked_mul(cmd.concurrency)
+        .ok_or_else(|| ferrum_types::FerrumError::model("rounds * concurrency overflow"))?;
+    u32::try_from(count).map_err(|_| {
+        ferrum_types::FerrumError::model("rounds * concurrency exceeds report capacity")
+    })
+}
+
 pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
+    validate_command(&cmd)?;
     // GGUF alias short-circuit (kept here because aliases like
     // `qwen3:8b-q4_k_m` map to a sibling .gguf file in the cache,
     // which `source_resolver` doesn't yet resolve directly).
@@ -220,7 +252,12 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
 
     // Warmup (discarded — once per process, not per repeat).
     eprintln!("{}", "Warmup...".dimmed());
-    let _ = run_single(&*engine, &model_id, "Hello", 16).await;
+    let warmup = run_single(&*engine, &model_id, "Hello", 16).await?;
+    if !warmup.success {
+        return Err(ferrum_types::FerrumError::model(
+            "benchmark warmup request failed",
+        ));
+    }
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // ─── n_repeats × rounds run loop ──────────────────────────────
@@ -262,18 +299,17 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     };
 
     let env = build_env(&cmd);
-    let slo = cmd.goodput.unwrap_or(Slo {
-        ttft_p99_ms: f64::INFINITY,
-        tpot_p99_ms: f64::INFINITY,
-        e2e_p99_ms: f64::INFINITY,
-    });
+    let slo = cmd.goodput.unwrap_or_else(Slo::unbounded);
+    let prompt_len = u32::try_from(prompt.len()).map_err(|_| {
+        ferrum_types::FerrumError::model("benchmark prompt length exceeds report capacity")
+    })?;
     let report = compute_metrics(
         model_id.clone(),
         backend_str,
         scenario,
         concurrency,
         None,
-        prompt.len() as u32, // n_prompt char approx — true token count requires tokenizer
+        prompt_len, // n_prompt char approx — true token count requires tokenizer
         cmd.max_tokens,
         0, // CLI bench: process-level warmup only (not per-repeat)
         slo,
@@ -281,22 +317,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
         env,
     );
 
-    match cmd.output.as_str() {
-        "human" => print_human_summary(&report, &cmd, &mode_str),
-        "json" => emit_json(&cmd, &report)?,
-        other => {
-            return Err(ferrum_types::FerrumError::model(format!(
-                "unknown --output '{other}': allowed values are human, json"
-            )))
-        }
-    }
-
-    // PLAYBOOK § 1.5: Rust's `static` items don't run Drop on program
-    // exit, so the global TraceWriter's flush-on-drop never fires. Call
-    // it explicitly here. No-op when FERRUM_TRACE_OUT is unset.
-    ferrum_bench_core::trace::flush_global_trace();
-
-    Ok(())
+    emit_then_enforce_bench_report(&cmd, &report, &mode_str)
 }
 
 // ── Run loops (one round = N sequential or concurrent passes) ───────
@@ -307,18 +328,28 @@ async fn run_sequential_round(
     prompt: &str,
     cmd: &BenchCommand,
 ) -> Result<RunRecord> {
+    let expected_requests = measured_request_count(cmd)?;
     let mut records = Vec::with_capacity(cmd.rounds);
     let start = Instant::now();
     for _ in 0..cmd.rounds {
-        let r = run_single(engine, model_id, prompt, cmd.max_tokens).await?;
-        records.push(r);
+        match run_single(engine, model_id, prompt, cmd.max_tokens).await {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                eprintln!("  request start error: {error}");
+                let mut quality = QualityIssueCounts::default();
+                quality.malformed_stream = 1;
+                records.push(failed_bench_record(quality));
+            }
+        }
         // Let engine finish cleanup between rounds.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     let duration_s = start.elapsed().as_secs_f64();
     Ok(RunRecord {
         records,
+        expected_requests,
         duration_s,
+        warmup: Default::default(),
     })
 }
 
@@ -328,20 +359,38 @@ async fn run_concurrent_round(
     prompt: &str,
     cmd: &BenchCommand,
 ) -> Result<RunRecord> {
-    let mut records = Vec::with_capacity(cmd.concurrency * cmd.rounds);
+    let expected_requests = measured_request_count(cmd)?;
+    let mut records = Vec::with_capacity(expected_requests as usize);
     let start = Instant::now();
     for _ in 0..cmd.rounds {
         let mut handles = Vec::with_capacity(cmd.concurrency);
         for _ in 0..cmd.concurrency {
             let request = make_request(model_id, prompt, cmd.max_tokens);
-            let stream = engine.infer_stream(request).await?;
-            handles.push(tokio::spawn(collect_stream(stream)));
+            match engine.infer_stream(request).await {
+                Ok(stream) => handles.push(tokio::spawn(collect_stream(stream))),
+                Err(error) => {
+                    eprintln!("  request start error: {error}");
+                    let mut quality = QualityIssueCounts::default();
+                    quality.malformed_stream = 1;
+                    records.push(failed_bench_record(quality));
+                }
+            }
         }
         for handle in handles {
             match handle.await {
                 Ok(Ok(r)) => records.push(r),
-                Ok(Err(e)) => eprintln!("  request error: {e}"),
-                Err(e) => eprintln!("  join error: {e}"),
+                Ok(Err(e)) => {
+                    eprintln!("  request error: {e}");
+                    let mut quality = QualityIssueCounts::default();
+                    quality.malformed_stream = 1;
+                    records.push(failed_bench_record(quality));
+                }
+                Err(e) => {
+                    eprintln!("  join error: {e}");
+                    let mut quality = QualityIssueCounts::default();
+                    quality.panic = 1;
+                    records.push(failed_bench_record(quality));
+                }
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -349,8 +398,24 @@ async fn run_concurrent_round(
     let duration_s = start.elapsed().as_secs_f64();
     Ok(RunRecord {
         records,
+        expected_requests,
         duration_s,
+        warmup: Default::default(),
     })
+}
+
+fn failed_bench_record(quality_issues: QualityIssueCounts) -> RequestRecord {
+    RequestRecord {
+        success: false,
+        ttft_ms: 0.0,
+        e2e_ms: 0.0,
+        input_tokens: 0,
+        output_tokens: 0,
+        output_token_count_source: OutputTokenCountSource::None,
+        itl_evidence: RequestItlEvidence::failed(ItlEvidenceSource::EngineTokenEvents),
+        quality_issues,
+        itl_ms: vec![],
+    }
 }
 
 // ── Single-stream collection ────────────────────────────────────────
@@ -410,6 +475,7 @@ async fn collect_stream(
     let mut first_token_time: Option<Instant> = None;
     let mut last_token_time: Option<Instant> = None;
     let mut itl_ms: Vec<f64> = Vec::new();
+    let mut quality_issues = QualityIssueCounts::default();
 
     let mut got_finish = false;
     while let Some(result) = stream.next().await {
@@ -423,21 +489,32 @@ async fn collect_stream(
                         itl_ms.push((now - prev).as_secs_f64() * 1000.0);
                     }
                     last_token_time = Some(now);
-                    token_count += 1;
+                    token_count = token_count
+                        .checked_add(1)
+                        .expect("benchmark output token count overflow");
                 }
                 if chunk.finish_reason.is_some() {
                     got_finish = true;
                     break;
                 }
             }
-            Err(_) => break,
+            Err(_) => {
+                quality_issues.malformed_stream = 1;
+                break;
+            }
         }
     }
-    if !got_finish && token_count > 0 {
-        eprintln!(
-            "  [warn] stream ended without finish_reason ({} tokens)",
-            token_count
-        );
+    if !got_finish {
+        quality_issues.missing_done = 1;
+        if token_count > 0 {
+            eprintln!(
+                "  [warn] stream ended without finish_reason ({} tokens)",
+                token_count
+            );
+        }
+    }
+    if token_count == 0 {
+        quality_issues.zero_output_tokens = 1;
     }
 
     let e2e_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -445,14 +522,22 @@ async fn collect_stream(
         .map(|t| t.duration_since(start).as_secs_f64() * 1000.0)
         .unwrap_or(e2e_ms);
 
+    let success = token_count > 0 && got_finish && quality_issues.request_error_count() == 0;
+    let observed_intervals =
+        u32::try_from(itl_ms.len()).expect("benchmark ITL interval count overflow");
     Ok(RequestRecord {
-        success: token_count > 0,
+        success,
         ttft_ms,
         e2e_ms,
         input_tokens: 0, // CLI bench doesn't tokenize; left as 0
         output_tokens: token_count,
-        output_token_count_source: OutputTokenCountSource::StreamChunks,
-        quality_issues: Default::default(),
+        output_token_count_source: if token_count > 0 {
+            OutputTokenCountSource::StreamChunks
+        } else {
+            OutputTokenCountSource::None
+        },
+        itl_evidence: RequestItlEvidence::engine(success, token_count, observed_intervals),
+        quality_issues,
         itl_ms,
     })
 }
@@ -522,12 +607,16 @@ fn print_human_summary(report: &BenchReport, cmd: &BenchCommand, mode_str: &str)
         fmt(&report.tpot_ms.p95),
         fmt(&report.tpot_ms.p99)
     );
-    eprintln!(
-        "ITL_ms       p50={}  p95={}  p99={}",
-        fmt(&report.itl_ms.p50),
-        fmt(&report.itl_ms.p95),
-        fmt(&report.itl_ms.p99)
-    );
+    if report.has_complete_itl_evidence() {
+        eprintln!(
+            "ITL_ms       p50={}  p95={}  p99={}",
+            fmt(&report.itl_ms.p50),
+            fmt(&report.itl_ms.p95),
+            fmt(&report.itl_ms.p99)
+        );
+    } else {
+        eprintln!("ITL_ms       unavailable");
+    }
     eprintln!("Output thr   {} tok/s", fmt(&report.output_throughput_tps));
     if cmd.goodput.is_some() {
         eprintln!("Goodput      {} req/s", fmt(&report.goodput_rps));
@@ -549,6 +638,42 @@ fn emit_json(cmd: &BenchCommand, report: &BenchReport) -> Result<()> {
     Ok(())
 }
 
+fn emit_then_enforce_bench_report(
+    cmd: &BenchCommand,
+    report: &BenchReport,
+    mode_str: &str,
+) -> Result<()> {
+    match cmd.output.as_str() {
+        "human" => print_human_summary(report, cmd, mode_str),
+        "json" => emit_json(cmd, report)?,
+        other => {
+            return Err(ferrum_types::FerrumError::model(format!(
+                "unknown --output '{other}': allowed values are human, json"
+            )))
+        }
+    }
+
+    // PLAYBOOK § 1.5: Rust's `static` items don't run Drop on program
+    // exit, so the global TraceWriter's flush-on-drop never fires. Call
+    // it explicitly here. No-op when FERRUM_TRACE_OUT is unset.
+    ferrum_bench_core::trace::flush_global_trace();
+    enforce_bench_error_policy(report)
+}
+
+fn enforce_bench_error_policy(report: &BenchReport) -> Result<()> {
+    let errored = report
+        .errored_per_run
+        .iter()
+        .try_fold(0_u64, |total, value| total.checked_add(*value as u64))
+        .ok_or_else(|| ferrum_types::FerrumError::model("benchmark error count overflow"))?;
+    if errored > 0 {
+        return Err(ferrum_types::FerrumError::model(format!(
+            "benchmark measured requests failed: {errored}"
+        )));
+    }
+    Ok(())
+}
+
 /// Generate a ~2k token prompt for long-context benchmarking.
 fn generate_long_prompt() -> String {
     let base = "The history of artificial intelligence is a fascinating journey through decades of research, breakthroughs, and setbacks. From the early days of symbolic AI in the 1950s, through the AI winters, to the modern era of deep learning and large language models, the field has undergone remarkable transformations. ";
@@ -559,4 +684,110 @@ fn generate_long_prompt() -> String {
     }
     prompt.push_str("\n\nNow analyze the above text in detail:");
     prompt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command() -> BenchCommand {
+        BenchCommand {
+            model: "test".to_string(),
+            rounds: 3,
+            max_tokens: 4,
+            backend: "cpu".to_string(),
+            prompt: "hello".to_string(),
+            concurrency: 2,
+            long_context: false,
+            kv_dtype: None,
+            n_repeats: 1,
+            goodput: None,
+            output: "json".to_string(),
+            out: None,
+            hw_id: None,
+            commit_sha: None,
+        }
+    }
+
+    #[test]
+    fn validates_expected_request_count_and_numeric_inputs() {
+        let mut cmd = command();
+        assert_eq!(measured_request_count(&cmd).unwrap(), 6);
+        assert_eq!(
+            measured_request_count(&cmd).unwrap() as usize,
+            cmd.rounds * cmd.concurrency
+        );
+        assert!(validate_command(&cmd).is_ok());
+        cmd.concurrency = 1;
+        assert_eq!(measured_request_count(&cmd).unwrap() as usize, cmd.rounds);
+        assert!(validate_command(&cmd).is_ok());
+        cmd.n_repeats = 0;
+        assert!(validate_command(&cmd).is_err());
+        cmd.n_repeats = 1;
+        cmd.goodput = Some(Slo {
+            ttft_p99_ms: f64::INFINITY,
+            ..Slo::default()
+        });
+        assert!(validate_command(&cmd).is_err());
+    }
+
+    #[test]
+    fn failed_bench_record_is_explicit_error_evidence() {
+        let mut quality = QualityIssueCounts::default();
+        quality.panic = 1;
+        let record = failed_bench_record(quality);
+        assert!(!record.success);
+        assert_eq!(record.quality_issues.panic, 1);
+        assert_eq!(
+            record.output_token_count_source,
+            OutputTokenCountSource::None
+        );
+        assert_eq!(
+            record.itl_evidence.source,
+            ItlEvidenceSource::EngineTokenEvents
+        );
+    }
+
+    #[test]
+    fn failed_bench_report_is_written_before_nonzero_result() {
+        let out = std::env::temp_dir().join(format!(
+            "ferrum-bench-failed-report-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&out);
+        let mut quality = QualityIssueCounts::default();
+        quality.malformed_stream = 1;
+        let report = compute_metrics(
+            "test".to_string(),
+            "cpu".to_string(),
+            Scenario::Cli,
+            None,
+            None,
+            1,
+            1,
+            0,
+            Slo::default(),
+            vec![RunRecord {
+                records: vec![failed_bench_record(quality)],
+                expected_requests: 1,
+                duration_s: 1.0,
+                warmup: Default::default(),
+            }],
+            Env::default(),
+        );
+        let mut cmd = command();
+        cmd.out = Some(out.clone());
+        let error = emit_then_enforce_bench_report(&cmd, &report, "test")
+            .expect_err("failed measured request must return nonzero");
+        assert!(error.to_string().contains("measured requests failed"));
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+        assert_eq!(json["errored_per_run"], serde_json::json!([1]));
+        assert_eq!(json["repeat_metrics"][0]["itl_ineligible_requests"], 1);
+        let _ = std::fs::remove_file(out);
+    }
 }

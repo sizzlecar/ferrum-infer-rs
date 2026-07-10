@@ -17,8 +17,9 @@
 use clap::Args;
 use colored::*;
 use ferrum_bench_core::{
-    arrivals::poisson_arrival_times, compute_metrics, BenchReport, Env, OutputTokenCountSource,
-    QualityIssueCounts, RequestRecord, RunRecord, Scenario, Slo, TokenLengthStats,
+    arrivals::poisson_arrival_times, compute_metrics, BenchReport, Env, ItlEvidenceSource,
+    OutputTokenCountSource, QualityIssueCounts, RequestItlEvidence, RequestRecord, RunRecord,
+    Scenario, Slo, TokenLengthStats, WarmupSummary,
 };
 use ferrum_types::Result;
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -83,6 +84,10 @@ pub struct BenchServeCommand {
     #[arg(long)]
     pub ignore_eos: bool,
 
+    /// Typed chat-template thinking control. Omitted from payloads unless set.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub enable_thinking: Option<bool>,
+
     /// Path to a ShareGPT-format JSONL file (`--dataset sharegpt`).
     /// Each line should be a `{"conversations": [{"from": "...", "value":
     /// "..."}, ...]}` object (HF anon8231489123/ShareGPT_Vicuna format).
@@ -123,7 +128,8 @@ pub struct BenchServeCommand {
     #[arg(long, default_value_t = 600.0)]
     pub timeout: f64,
 
-    /// Exit non-zero when any measured request errors. Release gates must set this.
+    /// Exit non-zero when any measured request errors. Warmup failures always fail.
+    /// Release gates must set this.
     #[arg(long)]
     pub fail_on_error: bool,
 
@@ -183,6 +189,11 @@ pub(super) fn parse_slo(s: &str) -> std::result::Result<Slo, String> {
             .split_once(':')
             .ok_or_else(|| format!("bad SLO token '{tok}', expected key:value"))?;
         let v: f64 = v.parse().map_err(|e| format!("bad SLO value '{v}': {e}"))?;
+        if !v.is_finite() || v <= 0.0 {
+            return Err(format!(
+                "bad SLO value '{v}': expected a positive finite number"
+            ));
+        }
         match k {
             "ttft" => ttft = Some(v),
             "tpot" => tpot = Some(v),
@@ -241,9 +252,10 @@ async fn stream_one(
     prompt: PromptCase,
     max_tokens: usize,
     ignore_eos: bool,
+    enable_thinking: Option<bool>,
     timeout_s: f64,
 ) -> RequestRecord {
-    let body = chat_completion_body(model, &prompt.text, max_tokens, ignore_eos);
+    let body = chat_completion_body(model, &prompt.text, max_tokens, ignore_eos, enable_thinking);
     let start = Instant::now();
     let mut state = StreamState::new(start, prompt.input_tokens);
 
@@ -277,7 +289,7 @@ async fn stream_one(
     }
 
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    let mut sse = SseLineBuffer::default();
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(c) => c,
@@ -288,45 +300,80 @@ async fn stream_one(
                 break;
             }
         };
-        let before_content_events = state.content_delta_tokens;
-        match std::str::from_utf8(&chunk) {
-            Ok(text) => buf.push_str(text),
-            Err(_) => {
-                state.quality_issues.malformed_stream = 1;
-                state.quality_issues.bad_output = 1;
-                buf.push_str(&String::from_utf8_lossy(&chunk));
-            }
-        }
-        loop {
-            let Some(nl) = buf.find('\n') else { break };
-            let line = buf[..nl].trim().to_string();
-            buf.drain(..=nl);
-            if !line.starts_with("data:") {
-                continue;
-            }
-            let payload = line.trim_start_matches("data:").trim();
-            if payload == "[DONE]" {
-                state.done_count += 1;
-                if state.done_count > 1 {
-                    state.quality_issues.duplicate_done = 1;
-                }
-                continue;
-            }
-            if let Err(err) = state.handle_payload(payload) {
-                eprintln!("[err] malformed sse json: {err}");
-                state.stream_error = Some(err);
-                state.quality_issues.malformed_stream = 1;
-            }
-        }
-        if state
-            .content_delta_tokens
-            .saturating_sub(before_content_events)
-            > 1
+        let before_output_events = state.output_delta_events;
+        sse.push(&chunk, &mut state);
+        state.note_transport_chunk(
+            state
+                .output_delta_events
+                .saturating_sub(before_output_events),
+        );
+    }
+    sse.finish(&mut state);
+    state.finish()
+}
+
+#[derive(Default)]
+struct SseLineBuffer {
+    pending: Vec<u8>,
+}
+
+impl SseLineBuffer {
+    fn push(&mut self, chunk: &[u8], state: &mut StreamState) {
+        self.pending.extend_from_slice(chunk);
+        let mut consumed = 0;
+        while let Some(relative_newline) = self.pending[consumed..]
+            .iter()
+            .position(|byte| *byte == b'\n')
         {
-            state.quality_issues.stream_bulk_flush = 1;
+            let newline = consumed + relative_newline;
+            let line = self.pending[consumed..newline].to_vec();
+            consumed = newline + 1;
+            Self::process_line(&line, state);
+        }
+        if consumed > 0 {
+            self.pending.drain(..consumed);
         }
     }
-    state.finish()
+
+    fn finish(&mut self, state: &mut StreamState) {
+        if !self.pending.is_empty() {
+            let line = std::mem::take(&mut self.pending);
+            Self::process_line(&line, state);
+        }
+    }
+
+    fn process_line(raw_line: &[u8], state: &mut StreamState) {
+        let raw_line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        let line = match std::str::from_utf8(raw_line) {
+            Ok(line) => line.trim(),
+            Err(error) => {
+                let message = format!("invalid UTF-8 in SSE line: {error}");
+                eprintln!("[err] {message}");
+                state.stream_error = Some(message);
+                state.quality_issues.malformed_stream = 1;
+                state.quality_issues.bad_output = 1;
+                return;
+            }
+        };
+        let Some(payload) = line.strip_prefix("data:").map(str::trim) else {
+            return;
+        };
+        if payload == "[DONE]" {
+            state.done_count = state
+                .done_count
+                .checked_add(1)
+                .expect("SSE done count overflow");
+            if state.done_count > 1 {
+                state.quality_issues.duplicate_done = 1;
+            }
+            return;
+        }
+        if let Err(error) = state.handle_payload(payload) {
+            eprintln!("[err] malformed sse json: {error}");
+            state.stream_error = Some(error);
+            state.quality_issues.malformed_stream = 1;
+        }
+    }
 }
 
 fn chat_completion_body(
@@ -334,6 +381,7 @@ fn chat_completion_body(
     prompt_text: &str,
     max_tokens: usize,
     ignore_eos: bool,
+    enable_thinking: Option<bool>,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -343,6 +391,9 @@ fn chat_completion_body(
         "stream_options": {"include_usage": true},
         "temperature": 0.0,
     });
+    if let Some(enable_thinking) = enable_thinking {
+        body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": enable_thinking});
+    }
     if ignore_eos {
         body["ignore_eos"] = serde_json::json!(true);
     }
@@ -361,9 +412,42 @@ fn failed_record(
         input_tokens,
         output_tokens: 0,
         output_token_count_source: OutputTokenCountSource::None,
+        itl_evidence: RequestItlEvidence::failed(ItlEvidenceSource::SseDeltaEvents),
         quality_issues,
         itl_ms: vec![],
     }
+}
+
+fn join_failed_record(input_tokens: u32) -> RequestRecord {
+    let mut quality_issues = QualityIssueCounts::default();
+    quality_issues.panic = 1;
+    RequestRecord {
+        success: false,
+        ttft_ms: 0.0,
+        e2e_ms: 0.0,
+        input_tokens,
+        output_tokens: 0,
+        output_token_count_source: OutputTokenCountSource::None,
+        itl_evidence: RequestItlEvidence::failed(ItlEvidenceSource::SseDeltaEvents),
+        quality_issues,
+        itl_ms: vec![],
+    }
+}
+
+async fn collect_measured_handles(
+    handles: Vec<(u32, tokio::task::JoinHandle<RequestRecord>)>,
+) -> Vec<RequestRecord> {
+    let mut records = Vec::with_capacity(handles.len());
+    for (input_tokens, handle) in handles {
+        match handle.await {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                eprintln!("[err] measured request task: {error}");
+                records.push(join_failed_record(input_tokens));
+            }
+        }
+    }
+    records
 }
 
 struct StreamState {
@@ -371,9 +455,10 @@ struct StreamState {
     input_tokens: u32,
     first_token_time: Option<Instant>,
     last_token_time: Option<Instant>,
-    content_delta_tokens: u32,
+    output_delta_events: u32,
     usage_completion_tokens: Option<u32>,
     itl_ms: Vec<f64>,
+    transport_coalesced_output_chunks: u32,
     done_count: u32,
     stream_error: Option<String>,
     quality_issues: QualityIssueCounts,
@@ -386,9 +471,10 @@ impl StreamState {
             input_tokens,
             first_token_time: None,
             last_token_time: None,
-            content_delta_tokens: 0,
+            output_delta_events: 0,
             usage_completion_tokens: None,
             itl_ms: Vec::new(),
+            transport_coalesced_output_chunks: 0,
             done_count: 0,
             stream_error: None,
             quality_issues: QualityIssueCounts::default(),
@@ -414,7 +500,10 @@ impl StreamState {
                             self.itl_ms.push((now - prev).as_secs_f64() * 1000.0);
                         }
                         self.last_token_time = Some(now);
-                        self.content_delta_tokens += 1;
+                        self.output_delta_events = self
+                            .output_delta_events
+                            .checked_add(1)
+                            .expect("stream output event count overflow");
                         if let Some(reason) = bad_output_reason(text) {
                             eprintln!(
                                 "[err] bad output {reason}: {}",
@@ -432,11 +521,20 @@ impl StreamState {
         Ok(())
     }
 
+    fn note_transport_chunk(&mut self, output_events: u32) {
+        if output_events > 1 {
+            self.transport_coalesced_output_chunks = self
+                .transport_coalesced_output_chunks
+                .checked_add(1)
+                .expect("coalesced output transport chunk count overflow");
+        }
+    }
+
     fn finish(mut self) -> RequestRecord {
         let (output_tokens, source) = match self.usage_completion_tokens {
             Some(tokens) => (tokens, OutputTokenCountSource::Usage),
-            None if self.content_delta_tokens > 0 => (
-                self.content_delta_tokens,
+            None if self.output_delta_events > 0 => (
+                self.output_delta_events,
                 OutputTokenCountSource::StreamChunks,
             ),
             None => (0, OutputTokenCountSource::None),
@@ -458,6 +556,15 @@ impl StreamState {
             && output_tokens > 0
             && self.stream_error.is_none()
             && self.quality_issues.request_error_count() == 0;
+        let observed_intervals =
+            u32::try_from(self.itl_ms.len()).expect("stream ITL interval count overflow");
+        let itl_evidence = RequestItlEvidence::sse(
+            success,
+            self.output_delta_events,
+            self.usage_completion_tokens,
+            observed_intervals,
+            self.transport_coalesced_output_chunks,
+        );
         RequestRecord {
             success,
             ttft_ms,
@@ -465,6 +572,7 @@ impl StreamState {
             input_tokens: self.input_tokens,
             output_tokens,
             output_token_count_source: source,
+            itl_evidence,
             quality_issues: self.quality_issues,
             itl_ms: self.itl_ms,
         }
@@ -727,10 +835,10 @@ fn prompt_case(tok: &tokenizers::Tokenizer, text: String) -> Result<PromptCase> 
     let encoding = tok
         .encode(text.as_str(), false)
         .map_err(|e| ferrum_types::FerrumError::model(format!("tokenize generated prompt: {e}")))?;
-    Ok(PromptCase {
-        text,
-        input_tokens: encoding.len() as u32,
-    })
+    let input_tokens = u32::try_from(encoding.len()).map_err(|_| {
+        ferrum_types::FerrumError::model("generated prompt token count exceeds report capacity")
+    })?;
+    Ok(PromptCase { text, input_tokens })
 }
 
 /// Generate `count` prompts that all share a 1024-token (or whatever
@@ -857,7 +965,34 @@ struct RunContext {
     model: Arc<String>,
     max_out: usize,
     ignore_eos: bool,
+    enable_thinking: Option<bool>,
     timeout_s: f64,
+}
+
+fn summarize_warmup(
+    expected: usize,
+    records: &[RequestRecord],
+    join_errors: usize,
+) -> WarmupSummary {
+    assert_eq!(records.len() + join_errors, expected);
+    let completed = records.iter().filter(|record| record.success).count() as u32;
+    let mut quality_issues = QualityIssueCounts::default();
+    for record in records {
+        quality_issues.add_assign(&record.quality_issues);
+    }
+    quality_issues.panic = quality_issues
+        .panic
+        .checked_add(u32::try_from(join_errors).expect("warmup join error count overflow"))
+        .expect("warmup panic count overflow");
+    let expected = u32::try_from(expected).expect("warmup expected count overflow");
+    WarmupSummary {
+        expected,
+        completed,
+        errored: expected
+            .checked_sub(completed)
+            .expect("warmup completed count exceeds expected"),
+        quality_issues,
+    }
 }
 
 /// Closed-loop: K workers in a tight loop. Warmup prompts run sequentially
@@ -877,7 +1012,7 @@ async fn run_closed_loop(
     );
 
     // Warmup window — fire and discard.
-    {
+    let warmup = {
         let sem = Arc::new(Semaphore::new(concurrency as usize));
         let mut handles = Vec::new();
         for prompt in prompts.iter().take(n_warmup) {
@@ -893,47 +1028,57 @@ async fn run_closed_loop(
                     p,
                     ctx_c.max_out,
                     ctx_c.ignore_eos,
+                    ctx_c.enable_thinking,
                     ctx_c.timeout_s,
                 )
                 .await
             }));
         }
-        for h in handles {
-            let _ = h.await;
+        let mut records = Vec::with_capacity(n_warmup);
+        let mut join_errors = 0;
+        for handle in handles {
+            match handle.await {
+                Ok(record) => records.push(record),
+                Err(_) => join_errors += 1,
+            }
         }
-    }
+        summarize_warmup(n_warmup, &records, join_errors)
+    };
 
     // Measurement window.
     let sem = Arc::new(Semaphore::new(concurrency as usize));
     let start = Instant::now();
     let mut handles = Vec::with_capacity(total - n_warmup);
     for prompt in prompts.into_iter().skip(n_warmup) {
+        let input_tokens = prompt.input_tokens;
         let permit = sem.clone().acquire_owned().await.expect("semaphore");
         let ctx_c = ctx.clone_inner();
-        handles.push(tokio::spawn(async move {
-            let _g = permit;
-            stream_one(
-                &ctx_c.client,
-                &ctx_c.base_url,
-                &ctx_c.model,
-                prompt,
-                ctx_c.max_out,
-                ctx_c.ignore_eos,
-                ctx_c.timeout_s,
-            )
-            .await
-        }));
+        handles.push((
+            input_tokens,
+            tokio::spawn(async move {
+                let _g = permit;
+                stream_one(
+                    &ctx_c.client,
+                    &ctx_c.base_url,
+                    &ctx_c.model,
+                    prompt,
+                    ctx_c.max_out,
+                    ctx_c.ignore_eos,
+                    ctx_c.enable_thinking,
+                    ctx_c.timeout_s,
+                )
+                .await
+            }),
+        ));
     }
-    let mut records = Vec::with_capacity(handles.len());
-    for h in handles {
-        if let Ok(r) = h.await {
-            records.push(r);
-        }
-    }
+    let records = collect_measured_handles(handles).await;
     let duration_s = start.elapsed().as_secs_f64();
     RunRecord {
         records,
+        expected_requests: u32::try_from(total - n_warmup)
+            .expect("measured request count overflow"),
         duration_s,
+        warmup,
     }
 }
 
@@ -950,18 +1095,23 @@ async fn run_open_loop(
     assert!(total > n_warmup);
 
     // Warmup: send a few sequentially to load caches.
+    let mut warmup_records = Vec::with_capacity(n_warmup);
     for prompt in prompts.iter().take(n_warmup) {
-        let _ = stream_one(
-            &ctx.client,
-            &ctx.base_url,
-            &ctx.model,
-            prompt.clone(),
-            ctx.max_out,
-            ctx.ignore_eos,
-            ctx.timeout_s,
-        )
-        .await;
+        warmup_records.push(
+            stream_one(
+                &ctx.client,
+                &ctx.base_url,
+                &ctx.model,
+                prompt.clone(),
+                ctx.max_out,
+                ctx.ignore_eos,
+                ctx.enable_thinking,
+                ctx.timeout_s,
+            )
+            .await,
+        );
     }
+    let warmup = summarize_warmup(n_warmup, &warmup_records, 0);
 
     // Pre-compute arrival schedule (re-zeroed after warmup).
     let mut rng = rand::rng();
@@ -977,29 +1127,32 @@ async fn run_open_loop(
             tokio::time::sleep(Duration::from_secs_f64(target - now)).await;
         }
         let ctx_c = ctx.clone_inner();
-        handles.push(tokio::spawn(async move {
-            stream_one(
-                &ctx_c.client,
-                &ctx_c.base_url,
-                &ctx_c.model,
-                prompt,
-                ctx_c.max_out,
-                ctx_c.ignore_eos,
-                ctx_c.timeout_s,
-            )
-            .await
-        }));
+        let input_tokens = prompt.input_tokens;
+        handles.push((
+            input_tokens,
+            tokio::spawn(async move {
+                stream_one(
+                    &ctx_c.client,
+                    &ctx_c.base_url,
+                    &ctx_c.model,
+                    prompt,
+                    ctx_c.max_out,
+                    ctx_c.ignore_eos,
+                    ctx_c.enable_thinking,
+                    ctx_c.timeout_s,
+                )
+                .await
+            }),
+        ));
     }
-    let mut records = Vec::with_capacity(handles.len());
-    for h in handles {
-        if let Ok(r) = h.await {
-            records.push(r);
-        }
-    }
+    let records = collect_measured_handles(handles).await;
     let duration_s = start.elapsed().as_secs_f64();
     RunRecord {
         records,
+        expected_requests: u32::try_from(measurement_count)
+            .expect("measured request count overflow"),
         duration_s,
+        warmup,
     }
 }
 
@@ -1011,6 +1164,7 @@ impl RunContext {
             model: self.model.clone(),
             max_out: self.max_out,
             ignore_eos: self.ignore_eos,
+            enable_thinking: self.enable_thinking,
             timeout_s: self.timeout_s,
         }
     }
@@ -1094,7 +1248,14 @@ async fn execute_cell(
             e
         ))
     })?;
-    let total_prompts = (cmd.num_prompts + cmd.warmup_requests) as usize;
+    let total_prompts_u32 = cmd
+        .num_prompts
+        .checked_add(cmd.warmup_requests)
+        .ok_or_else(|| {
+            ferrum_types::FerrumError::model("num_prompts + warmup_requests overflow")
+        })?;
+    let total_prompts = usize::try_from(total_prompts_u32)
+        .map_err(|_| ferrum_types::FerrumError::model("prompt count exceeds platform capacity"))?;
 
     let mut runs: Vec<RunRecord> = Vec::with_capacity(cmd.n_repeats as usize);
     let mut actual_input_lengths: Vec<u32> = Vec::new();
@@ -1143,15 +1304,15 @@ async fn execute_cell(
         );
         runs.push(run);
     }
-    let actual_input_tokens = input_token_stats(&actual_input_lengths, requested_input_len(cmd));
+    let requested_input_len = requested_input_len(cmd)?;
+    let requested_output_len = u32::try_from(cmd.random_output_len).map_err(|_| {
+        ferrum_types::FerrumError::model("random output length exceeds report capacity")
+    })?;
+    let actual_input_tokens = input_token_stats(&actual_input_lengths, requested_input_len);
     let token_count_source = output_token_count_source_from_runs(&runs);
 
     let env = build_env(cmd, detect_features());
-    let slo = cmd.goodput.unwrap_or(Slo {
-        ttft_p99_ms: f64::INFINITY,
-        tpot_p99_ms: f64::INFINITY,
-        e2e_p99_ms: f64::INFINITY,
-    });
+    let slo = cmd.goodput.unwrap_or_else(Slo::unbounded);
     let model_field = match &cmd.tag {
         Some(t) => format!("{}#{}", cmd.model, t),
         None => cmd.model.clone(),
@@ -1168,8 +1329,8 @@ async fn execute_cell(
         scenario,
         concurrency,
         request_rate,
-        requested_input_len(cmd),
-        cmd.random_output_len as u32,
+        requested_input_len,
+        requested_output_len,
         cmd.warmup_requests,
         slo,
         runs,
@@ -1181,10 +1342,20 @@ async fn execute_cell(
     Ok(report)
 }
 
-fn requested_input_len(cmd: &BenchServeCommand) -> u32 {
+fn requested_input_len(cmd: &BenchServeCommand) -> Result<u32> {
     match cmd.dataset.as_str() {
-        "shared-prefix" => cmd.shared_prefix_len.saturating_add(cmd.shared_suffix_len) as u32,
-        _ => cmd.random_input_len as u32,
+        "shared-prefix" => cmd
+            .shared_prefix_len
+            .checked_add(cmd.shared_suffix_len)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                ferrum_types::FerrumError::model(
+                    "shared prefix + suffix length exceeds report capacity",
+                )
+            }),
+        _ => u32::try_from(cmd.random_input_len).map_err(|_| {
+            ferrum_types::FerrumError::model("random input length exceeds report capacity")
+        }),
     }
 }
 
@@ -1283,6 +1454,7 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
         model: Arc::new(cmd.model.clone()),
         max_out: cmd.random_output_len,
         ignore_eos: cmd.ignore_eos,
+        enable_thinking: cmd.enable_thinking,
         timeout_s: cmd.timeout,
     };
 
@@ -1330,9 +1502,12 @@ fn validate_command(cmd: &BenchServeCommand) -> Result<()> {
             ));
         }
     }
-    if cmd.timeout <= 0.0 || !cmd.timeout.is_finite() {
+    if cmd.timeout <= 0.0
+        || !cmd.timeout.is_finite()
+        || Duration::try_from_secs_f64(cmd.timeout).is_err()
+    {
         return Err(ferrum_types::FerrumError::model(
-            "--timeout must be a positive finite number",
+            "--timeout must be a positive finite duration",
         ));
     }
     if cmd.concurrency == 0 {
@@ -1345,6 +1520,9 @@ fn validate_command(cmd: &BenchServeCommand) -> Result<()> {
             "--num-prompts must be > 0",
         ));
     }
+    if cmd.n_repeats == 0 {
+        return Err(ferrum_types::FerrumError::model("--n-repeats must be > 0"));
+    }
     if cmd.random_input_len == 0 {
         return Err(ferrum_types::FerrumError::model(
             "--random-input-len must be > 0",
@@ -1353,6 +1531,15 @@ fn validate_command(cmd: &BenchServeCommand) -> Result<()> {
     if cmd.random_output_len == 0 {
         return Err(ferrum_types::FerrumError::model(
             "--random-output-len must be > 0",
+        ));
+    }
+    u32::try_from(cmd.random_output_len).map_err(|_| {
+        ferrum_types::FerrumError::model("--random-output-len exceeds report capacity")
+    })?;
+    requested_input_len(cmd)?;
+    if cmd.goodput.is_some_and(|slo| !slo.is_valid()) {
+        return Err(ferrum_types::FerrumError::model(
+            "--goodput values must be positive finite numbers",
         ));
     }
     if cmd.require_ci && cmd.n_repeats < 3 {
@@ -1384,14 +1571,40 @@ fn validate_command(cmd: &BenchServeCommand) -> Result<()> {
 }
 
 fn enforce_error_policy(cmd: &BenchServeCommand, reports: &[BenchReport]) -> Result<()> {
-    if !cmd.fail_on_error && cmd.max_error_rate.is_none() {
-        return Ok(());
-    }
     let max_error_rate = cmd.max_error_rate.unwrap_or(0.0);
     for report in reports {
-        let completed: u32 = report.completed_per_run.iter().copied().sum();
-        let errored: u32 = report.errored_per_run.iter().copied().sum();
-        let total = completed + errored;
+        let warmup_errored: u64 = report
+            .repeat_metrics
+            .iter()
+            .map(|repeat| repeat.warmup_errored as u64)
+            .sum();
+        let warmup_has_quality_issue = report
+            .repeat_metrics
+            .iter()
+            .any(|repeat| repeat.warmup_quality_issues != QualityIssueCounts::default());
+        if warmup_errored > 0 || warmup_has_quality_issue {
+            return Err(ferrum_types::FerrumError::model(format!(
+                "bench-serve warmup failed for {}: {} errored request(s)",
+                report.model, warmup_errored
+            )));
+        }
+        if !cmd.fail_on_error && cmd.max_error_rate.is_none() {
+            continue;
+        }
+
+        let completed: u64 = report
+            .completed_per_run
+            .iter()
+            .map(|value| *value as u64)
+            .sum();
+        let errored: u64 = report
+            .errored_per_run
+            .iter()
+            .map(|value| *value as u64)
+            .sum();
+        let total = completed
+            .checked_add(errored)
+            .ok_or_else(|| ferrum_types::FerrumError::model("measured request count overflow"))?;
         let error_rate = if total == 0 {
             1.0
         } else {
@@ -1465,7 +1678,11 @@ fn emit_summary_line(r: &BenchReport) {
     eprintln!("    {} {}{}", "summary".bold(), scenario_str, ci);
     fmt_metric("TTFT_ms ", &r.ttft_ms, r.n_repeats);
     fmt_metric("TPOT_ms ", &r.tpot_ms, r.n_repeats);
-    fmt_metric("ITL_ms  ", &r.itl_ms, r.n_repeats);
+    if r.has_complete_itl_evidence() {
+        fmt_metric("ITL_ms  ", &r.itl_ms, r.n_repeats);
+    } else {
+        eprintln!("      ITL_ms   unavailable");
+    }
     let thr = &r.output_throughput_tps;
     let good = &r.goodput_rps;
     if r.n_repeats >= 3 {
@@ -1518,6 +1735,40 @@ fn emit_json(cmd: &BenchServeCommand, reports: &[BenchReport]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_bench_core::ItlEligibility;
+
+    fn parse_sse_chunks<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> RequestRecord {
+        let mut state = StreamState::new(Instant::now(), 7);
+        let mut parser = SseLineBuffer::default();
+        for chunk in chunks {
+            let before_output_events = state.output_delta_events;
+            parser.push(chunk, &mut state);
+            let output_events = state
+                .output_delta_events
+                .saturating_sub(before_output_events);
+            state.note_transport_chunk(output_events);
+        }
+        parser.finish(&mut state);
+        state.finish()
+    }
+
+    fn stream_semantics(
+        record: &RequestRecord,
+    ) -> (
+        bool,
+        u32,
+        OutputTokenCountSource,
+        QualityIssueCounts,
+        RequestItlEvidence,
+    ) {
+        (
+            record.success,
+            record.output_tokens,
+            record.output_token_count_source,
+            record.quality_issues.clone(),
+            record.itl_evidence.clone(),
+        )
+    }
 
     #[test]
     fn slo_parses_space_separated() {
@@ -1550,11 +1801,22 @@ mod tests {
     }
 
     #[test]
+    fn slo_rejects_nonfinite_and_nonpositive_values() {
+        for value in ["NaN", "inf", "0", "-1"] {
+            assert!(
+                parse_slo(&format!("ttft:{value} tpot:50 e2el:30000")).is_err(),
+                "SLO value {value} should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn chat_completion_body_omits_ignore_eos_by_default() {
-        let body = chat_completion_body("model", "prompt", 128, false);
+        let body = chat_completion_body("model", "prompt", 128, false, None);
         assert_eq!(body["model"], serde_json::json!("model"));
         assert_eq!(body["max_tokens"], serde_json::json!(128));
         assert_eq!(body["stream"], serde_json::json!(true));
+        assert!(body.get("chat_template_kwargs").is_none());
         assert_eq!(
             body["stream_options"]["include_usage"],
             serde_json::json!(true)
@@ -1564,8 +1826,103 @@ mod tests {
 
     #[test]
     fn chat_completion_body_sends_ignore_eos_when_requested() {
-        let body = chat_completion_body("model", "prompt", 128, true);
+        let body = chat_completion_body("model", "prompt", 128, true, None);
         assert_eq!(body["ignore_eos"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn chat_completion_body_sends_typed_thinking_values() {
+        let disabled = chat_completion_body("model", "prompt", 128, false, Some(false));
+        assert_eq!(
+            disabled["chat_template_kwargs"]["enable_thinking"],
+            serde_json::json!(false)
+        );
+        let enabled = chat_completion_body("model", "prompt", 128, false, Some(true));
+        assert_eq!(
+            enabled["chat_template_kwargs"]["enable_thinking"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn enable_thinking_cli_is_tri_state() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            command: BenchServeCommand,
+        }
+
+        let base = [
+            "test",
+            "--base-url",
+            "http://127.0.0.1:8000",
+            "--model",
+            "model",
+            "--tokenizer",
+            ".",
+        ];
+        let absent = TestCli::parse_from(base).command;
+        assert_eq!(absent.enable_thinking, None);
+
+        let disabled =
+            TestCli::parse_from(base.into_iter().chain(["--enable-thinking", "false"])).command;
+        assert_eq!(disabled.enable_thinking, Some(false));
+
+        let enabled =
+            TestCli::parse_from(base.into_iter().chain(["--enable-thinking", "true"])).command;
+        assert_eq!(enabled.enable_thinking, Some(true));
+    }
+
+    #[test]
+    fn incremental_sse_utf8_semantics_are_invariant_to_every_byte_cut() {
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你好🙂\"}}],\"usage\":null}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .as_bytes();
+        let baseline = parse_sse_chunks([stream]);
+        assert!(baseline.success);
+        assert_eq!(baseline.quality_issues, QualityIssueCounts::default());
+
+        for cut in 0..=stream.len() {
+            let split = parse_sse_chunks([&stream[..cut], &stream[cut..]]);
+            assert_eq!(
+                stream_semantics(&split),
+                stream_semantics(&baseline),
+                "SSE semantics changed at byte cut {cut}"
+            );
+        }
+
+        let bytewise = parse_sse_chunks(stream.chunks(1));
+        assert_eq!(stream_semantics(&bytewise), stream_semantics(&baseline));
+    }
+
+    #[test]
+    fn transport_coalescing_is_diagnostic_not_stream_bulk_failure() {
+        const FIRST: &[u8] =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\n\n";
+        const SECOND: &[u8] =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}],\"usage\":null}\n\n";
+        const TAIL: &[u8] =
+            b"data: {\"choices\":[],\"usage\":{\"completion_tokens\":2}}\n\ndata: [DONE]\n\n";
+        let together_bytes = [FIRST, SECOND, TAIL].concat();
+        let together = parse_sse_chunks([together_bytes.as_slice()]);
+        assert!(together.success);
+        assert_eq!(together.quality_issues.stream_bulk_flush, 0);
+        assert_eq!(together.itl_evidence.transport_coalesced_output_chunks, 1);
+        assert_eq!(
+            together.itl_evidence.eligibility,
+            ItlEligibility::TransportCoalesced
+        );
+
+        let separated = parse_sse_chunks([FIRST, SECOND, TAIL]);
+        assert!(separated.success);
+        assert_eq!(separated.quality_issues, QualityIssueCounts::default());
+        assert_eq!(separated.itl_evidence.transport_coalesced_output_chunks, 0);
+        assert_eq!(separated.itl_evidence.eligibility, ItlEligibility::Eligible);
     }
 
     #[test]
@@ -1584,6 +1941,65 @@ mod tests {
         assert_eq!(
             record.output_token_count_source,
             OutputTokenCountSource::Usage
+        );
+        assert_eq!(
+            record.itl_evidence.eligibility,
+            ItlEligibility::EventUsageMismatch
+        );
+        assert_eq!(record.itl_evidence.output_events, 1);
+        assert_eq!(record.itl_evidence.usage_output_tokens, Some(3));
+    }
+
+    #[test]
+    fn matching_sse_events_usage_and_intervals_are_itl_eligible() {
+        let mut state = StreamState::new(Instant::now(), 7);
+        for content in ["a", "b", "c"] {
+            state
+                .handle_payload(&format!(
+                    r#"{{"choices":[{{"delta":{{"content":"{content}"}}}}]}}"#
+                ))
+                .unwrap();
+        }
+        state
+            .handle_payload(r#"{"choices":[],"usage":{"completion_tokens":3}}"#)
+            .unwrap();
+        state.done_count = 1;
+        let record = state.finish();
+        assert!(record.success);
+        assert_eq!(record.itl_ms.len(), 2);
+        assert_eq!(record.itl_evidence.eligibility, ItlEligibility::Eligible);
+    }
+
+    #[tokio::test]
+    async fn measured_join_error_becomes_failed_evidence() {
+        let good = tokio::spawn(async {
+            RequestRecord {
+                success: true,
+                ttft_ms: 1.0,
+                e2e_ms: 2.0,
+                input_tokens: 7,
+                output_tokens: 1,
+                output_token_count_source: OutputTokenCountSource::Usage,
+                itl_evidence: RequestItlEvidence::sse(true, 1, Some(1), 0, 0),
+                quality_issues: QualityIssueCounts::default(),
+                itl_ms: vec![],
+            }
+        });
+        let panicked = tokio::spawn(async {
+            if true {
+                panic!("measured task panic");
+            }
+            join_failed_record(0)
+        });
+        let records = collect_measured_handles(vec![(7, good), (11, panicked)]).await;
+        assert_eq!(records.len(), 2);
+        assert!(records[0].success);
+        assert!(!records[1].success);
+        assert_eq!(records[1].input_tokens, 11);
+        assert_eq!(records[1].quality_issues.panic, 1);
+        assert_eq!(
+            records[1].output_token_count_source,
+            OutputTokenCountSource::None
         );
     }
 
@@ -1713,6 +2129,136 @@ mod tests {
             .map(|entry| entry.effective_value)
     }
 
+    fn test_command() -> BenchServeCommand {
+        BenchServeCommand {
+            base_url: "http://127.0.0.1:9".to_string(),
+            model: "test-model".to_string(),
+            tokenizer: std::path::PathBuf::from("."),
+            concurrency: 1,
+            concurrency_sweep: vec![],
+            request_rate: None,
+            dataset: "random".to_string(),
+            random_input_len: 2,
+            random_output_len: 3,
+            ignore_eos: false,
+            enable_thinking: None,
+            sharegpt_path: None,
+            shared_prefix_len: 1024,
+            shared_suffix_len: 64,
+            num_prompts: 1,
+            warmup_requests: 0,
+            n_repeats: 1,
+            goodput: None,
+            timeout: 1.0,
+            fail_on_error: false,
+            max_error_rate: None,
+            require_ci: false,
+            seed: Some(9271),
+            output: "json".to_string(),
+            out: None,
+            hw_id: None,
+            commit_sha: None,
+            tag: None,
+        }
+    }
+
+    fn policy_report(
+        completed: u32,
+        errored: u32,
+        warmup_completed: u32,
+        warmup_errored: u32,
+    ) -> BenchReport {
+        let mut records = Vec::with_capacity((completed + errored) as usize);
+        for _ in 0..completed {
+            records.push(RequestRecord {
+                success: true,
+                ttft_ms: 10.0,
+                e2e_ms: 30.0,
+                input_tokens: 2,
+                output_tokens: 3,
+                output_token_count_source: OutputTokenCountSource::Usage,
+                itl_evidence: RequestItlEvidence::sse(true, 3, Some(3), 2, 0),
+                quality_issues: QualityIssueCounts::default(),
+                itl_ms: vec![10.0, 10.0],
+            });
+        }
+        for _ in 0..errored {
+            let mut quality = QualityIssueCounts::default();
+            quality.missing_done = 1;
+            records.push(RequestRecord {
+                success: false,
+                ttft_ms: 0.0,
+                e2e_ms: 30.0,
+                input_tokens: 2,
+                output_tokens: 0,
+                output_token_count_source: OutputTokenCountSource::None,
+                itl_evidence: RequestItlEvidence::failed(ItlEvidenceSource::SseDeltaEvents),
+                quality_issues: quality,
+                itl_ms: vec![],
+            });
+        }
+        let warmup_expected = warmup_completed.checked_add(warmup_errored).unwrap();
+        let mut warmup_quality = QualityIssueCounts::default();
+        warmup_quality.missing_done = warmup_errored;
+        compute_metrics(
+            "test-model".to_string(),
+            "test-backend".to_string(),
+            Scenario::ClosedLoop,
+            Some(1),
+            None,
+            2,
+            3,
+            warmup_expected,
+            Slo::default(),
+            vec![RunRecord {
+                expected_requests: completed.checked_add(errored).unwrap(),
+                records,
+                duration_s: 1.0,
+                warmup: WarmupSummary {
+                    expected: warmup_expected,
+                    completed: warmup_completed,
+                    errored: warmup_errored,
+                    quality_issues: warmup_quality,
+                },
+            }],
+            Env::default(),
+        )
+    }
+
+    #[test]
+    fn validate_command_rejects_zero_repeats_and_invalid_programmatic_slo() {
+        let mut cmd = test_command();
+        cmd.n_repeats = 0;
+        assert!(validate_command(&cmd).is_err());
+        cmd.n_repeats = 1;
+        cmd.goodput = Some(Slo {
+            ttft_p99_ms: f64::NAN,
+            ..Slo::default()
+        });
+        assert!(validate_command(&cmd).is_err());
+        cmd.goodput = None;
+        cmd.timeout = f64::MAX;
+        assert!(validate_command(&cmd).is_err());
+    }
+
+    #[test]
+    fn measured_error_rate_excludes_successful_warmups() {
+        let report = policy_report(99, 1, 10, 0);
+        let mut cmd = test_command();
+        cmd.max_error_rate = Some(0.0095);
+        let err = enforce_error_policy(&cmd, &[report]).expect_err("measured rate is one percent");
+        assert!(err.to_string().contains("bench-serve error rate"));
+    }
+
+    #[test]
+    fn warmup_failure_is_independent_of_measured_error_allowance() {
+        let report = policy_report(100, 0, 9, 1);
+        let mut cmd = test_command();
+        cmd.max_error_rate = Some(1.0);
+        let err = enforce_error_policy(&cmd, &[report]).expect_err("warmup must be perfect");
+        assert!(err.to_string().contains("bench-serve warmup failed"));
+    }
+
     #[test]
     fn fail_on_error_still_writes_json_report() {
         let out = std::env::temp_dir().join(format!(
@@ -1736,6 +2282,7 @@ mod tests {
                     input_tokens: 4,
                     output_tokens: 3,
                     output_token_count_source: OutputTokenCountSource::Usage,
+                    itl_evidence: RequestItlEvidence::sse(true, 3, Some(3), 2, 0),
                     quality_issues: QualityIssueCounts::default(),
                     itl_ms: vec![10.0, 10.0],
                 },
@@ -1746,11 +2293,14 @@ mod tests {
                     input_tokens: 4,
                     output_tokens: 0,
                     output_token_count_source: OutputTokenCountSource::None,
+                    itl_evidence: RequestItlEvidence::failed(ItlEvidenceSource::SseDeltaEvents),
                     quality_issues: failed_quality,
                     itl_ms: vec![],
                 },
             ],
+            expected_requests: 2,
             duration_s: 1.0,
+            warmup: Default::default(),
         };
         let report = compute_metrics(
             "test-model".to_string(),
@@ -1776,6 +2326,7 @@ mod tests {
             random_input_len: 4,
             random_output_len: 3,
             ignore_eos: false,
+            enable_thinking: None,
             sharegpt_path: None,
             shared_prefix_len: 1024,
             shared_suffix_len: 64,
@@ -1810,5 +2361,77 @@ mod tests {
             serde_json::json!([[3, 0]])
         );
         let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
+    fn fail_on_error_rejects_warmup_only_failure() {
+        let mut warmup_quality = QualityIssueCounts::default();
+        warmup_quality.missing_done = 1;
+        let report = compute_metrics(
+            "test-model".to_string(),
+            "test-backend".to_string(),
+            Scenario::ClosedLoop,
+            Some(1),
+            None,
+            2,
+            3,
+            1,
+            Slo::default(),
+            vec![RunRecord {
+                records: vec![RequestRecord {
+                    success: true,
+                    ttft_ms: 10.0,
+                    e2e_ms: 30.0,
+                    input_tokens: 2,
+                    output_tokens: 3,
+                    output_token_count_source: OutputTokenCountSource::Usage,
+                    itl_evidence: RequestItlEvidence::sse(true, 3, Some(3), 2, 0),
+                    quality_issues: QualityIssueCounts::default(),
+                    itl_ms: vec![10.0, 10.0],
+                }],
+                expected_requests: 1,
+                duration_s: 1.0,
+                warmup: WarmupSummary {
+                    expected: 1,
+                    completed: 0,
+                    errored: 1,
+                    quality_issues: warmup_quality,
+                },
+            }],
+            Env::default(),
+        );
+        let cmd = BenchServeCommand {
+            base_url: "http://127.0.0.1:9".to_string(),
+            model: "test-model".to_string(),
+            tokenizer: std::path::PathBuf::from("."),
+            concurrency: 1,
+            concurrency_sweep: vec![],
+            request_rate: None,
+            dataset: "random".to_string(),
+            random_input_len: 2,
+            random_output_len: 3,
+            ignore_eos: false,
+            enable_thinking: None,
+            sharegpt_path: None,
+            shared_prefix_len: 1024,
+            shared_suffix_len: 64,
+            num_prompts: 1,
+            warmup_requests: 1,
+            n_repeats: 1,
+            goodput: None,
+            timeout: 1.0,
+            fail_on_error: true,
+            max_error_rate: None,
+            require_ci: false,
+            seed: Some(9271),
+            output: "json".to_string(),
+            out: None,
+            hw_id: None,
+            commit_sha: None,
+            tag: None,
+        };
+
+        let err = enforce_error_policy(&cmd, &[report]).expect_err("warmup failure");
+        assert!(err.to_string().contains("bench-serve warmup failed"));
     }
 }
