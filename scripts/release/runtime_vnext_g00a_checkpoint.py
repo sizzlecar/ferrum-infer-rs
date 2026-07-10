@@ -47,6 +47,9 @@ GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 FAMILY_RE = re.compile(r"^H(0[1-9]|1[0-5])$")
 CASE_RE = re.compile(r"^(H(?:0[1-9]|1[0-5]))\.([1-9][0-9]*)$")
+SAFETENSORS_SHARD_RE = re.compile(
+    r"-(\d{5,6})-of-(\d{5,6})\.safetensors$"
+)
 
 EXPECTED_MODEL_IDS = {
     "M1",
@@ -104,6 +107,41 @@ class CheckpointError(RuntimeError):
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise CheckpointError(message)
+
+
+def validate_safetensors_shard_paths(paths: set[str], label: str) -> bool:
+    shards = sorted(path for path in paths if path.endswith(".safetensors"))
+    matches = [(path, SAFETENSORS_SHARD_RE.search(path)) for path in shards]
+    sharded = len(shards) > 1 or any(match is not None for _, match in matches)
+    if not sharded:
+        return False
+    require(shards, f"{label} sharded safetensors set is empty")
+    require(
+        all(match is not None for _, match in matches),
+        f"{label} sharded safetensors path lacks canonical numbering",
+    )
+    numbered = [
+        (int(match.group(1)), int(match.group(2)), len(match.group(1)), len(match.group(2)))
+        for _, match in matches
+        if match is not None
+    ]
+    require(
+        len({number_width for _, _, number_width, _ in numbered}) == 1,
+        f"{label} sharded safetensors number width differs",
+    )
+    require(
+        len({total_width for _, _, _, total_width in numbered}) == 1,
+        f"{label} sharded safetensors total width differs",
+    )
+    totals = {total for _, total, _, _ in numbered}
+    require(len(totals) == 1, f"{label} safetensors shards disagree on total count")
+    total = totals.pop()
+    require(total == len(numbered), f"{label} safetensors shard count differs from numbered total")
+    require(
+        {number for number, _, _, _ in numbered} == set(range(1, total + 1)),
+        f"{label} safetensors shard numbering is incomplete",
+    )
+    return True
 
 
 def require_object(value: Any, label: str) -> dict[str, Any]:
@@ -828,7 +866,23 @@ def normalized_file(raw: Any, label: str) -> dict[str, Any]:
     if source == "hugging_face_lfs_oid":
         require(row.get("lfs_oid") == digest, f"{label}.lfs_oid must equal its SHA256")
         normalized["lfs_oid"] = digest
+        if path.endswith(".safetensors.index.json"):
+            require(size <= 32 * 1024 * 1024, f"{label} LFS index exceeds metadata limit")
+            url = require_string(row.get("content_request_url"), f"{label}.content_request_url")
+            require(url.startswith("https://huggingface.co/"), f"{label}.content_request_url must use Hugging Face HTTPS")
+            require(row.get("lfs_metadata_downloaded") is True, f"{label}.lfs_metadata_downloaded must be true")
+            normalized["content_request_url"] = url
+            normalized["lfs_metadata_downloaded"] = True
+        else:
+            require(
+                "content_request_url" not in row and "lfs_metadata_downloaded" not in row,
+                f"{label} non-index LFS file must not contain download evidence",
+            )
     else:
+        require(
+            "lfs_oid" not in row and "lfs_metadata_downloaded" not in row,
+            f"{label} downloaded metadata must not contain LFS identity or download flags",
+        )
         url = require_string(row.get("content_request_url"), f"{label}.content_request_url")
         require(url.startswith("https://huggingface.co/"), f"{label}.content_request_url must use Hugging Face HTTPS")
         normalized["content_request_url"] = url
@@ -875,6 +929,27 @@ def normalized_source(
         for index, item in enumerate(require_list(license_raw.get("files"), f"{label}.license.files"))
     ]
     license_files.sort(key=lambda item: item["path"])
+    license_paths = {item["path"] for item in license_files}
+    require(
+        len(license_paths) == len(license_files),
+        f"{label}.license.files contains duplicate paths",
+    )
+    require(
+        set(paths).isdisjoint(license_paths),
+        f"{label}.files and license.files contain duplicate paths",
+    )
+    allowed_license_basenames = {
+        "copying",
+        "license",
+        "license.md",
+        "license.txt",
+        "notice",
+        "notice.txt",
+    }
+    require(
+        all(Path(path).name.lower() in allowed_license_basenames for path in license_paths),
+        f"{label}.license.files contains a non-license path",
+    )
     license_id = license_raw.get("hugging_face_id")
     require(license_id is None or isinstance(license_id, str), f"{label}.license.hugging_face_id invalid")
     return {
@@ -892,13 +967,34 @@ def normalized_source(
 def require_catalog_weight_files(catalog_lane: dict[str, Any], source: dict[str, Any], label: str) -> None:
     files = {item["path"]: item for item in source["files"]}
     paths = set(files)
-    sharded = any(re.search(r"-\d{5}-of-\d{5}", path) for path in paths)
+    sharded = validate_safetensors_shard_paths(paths, label)
     selectors = require_list(catalog_lane.get("files"), f"{label}.catalog.files")
+    allowed_lfs_metadata_paths = {
+        str(selector["path"])
+        for selector in selectors
+        if isinstance(selector, dict)
+        and selector.get("required_if_sharded") is True
+        and "path" in selector
+        and str(selector["path"]).endswith(".safetensors.index.json")
+    }
+    conditional_paths = {
+        str(selector["path"])
+        for selector in selectors
+        if isinstance(selector, dict)
+        and selector.get("required_if_sharded") is True
+        and "path" in selector
+    }
+    require(
+        sharded or paths.isdisjoint(conditional_paths),
+        f"{label} unsharded model contains a conditional weight file",
+    )
+    active_selectors: list[dict[str, Any]] = []
     for index, raw in enumerate(selectors):
         selector = require_object(raw, f"{label}.catalog.files[{index}]")
         required = selector.get("required") is True or (selector.get("required_if_sharded") is True and sharded)
         if not required:
             continue
+        active_selectors.append(selector)
         if "path" in selector:
             path = str(selector["path"])
             require(path in paths, f"{label} is missing required weight file {path}")
@@ -922,13 +1018,35 @@ def require_catalog_weight_files(catalog_lane: dict[str, Any], source: dict[str,
             pattern = str(selector["glob"])
             require(any(fnmatch.fnmatchcase(path, pattern) for path in paths), f"{label} is missing required weight glob {pattern}")
     for path in sorted(paths):
+        file_row = files[path]
+        if file_row.get("lfs_metadata_downloaded") is True:
+            require(
+                sharded and path in allowed_lfs_metadata_paths,
+                f"{label} LFS metadata download is not bound to an exact required_if_sharded selector: {path}",
+            )
+        if (
+            sharded
+            and path in allowed_lfs_metadata_paths
+            and file_row.get("sha256_source") == "hugging_face_lfs_oid"
+        ):
+            require(
+                file_row.get("lfs_metadata_downloaded") is True,
+                f"{label} LFS safetensors index lacks download evidence: {path}",
+            )
         selected = any(
             ("path" in selector and selector["path"] == path)
             or ("glob" in selector and fnmatch.fnmatchcase(path, str(selector["glob"])))
-            for selector in selectors
-            if isinstance(selector, dict)
+            for selector in active_selectors
         )
         require(selected, f"{label} contains an unselected weight file: {path}")
+
+
+def require_no_lfs_metadata_downloads(source: dict[str, Any], label: str) -> None:
+    rows = [*source["files"], *source["license"]["files"]]
+    require(
+        all(row.get("lfs_metadata_downloaded") is not True for row in rows),
+        f"{label} must not carry LFS metadata download evidence",
+    )
 
 
 def validate_official_upstream(
@@ -1044,6 +1162,7 @@ def validate_resolution_matrix(
             required_paths=semantic_paths,
             expected_hashes={str(path): str(digest) for path, digest in semantic_hashes.items()},
         )
+        require_no_lfs_metadata_downloads(semantic, f"{label}.semantic_source")
 
         tokenizer: dict[str, Any] | None = None
         if reference.get("tokenizer_repo") is not None:
@@ -1059,6 +1178,7 @@ def validate_resolution_matrix(
                 required_paths=tokenizer_paths,
                 expected_hashes={str(path): str(digest) for path, digest in tokenizer_hashes.items()},
             )
+            require_no_lfs_metadata_downloads(tokenizer, f"{label}.tokenizer_source")
         else:
             require(lane.get("tokenizer_source") is None, f"{label}.tokenizer_source must be null")
 
@@ -1122,6 +1242,8 @@ def validate_resolution_matrix(
 
 def validate_resolution_provenance(resolution: dict[str, Any], lanes: list[dict[str, Any]]) -> None:
     request_lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    expected_request_keys: set[tuple[str, str]] = set()
+    expected_metadata_urls: set[str] = set()
     for index, raw in enumerate(require_list(resolution.get("requests"), "model-resolution.requests")):
         request = require_object(raw, f"model-resolution.requests[{index}]")
         key = (str(request.get("kind")), str(request.get("url")))
@@ -1136,12 +1258,14 @@ def validate_resolution_provenance(resolution: dict[str, Any], lanes: list[dict[
                 continue
             label = f"model-resolution.{lane_id}.{source_name}"
             model_url = str(source["model_request_url"])
+            expected_request_keys.add(("model-info", model_url))
             model_request = request_lookup.get(("model-info", model_url))
             require(model_request is not None, f"{label} model request is absent from provenance")
             model_body = require_object(request_json_body(model_request, f"{label} model request"), f"{label} model response")
             require(model_body.get("sha") == source["revision"], f"{label} model response revision mismatch")
             tree_entries: dict[str, dict[str, Any]] = {}
             for tree_url in source["tree_request_urls"]:
+                expected_request_keys.add(("repo-tree", tree_url))
                 tree_request = request_lookup.get(("repo-tree", tree_url))
                 require(tree_request is not None, f"{label} tree request is absent from provenance")
                 tree_body = require_list(request_json_body(tree_request, f"{label} tree request"), f"{label} tree response")
@@ -1163,13 +1287,35 @@ def validate_resolution_provenance(resolution: dict[str, Any], lanes: list[dict[
                         raw_lfs_oid = raw_lfs_oid.removeprefix("sha256:")
                     require(raw_lfs_oid == file_row["sha256"], f"{label} tree LFS SHA256 mismatch: {file_row['path']}")
                     require(lfs.get("size") == file_row["size_bytes"], f"{label} tree LFS size mismatch: {file_row['path']}")
+                    if file_row["path"].endswith(".safetensors.index.json"):
+                        require(file_row["size_bytes"] <= 32 * 1024 * 1024, f"{label} LFS index exceeds metadata limit: {file_row['path']}")
+                        expected_url = (
+                            f"https://huggingface.co/{source['repo']}/resolve/"
+                            f"{source['revision']}/{file_row['path']}"
+                        )
+                        require(file_row.get("lfs_metadata_downloaded") is True, f"{label} LFS index lacks downloaded metadata evidence: {file_row['path']}")
+                        require(file_row.get("content_request_url") == expected_url, f"{label} LFS index URL is not bound to repo/revision/path: {file_row['path']}")
+                        expected_metadata_urls.add(expected_url)
+                        expected_request_keys.add(("metadata-file", expected_url))
+                        request = request_lookup.get(("metadata-file", expected_url))
+                        require(request is not None, f"{label} LFS index request is absent from provenance: {file_row['path']}")
+                        require(request.get("response_sha256") == file_row["sha256"], f"{label} LFS index request SHA256 mismatch: {file_row['path']}")
+                        require(request.get("response_bytes") == file_row["size_bytes"], f"{label} LFS index request size mismatch: {file_row['path']}")
+                    else:
+                        require("content_request_url" not in file_row and "lfs_metadata_downloaded" not in file_row, f"{label} non-index LFS file has download evidence: {file_row['path']}")
                 if file_row["sha256_source"] != "downloaded_content":
                     continue
+                require(
+                    tree_entry.get("lfs") is None,
+                    f"{label} downloaded metadata is LFS-backed in the authoritative tree: {file_row['path']}",
+                )
                 expected_url = (
                     f"https://huggingface.co/{source['repo']}/resolve/"
                     f"{source['revision']}/{file_row['path']}"
                 )
                 require(file_row.get("content_request_url") == expected_url, f"{label} metadata URL is not bound to repo/revision/path: {file_row['path']}")
+                expected_metadata_urls.add(expected_url)
+                expected_request_keys.add(("metadata-file", expected_url))
                 request = request_lookup.get(("metadata-file", expected_url))
                 require(request is not None, f"{label} metadata request is absent from provenance: {file_row['path']}")
                 require(request.get("response_sha256") == file_row["sha256"], f"{label} request SHA256 mismatch: {file_row['path']}")
@@ -1177,13 +1323,51 @@ def validate_resolution_provenance(resolution: dict[str, Any], lanes: list[dict[
         official = lane.get("official_upstream")
         if official is not None:
             label = f"model-resolution.{lane_id}.official_upstream"
+            expected_request_keys.add(("model-info", official["model_request_url"]))
             model_request = request_lookup.get(("model-info", official["model_request_url"]))
             require(model_request is not None, f"{label} model request is absent from provenance")
             model_body = require_object(request_json_body(model_request, f"{label} model request"), f"{label} model response")
             require(model_body.get("sha") == official["revision"], f"{label} model response revision mismatch")
+            official_tree_entries: dict[str, dict[str, Any]] = {}
             for tree_url in official["tree_request_urls"]:
+                expected_request_keys.add(("repo-tree", tree_url))
                 require(("repo-tree", tree_url) in request_lookup, f"{label} tree request is absent from provenance")
-                request_json_body(request_lookup[("repo-tree", tree_url)], f"{label} tree request")
+                tree_body = require_list(
+                    request_json_body(request_lookup[("repo-tree", tree_url)], f"{label} tree request"),
+                    f"{label} tree response",
+                )
+                for tree_index, tree_raw in enumerate(tree_body):
+                    tree_row = require_object(tree_raw, f"{label} tree response[{tree_index}]")
+                    if tree_row.get("type") not in {"file", None}:
+                        continue
+                    tree_path = require_safe_relative_path(
+                        tree_row.get("path"),
+                        f"{label} tree response[{tree_index}].path",
+                    )
+                    require(tree_path not in official_tree_entries, f"{label} tree duplicates {tree_path}")
+                    official_tree_entries[tree_path] = tree_row
+            for match in official["mirror_blob_oid_matches"]:
+                match_path = str(match["path"])
+                tree_row = require_object(
+                    official_tree_entries.get(match_path),
+                    f"{label} tree fact {match_path}",
+                )
+                require(
+                    tree_row.get("oid") == match["git_oid"]
+                    and tree_row.get("size") == match["size_bytes"],
+                    f"{label} tree identity mismatch for {match_path}",
+                )
+    actual_metadata_urls = {
+        url for kind, url in request_lookup if kind == "metadata-file"
+    }
+    require(
+        actual_metadata_urls == expected_metadata_urls,
+        "metadata request provenance differs from the exact selected metadata file set",
+    )
+    require(
+        set(request_lookup) == expected_request_keys,
+        "network request provenance differs from the exact selected source request set",
+    )
 
 
 def validate_model_resolution(
@@ -1216,6 +1400,16 @@ def validate_model_resolution(
     require(policy.get("lfs_sha256_source") == "Hugging Face tree lfs.oid", "model resolution LFS identity policy mismatch")
     require(policy.get("non_lfs_max_download_bytes") == 32 * 1024 * 1024, "model resolution metadata download limit mismatch")
     require(
+        policy.get("lfs_metadata_download")
+        == {
+            "allowed_suffixes": [".safetensors.index.json"],
+            "max_bytes": 32 * 1024 * 1024,
+            "selector_requirement": "weight_source_exact_path_required_if_sharded",
+            "sha256_must_match_lfs_oid": True,
+        },
+        "model resolution LFS metadata download policy mismatch",
+    )
+    require(
         policy.get("raw_response_body_kinds") == ["model-info", "repo-tree"],
         "model resolution raw response body policy mismatch",
     )
@@ -1234,6 +1428,11 @@ def validate_model_resolution(
         status = request.get("status")
         require(isinstance(status, int) and 200 <= status < 300, f"model-resolution.requests[{index}] HTTP status is not successful")
         require_positive_int(request.get("response_bytes"), f"model-resolution.requests[{index}].response_bytes")
+        if kind == "metadata-file":
+            require(
+                request["response_bytes"] <= 32 * 1024 * 1024,
+                f"model-resolution.requests[{index}] metadata response exceeds download limit",
+            )
         require_sha256(request.get("response_sha256"), f"model-resolution.requests[{index}].response_sha256")
         if kind in {"model-info", "repo-tree"}:
             request_json_body(request, f"model-resolution.requests[{index}]")
@@ -1747,6 +1946,19 @@ def fixture_lfs_file(path: str, digest: str, size: int = 7) -> dict[str, Any]:
     }
 
 
+def fixture_json_request(kind: str, url: str, body: Any) -> dict[str, Any]:
+    payload = canonical_bytes(body)
+    return {
+        "kind": kind,
+        "method": "GET",
+        "response_body_base64": base64.b64encode(payload).decode("ascii"),
+        "response_bytes": len(payload),
+        "response_sha256": bytes_sha256(payload),
+        "status": 200,
+        "url": url,
+    }
+
+
 def fixture_source(repo: str, revision: str, requested: dict[str, Any], files: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "files": files,
@@ -1854,6 +2066,34 @@ def resolution_selftest_fixture() -> tuple[dict[str, Any], dict[str, dict[str, A
 
 
 def run_self_test() -> None:
+    require(
+        validate_safetensors_shard_paths(
+            {
+                "model-00001-of-000002.safetensors",
+                "model-00002-of-000002.safetensors",
+                "model.safetensors.index.json",
+            },
+            "valid shard fixture",
+        ),
+        "valid 5/6-width shard fixture was not detected as sharded",
+    )
+    expect_rejected(
+        "shard total differs from file count",
+        lambda: validate_safetensors_shard_paths(
+            {
+                "model-00001-of-00003.safetensors",
+                "model-00002-of-00003.safetensors",
+            },
+            "incomplete shard fixture",
+        ),
+    )
+    expect_rejected(
+        "multiple non-canonical safetensors files",
+        lambda: validate_safetensors_shard_paths(
+            {"model-a.safetensors", "model-b.safetensors"},
+            "non-canonical shard fixture",
+        ),
+    )
     expect_rejected(
         "duplicate JSON keys",
         lambda: read_json_bytes(b'{"fact":1,"fact":2}', "duplicate-key fixture"),
@@ -1861,6 +2101,39 @@ def run_self_test() -> None:
     expect_rejected(
         "non-finite JSON number",
         lambda: read_json_bytes(b'{"fact":NaN}', "non-finite fixture"),
+    )
+    lfs_index = fixture_lfs_file("model.safetensors.index.json", "6" * 64)
+    lfs_index["content_request_url"] = (
+        f"https://huggingface.co/acme/model/resolve/{'a' * 40}/model.safetensors.index.json"
+    )
+    lfs_index["lfs_metadata_downloaded"] = True
+    normalized_lfs_index = normalized_file(lfs_index, "LFS index fixture")
+    require(
+        normalized_lfs_index.get("content_request_url") == lfs_index["content_request_url"]
+        and normalized_lfs_index.get("lfs_metadata_downloaded") is True,
+        "LFS index fixture lost download provenance during normalization",
+    )
+    missing_lfs_index_provenance = copy.deepcopy(lfs_index)
+    missing_lfs_index_provenance.pop("content_request_url")
+    expect_rejected(
+        "LFS index missing download provenance",
+        lambda: normalized_file(missing_lfs_index_provenance, "missing LFS index provenance"),
+    )
+    forbidden_weight_download = fixture_lfs_file("model.safetensors", "7" * 64)
+    forbidden_weight_download["content_request_url"] = (
+        f"https://huggingface.co/acme/model/resolve/{'a' * 40}/model.safetensors"
+    )
+    forbidden_weight_download["lfs_metadata_downloaded"] = True
+    expect_rejected(
+        "weight LFS download provenance",
+        lambda: normalized_file(forbidden_weight_download, "weight LFS download"),
+    )
+    forged_downloaded_lfs = fixture_file("config.json", "8" * 64)
+    forged_downloaded_lfs["lfs_metadata_downloaded"] = True
+    expect_rejected(
+        "downloaded metadata with LFS flag",
+        lambda: normalized_file(forged_downloaded_lfs, "downloaded metadata LFS flag"),
+        marker="must not contain LFS identity or download flags",
     )
     request_payload = canonical_bytes({"sha": "a" * 40})
     request_fixture = {
@@ -1897,6 +2170,103 @@ def run_self_test() -> None:
     catalog, indexed, resolution = resolution_selftest_fixture()
     facts = validate_resolution_matrix(catalog, indexed, resolution, expected_lane_count=1)
     require(len(facts) == 1, "self-test resolution fixture did not produce one fact")
+    provenance_requests: dict[tuple[str, str], dict[str, Any]] = {}
+    provenance_tree_rows: dict[str, dict[str, Any]] = {}
+    for source_name in ("weight_source", "semantic_source"):
+        source = facts[0][source_name]
+        model_url = source["model_request_url"]
+        tree_url = source["tree_request_urls"][0]
+        provenance_requests[("model-info", model_url)] = fixture_json_request(
+            "model-info",
+            model_url,
+            {"sha": source["revision"]},
+        )
+        for file_row in source["files"]:
+            tree_row: dict[str, Any] = {
+                "oid": file_row["git_oid"],
+                "path": file_row["path"],
+                "size": file_row["size_bytes"],
+                "type": "file",
+            }
+            if file_row["sha256_source"] == "hugging_face_lfs_oid":
+                tree_row["lfs"] = {
+                    "oid": f"sha256:{file_row['sha256']}",
+                    "size": file_row["size_bytes"],
+                }
+            else:
+                content_url = file_row["content_request_url"]
+                provenance_requests[("metadata-file", content_url)] = {
+                    "kind": "metadata-file",
+                    "method": "GET",
+                    "response_bytes": file_row["size_bytes"],
+                    "response_sha256": file_row["sha256"],
+                    "status": 200,
+                    "url": content_url,
+                }
+            provenance_tree_rows[file_row["path"]] = tree_row
+        provenance_requests[("repo-tree", tree_url)] = fixture_json_request(
+            "repo-tree",
+            tree_url,
+            sorted(provenance_tree_rows.values(), key=lambda row: row["path"]),
+        )
+    provenance_fixture = {"requests": list(provenance_requests.values())}
+    validate_resolution_provenance(provenance_fixture, facts)
+    forged_tree_resolution = copy.deepcopy(provenance_fixture)
+    forged_tree_request = next(
+        row
+        for row in forged_tree_resolution["requests"]
+        if row["kind"] == "repo-tree"
+    )
+    forged_tree_body = request_json_body(forged_tree_request, "forged tree fixture")
+    forged_config = next(row for row in forged_tree_body if row["path"] == "config.json")
+    forged_config["lfs"] = {"oid": f"sha256:{'1' * 64}", "size": 7}
+    forged_tree_request.update(
+        fixture_json_request(
+            "repo-tree",
+            forged_tree_request["url"],
+            forged_tree_body,
+        )
+    )
+    expect_rejected(
+        "downloaded metadata backed by authoritative LFS tree",
+        lambda: validate_resolution_provenance(forged_tree_resolution, facts),
+        marker="downloaded metadata is LFS-backed in the authoritative tree",
+    )
+    duplicate_license_resolution = copy.deepcopy(resolution)
+    duplicate_weight = duplicate_license_resolution["lanes"][0]["weight_source"]
+    duplicate_weight["license"]["files"].append(
+        copy.deepcopy(duplicate_weight["files"][1])
+    )
+    expect_rejected(
+        "source/license duplicate path",
+        lambda: validate_resolution_matrix(
+            catalog,
+            indexed,
+            duplicate_license_resolution,
+            expected_lane_count=1,
+        ),
+        marker="files and license.files contain duplicate paths",
+    )
+    unsharded_conditional_catalog = copy.deepcopy(catalog)
+    unsharded_conditional_lane = unsharded_conditional_catalog["models"][0]
+    unsharded_conditional_lane["files"].append({"glob": "*", "required": True})
+    unsharded_conditional_lane["files"].append(
+        {"path": "model.safetensors.index.json", "required_if_sharded": True}
+    )
+    unsharded_conditional_resolution = copy.deepcopy(resolution)
+    unsharded_conditional_resolution["lanes"][0]["weight_source"]["files"].append(
+        fixture_file("model.safetensors.index.json", "8" * 64)
+    )
+    expect_rejected(
+        "unsharded conditional index",
+        lambda: validate_resolution_matrix(
+            unsharded_conditional_catalog,
+            {"T-CUDA": unsharded_conditional_lane},
+            unsharded_conditional_resolution,
+            expected_lane_count=1,
+        ),
+        marker="unsharded model contains a conditional weight file",
+    )
     compare_model_resolution_facts(facts, copy.deepcopy(facts))
     forged_lfs_fact = copy.deepcopy(facts)
     forged_lfs_fact[0]["weight_source"]["files"][1]["sha256"] = "9" * 64

@@ -2,7 +2,9 @@
 """Resolve the runtime-vNext model catalog to immutable Hugging Face files.
 
 The resolver deliberately does not download model weights. Hugging Face LFS OIDs
-are content SHA256 digests, so only small non-LFS metadata files are fetched.
+are content SHA256 digests, so only bounded metadata files are fetched. Some
+safetensors index files are stored in LFS; those are downloaded only after path,
+size, and content-SHA checks prove that they are metadata rather than weights.
 """
 
 from __future__ import annotations
@@ -34,10 +36,14 @@ CATALOG_PATH = ROOT / "scripts/release/configs/runtime_vnext_models.json"
 HF_BASE = "https://huggingface.co"
 OUTPUT_NAME = "model-resolution.json"
 MAX_METADATA_BYTES = 32 * 1024 * 1024
+LFS_METADATA_SUFFIXES = (".safetensors.index.json",)
 MAX_TREE_PAGES = 100
 PROVENANCE_BODY_KINDS = {"model-info", "repo-tree"}
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SAFETENSORS_SHARD_RE = re.compile(
+    r"-(\d{5,6})-of-(\d{5,6})\.safetensors$"
+)
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 MOVING_REVISIONS = {"main", "master", "latest", "head", "trunk"}
 DEFAULT_SEMANTIC_FILES = [
@@ -156,6 +162,20 @@ def next_link(value: str | None, current_url: str) -> str | None:
     return None
 
 
+def validate_metadata_content_length(value: str | None, url: str) -> None:
+    if value is None:
+        return
+    try:
+        size = int(value)
+    except ValueError as exc:
+        raise ResolutionError(f"invalid metadata Content-Length for {url}: {value!r}") from exc
+    require(size >= 0, f"invalid metadata Content-Length for {url}: {value!r}")
+    require(
+        size <= MAX_METADATA_BYTES,
+        f"metadata response exceeds download limit ({MAX_METADATA_BYTES} bytes): {url}",
+    )
+
+
 @dataclass(frozen=True)
 class Response:
     status: int
@@ -240,10 +260,25 @@ class NetworkTransport(Transport):
             request = urllib.request.Request(url, headers=headers, method="GET")
             try:
                 with self.opener.open(request, timeout=self.timeout) as handle:
+                    response_headers = {
+                        key.lower(): value for key, value in handle.headers.items()
+                    }
+                    if kind == "metadata-file":
+                        validate_metadata_content_length(
+                            response_headers.get("content-length"),
+                            url,
+                        )
+                        body = handle.read(MAX_METADATA_BYTES + 1)
+                        require(
+                            len(body) <= MAX_METADATA_BYTES,
+                            f"metadata response exceeds download limit ({MAX_METADATA_BYTES} bytes): {url}",
+                        )
+                    else:
+                        body = handle.read()
                     response = Response(
                         status=int(handle.status),
-                        headers={key.lower(): value for key, value in handle.headers.items()},
-                        body=handle.read(),
+                        headers=response_headers,
+                        body=body,
                     )
                 require(200 <= response.status < 300, f"HTTP {response.status} for {kind}: {url}")
                 self.record(url, kind, response)
@@ -307,6 +342,12 @@ class FixtureTransport(Transport):
                 body = base64.b64decode(item[field], validate=True)
             except ValueError as exc:
                 raise ResolutionError(f"invalid fixture base64 body for {url}") from exc
+        if kind == "metadata-file":
+            validate_metadata_content_length(headers.get("content-length"), url)
+            require(
+                len(body) <= MAX_METADATA_BYTES,
+                f"metadata response exceeds download limit ({MAX_METADATA_BYTES} bytes): {url}",
+            )
         response = Response(status=status, headers=headers, body=body)
         self.record(url, kind, response)
         require(200 <= status < 300, f"HTTP {status} for {kind}: {url}")
@@ -499,10 +540,44 @@ class Resolver:
         return copy.deepcopy(row)
 
     def file_content(self, snapshot: Snapshot, path: str, label: str) -> bytes:
+        cache_key = (snapshot.repo, snapshot.revision, path)
         self.locked_file(snapshot, path)
-        content = self.content_cache.get((snapshot.repo, snapshot.revision, path))
+        content = self.content_cache.get(cache_key)
         require(content is not None, f"{label} must be a downloaded non-LFS metadata file")
         return content
+
+    def safetensors_index_content(self, snapshot: Snapshot, path: str, label: str) -> bytes:
+        require(
+            any(path.endswith(suffix) for suffix in LFS_METADATA_SUFFIXES),
+            f"{label} is not an allowed safetensors index metadata path",
+        )
+        cache_key = (snapshot.repo, snapshot.revision, path)
+        row = self.locked_file(snapshot, path)
+        content = self.content_cache.get(cache_key)
+        if content is not None:
+            return content
+        entry = snapshot.tree[path]
+        require(entry.lfs_oid is not None, f"{label} metadata content is unavailable")
+        require(
+            entry.size <= MAX_METADATA_BYTES,
+            f"LFS metadata exceeds metadata limit ({MAX_METADATA_BYTES} bytes): {snapshot.repo}/{path}",
+        )
+        url = resolve_file_url(snapshot.repo, snapshot.revision, path)
+        response = self.transport.fetch(url, "metadata-file")
+        require(
+            len(response.body) == entry.size,
+            f"download/tree size mismatch for {snapshot.repo}/{path}: {len(response.body)} != {entry.size}",
+        )
+        digest = hashlib.sha256(response.body).hexdigest()
+        require(
+            digest == entry.lfs_oid,
+            f"downloaded LFS metadata SHA256 differs from tree LFS OID: {snapshot.repo}/{path}",
+        )
+        self.content_cache[cache_key] = response.body
+        row["content_request_url"] = url
+        row["lfs_metadata_downloaded"] = True
+        self.file_cache[cache_key] = row
+        return response.body
 
     def validate_expected_files(
         self,
@@ -554,8 +629,13 @@ class Resolver:
                 matches = sorted(path for path in snapshot.tree if fnmatch.fnmatchcase(path, expression))
             if spec.get("required") is True:
                 require(matches, f"{label} required file selection {expression!r} matched nothing")
-            if spec.get("required_if_sharded") is True:
+            conditional_only = spec.get("required_if_sharded") is True
+            if conditional_only:
                 require(has_path, f"{label}.files[{index}] required_if_sharded must use path")
+                require(
+                    spec.get("required") is not True,
+                    f"{label}.files[{index}] must not combine required and required_if_sharded",
+                )
                 conditional.append((expression, spec))
             expected_sha256 = spec.get("expected_sha256")
             if expected_sha256 is not None:
@@ -583,9 +663,12 @@ class Resolver:
                         entry.lfs_oid == expected_sha256,
                         f"{label} expected SHA256 mismatch for {path}",
                     )
-                selected.add(path)
+                if not conditional_only:
+                    selected.add(path)
         safetensors = [path for path in selected if path.endswith(".safetensors")]
-        is_sharded = len(safetensors) > 1 or any(re.search(r"-\d{5}-of-\d{5}\.safetensors$", path) for path in safetensors)
+        is_sharded = len(safetensors) > 1 or any(
+            SAFETENSORS_SHARD_RE.search(path) for path in safetensors
+        )
         if is_sharded:
             for path, _ in conditional:
                 require(path in snapshot.tree, f"{label} sharded model is missing required {path}")
@@ -606,9 +689,10 @@ class Resolver:
                 label,
             )
         else:
-            for path, _ in conditional:
-                if path in snapshot.tree:
-                    selected.add(path)
+            require(
+                not any(path in selected for path, _ in conditional),
+                f"{label} unsharded model selected a conditional index",
+            )
         require(selected, f"{label} selected no files")
         return [self.locked_file(snapshot, path) for path in sorted(selected)]
 
@@ -619,7 +703,11 @@ class Resolver:
         selected_shards: set[str],
         label: str,
     ) -> None:
-        content = self.file_content(snapshot, index_path, f"{label} safetensors index")
+        content = self.safetensors_index_content(
+            snapshot,
+            index_path,
+            f"{label} safetensors index",
+        )
         try:
             document = strict_json_loads(content)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
@@ -642,17 +730,33 @@ class Resolver:
             expected_shards == selected_shards,
             f"{label} safetensors index shard set differs from selected weight shards",
         )
-        numbered: list[tuple[int, int, str]] = []
+        numbered: list[tuple[int, int, int, int, str]] = []
         for shard in sorted(expected_shards):
-            match = re.search(r"-(\d{5})-of-(\d{5})\.safetensors$", shard)
+            match = SAFETENSORS_SHARD_RE.search(shard)
             require(match is not None, f"{label} sharded safetensors path lacks canonical numbering: {shard}")
-            numbered.append((int(match.group(1)), int(match.group(2)), shard))
-        totals = {total for _, total, _ in numbered}
+            numbered.append(
+                (
+                    int(match.group(1)),
+                    int(match.group(2)),
+                    len(match.group(1)),
+                    len(match.group(2)),
+                    shard,
+                )
+            )
+        require(
+            len({number_width for _, _, number_width, _, _ in numbered}) == 1,
+            f"{label} sharded safetensors number width differs",
+        )
+        require(
+            len({total_width for _, _, _, total_width, _ in numbered}) == 1,
+            f"{label} sharded safetensors total width differs",
+        )
+        totals = {total for _, total, _, _, _ in numbered}
         require(len(totals) == 1, f"{label} safetensors shards disagree on total count")
         total = totals.pop()
         require(total == len(numbered), f"{label} safetensors shard count differs from numbered total")
         require(
-            {number for number, _, _ in numbered} == set(range(1, total + 1)),
+            {number for number, _, _, _, _ in numbered} == set(range(1, total + 1)),
             f"{label} safetensors shard numbering is incomplete",
         )
 
@@ -1033,6 +1137,34 @@ def resolve_catalog(catalog_path: Path, transport: Transport) -> dict[str, Any]:
     lanes = [resolver.lane(raw, index) for index, raw in enumerate(lanes_raw)]
     lane_ids = [lane["catalog_lane_id"] for lane in lanes]
     require(len(set(lane_ids)) == len(lane_ids), "catalog lane ids must be unique")
+    expected_metadata_urls: set[str] = set()
+    for lane in lanes:
+        for source_name in ("weight_source", "semantic_source", "tokenizer_source"):
+            source = lane.get(source_name)
+            if source is None:
+                continue
+            rows = [*source["files"], *source["license"]["files"]]
+            for row in rows:
+                content_url = row.get("content_request_url")
+                if content_url is not None:
+                    expected_metadata_urls.add(str(content_url))
+    actual_metadata_urls = {
+        str(request["url"])
+        for request in transport.requests
+        if request.get("kind") == "metadata-file"
+    }
+    require(
+        actual_metadata_urls == expected_metadata_urls,
+        "metadata request provenance differs from the exact selected metadata file set",
+    )
+    require(
+        all(
+            request.get("response_bytes", MAX_METADATA_BYTES + 1) <= MAX_METADATA_BYTES
+            for request in transport.requests
+            if request.get("kind") == "metadata-file"
+        ),
+        "metadata request provenance exceeds the download limit",
+    )
     return {
         "schema_version": 1,
         "artifact_type": "runtime_vnext_model_resolution",
@@ -1050,6 +1182,12 @@ def resolve_catalog(catalog_path: Path, transport: Transport) -> dict[str, Any]:
             "large_weight_downloaded": False,
             "lfs_sha256_source": "Hugging Face tree lfs.oid",
             "non_lfs_max_download_bytes": MAX_METADATA_BYTES,
+            "lfs_metadata_download": {
+                "allowed_suffixes": list(LFS_METADATA_SUFFIXES),
+                "max_bytes": MAX_METADATA_BYTES,
+                "selector_requirement": "weight_source_exact_path_required_if_sharded",
+                "sha256_must_match_lfs_oid": True,
+            },
             "raw_response_body_kinds": sorted(PROVENANCE_BODY_KINDS),
             "transport": transport.provenance,
         },
@@ -1101,8 +1239,8 @@ def selftest_fixture() -> tuple[dict[str, Any], dict[str, Any]]:
         json.dumps(
             {
                 "weight_map": {
-                    "layer.0.weight": "model-00001-of-00002.safetensors",
-                    "layer.1.weight": "model-00002-of-00002.safetensors",
+                    "layer.0.weight": "model-00001-of-000002.safetensors",
+                    "layer.1.weight": "model-00002-of-000002.safetensors",
                 }
             },
             sort_keys=True,
@@ -1253,9 +1391,13 @@ def selftest_fixture() -> tuple[dict[str, Any], dict[str, Any]]:
         tree_entry("generation_config.json", generation),
         tree_entry("tokenizer_config.json", tokenizer_config),
         tree_entry("tokenizer.json", tokenizer),
-        tree_entry("model-00001-of-00002.safetensors", shard_a, lfs_oid=hashlib.sha256(shard_a).hexdigest()),
-        tree_entry("model-00002-of-00002.safetensors", shard_b, lfs_oid=hashlib.sha256(shard_b).hexdigest()),
-        tree_entry("model.safetensors.index.json", index),
+        tree_entry("model-00001-of-000002.safetensors", shard_a, lfs_oid=hashlib.sha256(shard_a).hexdigest()),
+        tree_entry("model-00002-of-000002.safetensors", shard_b, lfs_oid=hashlib.sha256(shard_b).hexdigest()),
+        tree_entry(
+            "model.safetensors.index.json",
+            index,
+            lfs_oid=hashlib.sha256(index).hexdigest(),
+        ),
         tree_entry("LICENSE", license_body),
     ]
     semantic_tree = [
@@ -1344,6 +1486,15 @@ def run_selftest() -> None:
             pass
         else:
             raise ResolutionError(f"strict JSON selftest unexpectedly accepted {payload}")
+    for content_length in (str(MAX_METADATA_BYTES + 1), "-1", "not-a-size"):
+        try:
+            validate_metadata_content_length(content_length, "https://huggingface.co/selftest")
+        except ResolutionError:
+            pass
+        else:
+            raise ResolutionError(
+                f"metadata Content-Length selftest unexpectedly accepted {content_length!r}"
+            )
     catalog, fixture = selftest_fixture()
     with tempfile.TemporaryDirectory(prefix="runtime-vnext-model-resolver-") as temporary:
         root = Path(temporary)
@@ -1368,8 +1519,15 @@ def run_selftest() -> None:
         weight_files = dense["weight_source"]["files"]
         require(len(weight_files) == 4, "selftest weight file count mismatch")
         require(
-            sum(row["sha256_source"] == "hugging_face_lfs_oid" for row in weight_files) == 2,
+            sum(row["sha256_source"] == "hugging_face_lfs_oid" for row in weight_files) == 3,
             "selftest did not preserve LFS hashes",
+        )
+        index_file = next(row for row in weight_files if row["path"] == "model.safetensors.index.json")
+        require(
+            index_file.get("lfs_metadata_downloaded") is True
+            and index_file.get("content_request_url")
+            == resolve_file_url("test/dense", "1" * 40, "model.safetensors.index.json"),
+            "selftest did not bind the downloaded LFS safetensors index",
         )
         require(
             dense["semantic_source"]["revision"] == dense["weight_source"]["revision"],
@@ -1407,6 +1565,30 @@ def run_selftest() -> None:
         moving["models"][1]["revision"]["value"] = "main"
         expect_failure(moving, fixture, "must not be a moving revision", root)
 
+        invalid_index_selector = copy.deepcopy(catalog)
+        invalid_index_selector["models"][0]["files"][2] = {
+            "glob": "*.safetensors.index.json",
+            "required_if_sharded": True,
+        }
+        invalid_selector_catalog = root / "invalid-index-selector.catalog.json"
+        invalid_selector_fixture = root / "invalid-index-selector.fixture.json"
+        invalid_selector_catalog.write_text(json.dumps(invalid_index_selector), encoding="utf-8")
+        invalid_selector_fixture.write_text(json.dumps(fixture), encoding="utf-8")
+        invalid_selector_transport = FixtureTransport(invalid_selector_fixture)
+        try:
+            resolve_catalog(invalid_selector_catalog, invalid_selector_transport)
+        except ResolutionError as exc:
+            require(
+                "required_if_sharded must use path" in str(exc),
+                f"invalid index selector rejected for unexpected reason: {exc}",
+            )
+        else:
+            raise ResolutionError("glob safetensors index selector unexpectedly passed")
+        require(
+            all(request.get("kind") != "metadata-file" for request in invalid_selector_transport.requests),
+            "invalid index selector fetched metadata before rejection",
+        )
+
         missing = copy.deepcopy(fixture)
         dense_tree_url = tree_api_url("test/dense", "1" * 40)
         missing["responses"][dense_tree_url]["json"] = [
@@ -1421,6 +1603,36 @@ def run_selftest() -> None:
         bad_size = copy.deepcopy(fixture)
         bad_size["responses"][dense_tree_url]["json"][4]["lfs"]["size"] += 1
         expect_failure(catalog, bad_size, "tree/LFS size mismatch", root)
+
+        oversized_lfs_index = copy.deepcopy(fixture)
+        oversized_index_entry = next(
+            row
+            for row in oversized_lfs_index["responses"][dense_tree_url]["json"]
+            if row["path"] == "model.safetensors.index.json"
+        )
+        oversized_index_entry["size"] = MAX_METADATA_BYTES + 1
+        oversized_index_entry["lfs"]["size"] = MAX_METADATA_BYTES + 1
+        expect_failure(
+            catalog,
+            oversized_lfs_index,
+            "LFS metadata exceeds metadata limit",
+            root,
+        )
+
+        mismatched_lfs_index = copy.deepcopy(fixture)
+        index_url = resolve_file_url("test/dense", "1" * 40, "model.safetensors.index.json")
+        valid_index_size = len(
+            base64.b64decode(fixture["responses"][index_url]["base64"], validate=True)
+        )
+        mismatched_lfs_index["responses"][index_url]["base64"] = base64.b64encode(
+            b"x" * valid_index_size
+        ).decode("ascii")
+        expect_failure(
+            catalog,
+            mismatched_lfs_index,
+            "downloaded LFS metadata SHA256 differs from tree LFS OID",
+            root,
+        )
 
         bad_expected_sha = copy.deepcopy(catalog)
         bad_expected_sha["models"][1]["files"][0]["expected_sha256"] = "0" * 64
@@ -1458,7 +1670,7 @@ def run_selftest() -> None:
         missing_shard["responses"][dense_tree_url]["json"] = [
             row
             for row in missing_shard["responses"][dense_tree_url]["json"]
-            if row["path"] != "model-00002-of-00002.safetensors"
+            if row["path"] != "model-00002-of-000002.safetensors"
         ]
         expect_failure(
             catalog,
@@ -1467,10 +1679,114 @@ def run_selftest() -> None:
             root,
         )
 
+        mixed_total_width = copy.deepcopy(fixture)
+        mixed_index_body = (
+            json.dumps(
+                {
+                    "weight_map": {
+                        "layer.0.weight": "model-00001-of-000002.safetensors",
+                        "layer.1.weight": "model-00002-of-00002.safetensors",
+                    }
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        mixed_total_width["responses"][dense_tree_url]["json"] = [
+            {**row, "path": "model-00002-of-00002.safetensors"}
+            if row["path"] == "model-00002-of-000002.safetensors"
+            else tree_entry(
+                "model.safetensors.index.json",
+                mixed_index_body,
+                lfs_oid=hashlib.sha256(mixed_index_body).hexdigest(),
+            )
+            if row["path"] == "model.safetensors.index.json"
+            else row
+            for row in mixed_total_width["responses"][dense_tree_url]["json"]
+        ]
+        mixed_total_width["responses"][
+            resolve_file_url("test/dense", "1" * 40, "model.safetensors.index.json")
+        ] = {
+            "status": 200,
+            "base64": base64.b64encode(mixed_index_body).decode("ascii"),
+        }
+        expect_failure(
+            catalog,
+            mixed_total_width,
+            "sharded safetensors total width differs",
+            root,
+        )
+
+        mixed_number_width = copy.deepcopy(fixture)
+        mixed_number_index_body = (
+            json.dumps(
+                {
+                    "weight_map": {
+                        "layer.0.weight": "model-00001-of-000002.safetensors",
+                        "layer.1.weight": "model-000002-of-000002.safetensors",
+                    }
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        mixed_number_width["responses"][dense_tree_url]["json"] = [
+            {**row, "path": "model-000002-of-000002.safetensors"}
+            if row["path"] == "model-00002-of-000002.safetensors"
+            else tree_entry(
+                "model.safetensors.index.json",
+                mixed_number_index_body,
+                lfs_oid=hashlib.sha256(mixed_number_index_body).hexdigest(),
+            )
+            if row["path"] == "model.safetensors.index.json"
+            else row
+            for row in mixed_number_width["responses"][dense_tree_url]["json"]
+        ]
+        mixed_number_width["responses"][
+            resolve_file_url("test/dense", "1" * 40, "model.safetensors.index.json")
+        ] = {
+            "status": 200,
+            "base64": base64.b64encode(mixed_number_index_body).decode("ascii"),
+        }
+        expect_failure(
+            catalog,
+            mixed_number_width,
+            "sharded safetensors number width differs",
+            root,
+        )
+
+        unsharded = copy.deepcopy(fixture)
+        unsharded["responses"][dense_tree_url]["json"] = [
+            {**row, "path": "model.safetensors"}
+            if row["path"] == "model-00001-of-000002.safetensors"
+            else row
+            for row in unsharded["responses"][dense_tree_url]["json"]
+            if row["path"] != "model-00002-of-000002.safetensors"
+        ]
+        unsharded_path = root / "unsharded.fixture.json"
+        unsharded_path.write_text(json.dumps(unsharded), encoding="utf-8")
+        unsharded_result = resolve_catalog(catalog_path, FixtureTransport(unsharded_path))
+        unsharded_weight_paths = {
+            row["path"] for row in unsharded_result["lanes"][0]["weight_source"]["files"]
+        }
+        require(
+            "model.safetensors" in unsharded_weight_paths
+            and "model.safetensors.index.json" not in unsharded_weight_paths,
+            "unsharded selftest selected a conditional safetensors index",
+        )
+        require(
+            all(
+                request.get("url")
+                != resolve_file_url("test/dense", "1" * 40, "model.safetensors.index.json")
+                for request in unsharded_result["requests"]
+            ),
+            "unsharded selftest downloaded a conditional safetensors index",
+        )
+
         incomplete_index = copy.deepcopy(fixture)
         incomplete_index_body = (
             json.dumps(
-                {"weight_map": {"layer.0.weight": "model-00001-of-00002.safetensors"}},
+                {"weight_map": {"layer.0.weight": "model-00001-of-000002.safetensors"}},
                 sort_keys=True,
             )
             + "\n"

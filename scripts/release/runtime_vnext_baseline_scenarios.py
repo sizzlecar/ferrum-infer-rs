@@ -5404,7 +5404,9 @@ def self_test() -> int:
             validate_report_document(report, root, report_path=out)
         except ScenarioError as exc:
             require(
-                "fixture runner is forbidden" in str(exc) or "exists on disk, but not in 'HEAD'" in str(exc),
+                "expectations catalog is not the checked-in contract" in str(exc)
+                or "fixture runner is forbidden" in str(exc)
+                or "exists on disk, but not in 'HEAD'" in str(exc),
                 f"canonical fixture rejection used unexpected reason: {exc}",
             )
         else:
