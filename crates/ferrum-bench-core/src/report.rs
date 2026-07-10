@@ -114,15 +114,23 @@ fn write_metrics_block(s: &mut String, r: &BenchReport) {
         fmt(&r.tpot_ms.p99, has_ci)
     )
     .ok();
-    writeln!(
-        s,
-        "| ITL (ms)  | {} | {} | {} | {} |",
-        fmt(&r.itl_ms.p50, has_ci),
-        fmt(&r.itl_ms.p75, has_ci),
-        fmt(&r.itl_ms.p95, has_ci),
-        fmt(&r.itl_ms.p99, has_ci)
-    )
-    .ok();
+    if r.has_complete_itl_evidence() {
+        writeln!(
+            s,
+            "| ITL (ms)  | {} | {} | {} | {} |",
+            fmt(&r.itl_ms.p50, has_ci),
+            fmt(&r.itl_ms.p75, has_ci),
+            fmt(&r.itl_ms.p95, has_ci),
+            fmt(&r.itl_ms.p99, has_ci)
+        )
+        .ok();
+    } else {
+        writeln!(
+            s,
+            "| ITL (ms)  | unavailable | unavailable | unavailable | unavailable |"
+        )
+        .ok();
+    }
     writeln!(
         s,
         "| E2E (ms)  | {} | {} | {} | {} |",
@@ -153,7 +161,8 @@ fn write_metrics_block(s: &mut String, r: &BenchReport) {
         fmt(&r.request_throughput_rps, has_ci)
     )
     .ok();
-    let slo_meaningful = r.slo.ttft_p99_ms.is_finite()
+    let slo_meaningful = !r.slo.is_unbounded()
+        && r.slo.ttft_p99_ms.is_finite()
         && r.slo.tpot_p99_ms.is_finite()
         && r.slo.e2e_p99_ms.is_finite();
     if slo_meaningful {
@@ -260,7 +269,7 @@ mod tests {
     };
 
     fn make_run(records: Vec<(bool, f64, f64, u32, u32)>, duration_s: f64) -> RunRecord {
-        let records = records
+        let records: Vec<RequestRecord> = records
             .into_iter()
             .map(|(success, ttft, e2e, in_tok, out_tok)| RequestRecord {
                 success,
@@ -269,13 +278,17 @@ mod tests {
                 input_tokens: in_tok,
                 output_tokens: out_tok,
                 output_token_count_source: OutputTokenCountSource::StreamChunks,
+                itl_evidence: crate::RequestItlEvidence::engine(success, out_tok, 0),
                 quality_issues: Default::default(),
                 itl_ms: vec![],
             })
             .collect();
+        let expected_requests = u32::try_from(records.len()).unwrap();
         RunRecord {
             records,
+            expected_requests,
             duration_s,
+            warmup: Default::default(),
         }
     }
 
@@ -288,7 +301,7 @@ mod tests {
             None,
             256,
             128,
-            10,
+            0,
             Slo::default(),
             vec![
                 make_run(vec![(true, 100.0, 200.0, 256, 128)], 1.0),
@@ -308,6 +321,7 @@ mod tests {
         assert!(md.contains("## Environment"));
         assert!(md.contains("## Metrics"));
         assert!(md.contains("env_hash"));
+        assert!(md.contains("| ITL (ms)  | unavailable |"));
         // n_repeats=3 → CI columns ARE present
         assert!(!md.contains("⚠ < 3"));
         assert!(md.contains("±")); // mean ± ci95 format
