@@ -1,0 +1,147 @@
+# G06: Observability、Replay 与统一性能实验室
+
+## 状态与依赖
+
+- 状态：Open
+- 依赖：G01、G02、G04、G05
+- 下游：G08-G10
+
+## 目标
+
+让正确性、资源、延迟和 kernel 性能使用同一 identity 和 artifact，而不是依赖约 50 个
+隐藏 profile/trace env、stderr regex 和多个互不关联 schema。一次失败必须自动给出首个失败
+阶段和可验证的下一步假设。
+
+## 统一 identity
+
+```text
+run_id -> request_id -> sequence_id -> plan_hash -> node_id -> operation_id
+       -> resource_lease_id -> backend_span_id -> kernel/native_op_id
+```
+
+所有 run/serve、scheduler、resource、op provider、kernel profile 和 benchmark row 使用相同
+identity。公共 analyzer 不得解析 backend-specific 日志才能判断 PASS。
+
+## Typed profiling 入口
+
+提供 documented CLI/config preset，例如：
+
+```text
+ferrum run ... --profile <preset> --artifact-out <dir>
+ferrum serve ... --profile <preset> --artifact-out <dir>
+```
+
+preset 至少有 `off`、`basic`、`resource`、`latency`、`kernel`、`replay`。release gate 不能
+要求用户不知道的 env 组合。
+
+## 统一阶段
+
+- source/config/plan；
+- weights load/convert/upload；
+- admission/queue；
+- prefill prepare/attention/FFN-or-MoE；
+- decode prepare/attention-or-DeltaNet/FFN-or-MoE；
+- state/KV update；
+- logits/sampling/decode text；
+- API serialize/stream flush；
+- cancel/release。
+
+每个阶段记录 wall/device time、count、bytes、tokens、batch shape、provider 和 first error。
+并发场景还必须记录每次 admission/start/defer/release 的 monotonic timestamp 和 active sequence
+count，由 analyzer 计算 requested concurrency、typed cap、observed max-active、eligible interval 与
+time-weighted active duty-cycle；只从日志最大值或 client queue depth 推断 active concurrency 禁止通过。
+
+### 时间覆盖率计算
+
+并行 CPU task、CUDA stream 和 Metal command buffer 可能重叠，覆盖率不得用 span duration 直接
+相加。每个请求/sequence 必须保存 monotonic-clock interval 与 parent/child/async-link：
+
+- `decode_wall_time` 是第一个 decode step ready 到最后一个 token commit/cancel 终态的 critical-path
+  wall interval；排队、HTTP flush 和调用者 backpressure 单列，不混入 decode。
+- `stage_accounted_time` 是所有 decode stage interval 与上述 critical-path interval 的交集并集长度；
+  同时发生的 span 只计一次。`stage coverage = union(stage intervals) / decode_wall_time`。
+- `device_busy_time` 是目标 device 上所有相关 kernel/native-op event interval 的并集；跨 stream 重叠
+  只计一次。每个 op 的 inclusive duration 可以单列，但 top-op coverage 的分子必须先按归属规则
+  消除 parent/child 和 fusion 重复，再求 interval union。
+- `unattributed_time = decode_wall_time - stage_accounted_time`，负值、coverage `>100%` 或缺失
+  clock-domain conversion 一律 validator REJECT。
+
+wall 和 device clock 不能直接相减；backend 必须记录同步 anchor、转换误差和 event source。正式
+artifact 中时钟转换误差须 `<=0.5% decode_wall_time`，否则只可作为 diagnostic。
+
+## 实验 contract
+
+每个性能候选必须有机器可读：
+
+- baseline artifact；
+- 单一主要 hypothesis；
+- expected trace/counter change；
+- correctness pre-gate；
+- performance command；
+- accept target、reject threshold、stop condition；
+- KEEP/REJECT 结果与 remaining gap。
+
+禁止无范围 env sweep。相同 failure class 两次 REJECT 后，runner 必须阻止新的 paid full run，
+直到提交 source-level hypothesis 和本地/plan-only evidence。
+
+## Benchmark 收敛
+
+- `/v1/chat/completions` 正式性能客户端只有 `ferrum bench-serve`。
+- BenchReport 每个 row 必须记录 requested/effective thinking preset 和实际发送的
+  `chat_template_kwargs`；performance validator 对缺字段、server 未生效或 external engine
+  payload 不一致一律 REJECT。
+- report schema 只有 `ferrum-bench-core::BenchReport`。
+- `BenchReport` 必须保存 typed per-request ITL source、output event、usage token、observed interval、
+  transport coalescing 和 eligibility；validator 从这些字段重算 repeat counts/totals。client
+  `sse_delta_events` 与 runtime `engine_token_events` 是不同指标，source 混用数量必须为 `0`。
+- `engine_token_events` 必须来自同一 monotonic clock 的 token-commit timestamps，interval 数精确为
+  `tokens-1`；HTTP flush/backpressure 单列。只有 server-side token-commit/flush span 能归因 server
+  bulk flush，client transport coalescing 不能。
+- `m3_ab_runner.py` 可保留为 orchestration，但不得重算 token、SSE correctness 或统计。
+- legacy wrappers 要么变成单行 manifest adapter，要么在 inventory 后删除/归档。
+- raw HTTP client 只允许 correctness scenario allowlist，不得产生正式 throughput claim。
+
+## Replay
+
+replay bundle 包含 tokenized input、template hash、plan/config snapshot、sampling seed、scheduler
+decisions、resource events、expected output/token ids 和 model/weight fingerprint。不得复制权重或
+secret。run 与 serve bundle 使用同 schema。
+
+## 验收
+
+- 顶层 observability 自测执行全部子组件；漏接线 `0`。
+- 当前 `product_observability_wiring_gate` SHA mismatch fixture 修复并被总 self-test 捕获。
+- basic profile overhead `<=2%`；resource/latency profile `<=5%`；kernel profile 可标 diagnostic，
+  但不得用于正式 throughput。
+- stage accounting 覆盖 decode wall time `>=90%`，重叠/未解释部分有字段而非丢失。
+- top operations/kernels 累计覆盖 device time `>=80%`。
+- 同配置 5 次正式 throughput CV `<=5%`；超过时 artifact REJECT 并报告噪声源。
+- historical failures：first failure class `15/15 family`、`M/M concrete case` 正确，replay
+  同样达到 `15/15` 和 `M/M`。
+- 从已有 artifact 到自动 top bottleneck/target gap 报告耗时 `<=60s`。
+- 正式 HTTP benchmark client 数量 `1`；正式 regex-derived throughput 数量 `0`。
+- 官方性能 lane `100%` 输出 BenchReport 和 KEEP/REJECT。
+- hidden-env-only profiling option 数量 `0`。
+- performance row 的 thinking requested/effective/payload 字段完整率 `100%`。
+- ITL typed 字段完整率与 eligibility/count/interval 重算一致率 `100%`；ineligible request 进入正式
+  ITL ratio 数 `0`，client SSE source 冒充 engine token-commit 数 `0`。
+- 三主模型 performance/concurrency row 的 active timeline、eligible interval、max-active 和 duty-cycle
+  字段完整率 `100%`；MODEL_MATRIX active floor/duty-cycle 计算可从原始事件确定性重放 `100/100`。
+
+## 产物与 PASS
+
+```text
+docs/release/runtime-vnext/0.8.0/g06-observability-perf-lab/
+  schema/
+  profiles/
+  replay/
+  historical-failure-report.json
+  benchmark-catalog.json
+  wrapper-inventory.json
+  overhead.json
+```
+
+```text
+FERRUM RUNTIME VNEXT G06 OBSERVABILITY PERF LAB PASS: <out_dir>
+FERRUM GATE vnext-g06 PASS: <out_dir>
+```
