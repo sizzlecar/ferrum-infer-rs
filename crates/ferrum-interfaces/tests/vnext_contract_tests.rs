@@ -19,6 +19,22 @@ fn sha(byte: char) -> String {
     std::iter::repeat_n(byte, 64).collect()
 }
 
+fn resource_work(sequence_token_counts: &[usize]) -> ResourceWorkShape {
+    ResourceWorkShape::from_token_spans(
+        sequence_token_counts
+            .iter()
+            .enumerate()
+            .map(|(sequence, count)| {
+                let tokens = (0..*count)
+                    .map(|token| u32::try_from(sequence * 1024 + token).unwrap())
+                    .collect::<Vec<_>>();
+                TokenSpanWork::from_token_ids(&tokens, 0..tokens.len()).unwrap()
+            })
+            .collect(),
+    )
+    .unwrap()
+}
+
 fn contiguous_storage_profile() -> DynamicStorageProfile {
     DynamicStorageProfile::new(
         DynamicStorageAllocator::LinearArena,
@@ -1842,34 +1858,34 @@ fn state_capacity_demand_is_explicit_checked_and_wire_closed() {
 
 #[test]
 fn provider_workspace_formulas_are_actual_shape_checked_and_wire_closed() {
-    let shape = DynamicResourceShape::new(4, 12, 3).unwrap();
+    let shape = resource_work(&[3, 3, 3, 3]);
     assert_eq!(
         DynamicResourceDemand::fixed(13)
             .unwrap()
-            .evaluate_bytes(shape)
+            .evaluate_bytes(&shape)
             .unwrap(),
         13
     );
     assert_eq!(
         DynamicResourceDemand::actual_sequences(7, 8)
             .unwrap()
-            .evaluate_bytes(shape)
+            .evaluate_bytes(&shape)
             .unwrap(),
         28
     );
     assert_eq!(
         DynamicResourceDemand::tokens(3, 32)
             .unwrap()
-            .evaluate_bytes(shape)
+            .evaluate_bytes(&shape)
             .unwrap(),
         36
     );
     assert_eq!(
         DynamicResourceDemand::pages(11, 8)
             .unwrap()
-            .evaluate_bytes(shape)
-            .unwrap(),
-        33
+            .evaluate_bytes(&shape)
+            .is_err(),
+        true
     );
 
     let buckets = DynamicResourceDemand::bounded_shape_buckets(vec![
@@ -1877,9 +1893,9 @@ fn provider_workspace_formulas_are_actual_shape_checked_and_wire_closed() {
         DynamicResourceShapeBucket::new(4, 32, 8, 128).unwrap(),
     ])
     .unwrap();
-    assert_eq!(buckets.evaluate_bytes(shape).unwrap(), 128);
+    assert_eq!(buckets.evaluate_bytes(&shape).unwrap(), 128);
     assert!(buckets
-        .evaluate_bytes(DynamicResourceShape::new(5, 12, 3).unwrap())
+        .evaluate_bytes(&resource_work(&[3, 3, 2, 2, 2]))
         .is_err());
 
     let aligned = ProviderWorkspaceRequirement::from_formula(
@@ -1889,7 +1905,7 @@ fn provider_workspace_formulas_are_actual_shape_checked_and_wire_closed() {
         contiguous_storage_requirement(),
     )
     .unwrap();
-    assert_eq!(aligned.evaluate_bytes(shape).unwrap(), 32);
+    assert_eq!(aligned.evaluate_bytes(&shape).unwrap(), 32);
     assert!(ProviderWorkspaceRequirement::from_formula(
         DynamicResourceDemand::tokens(4, 32).unwrap(),
         16,

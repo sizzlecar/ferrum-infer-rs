@@ -30,6 +30,14 @@ fn sha(byte: char) -> String {
     std::iter::repeat_n(byte, 64).collect()
 }
 
+fn one_token_span() -> TokenSpanWork {
+    TokenSpanWork::from_token_ids(&[1], 0..1).unwrap()
+}
+
+fn one_token_work() -> ResourceWorkShape {
+    ResourceWorkShape::single(one_token_span()).unwrap()
+}
+
 fn contiguous_storage_profile() -> DynamicStorageProfile {
     DynamicStorageProfile::new(
         DynamicStorageAllocator::LinearArena,
@@ -1292,10 +1300,8 @@ fn logical_resources(
     run_id: &str,
     request_id: &str,
 ) -> Arc<AdmittedSequenceResources<TestRuntime>> {
-    let shape = DynamicResourceShape::new(1, 1, 1).unwrap();
     let request = RequestResourceAdmissionRequest::new(
-        shape,
-        shape,
+        one_token_work(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
@@ -1304,7 +1310,7 @@ fn logical_resources(
     let mut request_maintenance_attempts = 0;
     let request_resources = loop {
         match binding
-            .try_admit_request(request, id(run_id), id(request_id))
+            .try_admit_request(request.clone(), id(run_id), id(request_id))
             .unwrap()
         {
             RequestResourceAdmissionDecision::Admitted(resources) => break resources,
@@ -1325,15 +1331,17 @@ fn logical_resources(
         }
     };
     let sequence = SequenceResourceAdmissionRequest::new(
-        shape,
-        shape,
+        one_token_work(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
     .unwrap();
     let mut sequence_maintenance_attempts = 0;
     loop {
-        match request_resources.try_admit_sequence(sequence).unwrap() {
+        match request_resources
+            .try_admit_sequence(sequence.clone())
+            .unwrap()
+        {
             SequenceResourceAdmissionDecision::Admitted(resources) => break resources,
             SequenceResourceAdmissionDecision::BackingDeferred(deferred) => {
                 assert!(
@@ -1357,17 +1365,33 @@ fn begin_single_participant_step(
     plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
     batch: &ExecutionBatchParticipants<TestRuntime>,
 ) -> Arc<StepResourceLease<TestRuntime>> {
-    let shape = DynamicResourceShape::new(1, 1, 1).unwrap();
     let request = StepResourceAdmissionRequest::new(
-        shape,
-        shape,
+        batch.bind_work_shape(vec![one_token_span()]).unwrap(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
     .unwrap();
     for attempt in 0..=3 {
         match batch.try_begin_step(request.clone()).unwrap() {
-            StepResourceAdmissionDecision::Admitted(step) => return step,
+            StepResourceAdmissionDecision::Admitted(step) => {
+                assert_eq!(step.work_shape().participants().len(), 1);
+                assert_eq!(step.work_shape().immediate_sequences(), 1);
+                assert_eq!(step.work_shape().immediate_tokens(), 1);
+                assert_eq!(step.work_shape().immediate_pages(), 0);
+                assert_eq!(step.work_shape().fit_sequences(), 1);
+                assert_eq!(step.work_shape().fit_tokens(), 1);
+                assert_eq!(step.work_shape().fit_pages(), 0);
+                assert_eq!(step.work_shape().fingerprint().len(), 64);
+                assert_eq!(step.claimed_backing().fingerprint().len(), 64);
+                match step.claimed_backing().logical_capacity() {
+                    Some(capacity) => assert_eq!(
+                        step.claimed_backing().demand().immediate_claim(),
+                        capacity.claims()
+                    ),
+                    None => assert!(step.claimed_backing().demand().immediate_claim().is_empty()),
+                }
+                return step;
+            }
             StepResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
                 plan_resources.maintain_for_deferred(&deferred).unwrap();
             }
@@ -1390,18 +1414,22 @@ fn admit_single_participant_invocation(
     step: &Arc<StepResourceLease<TestRuntime>>,
     node_id: &NodeId,
 ) -> InvocationResourceLease<TestRuntime> {
-    let shape = DynamicResourceShape::new(1, 1, 1).unwrap();
     let request = InvocationResourceAdmissionRequest::for_all_step_participants(
         node_id.clone(),
-        shape,
-        shape,
+        step.bind_all_invocation_work_shape(vec![one_token_span()])
+            .unwrap(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
     .unwrap();
     for attempt in 0..=3 {
         match step.try_admit_invocation(request.clone()).unwrap() {
-            InvocationResourceAdmissionDecision::Admitted(invocation) => return invocation,
+            InvocationResourceAdmissionDecision::Admitted(invocation) => {
+                assert_eq!(invocation.work_shape(), step.work_shape());
+                assert_eq!(invocation.claimed_backing().fingerprint().len(), 64);
+                assert_eq!(invocation.work_shape().fingerprint().len(), 64);
+                return invocation;
+            }
             InvocationResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
                 plan_resources.maintain_for_deferred(&deferred).unwrap();
             }

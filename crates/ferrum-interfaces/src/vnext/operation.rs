@@ -6,14 +6,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::{
-    classify_device_error, BufferUsage, CanonicalRational, CapabilityId, CompletionHandle,
-    CompletionReaper, ContractVersion, DeviceId, DeviceRuntime, ExecutionFrameId,
-    ExecutionIdentityEnvelope, ExecutionLane, IdentifiedFailure, IndeterminateSubmissionHandle,
-    InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView, LogicalBackingBufferView,
-    LogicalBackingSegmentBinding, NodeId, NodeInvocationId, OperationId, PlanHash, PlanId,
-    ProgramValueId, ProviderId, ProviderWorkspaceRequirement, QuantizationFormatId,
-    ResolvedModelPlan, ResourceId, SemanticValue, TrustedActiveSequenceBinding,
-    UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId, WeightId,
+    classify_device_error, AllocationLifetime, BatchWorkShape, BufferUsage, CanonicalRational,
+    CapabilityId, CompletionHandle, CompletionReaper, ContractVersion, DeviceId, DeviceRuntime,
+    ExecutionFrameId, ExecutionIdentityEnvelope, ExecutionLane, IdentifiedFailure,
+    IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
+    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, NodeInvocationId, OperationId,
+    PlanHash, PlanId, ProgramValueId, ProviderId, ProviderWorkspaceRequirement,
+    QuantizationFormatId, ResolvedModelPlan, ResourceId, SemanticValue,
+    TrustedActiveSequenceBinding, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
+    WeightId,
 };
 
 pub const MAX_OPERATION_CATALOG_ROWS: usize = 4096;
@@ -2718,6 +2719,8 @@ pub struct OperationInvocation<'a, B> {
     attributes: &'a BTreeMap<AttributeId, SemanticValue>,
     scratch_view: Option<usize>,
     persistent_view: Option<usize>,
+    work_shape: &'a BatchWorkShape,
+    claimed_backing_fingerprint: &'a str,
 }
 
 impl<'a, B> OperationInvocation<'a, B> {
@@ -2963,7 +2966,25 @@ impl<'a, B> OperationInvocation<'a, B> {
                     .backing_view(resource_id)
                     .or_else(|_| participant.backing_view(resource_id))?;
                 let evidence = backing.slice();
-                if evidence.size_bytes() < descriptor.minimum_request_bytes()?
+                let expected_bytes = match descriptor.lifetime() {
+                    AllocationLifetime::Invocation => descriptor.evaluate_request_bytes_for_shape(
+                        resources.work_shape().immediate_shape(),
+                    )?,
+                    AllocationLifetime::Step => descriptor.evaluate_request_bytes_for_shape(
+                        resources.step_resources().work_shape().immediate_shape(),
+                    )?,
+                    AllocationLifetime::Sequence => {
+                        descriptor.evaluate_request_bytes(participant.work_shape())?
+                    }
+                    AllocationLifetime::Request => descriptor
+                        .evaluate_request_bytes(participant.request_resources().work_shape())?,
+                    AllocationLifetime::Plan => {
+                        return Err(invalid_operation(format!(
+                            "plan-lifetime resource `{resource_id}` cannot use dynamic backing"
+                        )))
+                    }
+                };
+                if evidence.size_bytes() != expected_bytes
                     || evidence.alignment_bytes() != descriptor.alignment_bytes()
                     || evidence.usage() != descriptor.usage()
                     || evidence.element_type() != descriptor.element_type()
@@ -3124,6 +3145,8 @@ impl<'a, B> OperationInvocation<'a, B> {
             attributes: node.attributes(),
             scratch_view,
             persistent_view,
+            work_shape: resources.work_shape(),
+            claimed_backing_fingerprint: resources.claimed_backing().fingerprint(),
         })
     }
 
@@ -3161,6 +3184,14 @@ impl<'a, B> OperationInvocation<'a, B> {
 
     pub fn persistent_view(&self) -> Option<&OperationBufferView<'a, B>> {
         self.persistent_view.map(|index| &self.views[index])
+    }
+
+    pub fn work_shape(&self) -> &BatchWorkShape {
+        self.work_shape
+    }
+
+    pub fn claimed_backing_fingerprint(&self) -> &str {
+        self.claimed_backing_fingerprint
     }
 }
 
