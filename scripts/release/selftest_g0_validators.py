@@ -24,6 +24,10 @@ RUNTIME_VNEXT_BUILD_TIMING = REPO_ROOT / "scripts/release/runtime_vnext_build_ti
 RUNTIME_VNEXT_BASELINE_SCENARIOS = REPO_ROOT / "scripts/release/runtime_vnext_baseline_scenarios.py"
 RUNTIME_VNEXT_RESOURCE_SAMPLER = REPO_ROOT / "scripts/release/runtime_vnext_resource_sampler.py"
 RUNTIME_VNEXT_G00A_CHECKPOINT = REPO_ROOT / "scripts/release/runtime_vnext_g00a_checkpoint.py"
+RUNTIME_VNEXT_G00_ORCHESTRATOR = REPO_ROOT / "scripts/release/runtime_vnext_g00_orchestrator.py"
+RUNTIME_VNEXT_HISTORICAL_CORPUS = REPO_ROOT / "scripts/release/runtime_vnext_historical_corpus.py"
+RUNTIME_VNEXT_G01A_CHECKPOINT = REPO_ROOT / "scripts/release/runtime_vnext_g01a_checkpoint.py"
+BOUNDED_COMMAND = REPO_ROOT / "scripts/release/bounded_command.py"
 RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
 PRODUCT_BACKEND_SENTINEL_GATE = REPO_ROOT / "scripts/release/product_backend_sentinel_gate.py"
 PRODUCT_OBSERVABILITY_L1_SMOKE = REPO_ROOT / "scripts/release/product_observability_l1_smoke.py"
@@ -343,6 +347,39 @@ def test_runtime_vnext_g00a_checkpoint_selftest() -> None:
     require("FERRUM RUNTIME VNEXT G00A FACT CHECKPOINT SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
+def test_runtime_vnext_g00_orchestrator_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_G00_ORCHESTRATOR), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G00 ORCHESTRATOR SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_historical_corpus_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_HISTORICAL_CORPUS), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G00 HISTORICAL CORPUS SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_g01a_checkpoint_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_G01A_CHECKPOINT), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G01A CONTRACT CHECKPOINT SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_bounded_command_selftest() -> None:
+    ok = run([sys.executable, str(BOUNDED_COMMAND), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("BOUNDED COMMAND SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
 def test_run_scenarios_selftest() -> None:
     ok = run([sys.executable, str(RUN_SCENARIOS), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -520,6 +557,10 @@ def main() -> int:
     test_runtime_vnext_baseline_scenarios_selftest()
     test_runtime_vnext_resource_sampler_selftest()
     test_runtime_vnext_g00a_checkpoint_selftest()
+    test_runtime_vnext_g00_orchestrator_selftest()
+    test_runtime_vnext_historical_corpus_selftest()
+    test_runtime_vnext_g01a_checkpoint_selftest()
+    test_bounded_command_selftest()
     test_run_gate_selftest()
     test_run_scenarios_selftest()
     test_product_backend_sentinel_selftest()

@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "artifact_type": "runtime_vnext_historical_corpus_selftest_fixture",
+  "mutations": [
+    {
+      "id": "missing-receipt",
+      "expected_outcome": "incomplete",
+      "expected_message": "missing evidence receipt"
+    },
+    {
+      "id": "duplicate-case",
+      "expected_outcome": "reject",
+      "expected_message": "duplicate evidence receipt"
+    },
+    {
+      "id": "orphan-case",
+      "expected_outcome": "reject",
+      "expected_message": "orphan evidence receipt"
+    },
+    {
+      "id": "source-artifact-hash",
+      "expected_outcome": "reject",
+      "expected_message": "source artifact SHA256 mismatch"
+    },
+    {
+      "id": "reproducer-input-hash",
+      "expected_outcome": "reject",
+      "expected_message": "reproducer input SHA256 mismatch"
+    },
+    {
+      "id": "identical-mutation",
+      "expected_outcome": "reject",
+      "expected_message": "mutation must differ from input"
+    },
+    {
+      "id": "missing-failure-signature",
+      "expected_outcome": "reject",
+      "expected_message": "failure signature is absent"
+    },
+    {
+      "id": "success-returncode",
+      "expected_outcome": "reject",
+      "expected_message": "returncode must be non-zero"
+    },
+    {
+      "id": "stale-catalog",
+      "expected_outcome": "reject",
+      "expected_message": "catalog SHA256 is stale"
+    },
+    {
+      "id": "stale-binding",
+      "expected_outcome": "reject",
+      "expected_message": "freshness binding SHA256 mismatch"
+    },
+    {
+      "id": "future-timestamp",
+      "expected_outcome": "reject",
+      "expected_message": "captured_at is in the future"
+    },
+    {
+      "id": "duplicate-json-key",
+      "expected_outcome": "reject",
+      "expected_message": "duplicate JSON object key"
+    },
+    {
+      "id": "corpus-missing-family",
+      "expected_outcome": "reject",
+      "expected_message": "historical corpus family coverage mismatch"
+    },
+    {
+      "id": "corpus-duplicate-family",
+      "expected_outcome": "reject",
+      "expected_message": "duplicate historical corpus family"
+    },
+    {
+      "id": "corpus-missing-case",
+      "expected_outcome": "reject",
+      "expected_message": "historical corpus H01 concrete case coverage mismatch"
+    },
+    {
+      "id": "corpus-duplicate-case",
+      "expected_outcome": "reject",
+      "expected_message": "duplicate historical corpus case"
+    },
+    {
+      "id": "corpus-orphan-case",
+      "expected_outcome": "reject",
+      "expected_message": "orphan historical corpus case"
+    }
+  ]
+}

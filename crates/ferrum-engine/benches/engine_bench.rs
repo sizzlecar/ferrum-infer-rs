@@ -17,6 +17,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const VOCAB_SIZE: usize = 1000;
+const BENCH_RUNTIME_THREADS: usize = 2;
+
+fn make_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(BENCH_RUNTIME_THREADS)
+        .max_blocking_threads(BENCH_RUNTIME_THREADS)
+        .enable_all()
+        .build()
+        .unwrap()
+}
 
 fn make_engine() -> ContinuousBatchEngine {
     let config = ferrum_types::EngineConfig::default();
@@ -49,7 +59,7 @@ fn make_request(prompt: &str, max_tokens: usize) -> InferenceRequest {
 // ────────────────────────────────────────────────────────────────────────────
 
 fn bench_single_request(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = make_runtime();
 
     let mut group = c.benchmark_group("single_request");
     group.measurement_time(Duration::from_secs(5));
@@ -78,7 +88,7 @@ fn bench_single_request(c: &mut Criterion) {
 // ────────────────────────────────────────────────────────────────────────────
 
 fn bench_concurrent_throughput(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = make_runtime();
 
     let mut group = c.benchmark_group("concurrent_throughput");
     group.measurement_time(Duration::from_secs(5));
@@ -115,7 +125,7 @@ fn bench_concurrent_throughput(c: &mut Criterion) {
 // ────────────────────────────────────────────────────────────────────────────
 
 fn bench_scheduling_overhead(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = make_runtime();
 
     let mut group = c.benchmark_group("scheduling_overhead");
     group.measurement_time(Duration::from_secs(5));
