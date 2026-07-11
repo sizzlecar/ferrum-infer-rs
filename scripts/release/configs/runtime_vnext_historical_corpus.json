@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "artifact_type": "runtime_vnext_historical_corpus_policy",
+  "baseline_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394",
+  "catalog": {
+    "path": "scripts/release/configs/runtime_vnext_historical_bugs.json",
+    "sha256": "8269a599e4eceaf6421c994b52266adb16f7c1a55c9be2bb0eccc15a3717798e"
+  },
+  "goal_documents": [
+    {
+      "path": "docs/goals/runtime-vnext-0.8.0-2026-07-10/G00_BASELINE.md",
+      "sha256": "05e73f40c336ea8f9b99253afbc79d5603c7b287e0ef0a35d98290d4b05bbcb4"
+    },
+    {
+      "path": "docs/goals/runtime-vnext-0.8.0-2026-07-10/G02_TEST_EVIDENCE.md",
+      "sha256": "0e5b3cbd0b51c59cfa8b73ac9b454ec7cd64351d1beb5fabb9313d88da5c006c"
+    }
+  ],
+  "expected_family_ids": [
+    "H01",
+    "H02",
+    "H03",
+    "H04",
+    "H05",
+    "H06",
+    "H07",
+    "H08",
+    "H09",
+    "H10",
+    "H11",
+    "H12",
+    "H13",
+    "H14",
+    "H15"
+  ],
+  "expected_concrete_case_count": 28,
+  "artifact_file": "historical-bug-corpus.json",
+  "receipt_glob": "historical-bugs/**/evidence.json",
+  "receipt_template": "historical-bugs/{case_id}/evidence.json",
+  "required_source_evidence_kinds": [
+    "commit",
+    "artifact"
+  ],
+  "historical_artifact_role": "historical_failure",
+  "historical_artifact_roots": [
+    "docs/bench",
+    "docs/goals",
+    "docs/release",
+    "docs/status"
+  ],
+  "allowed_failure_layers": [
+    "L0",
+    "L1",
+    "L2",
+    "L3",
+    "L4",
+    "L5"
+  ],
+  "allowed_mutation_kinds": [
+    "revert_patch",
+    "fault_injection",
+    "frozen_bad_input"
+  ],
+  "allowed_runner_basenames": [
+    "cargo",
+    "ferrum",
+    "python",
+    "python3"
+  ],
+  "freshness": {
+    "mode": "content_addressed",
+    "max_clock_skew_seconds": 300,
+    "require_empty_invalidated_by": true
+  }
+}

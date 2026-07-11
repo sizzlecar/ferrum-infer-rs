@@ -48,6 +48,7 @@ BINARY_LANES = {
 LANES = (
     "vnext-g00a",
     "vnext-g00",
+    "vnext-g01a",
     "unit",
     "metal",
     "cuda-smoke",
@@ -201,6 +202,294 @@ VNEXT_G00A_CONTRACT_PATHS = {
     "scripts/release/runtime_vnext_g00a_checkpoint.py",
     "scripts/release/runtime_vnext_inventory.py",
     "scripts/release/runtime_vnext_model_resolver.py",
+}
+VNEXT_G01A_REQUIRED_CONTRACTS = {
+    "DeviceRuntime",
+    "OperationContract",
+    "ModelFamilyProvider",
+    "ModelProgram",
+    "ExecutionPlanner",
+    "ExecutionPlan",
+    "ResourceTransaction",
+    "ExecutionEventSink",
+    "ResolvedModelPlan",
+}
+VNEXT_G01A_EXECUTION_IDENTITY_VERSION = (3, 0)
+VNEXT_G01A_EVENT_REQUIRED_TRANSITION = "NodeRetired"
+VNEXT_G01A_EVENT_FORBIDDEN_TRANSITION = "NodeCompleted"
+VNEXT_G01A_SEMANTIC_TYPE_KINDS = {
+    "BatchWorkShape": "struct",
+    "ClaimedBackingTransaction": "struct",
+    "ParticipantNodeKey": "struct",
+    "BatchOperationIdentity": "struct",
+    "DefinitelyNotSubmittedRetryAuthority": "struct",
+    "BatchedOperationInvocation": "struct",
+}
+VNEXT_G01A_DNF_RETRY_AUTHORITY_TYPE = "DefinitelyNotSubmittedRetryAuthority"
+VNEXT_G01A_MULTIPARTICIPANT_DISPATCH_MARKERS = {
+    "batch_identity_parameter": "BatchOperationIdentity",
+    "participant_bindings_parameter": "active_bindings",
+    "participant_binding_type": "TrustedActiveSequenceBinding",
+    "batched_invocation_body": "BatchedOperationInvocation",
+}
+VNEXT_G01A_REQUIRED_UNIT_TESTS = {
+    "adversarial_runtime_policy_and_workspace_fanout_fail_before_materialization",
+    "blocked_tensor_storage_requires_explicit_exact_or_zero_fill_padding",
+    "blocked_weight_layout_requires_explicit_exact_or_zero_fill_padding",
+    "breaking_schema_versions_are_rejected_100_of_100",
+    "execution_alias_effect_wire_mutations_are_rejected",
+    "execution_alias_may_alias_supports_distinct_or_exact_storage",
+    "execution_alias_must_alias_builds_exact_equivalence_and_single_allocation",
+    "execution_alias_rejects_overwrite_before_last_consumer",
+    "execution_alias_rejects_partial_and_wrong_input_overlap",
+    "execution_memory_is_core_owned_and_exact",
+    "execution_plan_is_deterministic_100_of_100",
+    "execution_plan_schema_round_trip_100_of_100",
+    "execution_state_effect_graph_orders_raw_war_waw",
+    "execution_state_read_only_nodes_remain_independent",
+    "externally_trusted_node_resolution_cannot_be_replaced_by_wire_data",
+    "failure_envelope_wire_limit_precedes_deserialization",
+    "forged_self_hashed_plan_is_rejected_by_semantic_rebuild",
+    "generic_contracts_have_zero_architecture_names",
+    "mandatory_object_safe_contracts_accept_trait_objects",
+    "model_program_rejects_duplicate_declared_outputs",
+    "operation_resource_contract_requires_explicit_presence_and_alignment",
+    "physical_weight_layout_tree_accepts_dense_fixture",
+    "physical_weight_layout_tree_accepts_grouped_quantized_axis_index_fixture",
+    "physical_weight_layout_tree_accepts_recursive_quantized_expert_stack_fixture",
+    "physical_weight_layout_tree_rejects_invalid_shape_reuse_padding_overflow_and_limits",
+    "planning_registry_missing_duplicate_and_mismatched_entries_fail_before_plan",
+    "prepared_family_wire_requires_typed_registry_reconstruction",
+    "preferred_provider_is_only_a_core_validated_preference",
+    "provider_catalog_and_reference_oracle_fail_closed",
+    "provider_implementation_fingerprint_is_plan_hashed_and_revalidated",
+    "provider_raw_estimate_identity_input_and_output_are_revalidated_by_core",
+    "resolution_source_matrix_rejects_forbidden_binding_before_plan",
+    "resolved_external_device_catalog_runtime_and_node_resolution_are_exact",
+    "resolved_model_family_identity_is_unique_and_fail_closed",
+    "resolved_model_plan_closes_all_contract_links",
+    "resolved_model_plan_initial_construction_requires_verified_evidence_context",
+    "resolved_source_evidence_rejects_raw_bytes_and_provenance_tampering",
+    "resolved_source_parser_identity_and_determinism_are_enforced",
+    "runtime_capacity_reserve_and_concurrency_are_typed_planning_inputs",
+    "runtime_active_sequence_limit_accepts_boundary_and_rejects_out_of_range",
+    "self_consistent_wire_provider_selection_is_rejected",
+    "self_consistent_wire_resource_estimate_and_memory_mutation_is_rejected",
+    "silent_success_defaults_are_absent",
+    "typed_planning_registry_invokes_real_contract_and_estimator_once",
+    "unknown_inputs_fail_closed",
+    "weight_schema_order_is_normalized_before_fingerprinting",
+}
+VNEXT_G01A_REQUIRED_RESOURCE_TESTS = {
+    "closing_root_rejects_every_parent_to_child_derivation",
+    "plan_runtime_close_recovery_is_ownership_safe",
+    "poisoned_bound_stream_retains_sequence_until_stream_drop",
+    "resource_capacity_concurrency_is_bounded",
+    "resource_transaction_abandon_panic_child",
+    "resource_transaction_contract_is_exhaustive",
+    "sequence_owner_drop_defers_blocking_backend_recovery",
+}
+VNEXT_G01A_REQUIRED_EVENT_TESTS = {"vnext_event_replay_v5_contract"}
+VNEXT_G01A_REQUIRED_RESOLUTION_LIMITS_TESTS = {
+    "field_path_count_and_total_bytes_are_bounded_before_parser",
+    "json_parser_checks_source_bytes_when_called_directly",
+    "json_parser_preflight_enforces_node_budget_before_building_a_value_tree",
+    "json_parser_preflight_handles_escaped_structure_and_rejects_trailing_roots",
+    "json_parser_preflight_reports_depth_budget_before_serde_recursion_failure",
+    "parsed_json_depth_node_and_text_budgets_are_enforced_for_each_result",
+    "parser_descriptor_deserialization_and_each_verification_read_fail_closed",
+    "provenance_limit_accepts_max_and_rejects_max_plus_one_before_parser",
+    "public_resolution_availability_limits_are_stable",
+    "repeated_parser_results_must_be_canonically_deterministic",
+    "resolved_wire_limit_accepts_max_and_rejects_max_plus_one_before_serde",
+    "source_byte_limit_accepts_max_and_rejects_max_plus_one_before_parser",
+}
+VNEXT_G01A_REQUIRED_DEVICE_OPERATION_TESTS = {
+    "completion_reaper_drop_defers_blocking_backend_recovery",
+    "device_and_operation_contract_is_exhaustive"
+}
+VNEXT_G01A_REQUIRED_ORACLE_TESTS = {
+    "descriptor_and_request_result_wire_require_explicit_revalidation",
+    "exact_absolute_and_relative_comparison_are_fail_closed",
+    "external_trait_object_and_registry_bound_handle_invoke",
+    "host_tensor_rejects_noncanonical_nonfinite_and_overflowing_inputs",
+    "independently_anchored_descriptor_rejects_impostor_and_registry_never_accepts_call_oracle",
+    "operation_oracle_contract_proof_line",
+    "reference_operation_chain_resolves_to_one_terminal_oracle",
+    "registry_rejects_missing_duplicate_contract_signature_and_fingerprint_mismatches",
+    "request_result_count_and_attribute_bounds_are_enforced",
+}
+VNEXT_G01A_REQUIRED_MODEL_WIRE_TESTS = {
+    "prepared_family_wire_accepts_max_and_rejects_max_plus_one_before_serde",
+    "prepared_family_wire_rejects_unknown_fields_and_typed_drift",
+    "prepared_family_wire_round_trip_requires_external_typed_registry",
+    "prepared_model_family_wire_proof_line",
+    "typed_family_config_and_registry_identity_fail_closed",
+    "typed_config_is_serialized_once_and_signed_external_identity_is_replayed",
+}
+VNEXT_G01A_REQUIRED_COMPILE_TESTS = {"vnext_compile"}
+VNEXT_G01A_REQUIRED_LEGACY_TESTS = {"legacy_backend_methods_are_mapped_82_of_82"}
+VNEXT_G01A_REQUIRED_TESTS_BY_TARGET = {
+    "vnext_contract_tests": VNEXT_G01A_REQUIRED_UNIT_TESTS,
+    "vnext_resource_contract_tests": VNEXT_G01A_REQUIRED_RESOURCE_TESTS,
+    "vnext_event_contract_tests": VNEXT_G01A_REQUIRED_EVENT_TESTS,
+    "vnext_resolution_limits_contract_tests": VNEXT_G01A_REQUIRED_RESOLUTION_LIMITS_TESTS,
+    "vnext_device_operation_contract_tests": VNEXT_G01A_REQUIRED_DEVICE_OPERATION_TESTS,
+    "vnext_oracle_contract_tests": VNEXT_G01A_REQUIRED_ORACLE_TESTS,
+    "vnext_model_wire_contract_tests": VNEXT_G01A_REQUIRED_MODEL_WIRE_TESTS,
+    "vnext_compile": VNEXT_G01A_REQUIRED_COMPILE_TESTS,
+    "vnext_legacy_map": VNEXT_G01A_REQUIRED_LEGACY_TESTS,
+}
+VNEXT_G01A_REQUIRED_ADMISSION_LIB_TESTS = {
+    "vnext::admission::tests::allocator_availability_change_advances_capacity_epoch_without_recounting_units",
+    "vnext::admission::tests::batch_child_claim_charges_once_and_binds_every_parent",
+    "vnext::admission::tests::batch_child_defer_and_reject_have_zero_partial_parent_effect",
+    "vnext::admission::tests::batch_child_rejects_duplicate_and_foreign_parents_atomically",
+    "vnext::admission::tests::batch_child_rejects_stale_later_parent_without_partial_effect",
+    "vnext::admission::tests::batch_child_unwind_releases_all_parent_edges",
+    "vnext::admission::tests::child_claim_is_counted_in_future_request_epoch_headroom",
+    "vnext::admission::tests::child_claim_rejects_foreign_parent_and_epoch_exhaustion_atomically",
+    "vnext::admission::tests::child_claim_rejects_stale_sequence_generation_without_side_effect",
+    "vnext::admission::tests::child_claim_uses_parent_authority_without_consuming_sequence_slot",
+    "vnext::admission::tests::child_multi_domain_defer_and_reject_have_zero_partial_effect",
+    "vnext::admission::tests::child_unwind_releases_without_poisoning_parent",
+    "vnext::admission::tests::concurrent_admission_never_exceeds_ceiling",
+    "vnext::admission::tests::concurrent_children_preserve_global_and_per_parent_counts",
+    "vnext::admission::tests::early_release_of_any_batch_parent_fails_closed_and_retains_shared_claim",
+    "vnext::admission::tests::early_request_release_with_live_sequence_fails_closed_and_retains_claims",
+    "vnext::admission::tests::early_sequence_release_with_active_child_fails_closed",
+    "vnext::admission::tests::epoch_exhaustion_rejects_admission_before_claim",
+    "vnext::admission::tests::exact_fit_claims_only_immediate_and_release_retries",
+    "vnext::admission::tests::growth_defer_and_permanent_reject_are_distinct",
+    "vnext::admission::tests::lease_authority_is_bound_to_the_exact_coordinator",
+    "vnext::admission::tests::lease_release_uses_preallocated_reuse_storage",
+    "vnext::admission::tests::multi_domain_failure_has_zero_partial_effect",
+    "vnext::admission::tests::multi_domain_growth_validates_all_before_one_epoch_commit",
+    "vnext::admission::tests::mutation_unwind_wakes_parked_waiter_with_terminal_error",
+    "vnext::admission::tests::overlapping_batch_children_track_each_parent_without_double_charging",
+    "vnext::admission::tests::poisoned_child_drop_retains_capacity_and_child_counts",
+    "vnext::admission::tests::poisoned_drop_retains_claim_and_is_observable",
+    "vnext::admission::tests::request_authority_reuses_sparse_storage_with_new_generation",
+    "vnext::admission::tests::request_capacity_is_shared_once_across_multiple_sequences",
+    "vnext::admission::tests::request_defer_and_reject_are_atomic_and_do_not_consume_sequence_slots",
+    "vnext::admission::tests::request_unwind_releases_request_capacity_without_poisoning_coordinator",
+    "vnext::admission::tests::sequence_issue_failure_has_zero_side_effect",
+    "vnext::admission::tests::sequence_unwind_releases_lease_without_poisoning_coordinator",
+    "vnext::admission::tests::snapshot_counts_live_authorities_independently_from_active_counter",
+    "vnext::admission::tests::sparse_sequence_ids_reuse_storage_and_change_generation",
+    "vnext::admission::tests::temporary_multi_domain_shortfall_has_zero_partial_effect",
+    "vnext::admission::tests::waiter_listener_closes_recheck_to_park_race",
+    "vnext::admission::tests::waiter_recheck_closes_release_and_growth_races",
+    "vnext::admission::tests::zero_domain_plan_still_uses_dynamic_sequence_authority",
+}
+VNEXT_G01A_QUALITY_COMMANDS = (
+    ("cargo", "check", "-p", "ferrum-interfaces", "--no-default-features"),
+    ("cargo", "fmt", "--all", "--", "--check"),
+    (
+        "cargo",
+        "clippy",
+        "-p",
+        "ferrum-interfaces",
+        "--all-targets",
+        "--no-default-features",
+        "--",
+        "-A",
+        "warnings",
+    ),
+)
+VNEXT_G01A_EXPECTED_RESOURCE_CASES = 311
+VNEXT_G01A_EXPECTED_FAIL_CLOSED_CASES = 62
+VNEXT_G01A_EXPECTED_EVENT_REPLAY_V5_CASES = 161
+VNEXT_G01A_EXPECTED_DEVICE_OPERATION_CASES = 299
+VNEXT_G01A_EXPECTED_ORACLE_CASES = 26
+VNEXT_G01A_EXPECTED_MODEL_WIRE_CASES = 24
+VNEXT_G01A_EXPECTED_MODEL_IDENTITY_CASES = 5
+VNEXT_G01A_EXPECTED_DYNAMIC_ADMISSION_CASES = 40
+VNEXT_G01A_EXPECTED_TRYBUILD_PASS_CASES = 2
+VNEXT_G01A_EXPECTED_TRYBUILD_FAIL_CASES = 78
+VNEXT_G01A_TEST_THREADS_ARG = "--test-threads=1"
+VNEXT_G01A_BOUNDED_RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
+VNEXT_G01A_BOUNDED_TEST_COMMAND_COUNT = 20
+VNEXT_G01A_BOUNDED_TEST_ENV_OVERRIDES = {
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "CARGO_BUILD_JOBS": "2",
+}
+VNEXT_G01A_BOUNDED_TEST_PROFILES = {
+    "regular": {
+        "wall_timeout_seconds": 120.0,
+        "max_processes": 4,
+        "max_group_threads": 16,
+        "max_per_process_threads": 8,
+        "sample_interval_seconds": 0.05,
+        "max_sampling_errors": 3,
+        "term_grace_seconds": 1.0,
+    },
+    "resource": {
+        "wall_timeout_seconds": 60.0,
+        "max_processes": 4,
+        "max_group_threads": 12,
+        "max_per_process_threads": 8,
+        "sample_interval_seconds": 0.05,
+        "max_sampling_errors": 3,
+        "term_grace_seconds": 1.0,
+    },
+    "trybuild": {
+        "wall_timeout_seconds": 300.0,
+        "max_processes": 8,
+        "max_group_threads": 32,
+        "max_per_process_threads": 16,
+        "sample_interval_seconds": 0.05,
+        "max_sampling_errors": 3,
+        "term_grace_seconds": 1.0,
+    },
+}
+G0_UNIT_BOUNDED_COMMAND = [
+    "env",
+    "PYTHONDONTWRITEBYTECODE=1",
+    "CARGO_BUILD_JOBS=2",
+    "RUST_TEST_THREADS=1",
+    "cargo",
+    "test",
+    "--workspace",
+    "--all-targets",
+]
+G0_UNIT_BOUNDED_ENV_OVERRIDES = {
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "CARGO_BUILD_JOBS": "2",
+    "RUST_TEST_THREADS": "1",
+}
+G0_UNIT_BENCH_CASES = (
+    "single_request/tokens/1",
+    "single_request/tokens/5",
+    "single_request/tokens/10",
+    "single_request/tokens/20",
+    "single_request/tokens/50",
+    "concurrent_throughput/concurrency/1",
+    "concurrent_throughput/concurrency/2",
+    "concurrent_throughput/concurrency/4",
+    "concurrent_throughput/concurrency/8",
+    "concurrent_throughput/concurrency/16",
+    "scheduling_overhead/single_request_overhead",
+    "scheduling_overhead/sequential_10_requests",
+)
+G0_UNIT_BOUNDED_LIMITS = {
+    "wall_timeout_seconds": 1800.0,
+    "max_processes": 16,
+    "max_group_threads": 96,
+    "max_per_process_threads": 48,
+    "sample_interval_seconds": 0.05,
+    "max_sampling_errors": 3,
+    "term_grace_seconds": 1.0,
+}
+VNEXT_G01A_DOES_NOT_PROVE = {
+    "G00",
+    "G01B",
+    "G01",
+    "runtime_migration",
+    "product_routing",
+    "model_migration",
+    "performance",
+    "release",
 }
 VNEXT_LEGACY_EXPECTATIONS_PATH = (
     "scripts/release/configs/runtime_vnext_legacy_correctness_expectations.json"
@@ -365,11 +654,32 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             expected_source_git_sha=VNEXT_FROZEN_LEGACY_SHA,
             provenance_kind="vnext-g00",
         )
+    if lane == "vnext-g01a":
+        if args.g00a is None:
+            raise GateError("vnext-g01a requires --g00a")
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_g01a_checkpoint.py",
+                "--g00a",
+                str(args.g00a),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT G01A CONTRACT CHECKPOINT PASS: {out_dir}"
+            ),
+            child_manifest_path=(
+                out_dir / "g01a-contract-checkpoint" / "manifest.json"
+            ),
+            provenance_kind="vnext-g01a",
+        )
     if lane in SOURCE_LANES:
+        source_lane = SOURCE_LANES[lane]
         return LaneCommand(
             cmd=[
                 "scripts/release/g0_source_gate.sh",
-                SOURCE_LANES[lane],
+                source_lane,
                 str(out_dir),
             ],
             binary_path=Path("target/release/ferrum")
@@ -377,6 +687,10 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             else None,
             model=model_for_source_lane(lane),
             expected_child_pass_line=source_pass_line(lane, out_dir),
+            child_manifest_path=(out_dir / "unit.gate.json")
+            if source_lane == "unit"
+            else None,
+            provenance_kind="g0-source-unit" if source_lane == "unit" else None,
         )
     if lane in BINARY_LANES:
         if not args.version:
@@ -1635,6 +1949,1341 @@ def validate_vnext_g00a_provenance(
     }
 
 
+def discover_vnext_g01a_contract_paths() -> set[str]:
+    patterns = [
+        "crates/ferrum-interfaces/src/vnext.rs",
+        "crates/ferrum-interfaces/src/vnext/*.rs",
+        "crates/ferrum-interfaces/src/vnext/**/*.rs",
+        "crates/ferrum-interfaces/tests/vnext_*.rs",
+        "crates/ferrum-interfaces/tests/ui/vnext/*.rs",
+        "crates/ferrum-interfaces/tests/ui/vnext/*.stderr",
+        "crates/ferrum-interfaces/tests/ui/vnext/**/*.rs",
+        "crates/ferrum-interfaces/tests/ui/vnext/**/*.stderr",
+    ]
+    discovered = {
+        line
+        for line in git_output(["ls-files", "--", *patterns], default="").splitlines()
+        if line.strip()
+    }
+    fixed = {
+        "Cargo.lock",
+        "crates/ferrum-interfaces/Cargo.toml",
+        "crates/ferrum-interfaces/src/lib.rs",
+        "docs/goals/runtime-vnext-0.8.0-2026-07-10/G01_CORE_CONTRACTS.md",
+        "docs/goals/runtime-vnext-0.8.0-2026-07-10/G01A_CONTRACT_ADR.md",
+        "docs/goals/runtime-vnext-0.8.0-2026-07-10/G01A_LEGACY_CONTRACT_MAP.json",
+        "scripts/release/runtime_vnext_g01a_checkpoint.py",
+        "scripts/release/run_gate.py",
+        "scripts/release/bounded_command.py",
+        "scripts/release/selftest_g0_validators.py",
+    }
+    return discovered | fixed
+
+
+def validate_bounded_command_receipt(
+    receipt_raw: Any,
+    *,
+    expected_command: list[str] | tuple[str, ...],
+    expected_cwd: Path,
+    expected_limits: dict[str, int | float],
+    stdout_bytes: bytes,
+    stderr_bytes: bytes,
+    label: str,
+) -> dict[str, Any]:
+    receipt = require_object(receipt_raw, f"{label} receipt")
+    require_gate(
+        set(receipt)
+        == {
+            "schema",
+            "command",
+            "cwd",
+            "pid",
+            "pgid",
+            "limits",
+            "peaks",
+            "started_at",
+            "ended_at",
+            "duration_seconds",
+            "reason",
+            "rc",
+            "status",
+            "successful_samples",
+            "sampling_error_count",
+            "sampling_errors",
+            "violation",
+            "termination",
+            "cleanup",
+            "stdout",
+            "stderr",
+        },
+        f"{label} receipt field set mismatch",
+    )
+    require_gate(
+        receipt.get("schema") == VNEXT_G01A_BOUNDED_RECEIPT_SCHEMA,
+        f"{label} receipt schema mismatch",
+    )
+    command = require_list(receipt.get("command"), f"{label} receipt command")
+    require_gate(command == list(expected_command), f"{label} receipt command mismatch")
+    require_gate(
+        Path(require_string(receipt.get("cwd"), f"{label} receipt cwd")).resolve()
+        == expected_cwd.resolve(),
+        f"{label} receipt cwd mismatch",
+    )
+    pid = receipt.get("pid")
+    require_gate(
+        isinstance(pid, int)
+        and not isinstance(pid, bool)
+        and pid > 0
+        and receipt.get("pgid") == pid,
+        f"{label} receipt pid/pgid mismatch",
+    )
+    limits = require_object(receipt.get("limits"), f"{label} receipt limits")
+    require_gate(
+        set(limits) == set(expected_limits)
+        and all(
+            isinstance(limits.get(key), (int, float))
+            and not isinstance(limits.get(key), bool)
+            and limits[key] == value
+            for key, value in expected_limits.items()
+        ),
+        f"{label} receipt limits mismatch",
+    )
+    rc = receipt.get("rc")
+    require_gate(
+        receipt.get("status") == "pass"
+        and receipt.get("reason") == "command_completed"
+        and isinstance(rc, int)
+        and not isinstance(rc, bool)
+        and rc == 0,
+        f"{label} receipt command status mismatch",
+    )
+    successful_samples = receipt.get("successful_samples")
+    require_gate(
+        isinstance(successful_samples, int)
+        and not isinstance(successful_samples, bool)
+        and successful_samples >= 1,
+        f"{label} receipt successful_samples invalid",
+    )
+    sampling_error_count = receipt.get("sampling_error_count")
+    require_gate(
+        isinstance(sampling_error_count, int)
+        and not isinstance(sampling_error_count, bool)
+        and sampling_error_count == 0
+        and receipt.get("sampling_errors") == [],
+        f"{label} receipt contains sampling errors",
+    )
+    require_gate(
+        receipt.get("violation") is None,
+        f"{label} receipt contains a resource violation",
+    )
+    require_gate(
+        receipt.get("termination") == {"signals": [], "errors": []},
+        f"{label} receipt termination is not clean",
+    )
+    cleanup = require_object(receipt.get("cleanup"), f"{label} receipt cleanup")
+    require_gate(
+        set(cleanup) == {"process_group_gone"}
+        and cleanup.get("process_group_gone") is True,
+        f"{label} receipt process group cleanup failed",
+    )
+    require_gate(
+        bool(require_string(receipt.get("started_at"), f"{label} receipt started_at"))
+        and bool(require_string(receipt.get("ended_at"), f"{label} receipt ended_at"))
+        and isinstance(receipt.get("duration_seconds"), (int, float))
+        and not isinstance(receipt.get("duration_seconds"), bool)
+        and receipt["duration_seconds"] >= 0,
+        f"{label} receipt timing evidence invalid",
+    )
+    peaks = require_object(receipt.get("peaks"), f"{label} receipt peaks")
+    require_gate(
+        set(peaks)
+        == {
+            "processes",
+            "group_threads",
+            "per_process_threads",
+            "per_process_threads_pid",
+        },
+        f"{label} receipt peak field set mismatch",
+    )
+    for key in ("processes", "group_threads", "per_process_threads"):
+        value = peaks.get(key)
+        require_gate(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 1,
+            f"{label} receipt peak {key} invalid",
+        )
+    peak_pid = peaks.get("per_process_threads_pid")
+    require_gate(
+        isinstance(peak_pid, int)
+        and not isinstance(peak_pid, bool)
+        and peak_pid > 0,
+        f"{label} receipt peak pid invalid",
+    )
+    require_gate(
+        peaks["processes"] <= limits["max_processes"]
+        and peaks["group_threads"] <= limits["max_group_threads"]
+        and peaks["per_process_threads"] <= limits["max_per_process_threads"]
+        and peaks["group_threads"] >= peaks["processes"]
+        and peaks["group_threads"] >= peaks["per_process_threads"],
+        f"{label} receipt peak exceeds its fixed bound",
+    )
+    paths: list[str] = []
+    for stream, payload in (("stdout", stdout_bytes), ("stderr", stderr_bytes)):
+        identity = require_object(receipt.get(stream), f"{label} receipt {stream}")
+        require_gate(
+            set(identity) == {"path", "sha256", "size_bytes"},
+            f"{label} receipt {stream} identity field set mismatch",
+        )
+        paths.append(require_string(identity.get("path"), f"{label} receipt {stream}.path"))
+        size_bytes = identity.get("size_bytes")
+        require_gate(
+            isinstance(size_bytes, int)
+            and not isinstance(size_bytes, bool)
+            and size_bytes == len(payload)
+            and require_sha256(identity.get("sha256"), f"{label} receipt {stream}.sha256")
+            == hashlib.sha256(payload).hexdigest(),
+            f"{label} receipt {stream} identity mismatch",
+        )
+    require_gate(len(set(paths)) == 2, f"{label} receipt output paths are not distinct")
+    return receipt
+
+
+def vnext_g01a_bounded_profile(command: tuple[str, ...]) -> str:
+    require_gate(command[:2] == ("cargo", "test"), "vnext-g01a bounded command is not cargo test")
+    require_gate(
+        command.count(VNEXT_G01A_TEST_THREADS_ARG) == 1
+        and "--" in command
+        and command.index(VNEXT_G01A_TEST_THREADS_ARG) > command.index("--"),
+        f"vnext-g01a cargo test must contain exactly one {VNEXT_G01A_TEST_THREADS_ARG}",
+    )
+    if "--test" in command:
+        target_index = command.index("--test") + 1
+        require_gate(target_index < len(command), "vnext-g01a cargo test target is missing")
+        target = command[target_index]
+        if target == "vnext_resource_contract_tests":
+            return "resource"
+        if target == "vnext_compile":
+            return "trybuild"
+    return "regular"
+
+
+def validate_vnext_g01a_command_execution(
+    row: dict[str, Any],
+    command: tuple[str, ...],
+    stdout: str,
+    stderr: str,
+    index: int,
+) -> dict[str, Any] | None:
+    label = f"vnext-g01a compile commands[{index}]"
+    execution = require_object(row.get("execution"), f"{label}.execution")
+    require_gate(
+        set(execution) == {"kind", "profile", "receipt", "receipt_sha256"},
+        f"{label}.execution field set mismatch",
+    )
+    if command in VNEXT_G01A_QUALITY_COMMANDS:
+        require_gate(
+            execution
+            == {
+                "kind": "direct",
+                "profile": None,
+                "receipt": None,
+                "receipt_sha256": None,
+            }
+            and row.get("env_overrides") == {"PYTHONDONTWRITEBYTECODE": "1"},
+            f"{label} direct quality execution metadata mismatch",
+        )
+        return None
+    profile_name = vnext_g01a_bounded_profile(command)
+    require_gate(
+        execution.get("kind") == "bounded-command"
+        and execution.get("profile") == profile_name
+        and row.get("env_overrides") == VNEXT_G01A_BOUNDED_TEST_ENV_OVERRIDES,
+        f"{label} bounded execution metadata mismatch",
+    )
+    receipt = validate_bounded_command_receipt(
+        execution.get("receipt"),
+        expected_command=command,
+        expected_cwd=REPO_ROOT,
+        expected_limits=VNEXT_G01A_BOUNDED_TEST_PROFILES[profile_name],
+        stdout_bytes=stdout.encode("utf-8"),
+        stderr_bytes=stderr.encode("utf-8"),
+        label=label,
+    )
+    require_gate(
+        require_sha256(execution.get("receipt_sha256"), f"{label}.receipt_sha256")
+        == canonical_json_sha256(receipt),
+        f"{label} bounded receipt SHA256 mismatch",
+    )
+    return receipt
+
+
+def summarize_vnext_g01a_bounded_execution(
+    rows: list[tuple[str, dict[str, Any]]],
+) -> dict[str, Any]:
+    profile_counts = {name: 0 for name in VNEXT_G01A_BOUNDED_TEST_PROFILES}
+    receipts: list[dict[str, Any]] = []
+    for profile_name, receipt in rows:
+        profile_counts[profile_name] += 1
+        receipts.append(receipt)
+    require_gate(
+        len(receipts) == VNEXT_G01A_BOUNDED_TEST_COMMAND_COUNT,
+        "vnext-g01a bounded cargo test command count mismatch",
+    )
+    require_gate(
+        profile_counts == {"regular": 16, "resource": 2, "trybuild": 2},
+        "vnext-g01a bounded profile command counts mismatch",
+    )
+    return {
+        "runner": "scripts/release/bounded_command.py",
+        "receipt_schema": VNEXT_G01A_BOUNDED_RECEIPT_SCHEMA,
+        "required_command_count": VNEXT_G01A_BOUNDED_TEST_COMMAND_COUNT,
+        "passed_command_count": len(receipts),
+        "all_process_groups_gone": all(
+            receipt["cleanup"]["process_group_gone"] for receipt in receipts
+        ),
+        "peak_processes": max(receipt["peaks"]["processes"] for receipt in receipts),
+        "peak_group_threads": max(
+            receipt["peaks"]["group_threads"] for receipt in receipts
+        ),
+        "peak_per_process_threads": max(
+            receipt["peaks"]["per_process_threads"] for receipt in receipts
+        ),
+        "profile_counts": profile_counts,
+    }
+
+
+def validate_g0_unit_bench_witnesses(
+    stdout_text: str, stderr_text: str
+) -> dict[str, Any]:
+    require_gate(
+        "Running benches/engine_bench.rs" in stderr_text,
+        "g0 source unit engine_bench execution witness missing",
+    )
+    for bench_case in G0_UNIT_BENCH_CASES:
+        require_gate(
+            f"Testing {bench_case}\nSuccess" in stdout_text,
+            f"g0 source unit engine_bench case witness missing: {bench_case}",
+        )
+    return {
+        "executed_bench_targets": ["engine_bench"],
+        "executed_bench_case_count": len(G0_UNIT_BENCH_CASES),
+    }
+
+
+def validate_g0_source_unit_provenance(
+    lane_command: LaneCommand,
+    child_manifest: dict[str, Any],
+    child_manifest_sha256: str,
+) -> dict[str, Any]:
+    manifest_path = lane_command.child_manifest_path
+    require_gate(manifest_path is not None, "g0 source unit manifest path is missing")
+    root = manifest_path.parent.resolve()
+    require_gate(
+        set(child_manifest)
+        == {
+            "schema_version",
+            "artifact_type",
+            "status",
+            "lane",
+            "pass_line",
+            "command",
+            "env_overrides",
+            "receipt_schema",
+            "limits",
+            "peaks",
+            "cleanup",
+            "bounded_receipt",
+            "stdout_log",
+            "stderr_log",
+        },
+        "g0 source unit manifest field set mismatch",
+    )
+    require_gate(
+        child_manifest.get("schema_version") == 1
+        and child_manifest.get("artifact_type") == "g0_source_unit_bounded_gate"
+        and child_manifest.get("lane") == "unit",
+        "g0 source unit manifest schema/lane mismatch",
+    )
+    manifest_limits = require_object(child_manifest.get("limits"), "g0 source unit limits")
+    require_gate(
+        child_manifest.get("command") == G0_UNIT_BOUNDED_COMMAND
+        and child_manifest.get("env_overrides") == G0_UNIT_BOUNDED_ENV_OVERRIDES
+        and child_manifest.get("receipt_schema") == VNEXT_G01A_BOUNDED_RECEIPT_SCHEMA
+        and set(manifest_limits) == set(G0_UNIT_BOUNDED_LIMITS)
+        and all(
+            isinstance(manifest_limits.get(key), (int, float))
+            and not isinstance(manifest_limits.get(key), bool)
+            and manifest_limits[key] == value
+            for key, value in G0_UNIT_BOUNDED_LIMITS.items()
+        ),
+        "g0 source unit bounded command metadata mismatch",
+    )
+
+    def artifact_ref(name: str) -> tuple[Path, dict[str, Any]]:
+        ref = require_object(child_manifest.get(name), f"g0 source unit {name}")
+        require_gate(
+            set(ref) == {"path", "sha256", "size_bytes"},
+            f"g0 source unit {name} field set mismatch",
+        )
+        path, _ = child_artifact_path(root, ref.get("path"), f"g0 source unit {name}.path")
+        digest = require_sha256(ref.get("sha256"), f"g0 source unit {name}.sha256")
+        size = ref.get("size_bytes")
+        require_gate(
+            isinstance(size, int)
+            and not isinstance(size, bool)
+            and size >= 0
+            and path.stat().st_size == size
+            and sha256(path) == digest,
+            f"g0 source unit {name} identity mismatch",
+        )
+        return path, ref
+
+    receipt_path, receipt_ref = artifact_ref("bounded_receipt")
+    stdout_path, stdout_ref = artifact_ref("stdout_log")
+    stderr_path, stderr_ref = artifact_ref("stderr_log")
+    receipt = read_json_object(receipt_path, "g0 source unit bounded receipt")
+    stdout_bytes = stdout_path.read_bytes()
+    stderr_bytes = stderr_path.read_bytes()
+    bench_summary = validate_g0_unit_bench_witnesses(
+        stdout_bytes.decode("utf-8"), stderr_bytes.decode("utf-8")
+    )
+    receipt = validate_bounded_command_receipt(
+        receipt,
+        expected_command=G0_UNIT_BOUNDED_COMMAND,
+        expected_cwd=REPO_ROOT,
+        expected_limits=G0_UNIT_BOUNDED_LIMITS,
+        stdout_bytes=stdout_bytes,
+        stderr_bytes=stderr_bytes,
+        label="g0 source unit",
+    )
+    require_gate(
+        Path(require_string(receipt["stdout"].get("path"), "g0 source unit receipt stdout path")).resolve()
+        == stdout_path.resolve()
+        and Path(require_string(receipt["stderr"].get("path"), "g0 source unit receipt stderr path")).resolve()
+        == stderr_path.resolve(),
+        "g0 source unit receipt log path mismatch",
+    )
+    manifest_peaks = require_object(child_manifest.get("peaks"), "g0 source unit peaks")
+    manifest_cleanup = require_object(child_manifest.get("cleanup"), "g0 source unit cleanup")
+    require_gate(
+        manifest_peaks == receipt["peaks"]
+        and all(
+            isinstance(manifest_peaks.get(key), int)
+            and not isinstance(manifest_peaks.get(key), bool)
+            for key in (
+                "processes",
+                "group_threads",
+                "per_process_threads",
+                "per_process_threads_pid",
+            )
+        )
+        and set(manifest_cleanup) == {"process_group_gone"}
+        and manifest_cleanup.get("process_group_gone") is True,
+        "g0 source unit bounded summary mismatch",
+    )
+    return {
+        "kind": "g0-source-unit",
+        "child_manifest": {"path": str(manifest_path), "sha256": child_manifest_sha256},
+        "command": copy.deepcopy(G0_UNIT_BOUNDED_COMMAND),
+        "env_overrides": copy.deepcopy(G0_UNIT_BOUNDED_ENV_OVERRIDES),
+        **bench_summary,
+        "receipt": copy.deepcopy(receipt_ref),
+        "stdout": copy.deepcopy(stdout_ref),
+        "stderr": copy.deepcopy(stderr_ref),
+        "limits": copy.deepcopy(G0_UNIT_BOUNDED_LIMITS),
+        "peaks": copy.deepcopy(receipt["peaks"]),
+        "cleanup": {"process_group_gone": True},
+    }
+
+
+def validate_vnext_g01a_semantic_summary(raw: Any) -> dict[str, Any]:
+    summary = require_object(raw, "vnext-g01a semantic contracts")
+    require_gate(
+        set(summary)
+        == {
+            "schema_version",
+            "execution_identity",
+            "event_transition",
+            "required_type_kinds",
+            "definition_counts",
+            "dnf_retry_authority",
+            "multi_participant_dispatch",
+            "public_raw_dynamic_resource_shape",
+        }
+        and summary.get("schema_version") == 1,
+        "vnext-g01a semantic contract schema mismatch",
+    )
+
+    identity = require_object(
+        summary.get("execution_identity"), "vnext-g01a execution identity contract"
+    )
+    require_gate(
+        set(identity) == {"constant", "major", "minor", "definition_count"}
+        and identity.get("constant") == "EXECUTION_IDENTITY_VERSION"
+        and (identity.get("major"), identity.get("minor"))
+        == VNEXT_G01A_EXECUTION_IDENTITY_VERSION
+        and identity.get("definition_count") == 1,
+        "vnext-g01a execution identity version must be exactly 3.0",
+    )
+
+    transition = require_object(
+        summary.get("event_transition"), "vnext-g01a event transition contract"
+    )
+    require_gate(
+        set(transition)
+        == {
+            "enum",
+            "required_variant",
+            "required_variant_count",
+            "forbidden_identifier",
+            "forbidden_identifier_count",
+        }
+        and transition.get("enum") == "ExecutionEventKind"
+        and transition.get("required_variant")
+        == VNEXT_G01A_EVENT_REQUIRED_TRANSITION
+        and transition.get("required_variant_count") == 1,
+        f"vnext-g01a must define exactly one {VNEXT_G01A_EVENT_REQUIRED_TRANSITION}",
+    )
+    require_gate(
+        transition.get("forbidden_identifier")
+        == VNEXT_G01A_EVENT_FORBIDDEN_TRANSITION
+        and transition.get("forbidden_identifier_count") == 0,
+        f"vnext-g01a event contract must contain zero {VNEXT_G01A_EVENT_FORBIDDEN_TRANSITION} identifiers",
+    )
+
+    type_kinds = require_object(
+        summary.get("required_type_kinds"), "vnext-g01a semantic type kinds"
+    )
+    require_gate(
+        type_kinds == VNEXT_G01A_SEMANTIC_TYPE_KINDS,
+        "vnext-g01a semantic type/kind matrix mismatch",
+    )
+    definition_counts = require_object(
+        summary.get("definition_counts"), "vnext-g01a semantic definition counts"
+    )
+    require_gate(
+        set(definition_counts) == set(VNEXT_G01A_SEMANTIC_TYPE_KINDS)
+        and all(
+            isinstance(count, int)
+            and not isinstance(count, bool)
+            and count == 1
+            for count in definition_counts.values()
+        ),
+        "vnext-g01a semantic type definition count matrix mismatch",
+    )
+
+    retry = require_object(
+        summary.get("dnf_retry_authority"), "vnext-g01a DNF retry authority"
+    )
+    require_gate(
+        set(retry)
+        == {"type_name", "field_sealed", "public_associated_constructor_count"}
+        and retry.get("type_name") == VNEXT_G01A_DNF_RETRY_AUTHORITY_TYPE
+        and retry.get("field_sealed") is True
+        and retry.get("public_associated_constructor_count") == 0,
+        "vnext-g01a DefinitelyNotSubmitted retry authority is not sealed",
+    )
+
+    dispatch = require_object(
+        summary.get("multi_participant_dispatch"),
+        "vnext-g01a multi-participant dispatch",
+    )
+    require_gate(
+        set(dispatch)
+        == {
+            "owner",
+            "required_markers",
+            "observed_markers",
+            "matching_public_method_count",
+        }
+        and dispatch.get("owner") == "OperationDispatch"
+        and dispatch.get("required_markers")
+        == VNEXT_G01A_MULTIPARTICIPANT_DISPATCH_MARKERS,
+        "vnext-g01a multi-participant dispatch marker matrix mismatch",
+    )
+    observed_markers = require_object(
+        dispatch.get("observed_markers"),
+        "vnext-g01a observed multi-participant dispatch markers",
+    )
+    require_gate(
+        set(observed_markers) == set(VNEXT_G01A_MULTIPARTICIPANT_DISPATCH_MARKERS)
+        and all(observed is True for observed in observed_markers.values()),
+        "vnext-g01a multi-participant dispatch marker is missing",
+    )
+    require_gate(
+        dispatch.get("matching_public_method_count") == 1,
+        "vnext-g01a must have exactly one public multi-participant dispatch method",
+    )
+
+    raw_shape = require_object(
+        summary.get("public_raw_dynamic_resource_shape"),
+        "vnext-g01a public raw DynamicResourceShape contract",
+    )
+    require_gate(
+        set(raw_shape)
+        == {
+            "type_name",
+            "unrestricted_public_type_count",
+            "unrestricted_public_impl_method_count",
+            "unrestricted_public_parameter_path_count",
+        }
+        and raw_shape.get("type_name") == "DynamicResourceShape",
+        "vnext-g01a public raw DynamicResourceShape schema mismatch",
+    )
+    for count_name in (
+        "unrestricted_public_type_count",
+        "unrestricted_public_impl_method_count",
+        "unrestricted_public_parameter_path_count",
+    ):
+        count = raw_shape.get(count_name)
+        require_gate(
+            isinstance(count, int) and not isinstance(count, bool) and count == 0,
+            f"vnext-g01a public raw DynamicResourceShape {count_name} must be zero",
+        )
+    return copy.deepcopy(summary)
+
+
+def validate_vnext_g01a_provenance(
+    lane_command: LaneCommand,
+    child_manifest: dict[str, Any],
+    child_manifest_sha256: str,
+    *,
+    verify_checkout: bool = True,
+) -> dict[str, Any]:
+    manifest_path = lane_command.child_manifest_path
+    require_gate(manifest_path is not None, "vnext-g01a delegated manifest path is missing")
+    checkpoint_root = manifest_path.parent.resolve()
+    output_root = checkpoint_root.parent.resolve()
+    require_gate(
+        manifest_path.resolve() == output_root / "g01a-contract-checkpoint/manifest.json",
+        "vnext-g01a child manifest path mismatch",
+    )
+    require_gate(child_manifest.get("schema_version") == 1, "vnext-g01a schema_version mismatch")
+    require_gate(
+        child_manifest.get("artifact_type")
+        == "runtime_vnext_g01a_contract_checkpoint_manifest",
+        "vnext-g01a artifact_type mismatch",
+    )
+    require_gate(
+        child_manifest.get("checkpoint_id") == "G01A"
+        and child_manifest.get("lane") == "runtime-vnext-g01a",
+        "vnext-g01a checkpoint/lane mismatch",
+    )
+    require_gate(
+        child_manifest.get("canonical") is True and child_manifest.get("status") == "pass",
+        "vnext-g01a canonical/status mismatch",
+    )
+    require_gate(
+        Path(require_string(child_manifest.get("artifact_dir"), "vnext-g01a artifact_dir")).resolve()
+        == checkpoint_root,
+        "vnext-g01a artifact_dir mismatch",
+    )
+    require_gate(
+        Path(require_string(child_manifest.get("output_root"), "vnext-g01a output_root")).resolve()
+        == output_root,
+        "vnext-g01a output_root mismatch",
+    )
+    expected_pass = f"FERRUM RUNTIME VNEXT G01A CONTRACT CHECKPOINT PASS: {output_root}"
+    require_gate(child_manifest.get("pass_line") == expected_pass, "vnext-g01a pass_line mismatch")
+    require_exact_string_set(child_manifest.get("unlocks"), {"G01B"}, "vnext-g01a unlocks")
+    require_exact_string_set(
+        child_manifest.get("does_not_prove"),
+        VNEXT_G01A_DOES_NOT_PROVE,
+        "vnext-g01a does_not_prove",
+    )
+
+    freshness = require_object(child_manifest.get("freshness"), "vnext-g01a freshness")
+    expected_freshness = {
+        "checkout_clean",
+        "g00a_outer_matches_current_head",
+        "g00a_child_matches_current_head_and_tree",
+        "g00a_artifact_index_verified",
+        "contract_files_match_current_head_blobs",
+        "compile_tests_ran_on_current_head",
+    }
+    require_gate(set(freshness) == expected_freshness, "vnext-g01a freshness field set mismatch")
+    require_gate(all(value is True for value in freshness.values()), "vnext-g01a freshness contains a non-true value")
+
+    artifact_index = validate_child_artifact_index(
+        checkpoint_root, child_manifest, role_from_top_level_path=False
+    )
+    require_gate(
+        set(artifact_index) == {"adr.md", "contract-map.json", "compile-unit-trybuild.json"},
+        "vnext-g01a artifact set mismatch",
+    )
+    require_gate(child_manifest.get("artifact_count") == 3, "vnext-g01a artifact_count mismatch")
+
+    source = require_object(child_manifest.get("source"), "vnext-g01a source")
+    source_sha = require_git_sha(source.get("git_sha"), "vnext-g01a source.git_sha")
+    source_tree = require_git_sha(source.get("git_tree_sha"), "vnext-g01a source.git_tree_sha")
+    require_gate(source.get("dirty") is False and source.get("status_short") == [], "vnext-g01a source dirty state mismatch")
+    if verify_checkout:
+        require_gate(git_sha() == source_sha, "vnext-g01a source SHA is stale against current HEAD")
+        require_gate(
+            git_output(["rev-parse", "HEAD^{tree}"]) == source_tree,
+            "vnext-g01a source tree is stale against current HEAD",
+        )
+        require_gate(not git_dirty_status()["is_dirty"], "vnext-g01a run_gate checkout must remain clean")
+
+    g00a = require_object(child_manifest.get("g00a"), "vnext-g01a G00a binding")
+    require_gate(
+        set(g00a)
+        == {
+            "outer_manifest",
+            "child_manifest",
+            "artifact_index_sha256",
+            "source",
+            "coupling_inventory",
+        },
+        "vnext-g01a G00a binding field set mismatch",
+    )
+    g00a_source = require_object(g00a.get("source"), "vnext-g01a G00a source")
+    require_gate(
+        g00a_source == {"git_sha": source_sha, "git_tree_sha": source_tree},
+        "vnext-g01a G00a/current source binding mismatch",
+    )
+    for key, expected_name in (("outer_manifest", "gate.manifest.json"), ("child_manifest", "manifest.json")):
+        ref = require_object(g00a.get(key), f"vnext-g01a G00a {key}")
+        path = Path(require_string(ref.get("path"), f"vnext-g01a G00a {key}.path")).resolve()
+        require_gate(path.name == expected_name and path.is_file() and not path.is_symlink(), f"vnext-g01a G00a {key} path mismatch")
+        require_gate(
+            sha256(path) == require_sha256(ref.get("sha256"), f"vnext-g01a G00a {key}.sha256"),
+            f"vnext-g01a G00a {key} SHA mismatch",
+        )
+    outer_path = Path(g00a["outer_manifest"]["path"]).resolve()
+    child_path = Path(g00a["child_manifest"]["path"]).resolve()
+    require_gate(outer_path.parent == child_path.parent, "vnext-g01a G00a outer/child roots differ")
+    g00a_outer = read_json_object(outer_path, "vnext-g01a bound G00a outer manifest")
+    g00a_child = read_json_object(child_path, "vnext-g01a bound G00a child manifest")
+    require_gate(
+        g00a_outer.get("lane") == "vnext-g00a"
+        and g00a_outer.get("status") == "pass"
+        and g00a_outer.get("git_sha") == source_sha,
+        "vnext-g01a bound G00a outer is stale or invalid",
+    )
+    g00a_collector = require_object(g00a_child.get("collector"), "vnext-g01a bound G00a collector")
+    require_gate(
+        g00a_child.get("status") == "pass"
+        and g00a_child.get("checkpoint_id") == "G00a"
+        and g00a_collector.get("git_sha") == source_sha
+        and g00a_collector.get("git_tree_sha") == source_tree,
+        "vnext-g01a bound G00a child is stale or invalid",
+    )
+    bound_outer_child = require_object(
+        g00a_outer.get("child_artifacts"),
+        "vnext-g01a bound G00a outer child_artifacts",
+    )
+    require_gate(
+        bound_outer_child.get("kind") == "vnext-g00a"
+        and require_object(
+            bound_outer_child.get("child_manifest"),
+            "vnext-g01a bound G00a outer child_manifest",
+        )
+        == g00a["child_manifest"],
+        "vnext-g01a bound G00a outer/child manifest reference mismatch",
+    )
+    require_gate(
+        bound_outer_child.get("artifact_index_sha256")
+        == g00a.get("artifact_index_sha256"),
+        "vnext-g01a bound G00a outer artifact-index reference mismatch",
+    )
+    validate_vnext_g00a_provenance(
+        LaneCommand(
+            cmd=[],
+            expected_child_pass_line=g00a_child.get("pass_line"),
+            child_manifest_path=child_path,
+            provenance_kind="vnext-g00a",
+        ),
+        g00a_child,
+        require_sha256(
+            g00a["child_manifest"].get("sha256"),
+            "vnext-g01a G00a child manifest SHA256",
+        ),
+        verify_checkout=verify_checkout,
+    )
+    require_gate(
+        canonical_json_sha256(g00a_child.get("artifact_index"))
+        == require_sha256(g00a.get("artifact_index_sha256"), "vnext-g01a G00a artifact_index_sha256"),
+        "vnext-g01a bound G00a artifact index digest mismatch",
+    )
+    inventory_ref = require_object(g00a.get("coupling_inventory"), "vnext-g01a G00a coupling inventory")
+    inventory_path = Path(require_string(inventory_ref.get("path"), "vnext-g01a G00a coupling inventory path")).resolve()
+    require_gate(inventory_path == outer_path.parent / "coupling-inventory.json", "vnext-g01a coupling inventory path mismatch")
+    require_gate(
+        inventory_ref.get("backend_trait_method_count") == 82
+        and sha256(inventory_path) == require_sha256(inventory_ref.get("sha256"), "vnext-g01a coupling inventory SHA256"),
+        "vnext-g01a coupling inventory identity/count mismatch",
+    )
+
+    contract_rows = require_list(child_manifest.get("contract_files"), "vnext-g01a contract_files")
+    contracts: dict[str, dict[str, Any]] = {}
+    for index, raw in enumerate(contract_rows):
+        row = require_object(raw, f"vnext-g01a contract_files[{index}]")
+        require_gate(set(row) == {"path", "git_blob", "sha256", "size_bytes"}, f"vnext-g01a contract_files[{index}] field set mismatch")
+        relative = require_string(row.get("path"), f"vnext-g01a contract_files[{index}].path")
+        path = REPO_ROOT / relative
+        require_gate(relative not in contracts, f"duplicate vnext-g01a contract path: {relative}")
+        require_gate(path.is_file() and not path.is_symlink(), f"missing vnext-g01a contract path: {relative}")
+        size = row.get("size_bytes")
+        require_gate(isinstance(size, int) and not isinstance(size, bool) and size > 0 and path.stat().st_size == size, f"vnext-g01a contract size mismatch: {relative}")
+        require_gate(sha256(path) == require_sha256(row.get("sha256"), f"vnext-g01a contract {relative}.sha256"), f"vnext-g01a contract SHA mismatch: {relative}")
+        blob = require_string(row.get("git_blob"), f"vnext-g01a contract {relative}.git_blob")
+        require_gate(re.fullmatch(r"[0-9a-f]{40,64}", blob) is not None, f"vnext-g01a contract Git blob invalid: {relative}")
+        if verify_checkout:
+            require_gate(git_output(["rev-parse", f"HEAD:{relative}"]) == blob, f"vnext-g01a contract Git blob mismatch: {relative}")
+        contracts[relative] = row
+    require_gate(
+        set(contracts) == discover_vnext_g01a_contract_paths(),
+        "vnext-g01a contract path discovery/binding mismatch",
+    )
+    require_gate(
+        canonical_json_sha256(contract_rows)
+        == require_sha256(child_manifest.get("contract_files_sha256"), "vnext-g01a contract_files_sha256"),
+        "vnext-g01a contract file list digest mismatch",
+    )
+    copy_bindings = {
+        "adr.md": "docs/goals/runtime-vnext-0.8.0-2026-07-10/G01A_CONTRACT_ADR.md",
+        "contract-map.json": "docs/goals/runtime-vnext-0.8.0-2026-07-10/G01A_LEGACY_CONTRACT_MAP.json",
+    }
+    for artifact, relative in copy_bindings.items():
+        require_gate(artifact_index[artifact]["sha256"] == contracts[relative]["sha256"], f"vnext-g01a copied artifact differs from Git-bound source: {artifact}")
+
+    contracts_summary = require_object(child_manifest.get("contracts"), "vnext-g01a contracts summary")
+    require_gate(
+        set(require_list(contracts_summary.get("required_contracts"), "vnext-g01a required contracts"))
+        == VNEXT_G01A_REQUIRED_CONTRACTS
+        and contracts_summary.get("required_contract_count") == 9,
+        "vnext-g01a required contract matrix mismatch",
+    )
+    require_gate(contracts_summary.get("architecture_named_symbol_count") == 0, "vnext-g01a architecture-named contract count is nonzero")
+    require_gate(contracts_summary.get("silent_success_default_count") == 0, "vnext-g01a silent success default count is nonzero")
+    definition_counts = require_object(
+        contracts_summary.get("definition_counts"),
+        "vnext-g01a contract definition counts",
+    )
+    require_gate(
+        set(definition_counts) == VNEXT_G01A_REQUIRED_CONTRACTS
+        and all(value == 1 for value in definition_counts.values()),
+        "vnext-g01a contract definition count matrix mismatch",
+    )
+    forbidden = require_object(contracts_summary.get("forbidden_pattern_counts"), "vnext-g01a forbidden pattern counts")
+    require_gate(forbidden and all(value == 0 for value in forbidden.values()), "vnext-g01a forbidden pattern count is nonzero")
+    semantic_contracts = validate_vnext_g01a_semantic_summary(
+        contracts_summary.get("semantic_contracts")
+    )
+    isolation = require_object(child_manifest.get("isolation"), "vnext-g01a isolation")
+    require_gate(isolation.get("allowed_module_declaration_count") == 1 and isolation.get("outside_vnext_reference_count") == 0, "vnext-g01a isolation audit mismatch")
+    mapping = require_object(child_manifest.get("legacy_mapping"), "vnext-g01a legacy mapping")
+    require_gate(
+        mapping.get("mapped") == 82
+        and mapping.get("unmapped") == 0
+        and mapping.get("missing_owner") == 0
+        and mapping.get("special_case") == 0,
+        "vnext-g01a legacy mapping summary mismatch",
+    )
+    map_document = read_json_object(
+        checkpoint_root / "contract-map.json",
+        "vnext-g01a copied legacy contract map",
+    )
+    require_gate(
+        set(map_document)
+        == {"schema_version", "artifact_type", "source", "mappings", "summary"}
+        and map_document.get("schema_version") == 1
+        and map_document.get("artifact_type")
+        == "runtime_vnext_g01a_legacy_contract_map",
+        "vnext-g01a copied legacy contract map schema mismatch",
+    )
+    require_gate(
+        map_document.get("source")
+        == {
+            "g00a_checkpoint_id": "G00a",
+            "category": "backend_trait_method",
+            "expected_method_count": 82,
+        }
+        and map_document.get("summary")
+        == {"mapped": 82, "unmapped": 0, "missing_owner": 0, "special_case": 0},
+        "vnext-g01a copied legacy contract map source/summary mismatch",
+    )
+    map_rows = require_list(map_document.get("mappings"), "vnext-g01a legacy mappings")
+    require_gate(len(map_rows) == 82, "vnext-g01a copied legacy map must contain 82 rows")
+    map_keys: set[tuple[str, str]] = set()
+    allowed_classifications = {
+        "stable_device_primitive",
+        "versioned_operation",
+        "model_semantic",
+        "dead_code",
+    }
+    for index, raw in enumerate(map_rows):
+        row = require_object(raw, f"vnext-g01a legacy mappings[{index}]")
+        require_gate(
+            set(row)
+            == {"legacy_trait", "legacy_method", "classification", "owner", "disposition"},
+            f"vnext-g01a legacy mapping field set mismatch: {index}",
+        )
+        key = (
+            require_string(row.get("legacy_trait"), f"vnext-g01a legacy mappings[{index}].legacy_trait"),
+            require_string(row.get("legacy_method"), f"vnext-g01a legacy mappings[{index}].legacy_method"),
+        )
+        require_gate(key not in map_keys, f"duplicate vnext-g01a legacy mapping: {key}")
+        map_keys.add(key)
+        require_gate(
+            row.get("classification") in allowed_classifications
+            and bool(require_string(row.get("owner"), f"vnext-g01a legacy mappings[{index}].owner"))
+            and "special" not in require_string(
+                row.get("disposition"),
+                f"vnext-g01a legacy mappings[{index}].disposition",
+            ).lower(),
+            f"vnext-g01a legacy mapping classification/owner/disposition invalid: {key}",
+        )
+    inventory_document = read_json_object(
+        inventory_path,
+        "vnext-g01a bound G00a coupling inventory",
+    )
+    inventory_findings = require_list(
+        require_object(
+            inventory_document.get("coupling"),
+            "vnext-g01a bound G00a inventory coupling",
+        ).get("findings"),
+        "vnext-g01a bound G00a coupling findings",
+    )
+    inventory_method_keys = {
+        (
+            require_string(row.get("trait"), "vnext-g01a inventory backend trait"),
+            require_string(row.get("symbol"), "vnext-g01a inventory backend method"),
+        )
+        for raw in inventory_findings
+        if (row := require_object(raw, "vnext-g01a inventory finding")).get("category")
+        == "backend_trait_method"
+    }
+    require_gate(
+        len(inventory_method_keys) == 82 and map_keys == inventory_method_keys,
+        "vnext-g01a copied legacy map differs from bound G00a method inventory",
+    )
+
+    evidence_ref = require_object(child_manifest.get("compile_evidence"), "vnext-g01a compile evidence ref")
+    require_gate(evidence_ref == artifact_index["compile-unit-trybuild.json"], "vnext-g01a compile evidence/index mismatch")
+    evidence = read_json_object(checkpoint_root / "compile-unit-trybuild.json", "vnext-g01a compile evidence")
+    require_gate(
+        set(evidence)
+        == {
+            "schema_version",
+            "artifact_type",
+            "source",
+            "command_count",
+            "commands_passed",
+            "commands",
+            "bounded_execution",
+            "tests",
+            "assertions",
+        },
+        "vnext-g01a compile evidence field set mismatch",
+    )
+    require_gate(evidence.get("schema_version") == 1 and evidence.get("artifact_type") == "runtime_vnext_g01a_compile_unit_trybuild_evidence", "vnext-g01a compile evidence schema mismatch")
+    require_gate(evidence.get("source") == source, "vnext-g01a compile evidence source mismatch")
+    commands = require_list(evidence.get("commands"), "vnext-g01a compile commands")
+    require_gate(evidence.get("command_count") == len(commands) and evidence.get("commands_passed") == len(commands), "vnext-g01a compile command count mismatch")
+
+    def test_command(target: str, mode: str) -> tuple[str, ...]:
+        return (
+            "cargo",
+            "test",
+            "-p",
+            "ferrum-interfaces",
+            "--test",
+            target,
+            "--",
+            mode,
+            VNEXT_G01A_TEST_THREADS_ARG,
+        )
+
+    def admission_test_command(mode: str) -> tuple[str, ...]:
+        return (
+            "cargo",
+            "test",
+            "-p",
+            "ferrum-interfaces",
+            "--no-default-features",
+            "vnext::admission",
+            "--lib",
+            "--",
+            mode,
+            VNEXT_G01A_TEST_THREADS_ARG,
+        )
+
+    expected_command_sequence = list(VNEXT_G01A_QUALITY_COMMANDS)
+    expected_command_sequence.extend(
+        test_command(target, "--list")
+        for target in VNEXT_G01A_REQUIRED_TESTS_BY_TARGET
+    )
+    expected_command_sequence.extend(
+        test_command(target, "--nocapture")
+        for target in VNEXT_G01A_REQUIRED_TESTS_BY_TARGET
+    )
+    expected_command_sequence.append(admission_test_command("--list"))
+    expected_command_sequence.append(admission_test_command("--nocapture"))
+    require_gate(
+        len(commands) == len(expected_command_sequence) == 23,
+        "vnext-g01a compile evidence must contain exactly 23 commands",
+    )
+    command_outputs: dict[tuple[str, ...], str] = {}
+    actual_command_sequence: list[tuple[str, ...]] = []
+    bounded_rows: list[tuple[str, dict[str, Any]]] = []
+    for index, raw in enumerate(commands):
+        row = require_object(raw, f"vnext-g01a compile commands[{index}]")
+        require_gate(
+            set(row)
+            == {
+                "command",
+                "cwd",
+                "env_overrides",
+                "started_at",
+                "finished_at",
+                "duration_sec",
+                "returncode",
+                "stdout",
+                "stderr",
+                "stdout_sha256",
+                "stderr_sha256",
+                "execution",
+            },
+            f"vnext-g01a compile command field set mismatch: {index}",
+        )
+        require_gate(row.get("returncode") == 0, f"vnext-g01a compile command failed: {index}")
+        require_gate(
+            Path(require_string(row.get("cwd"), f"vnext-g01a compile commands[{index}].cwd")).resolve()
+            == REPO_ROOT.resolve(),
+            f"vnext-g01a compile command execution context mismatch: {index}",
+        )
+        require_gate(
+            isinstance(row.get("duration_sec"), (int, float))
+            and not isinstance(row.get("duration_sec"), bool)
+            and row["duration_sec"] >= 0
+            and bool(require_string(row.get("started_at"), f"vnext-g01a compile commands[{index}].started_at"))
+            and bool(require_string(row.get("finished_at"), f"vnext-g01a compile commands[{index}].finished_at")),
+            f"vnext-g01a compile command timing evidence invalid: {index}",
+        )
+        stdout = row.get("stdout")
+        stderr = row.get("stderr")
+        require_gate(isinstance(stdout, str) and isinstance(stderr, str), f"vnext-g01a compile command output type mismatch: {index}")
+        require_gate(hashlib.sha256(stdout.encode()).hexdigest() == row.get("stdout_sha256"), f"vnext-g01a compile stdout digest mismatch: {index}")
+        require_gate(hashlib.sha256(stderr.encode()).hexdigest() == row.get("stderr_sha256"), f"vnext-g01a compile stderr digest mismatch: {index}")
+        command = tuple(require_list(row.get("command"), f"vnext-g01a compile commands[{index}].command"))
+        require_gate(all(isinstance(part, str) and part for part in command), f"vnext-g01a compile command argv invalid: {index}")
+        require_gate(command not in command_outputs, f"duplicate vnext-g01a compile command: {command}")
+        receipt = validate_vnext_g01a_command_execution(
+            row,
+            command,
+            stdout,
+            stderr,
+            index,
+        )
+        if receipt is not None:
+            bounded_rows.append((vnext_g01a_bounded_profile(command), receipt))
+        command_outputs[command] = stdout
+        actual_command_sequence.append(command)
+    require_gate(
+        actual_command_sequence == expected_command_sequence,
+        "vnext-g01a compile command sequence mismatch",
+    )
+    bounded_summary = summarize_vnext_g01a_bounded_execution(bounded_rows)
+    recorded_bounded_summary = require_object(
+        evidence.get("bounded_execution"), "vnext-g01a bounded execution summary"
+    )
+    require_gate(
+        set(recorded_bounded_summary) == set(bounded_summary)
+        and recorded_bounded_summary.get("all_process_groups_gone") is True
+        and isinstance(recorded_bounded_summary.get("runner"), str)
+        and isinstance(recorded_bounded_summary.get("receipt_schema"), str)
+        and isinstance(recorded_bounded_summary.get("profile_counts"), dict)
+        and all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in recorded_bounded_summary["profile_counts"].values()
+        )
+        and all(
+            isinstance(recorded_bounded_summary.get(key), int)
+            and not isinstance(recorded_bounded_summary.get(key), bool)
+            for key in (
+                "required_command_count",
+                "passed_command_count",
+                "peak_processes",
+                "peak_group_threads",
+                "peak_per_process_threads",
+            )
+        ),
+        "vnext-g01a bounded execution summary types mismatch",
+    )
+    require_gate(
+        recorded_bounded_summary == bounded_summary,
+        "vnext-g01a bounded execution summary mismatch",
+    )
+    for target in VNEXT_G01A_REQUIRED_TESTS_BY_TARGET:
+        command = test_command(target, "--nocapture")
+        summaries = re.findall(
+            r"test result: ok\. (\d+) passed; 0 failed; (\d+) ignored; "
+            r"(\d+) measured; (\d+) filtered out;",
+            command_outputs[command],
+        )
+        require_gate(
+            summaries
+            == [
+                (
+                    str(len(VNEXT_G01A_REQUIRED_TESTS_BY_TARGET[target])),
+                    "0",
+                    "0",
+                    "0",
+                )
+            ],
+            f"vnext-g01a test output exact summary mismatch: {command}",
+        )
+    admission_run_command = admission_test_command("--nocapture")
+    admission_summaries = re.findall(
+        r"test result: ok\. (\d+) passed; 0 failed; (\d+) ignored; "
+        r"(\d+) measured; (\d+) filtered out;",
+        command_outputs[admission_run_command],
+    )
+    require_gate(
+        len(admission_summaries) == 1
+        and admission_summaries[0][:3]
+        == (
+            str(VNEXT_G01A_EXPECTED_DYNAMIC_ADMISSION_CASES),
+            "0",
+            "0",
+        ),
+        f"vnext-g01a admission lib test output exact summary mismatch: {admission_run_command}",
+    )
+    tests = require_object(evidence.get("tests"), "vnext-g01a tests")
+    require_gate(
+        set(tests)
+        == {
+            "test_targets",
+            "required_test_targets",
+            "admission_lib_tests",
+            "required_admission_lib_tests",
+            "trybuild_pass_cases",
+            "trybuild_fail_cases",
+            "trybuild_pass_case_count",
+            "trybuild_fail_case_count",
+        },
+        "vnext-g01a tests field set mismatch",
+    )
+    actual_test_targets = require_object(
+        tests.get("test_targets"), "vnext-g01a exact test targets"
+    )
+    recorded_required_targets = require_object(
+        tests.get("required_test_targets"), "vnext-g01a required test targets"
+    )
+    require_gate(
+        set(actual_test_targets) == set(VNEXT_G01A_REQUIRED_TESTS_BY_TARGET)
+        and set(recorded_required_targets) == set(VNEXT_G01A_REQUIRED_TESTS_BY_TARGET),
+        "vnext-g01a exact test target name set mismatch",
+    )
+    for target, expected_tests in VNEXT_G01A_REQUIRED_TESTS_BY_TARGET.items():
+        actual_tests = require_list(
+            actual_test_targets.get(target), f"vnext-g01a {target} exact tests"
+        )
+        recorded_required = require_list(
+            recorded_required_targets.get(target),
+            f"vnext-g01a {target} recorded required tests",
+        )
+        require_gate(
+            all(isinstance(name, str) and name for name in actual_tests)
+            and len(actual_tests) == len(set(actual_tests))
+            and set(actual_tests) == expected_tests
+            and actual_tests == sorted(expected_tests)
+            and recorded_required == sorted(expected_tests),
+            f"vnext-g01a {target} exact test set mismatch",
+        )
+        listed_lines = command_outputs[test_command(target, "--list")].splitlines()
+        listed_from_command = {
+            match.group(1)
+            for line in listed_lines
+            if (match := re.fullmatch(r"([^:][^:]*): test", line.strip()))
+        }
+        require_gate(
+            listed_from_command == expected_tests,
+            f"vnext-g01a {target} command output test set mismatch",
+        )
+    admission_tests = require_list(
+        tests.get("admission_lib_tests"), "vnext-g01a exact admission lib tests"
+    )
+    required_admission_tests = require_list(
+        tests.get("required_admission_lib_tests"),
+        "vnext-g01a required admission lib tests",
+    )
+    require_gate(
+        all(isinstance(name, str) and name for name in admission_tests)
+        and len(admission_tests) == len(set(admission_tests))
+        and set(admission_tests) == VNEXT_G01A_REQUIRED_ADMISSION_LIB_TESTS
+        and admission_tests == sorted(VNEXT_G01A_REQUIRED_ADMISSION_LIB_TESTS)
+        and required_admission_tests
+        == sorted(VNEXT_G01A_REQUIRED_ADMISSION_LIB_TESTS),
+        "vnext-g01a admission lib exact test set mismatch",
+    )
+    admission_list_stdout = command_outputs[admission_test_command("--list")]
+    admission_listed_from_command = {
+        match.group(1)
+        for line in admission_list_stdout.splitlines()
+        if (
+            match := re.fullmatch(
+                r"(vnext::admission::tests::[A-Za-z0-9_]+): test", line.strip()
+            )
+        )
+    }
+    admission_list_counts = re.findall(
+        r"(?m)^(\d+) tests, (\d+) benchmarks$", admission_list_stdout
+    )
+    require_gate(
+        admission_listed_from_command == VNEXT_G01A_REQUIRED_ADMISSION_LIB_TESTS
+        and admission_list_counts
+        == [(str(VNEXT_G01A_EXPECTED_DYNAMIC_ADMISSION_CASES), "0")],
+        "vnext-g01a admission lib command output test set/count mismatch",
+    )
+    pass_cases = require_list(tests.get("trybuild_pass_cases"), "vnext-g01a trybuild pass cases")
+    fail_cases = require_list(tests.get("trybuild_fail_cases"), "vnext-g01a trybuild fail cases")
+    expected_pass_cases = sorted(
+        relative
+        for relative in contracts
+        if "/tests/ui/vnext/pass/" in relative and relative.endswith(".rs")
+    )
+    expected_fail_cases = sorted(
+        relative
+        for relative in contracts
+        if "/tests/ui/vnext/fail/" in relative and relative.endswith(".rs")
+    )
+    require_gate(
+        pass_cases == expected_pass_cases
+        and fail_cases == expected_fail_cases
+        and tests.get("trybuild_pass_case_count")
+        == len(expected_pass_cases)
+        == VNEXT_G01A_EXPECTED_TRYBUILD_PASS_CASES
+        and tests.get("trybuild_fail_case_count")
+        == len(expected_fail_cases)
+        == VNEXT_G01A_EXPECTED_TRYBUILD_FAIL_CASES,
+        "vnext-g01a trybuild pass/fail coverage differs from Git-bound fixtures",
+    )
+    require_gate(
+        all(case.removesuffix(".rs") + ".stderr" in contracts for case in expected_fail_cases),
+        "vnext-g01a trybuild fail fixture lacks Git-bound stderr",
+    )
+    assertions = require_object(evidence.get("assertions"), "vnext-g01a assertions")
+    expected_assertions = {
+        "deterministic_plan_cases": 100,
+        "schema_round_trip_cases": 100,
+        "breaking_version_reject_cases": 100,
+        "resource_transaction_cases": VNEXT_G01A_EXPECTED_RESOURCE_CASES,
+        "fail_closed_cases": VNEXT_G01A_EXPECTED_FAIL_CLOSED_CASES,
+        "model_identity_cases": VNEXT_G01A_EXPECTED_MODEL_IDENTITY_CASES,
+        "event_replay_v5_contract_cases": VNEXT_G01A_EXPECTED_EVENT_REPLAY_V5_CASES,
+        "device_operation_contract_cases": VNEXT_G01A_EXPECTED_DEVICE_OPERATION_CASES,
+        "operation_oracle_contract_cases": VNEXT_G01A_EXPECTED_ORACLE_CASES,
+        "model_wire_contract_cases": VNEXT_G01A_EXPECTED_MODEL_WIRE_CASES,
+        "dynamic_admission_cases": VNEXT_G01A_EXPECTED_DYNAMIC_ADMISSION_CASES,
+        "legacy_backend_methods_mapped": 82,
+        "legacy_backend_methods_unmapped": 0,
+        "architecture_named_symbol_count": 0,
+        "required_contract_count": 9,
+        "silent_success_default_count": 0,
+        "unknown_fallback_success_count": 0,
+        "outside_vnext_production_reference_count": 0,
+    }
+    require_gate(
+        set(assertions) == set(expected_assertions),
+        "vnext-g01a compile assertion field set mismatch",
+    )
+    require_gate(
+        all(
+            isinstance(assertions.get(key), int)
+            and not isinstance(assertions.get(key), bool)
+            and assertions[key] == value
+            for key, value in expected_assertions.items()
+        ),
+        "vnext-g01a compile assertion summary mismatch",
+    )
+    contract_stdout = command_outputs[
+        test_command("vnext_contract_tests", "--nocapture")
+    ].splitlines()
+    for line in (
+        "VNEXT PLAN DETERMINISM PASS: 100/100",
+        "VNEXT PLAN ROUNDTRIP PASS: 100/100",
+        "VNEXT BREAKING VERSION REJECT PASS: 100/100",
+    ):
+        require_gate(contract_stdout.count(line) == 1, f"vnext-g01a missing or duplicate machine proof line: {line}")
+    for assertion_key, target, prefix in (
+        (
+            "resource_transaction_cases",
+            "vnext_resource_contract_tests",
+            "VNEXT RESOURCE TRANSACTION PASS",
+        ),
+        (
+            "fail_closed_cases",
+            "vnext_contract_tests",
+            "VNEXT FAIL CLOSED PASS",
+        ),
+        (
+            "model_identity_cases",
+            "vnext_contract_tests",
+            "VNEXT MODEL IDENTITY PASS",
+        ),
+        (
+            "event_replay_v5_contract_cases",
+            "vnext_event_contract_tests",
+            "VNEXT EVENT/REPLAY V5 PASS",
+        ),
+        (
+            "device_operation_contract_cases",
+            "vnext_device_operation_contract_tests",
+            "VNEXT DEVICE OPERATION PASS",
+        ),
+        (
+            "operation_oracle_contract_cases",
+            "vnext_oracle_contract_tests",
+            "VNEXT OPERATION ORACLE PASS",
+        ),
+        (
+            "model_wire_contract_cases",
+            "vnext_model_wire_contract_tests",
+            "VNEXT MODEL WIRE PASS",
+        ),
+        (
+            "legacy_backend_methods_mapped",
+            "vnext_legacy_map",
+            "VNEXT LEGACY MAP PASS",
+        ),
+    ):
+        pattern = re.compile(
+            rf"^{re.escape(prefix)}: ([1-9][0-9]*)/([1-9][0-9]*)$"
+        )
+        proof_stdout = command_outputs[test_command(target, "--nocapture")].splitlines()
+        matches = [match for line in proof_stdout if (match := pattern.fullmatch(line))]
+        require_gate(len(matches) == 1, f"vnext-g01a missing or duplicate machine proof ratio: {assertion_key}")
+        passed, total = (int(value) for value in matches[0].groups())
+        require_gate(
+            passed == total == assertions[assertion_key],
+            f"vnext-g01a machine proof ratio/assertion mismatch: {assertion_key}",
+        )
+
+    return {
+        "kind": "vnext-g01a",
+        "child_manifest": {
+            "path": str(manifest_path),
+            "sha256": require_sha256(child_manifest_sha256, "vnext-g01a child manifest SHA256"),
+        },
+        "checkpoint": {
+            "id": "G01A",
+            "unlocks": ["G01B"],
+            "does_not_prove": sorted(VNEXT_G01A_DOES_NOT_PROVE),
+        },
+        "source": {"git_sha": source_sha, "git_tree_sha": source_tree},
+        "g00a": copy.deepcopy(g00a),
+        "artifact_index_sha256": canonical_json_sha256(child_manifest["artifact_index"]),
+        "contract_files_sha256": child_manifest["contract_files_sha256"],
+        "required_contract_count": 9,
+        "semantic_contracts": semantic_contracts,
+        "legacy_backend_methods_mapped": 82,
+        "dynamic_admission_cases": assertions["dynamic_admission_cases"],
+        "bounded_execution": copy.deepcopy(bounded_summary),
+    }
+
+
 def validate_vnext_g00_full_redteam(
     lane_command: LaneCommand,
     stdout: str,
@@ -2180,6 +3829,19 @@ def verify_child_pass_line(
         require_gate(full_redteam is not None, "vnext-g00 full-redteam provenance is missing")
         provenance["full_redteam"] = full_redteam
         return provenance
+    if lane_command.provenance_kind == "vnext-g01a":
+        return validate_vnext_g01a_provenance(
+            lane_command,
+            child_manifest,
+            child_manifest_digest,
+            verify_checkout=verify_checkout,
+        )
+    if lane_command.provenance_kind == "g0-source-unit":
+        return validate_g0_source_unit_provenance(
+            lane_command,
+            child_manifest,
+            child_manifest_digest,
+        )
     return {
         "kind": "delegated-manifest",
         "child_manifest": {
@@ -3671,7 +5333,351 @@ def make_selftest_completion_manifest(path: Path) -> None:
 
 
 def self_test() -> int:
+    import runpy
+
     this_script = Path(__file__).resolve()
+    source_gate_text = (REPO_ROOT / "scripts/release/g0_source_gate.sh").read_text(
+        encoding="utf-8"
+    )
+    shell_command = (
+        "    -- env PYTHONDONTWRITEBYTECODE=1 CARGO_BUILD_JOBS=2 "
+        "RUST_TEST_THREADS=1 \\\n"
+        "      cargo test --workspace --all-targets"
+    )
+    shell_expected_command = """expected_command = [
+    "env",
+    "PYTHONDONTWRITEBYTECODE=1",
+    "CARGO_BUILD_JOBS=2",
+    "RUST_TEST_THREADS=1",
+    "cargo",
+    "test",
+    "--workspace",
+    "--all-targets",
+]"""
+    require_selftest(
+        source_gate_text.count(shell_command) == 1
+        and source_gate_text.count(shell_expected_command) == 1
+        and "-- --test-threads=1" not in source_gate_text,
+        "g0 source shell bounded command policy drift",
+    )
+    g01a_checkpoint = runpy.run_path(
+        str(REPO_ROOT / "scripts/release/runtime_vnext_g01a_checkpoint.py")
+    )
+    require_selftest(
+        set(g01a_checkpoint["REQUIRED_CONTRACTS"])
+        == VNEXT_G01A_REQUIRED_CONTRACTS,
+        "vnext-g01a checkpoint/run_gate required contract matrix drift",
+    )
+    require_selftest(
+        g01a_checkpoint["G01A_EXECUTION_IDENTITY_VERSION"]
+        == VNEXT_G01A_EXECUTION_IDENTITY_VERSION
+        and g01a_checkpoint["G01A_EVENT_REQUIRED_TRANSITION"]
+        == VNEXT_G01A_EVENT_REQUIRED_TRANSITION
+        and g01a_checkpoint["G01A_EVENT_FORBIDDEN_TRANSITION"]
+        == VNEXT_G01A_EVENT_FORBIDDEN_TRANSITION
+        and g01a_checkpoint["G01A_SEMANTIC_TYPE_KINDS"]
+        == VNEXT_G01A_SEMANTIC_TYPE_KINDS
+        and g01a_checkpoint["G01A_DNF_RETRY_AUTHORITY_TYPE"]
+        == VNEXT_G01A_DNF_RETRY_AUTHORITY_TYPE
+        and g01a_checkpoint["G01A_MULTIPARTICIPANT_DISPATCH_MARKERS"]
+        == VNEXT_G01A_MULTIPARTICIPANT_DISPATCH_MARKERS,
+        "vnext-g01a checkpoint/run_gate semantic contract policy drift",
+    )
+
+    semantic_summary = {
+        "schema_version": 1,
+        "execution_identity": {
+            "constant": "EXECUTION_IDENTITY_VERSION",
+            "major": 3,
+            "minor": 0,
+            "definition_count": 1,
+        },
+        "event_transition": {
+            "enum": "ExecutionEventKind",
+            "required_variant": "NodeRetired",
+            "required_variant_count": 1,
+            "forbidden_identifier": "NodeCompleted",
+            "forbidden_identifier_count": 0,
+        },
+        "required_type_kinds": copy.deepcopy(VNEXT_G01A_SEMANTIC_TYPE_KINDS),
+        "definition_counts": {
+            name: 1 for name in VNEXT_G01A_SEMANTIC_TYPE_KINDS
+        },
+        "dnf_retry_authority": {
+            "type_name": VNEXT_G01A_DNF_RETRY_AUTHORITY_TYPE,
+            "field_sealed": True,
+            "public_associated_constructor_count": 0,
+        },
+        "multi_participant_dispatch": {
+            "owner": "OperationDispatch",
+            "required_markers": copy.deepcopy(
+                VNEXT_G01A_MULTIPARTICIPANT_DISPATCH_MARKERS
+            ),
+            "observed_markers": {
+                name: True
+                for name in VNEXT_G01A_MULTIPARTICIPANT_DISPATCH_MARKERS
+            },
+            "matching_public_method_count": 1,
+        },
+        "public_raw_dynamic_resource_shape": {
+            "type_name": "DynamicResourceShape",
+            "unrestricted_public_type_count": 0,
+            "unrestricted_public_impl_method_count": 0,
+            "unrestricted_public_parameter_path_count": 0,
+        },
+    }
+    validate_vnext_g01a_semantic_summary(semantic_summary)
+
+    def expect_semantic_summary_reject(
+        name: str, mutated: dict[str, Any], marker: str
+    ) -> None:
+        try:
+            validate_vnext_g01a_semantic_summary(mutated)
+        except GateError as exc:
+            require_selftest(
+                marker.lower() in str(exc).lower(),
+                f"vnext-g01a semantic mutation {name} rejected for unexpected reason: {exc}",
+            )
+            return
+        raise AssertionError(
+            f"vnext-g01a semantic mutation unexpectedly passed: {name}"
+        )
+
+    identity_v2 = copy.deepcopy(semantic_summary)
+    identity_v2["execution_identity"]["major"] = 2
+    expect_semantic_summary_reject("identity v2", identity_v2, "exactly 3.0")
+    missing_retired = copy.deepcopy(semantic_summary)
+    missing_retired["event_transition"]["required_variant_count"] = 0
+    expect_semantic_summary_reject(
+        "missing NodeRetired", missing_retired, "exactly one NodeRetired"
+    )
+    completed_present = copy.deepcopy(semantic_summary)
+    completed_present["event_transition"]["forbidden_identifier_count"] = 1
+    expect_semantic_summary_reject(
+        "NodeCompleted present", completed_present, "zero NodeCompleted"
+    )
+    for type_name in VNEXT_G01A_SEMANTIC_TYPE_KINDS:
+        missing_type = copy.deepcopy(semantic_summary)
+        missing_type["definition_counts"][type_name] = 0
+        expect_semantic_summary_reject(
+            f"missing {type_name}", missing_type, "definition count matrix"
+        )
+        wrong_kind = copy.deepcopy(semantic_summary)
+        wrong_kind["required_type_kinds"][type_name] = "enum"
+        expect_semantic_summary_reject(
+            f"wrong kind {type_name}", wrong_kind, "type/kind matrix"
+        )
+    wrong_retry_name = copy.deepcopy(semantic_summary)
+    wrong_retry_name["dnf_retry_authority"]["type_name"] = "RetryAuthority"
+    expect_semantic_summary_reject(
+        "retry authority type name", wrong_retry_name, "not sealed"
+    )
+    public_retry_field = copy.deepcopy(semantic_summary)
+    public_retry_field["dnf_retry_authority"]["field_sealed"] = False
+    expect_semantic_summary_reject(
+        "public retry field", public_retry_field, "not sealed"
+    )
+    public_retry_constructor = copy.deepcopy(semantic_summary)
+    public_retry_constructor["dnf_retry_authority"][
+        "public_associated_constructor_count"
+    ] = 1
+    expect_semantic_summary_reject(
+        "public retry constructor", public_retry_constructor, "not sealed"
+    )
+    for marker_name in VNEXT_G01A_MULTIPARTICIPANT_DISPATCH_MARKERS:
+        missing_marker = copy.deepcopy(semantic_summary)
+        missing_marker["multi_participant_dispatch"]["observed_markers"][
+            marker_name
+        ] = False
+        expect_semantic_summary_reject(
+            f"dispatch marker {marker_name}", missing_marker, "marker is missing"
+        )
+    duplicate_dispatch = copy.deepcopy(semantic_summary)
+    duplicate_dispatch["multi_participant_dispatch"][
+        "matching_public_method_count"
+    ] = 2
+    expect_semantic_summary_reject(
+        "duplicate dispatch", duplicate_dispatch, "exactly one public"
+    )
+    for count_name in (
+        "unrestricted_public_type_count",
+        "unrestricted_public_impl_method_count",
+        "unrestricted_public_parameter_path_count",
+    ):
+        public_raw_shape = copy.deepcopy(semantic_summary)
+        public_raw_shape["public_raw_dynamic_resource_shape"][count_name] = 1
+        expect_semantic_summary_reject(
+            f"public raw shape {count_name}", public_raw_shape, count_name
+        )
+    checkpoint_test_targets = g01a_checkpoint["REQUIRED_TESTS_BY_TARGET"]
+    require_selftest(
+        checkpoint_test_targets.keys()
+        == VNEXT_G01A_REQUIRED_TESTS_BY_TARGET.keys()
+        and all(
+            checkpoint_test_targets[target]
+            == VNEXT_G01A_REQUIRED_TESTS_BY_TARGET[target]
+            for target in checkpoint_test_targets
+        ),
+        "vnext-g01a checkpoint/run_gate exact test matrix drift",
+    )
+    require_selftest(
+        g01a_checkpoint["REQUIRED_ADMISSION_LIB_TESTS"]
+        == VNEXT_G01A_REQUIRED_ADMISSION_LIB_TESTS,
+        "vnext-g01a checkpoint/run_gate admission lib test matrix drift",
+    )
+    require_selftest(
+        g01a_checkpoint["QUALITY_COMMANDS"] == VNEXT_G01A_QUALITY_COMMANDS
+        and len(g01a_checkpoint["evidence_command_matrix"]()) == 23,
+        "vnext-g01a checkpoint/run_gate command matrix drift",
+    )
+    checkpoint_commands = g01a_checkpoint["evidence_command_matrix"]()
+    checkpoint_cargo_tests = [
+        command
+        for command in checkpoint_commands
+        if tuple(command[:2]) == ("cargo", "test")
+    ]
+    require_selftest(
+        g01a_checkpoint["TEST_THREADS_ARG"] == VNEXT_G01A_TEST_THREADS_ARG
+        and g01a_checkpoint["BOUNDED_RECEIPT_SCHEMA"]
+        == VNEXT_G01A_BOUNDED_RECEIPT_SCHEMA
+        and g01a_checkpoint["BOUNDED_TEST_COMMAND_COUNT"]
+        == VNEXT_G01A_BOUNDED_TEST_COMMAND_COUNT
+        and g01a_checkpoint["BOUNDED_TEST_ENV_OVERRIDES"]
+        == VNEXT_G01A_BOUNDED_TEST_ENV_OVERRIDES
+        and g01a_checkpoint["BOUNDED_TEST_PROFILES"]
+        == VNEXT_G01A_BOUNDED_TEST_PROFILES
+        and len(checkpoint_cargo_tests) == VNEXT_G01A_BOUNDED_TEST_COMMAND_COUNT
+        and all(
+            command.count(VNEXT_G01A_TEST_THREADS_ARG) == 1
+            for command in checkpoint_cargo_tests
+        ),
+        "vnext-g01a checkpoint/run_gate bounded command policy drift",
+    )
+    for checkpoint_name, outer_value in (
+        ("EXPECTED_RESOURCE_CASES", VNEXT_G01A_EXPECTED_RESOURCE_CASES),
+        ("EXPECTED_FAIL_CLOSED_CASES", VNEXT_G01A_EXPECTED_FAIL_CLOSED_CASES),
+        ("EXPECTED_MODEL_IDENTITY_CASES", VNEXT_G01A_EXPECTED_MODEL_IDENTITY_CASES),
+        (
+            "EXPECTED_EVENT_REPLAY_V5_CASES",
+            VNEXT_G01A_EXPECTED_EVENT_REPLAY_V5_CASES,
+        ),
+        (
+            "EXPECTED_DEVICE_OPERATION_CASES",
+            VNEXT_G01A_EXPECTED_DEVICE_OPERATION_CASES,
+        ),
+        ("EXPECTED_ORACLE_CASES", VNEXT_G01A_EXPECTED_ORACLE_CASES),
+        ("EXPECTED_MODEL_WIRE_CASES", VNEXT_G01A_EXPECTED_MODEL_WIRE_CASES),
+        (
+            "EXPECTED_DYNAMIC_ADMISSION_CASES",
+            VNEXT_G01A_EXPECTED_DYNAMIC_ADMISSION_CASES,
+        ),
+        (
+            "EXPECTED_TRYBUILD_PASS_CASES",
+            VNEXT_G01A_EXPECTED_TRYBUILD_PASS_CASES,
+        ),
+        (
+            "EXPECTED_TRYBUILD_FAIL_CASES",
+            VNEXT_G01A_EXPECTED_TRYBUILD_FAIL_CASES,
+        ),
+    ):
+        require_selftest(
+            g01a_checkpoint[checkpoint_name] == outer_value,
+            f"vnext-g01a checkpoint/run_gate constant drift: {checkpoint_name}",
+        )
+
+    bounded_selftest_row = g01a_checkpoint["selftest_bounded_row"](
+        list(
+            g01a_checkpoint["test_command"](
+                "vnext_resource_contract_tests", "--nocapture"
+            )
+        )
+    )
+
+    def validate_bounded_selftest_row(row: dict[str, Any]) -> None:
+        command = tuple(row["command"])
+        validate_vnext_g01a_command_execution(
+            row,
+            command,
+            row["stdout"],
+            row["stderr"],
+            0,
+        )
+
+    def expect_bounded_selftest_reject(
+        name: str, row: dict[str, Any], marker: str
+    ) -> None:
+        try:
+            validate_bounded_selftest_row(row)
+        except GateError as exc:
+            require_selftest(
+                marker.lower() in str(exc).lower(),
+                f"{name} rejected for unexpected reason: {exc}",
+            )
+            return
+        raise AssertionError(f"vnext-g01a bounded mutation unexpectedly passed: {name}")
+
+    validate_bounded_selftest_row(bounded_selftest_row)
+    missing_receipt = copy.deepcopy(bounded_selftest_row)
+    missing_receipt["execution"]["receipt"] = None
+    missing_receipt["execution"]["receipt_sha256"] = None
+    expect_bounded_selftest_reject(
+        "missing receipt", missing_receipt, "receipt must be a JSON object"
+    )
+
+    cleanup_false = copy.deepcopy(bounded_selftest_row)
+    cleanup_false["execution"]["receipt"]["cleanup"]["process_group_gone"] = False
+    cleanup_false["execution"]["receipt_sha256"] = canonical_json_sha256(
+        cleanup_false["execution"]["receipt"]
+    )
+    expect_bounded_selftest_reject(
+        "cleanup false", cleanup_false, "process group cleanup failed"
+    )
+
+    peak_exceeded = copy.deepcopy(bounded_selftest_row)
+    peak_exceeded["execution"]["receipt"]["peaks"]["group_threads"] = (
+        VNEXT_G01A_BOUNDED_TEST_PROFILES["resource"]["max_group_threads"] + 1
+    )
+    peak_exceeded["execution"]["receipt_sha256"] = canonical_json_sha256(
+        peak_exceeded["execution"]["receipt"]
+    )
+    expect_bounded_selftest_reject(
+        "peak exceeded", peak_exceeded, "peak exceeds"
+    )
+
+    sampling_error = copy.deepcopy(bounded_selftest_row)
+    sampling_error["execution"]["receipt"]["sampling_error_count"] = 1
+    sampling_error["execution"]["receipt"]["sampling_errors"] = [
+        {"at": "2026-07-11T00:00:00.050Z", "type": "Synthetic", "error": "sample"}
+    ]
+    sampling_error["execution"]["receipt_sha256"] = canonical_json_sha256(
+        sampling_error["execution"]["receipt"]
+    )
+    expect_bounded_selftest_reject(
+        "sampling error", sampling_error, "contains sampling errors"
+    )
+
+    command_mismatch = copy.deepcopy(bounded_selftest_row)
+    command_mismatch["execution"]["receipt"]["command"].append("--unexpected")
+    command_mismatch["execution"]["receipt_sha256"] = canonical_json_sha256(
+        command_mismatch["execution"]["receipt"]
+    )
+    expect_bounded_selftest_reject(
+        "command mismatch", command_mismatch, "receipt command mismatch"
+    )
+
+    missing_threads = copy.deepcopy(bounded_selftest_row)
+    missing_threads["command"].remove(VNEXT_G01A_TEST_THREADS_ARG)
+    missing_threads["execution"]["receipt"]["command"].remove(
+        VNEXT_G01A_TEST_THREADS_ARG
+    )
+    missing_threads["execution"]["receipt_sha256"] = canonical_json_sha256(
+        missing_threads["execution"]["receipt"]
+    )
+    expect_bounded_selftest_reject(
+        "missing test threads",
+        missing_threads,
+        "must contain exactly one --test-threads=1",
+    )
     require_selftest(
         validate_safetensors_shard_paths(
             {
@@ -3749,6 +5755,186 @@ def self_test() -> int:
             dry_manifest["child_pass_line"] == source_pass_line("unit", dry_out),
             dry_manifest,
         )
+        unit_root = root / "unit-bounded-provenance"
+        bounded_root = unit_root / "unit-bounded"
+        bounded_root.mkdir(parents=True)
+        unit_stdout = bounded_root / "stdout.log"
+        unit_stderr = bounded_root / "stderr.log"
+        unit_receipt_path = bounded_root / "receipt.json"
+        unit_stdout.write_text(
+            "\n".join(f"Testing {case}\nSuccess" for case in G0_UNIT_BENCH_CASES)
+            + "\n",
+            encoding="utf-8",
+        )
+        unit_stderr.write_text(
+            "     Running benches/engine_bench.rs (target/debug/deps/engine_bench-selftest)\n",
+            encoding="utf-8",
+        )
+        unit_receipt = {
+            "schema": VNEXT_G01A_BOUNDED_RECEIPT_SCHEMA,
+            "command": copy.deepcopy(G0_UNIT_BOUNDED_COMMAND),
+            "cwd": str(REPO_ROOT),
+            "pid": 5252,
+            "pgid": 5252,
+            "limits": copy.deepcopy(G0_UNIT_BOUNDED_LIMITS),
+            "peaks": {
+                "processes": 1,
+                "group_threads": 2,
+                "per_process_threads": 2,
+                "per_process_threads_pid": 5252,
+            },
+            "started_at": "2026-07-11T00:00:00.000Z",
+            "ended_at": "2026-07-11T00:00:00.100Z",
+            "duration_seconds": 0.1,
+            "reason": "command_completed",
+            "rc": 0,
+            "status": "pass",
+            "successful_samples": 2,
+            "sampling_error_count": 0,
+            "sampling_errors": [],
+            "violation": None,
+            "termination": {"signals": [], "errors": []},
+            "cleanup": {"process_group_gone": True},
+            "stdout": {
+                "path": str(unit_stdout.resolve()),
+                "sha256": hashlib.sha256(unit_stdout.read_bytes()).hexdigest(),
+                "size_bytes": unit_stdout.stat().st_size,
+            },
+            "stderr": {
+                "path": str(unit_stderr.resolve()),
+                "sha256": hashlib.sha256(unit_stderr.read_bytes()).hexdigest(),
+                "size_bytes": unit_stderr.stat().st_size,
+            },
+        }
+        write_selftest_json(unit_receipt_path, unit_receipt)
+
+        def unit_ref(path: Path) -> dict[str, Any]:
+            return {
+                "path": path.relative_to(unit_root).as_posix(),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "size_bytes": path.stat().st_size,
+            }
+
+        unit_pass_line = f"G0 SOURCE unit PASS: {unit_root}"
+        unit_manifest_path = unit_root / "unit.gate.json"
+        unit_manifest = {
+            "schema_version": 1,
+            "artifact_type": "g0_source_unit_bounded_gate",
+            "status": "pass",
+            "lane": "unit",
+            "pass_line": unit_pass_line,
+            "command": copy.deepcopy(G0_UNIT_BOUNDED_COMMAND),
+            "env_overrides": copy.deepcopy(G0_UNIT_BOUNDED_ENV_OVERRIDES),
+            "receipt_schema": VNEXT_G01A_BOUNDED_RECEIPT_SCHEMA,
+            "limits": copy.deepcopy(G0_UNIT_BOUNDED_LIMITS),
+            "peaks": copy.deepcopy(unit_receipt["peaks"]),
+            "cleanup": {"process_group_gone": True},
+            "bounded_receipt": unit_ref(unit_receipt_path),
+            "stdout_log": unit_ref(unit_stdout),
+            "stderr_log": unit_ref(unit_stderr),
+        }
+        write_selftest_json(unit_manifest_path, unit_manifest)
+        unit_lane = LaneCommand(
+            cmd=["scripts/release/g0_source_gate.sh", "unit", str(unit_root)],
+            expected_child_pass_line=unit_pass_line,
+            child_manifest_path=unit_manifest_path,
+            provenance_kind="g0-source-unit",
+        )
+        unit_provenance = verify_child_pass_line(
+            unit_lane,
+            unit_pass_line + "\n",
+            verify_checkout=False,
+        )
+        require_selftest(
+            unit_provenance is not None
+            and unit_provenance.get("kind") == "g0-source-unit"
+            and unit_provenance.get("cleanup") == {"process_group_gone": True}
+            and unit_provenance.get("env_overrides")
+            == G0_UNIT_BOUNDED_ENV_OVERRIDES
+            and unit_provenance.get("executed_bench_targets") == ["engine_bench"]
+            and unit_provenance.get("executed_bench_case_count")
+            == len(G0_UNIT_BENCH_CASES),
+            "g0 source unit bounded provenance self-test mismatch",
+        )
+
+        def expect_unit_manifest_reject(
+            name: str, manifest: dict[str, Any], marker: str
+        ) -> None:
+            try:
+                validate_g0_source_unit_provenance(
+                    unit_lane, manifest, hashlib.sha256(name.encode()).hexdigest()
+                )
+            except GateError as exc:
+                require_selftest(
+                    marker.lower() in str(exc).lower(),
+                    f"{name} rejected for unexpected reason: {exc}",
+                )
+                return
+            raise AssertionError(f"g0 unit manifest mutation unexpectedly passed: {name}")
+
+        missing_thread_env = copy.deepcopy(unit_manifest)
+        del missing_thread_env["env_overrides"]["RUST_TEST_THREADS"]
+        expect_unit_manifest_reject(
+            "missing RUST_TEST_THREADS",
+            missing_thread_env,
+            "bounded command metadata mismatch",
+        )
+        wrong_thread_env = copy.deepcopy(unit_manifest)
+        wrong_thread_env["env_overrides"]["RUST_TEST_THREADS"] = "2"
+        expect_unit_manifest_reject(
+            "wrong RUST_TEST_THREADS",
+            wrong_thread_env,
+            "bounded command metadata mismatch",
+        )
+        legacy_trailing_command = copy.deepcopy(unit_manifest)
+        legacy_trailing_command["command"] = [
+            "cargo",
+            "test",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "--test-threads=1",
+        ]
+        expect_unit_manifest_reject(
+            "legacy trailing libtest argument",
+            legacy_trailing_command,
+            "bounded command metadata mismatch",
+        )
+
+        missing_receipt_env = copy.deepcopy(unit_receipt)
+        missing_receipt_env["command"].remove("RUST_TEST_THREADS=1")
+        try:
+            validate_bounded_command_receipt(
+                missing_receipt_env,
+                expected_command=G0_UNIT_BOUNDED_COMMAND,
+                expected_cwd=REPO_ROOT,
+                expected_limits=G0_UNIT_BOUNDED_LIMITS,
+                stdout_bytes=unit_stdout.read_bytes(),
+                stderr_bytes=unit_stderr.read_bytes(),
+                label="g0 source unit missing receipt env selftest",
+            )
+        except GateError as exc:
+            require_selftest(
+                "command mismatch" in str(exc).lower(),
+                f"missing receipt env rejected unexpectedly: {exc}",
+            )
+        else:
+            raise AssertionError("g0 unit receipt without thread env unexpectedly passed")
+
+        missing_bench_stdout = unit_stdout.read_text(encoding="utf-8").replace(
+            f"Testing {G0_UNIT_BENCH_CASES[-1]}\nSuccess\n", ""
+        )
+        try:
+            validate_g0_unit_bench_witnesses(
+                missing_bench_stdout, unit_stderr.read_text(encoding="utf-8")
+            )
+        except GateError as exc:
+            require_selftest(
+                G0_UNIT_BENCH_CASES[-1] in str(exc),
+                f"missing bench witness rejected unexpectedly: {exc}",
+            )
+        else:
+            raise AssertionError("g0 unit missing bench witness unexpectedly passed")
         in_tree_vnext_out = REPO_ROOT / (
             f".run-gate-vnext-g00-selftest-{os.getpid()}-{time.monotonic_ns()}"
         )
@@ -3830,6 +6016,63 @@ def self_test() -> int:
             g00a_manifest["child_pass_line"]
             == f"FERRUM RUNTIME VNEXT G00A FACT CHECKPOINT PASS: {g00a_out}",
             g00a_manifest,
+        )
+
+        g01a_out = (root / "vnext-g01a-dry-run").resolve()
+        g01a = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-g01a",
+                "--g00a",
+                str(g00a_out / "gate.manifest.json"),
+                "--out",
+                str(g01a_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(g01a.returncode == 0, g01a.stderr or g01a.stdout)
+        g01a_manifest = json.loads((g01a_out / "gate.manifest.json").read_text())
+        require_selftest(
+            g01a_manifest["status"] == "dry-run"
+            and g01a_manifest["lane"] == "vnext-g01a",
+            g01a_manifest,
+        )
+        require_selftest(
+            g01a_manifest["delegated_command_line"][1]
+            == "scripts/release/runtime_vnext_g01a_checkpoint.py"
+            and g01a_manifest["delegated_command_line"][2:4]
+            == ["--g00a", str(g00a_out / "gate.manifest.json")],
+            g01a_manifest,
+        )
+        require_selftest(
+            g01a_manifest["child_pass_line"]
+            == f"FERRUM RUNTIME VNEXT G01A CONTRACT CHECKPOINT PASS: {g01a_out}",
+            g01a_manifest,
+        )
+        in_tree_g01a_out = REPO_ROOT / (
+            f".run-gate-vnext-g01a-selftest-{os.getpid()}-{time.monotonic_ns()}"
+        )
+        in_tree_g01a = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-g01a",
+                "--g00a",
+                str(g00a_out / "gate.manifest.json"),
+                "--out",
+                str(in_tree_g01a_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            in_tree_g01a.returncode != 0,
+            "in-tree vnext-g01a --out unexpectedly passed",
+        )
+        require_selftest(
+            "must resolve outside the Git source tree" in in_tree_g01a.stderr
+            and not in_tree_g01a_out.exists(),
+            in_tree_g01a.stderr or in_tree_g01a.stdout,
         )
 
         g00a_provenance_root = root / "vnext-g00a-provenance"
@@ -4383,6 +6626,7 @@ def main() -> int:
     parser.add_argument("--completion-manifest", type=Path)
     parser.add_argument("--coupling-inventory", type=Path)
     parser.add_argument("--model-resolution", type=Path)
+    parser.add_argument("--g00a", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -4397,7 +6641,7 @@ def main() -> int:
         parser.error("--out is required")
 
     out_dir = args.out.resolve() if args.lane.startswith("vnext-") else args.out
-    if args.lane == "vnext-g00":
+    if args.lane in {"vnext-g00", "vnext-g01a"}:
         try:
             require_external_vnext_g00_output(out_dir)
         except GateError as exc:
