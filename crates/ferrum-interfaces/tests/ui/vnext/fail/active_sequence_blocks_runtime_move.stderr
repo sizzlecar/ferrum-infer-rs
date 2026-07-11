@@ -1,0 +1,5 @@
+error[E0616]: field `runtime` of struct `ferrum_interfaces::vnext::BoundExecutionStream` is private
+ --> tests/ui/vnext/fail/active_sequence_blocks_runtime_move.rs:4:28
+  |
+4 |     let _runtime = &stream.runtime;
+  |                            ^^^^^^^ private field

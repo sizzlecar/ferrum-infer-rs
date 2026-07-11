@@ -1,0 +1,10 @@
+error[E0499]: cannot borrow `stream` as mutable more than once at a time
+  --> tests/ui/vnext/fail/active_sequence_blocks_second_stream_borrow.rs:8:18
+   |
+ 7 |     let permit = resources.activate(&mut stream).unwrap();
+   |                                     ----------- first mutable borrow occurs here
+ 8 |     let second = &mut stream;
+   |                  ^^^^^^^^^^^ second mutable borrow occurs here
+ 9 |     drop(second);
+10 |     drop(permit);
+   |          ------ first borrow later used here

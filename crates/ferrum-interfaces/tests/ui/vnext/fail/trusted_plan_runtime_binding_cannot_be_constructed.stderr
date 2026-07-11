@@ -1,0 +1,5 @@
+error[E0451]: field `resources` of struct `TrustedPlanRuntimeBinding` is private
+ --> tests/ui/vnext/fail/trusted_plan_runtime_binding_cannot_be_constructed.rs:9:33
+  |
+9 |     TrustedPlanRuntimeBinding { resources }
+  |                                 ^^^^^^^^^ private field

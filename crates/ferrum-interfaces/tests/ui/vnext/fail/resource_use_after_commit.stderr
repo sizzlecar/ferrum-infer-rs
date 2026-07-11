@@ -1,0 +1,16 @@
+error[E0382]: use of moved value: `reserved`
+ --> tests/ui/vnext/fail/resource_use_after_commit.rs:7:13
+  |
+4 |     reserved: ResourceTransaction<D, TransactionReserved>,
+  |     -------- move occurs because `reserved` has type `ferrum_interfaces::vnext::ResourceTransaction<D, ferrum_interfaces::vnext::TransactionReserved>`, which does not implement the `Copy` trait
+5 | ) {
+6 |     let _committed = reserved.commit();
+  |                               -------- `reserved` moved due to this method call
+7 |     let _ = reserved.rollback();
+  |             ^^^^^^^^ value used here after move
+  |
+note: `ferrum_interfaces::vnext::ResourceTransaction::<D, ferrum_interfaces::vnext::TransactionReserved>::commit` takes ownership of the receiver `self`, which moves `reserved`
+ --> src/vnext/resource.rs
+  |
+  |         mut self,
+  |             ^^^^

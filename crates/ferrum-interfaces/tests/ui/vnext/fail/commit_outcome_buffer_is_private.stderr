@@ -1,0 +1,8 @@
+error[E0432]: unresolved import `ferrum_interfaces::vnext::ResourceCommitOutcome`
+ --> tests/ui/vnext/fail/commit_outcome_buffer_is_private.rs:1:5
+  |
+1 | use ferrum_interfaces::vnext::ResourceCommitOutcome;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^---------------------
+  |     |                         |
+  |     |                         help: a similar name exists in the module: `ResourceCommitView`
+  |     no `ResourceCommitOutcome` in `vnext`

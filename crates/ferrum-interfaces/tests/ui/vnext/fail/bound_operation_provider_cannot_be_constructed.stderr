@@ -1,0 +1,13 @@
+error[E0451]: fields `provider`, `plan_id`, `plan_hash` and `node_id` of struct `ferrum_interfaces::vnext::BoundOperationProvider` are private
+  --> tests/ui/vnext/fail/bound_operation_provider_cannot_be_constructed.rs:10:9
+   |
+ 9 |     let _ = BoundOperationProvider {
+   |             ---------------------- in this type
+10 |         provider,
+   |         ^^^^^^^^ private field
+11 |         plan_id,
+   |         ^^^^^^^ private field
+12 |         plan_hash,
+   |         ^^^^^^^^^ private field
+13 |         node_id,
+   |         ^^^^^^^ private field

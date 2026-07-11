@@ -18,6 +18,7 @@ pub mod sampler;
 pub mod scheduler;
 pub mod tensor;
 pub mod tokenizer;
+pub mod vnext;
 
 // Re-export core traits and important types
 pub use engine::InferenceEngine;

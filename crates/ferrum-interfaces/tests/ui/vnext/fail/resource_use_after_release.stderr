@@ -1,0 +1,16 @@
+error[E0382]: borrow of moved value: `committed`
+ --> tests/ui/vnext/fail/resource_use_after_release.rs:7:13
+  |
+4 |     committed: ResourceTransaction<D, TransactionCommitted>,
+  |     --------- move occurs because `committed` has type `ferrum_interfaces::vnext::ResourceTransaction<D, ferrum_interfaces::vnext::TransactionCommitted>`, which does not implement the `Copy` trait
+5 | ) {
+6 |     let _released = committed.release();
+  |                               --------- `committed` moved due to this method call
+7 |     let _ = committed.lease();
+  |             ^^^^^^^^^ value borrowed here after move
+  |
+note: `ferrum_interfaces::vnext::ResourceTransaction::<D, ferrum_interfaces::vnext::TransactionCommitted>::release` takes ownership of the receiver `self`, which moves `committed`
+ --> src/vnext/resource.rs
+  |
+  |         mut self,
+  |             ^^^^

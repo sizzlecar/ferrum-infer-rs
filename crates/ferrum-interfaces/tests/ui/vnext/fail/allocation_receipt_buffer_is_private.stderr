@@ -1,0 +1,5 @@
+error[E0599]: no method named `buffer` found for reference `&DeviceAllocationReceipt<'_>` in the current scope
+ --> tests/ui/vnext/fail/allocation_receipt_buffer_is_private.rs:4:21
+  |
+4 |     let _ = receipt.buffer();
+  |                     ^^^^^^ method not found in `&DeviceAllocationReceipt<'_>`

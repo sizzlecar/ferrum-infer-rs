@@ -1,0 +1,5 @@
+error[E0451]: field `phase` of struct `PlanRuntimeResources` is private
+ --> tests/ui/vnext/fail/plan_runtime_resources_fields_are_private.rs:4:32
+  |
+4 |     let PlanRuntimeResources { phase, .. } = resources;
+  |                                ^^^^^ private field

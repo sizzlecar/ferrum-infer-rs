@@ -1,0 +1,11 @@
+error[E0599]: no function or associated item named `new` found for struct `MemoryPlan` in the current scope
+ --> tests/ui/vnext/fail/memory_plan_cannot_be_supplied.rs:4:25
+  |
+4 |     let _ = MemoryPlan::new(1, 1, Vec::new());
+  |                         ^^^ function or associated item not found in `MemoryPlan`
+  |
+help: there is a method `ne` with a similar name, but with different arguments
+ --> $RUST/core/src/cmp.rs
+  |
+  |     fn ne(&self, other: &Rhs) -> bool {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

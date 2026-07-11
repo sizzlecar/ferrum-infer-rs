@@ -1,0 +1,5 @@
+error[E0599]: no method named `trusted_runtime_binding` found for reference `&StaticProvisioningLease<R>` in the current scope
+ --> tests/ui/vnext/fail/static_lease_cannot_mint_runtime_binding.rs:4:26
+  |
+4 |     let _binding = lease.trusted_runtime_binding();
+  |                          ^^^^^^^^^^^^^^^^^^^^^^^ method not found in `&StaticProvisioningLease<R>`

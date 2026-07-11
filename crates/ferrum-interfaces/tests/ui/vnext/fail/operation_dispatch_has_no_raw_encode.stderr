@@ -1,0 +1,5 @@
+error[E0599]: no function or associated item named `encode` found for struct `OperationDispatch` in the current scope
+ --> tests/ui/vnext/fail/operation_dispatch_has_no_raw_encode.rs:4:32
+  |
+4 |     let _ = OperationDispatch::encode;
+  |                                ^^^^^^ function or associated item not found in `OperationDispatch`

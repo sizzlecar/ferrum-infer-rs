@@ -1,0 +1,16 @@
+error[E0382]: use of moved value: `transaction`
+  --> tests/ui/vnext/fail/committed_transaction_is_moved_by_handoff.rs:10:21
+   |
+ 5 | fn handoff_then_release<D>(transaction: ResourceTransaction<D, TransactionCommitted>)
+   |                            ----------- move occurs because `transaction` has type `ResourceTransaction<D, TransactionCommitted>`, which does not implement the `Copy` trait
+...
+ 9 |     let _resources = transaction.into_plan_runtime();
+   |                                  ------------------- `transaction` moved due to this method call
+10 |     let _released = transaction.release();
+   |                     ^^^^^^^^^^^ value used here after move
+   |
+note: `ResourceTransaction::<D, TransactionCommitted>::into_plan_runtime` takes ownership of the receiver `self`, which moves `transaction`
+  --> src/vnext/resource.rs
+   |
+   |         mut self,
+   |             ^^^^

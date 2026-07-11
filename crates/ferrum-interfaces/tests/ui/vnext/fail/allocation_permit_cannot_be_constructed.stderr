@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `ferrum_interfaces::vnext::DeviceAllocationPermit<'a>` in the current scope
+ --> tests/ui/vnext/fail/allocation_permit_cannot_be_constructed.rs:4:20
+  |
+4 |     let _ = permit.clone();
+  |                    ^^^^^ method not found in `ferrum_interfaces::vnext::DeviceAllocationPermit<'_>`
