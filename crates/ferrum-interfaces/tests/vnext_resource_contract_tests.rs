@@ -32,6 +32,14 @@ fn sha(byte: char) -> String {
     std::iter::repeat_n(byte, 64).collect()
 }
 
+fn one_token_span() -> TokenSpanWork {
+    TokenSpanWork::from_token_ids(&[1], 0..1).unwrap()
+}
+
+fn one_token_work() -> ResourceWorkShape {
+    ResourceWorkShape::single(one_token_span()).unwrap()
+}
+
 fn contiguous_storage_profile() -> DynamicStorageProfile {
     DynamicStorageProfile::new(
         DynamicStorageAllocator::LinearArena,
@@ -1260,10 +1268,8 @@ fn admit_logical_request(
     run_id: &str,
     request_id: &str,
 ) -> Arc<AdmittedRequestResources<TestRuntime>> {
-    let shape = DynamicResourceShape::new(1, 1, 1).unwrap();
     let request = RequestResourceAdmissionRequest::new(
-        shape,
-        shape,
+        one_token_work(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
@@ -1298,10 +1304,8 @@ fn admit_logical_sequence(
     request_id: &str,
 ) -> Arc<AdmittedSequenceResources<TestRuntime>> {
     let request = admit_logical_request(root, run_id, request_id);
-    let shape = DynamicResourceShape::new(1, 1, 1).unwrap();
     let sequence = SequenceResourceAdmissionRequest::new(
-        shape,
-        shape,
+        one_token_work(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
@@ -2723,16 +2727,14 @@ fn admit_logical_child_sequence(
     root: &Arc<PlanRuntimeResources<TestRuntime>>,
     request: &Arc<AdmittedRequestResources<TestRuntime>>,
 ) -> Arc<AdmittedSequenceResources<TestRuntime>> {
-    let shape = DynamicResourceShape::new(1, 1, 1).unwrap();
     let admission = SequenceResourceAdmissionRequest::new(
-        shape,
-        shape,
+        one_token_work(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
     .unwrap();
     for attempt in 0..=3 {
-        match request.try_admit_sequence(admission).unwrap() {
+        match request.try_admit_sequence(admission.clone()).unwrap() {
             SequenceResourceAdmissionDecision::Admitted(resources) => return resources,
             SequenceResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
                 root.maintain_for_deferred(&deferred).unwrap();
@@ -2919,17 +2921,15 @@ fn deferred_admission_has_no_execution_authority(_plan: &ExecutionPlan, passed: 
         "request.logical.deferred-no-authority",
     );
     let first = admit_logical_child_sequence(&root, &request);
-    let shape = DynamicResourceShape::new(1, 1, 1).unwrap();
     let admission = SequenceResourceAdmissionRequest::new(
-        shape,
-        shape,
+        one_token_work(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
     .unwrap();
     let mut deferred = None;
     for attempt in 0..=3 {
-        match request.try_admit_sequence(admission).unwrap() {
+        match request.try_admit_sequence(admission.clone()).unwrap() {
             SequenceResourceAdmissionDecision::Deferred(decision) => {
                 deferred = Some(decision);
                 break;
@@ -3991,10 +3991,8 @@ fn begin_single_participant_step(
     root: &Arc<PlanRuntimeResources<TestRuntime>>,
     batch: &ExecutionBatchParticipants<TestRuntime>,
 ) -> Arc<StepResourceLease<TestRuntime>> {
-    let shape = DynamicResourceShape::new(1, 1, 1).unwrap();
     let request = StepResourceAdmissionRequest::new(
-        shape,
-        shape,
+        batch.bind_work_shape(vec![one_token_span()]).unwrap(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
@@ -4183,10 +4181,8 @@ fn closing_root_rejects_every_parent_to_child_derivation() {
     };
     assert!(root.is_closing());
 
-    let shape = DynamicResourceShape::new(1, 1, 1).unwrap();
     let sequence_request = SequenceResourceAdmissionRequest::new(
-        shape,
-        shape,
+        one_token_work(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
@@ -4213,8 +4209,9 @@ fn closing_root_rejects_every_parent_to_child_derivation() {
     ));
 
     let step_request = StepResourceAdmissionRequest::new(
-        shape,
-        shape,
+        existing_batch
+            .bind_work_shape(vec![one_token_span()])
+            .unwrap(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
@@ -4225,8 +4222,9 @@ fn closing_root_rejects_every_parent_to_child_derivation() {
     ));
     let invocation_request = InvocationResourceAdmissionRequest::for_all_step_participants(
         id("node.main"),
-        shape,
-        shape,
+        existing_step
+            .bind_all_invocation_work_shape(vec![one_token_span()])
+            .unwrap(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )

@@ -26,8 +26,8 @@ use super::{
     ExecutionFrameId, ExecutionPlan, FailureDomain, FailureEnvelope, LogicalAdmissionCoordinator,
     LogicalAdmissionCoordinatorId, LogicalAdmissionLease, LogicalBatchCapacityLease,
     LogicalRequestLease, NodeId, PlanHash, PlanId, PlanNode, RequestAdmissionDecision,
-    RequestAuthorityId, RequestIdentity, ResourceAllocation, ResourceId, RunId,
-    SequenceAuthorityId, StreamState, TransactionId, VNextError,
+    RequestAuthorityId, RequestIdentity, ResourceAllocation, ResourceId, ResourceWorkShape, RunId,
+    SequenceAuthorityId, StreamState, TokenSpanWork, TransactionId, VNextError,
 };
 
 pub const MAX_RESOURCE_TRANSITION_RECEIPT_WIRE_BYTES: usize = 4 * 1024 * 1024;
@@ -5947,55 +5947,53 @@ where
 
 macro_rules! scoped_resource_admission_request {
     ($name:ident, $single_sequence:literal) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[derive(Debug, Clone, PartialEq, Eq)]
         pub struct $name {
-            immediate_shape: DynamicResourceShape,
-            fit_shape: DynamicResourceShape,
+            work_shape: ResourceWorkShape,
             fit_policy: AdmissionFitPolicy,
             pressure_action: AdmissionPressureAction,
         }
 
         impl $name {
             pub fn new(
-                immediate_shape: DynamicResourceShape,
-                fit_shape: DynamicResourceShape,
+                work_shape: ResourceWorkShape,
                 fit_policy: AdmissionFitPolicy,
                 pressure_action: AdmissionPressureAction,
             ) -> Result<Self, VNextError> {
                 if $single_sequence
-                    && (immediate_shape.sequences() != 1 || fit_shape.sequences() != 1)
+                    && (work_shape.immediate_sequences() != 1 || work_shape.fit_sequences() != 1)
                 {
                     return Err(invalid_resource(
                         "sequence resource admission requires a single-sequence shape",
                     ));
                 }
-                if fit_policy == AdmissionFitPolicy::ImmediateOnly && immediate_shape != fit_shape
-                {
-                    return Err(invalid_resource(
-                        "immediate-only resource admission requires identical immediate and fit shapes",
-                    ));
-                }
                 Ok(Self {
-                    immediate_shape,
-                    fit_shape,
+                    work_shape,
                     fit_policy,
                     pressure_action,
                 })
             }
 
-            pub const fn immediate_shape(self) -> DynamicResourceShape {
-                self.immediate_shape
+            pub fn work_shape(&self) -> &ResourceWorkShape {
+                &self.work_shape
             }
 
-            pub const fn fit_shape(self) -> DynamicResourceShape {
-                self.fit_shape
+            pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
+                self.work_shape.immediate_shape()
             }
 
-            pub const fn fit_policy(self) -> AdmissionFitPolicy {
+            pub(crate) const fn fit_shape(&self) -> DynamicResourceShape {
+                match self.fit_policy {
+                    AdmissionFitPolicy::ImmediateOnly => self.work_shape.immediate_shape(),
+                    AdmissionFitPolicy::FullInputMustFit => self.work_shape.fit_shape(),
+                }
+            }
+
+            pub const fn fit_policy(&self) -> AdmissionFitPolicy {
                 self.fit_policy
             }
 
-            pub const fn pressure_action(self) -> AdmissionPressureAction {
+            pub const fn pressure_action(&self) -> AdmissionPressureAction {
                 self.pressure_action
             }
         }
@@ -6007,38 +6005,37 @@ scoped_resource_admission_request!(SequenceResourceAdmissionRequest, true);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepResourceAdmissionRequest {
-    immediate_shape: DynamicResourceShape,
-    fit_shape: DynamicResourceShape,
+    work_shape: BatchWorkShape,
     fit_policy: AdmissionFitPolicy,
     pressure_action: AdmissionPressureAction,
 }
 
 impl StepResourceAdmissionRequest {
     pub fn new(
-        immediate_shape: DynamicResourceShape,
-        fit_shape: DynamicResourceShape,
+        work_shape: BatchWorkShape,
         fit_policy: AdmissionFitPolicy,
         pressure_action: AdmissionPressureAction,
     ) -> Result<Self, VNextError> {
-        if fit_policy == AdmissionFitPolicy::ImmediateOnly && immediate_shape != fit_shape {
-            return Err(invalid_resource(
-                "immediate-only step admission requires identical immediate and fit shapes",
-            ));
-        }
         Ok(Self {
-            immediate_shape,
-            fit_shape,
+            work_shape,
             fit_policy,
             pressure_action,
         })
     }
 
-    pub const fn immediate_shape(&self) -> DynamicResourceShape {
-        self.immediate_shape
+    pub fn work_shape(&self) -> &BatchWorkShape {
+        &self.work_shape
     }
 
-    pub const fn fit_shape(&self) -> DynamicResourceShape {
-        self.fit_shape
+    pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
+        self.work_shape.immediate_shape()
+    }
+
+    pub(crate) const fn fit_shape(&self) -> DynamicResourceShape {
+        match self.fit_policy {
+            AdmissionFitPolicy::ImmediateOnly => self.work_shape.immediate_shape(),
+            AdmissionFitPolicy::FullInputMustFit => self.work_shape.fit_shape(),
+        }
     }
 
     pub const fn fit_policy(&self) -> AdmissionFitPolicy {
@@ -6085,6 +6082,142 @@ impl BatchParticipantAuthority {
     }
 }
 
+/// Opaque association between one exact admitted participant and token work
+/// derived from that participant's actual token ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BatchParticipantTokenSpan {
+    participant: BatchParticipantAuthority,
+    token_span: TokenSpanWork,
+}
+
+impl BatchParticipantTokenSpan {
+    fn new(participant: BatchParticipantAuthority, token_span: TokenSpanWork) -> Self {
+        Self {
+            participant,
+            token_span,
+        }
+    }
+
+    pub const fn participant(&self) -> BatchParticipantAuthority {
+        self.participant
+    }
+
+    pub fn token_span(&self) -> &TokenSpanWork {
+        &self.token_span
+    }
+}
+
+/// Immutable work authority for one exact non-empty participant set. The
+/// dimensions remain private so downstream claims and dispatch can only use
+/// the shape that core bound to this participant topology and fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BatchWorkShape {
+    participants: Vec<BatchParticipantAuthority>,
+    participant_work: Vec<BatchParticipantTokenSpan>,
+    resource_work: ResourceWorkShape,
+    fingerprint: String,
+}
+
+impl BatchWorkShape {
+    fn new(participant_work: Vec<BatchParticipantTokenSpan>) -> Result<Self, VNextError> {
+        if participant_work.is_empty()
+            || participant_work.windows(2).any(|pair| {
+                pair[0].participant().canonical_key() >= pair[1].participant().canonical_key()
+            })
+        {
+            return Err(invalid_resource(
+                "batch work shape requires canonical non-empty unique participant work",
+            ));
+        }
+        let participants = participant_work
+            .iter()
+            .map(BatchParticipantTokenSpan::participant)
+            .collect::<Vec<_>>();
+        let resource_work = ResourceWorkShape::from_token_spans(
+            participant_work
+                .iter()
+                .map(|work| work.token_span().clone())
+                .collect(),
+        )?;
+        if resource_work.immediate_sequences()
+            != u32::try_from(participants.len())
+                .map_err(|_| invalid_resource("batch work participant count exceeds u32"))?
+        {
+            return Err(invalid_resource(
+                "batch work shape sequence count differs from participant evidence",
+            ));
+        }
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            participant_work: &'a [BatchParticipantTokenSpan],
+            resource_work_fingerprint: &'a str,
+        }
+        let input = FingerprintInput {
+            domain: "ferrum.runtime-vnext.batch-work-shape.v2",
+            participant_work: &participant_work,
+            resource_work_fingerprint: resource_work.fingerprint(),
+        };
+        let bytes = serde_json::to_vec(&input).map_err(|error| {
+            invalid_resource(format!("batch work shape encode failed: {error}"))
+        })?;
+        Ok(Self {
+            participants,
+            participant_work,
+            resource_work,
+            fingerprint: format!("{:x}", Sha256::digest(bytes)),
+        })
+    }
+
+    pub fn participants(&self) -> &[BatchParticipantAuthority] {
+        &self.participants
+    }
+
+    pub fn participant_work(&self) -> &[BatchParticipantTokenSpan] {
+        &self.participant_work
+    }
+
+    pub fn resource_work(&self) -> &ResourceWorkShape {
+        &self.resource_work
+    }
+
+    pub const fn immediate_sequences(&self) -> u32 {
+        self.resource_work.immediate_sequences()
+    }
+
+    pub const fn immediate_tokens(&self) -> u64 {
+        self.resource_work.immediate_tokens()
+    }
+
+    pub const fn immediate_pages(&self) -> u64 {
+        self.resource_work.immediate_pages()
+    }
+
+    pub const fn fit_sequences(&self) -> u32 {
+        self.resource_work.fit_sequences()
+    }
+
+    pub const fn fit_tokens(&self) -> u64 {
+        self.resource_work.fit_tokens()
+    }
+
+    pub const fn fit_pages(&self) -> u64 {
+        self.resource_work.fit_pages()
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
+        self.resource_work.immediate_shape()
+    }
+
+    pub(crate) const fn fit_shape(&self) -> DynamicResourceShape {
+        self.resource_work.fit_shape()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct StepParticipantFrameAssignment {
     participant: BatchParticipantAuthority,
@@ -6125,17 +6258,9 @@ impl StepParticipantFrameAssignment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum InvocationParticipantSelection {
-    AllStepParticipants,
-    Exact(Vec<BatchParticipantAuthority>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvocationResourceAdmissionRequest {
     node_id: NodeId,
-    participants: InvocationParticipantSelection,
-    immediate_shape: DynamicResourceShape,
-    fit_shape: DynamicResourceShape,
+    work_shape: BatchWorkShape,
     fit_policy: AdmissionFitPolicy,
     pressure_action: AdmissionPressureAction,
 }
@@ -6143,82 +6268,44 @@ pub struct InvocationResourceAdmissionRequest {
 impl InvocationResourceAdmissionRequest {
     pub fn new(
         node_id: NodeId,
-        mut participants: Vec<BatchParticipantAuthority>,
-        immediate_shape: DynamicResourceShape,
-        fit_shape: DynamicResourceShape,
+        work_shape: BatchWorkShape,
         fit_policy: AdmissionFitPolicy,
         pressure_action: AdmissionPressureAction,
     ) -> Result<Self, VNextError> {
-        participants.sort_by_key(|participant| participant.canonical_key());
-        if participants.is_empty()
-            || participants
-                .windows(2)
-                .any(|pair| pair[0].canonical_key() == pair[1].canonical_key())
-        {
-            return Err(invalid_resource(
-                "invocation participant authorities must be non-empty and unique",
-            ));
-        }
-        Self::with_participants(
+        Ok(Self {
             node_id,
-            InvocationParticipantSelection::Exact(participants),
-            immediate_shape,
-            fit_shape,
+            work_shape,
             fit_policy,
             pressure_action,
-        )
+        })
     }
 
     pub fn for_all_step_participants(
         node_id: NodeId,
-        immediate_shape: DynamicResourceShape,
-        fit_shape: DynamicResourceShape,
+        work_shape: BatchWorkShape,
         fit_policy: AdmissionFitPolicy,
         pressure_action: AdmissionPressureAction,
     ) -> Result<Self, VNextError> {
-        Self::with_participants(
-            node_id,
-            InvocationParticipantSelection::AllStepParticipants,
-            immediate_shape,
-            fit_shape,
-            fit_policy,
-            pressure_action,
-        )
-    }
-
-    fn with_participants(
-        node_id: NodeId,
-        participants: InvocationParticipantSelection,
-        immediate_shape: DynamicResourceShape,
-        fit_shape: DynamicResourceShape,
-        fit_policy: AdmissionFitPolicy,
-        pressure_action: AdmissionPressureAction,
-    ) -> Result<Self, VNextError> {
-        if fit_policy == AdmissionFitPolicy::ImmediateOnly && immediate_shape != fit_shape {
-            return Err(invalid_resource(
-                "immediate-only invocation admission requires identical immediate and fit shapes",
-            ));
-        }
-        Ok(Self {
-            node_id,
-            participants,
-            immediate_shape,
-            fit_shape,
-            fit_policy,
-            pressure_action,
-        })
+        Self::new(node_id, work_shape, fit_policy, pressure_action)
     }
 
     pub fn node_id(&self) -> &NodeId {
         &self.node_id
     }
 
-    pub const fn immediate_shape(&self) -> DynamicResourceShape {
-        self.immediate_shape
+    pub fn work_shape(&self) -> &BatchWorkShape {
+        &self.work_shape
     }
 
-    pub const fn fit_shape(&self) -> DynamicResourceShape {
-        self.fit_shape
+    pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
+        self.work_shape.immediate_shape()
+    }
+
+    pub(crate) const fn fit_shape(&self) -> DynamicResourceShape {
+        match self.fit_policy {
+            AdmissionFitPolicy::ImmediateOnly => self.work_shape.immediate_shape(),
+            AdmissionFitPolicy::FullInputMustFit => self.work_shape.fit_shape(),
+        }
     }
 
     pub const fn fit_policy(&self) -> AdmissionFitPolicy {
@@ -7092,8 +7179,8 @@ where
                     continue;
                 }
                 matched = true;
-                let size_bytes = descriptor.evaluate_request_bytes(immediate_shape)?;
-                let fit_bytes = descriptor.evaluate_request_bytes(fit_shape)?;
+                let size_bytes = descriptor.evaluate_request_bytes_for_shape(immediate_shape)?;
+                let fit_bytes = descriptor.evaluate_request_bytes_for_shape(fit_shape)?;
                 immediate_pool_bytes =
                     immediate_pool_bytes
                         .checked_add(size_bytes)
@@ -7168,13 +7255,23 @@ where
         request_id: RequestIdentity,
     ) -> Result<RequestResourceAdmissionDecision<R>, VNextError> {
         let _lifecycle = self.resources.read_lifecycle("admit a request")?;
+        let RequestResourceAdmissionRequest {
+            work_shape,
+            fit_policy,
+            pressure_action,
+        } = request;
+        let immediate_shape = work_shape.immediate_shape();
+        let fit_shape = match fit_policy {
+            AdmissionFitPolicy::ImmediateOnly => immediate_shape,
+            AdmissionFitPolicy::FullInputMustFit => work_shape.fit_shape(),
+        };
         let (demand, requested_slices) = self.scoped_demand(
             AllocationLifetime::Request,
             None,
-            request.immediate_shape(),
-            request.fit_shape(),
-            request.fit_policy(),
-            request.pressure_action(),
+            immediate_shape,
+            fit_shape,
+            fit_policy,
+            pressure_action,
         )?;
         let prepared = match self.prepare_backing_slices(requested_slices)? {
             BackingPrepareDecision::Prepared(prepared) => prepared,
@@ -7197,6 +7294,7 @@ where
                         },
                         logical_lease,
                         slices,
+                        work_shape,
                         run_id,
                         request_id,
                     )?,
@@ -7360,6 +7458,7 @@ where
     backing_slices: Vec<LogicalBackingSliceAuthority>,
     logical_lease: LogicalRequestLease,
     plan: TrustedPlanRuntimeBinding<R>,
+    work_shape: ResourceWorkShape,
     run_id: RunId,
     request_id: RequestIdentity,
 }
@@ -7372,6 +7471,7 @@ where
         plan: TrustedPlanRuntimeBinding<R>,
         logical_lease: LogicalRequestLease,
         backing_slices: Vec<LogicalBackingSliceAuthority>,
+        work_shape: ResourceWorkShape,
         run_id: RunId,
         request_id: RequestIdentity,
     ) -> Result<Self, VNextError> {
@@ -7384,6 +7484,7 @@ where
             backing_slices,
             logical_lease,
             plan,
+            work_shape,
             run_id,
             request_id,
         })
@@ -7407,6 +7508,10 @@ where
 
     pub fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
         &self.backing_slices
+    }
+
+    pub fn work_shape(&self) -> &ResourceWorkShape {
+        &self.work_shape
     }
 
     pub fn static_provisioning(&self) -> Option<&StaticProvisioningLease<R>> {
@@ -7438,13 +7543,23 @@ where
             .plan
             .resources
             .read_lifecycle("admit a child sequence")?;
+        let SequenceResourceAdmissionRequest {
+            work_shape,
+            fit_policy,
+            pressure_action,
+        } = request;
+        let immediate_shape = work_shape.immediate_shape();
+        let fit_shape = match fit_policy {
+            AdmissionFitPolicy::ImmediateOnly => immediate_shape,
+            AdmissionFitPolicy::FullInputMustFit => work_shape.fit_shape(),
+        };
         let (demand, requested_slices) = self.plan.scoped_demand(
             AllocationLifetime::Sequence,
             None,
-            request.immediate_shape(),
-            request.fit_shape(),
-            request.fit_policy(),
-            request.pressure_action(),
+            immediate_shape,
+            fit_shape,
+            fit_policy,
+            pressure_action,
         )?;
         match self
             .plan
@@ -7482,7 +7597,12 @@ where
                 }
                 let slices = prepared.commit();
                 Ok(SequenceResourceAdmissionDecision::Admitted(Arc::new(
-                    AdmittedSequenceResources::new(Arc::clone(self), logical_lease, slices)?,
+                    AdmittedSequenceResources::new(
+                        Arc::clone(self),
+                        logical_lease,
+                        slices,
+                        work_shape,
+                    )?,
                 )))
             }
             AdmissionDecision::Deferred(deferred) => {
@@ -7950,6 +8070,7 @@ where
     backing_slices: ManuallyDrop<Vec<LogicalBackingSliceAuthority>>,
     logical_lease: ManuallyDrop<LogicalAdmissionLease>,
     request: ManuallyDrop<Arc<AdmittedRequestResources<R>>>,
+    work_shape: ResourceWorkShape,
     authority_source: Mutex<SequenceExecutionAuthoritySource>,
     session_slot: Arc<SequenceSessionSlot>,
     state: Arc<AtomicU64>,
@@ -8006,6 +8127,7 @@ where
         request: Arc<AdmittedRequestResources<R>>,
         logical_lease: LogicalAdmissionLease,
         backing_slices: Vec<LogicalBackingSliceAuthority>,
+        work_shape: ResourceWorkShape,
     ) -> Result<Self, VNextError> {
         if !request.plan.logical_admission().owns(&logical_lease)
             || logical_lease.request() != request.request_authority()
@@ -8022,6 +8144,7 @@ where
             backing_slices: ManuallyDrop::new(backing_slices),
             logical_lease: ManuallyDrop::new(logical_lease),
             request: ManuallyDrop::new(request),
+            work_shape,
             authority_source: Mutex::new(SequenceExecutionAuthoritySource::Unselected),
             session_slot: Arc::new(SequenceSessionSlot::new()),
             state: Arc::new(AtomicU64::new(0)),
@@ -8056,6 +8179,10 @@ where
 
     pub fn request_resources(&self) -> &Arc<AdmittedRequestResources<R>> {
         &self.request
+    }
+
+    pub fn work_shape(&self) -> &ResourceWorkShape {
+        &self.work_shape
     }
 
     pub(crate) fn backing_view(
@@ -8372,18 +8499,30 @@ where
         &self.plan_evidence
     }
 
-    fn validate_shapes(
+    pub fn bind_work_shape(
         &self,
-        immediate_shape: DynamicResourceShape,
-        fit_shape: DynamicResourceShape,
-        context: &'static str,
-    ) -> Result<(), VNextError> {
-        if immediate_shape.sequences() != self.len() || fit_shape.sequences() != self.len() {
-            return Err(invalid_resource(format!(
-                "{context} shape sequence count differs from its exact participant set"
-            )));
+        token_spans: Vec<TokenSpanWork>,
+    ) -> Result<BatchWorkShape, VNextError> {
+        if token_spans.len() != self.sessions.len() {
+            return Err(invalid_resource(
+                "batch token work count differs from its exact participant set",
+            ));
         }
-        Ok(())
+        BatchWorkShape::new(
+            self.sessions
+                .iter()
+                .zip(token_spans)
+                .map(|(session, token_span)| {
+                    BatchParticipantTokenSpan::new(
+                        BatchParticipantAuthority::new(
+                            session.sequence_authority(),
+                            session.request_authority(),
+                        ),
+                        token_span,
+                    )
+                })
+                .collect(),
+        )
     }
 }
 
@@ -8959,6 +9098,129 @@ impl StepParticipantRetirement {
     }
 }
 
+/// One atomic physical/logical backing claim bound to an immutable batch work
+/// authority. Even an empty resource demand retains the work shape and claim
+/// fingerprint through dispatch and fence ownership.
+#[must_use = "claimed backing must remain owned through its device fence"]
+pub struct ClaimedBackingTransaction {
+    // Physical extents release before the logical capacity claim.
+    backing_slices: Vec<LogicalBackingSliceAuthority>,
+    logical_capacity: Option<LogicalBatchCapacityLease>,
+    work_shape: BatchWorkShape,
+    demand: AdmissionDemand,
+    fingerprint: String,
+}
+
+impl ClaimedBackingTransaction {
+    fn new(
+        work_shape: BatchWorkShape,
+        demand: AdmissionDemand,
+        logical_capacity: Option<LogicalBatchCapacityLease>,
+        backing_slices: Vec<LogicalBackingSliceAuthority>,
+    ) -> Result<Self, VNextError> {
+        let mut backing_by_domain = BTreeMap::<CapacityDomainId, u64>::new();
+        for slice in &backing_slices {
+            let total = backing_by_domain.entry(slice.domain_id()).or_default();
+            *total = total
+                .checked_add(slice.size_bytes())
+                .ok_or_else(|| invalid_resource("claimed backing domain bytes overflow u64"))?;
+        }
+        let backing_claim = if backing_by_domain.is_empty() {
+            CapacityVector::empty()
+        } else {
+            CapacityVector::new(
+                backing_by_domain
+                    .into_iter()
+                    .map(|(domain, bytes)| CapacityEntry::new(domain, CapacityUnits::new(bytes)))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?
+        };
+        if backing_claim != *demand.immediate_claim() {
+            return Err(invalid_resource(
+                "physical backing differs from the exact evaluated immediate demand",
+            ));
+        }
+        match &logical_capacity {
+            Some(capacity)
+                if capacity.claims() == demand.immediate_claim()
+                    && capacity.parents().len() == work_shape.participants().len()
+                    && capacity
+                        .parents()
+                        .iter()
+                        .zip(work_shape.participants())
+                        .all(|(parent, participant)| {
+                            parent.sequence() == participant.sequence_authority()
+                                && parent.request() == participant.request_authority()
+                        }) => {}
+            None if demand.immediate_claim().is_empty() && backing_slices.is_empty() => {}
+            _ => {
+                return Err(invalid_resource(
+                    "logical backing claim differs from work participants or evaluated demand",
+                ))
+            }
+        }
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            work_fingerprint: &'a str,
+            demand: &'a AdmissionDemand,
+            backing: Vec<&'a LogicalBackingSliceEvidence>,
+            capacity_parents: Vec<(SequenceAuthorityId, RequestAuthorityId)>,
+        }
+        let input = FingerprintInput {
+            domain: "ferrum.runtime-vnext.claimed-backing.v1",
+            work_fingerprint: work_shape.fingerprint(),
+            demand: &demand,
+            backing: backing_slices
+                .iter()
+                .map(LogicalBackingSliceAuthority::evidence)
+                .collect(),
+            capacity_parents: logical_capacity
+                .as_ref()
+                .map(|capacity| {
+                    capacity
+                        .parents()
+                        .iter()
+                        .map(|parent| (parent.sequence(), parent.request()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        let bytes = serde_json::to_vec(&input).map_err(|error| {
+            invalid_resource(format!(
+                "claimed backing fingerprint encode failed: {error}"
+            ))
+        })?;
+        Ok(Self {
+            backing_slices,
+            logical_capacity,
+            work_shape,
+            demand,
+            fingerprint: format!("{:x}", Sha256::digest(bytes)),
+        })
+    }
+
+    pub fn work_shape(&self) -> &BatchWorkShape {
+        &self.work_shape
+    }
+
+    pub fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
+        &self.backing_slices
+    }
+
+    pub fn logical_capacity(&self) -> Option<&LogicalBatchCapacityLease> {
+        self.logical_capacity.as_ref()
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub fn demand(&self) -> &AdmissionDemand {
+        &self.demand
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StepRetirementReceipt {
     batch_step_id: BatchStepId,
@@ -9017,10 +9279,9 @@ pub struct StepResourceLease<R>
 where
     R: DeviceRuntime,
 {
-    // Declaration order is the release order: physical extents before the
-    // shared logical claim, then per-sequence frame guards before parents.
-    backing_slices: Vec<LogicalBackingSliceAuthority>,
-    logical_capacity: Option<LogicalBatchCapacityLease>,
+    // The transaction releases physical extents before its logical claim,
+    // then per-sequence frame guards release before their parent sessions.
+    claimed_backing: ClaimedBackingTransaction,
     participants: Vec<AdmittedStepParticipant<R>>,
     invocation_registry: Arc<InvocationRegistry>,
     batch_step_id: BatchStepId,
@@ -9034,8 +9295,7 @@ where
     fn new(
         participants: Vec<AdmittedStepParticipant<R>>,
         batch_step_id: BatchStepId,
-        logical_capacity: Option<LogicalBatchCapacityLease>,
-        backing_slices: Vec<LogicalBackingSliceAuthority>,
+        claimed_backing: ClaimedBackingTransaction,
     ) -> Result<Self, VNextError> {
         if participants.is_empty() {
             return Err(invalid_resource(
@@ -9048,7 +9308,22 @@ where
             .request
             .plan
             .logical_admission();
-        if let Some(capacity) = &logical_capacity {
+        if claimed_backing.work_shape().participants().len() != participants.len()
+            || claimed_backing
+                .work_shape()
+                .participants()
+                .iter()
+                .zip(&participants)
+                .any(|(authority, participant)| {
+                    authority.sequence_authority() != participant.session.sequence_authority()
+                        || authority.request_authority() != participant.session.request_authority()
+                })
+        {
+            return Err(invalid_resource(
+                "step work shape differs from its exact batch participants",
+            ));
+        }
+        if let Some(capacity) = claimed_backing.logical_capacity() {
             let parents_match = capacity
                 .parents()
                 .iter()
@@ -9064,14 +9339,9 @@ where
                     "step capacity authority differs from its exact batch participants",
                 ));
             }
-        } else if !backing_slices.is_empty() {
-            return Err(invalid_resource(
-                "step physical backing lacks its logical capacity authority",
-            ));
         }
         Ok(Self {
-            backing_slices,
-            logical_capacity,
+            claimed_backing,
             participants,
             invocation_registry: Arc::new(InvocationRegistry::default()),
             batch_step_id,
@@ -9183,11 +9453,76 @@ where
     }
 
     pub fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
-        &self.backing_slices
+        self.claimed_backing.backing_slices()
     }
 
     pub fn logical_capacity(&self) -> Option<&LogicalBatchCapacityLease> {
-        self.logical_capacity.as_ref()
+        self.claimed_backing.logical_capacity()
+    }
+
+    pub fn work_shape(&self) -> &BatchWorkShape {
+        self.claimed_backing.work_shape()
+    }
+
+    pub fn bind_invocation_work_shape(
+        &self,
+        mut participant_tokens: Vec<(BatchParticipantAuthority, TokenSpanWork)>,
+    ) -> Result<BatchWorkShape, VNextError> {
+        participant_tokens.sort_by_key(|(participant, _)| participant.canonical_key());
+        if participant_tokens.is_empty()
+            || participant_tokens
+                .windows(2)
+                .any(|pair| pair[0].0.canonical_key() == pair[1].0.canonical_key())
+            || participant_tokens.iter().any(|(authority, _)| {
+                self.participants
+                    .binary_search_by_key(&authority.canonical_key(), |participant| {
+                        session_participant_key(&participant.session)
+                    })
+                    .is_err()
+            })
+        {
+            return Err(invalid_resource(
+                "invocation token work must bind a unique non-empty step participant subset",
+            ));
+        }
+        BatchWorkShape::new(
+            participant_tokens
+                .into_iter()
+                .map(|(participant, token_span)| {
+                    BatchParticipantTokenSpan::new(participant, token_span)
+                })
+                .collect(),
+        )
+    }
+
+    pub fn bind_all_invocation_work_shape(
+        &self,
+        token_spans: Vec<TokenSpanWork>,
+    ) -> Result<BatchWorkShape, VNextError> {
+        if token_spans.len() != self.participants.len() {
+            return Err(invalid_resource(
+                "invocation token work count differs from all step participants",
+            ));
+        }
+        self.bind_invocation_work_shape(
+            self.participants
+                .iter()
+                .zip(token_spans)
+                .map(|(participant, token_span)| {
+                    (
+                        BatchParticipantAuthority::new(
+                            participant.session.sequence_authority(),
+                            participant.session.request_authority(),
+                        ),
+                        token_span,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    pub fn claimed_backing(&self) -> &ClaimedBackingTransaction {
+        &self.claimed_backing
     }
 
     pub fn static_provisioning(&self) -> Option<&StaticProvisioningLease<R>> {
@@ -9206,7 +9541,8 @@ where
         resource_id: &ResourceId,
     ) -> Result<LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
         if let Some(authority) = self
-            .backing_slices
+            .claimed_backing
+            .backing_slices()
             .iter()
             .find(|authority| authority.resource_id() == resource_id)
         {
@@ -9252,34 +9588,31 @@ where
             .read_lifecycle("admit a step invocation")?;
         let InvocationResourceAdmissionRequest {
             node_id,
-            participants: participant_selection,
-            immediate_shape,
-            fit_shape,
+            work_shape,
             fit_policy,
             pressure_action,
         } = request;
-        let participant_sessions = match participant_selection {
-            InvocationParticipantSelection::AllStepParticipants => self
-                .participants
-                .iter()
-                .map(|participant| Arc::clone(&participant.session))
-                .collect::<Vec<_>>(),
-            InvocationParticipantSelection::Exact(authorities) => authorities
-                .into_iter()
-                .map(|authority| {
-                    self.participants
-                        .binary_search_by_key(&authority.canonical_key(), |participant| {
-                            session_participant_key(&participant.session)
-                        })
-                        .map(|index| Arc::clone(&self.participants[index].session))
-                        .map_err(|_| {
-                            invalid_resource(
-                                "invocation participant is not a member of its execution frame",
-                            )
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
+        let immediate_shape = work_shape.immediate_shape();
+        let fit_shape = match fit_policy {
+            AdmissionFitPolicy::ImmediateOnly => immediate_shape,
+            AdmissionFitPolicy::FullInputMustFit => work_shape.fit_shape(),
         };
+        let participant_sessions = work_shape
+            .participants()
+            .iter()
+            .map(|authority| {
+                self.participants
+                    .binary_search_by_key(&authority.canonical_key(), |participant| {
+                        session_participant_key(&participant.session)
+                    })
+                    .map(|index| Arc::clone(&self.participants[index].session))
+                    .map_err(|_| {
+                        invalid_resource(
+                            "invocation participant is not a member of its execution frame",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut participant_frames = Vec::with_capacity(participant_sessions.len());
         let mut flight_candidates = Vec::with_capacity(participant_sessions.len());
         for participant in &participant_sessions {
@@ -9348,6 +9681,11 @@ where
                 )
             })
             .collect::<Vec<_>>();
+        if work_shape.participants() != participant_authorities {
+            return Err(invalid_resource(
+                "invocation work authority differs from selected participants",
+            ));
+        }
         let logical_capacity = if demand.immediate_claim().is_empty() {
             None
         } else {
@@ -9392,6 +9730,8 @@ where
             }
         };
         let backing_slices = prepared.commit();
+        let claimed_backing =
+            ClaimedBackingTransaction::new(work_shape, demand, logical_capacity, backing_slices)?;
         let batch_invocation_id = issue_batch_invocation_id()?;
         let active_invocation = self.invocation_registry.enter(
             &node_id,
@@ -9407,8 +9747,7 @@ where
                 participant_frames,
                 node_id,
                 batch_invocation_id,
-                logical_capacity,
-                backing_slices,
+                claimed_backing,
                 prepared_participant_flights,
                 active_invocation,
             )?,
@@ -9447,10 +9786,9 @@ pub struct InvocationResourceLease<R>
 where
     R: DeviceRuntime,
 {
-    // Physical backing is returned before the logical claim. The invocation
-    // registry and parent frame remain live until both have been released.
-    backing_slices: Vec<LogicalBackingSliceAuthority>,
-    logical_capacity: Option<LogicalBatchCapacityLease>,
+    // Claimed backing is returned before participant-flight and parent frame
+    // authorities. It retains the immutable work fingerprint even when empty.
+    claimed_backing: ClaimedBackingTransaction,
     prepared_participant_flights: Vec<PreparedParticipantFlightHold>,
     active_invocation: ActiveInvocationGuard,
     participants: Vec<Arc<AdmittedSequenceResources<R>>>,
@@ -9470,8 +9808,7 @@ where
         participant_frames: Vec<StepParticipantFrameAssignment>,
         node_id: NodeId,
         batch_invocation_id: BatchInvocationId,
-        logical_capacity: Option<LogicalBatchCapacityLease>,
-        backing_slices: Vec<LogicalBackingSliceAuthority>,
+        claimed_backing: ClaimedBackingTransaction,
         prepared_participant_flights: Vec<PreparedParticipantFlightHold>,
         active_invocation: ActiveInvocationGuard,
     ) -> Result<Self, VNextError> {
@@ -9494,7 +9831,27 @@ where
                 "invocation frame mapping differs from its exact participant set",
             ));
         }
-        if let Some(capacity) = &logical_capacity {
+        if claimed_backing.work_shape().participants().len() != participants.len()
+            || claimed_backing
+                .work_shape()
+                .participants()
+                .iter()
+                .zip(&participants)
+                .any(|(authority, participant)| {
+                    authority.sequence_authority() != participant.sequence_authority()
+                        || authority.request_authority() != participant.request_authority()
+                })
+            || claimed_backing.work_shape().immediate_tokens()
+                > step.work_shape().immediate_tokens()
+            || claimed_backing.work_shape().immediate_pages() > step.work_shape().immediate_pages()
+            || claimed_backing.work_shape().fit_tokens() > step.work_shape().fit_tokens()
+            || claimed_backing.work_shape().fit_pages() > step.work_shape().fit_pages()
+        {
+            return Err(invalid_resource(
+                "invocation work shape differs from participants or exceeds its step",
+            ));
+        }
+        if let Some(capacity) = claimed_backing.logical_capacity() {
             let coordinator = participants[0].request.plan.logical_admission();
             let parents_match = capacity
                 .parents()
@@ -9511,14 +9868,9 @@ where
                     "invocation capacity authority differs from its exact participants",
                 ));
             }
-        } else if !backing_slices.is_empty() {
-            return Err(invalid_resource(
-                "invocation physical backing lacks logical capacity authority",
-            ));
         }
         Ok(Self {
-            backing_slices,
-            logical_capacity,
+            claimed_backing,
             prepared_participant_flights,
             active_invocation,
             participants,
@@ -9587,11 +9939,19 @@ where
     }
 
     pub fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
-        &self.backing_slices
+        self.claimed_backing.backing_slices()
     }
 
     pub fn logical_capacity(&self) -> Option<&LogicalBatchCapacityLease> {
-        self.logical_capacity.as_ref()
+        self.claimed_backing.logical_capacity()
+    }
+
+    pub fn work_shape(&self) -> &BatchWorkShape {
+        self.claimed_backing.work_shape()
+    }
+
+    pub fn claimed_backing(&self) -> &ClaimedBackingTransaction {
+        &self.claimed_backing
     }
 
     pub fn plan_evidence(&self) -> TrustedPlanRuntimeEvidence {
@@ -9615,7 +9975,8 @@ where
         resource_id: &ResourceId,
     ) -> Result<LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
         if let Some(authority) = self
-            .backing_slices
+            .claimed_backing
+            .backing_slices()
             .iter()
             .find(|authority| authority.resource_id() == resource_id)
         {
@@ -9661,15 +10022,39 @@ where
             .plan
             .resources
             .read_lifecycle("begin an execution step")?;
-        self.validate_shapes(request.immediate_shape(), request.fit_shape(), "step")?;
+        let StepResourceAdmissionRequest {
+            work_shape,
+            fit_policy,
+            pressure_action,
+        } = request;
+        let expected_participants = self
+            .sessions
+            .iter()
+            .map(|session| {
+                BatchParticipantAuthority::new(
+                    session.sequence_authority(),
+                    session.request_authority(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if work_shape.participants() != expected_participants {
+            return Err(invalid_resource(
+                "step work authority differs from its exact participant set",
+            ));
+        }
+        let immediate_shape = work_shape.immediate_shape();
+        let fit_shape = match fit_policy {
+            AdmissionFitPolicy::ImmediateOnly => immediate_shape,
+            AdmissionFitPolicy::FullInputMustFit => work_shape.fit_shape(),
+        };
         let plan = &self.sessions[0].resources().request.plan;
         let (demand, requested_slices) = plan.scoped_demand(
             AllocationLifetime::Step,
             None,
-            request.immediate_shape(),
-            request.fit_shape(),
-            request.fit_policy(),
-            request.pressure_action(),
+            immediate_shape,
+            fit_shape,
+            fit_policy,
+            pressure_action,
         )?;
         let prepared = match plan.prepare_backing_slices(requested_slices)? {
             BackingPrepareDecision::Prepared(prepared) => prepared,
@@ -9717,6 +10102,8 @@ where
             }
         };
         let backing_slices = prepared.commit();
+        let claimed_backing =
+            ClaimedBackingTransaction::new(work_shape, demand, logical_capacity, backing_slices)?;
         let batch_step_id = issue_batch_step_id()?;
         let candidates = session_frame_candidates(&self.sessions);
         let frames = acquire_session_frames(&candidates, batch_step_id)?;
@@ -9728,12 +10115,7 @@ where
             .map(|(session, frame)| AdmittedStepParticipant { frame, session })
             .collect();
         Ok(StepResourceAdmissionDecision::Admitted(Arc::new(
-            StepResourceLease::new(
-                participants,
-                batch_step_id,
-                logical_capacity,
-                backing_slices,
-            )?,
+            StepResourceLease::new(participants, batch_step_id, claimed_backing)?,
         )))
     }
 }
@@ -13086,10 +13468,19 @@ mod dynamic_pool_tests {
         DynamicResourceShape::new(1, tokens, 1).unwrap()
     }
 
+    fn work(tokens: usize) -> ResourceWorkShape {
+        let token_ids = (0..tokens)
+            .map(|token| u32::try_from(token).unwrap())
+            .collect::<Vec<_>>();
+        ResourceWorkShape::single(
+            TokenSpanWork::from_token_ids(&token_ids, 0..token_ids.len()).unwrap(),
+        )
+        .unwrap()
+    }
+
     fn request_admission() -> RequestResourceAdmissionRequest {
         RequestResourceAdmissionRequest::new(
-            shape(1),
-            shape(1),
+            work(1),
             AdmissionFitPolicy::ImmediateOnly,
             AdmissionPressureAction::WaitForRelease,
         )
@@ -13120,8 +13511,7 @@ mod dynamic_pool_tests {
     ) -> Arc<AdmittedSequenceResources<TestRuntime>> {
         let request = admitted_request(root, suffix);
         let admission = SequenceResourceAdmissionRequest::new(
-            shape(1),
-            shape(1),
+            work(1),
             AdmissionFitPolicy::ImmediateOnly,
             AdmissionPressureAction::WaitForRelease,
         )
@@ -14173,7 +14563,7 @@ mod dynamic_pool_tests {
             domain: &pool.domain,
             descriptor: &pool.domain.descriptors[0],
             size_bytes: pool.domain.descriptors[0]
-                .evaluate_request_bytes(shape(2))
+                .evaluate_request_bytes(&work(2))
                 .unwrap(),
         };
         let BackingPrepareDecision::Deferred(deferred) = harness
@@ -14903,20 +15293,6 @@ mod sequence_session_frame_tests {
         assert_eq!(active.next_frame, Some(frame(2)));
         drop(state);
         assert!(acquire_session_frames(std::slice::from_ref(&candidate), step(2)).is_err());
-    }
-
-    #[test]
-    fn step_admission_request_contains_no_caller_frame_authority() {
-        let shape = DynamicResourceShape::new(3, 9, 2).unwrap();
-        let request = StepResourceAdmissionRequest::new(
-            shape,
-            shape,
-            AdmissionFitPolicy::ImmediateOnly,
-            AdmissionPressureAction::WaitForRelease,
-        )
-        .unwrap();
-        assert_eq!(request.immediate_shape(), shape);
-        assert_eq!(request.fit_shape(), shape);
     }
 
     #[test]
