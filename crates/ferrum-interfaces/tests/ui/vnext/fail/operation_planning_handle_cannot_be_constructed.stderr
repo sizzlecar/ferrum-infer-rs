@@ -1,0 +1,7 @@
+error: cannot construct `ferrum_interfaces::vnext::OperationPlanningHandle<'_>` with struct literal syntax due to private fields
+ --> tests/ui/vnext/fail/operation_planning_handle_cannot_be_constructed.rs:4:13
+  |
+4 |     let _ = OperationPlanningHandle { registry };
+  |             ^^^^^^^^^^^^^^^^^^^^^^^   -------- private field
+  |
+  = note: ...and other private field `authority` that was not provided

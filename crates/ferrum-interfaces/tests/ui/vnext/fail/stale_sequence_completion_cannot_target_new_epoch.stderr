@@ -1,0 +1,16 @@
+error[E0061]: this method takes 0 arguments but 1 argument was supplied
+ --> tests/ui/vnext/fail/stale_sequence_completion_cannot_target_new_epoch.rs:8:20
+  |
+8 |     let _ = second.complete(stale);
+  |                    ^^^^^^^^ ----- unexpected argument of type `ActiveSequenceCompletionReceipt`
+  |
+note: method defined here
+ --> src/vnext/resource.rs
+  |
+  |     pub fn complete(mut self) -> Result<ActiveSequenceCompletionReceipt, VNextError> {
+  |            ^^^^^^^^
+help: remove the extra argument
+      |
+8 -     let _ = second.complete(stale);
+8 +     let _ = second.complete();
+  |

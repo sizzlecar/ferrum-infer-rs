@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `StaticProvisioningLease<R>` in the current scope
+ --> tests/ui/vnext/fail/resource_lease_is_not_clone.rs:4:28
+  |
+4 |     let _duplicate = lease.clone();
+  |                            ^^^^^ method not found in `StaticProvisioningLease<R>`

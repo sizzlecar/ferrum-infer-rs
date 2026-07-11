@@ -1,0 +1,23 @@
+error[E0451]: fields `plan`, `coordinator_id`, `sequence_authority`, `run_id`, `request_id`, `activation_epoch`, `runtime_implementation_fingerprint`, `active_sequence_fingerprint` and `fingerprint` of struct `ferrum_interfaces::vnext::TrustedCompletedSequenceBinding` are private
+  --> tests/ui/vnext/fail/trusted_completed_sequence_binding_cannot_be_constructed.rs:11:9
+   |
+10 |     let _ = TrustedCompletedSequenceBinding {
+   |             ------------------------------- in this type
+11 |         plan,
+   |         ^^^^ private field
+12 |         coordinator_id,
+   |         ^^^^^^^^^^^^^^ private field
+13 |         sequence_authority,
+   |         ^^^^^^^^^^^^^^^^^^ private field
+14 |         run_id,
+   |         ^^^^^^ private field
+15 |         request_id,
+   |         ^^^^^^^^^^ private field
+16 |         activation_epoch: 1,
+   |         ^^^^^^^^^^^^^^^^ private field
+17 |         runtime_implementation_fingerprint: "1".repeat(64),
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private field
+18 |         active_sequence_fingerprint: "2".repeat(64),
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ private field
+19 |         fingerprint: "3".repeat(64),
+   |         ^^^^^^^^^^^ private field

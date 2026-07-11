@@ -1,0 +1,14 @@
+error[E0624]: method `view` is private
+ --> tests/ui/vnext/fail/resource_lease_view_is_private.rs:4:19
+  |
+4 |       let _ = lease.view(id, generation);
+  |                     ^^^^ private method
+  |
+ ::: src/vnext/resource.rs
+  |
+  | /     pub(crate) fn view(
+  | |         &self,
+  | |         resource_id: &ResourceId,
+  | |         generation: u64,
+  | |     ) -> Result<LeasedBufferView<'_, R::Buffer>, VNextError> {
+  | |____________________________________________________________- private method defined here

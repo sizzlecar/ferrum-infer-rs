@@ -1,0 +1,10 @@
+error[E0624]: method `authority` is private
+ --> tests/ui/vnext/fail/operation_planning_authority_is_private.rs:4:20
+  |
+4 |     let _ = handle.authority();
+  |                    ^^^^^^^^^ private method
+  |
+ ::: src/vnext/operation.rs
+  |
+  |     pub(crate) fn authority(&self) -> &OperationRegistryAuthority {
+  |     ------------------------------------------------------------- private method defined here

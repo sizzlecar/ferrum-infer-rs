@@ -1,0 +1,12 @@
+error[E0505]: cannot move out of `stream` because it is borrowed
+ --> tests/ui/vnext/fail/active_sequence_blocks_stream_move.rs:8:10
+  |
+5 |     mut stream: BoundExecutionStream<R>,
+  |     ---------- binding `stream` declared here
+6 | ) {
+7 |     let permit = resources.activate(&mut stream).unwrap();
+  |                                     ----------- borrow of `stream` occurs here
+8 |     drop(stream);
+  |          ^^^^^^ move out of `stream` occurs here
+9 |     drop(permit);
+  |          ------ borrow later used here

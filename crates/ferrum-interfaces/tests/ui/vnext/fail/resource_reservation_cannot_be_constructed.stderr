@@ -1,0 +1,11 @@
+error[E0599]: no function or associated item named `new` found for struct `ferrum_interfaces::vnext::ResourceReservation` in the current scope
+ --> tests/ui/vnext/fail/resource_reservation_cannot_be_constructed.rs:4:34
+  |
+4 |     let _ = ResourceReservation::new(
+  |                                  ^^^ function or associated item not found in `ferrum_interfaces::vnext::ResourceReservation`
+  |
+help: there is a method `ne` with a similar name, but with different arguments
+ --> $RUST/core/src/cmp.rs
+  |
+  |     fn ne(&self, other: &Rhs) -> bool {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

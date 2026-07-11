@@ -1,0 +1,16 @@
+error[E0308]: mismatched types
+  --> tests/ui/vnext/fail/synchronized_sequence_cannot_dispatch.rs:24:9
+   |
+17 |     let _ = OperationDispatch::encode_and_submit(
+   |             ------------------------------------ arguments to this function are incorrect
+...
+24 |         &mut synchronized,
+   |         ^^^^^^^^^^^^^^^^^ expected `&TrustedActiveSequenceBinding`, found `&mut ...`
+   |
+   = note:      expected reference `&TrustedActiveSequenceBinding`
+           found mutable reference `&mut ferrum_interfaces::vnext::SynchronizedSequencePermit<'_, '_, R>`
+note: associated function defined here
+  --> src/vnext/operation.rs
+   |
+   |     pub fn encode_and_submit<R>(
+   |            ^^^^^^^^^^^^^^^^^

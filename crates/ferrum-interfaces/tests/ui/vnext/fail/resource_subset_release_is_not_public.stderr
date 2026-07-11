@@ -1,0 +1,13 @@
+error[E0599]: no method named `release_subset` found for mutable reference `&mut ferrum_interfaces::vnext::ResourceTransaction<D, ferrum_interfaces::vnext::TransactionCommitted>` in the current scope
+ --> tests/ui/vnext/fail/resource_subset_release_is_not_public.rs:7:25
+  |
+7 |     let _ = transaction.release_subset(&[resource_id]);
+  |                         ^^^^^^^^^^^^^^
+  |
+help: there is a method `release` with a similar name, but with different arguments
+ --> src/vnext/resource.rs
+  |
+  | /     pub fn release(
+  | |         mut self,
+  | |     ) -> Result<ResourceTransaction<D, TransactionReleased>, ResourceReleaseTransitionError<D>>
+  | |_______________________________________________________________________________________________^

@@ -1,0 +1,5 @@
+error[E0616]: field `logical_lease` of struct `ferrum_interfaces::vnext::AdmittedSequenceResources` is private
+ --> tests/ui/vnext/fail/live_sequence_blocks_resource_release.rs:4:27
+  |
+4 |     let _ = &mut sequence.logical_lease;
+  |                           ^^^^^^^^^^^^^ private field

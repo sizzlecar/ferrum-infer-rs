@@ -1,0 +1,5 @@
+error[E0599]: no method named `resource_id` found for reference `&ResolvedValueBinding` in the current scope
+ --> tests/ui/vnext/fail/resolved_value_has_no_lossy_resource_id.rs:4:21
+  |
+4 |     let _ = binding.resource_id();
+  |                     ^^^^^^^^^^^ method not found in `&ResolvedValueBinding`

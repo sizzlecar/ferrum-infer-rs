@@ -1,0 +1,19 @@
+warning: unreachable expression
+ --> tests/ui/vnext/fail/operation_oracle_registration_cannot_be_constructed.rs:6:17
+  |
+5 |         expected_descriptor: panic!(),
+  |                              -------- any code following this expression is unreachable
+6 |         oracle: panic!(),
+  |                 ^^^^^^^^ unreachable expression
+  |
+  = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0451]: fields `expected_descriptor` and `oracle` of struct `OperationOracleRegistration` are private
+ --> tests/ui/vnext/fail/operation_oracle_registration_cannot_be_constructed.rs:5:9
+  |
+4 |     let _ = OperationOracleRegistration {
+  |             --------------------------- in this type
+5 |         expected_descriptor: panic!(),
+  |         ^^^^^^^^^^^^^^^^^^^ private field
+6 |         oracle: panic!(),
+  |         ^^^^^^ private field

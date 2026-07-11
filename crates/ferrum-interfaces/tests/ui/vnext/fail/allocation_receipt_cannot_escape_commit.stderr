@@ -1,0 +1,8 @@
+error: lifetime may not live long enough
+ --> tests/ui/vnext/fail/allocation_receipt_cannot_escape_commit.rs:7:5
+  |
+3 | fn stash<'commit>(
+  |          ------- lifetime `'commit` defined here
+...
+7 |     *slot = Some(receipt);
+  |     ^^^^^ assignment requires that `'commit` must outlive `'static`

@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/vnext/fail/model_family_config_is_typed.rs:53:34
+   |
+53 |     let _ = family.weight_schema(&WrongConfig);
+   |                    ------------- ^^^^^^^^^^^^ expected `&Config`, found `&WrongConfig`
+   |                    |
+   |                    arguments to this method are incorrect
+   |
+   = note: expected reference `&Config`
+              found reference `&WrongConfig`
+note: method defined here
+  --> src/vnext/model.rs
+   |
+   |     fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError>;
+   |        ^^^^^^^^^^^^^

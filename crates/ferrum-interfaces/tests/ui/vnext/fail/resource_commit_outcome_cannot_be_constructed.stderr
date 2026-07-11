@@ -1,0 +1,8 @@
+error[E0433]: failed to resolve: use of undeclared type `ResourceCommitOutcome`
+ --> tests/ui/vnext/fail/resource_commit_outcome_cannot_be_constructed.rs:4:13
+  |
+4 |     let _ = ResourceCommitOutcome::new(
+  |             ^^^^^^^^^^^^^^^^^^^^^
+  |             |
+  |             use of undeclared type `ResourceCommitOutcome`
+  |             help: a struct with a similar name exists: `ResourceCommitView`

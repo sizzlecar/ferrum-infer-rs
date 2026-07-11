@@ -1,0 +1,5 @@
+error[E0616]: field `schema` of struct `ExecutionPlanPayload` is private
+ --> tests/ui/vnext/fail/execution_plan_is_immutable.rs:4:20
+  |
+4 |     plan.payload().schema = ferrum_interfaces::vnext::PlanSchemaVersion::new(2, 0);
+  |                    ^^^^^^ private field

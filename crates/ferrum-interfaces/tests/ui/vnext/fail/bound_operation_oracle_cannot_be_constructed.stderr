@@ -1,0 +1,27 @@
+warning: unreachable expression
+ --> tests/ui/vnext/fail/bound_operation_oracle_cannot_be_constructed.rs:6:29
+  |
+5 |         requested_operation: panic!(),
+  |                              -------- any code following this expression is unreachable
+6 |         terminal_operation: panic!(),
+  |                             ^^^^^^^^ unreachable expression
+  |
+  = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0451]: fields `requested_operation`, `terminal_operation` and `registered` of struct `BoundOperationOracle` are private
+ --> tests/ui/vnext/fail/bound_operation_oracle_cannot_be_constructed.rs:5:9
+  |
+4 |     BoundOperationOracle {
+  |     -------------------- in this type
+5 |         requested_operation: panic!(),
+  |         ^^^^^^^^^^^^^^^^^^^ private field
+6 |         terminal_operation: panic!(),
+  |         ^^^^^^^^^^^^^^^^^^ private field
+7 |         registered: panic!(),
+  |         ^^^^^^^^^^ private field
+
+error: type `vnext::oracle::RegisteredOracle` is private
+ --> tests/ui/vnext/fail/bound_operation_oracle_cannot_be_constructed.rs:7:21
+  |
+7 |         registered: panic!(),
+  |                     ^^^^^^^^ private type
