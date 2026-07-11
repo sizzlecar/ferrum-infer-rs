@@ -47,7 +47,7 @@ cell 必须保留至少 `2 GiB` 实测物理 headroom 且 swap growth 为 `0`，
 
 若独立 preflight 证明指定硬件无法满足本文的物理 headroom 或 active-concurrency floor，只允许通过
 reviewed Goal amendment 更换明确命名的 reference hardware 或 weight format。amendment 必须保留
-C01-C21、工具/流式/结构化输出和外部 `0.80x` 门，重采 hardware/model lock、legacy/external baseline
+C01-C21、工具/流式/结构化输出和 G09 竞争性外部门，重采 hardware/model lock、legacy/external baseline
 及所有受影响 artifact；不得在同一次 amendment 中静默降低并发、正确性或性能门槛。硬件阻塞在
 amendment 合并前保持 `BLOCKED`，不构成 waiver 或 PASS。
 
@@ -289,9 +289,9 @@ binary 的 run 作为 `B`、serve-c1 作为 `A`，两侧使用 G06 token-commit 
 | latency non-regression | TTFT/TPOT candidate 中位数 `<=legacy`，ratio UCB `<=1.05`；client-SSE-event ITL 仅在全 paired request eligible 时执行同一门；G06 token-commit ITL 独立执行 no-regression |
 | memory non-regression | peak memory `<=1.03x` legacy；leak/swap growth/OOM `0` |
 | new-lane memory | CUDA peak `<=` typed preflight budget 且保留 `>=512 MiB` physical headroom；Metal peak 不越过 typed unified-memory budget、measured cell swap growth `0` |
-| CUDA external | 三模型 throughput LCB `>=0.80x` same-host vLLM |
-| CUDA external latency | 三模型所有 new/BLOCKED cell 的 TTFT/TPOT p95 `<=1.25x` same-host vLLM，paired latency ratio UCB `<=1.25`；client-SSE-event ITL 仅在全 paired request eligible 时执行同一门，否则 ratio 不得存在；legacy PASS cell 仍执行更严格门，G06 token-commit ITL 另行必采 |
-| Metal external | 三模型 c1/c4/c16 throughput LCB `>=0.80x` same-host llama.cpp，同 GGUF |
+| CUDA external | 三模型每 cell throughput LCB `>=0.90x` same-host vLLM，required-cell ratio 几何平均 LCB `>=0.95` |
+| CUDA external latency | 三模型所有 new/BLOCKED cell 的 TTFT/TPOT p95 `<=1.15x` same-host vLLM，paired latency ratio UCB `<=1.15`；client-SSE-event ITL 仅在全 paired request eligible 时执行同一门，否则 ratio 不得存在；legacy PASS cell 仍执行更严格门，G06 token-commit ITL 另行必采 |
+| Metal external | 三模型 c1/c4/c16 throughput LCB `>=0.90x` same-host llama.cpp、required-cell ratio 几何平均 LCB `>=0.95`，同 GGUF；TTFT/TPOT p95 和 eligible client-SSE-event ITL `<=1.15x` |
 | product run/serve | G06+ 同 binary、model、prompt、prefill/output 设置下，`ferrum run` token-commit 稳态 decode / Ferrum serve-c1 decode median `>=0.95`；legacy PASS lane 另以匹配的 `engine.infer` E2E 边界做 no-regression |
 | reliability | 每 required HTTP comparison 的每实现每 cell `1200/1200` measured requests completed；run comparison `12/12`；全部 warmup/error counters `0` |
 
@@ -317,8 +317,8 @@ binary 的 run 作为 `B`、serve-c1 作为 `A`，两侧使用 G06 token-commit 
   reference，不能直接成为硬 floor。
 
 M1 没有可信现有实模性能 artifact。G00 必须先尝试冻结 legacy CUDA 基线；如果 legacy
-产品路径失败，保存 BLOCKED artifact。vNext 仍必须通过完整正确性并达到 `>=0.80x vLLM`，
-TTFT/TPOT p95 `<=1.25x vLLM`；全 paired request eligible 时 client-SSE-event ITL 也执行该门；
+产品路径失败，保存 BLOCKED artifact。vNext 仍必须通过完整正确性并达到 `>=0.90x vLLM`，
+TTFT/TPOT p95 `<=1.15x vLLM`；全 paired request eligible 时 client-SSE-event ITL 也执行该门；
 `ferrum run` 稳态 decode 不低于同 binary Ferrum
 serve-c1 的 `0.95x`。不得把“旧版没有数字”解释为没有性能要求。
 
@@ -337,6 +337,10 @@ serve-c1 的 `0.95x`。不得把“旧版没有数字”解释为没有性能要
 - `itl_evidence_per_request`、逐 repeat eligibility counts、expected/observed interval totals、ITL
   source 与 ratio eligibility；ineligible 时 ratio 字段必须不存在；
 - typed admission cap、raw active timeline、observed max-active、eligible interval、active duty-cycle；
+- 每个 capacity domain 的 arena/block/slot unit、absolute total/effective/free capacity、reserve/
+  watermark、block/cache dtype，以及 immediate claim、fit requirement、实际 future reservation、
+  defer/impossible/release epoch、preemption/recompute timeline；Ferrum/vLLM 比较必须锁定并报告
+  相同的绝对有效 KV budget；
 - numerical checkpoint 的 tolerance catalog blob SHA、tolerance id/row fingerprint 和 raw tensor/logit metrics；
 - stdout/stderr 非空日志；
 - PASS/FAIL/REJECT/BLOCKED 与精确 failure class。

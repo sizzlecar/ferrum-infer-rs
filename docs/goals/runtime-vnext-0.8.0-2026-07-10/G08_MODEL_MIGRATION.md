@@ -62,7 +62,7 @@ backend 最高 required client concurrency、`--fail-on-error --seed 9271 --n-re
 100 requests，baseline 后 candidate 各运行一次并各自 warmup 10 requests。它不使用
 `--require-ci`、不产生 LCB，也不能支撑 performance/no-regression claim；legacy PASS lane 的
 candidate median 须 `>=0.90x` legacy，新 lane 须 `>=0.70x` same-host external。正式
-`ABBA-BAAB`、不回退和 80% 门全部在 G09 完成。
+`ABBA-BAAB`、不回退和竞争性外部门全部在 G09 完成。
 
 禁止先宣布模型迁移完成，再把旧路径删除留给以后。
 

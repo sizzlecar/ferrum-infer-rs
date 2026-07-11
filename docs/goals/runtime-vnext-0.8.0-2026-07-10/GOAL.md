@@ -8,6 +8,14 @@ Open。创建于 2026-07-10。
 `run`/`serve` 分叉上继续打补丁。目标是重新设计 Ferrum 的核心推理架构，并把
 已经可靠的测试、benchmark、artifact、kernel 和 release 能力收敛到新架构。
 
+本目标的产品北极星不是“完成一次内部重构”，而是在已声明支持的单机推理场景中具备
+蚕食 vLLM 市场的竞争力。设计、正确性、功能完整性、延迟和吞吐都不得用“项目规模较小”
+作为降级理由；凡是主三模型矩阵声明支持的 `run`、OpenAI-compatible `serve`、streaming、
+tool calling、structured output 和 multi-turn 路径，功能/正确性缺口必须为 `0`。CUDA 同机
+vLLM 的逐 cell throughput ratio LCB 必须 `>=0.90`、主矩阵几何平均必须 `>=0.95`，资源压力
+continuous-batching lane 必须 `>=0.95`；TTFT/TPOT p95 ratio 必须 `<=1.15`。低于这些门槛
+只能形成诊断 artifact，不能以“可用”替代“有竞争力”进入发布。
+
 完成本目标意味着实际发布 `v0.8.0`，而不是仅达到 release-ready。只有发布后的
 Metal/CUDA 安装产物通过最终验证器并打印下面这一行，目标才算完成：
 
@@ -174,6 +182,30 @@ fallback 和拒绝原因。capability 判断不得留在 token hot loop。
 边界和清理。唯一 `ResourceTransaction` 管理 KV、recurrent state、scratch、graph workspace、
 admission、commit、rollback、release。scheduler、engine 和 model 不得分别拥有半套资源真相。
 
+资源 authority 必须分为 `Plan -> Request -> Sequence -> Step(ExecutionFrame) -> Invocation` 五个
+语义 scope；Request state 可被同 request 的多个 child sequence 共享但只计费一次，Step state 跨
+同一 participant frame 的多个 node，Invocation scratch 只属于一次真实 batch node/provider 调用。
+continuous batch 的 Step/Invocation 必须持有 canonical non-empty participant parent set，而不是把
+batch authority 临时挂在首个 sequence；实际 shape 的 `sequences` 必须等于 participant 数，batch
+workspace/scratch 只 claim 一次。`BatchStepId`/`BatchInvocationId` 标识物理 scheduler step/submit，
+每个 participant 另保留自身连续的 `ExecutionFrameId`/request-journal node identity；新旧请求同批时
+这些本地 id 可以不同，不能投影成一个 leader identity。
+每个 participant 以 owning parent hold 保活 Request/Sequence/Step，
+适配 scheduler/in-flight reaper；不得用词法自引用、每 sequence stream 或合并不同 lifetime。
+
+device execution stream 属于 scheduler/device execution lane，不属于单个 sequence。`submit` 只能
+返回 `DefinitelyNotSubmitted` 或持有 typed fence 的 in-flight authority；任何 possibly-submitted
+错误都必须由 fence 终态报告。一次 batch invocation 的 extent、所有 participant hold 和 Request
+state hazard 由 durable completion reaper 持有到 fence quiescent；单个 sequence cancel/completion
+不得 drain 共享 lane 或阻塞其他 participant。
+
+`maximum_active_sequences` 只能是用户/协议 ceiling，不能等同于启动时预分配数量。Plan 以
+`O(graph)` scoped descriptor 保存每实例资源公式；静态资源在模型加载时提交，KV、recurrent
+state、request/sequence workspace 按实际请求和当前可用容量动态 claim。资源不足的请求必须
+进入 typed waiting/deferred 状态，在 claim 成功前 provider encode、kernel 和 prefill submit 次数
+均为 `0`；已有 decode 和其他可运行请求继续推进。每次资源释放递增 capacity-release epoch，
+等待请求据此重试，禁止用模型名、GPU 名、固定并发或显存档位硬编码正常 admission。
+
 ### 5.6 产品组合层
 
 `run` 和 `serve` 通过唯一 `ResolvedModelPlan` 进入同一个 engine。二者只保留 terminal 与
@@ -191,6 +223,23 @@ HTTP/SSE 的 I/O 适配，不得各自解析模型 alias、能力、默认值、
 | 核心 runtime 直接读取隐藏 `FERRUM_*` 环境变量 | `0` |
 | 同一模型的产品 source/config/capability 决策实现 | `1` |
 | model-owned scheduler/KV/recurrent manager | `0` |
+| 正常路径按 admission ceiling 预物化 per-slot 资源 | `0` |
+| 从未安装真实 backing segment 的数字发布动态 capacity | `0` |
+| metadata-only 动态资源 authority 到达 provider dispatch | `0` |
+| logical slice/page 重复计入全局物理显存 | `0` |
+| Request state 被每 child sequence 重复 claim | `0` |
+| Step state 被降级为单 node/invocation lifetime | `0` |
+| Invocation scratch 被提升为 Request/Sequence/Step lifetime | `0` |
+| batch scratch 按 participant 重复 claim | `0` |
+| batch child capacity 仅绑定 canonical leader sequence | `0` |
+| continuous batch 强制所有 participant 使用同一 request frame id | `0` |
+| execution stream 绑定单个 sequence | `0` |
+| dynamic provider 可见无 physical region 的 arena 裸 buffer | `0` |
+| device fence 完成前复用 Invocation extent/hazard permit | `0` |
+| sequence completion 通过 drain 共享 execution lane 阻塞其他请求 | `0` |
+| per-request projection 重复计数同一物理 command/fence | `0` |
+| capacity defer 后发生 provider/prefill submit | `0` |
+| 一个资源不足请求造成全局 scheduler HOL 阻塞 | `0` |
 | release binary 中 legacy executor/factory/runtime | `0` |
 | silent fallback / silent default success | `0` |
 | 未声明 sunset 的 compatibility adapter | `0` |
@@ -302,13 +351,14 @@ format，并重采全部受影响 baseline；不能原地降低 correctness、ac
 对原本 unsupported 的 Metal/Qwen3.5 cell，不能伪称 no-regression：
 
 - 与同机、同 GGUF、同 workload 的 llama.cpp 比较；
-- Metal 全部 required c=1/4/16 的 throughput ratio LCB `>=0.80`；
-- TTFT/TPOT p95 不高于 llama.cpp `1.25x`；全 paired request eligible 时 client-SSE-event ITL p95
-  也不高于 `1.25x`，否则不生成该 ratio；G06 Ferrum token-commit ITL 仍为必需证据；
+- Metal 全部 required c=1/4/16 的 throughput ratio LCB `>=0.90`，主矩阵几何平均 LCB
+  `>=0.95`；
+- TTFT/TPOT p95 不高于 llama.cpp `1.15x`；全 paired request eligible 时 client-SSE-event ITL p95
+  也不高于 `1.15x`，否则不生成该 ratio；G06 Ferrum token-commit ITL 仍为必需证据；
 - 正确性先通过 reference gate。
 
 CUDA 三个主模型还必须达到同机 vLLM 相同模型/格式/数据集 throughput LCB 的
-`>=0.80`。仅守住低性能 legacy 基线不足以完成目标。
+逐 cell `>=0.90`、主矩阵几何平均 `>=0.95`。仅守住低性能 legacy 基线不足以完成目标。
 
 Qwen3-30B-A3B 有两套独立历史向量，禁止拼成一个不存在的 baseline：0.7.7 默认路径为
 `164.2 / 353.3 / 636.9 / 706.0 tok/s`；历史 FA2 direct 路径为
@@ -352,7 +402,7 @@ artifact 和独立 source-build lane。
 | G06 | [`G06_OBSERVABILITY_PERF_LAB.md`](G06_OBSERVABILITY_PERF_LAB.md) | G01,G02,G04,G05 | 定位、replay、统一 profile 和性能实验协议 |
 | G07 | [`G07_BUILD_NATIVE_OPS.md`](G07_BUILD_NATIVE_OPS.md) | G07A<-G00+G01；G07B<-G03+G07A；G07 聚合 A/B | crate/build graph、native ops、增量编译 |
 | G08 | [`G08_MODEL_MIGRATION.md`](G08_MODEL_MIGRATION.md) | G03-G07；内部 A->B->C->D | 三主模型逐个迁移、parity、legacy 删除和长尾处置 |
-| G09 | [`G09_PERFORMANCE.md`](G09_PERFORMANCE.md) | G00,G06,G07,G08 | 三模型双端性能恢复及 80% 外部线 |
+| G09 | [`G09_PERFORMANCE.md`](G09_PERFORMANCE.md) | G00,G06,G07,G08 | 三模型双端性能恢复及竞争性外部线 |
 | G10 | [`G10_RELEASE.md`](G10_RELEASE.md) | G10A<-G00-G09 dev PASS；G10A->fresh G08-RC/G09-RC->G10B | release freeze、候选 SHA 重验、发布、安装后回归和最终 PASS |
 
 ### Canonical gate 入口
@@ -464,7 +514,7 @@ G07B 必须消费 G03 冻结的 operation catalog。
 | M2 新运行时纵切 | G03-G05 | tiny real-weight vNext runtime 经统一 run/serve composition root 完成纵切；不提前宣称主模型迁移 |
 | M3 可诊断可迭代 | G06-G07 | 一次失败可定位；dev compile 达标 |
 | M4 三模型迁移 | G08 | 三模型 CUDA -> Metal，旧路径随模型删除 |
-| M5 性能闭环 | G09 | legacy 不回退且三模型达到主流实现 80% |
+| M5 性能闭环 | G09 | legacy 不回退且三模型逐 cell 达主流实现 90%、矩阵几何平均 95% |
 | M6 发布 | G10A -> G08-RC/G09-RC -> G10B -> G10 | release-candidate SHA 重验后，`v0.8.0` 已发布且安装产物双端复验 |
 
 CUDA 优先顺序：Qwen3.5-4B -> Qwen3.5-35B-A3B -> Qwen3-30B-A3B。Metal 在每个模型

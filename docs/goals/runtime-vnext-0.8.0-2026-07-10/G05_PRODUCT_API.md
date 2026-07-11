@@ -29,6 +29,16 @@ token/template/stop/sampling semantics。入口差异只允许存在于 terminal
 
 ## 产品语义
 
+G05 必须生成 `vllm-target-segment-parity.json`，固定用于 G00/G09 外部基线的 vLLM
+version/commit，并逐项记录本目标单机 language-serving 细分市场中的能力：OpenAI chat
+completions、non-stream/stream、stream usage、continuous batching、动态资源 defer/resume、
+multi-turn、stop/EOS/max tokens、cancel/disconnect、required/auto/streamed tools、tool result、
+`json_object`、strict `json_schema`、prefix/session cache（若发布开启）及产品可见 sampling 参数。
+每项必须包含 vLLM source/doc evidence、Ferrum typed entry、三个主模型 scenario id、支持状态和
+artifact。required 行缺失、silent fallback 或仅 hidden-env 可达均为 G05/G08 release blocker；
+明确不属于 v0.8.0 language-only 范围的 multimodal/distributed 行必须记录 disposition，不能冒充
+已实现。该 ledger 衡量目标细分市场，不声称 Ferrum v0.8.0 已覆盖 vLLM 的全部产品表面。
+
 - run/serve 模型解析和自动下载策略统一。
 - template 使用模型 metadata；渲染失败 hard error。
 - Unicode 增量解码共享。
@@ -75,6 +85,8 @@ G00 必须把 legacy `json_object` 的实际结果记录为锁定的 pass/known-
 - `run` slow-path config materialization historical mutation 被 G02 gate 杀死。
 - `bench-serve --enable-thinking false/true/model-default` payload golden 各 `20/20`，server
   捕获值与 effective config 完全一致；非法值在发请求前失败。
+- `vllm-target-segment-parity.json` required 行 `100% PASS`，unsupported/silent/hidden-env-only
+  行 `0`；每行绑定至少一个真实主模型 scenario artifact，synthetic-only 行不得通过。
 
 G05 不得打印任何主模型迁移 PASS。它只完成产品组合与 API contract；G08 才把该 contract
 应用到三个真实模型和两个 backend。
@@ -94,6 +106,7 @@ docs/release/runtime-vnext/0.8.0/g05-product-api/
   run-serve-matrix/
   unicode-streaming/
   tool-schema/
+  vllm-target-segment-parity.json
   deprecated-config.json
 ```
 
