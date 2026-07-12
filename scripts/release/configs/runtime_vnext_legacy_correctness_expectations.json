@@ -9,7 +9,13 @@
     "discovery-required": "Only --discover may run this case. Discovery never emits the canonical PASS line and cannot enter a formal scenario report."
   },
   "resolution_policy": {
-    "selector_order": ["scenario_id", "variant", "preset"],
+    "selector_order": [
+      "scenario_id",
+      "variant",
+      "preset",
+      "entrypoint",
+      "case_id"
+    ],
     "wildcard": "*",
     "coverage": "Every generated case in all six primary model/backend lanes must resolve to exactly one most-specific rule.",
     "formal_rule": "Canonical collection rejects a lane while any resolved case is discovery-required.",
@@ -33,7 +39,13 @@
     "m1-qwen35-4b/cuda": {
       "rules": [
         {
-          "selector": {"scenario_id": "*", "variant": "*", "preset": "*"},
+          "selector": {
+            "scenario_id": "*",
+            "variant": "*",
+            "preset": "*",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "discovery-required",
           "failure_class": "unobserved-frozen-legacy-product-behavior",
           "downstream_goal": "G08A",
@@ -42,7 +54,13 @@
           "next_action": "Run --discover on the pinned 1x RTX 4090 lane and amend every observed case expectation."
         },
         {
-          "selector": {"scenario_id": "C01", "variant": "*", "preset": "*"},
+          "selector": {
+            "scenario_id": "C01",
+            "variant": "*",
+            "preset": "*",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08A",
@@ -55,7 +73,13 @@
     "m1-qwen35-4b/metal": {
       "rules": [
         {
-          "selector": {"scenario_id": "*", "variant": "*", "preset": "*"},
+          "selector": {
+            "scenario_id": "*",
+            "variant": "*",
+            "preset": "*",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "blocked",
           "failure_class": "legacy-model-backend-unsupported",
           "downstream_goal": "G08A",
@@ -68,7 +92,13 @@
     "m2-qwen35-35b-a3b/cuda": {
       "rules": [
         {
-          "selector": {"scenario_id": "*", "variant": "*", "preset": "*"},
+          "selector": {
+            "scenario_id": "*",
+            "variant": "*",
+            "preset": "*",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "discovery-required",
           "failure_class": "unobserved-frozen-legacy-product-behavior",
           "downstream_goal": "G08B",
@@ -77,7 +107,13 @@
           "next_action": "Run --discover on the pinned 1x RTX 4090 lane and amend every unresolved case expectation."
         },
         {
-          "selector": {"scenario_id": "C01", "variant": "*", "preset": "*"},
+          "selector": {
+            "scenario_id": "C01",
+            "variant": "*",
+            "preset": "*",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08B",
@@ -86,7 +122,13 @@
           "next_action": "Reproduce with the frozen binary and pinned metadata."
         },
         {
-          "selector": {"scenario_id": "C02", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "selector": {
+            "scenario_id": "C02",
+            "variant": "*",
+            "preset": "P_DETERMINISTIC",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08B",
@@ -95,7 +137,13 @@
           "next_action": "Reproduce the larger G00 deterministic corpus."
         },
         {
-          "selector": {"scenario_id": "C05", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "selector": {
+            "scenario_id": "C05",
+            "variant": "*",
+            "preset": "P_DETERMINISTIC",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08B",
@@ -104,7 +152,13 @@
           "next_action": "Reproduce the G00 known-answer corpus."
         },
         {
-          "selector": {"scenario_id": "C06", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "selector": {
+            "scenario_id": "C06",
+            "variant": "*",
+            "preset": "P_DETERMINISTIC",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08B",
@@ -113,7 +167,13 @@
           "next_action": "Reproduce all G00 stream cases."
         },
         {
-          "selector": {"scenario_id": "C10", "variant": "required-tool", "preset": "*"},
+          "selector": {
+            "scenario_id": "C10",
+            "variant": "required-tool",
+            "preset": "*",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "discovery-required",
           "failure_class": "expanded-thinking-tool-contract-not-observed",
           "downstream_goal": "G08B",
@@ -122,7 +182,13 @@
           "next_action": "Run discovery for both frozen thinking presets; retain the old temperature-zero result only as diagnostic evidence until an exact generated case is observed."
         },
         {
-          "selector": {"scenario_id": "C14", "variant": "*", "preset": "*"},
+          "selector": {
+            "scenario_id": "C14",
+            "variant": "*",
+            "preset": "*",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "discovery-required",
           "failure_class": "expanded-thinking-schema-contract-not-observed",
           "downstream_goal": "G08B",
@@ -131,7 +197,13 @@
           "next_action": "Run discovery for every generated preset/constraint case; keep the legacy twenty-case result as diagnostic evidence only."
         },
         {
-          "selector": {"scenario_id": "C18", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "selector": {
+            "scenario_id": "C18",
+            "variant": "*",
+            "preset": "P_DETERMINISTIC",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08B",
@@ -144,7 +216,13 @@
     "m2-qwen35-35b-a3b/metal": {
       "rules": [
         {
-          "selector": {"scenario_id": "*", "variant": "*", "preset": "*"},
+          "selector": {
+            "scenario_id": "*",
+            "variant": "*",
+            "preset": "*",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "blocked",
           "failure_class": "legacy-model-backend-unsupported",
           "downstream_goal": "G08B",
@@ -157,7 +235,13 @@
     "m3-qwen3-30b-a3b/cuda": {
       "rules": [
         {
-          "selector": {"scenario_id": "*", "variant": "*", "preset": "*"},
+          "selector": {
+            "scenario_id": "*",
+            "variant": "*",
+            "preset": "*",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "discovery-required",
           "failure_class": "g00-case-contract-not-previously-observed",
           "downstream_goal": "G08C",
@@ -166,7 +250,13 @@
           "next_action": "Run --discover for uncovered cases and amend the catalog before formal collection."
         },
         {
-          "selector": {"scenario_id": "C02", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "selector": {
+            "scenario_id": "C02",
+            "variant": "*",
+            "preset": "P_DETERMINISTIC",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08C",
@@ -175,7 +265,13 @@
           "next_action": "Reproduce the expanded deterministic corpus."
         },
         {
-          "selector": {"scenario_id": "C03", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "selector": {
+            "scenario_id": "C03",
+            "variant": "*",
+            "preset": "P_DETERMINISTIC",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08C",
@@ -184,7 +280,13 @@
           "next_action": "Reproduce ten independent three-round groups."
         },
         {
-          "selector": {"scenario_id": "C05", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "selector": {
+            "scenario_id": "C05",
+            "variant": "*",
+            "preset": "P_DETERMINISTIC",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08C",
@@ -193,7 +295,13 @@
           "next_action": "Reproduce the G00 known-answer corpus."
         },
         {
-          "selector": {"scenario_id": "C10", "variant": "required-tool", "preset": "*"},
+          "selector": {
+            "scenario_id": "C10",
+            "variant": "required-tool",
+            "preset": "*",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "discovery-required",
           "failure_class": "expanded-thinking-tool-contract-not-observed",
           "downstream_goal": "G08C",
@@ -202,7 +310,13 @@
           "next_action": "Run discovery for the generated hard-thinking preset cases; retain the legacy temperature-zero/model-default result as diagnostic evidence only."
         },
         {
-          "selector": {"scenario_id": "C18", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "selector": {
+            "scenario_id": "C18",
+            "variant": "*",
+            "preset": "P_DETERMINISTIC",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08C",
@@ -215,7 +329,13 @@
     "m3-qwen3-30b-a3b/metal": {
       "rules": [
         {
-          "selector": {"scenario_id": "*", "variant": "*", "preset": "*"},
+          "selector": {
+            "scenario_id": "*",
+            "variant": "*",
+            "preset": "*",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "discovery-required",
           "failure_class": "g00-case-contract-not-previously-observed",
           "downstream_goal": "G08C",
@@ -224,7 +344,13 @@
           "next_action": "Run --discover for uncovered cases and amend the catalog before formal collection."
         },
         {
-          "selector": {"scenario_id": "C02", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "selector": {
+            "scenario_id": "C02",
+            "variant": "*",
+            "preset": "P_DETERMINISTIC",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08C",
@@ -233,7 +359,13 @@
           "next_action": "Reproduce the expanded deterministic corpus."
         },
         {
-          "selector": {"scenario_id": "C03", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "selector": {
+            "scenario_id": "C03",
+            "variant": "*",
+            "preset": "P_DETERMINISTIC",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08C",
@@ -242,7 +374,13 @@
           "next_action": "Reproduce ten independent three-round groups."
         },
         {
-          "selector": {"scenario_id": "C04", "variant": "long-output", "preset": "P_DETERMINISTIC"},
+          "selector": {
+            "scenario_id": "C04",
+            "variant": "long-output",
+            "preset": "P_DETERMINISTIC",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "discovery-required",
           "failure_class": "expanded-512-token-run-contract-not-observed",
           "downstream_goal": "G08C",
@@ -251,7 +389,13 @@
           "next_action": "Run discovery for the explicit >=512-token cases; retain the old 256-token-cap smoke as diagnostic evidence only."
         },
         {
-          "selector": {"scenario_id": "C05", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "selector": {
+            "scenario_id": "C05",
+            "variant": "*",
+            "preset": "P_DETERMINISTIC",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08C",
@@ -260,7 +404,13 @@
           "next_action": "Reproduce the G00 known-answer corpus."
         },
         {
-          "selector": {"scenario_id": "C06", "variant": "stream", "preset": "P_DETERMINISTIC"},
+          "selector": {
+            "scenario_id": "C06",
+            "variant": "stream",
+            "preset": "P_DETERMINISTIC",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "discovery-required",
           "failure_class": "expanded-stream-equivalence-contract-not-observed",
           "downstream_goal": "G08C",
@@ -269,7 +419,13 @@
           "next_action": "Run discovery for the complete paired C05/C06 matrix; retain the old stream framing result as diagnostic evidence only."
         },
         {
-          "selector": {"scenario_id": "C07", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "selector": {
+            "scenario_id": "C07",
+            "variant": "*",
+            "preset": "P_DETERMINISTIC",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "discovery-required",
           "failure_class": "stateful-six-by-five-contract-not-observed",
           "downstream_goal": "G08C",
@@ -278,7 +434,13 @@
           "next_action": "Run discovery for six five-round history-carrying loops; retain the old stateless sanity result as diagnostic evidence only."
         },
         {
-          "selector": {"scenario_id": "C10", "variant": "required-tool", "preset": "*"},
+          "selector": {
+            "scenario_id": "C10",
+            "variant": "required-tool",
+            "preset": "*",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "discovery-required",
           "failure_class": "expanded-thinking-tool-contract-not-observed",
           "downstream_goal": "G08C",
@@ -287,7 +449,13 @@
           "next_action": "Run discovery for generated hard-thinking preset cases; retain the legacy temperature-zero/model-default result as diagnostic evidence only."
         },
         {
-          "selector": {"scenario_id": "C18", "variant": "*", "preset": "P_DETERMINISTIC"},
+          "selector": {
+            "scenario_id": "C18",
+            "variant": "*",
+            "preset": "P_DETERMINISTIC",
+            "entrypoint": "*",
+            "case_id": "*"
+          },
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08C",

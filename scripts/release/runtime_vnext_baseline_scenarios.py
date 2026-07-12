@@ -45,7 +45,9 @@ SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS"
 SCHEMA_VERSION = 1
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+CASE_ID_RE = re.compile(r"^c(?:0[1-9]|1[0-9]|2[01])-[0-9]{3}$")
 SCENARIO_IDS = tuple(f"C{index:02d}" for index in range(1, 22))
+EXPECTATION_SELECTOR_FIELDS = ("scenario_id", "variant", "preset", "entrypoint", "case_id")
 EXPECTED_STATUSES = {"pass", "known-fail", "blocked", "discovery-required"}
 BLOCKED_LANE_FAILURE_CLASSES = {
     "m1-qwen35-4b/metal": "legacy-model-backend-unsupported",
@@ -324,6 +326,10 @@ def validate_expectations_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
     require(set(vocabulary) == EXPECTED_STATUSES, "legacy expectations status vocabulary mismatch")
     policy = require_object(catalog.get("resolution_policy"), "legacy expectations resolution_policy")
     require(policy.get("wildcard") == "*", "legacy expectations wildcard must be '*'")
+    require(
+        policy.get("selector_order") == list(EXPECTATION_SELECTOR_FIELDS),
+        "legacy expectations selector order mismatch",
+    )
     blocked_policy = require_object(catalog.get("blocked_lane_policy"), "legacy expectations blocked_lane_policy")
     require(
         blocked_policy.get("allowed_lane_failure_classes") == BLOCKED_LANE_FAILURE_CLASSES,
@@ -358,12 +364,18 @@ def validate_expectations_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
                 f"{label} fields mismatch",
             )
             selector = require_object(rule.get("selector"), f"{label}.selector")
-            require(set(selector) == {"scenario_id", "variant", "preset"}, f"{label}.selector fields mismatch")
+            require(set(selector) == set(EXPECTATION_SELECTOR_FIELDS), f"{label}.selector fields mismatch")
             scenario = selector.get("scenario_id")
             require(scenario == "*" or scenario in SCENARIO_IDS, f"{label} scenario selector invalid")
             require(isinstance(selector.get("variant"), str) and selector["variant"], f"{label} variant selector invalid")
             preset = selector.get("preset")
             require(preset in {"*", "none", "P_DETERMINISTIC", "P_NO_THINKING", "P_THINKING", "P_OFFICIAL_DEFAULT"}, f"{label} preset selector invalid")
+            entrypoint = selector.get("entrypoint")
+            require(entrypoint in {"*", "run", "serve"}, f"{label} entrypoint selector invalid")
+            case_id = selector.get("case_id")
+            require(case_id == "*" or (isinstance(case_id, str) and CASE_ID_RE.fullmatch(case_id) is not None), f"{label} case_id selector invalid")
+            if case_id != "*" and scenario != "*":
+                require(case_id[:3].upper() == scenario, f"{label} case_id selector does not belong to its scenario")
             status = rule.get("expected_status")
             require(status in EXPECTED_STATUSES, f"{label} expected_status invalid")
             if status == "blocked":
@@ -390,6 +402,8 @@ def resolve_expectation(
     scenario_id: str,
     variant: str,
     preset: str | None,
+    entrypoint: str,
+    case_id: str,
 ) -> dict[str, Any]:
     lane_key = f"{model_key}/{backend}"
     lane = require_object(require_object(catalog["lanes"], "legacy expectations lanes").get(lane_key), f"legacy expectation lane {lane_key}")
@@ -398,13 +412,20 @@ def resolve_expectation(
     for rule_raw in require_list(lane.get("rules"), f"legacy expectation lane {lane_key}.rules"):
         rule = require_object(rule_raw, f"legacy expectation lane {lane_key} rule")
         selector = require_object(rule.get("selector"), "legacy expectation selector")
-        values = ((selector["scenario_id"], scenario_id), (selector["variant"], variant), (selector["preset"], preset_key))
+        values = (
+            (selector["scenario_id"], scenario_id),
+            (selector["variant"], variant),
+            (selector["preset"], preset_key),
+            (selector["entrypoint"], entrypoint),
+            (selector["case_id"], case_id),
+        )
         if all(selected == "*" or selected == actual for selected, actual in values):
             matches.append((sum(selected != "*" for selected, _ in values), rule))
-    require(matches, f"legacy expectations do not cover {lane_key}/{scenario_id}/{variant}/{preset_key}")
+    case_label = f"{lane_key}/{scenario_id}/{variant}/{preset_key}/{entrypoint}/{case_id}"
+    require(matches, f"legacy expectations do not cover {case_label}")
     specificity = max(score for score, _ in matches)
     winners = [rule for score, rule in matches if score == specificity]
-    require(len(winners) == 1, f"legacy expectations are ambiguous for {lane_key}/{scenario_id}/{variant}/{preset_key}")
+    require(len(winners) == 1, f"legacy expectations are ambiguous for {case_label}")
     return winners[0]
 
 
@@ -1203,6 +1224,8 @@ def validate_case_evidence(
         scenario_id=scenario_id,
         variant=variant,
         preset=preset,
+        entrypoint=entrypoint,
+        case_id=case_id,
     )
     expected_outcome = require_object(case.get("expected_outcome"), f"case {case_id}.expected_outcome")
     for key in ("expected_status", "failure_class", "downstream_goal", "owner", "evidence_basis", "next_action"):
@@ -1971,6 +1994,8 @@ def planned_case_rows(model_key: str, backend: str, catalog: dict[str, Any]) -> 
         shape = selftest_scenario_shape(scenario_id, model_key, backend)
         entrypoints = sorted(required_entrypoints(scenario_id))
         for index, (variant, preset) in enumerate(planned_variant_presets(scenario_id, shape), start=1):
+            case_id = f"{scenario_id.lower()}-{index:03d}"
+            entrypoint = planned_entrypoint(scenario_id, variant, index, entrypoints)
             expectation = resolve_expectation(
                 catalog,
                 model_key=model_key,
@@ -1978,15 +2003,17 @@ def planned_case_rows(model_key: str, backend: str, catalog: dict[str, Any]) -> 
                 scenario_id=scenario_id,
                 variant=variant,
                 preset=preset,
+                entrypoint=entrypoint,
+                case_id=case_id,
             )
             rows.append(
                 {
-                    "case_id": f"{scenario_id.lower()}-{index:03d}",
+                    "case_id": case_id,
                     "scenario_id": scenario_id,
                     "ordinal": index,
                     "variant": variant,
                     "preset": preset,
-                    "entrypoint": planned_entrypoint(scenario_id, variant, index, entrypoints),
+                    "entrypoint": entrypoint,
                     "expectation": expectation,
                     "shape": shape,
                     "concurrency_cell": shape.get("concurrency_cells", [None] * shape["case_count"])[index - 1]
@@ -4803,7 +4830,13 @@ def internal_expectations_catalog() -> dict[str, Any]:
             lanes[f"{model_key}/{backend}"] = {
                 "rules": [
                     {
-                        "selector": {"scenario_id": "*", "variant": "*", "preset": "*"},
+                        "selector": {
+                            "scenario_id": "*",
+                            "variant": "*",
+                            "preset": "*",
+                            "entrypoint": "*",
+                            "case_id": "*",
+                        },
                         "expected_status": "pass",
                         "failure_class": None,
                         "downstream_goal": goal,
@@ -4823,7 +4856,7 @@ def internal_expectations_catalog() -> dict[str, Any]:
             "blocked": "fixture",
             "discovery-required": "fixture",
         },
-        "resolution_policy": {"wildcard": "*"},
+        "resolution_policy": {"wildcard": "*", "selector_order": list(EXPECTATION_SELECTOR_FIELDS)},
         "blocked_lane_policy": {
             "allowed_lane_failure_classes": BLOCKED_LANE_FAILURE_CLASSES,
             "forbidden_lanes": [
@@ -5490,6 +5523,71 @@ def self_test() -> int:
         and SHA256_RE.fullmatch(history_errors[0]["response_sha256"]) is not None,
         "malformed history response evidence is incomplete",
     )
+    selector_catalog = internal_expectations_catalog()
+    selector_rules = selector_catalog["lanes"]["m3-qwen3-30b-a3b/metal"]["rules"]
+    exact_case_rule = copy.deepcopy(selector_rules[0])
+    exact_case_rule.update(
+        {
+            "selector": {
+                "scenario_id": "C03",
+                "variant": "all",
+                "preset": "P_DETERMINISTIC",
+                "entrypoint": "run",
+                "case_id": "c03-001",
+            },
+            "expected_status": "known-fail",
+            "failure_class": "selector-case-fixture",
+        }
+    )
+    serve_rule = copy.deepcopy(selector_rules[0])
+    serve_rule.update(
+        {
+            "selector": {
+                "scenario_id": "C21",
+                "variant": "*",
+                "preset": "*",
+                "entrypoint": "serve",
+                "case_id": "*",
+            },
+            "expected_status": "known-fail",
+            "failure_class": "selector-entrypoint-fixture",
+        }
+    )
+    selector_rules.extend((exact_case_rule, serve_rule))
+    validate_expectations_catalog(selector_catalog)
+    exact = resolve_expectation(
+        selector_catalog,
+        model_key="m3-qwen3-30b-a3b",
+        backend="metal",
+        scenario_id="C03",
+        variant="all",
+        preset="P_DETERMINISTIC",
+        entrypoint="run",
+        case_id="c03-001",
+    )
+    neighbor = resolve_expectation(
+        selector_catalog,
+        model_key="m3-qwen3-30b-a3b",
+        backend="metal",
+        scenario_id="C03",
+        variant="all",
+        preset="P_DETERMINISTIC",
+        entrypoint="run",
+        case_id="c03-002",
+    )
+    serve = resolve_expectation(
+        selector_catalog,
+        model_key="m3-qwen3-30b-a3b",
+        backend="metal",
+        scenario_id="C21",
+        variant="tool-priority",
+        preset="P_DETERMINISTIC",
+        entrypoint="serve",
+        case_id="c21-001",
+    )
+    require(exact["failure_class"] == "selector-case-fixture", "case selector did not override its neighboring cases")
+    require(neighbor["expected_status"] == "pass", "case selector leaked into a neighboring case")
+    require(serve["failure_class"] == "selector-entrypoint-fixture", "entrypoint selector did not resolve")
     with tempfile.TemporaryDirectory(prefix="ferrum-vnext-scenario-runner-") as tmp:
         root = Path(tmp) / "artifacts"
         root.mkdir()
@@ -5522,6 +5620,7 @@ def self_test() -> int:
         except ScenarioError as exc:
             require(
                 "expectations catalog is not the checked-in contract" in str(exc)
+                or "legacy expectations differ from checked-in blob" in str(exc)
                 or "fixture runner is forbidden" in str(exc)
                 or "exists on disk, but not in 'HEAD'" in str(exc),
                 f"canonical fixture rejection used unexpected reason: {exc}",
@@ -5908,7 +6007,13 @@ def self_test() -> int:
             blocked_catalog = copy.deepcopy(canonical_catalog)
             blocked_catalog["lanes"][lane_key]["rules"] = [
                 {
-                    "selector": {"scenario_id": "*", "variant": "*", "preset": "*"},
+                    "selector": {
+                        "scenario_id": "*",
+                        "variant": "*",
+                        "preset": "*",
+                        "entrypoint": "*",
+                        "case_id": "*",
+                    },
                     "expected_status": "blocked",
                     "failure_class": "legacy-model-backend-unsupported",
                     "downstream_goal": "G08A" if model_key == "m1-qwen35-4b" else "G08B",
