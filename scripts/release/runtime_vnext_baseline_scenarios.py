@@ -818,6 +818,23 @@ def response_message(response: dict[str, Any], label: str) -> tuple[dict[str, An
     return message, content or ""
 
 
+def history_response_message(exchange: dict[str, Any], label: str, errors: list[dict[str, Any]]) -> dict[str, Any] | None:
+    raw_response = exchange.get("response")
+    try:
+        response = require_object(raw_response, f"{label}.response")
+        message, _ = response_message(response, label)
+        return message
+    except ScenarioError as exc:
+        errors.append(
+            {
+                "label": label,
+                "error": str(exc),
+                "response_sha256": canonical_json_sha256(raw_response),
+            }
+        )
+        return None
+
+
 def validate_case_output(
     scenario_id: str,
     variant: str,
@@ -3316,6 +3333,7 @@ def serve_case_request(
     released = False
     release_observed_ns: int | None = None
     release_wall = 0.0
+    history_construction_errors: list[dict[str, Any]] = []
     if case["scenario_id"] == "C09":
         abort_started = time.monotonic()
         aborted = aborted_http_exchange(base_url, copy.deepcopy(payload), case["variant"])
@@ -3358,9 +3376,10 @@ def serve_case_request(
             turn_payload["metadata"] = {**turn_payload["metadata"], "g00_turn": turn}
             result = http_exchange(base_url, turn_payload, timeout_sec)
             results.append(result)
-            response = require_object(result[0].get("response"), f"case {case_id}.turn[{turn}].response")
-            assistant, _ = response_message(response, f"case {case_id}.turn[{turn}]")
-            history.extend([user_message, {"role": "assistant", "content": assistant.get("content")}])
+            history.append(user_message)
+            assistant = history_response_message(result[0], f"case {case_id}.turn[{turn}]", history_construction_errors)
+            if assistant is not None:
+                history.append({"role": "assistant", "content": assistant.get("content")})
     elif case["scenario_id"] in {"C06", "C12", "C17"} or (case["scenario_id"] == "C21" and case["variant"] == "serve-stream"):
         reference_payload = copy.deepcopy(payload)
         reference_payload.pop("stream", None)
@@ -3375,14 +3394,14 @@ def serve_case_request(
         results = [reference, stream]
     elif case["scenario_id"] == "C19":
         first = http_exchange(base_url, copy.deepcopy(payload), timeout_sec)
-        first_response = require_object(first[0].get("response"), f"case {case_id}.first.response")
-        first_message, _ = response_message(first_response, f"case {case_id}.first")
+        first_message = history_response_message(first[0], f"case {case_id}.first", history_construction_errors)
         second_payload = copy.deepcopy(payload)
-        second_payload["messages"] = [
-            copy.deepcopy(payload["messages"][0]),
-            copy.deepcopy(first_message),
-            {"role": "user", "content": f"Using that reasoning history, return {case_marker(case_id)}-H2 exactly."},
-        ]
+        second_payload["messages"] = [copy.deepcopy(payload["messages"][0])]
+        if first_message is not None:
+            second_payload["messages"].append(copy.deepcopy(first_message))
+        second_payload["messages"].append(
+            {"role": "user", "content": f"Using that reasoning history, return {case_marker(case_id)}-H2 exactly."}
+        )
         second_payload["metadata"] = {**second_payload["metadata"], "g00_history_turn": 2}
         second = http_exchange(base_url, second_payload, timeout_sec)
         results = [first, second]
@@ -3420,12 +3439,13 @@ def serve_case_request(
     models_response: dict[str, Any] | None = None
     if case["scenario_id"] == "C20":
         models_status, models_response = http_get_json(base_url.rstrip("/") + "/v1/models", timeout_sec)
-        require(models_status == 200, f"case {case_id} /v1/models returned {models_status}")
     transcript = {
         "case_id": case_id,
         "exchanges": exchanges,
         "scheduler_trace_rows": trace_rows,
         "models_response": models_response,
+        "models_status": models_status if case["scenario_id"] == "C20" else None,
+        "history_construction_errors": history_construction_errors,
         "utf8_wire_evidence": utf8_wire_evidence,
         **sse,
     }
@@ -5399,6 +5419,24 @@ def expect_execution_report_reject(root: Path, report: dict[str, Any], marker: s
 
 
 def self_test() -> int:
+    history_errors: list[dict[str, Any]] = []
+    valid_history = history_response_message(
+        {"response": {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}},
+        "history-fixture.valid",
+        history_errors,
+    )
+    require(valid_history == {"role": "assistant", "content": "ok"} and not history_errors, "valid history response was not preserved")
+    malformed_history = history_response_message(
+        {"response": {"error": {"message": "legacy malformed response"}}},
+        "history-fixture.malformed",
+        history_errors,
+    )
+    require(malformed_history is None and len(history_errors) == 1, "malformed history response did not become evidence")
+    require(
+        history_errors[0]["error"] == "history-fixture.malformed.choices must be a JSON array"
+        and SHA256_RE.fullmatch(history_errors[0]["response_sha256"]) is not None,
+        "malformed history response evidence is incomplete",
+    )
     with tempfile.TemporaryDirectory(prefix="ferrum-vnext-scenario-runner-") as tmp:
         root = Path(tmp) / "artifacts"
         root.mkdir()
