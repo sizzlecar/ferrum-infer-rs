@@ -850,12 +850,26 @@ def self_test() -> None:
         require(
             discovery_lanes
             == {
-                "m1-qwen35-4b/cuda",
                 "m2-qwen35-35b-a3b/cuda",
                 "m3-qwen3-30b-a3b/cuda",
                 "m3-qwen3-30b-a3b/metal",
             },
             "checked-in discovery/formal dependency matrix drifted",
+        )
+        m1_cuda = next(lane for lane in real_plan["lanes"] if lane["lane_id"] == "m1-qwen35-4b/cuda")
+        require(
+            m1_cuda["expectation_statuses"] == ["known-fail", "pass"],
+            "M1 CUDA formal expectation status set drifted",
+        )
+        require(not m1_cuda["phases"]["discovery"]["required"], "M1 CUDA unexpectedly regressed to discovery")
+        require(
+            not m1_cuda["phases"]["expectation-amendment"]["required"],
+            "M1 CUDA unexpectedly requires another expectation amendment",
+        )
+        require(
+            m1_cuda["phases"]["formal-correctness"]["dependencies"]
+            == ["global.models-lock", "global.legacy-binaries"],
+            "M1 CUDA formal correctness still depends on discovery",
         )
         lock_path = partial / "models.lock.json"
         lock_bytes = lock_path.read_bytes()
