@@ -6019,8 +6019,45 @@ def self_test() -> int:
         rejected_mutations.add("runner-identity")
 
         canonical_catalog = validate_expectations_catalog(read_json(EXPECTATIONS_PATH))
-        unresolved = [row for row in planned_case_rows("m1-qwen35-4b", "cuda", canonical_catalog) if row["expectation"]["expected_status"] == "discovery-required"]
-        require(unresolved, "discovery-required guard fixture unexpectedly resolved every M1 CUDA case")
+        m1_rows = planned_case_rows("m1-qwen35-4b", "cuda", canonical_catalog)
+        require(len(m1_rows) == 703, "M1 CUDA locked expectation matrix size drift")
+        m1_status_counts: dict[str, int] = {}
+        m1_failure_counts: dict[str, int] = {}
+        for row in m1_rows:
+            expectation = row["expectation"]
+            status = expectation["expected_status"]
+            m1_status_counts[status] = m1_status_counts.get(status, 0) + 1
+            failure_class = expectation["failure_class"]
+            if failure_class is not None:
+                m1_failure_counts[failure_class] = m1_failure_counts.get(failure_class, 0) + 1
+        require(
+            m1_status_counts == {"pass": 461, "known-fail": 242},
+            "M1 CUDA locked expectation status distribution drift",
+        )
+        require(
+            m1_failure_counts
+            == {
+                "c01-contract-violation": 20,
+                "c03-contract-violation": 4,
+                "c04-contract-violation": 3,
+                "c09-contract-violation": 60,
+                "c14-contract-violation": 20,
+                "c15-contract-violation": 5,
+                "c16-contract-violation": 6,
+                "c17-contract-violation": 50,
+                "c18-contract-violation": 4,
+                "c19-contract-violation": 16,
+                "c20-contract-violation": 50,
+                "c21-contract-violation": 4,
+            },
+            "M1 CUDA locked expectation failure-class distribution drift",
+        )
+        unresolved = [
+            row
+            for row in planned_case_rows("m2-qwen35-35b-a3b", "cuda", canonical_catalog)
+            if row["expectation"]["expected_status"] == "discovery-required"
+        ]
+        require(unresolved, "discovery-required guard fixture unexpectedly resolved every M2 CUDA case")
         for model_key in ("m1-qwen35-4b", "m2-qwen35-35b-a3b"):
             lane_key = f"{model_key}/cuda"
             blocked_catalog = copy.deepcopy(canonical_catalog)
