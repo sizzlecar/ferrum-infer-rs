@@ -3730,6 +3730,8 @@ def execute_manifest(
     root = root.resolve()
     out = out.resolve()
     validated = validate_execution_manifest(manifest, root)
+    lane_root = root / "correctness" / manifest["model_key"] / manifest["backend"]
+    executor_root = lane_root / "commands"
     catalog = internal_expectations_catalog() if allow_internal_fixture else validate_expectations_catalog(read_json(EXPECTATIONS_PATH))
     catalog_bytes = (json.dumps(catalog, indent=2, sort_keys=True) + "\n").encode("utf-8") if allow_internal_fixture else EXPECTATIONS_PATH.read_bytes()
     expectations_path = root / "legacy-correctness-expectations.json"
@@ -3743,7 +3745,7 @@ def execute_manifest(
         raise ScenarioError(f"canonical collection refused: {len(unresolved)} cases remain discovery-required; run --discover first")
     invocation_started = iso_now()
     invocation_start_ns = time.monotonic_ns()
-    input_manifest_path = root / "scenario-execution-manifest.snapshot.json"
+    input_manifest_path = executor_root / "scenario-execution-manifest.snapshot.json"
     write_json(input_manifest_path, manifest)
     invocation_argv = (
         [str(RUNNER_PATH), "--manifest", str(input_manifest_path), "--artifact-root", str(root), "--out", str(out), *(["--discover"] if discover else [])]
@@ -3756,7 +3758,7 @@ def execute_manifest(
         require(("--discover" in invocation_argv) is discover, "canonical executor mode differs from actual invocation argv")
     invocation_process_receipt = capture_process_receipt(
         root,
-        root / "scenario-executor-process-receipt.json",
+        executor_root / "scenario-executor-process-receipt.json",
         pid=os.getpid(),
         pgid=os.getpgid(0),
         argv=invocation_argv,
@@ -3778,7 +3780,6 @@ def execute_manifest(
     execution = validated["execution"]
     binary_path = validated["binary_path"]
     base_url = f"http://{execution['host']}:{execution['port']}"
-    lane_root = root / "correctness" / manifest["model_key"] / manifest["backend"]
     serve_stdout = lane_root / "commands/serve.stdout.log"
     serve_stderr = lane_root / "commands/serve.stderr.log"
     serve_config = lane_root / "commands/serve.actual-effective-config.json"
@@ -4029,7 +4030,7 @@ def execute_manifest(
     invocation["finished_at"] = iso_now()
     invocation["finished_monotonic_ns"] = time.monotonic_ns()
     invocation["duration_sec"] = (invocation["finished_monotonic_ns"] - invocation_start_ns) / 1e9
-    invocation_path = root / "scenario-executor-invocation.json"
+    invocation_path = executor_root / "scenario-executor-invocation.json"
     write_json(invocation_path, invocation)
     if discover:
         discovery = {
@@ -5574,6 +5575,13 @@ def self_test() -> int:
             allow_internal_fixture=True,
             require_current_output_path=True,
         )
+        executor_prefix = "correctness/m3-qwen3-30b-a3b/cuda/commands/"
+        invocation_ref = require_object(execution_report.get("executor_invocation"), "execution fixture invocation ref")
+        require(str(invocation_ref.get("path", "")).startswith(executor_prefix), "executor invocation is not lane-local")
+        invocation_document = read_json(execution_root / invocation_ref["path"])
+        for key in ("manifest_snapshot", "process_receipt"):
+            ref = require_object(invocation_document.get(key), f"execution fixture invocation {key}")
+            require(str(ref.get("path", "")).startswith(executor_prefix), f"executor {key} is not lane-local")
         require(len(planned_case_rows("m3-qwen3-30b-a3b", "cuda", internal_expectations_catalog())) == 783, "fake executor did not cover the complete C01-C21 case corpus")
         require(
             hostile_key not in json.dumps(execution_report, sort_keys=True),
