@@ -233,10 +233,10 @@ VNEXT_G01A_MULTIPARTICIPANT_DISPATCH_MARKERS = {
     "batched_invocation_body": "BatchedOperationInvocation",
 }
 VNEXT_G01A_REQUIRED_UNIT_TESTS = {
-    "adversarial_runtime_policy_and_workspace_fanout_fail_before_materialization",
     "blocked_tensor_storage_requires_explicit_exact_or_zero_fill_padding",
     "blocked_weight_layout_requires_explicit_exact_or_zero_fill_padding",
     "breaking_schema_versions_are_rejected_100_of_100",
+    "dynamic_descriptor_and_memory_plan_standalone_wire_are_checked",
     "execution_alias_effect_wire_mutations_are_rejected",
     "execution_alias_may_alias_supports_distinct_or_exact_storage",
     "execution_alias_must_alias_builds_exact_equivalence_and_single_allocation",
@@ -252,6 +252,8 @@ VNEXT_G01A_REQUIRED_UNIT_TESTS = {
     "forged_self_hashed_plan_is_rejected_by_semantic_rebuild",
     "generic_contracts_have_zero_architecture_names",
     "mandatory_object_safe_contracts_accept_trait_objects",
+    "maximum_active_sequence_ceiling_is_nonzero_and_o_graph",
+    "minimum_runnable_sums_lifetime_minima_and_sequential_invocation_peak",
     "model_program_rejects_duplicate_declared_outputs",
     "operation_resource_contract_requires_explicit_presence_and_alignment",
     "physical_weight_layout_tree_accepts_dense_fixture",
@@ -264,6 +266,7 @@ VNEXT_G01A_REQUIRED_UNIT_TESTS = {
     "provider_catalog_and_reference_oracle_fail_closed",
     "provider_implementation_fingerprint_is_plan_hashed_and_revalidated",
     "provider_raw_estimate_identity_input_and_output_are_revalidated_by_core",
+    "provider_workspace_formulas_are_actual_shape_checked_and_wire_closed",
     "resolution_source_matrix_rejects_forbidden_binding_before_plan",
     "resolved_external_device_catalog_runtime_and_node_resolution_are_exact",
     "resolved_model_family_identity_is_unique_and_fail_closed",
@@ -272,10 +275,12 @@ VNEXT_G01A_REQUIRED_UNIT_TESTS = {
     "resolved_source_evidence_rejects_raw_bytes_and_provenance_tampering",
     "resolved_source_parser_identity_and_determinism_are_enforced",
     "runtime_capacity_reserve_and_concurrency_are_typed_planning_inputs",
-    "runtime_active_sequence_limit_accepts_boundary_and_rejects_out_of_range",
     "self_consistent_wire_provider_selection_is_rejected",
     "self_consistent_wire_resource_estimate_and_memory_mutation_is_rejected",
     "silent_success_defaults_are_absent",
+    "state_capacity_demand_is_explicit_checked_and_wire_closed",
+    "storage_incompatible_preference_falls_back_with_canonical_evidence",
+    "theoretical_ceiling_over_u64_is_canonical_evidence_not_capacity_policy",
     "typed_planning_registry_invokes_real_contract_and_estimator_once",
     "unknown_inputs_fail_closed",
     "weight_schema_order_is_normalized_before_fingerprinting",
@@ -414,12 +419,24 @@ VNEXT_G01A_BOUNDED_TEST_ENV_OVERRIDES = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "CARGO_BUILD_JOBS": "2",
 }
+# These bounds cover the complete cargo/rustc/test process group. The observed
+# cold-compile peak is 22/12; 32/16 remains hundreds of times below the prior
+# runaway-test failure while avoiding a hidden warm-cache requirement.
 VNEXT_G01A_BOUNDED_TEST_PROFILES = {
     "regular": {
         "wall_timeout_seconds": 120.0,
         "max_processes": 4,
-        "max_group_threads": 16,
-        "max_per_process_threads": 8,
+        "max_group_threads": 32,
+        "max_per_process_threads": 16,
+        "sample_interval_seconds": 0.05,
+        "max_sampling_errors": 3,
+        "term_grace_seconds": 1.0,
+    },
+    "admission": {
+        "wall_timeout_seconds": 120.0,
+        "max_processes": 4,
+        "max_group_threads": 32,
+        "max_per_process_threads": 16,
         "sample_interval_seconds": 0.05,
         "max_sampling_errors": 3,
         "term_grace_seconds": 1.0,
@@ -427,8 +444,8 @@ VNEXT_G01A_BOUNDED_TEST_PROFILES = {
     "resource": {
         "wall_timeout_seconds": 60.0,
         "max_processes": 4,
-        "max_group_threads": 12,
-        "max_per_process_threads": 8,
+        "max_group_threads": 32,
+        "max_per_process_threads": 16,
         "sample_interval_seconds": 0.05,
         "max_sampling_errors": 3,
         "term_grace_seconds": 1.0,
@@ -2163,6 +2180,8 @@ def vnext_g01a_bounded_profile(command: tuple[str, ...]) -> str:
             return "resource"
         if target == "vnext_compile":
             return "trybuild"
+    if "vnext::admission" in command and "--lib" in command:
+        return "admission"
     return "regular"
 
 
@@ -2229,7 +2248,8 @@ def summarize_vnext_g01a_bounded_execution(
         "vnext-g01a bounded cargo test command count mismatch",
     )
     require_gate(
-        profile_counts == {"regular": 16, "resource": 2, "trybuild": 2},
+        profile_counts
+        == {"regular": 14, "admission": 2, "resource": 2, "trybuild": 2},
         "vnext-g01a bounded profile command counts mismatch",
     )
     return {
@@ -2249,6 +2269,16 @@ def summarize_vnext_g01a_bounded_execution(
         ),
         "profile_counts": profile_counts,
     }
+
+
+def vnext_g01a_expected_test_summaries(target: str) -> list[tuple[str, str, str, str]]:
+    expected_count = len(VNEXT_G01A_REQUIRED_TESTS_BY_TARGET[target])
+    if target == "vnext_resource_contract_tests":
+        return [
+            ("1", "0", "0", str(expected_count - 1)),
+            (str(expected_count), "0", "0", "0"),
+        ]
+    return [(str(expected_count), "0", "0", "0")]
 
 
 def validate_g0_unit_bench_witnesses(
@@ -3022,16 +3052,16 @@ def validate_vnext_g01a_provenance(
             r"(\d+) measured; (\d+) filtered out;",
             command_outputs[command],
         )
-        require_gate(
-            summaries
-            == [
-                (
-                    str(len(VNEXT_G01A_REQUIRED_TESTS_BY_TARGET[target])),
-                    "0",
-                    "0",
-                    "0",
+        if target == "vnext_resource_contract_tests":
+            require_gate(
+                command_outputs[command].count(
+                    "test resource_transaction_abandon_panic_child ... ok"
                 )
-            ],
+                == 2,
+                "vnext-g01a resource test must run the panic-isolation case once in the parent and once in its child",
+            )
+        require_gate(
+            summaries == vnext_g01a_expected_test_summaries(target),
             f"vnext-g01a test output exact summary mismatch: {command}",
         )
     admission_run_command = admission_test_command("--nocapture")
@@ -5552,6 +5582,23 @@ def self_test() -> int:
             for command in checkpoint_cargo_tests
         ),
         "vnext-g01a checkpoint/run_gate bounded command policy drift",
+    )
+    require_selftest(
+        all(
+            vnext_g01a_bounded_profile(
+                tuple(g01a_checkpoint["admission_test_command"](mode))
+            )
+            == "admission"
+            for mode in ("--list", "--nocapture")
+        ),
+        "vnext-g01a outer validator must classify admission cold-compile commands explicitly",
+    )
+    require_selftest(
+        vnext_g01a_expected_test_summaries("vnext_resource_contract_tests")
+        == [("1", "0", "0", "6"), ("7", "0", "0", "0")]
+        and vnext_g01a_expected_test_summaries("vnext_event_contract_tests")
+        == [("1", "0", "0", "0")],
+        "vnext-g01a outer validator test summary policy drift",
     )
     for checkpoint_name, outer_value in (
         ("EXPECTED_RESOURCE_CASES", VNEXT_G01A_EXPECTED_RESOURCE_CASES),
