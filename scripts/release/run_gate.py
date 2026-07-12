@@ -419,13 +419,15 @@ VNEXT_G01A_BOUNDED_TEST_ENV_OVERRIDES = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "CARGO_BUILD_JOBS": "2",
 }
-# These bounds cover the complete cargo/rustc/test process group. The observed
-# cold-compile peak is 22/12; 32/16 remains hundreds of times below the prior
-# runaway-test failure while avoiding a hidden warm-cache requirement.
+# These bounds cover the complete cargo/rustc/test process group. Regular cold
+# builds use up to five processes and 28 group threads. trybuild launches a
+# nested Cargo build which can transiently cross 32 group threads even with
+# CARGO_BUILD_JOBS=2, so it keeps the same process/per-process ceilings with a
+# 64-thread group ceiling, still 128x below the prior 8192-thread failure.
 VNEXT_G01A_BOUNDED_TEST_PROFILES = {
     "regular": {
         "wall_timeout_seconds": 120.0,
-        "max_processes": 4,
+        "max_processes": 8,
         "max_group_threads": 32,
         "max_per_process_threads": 16,
         "sample_interval_seconds": 0.05,
@@ -434,7 +436,7 @@ VNEXT_G01A_BOUNDED_TEST_PROFILES = {
     },
     "admission": {
         "wall_timeout_seconds": 120.0,
-        "max_processes": 4,
+        "max_processes": 8,
         "max_group_threads": 32,
         "max_per_process_threads": 16,
         "sample_interval_seconds": 0.05,
@@ -443,7 +445,7 @@ VNEXT_G01A_BOUNDED_TEST_PROFILES = {
     },
     "resource": {
         "wall_timeout_seconds": 60.0,
-        "max_processes": 4,
+        "max_processes": 8,
         "max_group_threads": 32,
         "max_per_process_threads": 16,
         "sample_interval_seconds": 0.05,
@@ -453,7 +455,7 @@ VNEXT_G01A_BOUNDED_TEST_PROFILES = {
     "trybuild": {
         "wall_timeout_seconds": 300.0,
         "max_processes": 8,
-        "max_group_threads": 32,
+        "max_group_threads": 64,
         "max_per_process_threads": 16,
         "sample_interval_seconds": 0.05,
         "max_sampling_errors": 3,
