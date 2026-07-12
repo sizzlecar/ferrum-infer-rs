@@ -451,6 +451,7 @@ def run_bounded_command(
                         break
 
                     rc_before_sample = process.poll()
+                    sample_error: Exception | None = None
                     try:
                         sample = sampler(pgid)
                         receipt["successful_samples"] += 1
@@ -458,11 +459,22 @@ def run_bounded_command(
                     except RunnerInterrupted:
                         raise
                     except Exception as error:
+                        sample = None
+                        sample_error = error
+
+                    rc = process.poll()
+                    # If the root exited while the sampler was running, sample
+                    # again after poll() has reaped it.  Otherwise the prior row
+                    # or a transient ps/proc error for the just-reaped root
+                    # could look like a leaked group or failed observation.
+                    if rc_before_sample is None and rc is not None:
+                        continue
+                    if sample_error is not None:
                         sampling_errors.append(
                             {
                                 "at": utc_now(),
-                                "type": type(error).__name__,
-                                "error": str(error)[:512],
+                                "type": type(sample_error).__name__,
+                                "error": str(sample_error)[:512],
                             }
                         )
                         receipt["sampling_error_count"] = len(sampling_errors)
@@ -470,14 +482,6 @@ def run_bounded_command(
                             status = "rejected"
                             reason = "sampling_error_limit_exceeded"
                             break
-                        sample = None
-
-                    rc = process.poll()
-                    # If the root exited while the sampler was running, sample
-                    # again after poll() has reaped it.  Otherwise the prior row
-                    # for the just-reaped root could look like a leaked group.
-                    if rc_before_sample is None and rc is not None:
-                        continue
                     if sample is not None:
                         if rc is None and process.pid not in sample.process_threads:
                             sampling_errors.append(
@@ -753,6 +757,30 @@ def self_test() -> int:
         assert receipt["reason"] == "sampling_error_limit_exceeded"
         assert receipt["sampling_error_count"] == fast["max_sampling_errors"]
         assert len(receipt["sampling_errors"]) == fast["max_sampling_errors"]
+
+        exit_race_calls = 0
+
+        def exit_race_sampling(_pgid: int) -> ProcessGroupSnapshot:
+            nonlocal exit_race_calls
+            exit_race_calls += 1
+            if exit_race_calls == 1:
+                time.sleep(0.15)
+                raise SamplingError("root exited during synthetic sample")
+            return ProcessGroupSnapshot({})
+
+        exit_code, receipt, _ = _self_test_case(
+            root,
+            "sampling-root-exit-race",
+            "import time; time.sleep(0.05)",
+            Limits(2.0, 2, 4, 4, **fast),
+            sampler=exit_race_sampling,
+        )
+        assert exit_code == EXIT_PASS
+        assert receipt["status"] == "pass"
+        assert receipt["reason"] == "command_completed"
+        assert receipt["sampling_error_count"] == 0
+        assert receipt["sampling_errors"] == []
+        assert exit_race_calls >= 2
 
     print("BOUNDED COMMAND SELFTEST PASS")
     return 0
