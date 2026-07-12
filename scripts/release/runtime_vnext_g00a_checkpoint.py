@@ -1627,7 +1627,10 @@ def validate_historical_catalog(
         normalized_families.append({"cases": normalized_cases, "id": family_id, "title": title})
     require(seen_families == {f"H{index:02d}" for index in range(1, 16)}, "historical bug catalog family ids are incomplete")
     require(len(seen_cases) == 28, "historical bug catalog must contain 28 unique concrete cases")
-    require(status_counts == Counter({"bound": 13, "partial": 10, "gap": 5}), "historical bug evidence status distribution changed without an explicit catalog update")
+    require(
+        status_counts == Counter({"bound": 28}),
+        "historical bug catalog must contain exactly 28 reviewed bound cases",
+    )
     normalized_families.sort(key=lambda item: item["id"])
     normalized = {
         "catalog_id": catalog.get("catalog_id"),
@@ -2338,6 +2341,16 @@ def run_self_test() -> None:
 
     validate_models_catalog()
     validate_historical_catalog()
+    with tempfile.TemporaryDirectory(prefix="ferrum-g00a-history-selftest-") as raw_tmp:
+        downgraded_catalog_path = Path(raw_tmp) / "historical-bugs.json"
+        downgraded_catalog = read_json(BUG_CATALOG_PATH)
+        downgraded_catalog["families"][0]["cases"][0]["evidence_status"] = "partial"
+        write_json(downgraded_catalog_path, downgraded_catalog)
+        expect_rejected(
+            "downgraded historical evidence status",
+            lambda: validate_historical_catalog(downgraded_catalog_path),
+            marker="exactly 28 reviewed bound cases",
+        )
     deterministic = {"facts": facts, "scope": {"unlocks": ["G01A"]}}
     require(canonical_bytes(deterministic) == canonical_bytes(copy.deepcopy(deterministic)), "model fact serialization is not deterministic")
 
