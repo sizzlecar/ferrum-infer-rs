@@ -80,6 +80,15 @@ impl ModelFamilyProvider for TestFamily {
         Ok(())
     }
 
+    fn validated_external_metadata_id(
+        &self,
+        raw: &Value,
+        config: &Self::Config,
+    ) -> Result<ExternalModelMetadataId, VNextError> {
+        self.validate_config_identity(raw, config)?;
+        ExternalModelMetadataId::try_from(config.model_type.clone())
+    }
+
     fn parse_config(&self, raw: &Value) -> Result<Self::Config, VNextError> {
         let config: TestConfig = serde_json::from_value(raw.clone()).map_err(|error| {
             VNextError::InvalidModelConfig {
@@ -241,6 +250,15 @@ impl ModelFamilyProvider for DuplicateExternalFamily {
         Ok(())
     }
 
+    fn validated_external_metadata_id(
+        &self,
+        raw: &Value,
+        config: &Self::Config,
+    ) -> Result<ExternalModelMetadataId, VNextError> {
+        self.validate_config_identity(raw, config)?;
+        Ok(id("metadata.model-wire-test"))
+    }
+
     fn parse_config(&self, _raw: &Value) -> Result<Self::Config, VNextError> {
         Err(VNextError::InvalidModelConfig {
             family_id: self.family_id().to_string(),
@@ -290,6 +308,15 @@ impl ModelFamilyProvider for ChangingFamily {
         _config: &Self::Config,
     ) -> Result<(), VNextError> {
         Ok(())
+    }
+
+    fn validated_external_metadata_id(
+        &self,
+        raw: &Value,
+        config: &Self::Config,
+    ) -> Result<ExternalModelMetadataId, VNextError> {
+        self.validate_config_identity(raw, config)?;
+        Ok(id("metadata.changing-config"))
     }
 
     fn parse_config(&self, raw: &Value) -> Result<Self::Config, VNextError> {
@@ -382,6 +409,15 @@ impl ModelFamilyProvider for OneShotFamily {
             });
         }
         Ok(())
+    }
+
+    fn validated_external_metadata_id(
+        &self,
+        raw: &Value,
+        config: &Self::Config,
+    ) -> Result<ExternalModelMetadataId, VNextError> {
+        self.validate_config_identity(raw, config)?;
+        ExternalModelMetadataId::try_from(config.model_type.clone())
     }
 
     fn parse_config(&self, raw: &Value) -> Result<Self::Config, VNextError> {

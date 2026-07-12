@@ -312,7 +312,7 @@ GIT_BLOB_RE = re.compile(r"^[0-9a-f]{40,64}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 KNOWN_ARCHITECTURE_RE = re.compile(
     r"\b(?:qwen|llama|deepseek|mistral|mixtral|gemma|phi|chatglm|internlm|baichuan|yi)"
-    r"[a-z0-9_.-]*\b",
+    r"(?!eld)[a-z0-9_.-]*\b",
     re.IGNORECASE,
 )
 FORBIDDEN_VNEXT_CHECKS = {
@@ -1020,6 +1020,12 @@ def _named_impl_bodies(tokens: list[RustToken], name: str) -> list[list[RustToke
     for index, token in enumerate(tokens):
         if token != ("ident", "impl"):
             continue
+        # `impl` also appears in argument and return-position `impl Trait`.
+        # Reject those before asking the item parser to find a body: treating a
+        # function's generic `<...>` as an impl-item header can make the scanner
+        # consume the surrounding function and report bogus delimiter failures.
+        if not _impl_header_mentions_name(tokens, index + 1, name):
+            continue
         opening = _item_body_opening(tokens, index + 1, f"impl {name}")
         header = tokens[index + 1 : opening]
         if ("ident", name) not in header or ("ident", "for") in header:
@@ -1027,6 +1033,39 @@ def _named_impl_bodies(tokens: list[RustToken], name: str) -> list[list[RustToke
         closing = _matching_token(tokens, opening, "{", "}")
         bodies.append(tokens[opening + 1 : closing])
     return bodies
+
+
+def _impl_header_mentions_name(
+    tokens: list[RustToken], start: int, name: str
+) -> bool:
+    angle_depth = 0
+    bracket_depth = 0
+    cursor = start
+    while cursor < len(tokens):
+        token = tokens[cursor]
+        if token == ("ident", name):
+            return True
+        if token == ("punct", "<"):
+            angle_depth += 1
+        elif token == ("punct", ">") and angle_depth:
+            angle_depth -= 1
+        elif token == ("punct", "["):
+            bracket_depth += 1
+        elif token == ("punct", "]"):
+            bracket_depth -= 1
+        elif angle_depth == bracket_depth == 0 and token in {
+            ("punct", ")"),
+            ("punct", ";"),
+            ("punct", "="),
+            ("punct", "{"),
+        }:
+            return False
+        require(
+            angle_depth >= 0 and bracket_depth >= 0,
+            "unbalanced delimiters while classifying impl header",
+        )
+        cursor += 1
+    return False
 
 
 def _unrestricted_public_functions(
@@ -2649,12 +2688,14 @@ pub struct BatchWorkShape { seal: () }
 struct ClaimedBackingTransaction { seal: () }
 struct ParticipantNodeKey { seal: () }
 pub struct BatchOperationIdentity { seal: () }
+fn accepts_impl_trait(reason: impl Into<String>) { let _ = reason.into(); }
 pub struct DefinitelyNotSubmittedRetryAuthority { seal: () }
 impl DefinitelyNotSubmittedRetryAuthority {
     pub fn consume(self) {}
 }
 pub struct BatchedOperationInvocation<'a> { seal: &'a () }
 pub struct OperationDispatch;
+pub fn yield_now() {}
 impl OperationDispatch {
     pub fn encode_and_submit(
         _batch_identity: &BatchOperationIdentity,
@@ -2718,6 +2759,7 @@ pub trait LexicalDecoySafeCombinator {
             )
             rejection_fixtures = (
                 ("architecture name", "pub struct QwenSpecialCase;", "architecture names"),
+                ("Yi architecture name", "pub struct YiModel;", "architecture names"),
                 ("raw architecture name", "pub struct r#LlamaSpecialCase;", "architecture names"),
                 ("Any", "use std::any::Any;", "Any/downcast"),
                 ("downcast", "fn cast(value: &dyn Any) { value.downcast_ref::<u8>(); }", "Any/downcast"),

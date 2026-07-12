@@ -2035,26 +2035,13 @@ pub trait ModelFamilyProvider: Send + Sync {
     ) -> Result<(), VNextError>;
 
     /// Returns the exact external metadata identity represented by `config`.
-    /// Providers with more than one declared identity must override this and
-    /// derive the result from their typed configuration. The single-identity
-    /// default keeps identity selection provider-owned without teaching core
-    /// about family-specific fields such as `model_type`.
+    /// Every provider must make this selection explicit; core never assumes a
+    /// singleton catalog row is the intended typed identity.
     fn validated_external_metadata_id(
         &self,
         raw: &serde_json::Value,
         config: &Self::Config,
-    ) -> Result<ExternalModelMetadataId, VNextError> {
-        self.validate_config_identity(raw, config)?;
-        let identities = self.external_metadata_ids();
-        if identities.len() != 1 {
-            return Err(VNextError::InvalidModelConfig {
-                family_id: self.family_id().to_string(),
-                field: "external_metadata_id".to_owned(),
-                reason: "providers declaring multiple external metadata identities must select the exact typed configuration identity".to_owned(),
-            });
-        }
-        Ok(identities.into_iter().next().expect("length checked"))
-    }
+    ) -> Result<ExternalModelMetadataId, VNextError>;
 
     fn parse_config(&self, raw: &serde_json::Value) -> Result<Self::Config, VNextError>;
 

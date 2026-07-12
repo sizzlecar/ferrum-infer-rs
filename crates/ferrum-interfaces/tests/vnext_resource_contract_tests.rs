@@ -100,6 +100,15 @@ impl ModelFamilyProvider for TestFamily {
         Ok(())
     }
 
+    fn validated_external_metadata_id(
+        &self,
+        raw: &Value,
+        config: &Self::Config,
+    ) -> Result<ExternalModelMetadataId, VNextError> {
+        self.validate_config_identity(raw, config)?;
+        Ok(id("external-metadata.resource-contract"))
+    }
+
     fn parse_config(&self, raw: &Value) -> Result<Self::Config, VNextError> {
         let config: TestConfig = serde_json::from_value(raw.clone()).map_err(|error| {
             VNextError::InvalidModelConfig {
@@ -361,7 +370,7 @@ impl OperationResourceEstimator for TestEstimator {
 impl OperationProvider<TestRuntime> for TestEstimator {
     fn encode_selected(
         &self,
-        _invocation: OperationInvocation<'_, TestBuffer>,
+        _invocation: BatchedOperationInvocation<'_, TestBuffer>,
     ) -> Result<(), OperationFailure> {
         Ok(())
     }

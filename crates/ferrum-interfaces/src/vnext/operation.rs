@@ -6,15 +6,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::{
-    classify_device_error, AllocationLifetime, BatchWorkShape, BufferUsage, CanonicalRational,
-    CapabilityId, CompletionHandle, CompletionReaper, ContractVersion,
-    DefinitelyNotSubmittedRetryAuthority, DeviceId, DeviceRuntime, ExecutionFrameId,
-    ExecutionIdentityEnvelope, ExecutionLane, IdentifiedFailure, IndeterminateSubmissionHandle,
-    InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView, LogicalBackingBufferView,
-    LogicalBackingSegmentBinding, NodeId, NodeInvocationId, OperationId, PlanHash, PlanId,
-    ProgramValueId, ProviderId, ProviderWorkspaceRequirement, QuantizationFormatId,
-    ResolvedModelPlan, ResourceId, SemanticValue, TrustedActiveSequenceBinding,
-    UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId, WeightId,
+    classify_device_error, AllocationLifetime, BatchInvocationId, BatchStepId, BatchWorkShape,
+    BufferUsage, CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper,
+    ContractVersion, DefinitelyNotSubmittedRetryAuthority, DeviceId, DeviceRuntime,
+    ExecutionIdentityEnvelope, ExecutionLane, ExecutionLaneId, IdentifiedFailure,
+    IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
+    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, OperationId,
+    ParticipantNodeKey, PlanHash, PlanId, ProgramValueId, ProviderId, ProviderWorkspaceRequirement,
+    QuantizationFormatId, ResolvedModelPlan, ResourceId, SemanticValue,
+    TrustedActiveSequenceBinding, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
+    WeightId,
 };
 
 pub const MAX_OPERATION_CATALOG_ROWS: usize = 4096;
@@ -2707,8 +2708,218 @@ mod operation_buffer_region_tests {
     }
 }
 
-/// A plan-selected typed-buffer invocation. It has no public constructor;
-/// `OperationDispatch` is the only path that can create one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BatchOperationParticipantIdentity {
+    participant_index: u32,
+    node_key: ParticipantNodeKey,
+    identity: ExecutionIdentityEnvelope,
+}
+
+impl BatchOperationParticipantIdentity {
+    pub const fn participant_index(&self) -> u32 {
+        self.participant_index
+    }
+
+    pub fn node_key(&self) -> &ParticipantNodeKey {
+        &self.node_key
+    }
+
+    pub fn identity(&self) -> &ExecutionIdentityEnvelope {
+        &self.identity
+    }
+}
+
+/// One physical batch attempt identity. Participant request identities remain
+/// explicit projections; no canonical leader can stand in for the batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BatchOperationIdentity {
+    batch_step_id: BatchStepId,
+    batch_invocation_id: BatchInvocationId,
+    plan_id: PlanId,
+    plan_hash: PlanHash,
+    node_id: NodeId,
+    operation_id: OperationId,
+    provider_id: ProviderId,
+    device_id: DeviceId,
+    runtime_implementation_fingerprint: String,
+    lane_id: ExecutionLaneId,
+    work_shape_fingerprint: String,
+    claimed_backing_fingerprint: String,
+    participants: Vec<BatchOperationParticipantIdentity>,
+    fingerprint: String,
+}
+
+impl BatchOperationIdentity {
+    #[allow(clippy::too_many_arguments)]
+    fn from_validated(
+        batch_step_id: BatchStepId,
+        batch_invocation_id: BatchInvocationId,
+        plan_id: PlanId,
+        plan_hash: PlanHash,
+        node_id: NodeId,
+        operation_id: OperationId,
+        provider_id: ProviderId,
+        device_id: DeviceId,
+        runtime_implementation_fingerprint: String,
+        lane_id: ExecutionLaneId,
+        work_shape_fingerprint: String,
+        claimed_backing_fingerprint: String,
+        participants: Vec<BatchOperationParticipantIdentity>,
+    ) -> Result<Self, VNextError> {
+        if participants.is_empty()
+            || participants.iter().enumerate().any(|(index, participant)| {
+                participant.participant_index as usize != index
+                    || participant.node_key.node_id() != &node_id
+                    || participant.identity.parts().frame_id
+                        != Some(participant.node_key.frame_id())
+                    || participant.identity.parts().node_id.as_ref() != Some(&node_id)
+                    || participant.identity.parts().operation_id.as_ref() != Some(&operation_id)
+                    || participant.identity.parts().provider_id.as_ref() != Some(&provider_id)
+                    || participant.identity.parts().plan_id.as_ref() != Some(&plan_id)
+                    || participant.identity.parts().plan_hash.as_ref() != Some(&plan_hash)
+                    || participant.identity.parts().device_id.as_ref() != Some(&device_id)
+                    || participant
+                        .identity
+                        .parts()
+                        .runtime_implementation_fingerprint
+                        .as_deref()
+                        != Some(runtime_implementation_fingerprint.as_str())
+            })
+            || participants
+                .windows(2)
+                .any(|pair| pair[0].node_key >= pair[1].node_key)
+            || !canonical_sha256(&runtime_implementation_fingerprint)
+            || !canonical_sha256(&work_shape_fingerprint)
+            || !canonical_sha256(&claimed_backing_fingerprint)
+        {
+            return Err(invalid_operation(
+                "batch operation identity is empty, non-canonical, or differs from its participant projections",
+            ));
+        }
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            batch_step_id: BatchStepId,
+            batch_invocation_id: BatchInvocationId,
+            plan_id: &'a PlanId,
+            plan_hash: &'a PlanHash,
+            node_id: &'a NodeId,
+            operation_id: &'a OperationId,
+            provider_id: &'a ProviderId,
+            device_id: &'a DeviceId,
+            runtime_implementation_fingerprint: &'a str,
+            lane_id: ExecutionLaneId,
+            work_shape_fingerprint: &'a str,
+            claimed_backing_fingerprint: &'a str,
+            participants: &'a [BatchOperationParticipantIdentity],
+        }
+        let fingerprint = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&FingerprintInput {
+                    domain: "ferrum.runtime-vnext.batch-operation-identity.v1",
+                    batch_step_id,
+                    batch_invocation_id,
+                    plan_id: &plan_id,
+                    plan_hash: &plan_hash,
+                    node_id: &node_id,
+                    operation_id: &operation_id,
+                    provider_id: &provider_id,
+                    device_id: &device_id,
+                    runtime_implementation_fingerprint: &runtime_implementation_fingerprint,
+                    lane_id,
+                    work_shape_fingerprint: &work_shape_fingerprint,
+                    claimed_backing_fingerprint: &claimed_backing_fingerprint,
+                    participants: &participants,
+                })
+                .map_err(|error| invalid_operation(format!(
+                    "batch operation identity encode failed: {error}"
+                )))?
+            )
+        );
+        Ok(Self {
+            batch_step_id,
+            batch_invocation_id,
+            plan_id,
+            plan_hash,
+            node_id,
+            operation_id,
+            provider_id,
+            device_id,
+            runtime_implementation_fingerprint,
+            lane_id,
+            work_shape_fingerprint,
+            claimed_backing_fingerprint,
+            participants,
+            fingerprint,
+        })
+    }
+
+    pub const fn batch_step_id(&self) -> BatchStepId {
+        self.batch_step_id
+    }
+
+    pub const fn batch_invocation_id(&self) -> BatchInvocationId {
+        self.batch_invocation_id
+    }
+
+    pub fn plan_id(&self) -> &PlanId {
+        &self.plan_id
+    }
+
+    pub fn plan_hash(&self) -> &PlanHash {
+        &self.plan_hash
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    pub fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    pub fn device_id(&self) -> &DeviceId {
+        &self.device_id
+    }
+
+    pub fn runtime_implementation_fingerprint(&self) -> &str {
+        &self.runtime_implementation_fingerprint
+    }
+
+    pub const fn lane_id(&self) -> ExecutionLaneId {
+        self.lane_id
+    }
+
+    pub fn work_shape_fingerprint(&self) -> &str {
+        &self.work_shape_fingerprint
+    }
+
+    pub fn claimed_backing_fingerprint(&self) -> &str {
+        &self.claimed_backing_fingerprint
+    }
+
+    pub fn participants(&self) -> &[BatchOperationParticipantIdentity] {
+        &self.participants
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    fn contains_identity(&self, identity: &ExecutionIdentityEnvelope) -> bool {
+        self.participants
+            .iter()
+            .any(|participant| participant.identity() == identity)
+    }
+}
+
+/// One participant projection inside a plan-selected physical batch. It has
+/// no public constructor and does not own submission authority.
 pub struct OperationInvocation<'a, B> {
     identity: &'a ExecutionIdentityEnvelope,
     operation: &'a OperationDescriptor,
@@ -2730,11 +2941,10 @@ impl<'a, B> OperationInvocation<'a, B> {
         resolved: &'a ResolvedModelPlan,
         provider: &'a OperationProviderDescriptor,
         identity: &'a ExecutionIdentityEnvelope,
-        frame_id: &'a ExecutionFrameId,
-        node_invocation_id: &'a NodeInvocationId,
         node_id: &'a NodeId,
         resources: &'a InvocationResourceLease<R>,
         active_binding: &TrustedActiveSequenceBinding,
+        participant_index: usize,
     ) -> Result<Self, VNextError>
     where
         R: DeviceRuntime<Buffer = B>,
@@ -2753,19 +2963,16 @@ impl<'a, B> OperationInvocation<'a, B> {
         let parts = identity.parts();
         let participant = resources
             .participants()
-            .next()
-            .ok_or_else(|| invalid_operation("operation invocation has no participant"))?;
+            .nth(participant_index)
+            .ok_or_else(|| invalid_operation("operation participant index is out of range"))?;
         let participant_frame = resources
             .participant_frames()
-            .first()
-            .ok_or_else(|| invalid_operation("operation invocation has no participant frame"))?;
+            .get(participant_index)
+            .ok_or_else(|| invalid_operation("operation participant frame is missing"))?;
         let participant_session = resources
-            .exact_single_participant_session_identity()
-            .ok_or_else(|| {
-                invalid_operation(
-                    "operation invocation requires one exact prepared sequence session",
-                )
-            })?;
+            .participant_session_identities()
+            .nth(participant_index)
+            .ok_or_else(|| invalid_operation("operation participant session is missing"))?;
         let static_lease = participant.static_provisioning();
         let lease_identity = static_lease.map(|lease| lease.identity());
         let admission = active_binding.plan().static_provisioning_binding();
@@ -2775,10 +2982,8 @@ impl<'a, B> OperationInvocation<'a, B> {
             .backing_slices()
             .iter()
             .map(|slice| slice.evidence()));
-        if resources.participant_count() != 1
-            || resources.prepared_participant_count() != 1
+        if resources.participant_count() != resources.prepared_participant_count()
             || resources.node_id() != node_id
-            || participant_frame.frame_id() != *frame_id
             || participant_frame.sequence_authority() != participant.sequence_authority()
             || participant_frame.request_authority() != participant.request_authority()
             || resources.plan_evidence() != *active_binding.plan()
@@ -2795,8 +3000,8 @@ impl<'a, B> OperationInvocation<'a, B> {
                 != plan.payload().device_runtime_implementation_fingerprint()
             || parts.plan_id.as_ref() != Some(plan.payload().plan_id())
             || parts.plan_hash.as_ref() != Some(plan.plan_hash())
-            || parts.frame_id.as_ref() != Some(frame_id)
-            || parts.node_invocation_id.as_ref() != Some(node_invocation_id)
+            || parts.frame_id != Some(participant_frame.frame_id())
+            || parts.node_invocation_id.is_none()
             || parts.node_id.as_ref() != Some(node.id())
             || parts.operation_id.as_ref() != Some(node.operation_id())
             || parts.provider_id.as_ref() != Some(node.selection().selected_provider())
@@ -3195,6 +3400,98 @@ impl<'a, B> OperationInvocation<'a, B> {
     }
 }
 
+/// Borrowed provider view for exactly one physical command. Participant-local
+/// resources remain separate projections while invocation/step/plan resources
+/// may be shared by every projection.
+pub struct BatchedOperationInvocation<'a, B> {
+    batch_identity: &'a BatchOperationIdentity,
+    participants: Vec<OperationInvocation<'a, B>>,
+}
+
+impl<'a, B> BatchedOperationInvocation<'a, B> {
+    fn from_resolved<R>(
+        runtime: &R,
+        resolved: &'a ResolvedModelPlan,
+        provider: &'a OperationProviderDescriptor,
+        batch_identity: &'a BatchOperationIdentity,
+        resources: &'a InvocationResourceLease<R>,
+        active_bindings: &'a [TrustedActiveSequenceBinding],
+    ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+    {
+        let participant_count = usize::try_from(resources.participant_count())
+            .map_err(|_| invalid_operation("operation participant count exceeds usize"))?;
+        let resource_keys = resources.participant_node_keys();
+        if participant_count == 0
+            || participant_count != active_bindings.len()
+            || participant_count != batch_identity.participants().len()
+            || participant_count != resource_keys.len()
+            || batch_identity.batch_step_id() != resources.batch_step_id()
+            || batch_identity.batch_invocation_id() != resources.batch_invocation_id()
+            || batch_identity.node_id() != resources.node_id()
+            || batch_identity.work_shape_fingerprint() != resources.work_shape().fingerprint()
+            || batch_identity.claimed_backing_fingerprint()
+                != resources.claimed_backing().fingerprint()
+            || batch_identity
+                .participants()
+                .iter()
+                .zip(&resource_keys)
+                .any(|(participant, key)| participant.node_key() != key)
+        {
+            return Err(invalid_operation(
+                "batched operation identity differs from its exact invocation resources",
+            ));
+        }
+        let participants = batch_identity
+            .participants()
+            .iter()
+            .zip(active_bindings)
+            .enumerate()
+            .map(|(index, (participant, active_binding))| {
+                OperationInvocation::from_resolved(
+                    runtime,
+                    resolved,
+                    provider,
+                    participant.identity(),
+                    batch_identity.node_id(),
+                    resources,
+                    active_binding,
+                    index,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            batch_identity,
+            participants,
+        })
+    }
+
+    pub fn batch_identity(&self) -> &BatchOperationIdentity {
+        self.batch_identity
+    }
+
+    pub fn participants(&self) -> &[OperationInvocation<'a, B>] {
+        &self.participants
+    }
+
+    pub fn operation(&self) -> &OperationDescriptor {
+        self.participants[0].operation()
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        self.batch_identity.node_id()
+    }
+
+    pub fn provider_id(&self) -> &ProviderId {
+        self.batch_identity.provider_id()
+    }
+
+    pub fn work_shape(&self) -> &BatchWorkShape {
+        self.participants[0].work_shape()
+    }
+}
+
 fn select_workspace_resource<'a>(
     requirement: Option<&ProviderWorkspaceRequirement>,
     resource: Option<&'a ResourceId>,
@@ -3275,7 +3572,7 @@ where
     Contract(VNextError),
     Provider(OperationFailure),
     DefinitelyNotSubmitted {
-        failure: IdentifiedFailure,
+        failures: Vec<IdentifiedFailure>,
         retry: DefinitelyNotSubmittedRetryAuthority<R>,
     },
     SubmissionIndeterminate {
@@ -3295,9 +3592,9 @@ where
         match self {
             Self::Contract(error) => formatter.debug_tuple("Contract").field(error).finish(),
             Self::Provider(error) => formatter.debug_tuple("Provider").field(error).finish(),
-            Self::DefinitelyNotSubmitted { failure, retry } => formatter
+            Self::DefinitelyNotSubmitted { failures, retry } => formatter
                 .debug_struct("DefinitelyNotSubmitted")
-                .field("failure", failure)
+                .field("failures", failures)
                 .field("retry", retry)
                 .finish(),
             Self::SubmissionIndeterminate { recovery } => formatter
@@ -3328,12 +3625,15 @@ where
                 error.code(),
                 error.message()
             ),
-            Self::DefinitelyNotSubmitted { failure, retry } => write!(
+            Self::DefinitelyNotSubmitted { failures, retry } => write!(
                 formatter,
-                "operation attempt {} was definitely not submitted: {}: {}",
+                "operation attempt {} with {} participants was definitely not submitted: {}",
                 retry.prior_attempt(),
-                failure.failure().code(),
-                failure.failure().message()
+                failures.len(),
+                failures
+                    .first()
+                    .map(|failure| failure.failure().message())
+                    .unwrap_or("missing classified participant failure")
             ),
             Self::SubmissionIndeterminate { recovery } => write!(
                 formatter,
@@ -3356,14 +3656,133 @@ pub struct OperationDispatch;
 
 impl OperationDispatch {
     #[allow(clippy::too_many_arguments)]
+    pub fn bind_batch_identity<R>(
+        resolved: &ResolvedModelPlan,
+        participant_identities: Vec<ExecutionIdentityEnvelope>,
+        active_bindings: &[TrustedActiveSequenceBinding],
+        invocation_resources: &InvocationResourceLease<R>,
+        lane: &Arc<ExecutionLane<R>>,
+    ) -> Result<BatchOperationIdentity, VNextError>
+    where
+        R: DeviceRuntime,
+    {
+        let plan = resolved.execution_plan();
+        let node_id = invocation_resources.node_id();
+        let node = plan
+            .payload()
+            .nodes()
+            .iter()
+            .find(|node| node.id() == node_id)
+            .ok_or_else(|| invalid_operation(format!("plan has no node `{node_id}`")))?;
+        let participants = invocation_resources.participants().collect::<Vec<_>>();
+        let frames = invocation_resources.participant_frames();
+        let sessions = invocation_resources
+            .participant_session_identities()
+            .collect::<Vec<_>>();
+        let node_keys = invocation_resources.participant_node_keys();
+        if participant_identities.is_empty()
+            || participant_identities.len() != participants.len()
+            || participant_identities.len() != frames.len()
+            || participant_identities.len() != sessions.len()
+            || participant_identities.len() != node_keys.len()
+            || participant_identities.len() != active_bindings.len()
+            || invocation_resources.prepared_participant_count()
+                != invocation_resources.participant_count()
+            || invocation_resources.plan_evidence().plan_id() != plan.payload().plan_id()
+            || invocation_resources.plan_evidence().plan_hash() != plan.plan_hash()
+            || invocation_resources.plan_evidence().device_id() != plan.payload().device_id()
+            || !Arc::ptr_eq(invocation_resources.runtime(), lane.runtime_arc())
+            || lane.descriptor() != &resolved.parts().device
+            || lane.descriptor() != resolved.parts().capabilities.device()
+            || lane.descriptor().runtime_implementation_fingerprint
+                != plan.payload().device_runtime_implementation_fingerprint()
+        {
+            return Err(invalid_operation(
+                "batch identity inputs differ from invocation resources, plan, or lane",
+            ));
+        }
+        let mut participant_projections = Vec::with_capacity(participant_identities.len());
+        for (index, identity) in participant_identities.into_iter().enumerate() {
+            let participant = participants[index];
+            let frame = frames[index];
+            let active = &active_bindings[index];
+            let session = sessions[index];
+            let key = &node_keys[index];
+            let parts = identity.parts();
+            if key.sequence_authority() != participant.sequence_authority()
+                || key.request_authority() != participant.request_authority()
+                || key.frame_id() != frame.frame_id()
+                || active.sequence_authority() != participant.sequence_authority()
+                || active.coordinator_id() != invocation_resources.coordinator_id()
+                || active.run_id() != participant.run_id()
+                || active.request_id() != participant.request_id()
+                || !active.matches_sequence_session(session.0, session.1)
+                || active.plan().plan_id() != plan.payload().plan_id()
+                || active.plan().plan_hash() != plan.plan_hash()
+                || active.plan().device_id() != plan.payload().device_id()
+                || active.runtime_implementation_fingerprint()
+                    != plan.payload().device_runtime_implementation_fingerprint()
+                || parts.run_id != *active.run_id()
+                || parts.request_id != *active.request_id()
+                || parts.plan_id.as_ref() != Some(plan.payload().plan_id())
+                || parts.plan_hash.as_ref() != Some(plan.plan_hash())
+                || parts.frame_id != Some(frame.frame_id())
+                || parts.node_invocation_id.is_none()
+                || parts.node_id.as_ref() != Some(node.id())
+                || parts.operation_id.as_ref() != Some(node.operation_id())
+                || parts.provider_id.as_ref() != Some(node.selection().selected_provider())
+                || parts.device_id.as_ref() != Some(plan.payload().device_id())
+                || parts.active_sequence_slot != Some(active.sequence_authority().sparse_id())
+                || parts.admission_generation != Some(active.sequence_authority().generation())
+                || parts.activation_epoch != Some(active.activation_epoch())
+                || parts.runtime_implementation_fingerprint.as_deref()
+                    != Some(active.runtime_implementation_fingerprint())
+                || parts.active_sequence_fingerprint.as_deref() != Some(active.fingerprint())
+                || parts.completed_sequence_fingerprint.is_some()
+                || parts.aborted_sequence_fingerprint.is_some()
+                || parts.resource_id.is_some()
+                || parts.resource_generation.is_some()
+                || parts.resource_batch_fingerprint.is_some()
+            {
+                return Err(invalid_operation(format!(
+                    "batch participant {index} differs from its exact resource, frame, session, or plan identity"
+                )));
+            }
+            participant_projections.push(BatchOperationParticipantIdentity {
+                participant_index: u32::try_from(index)
+                    .map_err(|_| invalid_operation("batch participant index exceeds u32"))?,
+                node_key: key.clone(),
+                identity,
+            });
+        }
+        BatchOperationIdentity::from_validated(
+            invocation_resources.batch_step_id(),
+            invocation_resources.batch_invocation_id(),
+            plan.payload().plan_id().clone(),
+            plan.plan_hash().clone(),
+            node.id().clone(),
+            node.operation_id().clone(),
+            node.selection().selected_provider().clone(),
+            plan.payload().device_id().clone(),
+            plan.payload()
+                .device_runtime_implementation_fingerprint()
+                .to_owned(),
+            lane.id(),
+            invocation_resources.work_shape().fingerprint().to_owned(),
+            invocation_resources
+                .claimed_backing()
+                .fingerprint()
+                .to_owned(),
+            participant_projections,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_and_submit<R>(
         provider: &BoundOperationProvider<'_, R>,
         resolved: &ResolvedModelPlan,
-        identity: &ExecutionIdentityEnvelope,
-        frame_id: &ExecutionFrameId,
-        node_invocation_id: &NodeInvocationId,
-        node_id: &NodeId,
-        active_binding: &TrustedActiveSequenceBinding,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: &[TrustedActiveSequenceBinding],
         mut invocation_resources: InvocationResourceLease<R>,
         lane: &Arc<ExecutionLane<R>>,
         reaper: &Arc<CompletionReaper<R>>,
@@ -3372,14 +3791,17 @@ impl OperationDispatch {
         R: DeviceRuntime,
     {
         provider
-            .validate_binding(resolved, node_id)
+            .validate_binding(resolved, batch_identity.node_id())
             .map_err(OperationDispatchError::Contract)?;
-        if lane.descriptor().id != *active_binding.plan().device_id()
+        if active_bindings.is_empty()
+            || active_bindings.len() != batch_identity.participants().len()
+            || lane.id() != batch_identity.lane_id()
+            || lane.descriptor().id != *batch_identity.device_id()
             || lane.descriptor().runtime_implementation_fingerprint
-                != active_binding.plan().runtime_implementation_fingerprint()
+                != batch_identity.runtime_implementation_fingerprint()
         {
             return Err(OperationDispatchError::Contract(invalid_operation(
-                "operation execution lane differs from logical plan evidence",
+                "operation execution lane or participant set differs from batch identity",
             )));
         }
         invocation_resources
@@ -3389,7 +3811,7 @@ impl OperationDispatch {
             reaper,
             invocation_resources,
             Arc::clone(lane),
-            identity.clone(),
+            batch_identity.clone(),
         )
         .map_err(OperationDispatchError::Contract)?;
         let runtime = lane.runtime();
@@ -3398,22 +3820,22 @@ impl OperationDispatch {
                 "operation encode runtime differs from its execution lane snapshot",
             )));
         }
-        let invocation = OperationInvocation::from_resolved(
+        let invocation = BatchedOperationInvocation::from_resolved(
             runtime,
             resolved,
             provider.provider.descriptor(),
-            identity,
-            frame_id,
-            node_invocation_id,
-            node_id,
+            batch_identity,
             completion.invocation(),
-            active_binding,
+            active_bindings,
         )
         .map_err(OperationDispatchError::Contract)?;
         let expected_phase = invocation.operation().profile_phase;
         let command = match provider.provider.encode_selected(invocation) {
             Ok(command) => command,
-            Err(failure) if failure.identity() == identity && failure.phase() == expected_phase => {
+            Err(failure)
+                if batch_identity.contains_identity(failure.identity())
+                    && failure.phase() == expected_phase =>
+            {
                 return Err(OperationDispatchError::Provider(failure));
             }
             Err(_) => {
@@ -3437,9 +3859,15 @@ impl OperationDispatch {
                 let retry = completion
                     .definitely_not_submitted()
                     .map_err(OperationDispatchError::Contract)?;
-                let failure = classify_device_error(runtime, identity.clone(), &error)
+                let failures = batch_identity
+                    .participants()
+                    .iter()
+                    .map(|participant| {
+                        classify_device_error(runtime, participant.identity().clone(), &error)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
                     .map_err(OperationDispatchError::Contract)?;
-                Err(OperationDispatchError::DefinitelyNotSubmitted { failure, retry })
+                Err(OperationDispatchError::DefinitelyNotSubmitted { failures, retry })
             }
             LaneSubmitOutcome::PossiblySubmittedPanic => {
                 drop(lane_reservation);
@@ -3662,7 +4090,7 @@ impl OperationPlanningRegistry for OperationPlanningHandle<'_> {
 pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
     fn encode_selected(
         &self,
-        invocation: OperationInvocation<'_, R::Buffer>,
+        invocation: BatchedOperationInvocation<'_, R::Buffer>,
     ) -> Result<R::Command, OperationFailure>;
 }
 

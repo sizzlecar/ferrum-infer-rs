@@ -1,22 +1,33 @@
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use super::{
-    classify_device_error, defer_device_cleanup, DeferredDeviceCleanupDisposition,
-    DeferredDeviceCleanupDomainId, DeferredDeviceCleanupTask, DefinitelyNotSubmittedRetryAuthority,
-    DeviceDescriptor, DeviceRuntime, DeviceTerminal, ExecutionIdentityEnvelope, FenceQuery,
-    IdentifiedFailure, InvocationResourceLease, StreamState, VNextError,
+    classify_device_error, defer_device_cleanup, BatchOperationIdentity,
+    DeferredDeviceCleanupDisposition, DeferredDeviceCleanupDomainId, DeferredDeviceCleanupTask,
+    DefinitelyNotSubmittedRetryAuthority, DeviceDescriptor, DeviceRuntime, DeviceTerminal,
+    ExecutionIdentityEnvelope, FenceQuery, IdentifiedFailure, InvocationResourceLease, StreamState,
+    VNextError,
 };
 
 fn invalid_completion(reason: impl Into<String>) -> VNextError {
     VNextError::InvalidExecutionPlan {
         reason: reason.into(),
     }
+}
+
+fn canonical_completion_fingerprint(value: &impl Serialize) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(value).expect("trusted completion evidence must serialize")
+        )
+    )
 }
 
 #[derive(Debug)]
@@ -42,10 +53,33 @@ struct ExecutionLaneState<S> {
     fail_closed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ExecutionLaneId(NonZeroU64);
+
+impl ExecutionLaneId {
+    fn mint() -> Result<Self, VNextError> {
+        static NEXT_LANE_ID: AtomicU64 = AtomicU64::new(1);
+        let raw = NEXT_LANE_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| invalid_completion("execution lane identity space is exhausted"))?;
+        NonZeroU64::new(raw)
+            .map(Self)
+            .ok_or_else(|| invalid_completion("execution lane identity must be non-zero"))
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
 /// Scheduler-owned stream lane. It is intentionally not bound to any request
 /// or sequence and may enqueue multiple mixed-batch commands in stream order.
 #[must_use = "scheduler-owned lanes must outlive every fence enqueued on them"]
 pub struct ExecutionLane<R: DeviceRuntime> {
+    id: ExecutionLaneId,
     runtime: Arc<R>,
     descriptor: DeviceDescriptor,
     fail_closed: AtomicBool,
@@ -56,6 +90,7 @@ impl<R: DeviceRuntime> fmt::Debug for ExecutionLane<R> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ExecutionLane")
+            .field("id", &self.id)
             .field("device_id", &self.descriptor.id)
             .field(
                 "runtime_implementation_fingerprint",
@@ -83,6 +118,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             )));
         }
         Ok(Arc::new(Self {
+            id: ExecutionLaneId::mint().map_err(ExecutionLaneCreationError::Contract)?,
             runtime,
             descriptor,
             fail_closed: AtomicBool::new(false),
@@ -96,6 +132,10 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
 
     pub fn descriptor(&self) -> &DeviceDescriptor {
         &self.descriptor
+    }
+
+    pub const fn id(&self) -> ExecutionLaneId {
+        self.id
     }
 
     pub fn is_reusable(&self) -> bool {
@@ -301,7 +341,18 @@ impl CompletionSlotId {
 #[must_use = "physical submission evidence must be recorded"]
 pub struct SubmittedOperationReceipt {
     slot_id: CompletionSlotId,
+    batch_identity: BatchOperationIdentity,
+    participants: Vec<SubmittedOperationParticipantReceipt>,
+    fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[must_use = "participant submission projections must remain linked to the physical batch"]
+pub struct SubmittedOperationParticipantReceipt {
+    slot_id: CompletionSlotId,
+    participant_index: u32,
     identity: ExecutionIdentityEnvelope,
+    batch_submission_fingerprint: String,
 }
 
 impl SubmittedOperationReceipt {
@@ -309,8 +360,34 @@ impl SubmittedOperationReceipt {
         self.slot_id
     }
 
+    pub fn batch_identity(&self) -> &BatchOperationIdentity {
+        &self.batch_identity
+    }
+
+    pub fn participants(&self) -> &[SubmittedOperationParticipantReceipt] {
+        &self.participants
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
+impl SubmittedOperationParticipantReceipt {
+    pub const fn slot_id(&self) -> CompletionSlotId {
+        self.slot_id
+    }
+
+    pub const fn participant_index(&self) -> u32 {
+        self.participant_index
+    }
+
     pub fn identity(&self) -> &ExecutionIdentityEnvelope {
         &self.identity
+    }
+
+    pub fn batch_submission_fingerprint(&self) -> &str {
+        &self.batch_submission_fingerprint
     }
 }
 
@@ -318,8 +395,38 @@ impl SubmittedOperationReceipt {
 #[serde(rename_all = "snake_case", tag = "status", content = "failure")]
 pub enum OperationCompletionDisposition {
     Succeeded,
+    FailedButQuiescent(Vec<IdentifiedFailure>),
+    ContractFailedButQuiescent(QuiescentCompletionContractFailure),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "failure")]
+pub enum OperationParticipantCompletionDisposition {
+    Succeeded,
     FailedButQuiescent(IdentifiedFailure),
     ContractFailedButQuiescent(QuiescentCompletionContractFailure),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[must_use = "participant completion projections must remain linked to the physical batch"]
+pub struct OperationParticipantCompletionReceipt {
+    submission: SubmittedOperationParticipantReceipt,
+    disposition: OperationParticipantCompletionDisposition,
+    batch_completion_fingerprint: String,
+}
+
+impl OperationParticipantCompletionReceipt {
+    pub fn submission(&self) -> &SubmittedOperationParticipantReceipt {
+        &self.submission
+    }
+
+    pub fn disposition(&self) -> &OperationParticipantCompletionDisposition {
+        &self.disposition
+    }
+
+    pub fn batch_completion_fingerprint(&self) -> &str {
+        &self.batch_completion_fingerprint
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -345,15 +452,94 @@ impl QuiescentCompletionContractFailure {
 pub struct OperationCompletionReceipt {
     submission: SubmittedOperationReceipt,
     disposition: OperationCompletionDisposition,
+    participants: Vec<OperationParticipantCompletionReceipt>,
+    fingerprint: String,
 }
 
 impl OperationCompletionReceipt {
+    fn new(
+        submission: SubmittedOperationReceipt,
+        disposition: OperationCompletionDisposition,
+    ) -> Result<Self, VNextError> {
+        let participant_dispositions = match &disposition {
+            OperationCompletionDisposition::Succeeded => submission
+                .participants()
+                .iter()
+                .map(|_| OperationParticipantCompletionDisposition::Succeeded)
+                .collect::<Vec<_>>(),
+            OperationCompletionDisposition::FailedButQuiescent(failures) => {
+                if failures.len() != submission.participants().len()
+                    || failures
+                        .iter()
+                        .zip(submission.participants())
+                        .any(|(failure, participant)| failure.identity() != participant.identity())
+                {
+                    return Err(invalid_completion(
+                        "batch completion failures differ from participant submission projections",
+                    ));
+                }
+                failures
+                    .iter()
+                    .cloned()
+                    .map(OperationParticipantCompletionDisposition::FailedButQuiescent)
+                    .collect()
+            }
+            OperationCompletionDisposition::ContractFailedButQuiescent(failure) => submission
+                .participants()
+                .iter()
+                .map(|_| {
+                    OperationParticipantCompletionDisposition::ContractFailedButQuiescent(
+                        failure.clone(),
+                    )
+                })
+                .collect(),
+        };
+        #[derive(Serialize)]
+        struct CompletionFingerprintInput<'a> {
+            domain: &'static str,
+            submission_fingerprint: &'a str,
+            disposition: &'a OperationCompletionDisposition,
+        }
+        let fingerprint = canonical_completion_fingerprint(&CompletionFingerprintInput {
+            domain: "ferrum.runtime-vnext.batch-operation-completion.v1",
+            submission_fingerprint: submission.fingerprint(),
+            disposition: &disposition,
+        });
+        let participants = submission
+            .participants()
+            .iter()
+            .cloned()
+            .zip(participant_dispositions)
+            .map(
+                |(submission, disposition)| OperationParticipantCompletionReceipt {
+                    submission,
+                    disposition,
+                    batch_completion_fingerprint: fingerprint.clone(),
+                },
+            )
+            .collect();
+        Ok(Self {
+            submission,
+            disposition,
+            participants,
+            fingerprint,
+        })
+    }
+
     pub fn submission(&self) -> &SubmittedOperationReceipt {
         &self.submission
     }
 
     pub fn disposition(&self) -> &OperationCompletionDisposition {
         &self.disposition
+    }
+
+    pub fn participants(&self) -> &[OperationParticipantCompletionReceipt] {
+        &self.participants
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
     }
 }
 
@@ -369,7 +555,8 @@ pub enum CompletionRecoveryCause {
 #[must_use = "a lane-drain receipt proves quiescence for one exact completion slot"]
 pub struct CompletionDrainReceipt {
     slot_id: CompletionSlotId,
-    identity: ExecutionIdentityEnvelope,
+    batch_identity: BatchOperationIdentity,
+    submission: Option<SubmittedOperationReceipt>,
     cause: CompletionRecoveryCause,
     had_submission_fence: bool,
 }
@@ -379,8 +566,12 @@ impl CompletionDrainReceipt {
         self.slot_id
     }
 
-    pub fn identity(&self) -> &ExecutionIdentityEnvelope {
-        &self.identity
+    pub fn batch_identity(&self) -> &BatchOperationIdentity {
+        &self.batch_identity
+    }
+
+    pub fn submission(&self) -> Option<&SubmittedOperationReceipt> {
+        self.submission.as_ref()
     }
 
     pub const fn cause(&self) -> CompletionRecoveryCause {
@@ -413,7 +604,8 @@ impl CompletionQuarantineFreshness {
 #[must_use = "a quarantine receipt identifies retained device-visible ownership"]
 pub struct CompletionQuarantineReceipt {
     slot_id: CompletionSlotId,
-    identity: ExecutionIdentityEnvelope,
+    batch_identity: BatchOperationIdentity,
+    submission: Option<SubmittedOperationReceipt>,
     cause: CompletionRecoveryCause,
     had_submission_fence: bool,
     device_id: super::DeviceId,
@@ -425,7 +617,8 @@ pub struct CompletionQuarantineReceipt {
 impl PartialEq for CompletionQuarantineReceipt {
     fn eq(&self, other: &Self) -> bool {
         self.slot_id == other.slot_id
-            && self.identity == other.identity
+            && self.batch_identity == other.batch_identity
+            && self.submission == other.submission
             && self.cause == other.cause
             && self.had_submission_fence == other.had_submission_fence
             && self.device_id == other.device_id
@@ -440,8 +633,12 @@ impl CompletionQuarantineReceipt {
         self.slot_id
     }
 
-    pub fn identity(&self) -> &ExecutionIdentityEnvelope {
-        &self.identity
+    pub fn batch_identity(&self) -> &BatchOperationIdentity {
+        &self.batch_identity
+    }
+
+    pub fn submission(&self) -> Option<&SubmittedOperationReceipt> {
+        self.submission.as_ref()
     }
 
     pub const fn cause(&self) -> CompletionRecoveryCause {
@@ -530,14 +727,14 @@ enum CompletionRecord<R: DeviceRuntime> {
         invocation: InvocationResourceLease<R>,
         lane: Arc<ExecutionLane<R>>,
         fence: R::Fence,
-        identity: ExecutionIdentityEnvelope,
+        batch_identity: BatchOperationIdentity,
         receipt: SubmittedOperationReceipt,
         recovery_state: CompletionRecoveryState,
     },
     SubmissionIndeterminate {
         invocation: InvocationResourceLease<R>,
         lane: Arc<ExecutionLane<R>>,
-        identity: ExecutionIdentityEnvelope,
+        batch_identity: BatchOperationIdentity,
     },
     Quarantined {
         ownership: CompletionQuarantineOwnership<R>,
@@ -558,13 +755,13 @@ enum CompletionQuarantineOwnership<R: DeviceRuntime> {
         invocation: InvocationResourceLease<R>,
         lane: Arc<ExecutionLane<R>>,
         fence: R::Fence,
-        identity: ExecutionIdentityEnvelope,
+        batch_identity: BatchOperationIdentity,
         submission: SubmittedOperationReceipt,
     },
     SubmissionIndeterminate {
         invocation: InvocationResourceLease<R>,
         lane: Arc<ExecutionLane<R>>,
-        identity: ExecutionIdentityEnvelope,
+        batch_identity: BatchOperationIdentity,
     },
 }
 
@@ -747,7 +944,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         reaper: &Arc<Self>,
         invocation: InvocationResourceLease<R>,
         lane: Arc<ExecutionLane<R>>,
-        identity: ExecutionIdentityEnvelope,
+        batch_identity: BatchOperationIdentity,
     ) -> Result<CompletionReservation<R>, VNextError> {
         if !Arc::ptr_eq(invocation.runtime(), lane.runtime_arc()) {
             return Err(invalid_completion(
@@ -768,9 +965,32 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             return Err(invalid_completion("completion slot identity was reused"));
         }
         drop(state);
+        #[derive(Serialize)]
+        struct SubmissionFingerprintInput<'a> {
+            domain: &'static str,
+            slot_id: CompletionSlotId,
+            batch_identity_fingerprint: &'a str,
+        }
+        let fingerprint = canonical_completion_fingerprint(&SubmissionFingerprintInput {
+            domain: "ferrum.runtime-vnext.batch-operation-submission.v1",
+            slot_id,
+            batch_identity_fingerprint: batch_identity.fingerprint(),
+        });
+        let participant_receipts = batch_identity
+            .participants()
+            .iter()
+            .map(|participant| SubmittedOperationParticipantReceipt {
+                slot_id,
+                participant_index: participant.participant_index(),
+                identity: participant.identity().clone(),
+                batch_submission_fingerprint: fingerprint.clone(),
+            })
+            .collect();
         let receipt = SubmittedOperationReceipt {
             slot_id,
-            identity: identity.clone(),
+            batch_identity: batch_identity.clone(),
+            participants: participant_receipts,
+            fingerprint,
         };
         let record_receipt = receipt.clone();
         Ok(CompletionReservation {
@@ -779,7 +999,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             slot_id,
             invocation: Some(invocation),
             lane: Some(lane),
-            identity: Some(identity),
+            batch_identity: Some(batch_identity),
             receipt: Some(receipt),
             record_receipt: Some(record_receipt),
             submission_may_have_happened: false,
@@ -852,15 +1072,19 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             CompletionRecord::InFlight {
                 lane,
                 fence,
-                identity,
+                batch_identity,
                 ..
             } if blocking => match catch_unwind(AssertUnwindSafe(|| lane.wait_fence(fence))) {
                 Ok(Ok(terminal)) => catch_unwind(AssertUnwindSafe(|| {
-                    terminal_observation(lane, identity, terminal)
+                    terminal_observation(lane, batch_identity, terminal)
                 }))
                 .unwrap_or(FenceObservation::ObservationPanicked),
                 Ok(Err(indeterminate)) => catch_unwind(AssertUnwindSafe(|| {
-                    classify_device_error(lane.runtime(), identity.clone(), indeterminate.error())
+                    classify_batch_device_error(
+                        lane.runtime(),
+                        batch_identity,
+                        indeterminate.error(),
+                    )
                 }))
                 .map_or(
                     FenceObservation::ObservationPanicked,
@@ -874,16 +1098,16 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             CompletionRecord::InFlight {
                 lane,
                 fence,
-                identity,
+                batch_identity,
                 ..
             } => match catch_unwind(AssertUnwindSafe(|| lane.query_fence(fence))) {
                 Ok(FenceQuery::Pending) => FenceObservation::Pending,
                 Ok(FenceQuery::Terminal(terminal)) => catch_unwind(AssertUnwindSafe(|| {
-                    terminal_observation(lane, identity, terminal)
+                    terminal_observation(lane, batch_identity, terminal)
                 }))
                 .unwrap_or(FenceObservation::ObservationPanicked),
                 Ok(FenceQuery::Indeterminate(error)) => catch_unwind(AssertUnwindSafe(|| {
-                    classify_device_error(lane.runtime(), identity.clone(), &error)
+                    classify_batch_device_error(lane.runtime(), batch_identity, &error)
                 }))
                 .map_or(
                     FenceObservation::ObservationPanicked,
@@ -935,12 +1159,8 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             }
             drop(guard);
             self.remove_exact(slot_id, &record);
-            return Ok(CompletionObservation::Terminal(
-                OperationCompletionReceipt {
-                    submission: receipt,
-                    disposition,
-                },
-            ));
+            return OperationCompletionReceipt::new(receipt, disposition)
+                .map(CompletionObservation::Terminal);
         }
         Ok(match observation {
             FenceObservation::Pending => CompletionObservation::Pending,
@@ -967,22 +1187,35 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         let mut guard = record
             .lock()
             .map_err(|_| invalid_completion("completion slot mutex is poisoned"))?;
-        let (lane, identity, cause, had_submission_fence) = match &*guard {
+        let (lane, batch_identity, submission, cause, had_submission_fence) = match &*guard {
             CompletionRecord::InFlight {
                 lane,
-                identity,
+                batch_identity,
+                receipt,
                 recovery_state: CompletionRecoveryState::DrainEligible(cause),
                 ..
-            } => (Arc::clone(lane), identity.clone(), *cause, true),
-            CompletionRecord::SubmissionIndeterminate { lane, identity, .. } => (
+            } => (
                 Arc::clone(lane),
-                identity.clone(),
+                batch_identity.clone(),
+                Some(receipt.clone()),
+                *cause,
+                true,
+            ),
+            CompletionRecord::SubmissionIndeterminate {
+                lane,
+                batch_identity,
+                ..
+            } => (
+                Arc::clone(lane),
+                batch_identity.clone(),
+                None,
                 CompletionRecoveryCause::SubmissionIndeterminate,
                 false,
             ),
             CompletionRecord::Quarantined { ownership, receipt } => (
                 Arc::clone(ownership.lane()),
-                receipt.identity.clone(),
+                receipt.batch_identity.clone(),
+                receipt.submission.clone(),
                 receipt.cause,
                 receipt.had_submission_fence,
             ),
@@ -1014,30 +1247,31 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                     invocation,
                     lane,
                     fence,
-                    identity,
+                    batch_identity,
                     receipt,
                     ..
                 } => CompletionQuarantineOwnership::InFlight {
                     invocation,
                     lane,
                     fence,
-                    identity,
+                    batch_identity,
                     submission: receipt,
                 },
                 CompletionRecord::SubmissionIndeterminate {
                     invocation,
                     lane,
-                    identity,
+                    batch_identity,
                 } => CompletionQuarantineOwnership::SubmissionIndeterminate {
                     invocation,
                     lane,
-                    identity,
+                    batch_identity,
                 },
                 _ => unreachable!("recovery source was validated before lane drain"),
             };
             let receipt = CompletionQuarantineReceipt {
                 slot_id,
-                identity,
+                batch_identity,
+                submission,
                 cause,
                 had_submission_fence,
                 device_id: lane.descriptor.id.clone(),
@@ -1062,7 +1296,8 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         drop(old);
         Ok(CompletionRecoveryOutcome::Drained(CompletionDrainReceipt {
             slot_id,
-            identity,
+            batch_identity,
+            submission,
             cause,
             had_submission_fence,
         }))
@@ -1072,7 +1307,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
 enum FenceObservation {
     Pending,
     Terminal(OperationCompletionDisposition),
-    Indeterminate(IdentifiedFailure),
+    Indeterminate(Vec<IdentifiedFailure>),
     ContractIndeterminate(VNextError),
     SubmissionIndeterminate,
     ObservationPanicked,
@@ -1081,7 +1316,7 @@ enum FenceObservation {
 
 fn terminal_observation<R: DeviceRuntime>(
     lane: &ExecutionLane<R>,
-    identity: &ExecutionIdentityEnvelope,
+    batch_identity: &BatchOperationIdentity,
     terminal: DeviceTerminal<R::Error>,
 ) -> FenceObservation {
     let descriptor_is_stable = catch_unwind(AssertUnwindSafe(|| {
@@ -1100,14 +1335,26 @@ fn terminal_observation<R: DeviceRuntime>(
     FenceObservation::Terminal(match terminal {
         DeviceTerminal::Succeeded => OperationCompletionDisposition::Succeeded,
         DeviceTerminal::FailedButQuiescent(error) => {
-            match classify_device_error(lane.runtime(), identity.clone(), &error) {
-                Ok(failure) => OperationCompletionDisposition::FailedButQuiescent(failure),
+            match classify_batch_device_error(lane.runtime(), batch_identity, &error) {
+                Ok(failures) => OperationCompletionDisposition::FailedButQuiescent(failures),
                 Err(error) => OperationCompletionDisposition::ContractFailedButQuiescent(
                     QuiescentCompletionContractFailure::new(error.to_string()),
                 ),
             }
         }
     })
+}
+
+fn classify_batch_device_error<R: DeviceRuntime>(
+    runtime: &R,
+    batch_identity: &BatchOperationIdentity,
+    error: &R::Error,
+) -> Result<Vec<IdentifiedFailure>, VNextError> {
+    batch_identity
+        .participants()
+        .iter()
+        .map(|participant| classify_device_error(runtime, participant.identity().clone(), error))
+        .collect()
 }
 
 struct DeferredCompletionCleanup<R: DeviceRuntime> {
@@ -1264,7 +1511,7 @@ impl<R: DeviceRuntime> Drop for CompletionReaper<R> {
 pub enum CompletionObservation {
     Pending,
     Terminal(OperationCompletionReceipt),
-    Indeterminate(IdentifiedFailure),
+    Indeterminate(Vec<IdentifiedFailure>),
     SubmissionIndeterminate,
     ObservationPanicked,
     Quarantined(CompletionQuarantineReceipt),
@@ -1340,8 +1587,8 @@ impl<R: DeviceRuntime> CompletionHandle<R> {
         &self.receipt
     }
 
-    pub fn identity(&self) -> &ExecutionIdentityEnvelope {
-        self.receipt.identity()
+    pub fn batch_identity(&self) -> &BatchOperationIdentity {
+        self.receipt.batch_identity()
     }
 
     pub const fn slot_id(&self) -> CompletionSlotId {
@@ -1369,7 +1616,7 @@ pub(crate) struct CompletionReservation<R: DeviceRuntime> {
     slot_id: CompletionSlotId,
     invocation: Option<InvocationResourceLease<R>>,
     lane: Option<Arc<ExecutionLane<R>>>,
-    identity: Option<ExecutionIdentityEnvelope>,
+    batch_identity: Option<BatchOperationIdentity>,
     receipt: Option<SubmittedOperationReceipt>,
     record_receipt: Option<SubmittedOperationReceipt>,
     submission_may_have_happened: bool,
@@ -1407,7 +1654,10 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
     ) -> Result<CompletionHandle<R>, (VNextError, CompletionHandle<R>)> {
         let invocation = self.invocation.take().expect("reservation owns invocation");
         let lane = self.lane.take().expect("reservation owns lane");
-        let identity = self.identity.take().expect("reservation owns identity");
+        let batch_identity = self
+            .batch_identity
+            .take()
+            .expect("reservation owns batch identity");
         let receipt = self.receipt.take().expect("reservation owns receipt");
         let record_receipt = self
             .record_receipt
@@ -1427,7 +1677,7 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             invocation,
             lane,
             fence,
-            identity,
+            batch_identity,
             receipt: record_receipt,
             recovery_state: CompletionRecoveryState::Unobserved,
         };
@@ -1457,7 +1707,10 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
     pub(crate) fn submission_indeterminate(mut self) -> IndeterminateSubmissionHandle<R> {
         let invocation = self.invocation.take().expect("reservation owns invocation");
         let lane = self.lane.take().expect("reservation owns lane");
-        let identity = self.identity.take().expect("reservation owns identity");
+        let batch_identity = self
+            .batch_identity
+            .take()
+            .expect("reservation owns batch identity");
         let mut record = match self.record.lock() {
             Ok(record) => record,
             Err(poisoned) => poisoned.into_inner(),
@@ -1466,11 +1719,11 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             *record = CompletionRecord::SubmissionIndeterminate {
                 invocation,
                 lane,
-                identity,
+                batch_identity,
             };
         } else {
             lane.fail_closed();
-            std::mem::forget((invocation, lane, identity));
+            std::mem::forget((invocation, lane, batch_identity));
         }
         drop(record);
         self.finished = true;
@@ -1505,7 +1758,7 @@ impl<R: DeviceRuntime> Drop for CompletionReservation<R> {
                 std::mem::forget(invocation);
                 return;
             };
-            let Some(identity) = self.identity.take() else {
+            let Some(batch_identity) = self.batch_identity.take() else {
                 std::mem::forget((invocation, lane));
                 return;
             };
@@ -1518,10 +1771,10 @@ impl<R: DeviceRuntime> Drop for CompletionReservation<R> {
                 *record = CompletionRecord::SubmissionIndeterminate {
                     invocation,
                     lane,
-                    identity,
+                    batch_identity,
                 };
             } else {
-                std::mem::forget((invocation, lane, identity));
+                std::mem::forget((invocation, lane, batch_identity));
             }
         } else {
             self.remove_reserved_slot();

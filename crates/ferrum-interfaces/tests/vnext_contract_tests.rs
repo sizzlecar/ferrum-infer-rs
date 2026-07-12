@@ -963,7 +963,7 @@ impl OperationResourceEstimator for TestEstimator {
 impl OperationProvider<PlanningTestRuntime> for TestEstimator {
     fn encode_selected(
         &self,
-        _invocation: OperationInvocation<'_, BufferDescriptor>,
+        _invocation: BatchedOperationInvocation<'_, BufferDescriptor>,
     ) -> Result<(), OperationFailure> {
         Ok(())
     }
@@ -1017,7 +1017,7 @@ impl OperationResourceEstimator for SequentialScratchEstimator {
 impl OperationProvider<PlanningTestRuntime> for SequentialScratchEstimator {
     fn encode_selected(
         &self,
-        _invocation: OperationInvocation<'_, BufferDescriptor>,
+        _invocation: BatchedOperationInvocation<'_, BufferDescriptor>,
     ) -> Result<(), OperationFailure> {
         Ok(())
     }
@@ -3524,6 +3524,15 @@ impl ModelFamilyProvider for DuplicateMetadataFamily {
         Ok(())
     }
 
+    fn validated_external_metadata_id(
+        &self,
+        raw: &Value,
+        config: &Self::Config,
+    ) -> Result<ExternalModelMetadataId, VNextError> {
+        self.validate_config_identity(raw, config)?;
+        Ok(id("metadata.synthetic"))
+    }
+
     fn parse_config(&self, _raw: &Value) -> Result<Self::Config, VNextError> {
         Err(VNextError::InvalidModelConfig {
             family_id: self.family_id().to_string(),
@@ -4646,6 +4655,15 @@ impl ModelFamilyProvider for GraphFamily {
         _config: &Self::Config,
     ) -> Result<(), VNextError> {
         Ok(())
+    }
+
+    fn validated_external_metadata_id(
+        &self,
+        raw: &Value,
+        config: &Self::Config,
+    ) -> Result<ExternalModelMetadataId, VNextError> {
+        self.validate_config_identity(raw, config)?;
+        Ok(id("metadata.execution-graph"))
     }
 
     fn parse_config(&self, raw: &Value) -> Result<Self::Config, VNextError> {
