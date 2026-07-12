@@ -7,14 +7,14 @@ use std::sync::Arc;
 
 use super::{
     classify_device_error, AllocationLifetime, BatchWorkShape, BufferUsage, CanonicalRational,
-    CapabilityId, CompletionHandle, CompletionReaper, ContractVersion, DeviceId, DeviceRuntime,
-    ExecutionFrameId, ExecutionIdentityEnvelope, ExecutionLane, IdentifiedFailure,
-    IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
-    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, NodeInvocationId, OperationId,
-    PlanHash, PlanId, ProgramValueId, ProviderId, ProviderWorkspaceRequirement,
-    QuantizationFormatId, ResolvedModelPlan, ResourceId, SemanticValue,
-    TrustedActiveSequenceBinding, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
-    WeightId,
+    CapabilityId, CompletionHandle, CompletionReaper, ContractVersion,
+    DefinitelyNotSubmittedRetryAuthority, DeviceId, DeviceRuntime, ExecutionFrameId,
+    ExecutionIdentityEnvelope, ExecutionLane, IdentifiedFailure, IndeterminateSubmissionHandle,
+    InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView, LogicalBackingBufferView,
+    LogicalBackingSegmentBinding, NodeId, NodeInvocationId, OperationId, PlanHash, PlanId,
+    ProgramValueId, ProviderId, ProviderWorkspaceRequirement, QuantizationFormatId,
+    ResolvedModelPlan, ResourceId, SemanticValue, TrustedActiveSequenceBinding,
+    UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId, WeightId,
 };
 
 pub const MAX_OPERATION_CATALOG_ROWS: usize = 4096;
@@ -3274,7 +3274,10 @@ where
 {
     Contract(VNextError),
     Provider(OperationFailure),
-    Device(IdentifiedFailure),
+    DefinitelyNotSubmitted {
+        failure: IdentifiedFailure,
+        retry: DefinitelyNotSubmittedRetryAuthority<R>,
+    },
     SubmissionIndeterminate {
         recovery: IndeterminateSubmissionHandle<R>,
     },
@@ -3292,7 +3295,11 @@ where
         match self {
             Self::Contract(error) => formatter.debug_tuple("Contract").field(error).finish(),
             Self::Provider(error) => formatter.debug_tuple("Provider").field(error).finish(),
-            Self::Device(error) => formatter.debug_tuple("Device").field(error).finish(),
+            Self::DefinitelyNotSubmitted { failure, retry } => formatter
+                .debug_struct("DefinitelyNotSubmitted")
+                .field("failure", failure)
+                .field("retry", retry)
+                .finish(),
             Self::SubmissionIndeterminate { recovery } => formatter
                 .debug_struct("SubmissionIndeterminate")
                 .field("recovery", recovery)
@@ -3321,11 +3328,12 @@ where
                 error.code(),
                 error.message()
             ),
-            Self::Device(error) => write!(
+            Self::DefinitelyNotSubmitted { failure, retry } => write!(
                 formatter,
-                "operation submit failed with {}: {}",
-                error.failure().code(),
-                error.failure().message()
+                "operation attempt {} was definitely not submitted: {}: {}",
+                retry.prior_attempt(),
+                failure.failure().code(),
+                failure.failure().message()
             ),
             Self::SubmissionIndeterminate { recovery } => write!(
                 formatter,
@@ -3426,10 +3434,12 @@ impl OperationDispatch {
         match lane_reservation.submit(command) {
             LaneSubmitOutcome::DefinitelyNotSubmitted(error) => {
                 drop(lane_reservation);
-                completion.definitely_not_submitted();
+                let retry = completion
+                    .definitely_not_submitted()
+                    .map_err(OperationDispatchError::Contract)?;
                 let failure = classify_device_error(runtime, identity.clone(), &error)
                     .map_err(OperationDispatchError::Contract)?;
-                Err(OperationDispatchError::Device(failure))
+                Err(OperationDispatchError::DefinitelyNotSubmitted { failure, retry })
             }
             LaneSubmitOutcome::PossiblySubmittedPanic => {
                 drop(lane_reservation);
@@ -3438,7 +3448,15 @@ impl OperationDispatch {
             }
             LaneSubmitOutcome::Submitted(fence) => {
                 drop(lane_reservation);
-                let completion = completion.arm(fence);
+                let completion = match completion.arm(fence) {
+                    Ok(completion) => completion,
+                    Err((error, completion)) => {
+                        return Err(OperationDispatchError::PostSubmitContract {
+                            error,
+                            completion,
+                        });
+                    }
+                };
                 if !lane.current_descriptor_matches_snapshot() {
                     lane.fail_closed();
                     return Err(OperationDispatchError::PostSubmitContract {

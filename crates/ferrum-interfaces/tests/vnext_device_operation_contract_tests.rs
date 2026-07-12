@@ -1798,51 +1798,43 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
     let reaper = CompletionReaper::new();
     let identity = operation_identity(&plan, &active, frame_id, invocation_id);
     device_failure_contract(&runtime, &plan, &identity, passed);
+    assert!(step.try_retire_normal().is_ok());
 
-    let base = identity.parts().clone();
-    let mut mutations = Vec::new();
-    let mut parts = base.clone();
-    parts.plan_id = Some(id(format!("plan/sha256/{}", sha('f'))));
-    mutations.push(parts);
-    let mut parts = base.clone();
-    parts.plan_hash = Some(serde_json::from_value(json!(sha('f'))).unwrap());
-    mutations.push(parts);
-    let mut parts = base.clone();
-    parts.resource_pool_id =
-        Some(ResourcePoolId::try_from(active.static_pool_id().unwrap().get() + 1).unwrap());
-    mutations.push(parts);
-    let mut parts = base.clone();
-    parts.resource_pool_identity_fingerprint = Some(sha('f'));
-    mutations.push(parts);
-    let mut parts = base.clone();
-    parts.activation_epoch = Some(active.activation_epoch() + 1);
-    mutations.push(parts);
-    let mut parts = base.clone();
-    parts.active_sequence_slot = Some(active.sequence_authority().sparse_id() + 1);
-    mutations.push(parts);
-    let mut parts = base.clone();
-    parts.request_id = id("request.device-operation.wrong");
-    mutations.push(parts);
-    let mut parts = base.clone();
-    parts.run_id = id("run.device-operation.wrong");
-    mutations.push(parts);
-    let mut parts = base.clone();
-    parts.frame_id = Some(ExecutionFrameId::try_from(2).unwrap());
-    mutations.push(parts);
-    let mut parts = base.clone();
-    parts.node_invocation_id = Some(NodeInvocationId::try_from(2).unwrap());
-    mutations.push(parts);
-    let mut parts = base.clone();
-    parts.provider_id = Some(id("provider.operation.wrong"));
-    mutations.push(parts);
-    let mut parts = base.clone();
-    parts.node_id = Some(id("node.wrong"));
-    mutations.push(parts);
-    let mut parts = base.clone();
-    parts.runtime_implementation_fingerprint = Some(sha('f'));
-    mutations.push(parts);
+    type IdentityMutation = fn(&mut ExecutionIdentityParts);
+    let mutations: [IdentityMutation; 13] = [
+        |parts| parts.plan_id = Some(id(format!("plan/sha256/{}", sha('f')))),
+        |parts| parts.plan_hash = Some(serde_json::from_value(json!(sha('f'))).unwrap()),
+        |parts| {
+            parts.resource_pool_id =
+                Some(ResourcePoolId::try_from(parts.resource_pool_id.unwrap().get() + 1).unwrap())
+        },
+        |parts| parts.resource_pool_identity_fingerprint = Some(sha('f')),
+        |parts| parts.activation_epoch = Some(parts.activation_epoch.unwrap() + 1),
+        |parts| parts.active_sequence_slot = Some(parts.active_sequence_slot.unwrap() + 1),
+        |parts| parts.request_id = id("request.device-operation.wrong"),
+        |parts| parts.run_id = id("run.device-operation.wrong"),
+        |parts| {
+            parts.frame_id =
+                Some(ExecutionFrameId::try_from(parts.frame_id.unwrap().get() + 1).unwrap())
+        },
+        |parts| {
+            parts.node_invocation_id = Some(
+                NodeInvocationId::try_from(parts.node_invocation_id.unwrap().get() + 1).unwrap(),
+            )
+        },
+        |parts| parts.provider_id = Some(id("provider.operation.wrong")),
+        |parts| parts.node_id = Some(id("node.wrong")),
+        |parts| parts.runtime_implementation_fingerprint = Some(sha('f')),
+    ];
 
-    for parts in mutations {
+    for mutate in mutations {
+        let step = begin_single_participant_step(&plan_resources, &batch);
+        let frame_id = step.participant_frames().next().unwrap().frame_id();
+        let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
+        let mut parts = operation_identity(&plan, &active, frame_id, invocation_id)
+            .parts()
+            .clone();
+        mutate(&mut parts);
         let wrong = ExecutionIdentityEnvelope::new(parts).unwrap();
         check(
             passed,
@@ -1862,15 +1854,20 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
                 Err(OperationDispatchError::Contract(_))
             ),
         );
+        assert!(step.try_retire_normal().is_ok());
     }
-    let mut terminal_identities = Vec::new();
-    let mut parts = base.clone();
-    parts.completed_sequence_fingerprint = Some(sha('c'));
-    terminal_identities.push(parts);
-    let mut parts = base.clone();
-    parts.aborted_sequence_fingerprint = Some(sha('a'));
-    terminal_identities.push(parts);
-    for parts in terminal_identities {
+    for completed in [true, false] {
+        let step = begin_single_participant_step(&plan_resources, &batch);
+        let frame_id = step.participant_frames().next().unwrap().frame_id();
+        let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
+        let mut parts = operation_identity(&plan, &active, frame_id, invocation_id)
+            .parts()
+            .clone();
+        if completed {
+            parts.completed_sequence_fingerprint = Some(sha('c'));
+        } else {
+            parts.aborted_sequence_fingerprint = Some(sha('a'));
+        }
         let terminal = ExecutionIdentityEnvelope::new(parts).unwrap();
         let failure_rejected = OperationFailure::new(
             terminal.clone(),
@@ -1896,11 +1893,17 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
             Err(OperationDispatchError::Contract(_))
         );
         check(passed, failure_rejected && dispatch_rejected);
+        assert!(step.try_retire_normal().is_ok());
     }
     check(passed, provider_trace.lock().unwrap().encode_calls == 0);
     check(passed, runtime_trace.lock().unwrap().submit_calls == 0);
 
-    let mut resource_item = base.clone();
+    let step = begin_single_participant_step(&plan_resources, &batch);
+    let frame_id = step.participant_frames().next().unwrap().frame_id();
+    let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
+    let mut resource_item = operation_identity(&plan, &active, frame_id, invocation_id)
+        .parts()
+        .clone();
     resource_item.resource_id = Some(id("resource.input"));
     resource_item.resource_generation = Some(active.sequence_authority().generation());
     let resource_item = ExecutionIdentityEnvelope::new(resource_item).unwrap();
@@ -1922,7 +1925,14 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
             Err(OperationDispatchError::Contract(_))
         ),
     );
-    let mut resource_batch = base.clone();
+    assert!(step.try_retire_normal().is_ok());
+
+    let step = begin_single_participant_step(&plan_resources, &batch);
+    let frame_id = step.participant_frames().next().unwrap().frame_id();
+    let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
+    let mut resource_batch = operation_identity(&plan, &active, frame_id, invocation_id)
+        .parts()
+        .clone();
     resource_batch.resource_batch_fingerprint = Some(sha('f'));
     let resource_batch = ExecutionIdentityEnvelope::new(resource_batch).unwrap();
     check(
@@ -1943,9 +1953,14 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
             Err(OperationDispatchError::Contract(_))
         ),
     );
+    assert!(step.try_retire_normal().is_ok());
     check(passed, provider_trace.lock().unwrap().encode_calls == 0);
 
     *provider_behavior.lock().unwrap() = ProviderBehavior::WrongIdentity;
+    let step = begin_single_participant_step(&plan_resources, &batch);
+    let frame_id = step.participant_frames().next().unwrap().frame_id();
+    let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
+    let identity = operation_identity(&plan, &active, frame_id, invocation_id);
     check(
         passed,
         matches!(
@@ -1965,7 +1980,13 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
         ),
     );
     check(passed, runtime_trace.lock().unwrap().submit_calls == 0);
+    assert!(step.try_retire_normal().is_ok());
+
     *provider_behavior.lock().unwrap() = ProviderBehavior::WrongPhase;
+    let step = begin_single_participant_step(&plan_resources, &batch);
+    let frame_id = step.participant_frames().next().unwrap().frame_id();
+    let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
+    let identity = operation_identity(&plan, &active, frame_id, invocation_id);
     check(
         passed,
         matches!(
@@ -1985,8 +2006,13 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
         ),
     );
     check(passed, runtime_trace.lock().unwrap().submit_calls == 0);
+    assert!(step.try_retire_normal().is_ok());
 
     *provider_behavior.lock().unwrap() = ProviderBehavior::Success;
+    let step = begin_single_participant_step(&plan_resources, &batch);
+    let frame_id = step.participant_frames().next().unwrap().frame_id();
+    let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
+    let identity = operation_identity(&plan, &active, frame_id, invocation_id);
     let receipt = OperationDispatch::encode_and_submit(
         &provider,
         &resolved,
@@ -2022,10 +2048,23 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
                 id("resource.weight.right"),
             ]),
     );
+    let step_receipt = step.try_retire_normal().unwrap();
+    check(
+        passed,
+        step_receipt.participants()[0]
+            .assignment()
+            .sequence_authority()
+            == active.sequence_authority(),
+    );
+    drop(receipt);
 
     let encode_before_tamper = provider_trace.lock().unwrap().encode_calls;
     let submit_before_tamper = runtime_trace.lock().unwrap().submit_calls;
     runtime_trace.lock().unwrap().tamper_buffer_descriptor = true;
+    let step = begin_single_participant_step(&plan_resources, &batch);
+    let frame_id = step.participant_frames().next().unwrap().frame_id();
+    let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
+    let identity = operation_identity(&plan, &active, frame_id, invocation_id);
     check(
         passed,
         matches!(
@@ -2053,18 +2092,10 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
         runtime_trace.lock().unwrap().submit_calls == submit_before_tamper,
     );
     runtime_trace.lock().unwrap().tamper_buffer_descriptor = false;
+    assert!(step.try_retire_normal().is_ok());
 
     wire_limit_contract(&plan, &identity, passed);
-    let step_receipt = step.try_retire_normal().unwrap();
-    check(
-        passed,
-        step_receipt.participants()[0]
-            .assignment()
-            .sequence_authority()
-            == active.sequence_authority(),
-    );
     check(passed, session.try_complete().is_ok());
-    drop(receipt);
     drop(reaper);
     drop(lane);
     drop(batch);
@@ -2466,13 +2497,17 @@ struct CompletionHarness {
     resources: Arc<AdmittedSequenceResources<TestRuntime>>,
     session: Arc<SequenceSession<TestRuntime>>,
     batch: ExecutionBatchParticipants<TestRuntime>,
-    step: Arc<StepResourceLease<TestRuntime>>,
+    step: Option<Arc<StepResourceLease<TestRuntime>>>,
     active: TrustedActiveSequenceBinding,
     lane: Arc<ExecutionLane<TestRuntime>>,
     reaper: Arc<CompletionReaper<TestRuntime>>,
 }
 
 impl CompletionHarness {
+    fn step(&self) -> &Arc<StepResourceLease<TestRuntime>> {
+        self.step.as_ref().expect("completion harness owns a step")
+    }
+
     fn new() -> Self {
         let Fixture {
             registry,
@@ -2504,7 +2539,7 @@ impl CompletionHarness {
             resources,
             session,
             batch,
-            step,
+            step: Some(step),
             active,
             lane,
             reaper,
@@ -2522,8 +2557,27 @@ impl CompletionHarness {
         lane: &Arc<ExecutionLane<TestRuntime>>,
     ) -> Result<CompletionHandle<TestRuntime>, OperationDispatchError<TestRuntime>> {
         let node = &self.plan.payload().nodes()[0];
+        self.dispatch_invocation_on_lane(
+            admit_single_participant_invocation(&self.plan_resources, self.step(), node.id()),
+            lane,
+        )
+    }
+
+    fn dispatch_invocation(
+        &self,
+        invocation: InvocationResourceLease<TestRuntime>,
+    ) -> Result<CompletionHandle<TestRuntime>, OperationDispatchError<TestRuntime>> {
+        self.dispatch_invocation_on_lane(invocation, &self.lane)
+    }
+
+    fn dispatch_invocation_on_lane(
+        &self,
+        invocation: InvocationResourceLease<TestRuntime>,
+        lane: &Arc<ExecutionLane<TestRuntime>>,
+    ) -> Result<CompletionHandle<TestRuntime>, OperationDispatchError<TestRuntime>> {
+        let node = &self.plan.payload().nodes()[0];
         let provider = self.registry.bind(&self.resolved, node.id()).unwrap();
-        let frame_id = self.step.participant_frames().next().unwrap().frame_id();
+        let frame_id = self.step().participant_frames().next().unwrap().frame_id();
         let invocation_id = NodeInvocationId::try_from(97).unwrap();
         let identity = operation_identity(&self.plan, &self.active, frame_id, invocation_id);
         OperationDispatch::encode_and_submit(
@@ -2534,7 +2588,7 @@ impl CompletionHarness {
             &invocation_id,
             node.id(),
             &self.active,
-            admit_single_participant_invocation(&self.plan_resources, &self.step, node.id()),
+            invocation,
             lane,
             &self.reaper,
         )
@@ -2578,11 +2632,18 @@ impl CompletionHarness {
         self.runtime_trace.lock().unwrap().describe_error_panics = panics;
     }
 
-    fn finish(self, passed: &mut usize) {
+    fn finish(mut self, passed: &mut usize) {
         check(passed, self.reaper.retained_count() == 0);
         check(passed, self.reaper.quarantined_count() == 0);
         check(passed, self.lane.in_flight_count() == 0);
-        check(passed, self.step.try_retire_normal().is_ok());
+        check(
+            passed,
+            self.step
+                .take()
+                .expect("completion harness owns a final step")
+                .try_retire_normal()
+                .is_ok(),
+        );
         check(passed, self.session.try_complete().is_ok());
         drop(self.reaper);
         drop(self.lane);
@@ -2688,7 +2749,7 @@ fn completion_reaper_drop_defers_blocking_backend_recovery() {
     assert_eq!(in_flight_while_blocked, 1);
     assert_eq!(cleanup.completed(), 1);
     assert_eq!(cleanup.status_after().pending(), 0);
-    let retirement = retire_step_after_deferred_cleanup(step)
+    let retirement = retire_step_after_deferred_cleanup(step.expect("harness owns a step"))
         .expect("deferred completion cleanup converges after backend release");
     assert_eq!(retirement.participants().len(), 1);
     assert_eq!(lane.in_flight_count(), 0);
@@ -2750,7 +2811,10 @@ fn completion_reaper_drop_defers_blocking_backend_recovery() {
     assert_eq!(second_cleanup.status_after().pending(), 0);
     assert!(!quarantine.is_current());
     assert_eq!(lane.in_flight_count(), 0);
-    assert!(step.try_retire_normal().is_ok());
+    assert!(step
+        .expect("harness owns a step")
+        .try_retire_normal()
+        .is_ok());
     assert!(session.try_complete().is_ok());
     drop(lane);
     drop(batch);
@@ -2781,17 +2845,28 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
 
     let definitely_not_submitted = CompletionHarness::new();
     definitely_not_submitted.set_submit_behavior(SubmitBehavior::DefinitelyNotSubmitted);
+    let retry = match definitely_not_submitted.dispatch() {
+        Err(OperationDispatchError::DefinitelyNotSubmitted { retry, .. }) => retry,
+        other => panic!("expected definitely-not-submitted retry authority, got {other:?}"),
+    };
+    let prior_attempt = retry.prior_attempt();
+    let retry_invocation = retry.retry().unwrap();
     check(
         passed,
-        matches!(
-            definitely_not_submitted.dispatch(),
-            Err(OperationDispatchError::Device(_))
-        ),
+        retry_invocation.batch_invocation_id() != prior_attempt,
     );
     check(
         passed,
         definitely_not_submitted.reaper.retained_count() == 0,
     );
+    definitely_not_submitted.set_submit_behavior(SubmitBehavior::Success);
+    let retry_completion = definitely_not_submitted
+        .dispatch_invocation(retry_invocation)
+        .unwrap();
+    assert!(matches!(
+        retry_completion.poll(),
+        Ok(CompletionObservation::Terminal(_))
+    ));
     definitely_not_submitted.finish(passed);
 
     let pending = CompletionHarness::new();
@@ -2938,7 +3013,7 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
     terminal_stream_failure.set_stream_failed(false);
     terminal_stream_failure.finish(passed);
 
-    let multiple = CompletionHarness::new();
+    let mut multiple = CompletionHarness::new();
     let second_resources = logical_resources(
         &multiple.plan_resources,
         "run.device-operation.completion.second",
@@ -2949,10 +3024,10 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
     let second_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&second_session)]).unwrap();
     let second_step = begin_single_participant_step(&multiple.plan_resources, &second_batch);
     let first = multiple.dispatch().unwrap();
-    let node = &multiple.plan.payload().nodes()[0];
+    let node_id = multiple.plan.payload().nodes()[0].id().clone();
     let provider = multiple
         .registry
-        .bind(&multiple.resolved, node.id())
+        .bind(&multiple.resolved, &node_id)
         .unwrap();
     let second_frame_id = second_step.participant_frames().next().unwrap().frame_id();
     let second_invocation_id = NodeInvocationId::try_from(98).unwrap();
@@ -2968,9 +3043,9 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
         &second_identity,
         &second_frame_id,
         &second_invocation_id,
-        node.id(),
+        &node_id,
         &second_active,
-        admit_single_participant_invocation(&multiple.plan_resources, &second_step, node.id()),
+        admit_single_participant_invocation(&multiple.plan_resources, &second_step, &node_id),
         &multiple.lane,
         &multiple.reaper,
     )
@@ -3018,18 +3093,40 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
     check(passed, multiple.lane.in_flight_count() == 0);
     check(passed, multiple.reaper.retained_count() == 0);
 
+    drop(second);
+    drop(first);
+    multiple
+        .step
+        .take()
+        .expect("multiple-slot harness owns its first step")
+        .try_retire_normal()
+        .expect("first multiple-slot step is quiescent");
+    multiple.step = Some(begin_single_participant_step(
+        &multiple.plan_resources,
+        &multiple.batch,
+    ));
+    assert!(second_step.try_retire_normal().is_ok());
+    let second_step = begin_single_participant_step(&multiple.plan_resources, &second_batch);
     multiple.set_fence_behavior_for(3, FenceBehavior::Indeterminate);
     multiple.set_fence_behavior_for(4, FenceBehavior::Succeeded);
     let drain_target = multiple.dispatch().unwrap();
+    let second_frame_id = second_step.participant_frames().next().unwrap().frame_id();
+    let second_invocation_id = NodeInvocationId::try_from(100).unwrap();
+    let second_identity = operation_identity(
+        &multiple.plan,
+        &second_active,
+        second_frame_id,
+        second_invocation_id,
+    );
     let drain_sibling = OperationDispatch::encode_and_submit(
         &provider,
         &multiple.resolved,
         &second_identity,
         &second_frame_id,
         &second_invocation_id,
-        node.id(),
+        &node_id,
         &second_active,
-        admit_single_participant_invocation(&multiple.plan_resources, &second_step, node.id()),
+        admit_single_participant_invocation(&multiple.plan_resources, &second_step, &node_id),
         &multiple.lane,
         &multiple.reaper,
     )
@@ -3080,12 +3177,10 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
         passed,
         multiple.lane.in_flight_count() == 0 && multiple.reaper.retained_count() == 0,
     );
-    check(passed, second_step.try_retire_normal().is_ok());
-    check(passed, second_session.try_complete().is_ok());
     drop(drain_sibling);
     drop(drain_target);
-    drop(second);
-    drop(first);
+    check(passed, second_step.try_retire_normal().is_ok());
+    check(passed, second_session.try_complete().is_ok());
     drop(second_batch);
     drop(second_session);
     drop(second_resources);
@@ -3170,10 +3265,54 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
     check(passed, recovered.reaper.retained_count() == 0);
     check(passed, recovered.lane.in_flight_count() == 0);
     check(passed, recovered.lane.is_fail_closed());
+    let failed_lane_resources = logical_resources(
+        &recovered.plan_resources,
+        "run.device-operation.completion.failed-lane",
+        "request.device-operation.completion.failed-lane",
+    );
+    let failed_lane_session = failed_lane_resources.open_session().unwrap();
+    let failed_lane_active =
+        TrustedActiveSequenceBinding::from_session(&failed_lane_session).unwrap();
+    let failed_lane_batch =
+        ExecutionBatchParticipants::new(vec![Arc::clone(&failed_lane_session)]).unwrap();
+    let failed_lane_step =
+        begin_single_participant_step(&recovered.plan_resources, &failed_lane_batch);
+    let failed_lane_frame = failed_lane_step
+        .participant_frames()
+        .next()
+        .unwrap()
+        .frame_id();
+    let failed_lane_invocation_id = NodeInvocationId::try_from(101).unwrap();
+    let failed_lane_identity = operation_identity(
+        &recovered.plan,
+        &failed_lane_active,
+        failed_lane_frame,
+        failed_lane_invocation_id,
+    );
+    let failed_lane_node = &recovered.plan.payload().nodes()[0];
+    let failed_lane_provider = recovered
+        .registry
+        .bind(&recovered.resolved, failed_lane_node.id())
+        .unwrap();
     check(
         passed,
         matches!(
-            recovered.dispatch(),
+            OperationDispatch::encode_and_submit(
+                &failed_lane_provider,
+                &recovered.resolved,
+                &failed_lane_identity,
+                &failed_lane_frame,
+                &failed_lane_invocation_id,
+                failed_lane_node.id(),
+                &failed_lane_active,
+                admit_single_participant_invocation(
+                    &recovered.plan_resources,
+                    &failed_lane_step,
+                    failed_lane_node.id(),
+                ),
+                &recovered.lane,
+                &recovered.reaper,
+            ),
             Err(OperationDispatchError::Contract(_))
         ),
     );
@@ -3181,6 +3320,11 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
         passed,
         recovered.runtime_trace.lock().unwrap().submit_calls == 1,
     );
+    assert!(failed_lane_step.try_retire_normal().is_ok());
+    assert!(failed_lane_session.try_complete().is_ok());
+    drop(failed_lane_batch);
+    drop(failed_lane_session);
+    drop(failed_lane_resources);
     recovered.finish(passed);
 
     let wait_panic = CompletionHarness::new();
@@ -3370,7 +3514,8 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
     assert_eq!(cleanup.status_after().pending(), 0);
     check(
         passed,
-        retire_step_after_deferred_cleanup(step).is_ok() && lane.in_flight_count() == 0,
+        retire_step_after_deferred_cleanup(step.expect("harness owns a step")).is_ok()
+            && lane.in_flight_count() == 0,
     );
     session.try_complete().unwrap();
     drop(lane);
