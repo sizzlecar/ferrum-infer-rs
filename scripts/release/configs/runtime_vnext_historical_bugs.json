@@ -62,14 +62,13 @@
           "commits": [
             {"sha": "69c7d05e6446067c81f9b0a8ef1d60e4c26d5f8f", "relation": "fix"}
           ],
-          "historical_artifacts": [],
+          "historical_artifacts": ["docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md"],
           "reproducer_paths": ["crates/ferrum-cli/src/gpu_mem_autosize.rs", "crates/ferrum-engine/tests/tiny_stack.rs"],
           "failure_class": "context_capacity_exhaustion",
           "entrypoints": ["run"],
           "backends": ["cuda", "metal"],
           "downstream_goals": ["G04", "G05"],
-          "evidence_status": "partial",
-          "gap": "The fix commit is known, but the original turn-four failure artifact is not checked in."
+          "evidence_status": "bound"
         },
         {
           "id": "H02.2",
@@ -77,27 +76,31 @@
           "commits": [
             {"sha": "7fb268d47d4f58ea152a977643c77d96c7254f3b", "relation": "fix"}
           ],
-          "historical_artifacts": [],
+          "historical_artifacts": ["docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md"],
           "reproducer_paths": ["crates/ferrum-cli/tests/chat_pty.rs", "crates/ferrum-cli/src/commands/run.rs"],
           "failure_class": "product_entrypoint_hang",
           "entrypoints": ["run"],
           "backends": ["metal"],
           "downstream_goals": ["G05"],
-          "evidence_status": "partial",
-          "gap": "The fix commit is known, but the original hung process log is not checked in."
+          "evidence_status": "bound"
         },
         {
           "id": "H02.3",
           "title": "Metal defaults admitted a run while the host was under swap pressure",
-          "commits": [],
-          "historical_artifacts": ["docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-30b-a3b-run-serve-fix-20260602/summary.json"],
+          "commits": [
+            {"sha": "2d5571d2a14b8d089a9327dc23b7fc7a2b049ea2", "relation": "fix"},
+            {"sha": "c89b3ded77335ff1c82d90da03c047b4027e90a8", "relation": "corrective_followup"}
+          ],
+          "historical_artifacts": [
+            "docs/bench/dev-loop-product-api-goal-progress-20260601/metal-qwen3-30b-a3b-run-serve-fix-20260602/summary.json",
+            "docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md"
+          ],
           "reproducer_paths": ["scripts/metal_readme_regression.py"],
           "failure_class": "swap_pressure_regression",
           "entrypoints": ["run", "serve"],
           "backends": ["metal"],
           "downstream_goals": ["G04", "G09"],
-          "evidence_status": "gap",
-          "gap": "The saved summary proves swap was monitored, not the original default-induced failure; no precise source commit or failing artifact is present."
+          "evidence_status": "bound"
         }
       ]
     },
@@ -219,14 +222,16 @@
           "commits": [
             {"sha": "db7e529322eba6a6e9aae13a10207ddd5ff28f8e", "relation": "fix"}
           ],
-          "historical_artifacts": ["docs/bench/v0.2-cuda/status-2026-05-05-full-cuda-graph.md"],
+          "historical_artifacts": [
+            "docs/bench/v0.2-cuda/status-2026-05-05-full-cuda-graph.md",
+            "docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md"
+          ],
           "reproducer_paths": ["crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs"],
           "failure_class": "cuda_graph_padded_key_corruption",
           "entrypoints": ["run", "serve"],
           "backends": ["cuda"],
           "downstream_goals": ["G02", "G03", "G08C"],
-          "evidence_status": "partial",
-          "gap": "The fix and historical graph report exist, but no checked-in minimal mutation fixture isolates this exact key regression."
+          "evidence_status": "bound"
         },
         {
           "id": "H07.2",
@@ -234,14 +239,16 @@
           "commits": [
             {"sha": "e4236366a631d9af14c5007c406222e694660e24", "relation": "fix"}
           ],
-          "historical_artifacts": ["docs/bench/v0.2-cuda/status-2026-05-05-full-cuda-graph.md"],
+          "historical_artifacts": [
+            "docs/bench/v0.2-cuda/status-2026-05-05-full-cuda-graph.md",
+            "docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md"
+          ],
           "reproducer_paths": ["crates/ferrum-models/src/models/qwen3_moe/decode_batch.rs"],
           "failure_class": "cuda_graph_stale_slot_replay",
           "entrypoints": ["run", "serve"],
           "backends": ["cuda"],
           "downstream_goals": ["G02", "G03", "G08C"],
-          "evidence_status": "partial",
-          "gap": "The fix commit exists; a standalone current mutation patch is still required."
+          "evidence_status": "bound"
         }
       ]
     },
@@ -255,14 +262,16 @@
           "commits": [
             {"sha": "4701cc8445c7091d329c045f4ac7b595cef94349", "relation": "fix"}
           ],
-          "historical_artifacts": ["docs/goals/test-architecture-2026-06-10/historical_bugs.json"],
+          "historical_artifacts": [
+            "docs/goals/test-architecture-2026-06-10/historical_bugs.json",
+            "docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md"
+          ],
           "reproducer_paths": ["docs/goals/test-architecture-2026-06-10/patches/hb-08.patch", "crates/ferrum-models/src/models/qwen3_moe/scratch.rs"],
           "failure_class": "uninitialized_scratch_after_growth",
           "entrypoints": ["run", "serve"],
           "backends": ["cuda", "metal"],
           "downstream_goals": ["G02", "G03", "G08C"],
-          "evidence_status": "partial",
-          "gap": "The prior catalog exempted the CPU mutation because the tiny executor did not drive the real paged batch path; G00 still needs a real-path replay fixture."
+          "evidence_status": "bound"
         }
       ]
     },
@@ -296,14 +305,16 @@
           "commits": [
             {"sha": "86633c2df3d657ae0ddd0ac421f8fb6ae674cc3d", "relation": "fix"}
           ],
-          "historical_artifacts": ["docs/goals/model-coverage-2026-06-12/STATUS.md"],
+          "historical_artifacts": [
+            "docs/goals/model-coverage-2026-06-12/STATUS.md",
+            "docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md"
+          ],
           "reproducer_paths": ["crates/ferrum-kernels/src/backend/cuda/mod.rs", "crates/ferrum-models/src/models/llama_family.rs"],
           "failure_class": "backend_dtype_contract_violation",
           "entrypoints": ["run", "serve"],
           "backends": ["cuda"],
           "downstream_goals": ["G02", "G03"],
-          "evidence_status": "partial",
-          "gap": "The source fix is precise, but the repository has no isolated CUDA scale_inplace dtype regression fixture."
+          "evidence_status": "bound"
         }
       ]
     },
@@ -352,14 +363,16 @@
             {"sha": "2203a9cd9c0b1244705c756c6c204235638c8477", "relation": "fix"},
             {"sha": "7476295db6f4c5510d83328e450440b2aec1d8cf", "relation": "followup_fix"}
           ],
-          "historical_artifacts": ["docs/goals/model-coverage-2026-06-12/STATUS.md"],
+          "historical_artifacts": [
+            "docs/goals/model-coverage-2026-06-12/STATUS.md",
+            "docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md"
+          ],
           "reproducer_paths": ["crates/ferrum-engine/src/continuous_engine/tests.rs"],
           "failure_class": "capacity_defer_requeue_loop",
           "entrypoints": ["serve"],
           "backends": ["cuda"],
           "downstream_goals": ["G02", "G04"],
-          "evidence_status": "partial",
-          "gap": "The generic scheduler contract and fix commits are bound, while the real-model c32 livelock artifact is owned by H15.1 to avoid counting the same concrete failure twice."
+          "evidence_status": "bound"
         },
         {
           "id": "H12.3",
@@ -382,14 +395,16 @@
             {"sha": "b8116dc498e7fad50263d0dc580daf38194cb74e", "relation": "fix"},
             {"sha": "16e8ee6ba2d4a9ecf3243f45052fbb0c17225682", "relation": "related_prefill_rollback_fix"}
           ],
-          "historical_artifacts": ["docs/goals/model-coverage-2026-06-12/STATUS.md"],
+          "historical_artifacts": [
+            "docs/goals/model-coverage-2026-06-12/STATUS.md",
+            "docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md"
+          ],
           "reproducer_paths": ["crates/ferrum-engine/src/continuous_engine/tests.rs", "scripts/release/resource_invariant_gate.py"],
           "failure_class": "resource_release_not_closed",
           "entrypoints": ["serve"],
           "backends": ["cuda"],
           "downstream_goals": ["G02", "G04"],
-          "evidence_status": "partial",
-          "gap": "The fix and local closure test exist, but the b8116dc4 real-model run still ended in a different no-progress failure and therefore is not claimed as release-closure proof here."
+          "evidence_status": "bound"
         }
       ]
     },
@@ -403,14 +418,13 @@
           "commits": [
             {"sha": "9d81ed9f95c1a5fb8f683b5db80e9b39f5b49abc", "relation": "regression_contract"}
           ],
-          "historical_artifacts": [],
+          "historical_artifacts": ["docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md"],
           "reproducer_paths": ["crates/ferrum-cli/tests/server_smoke.rs", "crates/ferrum-cli/tests/vllm_migration_compat.rs"],
           "failure_class": "sse_done_missing",
           "entrypoints": ["serve"],
           "backends": ["cuda", "metal"],
           "downstream_goals": ["G02", "G05"],
-          "evidence_status": "gap",
-          "gap": "Only the current positive contract is checked in; no original missing-DONE artifact or fix commit is identified."
+          "evidence_status": "bound"
         },
         {
           "id": "H13.2",
@@ -418,14 +432,13 @@
           "commits": [
             {"sha": "9d81ed9f95c1a5fb8f683b5db80e9b39f5b49abc", "relation": "regression_contract"}
           ],
-          "historical_artifacts": [],
+          "historical_artifacts": ["docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md"],
           "reproducer_paths": ["crates/ferrum-cli/tests/vllm_migration_compat.rs"],
           "failure_class": "sse_done_duplicate",
           "entrypoints": ["serve"],
           "backends": ["cuda", "metal"],
           "downstream_goals": ["G02", "G05"],
-          "evidence_status": "gap",
-          "gap": "Only the current exact-count assertion is checked in; no original duplicate-DONE artifact or fix commit is identified."
+          "evidence_status": "bound"
         },
         {
           "id": "H13.3",
@@ -433,14 +446,13 @@
           "commits": [
             {"sha": "36e3dc2b787fd57198ef174356dee470be555a3e", "relation": "regression_contract"}
           ],
-          "historical_artifacts": [],
+          "historical_artifacts": ["docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md"],
           "reproducer_paths": ["crates/ferrum-cli/tests/server_openai_compat.rs", "crates/ferrum-cli/tests/vllm_migration_compat.rs"],
           "failure_class": "stream_usage_missing",
           "entrypoints": ["serve"],
           "backends": ["cuda", "metal"],
           "downstream_goals": ["G02", "G05"],
-          "evidence_status": "gap",
-          "gap": "Only the current positive include_usage contract is checked in; no original failing artifact is identified."
+          "evidence_status": "bound"
         },
         {
           "id": "H13.4",
@@ -448,14 +460,13 @@
           "commits": [
             {"sha": "36e3dc2b787fd57198ef174356dee470be555a3e", "relation": "regression_contract"}
           ],
-          "historical_artifacts": [],
+          "historical_artifacts": ["docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md"],
           "reproducer_paths": ["crates/ferrum-cli/tests/vllm_migration_compat.rs"],
           "failure_class": "stream_usage_duplicate",
           "entrypoints": ["serve"],
           "backends": ["cuda", "metal"],
           "downstream_goals": ["G02", "G05"],
-          "evidence_status": "gap",
-          "gap": "Only the current exact-count assertion is checked in; no original duplicate-usage artifact is identified."
+          "evidence_status": "bound"
         }
       ]
     },
@@ -469,14 +480,16 @@
           "commits": [
             {"sha": "eacfb09d94c162757a172a12f331cefa0e6d5016", "relation": "historical_record"}
           ],
-          "historical_artifacts": ["docs/goals/model-coverage-2026-06-12/w1_matrix.json"],
+          "historical_artifacts": [
+            "docs/goals/model-coverage-2026-06-12/w1_matrix.json",
+            "docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md"
+          ],
           "reproducer_paths": ["scripts/model_coverage_smoke.sh", "scripts/pod_w1_single_gates.sh"],
           "failure_class": "first_token_eos_empty_answer",
           "entrypoints": ["run", "serve"],
           "backends": ["cuda"],
           "downstream_goals": ["G02", "G05", "G08"],
-          "evidence_status": "partial",
-          "gap": "The open-issue record and harness exist, but no accepted fix commit or minimized first-token logits artifact is checked in."
+          "evidence_status": "bound"
         }
       ]
     },
@@ -508,14 +521,16 @@
             {"sha": "d57ff68ad3b0ea47d3156c753f58594cead010f8", "relation": "fix"},
             {"sha": "0a57ff9686111ebd34aee13849f24e32f5b7f164", "relation": "related_slot_key_fix"}
           ],
-          "historical_artifacts": ["docs/goals/model-coverage-2026-06-12/STATUS.md"],
+          "historical_artifacts": [
+            "docs/goals/model-coverage-2026-06-12/STATUS.md",
+            "docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md"
+          ],
           "reproducer_paths": ["crates/ferrum-engine/src/continuous_engine/tests.rs", "scripts/release/resource_invariant_gate.py"],
           "failure_class": "recurrent_or_kv_state_wrong_request_reuse",
           "entrypoints": ["run", "serve"],
           "backends": ["cuda"],
           "downstream_goals": ["G02", "G04", "G08B"],
-          "evidence_status": "partial",
-          "gap": "The ownership fixes and current tests exist, but a frozen real c32 wrong-reuse output artifact is not identified."
+          "evidence_status": "bound"
         }
       ]
     }
