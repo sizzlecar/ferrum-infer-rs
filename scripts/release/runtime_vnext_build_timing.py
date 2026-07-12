@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,12 +81,20 @@ def artifact_ref(path: Path, artifact_root: Path) -> dict[str, Any]:
 
 def parse_cargo_messages(path: Path) -> dict[str, Any]:
     messages = []
+    verbose_build_script_lines = []
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         if not line.strip():
             continue
         try:
             value = json.loads(line)
         except json.JSONDecodeError as exc:
+            # `cargo -vv --message-format=json-render-diagnostics` multiplexes
+            # documented, package-prefixed build-script output onto stdout.
+            # Preserve those lines in the raw artifact and reject every other
+            # non-JSON shape.
+            if re.fullmatch(r"\[[^\]\r\n]+\] .+", line):
+                verbose_build_script_lines.append(line)
+                continue
             raise BuildTimingError(f"invalid Cargo JSON at {path}:{line_number}: {exc}") from exc
         require(isinstance(value, dict), f"Cargo JSON at {path}:{line_number} must be an object")
         messages.append(value)
@@ -105,6 +114,10 @@ def parse_cargo_messages(path: Path) -> dict[str, Any]:
     ]
     return {
         "message_count": len(messages),
+        "verbose_build_script_line_count": len(verbose_build_script_lines),
+        "verbose_build_script_sha256": hashlib.sha256(
+            ("\n".join(verbose_build_script_lines) + ("\n" if verbose_build_script_lines else "")).encode("utf-8")
+        ).hexdigest(),
         "compiler_artifact_count": len(artifacts),
         "fresh_artifact_count": len(fresh),
         "nonfresh_artifact_count": len(nonfresh),
@@ -385,6 +398,37 @@ def self_test() -> None:
     require(fixture.is_file(), "model catalog is missing")
     require(len(SCENARIOS) == 6 and len({row[0] for row in SCENARIOS}) == 6, "scenario matrix mismatch")
     require(BUILD_ARGV[0:2] == ["cargo", "build"] and "--release" in BUILD_ARGV, "build argv mismatch")
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-build-timing-") as raw_tmp:
+        root = Path(raw_tmp)
+        messages = root / "cargo-messages.jsonl"
+        messages.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "reason": "compiler-artifact",
+                            "package_id": "fixture 0.1.0",
+                            "target": {"kind": ["lib"]},
+                            "fresh": False,
+                        }
+                    ),
+                    "[fixture 0.1.0] cargo:rerun-if-changed=build.rs",
+                    json.dumps({"reason": "build-finished", "success": True}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        summary = parse_cargo_messages(messages)
+        require(summary["message_count"] == 2, "mixed Cargo JSON message count mismatch")
+        require(summary["verbose_build_script_line_count"] == 1, "verbose Cargo line count mismatch")
+        messages.write_text("not cargo JSON\n", encoding="utf-8")
+        try:
+            parse_cargo_messages(messages)
+        except BuildTimingError as exc:
+            require("invalid Cargo JSON" in str(exc), "unexpected malformed Cargo rejection")
+        else:
+            raise BuildTimingError("malformed non-JSON Cargo output unexpectedly passed")
     require(math.isfinite(1.0), "numeric self-test failed")
     print("RUNTIME VNEXT BUILD TIMING SELF-TEST PASS")
 
