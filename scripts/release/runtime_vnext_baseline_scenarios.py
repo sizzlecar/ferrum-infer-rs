@@ -1438,6 +1438,8 @@ def validate_case_evidence(
         "input_document": input_document,
         "input_sha256": file_sha256(resolved["input"][0]),
         "ordinal": ordinal,
+        "started_at": started,
+        "finished_at": finished,
     }
 
 
@@ -1898,6 +1900,11 @@ def validate_report_document(
             used_case_artifacts=used_case_artifacts,
             used_argv=used_argv,
         )
+    if invocation_ref is not None:
+        serve_command = next(require_object(row, "scenario_report serve command") for row in commands_raw if row.get("entrypoint") == "serve")
+        serve_started_at = parse_timestamp(serve_command.get("started_at"), "scenario_report serve command started_at")
+        for case in (case for rows in case_rows_by_scenario.values() for case in rows if case.get("entrypoint") == "run"):
+            require(case["finished_at"] <= serve_started_at, f"case {case.get('case_id')} overlapped the resident serve model")
     _, _, pair_registry_raw = validate_artifact_ref(root, report.get("pair_registry"), "scenario_report.pair_registry", allowed_kinds={"raw-json"})
     expected_pair_registry = build_pair_registry(case_rows_by_scenario, model_key=model_key, backend=backend)
     require(pair_registry_raw == expected_pair_registry, "scenario_report pair registry is not derived from persisted paired inputs")
@@ -3794,23 +3801,30 @@ def execute_manifest(
     ]
     server: ProductServer | None = None
     server_error: str | None = None
-    try:
-        server = ProductServer(
-            argv=serve_argv,
-            stdout_path=serve_stdout,
-            stderr_path=serve_stderr,
-            artifact_root=root,
-            receipt_path=lane_root / "commands/serve.process-receipt.json",
-            base_url=base_url,
-            startup_timeout_sec=float(execution["startup_timeout_sec"]),
-        )
-    except ScenarioError as exc:
-        server_error = str(exc)
+
+    def ensure_server() -> None:
+        nonlocal server, server_error
+        if server is not None or server_error is not None:
+            return
+        try:
+            server = ProductServer(
+                argv=serve_argv,
+                stdout_path=serve_stdout,
+                stderr_path=serve_stderr,
+                artifact_root=root,
+                receipt_path=lane_root / "commands/serve.process-receipt.json",
+                base_url=base_url,
+                startup_timeout_sec=float(execution["startup_timeout_sec"]),
+            )
+        except ScenarioError as exc:
+            server_error = str(exc)
+
     case_refs_by_scenario: dict[str, list[dict[str, str]]] = {scenario_id: [] for scenario_id in SCENARIO_IDS}
     case_results: dict[str, list[dict[str, Any]]] = {scenario_id: [] for scenario_id in SCENARIO_IDS}
     first_run_record: dict[str, Any] | None = None
     try:
-        for row in rows:
+        execution_rows = sorted(rows, key=lambda row: 0 if row["entrypoint"] == "run" else 1)
+        for row in execution_rows:
             row = {**row, "model_key": manifest["model_key"], "model_files": manifest["model_files"]}
             case_root = lane_root / "scenarios" / row["scenario_id"] / "cases" / row["case_id"]
             case_root.mkdir(parents=True, exist_ok=True)
@@ -3842,7 +3856,9 @@ def execute_manifest(
                         "stderr": stderr_path,
                         "process_receipt": extra["process_receipt"],
                     }
-            elif server is not None:
+            else:
+                ensure_server()
+            if row["entrypoint"] == "serve" and server is not None:
                 argv, envelope, input_path, stdout_path, stderr_path, transcript_path, observed = serve_case_request(
                     root,
                     row,
@@ -3857,7 +3873,7 @@ def execute_manifest(
                 execution_process_receipt = invocation_process_receipt
                 product_process_receipt = server.process_receipt
                 child_environment = server.child_environment
-            else:
+            elif row["entrypoint"] == "serve":
                 input_path = case_root / "input.json"
                 write_json(input_path, case_http_payload(row, manifest["model_key"]))
                 stdout_path = case_root / "stdout.log"
@@ -4003,6 +4019,13 @@ def execute_manifest(
     finally:
         if server is not None:
             server.stop()
+    for scenario_id in SCENARIO_IDS:
+        ordered = sorted(
+            zip(case_results[scenario_id], case_refs_by_scenario[scenario_id], strict=True),
+            key=lambda pair: int(pair[0]["ordinal"]),
+        )
+        case_results[scenario_id] = [case for case, _ in ordered]
+        case_refs_by_scenario[scenario_id] = [ref for _, ref in ordered]
     invocation["finished_at"] = iso_now()
     invocation["finished_monotonic_ns"] = time.monotonic_ns()
     invocation["duration_sec"] = (invocation["finished_monotonic_ns"] - invocation_start_ns) / 1e9
