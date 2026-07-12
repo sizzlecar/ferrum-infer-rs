@@ -54,6 +54,7 @@ INVENTORY_ANALYZER_PATH = REPO_ROOT / "scripts/release/runtime_vnext_inventory.p
 MODEL_RESOLVER_PATH = REPO_ROOT / "scripts/release/runtime_vnext_model_resolver.py"
 HARDWARE_PROBE_PATH = REPO_ROOT / "scripts/release/runtime_vnext_hardware_probe.py"
 BUILD_TIMING_COLLECTOR_PATH = REPO_ROOT / "scripts/release/runtime_vnext_build_timing.py"
+BUILD_TIMING_CORE_PTX_REPAIR_REL = Path("build-timing-repairs/core-ptx/summary.json")
 INVENTORY_REVIEW_PATH = REPO_ROOT / "scripts/release/configs/runtime_vnext_inventory_review.json"
 SCENARIO_RUNNER_PATH = REPO_ROOT / "scripts/release/runtime_vnext_baseline_scenarios.py"
 RESOURCE_SAMPLER_PATH = REPO_ROOT / "scripts/release/runtime_vnext_resource_sampler.py"
@@ -224,6 +225,7 @@ SELFTEST_MUTATION_NAMES = (
     "build-raw-summary",
     "build-finished-failure",
     "build-content-evidence",
+    "build-repair-base-binding",
     "build-native-log-derivation",
     "build-restore-fresh",
     "build-restore-binary",
@@ -347,6 +349,7 @@ SELFTEST_BUILD_MUTATIONS = frozenset(
         "build-raw-summary",
         "build-finished-failure",
         "build-content-evidence",
+        "build-repair-base-binding",
         "build-native-log-derivation",
         "build-restore-fresh",
         "build-restore-binary",
@@ -379,10 +382,12 @@ BUILD_SCENARIO_INPUTS = {
     "noop": ("none", None, None),
     "rust-model-leaf": ("content-mutation", "crates/ferrum-models/src/lib.rs", "ferrum-models"),
     "rust-runtime-leaf": ("content-mutation", "crates/ferrum-engine/src/lib.rs", "ferrum-engine"),
-    "core-ptx": ("content-mutation", "crates/ferrum-kernels/triton_ptx/add_bias_f16.ptx", "ferrum-kernels"),
+    "core-ptx": ("content-mutation", "crates/ferrum-kernels/kernels/add_bias.cu", "ferrum-kernels"),
     "native-tu": ("content-mutation", "crates/ferrum-kernels/vllm_marlin/gptq_marlin_repack.cu", "ferrum-kernels"),
     "clean-release": ("cargo-clean", None, None),
 }
+REJECTED_BUILD_TIMING_COLLECTOR_SHA256 = "2579e30d6c04dd8dbb502ac0dadd267f4edc0eb3e1fe574bba4fb0b42f53b13e"
+REJECTED_CORE_PTX_INPUT = "crates/ferrum-kernels/triton_ptx/add_bias_f16.ptx"
 PRIMARY_MODELS = {
     "m1-qwen35-4b": "Qwen/Qwen3.5-4B",
     "m2-qwen35-35b-a3b": "Qwen/Qwen3.5-35B-A3B",
@@ -4228,11 +4233,118 @@ def validate_build_timings(
     hardware: dict[str, dict[str, Any]],
     binaries: dict[str, str],
 ) -> None:
-    data = read_json(root / "build-timings" / "summary.json")
+    base_data = read_json(root / "build-timings" / "summary.json")
+    base_collector = require_object(base_data.get("collector"), "build-timings.collector")
+    collector_path = BUILD_TIMING_COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix()
+    require(base_collector.get("path") == collector_path, "build-timings collector path mismatch")
+    current_collector_sha = file_sha256(BUILD_TIMING_COLLECTOR_PATH)
+    if base_collector.get("sha256") == current_collector_sha:
+        require(
+            not (root / BUILD_TIMING_CORE_PTX_REPAIR_REL).exists(),
+            "build-timings contains an unexpected core PTX repair for the current collector",
+        )
+        data = base_data
+    else:
+        require(
+            base_collector.get("sha256") == REJECTED_BUILD_TIMING_COLLECTOR_SHA256,
+            "build-timings collector SHA256 mismatch",
+        )
+        repair_path = root / BUILD_TIMING_CORE_PTX_REPAIR_REL
+        require(repair_path.is_file() and not repair_path.is_symlink(), "rejected build-timings collector requires core PTX repair evidence")
+        repair = read_json(repair_path)
+        require_schema(repair, "build-timing-core-ptx-repair")
+        require_source_identity(repair, "build-timing-core-ptx-repair")
+        require(
+            repair.get("artifact_type") == "runtime_vnext_build_timing_core_ptx_repair",
+            "build-timing-core-ptx-repair artifact type mismatch",
+        )
+        repair_collector = require_object(repair.get("collector"), "build-timing-core-ptx-repair.collector")
+        require(repair_collector.get("path") == collector_path, "build-timing-core-ptx-repair collector path mismatch")
+        require(repair_collector.get("sha256") == current_collector_sha, "build-timing-core-ptx-repair collector SHA256 mismatch")
+        base_ref = require_object(repair.get("base_summary"), "build-timing-core-ptx-repair.base_summary")
+        require(base_ref.get("path") == "build-timings/summary.json", "build-timing-core-ptx-repair base summary path mismatch")
+        build_artifact_ref(root, base_ref, "build-timing-core-ptx-repair.base_summary")
+        require(
+            repair.get("base_failure")
+            == "build-timings.core-ptx.samples[0] touch did not invalidate any Cargo artifact",
+            "build-timing-core-ptx-repair failure class mismatch",
+        )
+        require(
+            repair.get("rejected_collector_sha256") == REJECTED_BUILD_TIMING_COLLECTOR_SHA256,
+            "build-timing-core-ptx-repair rejected collector mismatch",
+        )
+        require(repair.get("rejected_input") == REJECTED_CORE_PTX_INPUT, "build-timing-core-ptx-repair rejected input mismatch")
+        require(
+            repair.get("replacement_input") == BUILD_SCENARIO_INPUTS["core-ptx"][1],
+            "build-timing-core-ptx-repair replacement input mismatch",
+        )
+        require(repair.get("hardware_id") == base_data.get("hardware_id"), "build-timing-core-ptx-repair hardware id mismatch")
+        require(
+            repair.get("hardware_fingerprint") == base_data.get("hardware_fingerprint"),
+            "build-timing-core-ptx-repair hardware fingerprint mismatch",
+        )
+        require(
+            repair.get("canonical_binary_sha256") == binaries["cuda"],
+            "build-timing-core-ptx-repair canonical binary mismatch",
+        )
+        base_rows = require_list(base_data.get("scenarios"), "build-timings.scenarios")
+        rejected_rows = [row for row in base_rows if isinstance(row, dict) and row.get("name") == "core-ptx"]
+        require(len(rejected_rows) == 1, "rejected build-timings core PTX scenario is missing or duplicated")
+        rejected_row = rejected_rows[0]
+        rejected_samples = require_list(rejected_row.get("samples"), "rejected-build-timings.core-ptx.samples")
+        require(len(rejected_samples) == 5, "rejected build-timings core PTX sample count mismatch")
+        for index, sample_raw in enumerate(rejected_samples):
+            label = f"rejected-build-timings.core-ptx.samples[{index}]"
+            sample = require_object(sample_raw, label)
+            _, cargo_summary, _, _ = validate_build_record(
+                root,
+                sample,
+                label,
+                require_binary_sha=None,
+                require_output_binary=True,
+            )
+            setup = require_object(sample.get("setup"), f"{label}.setup")
+            require(setup.get("input_path") == REJECTED_CORE_PTX_INPUT, f"{label} rejected input mismatch")
+            require(
+                cargo_summary["nonfresh_artifact_count"] == 0
+                and cargo_summary["fresh_artifact_count"] == cargo_summary["compiler_artifact_count"],
+                f"{label} does not reproduce the reviewed all-Fresh failure",
+            )
+        rejected_restore = require_object(
+            rejected_row.get("restore_verification"),
+            "rejected-build-timings.core-ptx.restore_verification",
+        )
+        _, rejected_restore_summary, _, _ = validate_build_record(
+            root,
+            rejected_restore,
+            "rejected-build-timings.core-ptx.restore_verification",
+            require_binary_sha=binaries["cuda"],
+            require_output_binary=True,
+        )
+        rejected_restored_input = require_object(
+            rejected_restore.get("restored_input"),
+            "rejected-build-timings.core-ptx.restore_verification.restored_input",
+        )
+        require(
+            rejected_restored_input.get("input_path") == REJECTED_CORE_PTX_INPUT,
+            "rejected-build-timings core PTX restore input mismatch",
+        )
+        require(
+            rejected_restore_summary["nonfresh_artifact_count"] == 0,
+            "rejected-build-timings core PTX restore does not reproduce the all-Fresh failure",
+        )
+        repaired_scenario = require_object(repair.get("scenario"), "build-timing-core-ptx-repair.scenario")
+        require(repaired_scenario.get("name") == "core-ptx", "build-timing-core-ptx-repair scenario mismatch")
+        data = copy.deepcopy(base_data)
+        data["collector"] = copy.deepcopy(repair_collector)
+        data["scenarios"] = [
+            copy.deepcopy(repaired_scenario) if isinstance(row, dict) and row.get("name") == "core-ptx" else row
+            for row in base_rows
+        ]
     require_schema(data, "build-timings")
     require_source_identity(data, "build-timings")
     collector = require_object(data.get("collector"), "build-timings.collector")
-    require(collector.get("path") == BUILD_TIMING_COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix(), "build-timings collector path mismatch")
+    require(collector.get("path") == collector_path, "build-timings collector path mismatch")
     require(collector.get("sha256") == file_sha256(BUILD_TIMING_COLLECTOR_PATH), "build-timings collector SHA256 mismatch")
     hardware_id = require_string(data.get("hardware_id"), "build-timings.hardware_id")
     require(hardware_id in hardware and hardware[hardware_id]["backend"] == "cuda", "build-timings must use frozen CUDA hardware")
@@ -4310,6 +4422,11 @@ def validate_build_timings(
                 if name in {"core-ptx", "native-tu"}:
                     expected_log_input = str(expected_input).removeprefix("crates/ferrum-kernels/")
                     require(expected_log_input in log_text, f"{label}.log does not bind the edited input")
+                    if name == "core-ptx":
+                        require(
+                            f"artifact=core-ptx:{expected_log_input} status=built" in log_text,
+                            f"{label}.log does not prove the selected PTX input was rebuilt",
+                        )
             else:
                 require(setup.get("argv") == ["cargo", "clean"], f"{label}.setup.argv must be cargo clean")
                 require(setup.get("returncode") == 0, f"{label}.setup cargo clean failed")
@@ -4337,6 +4454,17 @@ def validate_build_timings(
             )
             require(restore_summary["nonfresh_artifact_count"] > 0, f"build-timings.{name}.restore_verification was Fresh")
             require(any(expected_package in package for package in restore_summary["nonfresh_packages"]), f"build-timings.{name}.restore_verification did not rebuild {expected_package}")
+            if name == "core-ptx":
+                restore_log = build_artifact_ref(
+                    root,
+                    require_object(row["restore_verification"].get("log"), "build-timings.core-ptx.restore_verification.log"),
+                    "build-timings.core-ptx.restore_verification.log",
+                ).read_text(encoding="utf-8")
+                expected_log_input = str(expected_input).removeprefix("crates/ferrum-kernels/")
+                require(
+                    f"artifact=core-ptx:{expected_log_input} status=built" in restore_log,
+                    "build-timings.core-ptx.restore_verification.log does not prove the canonical PTX input was rebuilt",
+                )
             restored = require_object(row["restore_verification"].get("restored_input"), f"build-timings.{name}.restore_verification.restored_input")
             require(restored.get("input_path") == expected_input, f"build-timings.{name}.restore_verification input mismatch")
             restored_sha = require_sha256(restored.get("sha256"), f"build-timings.{name}.restore_verification restored SHA256")
@@ -6675,6 +6803,10 @@ def make_synthetic_root(root: Path) -> None:
         if native_input:
             log_input = str(native_input).removeprefix("crates/ferrum-kernels/")
             log_lines.append(f"[self-test] cargo:rerun-if-changed={log_input}")
+            if name == "core-ptx":
+                log_lines.append(
+                    f"[self-test] [cuda-build-summary] artifact=core-ptx:{log_input} status=built reason=signature-changed"
+                )
         if name in {"native-tu", "clean-release"}:
             log_lines.extend(
                 [
@@ -7727,12 +7859,16 @@ def mutate_build_cargo_messages(
     if recompute_summary:
         record["cargo_summary"] = build_timing.parse_cargo_messages(messages_path)
     write_json(summary_path, summary)
+    refresh_build_repair_base_binding(root)
 
 
 def tamper_build_content_evidence(root: Path) -> None:
-    summary_path = root / "build-timings/summary.json"
+    repair_path = root / BUILD_TIMING_CORE_PTX_REPAIR_REL
+    summary_path = repair_path if repair_path.is_file() else root / "build-timings/summary.json"
     summary = read_json(summary_path)
-    scenario = next(row for row in summary["scenarios"] if row["name"] == "core-ptx")
+    scenario = summary["scenario"] if summary_path == repair_path else next(
+        row for row in summary["scenarios"] if row["name"] == "core-ptx"
+    )
     setup = scenario["samples"][0]["setup"]
     during_path = artifact_path(root, setup["during_input"]["path"], "selftest.build.during_input")
     during_path.write_bytes(during_path.read_bytes() + b"forged")
@@ -7740,6 +7876,87 @@ def tamper_build_content_evidence(root: Path) -> None:
     setup["during_input"]["sha256"] = digest
     setup["during_sha256"] = digest
     write_json(summary_path, summary)
+
+
+def rewrite_artifact_path_prefix(value: Any, old_prefix: str, new_prefix: str) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "path" and isinstance(item, str) and item.startswith(old_prefix):
+                value[key] = new_prefix + item.removeprefix(old_prefix)
+            else:
+                rewrite_artifact_path_prefix(item, old_prefix, new_prefix)
+    elif isinstance(value, list):
+        for item in value:
+            rewrite_artifact_path_prefix(item, old_prefix, new_prefix)
+
+
+def convert_synthetic_build_to_core_ptx_repair(root: Path) -> None:
+    base_path = root / "build-timings/summary.json"
+    base = read_json(base_path)
+    core = next(row for row in base["scenarios"] if row["name"] == "core-ptx")
+    repaired_core = copy.deepcopy(core)
+    repair_dir = root / BUILD_TIMING_CORE_PTX_REPAIR_REL.parent
+    repair_samples = repair_dir / "samples"
+    shutil.copytree(root / "build-timings/core-ptx", repair_samples)
+    rewrite_artifact_path_prefix(
+        repaired_core,
+        "build-timings/core-ptx/",
+        "build-timing-repairs/core-ptx/samples/",
+    )
+
+    for sample in core["samples"]:
+        sample["setup"]["input_path"] = REJECTED_CORE_PTX_INPUT
+        messages_path = artifact_path(root, sample["cargo_messages"]["path"], "selftest.rejected-core-ptx.messages")
+        messages = [json.loads(line) for line in messages_path.read_text(encoding="utf-8").splitlines() if line]
+        for row in messages:
+            if row.get("reason") == "compiler-artifact":
+                row["fresh"] = True
+        messages_path.write_text("".join(json.dumps(row) + "\n" for row in messages), encoding="utf-8")
+        sample["cargo_messages"]["sha256"] = file_sha256(messages_path)
+        sample["cargo_summary"] = build_timing.parse_cargo_messages(messages_path)
+    restore = core["restore_verification"]
+    restore["restored_input"]["input_path"] = REJECTED_CORE_PTX_INPUT
+    restore_messages = artifact_path(
+        root,
+        restore["cargo_messages"]["path"],
+        "selftest.rejected-core-ptx.restore.messages",
+    )
+    messages = [json.loads(line) for line in restore_messages.read_text(encoding="utf-8").splitlines() if line]
+    for row in messages:
+        if row.get("reason") == "compiler-artifact":
+            row["fresh"] = True
+    restore_messages.write_text("".join(json.dumps(row) + "\n" for row in messages), encoding="utf-8")
+    restore["cargo_messages"]["sha256"] = file_sha256(restore_messages)
+    restore["cargo_summary"] = build_timing.parse_cargo_messages(restore_messages)
+    base["collector"]["sha256"] = REJECTED_BUILD_TIMING_COLLECTOR_SHA256
+    write_json(base_path, base)
+
+    write_json(
+        repair_dir / "summary.json",
+        {
+            "schema_version": 1,
+            "artifact_type": "runtime_vnext_build_timing_core_ptx_repair",
+            "source_git_sha": base["source_git_sha"],
+            "source_tree_sha": base["source_tree_sha"],
+            "dirty_status": {"is_dirty": False, "status_short": []},
+            "collector": {
+                "path": BUILD_TIMING_COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix(),
+                "sha256": file_sha256(BUILD_TIMING_COLLECTOR_PATH),
+            },
+            "hardware_id": base["hardware_id"],
+            "hardware_fingerprint": base["hardware_fingerprint"],
+            "base_summary": {
+                "path": "build-timings/summary.json",
+                "sha256": file_sha256(base_path),
+            },
+            "base_failure": "build-timings.core-ptx.samples[0] touch did not invalidate any Cargo artifact",
+            "rejected_collector_sha256": REJECTED_BUILD_TIMING_COLLECTOR_SHA256,
+            "rejected_input": REJECTED_CORE_PTX_INPUT,
+            "replacement_input": BUILD_SCENARIO_INPUTS["core-ptx"][1],
+            "canonical_binary_sha256": file_sha256(root / "binaries/cuda/ferrum"),
+            "scenario": repaired_core,
+        },
+    )
 
 
 def tamper_restore_binary(root: Path) -> None:
@@ -7751,6 +7968,24 @@ def tamper_restore_binary(root: Path) -> None:
     binary_path.write_bytes(binary_path.read_bytes() + b"forged")
     binary_ref["sha256"] = file_sha256(binary_path)
     write_json(summary_path, summary)
+    refresh_build_repair_base_binding(root)
+
+
+def refresh_build_repair_base_binding(root: Path) -> None:
+    repair_path = root / BUILD_TIMING_CORE_PTX_REPAIR_REL
+    if not repair_path.is_file():
+        return
+    repair = read_json(repair_path)
+    repair["base_summary"]["sha256"] = file_sha256(root / "build-timings/summary.json")
+    write_json(repair_path, repair)
+
+
+def mutate_build_summary(root: Path, update: Callable[[dict[str, Any]], None]) -> None:
+    summary_path = root / "build-timings/summary.json"
+    summary = read_json(summary_path)
+    update(summary)
+    write_json(summary_path, summary)
+    refresh_build_repair_base_binding(root)
 
 
 def tamper_hardware_raw_output(root: Path) -> None:
@@ -8020,6 +8255,7 @@ def _run_self_test(mode: str) -> int:
         root = Path(tmp) / "valid"
         root.mkdir()
         make_synthetic_root(root)
+        convert_synthetic_build_to_core_ptx_repair(root)
         manifest = validate_root(root, allow_synthetic=True)
         require(manifest["status"] == "pass", "valid synthetic baseline did not pass")
         try:
@@ -8817,8 +9053,8 @@ def _run_self_test(mode: str) -> int:
         expect_reject(
             root,
             "build-real-command",
-            lambda case: mutate_json(
-                case / "build-timings/summary.json",
+            lambda case: mutate_build_summary(
+                case,
                 lambda data: data["scenarios"][0].update({"command": ["true"]}),
             ),
             "command is not canonical",
@@ -8826,8 +9062,8 @@ def _run_self_test(mode: str) -> int:
         expect_reject(
             root,
             "build-raw-summary",
-            lambda case: mutate_json(
-                case / "build-timings/summary.json",
+            lambda case: mutate_build_summary(
+                case,
                 lambda data: data["scenarios"][0]["samples"][0]["cargo_summary"].update(
                     {"compiler_artifact_count": 99}
                 ),
@@ -8856,9 +9092,18 @@ def _run_self_test(mode: str) -> int:
         )
         expect_reject(
             root,
-            "build-native-log-derivation",
+            "build-repair-base-binding",
             lambda case: mutate_json(
-                case / "build-timings/summary.json",
+                case / BUILD_TIMING_CORE_PTX_REPAIR_REL,
+                lambda data: data["base_summary"].update({"sha256": "0" * 64}),
+            ),
+            "sha256 mismatch",
+        )
+        expect_reject(
+            root,
+            "build-native-log-derivation",
+            lambda case: mutate_build_summary(
+                case,
                 lambda data: data["scenarios"][next(
                     index for index, row in enumerate(data["scenarios"]) if row["name"] == "native-tu"
                 )]["samples"][0]["native_build"].update({"compiled_tu_count": 99}),
@@ -8888,8 +9133,8 @@ def _run_self_test(mode: str) -> int:
         expect_reject(
             root,
             "build-restore-mtime",
-            lambda case: mutate_json(
-                case / "build-timings/summary.json",
+            lambda case: mutate_build_summary(
+                case,
                 lambda data: next(
                     row for row in data["scenarios"] if row["name"] == "rust-model-leaf"
                 )["restore_verification"]["restored_input"].update({"verification_mtime_ns": 100}),
