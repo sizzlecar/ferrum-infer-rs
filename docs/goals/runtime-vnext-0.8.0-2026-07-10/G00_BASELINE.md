@@ -81,6 +81,10 @@ legacy 期望源：
 - `blocked` 只表示该 legacy lane 没有可执行能力，不能用于掩盖已支持路径的失败；
 - `discovery-required` 只允许 discovery 命令产出 observation artifact，不构成正式证据且不得
   打印 PASS。观察结果必须通过独立 commit 固定为前三种状态，再完整重跑 canonical lane；
+- collector-only 的单个 versioned scenario contract 发生变化时，允许只对该 scenario 做 scoped
+  discovery，但必须执行该 scenario 的完整 case matrix，绑定 checked-in runner/contract/input/output
+  oracle SHA，并证明其余 scenario rules 的规范化内容 SHA 未变。禁止任意 case-id 列表、多个 scenario
+  拼接或在 canonical 模式使用 scope；amendment 提交后仍必须完整重跑该 model/backend canonical lane；
 - 正式 G00 artifact 中 `discovery-required`、现场改写 expectation、skip 和 waiver 数均为 `0`。
 
 因此 G00 的 legacy lane PASS 表示所有已锁定期望都被真实逐 case 执行并完全匹配，而不是声称

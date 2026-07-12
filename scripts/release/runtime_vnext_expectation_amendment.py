@@ -193,15 +193,18 @@ def compress_group(
     return min(options, key=plan_key)
 
 
-def compress_cases(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def compress_cases(
+    cases: list[dict[str, Any]],
+    scenario_ids: tuple[str, ...] = baseline.SCENARIO_IDS,
+) -> list[dict[str, Any]]:
     by_scenario: dict[str, list[dict[str, Any]]] = {}
     for case in cases:
         scenario_id = case.get("scenario_id")
         require(scenario_id in baseline.SCENARIO_IDS, f"case {case.get('case_id')} scenario is invalid")
         by_scenario.setdefault(str(scenario_id), []).append(case)
-    require(set(by_scenario) == set(baseline.SCENARIO_IDS), "discovery cases do not cover C01-C21")
+    require(set(by_scenario) == set(scenario_ids), f"discovery cases do not cover the exact scenario scope {scenario_ids}")
     proposals: list[dict[str, Any]] = []
-    for scenario_id in baseline.SCENARIO_IDS:
+    for scenario_id in scenario_ids:
         proposals.extend(compress_group(by_scenario[scenario_id], {"scenario_id": scenario_id}, SPLIT_FIELDS))
     return sorted(proposals, key=proposal_sort_key)
 
@@ -214,13 +217,19 @@ def materialize_rules(
     report_sha256: str,
     downstream_goal: str,
     owner: str,
+    scope: dict[str, Any],
 ) -> list[dict[str, Any]]:
     rules: list[dict[str, Any]] = []
     for row in proposals:
         status = row["expected_status"]
         count = row["observation_count"]
+        scope_evidence = (
+            f" scoped {scope['scenario_id']} contract {scope['contract_id']}"
+            if scope["kind"] == "scenario-contract"
+            else ""
+        )
         evidence_basis = (
-            f"Frozen cff4 {model_key}/{backend} discovery report sha256:{report_sha256} "
+            f"Frozen cff4 {model_key}/{backend}{scope_evidence} discovery report sha256:{report_sha256} "
             f"observed {count} matching case{'s' if count != 1 else ''}."
         )
         next_action = (
@@ -259,7 +268,10 @@ def safe_artifact_path(root: Path, raw: Any, label: str) -> Path:
     return path
 
 
-def load_discovery(root: Path, report_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+def load_discovery(
+    root: Path,
+    report_path: Path,
+) -> tuple[dict[str, Any], list[dict[str, Any]], str, dict[str, Any]]:
     root = root.resolve()
     report_input = report_path.expanduser().absolute()
     try:
@@ -278,6 +290,24 @@ def load_discovery(root: Path, report_path: Path) -> tuple[dict[str, Any], list[
     backend = report.get("backend")
     require(model_key in {"m1-qwen35-4b", "m2-qwen35-35b-a3b", "m3-qwen3-30b-a3b"}, "discovery model key invalid")
     require(backend in {"cuda", "metal"}, "discovery backend invalid")
+    raw_scope = report.get("scope")
+    if raw_scope is None:
+        scope = {"kind": "full", "scenario_ids": list(baseline.SCENARIO_IDS)}
+        scenario_ids = baseline.SCENARIO_IDS
+    else:
+        require(isinstance(raw_scope, dict), "discovery scope must be an object")
+        require(
+            raw_scope
+            == {
+                "kind": "scenario-contract",
+                "scenario_id": "C03",
+                "contract_id": baseline.C03_CONTRACT_ID,
+                "expected_case_count": 10,
+            },
+            "discovery scope is not the current versioned C03 contract",
+        )
+        scope = copy.deepcopy(raw_scope)
+        scenario_ids = ("C03",)
 
     snapshot_path = safe_artifact_path(root, "legacy-correctness-expectations.json", "discovery expectation snapshot")
     snapshot = read_json(snapshot_path)
@@ -292,6 +322,7 @@ def load_discovery(root: Path, report_path: Path) -> tuple[dict[str, Any], list[
     require(isinstance(snapshot_lanes, dict) and set(snapshot_lanes) == expected_lanes, "discovery expectation snapshot lane matrix drift")
     snapshot_sha = file_sha256(snapshot_path)
     require(report.get("expectations_catalog_sha256") == snapshot_sha, "discovery report expectation snapshot drift")
+    require(file_sha256(baseline.EXPECTATIONS_PATH) == snapshot_sha, "current expectations catalog differs from the discovery snapshot")
 
     invocation_ref = report.get("executor_invocation")
     require(isinstance(invocation_ref, dict), "discovery executor invocation ref is invalid")
@@ -301,15 +332,25 @@ def load_discovery(root: Path, report_path: Path) -> tuple[dict[str, Any], list[
     invocation = read_json(invocation_path)
     require(invocation.get("mode") == "discover", "discovery executor invocation mode drift")
     require(invocation.get("runner_path") == baseline.RUNNER_REPO_PATH, "discovery executor runner path drift")
+    require(invocation.get("runner_sha256") == file_sha256(baseline.RUNNER_PATH), "discovery executor runner SHA differs from the current contract")
     invocation_argv = invocation.get("argv")
     require(isinstance(invocation_argv, list) and "--discover" in invocation_argv, "discovery executor argv lacks --discover")
+    if scope["kind"] == "scenario-contract":
+        require(invocation_argv.count("--discover-scenario") == 1, "scoped discovery executor must select exactly one scenario")
+        scope_index = invocation_argv.index("--discover-scenario")
+        require(scope_index + 1 < len(invocation_argv) and invocation_argv[scope_index + 1] == "C03", "scoped discovery executor did not select C03")
+    else:
+        require("--discover-scenario" not in invocation_argv, "full discovery executor unexpectedly used a scenario filter")
 
     current_catalog = baseline.validate_expectations_catalog(read_json(baseline.EXPECTATIONS_PATH))
     planned = baseline.planned_case_rows(str(model_key), str(backend), current_catalog)
+    planned = [row for row in planned if row["scenario_id"] in scenario_ids]
     planned_by_id = {row["case_id"]: row for row in planned}
     observations = report.get("observations")
     require(isinstance(observations, list), "discovery observations must be an array")
-    require(report.get("case_count") == len(observations) == len(planned), "discovery case count differs from the current matrix")
+    require(report.get("case_count") == len(observations) == len(planned), "discovery case count differs from the current scoped matrix")
+    if scope["kind"] == "scenario-contract":
+        require(len(planned) == scope["expected_case_count"], "scoped discovery expected case count differs from the current matrix")
 
     cases: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
@@ -335,10 +376,109 @@ def load_discovery(root: Path, report_path: Path) -> tuple[dict[str, Any], list[
         expected_identity = (row["scenario_id"], row["variant"], row["preset"], row["entrypoint"])
         actual_identity = (case.get("scenario_id"), case.get("variant"), case.get("preset"), case.get("entrypoint"))
         require(actual_identity == expected_identity, f"case {case_id} identity differs from the current matrix")
-        outcome(case)
+        observed_outcome = outcome(case)
+        if scope["kind"] == "scenario-contract":
+            require(case.get("entrypoint") == "run", f"scoped case {case_id} did not exercise ferrum run")
+            execution = case.get("execution")
+            require(isinstance(execution, dict), f"scoped case {case_id} execution is invalid")
+            argv = execution.get("argv")
+            require(isinstance(argv, list) and all(isinstance(part, str) for part in argv), f"scoped case {case_id} argv is invalid")
+            artifacts = case.get("artifacts")
+            require(isinstance(artifacts, dict), f"scoped case {case_id} artifacts are invalid")
+            input_ref = artifacts.get("input")
+            stdout_ref = artifacts.get("stdout")
+            require(isinstance(input_ref, dict) and input_ref.get("kind") == "request-json", f"scoped case {case_id} input ref is invalid")
+            require(isinstance(stdout_ref, dict) and stdout_ref.get("kind") == "stdout-log", f"scoped case {case_id} stdout ref is invalid")
+            input_path = safe_artifact_path(root, input_ref.get("path"), f"scoped case {case_id} input")
+            stdout_path = safe_artifact_path(root, stdout_ref.get("path"), f"scoped case {case_id} stdout")
+            require(input_ref.get("sha256") == file_sha256(input_path), f"scoped case {case_id} input SHA mismatch")
+            require(stdout_ref.get("sha256") == file_sha256(stdout_path), f"scoped case {case_id} stdout SHA mismatch")
+            marker = baseline.case_marker(str(case_id))
+            require(
+                read_json(input_path) == baseline.c03_input_document(str(case_id), marker, argv),
+                f"scoped case {case_id} input differs from the current C03 contract",
+            )
+            observed = case.get("observed")
+            require(isinstance(observed, dict) and observed.get("contract_id") == baseline.C03_CONTRACT_ID, f"scoped case {case_id} observed contract id drift")
+            oracle_error: baseline.ScenarioError | None = None
+            try:
+                baseline.validate_case_output(
+                    "C03",
+                    str(case.get("variant")),
+                    "run",
+                    stdout_path,
+                    None,
+                    observed,
+                    f"scoped case {case_id}",
+                )
+            except baseline.ScenarioError as exc:
+                oracle_error = exc
+            require(
+                (oracle_error is None) is (observed_outcome[0] == "pass"),
+                f"scoped case {case_id} outcome differs from the recomputed C03 oracle",
+            )
+            envelope_ref = case.get("execution_envelope")
+            require(isinstance(envelope_ref, dict) and envelope_ref.get("kind") == "raw-json", f"scoped case {case_id} envelope ref is invalid")
+            envelope_path = safe_artifact_path(root, envelope_ref.get("path"), f"scoped case {case_id} envelope")
+            require(envelope_ref.get("sha256") == file_sha256(envelope_path), f"scoped case {case_id} envelope SHA mismatch")
+            checker = read_json(envelope_path).get("checker")
+            require(isinstance(checker, dict), f"scoped case {case_id} checker is invalid")
+            require(checker.get("runner_sha256") == file_sha256(baseline.RUNNER_PATH), f"scoped case {case_id} checker runner SHA drift")
+            checker_inputs = checker.get("input_artifact_sha256")
+            require(
+                isinstance(checker_inputs, dict) and checker_inputs.get("stdout") == file_sha256(stdout_path),
+                f"scoped case {case_id} checker input binding drift",
+            )
+            require(
+                checker.get("result") == observed_outcome[0] and checker.get("failure_class") == observed_outcome[1],
+                f"scoped case {case_id} checker outcome drift",
+            )
         cases.append(case)
     require(seen_ids == set(planned_by_id), "discovery observations do not cover the complete case-id matrix")
-    return report, cases, report_sha
+    return report, cases, report_sha, scope
+
+
+def replace_scoped_rules(
+    catalog: dict[str, Any],
+    *,
+    model_key: str,
+    backend: str,
+    scenario_id: str,
+    replacement_rules: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    lane_key = f"{model_key}/{backend}"
+    lane = catalog["lanes"][lane_key]
+    current_rules = lane["rules"]
+    require(
+        all(rule["selector"]["scenario_id"] != "*" for rule in current_rules),
+        "scoped amendment cannot preserve a lane with wildcard scenario rules",
+    )
+    require(
+        replacement_rules and all(rule["selector"]["scenario_id"] == scenario_id for rule in replacement_rules),
+        "scoped replacement rules escape their scenario",
+    )
+    merged: list[dict[str, Any]] = []
+    preserved: list[dict[str, Any]] = []
+    inserted = False
+    removed_count = 0
+    for rule in current_rules:
+        if rule["selector"]["scenario_id"] == scenario_id:
+            removed_count += 1
+            if not inserted:
+                merged.extend(copy.deepcopy(replacement_rules))
+                inserted = True
+        else:
+            preserved.append(copy.deepcopy(rule))
+            merged.append(copy.deepcopy(rule))
+    require(inserted and removed_count > 0, f"scoped amendment found no existing {scenario_id} rules")
+    preservation = {
+        "scenario_id": scenario_id,
+        "removed_rule_count": removed_count,
+        "replacement_rule_count": len(replacement_rules),
+        "preserved_rule_count": len(preserved),
+        "preserved_rules_sha256": canonical_json_sha256(preserved),
+    }
+    return merged, preservation
 
 
 def validate_candidate(
@@ -347,6 +487,7 @@ def validate_candidate(
     *,
     model_key: str,
     backend: str,
+    scenario_ids: tuple[str, ...],
 ) -> dict[str, Any]:
     catalog = baseline.validate_expectations_catalog(read_json(baseline.EXPECTATIONS_PATH))
     trial = copy.deepcopy(catalog)
@@ -355,8 +496,10 @@ def validate_candidate(
     baseline.validate_expectations_catalog(trial)
     case_by_id = {str(case["case_id"]): case for case in cases}
     rows = baseline.planned_case_rows(model_key, backend, trial)
+    scoped_rows = [row for row in rows if row["scenario_id"] in scenario_ids]
+    require(set(case_by_id) == {row["case_id"] for row in scoped_rows}, "candidate evidence does not cover its exact scenario scope")
     mismatches: list[dict[str, Any]] = []
-    for row in rows:
+    for row in scoped_rows:
         actual = outcome(case_by_id[row["case_id"]])
         expectation = row["expectation"]
         resolved = (expectation["expected_status"], expectation["failure_class"])
@@ -366,7 +509,8 @@ def validate_candidate(
     statuses = Counter(outcome(case)[0] for case in cases)
     failures = Counter(outcome(case)[1] for case in cases if outcome(case)[1] is not None)
     return {
-        "case_count": len(rows),
+        "case_count": len(scoped_rows),
+        "lane_case_count": len(rows),
         "mismatch_count": 0,
         "status_counts": dict(sorted(statuses.items())),
         "failure_class_counts": dict(sorted(failures.items())),
@@ -384,19 +528,39 @@ def generate(
 ) -> dict[str, Any]:
     require(downstream_goal in {"G08A", "G08B", "G08C"}, "downstream goal must be G08A, G08B, or G08C")
     require(owner.strip() == owner and owner, "owner must be a non-empty canonical string")
-    report, cases, report_sha = load_discovery(root, report_path)
+    report, cases, report_sha, scope = load_discovery(root, report_path)
     model_key = str(report["model_key"])
     backend = str(report["backend"])
-    proposals = compress_cases(cases)
-    rules = materialize_rules(
+    scenario_ids = tuple(scope["scenario_ids"]) if scope["kind"] == "full" else (str(scope["scenario_id"]),)
+    proposals = compress_cases(cases, scenario_ids)
+    discovered_rules = materialize_rules(
         proposals,
         model_key=model_key,
         backend=backend,
         report_sha256=report_sha,
         downstream_goal=downstream_goal,
         owner=owner,
+        scope=scope,
     )
-    validation = validate_candidate(cases, rules, model_key=model_key, backend=backend)
+    preservation: dict[str, Any] | None = None
+    if scope["kind"] == "scenario-contract":
+        catalog = baseline.validate_expectations_catalog(read_json(baseline.EXPECTATIONS_PATH))
+        rules, preservation = replace_scoped_rules(
+            catalog,
+            model_key=model_key,
+            backend=backend,
+            scenario_id=str(scope["scenario_id"]),
+            replacement_rules=discovered_rules,
+        )
+    else:
+        rules = discovered_rules
+    validation = validate_candidate(
+        cases,
+        rules,
+        model_key=model_key,
+        backend=backend,
+        scenario_ids=scenario_ids,
+    )
     out = out.expanduser().resolve()
     try:
         out.relative_to(REPO_ROOT)
@@ -410,10 +574,13 @@ def generate(
         "formal_pass_allowed": False,
         "model_key": model_key,
         "backend": backend,
+        "scope": scope,
         "source_report": {"path": str(report_path.resolve()), "sha256": report_sha},
         "source_expectations_catalog_sha256": report["expectations_catalog_sha256"],
         "generator": generator_identity(),
         "rule_count": len(rules),
+        "discovered_rule_count": len(discovered_rules),
+        "preservation": preservation,
         "validation": validation,
         "rules": rules,
         "next_gate": "Review and commit this lane together with every remaining discovery amendment, then rerun the full canonical lane.",
@@ -506,6 +673,72 @@ def self_test() -> int:
         require(len(rules) == expected_rule_count, f"{scenario_id} compression count drift")
         for case in cases:
             require(resolve_proposal(rules, case) == outcome(case), f"{scenario_id} compressed outcome drift")
+    scope = {
+        "kind": "scenario-contract",
+        "scenario_id": "C03",
+        "contract_id": baseline.C03_CONTRACT_ID,
+        "expected_case_count": 10,
+    }
+    scoped_proposals = compress_cases(mixed_exact, ("C03",))
+    scoped_rules = materialize_rules(
+        scoped_proposals,
+        model_key="m3-qwen3-30b-a3b",
+        backend="cuda",
+        report_sha256="a" * 64,
+        downstream_goal="G08C",
+        owner="selftest-owner",
+        scope=scope,
+    )
+    catalog = baseline.validate_expectations_catalog(read_json(baseline.EXPECTATIONS_PATH))
+    original_rules = copy.deepcopy(catalog["lanes"]["m3-qwen3-30b-a3b/cuda"]["rules"])
+    original_preserved = [rule for rule in original_rules if rule["selector"]["scenario_id"] != "C03"]
+    merged_rules, preservation = replace_scoped_rules(
+        catalog,
+        model_key="m3-qwen3-30b-a3b",
+        backend="cuda",
+        scenario_id="C03",
+        replacement_rules=scoped_rules,
+    )
+    require(
+        preservation["preserved_rules_sha256"] == canonical_json_sha256(original_preserved)
+        and preservation["preserved_rule_count"] == len(original_preserved),
+        "scoped amendment did not preserve non-C03 rules byte-for-byte",
+    )
+    scoped_validation = validate_candidate(
+        mixed_exact,
+        merged_rules,
+        model_key="m3-qwen3-30b-a3b",
+        backend="cuda",
+        scenario_ids=("C03",),
+    )
+    require(
+        scoped_validation["case_count"] == 10 and scoped_validation["lane_case_count"] == 783,
+        "scoped candidate validation did not retain the full lane matrix",
+    )
+    try:
+        validate_candidate(
+            mixed_exact[:-1],
+            merged_rules,
+            model_key="m3-qwen3-30b-a3b",
+            backend="cuda",
+            scenario_ids=("C03",),
+        )
+    except AmendmentError as exc:
+        require("exact scenario scope" in str(exc), f"partial C03 candidate used unexpected rejection: {exc}")
+    else:
+        raise AssertionError("scoped candidate accepted a partial C03 case matrix")
+    try:
+        replace_scoped_rules(
+            catalog,
+            model_key="m1-qwen35-4b",
+            backend="metal",
+            scenario_id="C03",
+            replacement_rules=scoped_rules,
+        )
+    except AmendmentError as exc:
+        require("wildcard scenario rules" in str(exc), f"wildcard lane used unexpected rejection: {exc}")
+    else:
+        raise AssertionError("scoped amendment accepted a wildcard scenario lane")
     ambiguous = compress_group(uniform, {"scenario_id": "C01"}, SPLIT_FIELDS)
     ambiguous.append(copy.deepcopy(ambiguous[0]))
     try:
