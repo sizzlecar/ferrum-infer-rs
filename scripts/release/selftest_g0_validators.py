@@ -22,6 +22,7 @@ RUNTIME_VNEXT_MODEL_RESOLVER = REPO_ROOT / "scripts/release/runtime_vnext_model_
 RUNTIME_VNEXT_HARDWARE_PROBE = REPO_ROOT / "scripts/release/runtime_vnext_hardware_probe.py"
 RUNTIME_VNEXT_BUILD_TIMING = REPO_ROOT / "scripts/release/runtime_vnext_build_timing.py"
 RUNTIME_VNEXT_BASELINE_SCENARIOS = REPO_ROOT / "scripts/release/runtime_vnext_baseline_scenarios.py"
+RUNTIME_VNEXT_BLOCKED_LANE = REPO_ROOT / "scripts/release/runtime_vnext_blocked_lane.py"
 RUNTIME_VNEXT_RESOURCE_SAMPLER = REPO_ROOT / "scripts/release/runtime_vnext_resource_sampler.py"
 RUNTIME_VNEXT_G00A_CHECKPOINT = REPO_ROOT / "scripts/release/runtime_vnext_g00a_checkpoint.py"
 RUNTIME_VNEXT_G00_ORCHESTRATOR = REPO_ROOT / "scripts/release/runtime_vnext_g00_orchestrator.py"
@@ -335,6 +336,12 @@ def test_runtime_vnext_baseline_scenarios_selftest() -> None:
     require("FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
+def test_runtime_vnext_blocked_lane_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_BLOCKED_LANE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("FERRUM RUNTIME VNEXT G00 BLOCKED LANE SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
 def test_runtime_vnext_resource_sampler_selftest() -> None:
     ok = run([sys.executable, str(RUNTIME_VNEXT_RESOURCE_SAMPLER), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -555,6 +562,7 @@ def main() -> int:
     test_runtime_vnext_hardware_probe_selftest()
     test_runtime_vnext_build_timing_selftest()
     test_runtime_vnext_baseline_scenarios_selftest()
+    test_runtime_vnext_blocked_lane_selftest()
     test_runtime_vnext_resource_sampler_selftest()
     test_runtime_vnext_g00a_checkpoint_selftest()
     test_runtime_vnext_g00_orchestrator_selftest()

@@ -159,6 +159,19 @@ M2 Metal Q4_K_S 还必须同时等于 catalog 的 `expected_size_bytes=206738458
 scripts/release/runtime_vnext_baseline_gate.py
 ```
 
+M1/M2 Metal legacy unsupported 只能由真实 product collector 生成，不接受手写 `lane.json`：
+
+```text
+python3 scripts/release/runtime_vnext_blocked_lane.py \
+  --artifact-root <g00-out> \
+  --model-key <m1-qwen35-4b|m2-qwen35-35b-a3b> \
+  --model-arg <pinned-gguf> \
+  --semantic-source-root <pinned-semantic-snapshot>
+```
+
+collector 必须保存并由 final validator 重验 sanitized child env、product PID/PGID/start identity、
+bounded resource receipt、memory/swap preflight、effective config 和精确 unsupported failure signature。
+
 有效执行命令：
 
 ```text
