@@ -114,6 +114,15 @@ impl ModelFamilyProvider for TestFamily {
         Ok(())
     }
 
+    fn validated_external_metadata_id(
+        &self,
+        raw: &Value,
+        config: &Self::Config,
+    ) -> Result<ExternalModelMetadataId, VNextError> {
+        self.validate_config_identity(raw, config)?;
+        Ok(id("metadata.device-operation"))
+    }
+
     fn parse_config(&self, raw: &Value) -> Result<Self::Config, VNextError> {
         let config: TestConfig = serde_json::from_value(raw.clone()).map_err(|error| {
             VNextError::InvalidModelConfig {
@@ -347,6 +356,8 @@ enum ProviderBehavior {
 #[derive(Default)]
 struct ProviderTrace {
     encode_calls: u64,
+    last_participant_count: usize,
+    last_work_sequences: u32,
     component_resources: BTreeSet<ResourceId>,
     view_resources: BTreeSet<ResourceId>,
 }
@@ -382,11 +393,14 @@ impl OperationResourceEstimator for TestProvider {
 impl OperationProvider<TestRuntime> for TestProvider {
     fn encode_selected(
         &self,
-        invocation: OperationInvocation<'_, TestBuffer>,
+        invocation: BatchedOperationInvocation<'_, TestBuffer>,
     ) -> Result<TestCommand, OperationFailure> {
         let mut trace = self.trace.lock().unwrap();
         trace.encode_calls += 1;
-        trace.component_resources = invocation
+        trace.last_participant_count = invocation.participants().len();
+        trace.last_work_sequences = invocation.work_shape().immediate_sequences();
+        let participant = &invocation.participants()[0];
+        trace.component_resources = participant
             .bindings()
             .iter()
             .find(|binding| binding.value_id().as_str() == "value.weight")
@@ -396,7 +410,7 @@ impl OperationProvider<TestRuntime> for TestProvider {
             .iter()
             .map(|component| component.resource_id().clone())
             .collect();
-        trace.view_resources = invocation
+        trace.view_resources = participant
             .views()
             .iter()
             .map(|view| view.resource_id().clone())
@@ -405,7 +419,7 @@ impl OperationProvider<TestRuntime> for TestProvider {
         match *self.behavior.lock().unwrap() {
             ProviderBehavior::Success => Ok(TestCommand),
             ProviderBehavior::WrongIdentity => {
-                let mut parts = invocation.identity().parts().clone();
+                let mut parts = participant.identity().parts().clone();
                 parts.request_id = id("request.provider.wrong");
                 let identity = ExecutionIdentityEnvelope::new(parts).unwrap();
                 Err(OperationFailure::new(
@@ -418,7 +432,7 @@ impl OperationProvider<TestRuntime> for TestProvider {
                 .unwrap())
             }
             ProviderBehavior::WrongPhase => Err(OperationFailure::new(
-                invocation.identity().clone(),
+                participant.identity().clone(),
                 ProfilePhase::Prefill,
                 "provider_failure",
                 "injected provider failure",
@@ -435,9 +449,9 @@ fn policy() -> ResolvedRuntimePolicy {
         ContractVersion::new(1, 0),
         SchedulingDiscipline::FirstReady,
         RuntimeMemoryPolicy {
-            capacity_bytes: 4096,
+            capacity_bytes: 65_536,
             reserve_bytes: 128,
-            maximum_active_sequences: 2,
+            maximum_active_sequences: 64,
             dynamic_storage_profile_order: vec![contiguous_storage_profile()],
         },
         AdmissionPolicy {
@@ -1447,6 +1461,50 @@ fn admit_single_participant_invocation(
     unreachable!("bounded invocation admission loop always returns or panics")
 }
 
+#[allow(clippy::too_many_arguments)]
+fn encode_and_submit_single(
+    provider: &BoundOperationProvider<'_, TestRuntime>,
+    resolved: &ResolvedModelPlan,
+    identity: &ExecutionIdentityEnvelope,
+    frame_id: &ExecutionFrameId,
+    node_invocation_id: &NodeInvocationId,
+    node_id: &NodeId,
+    active: &TrustedActiveSequenceBinding,
+    invocation: InvocationResourceLease<TestRuntime>,
+    lane: &Arc<ExecutionLane<TestRuntime>>,
+    reaper: &Arc<CompletionReaper<TestRuntime>>,
+) -> Result<CompletionHandle<TestRuntime>, OperationDispatchError<TestRuntime>> {
+    let parts = identity.parts();
+    if parts.frame_id != Some(*frame_id)
+        || parts.node_invocation_id != Some(*node_invocation_id)
+        || parts.node_id.as_ref() != Some(node_id)
+    {
+        return Err(OperationDispatchError::Contract(
+            VNextError::InvalidExecutionPlan {
+                reason: "single-participant dispatch arguments disagree".to_owned(),
+            },
+        ));
+    }
+    let active_bindings = std::slice::from_ref(active);
+    let batch_identity = OperationDispatch::bind_batch_identity(
+        resolved,
+        vec![identity.clone()],
+        active_bindings,
+        &invocation,
+        lane,
+    )
+    .map_err(OperationDispatchError::Contract)?;
+    OperationDispatch::encode_and_submit(
+        provider,
+        resolved,
+        &batch_identity,
+        active_bindings,
+        invocation,
+        lane,
+        reaper,
+    )
+}
+
 struct Fixture {
     registry: OperationRuntimeRegistry<TestRuntime>,
     impostor_registry: OperationRuntimeRegistry<TestRuntime>,
@@ -1839,7 +1897,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
         check(
             passed,
             matches!(
-                OperationDispatch::encode_and_submit(
+                encode_and_submit_single(
                     &provider,
                     &resolved,
                     &wrong,
@@ -1878,7 +1936,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
         )
         .is_err();
         let dispatch_rejected = matches!(
-            OperationDispatch::encode_and_submit(
+            encode_and_submit_single(
                 &provider,
                 &resolved,
                 &terminal,
@@ -1910,7 +1968,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
     check(
         passed,
         matches!(
-            OperationDispatch::encode_and_submit(
+            encode_and_submit_single(
                 &provider,
                 &resolved,
                 &resource_item,
@@ -1938,7 +1996,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
     check(
         passed,
         matches!(
-            OperationDispatch::encode_and_submit(
+            encode_and_submit_single(
                 &provider,
                 &resolved,
                 &resource_batch,
@@ -1964,7 +2022,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
     check(
         passed,
         matches!(
-            OperationDispatch::encode_and_submit(
+            encode_and_submit_single(
                 &provider,
                 &resolved,
                 &identity,
@@ -1990,7 +2048,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
     check(
         passed,
         matches!(
-            OperationDispatch::encode_and_submit(
+            encode_and_submit_single(
                 &provider,
                 &resolved,
                 &identity,
@@ -2013,7 +2071,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
     let frame_id = step.participant_frames().next().unwrap().frame_id();
     let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
     let identity = operation_identity(&plan, &active, frame_id, invocation_id);
-    let receipt = OperationDispatch::encode_and_submit(
+    let receipt = encode_and_submit_single(
         &provider,
         &resolved,
         &identity,
@@ -2026,7 +2084,10 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
         &reaper,
     )
     .unwrap();
-    check(passed, receipt.identity() == &identity);
+    check(
+        passed,
+        receipt.batch_identity().participants()[0].identity() == &identity,
+    );
     check(
         passed,
         matches!(receipt.poll(), Ok(CompletionObservation::Terminal(_))),
@@ -2068,7 +2129,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
     check(
         passed,
         matches!(
-            OperationDispatch::encode_and_submit(
+            encode_and_submit_single(
                 &provider,
                 &resolved,
                 &identity,
@@ -2142,7 +2203,7 @@ fn cancel_dispatch_linearization_contract(initial_fixture: Fixture, passed: &mut
     check(
         passed,
         matches!(
-            OperationDispatch::encode_and_submit(
+            encode_and_submit_single(
                 &provider,
                 &resolved,
                 &identity,
@@ -2209,7 +2270,7 @@ fn cancel_dispatch_linearization_contract(initial_fixture: Fixture, passed: &mut
     let identity = operation_identity(&plan, &active, frame_id, invocation_id);
     let lane = ExecutionLane::create(Arc::clone(&runtime)).unwrap();
     let reaper = CompletionReaper::new();
-    let completion = OperationDispatch::encode_and_submit(
+    let completion = encode_and_submit_single(
         &provider,
         &resolved,
         &identity,
@@ -2331,7 +2392,7 @@ fn submit_descriptor_drift_contract(fixture: Fixture, passed: &mut usize) {
     let lane = ExecutionLane::create(Arc::clone(&runtime)).unwrap();
     let reaper = CompletionReaper::new();
     runtime_trace.lock().unwrap().drift_on_submit = true;
-    let completion = match OperationDispatch::encode_and_submit(
+    let completion = match encode_and_submit_single(
         &provider,
         &resolved,
         &identity,
@@ -2455,7 +2516,7 @@ fn legacy_source_seals_sequence_and_cannot_authorize_other_session(
     check(
         passed,
         matches!(
-            OperationDispatch::encode_and_submit(
+            encode_and_submit_single(
                 &provider,
                 &resolved,
                 &identity,
@@ -2580,7 +2641,7 @@ impl CompletionHarness {
         let frame_id = self.step().participant_frames().next().unwrap().frame_id();
         let invocation_id = NodeInvocationId::try_from(97).unwrap();
         let identity = operation_identity(&self.plan, &self.active, frame_id, invocation_id);
-        OperationDispatch::encode_and_submit(
+        encode_and_submit_single(
             &provider,
             &self.resolved,
             &identity,
@@ -2912,8 +2973,14 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
         CompletionObservation::Indeterminate(failure) => failure,
         other => panic!("indeterminate fence produced {other:?}"),
     };
-    check(passed, failure.failure().code() == "test_runtime");
-    check(passed, failure.failure().message() == "fence-indeterminate");
+    check(
+        passed,
+        failure.len() == 1 && failure[0].failure().code() == "test_runtime",
+    );
+    check(
+        passed,
+        failure[0].failure().message() == "fence-indeterminate",
+    );
     check(passed, indeterminate.reaper.retained_count() == 1);
     indeterminate.set_fence_behavior(FenceBehavior::FailedButQuiescent);
     let terminal = match handle.wait().unwrap() {
@@ -2922,7 +2989,7 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
     };
     check(
         passed,
-        matches!(terminal.disposition(), OperationCompletionDisposition::FailedButQuiescent(failure) if failure.failure().code() == "test_runtime" && failure.failure().message() == "terminal-failure"),
+        matches!(terminal.disposition(), OperationCompletionDisposition::FailedButQuiescent(failures) if failures.len() == 1 && failures[0].failure().code() == "test_runtime" && failures[0].failure().message() == "terminal-failure"),
     );
     indeterminate.finish(passed);
 
@@ -3037,7 +3104,7 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
         second_frame_id,
         second_invocation_id,
     );
-    let second = OperationDispatch::encode_and_submit(
+    let second = encode_and_submit_single(
         &provider,
         &multiple.resolved,
         &second_identity,
@@ -3118,7 +3185,7 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
         second_frame_id,
         second_invocation_id,
     );
-    let drain_sibling = OperationDispatch::encode_and_submit(
+    let drain_sibling = encode_and_submit_single(
         &provider,
         &multiple.resolved,
         &second_identity,
@@ -3138,11 +3205,11 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
     );
     check(
         passed,
-        matches!(drain_target.poll(), Ok(CompletionObservation::Indeterminate(failure)) if failure.failure().message() == "fence-indeterminate"),
+        matches!(drain_target.poll(), Ok(CompletionObservation::Indeterminate(failures)) if failures.len() == 1 && failures[0].failure().message() == "fence-indeterminate"),
     );
     check(
         passed,
-        matches!(drain_target.wait(), Ok(CompletionObservation::Indeterminate(failure)) if failure.failure().message() == "fence-indeterminate"),
+        matches!(drain_target.wait(), Ok(CompletionObservation::Indeterminate(failures)) if failures.len() == 1 && failures[0].failure().message() == "fence-indeterminate"),
     );
     let drain = match multiple
         .reaper
@@ -3218,7 +3285,7 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
     let recovered = CompletionHarness::new();
     recovered.set_fence_behavior(FenceBehavior::Indeterminate);
     let handle = recovered.dispatch().unwrap();
-    let expected_identity = handle.identity().clone();
+    let expected_identity = handle.batch_identity().clone();
     drop(handle);
     let sweep = recovered.reaper.poll_bounded(1).unwrap();
     check(passed, sweep.entries().len() == 1);
@@ -3241,7 +3308,7 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
     check(passed, recovered.reaper.retained_count() == 1);
     check(
         passed,
-        matches!(recovered.reaper.wait_slot_for_recovery(slot_id), Ok(CompletionObservation::Indeterminate(failure)) if failure.failure().message() == "fence-indeterminate"),
+        matches!(recovered.reaper.wait_slot_for_recovery(slot_id), Ok(CompletionObservation::Indeterminate(failures)) if failures.len() == 1 && failures[0].failure().message() == "fence-indeterminate"),
     );
     let drain = match recovered
         .reaper
@@ -3252,7 +3319,7 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
         CompletionRecoveryOutcome::Quarantined(_) => panic!("successful drain was quarantined"),
     };
     check(passed, drain.slot_id() == slot_id);
-    check(passed, drain.identity() == &expected_identity);
+    check(passed, drain.batch_identity() == &expected_identity);
     check(
         passed,
         drain.cause() == CompletionRecoveryCause::FenceIndeterminate,
@@ -3297,7 +3364,7 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
     check(
         passed,
         matches!(
-            OperationDispatch::encode_and_submit(
+            encode_and_submit_single(
                 &failed_lane_provider,
                 &recovered.resolved,
                 &failed_lane_identity,
@@ -3364,7 +3431,7 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
     let quarantined = CompletionHarness::new();
     quarantined.set_fence_behavior(FenceBehavior::Indeterminate);
     let handle = quarantined.dispatch().unwrap();
-    let expected_identity = handle.identity().clone();
+    let expected_identity = handle.batch_identity().clone();
     drop(handle);
     let sweep = quarantined.reaper.poll_bounded(1).unwrap();
     check(passed, sweep.entries().len() == 1);
@@ -3405,7 +3472,7 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
             .is_none(),
     );
     check(passed, quarantine.slot_id() == slot_id);
-    check(passed, quarantine.identity() == &expected_identity);
+    check(passed, quarantine.batch_identity() == &expected_identity);
     check(
         passed,
         quarantine.cause() == CompletionRecoveryCause::FenceIndeterminate,
@@ -3551,6 +3618,171 @@ fn wrong_runtime_admission_contract(passed: &mut usize) {
     check(passed, runtime_trace.lock().unwrap().allocation_calls == 0);
 }
 
+fn admit_batch_step(
+    plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
+    batch: &ExecutionBatchParticipants<TestRuntime>,
+) -> Arc<StepResourceLease<TestRuntime>> {
+    let request = StepResourceAdmissionRequest::new(
+        batch
+            .bind_work_shape(vec![one_token_span(); batch.len() as usize])
+            .unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    for attempt in 0..=3 {
+        match batch.try_begin_step(request.clone()).unwrap() {
+            StepResourceAdmissionDecision::Admitted(step) => return step,
+            StepResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
+                plan_resources.maintain_for_deferred(&deferred).unwrap();
+            }
+            _ => panic!("batch step admission did not converge"),
+        }
+    }
+    unreachable!("bounded batch step admission returns or panics")
+}
+
+fn admit_batch_invocation(
+    plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
+    step: &Arc<StepResourceLease<TestRuntime>>,
+    node_id: &NodeId,
+) -> InvocationResourceLease<TestRuntime> {
+    let request = InvocationResourceAdmissionRequest::for_all_step_participants(
+        node_id.clone(),
+        step.bind_all_invocation_work_shape(vec![
+            one_token_span();
+            step.participant_count() as usize
+        ])
+        .unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    for attempt in 0..=3 {
+        match step.try_admit_invocation(request.clone()).unwrap() {
+            InvocationResourceAdmissionDecision::Admitted(invocation) => return invocation,
+            InvocationResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
+                plan_resources.maintain_for_deferred(&deferred).unwrap();
+            }
+            _ => panic!("batch invocation admission did not converge"),
+        }
+    }
+    unreachable!("bounded batch invocation admission returns or panics")
+}
+
+fn thirty_two_participant_dispatch_is_one_physical_submission() {
+    let Fixture {
+        registry,
+        resolved,
+        plan,
+        runtime,
+        runtime_trace,
+        provider_trace,
+        plan_resources,
+        ..
+    } = fixture();
+    let resources = (0..32)
+        .map(|index| {
+            logical_resources(
+                &plan_resources,
+                &format!("run.device-operation.batch32.{index}"),
+                &format!("request.device-operation.batch32.{index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let sessions = resources
+        .iter()
+        .map(|resources| resources.open_session().unwrap())
+        .collect::<Vec<_>>();
+    let batch = ExecutionBatchParticipants::new(sessions.clone()).unwrap();
+    let active_bindings = batch
+        .sessions()
+        .iter()
+        .map(|session| TrustedActiveSequenceBinding::from_session(session).unwrap())
+        .collect::<Vec<_>>();
+    let step = admit_batch_step(&plan_resources, &batch);
+    let node = &plan.payload().nodes()[0];
+    let invocation = admit_batch_invocation(&plan_resources, &step, node.id());
+    let identities = step
+        .participant_frames()
+        .zip(&active_bindings)
+        .enumerate()
+        .map(|(index, (frame, active))| {
+            operation_identity(
+                &plan,
+                active,
+                frame.frame_id(),
+                NodeInvocationId::try_from(index as u64 + 1).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let lane = ExecutionLane::create(Arc::clone(&runtime)).unwrap();
+    let reaper = CompletionReaper::new();
+    let provider = registry.bind(&resolved, node.id()).unwrap();
+    let batch_identity = OperationDispatch::bind_batch_identity(
+        &resolved,
+        identities,
+        &active_bindings,
+        &invocation,
+        &lane,
+    )
+    .unwrap();
+    assert_eq!(batch_identity.participants().len(), 32);
+    assert_eq!(
+        batch_identity.work_shape_fingerprint(),
+        invocation.work_shape().fingerprint()
+    );
+    let handle = OperationDispatch::encode_and_submit(
+        &provider,
+        &resolved,
+        &batch_identity,
+        &active_bindings,
+        invocation,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    assert_eq!(runtime_trace.lock().unwrap().submit_calls, 1);
+    let trace = provider_trace.lock().unwrap();
+    assert_eq!(trace.encode_calls, 1);
+    assert_eq!(trace.last_participant_count, 32);
+    assert_eq!(trace.last_work_sequences, 32);
+    drop(trace);
+    assert_eq!(handle.receipt().participants().len(), 32);
+    assert!(handle
+        .receipt()
+        .participants()
+        .iter()
+        .all(|participant| participant.batch_submission_fingerprint()
+            == handle.receipt().fingerprint()));
+    let completion = match handle.poll().unwrap() {
+        CompletionObservation::Terminal(completion) => completion,
+        other => panic!("32-participant batch did not complete: {other:?}"),
+    };
+    assert_eq!(completion.participants().len(), 32);
+    assert!(completion
+        .participants()
+        .iter()
+        .all(|participant| participant.batch_completion_fingerprint() == completion.fingerprint()));
+    assert_eq!(lane.in_flight_count(), 0);
+    assert_eq!(reaper.retained_count(), 0);
+    drop(handle);
+    step.try_retire_normal().unwrap();
+    drop(batch);
+    for session in &sessions {
+        session.try_complete().unwrap();
+    }
+    drop(sessions);
+    drop(resources);
+    drop(reaper);
+    drop(lane);
+    drop(runtime);
+    assert!(matches!(
+        PlanRuntimeResources::close(plan_resources),
+        Ok(PlanRuntimeCloseOutcome::Closed(_))
+    ));
+}
+
 #[test]
 fn device_and_operation_contract_is_exhaustive() {
     let mut passed = 0;
@@ -3561,6 +3793,7 @@ fn device_and_operation_contract_is_exhaustive() {
     submit_descriptor_drift_contract(fixture(), &mut passed);
     legacy_source_seals_sequence_and_cannot_authorize_other_session(fixture(), &mut passed);
     completion_reaper_owns_invocations_until_quiescent_terminal(&mut passed);
+    thirty_two_participant_dispatch_is_one_physical_submission();
     assert_eq!(passed, EXPECTED_CASES);
     println!("VNEXT DEVICE OPERATION PASS: {passed}/{EXPECTED_CASES}");
 }

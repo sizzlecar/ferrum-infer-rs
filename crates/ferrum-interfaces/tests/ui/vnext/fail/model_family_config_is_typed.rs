@@ -29,6 +29,14 @@ impl ModelFamilyProvider for Family {
         Ok(())
     }
 
+    fn validated_external_metadata_id(
+        &self,
+        _raw: &serde_json::Value,
+        _config: &Config,
+    ) -> Result<ExternalModelMetadataId, VNextError> {
+        unimplemented!()
+    }
+
     fn parse_config(&self, _raw: &serde_json::Value) -> Result<Config, VNextError> {
         unimplemented!()
     }

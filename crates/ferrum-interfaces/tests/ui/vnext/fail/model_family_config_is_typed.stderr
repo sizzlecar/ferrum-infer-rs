@@ -1,7 +1,7 @@
 error[E0308]: mismatched types
-  --> tests/ui/vnext/fail/model_family_config_is_typed.rs:53:34
+  --> tests/ui/vnext/fail/model_family_config_is_typed.rs:61:34
    |
-53 |     let _ = family.weight_schema(&WrongConfig);
+61 |     let _ = family.weight_schema(&WrongConfig);
    |                    ------------- ^^^^^^^^^^^^ expected `&Config`, found `&WrongConfig`
    |                    |
    |                    arguments to this method are incorrect

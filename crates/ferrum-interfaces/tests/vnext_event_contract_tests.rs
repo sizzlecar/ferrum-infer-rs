@@ -90,6 +90,15 @@ impl ModelFamilyProvider for TestFamily {
         Ok(())
     }
 
+    fn validated_external_metadata_id(
+        &self,
+        raw: &Value,
+        config: &Self::Config,
+    ) -> Result<ExternalModelMetadataId, VNextError> {
+        self.validate_config_identity(raw, config)?;
+        Ok(id("metadata.event"))
+    }
+
     fn parse_config(&self, raw: &Value) -> Result<Self::Config, VNextError> {
         let config: TestConfig = serde_json::from_value(raw.clone()).map_err(|error| {
             VNextError::InvalidModelConfig {
@@ -732,10 +741,54 @@ impl OperationResourceEstimator for TestExecutionProvider {
 impl OperationProvider<TestRuntime> for TestExecutionProvider {
     fn encode_selected(
         &self,
-        _invocation: OperationInvocation<'_, TestBuffer>,
+        _invocation: BatchedOperationInvocation<'_, TestBuffer>,
     ) -> Result<(), OperationFailure> {
         Ok(())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_and_submit_single(
+    provider: &BoundOperationProvider<'_, TestRuntime>,
+    resolved: &ResolvedModelPlan,
+    identity: &ExecutionIdentityEnvelope,
+    frame_id: &ExecutionFrameId,
+    node_invocation_id: &NodeInvocationId,
+    node_id: &NodeId,
+    active: &TrustedActiveSequenceBinding,
+    invocation: InvocationResourceLease<TestRuntime>,
+    lane: &Arc<ExecutionLane<TestRuntime>>,
+    reaper: &Arc<CompletionReaper<TestRuntime>>,
+) -> Result<CompletionHandle<TestRuntime>, OperationDispatchError<TestRuntime>> {
+    let parts = identity.parts();
+    if parts.frame_id != Some(*frame_id)
+        || parts.node_invocation_id != Some(*node_invocation_id)
+        || parts.node_id.as_ref() != Some(node_id)
+    {
+        return Err(OperationDispatchError::Contract(
+            VNextError::InvalidExecutionPlan {
+                reason: "single-participant dispatch arguments disagree".to_owned(),
+            },
+        ));
+    }
+    let active_bindings = std::slice::from_ref(active);
+    let batch_identity = OperationDispatch::bind_batch_identity(
+        resolved,
+        vec![identity.clone()],
+        active_bindings,
+        &invocation,
+        lane,
+    )
+    .map_err(OperationDispatchError::Contract)?;
+    OperationDispatch::encode_and_submit(
+        provider,
+        resolved,
+        &batch_identity,
+        active_bindings,
+        invocation,
+        lane,
+        reaper,
+    )
 }
 
 #[derive(Debug, Default)]
@@ -1186,7 +1239,7 @@ fn node_event(
     let node_span: SpanId = id(format!("span.frame.{frame}.node.{node_index}"));
     let operation_span: SpanId = id(format!("span.frame.{frame}.operation.{node_index}"));
     let (span, parent) = match kind {
-        ExecutionEventKind::NodeStarted | ExecutionEventKind::NodeCompleted => {
+        ExecutionEventKind::NodeStarted | ExecutionEventKind::NodeRetired => {
             (node_span, frame_span)
         }
         ExecutionEventKind::OperationSubmitted => (operation_span, node_span),
@@ -1400,6 +1453,7 @@ fn request_journal(
     active: &TrustedActiveSequenceBinding,
     completed: &TrustedCompletedSequenceBinding,
     submissions: &[SubmittedOperationReceipt],
+    completions: &[OperationCompletionReceipt],
     frames: u64,
 ) -> Vec<ExecutionEvent> {
     let run = active.run_id();
@@ -1408,6 +1462,7 @@ fn request_journal(
     let mut sequence = 3_u64;
     let mut invocation = 1_u64;
     let mut submission_index = 0_usize;
+    let mut completion_index = 0_usize;
     for frame in 1..=frames {
         events.push(frame_event(
             plan,
@@ -1423,14 +1478,25 @@ fn request_journal(
             for kind in [
                 ExecutionEventKind::NodeStarted,
                 ExecutionEventKind::OperationSubmitted,
-                ExecutionEventKind::NodeCompleted,
+                ExecutionEventKind::NodeRetired,
             ] {
                 let event = node_event(
                     plan, active, run, request, sequence, frame, invocation, node_index, kind,
                 );
                 if kind == ExecutionEventKind::OperationSubmitted {
-                    assert_eq!(submissions[submission_index].identity(), event.identity());
+                    assert_eq!(
+                        submissions[submission_index].participants()[0].identity(),
+                        event.identity()
+                    );
                     submission_index += 1;
+                } else if kind == ExecutionEventKind::NodeRetired {
+                    assert!(same_operation_authority(
+                        event.identity(),
+                        completions[completion_index].participants()[0]
+                            .submission()
+                            .identity(),
+                    ));
+                    completion_index += 1;
                 }
                 events.push(event);
                 sequence += 1;
@@ -1449,6 +1515,7 @@ fn request_journal(
         sequence += 1;
     }
     assert_eq!(submission_index, submissions.len());
+    assert_eq!(completion_index, completions.len());
     events.push(sequence_completed_event(plan, active, completed, sequence));
     sequence += 1;
     events.push(request_completed_event(
@@ -1457,12 +1524,24 @@ fn request_journal(
     events
 }
 
+fn same_operation_authority(
+    observation: &ExecutionIdentityEnvelope,
+    operation: &ExecutionIdentityEnvelope,
+) -> bool {
+    let mut normalized = observation.parts().clone();
+    normalized.sequence = operation.parts().sequence;
+    normalized.span_id = operation.parts().span_id.clone();
+    normalized.parent_span_id = operation.parts().parent_span_id.clone();
+    normalized == *operation.parts()
+}
+
 fn event_context<'a>(
     event: &'a ExecutionEvent,
     topology: &'a TrustedExecutionTopology,
     active: &'a TrustedActiveSequenceBinding,
     completed: &'a TrustedCompletedSequenceBinding,
     submissions: &'a [SubmittedOperationReceipt],
+    completions: &'a [OperationCompletionReceipt],
 ) -> TrustedExecutionEventContext<'a> {
     match event.kind() {
         ExecutionEventKind::RequestAccepted => {
@@ -1492,7 +1571,12 @@ fn event_context<'a>(
         ExecutionEventKind::OperationSubmitted => {
             let receipt = submissions
                 .iter()
-                .find(|receipt| receipt.identity() == event.identity())
+                .find(|receipt| {
+                    receipt
+                        .participants()
+                        .iter()
+                        .any(|participant| participant.identity() == event.identity())
+                })
                 .expect("journal operation has external submission receipt");
             TrustedExecutionEventContext::operation_submitted(
                 active.run_id(),
@@ -1500,6 +1584,22 @@ fn event_context<'a>(
                 topology,
                 active,
                 receipt,
+            )
+        }
+        ExecutionEventKind::NodeRetired => {
+            let completion = completions
+                .iter()
+                .flat_map(|receipt| receipt.participants())
+                .find(|participant| {
+                    same_operation_authority(event.identity(), participant.submission().identity())
+                })
+                .expect("retired node has external participant completion evidence");
+            TrustedExecutionEventContext::node_retired(
+                active.run_id(),
+                active.request_id(),
+                topology,
+                active,
+                completion,
             )
         }
         ExecutionEventKind::SequenceCompleted | ExecutionEventKind::RequestCompleted => {
@@ -1526,13 +1626,14 @@ fn observe_journal(
     active: &TrustedActiveSequenceBinding,
     completed: &TrustedCompletedSequenceBinding,
     submissions: &[SubmittedOperationReceipt],
+    completions: &[OperationCompletionReceipt],
 ) -> Result<ExecutionEventCursor, VNextError> {
     let mut cursor =
         ExecutionEventCursor::new(active.run_id().clone(), active.request_id().clone());
     for event in journal {
         cursor.observe_against(
             event,
-            &event_context(event, topology, active, completed, submissions),
+            &event_context(event, topology, active, completed, submissions, completions),
         )?;
     }
     Ok(cursor)
@@ -1562,7 +1663,12 @@ fn observe_failure_journal(
                 let submission = evidence
                     .submissions
                     .iter()
-                    .find(|receipt| receipt.identity() == event.identity())
+                    .find(|receipt| {
+                        receipt
+                            .participants()
+                            .iter()
+                            .any(|participant| participant.identity() == event.identity())
+                    })
                     .unwrap();
                 TrustedExecutionEventContext::operation_submitted(
                     evidence.active.run_id(),
@@ -1570,6 +1676,26 @@ fn observe_failure_journal(
                     topology,
                     &evidence.active,
                     submission,
+                )
+            }
+            ExecutionEventKind::NodeRetired => {
+                let completion = evidence
+                    .completions
+                    .iter()
+                    .flat_map(|receipt| receipt.participants())
+                    .find(|participant| {
+                        same_operation_authority(
+                            event.identity(),
+                            participant.submission().identity(),
+                        )
+                    })
+                    .unwrap();
+                TrustedExecutionEventContext::node_retired(
+                    evidence.active.run_id(),
+                    evidence.active.request_id(),
+                    topology,
+                    &evidence.active,
+                    completion,
                 )
             }
             ExecutionEventKind::FailureObserved => {
@@ -2326,7 +2452,7 @@ fn execute_sequence(
             );
             let node = &plan.payload().nodes()[node_index];
             let provider = registry.bind(resolved, node.id()).unwrap();
-            let completion = OperationDispatch::encode_and_submit(
+            let completion = encode_and_submit_single(
                 &provider,
                 resolved,
                 operation_event.identity(),
@@ -2401,7 +2527,7 @@ fn execute_failure_then_complete(
     if fail_fence {
         runtime.fail_next_fence();
     }
-    let submission = OperationDispatch::encode_and_submit(
+    let submission = encode_and_submit_single(
         &provider,
         resolved,
         operation_event.identity(),
@@ -2420,9 +2546,11 @@ fn execute_failure_then_complete(
         _ => panic!("event failure fixture operation did not reach a terminal fence"),
     };
     let failure = match operation_completion.disposition() {
-        OperationCompletionDisposition::FailedButQuiescent(failure) => failure.clone(),
+        OperationCompletionDisposition::FailedButQuiescent(failures) => {
+            failures.first().expect("one participant failure").clone()
+        }
         OperationCompletionDisposition::Succeeded => IdentifiedFailure::new(
-            submitted_operation.identity().clone(),
+            submitted_operation.participants()[0].identity().clone(),
             FailureEnvelope::new(
                 FailureDomain::Device,
                 "synthetic_success_reversal",
@@ -2525,7 +2653,7 @@ fn execute_terminal_failure_then_complete(
         ReplayTerminalFixtureMode::SubmissionIndeterminateDrained => runtime.panic_next_submit(),
     }
     let dispatch = suppress_expected_panic_hook(|| {
-        OperationDispatch::encode_and_submit(
+        encode_and_submit_single(
             &provider,
             resolved,
             operation_event.identity(),
@@ -2559,7 +2687,7 @@ fn execute_terminal_failure_then_complete(
                 receipt.disposition(),
                 OperationCompletionDisposition::ContractFailedButQuiescent(_)
             ));
-            let identity = receipt.submission().identity().clone();
+            let identity = receipt.submission().participants()[0].identity().clone();
             completions.push(receipt);
             runtime.reset_stream_failure();
             identity
@@ -2594,7 +2722,7 @@ fn execute_terminal_failure_then_complete(
                     ));
                 }
             }
-            submissions[0].identity().clone()
+            submissions[0].participants()[0].identity().clone()
         }
         ReplayTerminalFixtureMode::SubmissionIndeterminateDrained => {
             let recovery = match dispatch {
@@ -2607,7 +2735,9 @@ fn execute_terminal_failure_then_complete(
                     panic!("submit panic fixture unexpectedly quarantined")
                 }
             };
-            let identity = receipt.identity().clone();
+            let identity = receipt.batch_identity().participants()[0]
+                .identity()
+                .clone();
             drains.push(receipt);
             identity
         }
@@ -2964,7 +3094,7 @@ fn live_witness_emitter_contract(
     );
     let first_node = &plan.payload().nodes()[0];
     let first_provider = registry.bind(resolved, first_node.id()).unwrap();
-    let first_handle = OperationDispatch::encode_and_submit(
+    let first_handle = encode_and_submit_single(
         &first_provider,
         resolved,
         first_operation.identity(),
@@ -2989,46 +3119,55 @@ fn live_witness_emitter_contract(
             ),
         )
         .unwrap();
-    assert!(matches!(
-        first_handle.poll().unwrap(),
-        CompletionObservation::Terminal(_)
-    ));
-    for event in [
-        node_event(
-            plan,
-            &active,
-            active.run_id(),
-            active.request_id(),
-            6,
-            1,
-            1,
-            0,
-            ExecutionEventKind::NodeCompleted,
-        ),
-        node_event(
-            plan,
-            &active,
-            active.run_id(),
-            active.request_id(),
-            7,
-            1,
-            2,
-            1,
-            ExecutionEventKind::NodeStarted,
-        ),
-    ] {
-        emitter
-            .emit(
-                &event,
-                &TrustedExecutionEventContext::active(
-                    active.run_id(),
-                    active.request_id(),
-                    &topology,
-                    &active,
-                ),
-            )
-            .unwrap();
-    }
+    let first_completion = match first_handle.poll().unwrap() {
+        CompletionObservation::Terminal(completion) => completion,
+        other => panic!("first node did not complete: {other:?}"),
+    };
+    let first_retired = node_event(
+        plan,
+        &active,
+        active.run_id(),
+        active.request_id(),
+        6,
+        1,
+        1,
+        0,
+        ExecutionEventKind::NodeRetired,
+    );
+    emitter
+        .emit(
+            &first_retired,
+            &TrustedExecutionEventContext::node_retired(
+                active.run_id(),
+                active.request_id(),
+                &topology,
+                &active,
+                &first_completion.participants()[0],
+            ),
+        )
+        .unwrap();
+    let second_started = node_event(
+        plan,
+        &active,
+        active.run_id(),
+        active.request_id(),
+        7,
+        1,
+        2,
+        1,
+        ExecutionEventKind::NodeStarted,
+    );
+    emitter
+        .emit(
+            &second_started,
+            &TrustedExecutionEventContext::active(
+                active.run_id(),
+                active.request_id(),
+                &topology,
+                &active,
+            ),
+        )
+        .unwrap();
     let second_operation = node_event(
         plan,
         &active,
@@ -3042,7 +3181,7 @@ fn live_witness_emitter_contract(
     );
     let second_node = &plan.payload().nodes()[1];
     let second_provider = registry.bind(resolved, second_node.id()).unwrap();
-    let second_handle = OperationDispatch::encode_and_submit(
+    let second_handle = encode_and_submit_single(
         &second_provider,
         resolved,
         second_operation.identity(),
@@ -3068,44 +3207,53 @@ fn live_witness_emitter_contract(
             ),
         )
         .unwrap();
-    assert!(matches!(
-        second_handle.poll().unwrap(),
-        CompletionObservation::Terminal(_)
-    ));
-    for event in [
-        node_event(
-            plan,
-            &active,
-            active.run_id(),
-            active.request_id(),
-            9,
-            1,
-            2,
-            1,
-            ExecutionEventKind::NodeCompleted,
-        ),
-        frame_event(
-            plan,
-            &active,
-            active.run_id(),
-            active.request_id(),
-            10,
-            1,
-            ExecutionEventKind::FrameCompleted,
-        ),
-    ] {
-        emitter
-            .emit(
-                &event,
-                &TrustedExecutionEventContext::active(
-                    active.run_id(),
-                    active.request_id(),
-                    &topology,
-                    &active,
-                ),
-            )
-            .unwrap();
-    }
+    let second_completion = match second_handle.poll().unwrap() {
+        CompletionObservation::Terminal(completion) => completion,
+        other => panic!("second node did not complete: {other:?}"),
+    };
+    let second_retired = node_event(
+        plan,
+        &active,
+        active.run_id(),
+        active.request_id(),
+        9,
+        1,
+        2,
+        1,
+        ExecutionEventKind::NodeRetired,
+    );
+    emitter
+        .emit(
+            &second_retired,
+            &TrustedExecutionEventContext::node_retired(
+                active.run_id(),
+                active.request_id(),
+                &topology,
+                &active,
+                &second_completion.participants()[0],
+            ),
+        )
+        .unwrap();
+    let frame_completed = frame_event(
+        plan,
+        &active,
+        active.run_id(),
+        active.request_id(),
+        10,
+        1,
+        ExecutionEventKind::FrameCompleted,
+    );
+    emitter
+        .emit(
+            &frame_completed,
+            &TrustedExecutionEventContext::active(
+                active.run_id(),
+                active.request_id(),
+                &topology,
+                &active,
+            ),
+        )
+        .unwrap();
     check(
         passed,
         emitter.cursor().last_sequence() == 10
@@ -3271,7 +3419,7 @@ fn execute_failure_then_abort(
         .bind(resolved, plan.payload().nodes()[0].id())
         .unwrap();
     runtime.fail_next_fence();
-    let submission = OperationDispatch::encode_and_submit(
+    let submission = encode_and_submit_single(
         &provider,
         resolved,
         operation_event.identity(),
@@ -3290,7 +3438,9 @@ fn execute_failure_then_abort(
         _ => panic!("event abort fixture operation did not reach a terminal fence"),
     };
     let failure = match operation_completion.disposition() {
-        OperationCompletionDisposition::FailedButQuiescent(failure) => failure.clone(),
+        OperationCompletionDisposition::FailedButQuiescent(failures) => {
+            failures.first().expect("one participant failure").clone()
+        }
         disposition => panic!("event abort fixture received {disposition:?}"),
     };
     assert_eq!(reaper.retained_count(), 0);
@@ -3519,6 +3669,7 @@ fn vnext_event_replay_v5_contract() {
         &failed_completion_success.active,
         &failed_completion_success.completed,
         &failed_completion_success.submissions,
+        &failed_completion_success.completions,
         3,
     );
     let contract_terminal_failure = execute_terminal_failure_then_complete(
@@ -3656,8 +3807,16 @@ fn vnext_event_replay_v5_contract() {
         .is_err(),
     );
 
-    let journal = request_journal(&plan, &active, &completed, &submissions, 2);
-    let cursor = observe_journal(&journal, &topology, &active, &completed, &submissions).unwrap();
+    let journal = request_journal(&plan, &active, &completed, &submissions, &completions, 2);
+    let cursor = observe_journal(
+        &journal,
+        &topology,
+        &active,
+        &completed,
+        &submissions,
+        &completions,
+    )
+    .unwrap();
     check(
         &mut passed,
         cursor.is_terminal() && cursor.completed_frames() == 2,
@@ -3687,7 +3846,14 @@ fn vnext_event_replay_v5_contract() {
         frame_jump
             .observe_against(
                 event,
-                &event_context(event, &topology, &active, &completed, &submissions),
+                &event_context(
+                    event,
+                    &topology,
+                    &active,
+                    &completed,
+                    &submissions,
+                    &completions,
+                ),
             )
             .unwrap();
     }
@@ -3705,7 +3871,14 @@ fn vnext_event_replay_v5_contract() {
         frame_jump
             .observe_against(
                 &jump,
-                &event_context(&jump, &topology, &active, &completed, &submissions),
+                &event_context(
+                    &jump,
+                    &topology,
+                    &active,
+                    &completed,
+                    &submissions,
+                    &completions,
+                ),
             )
             .is_err()
             && frame_jump.last_sequence() == 2,
@@ -3717,7 +3890,14 @@ fn vnext_event_replay_v5_contract() {
         incomplete
             .observe_against(
                 event,
-                &event_context(event, &topology, &active, &completed, &submissions),
+                &event_context(
+                    event,
+                    &topology,
+                    &active,
+                    &completed,
+                    &submissions,
+                    &completions,
+                ),
             )
             .unwrap();
     }
@@ -3735,7 +3915,14 @@ fn vnext_event_replay_v5_contract() {
         incomplete
             .observe_against(
                 &premature,
-                &event_context(&premature, &topology, &active, &completed, &submissions),
+                &event_context(
+                    &premature,
+                    &topology,
+                    &active,
+                    &completed,
+                    &submissions,
+                    &completions,
+                ),
             )
             .is_err()
             && incomplete.last_sequence() == 3,
@@ -3747,7 +3934,14 @@ fn vnext_event_replay_v5_contract() {
         cross_frame
             .observe_against(
                 event,
-                &event_context(event, &topology, &active, &completed, &submissions),
+                &event_context(
+                    event,
+                    &topology,
+                    &active,
+                    &completed,
+                    &submissions,
+                    &completions,
+                ),
             )
             .unwrap();
     }
@@ -3773,6 +3967,7 @@ fn vnext_event_replay_v5_contract() {
                     &active,
                     &completed,
                     &submissions,
+                    &completions,
                 ),
             )
             .is_err(),
@@ -3784,7 +3979,14 @@ fn vnext_event_replay_v5_contract() {
         duplicate_invocation
             .observe_against(
                 event,
-                &event_context(event, &topology, &active, &completed, &submissions),
+                &event_context(
+                    event,
+                    &topology,
+                    &active,
+                    &completed,
+                    &submissions,
+                    &completions,
+                ),
             )
             .unwrap();
     }
@@ -3804,7 +4006,14 @@ fn vnext_event_replay_v5_contract() {
         duplicate_invocation
             .observe_against(
                 &duplicate,
-                &event_context(&duplicate, &topology, &active, &completed, &submissions),
+                &event_context(
+                    &duplicate,
+                    &topology,
+                    &active,
+                    &completed,
+                    &submissions,
+                    &completions,
+                ),
             )
             .is_err()
             && duplicate_invocation.last_sequence() == 6,
@@ -3816,7 +4025,14 @@ fn vnext_event_replay_v5_contract() {
         invocation_gap
             .observe_against(
                 event,
-                &event_context(event, &topology, &active, &completed, &submissions),
+                &event_context(
+                    event,
+                    &topology,
+                    &active,
+                    &completed,
+                    &submissions,
+                    &completions,
+                ),
             )
             .unwrap();
     }
@@ -3836,7 +4052,14 @@ fn vnext_event_replay_v5_contract() {
         invocation_gap
             .observe_against(
                 &gap,
-                &event_context(&gap, &topology, &active, &completed, &submissions),
+                &event_context(
+                    &gap,
+                    &topology,
+                    &active,
+                    &completed,
+                    &submissions,
+                    &completions,
+                ),
             )
             .is_err()
             && invocation_gap.last_sequence() == 3,
@@ -3848,7 +4071,14 @@ fn vnext_event_replay_v5_contract() {
         duplicate_node
             .observe_against(
                 event,
-                &event_context(event, &topology, &active, &completed, &submissions),
+                &event_context(
+                    event,
+                    &topology,
+                    &active,
+                    &completed,
+                    &submissions,
+                    &completions,
+                ),
             )
             .unwrap();
     }
@@ -3874,6 +4104,7 @@ fn vnext_event_replay_v5_contract() {
                     &active,
                     &completed,
                     &submissions,
+                    &completions,
                 ),
             )
             .is_err()
@@ -3887,7 +4118,14 @@ fn vnext_event_replay_v5_contract() {
         node_prefix
             .observe_against(
                 event,
-                &event_context(event, &topology, &active, &completed, &submissions),
+                &event_context(
+                    event,
+                    &topology,
+                    &active,
+                    &completed,
+                    &submissions,
+                    &completions,
+                ),
             )
             .unwrap();
     }
@@ -3934,7 +4172,14 @@ fn vnext_event_replay_v5_contract() {
             && valid_cursor
                 .observe_against(
                     node_started,
-                    &event_context(node_started, &topology, &active, &completed, &submissions),
+                    &event_context(
+                        node_started,
+                        &topology,
+                        &active,
+                        &completed,
+                        &submissions,
+                        &completions,
+                    ),
                 )
                 .is_ok();
         assert!(
@@ -4047,7 +4292,14 @@ fn vnext_event_replay_v5_contract() {
         missing_submission
             .observe_against(
                 event,
-                &event_context(event, &topology, &active, &completed, &submissions),
+                &event_context(
+                    event,
+                    &topology,
+                    &active,
+                    &completed,
+                    &submissions,
+                    &completions,
+                ),
             )
             .unwrap();
     }
@@ -4060,7 +4312,7 @@ fn vnext_event_replay_v5_contract() {
         1,
         1,
         0,
-        ExecutionEventKind::NodeCompleted,
+        ExecutionEventKind::NodeRetired,
     );
     check(
         &mut passed,
@@ -4073,6 +4325,7 @@ fn vnext_event_replay_v5_contract() {
                     &active,
                     &completed,
                     &submissions,
+                    &completions,
                 ),
             )
             .is_err()
@@ -4115,7 +4368,14 @@ fn vnext_event_replay_v5_contract() {
         before_sync
             .observe_against(
                 event,
-                &event_context(event, &topology, &active, &completed, &submissions),
+                &event_context(
+                    event,
+                    &topology,
+                    &active,
+                    &completed,
+                    &submissions,
+                    &completions,
+                ),
             )
             .unwrap();
     }
@@ -4777,7 +5037,14 @@ fn vnext_event_replay_v5_contract() {
             .is_err(),
     );
 
-    let journal_two = request_journal(&plan, &active_two, &completed_two, &submissions_two, 1);
+    let journal_two = request_journal(
+        &plan,
+        &active_two,
+        &completed_two,
+        &submissions_two,
+        &completions_two,
+        1,
+    );
     check(
         &mut passed,
         observe_journal(
@@ -4786,6 +5053,7 @@ fn vnext_event_replay_v5_contract() {
             &active_two,
             &completed_two,
             &submissions_two,
+            &completions_two,
         )
         .unwrap()
         .is_terminal(),
@@ -4835,8 +5103,8 @@ fn vnext_event_replay_v5_contract() {
         &mut passed,
         matches!(
             completed_failure.completions[0].disposition(),
-            OperationCompletionDisposition::FailedButQuiescent(failure)
-                if failure == completed_failure_first
+            OperationCompletionDisposition::FailedButQuiescent(failures)
+                if failures.as_slice() == std::slice::from_ref(completed_failure_first)
         ),
     );
     check(
@@ -5836,7 +6104,7 @@ fn no_static_replay_requires_explicit_root_cleanup() {
     assert!(active.static_pool_id().is_none());
     assert!(active.static_provisioning_identity().is_none());
     assert!(active.static_entries().is_empty());
-    let journal = request_journal(&plan, &active, &completed, &submissions, 1);
+    let journal = request_journal(&plan, &active, &completed, &submissions, &completions, 1);
 
     let missing_cleanup = ReplayEvidence::new_no_static(
         &resolved,

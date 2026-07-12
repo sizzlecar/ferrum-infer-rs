@@ -10103,17 +10103,25 @@ where
             .expect("prepared participant count was validated at construction")
     }
 
-    pub(crate) fn exact_single_participant_session_identity(
+    pub(crate) fn participant_session_identities(
         &self,
-    ) -> Option<(SequenceSessionEpoch, &SequenceSessionFingerprint)> {
-        match (
-            self.participants.as_slice(),
-            self.participant_frames.as_slice(),
-            self.prepared_participant_flights.as_slice(),
-        ) {
-            ([_], [_], [hold]) => Some((hold.epoch, &hold.fingerprint)),
-            _ => None,
-        }
+    ) -> impl ExactSizeIterator<Item = (SequenceSessionEpoch, &SequenceSessionFingerprint)> {
+        self.prepared_participant_flights
+            .iter()
+            .map(|hold| (hold.epoch, &hold.fingerprint))
+    }
+
+    pub(crate) fn participant_node_keys(&self) -> Vec<ParticipantNodeKey> {
+        self.participant_frames
+            .iter()
+            .map(|assignment| {
+                ParticipantNodeKey::new(
+                    assignment.participant(),
+                    assignment.frame_id(),
+                    self.node_id.clone(),
+                )
+            })
+            .collect()
     }
 
     pub(crate) fn begin_dispatch(&mut self) -> Result<(), VNextError> {

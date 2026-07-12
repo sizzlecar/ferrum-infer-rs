@@ -9,8 +9,8 @@ use super::{
     ActiveSequencePermit, CompletionDrainReceipt, CompletionQuarantineReceipt, CompletionSlotId,
     ContractVersion, DeviceId, DeviceRuntime, ExecutionPlan, FailureDomain, FailureEnvelope,
     FailureEnvelopeWire, LogicalAdmissionCoordinatorId, LogicalBackingSliceEvidence, NodeId,
-    OperationCompletionDisposition, OperationCompletionReceipt, OperationId, PlanHash, PlanId,
-    PlanRuntimeCloseReceipt, PlanRuntimeQuarantineReceipt, ProviderId, RequestIdentity,
+    OperationCompletionReceipt, OperationId, OperationParticipantCompletionReceipt, PlanHash,
+    PlanId, PlanRuntimeCloseReceipt, PlanRuntimeQuarantineReceipt, ProviderId, RequestIdentity,
     ResolvedModelPlan, ResourceFailureId, ResourceFailureReceipt, ResourceId, ResourceLeaseEntry,
     ResourceLeaseState, ResourceLeaseTransitionReceipt, ResourceLeaseValidationContext,
     ResourceLedgerEntrySnapshot, ResourceLedgerSnapshot, ResourcePoolId,
@@ -18,13 +18,13 @@ use super::{
     ResourceTransitionValidationContext, RunId, SequenceAuthorityId, SequenceSession,
     SequenceSessionEpoch, SequenceSessionFingerprint, SequenceSessionLiveWitness,
     SequenceSessionTerminalDisposition, SequenceSessionTerminalReceipt, SpanId,
-    StaticProvisioningBinding, SubmittedOperationReceipt, TransactionId,
-    TrustedPlanRuntimeEvidence, UnvalidatedFailureEnvelope,
+    StaticProvisioningBinding, SubmittedOperationParticipantReceipt, SubmittedOperationReceipt,
+    TransactionId, TrustedPlanRuntimeEvidence, UnvalidatedFailureEnvelope,
     UnvalidatedResourceLeaseTransitionReceipt, UnvalidatedResourceLeaseTransitionReceiptWire,
     UnvalidatedResourceTransitionReceipt, UnvalidatedResourceTransitionReceiptWire, VNextError,
 };
 
-pub const EXECUTION_IDENTITY_VERSION: ContractVersion = ContractVersion::new(2, 0);
+pub const EXECUTION_IDENTITY_VERSION: ContractVersion = ContractVersion::new(3, 0);
 pub const MAX_EXECUTION_EVENT_WIRE_BYTES: usize = 1024 * 1024;
 pub const MAX_REPLAY_IDENTITY_WIRE_BYTES: usize = 1024 * 1024;
 pub const MAX_RESOURCE_POOL_EVENT_WIRE_BYTES: usize = 16 * 1024 * 1024;
@@ -111,7 +111,7 @@ pub enum ExecutionEventKind {
     FrameStarted,
     NodeStarted,
     OperationSubmitted,
-    NodeCompleted,
+    NodeRetired,
     FrameCompleted,
     FailureObserved,
     SequenceCompleted,
@@ -1151,7 +1151,8 @@ pub struct TrustedExecutionEventContext<'a> {
     active: Option<&'a TrustedActiveSequenceBinding>,
     completed: Option<&'a TrustedCompletedSequenceBinding>,
     aborted: Option<&'a TrustedAbortedSequenceBinding>,
-    submitted_operation_identity: Option<&'a ExecutionIdentityEnvelope>,
+    submitted_operation: Option<&'a SubmittedOperationReceipt>,
+    retired_operation: Option<&'a OperationParticipantCompletionReceipt>,
     expected_failure: Option<&'a IdentifiedFailure>,
     unsubmitted_recovery_identity: Option<&'a ExecutionIdentityEnvelope>,
 }
@@ -1165,7 +1166,8 @@ impl<'a> TrustedExecutionEventContext<'a> {
             active: None,
             completed: None,
             aborted: None,
-            submitted_operation_identity: None,
+            submitted_operation: None,
+            retired_operation: None,
             expected_failure: None,
             unsubmitted_recovery_identity: None,
         }
@@ -1183,7 +1185,8 @@ impl<'a> TrustedExecutionEventContext<'a> {
             active: None,
             completed: None,
             aborted: None,
-            submitted_operation_identity: None,
+            submitted_operation: None,
+            retired_operation: None,
             expected_failure: None,
             unsubmitted_recovery_identity: None,
         }
@@ -1202,7 +1205,8 @@ impl<'a> TrustedExecutionEventContext<'a> {
             active: Some(active),
             completed: None,
             aborted: None,
-            submitted_operation_identity: None,
+            submitted_operation: None,
+            retired_operation: None,
             expected_failure: None,
             unsubmitted_recovery_identity: None,
         }
@@ -1222,7 +1226,8 @@ impl<'a> TrustedExecutionEventContext<'a> {
             active: Some(active),
             completed: None,
             aborted: None,
-            submitted_operation_identity: Some(submitted_operation.identity()),
+            submitted_operation: Some(submitted_operation),
+            retired_operation: None,
             expected_failure: None,
             unsubmitted_recovery_identity: None,
         }
@@ -1233,7 +1238,7 @@ impl<'a> TrustedExecutionEventContext<'a> {
         request_id: &'a RequestIdentity,
         topology: &'a TrustedExecutionTopology,
         active: &'a TrustedActiveSequenceBinding,
-        submitted_operation_identity: &'a ExecutionIdentityEnvelope,
+        submitted_operation: &'a SubmittedOperationReceipt,
     ) -> Self {
         Self {
             run_id,
@@ -1242,10 +1247,42 @@ impl<'a> TrustedExecutionEventContext<'a> {
             active: Some(active),
             completed: None,
             aborted: None,
-            submitted_operation_identity: Some(submitted_operation_identity),
+            submitted_operation: Some(submitted_operation),
+            retired_operation: None,
             expected_failure: None,
             unsubmitted_recovery_identity: None,
         }
+    }
+
+    pub fn node_retired(
+        run_id: &'a RunId,
+        request_id: &'a RequestIdentity,
+        topology: &'a TrustedExecutionTopology,
+        active: &'a TrustedActiveSequenceBinding,
+        retired_operation: &'a OperationParticipantCompletionReceipt,
+    ) -> Self {
+        Self {
+            run_id,
+            request_id,
+            topology: Some(topology),
+            active: Some(active),
+            completed: None,
+            aborted: None,
+            submitted_operation: None,
+            retired_operation: Some(retired_operation),
+            expected_failure: None,
+            unsubmitted_recovery_identity: None,
+        }
+    }
+
+    fn replay_node_retired(
+        run_id: &'a RunId,
+        request_id: &'a RequestIdentity,
+        topology: &'a TrustedExecutionTopology,
+        active: &'a TrustedActiveSequenceBinding,
+        retired_operation: &'a OperationParticipantCompletionReceipt,
+    ) -> Self {
+        Self::node_retired(run_id, request_id, topology, active, retired_operation)
     }
 
     pub fn completed(
@@ -1262,7 +1299,8 @@ impl<'a> TrustedExecutionEventContext<'a> {
             active: Some(active),
             completed: Some(completed),
             aborted: None,
-            submitted_operation_identity: None,
+            submitted_operation: None,
+            retired_operation: None,
             expected_failure: None,
             unsubmitted_recovery_identity: None,
         }
@@ -1282,7 +1320,8 @@ impl<'a> TrustedExecutionEventContext<'a> {
             active: Some(active),
             completed: None,
             aborted: Some(aborted),
-            submitted_operation_identity: None,
+            submitted_operation: None,
+            retired_operation: None,
             expected_failure: None,
             unsubmitted_recovery_identity: None,
         }
@@ -1302,7 +1341,8 @@ impl<'a> TrustedExecutionEventContext<'a> {
             active,
             completed: None,
             aborted: None,
-            submitted_operation_identity: None,
+            submitted_operation: None,
+            retired_operation: None,
             expected_failure: Some(expected_failure),
             unsubmitted_recovery_identity: None,
         }
@@ -1323,7 +1363,8 @@ impl<'a> TrustedExecutionEventContext<'a> {
             active,
             completed: None,
             aborted: None,
-            submitted_operation_identity: None,
+            submitted_operation: None,
+            retired_operation: None,
             expected_failure: Some(expected_failure),
             unsubmitted_recovery_identity,
         }
@@ -1345,7 +1386,8 @@ impl<'a> TrustedExecutionEventContext<'a> {
             active: Some(active),
             completed,
             aborted,
-            submitted_operation_identity: None,
+            submitted_operation: None,
+            retired_operation: None,
             expected_failure: Some(expected_failure),
             unsubmitted_recovery_identity: None,
         }
@@ -1451,7 +1493,7 @@ fn validate_event_shape(
         ExecutionEventKind::FrameStarted
         | ExecutionEventKind::NodeStarted
         | ExecutionEventKind::OperationSubmitted
-        | ExecutionEventKind::NodeCompleted
+        | ExecutionEventKind::NodeRetired
         | ExecutionEventKind::FrameCompleted => phase == ExecutionPhase::Execution,
         ExecutionEventKind::FailureObserved => true,
         ExecutionEventKind::SequenceCompleted
@@ -1506,7 +1548,7 @@ fn validate_event_shape(
         ExecutionEventKind::FrameStarted | ExecutionEventKind::FrameCompleted => frame_shape,
         ExecutionEventKind::NodeStarted
         | ExecutionEventKind::OperationSubmitted
-        | ExecutionEventKind::NodeCompleted => node_shape,
+        | ExecutionEventKind::NodeRetired => node_shape,
         ExecutionEventKind::SequenceCompleted | ExecutionEventKind::RequestCompleted => {
             completed_shape
         }
@@ -1557,7 +1599,7 @@ fn validate_event_shape(
             | ExecutionEventKind::FrameStarted
             | ExecutionEventKind::NodeStarted
             | ExecutionEventKind::OperationSubmitted
-            | ExecutionEventKind::NodeCompleted
+            | ExecutionEventKind::NodeRetired
             | ExecutionEventKind::FrameCompleted
             | ExecutionEventKind::SequenceCompleted
             | ExecutionEventKind::SequenceAborted,
@@ -1739,9 +1781,12 @@ fn validate_event_against_context(
             ));
         }
     }
-    match (event.kind, context.submitted_operation_identity) {
-        (ExecutionEventKind::OperationSubmitted, Some(identity))
-            if identity == event.identity() => {}
+    match (event.kind, context.submitted_operation) {
+        (ExecutionEventKind::OperationSubmitted, Some(submission))
+            if submission
+                .participants()
+                .iter()
+                .any(|participant| participant.identity() == event.identity()) => {}
         (ExecutionEventKind::OperationSubmitted, _) => {
             return Err(invalid_event(
                 "OperationSubmitted lacks its exact external dispatch receipt",
@@ -1751,6 +1796,24 @@ fn validate_event_against_context(
         (_, Some(_)) => {
             return Err(invalid_event(
                 "operation submission receipt supplied for a different event kind",
+            ));
+        }
+    }
+    match (event.kind, context.retired_operation) {
+        (ExecutionEventKind::NodeRetired, Some(completion))
+            if same_operation_authority_except_observation(
+                event.identity().parts(),
+                completion.submission().identity().parts(),
+            ) => {}
+        (ExecutionEventKind::NodeRetired, _) => {
+            return Err(invalid_event(
+                "NodeRetired lacks its exact participant completion projection",
+            ));
+        }
+        (_, None) => {}
+        (_, Some(_)) => {
+            return Err(invalid_event(
+                "operation completion projection supplied for a different event kind",
             ));
         }
     }
@@ -2009,7 +2072,7 @@ impl ExecutionEventCursor {
                 self.start_node(ids, topology)?;
             }
             ExecutionEventKind::OperationSubmitted => self.submit_operation(ids)?,
-            ExecutionEventKind::NodeCompleted => self.complete_node(ids)?,
+            ExecutionEventKind::NodeRetired => self.retire_node(ids)?,
             ExecutionEventKind::FrameCompleted => {
                 let topology = self.require_topology(context)?;
                 self.require_active(context)?;
@@ -2205,7 +2268,7 @@ impl ExecutionEventCursor {
         Ok(())
     }
 
-    fn complete_node(&mut self, ids: &ExecutionIdentityParts) -> Result<(), VNextError> {
+    fn retire_node(&mut self, ids: &ExecutionIdentityParts) -> Result<(), VNextError> {
         let node_id = ids.node_id.as_ref().expect("node shape validated");
         let frame = self
             .frame
@@ -3744,12 +3807,52 @@ impl<'a> ReplayOperationTerminalRef<'a> {
         }
     }
 
-    fn identity(self) -> &'a ExecutionIdentityEnvelope {
+    fn batch_identity(self) -> &'a super::BatchOperationIdentity {
         match self {
-            Self::Completion(receipt) => receipt.submission().identity(),
-            Self::Drain(receipt) => receipt.identity(),
-            Self::Quarantine(receipt) => receipt.identity(),
+            Self::Completion(receipt) => receipt.submission().batch_identity(),
+            Self::Drain(receipt) => receipt.batch_identity(),
+            Self::Quarantine(receipt) => receipt.batch_identity(),
         }
+    }
+
+    fn participant_submission(
+        self,
+        identity: &ExecutionIdentityEnvelope,
+    ) -> Option<&'a SubmittedOperationParticipantReceipt> {
+        self.submission()?
+            .participants()
+            .iter()
+            .find(|participant| participant.identity() == identity)
+    }
+
+    fn submission(self) -> Option<&'a SubmittedOperationReceipt> {
+        match self {
+            Self::Completion(receipt) => Some(receipt.submission()),
+            Self::Drain(receipt) => receipt.submission(),
+            Self::Quarantine(receipt) => receipt.submission(),
+        }
+    }
+
+    fn participant_completion(
+        self,
+        identity: &ExecutionIdentityEnvelope,
+    ) -> Option<&'a OperationParticipantCompletionReceipt> {
+        match self {
+            Self::Completion(receipt) => receipt.participants().iter().find(|participant| {
+                same_operation_authority_except_observation(
+                    identity.parts(),
+                    participant.submission().identity().parts(),
+                )
+            }),
+            Self::Drain(_) | Self::Quarantine(_) => None,
+        }
+    }
+
+    fn contains_identity(self, identity: &ExecutionIdentityEnvelope) -> bool {
+        self.batch_identity()
+            .participants()
+            .iter()
+            .any(|participant| participant.identity() == identity)
     }
 
     fn had_submission_fence(self) -> bool {
@@ -3760,23 +3863,30 @@ impl<'a> ReplayOperationTerminalRef<'a> {
         }
     }
 
-    fn exact_failed_completion(self) -> Option<&'a IdentifiedFailure> {
-        match self {
-            Self::Completion(receipt) => match receipt.disposition() {
-                OperationCompletionDisposition::FailedButQuiescent(failure) => Some(failure),
-                OperationCompletionDisposition::Succeeded
-                | OperationCompletionDisposition::ContractFailedButQuiescent(_) => None,
-            },
-            Self::Drain(_) | Self::Quarantine(_) => None,
-        }
+    fn exact_failed_completion(
+        self,
+        identity: &ExecutionIdentityEnvelope,
+    ) -> Option<&'a IdentifiedFailure> {
+        self.participant_completion(identity)
+            .and_then(|participant| match participant.disposition() {
+                super::OperationParticipantCompletionDisposition::FailedButQuiescent(failure) => {
+                    Some(failure)
+                }
+                super::OperationParticipantCompletionDisposition::Succeeded
+                | super::OperationParticipantCompletionDisposition::ContractFailedButQuiescent(
+                    _,
+                ) => None,
+            })
     }
 
-    fn is_success(self) -> bool {
-        matches!(
-            self,
-            Self::Completion(receipt)
-                if matches!(receipt.disposition(), OperationCompletionDisposition::Succeeded)
-        )
+    fn participant_is_success(self, identity: &ExecutionIdentityEnvelope) -> bool {
+        self.participant_completion(identity)
+            .is_some_and(|participant| {
+                matches!(
+                    participant.disposition(),
+                    super::OperationParticipantCompletionDisposition::Succeeded
+                )
+            })
     }
 }
 
@@ -4142,7 +4252,7 @@ impl ReplayIdentity {
                         .iter()
                         .filter(|(_, terminal)| {
                             !terminal.had_submission_fence()
-                                && terminal.identity() == failure.identity()
+                                && terminal.contains_identity(failure.identity())
                         })
                         .collect::<Vec<_>>();
                     if unsubmitted_recoveries.len() > 1 {
@@ -4161,9 +4271,7 @@ impl ReplayIdentity {
                             .then_some(&topology),
                         has_active(event.identity.parts()).then_some(active),
                         failure,
-                        unsubmitted_recoveries
-                            .first()
-                            .map(|(_, terminal)| terminal.identity()),
+                        unsubmitted_recoveries.first().map(|_| failure.identity()),
                     )
                 }
                 ExecutionEventKind::RequestFailed => match &event.detail {
@@ -4206,9 +4314,15 @@ impl ReplayIdentity {
                 ExecutionEventKind::OperationSubmitted => {
                     let matches = operation_terminals
                         .iter()
-                        .filter(|(_, terminal)| {
-                            terminal.had_submission_fence()
-                                && terminal.identity() == event.identity()
+                        .filter_map(|(key, terminal)| {
+                            terminal
+                                .had_submission_fence()
+                                .then(|| {
+                                    terminal
+                                        .participant_submission(event.identity())
+                                        .map(|participant| (*key, participant))
+                                })
+                                .flatten()
                         })
                         .collect::<Vec<_>>();
                     if matches.len() != 1 || !used_submitted_terminals.insert(matches[0].0) {
@@ -4221,7 +4335,33 @@ impl ReplayIdentity {
                         request_id,
                         &topology,
                         active,
-                        matches[0].1.identity(),
+                        operation_terminals
+                            .iter()
+                            .find(|(key, _)| *key == matches[0].0)
+                            .and_then(|(_, terminal)| terminal.submission())
+                            .expect("matched submitted participant has a batch receipt"),
+                    )
+                }
+                ExecutionEventKind::NodeRetired => {
+                    let matches = operation_terminals
+                        .iter()
+                        .filter_map(|(key, terminal)| {
+                            terminal
+                                .participant_completion(event.identity())
+                                .map(|participant| (*key, participant))
+                        })
+                        .collect::<Vec<_>>();
+                    if matches.len() != 1 || !used_submitted_terminals.contains(&matches[0].0) {
+                        return Err(invalid_event(
+                            "replay NodeRetired lacks the exact submitted batch completion projection",
+                        ));
+                    }
+                    TrustedExecutionEventContext::replay_node_retired(
+                        run_id,
+                        request_id,
+                        &topology,
+                        active,
+                        matches[0].1,
                     )
                 }
                 ExecutionEventKind::SequenceCompleted | ExecutionEventKind::RequestCompleted => {
@@ -4273,15 +4413,40 @@ impl ReplayIdentity {
             .iter()
             .filter(|failure| has_active(failure.identity().parts()))
             .collect::<Vec<_>>();
+        let submitted_identities = evidence
+            .request_journal
+            .iter()
+            .filter(|event| event.kind == ExecutionEventKind::OperationSubmitted)
+            .map(ExecutionEvent::identity)
+            .collect::<Vec<_>>();
         let mut used_operation_failures = BTreeSet::new();
         let request_failed = terminal.kind == ExecutionEventKind::RequestFailed;
         for (_, operation_terminal) in &operation_terminals {
+            let mut relevant_identities = submitted_identities
+                .iter()
+                .copied()
+                .filter(|identity| operation_terminal.contains_identity(identity))
+                .collect::<Vec<_>>();
+            if relevant_identities.is_empty() {
+                relevant_identities.extend(
+                    operation_failures
+                        .iter()
+                        .map(|failure| failure.identity())
+                        .filter(|identity| operation_terminal.contains_identity(identity)),
+                );
+            }
+            if relevant_identities.len() != 1 {
+                return Err(invalid_event(
+                    "operation terminal evidence has no unique participant projection in this request journal",
+                ));
+            }
+            let operation_identity = relevant_identities[0];
             let matching_failures = operation_failures
                 .iter()
                 .enumerate()
-                .filter(|(_, failure)| failure.identity() == operation_terminal.identity())
+                .filter(|(_, failure)| failure.identity() == operation_identity)
                 .collect::<Vec<_>>();
-            if operation_terminal.is_success() {
+            if operation_terminal.participant_is_success(operation_identity) {
                 if !matching_failures.is_empty() {
                     return Err(invalid_event(
                         "successful operation completion coexists with a failure for the same submitted operation",
@@ -4294,8 +4459,10 @@ impl ReplayIdentity {
                     "non-success operation terminal evidence requires one exact operation failure and RequestFailed",
                 ));
             }
-            if let Some(expected_failure) = operation_terminal.exact_failed_completion() {
-                if expected_failure.identity() != operation_terminal.identity()
+            if let Some(expected_failure) =
+                operation_terminal.exact_failed_completion(operation_identity)
+            {
+                if expected_failure.identity() != operation_identity
                     || *matching_failures[0].1 != expected_failure
                 {
                     return Err(invalid_event(
@@ -4664,7 +4831,7 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         let requires_live_sequence = matches!(
             event.kind,
             ExecutionEventKind::OperationSubmitted
-                | ExecutionEventKind::NodeCompleted
+                | ExecutionEventKind::NodeRetired
                 | ExecutionEventKind::FrameCompleted
         ) || event.kind == ExecutionEventKind::FailureObserved
             && has_active(event.identity.parts());
