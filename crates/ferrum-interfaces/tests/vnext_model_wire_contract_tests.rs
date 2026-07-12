@@ -909,5 +909,5 @@ fn prepared_model_family_wire_proof_line() {
     );
 
     assert_eq!(passed, EXPECTED);
-    println!("VNEXT MODEL WIRE PASS: {passed}/{EXPECTED}");
+    println!("\nVNEXT MODEL WIRE PASS: {passed}/{EXPECTED}");
 }

@@ -3795,5 +3795,5 @@ fn device_and_operation_contract_is_exhaustive() {
     completion_reaper_owns_invocations_until_quiescent_terminal(&mut passed);
     thirty_two_participant_dispatch_is_one_physical_submission();
     assert_eq!(passed, EXPECTED_CASES);
-    println!("VNEXT DEVICE OPERATION PASS: {passed}/{EXPECTED_CASES}");
+    println!("\nVNEXT DEVICE OPERATION PASS: {passed}/{EXPECTED_CASES}");
 }

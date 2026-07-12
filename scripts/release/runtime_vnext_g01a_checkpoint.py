@@ -65,10 +65,10 @@ G01A_MULTIPARTICIPANT_DISPATCH_MARKERS = {
     "batched_invocation_body": "BatchedOperationInvocation",
 }
 REQUIRED_UNIT_TESTS = {
-    "adversarial_runtime_policy_and_workspace_fanout_fail_before_materialization",
     "blocked_tensor_storage_requires_explicit_exact_or_zero_fill_padding",
     "blocked_weight_layout_requires_explicit_exact_or_zero_fill_padding",
     "breaking_schema_versions_are_rejected_100_of_100",
+    "dynamic_descriptor_and_memory_plan_standalone_wire_are_checked",
     "execution_alias_effect_wire_mutations_are_rejected",
     "execution_alias_may_alias_supports_distinct_or_exact_storage",
     "execution_alias_must_alias_builds_exact_equivalence_and_single_allocation",
@@ -84,6 +84,8 @@ REQUIRED_UNIT_TESTS = {
     "forged_self_hashed_plan_is_rejected_by_semantic_rebuild",
     "generic_contracts_have_zero_architecture_names",
     "mandatory_object_safe_contracts_accept_trait_objects",
+    "maximum_active_sequence_ceiling_is_nonzero_and_o_graph",
+    "minimum_runnable_sums_lifetime_minima_and_sequential_invocation_peak",
     "model_program_rejects_duplicate_declared_outputs",
     "operation_resource_contract_requires_explicit_presence_and_alignment",
     "physical_weight_layout_tree_accepts_dense_fixture",
@@ -96,6 +98,7 @@ REQUIRED_UNIT_TESTS = {
     "provider_catalog_and_reference_oracle_fail_closed",
     "provider_implementation_fingerprint_is_plan_hashed_and_revalidated",
     "provider_raw_estimate_identity_input_and_output_are_revalidated_by_core",
+    "provider_workspace_formulas_are_actual_shape_checked_and_wire_closed",
     "resolution_source_matrix_rejects_forbidden_binding_before_plan",
     "resolved_external_device_catalog_runtime_and_node_resolution_are_exact",
     "resolved_model_family_identity_is_unique_and_fail_closed",
@@ -104,10 +107,12 @@ REQUIRED_UNIT_TESTS = {
     "resolved_source_evidence_rejects_raw_bytes_and_provenance_tampering",
     "resolved_source_parser_identity_and_determinism_are_enforced",
     "runtime_capacity_reserve_and_concurrency_are_typed_planning_inputs",
-    "runtime_active_sequence_limit_accepts_boundary_and_rejects_out_of_range",
     "self_consistent_wire_provider_selection_is_rejected",
     "self_consistent_wire_resource_estimate_and_memory_mutation_is_rejected",
     "silent_success_defaults_are_absent",
+    "state_capacity_demand_is_explicit_checked_and_wire_closed",
+    "storage_incompatible_preference_falls_back_with_canonical_evidence",
+    "theoretical_ceiling_over_u64_is_canonical_evidence_not_capacity_policy",
     "typed_planning_registry_invokes_real_contract_and_estimator_once",
     "unknown_inputs_fail_closed",
     "weight_schema_order_is_normalized_before_fingerprinting",
@@ -235,12 +240,15 @@ BOUNDED_TEST_ENV_OVERRIDES = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "CARGO_BUILD_JOBS": "2",
 }
+# These process-group limits include cargo and rustc workers as well as the
+# test binary. A 32/16 ceiling admits the observed 22/12 cold-compile peak while
+# still terminating runaway test concurrency hundreds of times before 8192.
 BOUNDED_TEST_PROFILES = {
     "regular": {
         "wall_timeout_seconds": 120.0,
         "max_processes": 4,
-        "max_group_threads": 16,
-        "max_per_process_threads": 8,
+        "max_group_threads": 32,
+        "max_per_process_threads": 16,
         "sample_interval_seconds": 0.05,
         "max_sampling_errors": 3,
         "term_grace_seconds": 1.0,
@@ -260,8 +268,8 @@ BOUNDED_TEST_PROFILES = {
     "resource": {
         "wall_timeout_seconds": 60.0,
         "max_processes": 4,
-        "max_group_threads": 12,
-        "max_per_process_threads": 8,
+        "max_group_threads": 32,
+        "max_per_process_threads": 16,
         "sample_interval_seconds": 0.05,
         "max_sampling_errors": 3,
         "term_grace_seconds": 1.0,
@@ -2047,6 +2055,33 @@ def validate_test_run(row: dict[str, Any], label: str, expected_count: int) -> N
     )
 
 
+def validate_resource_test_run(
+    row: dict[str, Any], label: str, expected_count: int
+) -> None:
+    stdout = require_string(row.get("stdout"), f"{label}.stdout")
+    summaries = [
+        tuple(int(value) for value in match)
+        for match in re.findall(
+            r"test result: ok\. (\d+) passed; 0 failed; (\d+) ignored; "
+            r"(\d+) measured; (\d+) filtered out;",
+            stdout,
+        )
+    ]
+    expected = [
+        (1, 0, 0, expected_count - 1),
+        (expected_count, 0, 0, 0),
+    ]
+    require(
+        summaries == expected,
+        f"{label} must contain one exact panic-isolation child summary and one parent summary: "
+        f"expected={expected} actual={summaries}",
+    )
+    require(
+        stdout.count("test resource_transaction_abandon_panic_child ... ok") == 2,
+        f"{label} must run the panic-isolation test once in the parent and once in its child",
+    )
+
+
 def validate_admission_test_list(row: dict[str, Any], label: str) -> set[str]:
     stdout = require_string(row.get("stdout"), f"{label}.stdout")
     tests = {
@@ -2240,7 +2275,12 @@ def collect_compile_evidence(
         )
         tests_by_target[target] = listed
         run_row = rows_by_command[test_command(target, "--nocapture")]
-        validate_test_run(run_row, f"{target} tests", len(expected_tests))
+        if target == "vnext_resource_contract_tests":
+            validate_resource_test_run(
+                run_row, f"{target} tests", len(expected_tests)
+            )
+        else:
+            validate_test_run(run_row, f"{target} tests", len(expected_tests))
         stdout_by_target[target] = run_row["stdout"]
     admission_tests = validate_admission_test_list(
         rows_by_command[admission_test_command("--list")],
@@ -3060,6 +3100,35 @@ impl OperationDispatch {
         and bounded_profile_for_command(admission_test_command("--nocapture"))
         == "admission",
         "self-test admission commands must use the bounded cold-compile profile",
+    )
+    resource_summary_row = {
+        "stdout": "\n".join(
+            [
+                "test resource_transaction_abandon_panic_child ... ok",
+                "test resource_transaction_abandon_panic_child ... ok",
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out;",
+                "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;",
+            ]
+        )
+    }
+    validate_resource_test_run(
+        resource_summary_row,
+        "self-test resource child summary",
+        len(REQUIRED_RESOURCE_TESTS),
+    )
+    missing_resource_child = copy.deepcopy(resource_summary_row)
+    missing_resource_child["stdout"] = missing_resource_child["stdout"].replace(
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out;\n",
+        "",
+    )
+    expect_rejected(
+        "missing resource panic-isolation child summary",
+        lambda: validate_resource_test_run(
+            missing_resource_child,
+            "self-test missing resource child summary",
+            len(REQUIRED_RESOURCE_TESTS),
+        ),
+        "must contain one exact panic-isolation child summary",
     )
     bounded_row = selftest_bounded_row(
         list(test_command("vnext_resource_contract_tests", "--nocapture"))

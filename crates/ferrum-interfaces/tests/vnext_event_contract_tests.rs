@@ -6077,7 +6077,7 @@ fn vnext_event_replay_v5_contract() {
     no_static_replay_requires_explicit_root_cleanup();
 
     assert_eq!(passed, EXPECTED_CASES);
-    println!("VNEXT EVENT/REPLAY V5 PASS: {passed}/{EXPECTED_CASES}");
+    println!("\nVNEXT EVENT/REPLAY V5 PASS: {passed}/{EXPECTED_CASES}");
 }
 
 fn no_static_replay_requires_explicit_root_cleanup() {
