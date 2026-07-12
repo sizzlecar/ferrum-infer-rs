@@ -6019,47 +6019,126 @@ def self_test() -> int:
         rejected_mutations.add("runner-identity")
 
         canonical_catalog = validate_expectations_catalog(read_json(EXPECTATIONS_PATH))
-        m1_rows = planned_case_rows("m1-qwen35-4b", "cuda", canonical_catalog)
-        require(len(m1_rows) == 703, "M1 CUDA locked expectation matrix size drift")
-        m1_status_counts: dict[str, int] = {}
-        m1_failure_counts: dict[str, int] = {}
-        for row in m1_rows:
-            expectation = row["expectation"]
-            status = expectation["expected_status"]
-            m1_status_counts[status] = m1_status_counts.get(status, 0) + 1
-            failure_class = expectation["failure_class"]
-            if failure_class is not None:
-                m1_failure_counts[failure_class] = m1_failure_counts.get(failure_class, 0) + 1
-        require(
-            m1_status_counts == {"pass": 461, "known-fail": 242},
-            "M1 CUDA locked expectation status distribution drift",
-        )
-        require(
-            m1_failure_counts
-            == {
-                "c01-contract-violation": 20,
-                "c03-contract-violation": 4,
-                "c04-contract-violation": 3,
-                "c09-contract-violation": 60,
-                "c14-contract-violation": 20,
-                "c15-contract-violation": 5,
-                "c16-contract-violation": 6,
-                "c17-contract-violation": 50,
-                "c18-contract-violation": 4,
-                "c19-contract-violation": 16,
-                "c20-contract-violation": 50,
-                "c21-contract-violation": 4,
+        m3_failure_counts = {
+            "c01-contract-violation": 20,
+            "c03-contract-violation": 5,
+            "c04-contract-violation": 3,
+            "c05-contract-violation": 20,
+            "c06-contract-violation": 20,
+            "c07-contract-violation": 6,
+            "c09-contract-violation": 60,
+            "c10-contract-violation": 60,
+            "c11-contract-violation": 60,
+            "c12-contract-violation": 60,
+            "c13-contract-violation": 60,
+            "c14-contract-violation": 70,
+            "c15-contract-violation": 70,
+            "c17-contract-violation": 60,
+            "c19-contract-violation": 20,
+            "c20-contract-violation": 50,
+            "c21-contract-violation": 16,
+        }
+        locked_lanes = {
+            ("m1-qwen35-4b", "cuda"): {
+                "case_count": 703,
+                "status_counts": {"pass": 461, "known-fail": 242},
+                "failure_counts": {
+                    "c01-contract-violation": 20,
+                    "c03-contract-violation": 4,
+                    "c04-contract-violation": 3,
+                    "c09-contract-violation": 60,
+                    "c14-contract-violation": 20,
+                    "c15-contract-violation": 5,
+                    "c16-contract-violation": 6,
+                    "c17-contract-violation": 50,
+                    "c18-contract-violation": 4,
+                    "c19-contract-violation": 16,
+                    "c20-contract-violation": 50,
+                    "c21-contract-violation": 4,
+                },
             },
-            "M1 CUDA locked expectation failure-class distribution drift",
-        )
+            ("m2-qwen35-35b-a3b", "cuda"): {
+                "case_count": 703,
+                "status_counts": {"pass": 114, "known-fail": 589},
+                "failure_counts": {
+                    "c01-contract-violation": 20,
+                    "c03-contract-violation": 10,
+                    "c04-contract-violation": 3,
+                    "c05-contract-violation": 20,
+                    "c06-contract-violation": 20,
+                    "c07-contract-violation": 6,
+                    "c09-contract-violation": 60,
+                    "c10-contract-violation": 40,
+                    "c11-contract-violation": 40,
+                    "c12-contract-violation": 40,
+                    "c13-contract-violation": 40,
+                    "c14-contract-violation": 70,
+                    "c15-contract-violation": 70,
+                    "c17-contract-violation": 60,
+                    "c18-contract-violation": 4,
+                    "c19-contract-violation": 20,
+                    "c20-contract-violation": 50,
+                    "c21-contract-violation": 16,
+                },
+            },
+            ("m3-qwen3-30b-a3b", "cuda"): {
+                "case_count": 783,
+                "status_counts": {"pass": 119, "known-fail": 664},
+                "failure_counts": {**m3_failure_counts, "c18-contract-violation": 4},
+            },
+            ("m3-qwen3-30b-a3b", "metal"): {
+                "case_count": 782,
+                "status_counts": {"pass": 119, "known-fail": 663},
+                "failure_counts": {**m3_failure_counts, "c18-contract-violation": 3},
+            },
+        }
+        for (model_key, backend), locked in locked_lanes.items():
+            rows = planned_case_rows(model_key, backend, canonical_catalog)
+            require(len(rows) == locked["case_count"], f"{model_key}/{backend} locked expectation matrix size drift")
+            status_counts: dict[str, int] = {}
+            failure_counts: dict[str, int] = {}
+            for row in rows:
+                expectation = row["expectation"]
+                status = expectation["expected_status"]
+                status_counts[status] = status_counts.get(status, 0) + 1
+                failure_class = expectation["failure_class"]
+                if failure_class is not None:
+                    failure_counts[failure_class] = failure_counts.get(failure_class, 0) + 1
+            require(status_counts == locked["status_counts"], f"{model_key}/{backend} locked status distribution drift")
+            require(failure_counts == locked["failure_counts"], f"{model_key}/{backend} locked failure distribution drift")
+
+        discovery_catalog = copy.deepcopy(canonical_catalog)
+        discovery_catalog["lanes"]["m2-qwen35-35b-a3b/cuda"]["rules"] = [
+            {
+                "selector": {
+                    "scenario_id": "*",
+                    "variant": "*",
+                    "preset": "*",
+                    "entrypoint": "*",
+                    "case_id": "*",
+                },
+                "expected_status": "discovery-required",
+                "failure_class": "g00-case-contract-not-previously-observed",
+                "downstream_goal": "G08B",
+                "owner": "discovery-guard-fixture",
+                "evidence_basis": "Mutation fixture requires discovery before formal collection.",
+                "next_action": "Run discovery and review an expectation amendment.",
+            }
+        ]
+        validate_expectations_catalog(discovery_catalog)
         unresolved = [
             row
-            for row in planned_case_rows("m2-qwen35-35b-a3b", "cuda", canonical_catalog)
+            for row in planned_case_rows("m2-qwen35-35b-a3b", "cuda", discovery_catalog)
             if row["expectation"]["expected_status"] == "discovery-required"
         ]
-        require(unresolved, "discovery-required guard fixture unexpectedly resolved every M2 CUDA case")
-        for model_key in ("m1-qwen35-4b", "m2-qwen35-35b-a3b"):
-            lane_key = f"{model_key}/cuda"
+        require(len(unresolved) == 703, "discovery-required guard fixture did not cover the complete M2 CUDA lane")
+        for model_key, backend, downstream_goal in (
+            ("m1-qwen35-4b", "cuda", "G08A"),
+            ("m2-qwen35-35b-a3b", "cuda", "G08B"),
+            ("m3-qwen3-30b-a3b", "cuda", "G08C"),
+            ("m3-qwen3-30b-a3b", "metal", "G08C"),
+        ):
+            lane_key = f"{model_key}/{backend}"
             blocked_catalog = copy.deepcopy(canonical_catalog)
             blocked_catalog["lanes"][lane_key]["rules"] = [
                 {
@@ -6072,9 +6151,9 @@ def self_test() -> int:
                     },
                     "expected_status": "blocked",
                     "failure_class": "legacy-model-backend-unsupported",
-                    "downstream_goal": "G08A" if model_key == "m1-qwen35-4b" else "G08B",
+                    "downstream_goal": downstream_goal,
                     "owner": "red-team-fixture",
-                    "evidence_basis": "Hand-authored whole-lane blocker must not replace CUDA execution.",
+                    "evidence_basis": "Hand-authored whole-lane blocker must not replace executable product evidence.",
                     "next_action": "Run discovery and formal product cases.",
                 }
             ]
@@ -6084,7 +6163,7 @@ def self_test() -> int:
                 require("cannot use blocked for executable lane" in str(exc), f"{lane_key} blocked mutation rejected for unexpected reason: {exc}")
             else:
                 raise AssertionError(f"{lane_key} hand-authored blocked lane unexpectedly passed")
-            rejected_mutations.add(f"{model_key}-cuda-blocked-lane")
+            rejected_mutations.add(f"{model_key}-{backend}-blocked-lane")
 
         required_rejections = {
             "command-receipt-environment-divergence",
@@ -6114,6 +6193,8 @@ def self_test() -> int:
             "runner-identity",
             "m1-qwen35-4b-cuda-blocked-lane",
             "m2-qwen35-35b-a3b-cuda-blocked-lane",
+            "m3-qwen3-30b-a3b-cuda-blocked-lane",
+            "m3-qwen3-30b-a3b-metal-blocked-lane",
         }
         require(rejected_mutations == required_rejections, "self-test did not reject the complete mutation corpus")
     print(SELFTEST_PASS_LINE)
