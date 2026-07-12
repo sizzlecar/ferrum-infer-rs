@@ -3598,13 +3598,34 @@ def validate_local_source_root(raw: Any, source: dict[str, Any], label: str) -> 
     root = Path(require_string(raw, label)).expanduser().resolve()
     require(root.is_dir(), f"{label} is not a local directory")
     for rel, digest in source["files"].items():
-        path = (root / rel).resolve()
+        path = root / rel
         try:
-            path.relative_to(root)
+            path.absolute().relative_to(root)
         except ValueError as exc:
             raise ScenarioError(f"{label} file escapes its root: {rel}") from exc
         require(path.is_file() and file_sha256(path) == digest, f"{label} locked file missing or SHA mismatch: {rel}")
     return root
+
+
+def validate_local_model_arg(raw: Any, weight_files: dict[str, str], label: str) -> Path:
+    supplied = Path(require_string(raw, label)).expanduser().absolute()
+    require(supplied.exists(), f"{label} does not exist")
+    if supplied.is_file():
+        require(len(weight_files) == 1, f"{label} is a file, but the locked model has {len(weight_files)} files")
+        rel, digest = next(iter(weight_files.items()))
+        require(supplied.name == Path(rel).name, f"{label} filename differs from the locked model file: {rel}")
+        require(file_sha256(supplied) == digest, f"{label} locked weight SHA mismatch: {rel}")
+        return supplied
+    require(supplied.is_dir(), f"{label} is neither a model file nor directory")
+    root = supplied.resolve()
+    for rel, digest in weight_files.items():
+        path = root / rel
+        try:
+            path.absolute().relative_to(root)
+        except ValueError as exc:
+            raise ScenarioError(f"{label} weight escapes its root: {rel}") from exc
+        require(path.is_file() and file_sha256(path) == digest, f"{label} locked weight missing or SHA mismatch: {rel}")
+    return supplied
 
 
 def validate_execution_manifest(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
@@ -3641,6 +3662,7 @@ def validate_execution_manifest(manifest: dict[str, Any], root: Path) -> dict[st
     sources = locked_execution_sources(require_object(models_lock_document, "execution_manifest models.lock JSON"), manifest["model_key"], manifest["backend"])
     require(manifest["model_revision"] == sources["weight_revision"], "execution manifest model_revision differs from models.lock weight revision")
     require(manifest["model_files"] == sources["weight_files"], "execution manifest model_files must contain exactly the selected weight lock")
+    model_path = validate_local_model_arg(execution.get("model_arg"), sources["weight_files"], "execution_manifest.execution.model_arg")
     semantic_root = validate_local_source_root(execution.get("semantic_source_root"), sources["semantic_source"], "execution_manifest.execution.semantic_source_root")
     if sources["tokenizer_source"] is None:
         require(execution.get("tokenizer_source_root") in {None, str(semantic_root)}, "execution manifest has an undeclared tokenizer source root")
@@ -3653,6 +3675,7 @@ def validate_execution_manifest(manifest: dict[str, Any], root: Path) -> dict[st
         "effective_path": effective_path,
         "execution": execution,
         "sources": sources,
+        "model_path": model_path,
         "semantic_root": semantic_root,
         "tokenizer_root": tokenizer_root,
     }
@@ -5150,6 +5173,7 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
     model_dir = root / "models/fixture-model"
     config_path = model_dir / "config.json"
     tokenizer_path = model_dir / "tokenizer_config.json"
+    weight_path = model_dir / "weights.gguf"
     write_json(
         config_path,
         {
@@ -5168,6 +5192,8 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
             "fixture_tokenizer_extension": True,
         },
     )
+    weight_path.write_bytes(b"GGUF fixture weight bytes\n")
+    weight_sha = file_sha256(weight_path)
     semantic_repo = "internal/fixture-semantic"
     semantic_revision = "3" * 40
     template_text = read_json(tokenizer_path)["chat_template"]
@@ -5194,7 +5220,7 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
                         "cuda": {
                             "revision": "1" * 40,
                             "format": "gptq_int4",
-                            "files": [{"path": "weights.gguf", "sha256": "2" * 64}],
+                            "files": [{"path": "weights.gguf", "sha256": weight_sha}],
                             "semantic_source": {
                                 "repo": semantic_repo,
                                 "revision": semantic_revision,
@@ -5230,7 +5256,7 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
         "model_key": "m3-qwen3-30b-a3b",
         "backend": "cuda",
         "model_revision": "1" * 40,
-        "model_files": {"weights.gguf": "2" * 64},
+        "model_files": {"weights.gguf": weight_sha},
         "hardware_id": "cuda-fixture",
     }
     write_json(
@@ -5423,6 +5449,16 @@ def self_test() -> int:
         execution_root = Path(tmp) / "execution-artifacts"
         execution_root.mkdir()
         execution_manifest = make_execution_fixture_manifest(execution_root)
+        fixture_weight = Path(execution_manifest["execution"]["model_arg"]) / "weights.gguf"
+        fixture_weight_bytes = fixture_weight.read_bytes()
+        fixture_weight.write_bytes(fixture_weight_bytes + b"tampered")
+        try:
+            validate_execution_manifest(execution_manifest, execution_root)
+        except ScenarioError as exc:
+            require("locked weight missing or SHA mismatch" in str(exc), f"weight mutation used unexpected rejection: {exc}")
+        else:
+            raise AssertionError("execution manifest accepted mutated model bytes")
+        fixture_weight.write_bytes(fixture_weight_bytes)
         execution_out = execution_root / "correctness/m3-qwen3-30b-a3b/cuda/scenario-report.json"
         hostile_key = "FERRUM_HOSTILE_PARENT_SWITCH"
         previous_hostile = os.environ.get(hostile_key)
