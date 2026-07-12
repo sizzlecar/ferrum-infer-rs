@@ -3813,8 +3813,11 @@ def execute_manifest(
     out: Path,
     *,
     discover: bool,
+    discovery_scenario: str | None = None,
     allow_internal_fixture: bool = False,
 ) -> dict[str, Any]:
+    require(discovery_scenario is None or discover, "scenario-scoped execution is allowed only in discovery mode")
+    require(discovery_scenario in {None, "C03"}, "only the versioned C03 contract supports scoped discovery")
     root = root.resolve()
     out = out.resolve()
     validated = validate_execution_manifest(manifest, root)
@@ -3828,6 +3831,9 @@ def execute_manifest(
     if not allow_internal_fixture:
         require(expectations_sha == canonical_expectations_sha256(), "execution used a non-canonical expectations catalog")
     rows = planned_case_rows(manifest["model_key"], manifest["backend"], catalog)
+    if discovery_scenario is not None:
+        rows = [row for row in rows if row["scenario_id"] == discovery_scenario]
+        require(len(rows) == 10, "scoped C03 discovery must execute the complete 10-case contract")
     unresolved = [row for row in rows if row["expectation"]["expected_status"] == "discovery-required"]
     if unresolved and not discover:
         raise ScenarioError(f"canonical collection refused: {len(unresolved)} cases remain discovery-required; run --discover first")
@@ -3836,7 +3842,17 @@ def execute_manifest(
     input_manifest_path = executor_root / "scenario-execution-manifest.snapshot.json"
     write_json(input_manifest_path, manifest)
     invocation_argv = (
-        [str(RUNNER_PATH), "--manifest", str(input_manifest_path), "--artifact-root", str(root), "--out", str(out), *(["--discover"] if discover else [])]
+        [
+            str(RUNNER_PATH),
+            "--manifest",
+            str(input_manifest_path),
+            "--artifact-root",
+            str(root),
+            "--out",
+            str(out),
+            *(["--discover"] if discover else []),
+            *(["--discover-scenario", discovery_scenario] if discovery_scenario is not None else []),
+        ]
         if allow_internal_fixture
         else [str(Path(sys.argv[0]).resolve()), *sys.argv[1:]]
     )
@@ -3844,6 +3860,7 @@ def execute_manifest(
         require(Path(invocation_argv[0]).resolve() == RUNNER_PATH, "canonical executor must be entered through the checked-in runner main")
         require("--manifest" in invocation_argv and "--artifact-root" in invocation_argv and "--out" in invocation_argv, "canonical executor invocation argv incomplete")
         require(("--discover" in invocation_argv) is discover, "canonical executor mode differs from actual invocation argv")
+        require(("--discover-scenario" in invocation_argv) is (discovery_scenario is not None), "canonical executor discovery scope differs from actual invocation argv")
     invocation_process_receipt = capture_process_receipt(
         root,
         executor_root / "scenario-executor-process-receipt.json",
@@ -4133,6 +4150,18 @@ def execute_manifest(
             "observations": [existing_artifact_ref(root, root / ref["path"], "raw-json") for refs in case_refs_by_scenario.values() for ref in refs],
             "artifact_path": str(out),
             "formal_pass_allowed": False,
+            **(
+                {
+                    "scope": {
+                        "kind": "scenario-contract",
+                        "scenario_id": "C03",
+                        "contract_id": C03_CONTRACT_ID,
+                        "expected_case_count": 10,
+                    }
+                }
+                if discovery_scenario is not None
+                else {}
+            ),
         }
         return discovery
     require(server is not None, f"canonical serve session unavailable: {server_error}")
@@ -5873,6 +5902,57 @@ def self_test() -> int:
                 f"{model_key} C19 does not distinguish soft-command misuse from Qwen3 soft switches",
             )
 
+        scoped_root = Path(tmp) / "scoped-discovery-artifacts"
+        scoped_root.mkdir()
+        scoped_manifest = make_execution_fixture_manifest(scoped_root)
+        scoped_out = scoped_root / "discovery/m3-qwen3-30b-a3b/cuda/scenario-report.json"
+        scoped_report = execute_manifest(
+            scoped_manifest,
+            scoped_root,
+            scoped_out,
+            discover=True,
+            discovery_scenario="C03",
+            allow_internal_fixture=True,
+        )
+        write_json(scoped_out, scoped_report)
+        require(
+            scoped_report.get("scope")
+            == {
+                "kind": "scenario-contract",
+                "scenario_id": "C03",
+                "contract_id": C03_CONTRACT_ID,
+                "expected_case_count": 10,
+            },
+            "scoped discovery report contract drift",
+        )
+        scoped_observations = require_list(scoped_report.get("observations"), "scoped discovery observations")
+        require(scoped_report.get("case_count") == len(scoped_observations) == 10, "scoped discovery did not execute exactly ten cases")
+        scoped_cases = [read_json(scoped_root / require_object(ref, "scoped observation")["path"]) for ref in scoped_observations]
+        require(
+            {case.get("case_id") for case in scoped_cases} == {f"c03-{index:03d}" for index in range(1, 11)}
+            and {case.get("scenario_id") for case in scoped_cases} == {"C03"},
+            "scoped discovery observation matrix drift",
+        )
+        scoped_invocation = read_json(scoped_root / require_object(scoped_report.get("executor_invocation"), "scoped invocation")["path"])
+        require(
+            "--discover-scenario" in scoped_invocation["argv"]
+            and scoped_invocation["argv"][scoped_invocation["argv"].index("--discover-scenario") + 1] == "C03",
+            "scoped discovery invocation lacks its C03 selector",
+        )
+        try:
+            execute_manifest(
+                scoped_manifest,
+                scoped_root,
+                scoped_out,
+                discover=False,
+                discovery_scenario="C03",
+                allow_internal_fixture=True,
+            )
+        except ScenarioError as exc:
+            require("only in discovery mode" in str(exc), f"canonical scope rejection used unexpected reason: {exc}")
+        else:
+            raise AssertionError("canonical execution accepted a discovery scenario filter")
+
         rejected_mutations: set[str] = set()
 
         candidate = copy.deepcopy(execution_report)
@@ -6399,10 +6479,13 @@ def main() -> int:
     parser.add_argument("--artifact-root", type=Path)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--discover", action="store_true")
+    parser.add_argument("--discover-scenario", choices=("C03",))
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
+    if args.discover_scenario is not None and not args.discover:
+        parser.error("--discover-scenario requires --discover")
     if args.manifest is None or args.artifact_root is None or args.out is None:
         parser.error("--manifest, --artifact-root, and --out are required")
     root = args.artifact_root.resolve()
@@ -6410,7 +6493,17 @@ def main() -> int:
     try:
         out.relative_to(root)
         manifest = read_json(args.manifest.resolve())
-        report = execute_manifest(manifest, root, out, discover=args.discover) if args.discover else collect_manifest(manifest, root, out)
+        report = (
+            execute_manifest(
+                manifest,
+                root,
+                out,
+                discover=True,
+                discovery_scenario=args.discover_scenario,
+            )
+            if args.discover
+            else collect_manifest(manifest, root, out)
+        )
         write_json(out, report)
     except (ScenarioError, ValueError) as exc:
         print(f"FERRUM RUNTIME VNEXT G00 SCENARIOS FAIL: {args.out}: {exc}", file=sys.stderr)
