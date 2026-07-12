@@ -30,11 +30,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 try:
+    import runtime_vnext_blocked_lane as blocked_lane_collector
     import runtime_vnext_baseline_scenarios as scenario_runner
     import runtime_vnext_build_timing as build_timing
     import runtime_vnext_hardware_probe as hardware_probe
     import runtime_vnext_resource_sampler as resource_sampler
 except ModuleNotFoundError:
+    from scripts.release import runtime_vnext_blocked_lane as blocked_lane_collector
     from scripts.release import runtime_vnext_baseline_scenarios as scenario_runner
     from scripts.release import runtime_vnext_build_timing as build_timing
     from scripts.release import runtime_vnext_hardware_probe as hardware_probe
@@ -55,6 +57,7 @@ BUILD_TIMING_COLLECTOR_PATH = REPO_ROOT / "scripts/release/runtime_vnext_build_t
 INVENTORY_REVIEW_PATH = REPO_ROOT / "scripts/release/configs/runtime_vnext_inventory_review.json"
 SCENARIO_RUNNER_PATH = REPO_ROOT / "scripts/release/runtime_vnext_baseline_scenarios.py"
 RESOURCE_SAMPLER_PATH = REPO_ROOT / "scripts/release/runtime_vnext_resource_sampler.py"
+BLOCKED_LANE_COLLECTOR_PATH = REPO_ROOT / "scripts/release/runtime_vnext_blocked_lane.py"
 CONTRACT_PATHS = (
     REPO_ROOT / "docs/goals/runtime-vnext-0.8.0-2026-07-10/G00_BASELINE.md",
     REPO_ROOT / "docs/goals/runtime-vnext-0.8.0-2026-07-10/MODEL_MATRIX.md",
@@ -68,6 +71,7 @@ CONTRACT_PATHS = (
     BUILD_TIMING_COLLECTOR_PATH,
     SCENARIO_RUNNER_PATH,
     RESOURCE_SAMPLER_PATH,
+    BLOCKED_LANE_COLLECTOR_PATH,
     Path(__file__).resolve(),
 )
 FROZEN_LEGACY_SHA = "cff4c47765ef3259b8a04890187d99c60da86394"
@@ -2381,7 +2385,13 @@ def validate_lane_identity(
     require_no_forbidden_markers(lane, label)
 
 
-def validate_blocked_lane(root: Path, lane: dict[str, Any], label: str) -> None:
+def validate_blocked_lane(
+    root: Path,
+    lane: dict[str, Any],
+    label: str,
+    *,
+    allow_synthetic: bool,
+) -> None:
     require(lane.get("current_support") is False, f"{label}.current_support must be false")
     require(lane.get("comparable") is False, f"{label}.comparable must be false")
     require(lane.get("waiver") is False, f"{label}.waiver must be false")
@@ -2402,6 +2412,11 @@ def validate_blocked_lane(root: Path, lane: dict[str, Any], label: str) -> None:
     require(not lane.get("pass_line"), f"{label}.pass_line forbidden for blocked lane")
     forbidden = {"ratio", "throughput_tok_s", "cells", "run_legacy"} & set(lane)
     require(not forbidden, f"{label} blocked lane contains fabricated performance fields: {sorted(forbidden)}")
+    if not allow_synthetic:
+        try:
+            blocked_lane_collector.validate_lane_evidence(root, lane)
+        except (blocked_lane_collector.BlockedLaneError, OSError, ValueError) as exc:
+            raise BaselineError(f"{label} blocked product evidence rejected: {exc}") from exc
 
 
 def validate_pass_lane(
@@ -2516,7 +2531,12 @@ def validate_correctness(
                 if invocation is not None:
                     executor_invocations[f"{model_key}/{backend}"] = invocation
             else:
-                validate_blocked_lane(root, lane, label)
+                validate_blocked_lane(
+                    root,
+                    lane,
+                    label,
+                    allow_synthetic=allow_synthetic,
+                )
             statuses[(model_key, backend)] = str(status)
     require(len(statuses) == 6, "correctness matrix must contain six primary lanes")
     return statuses, executor_invocations
