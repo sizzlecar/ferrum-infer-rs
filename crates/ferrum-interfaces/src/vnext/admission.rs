@@ -429,6 +429,14 @@ pub struct RequestAuthorityId {
 }
 
 impl RequestAuthorityId {
+    #[cfg(test)]
+    pub(crate) const fn test_only(sparse_id: u32, generation: u64) -> Self {
+        Self {
+            sparse_id,
+            generation,
+        }
+    }
+
     pub const fn sparse_id(self) -> u32 {
         self.sparse_id
     }
@@ -439,6 +447,14 @@ impl RequestAuthorityId {
 }
 
 impl SequenceAuthorityId {
+    #[cfg(test)]
+    pub(crate) const fn test_only(sparse_id: u32, generation: u64) -> Self {
+        Self {
+            sparse_id,
+            generation,
+        }
+    }
+
     pub const fn sparse_id(self) -> u32 {
         self.sparse_id
     }

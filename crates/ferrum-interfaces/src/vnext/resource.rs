@@ -6082,6 +6082,48 @@ impl BatchParticipantAuthority {
     }
 }
 
+/// One participant-local node topology key in the physical batch ledger.
+/// Attempt ids are deliberately absent so a fresh id cannot bypass overlap
+/// detection for the same sequence/frame/node work.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct ParticipantNodeKey {
+    sequence_authority: SequenceAuthorityId,
+    request_authority: RequestAuthorityId,
+    frame_id: ExecutionFrameId,
+    node_id: NodeId,
+}
+
+impl ParticipantNodeKey {
+    fn new(
+        participant: BatchParticipantAuthority,
+        frame_id: ExecutionFrameId,
+        node_id: NodeId,
+    ) -> Self {
+        Self {
+            sequence_authority: participant.sequence_authority(),
+            request_authority: participant.request_authority(),
+            frame_id,
+            node_id,
+        }
+    }
+
+    pub const fn sequence_authority(&self) -> SequenceAuthorityId {
+        self.sequence_authority
+    }
+
+    pub const fn request_authority(&self) -> RequestAuthorityId {
+        self.request_authority
+    }
+
+    pub const fn frame_id(&self) -> ExecutionFrameId {
+        self.frame_id
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+}
+
 /// Opaque association between one exact admitted participant and token work
 /// derived from that participant's actual token ids.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -7715,13 +7757,6 @@ struct ActiveSequenceFrame {
     batch_step_id: BatchStepId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct ParticipantFlightKey {
-    frame_id: ExecutionFrameId,
-    batch_step_id: BatchStepId,
-    batch_invocation_id: BatchInvocationId,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParticipantFlightPhase {
     Prepared,
@@ -7735,7 +7770,7 @@ struct ActiveSequenceSessionState {
     phase: SequenceSessionPhase,
     next_frame: Option<ExecutionFrameId>,
     active_frame: Option<ActiveSequenceFrame>,
-    participant_flights: BTreeMap<ParticipantFlightKey, ParticipantFlightPhase>,
+    participant_flights: BTreeMap<ParticipantNodeKey, ParticipantFlightPhase>,
     retired_frames: u64,
 }
 
@@ -8548,16 +8583,19 @@ struct ParticipantFlightCandidate {
     epoch: SequenceSessionEpoch,
     fingerprint: SequenceSessionFingerprint,
     frame: ActiveSequenceFrame,
+    participant: BatchParticipantAuthority,
 }
 
-/// A participant has been admitted into one exact invocation, but no device
-/// submission exists yet. Dropping this token is therefore the typed
-/// definitely-not-submitted rollback path.
+/// One participant-local flight owned by an exact invocation. Dropping this
+/// hold removes the sequence-flight count, while the physical ledger guard
+/// independently retires its topology. Only the sealed device DNF path may
+/// reset an in-flight hold to Prepared for retry.
 struct PreparedParticipantFlightHold {
     slot: Arc<SequenceSessionSlot>,
     epoch: SequenceSessionEpoch,
     fingerprint: SequenceSessionFingerprint,
-    key: ParticipantFlightKey,
+    key: ParticipantNodeKey,
+    batch_step_id: BatchStepId,
     phase: ParticipantFlightPhase,
 }
 
@@ -8586,7 +8624,7 @@ impl Drop for PreparedParticipantFlightHold {
 
 fn prepare_participant_flights(
     candidates: &[ParticipantFlightCandidate],
-    batch_invocation_id: BatchInvocationId,
+    node_id: &NodeId,
 ) -> Result<Vec<PreparedParticipantFlightHold>, VNextError> {
     if candidates.is_empty()
         || candidates.iter().enumerate().any(|(index, candidate)| {
@@ -8611,11 +8649,11 @@ fn prepare_participant_flights(
         );
     }
     for (candidate, state) in candidates.iter().zip(&states) {
-        let key = ParticipantFlightKey {
-            frame_id: candidate.frame.frame_id,
-            batch_step_id: candidate.frame.batch_step_id,
-            batch_invocation_id,
-        };
+        let key = ParticipantNodeKey::new(
+            candidate.participant,
+            candidate.frame.frame_id,
+            node_id.clone(),
+        );
         match &**state {
             SequenceSessionSlotState::Active(active)
                 if active.epoch == candidate.epoch
@@ -8648,14 +8686,14 @@ fn prepare_participant_flights(
         let SequenceSessionSlotState::Active(active) = &mut **state else {
             unreachable!("all prepared invocation participants were validated");
         };
-        let key = ParticipantFlightKey {
-            frame_id: candidate.frame.frame_id,
-            batch_step_id: candidate.frame.batch_step_id,
-            batch_invocation_id,
-        };
+        let key = ParticipantNodeKey::new(
+            candidate.participant,
+            candidate.frame.frame_id,
+            node_id.clone(),
+        );
         if let Some(previous) = active
             .participant_flights
-            .insert(key, ParticipantFlightPhase::Prepared)
+            .insert(key.clone(), ParticipantFlightPhase::Prepared)
         {
             active.participant_flights.insert(key, previous);
             active.phase = SequenceSessionPhase::Poisoned;
@@ -8665,11 +8703,11 @@ fn prepare_participant_flights(
     }
     if let Some(index) = insertion_failure {
         for rollback_index in 0..index {
-            let rollback_key = ParticipantFlightKey {
-                frame_id: candidates[rollback_index].frame.frame_id,
-                batch_step_id: candidates[rollback_index].frame.batch_step_id,
-                batch_invocation_id,
-            };
+            let rollback_key = ParticipantNodeKey::new(
+                candidates[rollback_index].participant,
+                candidates[rollback_index].frame.frame_id,
+                node_id.clone(),
+            );
             let SequenceSessionSlotState::Active(rollback) = &mut *states[rollback_index] else {
                 continue;
             };
@@ -8682,16 +8720,17 @@ fn prepare_participant_flights(
     }
     drop(states);
     for candidate in candidates {
-        let key = ParticipantFlightKey {
-            frame_id: candidate.frame.frame_id,
-            batch_step_id: candidate.frame.batch_step_id,
-            batch_invocation_id,
-        };
+        let key = ParticipantNodeKey::new(
+            candidate.participant,
+            candidate.frame.frame_id,
+            node_id.clone(),
+        );
         holds.push(PreparedParticipantFlightHold {
             slot: Arc::clone(&candidate.slot),
             epoch: candidate.epoch,
             fingerprint: candidate.fingerprint.clone(),
             key,
+            batch_step_id: candidate.frame.batch_step_id,
             phase: ParticipantFlightPhase::Prepared,
         });
     }
@@ -8701,17 +8740,42 @@ fn prepare_participant_flights(
 fn begin_participant_flights_dispatch(
     holds: &mut [PreparedParticipantFlightHold],
 ) -> Result<(), VNextError> {
+    transition_participant_flights(
+        holds,
+        ParticipantFlightPhase::Prepared,
+        ParticipantFlightPhase::InFlight,
+        "begin dispatch",
+    )
+}
+
+fn reset_participant_flights_after_definitely_not_submitted(
+    holds: &mut [PreparedParticipantFlightHold],
+) -> Result<(), VNextError> {
+    transition_participant_flights(
+        holds,
+        ParticipantFlightPhase::InFlight,
+        ParticipantFlightPhase::Prepared,
+        "reset definitely-not-submitted dispatch",
+    )
+}
+
+fn transition_participant_flights(
+    holds: &mut [PreparedParticipantFlightHold],
+    expected: ParticipantFlightPhase,
+    next: ParticipantFlightPhase,
+    context: &'static str,
+) -> Result<(), VNextError> {
     if holds.is_empty()
         || holds.iter().enumerate().any(|(index, hold)| {
-            hold.phase != ParticipantFlightPhase::Prepared
+            hold.phase != expected
                 || holds[..index]
                     .iter()
                     .any(|prior| Arc::ptr_eq(&prior.slot, &hold.slot))
         })
     {
-        return Err(invalid_resource(
-            "dispatch requires non-empty unique prepared participant flights",
-        ));
+        return Err(invalid_resource(format!(
+            "{context} requires non-empty unique participant flights in the expected phase"
+        )));
     }
 
     // Holds originate from the canonically ordered batch participant set. Keep
@@ -8724,19 +8788,20 @@ fn begin_participant_flights_dispatch(
                 Arc::clone(&hold.slot),
                 hold.epoch,
                 hold.fingerprint.clone(),
-                hold.key,
+                hold.key.clone(),
+                hold.batch_step_id,
             )
         })
         .collect::<Vec<_>>();
     let mut states = Vec::with_capacity(candidates.len());
-    for (slot, _, _, _) in &candidates {
+    for (slot, _, _, _, _) in &candidates {
         states.push(
             slot.state
                 .lock()
                 .map_err(|_| invalid_resource("sequence session state mutex is poisoned"))?,
         );
     }
-    for ((_, epoch, fingerprint, key), state) in candidates.iter().zip(&states) {
+    for ((_, epoch, fingerprint, key, batch_step_id), state) in candidates.iter().zip(&states) {
         match &**state {
             SequenceSessionSlotState::Active(active)
                 if active.epoch == *epoch
@@ -8744,31 +8809,30 @@ fn begin_participant_flights_dispatch(
                     && active.phase == SequenceSessionPhase::Open
                     && active.active_frame
                         == Some(ActiveSequenceFrame {
-                            frame_id: key.frame_id,
-                            batch_step_id: key.batch_step_id,
+                            frame_id: key.frame_id(),
+                            batch_step_id: *batch_step_id,
                         })
-                    && active.participant_flights.get(key)
-                        == Some(&ParticipantFlightPhase::Prepared) => {}
+                    && active.participant_flights.get(key) == Some(&expected) => {}
             SequenceSessionSlotState::Active(active)
                 if active.epoch != *epoch || active.fingerprint != *fingerprint =>
             {
                 return Err(invalid_resource(
-                    "stale prepared invocation participant authority at dispatch",
+                    "stale invocation participant authority during phase transition",
                 ));
             }
             SequenceSessionSlotState::Active(_) => {
-                return Err(invalid_resource(
-                    "cancelled, poisoned, non-prepared, or cross-frame participant cannot begin dispatch",
-                ));
+                return Err(invalid_resource(format!(
+                    "cancelled, poisoned, wrong-phase, or cross-frame participant cannot {context}"
+                )));
             }
             _ => {
-                return Err(invalid_resource(
-                    "inactive or terminal participant cannot begin dispatch",
-                ));
+                return Err(invalid_resource(format!(
+                    "inactive or terminal participant cannot {context}"
+                )));
             }
         }
     }
-    for ((_, _, _, key), state) in candidates.iter().zip(&mut states) {
+    for ((_, _, _, key, _), state) in candidates.iter().zip(&mut states) {
         let SequenceSessionSlotState::Active(active) = &mut **state else {
             unreachable!("all dispatch participants were validated while locked");
         };
@@ -8776,10 +8840,10 @@ fn begin_participant_flights_dispatch(
             .participant_flights
             .get_mut(key)
             .expect("validated participant flight remains present while locked");
-        *phase = ParticipantFlightPhase::InFlight;
+        *phase = next;
     }
     for hold in holds {
-        hold.phase = ParticipantFlightPhase::InFlight;
+        hold.phase = next;
     }
     Ok(())
 }
@@ -8995,14 +9059,23 @@ fn finalize_session_frames(
 
 #[derive(Default)]
 struct InvocationRegistryState {
-    active: BTreeMap<BatchInvocationId, ActiveInvocationRecord>,
+    entries: BTreeMap<ParticipantNodeKey, ParticipantNodeLedgerEntry>,
     poisoned: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhysicalInvocationPhase {
+    Prepared,
+    NotSubmitted,
+    InFlight,
+    Retired,
+}
+
 #[derive(Clone, PartialEq, Eq)]
-struct ActiveInvocationRecord {
-    node_id: NodeId,
-    participants: Vec<BatchParticipantAuthority>,
+struct ParticipantNodeLedgerEntry {
+    batch_invocation_id: BatchInvocationId,
+    work_fingerprint: String,
+    phase: PhysicalInvocationPhase,
 }
 
 #[derive(Default)]
@@ -9013,10 +9086,15 @@ struct InvocationRegistry {
 impl InvocationRegistry {
     fn enter(
         self: &Arc<Self>,
-        node_id: &NodeId,
+        keys: Vec<ParticipantNodeKey>,
         batch_invocation_id: BatchInvocationId,
-        participants: &[BatchParticipantAuthority],
+        work_fingerprint: &str,
     ) -> Result<ActiveInvocationGuard, VNextError> {
+        if keys.is_empty() || keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(invalid_resource(
+                "physical invocation ledger requires canonical non-empty unique participant-node keys",
+            ));
+        }
         let mut state = self
             .state
             .lock()
@@ -9024,33 +9102,123 @@ impl InvocationRegistry {
         if state.poisoned {
             return Err(invalid_resource("invocation registry is fail-closed"));
         }
-        if let Some(active) = state.active.get(&batch_invocation_id) {
-            return Err(invalid_resource(format!(
-                "batch invocation {batch_invocation_id} is already active for `{}`",
-                active.node_id
-            )));
+        if keys.iter().any(|key| state.entries.contains_key(key)) {
+            return Err(invalid_resource(
+                "participant/frame/node topology is already prepared, in flight, or retired in this step",
+            ));
         }
-        let record = ActiveInvocationRecord {
-            node_id: node_id.clone(),
-            participants: participants.to_vec(),
+        let entry = ParticipantNodeLedgerEntry {
+            batch_invocation_id,
+            work_fingerprint: work_fingerprint.to_owned(),
+            phase: PhysicalInvocationPhase::Prepared,
         };
-        state.active.insert(batch_invocation_id, record.clone());
+        for key in &keys {
+            if state.entries.insert(key.clone(), entry.clone()).is_some() {
+                state.poisoned = true;
+                return Err(invalid_resource(
+                    "physical invocation ledger changed during atomic prepare",
+                ));
+            }
+        }
         Ok(ActiveInvocationGuard {
             registry: Arc::clone(self),
-            record,
+            keys,
+            work_fingerprint: work_fingerprint.to_owned(),
             batch_invocation_id,
+            phase: PhysicalInvocationPhase::Prepared,
         })
     }
 }
 
 struct ActiveInvocationGuard {
     registry: Arc<InvocationRegistry>,
-    record: ActiveInvocationRecord,
+    keys: Vec<ParticipantNodeKey>,
+    work_fingerprint: String,
     batch_invocation_id: BatchInvocationId,
+    phase: PhysicalInvocationPhase,
+}
+
+impl ActiveInvocationGuard {
+    fn transition(
+        &mut self,
+        expected: PhysicalInvocationPhase,
+        next: PhysicalInvocationPhase,
+        next_attempt: BatchInvocationId,
+    ) -> Result<(), VNextError> {
+        if self.phase != expected {
+            return Err(invalid_resource(
+                "physical invocation guard is not in the expected phase",
+            ));
+        }
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .map_err(|_| invalid_resource("invocation registry is poisoned"))?;
+        let expected_entry = ParticipantNodeLedgerEntry {
+            batch_invocation_id: self.batch_invocation_id,
+            work_fingerprint: self.work_fingerprint.clone(),
+            phase: expected,
+        };
+        if state.poisoned
+            || self
+                .keys
+                .iter()
+                .any(|key| state.entries.get(key) != Some(&expected_entry))
+        {
+            state.poisoned = true;
+            return Err(invalid_resource(
+                "physical invocation ledger differs from its exact transition authority",
+            ));
+        }
+        for key in &self.keys {
+            let entry = state
+                .entries
+                .get_mut(key)
+                .expect("validated physical invocation key remains present");
+            entry.batch_invocation_id = next_attempt;
+            entry.phase = next;
+        }
+        self.batch_invocation_id = next_attempt;
+        self.phase = next;
+        Ok(())
+    }
+
+    fn mark_not_submitted(&mut self) -> Result<(), VNextError> {
+        self.transition(
+            PhysicalInvocationPhase::Prepared,
+            PhysicalInvocationPhase::NotSubmitted,
+            self.batch_invocation_id,
+        )
+    }
+
+    fn prepare_retry(&mut self, fresh_attempt: BatchInvocationId) -> Result<(), VNextError> {
+        if fresh_attempt == self.batch_invocation_id {
+            return Err(invalid_resource(
+                "definitely-not-submitted retry requires a fresh physical attempt id",
+            ));
+        }
+        self.transition(
+            PhysicalInvocationPhase::NotSubmitted,
+            PhysicalInvocationPhase::Prepared,
+            fresh_attempt,
+        )
+    }
+
+    fn mark_in_flight(&mut self) -> Result<(), VNextError> {
+        self.transition(
+            PhysicalInvocationPhase::Prepared,
+            PhysicalInvocationPhase::InFlight,
+            self.batch_invocation_id,
+        )
+    }
 }
 
 impl Drop for ActiveInvocationGuard {
     fn drop(&mut self) {
+        if self.phase == PhysicalInvocationPhase::Retired {
+            return;
+        }
         let mut state = match self.registry.state.lock() {
             Ok(state) => state,
             Err(poisoned) => {
@@ -9059,9 +9227,27 @@ impl Drop for ActiveInvocationGuard {
                 state
             }
         };
-        if state.active.remove(&self.batch_invocation_id).as_ref() != Some(&self.record) {
+        let expected = ParticipantNodeLedgerEntry {
+            batch_invocation_id: self.batch_invocation_id,
+            work_fingerprint: self.work_fingerprint.clone(),
+            phase: self.phase,
+        };
+        if self
+            .keys
+            .iter()
+            .any(|key| state.entries.get(key) != Some(&expected))
+        {
             state.poisoned = true;
+            return;
         }
+        for key in &self.keys {
+            state
+                .entries
+                .get_mut(key)
+                .expect("validated physical invocation key remains present")
+                .phase = PhysicalInvocationPhase::Retired;
+        }
+        self.phase = PhysicalInvocationPhase::Retired;
     }
 }
 
@@ -9639,6 +9825,10 @@ where
                     frame_id: step_participant.frame.frame_id,
                     batch_step_id: self.batch_step_id,
                 },
+                participant: BatchParticipantAuthority::new(
+                    participant.sequence_authority(),
+                    participant.request_authority(),
+                ),
             });
         }
         let participants = participant_sessions
@@ -9733,13 +9923,23 @@ where
         let claimed_backing =
             ClaimedBackingTransaction::new(work_shape, demand, logical_capacity, backing_slices)?;
         let batch_invocation_id = issue_batch_invocation_id()?;
-        let active_invocation = self.invocation_registry.enter(
-            &node_id,
-            batch_invocation_id,
-            &participant_authorities,
-        )?;
         let prepared_participant_flights =
-            prepare_participant_flights(&flight_candidates, batch_invocation_id)?;
+            prepare_participant_flights(&flight_candidates, &node_id)?;
+        let topology_keys = participant_frames
+            .iter()
+            .map(|assignment| {
+                ParticipantNodeKey::new(
+                    assignment.participant(),
+                    assignment.frame_id(),
+                    node_id.clone(),
+                )
+            })
+            .collect();
+        let active_invocation = self.invocation_registry.enter(
+            topology_keys,
+            batch_invocation_id,
+            claimed_backing.work_shape().fingerprint(),
+        )?;
         Ok(InvocationResourceAdmissionDecision::Admitted(
             InvocationResourceLease::new(
                 Arc::clone(self),
@@ -9920,6 +10120,72 @@ where
         begin_participant_flights_dispatch(&mut self.prepared_participant_flights)
     }
 
+    pub(crate) fn mark_submission_fence_installed(&mut self) -> Result<(), VNextError> {
+        self.active_invocation.mark_in_flight()
+    }
+
+    pub(crate) fn definitely_not_submitted(
+        mut self,
+    ) -> Result<DefinitelyNotSubmittedRetryAuthority<R>, VNextError> {
+        self.active_invocation.mark_not_submitted()?;
+        reset_participant_flights_after_definitely_not_submitted(
+            &mut self.prepared_participant_flights,
+        )?;
+        let topology_fingerprint = self.retry_topology_fingerprint()?;
+        let work_fingerprint = self.work_shape().fingerprint().to_owned();
+        let prior_attempt = self.batch_invocation_id;
+        Ok(DefinitelyNotSubmittedRetryAuthority {
+            invocation: Some(self),
+            topology_fingerprint,
+            work_fingerprint,
+            prior_attempt,
+        })
+    }
+
+    fn prepare_definitely_not_submitted_retry(
+        &mut self,
+        fresh_attempt: BatchInvocationId,
+        topology_fingerprint: &str,
+        work_fingerprint: &str,
+    ) -> Result<(), VNextError> {
+        if self.retry_topology_fingerprint()? != topology_fingerprint
+            || self.work_shape().fingerprint() != work_fingerprint
+            || self
+                .prepared_participant_flights
+                .iter()
+                .any(|hold| hold.phase != ParticipantFlightPhase::Prepared)
+        {
+            return Err(invalid_resource(
+                "definitely-not-submitted retry topology or work fingerprint changed",
+            ));
+        }
+        self.active_invocation.prepare_retry(fresh_attempt)?;
+        self.batch_invocation_id = fresh_attempt;
+        Ok(())
+    }
+
+    fn retry_topology_fingerprint(&self) -> Result<String, VNextError> {
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            node_id: &'a NodeId,
+            participant_frames: &'a [StepParticipantFrameAssignment],
+            work_fingerprint: &'a str,
+        }
+        let bytes = serde_json::to_vec(&FingerprintInput {
+            domain: "ferrum.runtime-vnext.invocation-retry-topology.v1",
+            node_id: &self.node_id,
+            participant_frames: &self.participant_frames,
+            work_fingerprint: self.work_shape().fingerprint(),
+        })
+        .map_err(|error| {
+            invalid_resource(format!(
+                "invocation retry topology fingerprint encode failed: {error}"
+            ))
+        })?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+
     pub fn coordinator_id(&self) -> LogicalAdmissionCoordinatorId {
         self.participants[0].coordinator_id()
     }
@@ -10005,6 +10271,68 @@ where
                 ))
             })
             .collect()
+    }
+}
+
+/// The sole retry edge after a device runtime proves that submit did not
+/// happen. It owns the exact invocation, topology and work evidence; dropping
+/// it retires the ledger tombstone and cannot be relabeled as retryable later.
+#[must_use = "a definitely-not-submitted retry authority must be retried or retired"]
+pub struct DefinitelyNotSubmittedRetryAuthority<R>
+where
+    R: DeviceRuntime,
+{
+    invocation: Option<InvocationResourceLease<R>>,
+    topology_fingerprint: String,
+    work_fingerprint: String,
+    prior_attempt: BatchInvocationId,
+}
+
+impl<R> fmt::Debug for DefinitelyNotSubmittedRetryAuthority<R>
+where
+    R: DeviceRuntime,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DefinitelyNotSubmittedRetryAuthority")
+            .field("prior_attempt", &self.prior_attempt)
+            .field("topology_fingerprint", &self.topology_fingerprint)
+            .field("work_fingerprint", &self.work_fingerprint)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R> DefinitelyNotSubmittedRetryAuthority<R>
+where
+    R: DeviceRuntime,
+{
+    pub const fn prior_attempt(&self) -> BatchInvocationId {
+        self.prior_attempt
+    }
+
+    pub fn topology_fingerprint(&self) -> &str {
+        &self.topology_fingerprint
+    }
+
+    pub fn work_fingerprint(&self) -> &str {
+        &self.work_fingerprint
+    }
+
+    pub fn retry(mut self) -> Result<InvocationResourceLease<R>, VNextError> {
+        let fresh_attempt = issue_batch_invocation_id()?;
+        let invocation = self
+            .invocation
+            .as_mut()
+            .ok_or_else(|| invalid_resource("retry authority no longer owns its invocation"))?;
+        invocation.prepare_definitely_not_submitted_retry(
+            fresh_attempt,
+            &self.topology_fingerprint,
+            &self.work_fingerprint,
+        )?;
+        Ok(self
+            .invocation
+            .take()
+            .expect("validated retry authority still owns its invocation"))
     }
 }
 
@@ -15136,6 +15464,25 @@ mod sequence_session_frame_tests {
         BatchInvocationId::try_from(value).expect("test batch invocation id is non-zero")
     }
 
+    fn node(value: &str) -> NodeId {
+        NodeId::try_from(format!("node.{value}")).expect("test node id is valid")
+    }
+
+    fn participant_node_key(
+        participant: u32,
+        frame_id: u64,
+        node_name: &str,
+    ) -> ParticipantNodeKey {
+        ParticipantNodeKey::new(
+            BatchParticipantAuthority::new(
+                SequenceAuthorityId::test_only(participant, 1),
+                RequestAuthorityId::test_only(participant, 1),
+            ),
+            frame(frame_id),
+            node(node_name),
+        )
+    }
+
     fn active_candidate(next_frame: u64, fingerprint: &str) -> SequenceFrameCandidate {
         let epoch = SequenceSessionEpoch(NonZeroU64::new(1).expect("one is non-zero"));
         let fingerprint = SequenceSessionFingerprint(fingerprint.to_owned());
@@ -15175,6 +15522,10 @@ mod sequence_session_frame_tests {
                 frame_id: hold.frame_id,
                 batch_step_id: hold.batch_step_id,
             },
+            participant: BatchParticipantAuthority::new(
+                SequenceAuthorityId::test_only(1, 1),
+                RequestAuthorityId::test_only(1, 1),
+            ),
         }
     }
 
@@ -15313,7 +15664,7 @@ mod sequence_session_frame_tests {
             active.phase = SequenceSessionPhase::CancelRequested;
         }
 
-        assert!(prepare_participant_flights(&candidates, invocation(1)).is_err());
+        assert!(prepare_participant_flights(&candidates, &node("main")).is_err());
         for candidate in [&first, &cancelled] {
             let state = candidate.slot.state.lock().unwrap();
             let SequenceSessionSlotState::Active(active) = &*state else {
@@ -15340,7 +15691,7 @@ mod sequence_session_frame_tests {
             flight_candidate(&first, &frames[0]),
             flight_candidate(&cancelled, &frames[1]),
         ];
-        let mut prepared = prepare_participant_flights(&candidates, invocation(1)).unwrap();
+        let mut prepared = prepare_participant_flights(&candidates, &node("main")).unwrap();
         {
             let mut state = cancelled.slot.state.lock().unwrap();
             let SequenceSessionSlotState::Active(active) = &mut *state else {
@@ -15387,7 +15738,7 @@ mod sequence_session_frame_tests {
         let mut frames = acquire_session_frames(std::slice::from_ref(&session), step(1)).unwrap();
         let candidate = flight_candidate(&session, &frames[0]);
         let mut prepared =
-            prepare_participant_flights(std::slice::from_ref(&candidate), invocation(1)).unwrap();
+            prepare_participant_flights(std::slice::from_ref(&candidate), &node("main")).unwrap();
         begin_participant_flights_dispatch(&mut prepared).unwrap();
         {
             let mut state = session.slot.state.lock().unwrap();
@@ -15421,7 +15772,7 @@ mod sequence_session_frame_tests {
         let frames = acquire_session_frames(std::slice::from_ref(&session), step(1)).unwrap();
         let candidate = flight_candidate(&session, &frames[0]);
         let mut prepared =
-            prepare_participant_flights(std::slice::from_ref(&candidate), invocation(1)).unwrap();
+            prepare_participant_flights(std::slice::from_ref(&candidate), &node("main")).unwrap();
         begin_participant_flights_dispatch(&mut prepared).unwrap();
         {
             let mut state = session.slot.state.lock().unwrap();
@@ -15445,11 +15796,11 @@ mod sequence_session_frame_tests {
         let mut frames = acquire_session_frames(std::slice::from_ref(&session), step(1)).unwrap();
         let candidate = flight_candidate(&session, &frames[0]);
         let first =
-            prepare_participant_flights(std::slice::from_ref(&candidate), invocation(1)).unwrap();
+            prepare_participant_flights(std::slice::from_ref(&candidate), &node("first")).unwrap();
         let second =
-            prepare_participant_flights(std::slice::from_ref(&candidate), invocation(2)).unwrap();
+            prepare_participant_flights(std::slice::from_ref(&candidate), &node("second")).unwrap();
         assert!(
-            prepare_participant_flights(std::slice::from_ref(&candidate), invocation(1)).is_err()
+            prepare_participant_flights(std::slice::from_ref(&candidate), &node("first")).is_err()
         );
         {
             let state = session.slot.state.lock().unwrap();
@@ -15471,12 +15822,12 @@ mod sequence_session_frame_tests {
     }
 
     #[test]
-    fn prepared_flight_drop_is_typed_not_submitted_rollback() {
+    fn prepared_flight_drop_removes_the_unsubmitted_sequence_flight() {
         let session = active_candidate(1, "flight-drop");
         let mut frames = acquire_session_frames(std::slice::from_ref(&session), step(1)).unwrap();
         let candidate = flight_candidate(&session, &frames[0]);
         let prepared =
-            prepare_participant_flights(std::slice::from_ref(&candidate), invocation(1)).unwrap();
+            prepare_participant_flights(std::slice::from_ref(&candidate), &node("main")).unwrap();
         {
             let state = session.slot.state.lock().unwrap();
             let SequenceSessionSlotState::Active(active) = &*state else {
@@ -15502,7 +15853,7 @@ mod sequence_session_frame_tests {
         let stale_frames = acquire_session_frames(std::slice::from_ref(&stale), step(1)).unwrap();
         let stale_candidate = flight_candidate(&stale, &stale_frames[0]);
         let stale_prepared =
-            prepare_participant_flights(std::slice::from_ref(&stale_candidate), invocation(1))
+            prepare_participant_flights(std::slice::from_ref(&stale_candidate), &node("stale"))
                 .unwrap();
         {
             let mut state = stale.slot.state.lock().unwrap();
@@ -15522,7 +15873,7 @@ mod sequence_session_frame_tests {
             acquire_session_frames(std::slice::from_ref(&missing), step(2)).unwrap();
         let missing_candidate = flight_candidate(&missing, &missing_frames[0]);
         let missing_prepared =
-            prepare_participant_flights(std::slice::from_ref(&missing_candidate), invocation(2))
+            prepare_participant_flights(std::slice::from_ref(&missing_candidate), &node("missing"))
                 .unwrap();
         {
             let mut state = missing.slot.state.lock().unwrap();
@@ -15537,6 +15888,122 @@ mod sequence_session_frame_tests {
             unreachable!();
         };
         assert_eq!(active.phase, SequenceSessionPhase::Poisoned);
+    }
+
+    #[test]
+    fn physical_invocation_ledger_rejects_overlap_atomically_and_retains_tombstones() {
+        let registry = Arc::new(InvocationRegistry::default());
+        let first_key = participant_node_key(1, 7, "main");
+        let overlap_key = participant_node_key(2, 2, "main");
+        let untouched_key = participant_node_key(3, 19, "main");
+        let guard = registry
+            .enter(
+                vec![first_key.clone(), overlap_key.clone()],
+                invocation(1),
+                &"a".repeat(64),
+            )
+            .unwrap();
+
+        assert!(registry
+            .enter(
+                vec![overlap_key.clone(), untouched_key.clone()],
+                invocation(2),
+                &"b".repeat(64),
+            )
+            .is_err());
+        {
+            let state = registry.state.lock().unwrap();
+            assert_eq!(state.entries.len(), 2);
+            assert!(!state.entries.contains_key(&untouched_key));
+            assert!(state
+                .entries
+                .values()
+                .all(|entry| entry.phase == PhysicalInvocationPhase::Prepared));
+        }
+
+        drop(guard);
+        {
+            let state = registry.state.lock().unwrap();
+            assert!(state
+                .entries
+                .values()
+                .all(|entry| entry.phase == PhysicalInvocationPhase::Retired));
+        }
+        assert!(registry
+            .enter(vec![first_key], invocation(3), &"a".repeat(64))
+            .is_err());
+    }
+
+    #[test]
+    fn physical_invocation_retry_requires_not_submitted_and_a_fresh_attempt() {
+        let registry = Arc::new(InvocationRegistry::default());
+        let key = participant_node_key(1, 7, "retry");
+        let mut guard = registry
+            .enter(vec![key.clone()], invocation(11), &"c".repeat(64))
+            .unwrap();
+
+        guard.mark_not_submitted().unwrap();
+        assert!(guard.mark_in_flight().is_err());
+        assert!(guard.prepare_retry(invocation(11)).is_err());
+        guard.prepare_retry(invocation(12)).unwrap();
+        guard.mark_in_flight().unwrap();
+        {
+            let state = registry.state.lock().unwrap();
+            let entry = state.entries.get(&key).unwrap();
+            assert_eq!(entry.batch_invocation_id, invocation(12));
+            assert_eq!(entry.work_fingerprint, "c".repeat(64));
+            assert_eq!(entry.phase, PhysicalInvocationPhase::InFlight);
+        }
+        drop(guard);
+        assert_eq!(
+            registry.state.lock().unwrap().entries[&key].phase,
+            PhysicalInvocationPhase::Retired
+        );
+
+        let dropped_key = participant_node_key(2, 2, "retry");
+        let mut dropped = registry
+            .enter(vec![dropped_key.clone()], invocation(13), &"d".repeat(64))
+            .unwrap();
+        dropped.mark_not_submitted().unwrap();
+        drop(dropped);
+        assert_eq!(
+            registry.state.lock().unwrap().entries[&dropped_key].phase,
+            PhysicalInvocationPhase::Retired
+        );
+        assert!(registry
+            .enter(vec![dropped_key], invocation(14), &"d".repeat(64))
+            .is_err());
+    }
+
+    #[test]
+    fn definitely_not_submitted_participant_flights_reset_for_exact_retry() {
+        let session = active_candidate(1, "dispatch-retry");
+        let mut frames = acquire_session_frames(std::slice::from_ref(&session), step(1)).unwrap();
+        let candidate = flight_candidate(&session, &frames[0]);
+        let mut prepared =
+            prepare_participant_flights(std::slice::from_ref(&candidate), &node("retry")).unwrap();
+        begin_participant_flights_dispatch(&mut prepared).unwrap();
+        reset_participant_flights_after_definitely_not_submitted(&mut prepared).unwrap();
+        {
+            let state = session.slot.state.lock().unwrap();
+            let SequenceSessionSlotState::Active(active) = &*state else {
+                unreachable!();
+            };
+            assert_eq!(
+                active.participant_flights.values().next(),
+                Some(&ParticipantFlightPhase::Prepared)
+            );
+        }
+        begin_participant_flights_dispatch(&mut prepared).unwrap();
+        drop(prepared);
+        {
+            let state = session.slot.state.lock().unwrap();
+            let SequenceSessionSlotState::Active(active) = &*state else {
+                unreachable!();
+            };
+            assert!(active.participant_flights.is_empty());
+        }
+        retire(&mut frames);
     }
 
     #[test]

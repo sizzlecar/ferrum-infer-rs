@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use super::{
     classify_device_error, defer_device_cleanup, DeferredDeviceCleanupDisposition,
-    DeferredDeviceCleanupDomainId, DeferredDeviceCleanupTask, DeviceDescriptor, DeviceRuntime,
-    DeviceTerminal, ExecutionIdentityEnvelope, FenceQuery, IdentifiedFailure,
-    InvocationResourceLease, StreamState, VNextError,
+    DeferredDeviceCleanupDomainId, DeferredDeviceCleanupTask, DefinitelyNotSubmittedRetryAuthority,
+    DeviceDescriptor, DeviceRuntime, DeviceTerminal, ExecutionIdentityEnvelope, FenceQuery,
+    IdentifiedFailure, InvocationResourceLease, StreamState, VNextError,
 };
 
 fn invalid_completion(reason: impl Into<String>) -> VNextError {
@@ -1387,13 +1387,24 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         self.submission_may_have_happened = true;
     }
 
-    pub(crate) fn definitely_not_submitted(mut self) {
+    pub(crate) fn definitely_not_submitted(
+        mut self,
+    ) -> Result<DefinitelyNotSubmittedRetryAuthority<R>, VNextError> {
         self.remove_reserved_slot();
         self.submission_may_have_happened = false;
+        let invocation = self
+            .invocation
+            .take()
+            .expect("reservation owns definitely-not-submitted invocation");
+        let retry = invocation.definitely_not_submitted()?;
         self.finished = true;
+        Ok(retry)
     }
 
-    pub(crate) fn arm(mut self, fence: R::Fence) -> CompletionHandle<R> {
+    pub(crate) fn arm(
+        mut self,
+        fence: R::Fence,
+    ) -> Result<CompletionHandle<R>, (VNextError, CompletionHandle<R>)> {
         let invocation = self.invocation.take().expect("reservation owns invocation");
         let lane = self.lane.take().expect("reservation owns lane");
         let identity = self.identity.take().expect("reservation owns identity");
@@ -1420,11 +1431,26 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             receipt: record_receipt,
             recovery_state: CompletionRecoveryState::Unobserved,
         };
+        let transition = match &mut *record {
+            CompletionRecord::InFlight {
+                invocation, lane, ..
+            } => invocation
+                .mark_submission_fence_installed()
+                .map_err(|error| {
+                    lane.fail_closed();
+                    error
+                }),
+            _ => unreachable!("completion record was just armed"),
+        };
         drop(record);
         self.finished = true;
-        CompletionHandle {
+        let handle = CompletionHandle {
             reaper: Arc::downgrade(&self.reaper),
             receipt,
+        };
+        match transition {
+            Ok(()) => Ok(handle),
+            Err(error) => Err((error, handle)),
         }
     }
 
