@@ -1171,6 +1171,10 @@ def scheduler_trace_rows_for_status(raw: Any, *, case_status: str, label: str) -
     return rows
 
 
+def scheduler_success_derivation_required(case_status: str) -> bool:
+    return case_status == "pass"
+
+
 def validate_case_evidence(
     root: Path,
     raw_ref: Any,
@@ -1449,20 +1453,21 @@ def validate_case_evidence(
             require(trace.get("raw_sha256") == canonical_json_sha256(raw_trace), f"case {case_id} scheduler trace raw SHA mismatch")
             observed_ns = require_count(trace.get("collector_observed_monotonic_ns"), f"case {case_id}.scheduler_trace_rows[{index}].collector_observed_monotonic_ns", minimum=1)
             require(spawn["started_monotonic_ns"] <= observed_ns <= spawn["finished_monotonic_ns"], f"case {case_id} scheduler trace observation is outside case window")
-        if scenario_id == "C09":
-            released, derived_ticks, release_ns = trace_released(trace_rows)
-            require(released and release_ns is not None, f"case {case_id} scheduler trace never proves release")
-            exchanges = require_list(transcript_object.get("exchanges"), f"case {case_id}.exchanges")
-            abort_start_ns = require_count(require_object(exchanges[0], f"case {case_id}.exchange[0]").get("started_monotonic_ns"), f"case {case_id}.abort_start_ns", minimum=1)
-            derived_wall = (release_ns - abort_start_ns) / 1e9
-            require(observed.get("scheduler_ticks_to_release") == derived_ticks, f"case {case_id} release tick count is not derived from trace")
-            wall = observed.get("wall_sec_to_release")
-            require(isinstance(wall, (int, float)) and abs(float(wall) - derived_wall) <= 0.02, f"case {case_id} release wall time is not derived from trace")
-        else:
-            derived_active = observed_max_active(trace_rows)
-            require(derived_active > 0 and observed.get("observed_max_active") == derived_active, f"case {case_id} observed max-active is not derived from trace")
-            derived_cap = typed_admission_cap_value(actual_config)
-            require(derived_cap > 0 and observed.get("typed_admission_cap") == derived_cap, f"case {case_id} admission cap is not derived from actual effective config")
+        if scheduler_success_derivation_required(case["status"]):
+            if scenario_id == "C09":
+                released, derived_ticks, release_ns = trace_released(trace_rows)
+                require(released and release_ns is not None, f"case {case_id} scheduler trace never proves release")
+                exchanges = require_list(transcript_object.get("exchanges"), f"case {case_id}.exchanges")
+                abort_start_ns = require_count(require_object(exchanges[0], f"case {case_id}.exchange[0]").get("started_monotonic_ns"), f"case {case_id}.abort_start_ns", minimum=1)
+                derived_wall = (release_ns - abort_start_ns) / 1e9
+                require(observed.get("scheduler_ticks_to_release") == derived_ticks, f"case {case_id} release tick count is not derived from trace")
+                wall = observed.get("wall_sec_to_release")
+                require(isinstance(wall, (int, float)) and abs(float(wall) - derived_wall) <= 0.02, f"case {case_id} release wall time is not derived from trace")
+            else:
+                derived_active = observed_max_active(trace_rows)
+                require(derived_active > 0 and observed.get("observed_max_active") == derived_active, f"case {case_id} observed max-active is not derived from trace")
+                derived_cap = typed_admission_cap_value(actual_config)
+                require(derived_cap > 0 and observed.get("typed_admission_cap") == derived_cap, f"case {case_id} admission cap is not derived from actual effective config")
     output_error: ScenarioError | None = None
     try:
         validate_case_output(
@@ -5653,6 +5658,11 @@ def self_test() -> int:
     require(
         scheduler_trace_rows_for_status([], case_status="known-fail", label="known-fail fixture") == [],
         "known-fail scheduler trace absence was not preserved",
+    )
+    require(
+        scheduler_success_derivation_required("pass")
+        and not scheduler_success_derivation_required("known-fail"),
+        "scheduler success derivation policy does not distinguish pass from known-fail",
     )
     try:
         scheduler_trace_rows_for_status([], case_status="pass", label="passing fixture")
