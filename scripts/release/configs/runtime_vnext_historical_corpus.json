@@ -4,7 +4,7 @@
   "baseline_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394",
   "catalog": {
     "path": "scripts/release/configs/runtime_vnext_historical_bugs.json",
-    "sha256": "8269a599e4eceaf6421c994b52266adb16f7c1a55c9be2bb0eccc15a3717798e"
+    "sha256": "00a10fabce214bcc232c8315bdb645df27b1d7087beaba57ab4889e482cb0aad"
   },
   "goal_documents": [
     {

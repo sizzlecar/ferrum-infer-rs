@@ -27,6 +27,8 @@ RUNTIME_VNEXT_RESOURCE_SAMPLER = REPO_ROOT / "scripts/release/runtime_vnext_reso
 RUNTIME_VNEXT_G00A_CHECKPOINT = REPO_ROOT / "scripts/release/runtime_vnext_g00a_checkpoint.py"
 RUNTIME_VNEXT_G00_ORCHESTRATOR = REPO_ROOT / "scripts/release/runtime_vnext_g00_orchestrator.py"
 RUNTIME_VNEXT_HISTORICAL_CORPUS = REPO_ROOT / "scripts/release/runtime_vnext_historical_corpus.py"
+RUNTIME_VNEXT_HISTORICAL_REPLAY = REPO_ROOT / "scripts/release/runtime_vnext_historical_replay.py"
+RUNTIME_VNEXT_HISTORICAL_CAPTURE = REPO_ROOT / "scripts/release/runtime_vnext_historical_capture.py"
 RUNTIME_VNEXT_G01A_CHECKPOINT = REPO_ROOT / "scripts/release/runtime_vnext_g01a_checkpoint.py"
 BOUNDED_COMMAND = REPO_ROOT / "scripts/release/bounded_command.py"
 RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
@@ -372,6 +374,24 @@ def test_runtime_vnext_historical_corpus_selftest() -> None:
     )
 
 
+def test_runtime_vnext_historical_replay_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_HISTORICAL_REPLAY), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT HISTORICAL REPLAY SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_historical_capture_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_HISTORICAL_CAPTURE), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G00 HISTORICAL CAPTURE SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
 def test_runtime_vnext_g01a_checkpoint_selftest() -> None:
     ok = run([sys.executable, str(RUNTIME_VNEXT_G01A_CHECKPOINT), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -567,6 +587,8 @@ def main() -> int:
     test_runtime_vnext_g00a_checkpoint_selftest()
     test_runtime_vnext_g00_orchestrator_selftest()
     test_runtime_vnext_historical_corpus_selftest()
+    test_runtime_vnext_historical_replay_selftest()
+    test_runtime_vnext_historical_capture_selftest()
     test_runtime_vnext_g01a_checkpoint_selftest()
     test_bounded_command_selftest()
     test_run_gate_selftest()

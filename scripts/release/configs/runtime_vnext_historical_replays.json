@@ -1,0 +1,289 @@
+{
+  "schema_version": 1,
+  "artifact_type": "runtime_vnext_historical_replay_catalog",
+  "baseline_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394",
+  "review_artifact": "docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md",
+  "case_count": 28,
+  "cases": [
+    {
+      "id": "H01.1",
+      "expected_failure_layer": "L2",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "historical_artifact",
+      "expected_invariant": "run materializes the capability-gated vLLM Marlin MoE selector",
+      "expected_summary": {"effective_moe_path": "vllm_moe_marlin", "materialized": true},
+      "observed_summary": {"effective_moe_path": "legacy", "materialized": false},
+      "trace": [{"entrypoint": "run", "resolved": "vllm_moe_marlin", "runtime_read": "legacy"}]
+    },
+    {
+      "id": "H01.2",
+      "expected_failure_layer": "L2",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "historical_artifact",
+      "expected_invariant": "serve materializes resolved MoE selectors for legacy runtime readers",
+      "expected_summary": {"effective_moe_path": "vllm_moe_marlin", "materialized": true},
+      "observed_summary": {"effective_moe_path": "legacy", "materialized": false},
+      "trace": [{"entrypoint": "serve", "resolved": "vllm_moe_marlin", "runtime_read": "legacy"}]
+    },
+    {
+      "id": "H02.1",
+      "expected_failure_layer": "L2",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "fix_diff_reconstruction",
+      "expected_invariant": "chat defaults retain enough KV capacity for five rounds",
+      "expected_summary": {"completed_rounds": 5, "capacity_error_count": 0, "terminal": "complete"},
+      "observed_summary": {"completed_rounds": 3, "capacity_error_count": 1, "terminal": "resource_exhausted"},
+      "trace": [{"round": 4, "event": "kv_capacity_exhausted"}]
+    },
+    {
+      "id": "H02.2",
+      "expected_failure_layer": "L2",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "fix_diff_reconstruction",
+      "expected_invariant": "GGUF run reaches a terminal state within its bounded timeout",
+      "expected_summary": {"exit_state": "completed", "timed_out": false},
+      "observed_summary": {"exit_state": "running", "timed_out": true},
+      "trace": [{"event": "deadline", "seconds": 30, "process_state": "running"}]
+    },
+    {
+      "id": "H02.3",
+      "expected_failure_layer": "L2",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "fix_diff_reconstruction",
+      "expected_invariant": "Metal memory preflight rejects admission below two GiB physical headroom",
+      "expected_summary": {"admitted": false, "headroom_bytes": 2147483648, "swap_growth_bytes": 0},
+      "observed_summary": {"admitted": true, "headroom_bytes": 1073741824, "swap_growth_bytes": 268435456},
+      "trace": [{"event": "memory_preflight", "decision": "admit", "swap_after_bytes": 268435456}]
+    },
+    {
+      "id": "H03.1",
+      "expected_failure_layer": "L0",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "historical_artifact",
+      "expected_invariant": "replacement-character mojibake is never eligible for sampling",
+      "expected_summary": {"eligible_replacement_tokens": 0, "replacement_character_count": 0},
+      "observed_summary": {"eligible_replacement_tokens": 1, "replacement_character_count": 1},
+      "trace": [{"token_id": 17, "decoded_codepoint": 65533, "eligible": true}]
+    },
+    {
+      "id": "H04.1",
+      "expected_failure_layer": "L0",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "historical_artifact",
+      "expected_invariant": "incremental UTF-8 decoding buffers incomplete byte sequences",
+      "expected_summary": {"decoded_codepoints": [20320, 22909], "replacement_character_count": 0},
+      "observed_summary": {"decoded_codepoints": [65533, 65533], "replacement_character_count": 2},
+      "trace": [{"chunk_hex": "e4bd"}, {"chunk_hex": "a0e5a5bd"}]
+    },
+    {
+      "id": "H05.1",
+      "expected_failure_layer": "L1",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "historical_artifact",
+      "expected_invariant": "model EOS terminates the sequence without emitting later tokens",
+      "expected_summary": {"eos_terminated": true, "tokens_after_eos": 0},
+      "observed_summary": {"eos_terminated": false, "tokens_after_eos": 1},
+      "trace": [{"token": 151645, "kind": "eos"}, {"token": 42, "kind": "emitted_after_eos"}]
+    },
+    {
+      "id": "H05.2",
+      "expected_failure_layer": "L1",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "historical_artifact",
+      "expected_invariant": "trailing stop sentinel is removed from the OpenAI response",
+      "expected_summary": {"finish_reason": "stop", "stop_text_visible": false},
+      "observed_summary": {"finish_reason": "stop", "stop_text_visible": true},
+      "trace": [{"wire_content": "answer<|im_end|>"}]
+    },
+    {
+      "id": "H05.3",
+      "expected_failure_layer": "L1",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "historical_artifact",
+      "expected_invariant": "stop text embedded in a composite token is detected before emission",
+      "expected_summary": {"emitted_stop_suffix": "", "stop_detected": true},
+      "observed_summary": {"emitted_stop_suffix": "<END>", "stop_detected": false},
+      "trace": [{"decoded_token": "answer<END>", "configured_stop": "<END>"}]
+    },
+    {
+      "id": "H06.1",
+      "expected_failure_layer": "L1",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "historical_artifact",
+      "expected_invariant": "multi-turn decode positions continue after the rendered prompt",
+      "expected_summary": {"decode_positions": [17, 18], "prompt_token_count": 17},
+      "observed_summary": {"decode_positions": [0, 1], "prompt_token_count": 17},
+      "trace": [{"turn": 2, "prompt_tokens": 17, "first_decode_position": 0}]
+    },
+    {
+      "id": "H07.1",
+      "expected_failure_layer": "L4",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "fix_diff_reconstruction",
+      "expected_invariant": "CUDA MoE graph cache keys include actual batch size",
+      "expected_summary": {"graph_keys": [16, 32], "unique_graph_key_count": 2},
+      "observed_summary": {"graph_keys": [32, 32], "unique_graph_key_count": 1},
+      "trace": [{"actual_m": 16, "padded_m": 32, "cache_key": 32}, {"actual_m": 32, "padded_m": 32, "cache_key": 32}]
+    },
+    {
+      "id": "H07.2",
+      "expected_failure_layer": "L4",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "fix_diff_reconstruction",
+      "expected_invariant": "release preserves captured graph ownership until the replay slot retires",
+      "expected_summary": {"graph_generation": 2, "replay_slot_valid": true},
+      "observed_summary": {"graph_generation": 1, "replay_slot_valid": false},
+      "trace": [{"event": "release"}, {"event": "replay", "slot": "stale"}]
+    },
+    {
+      "id": "H08.1",
+      "expected_failure_layer": "L1",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "fix_diff_reconstruction",
+      "expected_invariant": "paged batch scratch is initialized after every growth reallocation",
+      "expected_summary": {"initialized_slot_count": 64, "scratch_initialized": true},
+      "observed_summary": {"initialized_slot_count": 0, "scratch_initialized": false},
+      "trace": [{"event": "ensure_scratch", "old_capacity": 32, "new_capacity": 64}, {"event": "dispatch", "initialized": false}]
+    },
+    {
+      "id": "H09.1",
+      "expected_failure_layer": "L1",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "historical_artifact",
+      "expected_invariant": "Metal falls back per item when varlen QKV is unsupported",
+      "expected_summary": {"dispatch": "per_item_fallback", "unsupported_primitive_calls": 0},
+      "observed_summary": {"dispatch": "varlen_qkv", "unsupported_primitive_calls": 1},
+      "trace": [{"backend": "metal", "supports_varlen_qkv": false, "called": "varlen_qkv"}]
+    },
+    {
+      "id": "H10.1",
+      "expected_failure_layer": "L1",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "fix_diff_reconstruction",
+      "expected_invariant": "CUDA scale_inplace preserves the f16 residual buffer dtype",
+      "expected_summary": {"input_dtype": "f16", "output_dtype": "f16"},
+      "observed_summary": {"input_dtype": "f16", "output_dtype": "f32"},
+      "trace": [{"backend": "cuda", "operation": "scale_inplace", "fallback": "host_default"}]
+    },
+    {
+      "id": "H11.1",
+      "expected_failure_layer": "L1",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "historical_artifact",
+      "expected_invariant": "Metal head_dim 256 attention accumulation remains finite",
+      "expected_summary": {"finite": true, "head_dim": 256, "nan_count": 0},
+      "observed_summary": {"finite": false, "head_dim": 256, "nan_count": 64},
+      "trace": [{"operation": "flash_attention", "head_dim": 256, "accumulator": "overflow"}]
+    },
+    {
+      "id": "H12.1",
+      "expected_failure_layer": "L1",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "historical_artifact",
+      "expected_invariant": "capacity exhaustion is classified without panic",
+      "expected_summary": {"error_class": "ResourceExhausted", "panic": false},
+      "observed_summary": {"error_class": "Unclassified", "panic": true},
+      "trace": [{"event": "capacity_exhausted"}, {"event": "panic"}]
+    },
+    {
+      "id": "H12.2",
+      "expected_failure_layer": "L4",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "fix_diff_reconstruction",
+      "expected_invariant": "capacity-deferred work waits for a capacity epoch change before readmission",
+      "expected_summary": {"immediate_readmit": false, "progress_epoch_delta": 1},
+      "observed_summary": {"immediate_readmit": true, "progress_epoch_delta": 0},
+      "trace": [{"event": "capacity_defer", "epoch": 7}, {"event": "readmit", "epoch": 7}]
+    },
+    {
+      "id": "H12.3",
+      "expected_failure_layer": "L1",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "historical_artifact",
+      "expected_invariant": "partial paged KV allocation rolls back every allocated block",
+      "expected_summary": {"blocks_after_rollback": 0, "leaked_block_count": 0},
+      "observed_summary": {"blocks_after_rollback": 3, "leaked_block_count": 3},
+      "trace": [{"event": "allocate", "blocks": 3}, {"event": "failure"}, {"event": "rollback", "released": 0}]
+    },
+    {
+      "id": "H12.4",
+      "expected_failure_layer": "L4",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "fix_diff_reconstruction",
+      "expected_invariant": "capacity defer releases an existing KV handle before requeue",
+      "expected_summary": {"closure_complete": true, "live_kv_handles": 0},
+      "observed_summary": {"closure_complete": false, "live_kv_handles": 1},
+      "trace": [{"event": "capacity_defer", "kv_handle": "retained"}, {"event": "requeue"}]
+    },
+    {
+      "id": "H13.1",
+      "expected_failure_layer": "L0",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "regression_contract_mutation",
+      "expected_invariant": "a successful SSE stream emits exactly one DONE terminator",
+      "expected_summary": {"done_count": 1, "usage_count": 0},
+      "observed_summary": {"done_count": 0, "usage_count": 0},
+      "trace": [{"data": {"choices": [{"delta": {"content": "hi"}}]}}]
+    },
+    {
+      "id": "H13.2",
+      "expected_failure_layer": "L0",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "regression_contract_mutation",
+      "expected_invariant": "a successful SSE stream emits exactly one DONE terminator",
+      "expected_summary": {"done_count": 1, "usage_count": 0},
+      "observed_summary": {"done_count": 2, "usage_count": 0},
+      "trace": [{"data": "[DONE]"}, {"data": "[DONE]"}]
+    },
+    {
+      "id": "H13.3",
+      "expected_failure_layer": "L0",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "regression_contract_mutation",
+      "expected_invariant": "include_usage emits exactly one final usage chunk",
+      "expected_summary": {"done_count": 1, "usage_count": 1},
+      "observed_summary": {"done_count": 1, "usage_count": 0},
+      "trace": [{"data": {"choices": []}}, {"data": "[DONE]"}]
+    },
+    {
+      "id": "H13.4",
+      "expected_failure_layer": "L0",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "regression_contract_mutation",
+      "expected_invariant": "include_usage emits exactly one final usage chunk",
+      "expected_summary": {"done_count": 1, "usage_count": 1},
+      "observed_summary": {"done_count": 1, "usage_count": 2},
+      "trace": [{"usage": {"total_tokens": 8}}, {"usage": {"total_tokens": 8}}, {"data": "[DONE]"}]
+    },
+    {
+      "id": "H14.1",
+      "expected_failure_layer": "L2",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "historical_artifact",
+      "expected_invariant": "Qwen3-Coder CUDA chat generates a non-EOS first token and non-empty answer",
+      "expected_summary": {"first_token_eos": false, "output_token_count": 16},
+      "observed_summary": {"first_token_eos": true, "output_token_count": 0},
+      "trace": [{"position": 0, "token_kind": "eos"}, {"wire_content": ""}]
+    },
+    {
+      "id": "H15.1",
+      "expected_failure_layer": "L4",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "historical_artifact",
+      "expected_invariant": "c32 capacity defer eventually changes epoch and reaches a terminal state",
+      "expected_summary": {"progress_epoch_delta": 1, "same_epoch_retry": false, "terminal": "complete"},
+      "observed_summary": {"progress_epoch_delta": 0, "same_epoch_retry": true, "terminal": "timeout"},
+      "trace": [{"event": "defer", "epoch": 11}, {"event": "retry", "epoch": 11}, {"event": "timeout"}]
+    },
+    {
+      "id": "H15.2",
+      "expected_failure_layer": "L4",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "fix_diff_reconstruction",
+      "expected_invariant": "recurrent and KV ownership cannot survive fallback into another request",
+      "expected_summary": {"cross_request_reuse": false, "previous_owner_cleared": true},
+      "observed_summary": {"cross_request_reuse": true, "previous_owner_cleared": false},
+      "trace": [{"event": "fallback", "owner": "request-a"}, {"event": "reuse", "request": "request-b", "state_owner": "request-a"}]
+    }
+  ]
+}

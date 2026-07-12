@@ -59,6 +59,8 @@ run_unit() {
     scripts/release/runtime_vnext_g00a_checkpoint.py \
     scripts/release/runtime_vnext_g00_orchestrator.py \
     scripts/release/runtime_vnext_historical_corpus.py \
+    scripts/release/runtime_vnext_historical_replay.py \
+    scripts/release/runtime_vnext_historical_capture.py \
     scripts/release/runtime_vnext_g01a_checkpoint.py \
     scripts/release/bounded_command.py \
     scripts/release/run_gate.py \
