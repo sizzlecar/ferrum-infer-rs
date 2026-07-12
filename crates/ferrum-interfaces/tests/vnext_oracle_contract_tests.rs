@@ -947,5 +947,5 @@ fn operation_oracle_contract_proof_line() {
         .unwrap());
 
     assert_eq!(passed, EXPECTED);
-    println!("VNEXT OPERATION ORACLE PASS: {passed}/{EXPECTED}");
+    println!("\nVNEXT OPERATION ORACLE PASS: {passed}/{EXPECTED}");
 }

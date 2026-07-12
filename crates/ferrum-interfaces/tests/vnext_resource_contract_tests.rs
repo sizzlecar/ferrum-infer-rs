@@ -1802,7 +1802,9 @@ fn resource_capacity_concurrency_is_bounded() {
     let mut passed = 0;
     device_global_capacity_contract(&plan, &mut passed);
     assert_eq!(passed, DEVICE_GLOBAL_CAPACITY_CASES);
-    println!("VNEXT RESOURCE CAPACITY THREAD BOUND PASS: {passed}/{DEVICE_GLOBAL_CAPACITY_CASES}");
+    println!(
+        "\nVNEXT RESOURCE CAPACITY THREAD BOUND PASS: {passed}/{DEVICE_GLOBAL_CAPACITY_CASES}"
+    );
 }
 
 fn admission_and_success(plan: &ExecutionPlan, passed: &mut usize) {
@@ -3989,7 +3991,7 @@ fn plan_runtime_close_recovery_is_ownership_safe() {
     check(&mut passed, trace.lock().unwrap().abandon.is_empty());
 
     assert_eq!(passed, EXPECTED_CLOSE_CASES);
-    println!("VNEXT PLAN RUNTIME CLOSE PASS: {passed}/{EXPECTED_CLOSE_CASES}");
+    println!("\nVNEXT PLAN RUNTIME CLOSE PASS: {passed}/{EXPECTED_CLOSE_CASES}");
 }
 
 fn closing_error(error: &VNextError) -> bool {
@@ -4283,5 +4285,5 @@ fn resource_transaction_contract_is_exhaustive() {
     abandon_callback_panic_during_unwind_is_contained(&mut passed);
     allocation_withholding_is_core_owned(&plan, &mut passed);
     assert_eq!(passed, EXPECTED_CASES);
-    println!("VNEXT RESOURCE TRANSACTION PASS: {passed}/{EXPECTED_CASES}");
+    println!("\nVNEXT RESOURCE TRANSACTION PASS: {passed}/{EXPECTED_CASES}");
 }

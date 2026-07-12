@@ -2051,7 +2051,7 @@ fn execution_plan_is_deterministic_100_of_100() {
         assert_eq!(left.plan_hash(), right.plan_hash());
         assert_eq!(left.to_json().unwrap(), right.to_json().unwrap());
     }
-    println!("VNEXT PLAN DETERMINISM PASS: 100/100");
+    println!("\nVNEXT PLAN DETERMINISM PASS: 100/100");
 }
 
 #[test]
@@ -2068,7 +2068,7 @@ fn execution_plan_schema_round_trip_100_of_100() {
         .unwrap();
         assert_eq!(fixture.plan, restored);
     }
-    println!("VNEXT PLAN ROUNDTRIP PASS: 100/100");
+    println!("\nVNEXT PLAN ROUNDTRIP PASS: 100/100");
 }
 
 #[test]
@@ -2087,7 +2087,7 @@ fn breaking_schema_versions_are_rejected_100_of_100() {
         )
         .is_err());
     }
-    println!("VNEXT BREAKING VERSION REJECT PASS: 100/100");
+    println!("\nVNEXT BREAKING VERSION REJECT PASS: 100/100");
 }
 
 #[test]
@@ -4222,7 +4222,7 @@ fn resolved_model_family_identity_is_unique_and_fail_closed() {
     passed += 1;
 
     assert_eq!(passed, EXPECTED);
-    println!("VNEXT MODEL IDENTITY PASS: {passed}/{EXPECTED}");
+    println!("\nVNEXT MODEL IDENTITY PASS: {passed}/{EXPECTED}");
 }
 
 #[test]
@@ -4475,7 +4475,7 @@ fn unknown_inputs_fail_closed() {
     passed += 1;
 
     assert_eq!(passed, EXPECTED);
-    println!("VNEXT FAIL CLOSED PASS: {passed}/{EXPECTED}");
+    println!("\nVNEXT FAIL CLOSED PASS: {passed}/{EXPECTED}");
 }
 
 #[test]

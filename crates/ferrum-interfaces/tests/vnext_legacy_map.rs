@@ -59,5 +59,5 @@ fn legacy_backend_methods_are_mapped_82_of_82() {
         assert!(!mapping["disposition"].as_str().unwrap().trim().is_empty());
     }
     assert_eq!(mapped.len(), 82);
-    println!("VNEXT LEGACY MAP PASS: 82/82");
+    println!("\nVNEXT LEGACY MAP PASS: 82/82");
 }
