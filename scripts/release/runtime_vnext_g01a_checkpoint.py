@@ -241,12 +241,13 @@ BOUNDED_TEST_ENV_OVERRIDES = {
     "CARGO_BUILD_JOBS": "2",
 }
 # These process-group limits include cargo and rustc workers as well as the
-# test binary. A 32/16 ceiling admits the observed 22/12 cold-compile peak while
-# still terminating runaway test concurrency hundreds of times before 8192.
+# test binary. An 8-process/32-group-thread/16-per-process ceiling admits the
+# observed 5-process/28-thread cold-compile peak while still terminating
+# runaway test concurrency hundreds of times before 8192 threads.
 BOUNDED_TEST_PROFILES = {
     "regular": {
         "wall_timeout_seconds": 120.0,
-        "max_processes": 4,
+        "max_processes": 8,
         "max_group_threads": 32,
         "max_per_process_threads": 16,
         "sample_interval_seconds": 0.05,
@@ -258,7 +259,7 @@ BOUNDED_TEST_PROFILES = {
     # mistaking rustc's normal internal workers for a runaway test process.
     "admission": {
         "wall_timeout_seconds": 120.0,
-        "max_processes": 4,
+        "max_processes": 8,
         "max_group_threads": 32,
         "max_per_process_threads": 16,
         "sample_interval_seconds": 0.05,
@@ -267,7 +268,7 @@ BOUNDED_TEST_PROFILES = {
     },
     "resource": {
         "wall_timeout_seconds": 60.0,
-        "max_processes": 4,
+        "max_processes": 8,
         "max_group_threads": 32,
         "max_per_process_threads": 16,
         "sample_interval_seconds": 0.05,
