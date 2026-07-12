@@ -241,9 +241,9 @@ BOUNDED_TEST_ENV_OVERRIDES = {
     "CARGO_BUILD_JOBS": "2",
 }
 # These process-group limits include cargo and rustc workers as well as the
-# test binary. An 8-process/32-group-thread/16-per-process ceiling admits the
-# observed 5-process/28-thread cold-compile peak while still terminating
-# runaway test concurrency hundreds of times before 8192 threads.
+# test binary. The regular profiles' 8-process/32-group-thread/16-per-process
+# ceiling admits the observed 5-process/28-thread cold-compile peak while still
+# terminating runaway test concurrency hundreds of times before 8192 threads.
 BOUNDED_TEST_PROFILES = {
     "regular": {
         "wall_timeout_seconds": 120.0,
@@ -278,7 +278,13 @@ BOUNDED_TEST_PROFILES = {
     "trybuild": {
         "wall_timeout_seconds": 300.0,
         "max_processes": 8,
-        "max_group_threads": 32,
+        # trybuild launches its own bounded Cargo build. With
+        # CARGO_BUILD_JOBS=2 the observed cold compile uses seven processes and
+        # can transiently cross 32 group threads while each process remains at
+        # or below 16. Keep the independent process/per-process ceilings and a
+        # group ceiling that is still 128x below the historical 8192-thread
+        # failure.
+        "max_group_threads": 64,
         "max_per_process_threads": 16,
         "sample_interval_seconds": 0.05,
         "max_sampling_errors": 3,
