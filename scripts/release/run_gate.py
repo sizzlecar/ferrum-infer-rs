@@ -83,8 +83,8 @@ VNEXT_G00_FULL_SELFTEST_PASS = (
 VNEXT_G00_SELFTEST_SUMMARY_PREFIX = (
     "FERRUM RUNTIME VNEXT G00 BASELINE SELFTEST SUMMARY:"
 )
-VNEXT_G00_REDTEAM_MUTATION_COUNT = 102
-VNEXT_G00_REDTEAM_MUTATION_MATRIX_SHA256 = "097f6af783d6b77311fea7853955a68e36f27867f4cc65e5627fa32feecfd99b"
+VNEXT_G00_REDTEAM_MUTATION_COUNT = 103
+VNEXT_G00_REDTEAM_MUTATION_MATRIX_SHA256 = "586a8cc3b69ddd64edefa220b30e4f3f2a1b9dc53dc7969d0d89a21718ae1f46"
 VNEXT_G00_REDTEAM_MUTATION_NAMES = (
     "dirty",
     "stale",
@@ -183,6 +183,7 @@ VNEXT_G00_REDTEAM_MUTATION_NAMES = (
     "build-raw-summary",
     "build-finished-failure",
     "build-content-evidence",
+    "build-repair-base-binding",
     "build-native-log-derivation",
     "build-restore-fresh",
     "build-restore-binary",
