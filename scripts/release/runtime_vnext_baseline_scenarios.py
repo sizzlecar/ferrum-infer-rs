@@ -49,6 +49,7 @@ CASE_ID_RE = re.compile(r"^c(?:0[1-9]|1[0-9]|2[01])-[0-9]{3}$")
 SCENARIO_IDS = tuple(f"C{index:02d}" for index in range(1, 22))
 EXPECTATION_SELECTOR_FIELDS = ("scenario_id", "variant", "preset", "entrypoint", "case_id")
 EXPECTED_STATUSES = {"pass", "known-fail", "blocked", "discovery-required"}
+C03_CONTRACT_ID = "c03-exact-identifier-v2"
 BLOCKED_LANE_FAILURE_CLASSES = {
     "m1-qwen35-4b/metal": "legacy-model-backend-unsupported",
     "m2-qwen35-35b-a3b/metal": "legacy-model-backend-unsupported",
@@ -883,9 +884,21 @@ def validate_case_output(
         if scenario_id == "C02":
             require(assistants[-1].get("finish_reason") in {"stop", "eos"}, f"{label} did not end naturally")
         if scenario_id == "C03":
-            require(len(assistants) >= 3, f"{label} must contain three assistant turns")
+            require(len(assistants) == 3, f"{label} must contain exactly three assistant turns")
+            users = [row for row in rows if row.get("event") == "user"]
+            require(len(users) == 3, f"{label} must contain exactly three user turns")
+            require([row.get("turn") for row in users] == [0, 1, 2], f"{label} user turn sequence mismatch")
+            require([row.get("turn") for row in assistants] == [0, 1, 2], f"{label} assistant turn sequence mismatch")
             marker = require_string(observed.get("expected_marker"), f"{label}.observed.expected_marker")
-            require(marker in str(assistants[-1].get("content")), f"{label} did not recall its marker")
+            require(observed.get("contract_id") == C03_CONTRACT_ID, f"{label} C03 contract id mismatch")
+            require(
+                [row.get("content") for row in users] == c03_user_turns(marker),
+                f"{label} C03 user turns differ from the versioned contract",
+            )
+            require(
+                [row.get("content") for row in assistants] == c03_expected_assistant_turns(marker),
+                f"{label} C03 assistant turns differ from the versioned contract",
+            )
         if scenario_id == "C04":
             require(sum(require_count(row.get("n_tokens"), f"{label}.n_tokens", minimum=1) for row in assistants) >= 512, f"{label} long output is shorter than 512 tokens")
             require(any(require_count(row.get("chunk_count"), f"{label}.chunk_count", minimum=1) > 1 for row in assistants), f"{label} long output was not incremental")
@@ -1294,6 +1307,12 @@ def validate_case_evidence(
             expected["model_key"],
         )
         require(input_document == expected_payload, f"case {case_id} persisted input differs from generated scenario contract")
+    elif scenario_id == "C03":
+        marker = expected_case_text({"scenario_id": scenario_id, "case_id": case_id})
+        require(
+            input_document == c03_input_document(case_id, marker, list(argv)),
+            f"case {case_id} persisted input differs from the versioned C03 contract",
+        )
     require(file_sha256(resolved["effective_config"][0]) == expected["effective_config_sha256"], f"case {case_id} effective config mismatch")
     actual_config: dict[str, Any] | None = None
     envelope_ref = case.get("execution_envelope")
@@ -1389,6 +1408,11 @@ def validate_case_evidence(
             expected_backend=expected["backend"],
             expected_model_key=expected["model_key"],
             label=f"case {case_id}.actual_effective_config JSON",
+            allow_architecture_mismatch=allow_c01_known_failure_architecture_mismatch(
+                scenario_id,
+                case["status"],
+                observed_outcome.get("failure_class"),
+            ),
         )
         require(
             command_spec.get("actual_effective_config_sha256") == file_sha256(actual_config_path),
@@ -2054,6 +2078,37 @@ def expected_case_text(case: dict[str, Any]) -> str:
     if case["scenario_id"] == "C06":
         return case_marker(f"c05-{int(case['ordinal']):03d}")
     return case_marker(case["case_id"])
+
+
+def c03_user_turns(marker: str) -> list[str]:
+    return [
+        f"Remember this identifier for later: {marker}. Reply with exactly ACKNOWLEDGED and do not include the identifier.",
+        "Reply with exactly CONTINUE.",
+        "What identifier did I ask you to remember in the first message? Reply with only the identifier.",
+    ]
+
+
+def c03_expected_assistant_turns(marker: str) -> list[str]:
+    return ["ACKNOWLEDGED", "CONTINUE", marker]
+
+
+def c03_input_document(case_id: str, marker: str, argv: list[str]) -> dict[str, Any]:
+    user_turns = c03_user_turns(marker)
+    return {
+        "case_id": case_id,
+        "contract_id": C03_CONTRACT_ID,
+        "user_turns": user_turns,
+        "stdin": "\n".join(user_turns) + "\n",
+        "argv": argv,
+    }
+
+
+def allow_c01_known_failure_architecture_mismatch(
+    scenario_id: str,
+    status: str,
+    failure_class: Any,
+) -> bool:
+    return scenario_id == "C01" and status == "known-fail" and failure_class == "c01-contract-violation"
 
 
 def model_file_digest(model_files: dict[str, str], source_path: Path) -> str | None:
@@ -2860,6 +2915,7 @@ def validate_actual_effective_config(
     expected_backend: str,
     expected_model_key: str,
     label: str,
+    allow_architecture_mismatch: bool = False,
 ) -> dict[str, Any]:
     config = require_object(raw, label)
     require(config.get("missing") is not True, f"{label} declares missing product evidence")
@@ -2873,12 +2929,8 @@ def validate_actual_effective_config(
     model_capabilities = require_object(config.get("model_capabilities"), f"{label}.model_capabilities")
     require(model_capabilities, f"{label}.model_capabilities empty")
     architecture = require_string(model_capabilities.get("architecture"), f"{label}.model_capabilities.architecture")
-    expected_architectures = {
-        "m1-qwen35-4b": {"qwen3_5", "qwen3_5_text"},
-        "m2-qwen35-35b-a3b": {"qwen3_5_moe", "qwen3_5_moe_text"},
-        "m3-qwen3-30b-a3b": {"qwen3", "qwen3_moe"},
-    }
-    require(architecture in expected_architectures[expected_model_key], f"{label} architecture differs from lane model")
+    if not allow_architecture_mismatch:
+        require(architecture in EXPECTED_ARCHITECTURES[expected_model_key], f"{label} architecture differs from lane model")
     workload = require_object(config.get("workload_profile"), f"{label}.workload_profile")
     require(workload, f"{label}.workload_profile empty")
     require_string(workload.get("serving_mode"), f"{label}.workload_profile.serving_mode")
@@ -3207,13 +3259,7 @@ def run_case_command(
     values = preset_values(case["model_key"], case["preset"])
     argv = [str(binary_path), "run", model_arg, "--backend", backend, "--output-format", "jsonl"]
     if case["scenario_id"] == "C03":
-        stdin_text = "\n".join(
-            [
-                f"Remember the exact secret {marker}.",
-                "Reply with the word acknowledged.",
-                "What exact secret did I ask you to remember?",
-            ]
-        ) + "\n"
+        stdin_text = "\n".join(c03_user_turns(marker)) + "\n"
     elif case["scenario_id"] == "C19":
         soft_suffix = ""
         if case["variant"] in {"soft-think", "soft-think-misuse"}:
@@ -3251,7 +3297,11 @@ def run_case_command(
         argv.append("--disable-thinking")
     argv.extend(["--effective-config-json", str(actual_config), *run_extra_args])
     input_path = case_root / "input.json"
-    input_document: dict[str, Any] = {"case_id": case_id, "stdin": stdin_text, "argv": argv}
+    input_document: dict[str, Any] = (
+        c03_input_document(case_id, marker, argv)
+        if case["scenario_id"] == "C03"
+        else {"case_id": case_id, "stdin": stdin_text, "argv": argv}
+    )
     if case["scenario_id"] == "C01":
         input_document["resolution_probe"] = build_c01_resolution_probe(
             model_arg,
@@ -3337,6 +3387,8 @@ def run_case_command(
         "child_environment_sha256": canonical_json_sha256(child_environment),
     }
     observed = {"case_id": case_id, "expected_marker": marker}
+    if case["scenario_id"] == "C03":
+        observed["contract_id"] = C03_CONTRACT_ID
     if case["scenario_id"] == "C01":
         observed.update(
             {
@@ -4341,9 +4393,16 @@ def make_case_fixture(
         "model_key": base["model_key"],
     }
     marker = expected_case_text(case_spec)
+    run_argv = [binary_argv0, "run", base["model_key"], "--output-format", "jsonl"]
+    if scenario_id == "C03":
+        run_argv.extend(["--effective-config-json", f"{case_root}/actual-effective-config.json"])
+    else:
+        run_argv.extend(["--prompt", case_id])
     input_value: dict[str, Any]
     if entrypoint == "serve":
         input_value = case_http_payload(case_spec, base["model_key"])
+    elif scenario_id == "C03":
+        input_value = c03_input_document(case_id, marker, run_argv)
     else:
         input_value = {
             "case_id": case_id,
@@ -4513,13 +4572,15 @@ def make_case_fixture(
     if entrypoint == "run":
         assistant_count = 3 if scenario_id == "C03" else 2 if scenario_id == "C19" else 1
         rows: list[dict[str, Any]] = [{"event": "ready", "model": base["model_key"], "backend": base["backend"]}]
-        for turn in range(1, assistant_count + 1):
-            content = (
-                f"{marker}-H{turn}"
-                if scenario_id == "C19"
-                else marker if turn == assistant_count else f"turn-{turn}-ack"
-            )
-            rows.append({"event": "user", "turn": turn, "content": input_value["prompt"]})
+        turn_indices = range(3) if scenario_id == "C03" else range(1, assistant_count + 1)
+        for turn in turn_indices:
+            if scenario_id == "C03":
+                content = c03_expected_assistant_turns(marker)[turn]
+                user_content = c03_user_turns(marker)[turn]
+            else:
+                content = f"{marker}-H{turn}" if scenario_id == "C19" else marker
+                user_content = input_value["prompt"]
+            rows.append({"event": "user", "turn": turn, "content": user_content})
             assistant_row = {
                     "event": "assistant",
                     "turn": turn,
@@ -4537,8 +4598,10 @@ def make_case_fixture(
         rows.append({"event": "exit", "reason": "complete"})
         stdout_text = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
         transcript_ref = None
-        argv = [binary_argv0, "run", base["model_key"], "--output-format", "jsonl", "--prompt", case_id]
+        argv = run_argv
         observed: dict[str, Any] = {"case_id": case_id, "expected_marker": marker}
+        if scenario_id == "C03":
+            observed["contract_id"] = C03_CONTRACT_ID
         if scenario_id == "C01":
             observed.update(
                 {
@@ -5084,10 +5147,20 @@ def run_mode(argv):
     if scenario == "C06":
         marker = f"G00-c05-{ordinal:03d}-OK"
     turns = 3 if scenario == "C03" else 2 if scenario == "C19" else 1
+    turn_indices = range(3) if scenario == "C03" else range(1, turns + 1)
     print(json.dumps({"event": "ready", "model": argv[1], "backend": value_after(argv, "--backend", "auto")}))
-    for turn in range(1, turns + 1):
-        print(json.dumps({"event": "user", "turn": turn, "content": "fixture input"}))
-        content = f"{marker}-H{turn}" if scenario == "C19" else marker if turn == turns else f"turn-{turn}-ack"
+    for turn in turn_indices:
+        if scenario == "C03":
+            user_content = [
+                f"Remember this identifier for later: {marker}. Reply with exactly ACKNOWLEDGED and do not include the identifier.",
+                "Reply with exactly CONTINUE.",
+                "What identifier did I ask you to remember in the first message? Reply with only the identifier.",
+            ][turn]
+            content = ["ACKNOWLEDGED", "CONTINUE", marker][turn]
+        else:
+            user_content = "fixture input"
+            content = f"{marker}-H{turn}" if scenario == "C19" else marker
+        print(json.dumps({"event": "user", "turn": turn, "content": user_content}))
         row = {"event": "assistant", "turn": turn, "content": content, "finish_reason": "eos", "n_tokens": 512 if scenario == "C04" else 4, "chunk_count": 512 if scenario == "C04" else 2, "ms": 1.0}
         if scenario == "C19":
             if "--disable-thinking" not in argv and not (scenario == "C19" and ordinal >= 17):
@@ -5542,6 +5615,88 @@ def self_test() -> int:
         require("scheduler trace evidence is empty" in str(exc), f"passing trace rejection used unexpected reason: {exc}")
     else:
         raise AssertionError("passing scheduler case accepted empty trace evidence")
+    require(
+        allow_c01_known_failure_architecture_mismatch("C01", "known-fail", "c01-contract-violation"),
+        "exact C01 known-fail architecture allowance did not resolve",
+    )
+    for scenario_id, status, failure_class in (
+        ("C01", "pass", None),
+        ("C01", "known-fail", "other-contract-violation"),
+        ("C02", "known-fail", "c01-contract-violation"),
+    ):
+        require(
+            not allow_c01_known_failure_architecture_mismatch(scenario_id, status, failure_class),
+            f"C01 architecture allowance leaked to {scenario_id}/{status}/{failure_class}",
+        )
+    unknown_architecture_config = {
+        "schema_version": SCHEMA_VERSION,
+        "entries": [{"key": "FERRUM_BACKEND", "effective_value": "metal"}],
+        "hardware_capabilities": {"backend": "metal"},
+        "model_capabilities": {"architecture": "unknown"},
+        "workload_profile": {"serving_mode": "openai_chat", "target_concurrency": 1},
+        "decisions": [],
+    }
+    try:
+        validate_actual_effective_config(
+            unknown_architecture_config,
+            expected_backend="metal",
+            expected_model_key="m3-qwen3-30b-a3b",
+            label="passing C01 architecture fixture",
+        )
+    except ScenarioError as exc:
+        require("architecture differs from lane model" in str(exc), f"passing architecture fixture used unexpected rejection: {exc}")
+    else:
+        raise AssertionError("passing C01 architecture fixture accepted unknown architecture")
+    validate_actual_effective_config(
+        unknown_architecture_config,
+        expected_backend="metal",
+        expected_model_key="m3-qwen3-30b-a3b",
+        label="known-fail C01 architecture fixture",
+        allow_architecture_mismatch=True,
+    )
+    with tempfile.TemporaryDirectory(prefix="ferrum-vnext-c03-contract-") as contract_tmp:
+        marker = "G00-c03-001-OK"
+        observed = {"case_id": "c03-001", "expected_marker": marker, "contract_id": C03_CONTRACT_ID}
+        rows: list[dict[str, Any]] = [{"event": "ready", "model": "fixture", "backend": "metal"}]
+        for turn, (user_content, assistant_content) in enumerate(
+            zip(c03_user_turns(marker), c03_expected_assistant_turns(marker), strict=True)
+        ):
+            rows.extend(
+                [
+                    {"event": "user", "turn": turn, "content": user_content},
+                    {
+                        "event": "assistant",
+                        "turn": turn,
+                        "content": assistant_content,
+                        "finish_reason": "stop",
+                        "n_tokens": 1,
+                        "chunk_count": 1,
+                    },
+                ]
+            )
+        rows.append({"event": "exit", "reason": "eof"})
+        stdout_path = Path(contract_tmp) / "stdout.jsonl"
+
+        def validate_c03_rows(candidate_rows: list[dict[str, Any]], label: str) -> None:
+            stdout_path.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in candidate_rows), encoding="utf-8")
+            validate_case_output("C03", "all", "run", stdout_path, None, observed, label)
+
+        validate_c03_rows(rows, "valid C03 fixture")
+        c03_mutations: tuple[tuple[str, Callable[[list[dict[str, Any]]], None], str], ...] = (
+            ("first-assistant", lambda value: value[2].update({"content": "ACK"}), "assistant turns differ"),
+            ("second-assistant", lambda value: value[4].update({"content": "PROCEED"}), "assistant turns differ"),
+            ("final-assistant", lambda value: value[6].update({"content": "wrong-marker"}), "assistant turns differ"),
+            ("assistant-turn-order", lambda value: value[4].update({"turn": 2}), "assistant turn sequence mismatch"),
+        )
+        for name, mutate, rejection in c03_mutations:
+            candidate_rows = copy.deepcopy(rows)
+            mutate(candidate_rows)
+            try:
+                validate_c03_rows(candidate_rows, name)
+            except ScenarioError as exc:
+                require(rejection in str(exc), f"{name} C03 mutation used unexpected rejection: {exc}")
+            else:
+                raise AssertionError(f"{name} C03 mutation unexpectedly passed")
     selector_catalog = internal_expectations_catalog()
     selector_rules = selector_catalog["lanes"]["m3-qwen3-30b-a3b/metal"]["rules"]
     exact_case_rule = copy.deepcopy(selector_rules[0])
@@ -5769,6 +5924,41 @@ def self_test() -> int:
             persist_input_mutation(mutation_root, scenario, raw_path, raw, case_path, case, envelope_path, envelope, input_document)
             expect_execution_report_reject(mutation_root, candidate, "negative tokenizer differs from the locked source")
             rejected_mutations.add("c01-negative-tokenizer-drift")
+
+        with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c01-pass-architecture") as (mutation_root, candidate):
+            scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=0)
+            envelope = read_json(envelope_path)
+            actual_config_path = mutation_root / envelope["actual_effective_config"]["path"]
+            actual_config = read_json(actual_config_path)
+            actual_config["model_capabilities"]["architecture"] = "unknown"
+            write_json(actual_config_path, actual_config)
+            update_ref_sha(envelope["actual_effective_config"], mutation_root)
+            command_spec_path = mutation_root / envelope["command_spec"]["path"]
+            command_spec = read_json(command_spec_path)
+            command_spec["actual_effective_config_sha256"] = file_sha256(actual_config_path)
+            write_json(command_spec_path, command_spec)
+            update_ref_sha(envelope["command_spec"], mutation_root)
+            persist_execution_case_mutation(
+                mutation_root,
+                scenario,
+                raw_path,
+                raw,
+                case_path,
+                case,
+                envelope_path=envelope_path,
+                envelope=envelope,
+            )
+            expect_execution_report_reject(mutation_root, candidate, "architecture differs from lane model")
+            rejected_mutations.add("c01-pass-architecture-mismatch")
+
+        with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c03-input-contract") as (mutation_root, candidate):
+            scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=2)
+            envelope = read_json(envelope_path)
+            input_document = read_json(mutation_root / case["artifacts"]["input"]["path"])
+            input_document["contract_id"] = "c03-unbound-mutation"
+            persist_input_mutation(mutation_root, scenario, raw_path, raw, case_path, case, envelope_path, envelope, input_document)
+            expect_execution_report_reject(mutation_root, candidate, "versioned C03 contract")
+            rejected_mutations.add("c03-input-contract-drift")
 
         with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-forged-pair-payload") as (mutation_root, candidate):
             for scenario_index in (4, 5):
@@ -6169,7 +6359,9 @@ def self_test() -> int:
             "command-receipt-environment-divergence",
             "c01-missing-resolution-probe",
             "c01-negative-tokenizer-drift",
+            "c01-pass-architecture-mismatch",
             "c01-wrong-negative-failure-class",
+            "c03-input-contract-drift",
             "simultaneously-forged-pair-payload",
             "simultaneously-forged-tool-pair-payload",
             "c06-missing-stream-reconstruction",
