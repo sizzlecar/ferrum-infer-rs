@@ -54,6 +54,7 @@ run_unit() {
     scripts/release/runtime_vnext_hardware_probe.py \
     scripts/release/runtime_vnext_build_timing.py \
     scripts/release/runtime_vnext_baseline_scenarios.py \
+    scripts/release/runtime_vnext_expectation_amendment.py \
     scripts/release/runtime_vnext_blocked_lane.py \
     scripts/release/runtime_vnext_resource_sampler.py \
     scripts/release/runtime_vnext_g00a_checkpoint.py \
