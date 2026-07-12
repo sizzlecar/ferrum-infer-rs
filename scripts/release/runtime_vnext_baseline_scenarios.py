@@ -2066,6 +2066,7 @@ def build_c01_resolution_probe(
         template_text = require_string(template_value, "C01 selected chat template")
     token_source = tokenizer if tokenizer is not None else semantic
     token_root = tokenizer_root if tokenizer is not None else semantic_root
+    tokenizer_path = token_root / "tokenizer.json"
     tokenizer_config_path = token_root / "tokenizer_config.json"
     tokenizer_config = read_json(tokenizer_config_path)
     eos_ids = config_model.get("eos_token_id") if isinstance(config_model, dict) else None
@@ -2116,6 +2117,8 @@ def build_c01_resolution_probe(
         },
         "special_tokens": {
             "source": ("tokenizer_source" if tokenizer is not None else "semantic_source") + "/tokenizer_config.json",
+            "tokenizer_sha256": file_sha256(tokenizer_path),
+            "locked_tokenizer_sha256": token_source["files"]["tokenizer.json"],
             "container_sha256": file_sha256(tokenizer_config_path),
             "locked_container_sha256": token_source["files"]["tokenizer_config.json"],
             "tokens": special_tokens,
@@ -2154,6 +2157,7 @@ def validate_c01_resolution_probe(
     require(probe.get("expected_runtime_architectures") == sorted(EXPECTED_ARCHITECTURES[model_key]), f"{label} expected architecture set drift")
     if variant == "special-token-eos":
         special = require_object(probe.get("special_tokens"), f"{label}.resolution_probe.special_tokens")
+        require(special.get("tokenizer_sha256") == special.get("locked_tokenizer_sha256"), f"{label} tokenizer.json is not locked")
         require(special.get("container_sha256") == special.get("locked_container_sha256"), f"{label} tokenizer_config is not locked")
         tokens = require_object(special.get("tokens"), f"{label}.resolution_probe.special_tokens.tokens")
         require(tokens.get("eos_token") is not None, f"{label} official EOS token is absent")
@@ -2189,7 +2193,7 @@ def validate_c01_negative_probe(
     require(probe.get("environment_sha256") == canonical_json_sha256(environment), f"{label} negative probe environment SHA mismatch")
     artifacts = require_object(probe.get("artifacts"), f"{label}.negative_probe.artifacts")
     require(
-        set(artifacts) == {"config", "tokenizer_config", "dummy_weight_marker", "named_weight", "stdout", "stderr", "process_receipt"},
+        set(artifacts) == {"config", "tokenizer", "tokenizer_config", "dummy_weight_marker", "named_weight", "stdout", "stderr", "process_receipt"},
         f"{label} negative probe artifact set mismatch",
     )
     require(probe.get("fixture_manifest_sha256") == canonical_json_sha256(artifacts), f"{label} negative fixture manifest SHA mismatch")
@@ -2201,6 +2205,9 @@ def validate_c01_negative_probe(
     require(target.get("model_type") == f"g00_unsupported_layout_{ordinal:03d}", f"{label} negative config layout mismatch")
     marker = require_object(config.get("g00_negative_fixture"), f"{label}.negative.config.g00_negative_fixture")
     require(marker == {"ordinal": ordinal, "expected_failure": "unsupported-architecture-layout"}, f"{label} negative config marker mismatch")
+    tokenizer_path, _, _ = validate_artifact_ref(root, artifacts["tokenizer"], f"{label}.negative.tokenizer", allowed_kinds={"raw-json"})
+    special_tokens = require_object(resolution_probe.get("special_tokens"), f"{label}.resolution_probe.special_tokens")
+    require(file_sha256(tokenizer_path) == special_tokens.get("locked_tokenizer_sha256"), f"{label} negative tokenizer differs from the locked source")
     validate_artifact_ref(root, artifacts["tokenizer_config"], f"{label}.negative.tokenizer_config", allowed_kinds={"raw-json"})
     dummy_path, _, _ = validate_artifact_ref(root, artifacts["dummy_weight_marker"], f"{label}.negative.dummy", allowed_kinds={"runtime-log"})
     require("must reject" in dummy_path.read_text(encoding="utf-8").lower(), f"{label} negative dummy marker contract missing")
@@ -3004,6 +3011,9 @@ def execute_c01_unknown_fixture(
     config["g00_negative_fixture"] = {"ordinal": ordinal, "expected_failure": "unsupported-architecture-layout"}
     fixture_config = fixture_root / "config.json"
     write_json(fixture_config, config)
+    source_tokenizer = tokenizer_root / "tokenizer.json"
+    fixture_tokenizer = fixture_root / "tokenizer.json"
+    shutil.copy2(source_tokenizer, fixture_tokenizer)
     source_tokenizer_config = tokenizer_root / "tokenizer_config.json"
     fixture_tokenizer_config = fixture_root / "tokenizer_config.json"
     shutil.copy2(source_tokenizer_config, fixture_tokenizer_config)
@@ -3093,6 +3103,7 @@ def execute_c01_unknown_fixture(
     dummy_path = fixture_root / "DUMMY_WEIGHT_NOT_FOR_LOADING"
     artifacts = {
         "config": existing_artifact_ref(root, fixture_config, "raw-json"),
+        "tokenizer": existing_artifact_ref(root, fixture_tokenizer, "raw-json"),
         "tokenizer_config": existing_artifact_ref(root, fixture_tokenizer_config, "raw-json"),
         "dummy_weight_marker": existing_artifact_ref(root, dummy_path, "runtime-log"),
         "named_weight": existing_artifact_ref(root, named_weight, "binary"),
@@ -4288,6 +4299,10 @@ def make_case_fixture(
                 "eos_token_id": [1],
                 "fixture_unknown_official_field": {"preserved": True},
             }
+            fixture_tokenizer = {"model": {"type": "BPE", "vocab": {"<s>": 0, "</s>": 1}}}
+            fixture_tokenizer_path = root / case_root / "tokenizer.json"
+            write_json(fixture_tokenizer_path, fixture_tokenizer)
+            tokenizer_digest = file_sha256(fixture_tokenizer_path)
             fixture_template = "{% for message in messages %}{{ message['role'] }}:{{ message['content'] }}{% endfor %}"
             config_digest = canonical_json_sha256(fixture_config)
             template_digest = hashlib.sha256(fixture_template.encode("utf-8")).hexdigest()
@@ -4316,6 +4331,8 @@ def make_case_fixture(
                 },
                 "special_tokens": {
                     "source": "semantic_source/tokenizer_config.json",
+                    "tokenizer_sha256": tokenizer_digest,
+                    "locked_tokenizer_sha256": tokenizer_digest,
                     "container_sha256": template_digest,
                     "locked_container_sha256": template_digest,
                     "tokens": {"bos_token": "<s>", "eos_token": "</s>"},
@@ -4342,11 +4359,13 @@ def make_case_fixture(
                 negative_config["model_type"] = f"g00_unsupported_layout_{ordinal:03d}"
                 negative_config["g00_negative_fixture"] = {"ordinal": ordinal, "expected_failure": "unsupported-architecture-layout"}
                 negative_config_path = negative_root / "config.json"
+                negative_tokenizer_json_path = negative_root / "tokenizer.json"
                 negative_tokenizer_path = negative_root / "tokenizer_config.json"
                 dummy_path = negative_root / "DUMMY_WEIGHT_NOT_FOR_LOADING"
                 negative_stdout = negative_root / "stdout.log"
                 negative_stderr = negative_root / "stderr.log"
                 write_json(negative_config_path, negative_config)
+                shutil.copy2(fixture_tokenizer_path, negative_tokenizer_json_path)
                 write_json(negative_tokenizer_path, {"chat_template": fixture_template, "bos_token": "<s>", "eos_token": "</s>"})
                 dummy_path.write_text("Architecture dispatch must reject this fixture before any weight or kernel load.\n", encoding="utf-8")
                 if base["backend"] == "metal":
@@ -4387,6 +4406,7 @@ def make_case_fixture(
                 finished = iso_now()
                 negative_artifacts = {
                     "config": existing_artifact_ref(root, negative_config_path, "raw-json"),
+                    "tokenizer": existing_artifact_ref(root, negative_tokenizer_json_path, "raw-json"),
                     "tokenizer_config": existing_artifact_ref(root, negative_tokenizer_path, "raw-json"),
                     "dummy_weight_marker": existing_artifact_ref(root, dummy_path, "runtime-log"),
                     "named_weight": existing_artifact_ref(root, negative_named_weight, "binary"),
@@ -5192,6 +5212,7 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
     models_lock = root / "models.lock.json"
     model_dir = root / "models/fixture-model"
     config_path = model_dir / "config.json"
+    tokenizer_json_path = model_dir / "tokenizer.json"
     tokenizer_path = model_dir / "tokenizer_config.json"
     weight_path = model_dir / "weights.gguf"
     write_json(
@@ -5201,6 +5222,13 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
             "model_type": "qwen3",
             "eos_token_id": [1],
             "fixture_unknown_official_field": {"preserved": True},
+        },
+    )
+    write_json(
+        tokenizer_json_path,
+        {
+            "model": {"type": "BPE", "vocab": {"<s>": 0, "</s>": 1}},
+            "added_tokens": [],
         },
     )
     write_json(
@@ -5246,6 +5274,7 @@ def make_execution_fixture_manifest(root: Path) -> dict[str, Any]:
                                 "revision": semantic_revision,
                                 "files": [
                                     {"path": "config.json", "sha256": file_sha256(config_path)},
+                                    {"path": "tokenizer.json", "sha256": file_sha256(tokenizer_json_path)},
                                     {"path": "tokenizer_config.json", "sha256": file_sha256(tokenizer_path)},
                                 ],
                             },
@@ -5579,6 +5608,19 @@ def self_test() -> int:
             expect_execution_report_reject(mutation_root, candidate, "lacks exact unsupported architecture/layout evidence")
             rejected_mutations.add("c01-wrong-negative-failure-class")
 
+        with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c01-negative-tokenizer") as (mutation_root, candidate):
+            scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=0, case_index=15)
+            envelope = read_json(envelope_path)
+            input_document = read_json(mutation_root / case["artifacts"]["input"]["path"])
+            negative = require_object(input_document.get("negative_probe"), "C01 mutation negative probe")
+            negative_tokenizer = mutation_root / negative["artifacts"]["tokenizer"]["path"]
+            write_json(negative_tokenizer, {"tampered": True})
+            update_ref_sha(negative["artifacts"]["tokenizer"], mutation_root)
+            negative["fixture_manifest_sha256"] = canonical_json_sha256(negative["artifacts"])
+            persist_input_mutation(mutation_root, scenario, raw_path, raw, case_path, case, envelope_path, envelope, input_document)
+            expect_execution_report_reject(mutation_root, candidate, "negative tokenizer differs from the locked source")
+            rejected_mutations.add("c01-negative-tokenizer-drift")
+
         with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-forged-pair-payload") as (mutation_root, candidate):
             for scenario_index in (4, 5):
                 scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=scenario_index)
@@ -5855,6 +5897,7 @@ def self_test() -> int:
         required_rejections = {
             "command-receipt-environment-divergence",
             "c01-missing-resolution-probe",
+            "c01-negative-tokenizer-drift",
             "c01-wrong-negative-failure-class",
             "simultaneously-forged-pair-payload",
             "simultaneously-forged-tool-pair-payload",
