@@ -1149,7 +1149,13 @@ def validate_case_output(
             elif variant == "json-object":
                 require(request.get("response_format") == {"type": "json_object"}, f"{label} json_object request contract mismatch")
                 parsed = json.loads(content)
-                require(parsed == {"result": marker}, f"{label} json_object result mismatch")
+            require(parsed == {"result": marker}, f"{label} json_object result mismatch")
+
+
+def scheduler_trace_rows_for_status(raw: Any, *, case_status: str, label: str) -> list[Any]:
+    rows = require_list(raw, f"{label}.scheduler_trace_rows")
+    require(rows or case_status == "known-fail", f"{label} scheduler trace evidence is empty")
+    return rows
 
 
 def validate_case_evidence(
@@ -1407,8 +1413,11 @@ def validate_case_evidence(
     transcript = resolved.get("http_transcript", (Path(), None))[1]
     if scenario_id in {"C09", "C18"} and (not expected["allow_internal_fixture"] or envelope_ref is not None):
         transcript_object = require_object(transcript, f"case {case_id}.http_transcript")
-        trace_rows = require_list(transcript_object.get("scheduler_trace_rows"), f"case {case_id}.scheduler_trace_rows")
-        require(trace_rows, f"case {case_id} scheduler trace evidence is empty")
+        trace_rows = scheduler_trace_rows_for_status(
+            transcript_object.get("scheduler_trace_rows"),
+            case_status=case["status"],
+            label=f"case {case_id}",
+        )
         for index, trace_raw in enumerate(trace_rows):
             trace = require_object(trace_raw, f"case {case_id}.scheduler_trace_rows[{index}]")
             raw_trace = require_object(trace.get("raw"), f"case {case_id}.scheduler_trace_rows[{index}].raw")
@@ -5523,6 +5532,16 @@ def self_test() -> int:
         and SHA256_RE.fullmatch(history_errors[0]["response_sha256"]) is not None,
         "malformed history response evidence is incomplete",
     )
+    require(
+        scheduler_trace_rows_for_status([], case_status="known-fail", label="known-fail fixture") == [],
+        "known-fail scheduler trace absence was not preserved",
+    )
+    try:
+        scheduler_trace_rows_for_status([], case_status="pass", label="passing fixture")
+    except ScenarioError as exc:
+        require("scheduler trace evidence is empty" in str(exc), f"passing trace rejection used unexpected reason: {exc}")
+    else:
+        raise AssertionError("passing scheduler case accepted empty trace evidence")
     selector_catalog = internal_expectations_catalog()
     selector_rules = selector_catalog["lanes"]["m3-qwen3-30b-a3b/metal"]["rules"]
     exact_case_rule = copy.deepcopy(selector_rules[0])
