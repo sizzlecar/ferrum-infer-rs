@@ -1408,11 +1408,12 @@ def validate_case_evidence(
             expected_backend=expected["backend"],
             expected_model_key=expected["model_key"],
             label=f"case {case_id}.actual_effective_config JSON",
-            allow_architecture_mismatch=allow_c01_known_failure_architecture_mismatch(
+            allow_unknown_architecture=allow_c01_known_failure_unknown_architecture(
                 scenario_id,
                 case["status"],
                 observed_outcome.get("failure_class"),
-            ),
+            )
+            or allow_frozen_unknown_architecture(expected["model_key"], expected["backend"]),
         )
         require(
             command_spec.get("actual_effective_config_sha256") == file_sha256(actual_config_path),
@@ -2103,12 +2104,16 @@ def c03_input_document(case_id: str, marker: str, argv: list[str]) -> dict[str, 
     }
 
 
-def allow_c01_known_failure_architecture_mismatch(
+def allow_c01_known_failure_unknown_architecture(
     scenario_id: str,
     status: str,
     failure_class: Any,
 ) -> bool:
     return scenario_id == "C01" and status == "known-fail" and failure_class == "c01-contract-violation"
+
+
+def allow_frozen_unknown_architecture(model_key: str, backend: str) -> bool:
+    return model_key == "m3-qwen3-30b-a3b" and backend == "metal"
 
 
 def model_file_digest(model_files: dict[str, str], source_path: Path) -> str | None:
@@ -2915,7 +2920,7 @@ def validate_actual_effective_config(
     expected_backend: str,
     expected_model_key: str,
     label: str,
-    allow_architecture_mismatch: bool = False,
+    allow_unknown_architecture: bool = False,
 ) -> dict[str, Any]:
     config = require_object(raw, label)
     require(config.get("missing") is not True, f"{label} declares missing product evidence")
@@ -2929,15 +2934,26 @@ def validate_actual_effective_config(
     model_capabilities = require_object(config.get("model_capabilities"), f"{label}.model_capabilities")
     require(model_capabilities, f"{label}.model_capabilities empty")
     architecture = require_string(model_capabilities.get("architecture"), f"{label}.model_capabilities.architecture")
-    if not allow_architecture_mismatch:
-        require(architecture in EXPECTED_ARCHITECTURES[expected_model_key], f"{label} architecture differs from lane model")
+    if architecture not in EXPECTED_ARCHITECTURES[expected_model_key]:
+        require(
+            allow_unknown_architecture and architecture == "unknown",
+            f"{label} architecture differs from lane model",
+        )
     workload = require_object(config.get("workload_profile"), f"{label}.workload_profile")
     require(workload, f"{label}.workload_profile empty")
     require_string(workload.get("serving_mode"), f"{label}.workload_profile.serving_mode")
     require_count(workload.get("target_concurrency"), f"{label}.workload_profile.target_concurrency", minimum=1)
     require_list(config.get("decisions"), f"{label}.decisions")
+    top_level_backend = config.get("backend")
+    if top_level_backend is not None:
+        require(top_level_backend == expected_backend, f"{label} top-level backend differs from lane")
     backend_entries = [entry for entry in entries if isinstance(entry, dict) and entry.get("key") == "FERRUM_BACKEND"]
-    require(len(backend_entries) == 1 and backend_entries[0].get("effective_value") == expected_backend, f"{label} typed backend entry mismatch")
+    require(
+        len(backend_entries) <= 1
+        and (not backend_entries or backend_entries[0].get("effective_value") == expected_backend),
+        f"{label} typed backend entry mismatch",
+    )
+    require(top_level_backend == expected_backend or len(backend_entries) == 1, f"{label} typed backend evidence missing")
     return config
 
 
@@ -5645,7 +5661,7 @@ def self_test() -> int:
     else:
         raise AssertionError("passing scheduler case accepted empty trace evidence")
     require(
-        allow_c01_known_failure_architecture_mismatch("C01", "known-fail", "c01-contract-violation"),
+        allow_c01_known_failure_unknown_architecture("C01", "known-fail", "c01-contract-violation"),
         "exact C01 known-fail architecture allowance did not resolve",
     )
     for scenario_id, status, failure_class in (
@@ -5654,8 +5670,21 @@ def self_test() -> int:
         ("C02", "known-fail", "c01-contract-violation"),
     ):
         require(
-            not allow_c01_known_failure_architecture_mismatch(scenario_id, status, failure_class),
+            not allow_c01_known_failure_unknown_architecture(scenario_id, status, failure_class),
             f"C01 architecture allowance leaked to {scenario_id}/{status}/{failure_class}",
+        )
+    require(
+        allow_frozen_unknown_architecture("m3-qwen3-30b-a3b", "metal"),
+        "M3 Metal frozen unknown-architecture allowance did not resolve",
+    )
+    for model_key, backend in (
+        ("m3-qwen3-30b-a3b", "cuda"),
+        ("m1-qwen35-4b", "metal"),
+        ("m2-qwen35-35b-a3b", "metal"),
+    ):
+        require(
+            not allow_frozen_unknown_architecture(model_key, backend),
+            f"frozen unknown-architecture allowance leaked to {model_key}/{backend}",
         )
     unknown_architecture_config = {
         "schema_version": SCHEMA_VERSION,
@@ -5681,8 +5710,75 @@ def self_test() -> int:
         expected_backend="metal",
         expected_model_key="m3-qwen3-30b-a3b",
         label="known-fail C01 architecture fixture",
-        allow_architecture_mismatch=True,
+        allow_unknown_architecture=True,
     )
+    wrong_known_architecture_config = copy.deepcopy(unknown_architecture_config)
+    wrong_known_architecture_config["model_capabilities"]["architecture"] = "qwen3_5"
+    try:
+        validate_actual_effective_config(
+            wrong_known_architecture_config,
+            expected_backend="metal",
+            expected_model_key="m3-qwen3-30b-a3b",
+            label="wrong known architecture fixture",
+            allow_unknown_architecture=True,
+        )
+    except ScenarioError as exc:
+        require(
+            "architecture differs from lane model" in str(exc),
+            f"wrong known architecture fixture used unexpected rejection: {exc}",
+        )
+    else:
+        raise AssertionError("unknown-architecture allowance accepted a wrong known architecture")
+    legacy_top_level_backend_config = copy.deepcopy(unknown_architecture_config)
+    legacy_top_level_backend_config["backend"] = "metal"
+    legacy_top_level_backend_config["entries"] = [
+        {"key": "FERRUM_KV_CAPACITY", "effective_value": "4096"}
+    ]
+    validate_actual_effective_config(
+        legacy_top_level_backend_config,
+        expected_backend="metal",
+        expected_model_key="m3-qwen3-30b-a3b",
+        label="legacy top-level backend fixture",
+        allow_unknown_architecture=True,
+    )
+    for name, mutate, marker in (
+        (
+            "missing backend evidence",
+            lambda config: config.update(
+                {"entries": [{"key": "FERRUM_KV_CAPACITY", "effective_value": "4096"}]}
+            ),
+            "typed backend evidence missing",
+        ),
+        (
+            "contradictory backend entry",
+            lambda config: config.update(
+                {
+                    "backend": "metal",
+                    "entries": [{"key": "FERRUM_BACKEND", "effective_value": "cuda"}],
+                }
+            ),
+            "typed backend entry mismatch",
+        ),
+        (
+            "contradictory top-level backend",
+            lambda config: config.update({"backend": "cuda"}),
+            "top-level backend differs from lane",
+        ),
+    ):
+        candidate = copy.deepcopy(unknown_architecture_config)
+        mutate(candidate)
+        try:
+            validate_actual_effective_config(
+                candidate,
+                expected_backend="metal",
+                expected_model_key="m3-qwen3-30b-a3b",
+                label=name,
+                allow_unknown_architecture=True,
+            )
+        except ScenarioError as exc:
+            require(marker in str(exc), f"{name} used unexpected rejection: {exc}")
+        else:
+            raise AssertionError(f"{name} unexpectedly passed")
     with tempfile.TemporaryDirectory(prefix="ferrum-vnext-c03-contract-") as contract_tmp:
         marker = "G00-c03-001-OK"
         observed = {"case_id": "c03-001", "expected_marker": marker, "contract_id": C03_CONTRACT_ID}
