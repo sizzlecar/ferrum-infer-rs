@@ -245,6 +245,18 @@ BOUNDED_TEST_PROFILES = {
         "max_sampling_errors": 3,
         "term_grace_seconds": 1.0,
     },
+    # The no-default-features admission target may require a fresh rustc link
+    # after trybuild changes the target cache. Keep that compile bounded without
+    # mistaking rustc's normal internal workers for a runaway test process.
+    "admission": {
+        "wall_timeout_seconds": 120.0,
+        "max_processes": 4,
+        "max_group_threads": 32,
+        "max_per_process_threads": 16,
+        "sample_interval_seconds": 0.05,
+        "max_sampling_errors": 3,
+        "term_grace_seconds": 1.0,
+    },
     "resource": {
         "wall_timeout_seconds": 60.0,
         "max_processes": 4,
@@ -1615,6 +1627,8 @@ def bounded_profile_for_command(command: list[str] | tuple[str, ...]) -> str:
             return "resource"
         if target == "vnext_compile":
             return "trybuild"
+    if "vnext::admission" in command and "--lib" in command:
+        return "admission"
     return "regular"
 
 
@@ -1850,7 +1864,8 @@ def summarize_bounded_execution(rows: list[dict[str, Any]]) -> dict[str, Any]:
         f"G01A must contain exactly {BOUNDED_TEST_COMMAND_COUNT} bounded cargo test commands",
     )
     require(
-        profile_counts == {"regular": 16, "resource": 2, "trybuild": 2},
+        profile_counts
+        == {"regular": 14, "admission": 2, "resource": 2, "trybuild": 2},
         f"G01A bounded profile command counts mismatch: {profile_counts}",
     )
     return {
@@ -3039,6 +3054,12 @@ impl OperationDispatch {
         len(cargo_test_commands) == BOUNDED_TEST_COMMAND_COUNT
         and all(command.count(TEST_THREADS_ARG) == 1 for command in cargo_test_commands),
         "self-test G01A command matrix must contain 20 single-threaded cargo tests",
+    )
+    require(
+        bounded_profile_for_command(admission_test_command("--list")) == "admission"
+        and bounded_profile_for_command(admission_test_command("--nocapture"))
+        == "admission",
+        "self-test admission commands must use the bounded cold-compile profile",
     )
     bounded_row = selftest_bounded_row(
         list(test_command("vnext_resource_contract_tests", "--nocapture"))
