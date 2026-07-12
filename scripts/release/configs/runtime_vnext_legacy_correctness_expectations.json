@@ -79,69 +79,9 @@
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08A",
-          "owner": "qwen35-dense-migration",
-          "evidence_basis": "Frozen cff4 M1 CUDA discovery report sha256:97782c70a14ce622a50643ad652a4b3466fbebbec7bb5334c1636e9e0e54b932, independently validated by sha256:3ea76962b94f69412585bc47826f8028dda89ed892cc87f4c31ddb038bbde99e, observed 6 matching cases.",
+          "owner": "qwen35-dense-hybrid-migration",
+          "evidence_basis": "Frozen cff4 m1-qwen35-4b/cuda scoped C03 contract c03-exact-identifier-v2 discovery report sha256:fbf917baed0c820109219de5aa3f18c379e65e673546386377bfae25c59ee5ef observed 10 matching cases.",
           "next_action": "Preserve this frozen legacy behavior through G08A migration."
-        },
-        {
-          "selector": {
-            "scenario_id": "C03",
-            "variant": "*",
-            "preset": "*",
-            "entrypoint": "*",
-            "case_id": "c03-004"
-          },
-          "expected_status": "known-fail",
-          "failure_class": "c03-contract-violation",
-          "downstream_goal": "G08A",
-          "owner": "qwen35-dense-migration",
-          "evidence_basis": "Frozen cff4 M1 CUDA discovery report sha256:97782c70a14ce622a50643ad652a4b3466fbebbec7bb5334c1636e9e0e54b932, independently validated by sha256:3ea76962b94f69412585bc47826f8028dda89ed892cc87f4c31ddb038bbde99e, observed this exact case.",
-          "next_action": "Reproduce this frozen failure in G00 and make the final contract pass in G08A."
-        },
-        {
-          "selector": {
-            "scenario_id": "C03",
-            "variant": "*",
-            "preset": "*",
-            "entrypoint": "*",
-            "case_id": "c03-005"
-          },
-          "expected_status": "known-fail",
-          "failure_class": "c03-contract-violation",
-          "downstream_goal": "G08A",
-          "owner": "qwen35-dense-migration",
-          "evidence_basis": "Frozen cff4 M1 CUDA discovery report sha256:97782c70a14ce622a50643ad652a4b3466fbebbec7bb5334c1636e9e0e54b932, independently validated by sha256:3ea76962b94f69412585bc47826f8028dda89ed892cc87f4c31ddb038bbde99e, observed this exact case.",
-          "next_action": "Reproduce this frozen failure in G00 and make the final contract pass in G08A."
-        },
-        {
-          "selector": {
-            "scenario_id": "C03",
-            "variant": "*",
-            "preset": "*",
-            "entrypoint": "*",
-            "case_id": "c03-007"
-          },
-          "expected_status": "known-fail",
-          "failure_class": "c03-contract-violation",
-          "downstream_goal": "G08A",
-          "owner": "qwen35-dense-migration",
-          "evidence_basis": "Frozen cff4 M1 CUDA discovery report sha256:97782c70a14ce622a50643ad652a4b3466fbebbec7bb5334c1636e9e0e54b932, independently validated by sha256:3ea76962b94f69412585bc47826f8028dda89ed892cc87f4c31ddb038bbde99e, observed this exact case.",
-          "next_action": "Reproduce this frozen failure in G00 and make the final contract pass in G08A."
-        },
-        {
-          "selector": {
-            "scenario_id": "C03",
-            "variant": "*",
-            "preset": "*",
-            "entrypoint": "*",
-            "case_id": "c03-009"
-          },
-          "expected_status": "known-fail",
-          "failure_class": "c03-contract-violation",
-          "downstream_goal": "G08A",
-          "owner": "qwen35-dense-migration",
-          "evidence_basis": "Frozen cff4 M1 CUDA discovery report sha256:97782c70a14ce622a50643ad652a4b3466fbebbec7bb5334c1636e9e0e54b932, independently validated by sha256:3ea76962b94f69412585bc47826f8028dda89ed892cc87f4c31ddb038bbde99e, observed this exact case.",
-          "next_action": "Reproduce this frozen failure in G00 and make the final contract pass in G08A."
         },
         {
           "selector": {
@@ -643,7 +583,7 @@
           "failure_class": "c03-contract-violation",
           "downstream_goal": "G08B",
           "owner": "qwen35-moe-migration",
-          "evidence_basis": "Frozen cff4 m2-qwen35-35b-a3b/cuda discovery report sha256:891f6049d9ecb56d89d5f166d7efb0b42933156fb8052a7352727e6e824c76f5, independently validated by sha256:6b3f934bb88f02cd9bd6dcc03228bb2641c3ea25dac735b02c11a2a927e636eb, observed 10 matching cases.",
+          "evidence_basis": "Frozen cff4 m2-qwen35-35b-a3b/cuda scoped C03 contract c03-exact-identifier-v2 discovery report sha256:e38505e8250f4a280701a6d2e64c8c5c26fab85015b175bccf2a7f3adb1cd9b1 observed 10 matching cases.",
           "next_action": "Reproduce this frozen failure in G00 and make the final contract pass in G08B."
         },
         {
@@ -992,86 +932,11 @@
             "scenario_id": "C03",
             "variant": "*"
           },
-          "expected_status": "known-fail",
-          "failure_class": "c03-contract-violation",
-          "downstream_goal": "G08C",
-          "owner": "qwen3-moe-migration",
-          "evidence_basis": "Frozen cff4 m3-qwen3-30b-a3b/cuda discovery report sha256:bf7327c2dc5e6ff08293fa3418e49c22e91ecfbe85705c13a11b7638a36c99de, independently validated by sha256:abdac55d1fe374036ca273a81117823c4b2fe439c8993e2256a94842c1898207, observed 5 matching cases.",
-          "next_action": "Reproduce this frozen failure in G00 and make the final contract pass in G08C."
-        },
-        {
-          "selector": {
-            "case_id": "c03-001",
-            "entrypoint": "*",
-            "preset": "*",
-            "scenario_id": "C03",
-            "variant": "*"
-          },
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08C",
           "owner": "qwen3-moe-migration",
-          "evidence_basis": "Frozen cff4 m3-qwen3-30b-a3b/cuda discovery report sha256:bf7327c2dc5e6ff08293fa3418e49c22e91ecfbe85705c13a11b7638a36c99de, independently validated by sha256:abdac55d1fe374036ca273a81117823c4b2fe439c8993e2256a94842c1898207, observed 1 matching case.",
-          "next_action": "Preserve this frozen legacy behavior through G08C migration."
-        },
-        {
-          "selector": {
-            "case_id": "c03-002",
-            "entrypoint": "*",
-            "preset": "*",
-            "scenario_id": "C03",
-            "variant": "*"
-          },
-          "expected_status": "pass",
-          "failure_class": null,
-          "downstream_goal": "G08C",
-          "owner": "qwen3-moe-migration",
-          "evidence_basis": "Frozen cff4 m3-qwen3-30b-a3b/cuda discovery report sha256:bf7327c2dc5e6ff08293fa3418e49c22e91ecfbe85705c13a11b7638a36c99de, independently validated by sha256:abdac55d1fe374036ca273a81117823c4b2fe439c8993e2256a94842c1898207, observed 1 matching case.",
-          "next_action": "Preserve this frozen legacy behavior through G08C migration."
-        },
-        {
-          "selector": {
-            "case_id": "c03-005",
-            "entrypoint": "*",
-            "preset": "*",
-            "scenario_id": "C03",
-            "variant": "*"
-          },
-          "expected_status": "pass",
-          "failure_class": null,
-          "downstream_goal": "G08C",
-          "owner": "qwen3-moe-migration",
-          "evidence_basis": "Frozen cff4 m3-qwen3-30b-a3b/cuda discovery report sha256:bf7327c2dc5e6ff08293fa3418e49c22e91ecfbe85705c13a11b7638a36c99de, independently validated by sha256:abdac55d1fe374036ca273a81117823c4b2fe439c8993e2256a94842c1898207, observed 1 matching case.",
-          "next_action": "Preserve this frozen legacy behavior through G08C migration."
-        },
-        {
-          "selector": {
-            "case_id": "c03-006",
-            "entrypoint": "*",
-            "preset": "*",
-            "scenario_id": "C03",
-            "variant": "*"
-          },
-          "expected_status": "pass",
-          "failure_class": null,
-          "downstream_goal": "G08C",
-          "owner": "qwen3-moe-migration",
-          "evidence_basis": "Frozen cff4 m3-qwen3-30b-a3b/cuda discovery report sha256:bf7327c2dc5e6ff08293fa3418e49c22e91ecfbe85705c13a11b7638a36c99de, independently validated by sha256:abdac55d1fe374036ca273a81117823c4b2fe439c8993e2256a94842c1898207, observed 1 matching case.",
-          "next_action": "Preserve this frozen legacy behavior through G08C migration."
-        },
-        {
-          "selector": {
-            "case_id": "c03-009",
-            "entrypoint": "*",
-            "preset": "*",
-            "scenario_id": "C03",
-            "variant": "*"
-          },
-          "expected_status": "pass",
-          "failure_class": null,
-          "downstream_goal": "G08C",
-          "owner": "qwen3-moe-migration",
-          "evidence_basis": "Frozen cff4 m3-qwen3-30b-a3b/cuda discovery report sha256:bf7327c2dc5e6ff08293fa3418e49c22e91ecfbe85705c13a11b7638a36c99de, independently validated by sha256:abdac55d1fe374036ca273a81117823c4b2fe439c8993e2256a94842c1898207, observed 1 matching case.",
+          "evidence_basis": "Frozen cff4 m3-qwen3-30b-a3b/cuda scoped C03 contract c03-exact-identifier-v2 discovery report sha256:6eb88c4323f90220d588623ee300b744ce7eb9baf6a4377d69266a7ae728de11 observed 10 matching cases.",
           "next_action": "Preserve this frozen legacy behavior through G08C migration."
         },
         {
@@ -1401,86 +1266,11 @@
             "scenario_id": "C03",
             "variant": "*"
           },
-          "expected_status": "known-fail",
-          "failure_class": "c03-contract-violation",
-          "downstream_goal": "G08C",
-          "owner": "qwen3-moe-migration",
-          "evidence_basis": "Frozen cff4 m3-qwen3-30b-a3b/metal discovery report sha256:0078baa430b362cd449f63664612ec0b5cb17a68911864b8a0a4359f5a3e5ef0, independently reconciled against the current matrix and validated by sha256:622776ebf8ec2a0a5e75843389cde216cc0588aaec67bc2856e8a9920a0911c9, observed 5 matching cases.",
-          "next_action": "Reproduce this frozen failure in G00 and make the final contract pass in G08C."
-        },
-        {
-          "selector": {
-            "case_id": "c03-002",
-            "entrypoint": "*",
-            "preset": "*",
-            "scenario_id": "C03",
-            "variant": "*"
-          },
           "expected_status": "pass",
           "failure_class": null,
           "downstream_goal": "G08C",
           "owner": "qwen3-moe-migration",
-          "evidence_basis": "Frozen cff4 m3-qwen3-30b-a3b/metal discovery report sha256:0078baa430b362cd449f63664612ec0b5cb17a68911864b8a0a4359f5a3e5ef0, independently reconciled against the current matrix and validated by sha256:622776ebf8ec2a0a5e75843389cde216cc0588aaec67bc2856e8a9920a0911c9, observed 1 matching case.",
-          "next_action": "Preserve this frozen legacy behavior through G08C migration."
-        },
-        {
-          "selector": {
-            "case_id": "c03-005",
-            "entrypoint": "*",
-            "preset": "*",
-            "scenario_id": "C03",
-            "variant": "*"
-          },
-          "expected_status": "pass",
-          "failure_class": null,
-          "downstream_goal": "G08C",
-          "owner": "qwen3-moe-migration",
-          "evidence_basis": "Frozen cff4 m3-qwen3-30b-a3b/metal discovery report sha256:0078baa430b362cd449f63664612ec0b5cb17a68911864b8a0a4359f5a3e5ef0, independently reconciled against the current matrix and validated by sha256:622776ebf8ec2a0a5e75843389cde216cc0588aaec67bc2856e8a9920a0911c9, observed 1 matching case.",
-          "next_action": "Preserve this frozen legacy behavior through G08C migration."
-        },
-        {
-          "selector": {
-            "case_id": "c03-006",
-            "entrypoint": "*",
-            "preset": "*",
-            "scenario_id": "C03",
-            "variant": "*"
-          },
-          "expected_status": "pass",
-          "failure_class": null,
-          "downstream_goal": "G08C",
-          "owner": "qwen3-moe-migration",
-          "evidence_basis": "Frozen cff4 m3-qwen3-30b-a3b/metal discovery report sha256:0078baa430b362cd449f63664612ec0b5cb17a68911864b8a0a4359f5a3e5ef0, independently reconciled against the current matrix and validated by sha256:622776ebf8ec2a0a5e75843389cde216cc0588aaec67bc2856e8a9920a0911c9, observed 1 matching case.",
-          "next_action": "Preserve this frozen legacy behavior through G08C migration."
-        },
-        {
-          "selector": {
-            "case_id": "c03-008",
-            "entrypoint": "*",
-            "preset": "*",
-            "scenario_id": "C03",
-            "variant": "*"
-          },
-          "expected_status": "pass",
-          "failure_class": null,
-          "downstream_goal": "G08C",
-          "owner": "qwen3-moe-migration",
-          "evidence_basis": "Frozen cff4 m3-qwen3-30b-a3b/metal discovery report sha256:0078baa430b362cd449f63664612ec0b5cb17a68911864b8a0a4359f5a3e5ef0, independently reconciled against the current matrix and validated by sha256:622776ebf8ec2a0a5e75843389cde216cc0588aaec67bc2856e8a9920a0911c9, observed 1 matching case.",
-          "next_action": "Preserve this frozen legacy behavior through G08C migration."
-        },
-        {
-          "selector": {
-            "case_id": "c03-009",
-            "entrypoint": "*",
-            "preset": "*",
-            "scenario_id": "C03",
-            "variant": "*"
-          },
-          "expected_status": "pass",
-          "failure_class": null,
-          "downstream_goal": "G08C",
-          "owner": "qwen3-moe-migration",
-          "evidence_basis": "Frozen cff4 m3-qwen3-30b-a3b/metal discovery report sha256:0078baa430b362cd449f63664612ec0b5cb17a68911864b8a0a4359f5a3e5ef0, independently reconciled against the current matrix and validated by sha256:622776ebf8ec2a0a5e75843389cde216cc0588aaec67bc2856e8a9920a0911c9, observed 1 matching case.",
+          "evidence_basis": "Frozen cff4 m3-qwen3-30b-a3b/metal scoped C03 contract c03-exact-identifier-v2 discovery report sha256:bc939eb8f6a1226438f145db0927c280e64fc11a0a27b26f0459b49aaa7fcdb0 observed 10 matching cases.",
           "next_action": "Preserve this frozen legacy behavior through G08C migration."
         },
         {

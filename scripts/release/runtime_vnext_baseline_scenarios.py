@@ -6291,7 +6291,6 @@ def self_test() -> int:
         canonical_catalog = validate_expectations_catalog(read_json(EXPECTATIONS_PATH))
         m3_failure_counts = {
             "c01-contract-violation": 20,
-            "c03-contract-violation": 5,
             "c04-contract-violation": 3,
             "c05-contract-violation": 20,
             "c06-contract-violation": 20,
@@ -6311,10 +6310,9 @@ def self_test() -> int:
         locked_lanes = {
             ("m1-qwen35-4b", "cuda"): {
                 "case_count": 703,
-                "status_counts": {"pass": 461, "known-fail": 242},
+                "status_counts": {"pass": 465, "known-fail": 238},
                 "failure_counts": {
                     "c01-contract-violation": 20,
-                    "c03-contract-violation": 4,
                     "c04-contract-violation": 3,
                     "c09-contract-violation": 60,
                     "c14-contract-violation": 20,
@@ -6353,12 +6351,12 @@ def self_test() -> int:
             },
             ("m3-qwen3-30b-a3b", "cuda"): {
                 "case_count": 783,
-                "status_counts": {"pass": 119, "known-fail": 664},
+                "status_counts": {"pass": 124, "known-fail": 659},
                 "failure_counts": {**m3_failure_counts, "c18-contract-violation": 4},
             },
             ("m3-qwen3-30b-a3b", "metal"): {
                 "case_count": 782,
-                "status_counts": {"pass": 119, "known-fail": 663},
+                "status_counts": {"pass": 124, "known-fail": 658},
                 "failure_counts": {**m3_failure_counts, "c18-contract-violation": 3},
             },
         }
