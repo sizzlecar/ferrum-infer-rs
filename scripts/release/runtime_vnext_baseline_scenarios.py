@@ -804,7 +804,11 @@ def validate_concurrency_cells(backend: str, raw: Any, *, case_count: int, requi
             rate = cell.get("completion_rate")
             require(isinstance(rate, (int, float)) and not isinstance(rate, bool) and 0 <= rate <= 1, f"C18.c{requested} completion_rate invalid")
         cap = require_count(cell.get("typed_admission_cap"), f"C18.c{requested}.typed_admission_cap", minimum=1)
-        active = require_count(cell.get("observed_max_active"), f"C18.c{requested}.observed_max_active", minimum=1)
+        active = require_count(
+            cell.get("observed_max_active"),
+            f"C18.c{requested}.observed_max_active",
+            minimum=1 if require_pass else 0,
+        )
         require(active <= min(requested, cap), f"C18.c{requested} observed max-active exceeds requested/cap")
         for field in ("error_count", "bad_output_count", "crosstalk_count", "bad_checksum_count", "server_500_count", "panic_count", "oom_count"):
             value = require_count(cell.get(field), f"C18.c{requested}.{field}")
@@ -5664,6 +5668,34 @@ def self_test() -> int:
         and not scheduler_success_derivation_required("known-fail"),
         "scheduler success derivation policy does not distinguish pass from known-fail",
     )
+    known_fail_concurrency_cells = [
+        {
+            "requested_concurrency": requested,
+            "case_count": 1,
+            "passed_count": 0,
+            "completion_rate": 0.0,
+            "typed_admission_cap": 4,
+            "observed_max_active": 0,
+            "error_count": 1,
+            "bad_output_count": 0,
+            "crosstalk_count": 0,
+            "bad_checksum_count": 0,
+            "server_500_count": 0,
+            "panic_count": 0,
+            "oom_count": 0,
+        }
+        for requested in (1, 4, 16)
+    ]
+    validate_concurrency_cells("metal", known_fail_concurrency_cells, case_count=3, require_pass=False)
+    passing_concurrency_cells = copy.deepcopy(known_fail_concurrency_cells)
+    for cell in passing_concurrency_cells:
+        cell.update({"passed_count": 1, "completion_rate": 1.0, "error_count": 0})
+    try:
+        validate_concurrency_cells("metal", passing_concurrency_cells, case_count=3, require_pass=True)
+    except ScenarioError as exc:
+        require("observed_max_active must be >= 1" in str(exc), f"passing zero-active cell used unexpected rejection: {exc}")
+    else:
+        raise AssertionError("passing zero-active concurrency cells unexpectedly passed")
     try:
         scheduler_trace_rows_for_status([], case_status="pass", label="passing fixture")
     except ScenarioError as exc:
