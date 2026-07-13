@@ -1170,6 +1170,14 @@ def validate_case_output(
             require(parsed == {"result": marker}, f"{label} json_object result mismatch")
 
 
+def capture_case_output_error(check: Callable[[], Any]) -> Exception | None:
+    try:
+        check()
+    except (ScenarioError, json.JSONDecodeError) as exc:
+        return exc
+    return None
+
+
 def scheduler_trace_rows_for_status(raw: Any, *, case_status: str, label: str) -> list[Any]:
     rows = require_list(raw, f"{label}.scheduler_trace_rows")
     require(rows or case_status == "known-fail", f"{label} scheduler trace evidence is empty")
@@ -1492,9 +1500,8 @@ def validate_case_evidence(
                 require(derived_active > 0 and observed.get("observed_max_active") == derived_active, f"case {case_id} observed max-active is not derived from trace")
                 derived_cap = typed_admission_cap_value(actual_config)
                 require(derived_cap > 0 and observed.get("typed_admission_cap") == derived_cap, f"case {case_id} admission cap is not derived from actual effective config")
-    output_error: ScenarioError | None = None
-    try:
-        validate_case_output(
+    output_error = capture_case_output_error(
+        lambda: validate_case_output(
             scenario_id,
             variant,
             entrypoint,
@@ -1506,8 +1513,7 @@ def validate_case_evidence(
             actual_config=actual_config,
             artifact_root=root,
         )
-    except ScenarioError as exc:
-        output_error = exc
+    )
     if case["status"] == "pass":
         require(output_error is None, f"case {case_id} expected pass but checker failed: {output_error}")
     elif case["status"] == "known-fail":
@@ -3713,8 +3719,8 @@ def classify_execution_outcome(
             return "blocked", "legacy-model-backend-unsupported", "product command reported unsupported model/backend"
         return "blocked", "product-command-failed", f"product command returned {returncode}"
     transcript = read_json(transcript_path) if transcript_path is not None else None
-    try:
-        validate_case_output(
+    output_error = capture_case_output_error(
+        lambda: validate_case_output(
             case["scenario_id"],
             case["variant"],
             case["entrypoint"],
@@ -3726,8 +3732,9 @@ def classify_execution_outcome(
             actual_config=read_json(actual_config_path),
             artifact_root=artifact_root,
         )
-    except (ScenarioError, json.JSONDecodeError) as exc:
-        return "known-fail", f"{case['scenario_id'].lower()}-contract-violation", str(exc)
+    )
+    if output_error is not None:
+        return "known-fail", f"{case['scenario_id'].lower()}-contract-violation", str(output_error)
     return "pass", None, None
 
 
@@ -5740,6 +5747,12 @@ def expect_execution_report_reject(root: Path, report: dict[str, Any], marker: s
 
 
 def self_test() -> int:
+    json_failure = capture_case_output_error(lambda: json.loads(""))
+    scenario_failure = capture_case_output_error(lambda: require(False, "case-output scenario failure"))
+    no_failure = capture_case_output_error(lambda: None)
+    require(isinstance(json_failure, json.JSONDecodeError), "case-output JSON decode failure was not captured")
+    require(isinstance(scenario_failure, ScenarioError), "case-output scenario failure was not captured")
+    require(no_failure is None, "successful case output produced a captured failure")
     history_errors: list[dict[str, Any]] = []
     valid_history = history_response_message(
         {"response": {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}},
