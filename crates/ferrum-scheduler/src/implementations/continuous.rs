@@ -100,6 +100,8 @@ pub struct ContinuousBatchRequest {
     pub capacity_deferred_until_release_epoch: u64,
     /// Capacity evidence epoch in which a mixed recompute attempt made no recorded progress.
     pub capacity_deferred_mixed_attempt_epoch: Option<u64>,
+    /// Release epoch in which an otherwise idle scheduler already retried this request.
+    pub capacity_deferred_empty_retry_epoch: Option<u64>,
     /// True when a decode request was evicted to waiting and must recompute KV.
     pub capacity_deferred_from_decode: bool,
 }
@@ -120,6 +122,7 @@ impl ContinuousBatchRequest {
             decode_time_ms: 0,
             capacity_deferred_until_release_epoch: 0,
             capacity_deferred_mixed_attempt_epoch: None,
+            capacity_deferred_empty_retry_epoch: None,
             capacity_deferred_from_decode: false,
         }
     }
@@ -418,8 +421,11 @@ impl ContinuousBatchScheduler {
         self.request_index.read().get(request_id).copied()
     }
 
-    /// Move request from waiting to prefill queue
-    fn promote_to_prefill(&self, request_id: &RequestId) -> bool {
+    fn promote_to_prefill_with_empty_retry(
+        &self,
+        request_id: &RequestId,
+        empty_retry_epoch: Option<u64>,
+    ) -> bool {
         let mut waiting_queue = self.waiting_queue.write();
         let mut prefill_queue = self.prefill_queue.write();
         let mut request_index = self.request_index.write();
@@ -429,6 +435,9 @@ impl ContinuousBatchScheduler {
             .position(|r| r.inner.request.id == *request_id)
         {
             let mut req = waiting_queue.remove(pos).unwrap();
+            if let Some(epoch) = empty_retry_epoch {
+                req.capacity_deferred_empty_retry_epoch = Some(epoch);
+            }
             req.phase = RequestPhase::Prefilling;
             req.inner.state = RequestState::Running;
             let started_at = chrono::Utc::now();
@@ -470,14 +479,16 @@ impl ContinuousBatchScheduler {
     }
 
     fn capacity_blocked_waiting_len(&self) -> usize {
-        if self.active_count() == 0 {
-            return 0;
-        }
+        let has_active_requests = self.active_count() > 0;
         let release_epoch = self.capacity_release_epoch.load(Ordering::Relaxed);
         self.waiting_queue
             .read()
             .iter()
-            .filter(|req| req.capacity_deferred_until_release_epoch > release_epoch)
+            .filter(|req| {
+                req.capacity_deferred_until_release_epoch > release_epoch
+                    && (has_active_requests
+                        || req.capacity_deferred_empty_retry_epoch == Some(release_epoch))
+            })
             .count()
     }
 
@@ -617,6 +628,11 @@ impl ContinuousBatchScheduler {
         self.capacity_mixed_recompute_observed_free_blocks
             .store(usize::MAX, Ordering::Relaxed);
         self.record_resource_progress();
+    }
+
+    /// Record physical capacity released outside an active scheduler queue.
+    pub fn record_external_capacity_release(&self) {
+        self.record_capacity_release_progress();
     }
 
     fn record_capacity_recompute_progress(&self) {
@@ -804,6 +820,7 @@ impl ContinuousBatchScheduler {
                 .load(Ordering::Relaxed)
                 .saturating_add(1);
             req.capacity_deferred_mixed_attempt_epoch = None;
+            req.capacity_deferred_empty_retry_epoch = None;
             req.capacity_deferred_from_decode = true;
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
             request_index.insert(request_id.clone(), RequestPhase::Waiting);
@@ -834,6 +851,7 @@ impl ContinuousBatchScheduler {
             req.phase = RequestPhase::Decoding;
             req.capacity_deferred_until_release_epoch = 0;
             req.capacity_deferred_mixed_attempt_epoch = None;
+            req.capacity_deferred_empty_retry_epoch = None;
             req.capacity_deferred_from_decode = false;
 
             request_index.insert(request_id.clone(), RequestPhase::Decoding);
@@ -1357,10 +1375,15 @@ impl ContinuousBatchScheduler {
                 req,
                 active_decode_prefill_chunk,
             );
-            let release_ready = active_count_for_capacity_wait == 0
-                || req.capacity_deferred_until_release_epoch <= capacity_release_epoch;
+            let release_ready = req.capacity_deferred_until_release_epoch <= capacity_release_epoch;
+            let empty_scheduler_retry = active_count_for_capacity_wait == 0
+                && !release_ready
+                && req.capacity_deferred_empty_retry_epoch != Some(capacity_release_epoch);
             if release_ready && !budgeted_capacity_deferred {
-                requests_to_admit.push(req.inner.request.id.clone());
+                requests_to_admit.push((req.inner.request.id.clone(), None));
+            } else if empty_scheduler_retry && !budgeted_capacity_deferred {
+                requests_to_admit
+                    .push((req.inner.request.id.clone(), Some(capacity_release_epoch)));
             } else if req.capacity_deferred_mixed_attempt_epoch
                 == Some(capacity_mixed_recompute_epoch)
             {
@@ -1369,15 +1392,15 @@ impl ContinuousBatchScheduler {
                 && release_blocked_capacity_deferred_admissions
                     < capacity_deferred_mixed_recompute_slots_remaining.unwrap_or(0)
             {
-                requests_to_admit.push(req.inner.request.id.clone());
+                requests_to_admit.push((req.inner.request.id.clone(), None));
                 release_blocked_capacity_deferred_admissions += 1;
             }
         }
         drop(waiting_queue);
 
         // Promote waiting requests to prefill
-        for req_id in requests_to_admit {
-            self.promote_to_prefill(&req_id);
+        for (req_id, empty_retry_epoch) in requests_to_admit {
+            self.promote_to_prefill_with_empty_retry(&req_id, empty_retry_epoch);
         }
 
         // vLLM's scheduler spends the remaining per-step token budget on
@@ -1527,6 +1550,7 @@ impl ContinuousBatchScheduler {
                 .min(total_prompt_tokens);
             if chunk_tokens > 0 {
                 req.capacity_deferred_mixed_attempt_epoch = None;
+                req.capacity_deferred_empty_retry_epoch = None;
             }
             fully_done = req.prefill_chunk_offset >= total_prompt_tokens;
             made_progress = chunk_tokens > 0;
@@ -2129,6 +2153,45 @@ mod tests {
         assert_eq!(after.active_len, 2);
         assert_eq!(after.admitted_total, 6);
         assert_eq!(after.capacity_backpressure_admit_limit, Some(2));
+    }
+
+    #[test]
+    fn capacity_deferred_prefill_retries_once_without_release_then_parks() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 1,
+            prompt_token_estimate: true,
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 1,
+            max_tokens: 1024,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+        let request = create_test_request_with_prompt_tokens(Priority::Normal, 128);
+        let request_id = request.id.clone();
+        enqueue_waiting(&scheduler, request);
+
+        let first = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(first.requests[0].request.id, request_id);
+        assert!(scheduler.defer_prefill_to_waiting(&request_id));
+
+        let reduced_retry = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(reduced_retry.requests[0].request.id, request_id);
+        assert!(scheduler.defer_prefill_to_waiting(&request_id));
+
+        assert!(scheduler.create_iteration_batch(hint.clone()).is_none());
+        let parked = scheduler.trace_snapshot();
+        assert_eq!(parked.waiting_queue_len, 1);
+        assert_eq!(parked.active_len, 0);
+        assert_eq!(parked.capacity_blocked_waiting_len, 1);
+        assert_eq!(parked.admitted_total, 2);
+        assert_eq!(parked.capacity_deferred_total, 2);
+
+        scheduler.record_capacity_release_progress();
+        let after_release = scheduler.create_iteration_batch(hint).unwrap();
+        assert_eq!(after_release.requests[0].request.id, request_id);
     }
 
     #[test]

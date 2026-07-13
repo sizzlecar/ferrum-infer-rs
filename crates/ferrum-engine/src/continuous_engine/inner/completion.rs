@@ -1,5 +1,26 @@
 use super::*;
 
+impl SequencePhysicalResources {
+    fn is_empty(&self) -> bool {
+        self.kv_allocation.is_none()
+            && self.draft_kv_allocation.is_none()
+            && self.recurrent_state_allocation.is_none()
+            && self.model_cache_id.is_none()
+    }
+}
+
+impl SequenceState {
+    pub(in crate::continuous_engine) fn client_receiver_closed(&self) -> bool {
+        self.response_sender
+            .as_ref()
+            .is_some_and(tokio::sync::oneshot::Sender::is_closed)
+            || self
+                .stream_sender
+                .as_ref()
+                .is_some_and(tokio::sync::mpsc::Sender::is_closed)
+    }
+}
+
 impl EngineInner {
     // ── stream helper ──────────────────────────────────────────────────
 
@@ -144,6 +165,62 @@ impl EngineInner {
     }
 
     // ── completion ─────────────────────────────────────────────────────
+
+    pub(super) async fn cancel_abandoned_requests(&self) -> Result<()> {
+        let abandoned: Vec<_> = self
+            .sequences
+            .read()
+            .iter()
+            .filter_map(|(request_id, sequence)| {
+                sequence
+                    .client_receiver_closed()
+                    .then(|| request_id.clone())
+            })
+            .collect();
+
+        for request_id in abandoned {
+            self.cancel_abandoned_request(&request_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn cancel_abandoned_request(&self, request_id: &RequestId) -> Result<()> {
+        let completion_resources = {
+            let mut sequences = self.sequences.write();
+            let Some(mut sequence) = sequences.remove(request_id) else {
+                return Ok(());
+            };
+            sequence.take_completion_resources()
+        };
+
+        let released_waiting_capacity = self.scheduler.trace_phase(request_id)
+            == Some(RequestPhase::Waiting)
+            && !completion_resources.physical.is_empty();
+        self.release_sequence_physical_resources(request_id, completion_resources.physical)
+            .await;
+        let scheduler_cancel = self.scheduler.cancel(request_id.clone()).await;
+        if released_waiting_capacity {
+            self.scheduler.record_external_capacity_release();
+        }
+        if let Some(request_slot) = completion_resources.request_slot {
+            request_slot.close(self);
+        }
+
+        match scheduler_cancel {
+            Ok(true) => {
+                debug!(request_id = %request_id, "Cancelled request after client disconnected");
+                Ok(())
+            }
+            Ok(false) => {
+                warn!(
+                    request_id = %request_id,
+                    "Client-disconnected sequence was absent from scheduler during cancellation"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
 
     pub(super) async fn complete_request(
         &self,

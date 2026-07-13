@@ -363,6 +363,8 @@ impl EngineInner {
 
     /// Run one iteration: ask the scheduler for a batch, then process it.
     pub(super) async fn run_iteration(&self) -> Result<()> {
+        self.cancel_abandoned_requests().await?;
+
         let iteration = self.iteration_count.fetch_add(1, Ordering::Relaxed);
         counter!("ferrum.engine.iterations_total").increment(1);
         let prof = self.runtime_config.batch_decode_prof;
