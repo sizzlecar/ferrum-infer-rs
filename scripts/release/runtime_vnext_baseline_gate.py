@@ -474,6 +474,7 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
+    record_selftest_mutation_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -7155,6 +7156,19 @@ def make_synthetic_root(root: Path) -> None:
 _ACTIVE_SELFTEST: dict[str, Any] | None = None
 
 
+def record_selftest_mutation_path(path: Path) -> None:
+    runtime = _ACTIVE_SELFTEST
+    if runtime is None:
+        return
+    root = Path(os.path.realpath(runtime["root"]))
+    absolute = Path(os.path.realpath(path))
+    try:
+        relative = absolute.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise AssertionError(f"self-test mutation escaped fixture root: {absolute}") from exc
+    runtime["touched_paths"].add(relative)
+
+
 def clone_tree(source: Path, destination: Path) -> None:
     shutil.rmtree(destination, ignore_errors=True)
     copied = subprocess.run(
@@ -7176,8 +7190,10 @@ class SelftestTreeRestorer:
         self.entries = self._tree_state(pristine)
 
     @staticmethod
-    def _tree_state(root: Path) -> dict[str, tuple[str, int, str | None]]:
-        states: dict[str, tuple[str, int, str | None]] = {}
+    def _tree_state(
+        root: Path,
+    ) -> dict[str, tuple[str, int, int | None, int | None, str | None]]:
+        states: dict[str, tuple[str, int, int | None, int | None, str | None]] = {}
         pending = [root]
         while pending:
             directory = pending.pop()
@@ -7188,14 +7204,20 @@ class SelftestTreeRestorer:
                     metadata = entry.stat(follow_symlinks=False)
                     mode = stat.S_IMODE(metadata.st_mode)
                     if stat.S_ISDIR(metadata.st_mode):
-                        states[rel] = ("directory", mode, None)
+                        states[rel] = ("directory", mode, None, None, None)
                         pending.append(path)
                     elif stat.S_ISREG(metadata.st_mode):
-                        states[rel] = ("file", mode, file_sha256(path))
+                        states[rel] = (
+                            "file",
+                            mode,
+                            metadata.st_size,
+                            metadata.st_mtime_ns,
+                            None,
+                        )
                     elif stat.S_ISLNK(metadata.st_mode):
-                        states[rel] = ("symlink", mode, os.readlink(path))
+                        states[rel] = ("symlink", mode, None, None, os.readlink(path))
                     else:
-                        states[rel] = ("other", mode, None)
+                        states[rel] = ("other", mode, None, None, None)
         return states
 
     @staticmethod
@@ -7209,10 +7231,31 @@ class SelftestTreeRestorer:
         else:
             path.unlink()
 
-    def _restore_entry(self, rel: str, expected: tuple[str, int, str | None]) -> None:
+    @staticmethod
+    def _path_state(
+        path: Path,
+    ) -> tuple[str, int, int | None, int | None, str | None] | None:
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return None
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISDIR(metadata.st_mode):
+            return ("directory", mode, None, None, None)
+        if stat.S_ISREG(metadata.st_mode):
+            return ("file", mode, metadata.st_size, metadata.st_mtime_ns, None)
+        if stat.S_ISLNK(metadata.st_mode):
+            return ("symlink", mode, None, None, os.readlink(path))
+        return ("other", mode, None, None, None)
+
+    def _restore_entry(
+        self,
+        rel: str,
+        expected: tuple[str, int, int | None, int | None, str | None],
+    ) -> None:
         source = self.pristine / rel
         destination = self.root / rel
-        kind, mode, target = expected
+        kind, mode, _, _, target = expected
         destination.parent.mkdir(parents=True, exist_ok=True)
         if kind == "directory":
             destination.mkdir(exist_ok=True)
@@ -7225,28 +7268,36 @@ class SelftestTreeRestorer:
         else:
             raise AssertionError(f"unsupported pristine self-test entry type: {rel}: {kind}")
 
-    def restore(self) -> None:
-        current = self._tree_state(self.root)
-        changed = {
-            rel
-            for rel in current.keys() | self.entries.keys()
-            if current.get(rel) != self.entries.get(rel)
-        }
-        directory_mode_changes = {
-            rel
-            for rel in changed
-            if current.get(rel, (None,))[0] == "directory"
-            and self.entries.get(rel, (None,))[0] == "directory"
-        }
-        for rel in directory_mode_changes:
-            (self.root / rel).chmod(self.entries[rel][1])
-        changed -= directory_mode_changes
-        for rel in sorted(changed, key=lambda value: len(Path(value).parts), reverse=True):
+    def restore(self, touched_paths: set[str]) -> int:
+        require(touched_paths, "self-test mutation made no journaled filesystem change")
+        restored = set(touched_paths)
+        for rel in tuple(restored):
+            expected = self.entries.get(rel)
+            if expected is not None and expected[0] == "directory":
+                prefix = f"{rel}/"
+                restored.update(candidate for candidate in self.entries if candidate.startswith(prefix))
+        for rel in sorted(restored, key=lambda value: len(Path(value).parts), reverse=True):
             self._remove_path(self.root / rel)
-        for rel in sorted(changed, key=lambda value: len(Path(value).parts)):
+        for rel in sorted(restored, key=lambda value: len(Path(value).parts)):
             expected = self.entries.get(rel)
             if expected is not None:
                 self._restore_entry(rel, expected)
+        for rel in restored:
+            expected = self.entries.get(rel)
+            actual = self._path_state(self.root / rel)
+            require(actual == expected, f"self-test failed to restore pristine metadata: {rel}")
+        return len(restored)
+
+    def require_pristine_metadata(self) -> None:
+        current = self._tree_state(self.root)
+        if current == self.entries:
+            return
+        changed = sorted(
+            rel
+            for rel in current.keys() | self.entries.keys()
+            if current.get(rel) != self.entries.get(rel)
+        )
+        raise BaselineError(f"self-test mutation journal left non-pristine paths: {changed[:10]}")
 
 
 def selftest_mutation_scope(name: str) -> str:
@@ -7347,10 +7398,10 @@ def validate_selftest_mutation(root: Path, name: str, context: dict[str, Any]) -
 
 def expect_reject(root: Path, name: str, mutate: Callable[[Path], None], marker: str) -> None:
     runtime = _ACTIVE_SELFTEST
-    fast = runtime is not None and runtime["mode"] == "fast"
-    case = root if fast else root.parent / f"reject-{name}"
-    if not fast:
-        clone_tree(root, case)
+    require(runtime is not None, "self-test mutation executed without active runtime state")
+    fast = runtime["mode"] == "fast"
+    case = root
+    runtime["touched_paths"] = set()
     try:
         mutate(case)
         try:
@@ -7368,10 +7419,8 @@ def expect_reject(root: Path, name: str, mutate: Callable[[Path], None], marker:
             return
         raise AssertionError(f"{name} unexpectedly passed")
     finally:
-        if fast:
-            runtime["restorer"].restore()
-        else:
-            shutil.rmtree(case, ignore_errors=True)
+        restored_count = runtime["restorer"].restore(runtime["touched_paths"])
+        require(restored_count > 0, f"{name} mutation made no restorable filesystem change")
 
 
 def mutate_json(path: Path, update: Callable[[dict[str, Any]], None]) -> None:
@@ -7438,6 +7487,7 @@ def mutate_perf_resource_observations(
     observation_path = root / resource["observations"]
     rows = [json.loads(line) for line in observation_path.read_text(encoding="utf-8").splitlines()]
     update(rows)
+    record_selftest_mutation_path(observation_path)
     observation_path.write_text(
         "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows),
         encoding="utf-8",
@@ -7566,6 +7616,7 @@ def make_first_historical_mutation_identical(root: Path) -> None:
     reproducer = data["families"][0]["cases"][0]["reproducer"]
     input_path = artifact_path(root, reproducer["input_path"], "selftest.historical.input")
     mutation_path = artifact_path(root, reproducer["mutation_path"], "selftest.historical.mutation")
+    record_selftest_mutation_path(mutation_path)
     mutation_path.write_bytes(input_path.read_bytes())
     reproducer["mutation_sha256"] = file_sha256(mutation_path)
     write_json(path, data)
@@ -7854,6 +7905,7 @@ def mutate_build_cargo_messages(
     messages_path = artifact_path(root, messages_ref["path"], "selftest.build.cargo_messages")
     messages = [json.loads(line) for line in messages_path.read_text(encoding="utf-8").splitlines() if line]
     update(messages)
+    record_selftest_mutation_path(messages_path)
     messages_path.write_text("".join(json.dumps(row) + "\n" for row in messages), encoding="utf-8")
     messages_ref["sha256"] = file_sha256(messages_path)
     if recompute_summary:
@@ -7871,6 +7923,7 @@ def tamper_build_content_evidence(root: Path) -> None:
     )
     setup = scenario["samples"][0]["setup"]
     during_path = artifact_path(root, setup["during_input"]["path"], "selftest.build.during_input")
+    record_selftest_mutation_path(during_path)
     during_path.write_bytes(during_path.read_bytes() + b"forged")
     digest = file_sha256(during_path)
     setup["during_input"]["sha256"] = digest
@@ -7965,6 +8018,7 @@ def tamper_restore_binary(root: Path) -> None:
     scenario = next(row for row in summary["scenarios"] if row["name"] == "rust-model-leaf")
     binary_ref = scenario["restore_verification"]["output_binary"]
     binary_path = artifact_path(root, binary_ref["path"], "selftest.build.restore_binary")
+    record_selftest_mutation_path(binary_path)
     binary_path.write_bytes(binary_path.read_bytes() + b"forged")
     binary_ref["sha256"] = file_sha256(binary_path)
     write_json(summary_path, summary)
@@ -7996,6 +8050,7 @@ def tamper_hardware_raw_output(root: Path) -> None:
     probe = read_json(probe_path)
     gpu_command = next(row for row in probe["commands"] if row["kind"] == "gpu")
     stdout_path = artifact_path(probe_path.parent, gpu_command["stdout"], "selftest.hardware.gpu.stdout")
+    record_selftest_mutation_path(stdout_path)
     stdout_path.write_text(
         stdout_path.read_text(encoding="utf-8").replace("24576", "24000"),
         encoding="utf-8",
@@ -8125,6 +8180,7 @@ def mutate_cross_lane_session_id_conflict(root: Path) -> None:
                     for line in observations_path.read_text(encoding="utf-8").splitlines()
                     if line
                 ]
+                record_selftest_mutation_path(observations_path)
                 observations_path.write_text(
                     "".join(
                         json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
@@ -8150,8 +8206,16 @@ def mutate_inventory_review_binding(root: Path) -> None:
     write_json(path, data)
 
 
+def add_artifact_index_empty_file(root: Path) -> None:
+    path = root / "artifact-index-selftest-empty"
+    record_selftest_mutation_path(path)
+    path.write_bytes(b"")
+
+
 def add_artifact_index_symlink(root: Path) -> None:
-    os.symlink("models.lock.json", root / "artifact-index-selftest-link")
+    path = root / "artifact-index-selftest-link"
+    record_selftest_mutation_path(path)
+    os.symlink("models.lock.json", path)
 
 
 def external_path_self_test() -> int:
@@ -8265,7 +8329,6 @@ def _run_self_test(mode: str) -> int:
             require("synthetic/self-test" in str(exc), f"synthetic fixture rejected for unexpected reason: {exc}")
 
         context: dict[str, Any] = {}
-        restorer: SelftestTreeRestorer | None = None
         if mode == "fast":
             models_lock, hardware, models = validate_models_lock(root, allow_synthetic=True)
             binaries = validate_legacy_binaries(root, hardware)
@@ -8275,7 +8338,7 @@ def _run_self_test(mode: str) -> int:
                 "models": models,
                 "binaries": binaries,
             }
-            restorer = SelftestTreeRestorer(root, Path(tmp) / "pristine")
+        restorer = SelftestTreeRestorer(root, Path(tmp) / "pristine")
         runtime = {
             "mode": mode,
             "root": root,
@@ -9041,7 +9104,7 @@ def _run_self_test(mode: str) -> int:
         expect_reject(
             root,
             "artifact-index-empty-file",
-            lambda case: (case / "artifact-index-selftest-empty").write_bytes(b""),
+            add_artifact_index_empty_file,
             "artifact file is empty",
         )
         expect_reject(
@@ -9155,8 +9218,10 @@ def _run_self_test(mode: str) -> int:
             "self-test mutation names/order differ from the locked red-team matrix",
         )
         if mode == "fast":
+            restorer.require_pristine_metadata()
+        else:
             restored_manifest = validate_root(root, allow_synthetic=True)
-            require(restored_manifest["status"] == "pass", "fast self-test did not restore the valid fixture")
+            require(restored_manifest["status"] == "pass", "full self-test did not restore the valid fixture")
         _ACTIVE_SELFTEST = None
         summary = {
             "schema_version": 1,
@@ -9165,7 +9230,7 @@ def _run_self_test(mode: str) -> int:
             "expected_mutation_assertion_count": len(SELFTEST_MUTATION_NAMES),
             "mutation_names": runtime["mutations"],
             "validator_counts": dict(sorted(runtime["validator_counts"].items())),
-            "valid_fixture_assertion_count": 3 if mode == "fast" else 2,
+            "valid_fixture_assertion_count": 3,
         }
     print(f"{SELFTEST_SUMMARY_PREFIX} {json.dumps(summary, sort_keys=True, separators=(',', ':'))}")
     print(SELFTEST_FAST_PASS_LINE if mode == "fast" else SELFTEST_FULL_PASS_LINE)
@@ -9208,12 +9273,29 @@ def main() -> int:
         return 1
     if not args.require_full_self_test:
         parser.error("--require-full-self-test is required for real --out validation")
+    try:
+        validate_root(root)
+    except BaselineError as exc:
+        root.mkdir(parents=True, exist_ok=True)
+        write_json(
+            root / "manifest.json",
+            {
+                "schema_version": SCHEMA_VERSION,
+                "status": "fail",
+                "source_git_sha": FROZEN_LEGACY_SHA,
+                "validated_at": now_iso(),
+                "artifact_dir": str(root),
+                "error": str(exc),
+                "pass_line": None,
+            },
+        )
+        print(f"FERRUM RUNTIME VNEXT G00 BASELINE FAIL: {root}: {exc}", file=sys.stderr)
+        return 1
     full_self_test()
     try:
         manifest = validate_root(root)
         write_json(root / "manifest.json", manifest)
     except BaselineError as exc:
-        root.mkdir(parents=True, exist_ok=True)
         write_json(
             root / "manifest.json",
             {

@@ -4396,7 +4396,7 @@ def selftest_vnext_full_summary(**updates: Any) -> dict[str, Any]:
         "expected_mutation_assertion_count": VNEXT_G00_REDTEAM_MUTATION_COUNT,
         "mutation_names": list(VNEXT_G00_REDTEAM_MUTATION_NAMES),
         "validator_counts": {"full-root": VNEXT_G00_REDTEAM_MUTATION_COUNT},
-        "valid_fixture_assertion_count": 2,
+        "valid_fixture_assertion_count": 3,
     }
     summary.update(updates)
     return summary
