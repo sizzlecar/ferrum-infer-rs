@@ -30,6 +30,9 @@ pub struct Env {
     pub rust: String,
     /// Cargo features enabled on the ferrum build (sorted).
     pub ferrum_features: Vec<String>,
+    /// Effective HTTP connection lifecycle for HTTP benchmark clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_connection_mode: Option<String>,
 
     /// GPU clock lock value in MHz (`nvidia-smi -lgc <mhz>,<mhz>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,6 +106,7 @@ impl Env {
             cuda: detect_cuda_version(),
             rust: detect_rust_version(),
             ferrum_features: feat,
+            http_connection_mode: None,
             gpu_clock_lock_mhz: detect_gpu_clock_lock_mhz(),
             gpu_power_limit_w: detect_gpu_power_limit_w(),
             gpu_persistence_mode: detect_gpu_persistence(),
@@ -260,6 +264,7 @@ mod tests {
             cuda: Some("12.4".into()),
             rust: "1.78.0".into(),
             ferrum_features: vec!["cuda".into(), "vllm-moe-marlin".into()],
+            http_connection_mode: None,
             gpu_clock_lock_mhz: Some(2520),
             gpu_power_limit_w: Some(350),
             gpu_persistence_mode: Some(true),

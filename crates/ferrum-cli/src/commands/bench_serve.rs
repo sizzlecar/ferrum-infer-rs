@@ -50,6 +50,22 @@ impl BenchTargetBackend {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum BenchHttpConnectionMode {
+    #[default]
+    Pooled,
+    Fresh,
+}
+
+impl BenchHttpConnectionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pooled => "pooled",
+            Self::Fresh => "fresh",
+        }
+    }
+}
+
 #[derive(Args, Clone)]
 pub struct BenchServeCommand {
     /// Base URL of the ferrum (or other OpenAI-compatible) server.
@@ -70,6 +86,10 @@ pub struct BenchServeCommand {
     /// client's own compile-time accelerator features.
     #[arg(long, value_enum)]
     pub target_backend: Option<BenchTargetBackend>,
+
+    /// HTTP connection lifecycle used by the benchmark client.
+    #[arg(long, value_enum, default_value = "pooled")]
+    pub http_connection_mode: BenchHttpConnectionMode,
 
     // ─── Workload selection (pick one mode) ────────────────────────
     /// Closed-loop concurrency (single cell). Default when no other
@@ -1274,6 +1294,7 @@ fn build_env(cmd: &BenchServeCommand, features: Vec<String>) -> Env {
         .unwrap_or_else(|| "unknown".to_string());
 
     let mut env = Env::capture_minimal(commit_sha, features);
+    env.http_connection_mode = Some(cmd.http_connection_mode.as_str().to_string());
     if let Some(hw) = cmd.hw_id.clone() {
         env.hw_id = hw;
     }
@@ -1532,9 +1553,13 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
         vec![Cell::Closed(cmd.concurrency)]
     };
 
+    let pool_max_idle_per_host = match cmd.http_connection_mode {
+        BenchHttpConnectionMode::Pooled => 64,
+        BenchHttpConnectionMode::Fresh => 0,
+    };
     let client = Arc::new(
         reqwest::Client::builder()
-            .pool_max_idle_per_host(64)
+            .pool_max_idle_per_host(pool_max_idle_per_host)
             .build()
             .map_err(|e| ferrum_types::FerrumError::model(format!("reqwest client: {e}")))?,
     );
@@ -1955,6 +1980,7 @@ mod tests {
         ];
         let absent = TestCli::parse_from(base).command;
         assert_eq!(absent.enable_thinking, None);
+        assert_eq!(absent.http_connection_mode, BenchHttpConnectionMode::Pooled);
 
         let disabled =
             TestCli::parse_from(base.into_iter().chain(["--enable-thinking", "false"])).command;
@@ -1967,6 +1993,24 @@ mod tests {
         let metal =
             TestCli::parse_from(base.into_iter().chain(["--target-backend", "metal"])).command;
         assert_eq!(metal.target_backend, Some(BenchTargetBackend::Metal));
+
+        let fresh =
+            TestCli::parse_from(base.into_iter().chain(["--http-connection-mode", "fresh"]))
+                .command;
+        assert_eq!(fresh.http_connection_mode, BenchHttpConnectionMode::Fresh);
+    }
+
+    #[test]
+    fn bench_env_locks_http_connection_mode() {
+        let pooled_cmd = test_command();
+        let pooled = build_env(&pooled_cmd, vec![]);
+        assert_eq!(pooled.http_connection_mode.as_deref(), Some("pooled"));
+
+        let mut fresh_cmd = pooled_cmd;
+        fresh_cmd.http_connection_mode = BenchHttpConnectionMode::Fresh;
+        let fresh = build_env(&fresh_cmd, vec![]);
+        assert_eq!(fresh.http_connection_mode.as_deref(), Some("fresh"));
+        assert_ne!(pooled.hash(), fresh.hash());
     }
 
     #[test]
@@ -2245,6 +2289,7 @@ mod tests {
             model: "test-model".to_string(),
             tokenizer: std::path::PathBuf::from("."),
             target_backend: None,
+            http_connection_mode: BenchHttpConnectionMode::Pooled,
             concurrency: 1,
             concurrency_sweep: vec![],
             request_rate: None,
@@ -2431,6 +2476,7 @@ mod tests {
             model: "test-model".to_string(),
             tokenizer: std::path::PathBuf::from("."),
             target_backend: None,
+            http_connection_mode: BenchHttpConnectionMode::Pooled,
             concurrency: 2,
             concurrency_sweep: vec![],
             request_rate: None,
@@ -2517,6 +2563,7 @@ mod tests {
             model: "test-model".to_string(),
             tokenizer: std::path::PathBuf::from("."),
             target_backend: None,
+            http_connection_mode: BenchHttpConnectionMode::Pooled,
             concurrency: 1,
             concurrency_sweep: vec![],
             request_rate: None,
