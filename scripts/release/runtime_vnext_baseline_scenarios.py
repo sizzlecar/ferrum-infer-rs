@@ -40,6 +40,10 @@ RUNNER_REPO_PATH = RUNNER_PATH.relative_to(REPO_ROOT).as_posix()
 EXPECTATIONS_PATH = REPO_ROOT / "scripts/release/configs/runtime_vnext_legacy_correctness_expectations.json"
 EXPECTATIONS_REPO_PATH = EXPECTATIONS_PATH.relative_to(REPO_ROOT).as_posix()
 FROZEN_LEGACY_SHA = "cff4c47765ef3259b8a04890187d99c60da86394"
+C20_REMOTE_MEDIA_URL = (
+    "https://raw.githubusercontent.com/sizzlecar/ferrum-infer-rs/"
+    f"{FROZEN_LEGACY_SHA}/docs/bench/framework-validation-2026-05-25/m3_layerwise.png"
+)
 PASS_PREFIX = "FERRUM RUNTIME VNEXT G00 SCENARIOS PASS"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS"
 SCHEMA_VERSION = 1
@@ -2677,7 +2681,7 @@ def case_http_payload(case: dict[str, Any], model_key: str) -> dict[str, Any]:
             payload["messages"] = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
         else:
             media_type = "video_url" if variant == "video-url" else "image_url"
-            url = "data:image/png;base64,iVBORw0KGgo=" if variant == "data-url" else "https://example.invalid/media.png"
+            url = "data:image/png;base64,iVBORw0KGgo=" if variant == "data-url" else C20_REMOTE_MEDIA_URL
             content: list[dict[str, Any]] = [{"type": media_type, media_type: {"url": url}}]
             if variant == "mixed-text-media":
                 content.insert(0, {"type": "text", "text": prompt})
@@ -5753,6 +5757,26 @@ def self_test() -> int:
     require(isinstance(json_failure, json.JSONDecodeError), "case-output JSON decode failure was not captured")
     require(isinstance(scenario_failure, ScenarioError), "case-output scenario failure was not captured")
     require(no_failure is None, "successful case output produced a captured failure")
+    for ordinal, variant in enumerate(("image-url", "video-url", "mixed-text-media"), start=1):
+        payload = case_http_payload(
+            {
+                "case_id": f"c20-{ordinal:03d}",
+                "scenario_id": "C20",
+                "ordinal": ordinal,
+                "variant": variant,
+                "preset": None,
+            },
+            "m3-qwen3-30b-a3b",
+        )
+        content = payload["messages"][0]["content"]
+        media = next(item for item in content if item["type"] in {"image_url", "video_url"})
+        url = media[media["type"]]["url"]
+        require(url == C20_REMOTE_MEDIA_URL, f"C20 {variant} did not use the pinned real media URL")
+        lowered = url.lower()
+        require(
+            not any(marker in lowered for marker in ("selftest", "self-test", "synthetic", "example.invalid")),
+            f"C20 {variant} used a synthetic/self-test media URL",
+        )
     history_errors: list[dict[str, Any]] = []
     valid_history = history_response_message(
         {"response": {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}},
