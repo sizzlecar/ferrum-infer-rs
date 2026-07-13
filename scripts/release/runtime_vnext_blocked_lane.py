@@ -45,6 +45,23 @@ PROCESS_RECEIPT_TYPE = "runtime_vnext_product_process_receipt"
 PASS_PREFIX = "FERRUM RUNTIME VNEXT G00 BLOCKED LANE PASS"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT G00 BLOCKED LANE SELFTEST PASS"
 MIN_METAL_HEADROOM_BYTES = 2 * 1024**3
+RESOURCE_PROBE_TIMEOUT_SECONDS = 30.0
+RESOURCE_PROBE_REQUEST = {
+    "chat_template_kwargs": {"enable_thinking": False},
+    "max_tokens": 1,
+    "messages": [
+        {
+            "content": "Reply with Paris.",
+            "role": "user",
+        }
+    ],
+    "model": "m3-qwen3-30b-a3b",
+    "seed": 9271,
+    "stream": False,
+    "temperature": 0.0,
+    "top_k": 0,
+    "top_p": 1.0,
+}
 BLOCKED_MODELS = {
     "m1-qwen35-4b": {
         "mode": "unsupported-architecture",
@@ -298,6 +315,75 @@ def server_ready(url: str) -> bool:
         return False
 
 
+def execute_resource_probe(
+    root: Path,
+    attempt_root: Path,
+    *,
+    url: str,
+    request_body: dict[str, Any],
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    request_path = attempt_root / "inference-probe.request.json"
+    response_path = attempt_root / "inference-probe.response.json"
+    receipt_path = attempt_root / "inference-probe.receipt.json"
+    bounded_command.atomic_write_json(request_path, request_body)
+    payload = json.dumps(
+        request_body,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    started_at = utc_now()
+    started_monotonic_ns = time.monotonic_ns()
+    status: int | None = None
+    error: str | None = None
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            status = int(response.status)
+            response_body = response.read()
+    except urllib.error.HTTPError as exc:
+        status = int(exc.code)
+        response_body = exc.read()
+        error = f"HTTPError: {exc}"
+    except (OSError, TimeoutError, urllib.error.URLError) as exc:
+        response_body = json.dumps(
+            {"error": f"{type(exc).__name__}: {exc}"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        error = f"{type(exc).__name__}: {exc}"
+    finished_monotonic_ns = time.monotonic_ns()
+    finished_at = utc_now()
+    response_path.write_bytes(response_body)
+    receipt = {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": "runtime_vnext_resource_inference_probe",
+        "method": "POST",
+        "url": url,
+        "request_body_sha256": canonical_json_sha256(request_body),
+        "request": file_ref(request_path, root),
+        "response": file_ref(response_path, root),
+        "status": status,
+        "error": error,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "started_monotonic_ns": started_monotonic_ns,
+        "finished_monotonic_ns": finished_monotonic_ns,
+        "duration_seconds": round(
+            (finished_monotonic_ns - started_monotonic_ns) / 1_000_000_000,
+            6,
+        ),
+    }
+    bounded_command.atomic_write_json(receipt_path, receipt)
+    return file_ref(receipt_path, root)
+
+
 def write_memory_samples(path: Path, rows: list[dict[str, Any]]) -> None:
     path.write_text(
         "".join(
@@ -414,6 +500,7 @@ def internal_execute(spec_path: Path) -> int:
     memory_rows: list[dict[str, Any]] = []
     violation: dict[str, Any] | None = None
     ready_observed = False
+    inference_probe: dict[str, Any] | None = None
     with (
         stdout_path.open("wb") as stdout_handle,
         stderr_path.open("wb") as stderr_handle,
@@ -445,6 +532,9 @@ def internal_execute(spec_path: Path) -> int:
             deadline = time.monotonic() + float(spec["product_timeout_seconds"])
             interval = float(spec["sample_interval_seconds"])
             health_url = str(spec["health_url"])
+            inference_url = str(spec["inference_url"])
+            inference_request = dict(spec["inference_request"])
+            inference_timeout_seconds = float(spec["inference_timeout_seconds"])
             sequence = 0
             while time.monotonic() < deadline:
                 headroom, swap = memory_values()
@@ -476,6 +566,14 @@ def internal_execute(spec_path: Path) -> int:
                     }
                 if violation is not None or process.poll() is not None:
                     break
+                if ready_observed and inference_probe is None:
+                    inference_probe = execute_resource_probe(
+                        root,
+                        attempt_root,
+                        url=inference_url,
+                        request_body=inference_request,
+                        timeout_seconds=inference_timeout_seconds,
+                    )
                 sequence += 1
                 time.sleep(interval)
             returncode = terminate_product(process)
@@ -542,6 +640,7 @@ def internal_execute(spec_path: Path) -> int:
             "violation": violation,
         },
         "ready_observed": ready_observed,
+        "inference_probe": inference_probe,
         "stdout": file_ref(stdout_path, root),
         "stderr": file_ref(stderr_path, root),
         "failure_log": file_ref(failure_log_path, root),
@@ -824,6 +923,13 @@ def validate_attempt_document(
             all(left <= right for left, right in zip(wall_values, wall_values[1:])),
             "resource attempt wall-clock sample order invalid",
         )
+        ready_indexes = [
+            index for index, row in enumerate(rows) if row.get("ready_observed") is True
+        ]
+        require(
+            attempt.get("ready_observed") == bool(ready_indexes),
+            "resource attempt ready observation differs from samples",
+        )
         violation = memory.get("violation")
         require(isinstance(violation, dict), "resource attempt violation missing")
         sequence = violation.get("sequence")
@@ -833,6 +939,19 @@ def validate_attempt_document(
         )
         row = rows[sequence]
         require(row.get("process_alive") is True, "resource violation was not observed while product was alive")
+        probe_ref = attempt.get("inference_probe")
+        if probe_ref is None:
+            require(
+                not ready_indexes or ready_indexes == [sequence],
+                "resource attempt reached ready state without a real inference probe",
+            )
+        else:
+            probe = validate_resource_probe(root, probe_ref)
+            require(
+                probe["finished_monotonic_ns"]
+                <= row["captured_monotonic_ns"],
+                "resource violation sample precedes the inference probe",
+            )
         if violation.get("kind") == "swap_growth":
             require(
                 violation.get("initial_bytes") == before["swap_used_bytes"]
@@ -914,6 +1033,89 @@ def validate_bounded_receipt(receipt: dict[str, Any]) -> None:
     )
 
 
+def validate_resource_probe(root: Path, raw: Any) -> dict[str, Any]:
+    receipt_path = validate_file_ref(
+        root, raw, "resource inference probe", nonempty=True
+    )
+    receipt = read_json(receipt_path)
+    require(
+        set(receipt)
+        == {
+            "schema_version",
+            "artifact_type",
+            "method",
+            "url",
+            "request_body_sha256",
+            "request",
+            "response",
+            "status",
+            "error",
+            "started_at",
+            "finished_at",
+            "started_monotonic_ns",
+            "finished_monotonic_ns",
+            "duration_seconds",
+        },
+        "resource inference probe field set mismatch",
+    )
+    require(
+        receipt.get("schema_version") == SCHEMA_VERSION
+        and receipt.get("artifact_type")
+        == "runtime_vnext_resource_inference_probe",
+        "resource inference probe schema mismatch",
+    )
+    require(
+        receipt.get("method") == "POST"
+        and str(receipt.get("url", "")).startswith("http://127.0.0.1:")
+        and str(receipt.get("url", "")).endswith("/v1/chat/completions"),
+        "resource inference probe endpoint mismatch",
+    )
+    request_path = validate_file_ref(
+        root, receipt.get("request"), "resource inference request", nonempty=True
+    )
+    request_body = read_json(request_path)
+    require(
+        request_body == RESOURCE_PROBE_REQUEST
+        and receipt.get("request_body_sha256")
+        == canonical_json_sha256(request_body),
+        "resource inference request body mismatch",
+    )
+    response_path = validate_file_ref(
+        root, receipt.get("response"), "resource inference response", nonempty=True
+    )
+    response = read_json(response_path)
+    require(
+        receipt.get("status") == 200
+        and receipt.get("error") is None
+        and isinstance(response.get("choices"), list)
+        and response["choices"],
+        "resource inference probe did not complete a real generation",
+    )
+    started_monotonic_ns = receipt.get("started_monotonic_ns")
+    finished_monotonic_ns = receipt.get("finished_monotonic_ns")
+    require(
+        isinstance(started_monotonic_ns, int)
+        and isinstance(finished_monotonic_ns, int)
+        and 0 < started_monotonic_ns < finished_monotonic_ns,
+        "resource inference probe monotonic window invalid",
+    )
+    duration = receipt.get("duration_seconds")
+    require(
+        isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and duration > 0,
+        "resource inference probe duration invalid",
+    )
+    started = datetime.fromisoformat(
+        str(receipt.get("started_at")).replace("Z", "+00:00")
+    )
+    finished = datetime.fromisoformat(
+        str(receipt.get("finished_at")).replace("Z", "+00:00")
+    )
+    require(finished > started, "resource inference probe wall-clock window invalid")
+    return receipt
+
+
 def validate_lane_evidence(
     root: Path, lane: dict[str, Any], *, allow_selftest: bool = False
 ) -> None:
@@ -971,7 +1173,16 @@ def validate_lane_evidence(
         )
         require(
             spec.get("minimum_physical_headroom_bytes") == MIN_METAL_HEADROOM_BYTES
-            and spec.get("allow_swap_growth") is False,
+            and spec.get("allow_swap_growth") is False
+            and str(spec.get("inference_url", "")).startswith(
+                "http://127.0.0.1:"
+            )
+            and str(spec.get("inference_url", "")).endswith(
+                "/v1/chat/completions"
+            )
+            and spec.get("inference_request") == RESOURCE_PROBE_REQUEST
+            and spec.get("inference_timeout_seconds")
+            == RESOURCE_PROBE_TIMEOUT_SECONDS,
             "blocked resource policy drift",
         )
         require(
@@ -1144,6 +1355,9 @@ def collect(args: argparse.Namespace) -> Path:
         ]
         resource_spec = {
             "health_url": f"http://127.0.0.1:{port}/health",
+            "inference_url": f"http://127.0.0.1:{port}/v1/chat/completions",
+            "inference_request": RESOURCE_PROBE_REQUEST,
+            "inference_timeout_seconds": RESOURCE_PROBE_TIMEOUT_SECONDS,
             "sample_interval_seconds": 0.1,
             "minimum_physical_headroom_bytes": MIN_METAL_HEADROOM_BYTES,
             "allow_swap_growth": False,
@@ -1444,6 +1658,73 @@ def self_test() -> None:
             "failure_log": resource_attempt["failure_log"]["path"],
         }
         validate_attempt_document(root, resource_attempt, resource_lane)
+        probed_attempt = copy.deepcopy(resource_attempt)
+        probe_request_path = attempt_root / "selftest-inference-probe.request.json"
+        probe_response_path = attempt_root / "selftest-inference-probe.response.json"
+        bounded_command.atomic_write_json(probe_request_path, RESOURCE_PROBE_REQUEST)
+        bounded_command.atomic_write_json(
+            probe_response_path,
+            {"choices": [{"message": {"content": "Paris", "role": "assistant"}}]},
+        )
+        probe_started_ns = time.monotonic_ns()
+        probe_finished_ns = probe_started_ns + 1_000_000
+        probe_receipt_path = attempt_root / "selftest-inference-probe.receipt.json"
+        bounded_command.atomic_write_json(
+            probe_receipt_path,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "artifact_type": "runtime_vnext_resource_inference_probe",
+                "method": "POST",
+                "url": "http://127.0.0.1:12345/v1/chat/completions",
+                "request_body_sha256": canonical_json_sha256(
+                    RESOURCE_PROBE_REQUEST
+                ),
+                "request": file_ref(probe_request_path, root),
+                "response": file_ref(probe_response_path, root),
+                "status": 200,
+                "error": None,
+                "started_at": "2026-07-13T00:00:00.000000Z",
+                "finished_at": "2026-07-13T00:00:00.001000Z",
+                "started_monotonic_ns": probe_started_ns,
+                "finished_monotonic_ns": probe_finished_ns,
+                "duration_seconds": 0.001,
+            },
+        )
+        probed_samples_path = attempt_root / "probed-resource-memory.samples.jsonl"
+        write_memory_samples(
+            probed_samples_path,
+            [
+                {
+                    "sequence": 0,
+                    "captured_at": "2026-07-13T00:00:00.000500Z",
+                    "captured_monotonic_ns": probe_started_ns - 1_000_000,
+                    "physical_headroom_bytes": probed_attempt["memory"]["before"]["physical_headroom_bytes"],
+                    "swap_used_bytes": before_swap,
+                    "process_alive": True,
+                    "ready_observed": True,
+                },
+                {
+                    "sequence": 1,
+                    "captured_at": utc_now(),
+                    "captured_monotonic_ns": probe_finished_ns + 1_000_000,
+                    "physical_headroom_bytes": probed_attempt["memory"]["before"]["physical_headroom_bytes"],
+                    "swap_used_bytes": before_swap + 4096,
+                    "process_alive": True,
+                    "ready_observed": True,
+                }
+            ],
+        )
+        probed_attempt["ready_observed"] = True
+        probed_attempt["inference_probe"] = file_ref(probe_receipt_path, root)
+        probed_attempt["memory"]["samples"] = file_ref(probed_samples_path, root)
+        probed_attempt["memory"]["violation"]["sequence"] = 1
+        validate_attempt_document(root, probed_attempt, resource_lane)
+        missing_probe = copy.deepcopy(probed_attempt)
+        missing_probe["inference_probe"] = None
+        _expect_reject(
+            lambda: validate_attempt_document(root, missing_probe, resource_lane),
+            "without a real inference probe",
+        )
         missing_growth = copy.deepcopy(resource_attempt)
         missing_growth["memory"]["violation"]["observed_bytes"] = before_swap
         _expect_reject(
