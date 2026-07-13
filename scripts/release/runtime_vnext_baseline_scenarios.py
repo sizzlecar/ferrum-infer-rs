@@ -1379,6 +1379,11 @@ def validate_case_evidence(
         product_process = require_object(envelope_document.get("product_process"), f"case {case_id}.product_process")
         require_count(product_process.get("pid"), f"case {case_id}.product_process.pid", minimum=1)
         require_count(product_process.get("pgid"), f"case {case_id}.product_process.pgid", minimum=1)
+        require(
+            spawn["pgid"] == expected["invocation_pgid"]
+            and product_process["pgid"] == expected["invocation_pgid"],
+            f"case {case_id} product escaped the bounded executor process group",
+        )
         execution_receipt = validate_process_receipt(
             root,
             envelope_document.get("execution_process_receipt"),
@@ -1965,6 +1970,7 @@ def validate_report_document(
                 "invocation_started_monotonic_ns": start_ns,
                 "invocation_finished_monotonic_ns": finish_ns,
                 "invocation_pid": invocation["pid"],
+                "invocation_pgid": invocation["pgid"],
                 "binary_path": snapshot["binary_path"],
             }
         )
@@ -3081,7 +3087,7 @@ class ProductServer:
             stdout=self.stdout_handle,
             stderr=self.stderr_handle,
             env=self.child_environment,
-            start_new_session=True,
+            start_new_session=False,
         )
         self.pid = self.proc.pid
         self.pgid = os.getpgid(self.proc.pid)
@@ -3248,7 +3254,7 @@ def execute_c01_unknown_fixture(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=child_environment,
-        start_new_session=True,
+        start_new_session=False,
     )
     pid = proc.pid
     pgid = os.getpgid(pid)
@@ -3405,7 +3411,7 @@ def run_case_command(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=child_environment,
-        start_new_session=True,
+        start_new_session=False,
     )
     pid = proc.pid
     pgid = os.getpgid(proc.pid)
@@ -6168,6 +6174,14 @@ def self_test() -> int:
         invocation_ref = require_object(execution_report.get("executor_invocation"), "execution fixture invocation ref")
         require(str(invocation_ref.get("path", "")).startswith(executor_prefix), "executor invocation is not lane-local")
         invocation_document = read_json(execution_root / invocation_ref["path"])
+        run_receipt = read_json(execution_root / execution_commands["actual-run"]["process_receipt"]["path"])
+        require(
+            all(
+                receipt["pgid"] == invocation_document["pgid"]
+                for receipt in (run_receipt, first_serve_receipt, second_serve_receipt)
+            ),
+            "execution fixture product escaped the bounded executor process group",
+        )
         for key in ("manifest_snapshot", "process_receipt"):
             ref = require_object(invocation_document.get(key), f"execution fixture invocation {key}")
             require(str(ref.get("path", "")).startswith(executor_prefix), f"executor {key} is not lane-local")
@@ -6466,7 +6480,6 @@ def self_test() -> int:
             envelope = read_json(envelope_path)
             for process in (envelope["spawn"], envelope["product_process"]):
                 process["pid"] = 99_999_999
-                process["pgid"] = 99_999_999
             persist_execution_case_mutation(
                 mutation_root,
                 scenario,
@@ -6479,6 +6492,23 @@ def self_test() -> int:
             )
             expect_execution_report_reject(mutation_root, candidate, "PID/PGID mismatch")
             rejected_mutations.add("nonexistent-pid-pgid")
+
+        with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-escaped-product-group") as (mutation_root, candidate):
+            scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root)
+            envelope = read_json(envelope_path)
+            envelope["product_process"]["pgid"] += 1
+            persist_execution_case_mutation(
+                mutation_root,
+                scenario,
+                raw_path,
+                raw,
+                case_path,
+                case,
+                envelope_path=envelope_path,
+                envelope=envelope,
+            )
+            expect_execution_report_reject(mutation_root, candidate, "escaped the bounded executor process group")
+            rejected_mutations.add("escaped-product-process-group")
 
         with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c09-trace") as (mutation_root, candidate):
             scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=8)
@@ -6761,6 +6791,7 @@ def self_test() -> int:
             "invocation-mode",
             "bilateral-status",
             "nonexistent-pid-pgid",
+            "escaped-product-process-group",
             "c09-missing-scheduler-trace",
             "c18-fabricated-max-active",
             "invocation-disjoint-time",
