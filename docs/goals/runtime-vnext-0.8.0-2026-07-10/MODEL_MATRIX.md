@@ -29,7 +29,7 @@ M1/M2 官方模型包含 vision 能力，但本 Goal 只认证 language path。v
 |---|---|---|---|
 | M1 Qwen3.5-4B | `Qwen/Qwen3.5-4B`, BF16 safetensors | `unsloth/Qwen3.5-4B-GGUF`, `Qwen3.5-4B-Q4_K_M.gguf` | 代码声明 Qwen3.5 CUDA product path；缺少正式实模产品/perf artifact；Metal 当前明确 unsupported |
 | M2 Qwen3.5-35B-A3B | [官方 GPTQ-Int4](https://huggingface.co/Qwen/Qwen3.5-35B-A3B-GPTQ-Int4) | `unsloth/Qwen3.5-35B-A3B-GGUF`, `Qwen3.5-35B-A3B-Q4_K_S.gguf` | CUDA 有大量 correctness/L5 diagnostic，但没有 W3 release PASS；Metal 当前 unsupported |
-| M3 Qwen3-30B-A3B | `Qwen/Qwen3-30B-A3B-GPTQ-Int4` | `Qwen/Qwen3-30B-A3B-GGUF`, `Qwen3-30B-A3B-Q4_K_M.gguf` | CUDA 有 0.7.7 release 锚点；冻结 cff4 Metal 在 32 GiB M1 Max 上有 reviewed resource blocker，vNext 最终双端目标不变 |
+| M3 Qwen3-30B-A3B | `Qwen/Qwen3-30B-A3B-GPTQ-Int4` | `Qwen/Qwen3-30B-A3B-GGUF`, `Qwen3-30B-A3B-Q4_K_M.gguf` | 当前 0.7.7 双端 release 锚点 |
 
 G00 固定 M1 GGUF revision `e87f176479d0855a907a41277aca2f8ee7a09523`、M2 GGUF revision
 `bc014a17be43adabd7066b7a86075ff935c6a4e2`，并通过 Hugging Face revision/file probe 从该
@@ -314,9 +314,7 @@ binary 的 run 作为 `B`、serve-c1 作为 `A`，两侧使用 G06 token-commit 
 - M3 Metal v0.7.7
   [artifact](../../release/g0/0.7.7/metal/metal-readme/summary.md) 同样位于 SHA `22b8b7ad`；
   旧 `16 input / 64 output` c16 约 `68.5 tok/s`，与本 Goal `64/128` 不同，只能作 sanity
-  reference，不能直接成为硬 floor。冻结 `cff4` 在固定 32 GiB 主机上的 fresh legacy lane 按
-  [`G00_M3_METAL_32GB_AMENDMENT.md`](G00_M3_METAL_32GB_AMENDMENT.md) 标记 resource-blocked，
-  不生成 legacy ratio；G08C/G09 仍在同一主机验证 vNext Metal。
+  reference，不能直接成为硬 floor。
 
 M1 没有可信现有实模性能 artifact。G00 必须先尝试冻结 legacy CUDA 基线；如果 legacy
 产品路径失败，保存 BLOCKED artifact。vNext 仍必须通过完整正确性并达到 `>=0.90x vLLM`，

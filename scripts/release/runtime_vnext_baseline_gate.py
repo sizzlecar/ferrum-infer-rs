@@ -61,7 +61,6 @@ RESOURCE_SAMPLER_PATH = REPO_ROOT / "scripts/release/runtime_vnext_resource_samp
 BLOCKED_LANE_COLLECTOR_PATH = REPO_ROOT / "scripts/release/runtime_vnext_blocked_lane.py"
 CONTRACT_PATHS = (
     REPO_ROOT / "docs/goals/runtime-vnext-0.8.0-2026-07-10/G00_BASELINE.md",
-    REPO_ROOT / "docs/goals/runtime-vnext-0.8.0-2026-07-10/G00_M3_METAL_32GB_AMENDMENT.md",
     REPO_ROOT / "docs/goals/runtime-vnext-0.8.0-2026-07-10/MODEL_MATRIX.md",
     MODELS_CATALOG_PATH,
     PRESETS_CATALOG_PATH,
@@ -2523,12 +2522,8 @@ def validate_correctness(
             require(status in {"pass", "blocked"}, f"{label}.status must be pass or blocked")
             if backend == "cuda":
                 require(status == "pass", f"{label} CUDA primary lane must PASS")
-            if model_key == "m3-qwen3-30b-a3b" and backend == "metal":
-                require(status == "blocked", f"{label} must carry the reviewed 32 GiB resource blocker")
-                require(
-                    lane.get("failure_class") == "legacy-metal-unified-memory-capacity",
-                    f"{label} M3 Metal blocker failure class mismatch",
-                )
+            if model_key == "m3-qwen3-30b-a3b":
+                require(status == "pass", f"{label} M3 legacy lane must PASS")
             if model_key in {"m1-qwen35-4b", "m2-qwen35-35b-a3b"} and backend == "metal":
                 require(status == "blocked", f"{label} must truthfully capture current unsupported Metal lane")
             if status == "pass":
@@ -6571,7 +6566,7 @@ def make_synthetic_root(root: Path) -> None:
                 "hardware_id": model["lanes"][backend]["hardware_id"],
                 "binary_sha256": binary_map[backend],
             }
-            blocked = backend == "metal"
+            blocked = backend == "metal" and model_key in {"m1-qwen35-4b", "m2-qwen35-35b-a3b"}
             lane = copy.deepcopy(base)
             if blocked:
                 lane.update(
@@ -6580,22 +6575,14 @@ def make_synthetic_root(root: Path) -> None:
                         "current_support": False,
                         "comparable": False,
                         "waiver": False,
-                        "failure_class": (
-                            "legacy-metal-unified-memory-capacity"
-                            if model_key == "m3-qwen3-30b-a3b"
-                            else "unsupported_architecture"
-                        ),
-                        "reason": "legacy Metal lane is not executable under the locked G00 policy",
-                        "first_failure": "model loader or resource preflight rejected the lane before measurement",
-                        "downstream_goal": (
-                            "G08C"
-                            if model_key == "m3-qwen3-30b-a3b"
-                            else "G08A" if model_key == "m1-qwen35-4b" else "G08B"
-                        ),
-                        "implementation_path": "add vNext operation providers and resource-safe Metal residency",
+                        "failure_class": "unsupported_architecture",
+                        "reason": "legacy does not support this architecture on Metal",
+                        "first_failure": "model loader rejected the architecture before execution",
+                        "downstream_goal": "G08A",
+                        "implementation_path": "add vNext operation providers",
                         "acceptance_path": "run the full product matrix",
-                        "downstream_acceptance_pass_line": "FERRUM RUNTIME VNEXT MODEL PASS: <out_dir>",
-                        "attempted_command": ["ferrum", "serve" if model_key == "m3-qwen3-30b-a3b" else "run", model_key],
+                        "downstream_acceptance_pass_line": "FERRUM RUNTIME VNEXT G08A MODEL PASS: <out_dir>",
+                        "attempted_command": ["ferrum", "run", model_key],
                         "attempted_returncode": 1,
                         "failure_log": synthetic_log(root, f"correctness/{model_key}/{backend}/failure.log"),
                     }
