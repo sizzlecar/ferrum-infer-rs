@@ -9,7 +9,7 @@
   "goal_documents": [
     {
       "path": "docs/goals/runtime-vnext-0.8.0-2026-07-10/G00_BASELINE.md",
-      "sha256": "a1f7e2fb18a5265b3eda9898b1b11388ce160c77e6a625d1cceaf39059fd76b0"
+      "sha256": "0fb764f0f905754a5f40a5a7ec70bacb648fad5d497ccce6debe5ed487018f58"
     },
     {
       "path": "docs/goals/runtime-vnext-0.8.0-2026-07-10/G02_TEST_EVIDENCE.md",

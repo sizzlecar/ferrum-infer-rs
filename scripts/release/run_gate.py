@@ -83,8 +83,8 @@ VNEXT_G00_FULL_SELFTEST_PASS = (
 VNEXT_G00_SELFTEST_SUMMARY_PREFIX = (
     "FERRUM RUNTIME VNEXT G00 BASELINE SELFTEST SUMMARY:"
 )
-VNEXT_G00_REDTEAM_MUTATION_COUNT = 103
-VNEXT_G00_REDTEAM_MUTATION_MATRIX_SHA256 = "586a8cc3b69ddd64edefa220b30e4f3f2a1b9dc53dc7969d0d89a21718ae1f46"
+VNEXT_G00_REDTEAM_MUTATION_COUNT = 115
+VNEXT_G00_REDTEAM_MUTATION_MATRIX_SHA256 = "54a1cb0ffd4742f26c416b1c40f13803840d65fe7c7ba51c4866725fca9db3eb"
 VNEXT_G00_REDTEAM_MUTATION_NAMES = (
     "dirty",
     "stale",
@@ -129,20 +129,29 @@ VNEXT_G00_REDTEAM_MUTATION_NAMES = (
     "errors",
     "usage",
     "ab-identity-swap",
+    "ab-request-model-alias",
     "duplicate-server-session",
     "server-session-same-lane-overlap",
     "cross-lane-session-id-conflict",
     "server-cell-window-overlap",
     "report-outside-cell-window",
     "server-process-start-marker",
+    "server-process-receipt-env",
     "ready-probe-returncode",
     "loaded-model-probe",
+    "external-identity-probe",
+    "external-active-cap-argv",
+    "external-server-bind-argv",
+    "external-vllm-positional-model",
+    "performance-collector-plan",
+    "performance-collector-config-fingerprint",
     "server-effective-config-model",
     "server-product-config-cap",
     "server-effective-config-argv",
     "benchmark-client-tree-binding",
     "benchmark-client-rust-allowlist",
     "bench-canonical-argv",
+    "bench-http-connection-argv",
     "dataset-sha",
     "tokenizer-sha",
     "config-sha",
@@ -154,6 +163,7 @@ VNEXT_G00_REDTEAM_MUTATION_NAMES = (
     "resource-observation-process-start",
     "resource-summary-forgery",
     "resource-http-process-probe",
+    "resource-http-exit-reason",
     "raw-report-sha",
     "raw-report-metric",
     "raw-report-usage",
@@ -172,7 +182,9 @@ VNEXT_G00_REDTEAM_MUTATION_NAMES = (
     "warmup-error",
     "bench-thinking-payload",
     "bench-env-hash",
+    "bench-http-connection-env",
     "run-real-command",
+    "run-process-receipt-missing",
     "run-session-global-overlap",
     "run-command-window-binding",
     "inventory-source-coverage",

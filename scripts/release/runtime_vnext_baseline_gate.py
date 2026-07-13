@@ -204,6 +204,7 @@ SELFTEST_MUTATION_NAMES = (
     "benchmark-client-tree-binding",
     "benchmark-client-rust-allowlist",
     "bench-canonical-argv",
+    "bench-http-connection-argv",
     "dataset-sha",
     "tokenizer-sha",
     "config-sha",
@@ -234,6 +235,7 @@ SELFTEST_MUTATION_NAMES = (
     "warmup-error",
     "bench-thinking-payload",
     "bench-env-hash",
+    "bench-http-connection-env",
     "run-real-command",
     "run-process-receipt-missing",
     "run-session-global-overlap",
@@ -328,6 +330,7 @@ SELFTEST_PERFORMANCE_MUTATIONS = frozenset(
         "benchmark-client-tree-binding",
         "benchmark-client-rust-allowlist",
         "bench-canonical-argv",
+        "bench-http-connection-argv",
         "dataset-sha",
         "tokenizer-sha",
         "config-sha",
@@ -358,6 +361,7 @@ SELFTEST_PERFORMANCE_MUTATIONS = frozenset(
         "warmup-error",
         "bench-thinking-payload",
         "bench-env-hash",
+        "bench-http-connection-env",
         "run-real-command",
         "run-process-receipt-missing",
         "run-session-global-overlap",
@@ -477,6 +481,7 @@ PRESET_FIELDS = {
 }
 FORBIDDEN_OUTPUT_KEYS = {"waiver", "waivers", "skipped", "placeholder"}
 BENCHMARK_CLIENT_RUST_ALLOWLIST = (
+    "crates/ferrum-bench-core/src/env.rs",
     "crates/ferrum-bench-core/src/lib.rs",
     "crates/ferrum-bench-core/src/report.rs",
     "crates/ferrum-cli/src/commands/bench.rs",
@@ -861,6 +866,7 @@ def recompute_bench_env_hash(raw: dict[str, Any], label: str) -> str:
         "cuda",
         "rust",
         "ferrum_features",
+        "http_connection_mode",
         "gpu_clock_lock_mhz",
         "gpu_power_limit_w",
         "gpu_persistence_mode",
@@ -3353,6 +3359,7 @@ def validate_bench_argv(
     require_option(options, "--model", workload["_config"]["request_model"], label)
     require_option(options, "--tokenizer", workload["tokenizer_origin_path"], label)
     require_option(options, "--target-backend", backend, label)
+    require_option(options, "--http-connection-mode", "fresh", label)
     require_option(options, "--concurrency", concurrency, label)
     require_option(options, "--random-output-len", 128, label)
     require_option(options, "--num-prompts", 100, label)
@@ -3612,6 +3619,7 @@ def validate_raw_bench_report(
     require(env.get("commit_sha") == client["source_git_sha"], f"{label}.env.commit_sha must identify benchmark client")
     require(env.get("hw_id") == session["hardware_id"], f"{label}.env.hw_id mismatch")
     require(isinstance(env.get("ferrum_features"), list), f"{label}.env.ferrum_features must be a list")
+    require(env.get("http_connection_mode") == "fresh", f"{label}.env.http_connection_mode must be fresh")
     require(env.get("ferrum_env") == {}, f"{label}.env.ferrum_env must not contain hidden benchmark-client switches")
     env_hash = require_string(report.get("env_hash"), f"{label}.env_hash")
     require(re.fullmatch(r"sha256:[0-9a-f]{64}", env_hash) is not None, f"{label}.env_hash must be sha256:<digest>")
@@ -5660,6 +5668,7 @@ def synthetic_bench_report(
         "hw_id": hardware_id,
         "rust": "rustc-selftest",
         "ferrum_features": [backend],
+        "http_connection_mode": "fresh",
         "ferrum_env": {},
         "runtime_config": {"entries": []},
     }
@@ -5768,6 +5777,8 @@ def synthetic_http_implementation(
             workload["tokenizer_origin_path"],
             "--target-backend",
             backend,
+            "--http-connection-mode",
+            "fresh",
             "--concurrency",
             str(concurrency),
             "--dataset",
@@ -9626,6 +9637,18 @@ def _run_self_test(mode: str) -> int:
         )
         expect_reject(
             root,
+            "bench-http-connection-argv",
+            lambda case: mutate_json(
+                case / "performance/m3-qwen3-30b-a3b/cuda/summary.json",
+                lambda data: remove_option_with_value(
+                    data["cells"][0]["implementations"]["B"]["reports"][0]["bench_argv"],
+                    "--http-connection-mode",
+                ),
+            ),
+            "--http-connection-mode",
+        )
+        expect_reject(
+            root,
             "dataset-sha",
             lambda case: mutate_json(
                 case / "performance/m3-qwen3-30b-a3b/cuda/summary.json",
@@ -9897,6 +9920,15 @@ def _run_self_test(mode: str) -> int:
             "bench-env-hash",
             lambda case: mutate_perf_report(case, lambda data: data.update({"env_hash": "sha256:" + "0" * 64})),
             "env_hash is not derived",
+        )
+        expect_reject(
+            root,
+            "bench-http-connection-env",
+            lambda case: mutate_perf_report(
+                case,
+                lambda data: data["env"].update({"http_connection_mode": "pooled"}),
+            ),
+            "env.http_connection_mode must be fresh",
         )
         expect_reject(
             root,
