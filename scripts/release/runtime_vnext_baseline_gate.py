@@ -3352,6 +3352,7 @@ def validate_bench_argv(
     require_option(options, "--base-url", session["base_url"], label)
     require_option(options, "--model", workload["_config"]["request_model"], label)
     require_option(options, "--tokenizer", workload["tokenizer_origin_path"], label)
+    require_option(options, "--target-backend", backend, label)
     require_option(options, "--concurrency", concurrency, label)
     require_option(options, "--random-output-len", 128, label)
     require_option(options, "--num-prompts", 100, label)
@@ -5765,6 +5766,8 @@ def synthetic_http_implementation(
             workload_config["request_model"],
             "--tokenizer",
             workload["tokenizer_origin_path"],
+            "--target-backend",
+            backend,
             "--concurrency",
             str(concurrency),
             "--dataset",

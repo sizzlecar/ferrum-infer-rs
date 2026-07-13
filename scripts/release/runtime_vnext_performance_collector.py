@@ -1063,6 +1063,8 @@ def bench_argv(
         config["request_model"],
         "--tokenizer",
         workload["tokenizer_origin_path"],
+        "--target-backend",
+        config["backend"],
         "--concurrency",
         str(concurrency),
         "--dataset",
