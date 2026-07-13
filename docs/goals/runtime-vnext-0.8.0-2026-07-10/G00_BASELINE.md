@@ -157,6 +157,94 @@ M2 Metal Q4_K_S 还必须同时等于 catalog 的 `expected_size_bytes=206738458
 `expected_sha256=ee93ceffed5ce4df8b09bcbaf59a286d531025a1ebde9cf204c74e800c47d57e`；只匹配文件名或 size
 不能通过。
 
+### 真实性能采集器
+
+六个 performance lane 统一由 checked-in collector 采集，不允许人工拼装 summary：
+
+```text
+python3 scripts/release/runtime_vnext_performance_collector.py \
+  --artifact-root <g00-out> \
+  --config <lane-config.json> \
+  --plan-only
+
+python3 scripts/release/runtime_vnext_performance_collector.py \
+  --artifact-root <g00-out> \
+  --config <lane-config.json> \
+  --resume
+```
+
+若先执行 `--plan-only`，首次正式采集必须用原 config 加 `--resume` 消费已冻结计划；若跳过
+`--plan-only`，首次正式执行不带 `--resume`。进程中断后只能用原 config 和原输入执行 `--resume`。collection
+fingerprint 同时绑定 collector、`models.lock.json`、`legacy-binaries.json`、correctness lane、external
+binary 内容和规范化 config。任一输入变化必须新建 lane artifact，不允许复用旧 slot。
+external version/revision identity probe 固定 `60s` 超时，禁止在付费机器上无限等待。
+external/performance summary 必须引用同一不可变 `plan.json` 和 normalized config；final validator
+从原始输入重算 collection fingerprint，不接受只填写一个不可验证的摘要 hash。
+
+每个 lane config 至少包含以下 typed 输入；路径必须是实际绝对路径或可解析本机路径，config 和
+child env 中禁止 secret-bearing key 与 `FERRUM_*`：
+
+```json
+{
+  "schema_version": 1,
+  "model_key": "m3-qwen3-30b-a3b",
+  "backend": "cuda",
+  "model_origin_path": "/models/pinned-snapshot",
+  "tokenizer_origin_path": "/models/pinned-tokenizer-snapshot",
+  "request_model": "Qwen/Qwen3-30B-A3B",
+  "typed_active_cap": 32,
+  "memory_budget_bytes": 24696061952,
+  "server": {
+    "host": "127.0.0.1",
+    "port": 18080,
+    "ready_timeout_sec": 900,
+    "shutdown_timeout_sec": 60,
+    "command_timeout_sec": 7200
+  },
+  "benchmark_client": {
+    "binary_path": "/build/e6b55457125487a0ccb3d88dd3f81eb460783fad/ferrum",
+    "build_log_path": "/build/e6b55457125487a0ccb3d88dd3f81eb460783fad/build.log",
+    "source_git_sha": "e6b55457125487a0ccb3d88dd3f81eb460783fad",
+    "cargo_features": ["cuda"]
+  },
+  "external": {
+    "engine": "vllm",
+    "binary_path": "/venv/bin/vllm",
+    "engine_version": "<exact-version-output>",
+    "engine_revision": "<40-hex-source-commit>",
+    "server_argv": [
+      "/venv/bin/vllm", "serve", "{model_origin_path}",
+      "--served-model-name", "{request_model}", "--host", "{host}",
+      "--port", "{port}", "--max-num-seqs", "{typed_active_cap}"
+    ],
+    "version_argv": ["/venv/bin/vllm", "--version"],
+    "revision_argv": ["/opt/vllm-source-revision"],
+    "active_probe": {
+      "format": "prometheus",
+      "path": "/metrics",
+      "selector": "vllm:num_requests_running"
+    }
+  },
+  "legacy": {
+    "extra_serve_argv": [],
+    "active_probe": {
+      "format": "prometheus",
+      "path": "/metrics",
+      "selector": "<ferrum-active-request-metric>"
+    }
+  },
+  "datasets": {"sharegpt": "/datasets/pinned-sharegpt.jsonl"},
+  "goodput_slo": {"ttft": 500.0, "tpot": 50.0, "e2e": 30000.0}
+}
+```
+
+Metal 将 external engine 改为 `llama.cpp`，server argv 必须用 `--parallel {typed_active_cap}`，真实对话
+数据键改为 `real-chat`。collector 对 comparable lane 执行固定 `A,B,B,A,B,A,A,B`，对 blocked
+M1/M2 Metal 只执行 A slots `1,4,6,7`；每个 HTTP cell 都启动独立 resource sampler。cold
+`ferrum run` 使用同 PID exec barrier，先建立 sampler 再 exec 产品，避免漏掉模型加载初期资源峰值。
+所有 server/run process receipt、sanitized env、identity probe、raw report 和 resource JSONL 都由 final
+validator 重算。collector 自身的 PASS 只表示单 lane 证据结构有效，不替代下方 canonical G00 PASS。
+
 内部 validator（只能由 canonical lane 调用）：
 
 ```text

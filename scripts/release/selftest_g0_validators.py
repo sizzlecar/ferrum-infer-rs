@@ -25,6 +25,7 @@ RUNTIME_VNEXT_BASELINE_SCENARIOS = REPO_ROOT / "scripts/release/runtime_vnext_ba
 RUNTIME_VNEXT_EXPECTATION_AMENDMENT = REPO_ROOT / "scripts/release/runtime_vnext_expectation_amendment.py"
 RUNTIME_VNEXT_BLOCKED_LANE = REPO_ROOT / "scripts/release/runtime_vnext_blocked_lane.py"
 RUNTIME_VNEXT_RESOURCE_SAMPLER = REPO_ROOT / "scripts/release/runtime_vnext_resource_sampler.py"
+RUNTIME_VNEXT_PERFORMANCE_COLLECTOR = REPO_ROOT / "scripts/release/runtime_vnext_performance_collector.py"
 RUNTIME_VNEXT_G00A_CHECKPOINT = REPO_ROOT / "scripts/release/runtime_vnext_g00a_checkpoint.py"
 RUNTIME_VNEXT_G00_ORCHESTRATOR = REPO_ROOT / "scripts/release/runtime_vnext_g00_orchestrator.py"
 RUNTIME_VNEXT_HISTORICAL_CORPUS = REPO_ROOT / "scripts/release/runtime_vnext_historical_corpus.py"
@@ -357,6 +358,12 @@ def test_runtime_vnext_resource_sampler_selftest() -> None:
     require("FERRUM RUNTIME VNEXT RESOURCE SAMPLER SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
+def test_runtime_vnext_performance_collector_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_PERFORMANCE_COLLECTOR), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require("FERRUM RUNTIME VNEXT PERFORMANCE COLLECTOR SELFTEST PASS" in ok.stdout, ok.stdout)
+
+
 def test_runtime_vnext_g00a_checkpoint_selftest() -> None:
     ok = run([sys.executable, str(RUNTIME_VNEXT_G00A_CHECKPOINT), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -592,6 +599,7 @@ def main() -> int:
     test_runtime_vnext_expectation_amendment_selftest()
     test_runtime_vnext_blocked_lane_selftest()
     test_runtime_vnext_resource_sampler_selftest()
+    test_runtime_vnext_performance_collector_selftest()
     test_runtime_vnext_g00a_checkpoint_selftest()
     test_runtime_vnext_g00_orchestrator_selftest()
     test_runtime_vnext_historical_corpus_selftest()
