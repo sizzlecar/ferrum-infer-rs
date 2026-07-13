@@ -1065,6 +1065,8 @@ def bench_argv(
         workload["tokenizer_origin_path"],
         "--target-backend",
         config["backend"],
+        "--http-connection-mode",
+        "fresh",
         "--concurrency",
         str(concurrency),
         "--dataset",
