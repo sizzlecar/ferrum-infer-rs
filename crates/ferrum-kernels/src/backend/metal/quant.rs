@@ -6,7 +6,10 @@
 //! external `crate::backend::metal::{MetalQuantStore, ...}` paths keep
 //! working without changes.
 
-use super::{metal_mmap_trace_enabled, slice_is_in_registered_mmap, st, MetalBackend};
+use super::{
+    add_registered_mmap_buffer, metal_mmap_trace_enabled, slice_is_in_registered_mmap, st,
+    MetalBackend,
+};
 use crate::backend::{Backend, GgufQuantType};
 use ferrum_types::{FerrumError, Result};
 use metal::MTLResourceOptions;
@@ -50,6 +53,8 @@ pub enum MetalQuantStore {
         n_rows: usize,
         n_cols: usize,
         n_blocks: usize,
+        // Keep after `blocks`: the Metal handle must drop before its mmap.
+        _mmap_lease: Option<super::MetalMmapLease>,
     },
     Q6K {
         /// See `Q4K::blocks`.
@@ -58,6 +63,8 @@ pub enum MetalQuantStore {
         n_rows: usize,
         n_cols: usize,
         n_blocks: usize,
+        // Keep after `blocks`: the Metal handle must drop before its mmap.
+        _mmap_lease: Option<super::MetalMmapLease>,
     },
     /// Row-concatenation of multiple parts that may have different
     /// quant types. Each part is a leaf (Q4K / Q6K) with the same
@@ -82,6 +89,8 @@ pub enum MetalQuantStore {
         num_experts: usize,
         n_rows: usize, // per-expert out_features
         n_cols: usize, // in_features
+        // Keep after `blocks`: the Metal handle must drop before its mmap.
+        _mmap_lease: Option<super::MetalMmapLease>,
     },
     Q6KExperts {
         blocks: metal::Buffer,
@@ -89,6 +98,8 @@ pub enum MetalQuantStore {
         num_experts: usize,
         n_rows: usize,
         n_cols: usize,
+        // Keep after `blocks`: the Metal handle must drop before its mmap.
+        _mmap_lease: Option<super::MetalMmapLease>,
     },
 }
 
@@ -125,18 +136,17 @@ unsafe impl Sync for MetalQuantStore {}
 /// Why per-tensor `newBufferWithBytesNoCopy` instead of one big buffer
 /// covering the whole file: a 16-GiB MTLBuffer regresses decode tok/s
 /// ~30× on M1 Max — Apple's GPU residency tracking on huge buffers is
-/// expensive per dispatch. Many small per-tensor buffers fit Apple's
-/// model better (this is the same pattern llama.cpp uses for tensors
-/// that fit in one view, just at finer granularity).
-fn buffer_for_quant_bytes(bytes: &[u8]) -> (metal::Buffer, u64) {
+/// expensive per dispatch. Per-tensor views are registered in one model-owned
+/// residency set so Metal wires them during load instead of every dispatch.
+fn buffer_for_quant_bytes(
+    bytes: &[u8],
+) -> Result<(metal::Buffer, u64, Option<super::MetalMmapLease>)> {
     const PAGE: usize = 16384;
     let trace = metal_mmap_trace_enabled();
     if slice_is_in_registered_mmap(bytes) {
         // Zero-copy: page-align the host range covering this tensor and
-        // wrap it in an MTLBuffer. The keeper Arc on the registry entry
-        // keeps the underlying mmap alive as long as the registry has
-        // any entry for it; that outlives any MetalQuantStore we ever
-        // hand back, so the buffer's pointer stays valid.
+        // wrap it in an MTLBuffer. The lease returned below keeps the mmap
+        // and residency set alive for exactly as long as the quant store.
         let ptr_addr = bytes.as_ptr() as usize;
         let aligned_start = ptr_addr & !(PAGE - 1);
         let aligned_end = (ptr_addr + bytes.len()).div_ceil(PAGE) * PAGE;
@@ -149,13 +159,14 @@ fn buffer_for_quant_bytes(bytes: &[u8]) -> (metal::Buffer, u64) {
             None,
         );
         if buf.length() != 0 {
+            let mmap_lease = add_registered_mmap_buffer(bytes, &buf)?;
             if trace {
                 eprintln!(
                     "[mmap] zero-copy: tensor ptr=0x{ptr_addr:x} len={} -> buf @0x{aligned_start:x} len={aligned_len} off={byte_offset}",
                     bytes.len()
                 );
             }
-            return (buf, byte_offset);
+            return Ok((buf, byte_offset, Some(mmap_lease)));
         }
         // newBufferWithBytesNoCopy can refuse very rare edge cases
         // (fragmented host pages?). Fall through to the copy path.
@@ -174,7 +185,7 @@ fn buffer_for_quant_bytes(bytes: &[u8]) -> (metal::Buffer, u64) {
         bytes.len() as u64,
         MTLResourceOptions::StorageModeShared,
     );
-    (buf, 0)
+    Ok((buf, 0, None))
 }
 
 // ── MoE expert stack builders ────────────────────────────────────────
@@ -206,13 +217,14 @@ pub fn load_q4k_experts(
             bytes.len()
         )));
     }
-    let (blocks, byte_offset) = buffer_for_quant_bytes(bytes);
+    let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes)?;
     Ok(MetalQuantStore::Q4KExperts {
         blocks,
         byte_offset,
         num_experts,
         n_rows,
         n_cols,
+        _mmap_lease: mmap_lease,
     })
 }
 
@@ -238,13 +250,14 @@ pub fn load_q6k_experts(
             bytes.len()
         )));
     }
-    let (blocks, byte_offset) = buffer_for_quant_bytes(bytes);
+    let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes)?;
     Ok(MetalQuantStore::Q6KExperts {
         blocks,
         byte_offset,
         num_experts,
         n_rows,
         n_cols,
+        _mmap_lease: mmap_lease,
     })
 }
 
@@ -575,13 +588,14 @@ fn metal_load_quant_store_helper(
                     expected
                 )));
             }
-            let (blocks, byte_offset) = buffer_for_quant_bytes(bytes);
+            let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes)?;
             Ok(MetalQuantStore::Q4K {
                 blocks,
                 byte_offset,
                 n_rows,
                 n_cols,
                 n_blocks,
+                _mmap_lease: mmap_lease,
             })
         }
         GgufQuantType::Q6K => {
@@ -601,13 +615,14 @@ fn metal_load_quant_store_helper(
                     expected
                 )));
             }
-            let (blocks, byte_offset) = buffer_for_quant_bytes(bytes);
+            let (blocks, byte_offset, mmap_lease) = buffer_for_quant_bytes(bytes)?;
             Ok(MetalQuantStore::Q6K {
                 blocks,
                 byte_offset,
                 n_rows,
                 n_cols,
                 n_blocks,
+                _mmap_lease: mmap_lease,
             })
         }
         other => Err(FerrumError::unsupported(format!(
@@ -764,6 +779,7 @@ pub fn metal_gemm_quant_dispatch(
             n_rows,
             n_cols,
             n_blocks,
+            ..
         } => (blocks, *byte_offset, *n_rows, *n_cols, *n_blocks, false),
         MetalQuantStore::Q6K {
             blocks,
@@ -771,6 +787,7 @@ pub fn metal_gemm_quant_dispatch(
             n_rows,
             n_cols,
             n_blocks,
+            ..
         } => (blocks, *byte_offset, *n_rows, *n_cols, *n_blocks, true),
         MetalQuantStore::Fused { .. } => unreachable!("handled above"),
         MetalQuantStore::Q4KExperts { .. } | MetalQuantStore::Q6KExperts { .. } => {
