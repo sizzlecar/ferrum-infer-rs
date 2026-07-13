@@ -197,7 +197,10 @@ def derive_summary(
     footer_finished = _parse_timestamp(footer.get("finished_at"), "resource footer finished_at")
     _require(session_start <= header_started < measure_start, "resource sampler must start after process start and before measurement")
     _require(measure_finish < footer_finished <= session_finish, "resource sampler must finish after measurement and before session finish")
-    _require(footer.get("exit_reason") in {"stop-file", "signal", "duration"}, "resource footer exit_reason is invalid")
+    _require(
+        footer.get("exit_reason") in {"stop-file", "signal", "duration", "process-exit"},
+        "resource footer exit_reason is invalid",
+    )
     _require(footer.get("sample_count") == len(samples), "resource footer sample_count mismatch")
 
     timestamps: list[datetime] = []
@@ -264,6 +267,7 @@ def derive_summary(
     _require(all(row["_admission"] == 0 for row in covered), "raw resource observations contain admission errors")
 
     summary: dict[str, Any] = {
+        "exit_reason": footer["exit_reason"],
         "sample_count": len(covered),
         "first_sample_at": covered[0]["sampled_at"],
         "last_sample_at": covered[-1]["sampled_at"],
@@ -537,7 +541,9 @@ def collect(args: argparse.Namespace) -> None:
             group_rows = _process_group_rows(args.pgid)
             group_pids = {row[0] for row in group_rows}
             process_alive = args.pid in group_pids
-            _require(process_alive, "server process exited while resource sampler was active")
+            if not process_alive:
+                exit_reason = "process-exit"
+                break
             rss = sum(row[1] for row in group_rows)
             if args.backend == "cuda":
                 memory_used, headroom = _cuda_memory(group_pids)

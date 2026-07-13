@@ -57,6 +57,7 @@ run_unit() {
     scripts/release/runtime_vnext_expectation_amendment.py \
     scripts/release/runtime_vnext_blocked_lane.py \
     scripts/release/runtime_vnext_resource_sampler.py \
+    scripts/release/runtime_vnext_performance_collector.py \
     scripts/release/runtime_vnext_g00a_checkpoint.py \
     scripts/release/runtime_vnext_g00_orchestrator.py \
     scripts/release/runtime_vnext_historical_corpus.py \
