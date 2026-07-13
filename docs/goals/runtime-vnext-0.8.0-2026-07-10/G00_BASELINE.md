@@ -41,7 +41,9 @@
   correctness command、performance command 和 stop condition。
 - Metal：固定本机 `32GB / 24-GPU-core Apple M1 Max`。M2 使用固定的 Q4_K_S 文件，并在
   启动和每个测量 cell 前执行 typed memory preflight；任何 active swap growth 或不足
-  `2 GiB` 的实测物理 headroom 都是 REJECT，不能把 Qwen3.5 Metal 从总目标删除。
+  `2 GiB` 的实测物理 headroom 都是 REJECT，不能把 Qwen3.5 Metal 从总目标删除。冻结 M3
+  legacy Metal 的 32 GiB resource blocker 仅按
+  [`G00_M3_METAL_32GB_AMENDMENT.md`](G00_M3_METAL_32GB_AMENDMENT.md) 接受。
 - 基线采集完成后必须停止或明确 bounded cache-retention，不允许 GPU 空闲计费。
 
 MODEL_MATRIX 为 vNext 最终态定义的 active-concurrency floor 不得倒灌并改写冻结 legacy 行为。
@@ -88,12 +90,14 @@ legacy 期望源：
 - 正式 G00 artifact 中 `discovery-required`、现场改写 expectation、skip 和 waiver 数均为 `0`。
 
 因此 G00 的 legacy lane PASS 表示所有已锁定期望都被真实逐 case 执行并完全匹配，而不是声称
-legacy 已经实现 C01-C21 的最终 v0.8.0 合同。M3 两个既有 release-critical `run`/`serve`、
-stream、multi-turn、usage、终止和坏输出扫描子集仍必须全部真实 PASS；C01-C21 的最终全绿属于
-G08/G10。该区分不降低最终目标，只防止基线阶段要求未来功能倒灌到冻结二进制。
+legacy 已经实现 C01-C21 的最终 v0.8.0 合同。M3 CUDA 既有 release-critical 子集必须真实 PASS；
+M3 Metal 在固定 32 GiB 主机上只允许由 reviewed amendment 的真实 resource-blocked artifact
+替代 legacy case PASS。G08C/G10 仍必须让 vNext M3 Metal 的 `run`/`serve`、stream、multi-turn、
+usage、终止和坏输出扫描全部 PASS。该区分不降低最终目标，只冻结 legacy 无法安全执行的事实。
 
 - 三模型 x CUDA/Metal 共 6 个 lane 均有 PASS 或真实 BLOCKED artifact；waiver 数 `0`。
-- M3 Qwen3-30B 的 CUDA/Metal 两个既有 lane 必须全部 PASS。
+- M3 Qwen3-30B CUDA 必须 PASS；本次固定 32 GiB G00 的 M3 Metal 必须严格匹配 reviewed
+  `legacy-metal-unified-memory-capacity` blocker，且不得产生 legacy performance ratio。
 - M1/M2 Qwen3.5 Metal 必须准确证明当前 unsupported，不得伪造 baseline。
 - 每个存在 Ferrum legacy 与 external 两个可执行实现的 comparable performance cell 使用外层
   `ABBA-BAAB`；每 slot `100 requests x 3 inner repeats`，因此每实现每 cell `1200`
@@ -163,18 +167,20 @@ M2 Metal Q4_K_S 还必须同时等于 catalog 的 `expected_size_bytes=206738458
 scripts/release/runtime_vnext_baseline_gate.py
 ```
 
-M1/M2 Metal legacy unsupported 只能由真实 product collector 生成，不接受手写 `lane.json`：
+M1/M2 Metal legacy unsupported 和 reviewed M3 Metal 32 GiB resource blocker 只能由真实
+product collector 生成，不接受手写 `lane.json`：
 
 ```text
 python3 scripts/release/runtime_vnext_blocked_lane.py \
   --artifact-root <g00-out> \
-  --model-key <m1-qwen35-4b|m2-qwen35-35b-a3b> \
+  --model-key <m1-qwen35-4b|m2-qwen35-35b-a3b|m3-qwen3-30b-a3b> \
   --model-arg <pinned-gguf> \
   --semantic-source-root <pinned-semantic-snapshot>
 ```
 
 collector 必须保存并由 final validator 重验 sanitized child env、product PID/PGID/start identity、
-bounded resource receipt、memory/swap preflight、effective config 和精确 unsupported failure signature。
+bounded resource receipt、memory/swap preflight、effective config 和精确 failure signature。M3 还必须
+保存逐样本 resource timeline，并证明 violation 发生时 product 仍存活。
 
 有效执行命令：
 

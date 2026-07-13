@@ -855,7 +855,6 @@ def self_test() -> None:
             "m1-qwen35-4b/cuda",
             "m2-qwen35-35b-a3b/cuda",
             "m3-qwen3-30b-a3b/cuda",
-            "m3-qwen3-30b-a3b/metal",
         }
         for lane_id in executable_lanes:
             lane = next(row for row in real_plan["lanes"] if row["lane_id"] == lane_id)
@@ -870,6 +869,18 @@ def self_test() -> None:
                 == ["global.models-lock", "global.legacy-binaries"],
                 f"{lane_id} formal correctness still depends on discovery",
             )
+        m3_metal = next(
+            row
+            for row in real_plan["lanes"]
+            if row["lane_id"] == "m3-qwen3-30b-a3b/metal"
+        )
+        require(
+            m3_metal["expectation_statuses"] == ["blocked"]
+            and m3_metal["formal_expected_result"] == "blocked"
+            and m3_metal["phases"]["formal-correctness"]["state"]
+            == "truthful-blocked-artifact-required",
+            "M3 Metal reviewed resource blocker did not enter the blocked collection path",
+        )
         lock_path = partial / "models.lock.json"
         lock_bytes = lock_path.read_bytes()
         atomic_write(lock_path, lock_bytes + b" ")

@@ -193,6 +193,7 @@ VNEXT_G00_REDTEAM_MUTATION_NAMES = (
 VNEXT_G00A_DOES_NOT_PROVE = {"G00", "G01B", "model_migration", "performance", "release"}
 VNEXT_G00A_CONTRACT_PATHS = {
     "docs/goals/runtime-vnext-0.8.0-2026-07-10/G00_BASELINE.md",
+    "docs/goals/runtime-vnext-0.8.0-2026-07-10/G00_M3_METAL_32GB_AMENDMENT.md",
     "docs/goals/runtime-vnext-0.8.0-2026-07-10/G01_CORE_CONTRACTS.md",
     "docs/goals/runtime-vnext-0.8.0-2026-07-10/GOAL.md",
     "docs/goals/runtime-vnext-0.8.0-2026-07-10/MODEL_MATRIX.md",
@@ -3608,7 +3609,7 @@ def validate_vnext_g00_provenance(
         "m2-qwen35-35b-a3b/cuda": "pass",
         "m2-qwen35-35b-a3b/metal": "blocked",
         "m3-qwen3-30b-a3b/cuda": "pass",
-        "m3-qwen3-30b-a3b/metal": "pass",
+        "m3-qwen3-30b-a3b/metal": "blocked",
     }
     require_gate(correctness == expected_correctness_status, "delegated correctness status matrix mismatch")
 
@@ -4270,11 +4271,17 @@ def make_selftest_vnext_g00_artifact(root: Path) -> LaneCommand:
             if backend == "metal" and model_key in {
                 "m1-qwen35-4b",
                 "m2-qwen35-35b-a3b",
+                "m3-qwen3-30b-a3b",
             }:
                 correctness[f"{model_key}/{backend}"] = "blocked"
                 executor_invocations.pop(f"{model_key}/{backend}")
                 failure_log_rel = f"correctness/{model_key}/{backend}/blocked.log"
-                (root / failure_log_rel).write_text("legacy model/backend unsupported\n")
+                resource_blocked = model_key == "m3-qwen3-30b-a3b"
+                (root / failure_log_rel).write_text(
+                    "legacy Metal unified-memory capacity gate rejected\n"
+                    if resource_blocked
+                    else "legacy model/backend unsupported\n"
+                )
                 write_selftest_json(
                     root / f"correctness/{model_key}/{backend}/lane.json",
                     {
@@ -4289,14 +4296,18 @@ def make_selftest_vnext_g00_artifact(root: Path) -> LaneCommand:
                         "current_support": False,
                         "comparable": False,
                         "waiver": False,
-                        "failure_class": "legacy-model-backend-unsupported",
-                        "reason": "selftest frozen unsupported lane",
-                        "first_failure": "model load rejected before inference",
-                        "downstream_goal": "G08A" if model_key == "m1-qwen35-4b" else "G08B",
+                        "failure_class": (
+                            "legacy-metal-unified-memory-capacity"
+                            if resource_blocked
+                            else "legacy-model-backend-unsupported"
+                        ),
+                        "reason": "selftest frozen resource-blocked lane" if resource_blocked else "selftest frozen unsupported lane",
+                        "first_failure": "active swap growth during serve startup" if resource_blocked else "model load rejected before inference",
+                        "downstream_goal": "G08C" if resource_blocked else "G08A" if model_key == "m1-qwen35-4b" else "G08B",
                         "implementation_path": "vNext model migration",
                         "acceptance_path": "runtime-vNext model lane gate",
                         "downstream_acceptance_pass_line": "FERRUM RUNTIME VNEXT MODEL PASS: fixture",
-                        "attempted_command": ["ferrum", "run", "--model", model_key],
+                        "attempted_command": ["ferrum", "serve" if resource_blocked else "run", "--model", model_key],
                         "attempted_returncode": 1,
                         "failure_log": failure_log_rel,
                     },
