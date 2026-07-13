@@ -47,6 +47,7 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 CASE_ID_RE = re.compile(r"^c(?:0[1-9]|1[0-9]|2[01])-[0-9]{3}$")
 SCENARIO_IDS = tuple(f"C{index:02d}" for index in range(1, 22))
+SERVE_ISOLATION_BOUNDARIES = frozenset({"C09"})
 EXPECTATION_SELECTOR_FIELDS = ("scenario_id", "variant", "preset", "entrypoint", "case_id")
 EXPECTED_STATUSES = {"pass", "known-fail", "blocked", "discovery-required"}
 C03_CONTRACT_ID = "c03-exact-identifier-v2"
@@ -1189,6 +1190,7 @@ def validate_case_evidence(
     used_case_ids: set[str],
     used_case_artifacts: set[Path],
     used_argv: set[tuple[str, ...]],
+    commands: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     raw_path, _, parsed = validate_artifact_ref(root, raw_ref, f"scenario {scenario_id}.cases[{ordinal}]", allowed_kinds={"raw-json"})
     require(raw_path not in used_case_artifacts, f"scenario {scenario_id} reuses case evidence {raw_path}")
@@ -1220,6 +1222,9 @@ def validate_case_evidence(
         require(case.get(key) == expected.get(key), f"case {case_id} {key} binding mismatch")
     entrypoint = require_string(case.get("entrypoint"), f"case {case_id}.entrypoint")
     require(entrypoint in required_entrypoints(scenario_id), f"case {case_id} uses forbidden entrypoint")
+    command_id = require_string(case.get("command_id"), f"case {case_id}.command_id")
+    require(command_id in commands, f"case {case_id} references unknown command {command_id}")
+    require(commands[command_id]["entrypoint"] == entrypoint, f"case {case_id} command {command_id} entrypoint mismatch")
     variant = require_string(case.get("variant"), f"case {case_id}.variant")
     preset = case.get("preset")
     require(preset is None or preset in {"P_DETERMINISTIC", "P_NO_THINKING", "P_THINKING", "P_OFFICIAL_DEFAULT"}, f"case {case_id} preset invalid")
@@ -1330,6 +1335,7 @@ def validate_case_evidence(
         used_case_artifacts.add(envelope_path)
         envelope_document = require_object(envelope_parsed, f"case {case_id} execution envelope JSON")
         require(envelope_document.get("schema_version") == SCHEMA_VERSION and envelope_document.get("case_id") == case_id, f"case {case_id} execution envelope binding mismatch")
+        require(envelope_document.get("command_id") == command_id, f"case {case_id} execution envelope command binding mismatch")
         command_spec_path, _, command_spec_parsed = validate_artifact_ref(root, envelope_document.get("command_spec"), f"case {case_id}.command_spec", allowed_kinds={"raw-json"})
         require(command_spec_path not in used_case_artifacts, f"case {case_id} reuses command spec {command_spec_path}")
         used_case_artifacts.add(command_spec_path)
@@ -1383,6 +1389,20 @@ def validate_case_evidence(
             expected_ppid=expected["invocation_pid"],
             expected_environment=child_environment,
         )
+        if entrypoint == "serve":
+            command_receipt_path, _, _ = validate_artifact_ref(
+                root,
+                commands[command_id]["raw"].get("process_receipt"),
+                f"case {case_id}.command_process_receipt",
+                allowed_kinds={"raw-json"},
+            )
+            product_receipt_path, _, _ = validate_artifact_ref(
+                root,
+                envelope_document.get("product_process_receipt"),
+                f"case {case_id}.product_process_receipt_binding",
+                allowed_kinds={"raw-json"},
+            )
+            require(product_receipt_path == command_receipt_path, f"case {case_id} is not bound to command {command_id} process receipt")
         for receipt in (execution_receipt, product_receipt):
             captured = parse_timestamp(receipt["captured_at"], f"case {case_id}.receipt.captured_at")
             require(expected["invocation_started_at"] <= captured <= expected["invocation_finished_at"], f"case {case_id} process receipt is outside invocation window")
@@ -1503,6 +1523,7 @@ def validate_case_evidence(
         "observed": observed,
         "input_document": input_document,
         "input_sha256": file_sha256(resolved["input"][0]),
+        "command_id": command_id,
         "ordinal": ordinal,
         "started_at": started,
         "finished_at": finished,
@@ -1515,7 +1536,7 @@ def validate_scenario(
     *,
     expected_id: str,
     expected: dict[str, Any],
-    commands: dict[str, str],
+    commands: dict[str, dict[str, Any]],
     used_artifacts: set[Path],
     used_case_ids: set[str],
     used_case_artifacts: set[Path],
@@ -1556,7 +1577,7 @@ def validate_scenario(
     referenced_entrypoints: set[str] = set()
     for command_id in command_ids:
         require(command_id in commands, f"scenario {expected_id} references unknown command {command_id}")
-        referenced_entrypoints.add(commands[command_id])
+        referenced_entrypoints.add(commands[command_id]["entrypoint"])
     require(entrypoints <= referenced_entrypoints, f"scenario {expected_id} command records do not cover its entrypoints")
     variants = require_object(scenario.get("variants"), f"scenario {expected_id}.variants")
     for name, value in variants.items():
@@ -1645,11 +1666,14 @@ def validate_scenario(
             used_case_ids=used_case_ids,
             used_case_artifacts=used_case_artifacts,
             used_argv=used_argv,
+            commands=commands,
         )
         for index, case_ref in enumerate(case_refs, start=1)
     ]
     derived_entrypoints = sorted({row["entrypoint"] for row in case_rows})
     require(derived_entrypoints == sorted(scenario["entrypoints"]), f"scenario {expected_id} entrypoints are not derived from cases")
+    derived_command_ids = {row["command_id"] for row in case_rows}
+    require(derived_command_ids == set(command_ids), f"scenario {expected_id} command ids are not derived from cases")
     derived_variants: dict[str, int] = {}
     derived_presets: dict[str, int] = {}
     derived_unpreset = 0
@@ -1935,7 +1959,7 @@ def validate_report_document(
             }
         )
     commands_raw = require_list(report.get("commands"), "scenario_report.commands")
-    commands: dict[str, str] = {}
+    commands: dict[str, dict[str, Any]] = {}
     for index, command_raw in enumerate(commands_raw):
         command_id, entrypoint = validate_command(
             root,
@@ -1945,8 +1969,8 @@ def validate_report_document(
             effective_config_sha256=effective_config_sha256,
         )
         require(command_id not in commands, f"duplicate scenario command id {command_id}")
-        commands[command_id] = entrypoint
-    require(set(commands.values()) == {"run", "serve"}, "scenario report must contain real ferrum run and serve commands")
+        commands[command_id] = {"entrypoint": entrypoint, "raw": require_object(command_raw, f"scenario_report.commands[{index}]")}
+    require({command["entrypoint"] for command in commands.values()} == {"run", "serve"}, "scenario report must contain real ferrum run and serve commands")
     scenarios_raw = require_list(report.get("scenarios"), "scenario_report.scenarios")
     require(len(scenarios_raw) == len(SCENARIO_IDS), "scenario report must contain exactly C01-C21")
     used_artifacts: set[Path] = set()
@@ -1967,7 +1991,30 @@ def validate_report_document(
             used_argv=used_argv,
         )
     if invocation_ref is not None:
-        serve_command = next(require_object(row, "scenario_report serve command") for row in commands_raw if row.get("entrypoint") == "serve")
+        require(
+            set(commands) == {"actual-run", "actual-serve-01", "actual-serve-02"},
+            "canonical report must contain one run command and exactly two C09-isolated serve sessions",
+        )
+        first_serve = commands["actual-serve-01"]["raw"]
+        second_serve = commands["actual-serve-02"]["raw"]
+        first_finished_at = parse_timestamp(first_serve.get("finished_at"), "first isolated serve command finished_at")
+        second_started_at = parse_timestamp(second_serve.get("started_at"), "second isolated serve command started_at")
+        require(first_finished_at <= second_started_at, "post-C09 serve session started before the first session stopped")
+        _, _, first_receipt_raw = validate_artifact_ref(root, first_serve.get("process_receipt"), "first isolated serve receipt", allowed_kinds={"raw-json"})
+        _, _, second_receipt_raw = validate_artifact_ref(root, second_serve.get("process_receipt"), "second isolated serve receipt", allowed_kinds={"raw-json"})
+        first_receipt = require_object(first_receipt_raw, "first isolated serve receipt JSON")
+        second_receipt = require_object(second_receipt_raw, "second isolated serve receipt JSON")
+        require(first_receipt.get("pid") != second_receipt.get("pid"), "C09 isolation reused the same serve process")
+        for scenario_id, scenario_raw in zip(SCENARIO_IDS, scenarios_raw):
+            scenario = require_object(scenario_raw, f"scenario {scenario_id}")
+            expected_command_ids = {"actual-run"} if "run" in required_entrypoints(scenario_id) else set()
+            if "serve" in required_entrypoints(scenario_id):
+                expected_command_ids.add("actual-serve-01" if int(scenario_id[1:]) <= 9 else "actual-serve-02")
+            require(
+                set(require_list(scenario.get("command_ids"), f"scenario {scenario_id}.command_ids")) == expected_command_ids,
+                f"scenario {scenario_id} violates the C09 serve isolation boundary",
+            )
+        serve_command = first_serve
         serve_started_at = parse_timestamp(serve_command.get("started_at"), "scenario_report serve command started_at")
         for case in (case for rows in case_rows_by_scenario.values() for case in rows if case.get("entrypoint") == "run"):
             require(case["finished_at"] <= serve_started_at, f"case {case.get('case_id')} overlapped the resident serve model")
@@ -3910,49 +3957,68 @@ def execute_manifest(
     execution = validated["execution"]
     binary_path = validated["binary_path"]
     base_url = f"http://{execution['host']}:{execution['port']}"
-    serve_stdout = lane_root / "commands/serve.stdout.log"
-    serve_stderr = lane_root / "commands/serve.stderr.log"
-    serve_config = lane_root / "commands/serve.actual-effective-config.json"
-    scheduler_trace = lane_root / "commands/serve.scheduler-trace.jsonl"
-    serve_argv = [
-        str(binary_path),
-        "serve",
-        execution["model_arg"],
-        "--backend",
-        manifest["backend"],
-        "--host",
-        execution["host"],
-        "--port",
-        str(execution["port"]),
-        "--effective-config-json",
-        str(serve_config),
-        "--scheduler-trace-jsonl",
-        str(scheduler_trace),
-        *execution["serve_extra_args"],
-    ]
     server: ProductServer | None = None
+    active_serve_session: dict[str, Any] | None = None
+    serve_sessions: list[dict[str, Any]] = []
     server_error: str | None = None
 
+    def serve_session_spec(generation: int) -> dict[str, Any]:
+        stem = f"serve-{generation:02d}"
+        serve_config = lane_root / f"commands/{stem}.actual-effective-config.json"
+        scheduler_trace = lane_root / f"commands/{stem}.scheduler-trace.jsonl"
+        serve_argv = [
+            str(binary_path),
+            "serve",
+            execution["model_arg"],
+            "--backend",
+            manifest["backend"],
+            "--host",
+            execution["host"],
+            "--port",
+            str(execution["port"]),
+            "--effective-config-json",
+            str(serve_config),
+            "--scheduler-trace-jsonl",
+            str(scheduler_trace),
+            *execution["serve_extra_args"],
+        ]
+        return {
+            "command_id": f"actual-serve-{generation:02d}",
+            "generation": generation,
+            "argv": serve_argv,
+            "stdout": lane_root / f"commands/{stem}.stdout.log",
+            "stderr": lane_root / f"commands/{stem}.stderr.log",
+            "config": serve_config,
+            "scheduler_trace": scheduler_trace,
+            "receipt": lane_root / f"commands/{stem}.process-receipt.json",
+            "scenario_ids": set(),
+        }
+
     def ensure_server() -> None:
-        nonlocal server, server_error
+        nonlocal server, active_serve_session, server_error
         if server is not None or server_error is not None:
             return
+        session = serve_session_spec(len(serve_sessions) + 1)
+        active_serve_session = session
         try:
             server = ProductServer(
-                argv=serve_argv,
-                stdout_path=serve_stdout,
-                stderr_path=serve_stderr,
+                argv=session["argv"],
+                stdout_path=session["stdout"],
+                stderr_path=session["stderr"],
                 artifact_root=root,
-                receipt_path=lane_root / "commands/serve.process-receipt.json",
+                receipt_path=session["receipt"],
                 base_url=base_url,
                 startup_timeout_sec=float(execution["startup_timeout_sec"]),
             )
+            session["server"] = server
+            serve_sessions.append(session)
         except ScenarioError as exc:
             server_error = str(exc)
 
     case_refs_by_scenario: dict[str, list[dict[str, str]]] = {scenario_id: [] for scenario_id in SCENARIO_IDS}
     case_results: dict[str, list[dict[str, Any]]] = {scenario_id: [] for scenario_id in SCENARIO_IDS}
     first_run_record: dict[str, Any] | None = None
+    last_serve_scenario: str | None = None
     try:
         execution_rows = sorted(rows, key=lambda row: 0 if row["entrypoint"] == "run" else 1)
         for row in execution_rows:
@@ -3979,6 +4045,7 @@ def execute_manifest(
                 execution_process_receipt = extra["process_receipt"]
                 product_process_receipt = extra["process_receipt"]
                 child_environment = extra["child_environment"]
+                command_id = "actual-run"
                 if first_run_record is None:
                     first_run_record = {
                         "argv": argv,
@@ -3988,8 +4055,19 @@ def execute_manifest(
                         "process_receipt": extra["process_receipt"],
                     }
             else:
+                if (
+                    server is not None
+                    and last_serve_scenario in SERVE_ISOLATION_BOUNDARIES
+                    and row["scenario_id"] != last_serve_scenario
+                ):
+                    server.stop()
+                    server = None
+                    active_serve_session = None
+                    server_error = None
                 ensure_server()
             if row["entrypoint"] == "serve" and server is not None:
+                require(active_serve_session is not None, "active serve session metadata missing")
+                active_serve_session["scenario_ids"].add(row["scenario_id"])
                 argv, envelope, input_path, stdout_path, stderr_path, transcript_path, observed = serve_case_request(
                     root,
                     row,
@@ -3997,14 +4075,17 @@ def execute_manifest(
                     timeout_sec=float(execution["case_timeout_sec"]),
                     case_root=case_root,
                     server=server,
-                    scheduler_trace_path=scheduler_trace,
-                    effective_config_path=serve_config,
+                    scheduler_trace_path=active_serve_session["scheduler_trace"],
+                    effective_config_path=active_serve_session["config"],
                 )
-                actual_config = serve_config
+                actual_config = active_serve_session["config"]
                 execution_process_receipt = invocation_process_receipt
                 product_process_receipt = server.process_receipt
                 child_environment = server.child_environment
+                command_id = active_serve_session["command_id"]
+                last_serve_scenario = row["scenario_id"]
             elif row["entrypoint"] == "serve":
+                require(active_serve_session is not None, "failed serve session metadata missing")
                 input_path = case_root / "input.json"
                 write_json(input_path, case_http_payload(row, manifest["model_key"]))
                 stdout_path = case_root / "stdout.log"
@@ -4021,6 +4102,8 @@ def execute_manifest(
                 execution_process_receipt = invocation_process_receipt
                 product_process_receipt = None
                 child_environment = sanitized_child_environment()
+                command_id = active_serve_session["command_id"]
+                last_serve_scenario = row["scenario_id"]
             status, failure_class, checker_error = classify_execution_outcome(
                 row,
                 returncode=int(envelope["returncode"]),
@@ -4060,13 +4143,14 @@ def execute_manifest(
             envelope_document = {
                 "schema_version": SCHEMA_VERSION,
                 "case_id": row["case_id"],
+                "command_id": command_id,
                 "command_spec": existing_artifact_ref(root, command_spec_path, "raw-json"),
                 "spawn": envelope,
                 "execution_process_receipt": execution_process_receipt,
                 "product_process_receipt": product_process_receipt,
                 "child_environment": child_environment,
                 "child_environment_sha256": canonical_json_sha256(child_environment),
-                "product_argv": argv if row["entrypoint"] == "run" else serve_argv,
+                "product_argv": argv if row["entrypoint"] == "run" else active_serve_session["argv"],
                 "product_process": (
                     {
                         "argv": argv,
@@ -4080,7 +4164,7 @@ def execute_manifest(
                     }
                     if row["entrypoint"] == "run"
                     else ({
-                        "argv": serve_argv,
+                        "argv": active_serve_session["argv"],
                         "pid": server.pid,
                         "pgid": server.pgid,
                         "started_at": server.started_at,
@@ -4088,7 +4172,7 @@ def execute_manifest(
                         "started_monotonic_ns": server.started_monotonic_ns,
                         "ready_monotonic_ns": server.ready_monotonic_ns,
                         "state_during_case": "running",
-                    } if server is not None else {"argv": serve_argv, "state_during_case": "startup-failed", "failure": server_error})
+                    } if server is not None else {"argv": active_serve_session["argv"], "state_during_case": "startup-failed", "failure": server_error})
                 ),
                 "stdout": existing_artifact_ref(root, stdout_path, "stdout-log"),
                 "stderr": existing_artifact_ref(root, stderr_path, "stderr-log"),
@@ -4120,6 +4204,7 @@ def execute_manifest(
                 "effective_config_sha256": file_sha256(validated["effective_path"]),
                 "expectations_catalog_sha256": expectations_sha,
                 "entrypoint": row["entrypoint"],
+                "command_id": command_id,
                 "variant": row["variant"],
                 "preset": row["preset"],
                 "model_identity": {
@@ -4189,14 +4274,27 @@ def execute_manifest(
             ),
         }
         return discovery
-    require(server is not None, f"canonical serve session unavailable: {server_error}")
+    require(serve_sessions, f"canonical serve session unavailable: {server_error}")
+    require(len(serve_sessions) == 2, "canonical serve collection must isolate post-C09 scenarios in a second server session")
     require(first_run_record is not None, "canonical run produced no execution record")
     effective_sha = file_sha256(validated["effective_path"])
     commands = []
-    for command_id, entrypoint, argv, times, stdout_path, stderr_path, process_receipt in (
+    command_sources = [
         ("actual-run", "run", first_run_record["argv"], first_run_record["envelope"], first_run_record["stdout"], first_run_record["stderr"], first_run_record["process_receipt"]),
-        ("actual-serve", "serve", serve_argv, server.envelope(), serve_stdout, serve_stderr, server.process_receipt),
-    ):
+        *[
+            (
+                session["command_id"],
+                "serve",
+                session["argv"],
+                session["server"].envelope(),
+                session["stdout"],
+                session["stderr"],
+                session["server"].process_receipt,
+            )
+            for session in serve_sessions
+        ],
+    ]
+    for command_id, entrypoint, argv, times, stdout_path, stderr_path, process_receipt in command_sources:
         duration = (parse_timestamp(times["finished_at"], "command finished") - parse_timestamp(times["started_at"], "command started")).total_seconds()
         commands.append(
             {
@@ -4256,7 +4354,7 @@ def execute_manifest(
             "failed_count": known,
             "error_count": 0,
             "unexpected_count": 0,
-            "command_ids": ["actual-run" if entrypoint == "run" else "actual-serve" for entrypoint in shape["entrypoints"]],
+            "command_ids": list(dict.fromkeys(case["command_id"] for case in results)),
             "assertions": assertions,
         }
         raw = {
@@ -4913,6 +5011,7 @@ def make_case_fixture(
         "status": "pass",
         **base,
         "entrypoint": entrypoint,
+        "command_id": f"fixture-{entrypoint}",
         "variant": variant,
         "preset": preset,
         "model_identity": {
@@ -6015,6 +6114,19 @@ def self_test() -> int:
             allow_internal_fixture=True,
             require_current_output_path=True,
         )
+        execution_commands = {command["id"]: command for command in execution_report["commands"]}
+        require(
+            set(execution_commands) == {"actual-run", "actual-serve-01", "actual-serve-02"},
+            "execution fixture did not persist both C09-isolated serve sessions",
+        )
+        first_serve_receipt = read_json(execution_root / execution_commands["actual-serve-01"]["process_receipt"]["path"])
+        second_serve_receipt = read_json(execution_root / execution_commands["actual-serve-02"]["process_receipt"]["path"])
+        require(first_serve_receipt["pid"] != second_serve_receipt["pid"], "execution fixture did not restart serve after C09")
+        require(
+            execution_report["scenarios"][8]["command_ids"] == ["actual-serve-01"]
+            and execution_report["scenarios"][13]["command_ids"] == ["actual-serve-02"],
+            "C09/C14 command evidence crossed the isolation boundary",
+        )
         executor_prefix = "correctness/m3-qwen3-30b-a3b/cuda/commands/"
         invocation_ref = require_object(execution_report.get("executor_invocation"), "execution fixture invocation ref")
         require(str(invocation_ref.get("path", "")).startswith(executor_prefix), "executor invocation is not lane-local")
@@ -6099,6 +6211,26 @@ def self_test() -> int:
         candidate["commands"][0]["env_sha256"] = canonical_json_sha256(candidate["commands"][0]["env"])
         expect_execution_report_reject(execution_root, candidate, "environment differs from process receipt")
         rejected_mutations.add("command-receipt-environment-divergence")
+
+        with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c14-command-binding") as (mutation_root, candidate):
+            scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=13)
+            envelope = read_json(envelope_path)
+            scenario["command_ids"] = ["actual-serve-01"]
+            raw["command_ids"] = ["actual-serve-01"]
+            case["command_id"] = "actual-serve-01"
+            envelope["command_id"] = "actual-serve-01"
+            persist_execution_case_mutation(
+                mutation_root,
+                scenario,
+                raw_path,
+                raw,
+                case_path,
+                case,
+                envelope_path=envelope_path,
+                envelope=envelope,
+            )
+            expect_execution_report_reject(mutation_root, candidate, "is not bound to command actual-serve-01 process receipt")
+            rejected_mutations.add("post-c09-case-old-process-binding")
 
         with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c01-resolution") as (mutation_root, candidate):
             scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=0)
@@ -6573,6 +6705,7 @@ def self_test() -> int:
 
         required_rejections = {
             "command-receipt-environment-divergence",
+            "post-c09-case-old-process-binding",
             "c01-missing-resolution-probe",
             "c01-negative-tokenizer-drift",
             "c01-pass-architecture-mismatch",
