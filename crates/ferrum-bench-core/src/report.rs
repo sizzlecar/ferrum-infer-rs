@@ -65,6 +65,9 @@ fn write_env_block(s: &mut String, r: &BenchReport) {
     if !r.env.ferrum_features.is_empty() {
         writeln!(s, "| features | {} |", r.env.ferrum_features.join(", ")).ok();
     }
+    if let Some(mode) = r.env.http_connection_mode.as_ref() {
+        writeln!(s, "| http_connection_mode | {} |", mode).ok();
+    }
     if let Some(mhz) = r.env.gpu_clock_lock_mhz {
         writeln!(s, "| gpu_clock_lock | {} MHz |", mhz).ok();
     }
