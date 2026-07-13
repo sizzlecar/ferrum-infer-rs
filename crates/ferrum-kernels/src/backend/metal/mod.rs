@@ -34,6 +34,7 @@
 pub mod moe;
 pub mod paged;
 pub mod quant;
+mod residency;
 
 // GGUF k-quant kernels (Audit #9 moved here from kernels-crate top level).
 // Re-exported via `pub use backend::metal::{...}` in `crate::lib` so the
@@ -73,7 +74,7 @@ use ferrum_types::{FerrumError, Result};
 use half::{bf16, f16};
 use metal::{Device, MTLResourceOptions, MTLSize};
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 // ── Shared Metal state ────────────────────────────────────────────────
 
@@ -96,16 +97,54 @@ use std::sync::{Arc, Mutex, OnceLock};
 struct MetalMmapEntry {
     base_addr: usize,
     len: usize,
+    residency: Option<Mutex<residency::MetalResidencySet>>,
+    // Rust drops fields in declaration order. Keep this after `residency` so
+    // the mmap remains valid until the set releases its Metal allocations.
     _keeper: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+/// Keeps a registered mmap and its residency set alive for one quantized
+/// weight. The last lease releases both resources when the model is dropped.
+pub struct MetalMmapLease {
+    _entry: Arc<MetalMmapEntry>,
+}
+
+impl MetalMmapLease {
+    fn new(entry: Arc<MetalMmapEntry>) -> Self {
+        Self { _entry: entry }
+    }
+}
+
+/// Construction-time handle for one registered GGUF mmap.
+#[must_use = "keep this registration alive while constructing Metal quant stores"]
+pub struct MetalMmapRegistration {
+    entry: Arc<MetalMmapEntry>,
+}
+
+impl MetalMmapRegistration {
+    /// Publish all registered zero-copy allocations and request residency.
+    pub fn commit_residency(&self) -> Result<()> {
+        let Some(residency) = self.entry.residency.as_ref() else {
+            return Ok(());
+        };
+        let residency = residency
+            .lock()
+            .map_err(|e| FerrumError::model(format!("Metal residency set poisoned: {e}")))?;
+        let stats = residency.commit_and_request();
+        tracing::info!(
+            allocation_count = stats.allocation_count,
+            allocated_size_bytes = stats.allocated_size,
+            "Metal GGUF residency set committed"
+        );
+        Ok(())
+    }
 }
 
 pub(crate) struct MetalState {
     pub(crate) pipes: MetalPipelines,
-    /// Registered mmap regions wrapped as zero-copy Metal buffers. Looked
-    /// up at `load_quant*` time so weight tensors that already live in a
-    /// registered mmap can reuse the big buffer with an offset instead of
-    /// being copied (`new_buffer_with_data`) into a fresh allocation.
-    mmaps: Mutex<Vec<MetalMmapEntry>>,
+    /// Weak index of mmap regions eligible for zero-copy Metal buffers.
+    /// Per-weight leases, rather than this registry, own each live mapping.
+    mmaps: Mutex<Vec<Weak<MetalMmapEntry>>>,
 }
 static METAL_STATE: OnceLock<MetalState> = OnceLock::new();
 pub(crate) fn st() -> &'static MetalState {
@@ -157,9 +196,9 @@ pub(crate) fn metal_mmap_trace_enabled() -> bool {
 /// fresh device-resident copy.
 ///
 /// `keeper` is anything that, while alive, guarantees `slice` stays mapped.
-/// For GGUF the natural choice is `Arc<GgufFile>`. The Metal state holds
-/// onto it for the lifetime of the registration entry, which is the
-/// process lifetime — registrations are not removed today.
+/// For GGUF the natural choice is `Arc<GgufFile>`. The returned registration
+/// is held during construction; each zero-copy quant store then owns a lease,
+/// so model drop releases the mmap and residency set without global pinning.
 ///
 /// Constraints (`newBufferWithBytesNoCopy`):
 ///   * the slice base pointer must be page-aligned (16 KB on Apple Silicon)
@@ -170,12 +209,12 @@ pub(crate) fn metal_mmap_trace_enabled() -> bool {
 /// zero-fills any tail past EOF, but our reads never go past the file
 /// length so that's harmless.
 ///
-/// Returns `Ok(())` on success; on alignment failure or duplicate
-/// registration, returns an error and does not mutate the registry.
+/// Returns a construction handle on success. Duplicate registration of the
+/// same live mapping shares the existing entry.
 pub fn register_gguf_mmap(
     slice: &[u8],
     keeper: Arc<dyn std::any::Any + Send + Sync>,
-) -> Result<()> {
+) -> Result<MetalMmapRegistration> {
     const PAGE: usize = 16384;
     let base_addr = slice.as_ptr() as usize;
     if !base_addr.is_multiple_of(PAGE) {
@@ -191,50 +230,110 @@ pub fn register_gguf_mmap(
             slice.len() as f64 / 1e9
         );
     }
-    let mut guard = st()
+    let state = st();
+    let mut guard = state
         .mmaps
         .lock()
         .map_err(|e| FerrumError::model(format!("register_gguf_mmap: registry poisoned: {e}")))?;
-    if guard
+    guard.retain(|entry| entry.strong_count() > 0);
+    if let Some(entry) = guard
         .iter()
-        .any(|e| e.base_addr == base_addr && e.len == slice.len())
+        .filter_map(Weak::upgrade)
+        .find(|entry| entry.base_addr == base_addr && entry.len == slice.len())
     {
-        return Ok(());
+        return Ok(MetalMmapRegistration { entry });
     }
-    guard.push(MetalMmapEntry {
+    let residency = residency::MetalResidencySet::new(&state.pipes.device)?.map(Mutex::new);
+    if residency.is_none() {
+        tracing::info!("Metal residency sets unavailable; using implicit resource residency");
+    }
+    let entry = Arc::new(MetalMmapEntry {
         base_addr,
         len: slice.len(),
+        residency,
         _keeper: keeper,
     });
-    Ok(())
+    guard.push(Arc::downgrade(&entry));
+    Ok(MetalMmapRegistration { entry })
 }
 
-/// Check whether `bytes` lives inside a registered mmap region. Returns
-/// the (registered_base, registered_len) for the matching entry — the
-/// caller uses this only to know "yes, the host memory will outlive any
-/// MTLBuffer we wrap around it" via the entry's keeper Arc.
+/// Check whether `bytes` lives inside a registered mmap region.
 #[inline(never)]
 pub(crate) fn slice_is_in_registered_mmap(bytes: &[u8]) -> bool {
+    registered_mmap_entry(bytes).is_some()
+}
+
+fn registered_mmap_entry(bytes: &[u8]) -> Option<Arc<MetalMmapEntry>> {
     let ptr = bytes.as_ptr() as usize;
     let len = bytes.len();
     let end = match ptr.checked_add(len) {
         Some(e) => e,
-        None => return false,
+        None => return None,
     };
-    let guard = match st().mmaps.lock() {
+    let mut guard = match st().mmaps.lock() {
         Ok(g) => g,
-        Err(_) => return false,
+        Err(_) => return None,
     };
-    for entry in guard.iter() {
+    guard.retain(|entry| entry.strong_count() > 0);
+    for entry in guard.iter().filter_map(Weak::upgrade) {
         let entry_end = match entry.base_addr.checked_add(entry.len) {
             Some(e) => e,
             None => continue,
         };
         if ptr >= entry.base_addr && end <= entry_end {
-            return true;
+            return Some(entry);
         }
     }
-    false
+    None
+}
+
+/// Add a zero-copy buffer to the residency set owned by its registered mmap.
+/// The returned lease ties the mapping and residency lifetime to the weight.
+pub(crate) fn add_registered_mmap_buffer(
+    bytes: &[u8],
+    buffer: &metal::BufferRef,
+) -> Result<MetalMmapLease> {
+    let entry = registered_mmap_entry(bytes)
+        .ok_or_else(|| FerrumError::model("zero-copy Metal buffer has no registered mmap owner"))?;
+    if let Some(residency) = entry.residency.as_ref() {
+        residency
+            .lock()
+            .map_err(|e| FerrumError::model(format!("Metal residency set poisoned: {e}")))?
+            .add_allocation(buffer);
+    }
+    Ok(MetalMmapLease::new(entry))
+}
+
+#[cfg(test)]
+mod mmap_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn mmap_lease_keeps_entry_alive_until_last_weight_drop() {
+        let entry = Arc::new(MetalMmapEntry {
+            base_addr: 0,
+            len: 1,
+            residency: None,
+            _keeper: Arc::new(()),
+        });
+        let weak = Arc::downgrade(&entry);
+        let registration = MetalMmapRegistration {
+            entry: Arc::clone(&entry),
+        };
+        let lease = MetalMmapLease::new(entry);
+
+        drop(registration);
+        assert!(
+            weak.upgrade().is_some(),
+            "weight lease must retain the mmap"
+        );
+
+        drop(lease);
+        assert!(
+            weak.upgrade().is_none(),
+            "last weight lease must release the mmap and residency set"
+        );
+    }
 }
 
 // ── Frame capture ─────────────────────────────────────────────────────

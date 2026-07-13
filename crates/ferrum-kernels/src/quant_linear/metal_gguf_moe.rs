@@ -374,6 +374,7 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
                 num_experts,
                 n_rows,
                 n_cols,
+                ..
             } => {
                 crate::q4_k_moe_id_gemm::dispatch_gemm_q4k_moe_id_on_encoder(
                     &st().pipes.device,
@@ -400,6 +401,7 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
                 num_experts,
                 n_rows,
                 n_cols,
+                ..
             } => {
                 crate::q6_k_moe_id_gemm::dispatch_gemm_q6k_moe_id_on_encoder(
                     &st().pipes.device,
@@ -450,6 +452,7 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
                 num_experts,
                 n_rows,
                 n_cols,
+                ..
             } => {
                 crate::q4_k_moe_id_gemm::dispatch_gemm_q4k_moe_id_indirect_on_encoder(
                     &st().pipes.device,
@@ -477,6 +480,7 @@ impl StackedExpertGgufLinear<MetalBackend> for MetalStackedExpertGgufLinear {
                 num_experts,
                 n_rows,
                 n_cols,
+                ..
             } => {
                 crate::q6_k_moe_id_gemm::dispatch_gemm_q6k_moe_id_indirect_on_encoder(
                     &st().pipes.device,
