@@ -14,7 +14,7 @@
 //! are aggregated with mean + sample stddev + Student-t 95% CI half-width.
 //! Cells where `n_repeats < 3` emit `mean` only (PLAYBOOK § 0.4 contract).
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use colored::*;
 use ferrum_bench_core::{
     arrivals::poisson_arrival_times, compute_metrics, BenchReport, Env, ItlEvidenceSource,
@@ -24,6 +24,7 @@ use ferrum_bench_core::{
 use ferrum_types::Result;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,6 +32,23 @@ use tokio::sync::Semaphore;
 use tokio_stream::StreamExt;
 
 use crate::config::CliConfig;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum BenchTargetBackend {
+    Cpu,
+    Metal,
+    Cuda,
+}
+
+impl BenchTargetBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Metal => "metal",
+            Self::Cuda => "cuda",
+        }
+    }
+}
 
 #[derive(Args, Clone)]
 pub struct BenchServeCommand {
@@ -47,6 +65,11 @@ pub struct BenchServeCommand {
     /// generate exact-length random token sequences.
     #[arg(long)]
     pub tokenizer: PathBuf,
+
+    /// Backend of the server under test. This is independent of the HTTP
+    /// client's own compile-time accelerator features.
+    #[arg(long, value_enum)]
+    pub target_backend: Option<BenchTargetBackend>,
 
     // ─── Workload selection (pick one mode) ────────────────────────
     /// Closed-loop concurrency (single cell). Default when no other
@@ -239,6 +262,7 @@ struct OpenAiUsage {
 struct PromptCase {
     text: String,
     input_tokens: u32,
+    sha256: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -255,9 +279,14 @@ async fn stream_one(
     enable_thinking: Option<bool>,
     timeout_s: f64,
 ) -> RequestRecord {
-    let body = chat_completion_body(model, &prompt.text, max_tokens, ignore_eos, enable_thinking);
+    let PromptCase {
+        text,
+        input_tokens,
+        sha256: prompt_sha256,
+    } = prompt;
+    let body = chat_completion_body(model, &text, max_tokens, ignore_eos, enable_thinking);
     let start = Instant::now();
-    let mut state = StreamState::new(start, prompt.input_tokens);
+    let mut state = StreamState::for_prompt(start, input_tokens, prompt_sha256.clone());
 
     let resp = match client
         .post(format!("{}/v1/chat/completions", base_url))
@@ -268,16 +297,28 @@ async fn stream_one(
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[err] post: {}", e);
+            eprintln!(
+                "[err] post prompt_sha256={prompt_sha256} input_tokens={} \
+                 timeout={} connect={} request={} body={} decode={}: display={e}; debug={e:?}",
+                input_tokens,
+                e.is_timeout(),
+                e.is_connect(),
+                e.is_request(),
+                e.is_body(),
+                e.is_decode(),
+            );
             let mut quality_issues = QualityIssueCounts::default();
             quality_issues.malformed_stream = 1;
-            return failed_record(prompt.input_tokens, start, quality_issues);
+            return failed_record(input_tokens, start, quality_issues);
         }
     };
     if !resp.status().is_success() {
         let status = resp.status();
         let txt = resp.text().await.unwrap_or_default();
-        eprintln!("[err] http {}: {}", status, &txt[..txt.len().min(200)]);
+        eprintln!(
+            "[err] http prompt_sha256={prompt_sha256} {status}: {}",
+            clipped_debug_text(&txt, 200)
+        );
         let mut quality_issues = QualityIssueCounts::default();
         if status.as_u16() == 500 {
             quality_issues.http_500 = 1;
@@ -285,7 +326,7 @@ async fn stream_one(
         if looks_like_panic(&txt) {
             quality_issues.panic = 1;
         }
-        return failed_record(prompt.input_tokens, start, quality_issues);
+        return failed_record(input_tokens, start, quality_issues);
     }
 
     let mut stream = resp.bytes_stream();
@@ -294,7 +335,7 @@ async fn stream_one(
         let chunk = match chunk {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[err] stream: {}", e);
+                eprintln!("[err] stream prompt_sha256={prompt_sha256}: display={e}; debug={e:?}");
                 state.stream_error = Some(e.to_string());
                 state.quality_issues.malformed_stream = 1;
                 break;
@@ -348,7 +389,7 @@ impl SseLineBuffer {
             Ok(line) => line.trim(),
             Err(error) => {
                 let message = format!("invalid UTF-8 in SSE line: {error}");
-                eprintln!("[err] {message}");
+                eprintln!("[err] prompt_sha256={} {message}", state.prompt_sha256);
                 state.stream_error = Some(message);
                 state.quality_issues.malformed_stream = 1;
                 state.quality_issues.bad_output = 1;
@@ -369,7 +410,10 @@ impl SseLineBuffer {
             return;
         }
         if let Err(error) = state.handle_payload(payload) {
-            eprintln!("[err] malformed sse json: {error}");
+            eprintln!(
+                "[err] malformed sse json prompt_sha256={}: {error}",
+                state.prompt_sha256
+            );
             state.stream_error = Some(error);
             state.quality_issues.malformed_stream = 1;
         }
@@ -462,10 +506,16 @@ struct StreamState {
     done_count: u32,
     stream_error: Option<String>,
     quality_issues: QualityIssueCounts,
+    prompt_sha256: String,
 }
 
 impl StreamState {
+    #[cfg(test)]
     fn new(start: Instant, input_tokens: u32) -> Self {
+        Self::for_prompt(start, input_tokens, "unknown".to_string())
+    }
+
+    fn for_prompt(start: Instant, input_tokens: u32, prompt_sha256: String) -> Self {
         Self {
             start,
             input_tokens,
@@ -478,6 +528,7 @@ impl StreamState {
             done_count: 0,
             stream_error: None,
             quality_issues: QualityIssueCounts::default(),
+            prompt_sha256,
         }
     }
 
@@ -506,7 +557,8 @@ impl StreamState {
                             .expect("stream output event count overflow");
                         if let Some(reason) = bad_output_reason(text) {
                             eprintln!(
-                                "[err] bad output {reason}: {}",
+                                "[err] bad output prompt_sha256={} {reason}: {}",
+                                self.prompt_sha256,
                                 clipped_debug_text(text, 160)
                             );
                             self.quality_issues.bad_output = 1;
@@ -642,6 +694,12 @@ fn clipped_debug_text(text: &str, max_chars: usize) -> String {
     text.escape_debug().take(max_chars).collect()
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 fn looks_like_panic(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("panicked at") || lower.contains("thread '") && lower.contains("panicked")
@@ -660,15 +718,44 @@ fn gen_random_prompt(
     if let Some(text) = gen_random_prompt_target_len(tok, n_tokens, rng) {
         return text;
     }
-    // Last-resort fallback for tokenizers whose decode/encode roundtrip is
-    // hostile to arbitrary ids. Keep the old behavior rather than failing the
-    // whole benchmark; the JSON report still records actual token lengths.
-    let vocab_size = tok.get_vocab_size(false) as u32;
-    let lo: u32 = 256.min(vocab_size.saturating_sub(1));
-    let hi: u32 = vocab_size.saturating_sub(1);
-    let ids: Vec<u32> = (0..n_tokens).map(|_| rng.random_range(lo..=hi)).collect();
-    tok.decode(&ids, false)
-        .unwrap_or_else(|_| "hello world ".repeat(n_tokens / 2))
+    // Never fall back to arbitrary byte-level token ids: decoding those ids
+    // can inject U+FFFD into a request and turn a workload bug into a server
+    // correctness or transport failure.
+    " x".repeat(n_tokens)
+}
+
+fn generated_prompt_is_safe(text: &str) -> bool {
+    !text.is_empty()
+        && !text.contains("<|")
+        && bad_output_reason(text).is_none()
+        && text
+            .chars()
+            .all(|ch| !ch.is_control() || matches!(ch, '\n' | '\r' | '\t'))
+}
+
+fn sample_safe_token_ids(
+    tok: &tokenizers::Tokenizer,
+    count: usize,
+    rng: &mut (impl Rng + ?Sized),
+    lo: u32,
+    hi: u32,
+) -> Option<Vec<u32>> {
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut selected = None;
+        for _ in 0..256 {
+            let id = rng.random_range(lo..=hi);
+            let Ok(piece) = tok.decode(&[id], false) else {
+                continue;
+            };
+            if generated_prompt_is_safe(&piece) {
+                selected = Some(id);
+                break;
+            }
+        }
+        ids.push(selected?);
+    }
+    Some(ids)
 }
 
 fn gen_random_prompt_target_len(
@@ -690,9 +777,9 @@ fn gen_random_prompt_target_len(
     let mut best_under: Option<(usize, String)> = None;
     let mut best_any: Option<(usize, String)> = None;
     for _ in 0..64 {
-        let ids: Vec<u32> = (0..sample_len).map(|_| rng.random_range(lo..=hi)).collect();
+        let ids = sample_safe_token_ids(tok, sample_len, rng, lo, hi)?;
         let text = match tok.decode(&ids, false) {
-            Ok(text) if !text.is_empty() => text,
+            Ok(text) if generated_prompt_is_safe(&text) => text,
             _ => continue,
         };
         let len = match token_count(tok, &text) {
@@ -791,11 +878,12 @@ fn append_decoded_piece(
     id: u32,
 ) -> Option<(String, usize)> {
     let piece = tok.decode(&[id], false).ok()?;
-    if piece.is_empty() {
+    if !generated_prompt_is_safe(&piece) {
         return None;
     }
     let candidate = format!("{base}{piece}");
-    (token_count(tok, &candidate) == Some(base_len + 1)).then_some((candidate, base_len + 1))
+    (generated_prompt_is_safe(&candidate) && token_count(tok, &candidate) == Some(base_len + 1))
+        .then_some((candidate, base_len + 1))
 }
 
 fn build_prompts(
@@ -838,7 +926,12 @@ fn prompt_case(tok: &tokenizers::Tokenizer, text: String) -> Result<PromptCase> 
     let input_tokens = u32::try_from(encoding.len()).map_err(|_| {
         ferrum_types::FerrumError::model("generated prompt token count exceeds report capacity")
     })?;
-    Ok(PromptCase { text, input_tokens })
+    let sha256 = sha256_hex(text.as_bytes());
+    Ok(PromptCase {
+        text,
+        input_tokens,
+        sha256,
+    })
 }
 
 /// Generate `count` prompts that all share a 1024-token (or whatever
@@ -857,20 +950,12 @@ fn gen_shared_prefix_prompts(
     suffix_len: usize,
     rng: &mut (impl Rng + ?Sized),
 ) -> Result<Vec<PromptCase>> {
-    let vocab_size = tok.get_vocab_size(false) as u32;
-    let lo: u32 = 256.min(vocab_size.saturating_sub(1));
-    let hi: u32 = vocab_size.saturating_sub(1);
-    // Shared prefix sampled once.
-    let prefix_ids: Vec<u32> = (0..prefix_len).map(|_| rng.random_range(lo..=hi)).collect();
-    let prefix = tok
-        .decode(&prefix_ids, false)
-        .unwrap_or_else(|_| "hello world ".repeat(prefix_len / 2));
+    // Shared prefix sampled once. The random generator rejects byte-fallback
+    // fragments that do not independently decode to safe Unicode text.
+    let prefix = gen_random_prompt(tok, prefix_len, rng);
     (0..count)
         .map(|_| {
-            let suffix_ids: Vec<u32> = (0..suffix_len).map(|_| rng.random_range(lo..=hi)).collect();
-            let suffix = tok
-                .decode(&suffix_ids, false)
-                .unwrap_or_else(|_| "x ".repeat(suffix_len / 2));
+            let suffix = gen_random_prompt(tok, suffix_len, rng);
             // Insert a newline so the prefix is a clear boundary — helps
             // server-side prefix-cache hashing key on the same prefix
             // even when suffixes differ.
@@ -1229,16 +1314,21 @@ async fn execute_cell(
     ctx: &RunContext,
     cell: Cell,
 ) -> Result<BenchReport> {
-    // Backend tag is a build-time fact, not a runtime env-var check. The earlier
-    // `CUDA_VISIBLE_DEVICES.is_ok()` heuristic silently mistagged every CUDA-built
-    // run as "cpu" when that env var was unset, polluting bench artifacts.
-    let backend = if cfg!(feature = "cuda") {
-        "cuda"
-    } else if cfg!(feature = "metal") {
-        "metal"
-    } else {
-        "cpu"
-    };
+    // A neutral HTTP client can measure a different backend, so canonical
+    // collectors supply the target explicitly. Direct product invocations keep
+    // the build-feature fallback and never infer from runtime environment state.
+    let backend = cmd
+        .target_backend
+        .map(BenchTargetBackend::as_str)
+        .unwrap_or_else(|| {
+            if cfg!(feature = "cuda") {
+                "cuda"
+            } else if cfg!(feature = "metal") {
+                "metal"
+            } else {
+                "cpu"
+            }
+        });
 
     let tokenizer_path = cmd.tokenizer.join("tokenizer.json");
     let tok = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
@@ -1873,6 +1963,10 @@ mod tests {
         let enabled =
             TestCli::parse_from(base.into_iter().chain(["--enable-thinking", "true"])).command;
         assert_eq!(enabled.enable_thinking, Some(true));
+
+        let metal =
+            TestCli::parse_from(base.into_iter().chain(["--target-backend", "metal"])).command;
+        assert_eq!(metal.target_backend, Some(BenchTargetBackend::Metal));
     }
 
     #[test]
@@ -2118,7 +2212,23 @@ mod tests {
         for _ in 0..16 {
             let text = gen_random_prompt(&tok, 256, &mut rng);
             assert_eq!(token_count(&tok, &text), Some(256));
+            assert!(generated_prompt_is_safe(&text));
         }
+
+        let prompts = gen_shared_prefix_prompts(&tok, 4, 128, 16, &mut rng)
+            .expect("generate shared-prefix prompts");
+        assert_eq!(prompts.len(), 4);
+        assert!(prompts
+            .iter()
+            .all(|prompt| generated_prompt_is_safe(&prompt.text)));
+    }
+
+    #[test]
+    fn generated_prompt_safety_rejects_transport_poisoning_text() {
+        assert!(generated_prompt_is_safe("hello world\nnext"));
+        assert!(!generated_prompt_is_safe("bad \u{fffd} text"));
+        assert!(!generated_prompt_is_safe("<|im_start|>"));
+        assert!(!generated_prompt_is_safe("control \u{7}"));
     }
 
     fn ferrum_env_value(key: &str) -> Option<String> {
@@ -2134,6 +2244,7 @@ mod tests {
             base_url: "http://127.0.0.1:9".to_string(),
             model: "test-model".to_string(),
             tokenizer: std::path::PathBuf::from("."),
+            target_backend: None,
             concurrency: 1,
             concurrency_sweep: vec![],
             request_rate: None,
@@ -2319,6 +2430,7 @@ mod tests {
             base_url: "http://127.0.0.1:9".to_string(),
             model: "test-model".to_string(),
             tokenizer: std::path::PathBuf::from("."),
+            target_backend: None,
             concurrency: 2,
             concurrency_sweep: vec![],
             request_rate: None,
@@ -2404,6 +2516,7 @@ mod tests {
             base_url: "http://127.0.0.1:9".to_string(),
             model: "test-model".to_string(),
             tokenizer: std::path::PathBuf::from("."),
+            target_backend: None,
             concurrency: 1,
             concurrency_sweep: vec![],
             request_rate: None,
