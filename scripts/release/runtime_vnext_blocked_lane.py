@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Collect a truthful Runtime vNext G00 blocked Metal product lane.
 
-The collector executes a frozen ``ferrum run`` or ``ferrum serve`` product
-entrypoint inside the repository's bounded process-group runner. The product receives an explicit,
+The collector executes the frozen ``ferrum run`` product entrypoint inside the
+repository's bounded process-group runner.  The product receives an explicit,
 sanitized environment, while the artifact binds the product PID/PGID/start
 identity, resource peaks, memory/swap preflight, output logs, effective config,
 model bytes, and the checked-in collector identity.
@@ -16,13 +16,10 @@ import hashlib
 import json
 import os
 import platform
-import socket
 import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -45,27 +42,9 @@ PROCESS_RECEIPT_TYPE = "runtime_vnext_product_process_receipt"
 PASS_PREFIX = "FERRUM RUNTIME VNEXT G00 BLOCKED LANE PASS"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT G00 BLOCKED LANE SELFTEST PASS"
 MIN_METAL_HEADROOM_BYTES = 2 * 1024**3
-RESOURCE_PROBE_TIMEOUT_SECONDS = 30.0
-RESOURCE_PROBE_REQUEST = {
-    "chat_template_kwargs": {"enable_thinking": False},
-    "max_tokens": 1,
-    "messages": [
-        {
-            "content": "Reply with Paris.",
-            "role": "user",
-        }
-    ],
-    "model": "m3-qwen3-30b-a3b",
-    "seed": 9271,
-    "stream": False,
-    "temperature": 0.0,
-    "top_k": 0,
-    "top_p": 1.0,
-}
+EXPECTED_FAILURE_CLASS = "legacy-model-backend-unsupported"
 BLOCKED_MODELS = {
     "m1-qwen35-4b": {
-        "mode": "unsupported-architecture",
-        "failure_class": "legacy-model-backend-unsupported",
         "architecture_marker": "unsupported GGUF architecture 'qwen35'",
         "downstream_goal": "G08A",
         "implementation_path": "implement Qwen3.5 dense-hybrid operations and Metal providers through Runtime vNext",
@@ -73,21 +52,11 @@ BLOCKED_MODELS = {
         "pass_line": "FERRUM RUNTIME VNEXT G08A QWEN35 4B PASS: <out_dir>",
     },
     "m2-qwen35-35b-a3b": {
-        "mode": "unsupported-architecture",
-        "failure_class": "legacy-model-backend-unsupported",
         "architecture_marker": "unsupported GGUF architecture 'qwen35moe'",
         "downstream_goal": "G08B",
         "implementation_path": "implement Qwen3.5 hybrid-MoE operations and Metal providers through Runtime vNext",
         "acceptance_path": "run the complete G08B Qwen3.5-35B-A3B correctness and performance matrix",
         "pass_line": "FERRUM RUNTIME VNEXT G08B QWEN35 35B A3B PASS: <out_dir>",
-    },
-    "m3-qwen3-30b-a3b": {
-        "mode": "resource-capacity",
-        "failure_class": "legacy-metal-unified-memory-capacity",
-        "downstream_goal": "G08C",
-        "implementation_path": "retain GGUF weights with explicit Metal residency and typed unified-memory admission through Runtime vNext",
-        "acceptance_path": "run the complete G08C Qwen3-30B-A3B Metal correctness and performance matrix without active swap growth",
-        "pass_line": "FERRUM RUNTIME VNEXT G08C QWEN3 30B A3B PASS: <out_dir>",
     },
 }
 CHILD_ENV_ALLOWLIST = frozenset(
@@ -293,118 +262,6 @@ def capture_memory_snapshot(
     }
 
 
-def memory_values() -> tuple[int, int]:
-    if platform.system() == "Darwin":
-        return resource_sampler._mac_memory()
-    if platform.system() == "Linux":
-        return resource_sampler._linux_memory()
-    raise BlockedLaneError(f"unsupported memory platform: {platform.system()}")
-
-
-def reserve_loopback_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
-
-
-def server_ready(url: str) -> bool:
-    try:
-        with urllib.request.urlopen(url, timeout=0.2) as response:
-            return response.status == 200
-    except (OSError, urllib.error.URLError):
-        return False
-
-
-def execute_resource_probe(
-    root: Path,
-    attempt_root: Path,
-    *,
-    url: str,
-    request_body: dict[str, Any],
-    timeout_seconds: float,
-) -> dict[str, Any]:
-    request_path = attempt_root / "inference-probe.request.json"
-    response_path = attempt_root / "inference-probe.response.json"
-    receipt_path = attempt_root / "inference-probe.receipt.json"
-    bounded_command.atomic_write_json(request_path, request_body)
-    payload = json.dumps(
-        request_body,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    started_at = utc_now()
-    started_monotonic_ns = time.monotonic_ns()
-    status: int | None = None
-    error: str | None = None
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            status = int(response.status)
-            response_body = response.read()
-    except urllib.error.HTTPError as exc:
-        status = int(exc.code)
-        response_body = exc.read()
-        error = f"HTTPError: {exc}"
-    except (OSError, TimeoutError, urllib.error.URLError) as exc:
-        response_body = json.dumps(
-            {"error": f"{type(exc).__name__}: {exc}"},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        error = f"{type(exc).__name__}: {exc}"
-    finished_monotonic_ns = time.monotonic_ns()
-    finished_at = utc_now()
-    response_path.write_bytes(response_body)
-    receipt = {
-        "schema_version": SCHEMA_VERSION,
-        "artifact_type": "runtime_vnext_resource_inference_probe",
-        "method": "POST",
-        "url": url,
-        "request_body_sha256": canonical_json_sha256(request_body),
-        "request": file_ref(request_path, root),
-        "response": file_ref(response_path, root),
-        "status": status,
-        "error": error,
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "started_monotonic_ns": started_monotonic_ns,
-        "finished_monotonic_ns": finished_monotonic_ns,
-        "duration_seconds": round(
-            (finished_monotonic_ns - started_monotonic_ns) / 1_000_000_000,
-            6,
-        ),
-    }
-    bounded_command.atomic_write_json(receipt_path, receipt)
-    return file_ref(receipt_path, root)
-
-
-def write_memory_samples(path: Path, rows: list[dict[str, Any]]) -> None:
-    path.write_text(
-        "".join(
-            json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
-            for row in rows
-        ),
-        encoding="utf-8",
-    )
-
-
-def terminate_product(process: subprocess.Popen[bytes]) -> int:
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
-    return int(process.returncode)
-
-
 def capture_process_receipt(
     root: Path,
     path: Path,
@@ -471,9 +328,6 @@ def capture_process_receipt(
 
 def internal_execute(spec_path: Path) -> int:
     spec = read_json(spec_path)
-    mode = str(spec["mode"])
-    policy = BLOCKED_MODELS[str(spec["model_key"])]
-    require(mode == policy["mode"], "blocked attempt mode differs from model policy")
     root = Path(spec["artifact_root"]).resolve()
     attempt_root = Path(spec["attempt_root"]).resolve()
     attempt_root.mkdir(parents=True, exist_ok=True)
@@ -488,19 +342,9 @@ def internal_execute(spec_path: Path) -> int:
     stdout_path = attempt_root / "product.stdout.log"
     stderr_path = attempt_root / "product.stderr.log"
     effective_path = attempt_root / "effective-config.json"
-    samples_path = attempt_root / "memory.samples.jsonl"
-    failure_log_path = attempt_root / "failure.log"
     before = capture_memory_snapshot(root, attempt_root, "before")
-    require(
-        before["physical_headroom_bytes"] >= MIN_METAL_HEADROOM_BYTES,
-        "blocked product preflight headroom is below 2 GiB",
-    )
     started_at = utc_now()
     started_monotonic = time.monotonic()
-    memory_rows: list[dict[str, Any]] = []
-    violation: dict[str, Any] | None = None
-    ready_observed = False
-    inference_probe: dict[str, Any] | None = None
     with (
         stdout_path.open("wb") as stdout_handle,
         stderr_path.open("wb") as stderr_handle,
@@ -521,94 +365,25 @@ def internal_execute(spec_path: Path) -> int:
             argv=argv,
             environment=environment,
         )
-        if mode == "unsupported-architecture":
-            try:
-                returncode = process.wait(timeout=float(spec["product_timeout_seconds"]))
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-                returncode = 124
-        else:
-            deadline = time.monotonic() + float(spec["product_timeout_seconds"])
-            interval = float(spec["sample_interval_seconds"])
-            health_url = str(spec["health_url"])
-            inference_url = str(spec["inference_url"])
-            inference_request = dict(spec["inference_request"])
-            inference_timeout_seconds = float(spec["inference_timeout_seconds"])
-            sequence = 0
-            while time.monotonic() < deadline:
-                headroom, swap = memory_values()
-                ready_observed = ready_observed or server_ready(health_url)
-                row = {
-                    "sequence": sequence,
-                    "captured_at": utc_now(),
-                    "captured_monotonic_ns": time.monotonic_ns(),
-                    "physical_headroom_bytes": headroom,
-                    "swap_used_bytes": swap,
-                    "process_alive": process.poll() is None,
-                    "ready_observed": ready_observed,
-                }
-                memory_rows.append(row)
-                write_memory_samples(samples_path, memory_rows)
-                if swap > before["swap_used_bytes"]:
-                    violation = {
-                        "kind": "swap_growth",
-                        "sequence": sequence,
-                        "initial_bytes": before["swap_used_bytes"],
-                        "observed_bytes": swap,
-                    }
-                elif headroom < MIN_METAL_HEADROOM_BYTES:
-                    violation = {
-                        "kind": "physical_headroom_below_2gib",
-                        "sequence": sequence,
-                        "limit_bytes": MIN_METAL_HEADROOM_BYTES,
-                        "observed_bytes": headroom,
-                    }
-                if violation is not None or process.poll() is not None:
-                    break
-                if ready_observed and inference_probe is None:
-                    inference_probe = execute_resource_probe(
-                        root,
-                        attempt_root,
-                        url=inference_url,
-                        request_body=inference_request,
-                        timeout_seconds=inference_timeout_seconds,
-                    )
-                sequence += 1
-                time.sleep(interval)
-            returncode = terminate_product(process)
+        try:
+            returncode = process.wait(timeout=float(spec["product_timeout_seconds"]))
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+            returncode = 124
     finished_at = utc_now()
     duration = time.monotonic() - started_monotonic
     after = capture_memory_snapshot(root, attempt_root, "after")
     if stdout_path.stat().st_size == 0:
         stdout_path.write_text(
-            "product stdout capture was empty; collector observed the product attempt directly\n",
+            "product stdout capture was empty; collector observed a pre-inference loader failure\n",
             encoding="utf-8",
         )
     stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
-    if mode == "unsupported-architecture":
-        marker = str(spec["architecture_marker"])
-        failure_line = next(
-            (line.strip() for line in stderr_text.splitlines() if marker in line), ""
-        )
-        observed_failure_class = (
-            str(policy["failure_class"])
-            if returncode != 0 and failure_line
-            else "unexpected-product-outcome"
-        )
-    else:
-        marker = str(violation["kind"]) if violation is not None else "resource-capacity-violation-missing"
-        failure_line = (
-            f"{marker}: {json.dumps(violation, sort_keys=True)}"
-            if violation is not None
-            else "frozen Metal serve exited or timed out without the required resource-capacity evidence"
-        )
-        observed_failure_class = (
-            str(policy["failure_class"])
-            if violation is not None and returncode != 0
-            else "unexpected-product-outcome"
-        )
-    failure_log_path.write_text(failure_line + "\n" + stderr_text, encoding="utf-8")
+    marker = str(spec["architecture_marker"])
+    failure_line = next(
+        (line.strip() for line in stderr_text.splitlines() if marker in line), ""
+    )
     effective: dict[str, Any] | None = None
     if effective_path.is_file():
         effective = read_json(effective_path)
@@ -617,8 +392,9 @@ def internal_execute(spec_path: Path) -> int:
         "artifact_type": ATTEMPT_TYPE,
         "model_key": spec["model_key"],
         "backend": "metal",
-        "mode": mode,
-        "failure_class": observed_failure_class,
+        "failure_class": EXPECTED_FAILURE_CLASS
+        if returncode != 0 and failure_line
+        else "unexpected-product-outcome",
         "failure_signature": marker,
         "first_failure": failure_line,
         "argv": argv,
@@ -633,17 +409,9 @@ def internal_execute(spec_path: Path) -> int:
         "finished_at": finished_at,
         "duration_seconds": round(duration, 6),
         "returncode": returncode,
-        "memory": {
-            "before": before,
-            "after": after,
-            "samples": file_ref(samples_path, root) if samples_path.is_file() else None,
-            "violation": violation,
-        },
-        "ready_observed": ready_observed,
-        "inference_probe": inference_probe,
+        "memory": {"before": before, "after": after},
         "stdout": file_ref(stdout_path, root),
         "stderr": file_ref(stderr_path, root),
-        "failure_log": file_ref(failure_log_path, root),
         "effective_config": file_ref(effective_path, root)
         if effective is not None
         else None,
@@ -669,7 +437,7 @@ def internal_execute(spec_path: Path) -> int:
     )
     return (
         0
-        if attempt["failure_class"] == policy["failure_class"] and effective is not None
+        if attempt["failure_class"] == EXPECTED_FAILURE_CLASS and effective is not None
         else 1
     )
 
@@ -699,10 +467,6 @@ def _validate_environment(environment: dict[str, Any], label: str) -> None:
 def validate_attempt_document(
     root: Path, attempt: dict[str, Any], lane: dict[str, Any]
 ) -> None:
-    model_key = str(lane.get("model_key"))
-    require(model_key in BLOCKED_MODELS, "attempt model is not blockable")
-    policy = BLOCKED_MODELS[model_key]
-    mode = str(policy["mode"])
     require(attempt.get("schema_version") == SCHEMA_VERSION, "attempt schema mismatch")
     require(
         attempt.get("artifact_type") == ATTEMPT_TYPE, "attempt artifact type mismatch"
@@ -713,11 +477,7 @@ def validate_attempt_document(
         "attempt lane identity mismatch",
     )
     require(
-        attempt.get("mode") == mode,
-        "attempt mode mismatch",
-    )
-    require(
-        attempt.get("failure_class") == policy["failure_class"],
+        attempt.get("failure_class") == EXPECTED_FAILURE_CLASS,
         "attempt failure class mismatch",
     )
     signature = attempt.get("failure_signature")
@@ -731,11 +491,6 @@ def validate_attempt_document(
     require(
         attempt.get("argv") == lane.get("attempted_command"),
         "attempt argv differs from lane",
-    )
-    require(
-        (mode == "resource-capacity" and "serve" in attempt["argv"])
-        or (mode == "unsupported-architecture" and "run" in attempt["argv"]),
-        "attempt product entrypoint differs from blocked mode",
     )
     require(
         attempt.get("argv_sha256") == canonical_json_sha256(attempt["argv"]),
@@ -824,18 +579,15 @@ def validate_attempt_document(
         isinstance(read_json(effective_path), dict),
         "attempt effective config must be JSON",
     )
-    failure_log_path = validate_file_ref(
-        root, attempt.get("failure_log"), "attempt failure log", nonempty=True
+    require(
+        signature in stderr_path.read_text(encoding="utf-8", errors="strict"),
+        "failure signature absent from stderr",
     )
     require(
-        lane.get("failure_log")
-        == failure_log_path.relative_to(root.resolve()).as_posix(),
-        "lane failure log differs from attempt evidence",
+        lane.get("failure_log") == stderr_path.relative_to(root.resolve()).as_posix(),
+        "lane failure log differs from attempt stderr",
     )
-    require(
-        len({stdout_path, stderr_path, failure_log_path}) == 3,
-        "attempt output paths must be distinct",
-    )
+    require(stdout_path != stderr_path, "attempt stdout/stderr paths must differ")
     memory = attempt.get("memory")
     require(isinstance(memory, dict), "attempt memory evidence missing")
     before = memory.get("before")
@@ -846,8 +598,9 @@ def validate_attempt_document(
     )
     for name, snapshot in (("before", before), ("after", after)):
         require(
-            isinstance(snapshot.get("physical_headroom_bytes"), int),
-            f"attempt {name} headroom invalid",
+            isinstance(snapshot.get("physical_headroom_bytes"), int)
+            and snapshot["physical_headroom_bytes"] >= MIN_METAL_HEADROOM_BYTES,
+            f"attempt {name} headroom below 2 GiB",
         )
         require(
             isinstance(snapshot.get("swap_used_bytes"), int)
@@ -863,112 +616,9 @@ def validate_attempt_document(
                 root, ref, f"attempt {name} memory raw[{index}]", nonempty=True
             )
     require(
-        before["physical_headroom_bytes"] >= MIN_METAL_HEADROOM_BYTES,
-        "attempt before headroom below 2 GiB",
+        after["swap_used_bytes"] <= before["swap_used_bytes"],
+        "attempt active swap growth detected",
     )
-    failure_text = failure_log_path.read_text(encoding="utf-8", errors="strict")
-    require(signature in failure_text, "failure signature absent from failure log")
-    if mode == "unsupported-architecture":
-        require(
-            signature in stderr_path.read_text(encoding="utf-8", errors="strict"),
-            "failure signature absent from stderr",
-        )
-        require(
-            after["physical_headroom_bytes"] >= MIN_METAL_HEADROOM_BYTES,
-            "attempt after headroom below 2 GiB",
-        )
-        require(
-            after["swap_used_bytes"] <= before["swap_used_bytes"],
-            "attempt active swap growth detected",
-        )
-        require(memory.get("samples") is None and memory.get("violation") is None, "unsupported attempt fabricated resource violation")
-    else:
-        samples_path = validate_file_ref(
-            root, memory.get("samples"), "attempt memory samples", nonempty=True
-        )
-        rows = [
-            json.loads(line)
-            for line in samples_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        require(rows, "resource attempt has no memory samples")
-        require(
-            all(isinstance(row, dict) for row in rows),
-            "resource attempt memory samples must be objects",
-        )
-        require(
-            [row.get("sequence") for row in rows] == list(range(len(rows))),
-            "resource attempt memory sample sequence mismatch",
-        )
-        require(
-            all(
-                isinstance(row.get("captured_monotonic_ns"), int)
-                and row["captured_monotonic_ns"] > 0
-                and isinstance(row.get("physical_headroom_bytes"), int)
-                and isinstance(row.get("swap_used_bytes"), int)
-                for row in rows
-            ),
-            "resource attempt memory sample fields invalid",
-        )
-        monotonic_values = [row["captured_monotonic_ns"] for row in rows]
-        require(
-            all(left < right for left, right in zip(monotonic_values, monotonic_values[1:])),
-            "resource attempt monotonic sample order invalid",
-        )
-        wall_values = [
-            datetime.fromisoformat(str(row.get("captured_at")).replace("Z", "+00:00"))
-            for row in rows
-        ]
-        require(
-            all(left <= right for left, right in zip(wall_values, wall_values[1:])),
-            "resource attempt wall-clock sample order invalid",
-        )
-        ready_indexes = [
-            index for index, row in enumerate(rows) if row.get("ready_observed") is True
-        ]
-        require(
-            attempt.get("ready_observed") == bool(ready_indexes),
-            "resource attempt ready observation differs from samples",
-        )
-        violation = memory.get("violation")
-        require(isinstance(violation, dict), "resource attempt violation missing")
-        sequence = violation.get("sequence")
-        require(
-            isinstance(sequence, int) and sequence == len(rows) - 1,
-            "resource attempt violation is not bound to the final sample",
-        )
-        row = rows[sequence]
-        require(row.get("process_alive") is True, "resource violation was not observed while product was alive")
-        probe_ref = attempt.get("inference_probe")
-        if probe_ref is None:
-            require(
-                not ready_indexes or ready_indexes == [sequence],
-                "resource attempt reached ready state without a real inference probe",
-            )
-        else:
-            probe = validate_resource_probe(root, probe_ref)
-            require(
-                probe["finished_monotonic_ns"]
-                <= row["captured_monotonic_ns"],
-                "resource violation sample precedes the inference probe",
-            )
-        if violation.get("kind") == "swap_growth":
-            require(
-                violation.get("initial_bytes") == before["swap_used_bytes"]
-                and violation.get("observed_bytes") == row["swap_used_bytes"]
-                and row["swap_used_bytes"] > before["swap_used_bytes"],
-                "resource attempt swap-growth evidence mismatch",
-            )
-        elif violation.get("kind") == "physical_headroom_below_2gib":
-            require(
-                violation.get("limit_bytes") == MIN_METAL_HEADROOM_BYTES
-                and violation.get("observed_bytes") == row["physical_headroom_bytes"]
-                and row["physical_headroom_bytes"] < MIN_METAL_HEADROOM_BYTES,
-                "resource attempt headroom evidence mismatch",
-            )
-        else:
-            raise BlockedLaneError("resource attempt violation kind invalid")
-        require(signature == violation["kind"], "resource attempt failure signature differs from violation")
     started = datetime.fromisoformat(
         str(attempt.get("started_at")).replace("Z", "+00:00")
     )
@@ -1033,100 +683,10 @@ def validate_bounded_receipt(receipt: dict[str, Any]) -> None:
     )
 
 
-def validate_resource_probe(root: Path, raw: Any) -> dict[str, Any]:
-    receipt_path = validate_file_ref(
-        root, raw, "resource inference probe", nonempty=True
-    )
-    receipt = read_json(receipt_path)
-    require(
-        set(receipt)
-        == {
-            "schema_version",
-            "artifact_type",
-            "method",
-            "url",
-            "request_body_sha256",
-            "request",
-            "response",
-            "status",
-            "error",
-            "started_at",
-            "finished_at",
-            "started_monotonic_ns",
-            "finished_monotonic_ns",
-            "duration_seconds",
-        },
-        "resource inference probe field set mismatch",
-    )
-    require(
-        receipt.get("schema_version") == SCHEMA_VERSION
-        and receipt.get("artifact_type")
-        == "runtime_vnext_resource_inference_probe",
-        "resource inference probe schema mismatch",
-    )
-    require(
-        receipt.get("method") == "POST"
-        and str(receipt.get("url", "")).startswith("http://127.0.0.1:")
-        and str(receipt.get("url", "")).endswith("/v1/chat/completions"),
-        "resource inference probe endpoint mismatch",
-    )
-    request_path = validate_file_ref(
-        root, receipt.get("request"), "resource inference request", nonempty=True
-    )
-    request_body = read_json(request_path)
-    require(
-        request_body == RESOURCE_PROBE_REQUEST
-        and receipt.get("request_body_sha256")
-        == canonical_json_sha256(request_body),
-        "resource inference request body mismatch",
-    )
-    response_path = validate_file_ref(
-        root, receipt.get("response"), "resource inference response", nonempty=True
-    )
-    response = read_json(response_path)
-    require(
-        receipt.get("status") == 200
-        and receipt.get("error") is None
-        and isinstance(response.get("choices"), list)
-        and response["choices"],
-        "resource inference probe did not complete a real generation",
-    )
-    started_monotonic_ns = receipt.get("started_monotonic_ns")
-    finished_monotonic_ns = receipt.get("finished_monotonic_ns")
-    require(
-        isinstance(started_monotonic_ns, int)
-        and isinstance(finished_monotonic_ns, int)
-        and 0 < started_monotonic_ns < finished_monotonic_ns,
-        "resource inference probe monotonic window invalid",
-    )
-    duration = receipt.get("duration_seconds")
-    require(
-        isinstance(duration, (int, float))
-        and not isinstance(duration, bool)
-        and duration > 0,
-        "resource inference probe duration invalid",
-    )
-    started = datetime.fromisoformat(
-        str(receipt.get("started_at")).replace("Z", "+00:00")
-    )
-    finished = datetime.fromisoformat(
-        str(receipt.get("finished_at")).replace("Z", "+00:00")
-    )
-    require(finished > started, "resource inference probe wall-clock window invalid")
-    return receipt
-
-
 def validate_lane_evidence(
     root: Path, lane: dict[str, Any], *, allow_selftest: bool = False
 ) -> None:
     root = root.resolve()
-    model_key = str(lane.get("model_key"))
-    require(model_key in BLOCKED_MODELS, "blocked lane model policy missing")
-    policy = BLOCKED_MODELS[model_key]
-    require(
-        lane.get("failure_class") == policy["failure_class"],
-        "blocked lane failure class differs from model policy",
-    )
     require(
         lane.get("models_lock_sha256") == file_sha256(root / "models.lock.json"),
         "blocked lane models.lock SHA mismatch",
@@ -1148,54 +708,11 @@ def validate_lane_evidence(
         root, lane.get("collection_spec"), "blocked lane collection spec", nonempty=True
     )
     spec = read_json(spec_path)
-    require(spec.get("model_key") == model_key and spec.get("mode") == policy["mode"], "blocked lane collection spec mismatch")
-    if policy["mode"] == "unsupported-architecture":
-        require(
-            spec.get("architecture_marker") in lane.get("first_failure", ""),
-            "blocked lane architecture signature mismatch",
-        )
-    else:
-        models_lock = read_json(root / "models.lock.json")
-        locked_hardware = next(
-            (
-                row
-                for row in models_lock.get("hardware", [])
-                if isinstance(row, dict) and row.get("id") == lane.get("hardware_id")
-            ),
-            None,
-        )
-        require(
-            isinstance(locked_hardware, dict)
-            and locked_hardware.get("policy_id") == "metal-reference-m1-max-32gb"
-            and locked_hardware.get("device_name") == "Apple M1 Max"
-            and locked_hardware.get("memory_bytes") == 32 * 1024**3,
-            "blocked resource models.lock hardware identity mismatch",
-        )
-        require(
-            spec.get("minimum_physical_headroom_bytes") == MIN_METAL_HEADROOM_BYTES
-            and spec.get("allow_swap_growth") is False
-            and str(spec.get("inference_url", "")).startswith(
-                "http://127.0.0.1:"
-            )
-            and str(spec.get("inference_url", "")).endswith(
-                "/v1/chat/completions"
-            )
-            and spec.get("inference_request") == RESOURCE_PROBE_REQUEST
-            and spec.get("inference_timeout_seconds")
-            == RESOURCE_PROBE_TIMEOUT_SECONDS,
-            "blocked resource policy drift",
-        )
-        require(
-            lane.get("hardware_constraint")
-            == {
-                "policy_id": "metal-reference-m1-max-32gb",
-                "device_name": "Apple M1 Max",
-                "memory_bytes": 32 * 1024**3,
-                "minimum_physical_headroom_bytes": MIN_METAL_HEADROOM_BYTES,
-                "allow_swap_growth": False,
-            },
-            "blocked resource hardware constraint drift",
-        )
+    require(
+        spec.get("model_key") == lane.get("model_key")
+        and spec.get("architecture_marker") in lane.get("first_failure", ""),
+        "blocked lane collection spec mismatch",
+    )
     attempt_path = validate_file_ref(
         root, lane.get("attempt_receipt"), "blocked lane attempt receipt", nonempty=True
     )
@@ -1257,28 +774,8 @@ def collect(args: argparse.Namespace) -> Path:
         "models.lock does not bind the frozen legacy SHA",
     )
     model = _locked_model(models_lock, args.model_key)
-    policy = BLOCKED_MODELS[args.model_key]
     lane_lock = model.get("lanes", {}).get("metal")
     require(isinstance(lane_lock, dict), "models.lock Metal lane missing")
-    hardware_rows = models_lock.get("hardware")
-    require(isinstance(hardware_rows, list), "models.lock hardware list missing")
-    locked_hardware = next(
-        (
-            row
-            for row in hardware_rows
-            if isinstance(row, dict) and row.get("id") == lane_lock.get("hardware_id")
-        ),
-        None,
-    )
-    require(isinstance(locked_hardware, dict), "blocked lane hardware lock missing")
-    if policy["mode"] == "resource-capacity":
-        require(platform.system() == "Darwin", "M3 resource blocker must be collected on Darwin")
-        require(
-            locked_hardware.get("policy_id") == "metal-reference-m1-max-32gb"
-            and locked_hardware.get("device_name") == "Apple M1 Max"
-            and locked_hardware.get("memory_bytes") == 32 * 1024**3,
-            "M3 resource blocker is allowed only on the locked 32 GiB M1 Max",
-        )
     weights = lane_lock.get("files")
     require(
         isinstance(weights, list) and len(weights) == 1,
@@ -1317,51 +814,24 @@ def collect(args: argparse.Namespace) -> Path:
     attempt_root = lane_root / "attempt"
     attempt_root.mkdir(parents=True)
     effective_path = attempt_root / "effective-config.json"
-    if policy["mode"] == "unsupported-architecture":
-        argv = [
-            str(binary),
-            "run",
-            str(model_arg),
-            "--backend",
-            "metal",
-            "--prompt",
-            "Reply with Paris.",
-            "--max-tokens",
-            "4",
-            "--output-format",
-            "jsonl",
-            "--tokenizer",
-            str(tokenizer_root / "tokenizer.json"),
-            "--effective-config-json",
-            str(effective_path),
-        ]
-        resource_spec: dict[str, Any] = {}
-    else:
-        port = reserve_loopback_port()
-        argv = [
-            str(binary),
-            "serve",
-            str(model_arg),
-            "--backend",
-            "metal",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--effective-config-json",
-            str(effective_path),
-            "--scheduler-trace-jsonl",
-            str(attempt_root / "scheduler-trace.jsonl"),
-        ]
-        resource_spec = {
-            "health_url": f"http://127.0.0.1:{port}/health",
-            "inference_url": f"http://127.0.0.1:{port}/v1/chat/completions",
-            "inference_request": RESOURCE_PROBE_REQUEST,
-            "inference_timeout_seconds": RESOURCE_PROBE_TIMEOUT_SECONDS,
-            "sample_interval_seconds": 0.1,
-            "minimum_physical_headroom_bytes": MIN_METAL_HEADROOM_BYTES,
-            "allow_swap_growth": False,
-        }
+    argv = [
+        str(binary),
+        "run",
+        str(model_arg),
+        "--backend",
+        "metal",
+        "--prompt",
+        "Reply with Paris.",
+        "--max-tokens",
+        "4",
+        "--output-format",
+        "jsonl",
+        "--tokenizer",
+        str(tokenizer_root / "tokenizer.json"),
+        "--effective-config-json",
+        str(effective_path),
+    ]
+    policy = BLOCKED_MODELS[args.model_key]
     spec = {
         "schema_version": SCHEMA_VERSION,
         "artifact_type": "runtime_vnext_blocked_lane_collection_spec",
@@ -1370,16 +840,10 @@ def collect(args: argparse.Namespace) -> Path:
         "attempt_receipt_path": str(attempt_root / "attempt-receipt.json"),
         "cwd": str(REPO_ROOT),
         "model_key": args.model_key,
-        "mode": policy["mode"],
-        "failure_class": policy["failure_class"],
+        "architecture_marker": policy["architecture_marker"],
         "product_timeout_seconds": 60,
         "argv": argv,
         "child_environment": sanitized_child_environment(),
-        **(
-            {"architecture_marker": policy["architecture_marker"]}
-            if policy["mode"] == "unsupported-architecture"
-            else resource_spec
-        ),
     }
     spec_path = attempt_root / "collection-spec.json"
     bounded_command.atomic_write_json(spec_path, spec)
@@ -1429,12 +893,8 @@ def collect(args: argparse.Namespace) -> Path:
         "current_support": False,
         "comparable": False,
         "waiver": False,
-        "failure_class": policy["failure_class"],
-        "reason": (
-            "the frozen legacy product loader rejects this pinned Qwen3.5 GGUF architecture before inference"
-            if policy["mode"] == "unsupported-architecture"
-            else "the frozen legacy M3 Metal serve path violates the locked 32 GiB M1 Max headroom/swap safety gate during startup"
-        ),
+        "failure_class": EXPECTED_FAILURE_CLASS,
+        "reason": "the frozen legacy product loader rejects this pinned Qwen3.5 GGUF architecture before inference",
         "first_failure": attempt["first_failure"],
         "downstream_goal": policy["downstream_goal"],
         "implementation_path": policy["implementation_path"],
@@ -1442,7 +902,7 @@ def collect(args: argparse.Namespace) -> Path:
         "downstream_acceptance_pass_line": policy["pass_line"],
         "attempted_command": argv,
         "attempted_returncode": attempt["returncode"],
-        "failure_log": attempt["failure_log"]["path"],
+        "failure_log": attempt["stderr"]["path"],
         "collector": collector_identity(),
         "collection_spec": file_ref(spec_path, root),
         "attempt_receipt": file_ref(attempt_path, root),
@@ -1457,19 +917,6 @@ def collect(args: argparse.Namespace) -> Path:
             "semantic_source_revision": lane_lock["semantic_source"]["revision"],
             "tokenizer_source_root": str(tokenizer_root),
         },
-        **(
-            {
-                "hardware_constraint": {
-                    "policy_id": locked_hardware["policy_id"],
-                    "device_name": locked_hardware["device_name"],
-                    "memory_bytes": locked_hardware["memory_bytes"],
-                    "minimum_physical_headroom_bytes": MIN_METAL_HEADROOM_BYTES,
-                    "allow_swap_growth": False,
-                }
-            }
-            if policy["mode"] == "resource-capacity"
-            else {}
-        ),
     }
     lane_path = lane_root / "lane.json"
     bounded_command.atomic_write_json(lane_path, lane)
@@ -1527,8 +974,6 @@ def self_test() -> None:
                 "attempt_receipt_path": str(attempt_root / "attempt-receipt.json"),
                 "cwd": str(root),
                 "model_key": "m1-qwen35-4b",
-                "mode": "unsupported-architecture",
-                "failure_class": "legacy-model-backend-unsupported",
                 "architecture_marker": "unsupported GGUF architecture 'qwen35'",
                 "product_timeout_seconds": 5,
                 "argv": argv,
@@ -1561,7 +1006,7 @@ def self_test() -> None:
             "model_key": "m1-qwen35-4b",
             "attempted_command": argv,
             "attempted_returncode": 42,
-            "failure_log": attempt["failure_log"]["path"],
+            "failure_log": attempt["stderr"]["path"],
         }
         validate_attempt_document(root, attempt, lane)
         effective_doc = read_json(effective)
@@ -1599,137 +1044,6 @@ def self_test() -> None:
         _expect_reject(
             lambda: validate_attempt_document(root, missing_signature, lane),
             "first failure",
-        )
-        resource_attempt = copy.deepcopy(attempt)
-        resource_argv = [str(fake), "serve", str(root / "model.gguf")]
-        resource_attempt.update(
-            {
-                "model_key": "m3-qwen3-30b-a3b",
-                "mode": "resource-capacity",
-                "failure_class": "legacy-metal-unified-memory-capacity",
-                "failure_signature": "swap_growth",
-                "first_failure": "swap_growth: synthetic self-test resource violation",
-                "argv": resource_argv,
-                "argv_sha256": canonical_json_sha256(resource_argv),
-            }
-        )
-        resource_process = read_json(
-            artifact_path(root, resource_attempt["process_receipt"]["path"], "resource process receipt")
-        )
-        resource_process["argv"] = resource_argv
-        resource_process["argv_sha256"] = canonical_json_sha256(resource_argv)
-        resource_process_path = attempt_root / "resource-process-receipt.json"
-        bounded_command.atomic_write_json(resource_process_path, resource_process)
-        resource_attempt["process_receipt"] = file_ref(resource_process_path, root)
-        before_swap = resource_attempt["memory"]["before"]["swap_used_bytes"]
-        samples_path = attempt_root / "resource-memory.samples.jsonl"
-        write_memory_samples(
-            samples_path,
-            [
-                {
-                    "sequence": 0,
-                    "captured_at": utc_now(),
-                    "captured_monotonic_ns": time.monotonic_ns(),
-                    "physical_headroom_bytes": resource_attempt["memory"]["before"]["physical_headroom_bytes"],
-                    "swap_used_bytes": before_swap + 4096,
-                    "process_alive": True,
-                    "ready_observed": False,
-                }
-            ],
-        )
-        resource_attempt["memory"].update(
-            {
-                "samples": file_ref(samples_path, root),
-                "violation": {
-                    "kind": "swap_growth",
-                    "sequence": 0,
-                    "initial_bytes": before_swap,
-                    "observed_bytes": before_swap + 4096,
-                },
-            }
-        )
-        resource_failure_path = attempt_root / "resource-failure.log"
-        resource_failure_path.write_text(resource_attempt["first_failure"] + "\n", encoding="utf-8")
-        resource_attempt["failure_log"] = file_ref(resource_failure_path, root)
-        resource_lane = {
-            "model_key": "m3-qwen3-30b-a3b",
-            "attempted_command": resource_argv,
-            "attempted_returncode": 42,
-            "failure_log": resource_attempt["failure_log"]["path"],
-        }
-        validate_attempt_document(root, resource_attempt, resource_lane)
-        probed_attempt = copy.deepcopy(resource_attempt)
-        probe_request_path = attempt_root / "selftest-inference-probe.request.json"
-        probe_response_path = attempt_root / "selftest-inference-probe.response.json"
-        bounded_command.atomic_write_json(probe_request_path, RESOURCE_PROBE_REQUEST)
-        bounded_command.atomic_write_json(
-            probe_response_path,
-            {"choices": [{"message": {"content": "Paris", "role": "assistant"}}]},
-        )
-        probe_started_ns = time.monotonic_ns()
-        probe_finished_ns = probe_started_ns + 1_000_000
-        probe_receipt_path = attempt_root / "selftest-inference-probe.receipt.json"
-        bounded_command.atomic_write_json(
-            probe_receipt_path,
-            {
-                "schema_version": SCHEMA_VERSION,
-                "artifact_type": "runtime_vnext_resource_inference_probe",
-                "method": "POST",
-                "url": "http://127.0.0.1:12345/v1/chat/completions",
-                "request_body_sha256": canonical_json_sha256(
-                    RESOURCE_PROBE_REQUEST
-                ),
-                "request": file_ref(probe_request_path, root),
-                "response": file_ref(probe_response_path, root),
-                "status": 200,
-                "error": None,
-                "started_at": "2026-07-13T00:00:00.000000Z",
-                "finished_at": "2026-07-13T00:00:00.001000Z",
-                "started_monotonic_ns": probe_started_ns,
-                "finished_monotonic_ns": probe_finished_ns,
-                "duration_seconds": 0.001,
-            },
-        )
-        probed_samples_path = attempt_root / "probed-resource-memory.samples.jsonl"
-        write_memory_samples(
-            probed_samples_path,
-            [
-                {
-                    "sequence": 0,
-                    "captured_at": "2026-07-13T00:00:00.000500Z",
-                    "captured_monotonic_ns": probe_started_ns - 1_000_000,
-                    "physical_headroom_bytes": probed_attempt["memory"]["before"]["physical_headroom_bytes"],
-                    "swap_used_bytes": before_swap,
-                    "process_alive": True,
-                    "ready_observed": True,
-                },
-                {
-                    "sequence": 1,
-                    "captured_at": utc_now(),
-                    "captured_monotonic_ns": probe_finished_ns + 1_000_000,
-                    "physical_headroom_bytes": probed_attempt["memory"]["before"]["physical_headroom_bytes"],
-                    "swap_used_bytes": before_swap + 4096,
-                    "process_alive": True,
-                    "ready_observed": True,
-                }
-            ],
-        )
-        probed_attempt["ready_observed"] = True
-        probed_attempt["inference_probe"] = file_ref(probe_receipt_path, root)
-        probed_attempt["memory"]["samples"] = file_ref(probed_samples_path, root)
-        probed_attempt["memory"]["violation"]["sequence"] = 1
-        validate_attempt_document(root, probed_attempt, resource_lane)
-        missing_probe = copy.deepcopy(probed_attempt)
-        missing_probe["inference_probe"] = None
-        _expect_reject(
-            lambda: validate_attempt_document(root, missing_probe, resource_lane),
-            "without a real inference probe",
-        )
-        missing_growth = copy.deepcopy(resource_attempt)
-        missing_growth["memory"]["violation"]["observed_bytes"] = before_swap
-        _expect_reject(
-            lambda: validate_attempt_document(root, missing_growth, resource_lane),
-            "swap-growth evidence mismatch",
         )
         leaked = copy.deepcopy(bounded_receipt)
         leaked["cleanup"] = {"process_group_gone": False}

@@ -58,7 +58,6 @@ C03_CONTRACT_ID = "c03-exact-identifier-v2"
 BLOCKED_LANE_FAILURE_CLASSES = {
     "m1-qwen35-4b/metal": "legacy-model-backend-unsupported",
     "m2-qwen35-35b-a3b/metal": "legacy-model-backend-unsupported",
-    "m3-qwen3-30b-a3b/metal": "legacy-metal-unified-memory-capacity",
 }
 FORBIDDEN_KEYS = {"skip", "skipped", "waiver", "waivers", "placeholder"}
 LOG_KINDS = {"stdout-log", "stderr-log", "checker-log", "runtime-log"}
@@ -348,6 +347,7 @@ def validate_expectations_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
             "m1-qwen35-4b/cuda",
             "m2-qwen35-35b-a3b/cuda",
             "m3-qwen3-30b-a3b/cuda",
+            "m3-qwen3-30b-a3b/metal",
         },
         "legacy expectations blocked forbidden-lane set mismatch",
     )
@@ -5105,6 +5105,7 @@ def internal_expectations_catalog() -> dict[str, Any]:
                 "m1-qwen35-4b/cuda",
                 "m2-qwen35-35b-a3b/cuda",
                 "m3-qwen3-30b-a3b/cuda",
+                "m3-qwen3-30b-a3b/metal",
             ],
         },
         "lanes": lanes,
@@ -6692,8 +6693,8 @@ def self_test() -> int:
             },
             ("m3-qwen3-30b-a3b", "metal"): {
                 "case_count": 782,
-                "status_counts": {"blocked": 782},
-                "failure_counts": {"legacy-metal-unified-memory-capacity": 782},
+                "status_counts": {"pass": 124, "known-fail": 658},
+                "failure_counts": {**m3_failure_counts, "c18-contract-violation": 3},
             },
         }
         for (model_key, backend), locked in locked_lanes.items():
