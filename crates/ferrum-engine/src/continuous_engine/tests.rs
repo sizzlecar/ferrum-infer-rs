@@ -2439,6 +2439,95 @@ async fn engine_allocates_and_deallocates_model_declared_recurrent_state() {
 }
 
 #[tokio::test]
+async fn run_iteration_cancels_disconnected_client_and_releases_recurrent_state() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(64, &[]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
+    let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(RecurrentSpecExecutor {
+        inner: MockModelExecutor::new(64, Duration::ZERO, Duration::ZERO),
+    });
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let recurrent_manager = Arc::new(InMemoryRecurrentStateManager::new(
+        InMemoryRecurrentStateConfig {
+            total_memory_bytes: 1024,
+            total_batch_slots: 1,
+        },
+    ));
+    let engine = ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+        config,
+        scheduler.clone(),
+        tokenizer,
+        sampler,
+        kv_cache,
+        executor,
+        tensor_factory,
+        None,
+        None,
+        Some(recurrent_manager.clone()),
+    );
+
+    let request = policy_request();
+    let request_id = request.id.clone();
+    scheduler.submit(request.clone()).await.unwrap();
+    let recurrent_spec = RecurrentStateSpec {
+        request_id: request_id.clone(),
+        num_layers: 1,
+        tensors: vec![RecurrentStateTensorSpec::new(0, "state", vec![1])],
+        dtype: DataType::FP32,
+        device: Device::CPU,
+        max_batch_slots: 1,
+    };
+    let recurrent_state = recurrent_manager.allocate(&recurrent_spec).await.unwrap();
+    let (stream_sender, stream_receiver) = tokio::sync::mpsc::channel(1);
+    drop(stream_receiver);
+
+    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
+    sequence.stream_sender = Some(stream_sender);
+    sequence.commit_recurrent_state_admission(recurrent_state, 1);
+    let mut request_slot = RequestSlotLease::open(&engine.inner, request_id.clone());
+    request_slot.admit(&engine.inner);
+    sequence.request_slot = Some(request_slot);
+    engine
+        .inner
+        .sequences
+        .write()
+        .insert(request_id.clone(), sequence);
+
+    engine.inner.run_iteration().await.unwrap();
+
+    assert!(!engine.inner.sequences.read().contains_key(&request_id));
+    assert_eq!(scheduler.trace_phase(&request_id), None);
+    let scheduler_stats = scheduler.trace_snapshot();
+    assert_eq!(scheduler_stats.waiting_queue_len, 0);
+    assert_eq!(scheduler_stats.cancelled_total, 1);
+    assert_eq!(scheduler_stats.capacity_release_epoch, 1);
+    let recurrent_stats = recurrent_manager.stats();
+    assert_eq!(recurrent_stats.active_states, 0);
+    assert_eq!(recurrent_stats.used_batch_slots, 0);
+    assert_eq!(recurrent_stats.used_memory_bytes, 0);
+}
+
+#[test]
+fn sequence_state_detects_closed_run_and_serve_receivers() {
+    let mut run_sequence = SequenceState::new(policy_request(), vec![TokenId::new(1)]);
+    let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+    run_sequence.response_sender = Some(response_sender);
+    assert!(!run_sequence.client_receiver_closed());
+    drop(response_receiver);
+    assert!(run_sequence.client_receiver_closed());
+
+    let mut serve_sequence = SequenceState::new(policy_request(), vec![TokenId::new(1)]);
+    let (stream_sender, stream_receiver) = tokio::sync::mpsc::channel(1);
+    serve_sequence.stream_sender = Some(stream_sender);
+    assert!(!serve_sequence.client_receiver_closed());
+    drop(stream_receiver);
+    assert!(serve_sequence.client_receiver_closed());
+}
+
+#[tokio::test]
 async fn engine_status_reports_kv_cache_memory_from_manager_stats() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;

@@ -931,6 +931,15 @@ impl EngineInner {
         self.release_sequence_physical_resources(request_id, physical_resources)
             .await;
         self.scheduler.defer_prefill_to_waiting(request_id);
+        self.write_scheduler_trace_event(serde_json::json!({
+            "event": "scheduler_capacity_defer",
+            "request_id": request_id.to_string(),
+            "scheduler": self.scheduler.trace_snapshot(),
+            "recurrent_state": self
+                .recurrent_state_manager
+                .as_ref()
+                .map(|manager| manager.stats()),
+        }));
         self.trace_scheduler_defer(
             request_id,
             "engine_scheduler_prefill_capacity_defer",
