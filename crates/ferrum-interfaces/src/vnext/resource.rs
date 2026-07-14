@@ -39,6 +39,8 @@ mod provisioning;
 pub use provisioning::*;
 mod allocation;
 pub use allocation::*;
+mod runtime_driver;
+pub use runtime_driver::*;
 mod ledger;
 pub use ledger::*;
 mod recovery;
