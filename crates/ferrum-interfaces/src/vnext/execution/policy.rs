@@ -20,6 +20,11 @@ pub trait RuntimePolicy:
     /// iterate, or materialize resources up to this value.
     fn maximum_active_sequences(&self) -> u32;
 
+    /// A non-zero ceiling for tokens selected into one scheduler step. This is
+    /// not installed capacity: admission still evaluates the exact step shape
+    /// against then-live backing before any provider work is encoded.
+    fn maximum_scheduled_tokens(&self) -> u64;
+
     /// Ordered, non-empty allowlist used by planning after intersecting every
     /// selected provider requirement with the concrete runtime offers.
     fn dynamic_storage_profile_order(&self) -> &[DynamicStorageProfile];

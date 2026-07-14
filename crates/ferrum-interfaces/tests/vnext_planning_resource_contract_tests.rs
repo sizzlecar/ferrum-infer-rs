@@ -227,10 +227,23 @@ fn minimum_runnable_sums_lifetime_minima_and_sequential_invocation_peak() {
         .filter(|descriptor| matches!(descriptor.kind(), AllocationKind::Scratch { .. }))
         .map(|descriptor| descriptor.minimum_request_bytes().unwrap())
         .sum::<u64>();
+    let intermediate = memory
+        .dynamic_descriptors()
+        .iter()
+        .find(|descriptor| {
+            descriptor.base_resource_id().as_str() == "resource.sequential.intermediate"
+        })
+        .unwrap();
     assert_eq!(scratch_sum, 160);
-    assert_eq!(memory.minimum_request_bytes(), 48);
+    assert_eq!(intermediate.lifetime(), AllocationLifetime::Step);
+    assert_eq!(intermediate.minimum_request_bytes().unwrap(), 16);
+    assert_eq!(
+        intermediate.theoretical_maximum_request_bytes().unwrap(),
+        16 * 4096
+    );
+    assert_eq!(memory.minimum_request_bytes(), 32);
     assert_eq!(memory.minimum_sequence_bytes(), 16);
-    assert_eq!(memory.minimum_step_bytes(), 0);
+    assert_eq!(memory.minimum_step_bytes(), 16);
     assert_eq!(memory.minimum_invocation_peak_bytes(), 96);
     assert_eq!(memory.minimum_runnable_request_bytes(), 160);
 }
@@ -285,6 +298,7 @@ fn maximum_active_sequence_ceiling_is_nonzero_and_o_graph() {
     let rejected_planning = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::Correct);
     let malicious = AdversarialRuntimePolicy {
         maximum_active_sequences: 0,
+        maximum_scheduled_tokens: 4096,
         dynamic_storage_profile_order: vec![contiguous_storage_profile()],
     };
     let planning = rejected_planning.planning();
@@ -292,6 +306,23 @@ fn maximum_active_sequence_ceiling_is_nonzero_and_o_graph() {
         &family,
         &catalog,
         &malicious,
+        &planning,
+        id("node.main"),
+        resolved_values(0),
+        BTreeSet::new(),
+        None,
+    )
+    .is_err());
+
+    let zero_tokens = AdversarialRuntimePolicy {
+        maximum_active_sequences: 1,
+        maximum_scheduled_tokens: 0,
+        dynamic_storage_profile_order: vec![contiguous_storage_profile()],
+    };
+    assert!(PlanNodeResolution::resolve(
+        &family,
+        &catalog,
+        &zero_tokens,
         &planning,
         id("node.main"),
         resolved_values(0),

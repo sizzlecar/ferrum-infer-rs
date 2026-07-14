@@ -652,6 +652,7 @@ pub struct RuntimeMemoryPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdmissionPolicy {
     pub maximum_queue_depth: u32,
+    pub maximum_scheduled_tokens: u64,
     pub allow_defer: bool,
     pub cancellation_check_interval_steps: u32,
 }
@@ -762,10 +763,13 @@ impl ResolvedRuntimePolicy {
                 "capacity and reserve must be valid and maximum_active_sequences must be non-zero",
             ));
         }
-        if admission.maximum_queue_depth == 0 || admission.cancellation_check_interval_steps == 0 {
+        if admission.maximum_queue_depth == 0
+            || admission.maximum_scheduled_tokens == 0
+            || admission.cancellation_check_interval_steps == 0
+        {
             return Err(invalid_plan(
                 "runtime_policy.admission",
-                "queue depth and cancellation interval must be non-zero",
+                "queue depth, scheduled-token ceiling, and cancellation interval must be non-zero",
             ));
         }
         Ok(())
@@ -830,6 +834,10 @@ impl RuntimePolicy for ResolvedRuntimePolicy {
 
     fn maximum_active_sequences(&self) -> u32 {
         self.memory.maximum_active_sequences
+    }
+
+    fn maximum_scheduled_tokens(&self) -> u64 {
+        self.admission.maximum_scheduled_tokens
     }
 
     fn dynamic_storage_profile_order(&self) -> &[DynamicStorageProfile] {

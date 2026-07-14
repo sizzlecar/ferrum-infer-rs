@@ -17,6 +17,17 @@ pub(super) fn validate_active_sequence_ceiling(
     Ok(())
 }
 
+pub(super) fn validate_scheduled_token_ceiling(
+    maximum_scheduled_tokens: u64,
+) -> Result<(), VNextError> {
+    if maximum_scheduled_tokens == 0 {
+        return Err(invalid_plan(
+            "maximum scheduled tokens protocol ceiling must be non-zero",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn canonical_json(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Array(values) => {
