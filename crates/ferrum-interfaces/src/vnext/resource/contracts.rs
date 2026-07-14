@@ -1,4 +1,12 @@
-use super::*;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::fmt;
+
+use super::{
+    AllocationKind, AllocationLifetime, BufferDescriptor, BufferUsage, CapacityDomainId,
+    DeviceDescriptor, DeviceId, ElementType, NodeId, PlanHash, PlanId, RequestIdentity,
+    ResourceAllocation, ResourceId, VNextError,
+};
 
 pub const MAX_RESOURCE_TRANSITION_RECEIPT_WIRE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_RESOURCE_LEASE_RECEIPT_WIRE_BYTES: usize = 4 * 1024 * 1024;

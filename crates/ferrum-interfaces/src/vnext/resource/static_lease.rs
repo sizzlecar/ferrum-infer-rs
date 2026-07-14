@@ -1,4 +1,10 @@
-use super::*;
+use super::{
+    expected_lease_transition, invalid_resource, AdmissionFitPolicy, AdmissionPressureAction, Arc,
+    BTreeSet, BufferDescriptor, CoreOwnedAllocation, DeviceRuntime, DynamicResourceShape,
+    LeasedBufferView, OwnedLeaseSlot, ResourceId, ResourceLeaseAction, ResourceLeaseEntry,
+    ResourceLeaseState, ResourceOwnedBuffer, ResourceReservationBatch, ResourceTransactionIdentity,
+    ResourceWorkShape, StaticProvisioningBinding, VNextError,
+};
 
 #[must_use = "a resource lease is the batch owner of committed buffers"]
 pub struct StaticProvisioningLease<R>

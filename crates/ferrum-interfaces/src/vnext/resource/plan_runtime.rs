@@ -1,4 +1,25 @@
-use super::*;
+use super::{
+    core_resource_failure, deferred_device_cleanup_status, invalid_resource,
+    maintain_deferred_device_cleanups, new_deferred_device_cleanup_domain,
+    retire_deferred_device_cleanup_domain, watch, AdmissionDemand, AdmissionFitPolicy,
+    AdmissionPressureAction, AdmittedRequestResources, AllocationLifetime, Arc, AtomicU8,
+    BackingChunkIdentity, BackingPrepareDecision, BackingSegment, BackingSegmentLease,
+    BufferDescriptor, BufferUsage, CapacityDomainId, CapacityEntry, CapacityEpochs, CapacityUnits,
+    CapacityVector, CapacityWaitRecheck, CapacityWaitRegistration, DeferredDeviceCleanupDomainId,
+    DeferredDeviceCleanupMaintenanceReceipt, DeferredDeviceCleanupStatus, DeviceCapacityClaim,
+    DeviceId, DeviceRuntime, DynamicBackingDeferred, DynamicBackingPoolId,
+    DynamicDeferredMaintenanceOutcome, DynamicPoolMaintenanceController, DynamicPoolSet,
+    DynamicResourceShape, DynamicStorageProfile, ElementType, EvaluatedBackingRequest,
+    FailureEnvelope, LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex, NoStatic,
+    NodeId, Ordering, PlanHash, PlanId, PlanNode, RequestAdmissionDecision, RequestIdentity,
+    RequestResourceAdmissionDecision, RequestResourceAdmissionRequest, ResidentChunkBacking,
+    ResourceAbandonSignal, ResourceActionCursor, ResourceDriverFailure, ResourceId,
+    ResourceLedgerEntrySnapshot, ResourceOwnershipReason, ResourceOwnershipTransferFailure,
+    ResourcePoolIdentity, ResourcePoolOwnership, ResourceReservation, ResourceReservationBatch,
+    ResourceTransactionAction, ResourceTransactionContext, ResourceTransactionDriver,
+    ResourceTransactionIdentity, ResourceTransactionState, RunId, RwLock, RwLockReadGuard,
+    Serialize, StaticProvisioningBinding, StaticProvisioningLease, VNextError,
+};
 
 pub(super) const PLAN_RUNTIME_OPEN: u8 = 0;
 const PLAN_RUNTIME_CLOSING: u8 = 1;
