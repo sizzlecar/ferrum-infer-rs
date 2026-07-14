@@ -179,11 +179,11 @@ extern "C" __global__ void linear_attention_prepare_f16_params_f32(
       conv_kernel);
 }
 
-template <typename InputT, typename ParamT>
+template <typename InputT, typename ParamT, typename StateT>
 static __device__ void linear_attention_prepare_varlen_impl(
     const InputT* __restrict__ mixed_qkv_raw,
     const InputT* __restrict__ conv_weight,
-    const float* __restrict__ initial_conv_states,
+    const StateT* __restrict__ initial_conv_states,
     const InputT* __restrict__ a_raw,
     const InputT* __restrict__ b_raw,
     const ParamT* __restrict__ a_log,
@@ -195,7 +195,7 @@ static __device__ void linear_attention_prepare_varlen_impl(
     float* __restrict__ value,
     float* __restrict__ g,
     float* __restrict__ beta,
-    float* __restrict__ final_conv_states,
+    StateT* __restrict__ final_conv_states,
     const int batch,
     const int total_tokens,
     const int key_heads,
@@ -231,7 +231,9 @@ static __device__ void linear_attention_prepare_varlen_impl(
                           ? ferrum_load_value(
                                 mixed_qkv_raw,
                                 (token_start + source) * conv_channels + channel)
-                          : initial_conv_states[state_base + state_len + source];
+                          : ferrum_load_value(
+                                initial_conv_states,
+                                state_base + state_len + source);
       acc += x *
              ferrum_load_value(conv_weight,
                                channel * conv_kernel + kernel_idx);
@@ -265,11 +267,13 @@ static __device__ void linear_attention_prepare_varlen_impl(
     const int seq_tokens = token_end - token_start;
     const int source = seq_tokens + pos - state_len;
     const int state_base = seq * conv_state_len + channel * state_len;
-    final_conv_states[idx] =
+    const float final_value =
         source >= 0
             ? ferrum_load_value(mixed_qkv_raw,
                                 (token_start + source) * conv_channels + channel)
-            : initial_conv_states[state_base + state_len + source];
+            : ferrum_load_value(initial_conv_states,
+                                state_base + state_len + source);
+    ferrum_store_value(final_conv_states, idx, final_value);
   }
 }
 
@@ -296,7 +300,7 @@ extern "C" __global__ void linear_attention_prepare_varlen_f32(
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  linear_attention_prepare_varlen_impl<float, float>(
+  linear_attention_prepare_varlen_impl<float, float, float>(
       mixed_qkv_raw, conv_weight, initial_conv_states, a_raw, b_raw, a_log,
       dt_bias, cu_seqlens, token_seq_indices, query, key, value, g, beta,
       final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
@@ -326,7 +330,7 @@ extern "C" __global__ void linear_attention_prepare_varlen_f16_to_f32(
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  linear_attention_prepare_varlen_impl<__half, __half>(
+  linear_attention_prepare_varlen_impl<__half, __half, float>(
       mixed_qkv_raw, conv_weight, initial_conv_states, a_raw, b_raw, a_log,
       dt_bias, cu_seqlens, token_seq_indices, query, key, value, g, beta,
       final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
@@ -356,7 +360,37 @@ extern "C" __global__ void linear_attention_prepare_varlen_f16_params_f32(
     const int key_dim,
     const int value_dim,
     const int conv_kernel) {
-  linear_attention_prepare_varlen_impl<__half, float>(
+  linear_attention_prepare_varlen_impl<__half, float, float>(
+      mixed_qkv_raw, conv_weight, initial_conv_states, a_raw, b_raw, a_log,
+      dt_bias, cu_seqlens, token_seq_indices, query, key, value, g, beta,
+      final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
+      value_dim, conv_kernel);
+}
+
+extern "C" __global__ void linear_attention_prepare_varlen_f16_to_f32_state_f16(
+    const __half* __restrict__ mixed_qkv_raw,
+    const __half* __restrict__ conv_weight,
+    const __half* __restrict__ initial_conv_states,
+    const __half* __restrict__ a_raw,
+    const __half* __restrict__ b_raw,
+    const __half* __restrict__ a_log,
+    const __half* __restrict__ dt_bias,
+    const unsigned int* __restrict__ cu_seqlens,
+    const unsigned int* __restrict__ token_seq_indices,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    __half* __restrict__ final_conv_states,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  linear_attention_prepare_varlen_impl<__half, __half, __half>(
       mixed_qkv_raw, conv_weight, initial_conv_states, a_raw, b_raw, a_log,
       dt_bias, cu_seqlens, token_seq_indices, query, key, value, g, beta,
       final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,

@@ -763,16 +763,17 @@ extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_packed_f32_b
       max_slots, key_heads, value_heads, key_dim, value_dim, scale);
 }
 
-extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32(
+template <typename StateT>
+static __device__ void recurrent_gated_delta_rule_varlen_f32_impl(
     const float* __restrict__ query,
     const float* __restrict__ key,
     const float* __restrict__ value,
     const float* __restrict__ g,
     const float* __restrict__ beta,
-    const float* __restrict__ initial_states,
+    const StateT* __restrict__ initial_states,
     const unsigned int* __restrict__ cu_seqlens,
     float* __restrict__ out,
-    float* __restrict__ final_states,
+    StateT* __restrict__ final_states,
     const int batch,
     const int total_tokens,
     const int key_heads,
@@ -802,7 +803,9 @@ extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32(
         row_state_base + (value_head * value_dim + value_offset) * key_dim;
 
     for (int kd = 0; kd < key_dim; ++kd) {
-      final_states[state_base + kd] = initial_states[state_base + kd];
+      ferrum_gdr_store_value(
+          final_states, state_base + kd,
+          ferrum_gdr_load_value(initial_states, state_base + kd));
     }
 
     for (int token = token_start; token < token_end; ++token) {
@@ -830,8 +833,10 @@ extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32(
       for (int kd = 0; kd < key_dim; ++kd) {
         const int state_idx = state_base + kd;
         const int qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
-        final_states[state_idx] *= decay;
-        kv_mem += final_states[state_idx] * (key[qk_idx] * k_inv);
+        const float state =
+            ferrum_gdr_load_value(final_states, state_idx) * decay;
+        ferrum_gdr_store_value(final_states, state_idx, state);
+        kv_mem += state * (key[qk_idx] * k_inv);
       }
 
       const int value_idx =
@@ -840,22 +845,24 @@ extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32(
       for (int kd = 0; kd < key_dim; ++kd) {
         const int state_idx = state_base + kd;
         const int qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
-        final_states[state_idx] += delta * (key[qk_idx] * k_inv);
+        const float updated = ferrum_gdr_load_value(final_states, state_idx) +
+                              delta * (key[qk_idx] * k_inv);
+        ferrum_gdr_store_value(final_states, state_idx, updated);
       }
 
       float acc = 0.0f;
       for (int kd = 0; kd < key_dim; ++kd) {
         const int state_idx = state_base + kd;
         const int qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
-        acc += final_states[state_idx] * (query[qk_idx] * q_inv * scale);
+        acc += ferrum_gdr_load_value(final_states, state_idx) *
+               (query[qk_idx] * q_inv * scale);
       }
       out[value_idx] = acc;
     }
   }
 }
 
-template <int BV_TILE>
-static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
+extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32(
     const float* __restrict__ query,
     const float* __restrict__ key,
     const float* __restrict__ value,
@@ -865,6 +872,55 @@ static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
     const unsigned int* __restrict__ cu_seqlens,
     float* __restrict__ out,
     float* __restrict__ final_states,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int use_qk_l2norm,
+    const float scale) {
+  recurrent_gated_delta_rule_varlen_f32_impl<float>(
+      query, key, value, g, beta, initial_states, cu_seqlens, out,
+      final_states, batch, total_tokens, key_heads, value_heads, key_dim,
+      value_dim, use_qk_l2norm, scale);
+}
+
+extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32_state_f16(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    const __half* __restrict__ initial_states,
+    const unsigned int* __restrict__ cu_seqlens,
+    float* __restrict__ out,
+    __half* __restrict__ final_states,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int use_qk_l2norm,
+    const float scale) {
+  recurrent_gated_delta_rule_varlen_f32_impl<__half>(
+      query, key, value, g, beta, initial_states, cu_seqlens, out,
+      final_states, batch, total_tokens, key_heads, value_heads, key_dim,
+      value_dim, use_qk_l2norm, scale);
+}
+
+template <typename StateT, int BV_TILE>
+static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    const StateT* __restrict__ initial_states,
+    const unsigned int* __restrict__ cu_seqlens,
+    float* __restrict__ out,
+    StateT* __restrict__ final_states,
     const int batch,
     const int total_tokens,
     const int key_heads,
@@ -901,7 +957,9 @@ static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
 
     const int state_idx =
         row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
-    final_states[state_idx] = initial_states[state_idx];
+    ferrum_gdr_store_value(
+        final_states, state_idx,
+        ferrum_gdr_load_value(initial_states, state_idx));
   }
   __syncthreads();
 
@@ -924,8 +982,9 @@ static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
       const int state_idx =
           row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
       const int qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
-      const float state = final_states[state_idx] * decay;
-      final_states[state_idx] = state;
+      const float state =
+          ferrum_gdr_load_value(final_states, state_idx) * decay;
+      ferrum_gdr_store_value(final_states, state_idx, state);
       local[local_v] += state * key[qk_idx];
     }
 
@@ -974,8 +1033,9 @@ static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
       const int state_idx =
           row_state_base + (value_head * value_dim + value_offset) * key_dim + kd;
       const int qk_idx = ((token * key_heads + key_head) * key_dim) + kd;
-      const float updated = final_states[state_idx] + delta[local_v] * key[qk_idx];
-      final_states[state_idx] = updated;
+      const float updated = ferrum_gdr_load_value(final_states, state_idx) +
+                            delta[local_v] * key[qk_idx];
+      ferrum_gdr_store_value(final_states, state_idx, updated);
       local[local_v] += updated * (query[qk_idx] * scale);
     }
 
@@ -1027,7 +1087,30 @@ extern "C" __global__ void recurrent_gated_delta_rule_varlen_tiled16_f32(
     const int key_dim,
     const int value_dim,
     const float scale) {
-  recurrent_gated_delta_rule_varlen_tiled_f32_impl<16>(
+  recurrent_gated_delta_rule_varlen_tiled_f32_impl<float, 16>(
+      query, key, value, g, beta, initial_states, cu_seqlens, out,
+      final_states, batch, total_tokens, key_heads, value_heads, key_dim,
+      value_dim, scale);
+}
+
+extern "C" __global__ void recurrent_gated_delta_rule_varlen_tiled16_f32_state_f16(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    const __half* __restrict__ initial_states,
+    const unsigned int* __restrict__ cu_seqlens,
+    float* __restrict__ out,
+    __half* __restrict__ final_states,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  recurrent_gated_delta_rule_varlen_tiled_f32_impl<__half, 16>(
       query, key, value, g, beta, initial_states, cu_seqlens, out,
       final_states, batch, total_tokens, key_heads, value_heads, key_dim,
       value_dim, scale);
