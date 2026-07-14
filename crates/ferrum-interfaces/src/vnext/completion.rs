@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use super::{
     classify_device_error, defer_device_cleanup, BatchOperationIdentity,
     DeferredDeviceCleanupDisposition, DeferredDeviceCleanupDomainId, DeferredDeviceCleanupTask,
-    DefinitelyNotSubmittedRetryAuthority, DeviceDescriptor, DeviceRuntime, DeviceTerminal,
-    ExecutionIdentityEnvelope, FenceQuery, IdentifiedFailure, InvocationResourceLease, StreamState,
+    DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
+    DeviceDescriptor, DeviceRuntime, DeviceTerminal, ExecutionIdentityEnvelope, FenceQuery,
+    IdentifiedFailure, InvocationResourceLease, PreparedStepSubmissionWave, StreamState,
     VNextError,
 };
 
@@ -724,10 +725,38 @@ impl CompletionSweepReceipt {
     }
 }
 
+enum CompletionResourceLease<R: DeviceRuntime> {
+    Invocation(InvocationResourceLease<R>),
+    Wave(PreparedStepSubmissionWave<R>),
+}
+
+impl<R: DeviceRuntime> CompletionResourceLease<R> {
+    fn runtime(&self) -> &Arc<R> {
+        match self {
+            Self::Invocation(invocation) => invocation.runtime(),
+            Self::Wave(wave) => wave.runtime(),
+        }
+    }
+
+    fn deferred_cleanup_domain(&self) -> DeferredDeviceCleanupDomainId {
+        match self {
+            Self::Invocation(invocation) => invocation.deferred_cleanup_domain(),
+            Self::Wave(wave) => wave.deferred_cleanup_domain(),
+        }
+    }
+
+    fn mark_submission_fence_installed(&mut self) -> Result<(), VNextError> {
+        match self {
+            Self::Invocation(invocation) => invocation.mark_submission_fence_installed(),
+            Self::Wave(wave) => wave.mark_submission_fence_installed(),
+        }
+    }
+}
+
 enum CompletionRecord<R: DeviceRuntime> {
     Reserved,
     InFlight {
-        invocation: InvocationResourceLease<R>,
+        resources: CompletionResourceLease<R>,
         lane: Arc<ExecutionLane<R>>,
         fence: R::Fence,
         batch_identity: BatchOperationIdentity,
@@ -735,7 +764,7 @@ enum CompletionRecord<R: DeviceRuntime> {
         recovery_state: CompletionRecoveryState,
     },
     SubmissionIndeterminate {
-        invocation: InvocationResourceLease<R>,
+        resources: CompletionResourceLease<R>,
         lane: Arc<ExecutionLane<R>>,
         batch_identity: BatchOperationIdentity,
     },
@@ -755,14 +784,14 @@ enum CompletionRecoveryState {
 
 enum CompletionQuarantineOwnership<R: DeviceRuntime> {
     InFlight {
-        invocation: InvocationResourceLease<R>,
+        resources: CompletionResourceLease<R>,
         lane: Arc<ExecutionLane<R>>,
         fence: R::Fence,
         batch_identity: BatchOperationIdentity,
         submission: SubmittedOperationReceipt,
     },
     SubmissionIndeterminate {
-        invocation: InvocationResourceLease<R>,
+        resources: CompletionResourceLease<R>,
         lane: Arc<ExecutionLane<R>>,
         batch_identity: BatchOperationIdentity,
     },
@@ -777,9 +806,8 @@ impl<R: DeviceRuntime> CompletionQuarantineOwnership<R> {
 
     fn deferred_cleanup_domain(&self) -> DeferredDeviceCleanupDomainId {
         match self {
-            Self::InFlight { invocation, .. }
-            | Self::SubmissionIndeterminate { invocation, .. } => {
-                invocation.deferred_cleanup_domain()
+            Self::InFlight { resources, .. } | Self::SubmissionIndeterminate { resources, .. } => {
+                resources.deferred_cleanup_domain()
             }
         }
     }
@@ -788,9 +816,8 @@ impl<R: DeviceRuntime> CompletionQuarantineOwnership<R> {
 impl<R: DeviceRuntime> CompletionRecord<R> {
     fn deferred_cleanup_domain(&self) -> Option<DeferredDeviceCleanupDomainId> {
         match self {
-            Self::InFlight { invocation, .. }
-            | Self::SubmissionIndeterminate { invocation, .. } => {
-                Some(invocation.deferred_cleanup_domain())
+            Self::InFlight { resources, .. } | Self::SubmissionIndeterminate { resources, .. } => {
+                Some(resources.deferred_cleanup_domain())
             }
             Self::Quarantined { ownership, .. } => Some(ownership.deferred_cleanup_domain()),
             Self::Reserved | Self::Reaped => None,
@@ -949,9 +976,37 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         lane: Arc<ExecutionLane<R>>,
         batch_identity: BatchOperationIdentity,
     ) -> Result<CompletionReservation<R>, VNextError> {
-        if !Arc::ptr_eq(invocation.runtime(), lane.runtime_arc()) {
+        Self::reserve_resources(
+            reaper,
+            CompletionResourceLease::Invocation(invocation),
+            lane,
+            batch_identity,
+        )
+    }
+
+    pub(crate) fn reserve_wave(
+        reaper: &Arc<Self>,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: Arc<ExecutionLane<R>>,
+        batch_identity: BatchOperationIdentity,
+    ) -> Result<CompletionReservation<R>, VNextError> {
+        Self::reserve_resources(
+            reaper,
+            CompletionResourceLease::Wave(wave),
+            lane,
+            batch_identity,
+        )
+    }
+
+    fn reserve_resources(
+        reaper: &Arc<Self>,
+        resources: CompletionResourceLease<R>,
+        lane: Arc<ExecutionLane<R>>,
+        batch_identity: BatchOperationIdentity,
+    ) -> Result<CompletionReservation<R>, VNextError> {
+        if !Arc::ptr_eq(resources.runtime(), lane.runtime_arc()) {
             return Err(invalid_completion(
-                "completion lane runtime is not the invocation root runtime instance",
+                "completion lane runtime is not the submission resource runtime instance",
             ));
         }
         let mut state = reaper
@@ -1000,7 +1055,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             reaper: Arc::clone(reaper),
             record,
             slot_id,
-            invocation: Some(invocation),
+            resources: Some(resources),
             lane: Some(lane),
             batch_identity: Some(batch_identity),
             receipt: Some(receipt),
@@ -1247,25 +1302,25 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             let old = std::mem::replace(&mut *guard, CompletionRecord::Reaped);
             let ownership = match old {
                 CompletionRecord::InFlight {
-                    invocation,
+                    resources,
                     lane,
                     fence,
                     batch_identity,
                     receipt,
                     ..
                 } => CompletionQuarantineOwnership::InFlight {
-                    invocation,
+                    resources,
                     lane,
                     fence,
                     batch_identity,
                     submission: receipt,
                 },
                 CompletionRecord::SubmissionIndeterminate {
-                    invocation,
+                    resources,
                     lane,
                     batch_identity,
                 } => CompletionQuarantineOwnership::SubmissionIndeterminate {
-                    invocation,
+                    resources,
                     lane,
                     batch_identity,
                 },
@@ -1617,7 +1672,7 @@ pub(crate) struct CompletionReservation<R: DeviceRuntime> {
     reaper: Arc<CompletionReaper<R>>,
     record: SharedCompletionRecord<R>,
     slot_id: CompletionSlotId,
-    invocation: Option<InvocationResourceLease<R>>,
+    resources: Option<CompletionResourceLease<R>>,
     lane: Option<Arc<ExecutionLane<R>>>,
     batch_identity: Option<BatchOperationIdentity>,
     receipt: Option<SubmittedOperationReceipt>,
@@ -1628,9 +1683,29 @@ pub(crate) struct CompletionReservation<R: DeviceRuntime> {
 
 impl<R: DeviceRuntime> CompletionReservation<R> {
     pub(crate) fn invocation(&self) -> &InvocationResourceLease<R> {
-        self.invocation
+        match self
+            .resources
             .as_ref()
-            .expect("live completion reservation owns invocation resources")
+            .expect("live completion reservation owns submission resources")
+        {
+            CompletionResourceLease::Invocation(invocation) => invocation,
+            CompletionResourceLease::Wave(_) => {
+                unreachable!("single-operation reservation cannot own a submission wave")
+            }
+        }
+    }
+
+    pub(crate) fn wave(&self) -> &PreparedStepSubmissionWave<R> {
+        match self
+            .resources
+            .as_ref()
+            .expect("live completion reservation owns submission resources")
+        {
+            CompletionResourceLease::Wave(wave) => wave,
+            CompletionResourceLease::Invocation(_) => {
+                unreachable!("wave reservation cannot own single-operation resources")
+            }
+        }
     }
 
     pub(crate) fn mark_submission_started(&mut self) {
@@ -1642,11 +1717,35 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
     ) -> Result<DefinitelyNotSubmittedRetryAuthority<R>, VNextError> {
         self.remove_reserved_slot();
         self.submission_may_have_happened = false;
-        let invocation = self
-            .invocation
+        let resources = self
+            .resources
             .take()
-            .expect("reservation owns definitely-not-submitted invocation");
+            .expect("reservation owns definitely-not-submitted resources");
+        let CompletionResourceLease::Invocation(invocation) = resources else {
+            return Err(invalid_completion(
+                "single-operation retry requested from a submission wave reservation",
+            ));
+        };
         let retry = invocation.definitely_not_submitted()?;
+        self.finished = true;
+        Ok(retry)
+    }
+
+    pub(crate) fn definitely_not_submitted_wave(
+        mut self,
+    ) -> Result<DefinitelyNotSubmittedWaveRetryAuthority<R>, VNextError> {
+        self.remove_reserved_slot();
+        self.submission_may_have_happened = false;
+        let resources = self
+            .resources
+            .take()
+            .expect("reservation owns definitely-not-submitted resources");
+        let CompletionResourceLease::Wave(wave) = resources else {
+            return Err(invalid_completion(
+                "wave retry requested from a single-operation reservation",
+            ));
+        };
+        let retry = wave.definitely_not_submitted()?;
         self.finished = true;
         Ok(retry)
     }
@@ -1655,7 +1754,7 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         mut self,
         fence: R::Fence,
     ) -> Result<CompletionHandle<R>, (VNextError, CompletionHandle<R>)> {
-        let invocation = self.invocation.take().expect("reservation owns invocation");
+        let resources = self.resources.take().expect("reservation owns resources");
         let lane = self.lane.take().expect("reservation owns lane");
         let batch_identity = self
             .batch_identity
@@ -1672,12 +1771,12 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         };
         if !matches!(&*record, CompletionRecord::Reserved) {
             lane.fail_closed();
-            std::mem::forget((invocation, lane, fence));
+            std::mem::forget((resources, lane, fence));
             self.finished = true;
             panic!("completion reservation changed after submission");
         }
         *record = CompletionRecord::InFlight {
-            invocation,
+            resources,
             lane,
             fence,
             batch_identity,
@@ -1686,8 +1785,8 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         };
         let transition = match &mut *record {
             CompletionRecord::InFlight {
-                invocation, lane, ..
-            } => invocation
+                resources, lane, ..
+            } => resources
                 .mark_submission_fence_installed()
                 .map_err(|error| {
                     lane.fail_closed();
@@ -1708,7 +1807,7 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
     }
 
     pub(crate) fn submission_indeterminate(mut self) -> IndeterminateSubmissionHandle<R> {
-        let invocation = self.invocation.take().expect("reservation owns invocation");
+        let resources = self.resources.take().expect("reservation owns resources");
         let lane = self.lane.take().expect("reservation owns lane");
         let batch_identity = self
             .batch_identity
@@ -1720,13 +1819,13 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         };
         if matches!(&*record, CompletionRecord::Reserved) {
             *record = CompletionRecord::SubmissionIndeterminate {
-                invocation,
+                resources,
                 lane,
                 batch_identity,
             };
         } else {
             lane.fail_closed();
-            std::mem::forget((invocation, lane, batch_identity));
+            std::mem::forget((resources, lane, batch_identity));
         }
         drop(record);
         self.finished = true;
@@ -1754,15 +1853,15 @@ impl<R: DeviceRuntime> Drop for CompletionReservation<R> {
             return;
         }
         if self.submission_may_have_happened {
-            let Some(invocation) = self.invocation.take() else {
+            let Some(resources) = self.resources.take() else {
                 return;
             };
             let Some(lane) = self.lane.take() else {
-                std::mem::forget(invocation);
+                std::mem::forget(resources);
                 return;
             };
             let Some(batch_identity) = self.batch_identity.take() else {
-                std::mem::forget((invocation, lane));
+                std::mem::forget((resources, lane));
                 return;
             };
             lane.fail_closed();
@@ -1772,12 +1871,12 @@ impl<R: DeviceRuntime> Drop for CompletionReservation<R> {
             };
             if matches!(&*record, CompletionRecord::Reserved) {
                 *record = CompletionRecord::SubmissionIndeterminate {
-                    invocation,
+                    resources,
                     lane,
                     batch_identity,
                 };
             } else {
-                std::mem::forget((invocation, lane, batch_identity));
+                std::mem::forget((resources, lane, batch_identity));
             }
         } else {
             self.remove_reserved_slot();
