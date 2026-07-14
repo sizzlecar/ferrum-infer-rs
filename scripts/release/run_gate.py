@@ -298,14 +298,56 @@ VNEXT_G01A_REQUIRED_UNIT_TESTS = {
     "unknown_inputs_fail_closed",
     "weight_schema_order_is_normalized_before_fingerprinting",
 }
-VNEXT_G01A_REQUIRED_RESOURCE_TESTS = {
-    "closing_root_rejects_every_parent_to_child_derivation",
-    "plan_runtime_close_recovery_is_ownership_safe",
-    "poisoned_bound_stream_retains_sequence_until_stream_drop",
-    "resource_capacity_concurrency_is_bounded",
-    "resource_transaction_abandon_panic_child",
-    "resource_transaction_contract_is_exhaustive",
-    "sequence_owner_drop_defers_blocking_backend_recovery",
+VNEXT_G01A_REQUIRED_RESOURCE_TESTS_BY_TARGET = {
+    "vnext_resource_capacity_contract_tests": {
+        "resource_capacity_concurrency_is_bounded",
+        "runtime_implementation_authority_is_exact",
+    },
+    "vnext_resource_transaction_lifecycle_tests": {
+        "transaction_lifecycle_contracts_are_exhaustive",
+    },
+    "vnext_resource_transaction_evidence_tests": {
+        "resource_transaction_abandon_panic_child",
+        "transaction_evidence_contracts_are_exhaustive",
+    },
+    "vnext_resource_sequence_activation_tests": {
+        "sequence_activation_contracts_are_exhaustive",
+    },
+    "vnext_resource_sequence_recovery_tests": {
+        "sequence_recovery_contracts_are_exhaustive",
+    },
+    "vnext_resource_recovery_authority_tests": {
+        "recovery_authority_contracts_are_exhaustive",
+    },
+    "vnext_resource_runtime_close_tests": {
+        "closing_root_rejects_every_parent_to_child_derivation",
+        "plan_runtime_close_recovery_is_ownership_safe",
+        "poisoned_bound_stream_retains_sequence_until_stream_drop",
+        "sequence_owner_drop_defers_blocking_backend_recovery",
+    },
+}
+VNEXT_G01A_RESOURCE_PANIC_ISOLATION_TARGET = "vnext_resource_transaction_evidence_tests"
+VNEXT_G01A_RESOURCE_PROOF_LINES = {
+    "vnext_resource_capacity_contract_tests": (
+        ("VNEXT RUNTIME IMPLEMENTATION AUTHORITY PASS", 13),
+        ("VNEXT RESOURCE CAPACITY THREAD BOUND PASS", 20),
+    ),
+    "vnext_resource_transaction_lifecycle_tests": (
+        ("VNEXT TRANSACTION LIFECYCLE PASS", 70),
+    ),
+    "vnext_resource_transaction_evidence_tests": (
+        ("VNEXT TRANSACTION EVIDENCE PASS", 69),
+    ),
+    "vnext_resource_sequence_activation_tests": (
+        ("VNEXT SEQUENCE ACTIVATION PASS", 53),
+    ),
+    "vnext_resource_sequence_recovery_tests": (
+        ("VNEXT SEQUENCE RECOVERY PASS", 48),
+    ),
+    "vnext_resource_recovery_authority_tests": (
+        ("VNEXT RECOVERY AUTHORITY PASS", 38),
+    ),
+    "vnext_resource_runtime_close_tests": (),
 }
 VNEXT_G01A_REQUIRED_EVENT_TESTS = {"vnext_event_replay_v5_contract"}
 VNEXT_G01A_REQUIRED_RESOLUTION_LIMITS_TESTS = {
@@ -349,7 +391,7 @@ VNEXT_G01A_REQUIRED_COMPILE_TESTS = {"vnext_compile"}
 VNEXT_G01A_REQUIRED_LEGACY_TESTS = {"legacy_backend_methods_are_mapped_82_of_82"}
 VNEXT_G01A_REQUIRED_TESTS_BY_TARGET = {
     "vnext_contract_tests": VNEXT_G01A_REQUIRED_UNIT_TESTS,
-    "vnext_resource_contract_tests": VNEXT_G01A_REQUIRED_RESOURCE_TESTS,
+    **VNEXT_G01A_REQUIRED_RESOURCE_TESTS_BY_TARGET,
     "vnext_event_contract_tests": VNEXT_G01A_REQUIRED_EVENT_TESTS,
     "vnext_resolution_limits_contract_tests": VNEXT_G01A_REQUIRED_RESOLUTION_LIMITS_TESTS,
     "vnext_device_operation_contract_tests": VNEXT_G01A_REQUIRED_DEVICE_OPERATION_TESTS,
@@ -427,7 +469,7 @@ VNEXT_G01A_EXPECTED_TRYBUILD_PASS_CASES = 2
 VNEXT_G01A_EXPECTED_TRYBUILD_FAIL_CASES = 78
 VNEXT_G01A_TEST_THREADS_ARG = "--test-threads=1"
 VNEXT_G01A_BOUNDED_RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
-VNEXT_G01A_BOUNDED_TEST_COMMAND_COUNT = 20
+VNEXT_G01A_BOUNDED_TEST_COMMAND_COUNT = 32
 VNEXT_G01A_BOUNDED_TEST_ENV_OVERRIDES = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "CARGO_BUILD_JOBS": "2",
@@ -2191,7 +2233,7 @@ def vnext_g01a_bounded_profile(command: tuple[str, ...]) -> str:
         target_index = command.index("--test") + 1
         require_gate(target_index < len(command), "vnext-g01a cargo test target is missing")
         target = command[target_index]
-        if target == "vnext_resource_contract_tests":
+        if target in VNEXT_G01A_REQUIRED_RESOURCE_TESTS_BY_TARGET:
             return "resource"
         if target == "vnext_compile":
             return "trybuild"
@@ -2264,7 +2306,7 @@ def summarize_vnext_g01a_bounded_execution(
     )
     require_gate(
         profile_counts
-        == {"regular": 14, "admission": 2, "resource": 2, "trybuild": 2},
+        == {"regular": 14, "admission": 2, "resource": 14, "trybuild": 2},
         "vnext-g01a bounded profile command counts mismatch",
     )
     return {
@@ -2288,7 +2330,7 @@ def summarize_vnext_g01a_bounded_execution(
 
 def vnext_g01a_expected_test_summaries(target: str) -> list[tuple[str, str, str, str]]:
     expected_count = len(VNEXT_G01A_REQUIRED_TESTS_BY_TARGET[target])
-    if target == "vnext_resource_contract_tests":
+    if target == VNEXT_G01A_RESOURCE_PANIC_ISOLATION_TARGET:
         return [
             ("1", "0", "0", str(expected_count - 1)),
             (str(expected_count), "0", "0", "0"),
@@ -2966,8 +3008,9 @@ def validate_vnext_g01a_provenance(
     expected_command_sequence.append(admission_test_command("--list"))
     expected_command_sequence.append(admission_test_command("--nocapture"))
     require_gate(
-        len(commands) == len(expected_command_sequence) == 23,
-        "vnext-g01a compile evidence must contain exactly 23 commands",
+        len(commands) == len(expected_command_sequence)
+        == len(VNEXT_G01A_QUALITY_COMMANDS) + VNEXT_G01A_BOUNDED_TEST_COMMAND_COUNT,
+        "vnext-g01a compile evidence command matrix size mismatch",
     )
     command_outputs: dict[tuple[str, ...], str] = {}
     actual_command_sequence: list[tuple[str, ...]] = []
@@ -3067,7 +3110,7 @@ def validate_vnext_g01a_provenance(
             r"(\d+) measured; (\d+) filtered out;",
             command_outputs[command],
         )
-        if target == "vnext_resource_contract_tests":
+        if target == VNEXT_G01A_RESOURCE_PANIC_ISOLATION_TARGET:
             require_gate(
                 command_outputs[command].count(
                     "test resource_transaction_abandon_panic_child ... ok"
@@ -3252,12 +3295,31 @@ def validate_vnext_g01a_provenance(
         "VNEXT BREAKING VERSION REJECT PASS: 100/100",
     ):
         require_gate(contract_stdout.count(line) == 1, f"vnext-g01a missing or duplicate machine proof line: {line}")
+    resource_total = 0
+    for target, proofs in VNEXT_G01A_RESOURCE_PROOF_LINES.items():
+        proof_stdout = command_outputs[test_command(target, "--nocapture")].splitlines()
+        for prefix, expected in proofs:
+            pattern = re.compile(
+                rf"^{re.escape(prefix)}: ([1-9][0-9]*)/([1-9][0-9]*)$"
+            )
+            matches = [
+                match for line in proof_stdout if (match := pattern.fullmatch(line))
+            ]
+            require_gate(
+                len(matches) == 1,
+                f"vnext-g01a missing or duplicate resource machine proof: {target} {prefix}",
+            )
+            passed, total = (int(value) for value in matches[0].groups())
+            require_gate(
+                passed == total == expected,
+                f"vnext-g01a resource proof mismatch: {target} {prefix}",
+            )
+            resource_total += total
+    require_gate(
+        resource_total == assertions["resource_transaction_cases"],
+        "vnext-g01a resource proof total/assertion mismatch",
+    )
     for assertion_key, target, prefix in (
-        (
-            "resource_transaction_cases",
-            "vnext_resource_contract_tests",
-            "VNEXT RESOURCE TRANSACTION PASS",
-        ),
         (
             "fail_closed_cases",
             "vnext_contract_tests",
@@ -5572,7 +5634,12 @@ def self_test() -> int:
     )
     require_selftest(
         g01a_checkpoint["QUALITY_COMMANDS"] == VNEXT_G01A_QUALITY_COMMANDS
-        and len(g01a_checkpoint["evidence_command_matrix"]()) == 23,
+        and g01a_checkpoint["REQUIRED_RESOURCE_TESTS_BY_TARGET"]
+        == VNEXT_G01A_REQUIRED_RESOURCE_TESTS_BY_TARGET
+        and g01a_checkpoint["RESOURCE_PROOF_LINES"]
+        == VNEXT_G01A_RESOURCE_PROOF_LINES
+        and len(g01a_checkpoint["evidence_command_matrix"]())
+        == len(VNEXT_G01A_QUALITY_COMMANDS) + VNEXT_G01A_BOUNDED_TEST_COMMAND_COUNT,
         "vnext-g01a checkpoint/run_gate command matrix drift",
     )
     checkpoint_commands = g01a_checkpoint["evidence_command_matrix"]()
@@ -5609,8 +5676,10 @@ def self_test() -> int:
         "vnext-g01a outer validator must classify admission cold-compile commands explicitly",
     )
     require_selftest(
-        vnext_g01a_expected_test_summaries("vnext_resource_contract_tests")
-        == [("1", "0", "0", "6"), ("7", "0", "0", "0")]
+        vnext_g01a_expected_test_summaries(
+            VNEXT_G01A_RESOURCE_PANIC_ISOLATION_TARGET
+        )
+        == [("1", "0", "0", "1"), ("2", "0", "0", "0")]
         and vnext_g01a_expected_test_summaries("vnext_event_contract_tests")
         == [("1", "0", "0", "0")],
         "vnext-g01a outer validator test summary policy drift",
@@ -5650,7 +5719,7 @@ def self_test() -> int:
     bounded_selftest_row = g01a_checkpoint["selftest_bounded_row"](
         list(
             g01a_checkpoint["test_command"](
-                "vnext_resource_contract_tests", "--nocapture"
+                VNEXT_G01A_RESOURCE_PANIC_ISOLATION_TARGET, "--nocapture"
             )
         )
     )

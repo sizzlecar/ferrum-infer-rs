@@ -117,14 +117,56 @@ REQUIRED_UNIT_TESTS = {
     "unknown_inputs_fail_closed",
     "weight_schema_order_is_normalized_before_fingerprinting",
 }
-REQUIRED_RESOURCE_TESTS = {
-    "closing_root_rejects_every_parent_to_child_derivation",
-    "plan_runtime_close_recovery_is_ownership_safe",
-    "poisoned_bound_stream_retains_sequence_until_stream_drop",
-    "resource_capacity_concurrency_is_bounded",
-    "resource_transaction_abandon_panic_child",
-    "resource_transaction_contract_is_exhaustive",
-    "sequence_owner_drop_defers_blocking_backend_recovery",
+REQUIRED_RESOURCE_TESTS_BY_TARGET = {
+    "vnext_resource_capacity_contract_tests": {
+        "resource_capacity_concurrency_is_bounded",
+        "runtime_implementation_authority_is_exact",
+    },
+    "vnext_resource_transaction_lifecycle_tests": {
+        "transaction_lifecycle_contracts_are_exhaustive",
+    },
+    "vnext_resource_transaction_evidence_tests": {
+        "resource_transaction_abandon_panic_child",
+        "transaction_evidence_contracts_are_exhaustive",
+    },
+    "vnext_resource_sequence_activation_tests": {
+        "sequence_activation_contracts_are_exhaustive",
+    },
+    "vnext_resource_sequence_recovery_tests": {
+        "sequence_recovery_contracts_are_exhaustive",
+    },
+    "vnext_resource_recovery_authority_tests": {
+        "recovery_authority_contracts_are_exhaustive",
+    },
+    "vnext_resource_runtime_close_tests": {
+        "closing_root_rejects_every_parent_to_child_derivation",
+        "plan_runtime_close_recovery_is_ownership_safe",
+        "poisoned_bound_stream_retains_sequence_until_stream_drop",
+        "sequence_owner_drop_defers_blocking_backend_recovery",
+    },
+}
+RESOURCE_PANIC_ISOLATION_TARGET = "vnext_resource_transaction_evidence_tests"
+RESOURCE_PROOF_LINES = {
+    "vnext_resource_capacity_contract_tests": (
+        ("VNEXT RUNTIME IMPLEMENTATION AUTHORITY PASS", 13),
+        ("VNEXT RESOURCE CAPACITY THREAD BOUND PASS", 20),
+    ),
+    "vnext_resource_transaction_lifecycle_tests": (
+        ("VNEXT TRANSACTION LIFECYCLE PASS", 70),
+    ),
+    "vnext_resource_transaction_evidence_tests": (
+        ("VNEXT TRANSACTION EVIDENCE PASS", 69),
+    ),
+    "vnext_resource_sequence_activation_tests": (
+        ("VNEXT SEQUENCE ACTIVATION PASS", 53),
+    ),
+    "vnext_resource_sequence_recovery_tests": (
+        ("VNEXT SEQUENCE RECOVERY PASS", 48),
+    ),
+    "vnext_resource_recovery_authority_tests": (
+        ("VNEXT RECOVERY AUTHORITY PASS", 38),
+    ),
+    "vnext_resource_runtime_close_tests": (),
 }
 REQUIRED_EVENT_TESTS = {"vnext_event_replay_v5_contract"}
 REQUIRED_RESOLUTION_LIMITS_TESTS = {
@@ -168,7 +210,7 @@ REQUIRED_COMPILE_TESTS = {"vnext_compile"}
 REQUIRED_LEGACY_TESTS = {"legacy_backend_methods_are_mapped_82_of_82"}
 REQUIRED_TESTS_BY_TARGET = {
     "vnext_contract_tests": REQUIRED_UNIT_TESTS,
-    "vnext_resource_contract_tests": REQUIRED_RESOURCE_TESTS,
+    **REQUIRED_RESOURCE_TESTS_BY_TARGET,
     "vnext_event_contract_tests": REQUIRED_EVENT_TESTS,
     "vnext_resolution_limits_contract_tests": REQUIRED_RESOLUTION_LIMITS_TESTS,
     "vnext_device_operation_contract_tests": REQUIRED_DEVICE_OPERATION_TESTS,
@@ -235,7 +277,7 @@ EXPECTED_TRYBUILD_PASS_CASES = 2
 EXPECTED_TRYBUILD_FAIL_CASES = 78
 TEST_THREADS_ARG = "--test-threads=1"
 BOUNDED_RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
-BOUNDED_TEST_COMMAND_COUNT = 20
+BOUNDED_TEST_COMMAND_COUNT = 32
 BOUNDED_TEST_ENV_OVERRIDES = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "CARGO_BUILD_JOBS": "2",
@@ -1638,7 +1680,7 @@ def bounded_profile_for_command(command: list[str] | tuple[str, ...]) -> str:
         target_index = command.index("--test") + 1
         require(target_index < len(command), "bounded cargo test target is missing")
         target = command[target_index]
-        if target == "vnext_resource_contract_tests":
+        if target in REQUIRED_RESOURCE_TESTS_BY_TARGET:
             return "resource"
         if target == "vnext_compile":
             return "trybuild"
@@ -1880,7 +1922,7 @@ def summarize_bounded_execution(rows: list[dict[str, Any]]) -> dict[str, Any]:
     )
     require(
         profile_counts
-        == {"regular": 14, "admission": 2, "resource": 2, "trybuild": 2},
+        == {"regular": 14, "admission": 2, "resource": 14, "trybuild": 2},
         f"G01A bounded profile command counts mismatch: {profile_counts}",
     )
     return {
@@ -2193,12 +2235,33 @@ def parse_machine_proofs(target_stdout: dict[str, str]) -> dict[str, int]:
     }
     for label, line in exact_contract.items():
         require(contract_lines.count(line) == 1, f"missing or duplicate machine proof line for {label}: {line}")
+    resource_total = 0
+    for target, proofs in RESOURCE_PROOF_LINES.items():
+        for prefix, expected in proofs:
+            pattern = re.compile(
+                rf"^{re.escape(prefix)}: ([1-9][0-9]*)/([1-9][0-9]*)$"
+            )
+            matches = [
+                match
+                for line in lines_by_target[target]
+                if (match := pattern.fullmatch(line))
+            ]
+            require(
+                len(matches) == 1,
+                f"missing or duplicate resource machine proof line: {target} {prefix}",
+            )
+            passed, total = (int(value) for value in matches[0].groups())
+            require(
+                passed == total == expected,
+                f"resource machine proof count changed: {target} {prefix} "
+                f"expected={expected}/{expected} actual={passed}/{total}",
+            )
+            resource_total += total
+    require(
+        resource_total == EXPECTED_RESOURCE_CASES,
+        f"resource machine proof total changed: expected={EXPECTED_RESOURCE_CASES} actual={resource_total}",
+    )
     ratio_proofs = {
-        "resource_transaction_cases": (
-            "vnext_resource_contract_tests",
-            "VNEXT RESOURCE TRANSACTION PASS",
-            EXPECTED_RESOURCE_CASES,
-        ),
         "fail_closed_cases": (
             "vnext_contract_tests",
             "VNEXT FAIL CLOSED PASS",
@@ -2235,7 +2298,7 @@ def parse_machine_proofs(target_stdout: dict[str, str]) -> dict[str, int]:
             82,
         ),
     }
-    ratios: dict[str, int] = {}
+    ratios: dict[str, int] = {"resource_transaction_cases": resource_total}
     for label, (target, prefix, expected) in ratio_proofs.items():
         pattern = re.compile(
             rf"^{re.escape(prefix)}: ([1-9][0-9]*)/([1-9][0-9]*)$"
@@ -2282,7 +2345,7 @@ def collect_compile_evidence(
         )
         tests_by_target[target] = listed
         run_row = rows_by_command[test_command(target, "--nocapture")]
-        if target == "vnext_resource_contract_tests":
+        if target == RESOURCE_PANIC_ISOLATION_TARGET:
             validate_resource_test_run(
                 run_row, f"{target} tests", len(expected_tests)
             )
@@ -3019,10 +3082,6 @@ impl OperationDispatch {
     proof_stdout.update(
         {
             "vnext_contract_tests": contract_proofs,
-            "vnext_resource_contract_tests": (
-                f"VNEXT RESOURCE TRANSACTION PASS: "
-                f"{EXPECTED_RESOURCE_CASES}/{EXPECTED_RESOURCE_CASES}\n"
-            ),
             "vnext_event_contract_tests": (
                 f"VNEXT EVENT/REPLAY V5 PASS: "
                 f"{EXPECTED_EVENT_REPLAY_V5_CASES}/{EXPECTED_EVENT_REPLAY_V5_CASES}\n"
@@ -3041,6 +3100,10 @@ impl OperationDispatch {
             "vnext_legacy_map": "VNEXT LEGACY MAP PASS: 82/82\n",
         }
     )
+    for target, resource_proofs in RESOURCE_PROOF_LINES.items():
+        proof_stdout[target] = "".join(
+            f"{prefix}: {count}/{count}\n" for prefix, count in resource_proofs
+        )
     proofs = parse_machine_proofs(proof_stdout)
     require(
         proofs["resource_transaction_cases"] == EXPECTED_RESOURCE_CASES
@@ -3071,16 +3134,16 @@ impl OperationDispatch {
         "legacy_backend_methods_mapped",
     )
     resource_drift = copy.deepcopy(proof_stdout)
-    resource_drift["vnext_resource_contract_tests"] = resource_drift[
-        "vnext_resource_contract_tests"
+    resource_drift["vnext_resource_transaction_lifecycle_tests"] = resource_drift[
+        "vnext_resource_transaction_lifecycle_tests"
     ].replace(
-        f"{EXPECTED_RESOURCE_CASES}/{EXPECTED_RESOURCE_CASES}",
-        f"{EXPECTED_RESOURCE_CASES - 1}/{EXPECTED_RESOURCE_CASES - 1}",
+        "70/70",
+        "69/69",
     )
     expect_rejected(
         "resource proof count drift",
         lambda: parse_machine_proofs(resource_drift),
-        "machine proof count changed for resource_transaction_cases",
+        "resource machine proof count changed",
     )
     missing_event = copy.deepcopy(proof_stdout)
     missing_event["vnext_event_contract_tests"] = ""
@@ -3091,8 +3154,9 @@ impl OperationDispatch {
     )
     commands = evidence_command_matrix()
     require(
-        len(commands) == 23 and len({tuple(command) for command in commands}) == 23,
-        "self-test G01A command matrix must contain 23 unique commands",
+        len(commands) == len(QUALITY_COMMANDS) + BOUNDED_TEST_COMMAND_COUNT
+        and len({tuple(command) for command in commands}) == len(commands),
+        "self-test G01A command matrix must contain the exact unique command set",
     )
     cargo_test_commands = [
         command for command in commands if tuple(command[:2]) == ("cargo", "test")
@@ -3100,7 +3164,7 @@ impl OperationDispatch {
     require(
         len(cargo_test_commands) == BOUNDED_TEST_COMMAND_COUNT
         and all(command.count(TEST_THREADS_ARG) == 1 for command in cargo_test_commands),
-        "self-test G01A command matrix must contain 20 single-threaded cargo tests",
+        f"self-test G01A command matrix must contain {BOUNDED_TEST_COMMAND_COUNT} single-threaded cargo tests",
     )
     require(
         bounded_profile_for_command(admission_test_command("--list")) == "admission"
@@ -3113,19 +3177,19 @@ impl OperationDispatch {
             [
                 "test resource_transaction_abandon_panic_child ... ok",
                 "test resource_transaction_abandon_panic_child ... ok",
-                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out;",
-                "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;",
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out;",
+                "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;",
             ]
         )
     }
     validate_resource_test_run(
         resource_summary_row,
         "self-test resource child summary",
-        len(REQUIRED_RESOURCE_TESTS),
+        len(REQUIRED_RESOURCE_TESTS_BY_TARGET[RESOURCE_PANIC_ISOLATION_TARGET]),
     )
     missing_resource_child = copy.deepcopy(resource_summary_row)
     missing_resource_child["stdout"] = missing_resource_child["stdout"].replace(
-        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out;\n",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out;\n",
         "",
     )
     expect_rejected(
@@ -3133,12 +3197,12 @@ impl OperationDispatch {
         lambda: validate_resource_test_run(
             missing_resource_child,
             "self-test missing resource child summary",
-            len(REQUIRED_RESOURCE_TESTS),
+            len(REQUIRED_RESOURCE_TESTS_BY_TARGET[RESOURCE_PANIC_ISOLATION_TARGET]),
         ),
         "must contain one exact panic-isolation child summary",
     )
     bounded_row = selftest_bounded_row(
-        list(test_command("vnext_resource_contract_tests", "--nocapture"))
+        list(test_command(RESOURCE_PANIC_ISOLATION_TARGET, "--nocapture"))
     )
     validate_command_execution(bounded_row, "self-test valid bounded row")
 
