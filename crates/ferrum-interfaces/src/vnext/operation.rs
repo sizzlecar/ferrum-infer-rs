@@ -6,12 +6,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::{
-    classify_device_error, AllocationLifetime, BatchInvocationId, BatchStepId, BatchWorkShape,
-    BufferUsage, CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper,
-    ContractVersion, DefinitelyNotSubmittedRetryAuthority, DeviceCommandBatch, DeviceId,
-    DeviceRuntime, ExecutionIdentityEnvelope, ExecutionLane, ExecutionLaneId, IdentifiedFailure,
-    IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
-    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, OperationId,
+    classify_device_error, AllocationLifetime, BatchInvocationId, BatchParticipantTokenRange,
+    BatchStepId, BatchWorkShape, BufferUsage, CanonicalRational, CapabilityId, CompletionHandle,
+    CompletionReaper, ContractVersion, DefinitelyNotSubmittedRetryAuthority, DeviceCommandBatch,
+    DeviceId, DeviceRuntime, ExecutionIdentityEnvelope, ExecutionLane, ExecutionLaneId,
+    IdentifiedFailure, IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome,
+    LeasedBufferView, LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, OperationId,
     ParticipantNodeKey, PlanHash, PlanId, ProgramValueId, ProviderId, ProviderWorkspaceRequirement,
     QuantizationFormatId, ResolvedModelPlan, ResourceId, SemanticValue,
     TrustedActiveSequenceBinding, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
@@ -3489,6 +3489,10 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
 
     pub fn work_shape(&self) -> &BatchWorkShape {
         self.participants[0].work_shape()
+    }
+
+    pub fn participant_token_ranges(&self) -> &[BatchParticipantTokenRange] {
+        self.work_shape().participant_token_ranges()
     }
 }
 

@@ -88,6 +88,20 @@ fn thirty_two_participant_dispatch_is_one_physical_submission() {
     let step = admit_batch_step(&plan_resources, &batch);
     let node = &plan.payload().nodes()[0];
     let invocation = admit_batch_invocation(&plan_resources, &step, node.id());
+    let packed_ranges = invocation.work_shape().participant_token_ranges();
+    assert_eq!(packed_ranges.len(), 32);
+    for (index, range) in packed_ranges.iter().enumerate() {
+        assert_eq!(
+            range.participant(),
+            invocation.work_shape().participants()[index]
+        );
+        assert_eq!(
+            range.immediate_token_range(),
+            index as u64..index as u64 + 1
+        );
+        assert_eq!(range.immediate_tokens(), 1);
+        assert_eq!(range.full_input_tokens(), 1);
+    }
     let identities = step
         .participant_frames()
         .zip(&active_bindings)

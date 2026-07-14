@@ -25,6 +25,10 @@ impl RuntimePolicy for Policy {
         4
     }
 
+    fn maximum_scheduled_tokens(&self) -> u64 {
+        4
+    }
+
     fn dynamic_storage_profile_order(&self) -> &[DynamicStorageProfile] {
         &self.dynamic_storage_profile_order
     }

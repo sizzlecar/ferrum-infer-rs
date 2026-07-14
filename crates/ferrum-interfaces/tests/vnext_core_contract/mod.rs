@@ -1133,6 +1133,7 @@ pub(crate) fn policy_with(
         },
         serde_json::from_value(json!({
             "maximum_queue_depth": 8,
+            "maximum_scheduled_tokens": 4096,
             "allow_defer": true,
             "cancellation_check_interval_steps": 1
         }))
@@ -1143,6 +1144,7 @@ pub(crate) fn policy_with(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AdversarialRuntimePolicy {
     pub(crate) maximum_active_sequences: u32,
+    pub(crate) maximum_scheduled_tokens: u64,
     pub(crate) dynamic_storage_profile_order: Vec<DynamicStorageProfile>,
 }
 
@@ -1161,6 +1163,10 @@ impl RuntimePolicy for AdversarialRuntimePolicy {
 
     fn maximum_active_sequences(&self) -> u32 {
         self.maximum_active_sequences
+    }
+
+    fn maximum_scheduled_tokens(&self) -> u64 {
+        self.maximum_scheduled_tokens
     }
 
     fn dynamic_storage_profile_order(&self) -> &[DynamicStorageProfile] {

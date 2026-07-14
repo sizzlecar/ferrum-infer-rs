@@ -1,11 +1,12 @@
 use super::{
     invalid_plan, node_weight_requirements, provider_resource_estimator_input_fingerprint,
-    validate_active_sequence_ceiling, validate_program_bindings, validate_semantic_binding,
-    workspace_base_id, BTreeMap, BTreeSet, BufferUsage, CapabilityCatalog, CapabilityId,
-    DynamicStorageRequirement, NodeId, OperationPlanningHandle, OperationPlanningRegistry,
-    OperationRegistryAuthority, OperationResourceEstimateRequest, PlanNodeResolution,
-    PlanProviderRejectReason, PreparedModelFamily, ProviderCompatibilityRequest, ProviderId,
-    ProviderResourcePlan, ResolvedValueBinding, RuntimePolicy, VNextError,
+    validate_active_sequence_ceiling, validate_program_bindings, validate_scheduled_token_ceiling,
+    validate_semantic_binding, workspace_base_id, BTreeMap, BTreeSet, BufferUsage,
+    CapabilityCatalog, CapabilityId, DynamicStorageRequirement, NodeId, OperationPlanningHandle,
+    OperationPlanningRegistry, OperationRegistryAuthority, OperationResourceEstimateRequest,
+    PlanNodeResolution, PlanProviderRejectReason, PreparedModelFamily,
+    ProviderCompatibilityRequest, ProviderId, ProviderResourcePlan, ResolvedValueBinding,
+    RuntimePolicy, VNextError,
 };
 
 impl PlanNodeResolution {
@@ -88,6 +89,7 @@ impl PlanNodeResolution {
     ) -> Result<Self, VNextError> {
         policy.validate()?;
         validate_active_sequence_ceiling(policy.maximum_active_sequences())?;
+        validate_scheduled_token_ceiling(policy.maximum_scheduled_tokens())?;
         if values.is_empty() {
             return Err(invalid_plan(format!(
                 "node `{node_id}` has no physical value resolution"

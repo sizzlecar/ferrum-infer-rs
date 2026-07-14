@@ -3,14 +3,14 @@ use super::{
     joint_candidate_components, joint_partial_precedes, node_weight_requirements,
     provider_resource_estimator_input_fingerprint, static_contiguous_storage_profile,
     storage_incompatible_resource_ids, tensor_storage_layout_fingerprint,
-    validate_active_sequence_ceiling, validate_program_bindings, validate_semantic_binding,
-    workspace_base_id, workspace_storage_layout_fingerprint, AliasPolicy, AllocationKind,
-    AllocationLifetime, BTreeMap, BTreeSet, BufferUsage, CanonicalValueBinding, CapabilityCatalog,
-    CapabilityId, DynamicResourceDescriptor, DynamicStorageContract, DynamicStorageProfile,
-    DynamicStorageRequirement, ElementType, ExecutionPlanPayload, GlobalValueRange,
-    JointComponentSolution, JointPartialSelection, JointProviderCandidate,
-    JointProviderStorageSelection, JointSelectionObjective, MemoryPlan, NodeId,
-    OperationDescriptor, OperationRegistryAuthority, PlanBuildRequest, PlanExactAlias,
+    validate_active_sequence_ceiling, validate_program_bindings, validate_scheduled_token_ceiling,
+    validate_semantic_binding, workspace_base_id, workspace_storage_layout_fingerprint,
+    AliasPolicy, AllocationKind, AllocationLifetime, BTreeMap, BTreeSet, BufferUsage,
+    CanonicalValueBinding, CapabilityCatalog, CapabilityId, DynamicResourceDescriptor,
+    DynamicStorageContract, DynamicStorageProfile, DynamicStorageRequirement, ElementType,
+    ExecutionPlanPayload, GlobalValueRange, JointComponentSolution, JointPartialSelection,
+    JointProviderCandidate, JointProviderStorageSelection, JointSelectionObjective, MemoryPlan,
+    NodeId, OperationDescriptor, OperationRegistryAuthority, PlanBuildRequest, PlanExactAlias,
     PlanExactAliasKind, PlanHash, PlanHashMaterial, PlanId, PlanNode, PlanNodeResolution,
     PlanProviderRejectReason, PlanStateEffect, PreparedModelFamily, ProgramNode, ProgramValueId,
     ProviderCompatibilityRequest, ProviderId, ProviderResourcePlan, ProviderSelection,
@@ -34,6 +34,8 @@ impl ExecutionPlan {
         request.policy.validate()?;
         let maximum_active_sequences = request.policy.maximum_active_sequences();
         validate_active_sequence_ceiling(maximum_active_sequences)?;
+        let maximum_scheduled_tokens = request.policy.maximum_scheduled_tokens();
+        validate_scheduled_token_ceiling(maximum_scheduled_tokens)?;
         let operation_registry_authority = request
             .node_resolutions
             .first()
@@ -167,6 +169,7 @@ impl ExecutionPlan {
             policy_capacity,
             memory_reserve,
             maximum_active_sequences,
+            maximum_scheduled_tokens,
             &nodes,
             &selected_resource_profiles,
         )?;
@@ -1247,9 +1250,23 @@ impl ExecutionPlan {
         policy_capacity_bytes: u64,
         reserve_bytes: u64,
         maximum_active_sequences: u32,
+        maximum_scheduled_tokens: u64,
         nodes: &[PlanNode],
         selected_resource_profiles: &BTreeMap<ResourceId, DynamicStorageProfile>,
     ) -> Result<MemoryPlan, VNextError> {
+        validate_scheduled_token_ceiling(maximum_scheduled_tokens)?;
+        let program_inputs = family
+            .program()
+            .inputs()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let program_outputs = family
+            .program()
+            .outputs()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let mut values = BTreeMap::<ResourceId, ValueAllocationAccumulator>::new();
         let mut static_allocations = Vec::new();
         let mut dynamic_descriptors = Vec::new();
@@ -1271,7 +1288,15 @@ impl ExecutionPlan {
                         .offset_bytes()
                         .checked_add(component.length_bytes())
                         .ok_or_else(|| invalid_plan("resource byte range overflows u64"))?;
-                    let demand = Self::value_resource_demand(family, binding.value_id(), end)?;
+                    let demand = Self::value_resource_demand(
+                        family,
+                        binding.value_id(),
+                        binding.usage(),
+                        end,
+                        maximum_scheduled_tokens,
+                        &program_inputs,
+                        &program_outputs,
+                    )?;
                     values
                         .entry(component.resource_id().clone())
                         .and_modify(|allocation| {
@@ -1491,7 +1516,11 @@ impl ExecutionPlan {
     pub(super) fn value_resource_demand(
         family: &PreparedModelFamily,
         value_id: &ProgramValueId,
+        usage: BufferUsage,
         minimum_bytes: u64,
+        maximum_scheduled_tokens: u64,
+        program_inputs: &BTreeSet<ProgramValueId>,
+        program_outputs: &BTreeSet<ProgramValueId>,
     ) -> Result<ValueResourceDemand, VNextError> {
         if family
             .program()
@@ -1507,6 +1536,17 @@ impl ExecutionPlan {
             .iter()
             .find(|state| &state.value_id == value_id);
         let Some(state) = state else {
+            if !program_inputs.contains(value_id)
+                && !program_outputs.contains(value_id)
+                && usage == BufferUsage::Activations
+            {
+                validate_scheduled_token_ceiling(maximum_scheduled_tokens)?;
+                return Ok(ValueResourceDemand::TokenScaled {
+                    lifetime: AllocationLifetime::Step,
+                    bytes_per_token: minimum_bytes,
+                    maximum_tokens: maximum_scheduled_tokens,
+                });
+            }
             return Ok(ValueResourceDemand::Fixed {
                 lifetime: AllocationLifetime::Request,
             });

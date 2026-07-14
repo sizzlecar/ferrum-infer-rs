@@ -1050,7 +1050,7 @@ fn rejected_plan_mutation(fixture: &PlanFixture, mutate: impl FnOnce(&mut Value)
 
 #[test]
 fn unknown_inputs_fail_closed() {
-    const EXPECTED: usize = 62;
+    const EXPECTED: usize = 63;
     let fixture = plan_fixture(0);
     let mut passed = 0;
     macro_rules! reject {
@@ -1213,10 +1213,16 @@ fn unknown_inputs_fail_closed() {
     assert!(serde_json::from_value::<ResolvedRuntimePolicy>(zero_policy_wire).is_err());
     passed += 1;
 
+    let mut zero_token_policy_wire = serde_json::to_value(&fixture.policy).unwrap();
+    zero_token_policy_wire["admission"]["maximum_scheduled_tokens"] = json!(0);
+    assert!(serde_json::from_value::<ResolvedRuntimePolicy>(zero_token_policy_wire).is_err());
+    passed += 1;
+
     let rejected_planning =
         TestPlanningRegistry::new(&fixture.catalog, 64, 32, EstimateBehavior::Correct);
     let malicious = AdversarialRuntimePolicy {
         maximum_active_sequences: 0,
+        maximum_scheduled_tokens: 4096,
         dynamic_storage_profile_order: vec![contiguous_storage_profile()],
     };
     let planning = rejected_planning.planning();
@@ -1236,6 +1242,7 @@ fn unknown_inputs_fail_closed() {
 
     let malicious = AdversarialRuntimePolicy {
         maximum_active_sequences: 0,
+        maximum_scheduled_tokens: 4096,
         dynamic_storage_profile_order: vec![contiguous_storage_profile()],
     };
     assert!(ExecutionPlan::build(

@@ -3,6 +3,7 @@ use super::{
     ExecutionFrameId, NodeId, RequestAuthorityId, ResourceWorkShape, SequenceAuthorityId,
     Serialize, Sha256, TokenSpanWork, VNextError,
 };
+use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepResourceAdmissionRequest {
@@ -133,6 +134,56 @@ pub struct BatchParticipantTokenSpan {
     token_span: TokenSpanWork,
 }
 
+/// Exact packed-token projection for one participant in a scheduler step.
+/// The range addresses the shared batch transient arena; it is derived from
+/// the canonical participant work and cannot be supplied independently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BatchParticipantTokenRange {
+    participant: BatchParticipantAuthority,
+    immediate_start_token: u64,
+    immediate_end_token: u64,
+    full_input_tokens: u64,
+}
+
+impl BatchParticipantTokenRange {
+    fn new(
+        participant: BatchParticipantAuthority,
+        immediate_start_token: u64,
+        immediate_end_token: u64,
+        full_input_tokens: u64,
+    ) -> Result<Self, VNextError> {
+        if immediate_start_token >= immediate_end_token
+            || full_input_tokens < immediate_end_token - immediate_start_token
+        {
+            return Err(invalid_resource(
+                "batch participant packed-token range is empty or exceeds its full input",
+            ));
+        }
+        Ok(Self {
+            participant,
+            immediate_start_token,
+            immediate_end_token,
+            full_input_tokens,
+        })
+    }
+
+    pub const fn participant(&self) -> BatchParticipantAuthority {
+        self.participant
+    }
+
+    pub fn immediate_token_range(&self) -> Range<u64> {
+        self.immediate_start_token..self.immediate_end_token
+    }
+
+    pub const fn immediate_tokens(&self) -> u64 {
+        self.immediate_end_token - self.immediate_start_token
+    }
+
+    pub const fn full_input_tokens(&self) -> u64 {
+        self.full_input_tokens
+    }
+}
+
 impl BatchParticipantTokenSpan {
     pub(super) fn new(participant: BatchParticipantAuthority, token_span: TokenSpanWork) -> Self {
         Self {
@@ -157,6 +208,7 @@ impl BatchParticipantTokenSpan {
 pub struct BatchWorkShape {
     participants: Vec<BatchParticipantAuthority>,
     participant_work: Vec<BatchParticipantTokenSpan>,
+    participant_token_ranges: Vec<BatchParticipantTokenRange>,
     resource_work: ResourceWorkShape,
     fingerprint: String,
 }
@@ -178,6 +230,22 @@ impl BatchWorkShape {
             .iter()
             .map(BatchParticipantTokenSpan::participant)
             .collect::<Vec<_>>();
+        let mut next_token = 0_u64;
+        let participant_token_ranges = participant_work
+            .iter()
+            .map(|work| {
+                let start = next_token;
+                next_token = next_token
+                    .checked_add(work.token_span().immediate_tokens())
+                    .ok_or_else(|| invalid_resource("packed batch token range overflows u64"))?;
+                BatchParticipantTokenRange::new(
+                    work.participant(),
+                    start,
+                    next_token,
+                    work.token_span().full_input_tokens(),
+                )
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
         let resource_work = ResourceWorkShape::from_token_spans(
             participant_work
                 .iter()
@@ -187,20 +255,23 @@ impl BatchWorkShape {
         if resource_work.immediate_sequences()
             != u32::try_from(participants.len())
                 .map_err(|_| invalid_resource("batch work participant count exceeds u32"))?
+            || next_token != resource_work.immediate_tokens()
         {
             return Err(invalid_resource(
-                "batch work shape sequence count differs from participant evidence",
+                "batch work shape aggregate differs from participant evidence",
             ));
         }
         #[derive(Serialize)]
         struct FingerprintInput<'a> {
             domain: &'static str,
             participant_work: &'a [BatchParticipantTokenSpan],
+            participant_token_ranges: &'a [BatchParticipantTokenRange],
             resource_work_fingerprint: &'a str,
         }
         let input = FingerprintInput {
-            domain: "ferrum.runtime-vnext.batch-work-shape.v2",
+            domain: "ferrum.runtime-vnext.batch-work-shape.v3",
             participant_work: &participant_work,
+            participant_token_ranges: &participant_token_ranges,
             resource_work_fingerprint: resource_work.fingerprint(),
         };
         let bytes = serde_json::to_vec(&input).map_err(|error| {
@@ -209,6 +280,7 @@ impl BatchWorkShape {
         Ok(Self {
             participants,
             participant_work,
+            participant_token_ranges,
             resource_work,
             fingerprint: format!("{:x}", Sha256::digest(bytes)),
         })
@@ -220,6 +292,10 @@ impl BatchWorkShape {
 
     pub fn participant_work(&self) -> &[BatchParticipantTokenSpan] {
         &self.participant_work
+    }
+
+    pub fn participant_token_ranges(&self) -> &[BatchParticipantTokenRange] {
+        &self.participant_token_ranges
     }
 
     pub fn resource_work(&self) -> &ResourceWorkShape {
