@@ -252,6 +252,34 @@ impl CudaDeviceCommand {
         })
     }
 
+    pub(crate) fn operation_with_host_storage_and_blas(
+        operation: &'static str,
+        regions: Vec<CudaBufferRegion>,
+        host_storage: Vec<Box<[u8]>>,
+        enqueue: impl FnOnce(
+                &CudaStream,
+                &CudaBlas,
+                &[CudaBufferRegion],
+                &[Box<[u8]>],
+            ) -> Result<(), CudaDeviceRuntimeError>
+            + Send
+            + 'static,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let runtime_instance = common_runtime_instance(&regions)?;
+        if host_storage.iter().any(|storage| storage.is_empty()) {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA operation host storage contains an empty region",
+            ));
+        }
+        Ok(Self {
+            runtime_instance,
+            operation,
+            regions,
+            host_storage,
+            enqueue: Some(Box::new(enqueue)),
+        })
+    }
+
     fn transfer(
         runtime_instance: u64,
         operation: &'static str,

@@ -5,15 +5,16 @@ use std::collections::BTreeSet;
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
-    dense_linear_contract, dense_swiglu_contract, residual_add_contract, rms_norm_contract,
-    token_embedding_contract, AttributeId, BatchedOperationInvocation, CapabilityId,
-    ContractVersion, DeviceId, DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile,
-    DynamicStorageRequirement, DynamicStorageView, ElementType, OperationContract,
-    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    OperationRuntimeRegistry, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
-    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError,
-    WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
+    dense_linear_contract, dense_swiglu_contract, gated_delta_recurrent_attention_contract,
+    residual_add_contract, rms_norm_contract, token_embedding_contract, AttributeId,
+    BatchedOperationInvocation, CapabilityId, ContractVersion, DeviceId, DeviceRuntime,
+    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
+    ElementType, OperationContract, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationResourceEstimator, OperationRuntimeRegistry, ProfilePhase, ProviderId,
+    ProviderStorageBindingRequirement, ResolvedTensorLayout, ResolvedValueBinding,
+    ResolvedValueRole, SemanticValue, VNextError, WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID,
+    DENSE_SWIGLU_F16_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     RESIDUAL_ADD_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
     TOKEN_EMBEDDING_OPERATION_ID,
 };
@@ -46,10 +47,14 @@ pub fn cuda_vnext_runtime_config(
             include_str!("vnext_runtime.rs").as_bytes(),
             include_str!("vnext_ops.rs").as_bytes(),
             include_str!("vnext_ops/transformer.rs").as_bytes(),
+            include_str!("vnext_ops/transformer/attention.rs").as_bytes(),
             crate::ptx::EMBEDDING_LOOKUP.as_bytes(),
             crate::ptx::RMS_NORM.as_bytes(),
             crate::ptx::FUSED_SILU_MUL.as_bytes(),
             crate::ptx::RESIDUAL_ADD.as_bytes(),
+            crate::ptx::SANDWICH_NORM.as_bytes(),
+            crate::ptx::LINEAR_ATTENTION.as_bytes(),
+            crate::ptx::GATED_DELTA_RULE.as_bytes(),
         ]),
         capabilities: cuda_vnext_capabilities()?,
         dynamic_storage_profiles: BTreeSet::from([DynamicStorageProfile::new(
@@ -66,6 +71,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         DENSE_LINEAR_F16_CAPABILITY_ID,
         DENSE_SWIGLU_F16_CAPABILITY_ID,
         RESIDUAL_ADD_F16_CAPABILITY_ID,
+        GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     ]
     .into_iter()
     .map(CapabilityId::new)
@@ -82,6 +88,7 @@ pub fn cuda_vnext_operation_registry(
         Box::new(dense_linear_contract().map_err(contract_error)?),
         Box::new(dense_swiglu_contract().map_err(contract_error)?),
         Box::new(residual_add_contract().map_err(contract_error)?),
+        Box::new(gated_delta_recurrent_attention_contract().map_err(contract_error)?),
     ];
     let providers: Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> = vec![
         Box::new(CudaTokenEmbeddingProvider::new(runtime)?),
@@ -89,6 +96,9 @@ pub fn cuda_vnext_operation_registry(
         Box::new(transformer::CudaDenseLinearProvider::new(runtime)?),
         Box::new(transformer::CudaDenseSwiGluProvider::new(runtime)?),
         Box::new(transformer::CudaResidualAddProvider::new(runtime)?),
+        Box::new(transformer::CudaGatedDeltaRecurrentAttentionProvider::new(
+            runtime,
+        )?),
     ];
     OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
 }
