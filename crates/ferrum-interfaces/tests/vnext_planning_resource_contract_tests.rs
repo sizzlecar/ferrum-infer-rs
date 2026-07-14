@@ -542,6 +542,13 @@ fn provider_workspace_formulas_are_actual_shape_checked_and_wire_closed() {
         36
     );
     assert_eq!(
+        DynamicResourceDemand::affine(5, 7, 8, 3, 32)
+            .unwrap()
+            .evaluate_bytes(&shape)
+            .unwrap(),
+        69
+    );
+    assert_eq!(
         DynamicResourceDemand::pages(11, 8)
             .unwrap()
             .evaluate_bytes(&shape)
@@ -567,6 +574,14 @@ fn provider_workspace_formulas_are_actual_shape_checked_and_wire_closed() {
     )
     .unwrap();
     assert_eq!(aligned.evaluate_bytes(&shape).unwrap(), 32);
+    let affine = ProviderWorkspaceRequirement::from_formula(
+        ProviderWorkspaceSizeFormula::affine(5, 7, 3).unwrap(),
+        16,
+        ProviderWorkspaceScope::Invocation,
+        contiguous_storage_requirement(),
+    )
+    .unwrap();
+    assert_eq!(affine.evaluate_bytes(&shape).unwrap(), 80);
     assert!(ProviderWorkspaceRequirement::from_formula(
         ProviderWorkspaceSizeFormula::tokens(4).unwrap(),
         16,
@@ -591,6 +606,15 @@ fn provider_workspace_formulas_are_actual_shape_checked_and_wire_closed() {
 
     assert!(DynamicResourceDemand::tokens(u64::MAX, 2).is_err());
     assert!(DynamicResourceDemand::actual_sequences(u64::MAX, 2).is_err());
+    assert!(DynamicResourceDemand::affine(1, u64::MAX, 2, 1, 2).is_err());
+    assert!(ProviderWorkspaceSizeFormula::affine(1, 0, 0).is_err());
+    assert!(ProviderWorkspaceRequirement::from_formula(
+        ProviderWorkspaceSizeFormula::affine(1, 1, 1).unwrap(),
+        16,
+        ProviderWorkspaceScope::Sequence,
+        contiguous_storage_requirement(),
+    )
+    .is_err());
     assert!(
         serde_json::from_value::<ProviderWorkspaceSizeFormula>(json!({
             "actual_sequences": {
