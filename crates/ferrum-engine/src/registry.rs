@@ -1457,6 +1457,28 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                     {
                         info!("Using Qwen3.5/Qwen3.6 CUDA backend executor");
                         let model_dir = std::path::Path::new(&model_path);
+                        let prepared_family = if model_def.architecture
+                            == ferrum_models::Architecture::Qwen35
+                        {
+                            let prepared =
+                                ferrum_models::vnext::qwen35::prepare_from_model_dir(model_dir)?;
+                            let family_fingerprint = prepared
+                                .fingerprint()
+                                .map_err(|error| FerrumError::model(error.to_string()))?;
+                            let program_fingerprint = prepared
+                                .program()
+                                .fingerprint()
+                                .map_err(|error| FerrumError::model(error.to_string()))?;
+                            info!(
+                                family_id = %prepared.family_id(),
+                                family_fingerprint,
+                                program_fingerprint,
+                                "Prepared typed vNext Qwen3.5 model family before CUDA weight allocation"
+                            );
+                            Some(Arc::new(prepared))
+                        } else {
+                            None
+                        };
                         let llm = ferrum_models::models::Qwen35BackendModel::<
                             ferrum_kernels::backend::cuda::CudaBackend,
                         >::from_definition_with_native_safetensors(
@@ -1466,10 +1488,15 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                             .to_model_info(config.engine_config.model.model_id.to_string());
                         model_info.dtype = DataType::FP16;
                         model_info.device = config.device.clone();
-                        return Ok(Arc::new(ferrum_models::LlmExecutor::new(
-                            Box::new(llm),
-                            model_info,
-                        )));
+                        let executor = match prepared_family {
+                            Some(prepared) => ferrum_models::LlmExecutor::new_with_vnext_family(
+                                Box::new(llm),
+                                model_info,
+                                prepared,
+                            ),
+                            None => ferrum_models::LlmExecutor::new(Box::new(llm), model_info),
+                        };
+                        return Ok(Arc::new(executor));
                     }
                     #[cfg(not(feature = "cuda"))]
                     {
