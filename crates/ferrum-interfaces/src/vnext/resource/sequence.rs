@@ -95,16 +95,15 @@ where
             fit_policy,
             pressure_action,
         } = request;
-        let immediate_shape = work_shape.immediate_shape();
-        let fit_shape = match fit_policy {
-            AdmissionFitPolicy::ImmediateOnly => immediate_shape,
-            AdmissionFitPolicy::FullInputMustFit => work_shape.fit_shape(),
-        };
+        // Request-lifetime values own the complete canonical input/output for
+        // every prefill chunk. This is live request state, not a reservation
+        // for future Sequence/Step/Invocation capacity.
+        let request_shape = work_shape.fit_shape();
         let (demand, requested_slices) = self.scoped_demand(
             AllocationLifetime::Request,
             None,
-            immediate_shape,
-            fit_shape,
+            request_shape,
+            request_shape,
             fit_policy,
             pressure_action,
         )?;

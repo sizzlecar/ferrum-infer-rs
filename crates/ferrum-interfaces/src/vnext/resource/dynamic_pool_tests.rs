@@ -656,6 +656,14 @@ fn token_span(tokens: usize) -> TokenSpanWork {
     TokenSpanWork::from_token_ids(&token_ids, 0..token_ids.len()).unwrap()
 }
 
+fn chunked_work(tokens: usize, immediate_range: std::ops::Range<usize>) -> ResourceWorkShape {
+    let token_ids = (0..tokens)
+        .map(|token| u32::try_from(token).unwrap())
+        .collect::<Vec<_>>();
+    ResourceWorkShape::single(TokenSpanWork::from_token_ids(&token_ids, immediate_range).unwrap())
+        .unwrap()
+}
+
 fn request_admission() -> RequestResourceAdmissionRequest {
     RequestResourceAdmissionRequest::new(
         work(1),
@@ -1758,6 +1766,59 @@ fn scoped_demand_merges_per_pool_and_release_coalesces_extents() {
         128
     );
     assert_eq!(chunk.live_segments, 0);
+}
+
+#[test]
+fn request_token_backing_covers_nonzero_chunk_source_range() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'a',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 256)
+        .unwrap();
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    let request = RequestResourceAdmissionRequest::new(
+        chunked_work(4, 2..3),
+        AdmissionFitPolicy::FullInputMustFit,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let admitted = match binding
+        .try_admit_request(
+            request,
+            RunId::new("run/chunked-request-backing").unwrap(),
+            RequestIdentity::new("request/chunked-request-backing").unwrap(),
+        )
+        .unwrap()
+    {
+        RequestResourceAdmissionDecision::Admitted(admitted) => admitted,
+        _ => panic!("resident full-input request backing must admit"),
+    };
+
+    assert_eq!(admitted.work_shape().immediate_tokens(), 1);
+    assert_eq!(admitted.work_shape().fit_tokens(), 4);
+    assert_eq!(admitted.backing_slices().len(), 1);
+    assert_eq!(admitted.backing_slices()[0].size_bytes(), 256);
+    let snapshot = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .snapshot()
+        .unwrap();
+    assert_eq!(snapshot.domains()[0].used().get(), 256);
+
+    drop(admitted);
+    drop(binding);
+    close_dynamic_test_root(harness.root);
 }
 
 #[test]

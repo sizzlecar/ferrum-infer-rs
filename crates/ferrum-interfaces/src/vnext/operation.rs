@@ -3456,7 +3456,7 @@ impl<'a, B> OperationInvocation<'a, B> {
                         descriptor.evaluate_request_bytes(participant.work_shape())?
                     }
                     AllocationLifetime::Request => descriptor
-                        .evaluate_request_bytes(participant.request_resources().work_shape())?,
+                        .evaluate_fit_request_bytes(participant.request_resources().work_shape())?,
                     AllocationLifetime::Plan => {
                         return Err(invalid_operation(format!(
                             "plan-lifetime resource `{resource_id}` cannot use dynamic backing"
