@@ -1,0 +1,7 @@
+{
+  "result": "REJECT",
+  "failure_class": "vast_ssh_bootstrap_unreachable",
+  "detail": "cur_state running, actual_status null, SSH connection refused for 120 seconds",
+  "ended_at": "2026-07-15T04:11:07+08:00",
+  "next_hypothesis": "retry another offer with platform SSH startup kept minimal; install dependencies only after SSH works"
+}

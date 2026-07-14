@@ -1,0 +1,7 @@
+{
+  "result": "REJECT",
+  "failure_class": "vast_ssh_bootstrap_unreachable",
+  "detail": "second offer: cur_state running, actual_status null, SSH connection refused for 180 seconds",
+  "ended_at": "2026-07-15T04:16:21+08:00",
+  "next_hypothesis": "do not rent again for this failure class; validate CUDA source through existing or non-paid Linux CUDA build infrastructure"
+}
