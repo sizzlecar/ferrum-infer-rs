@@ -52,6 +52,10 @@ impl<'archive> SafetensorsTensor<'archive> {
         self.dtype
     }
 
+    pub fn element_type(&self) -> Option<ElementType> {
+        element_type(self.dtype)
+    }
+
     pub fn shape(&self) -> &'archive [u64] {
         self.shape
     }
@@ -141,6 +145,10 @@ impl SafetensorsArchive {
 
     pub fn tensor_count(&self) -> usize {
         self.tensors.len()
+    }
+
+    pub fn tensor_names(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.tensors.keys().map(String::as_str)
     }
 }
 
