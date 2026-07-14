@@ -106,6 +106,10 @@ impl<R> StaticProvisioningLease<R>
 where
     R: DeviceRuntime,
 {
+    pub(crate) fn runtime(&self) -> &Arc<R> {
+        &self.runtime
+    }
+
     pub(super) fn new(
         runtime: Arc<R>,
         identity: &ResourceTransactionIdentity,

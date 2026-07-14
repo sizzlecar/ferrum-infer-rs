@@ -61,6 +61,8 @@ mod invocation;
 pub use invocation::*;
 mod transaction;
 pub use transaction::*;
+mod static_initialization;
+pub use static_initialization::*;
 
 #[cfg(test)]
 #[path = "resource/dynamic_pool_tests.rs"]
