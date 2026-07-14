@@ -117,6 +117,73 @@ REQUIRED_UNIT_TESTS = {
     "unknown_inputs_fail_closed",
     "weight_schema_order_is_normalized_before_fingerprinting",
 }
+REQUIRED_CORE_TESTS_BY_TARGET = {
+    "vnext_planning_resource_contract_tests": {
+        "operation_resource_contract_requires_explicit_presence_and_alignment",
+        "execution_memory_is_core_owned_and_exact",
+        "minimum_runnable_sums_lifetime_minima_and_sequential_invocation_peak",
+        "runtime_capacity_reserve_and_concurrency_are_typed_planning_inputs",
+        "maximum_active_sequence_ceiling_is_nonzero_and_o_graph",
+        "theoretical_ceiling_over_u64_is_canonical_evidence_not_capacity_policy",
+        "state_capacity_demand_is_explicit_checked_and_wire_closed",
+        "provider_workspace_formulas_are_actual_shape_checked_and_wire_closed",
+    },
+    "vnext_plan_wire_contract_tests": {
+        "dynamic_descriptor_and_memory_plan_standalone_wire_are_checked",
+        "execution_plan_is_deterministic_100_of_100",
+        "execution_plan_schema_round_trip_100_of_100",
+        "breaking_schema_versions_are_rejected_100_of_100",
+        "forged_self_hashed_plan_is_rejected_by_semantic_rebuild",
+        "externally_trusted_node_resolution_cannot_be_replaced_by_wire_data",
+        "self_consistent_wire_resource_estimate_and_memory_mutation_is_rejected",
+        "self_consistent_wire_provider_selection_is_rejected",
+        "typed_planning_registry_invokes_real_contract_and_estimator_once",
+    },
+    "vnext_provider_selection_contract_tests": {
+        "provider_implementation_fingerprint_is_plan_hashed_and_revalidated",
+        "planning_registry_missing_duplicate_and_mismatched_entries_fail_before_plan",
+        "provider_raw_estimate_identity_input_and_output_are_revalidated_by_core",
+        "preferred_provider_is_only_a_core_validated_preference",
+        "storage_incompatible_preference_falls_back_with_canonical_evidence",
+    },
+    "vnext_weight_layout_contract_tests": {
+        "physical_weight_layout_tree_accepts_dense_fixture",
+        "physical_weight_layout_tree_accepts_grouped_quantized_axis_index_fixture",
+        "physical_weight_layout_tree_accepts_recursive_quantized_expert_stack_fixture",
+        "weight_schema_order_is_normalized_before_fingerprinting",
+        "blocked_weight_layout_requires_explicit_exact_or_zero_fill_padding",
+        "physical_weight_layout_tree_rejects_invalid_shape_reuse_padding_overflow_and_limits",
+        "blocked_tensor_storage_requires_explicit_exact_or_zero_fill_padding",
+        "model_program_rejects_duplicate_declared_outputs",
+    },
+    "vnext_resolution_contract_tests": {
+        "resolved_model_plan_closes_all_contract_links",
+        "resolved_model_plan_initial_construction_requires_verified_evidence_context",
+        "resolved_source_evidence_rejects_raw_bytes_and_provenance_tampering",
+        "resolved_source_parser_identity_and_determinism_are_enforced",
+        "resolved_external_device_catalog_runtime_and_node_resolution_are_exact",
+        "resolved_model_family_identity_is_unique_and_fail_closed",
+        "resolution_source_matrix_rejects_forbidden_binding_before_plan",
+        "unknown_inputs_fail_closed",
+        "provider_catalog_and_reference_oracle_fail_closed",
+        "prepared_family_wire_requires_typed_registry_reconstruction",
+        "mandatory_object_safe_contracts_accept_trait_objects",
+    },
+    "vnext_execution_graph_contract_tests": {
+        "execution_alias_must_alias_builds_exact_equivalence_and_single_allocation",
+        "execution_alias_may_alias_supports_distinct_or_exact_storage",
+        "execution_alias_rejects_partial_and_wrong_input_overlap",
+        "execution_alias_rejects_overwrite_before_last_consumer",
+        "execution_state_effect_graph_orders_raw_war_waw",
+        "execution_state_read_only_nodes_remain_independent",
+        "execution_alias_effect_wire_mutations_are_rejected",
+    },
+    "vnext_source_audit_contract_tests": {
+        "generic_contracts_have_zero_architecture_names",
+        "silent_success_defaults_are_absent",
+        "failure_envelope_wire_limit_precedes_deserialization",
+    },
+}
 REQUIRED_RESOURCE_TESTS_BY_TARGET = {
     "vnext_resource_capacity_contract_tests": {
         "resource_capacity_concurrency_is_bounded",
@@ -227,7 +294,7 @@ REQUIRED_MODEL_WIRE_TESTS = {
 REQUIRED_COMPILE_TESTS = {"vnext_compile"}
 REQUIRED_LEGACY_TESTS = {"legacy_backend_methods_are_mapped_82_of_82"}
 REQUIRED_TESTS_BY_TARGET = {
-    "vnext_contract_tests": REQUIRED_UNIT_TESTS,
+    **REQUIRED_CORE_TESTS_BY_TARGET,
     **REQUIRED_RESOURCE_TESTS_BY_TARGET,
     **REQUIRED_EVENT_TESTS_BY_TARGET,
     "vnext_resolution_limits_contract_tests": REQUIRED_RESOLUTION_LIMITS_TESTS,
@@ -295,7 +362,7 @@ EXPECTED_TRYBUILD_PASS_CASES = 2
 EXPECTED_TRYBUILD_FAIL_CASES = 78
 TEST_THREADS_ARG = "--test-threads=1"
 BOUNDED_RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
-BOUNDED_TEST_COMMAND_COUNT = 40
+BOUNDED_TEST_COMMAND_COUNT = 52
 BOUNDED_TEST_ENV_OVERRIDES = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "CARGO_BUILD_JOBS": "2",
@@ -2245,7 +2312,7 @@ def parse_machine_proofs(target_stdout: dict[str, str]) -> dict[str, int]:
         target: [line.strip() for line in stdout.splitlines()]
         for target, stdout in target_stdout.items()
     }
-    contract_lines = lines_by_target["vnext_contract_tests"]
+    contract_lines = lines_by_target["vnext_plan_wire_contract_tests"]
     exact_contract = {
         "deterministic_plan_cases": "VNEXT PLAN DETERMINISM PASS: 100/100",
         "schema_round_trip_cases": "VNEXT PLAN ROUNDTRIP PASS: 100/100",
@@ -2307,12 +2374,12 @@ def parse_machine_proofs(target_stdout: dict[str, str]) -> dict[str, int]:
     )
     ratio_proofs = {
         "fail_closed_cases": (
-            "vnext_contract_tests",
+            "vnext_resolution_contract_tests",
             "VNEXT FAIL CLOSED PASS",
             EXPECTED_FAIL_CLOSED_CASES,
         ),
         "model_identity_cases": (
-            "vnext_contract_tests",
+            "vnext_resolution_contract_tests",
             "VNEXT MODEL IDENTITY PASS",
             EXPECTED_MODEL_IDENTITY_CASES,
         ),
@@ -3111,11 +3178,15 @@ impl OperationDispatch {
     validate_adr(valid_adr)
     expect_rejected("ADR topic", lambda: validate_adr(valid_adr.replace(b"object safety", b"object semantics")), "object-safety")
 
-    contract_proofs = "\n".join(
+    plan_proofs = "\n".join(
         [
             "VNEXT PLAN DETERMINISM PASS: 100/100",
             "VNEXT PLAN ROUNDTRIP PASS: 100/100",
             "VNEXT BREAKING VERSION REJECT PASS: 100/100",
+        ]
+    )
+    resolution_proofs = "\n".join(
+        [
             f"VNEXT FAIL CLOSED PASS: {EXPECTED_FAIL_CLOSED_CASES}/{EXPECTED_FAIL_CLOSED_CASES}",
             f"VNEXT MODEL IDENTITY PASS: {EXPECTED_MODEL_IDENTITY_CASES}/{EXPECTED_MODEL_IDENTITY_CASES}",
         ]
@@ -3123,7 +3194,8 @@ impl OperationDispatch {
     proof_stdout = {target: "" for target in REQUIRED_TESTS_BY_TARGET}
     proof_stdout.update(
         {
-            "vnext_contract_tests": contract_proofs,
+            "vnext_plan_wire_contract_tests": plan_proofs,
+            "vnext_resolution_contract_tests": resolution_proofs,
             "vnext_device_operation_contract_tests": (
                 f"VNEXT DEVICE OPERATION PASS: "
                 f"{EXPECTED_DEVICE_OPERATION_CASES}/{EXPECTED_DEVICE_OPERATION_CASES}\n"
@@ -3158,8 +3230,8 @@ impl OperationDispatch {
         "self-test machine proof parse mismatch",
     )
     missing_roundtrip = copy.deepcopy(proof_stdout)
-    missing_roundtrip["vnext_contract_tests"] = missing_roundtrip[
-        "vnext_contract_tests"
+    missing_roundtrip["vnext_plan_wire_contract_tests"] = missing_roundtrip[
+        "vnext_plan_wire_contract_tests"
     ].replace("VNEXT PLAN ROUNDTRIP PASS: 100/100\n", "")
     expect_rejected(
         "missing proof line",

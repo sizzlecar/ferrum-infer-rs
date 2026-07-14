@@ -171,6 +171,27 @@ fixture. This physical split does not yet claim the stricter transitive target-L
 targets currently compile the shared fixture module graph, so fixture dependency reduction or a
 reusable bounded test-support owner remains open before final S0A PASS.
 
+## Core Contract Test Ownership
+
+The former 5,445-line `vnext_contract_tests` target is replaced by a 1,648-line shared contract
+fixture and seven invariant-owner targets:
+
+| Target | Owner lines | Test count | Primary invariant owner |
+|---|---:|---:|---|
+| `vnext_planning_resource_contract_tests` | 573 | 8 | resource demand, memory and capacity planning |
+| `vnext_plan_wire_contract_tests` | 257 | 9 | deterministic plan build and validated wire reconstruction |
+| `vnext_provider_selection_contract_tests` | 310 | 5 | provider identity, fallback and registry rejection |
+| `vnext_weight_layout_contract_tests` | 659 | 8 | physical weight layout, padding and model program shape |
+| `vnext_resolution_contract_tests` | 1,429 | 11 | typed model resolution, provenance and fail-closed input |
+| `vnext_execution_graph_contract_tests` | 530 | 7 | alias and state-effect dependency graph |
+| `vnext_source_audit_contract_tests` | 59 | 3 | architecture-neutral source and wire-size audit |
+
+The exact test-name union is still `51/51`, with no duplicate owner. The plan proof lines remain
+`100/100` for determinism, round trip and breaking-version rejection; resolution retains
+`VNEXT FAIL CLOSED PASS: 62/62` and `VNEXT MODEL IDENTITY PASS: 5/5`. Both release validators now
+require the seven-target matrix. As with the event fixture, physical source owners are bounded but
+the stricter transitive target-LOC accounting remains open before final S0A PASS.
+
 ## Preserved Dynamic Resource Invariants
 
 This split is not permission to simplify the resource model. The following owners and behavior
