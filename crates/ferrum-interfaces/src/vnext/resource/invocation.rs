@@ -1,11 +1,11 @@
 use super::{
     acquire_session_frames, begin_participant_flights_dispatch, enter_sequence_dispatch,
     finalize_session_frames, fmt, invalid_resource, issue_batch_invocation_id, issue_batch_step_id,
-    poison_session_frame, prepare_participant_flights,
+    poison_session_frame, prepare_participant_flight_wave, prepare_participant_flights,
     reset_participant_flights_after_definitely_not_submitted, sequence_dispatch_is_poisoned,
     sequence_slot_active, sequence_slot_is_poisoned, sequence_slot_poisoned_drained,
     sequence_slot_poisoned_undrained, session_frame_candidates, session_participant_key,
-    AbandonedSequenceMetadata, AbandonedSequenceRecoveryError, ActiveInvocationGuard,
+    AbandonedSequenceMetadata, AbandonedSequenceRecoveryError, ActiveInvocationWaveGuard,
     ActiveSequenceAbortDisposition, ActiveSequenceAbortReceipt, ActiveSequenceFrame,
     AdmissionDeferred, AdmissionFitPolicy, AdmissionRejected, AdmittedSequenceResources,
     AdmittedStepParticipant, AllocationLifetime, Arc, AtomicU64, BackingPrepareDecision,
@@ -15,11 +15,12 @@ use super::{
     ExecutionBatchParticipants, InvocationRegistry, InvocationResourceAdmissionRequest,
     LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSliceAuthority,
     LogicalBatchCapacityLease, NodeId, Ordering, ParticipantFlightCandidate,
-    ParticipantFlightPhase, ParticipantNodeKey, PreparedParticipantFlightHold, RequestIdentity,
-    ResourceId, RunId, SequenceAuthorityId, SequenceExecutionAuthoritySource,
-    SequenceRecoveryRegistry, SequenceSessionEpoch, SequenceSessionFingerprint, Serialize, Sha256,
-    StaticProvisioningLease, StepFinalizationFailure, StepParticipantFrameAssignment,
-    StepParticipantRetirement, StepParticipantRetirementDisposition, StepResourceAdmissionDecision,
+    ParticipantFlightPhase, ParticipantFlightWaveCandidate, ParticipantNodeKey,
+    PreparedParticipantFlightHold, RequestIdentity, ResourceId, RunId, SequenceAuthorityId,
+    SequenceExecutionAuthoritySource, SequenceRecoveryRegistry, SequenceSessionEpoch,
+    SequenceSessionFingerprint, Serialize, Sha256, StaticProvisioningLease,
+    StepFinalizationFailure, StepParticipantFrameAssignment, StepParticipantRetirement,
+    StepParticipantRetirementDisposition, StepResourceAdmissionDecision,
     StepResourceAdmissionRequest, StepResourceLease, StepRetirementReceipt, StreamState,
     TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError, SEQUENCE_DISPATCH_POISONED_BIT,
 };
@@ -394,6 +395,149 @@ where
                 "shared Step activation backing requires an ordered single-fence submission wave",
             ));
         }
+        let prepared = match self.prepare_invocation_scope(request)? {
+            PreparedInvocationScopeDecision::Prepared(prepared) => prepared,
+            PreparedInvocationScopeDecision::Deferred(deferred) => {
+                return Ok(InvocationResourceAdmissionDecision::Deferred(deferred));
+            }
+            PreparedInvocationScopeDecision::BackingDeferred(deferred) => {
+                return Ok(InvocationResourceAdmissionDecision::BackingDeferred(
+                    deferred,
+                ));
+            }
+            PreparedInvocationScopeDecision::PermanentRejected(rejected) => {
+                return Ok(InvocationResourceAdmissionDecision::PermanentRejected(
+                    rejected,
+                ));
+            }
+        };
+        let PreparedInvocationScope {
+            participants,
+            participant_frames,
+            participant_session_identities: _,
+            node_id,
+            claimed_backing,
+            flight_candidates,
+        } = prepared;
+        let batch_invocation_id = issue_batch_invocation_id()?;
+        let prepared_participant_flights =
+            prepare_participant_flights(&flight_candidates, &node_id)?;
+        let topology_keys = participant_frames
+            .iter()
+            .map(|assignment| {
+                ParticipantNodeKey::new(
+                    assignment.participant(),
+                    assignment.frame_id(),
+                    node_id.clone(),
+                )
+            })
+            .collect();
+        let active_wave = self.invocation_registry.enter(
+            topology_keys,
+            batch_invocation_id,
+            claimed_backing.work_shape().fingerprint(),
+        )?;
+        Ok(InvocationResourceAdmissionDecision::Admitted(
+            InvocationResourceLease::new(
+                Arc::clone(self),
+                participants,
+                participant_frames,
+                node_id,
+                batch_invocation_id,
+                claimed_backing,
+                prepared_participant_flights,
+                active_wave,
+            )?,
+        ))
+    }
+
+    pub fn try_prepare_submission_wave(
+        self: &Arc<Self>,
+        requests: Vec<InvocationResourceAdmissionRequest>,
+    ) -> Result<StepSubmissionWaveAdmissionDecision<R>, VNextError> {
+        let _lifecycle = self.participants[0]
+            .session
+            .resources()
+            .request
+            .plan
+            .resources
+            .read_lifecycle("prepare a step submission wave")?;
+        let plan = &self.participants[0].session.resources().request.plan;
+        let plan_nodes = plan.nodes();
+        if requests.is_empty()
+            || requests.len() != plan_nodes.len()
+            || requests
+                .iter()
+                .zip(plan_nodes)
+                .any(|(request, node)| request.node_id() != node.id())
+        {
+            return Err(invalid_resource(
+                "submission wave must cover every plan node exactly once in immutable plan order",
+            ));
+        }
+
+        let mut prepared_nodes = Vec::with_capacity(requests.len());
+        for request in requests {
+            match self.prepare_invocation_scope(request)? {
+                PreparedInvocationScopeDecision::Prepared(prepared) => {
+                    prepared_nodes.push(prepared)
+                }
+                PreparedInvocationScopeDecision::Deferred(deferred) => {
+                    return Ok(StepSubmissionWaveAdmissionDecision::Deferred(deferred));
+                }
+                PreparedInvocationScopeDecision::BackingDeferred(deferred) => {
+                    return Ok(StepSubmissionWaveAdmissionDecision::BackingDeferred(
+                        deferred,
+                    ));
+                }
+                PreparedInvocationScopeDecision::PermanentRejected(rejected) => {
+                    return Ok(StepSubmissionWaveAdmissionDecision::PermanentRejected(
+                        rejected,
+                    ));
+                }
+            }
+        }
+
+        let wave_fingerprint = submission_wave_fingerprint(self, &prepared_nodes)?;
+        let batch_invocation_id = issue_batch_invocation_id()?;
+        let flight_candidates = prepared_nodes
+            .iter()
+            .flat_map(|node| {
+                node.flight_candidates.iter().cloned().map(|candidate| {
+                    ParticipantFlightWaveCandidate::new(candidate, node.node_id.clone())
+                })
+            })
+            .collect();
+        let prepared_participant_flights = prepare_participant_flight_wave(flight_candidates)?;
+        let topology_keys = prepared_participant_flights
+            .iter()
+            .map(|hold| hold.key().clone())
+            .collect();
+        let active_wave = self.invocation_registry.enter(
+            topology_keys,
+            batch_invocation_id,
+            &wave_fingerprint,
+        )?;
+        let nodes = prepared_nodes
+            .into_iter()
+            .map(PreparedStepSubmissionNode::from_prepared)
+            .collect();
+        Ok(StepSubmissionWaveAdmissionDecision::Prepared(
+            PreparedStepSubmissionWave {
+                nodes,
+                prepared_participant_flights,
+                active_wave,
+                step: Arc::clone(self),
+                batch_invocation_id,
+                fingerprint: wave_fingerprint,
+            },
+        ))
+    }
+
+    fn prepare_invocation_scope(
+        &self,
+        request: InvocationResourceAdmissionRequest,
+    ) -> Result<PreparedInvocationScopeDecision<R>, VNextError> {
         let InvocationResourceAdmissionRequest {
             node_id,
             work_shape,
@@ -479,9 +623,7 @@ where
         let prepared = match plan.prepare_backing_slices(requested_slices)? {
             BackingPrepareDecision::Prepared(prepared) => prepared,
             BackingPrepareDecision::Deferred(deferred) => {
-                return Ok(InvocationResourceAdmissionDecision::BackingDeferred(
-                    deferred,
-                ));
+                return Ok(PreparedInvocationScopeDecision::BackingDeferred(deferred));
             }
         };
         let participant_authorities = participants
@@ -532,47 +674,29 @@ where
                     Some(capacity)
                 }
                 BatchCapacityClaimDecision::Deferred(deferred) => {
-                    return Ok(InvocationResourceAdmissionDecision::Deferred(deferred));
+                    return Ok(PreparedInvocationScopeDecision::Deferred(deferred));
                 }
                 BatchCapacityClaimDecision::PermanentRejected(rejected) => {
-                    return Ok(InvocationResourceAdmissionDecision::PermanentRejected(
-                        rejected,
-                    ));
+                    return Ok(PreparedInvocationScopeDecision::PermanentRejected(rejected));
                 }
             }
         };
         let backing_slices = prepared.commit();
         let claimed_backing =
             ClaimedBackingTransaction::new(work_shape, demand, logical_capacity, backing_slices)?;
-        let batch_invocation_id = issue_batch_invocation_id()?;
-        let prepared_participant_flights =
-            prepare_participant_flights(&flight_candidates, &node_id)?;
-        let topology_keys = participant_frames
+        let participant_session_identities = flight_candidates
             .iter()
-            .map(|assignment| {
-                ParticipantNodeKey::new(
-                    assignment.participant(),
-                    assignment.frame_id(),
-                    node_id.clone(),
-                )
-            })
+            .map(|candidate| (candidate.epoch, candidate.fingerprint.clone()))
             .collect();
-        let active_invocation = self.invocation_registry.enter(
-            topology_keys,
-            batch_invocation_id,
-            claimed_backing.work_shape().fingerprint(),
-        )?;
-        Ok(InvocationResourceAdmissionDecision::Admitted(
-            InvocationResourceLease::new(
-                Arc::clone(self),
+        Ok(PreparedInvocationScopeDecision::Prepared(
+            PreparedInvocationScope {
                 participants,
                 participant_frames,
+                participant_session_identities,
                 node_id,
-                batch_invocation_id,
                 claimed_backing,
-                prepared_participant_flights,
-                active_invocation,
-            )?,
+                flight_candidates,
+            },
         ))
     }
 }
@@ -600,6 +724,352 @@ where
     PermanentRejected(AdmissionRejected),
 }
 
+enum PreparedInvocationScopeDecision<R>
+where
+    R: DeviceRuntime,
+{
+    Prepared(PreparedInvocationScope<R>),
+    Deferred(AdmissionDeferred),
+    BackingDeferred(DynamicBackingDeferred),
+    PermanentRejected(AdmissionRejected),
+}
+
+struct PreparedInvocationScope<R>
+where
+    R: DeviceRuntime,
+{
+    claimed_backing: ClaimedBackingTransaction,
+    participants: Vec<Arc<AdmittedSequenceResources<R>>>,
+    participant_frames: Vec<StepParticipantFrameAssignment>,
+    participant_session_identities: Vec<(SequenceSessionEpoch, SequenceSessionFingerprint)>,
+    flight_candidates: Vec<ParticipantFlightCandidate>,
+    node_id: NodeId,
+}
+
+fn submission_wave_fingerprint<R>(
+    step: &StepResourceLease<R>,
+    nodes: &[PreparedInvocationScope<R>],
+) -> Result<String, VNextError>
+where
+    R: DeviceRuntime,
+{
+    #[derive(Serialize)]
+    struct NodeInput<'a> {
+        node_id: &'a NodeId,
+        participant_frames: &'a [StepParticipantFrameAssignment],
+        work_fingerprint: &'a str,
+        backing_fingerprint: &'a str,
+    }
+
+    #[derive(Serialize)]
+    struct WaveInput<'a> {
+        domain: &'static str,
+        batch_step_id: BatchStepId,
+        step_backing_fingerprint: &'a str,
+        nodes: Vec<NodeInput<'a>>,
+    }
+
+    let bytes = serde_json::to_vec(&WaveInput {
+        domain: "ferrum.runtime-vnext.step-submission-wave.v1",
+        batch_step_id: step.batch_step_id,
+        step_backing_fingerprint: step.claimed_backing.fingerprint(),
+        nodes: nodes
+            .iter()
+            .map(|node| NodeInput {
+                node_id: &node.node_id,
+                participant_frames: &node.participant_frames,
+                work_fingerprint: node.claimed_backing.work_shape().fingerprint(),
+                backing_fingerprint: node.claimed_backing.fingerprint(),
+            })
+            .collect(),
+    })
+    .map_err(|error| {
+        invalid_resource(format!(
+            "submission wave fingerprint encode failed: {error}"
+        ))
+    })?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+pub enum StepSubmissionWaveAdmissionDecision<R>
+where
+    R: DeviceRuntime,
+{
+    Prepared(PreparedStepSubmissionWave<R>),
+    Deferred(AdmissionDeferred),
+    BackingDeferred(DynamicBackingDeferred),
+    PermanentRejected(AdmissionRejected),
+}
+
+/// One immutable-plan node projection inside a prepared physical submission
+/// wave. The parent wave owns device-flight and retry authority for every node
+/// as one atomic unit.
+pub struct PreparedStepSubmissionNode<R>
+where
+    R: DeviceRuntime,
+{
+    claimed_backing: ClaimedBackingTransaction,
+    participants: Vec<Arc<AdmittedSequenceResources<R>>>,
+    participant_frames: Vec<StepParticipantFrameAssignment>,
+    participant_session_identities: Vec<(SequenceSessionEpoch, SequenceSessionFingerprint)>,
+    node_id: NodeId,
+}
+
+impl<R> PreparedStepSubmissionNode<R>
+where
+    R: DeviceRuntime,
+{
+    fn from_prepared(prepared: PreparedInvocationScope<R>) -> Self {
+        Self {
+            claimed_backing: prepared.claimed_backing,
+            participants: prepared.participants,
+            participant_frames: prepared.participant_frames,
+            participant_session_identities: prepared.participant_session_identities,
+            node_id: prepared.node_id,
+        }
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+
+    pub fn participant_count(&self) -> u32 {
+        u32::try_from(self.participants.len())
+            .expect("wave participant count was validated before admission")
+    }
+
+    pub fn participants(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &Arc<AdmittedSequenceResources<R>>> {
+        self.participants.iter()
+    }
+
+    pub fn participant_frames(&self) -> &[StepParticipantFrameAssignment] {
+        &self.participant_frames
+    }
+
+    pub fn work_shape(&self) -> &BatchWorkShape {
+        self.claimed_backing.work_shape()
+    }
+
+    pub fn claimed_backing(&self) -> &ClaimedBackingTransaction {
+        &self.claimed_backing
+    }
+
+    pub fn plan_evidence(&self) -> TrustedPlanRuntimeEvidence {
+        self.participants[0].plan_evidence()
+    }
+
+    pub(crate) fn runtime(&self) -> &Arc<R> {
+        &self.participants[0].request.plan.runtime()
+    }
+
+    pub(crate) fn participant_session_identities(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (SequenceSessionEpoch, &SequenceSessionFingerprint)> {
+        self.participant_session_identities
+            .iter()
+            .map(|(epoch, fingerprint)| (*epoch, fingerprint))
+    }
+
+    pub(crate) fn participant_node_keys(&self) -> Vec<ParticipantNodeKey> {
+        self.participant_frames
+            .iter()
+            .map(|assignment| {
+                ParticipantNodeKey::new(
+                    assignment.participant(),
+                    assignment.frame_id(),
+                    self.node_id.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn backing_view<'wave>(
+        &'wave self,
+        step: &'wave StepResourceLease<R>,
+        resource_id: &ResourceId,
+    ) -> Result<LogicalBackingBufferView<'wave, R::Buffer>, VNextError> {
+        if let Some(authority) = self
+            .claimed_backing
+            .backing_slices()
+            .iter()
+            .find(|authority| authority.resource_id() == resource_id)
+        {
+            return self.participants[0]
+                .request
+                .plan
+                .dynamic_pools()
+                .view(authority);
+        }
+        step.backing_view(resource_id)
+    }
+}
+
+/// Exact all-node command wave for one Step. Its node projections and shared
+/// Step backing remain owned until the one device fence reaches a terminal
+/// state; dropping a merely prepared wave performs zero-submit rollback.
+#[must_use = "a prepared submission wave must be dispatched or explicitly dropped"]
+pub struct PreparedStepSubmissionWave<R>
+where
+    R: DeviceRuntime,
+{
+    // Drop node-local claims and participant flights before releasing the Step.
+    nodes: Vec<PreparedStepSubmissionNode<R>>,
+    prepared_participant_flights: Vec<PreparedParticipantFlightHold>,
+    active_wave: ActiveInvocationWaveGuard,
+    step: Arc<StepResourceLease<R>>,
+    batch_invocation_id: BatchInvocationId,
+    fingerprint: String,
+}
+
+impl<R> PreparedStepSubmissionWave<R>
+where
+    R: DeviceRuntime,
+{
+    pub fn batch_step_id(&self) -> BatchStepId {
+        self.step.batch_step_id()
+    }
+
+    pub const fn batch_invocation_id(&self) -> BatchInvocationId {
+        self.batch_invocation_id
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub fn nodes(&self) -> &[PreparedStepSubmissionNode<R>] {
+        &self.nodes
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn prepared_participant_flight_count(&self) -> usize {
+        self.prepared_participant_flights.len()
+    }
+
+    pub fn step_resources(&self) -> &Arc<StepResourceLease<R>> {
+        &self.step
+    }
+
+    pub fn has_shared_step_backing(&self) -> bool {
+        self.step.claimed_backing().has_shared_physical_claims()
+    }
+
+    pub(crate) fn participant_node_keys(&self) -> Vec<ParticipantNodeKey> {
+        self.prepared_participant_flights
+            .iter()
+            .map(|hold| hold.key().clone())
+            .collect()
+    }
+
+    pub(crate) fn backing_view(
+        &self,
+        node_index: usize,
+        resource_id: &ResourceId,
+    ) -> Result<LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
+        self.nodes
+            .get(node_index)
+            .ok_or_else(|| invalid_resource("submission wave node index is out of bounds"))?
+            .backing_view(&self.step, resource_id)
+    }
+
+    pub(crate) fn begin_dispatch(&mut self) -> Result<(), VNextError> {
+        begin_participant_flights_dispatch(&mut self.prepared_participant_flights)
+    }
+
+    pub(crate) fn mark_submission_fence_installed(&mut self) -> Result<(), VNextError> {
+        self.active_wave.mark_in_flight()
+    }
+
+    pub(crate) fn definitely_not_submitted(
+        mut self,
+    ) -> Result<DefinitelyNotSubmittedWaveRetryAuthority<R>, VNextError> {
+        self.active_wave.mark_not_submitted()?;
+        reset_participant_flights_after_definitely_not_submitted(
+            &mut self.prepared_participant_flights,
+        )?;
+        let topology_fingerprint = self.fingerprint.clone();
+        let prior_attempt = self.batch_invocation_id;
+        Ok(DefinitelyNotSubmittedWaveRetryAuthority {
+            wave: Some(self),
+            topology_fingerprint,
+            prior_attempt,
+        })
+    }
+
+    fn prepare_definitely_not_submitted_retry(
+        &mut self,
+        fresh_attempt: BatchInvocationId,
+        topology_fingerprint: &str,
+    ) -> Result<(), VNextError> {
+        if self.fingerprint != topology_fingerprint
+            || self
+                .prepared_participant_flights
+                .iter()
+                .any(|hold| hold.phase != ParticipantFlightPhase::Prepared)
+        {
+            return Err(invalid_resource(
+                "definitely-not-submitted wave retry topology changed",
+            ));
+        }
+        self.active_wave.prepare_retry(fresh_attempt)?;
+        self.batch_invocation_id = fresh_attempt;
+        Ok(())
+    }
+}
+
+#[must_use = "a definitely-not-submitted wave retry must be retried or retired"]
+pub struct DefinitelyNotSubmittedWaveRetryAuthority<R>
+where
+    R: DeviceRuntime,
+{
+    wave: Option<PreparedStepSubmissionWave<R>>,
+    topology_fingerprint: String,
+    prior_attempt: BatchInvocationId,
+}
+
+impl<R> fmt::Debug for DefinitelyNotSubmittedWaveRetryAuthority<R>
+where
+    R: DeviceRuntime,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DefinitelyNotSubmittedWaveRetryAuthority")
+            .field("prior_attempt", &self.prior_attempt)
+            .field("topology_fingerprint", &self.topology_fingerprint)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R> DefinitelyNotSubmittedWaveRetryAuthority<R>
+where
+    R: DeviceRuntime,
+{
+    pub const fn prior_attempt(&self) -> BatchInvocationId {
+        self.prior_attempt
+    }
+
+    pub fn topology_fingerprint(&self) -> &str {
+        &self.topology_fingerprint
+    }
+
+    pub fn retry(mut self) -> Result<PreparedStepSubmissionWave<R>, VNextError> {
+        let fresh_attempt = issue_batch_invocation_id()?;
+        let wave = self
+            .wave
+            .as_mut()
+            .ok_or_else(|| invalid_resource("wave retry authority no longer owns its wave"))?;
+        wave.prepare_definitely_not_submitted_retry(fresh_attempt, &self.topology_fingerprint)?;
+        self.wave
+            .take()
+            .ok_or_else(|| invalid_resource("validated wave retry authority lost its wave"))
+    }
+}
+
 /// Exact prepared batch node/provider invocation authority. No device command
 /// has been submitted at this layer; dropping it performs the typed
 /// definitely-not-submitted participant-flight rollback.
@@ -612,7 +1082,7 @@ where
     // authorities. It retains the immutable work fingerprint even when empty.
     claimed_backing: ClaimedBackingTransaction,
     prepared_participant_flights: Vec<PreparedParticipantFlightHold>,
-    active_invocation: ActiveInvocationGuard,
+    active_wave: ActiveInvocationWaveGuard,
     participants: Vec<Arc<AdmittedSequenceResources<R>>>,
     participant_frames: Vec<StepParticipantFrameAssignment>,
     step: Arc<StepResourceLease<R>>,
@@ -632,7 +1102,7 @@ where
         batch_invocation_id: BatchInvocationId,
         claimed_backing: ClaimedBackingTransaction,
         prepared_participant_flights: Vec<PreparedParticipantFlightHold>,
-        active_invocation: ActiveInvocationGuard,
+        active_wave: ActiveInvocationWaveGuard,
     ) -> Result<Self, VNextError> {
         if participants.is_empty() {
             return Err(invalid_resource(
@@ -694,7 +1164,7 @@ where
         Ok(Self {
             claimed_backing,
             prepared_participant_flights,
-            active_invocation,
+            active_wave,
             participants,
             participant_frames,
             step,
@@ -751,13 +1221,13 @@ where
     }
 
     pub(crate) fn mark_submission_fence_installed(&mut self) -> Result<(), VNextError> {
-        self.active_invocation.mark_in_flight()
+        self.active_wave.mark_in_flight()
     }
 
     pub(crate) fn definitely_not_submitted(
         mut self,
     ) -> Result<DefinitelyNotSubmittedRetryAuthority<R>, VNextError> {
-        self.active_invocation.mark_not_submitted()?;
+        self.active_wave.mark_not_submitted()?;
         reset_participant_flights_after_definitely_not_submitted(
             &mut self.prepared_participant_flights,
         )?;
@@ -789,7 +1259,7 @@ where
                 "definitely-not-submitted retry topology or work fingerprint changed",
             ));
         }
-        self.active_invocation.prepare_retry(fresh_attempt)?;
+        self.active_wave.prepare_retry(fresh_attempt)?;
         self.batch_invocation_id = fresh_attempt;
         Ok(())
     }
