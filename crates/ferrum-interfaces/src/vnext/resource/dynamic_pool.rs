@@ -1,0 +1,1978 @@
+use super::*;
+
+static NEXT_DYNAMIC_POOL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn align_up_resource(value: u64, alignment: u64) -> Result<u64, VNextError> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return Err(invalid_resource(
+            "dynamic pool alignment is not a non-zero power of two",
+        ));
+    }
+    value
+        .checked_add(alignment - 1)
+        .map(|rounded| rounded & !(alignment - 1))
+        .ok_or_else(|| invalid_resource("dynamic pool aligned bytes overflow u64"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct BackingChunkIdentity {
+    pool_id: DynamicBackingPoolId,
+    ordinal: u32,
+    generation: u64,
+}
+
+impl BackingChunkIdentity {
+    pub fn pool_id(&self) -> &DynamicBackingPoolId {
+        &self.pool_id
+    }
+
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BackingSegment {
+    chunk: BackingChunkIdentity,
+    offset_bytes: u64,
+    length_bytes: u64,
+}
+
+impl BackingSegment {
+    pub(crate) fn new(
+        chunk: BackingChunkIdentity,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> Result<Self, VNextError> {
+        Self::from_chunk(
+            &chunk.pool_id,
+            chunk.ordinal,
+            chunk.generation,
+            offset_bytes,
+            length_bytes,
+        )
+    }
+
+    fn from_chunk(
+        pool_id: &DynamicBackingPoolId,
+        chunk_ordinal: u32,
+        chunk_generation: u64,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> Result<Self, VNextError> {
+        if chunk_ordinal == 0
+            || chunk_generation == 0
+            || length_bytes == 0
+            || offset_bytes.checked_add(length_bytes).is_none()
+        {
+            return Err(invalid_resource(
+                "backing segment has invalid chunk identity or physical range",
+            ));
+        }
+        Ok(Self {
+            chunk: BackingChunkIdentity {
+                pool_id: pool_id.clone(),
+                ordinal: chunk_ordinal,
+                generation: chunk_generation,
+            },
+            offset_bytes,
+            length_bytes,
+        })
+    }
+
+    pub fn chunk(&self) -> &BackingChunkIdentity {
+        &self.chunk
+    }
+
+    pub fn pool_id(&self) -> &DynamicBackingPoolId {
+        self.chunk.pool_id()
+    }
+
+    pub const fn chunk_ordinal(&self) -> u32 {
+        self.chunk.ordinal()
+    }
+
+    pub const fn chunk_generation(&self) -> u64 {
+        self.chunk.generation()
+    }
+
+    pub const fn offset_bytes(&self) -> u64 {
+        self.offset_bytes
+    }
+
+    pub const fn length_bytes(&self) -> u64 {
+        self.length_bytes
+    }
+}
+
+pub(super) struct ResidentChunkBacking<B> {
+    // Buffer must drop before its physical capacity grant is returned.
+    pub(super) buffer: B,
+    _grant: DeviceCapacityGrant,
+    identity: BackingChunkIdentity,
+    pub(super) descriptor: BufferDescriptor,
+}
+
+pub(super) struct ResidentChunkState<B> {
+    pub(super) backing: Arc<ResidentChunkBacking<B>>,
+    pub(super) live_segments: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FreeExtent {
+    pub(super) chunk_generation: u64,
+    pub(super) length_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct FreeExtentIndex {
+    pub(super) by_offset: BTreeMap<(u32, u64), FreeExtent>,
+    pub(super) by_size: BTreeSet<(u64, u32, u64, u64)>,
+    pub(super) free_bytes: u64,
+    pub(super) search_probes: u64,
+}
+
+impl FreeExtentIndex {
+    fn rollback_segments(&mut self, segments: &[BackingSegment]) -> Result<(), VNextError> {
+        for segment in segments.iter().rev() {
+            self.release(segment)?;
+        }
+        Ok(())
+    }
+
+    fn with_rollback_context(
+        &mut self,
+        segments: &[BackingSegment],
+        error: VNextError,
+    ) -> VNextError {
+        match self.rollback_segments(segments) {
+            Ok(()) => error,
+            Err(rollback) => invalid_resource(format!(
+                "dynamic allocator failed and its journal rollback also failed: {error}; rollback: {rollback}"
+            )),
+        }
+    }
+
+    pub(super) fn insert_extent(
+        &mut self,
+        chunk_ordinal: u32,
+        chunk_generation: u64,
+        offset_bytes: u64,
+        length_bytes: u64,
+    ) -> Result<(), VNextError> {
+        if chunk_ordinal == 0
+            || chunk_generation == 0
+            || length_bytes == 0
+            || offset_bytes.checked_add(length_bytes).is_none()
+            || self.by_offset.contains_key(&(chunk_ordinal, offset_bytes))
+        {
+            return Err(invalid_resource("free extent identity or range is invalid"));
+        }
+        let end = offset_bytes + length_bytes;
+        if self
+            .by_offset
+            .range(..(chunk_ordinal, offset_bytes))
+            .next_back()
+            .is_some_and(|(&(ordinal, previous_offset), previous)| {
+                ordinal == chunk_ordinal && previous_offset + previous.length_bytes > offset_bytes
+            })
+            || self
+                .by_offset
+                .range((chunk_ordinal, offset_bytes)..)
+                .next()
+                .is_some_and(|(&(ordinal, next_offset), _)| {
+                    ordinal == chunk_ordinal && next_offset < end
+                })
+        {
+            return Err(invalid_resource("free extent overlaps an existing extent"));
+        }
+        let next_free = self
+            .free_bytes
+            .checked_add(length_bytes)
+            .ok_or_else(|| invalid_resource("free extent bytes overflow u64"))?;
+        self.by_offset.insert(
+            (chunk_ordinal, offset_bytes),
+            FreeExtent {
+                chunk_generation,
+                length_bytes,
+            },
+        );
+        assert!(self
+            .by_size
+            .insert((length_bytes, chunk_ordinal, chunk_generation, offset_bytes,)));
+        self.free_bytes = next_free;
+        Ok(())
+    }
+
+    fn remove_extent(
+        &mut self,
+        chunk_ordinal: u32,
+        offset_bytes: u64,
+    ) -> Result<FreeExtent, VNextError> {
+        let extent = *self
+            .by_offset
+            .get(&(chunk_ordinal, offset_bytes))
+            .ok_or_else(|| invalid_resource("free extent journal references a missing range"))?;
+        let size_key = (
+            extent.length_bytes,
+            chunk_ordinal,
+            extent.chunk_generation,
+            offset_bytes,
+        );
+        if !self.by_size.contains(&size_key) {
+            return Err(invalid_resource("free extent indexes diverged"));
+        }
+        let next_free_bytes = self
+            .free_bytes
+            .checked_sub(extent.length_bytes)
+            .ok_or_else(|| invalid_resource("free extent bytes underflowed"))?;
+        self.by_offset.remove(&(chunk_ordinal, offset_bytes));
+        assert!(self.by_size.remove(&size_key));
+        self.free_bytes = next_free_bytes;
+        Ok(extent)
+    }
+
+    pub(super) fn allocate_contiguous(
+        &mut self,
+        pool_id: &DynamicBackingPoolId,
+        size_bytes: u64,
+    ) -> Result<Option<BackingSegment>, VNextError> {
+        self.search_probes = self.search_probes.saturating_add(1);
+        let selected = self.by_size.range((size_bytes, 0, 0, 0)..).next().copied();
+        let Some((length_bytes, chunk_ordinal, chunk_generation, offset_bytes)) = selected else {
+            return Ok(None);
+        };
+        let segment = BackingSegment::from_chunk(
+            pool_id,
+            chunk_ordinal,
+            chunk_generation,
+            offset_bytes,
+            size_bytes,
+        )?;
+        let removed = self.remove_extent(chunk_ordinal, offset_bytes)?;
+        debug_assert_eq!(removed.length_bytes, length_bytes);
+        debug_assert_eq!(removed.chunk_generation, chunk_generation);
+        if size_bytes < length_bytes {
+            if let Err(error) = self.insert_extent(
+                chunk_ordinal,
+                chunk_generation,
+                offset_bytes + size_bytes,
+                length_bytes - size_bytes,
+            ) {
+                let restore =
+                    self.insert_extent(chunk_ordinal, chunk_generation, offset_bytes, length_bytes);
+                return Err(match restore {
+                    Ok(()) => error,
+                    Err(rollback) => invalid_resource(format!(
+                        "contiguous allocator failed and could not restore its selected extent: {error}; rollback: {rollback}"
+                    )),
+                });
+            }
+        }
+        Ok(Some(segment))
+    }
+
+    pub(super) fn allocate_paged(
+        &mut self,
+        pool_id: &DynamicBackingPoolId,
+        size_bytes: u64,
+        block_bytes: u64,
+    ) -> Result<Option<Vec<BackingSegment>>, VNextError> {
+        if size_bytes == 0 || size_bytes % block_bytes != 0 {
+            return Err(invalid_resource(
+                "paged backing reservation is not block aligned",
+            ));
+        }
+        if self.free_bytes < size_bytes {
+            return Ok(None);
+        }
+        let mut remaining = size_bytes;
+        let mut segments = Vec::new();
+        while remaining != 0 {
+            self.search_probes = self.search_probes.saturating_add(1);
+            let Some((&(chunk_ordinal, offset_bytes), &extent)) = self.by_offset.first_key_value()
+            else {
+                self.rollback_segments(&segments)?;
+                return Ok(None);
+            };
+            if extent.length_bytes % block_bytes != 0 {
+                let error = invalid_resource("paged free extent lost fixed-block alignment");
+                return Err(self.with_rollback_context(&segments, error));
+            }
+            let take = extent.length_bytes.min(remaining);
+            let segment = match BackingSegment::from_chunk(
+                pool_id,
+                chunk_ordinal,
+                extent.chunk_generation,
+                offset_bytes,
+                take,
+            ) {
+                Ok(segment) => segment,
+                Err(error) => return Err(self.with_rollback_context(&segments, error)),
+            };
+            if let Err(error) = self.remove_extent(chunk_ordinal, offset_bytes) {
+                return Err(self.with_rollback_context(&segments, error));
+            }
+            if take < extent.length_bytes {
+                if let Err(error) = self.insert_extent(
+                    chunk_ordinal,
+                    extent.chunk_generation,
+                    offset_bytes + take,
+                    extent.length_bytes - take,
+                ) {
+                    let restore = self.insert_extent(
+                        chunk_ordinal,
+                        extent.chunk_generation,
+                        offset_bytes,
+                        extent.length_bytes,
+                    );
+                    let error = match restore {
+                        Ok(()) => error,
+                        Err(rollback) => invalid_resource(format!(
+                            "paged allocator failed and could not restore its selected extent: {error}; rollback: {rollback}"
+                        )),
+                    };
+                    return Err(self.with_rollback_context(&segments, error));
+                }
+            }
+            segments.push(segment);
+            remaining -= take;
+        }
+        Ok(Some(segments))
+    }
+
+    fn release(&mut self, segment: &BackingSegment) -> Result<(), VNextError> {
+        let chunk_ordinal = segment.chunk_ordinal();
+        let chunk_generation = segment.chunk_generation();
+        let mut offset_bytes = segment.offset_bytes();
+        let mut length_bytes = segment.length_bytes();
+        if let Some((&(ordinal, previous_offset), &previous)) = self
+            .by_offset
+            .range(..(chunk_ordinal, offset_bytes))
+            .next_back()
+        {
+            if ordinal == chunk_ordinal
+                && previous.chunk_generation == chunk_generation
+                && previous_offset + previous.length_bytes == offset_bytes
+            {
+                self.remove_extent(ordinal, previous_offset)?;
+                offset_bytes = previous_offset;
+                length_bytes = length_bytes
+                    .checked_add(previous.length_bytes)
+                    .ok_or_else(|| invalid_resource("coalesced free extent overflows u64"))?;
+            }
+        }
+        if let Some((&(ordinal, next_offset), &next)) =
+            self.by_offset.range((chunk_ordinal, offset_bytes)..).next()
+        {
+            if ordinal == chunk_ordinal
+                && next.chunk_generation == chunk_generation
+                && offset_bytes + length_bytes == next_offset
+            {
+                self.remove_extent(ordinal, next_offset)?;
+                length_bytes = length_bytes
+                    .checked_add(next.length_bytes)
+                    .ok_or_else(|| invalid_resource("coalesced free extent overflows u64"))?;
+            }
+        }
+        self.insert_extent(chunk_ordinal, chunk_generation, offset_bytes, length_bytes)
+    }
+
+    pub(super) fn largest_contiguous_bytes(&self) -> u64 {
+        self.by_size
+            .last()
+            .map_or(0, |(length_bytes, _, _, _)| *length_bytes)
+    }
+}
+
+fn rollback_free_extent_journal<B>(
+    states: &mut [std::sync::MutexGuard<'_, DynamicBackingPoolState<B>>],
+    journals: &[Vec<Vec<BackingSegment>>],
+) -> Result<(), VNextError> {
+    for group_index in (0..journals.len()).rev() {
+        for segments in journals[group_index].iter().rev() {
+            for segment in segments.iter().rev() {
+                if let Err(error) = states[group_index].allocator.release(segment) {
+                    states[group_index].poisoned = true;
+                    return Err(invalid_resource(format!(
+                        "dynamic backing rollback failed and poisoned its pool: {error}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) struct DynamicBackingPoolState<B> {
+    pub(super) resident_bytes: u64,
+    pub(super) pending_growth_bytes: u64,
+    pub(super) next_chunk_ordinal: u32,
+    pub(super) next_chunk_generation: u64,
+    pub(super) chunks: BTreeMap<u32, ResidentChunkState<B>>,
+    pub(super) allocator: FreeExtentIndex,
+    pub(super) quarantined: Vec<QuarantinedDynamicChunk<B>>,
+    pub(super) poisoned: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicChunkQuarantineReason {
+    DescriptorMismatch,
+    PublicationRejected,
+}
+
+pub(super) struct QuarantinedDynamicChunk<B> {
+    pub(super) backing: Arc<ResidentChunkBacking<B>>,
+    pub(super) reason: DynamicChunkQuarantineReason,
+}
+
+pub(super) struct DynamicBackingPool<R>
+where
+    R: DeviceRuntime,
+{
+    instance_id: u64,
+    pub(super) domain: DynamicPoolDomainSpec,
+    logical_admission: LogicalAdmissionCoordinator,
+    maintenance: Mutex<()>,
+    next_extent_generation: AtomicU64,
+    pub(super) state: Mutex<DynamicBackingPoolState<R::Buffer>>,
+}
+
+struct PendingGrowthGuard<R>
+where
+    R: DeviceRuntime,
+{
+    pool: Arc<DynamicBackingPool<R>>,
+    bytes: u64,
+    armed: bool,
+}
+
+impl<R> PendingGrowthGuard<R>
+where
+    R: DeviceRuntime,
+{
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<R> Drop for PendingGrowthGuard<R>
+where
+    R: DeviceRuntime,
+{
+    fn drop(&mut self) {
+        if self.armed {
+            self.pool.cancel_pending_growth(self.bytes);
+        }
+    }
+}
+
+trait BackingExtentOwner: Send + Sync {
+    fn instance_id(&self) -> u64;
+    fn release_segments(&self, segments: &[BackingSegment]);
+}
+
+pub(super) struct BackingSegmentLease {
+    owner: Arc<dyn BackingExtentOwner>,
+    owner_instance_id: u64,
+    segment_generation: u64,
+    segments: Vec<BackingSegment>,
+    released: bool,
+}
+
+impl Drop for BackingSegmentLease {
+    fn drop(&mut self) {
+        if !self.released {
+            self.owner.release_segments(&self.segments);
+            self.released = true;
+        }
+    }
+}
+
+impl<R> BackingExtentOwner for DynamicBackingPool<R>
+where
+    R: DeviceRuntime,
+{
+    fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
+    fn release_segments(&self, segments: &[BackingSegment]) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                state.poisoned = true;
+                return;
+            }
+        };
+        if state.poisoned {
+            return;
+        }
+        for segment in segments {
+            if segment.pool_id() != self.domain.pool_id() {
+                state.poisoned = true;
+                return;
+            }
+            let Some(chunk) = state.chunks.get_mut(&segment.chunk.ordinal) else {
+                state.poisoned = true;
+                return;
+            };
+            if chunk.backing.identity != segment.chunk || chunk.live_segments == 0 {
+                state.poisoned = true;
+                return;
+            }
+        }
+        for segment in segments {
+            if state.allocator.release(segment).is_err() {
+                state.poisoned = true;
+                return;
+            }
+            let chunk = state
+                .chunks
+                .get_mut(&segment.chunk_ordinal())
+                .expect("validated released chunk remains installed");
+            chunk.live_segments -= 1;
+        }
+        drop(state);
+        if self
+            .logical_admission
+            .notify_domain_availability_changed(self.domain.domain_id)
+            .is_err()
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.poisoned = true;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DynamicPoolGrowthReceipt {
+    pool_id: DynamicBackingPoolId,
+    chunk: BackingChunkIdentity,
+    chunk_bytes: u64,
+    published_capacity_bytes: u64,
+    capacity_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DynamicPoolStatus {
+    pool_id: DynamicBackingPoolId,
+    domain_id: CapacityDomainId,
+    storage_profile: DynamicStorageProfile,
+    resident_bytes: u64,
+    pending_growth_bytes: u64,
+    free_bytes: u64,
+    largest_contiguous_bytes: u64,
+    resident_chunks: usize,
+    live_segments: u64,
+    quarantined_chunks: usize,
+    quarantined_bytes: u64,
+    descriptor_mismatch_chunks: usize,
+    publication_rejected_chunks: usize,
+    poisoned: bool,
+}
+
+impl DynamicPoolStatus {
+    pub fn pool_id(&self) -> &DynamicBackingPoolId {
+        &self.pool_id
+    }
+
+    pub const fn domain_id(&self) -> CapacityDomainId {
+        self.domain_id
+    }
+
+    pub const fn storage_profile(&self) -> DynamicStorageProfile {
+        self.storage_profile
+    }
+
+    pub const fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
+    }
+
+    pub const fn pending_growth_bytes(&self) -> u64 {
+        self.pending_growth_bytes
+    }
+
+    pub const fn free_bytes(&self) -> u64 {
+        self.free_bytes
+    }
+
+    pub const fn largest_contiguous_bytes(&self) -> u64 {
+        self.largest_contiguous_bytes
+    }
+
+    pub const fn resident_chunks(&self) -> usize {
+        self.resident_chunks
+    }
+
+    pub const fn live_segments(&self) -> u64 {
+        self.live_segments
+    }
+
+    pub const fn quarantined_chunks(&self) -> usize {
+        self.quarantined_chunks
+    }
+
+    pub const fn quarantined_bytes(&self) -> u64 {
+        self.quarantined_bytes
+    }
+
+    pub const fn descriptor_mismatch_chunks(&self) -> usize {
+        self.descriptor_mismatch_chunks
+    }
+
+    pub const fn publication_rejected_chunks(&self) -> usize {
+        self.publication_rejected_chunks
+    }
+
+    pub const fn poisoned(&self) -> bool {
+        self.poisoned
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DynamicPoolMaintenanceStatus {
+    epochs: CapacityEpochs,
+    device_capacity_bytes: u64,
+    effective_device_usable_ceiling_bytes: u64,
+    process_claimed_bytes: u64,
+    budget_device_wide_usable_ceiling_bytes: u64,
+    budget_claimed_bytes: u64,
+    pools: Vec<DynamicPoolStatus>,
+}
+
+impl DynamicPoolMaintenanceStatus {
+    pub const fn epochs(&self) -> CapacityEpochs {
+        self.epochs
+    }
+
+    pub const fn device_capacity_bytes(&self) -> u64 {
+        self.device_capacity_bytes
+    }
+
+    pub const fn effective_device_usable_ceiling_bytes(&self) -> u64 {
+        self.effective_device_usable_ceiling_bytes
+    }
+
+    pub const fn process_claimed_bytes(&self) -> u64 {
+        self.process_claimed_bytes
+    }
+
+    pub const fn budget_device_wide_usable_ceiling_bytes(&self) -> u64 {
+        self.budget_device_wide_usable_ceiling_bytes
+    }
+
+    pub const fn budget_claimed_bytes(&self) -> u64 {
+        self.budget_claimed_bytes
+    }
+
+    pub fn pools(&self) -> &[DynamicPoolStatus] {
+        &self.pools
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum DynamicDeferredMaintenanceOutcome {
+    RetryWithoutGrowth { current_epochs: CapacityEpochs },
+    Maintained(DynamicPoolGrowthBatchReceipt),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DynamicPoolQuarantineRelease {
+    pool_id: DynamicBackingPoolId,
+    released_chunks: usize,
+    released_bytes: u64,
+}
+
+impl DynamicPoolQuarantineRelease {
+    pub fn pool_id(&self) -> &DynamicBackingPoolId {
+        &self.pool_id
+    }
+
+    pub const fn released_chunks(&self) -> usize {
+        self.released_chunks
+    }
+
+    pub const fn released_bytes(&self) -> u64 {
+        self.released_bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DynamicPoolQuarantineReleaseReceipt {
+    pools: Vec<DynamicPoolQuarantineRelease>,
+    released_chunks: usize,
+    released_bytes: u64,
+}
+
+impl DynamicPoolQuarantineReleaseReceipt {
+    pub fn pools(&self) -> &[DynamicPoolQuarantineRelease] {
+        &self.pools
+    }
+
+    pub const fn released_chunks(&self) -> usize {
+        self.released_chunks
+    }
+
+    pub const fn released_bytes(&self) -> u64 {
+        self.released_bytes
+    }
+}
+
+/// Plan-owner capability for changing physical dynamic-pool residency. It is
+/// created once during provisioning, is intentionally not `Clone`, and cannot
+/// be derived from any request, sequence, step, invocation, or static lease.
+///
+/// ```compile_fail
+/// use ferrum_interfaces::vnext::{AdmittedRequestResources, DeviceRuntime};
+/// fn request_cannot_mint<R: DeviceRuntime>(request: &AdmittedRequestResources<R>) {
+///     let _ = request.dynamic_pool_maintenance_controller();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ferrum_interfaces::vnext::{DeviceRuntime, StaticProvisioningLease};
+/// fn lease_cannot_mint<R: DeviceRuntime>(lease: &StaticProvisioningLease<R>) {
+///     let _ = lease.dynamic_pool_maintenance_controller();
+/// }
+/// ```
+#[must_use = "dynamic pool maintenance controller must be retained by the plan owner"]
+pub struct DynamicPoolMaintenanceController<R>
+where
+    R: DeviceRuntime,
+{
+    pools: Arc<DynamicPoolSet<R>>,
+}
+
+impl<R> DynamicPoolMaintenanceController<R>
+where
+    R: DeviceRuntime,
+{
+    pub(super) fn new(pools: Arc<DynamicPoolSet<R>>) -> Self {
+        Self { pools }
+    }
+
+    pub fn pool_ids(&self) -> impl ExactSizeIterator<Item = &DynamicBackingPoolId> {
+        self.pools.pools.keys()
+    }
+
+    /// Returns one exact domain-to-pool and physical-capacity snapshot. The
+    /// process-wide usable ceiling is the conservative minimum across all live
+    /// plan budgets; plan claims remain separately visible.
+    pub fn status(&self) -> Result<DynamicPoolMaintenanceStatus, VNextError> {
+        let mut pools = Vec::with_capacity(self.pools.pools.len());
+        for pool in self.pools.pools.values() {
+            let state = pool
+                .state
+                .lock()
+                .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))?;
+            let live_segments = state.chunks.values().try_fold(0_u64, |total, chunk| {
+                total
+                    .checked_add(chunk.live_segments)
+                    .ok_or_else(|| invalid_resource("dynamic live segment count overflows u64"))
+            })?;
+            let quarantined_bytes = state.quarantined.iter().try_fold(0_u64, |total, chunk| {
+                total
+                    .checked_add(chunk.backing._grant.bytes())
+                    .ok_or_else(|| invalid_resource("dynamic quarantine bytes overflow u64"))
+            })?;
+            pools.push(DynamicPoolStatus {
+                pool_id: pool.domain.pool_id().clone(),
+                domain_id: pool.domain.domain_id,
+                storage_profile: pool.domain.pool.compatibility().profile(),
+                resident_bytes: state.resident_bytes,
+                pending_growth_bytes: state.pending_growth_bytes,
+                free_bytes: state.allocator.free_bytes,
+                largest_contiguous_bytes: state.allocator.largest_contiguous_bytes(),
+                resident_chunks: state.chunks.len(),
+                live_segments,
+                quarantined_chunks: state.quarantined.len(),
+                quarantined_bytes,
+                descriptor_mismatch_chunks: state
+                    .quarantined
+                    .iter()
+                    .filter(|chunk| {
+                        chunk.reason == DynamicChunkQuarantineReason::DescriptorMismatch
+                    })
+                    .count(),
+                publication_rejected_chunks: state
+                    .quarantined
+                    .iter()
+                    .filter(|chunk| {
+                        chunk.reason == DynamicChunkQuarantineReason::PublicationRejected
+                    })
+                    .count(),
+                poisoned: state.poisoned,
+            });
+        }
+        let account = &self.pools.budget.account;
+        let state = account
+            .state
+            .lock()
+            .map_err(|_| invalid_resource("device capacity account is poisoned"))?;
+        let effective_device_usable_ceiling_bytes = state
+            .budgets
+            .values()
+            .map(|budget| budget.device_wide_usable_ceiling_bytes)
+            .min()
+            .ok_or_else(|| invalid_resource("device capacity account has no live budget"))?;
+        let budget_claimed_bytes = state
+            .budgets
+            .get(&self.pools.budget.budget_id)
+            .ok_or_else(|| invalid_resource("dynamic pool plan budget is stale"))?
+            .claimed_bytes;
+        Ok(DynamicPoolMaintenanceStatus {
+            epochs: self.pools.logical_admission.epochs()?,
+            device_capacity_bytes: account.device_capacity_bytes,
+            effective_device_usable_ceiling_bytes,
+            process_claimed_bytes: state.claimed_bytes,
+            budget_device_wide_usable_ceiling_bytes: self
+                .pools
+                .budget
+                .device_wide_usable_ceiling_bytes,
+            budget_claimed_bytes,
+            pools,
+        })
+    }
+
+    /// Makes the core-derived runnable minimum resident. A second call is a
+    /// no-op and returns `None`; it never creates a duplicate initial chunk.
+    pub fn initialize_pool(
+        &self,
+        pool_id: &DynamicBackingPoolId,
+    ) -> Result<Option<DynamicPoolGrowthReceipt>, VNextError> {
+        let mut receipt = self
+            .pools
+            .maintain_pools(vec![DynamicPoolGrowthIntent::Minimum(pool_id.clone())])?;
+        Ok(receipt.growths.pop())
+    }
+
+    /// Initializes several pools in one canonical all-or-nothing publication.
+    pub fn initialize_pools(
+        &self,
+        pool_ids: &[DynamicBackingPoolId],
+    ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
+        self.pools.maintain_pools(
+            pool_ids
+                .iter()
+                .cloned()
+                .map(DynamicPoolGrowthIntent::Minimum)
+                .collect(),
+        )
+    }
+
+    /// Adds one explicitly-sized resident chunk. The physical allocation is
+    /// globally reserved before the runtime is called and published only after
+    /// allocation, descriptor validation, and installation all succeed.
+    pub fn grow_pool(
+        &self,
+        pool_id: &DynamicBackingPoolId,
+        requested_bytes: u64,
+    ) -> Result<DynamicPoolGrowthReceipt, VNextError> {
+        let request = DynamicPoolGrowthRequest::new(pool_id.clone(), requested_bytes)?;
+        let mut receipt = self.grow_pools(vec![request])?;
+        receipt
+            .growths
+            .pop()
+            .ok_or_else(|| invalid_resource("single-pool growth produced no receipt"))
+    }
+
+    /// Grows distinct pools under one global reservation and one capacity
+    /// epoch publication. Input order is ignored; duplicate pools are rejected.
+    pub fn grow_pools(
+        &self,
+        requests: Vec<DynamicPoolGrowthRequest>,
+    ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
+        self.pools.maintain_pools(
+            requests
+                .into_iter()
+                .map(DynamicPoolGrowthIntent::Additional)
+                .collect(),
+        )
+    }
+
+    /// Resolves a still-current physical deferral by pool identity. If any
+    /// release or capacity event happened since observation, no allocation is
+    /// performed and the caller must retry admission against the new state.
+    pub fn maintain_for_deferred(
+        &self,
+        deferred: &DynamicBackingDeferred,
+    ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        let current_epochs = self.pools.logical_admission.epochs()?;
+        if current_epochs.coordinator_id() != deferred.epochs().coordinator_id() {
+            return Err(invalid_resource(
+                "dynamic backing deferral belongs to another admission coordinator",
+            ));
+        }
+        if current_epochs != deferred.epochs() {
+            return Ok(DynamicDeferredMaintenanceOutcome::RetryWithoutGrowth { current_epochs });
+        }
+        if deferred.blockers().is_empty() {
+            return Err(invalid_resource(
+                "dynamic backing deferral contains no blocking pool",
+            ));
+        }
+        let mut requested_by_pool = BTreeMap::<DynamicBackingPoolId, u64>::new();
+        for blocker in deferred.blockers() {
+            if !self.pools.pools.contains_key(blocker.pool_id()) {
+                return Err(invalid_resource(
+                    "dynamic backing deferral belongs to another plan owner",
+                ));
+            }
+            requested_by_pool
+                .entry(blocker.pool_id().clone())
+                .and_modify(|bytes| *bytes = (*bytes).max(blocker.requested_bytes()))
+                .or_insert(blocker.requested_bytes());
+        }
+        let receipt = self.grow_pools(
+            requested_by_pool
+                .into_iter()
+                .map(|(pool_id, bytes)| DynamicPoolGrowthRequest::new(pool_id, bytes))
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        Ok(DynamicDeferredMaintenanceOutcome::Maintained(receipt))
+    }
+
+    /// Explicitly releases only unclaimable quarantined chunks. Resident
+    /// chunks and logical totals are unchanged; the returned grants are
+    /// dropped after all pool locks have been released.
+    pub fn release_quarantined_chunks(
+        &self,
+    ) -> Result<DynamicPoolQuarantineReleaseReceipt, VNextError> {
+        let pools = self.pools.pools.values().cloned().collect::<Vec<_>>();
+        let _maintenance = pools
+            .iter()
+            .map(|pool| {
+                pool.maintenance
+                    .lock()
+                    .map_err(|_| invalid_resource("dynamic pool maintenance authority is poisoned"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut states = pools
+            .iter()
+            .map(|pool| {
+                pool.state
+                    .lock()
+                    .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let pool_totals = states
+            .iter()
+            .map(|state| {
+                let bytes = state.quarantined.iter().try_fold(0_u64, |total, chunk| {
+                    total
+                        .checked_add(chunk.backing._grant.bytes())
+                        .ok_or_else(|| invalid_resource("released quarantine bytes overflow u64"))
+                })?;
+                Ok((state.quarantined.len(), bytes))
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        let released_chunks = pool_totals.iter().try_fold(0_usize, |total, (count, _)| {
+            total
+                .checked_add(*count)
+                .ok_or_else(|| invalid_resource("released quarantine count overflows usize"))
+        })?;
+        let released_bytes = pool_totals.iter().try_fold(0_u64, |total, (_, bytes)| {
+            total
+                .checked_add(*bytes)
+                .ok_or_else(|| invalid_resource("released quarantine bytes overflow u64"))
+        })?;
+        let mut released = Vec::with_capacity(pools.len());
+        let mut receipts = Vec::new();
+        for ((pool, state), (pool_chunks, pool_bytes)) in
+            pools.iter().zip(states.iter_mut()).zip(pool_totals)
+        {
+            if pool_chunks == 0 {
+                continue;
+            }
+            let chunks = std::mem::take(&mut state.quarantined);
+            debug_assert_eq!(chunks.len(), pool_chunks);
+            receipts.push(DynamicPoolQuarantineRelease {
+                pool_id: pool.domain.pool_id().clone(),
+                released_chunks: pool_chunks,
+                released_bytes: pool_bytes,
+            });
+            released.push(chunks);
+        }
+        drop(states);
+        drop(released);
+        Ok(DynamicPoolQuarantineReleaseReceipt {
+            pools: receipts,
+            released_chunks,
+            released_bytes,
+        })
+    }
+}
+
+impl DynamicPoolGrowthReceipt {
+    pub fn pool_id(&self) -> &DynamicBackingPoolId {
+        &self.pool_id
+    }
+
+    pub fn chunk(&self) -> &BackingChunkIdentity {
+        &self.chunk
+    }
+
+    pub const fn chunk_bytes(&self) -> u64 {
+        self.chunk_bytes
+    }
+
+    pub const fn published_capacity_bytes(&self) -> u64 {
+        self.published_capacity_bytes
+    }
+
+    pub const fn capacity_epoch(&self) -> u64 {
+        self.capacity_epoch
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DynamicPoolGrowthRequest {
+    pool_id: DynamicBackingPoolId,
+    requested_bytes: u64,
+}
+
+impl DynamicPoolGrowthRequest {
+    pub fn new(pool_id: DynamicBackingPoolId, requested_bytes: u64) -> Result<Self, VNextError> {
+        if requested_bytes == 0 {
+            return Err(invalid_resource(
+                "dynamic pool growth must request non-zero bytes",
+            ));
+        }
+        Ok(Self {
+            pool_id,
+            requested_bytes,
+        })
+    }
+
+    pub fn pool_id(&self) -> &DynamicBackingPoolId {
+        &self.pool_id
+    }
+
+    pub const fn requested_bytes(&self) -> u64 {
+        self.requested_bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DynamicPoolGrowthBatchReceipt {
+    growths: Vec<DynamicPoolGrowthReceipt>,
+    capacity_epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicBackingDeferralReason {
+    GrowthRequired,
+    FragmentedContiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DynamicBackingBlocker {
+    pool_id: DynamicBackingPoolId,
+    reason: DynamicBackingDeferralReason,
+    requested_bytes: u64,
+    free_bytes: u64,
+    largest_contiguous_bytes: u64,
+}
+
+impl DynamicBackingBlocker {
+    pub fn pool_id(&self) -> &DynamicBackingPoolId {
+        &self.pool_id
+    }
+
+    pub const fn reason(&self) -> DynamicBackingDeferralReason {
+        self.reason
+    }
+
+    pub const fn requested_bytes(&self) -> u64 {
+        self.requested_bytes
+    }
+
+    pub const fn free_bytes(&self) -> u64 {
+        self.free_bytes
+    }
+
+    pub const fn largest_contiguous_bytes(&self) -> u64 {
+        self.largest_contiguous_bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DynamicBackingDeferred {
+    blockers: Vec<DynamicBackingBlocker>,
+    epochs: CapacityEpochs,
+}
+
+impl DynamicBackingDeferred {
+    pub fn blockers(&self) -> &[DynamicBackingBlocker] {
+        &self.blockers
+    }
+
+    pub const fn release_epoch(&self) -> u64 {
+        self.epochs.release_epoch()
+    }
+
+    pub const fn capacity_epoch(&self) -> u64 {
+        self.epochs.capacity_epoch()
+    }
+
+    pub const fn epochs(&self) -> CapacityEpochs {
+        self.epochs
+    }
+}
+
+impl DynamicPoolGrowthBatchReceipt {
+    pub fn growths(&self) -> &[DynamicPoolGrowthReceipt] {
+        &self.growths
+    }
+
+    pub const fn capacity_epoch(&self) -> u64 {
+        self.capacity_epoch
+    }
+}
+
+enum DynamicPoolGrowthIntent {
+    Additional(DynamicPoolGrowthRequest),
+    Minimum(DynamicBackingPoolId),
+}
+
+impl DynamicPoolGrowthIntent {
+    fn pool_id(&self) -> &DynamicBackingPoolId {
+        match self {
+            Self::Additional(request) => request.pool_id(),
+            Self::Minimum(pool_id) => pool_id,
+        }
+    }
+}
+
+struct PlannedDynamicGrowth<R>
+where
+    R: DeviceRuntime,
+{
+    pool: Arc<DynamicBackingPool<R>>,
+    chunk: BackingChunkIdentity,
+    expected_resource_id: ResourceId,
+    chunk_bytes: u64,
+}
+
+struct AllocatedDynamicGrowth<B> {
+    backing: Arc<ResidentChunkBacking<B>>,
+}
+
+pub(super) struct EvaluatedBackingRequest<'a> {
+    pub(super) domain: &'a DynamicPoolDomainSpec,
+    pub(super) descriptor: &'a DynamicResourceDescriptor,
+    pub(super) size_bytes: u64,
+}
+
+struct PreparedBackingSlice<R>
+where
+    R: DeviceRuntime,
+{
+    pool: Arc<DynamicBackingPool<R>>,
+    evidence: LogicalBackingSliceEvidence,
+}
+
+pub(super) struct PreparedBackingClaim<R>
+where
+    R: DeviceRuntime,
+{
+    slices: Vec<PreparedBackingSlice<R>>,
+    committed: bool,
+}
+
+impl<R> PreparedBackingClaim<R>
+where
+    R: DeviceRuntime,
+{
+    fn empty() -> Self {
+        Self {
+            slices: Vec::new(),
+            committed: false,
+        }
+    }
+
+    pub(super) fn commit(mut self) -> Vec<LogicalBackingSliceAuthority> {
+        let slices = std::mem::take(&mut self.slices)
+            .into_iter()
+            .map(|slice| {
+                let owner: Arc<dyn BackingExtentOwner> = slice.pool;
+                let segment_generation = slice.evidence.segment_generation;
+                let segments = slice.evidence.segments.clone();
+                LogicalBackingSliceAuthority {
+                    evidence: slice.evidence,
+                    segment_lease: BackingSegmentLease {
+                        owner_instance_id: owner.instance_id(),
+                        owner,
+                        segment_generation,
+                        segments,
+                        released: false,
+                    },
+                }
+            })
+            .collect();
+        self.committed = true;
+        slices
+    }
+}
+
+impl<R> Drop for PreparedBackingClaim<R>
+where
+    R: DeviceRuntime,
+{
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for slice in self.slices.iter().rev() {
+            slice.pool.rollback_prepared(&slice.evidence.segments);
+        }
+    }
+}
+
+pub(super) enum BackingPrepareDecision<R>
+where
+    R: DeviceRuntime,
+{
+    Prepared(PreparedBackingClaim<R>),
+    Deferred(DynamicBackingDeferred),
+}
+
+pub(super) struct DynamicPoolSet<R>
+where
+    R: DeviceRuntime,
+{
+    pub(super) pools: BTreeMap<DynamicBackingPoolId, Arc<DynamicBackingPool<R>>>,
+    pub(super) domains: Vec<DynamicPoolDomainSpec>,
+    pub(super) nodes: Arc<[PlanNode]>,
+    pub(super) logical_admission: LogicalAdmissionCoordinator,
+    pub(super) budget: Arc<DeviceCapacityBudget>,
+    binding: StaticProvisioningBinding,
+    // Backend context must outlive every resident/quarantined buffer above.
+    runtime: Arc<R>,
+}
+
+impl<R> DynamicPoolSet<R>
+where
+    R: DeviceRuntime,
+{
+    pub(super) fn new(
+        runtime: Arc<R>,
+        binding: StaticProvisioningBinding,
+        budget: Arc<DeviceCapacityBudget>,
+        logical_admission: LogicalAdmissionCoordinator,
+        domains: Vec<DynamicPoolDomainSpec>,
+        nodes: Arc<[PlanNode]>,
+    ) -> Result<Self, VNextError> {
+        let mut pools = BTreeMap::new();
+        for domain in &domains {
+            let instance_id = NEXT_DYNAMIC_POOL_INSTANCE_ID
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(1)
+                })
+                .map_err(|_| invalid_resource("dynamic pool instance id space is exhausted"))?;
+            let pool = Arc::new(DynamicBackingPool {
+                instance_id,
+                domain: domain.clone(),
+                logical_admission: logical_admission.clone(),
+                maintenance: Mutex::new(()),
+                next_extent_generation: AtomicU64::new(1),
+                state: Mutex::new(DynamicBackingPoolState {
+                    resident_bytes: 0,
+                    pending_growth_bytes: 0,
+                    next_chunk_ordinal: 1,
+                    next_chunk_generation: 1,
+                    chunks: BTreeMap::new(),
+                    allocator: FreeExtentIndex::default(),
+                    quarantined: Vec::new(),
+                    poisoned: false,
+                }),
+            });
+            if pools.insert(domain.pool_id().clone(), pool).is_some() {
+                return Err(invalid_resource(
+                    "dynamic pool set contains a duplicate pool",
+                ));
+            }
+        }
+        Ok(Self {
+            runtime,
+            binding,
+            budget,
+            logical_admission,
+            domains,
+            pools,
+            nodes,
+        })
+    }
+
+    fn maintain_pools(
+        &self,
+        mut intents: Vec<DynamicPoolGrowthIntent>,
+    ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
+        intents.sort_by(|left, right| left.pool_id().cmp(right.pool_id()));
+        if intents
+            .windows(2)
+            .any(|pair| pair[0].pool_id() == pair[1].pool_id())
+        {
+            return Err(invalid_resource(
+                "dynamic maintenance batch contains a duplicate pool",
+            ));
+        }
+        let pools = intents
+            .iter()
+            .map(|intent| {
+                self.pools.get(intent.pool_id()).cloned().ok_or_else(|| {
+                    invalid_resource("dynamic maintenance references an unknown pool")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let _maintenance = pools
+            .iter()
+            .map(|pool| {
+                pool.maintenance
+                    .lock()
+                    .map_err(|_| invalid_resource("dynamic pool maintenance authority is poisoned"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut planned = Vec::with_capacity(intents.len());
+        let mut pending = Vec::with_capacity(intents.len());
+        for (intent, pool) in intents.iter().zip(&pools) {
+            let requested_bytes = {
+                let state = pool
+                    .state
+                    .lock()
+                    .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))?;
+                if state.poisoned {
+                    return Err(invalid_resource("dynamic backing pool is fail-closed"));
+                }
+                match intent {
+                    DynamicPoolGrowthIntent::Additional(request) => request.requested_bytes(),
+                    DynamicPoolGrowthIntent::Minimum(_) => {
+                        let current = state
+                            .resident_bytes
+                            .checked_add(state.pending_growth_bytes)
+                            .ok_or_else(|| {
+                                invalid_resource("dynamic pool residency overflows u64")
+                            })?;
+                        let minimum = pool.domain.pool.provisioning().minimum_resident_bytes();
+                        if current >= minimum {
+                            continue;
+                        }
+                        minimum - current
+                    }
+                }
+            };
+            let chunk_bytes = align_up_resource(requested_bytes, pool.allocation_quantum())?;
+            let chunk = {
+                let mut state = pool
+                    .state
+                    .lock()
+                    .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))?;
+                if state.poisoned {
+                    return Err(invalid_resource("dynamic backing pool is fail-closed"));
+                }
+                let next_residency = state
+                    .resident_bytes
+                    .checked_add(state.pending_growth_bytes)
+                    .and_then(|bytes| bytes.checked_add(chunk_bytes))
+                    .ok_or_else(|| invalid_resource("dynamic pool resident bytes overflow u64"))?;
+                if next_residency > pool.domain.pool.provisioning().maximum_resident_bytes() {
+                    return Err(invalid_resource(
+                        "dynamic pool growth exceeds its core-derived resident maximum",
+                    ));
+                }
+                let ordinal = state.next_chunk_ordinal;
+                let generation = state.next_chunk_generation;
+                let next_ordinal = ordinal
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_resource("dynamic chunk ordinal space is exhausted"))?;
+                let next_generation = generation.checked_add(1).ok_or_else(|| {
+                    invalid_resource("dynamic chunk generation space is exhausted")
+                })?;
+                let next_pending = state
+                    .pending_growth_bytes
+                    .checked_add(chunk_bytes)
+                    .ok_or_else(|| invalid_resource("pending dynamic growth bytes overflow u64"))?;
+                state.next_chunk_ordinal = next_ordinal;
+                state.next_chunk_generation = next_generation;
+                state.pending_growth_bytes = next_pending;
+                BackingChunkIdentity {
+                    pool_id: pool.domain.pool_id().clone(),
+                    ordinal,
+                    generation,
+                }
+            };
+            pending.push(PendingGrowthGuard {
+                pool: Arc::clone(pool),
+                bytes: chunk_bytes,
+                armed: true,
+            });
+            let expected_resource_id = ResourceId::new(format!(
+                "{}/chunk/{}/{}",
+                pool.domain.pool_id().as_str(),
+                chunk.ordinal,
+                chunk.generation
+            ))?;
+            planned.push(PlannedDynamicGrowth {
+                pool: Arc::clone(pool),
+                chunk,
+                expected_resource_id,
+                chunk_bytes,
+            });
+        }
+        if planned.is_empty() {
+            return Ok(DynamicPoolGrowthBatchReceipt {
+                growths: Vec::new(),
+                capacity_epoch: self.logical_admission.epochs()?.capacity_epoch(),
+            });
+        }
+
+        let total_bytes = planned.iter().try_fold(0_u64, |total, growth| {
+            total
+                .checked_add(growth.chunk_bytes)
+                .ok_or_else(|| invalid_resource("dynamic maintenance batch bytes overflow u64"))
+        })?;
+        let reservation = DeviceCapacityReservation::reserve(&self.budget, total_bytes)?;
+        let grants = reservation.commit_split(
+            &planned
+                .iter()
+                .map(|growth| growth.chunk_bytes)
+                .collect::<Vec<_>>(),
+        )?;
+        let mut allocated = Vec::with_capacity(planned.len());
+        for (growth, grant) in planned.iter().zip(grants) {
+            let transaction_identity = ResourceTransactionIdentity {
+                pool_id: self.binding.pool_id(),
+                run_id: RunId::new(format!("dynamic-grow-{}", growth.chunk.generation))?,
+                transaction_id: TransactionId::new(format!(
+                    "dynamic-grow-{}-{}",
+                    growth.chunk.ordinal, growth.chunk.generation
+                ))?,
+                request_id: self.binding.request_id().clone(),
+            };
+            let reservation_evidence = ResourceReservation {
+                resource_id: growth.expected_resource_id.clone(),
+                request_id: self.binding.request_id().clone(),
+                owner_node_id: None,
+                size_bytes: growth.chunk_bytes,
+                alignment_bytes: growth.pool.domain.pool.compatibility().alignment_bytes(),
+                usage: growth.pool.domain.pool.compatibility().usage(),
+                element_type: growth.pool.domain.pool.compatibility().element_type(),
+                retention_policy: ResourceRetentionPolicy::Plan,
+                backing_domain_id: Some(growth.pool.domain.domain_id),
+                generation: growth.chunk.generation,
+            };
+            let request = BufferRequest::new(
+                growth.expected_resource_id.clone(),
+                growth.chunk_bytes,
+                reservation_evidence.alignment_bytes,
+                reservation_evidence.usage,
+                reservation_evidence.element_type,
+            )?;
+            validate_runtime_descriptor_for_admission(
+                self.runtime.descriptor(),
+                &self.binding,
+                "dynamic pool batch growth preflight",
+            )?;
+            let buffer = self
+                .runtime
+                .allocate(DeviceAllocationPermit {
+                    identity: &transaction_identity,
+                    binding: &self.binding,
+                    reservation: &reservation_evidence,
+                    request: &request,
+                    seal: AllocationSeal,
+                })
+                .map_err(|error| {
+                    invalid_resource(format!("dynamic pool device allocation failed: {error}"))
+                })?;
+            let actual_descriptor = self.runtime.buffer_descriptor(&buffer);
+            validate_runtime_descriptor_for_admission(
+                self.runtime.descriptor(),
+                &self.binding,
+                "dynamic pool batch growth completion",
+            )?;
+            if grant.bytes() != growth.chunk_bytes {
+                return Err(invalid_resource(
+                    "dynamic pool capacity grant differs from its chunk",
+                ));
+            }
+            let backing = Arc::new(ResidentChunkBacking {
+                buffer,
+                _grant: grant,
+                identity: growth.chunk.clone(),
+                descriptor: actual_descriptor.clone(),
+            });
+            if !reservation_evidence.matches_descriptor(&actual_descriptor) {
+                let mut state = growth
+                    .pool
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.quarantined.push(QuarantinedDynamicChunk {
+                    backing,
+                    reason: DynamicChunkQuarantineReason::DescriptorMismatch,
+                });
+                return Err(invalid_resource(
+                    "dynamic chunk descriptor mismatch was quarantined without capacity publication",
+                ));
+            }
+            allocated.push(AllocatedDynamicGrowth { backing });
+        }
+
+        let mut states = planned
+            .iter()
+            .map(|growth| {
+                growth.pool.state.lock().map_err(|_| {
+                    invalid_resource("dynamic backing pool is poisoned after allocation")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut published_totals = Vec::with_capacity(planned.len());
+        for ((growth, allocation), state) in planned.iter().zip(&allocated).zip(&states) {
+            if state.poisoned
+                || state.pending_growth_bytes < growth.chunk_bytes
+                || state.chunks.contains_key(&growth.chunk.ordinal)
+                || state
+                    .allocator
+                    .by_offset
+                    .range((growth.chunk.ordinal, 0)..=(growth.chunk.ordinal, u64::MAX))
+                    .next()
+                    .is_some()
+                || state
+                    .allocator
+                    .free_bytes
+                    .checked_add(growth.chunk_bytes)
+                    .is_none()
+                || allocation.backing.identity != growth.chunk
+            {
+                return Err(invalid_resource(
+                    "dynamic batch installation preconditions changed before publication",
+                ));
+            }
+            published_totals.push(
+                state
+                    .resident_bytes
+                    .checked_add(growth.chunk_bytes)
+                    .ok_or_else(|| invalid_resource("published dynamic capacity overflows u64"))?,
+            );
+        }
+        for index in 0..planned.len() {
+            let growth = &planned[index];
+            let state = &mut states[index];
+            state.pending_growth_bytes -= growth.chunk_bytes;
+            pending[index].disarm();
+            state
+                .allocator
+                .insert_extent(
+                    growth.chunk.ordinal,
+                    growth.chunk.generation,
+                    0,
+                    growth.chunk_bytes,
+                )
+                .expect("validated new chunk has one disjoint free extent");
+            state.chunks.insert(
+                growth.chunk.ordinal,
+                ResidentChunkState {
+                    backing: Arc::clone(&allocated[index].backing),
+                    live_segments: 0,
+                },
+            );
+        }
+        let updates = planned
+            .iter()
+            .zip(&published_totals)
+            .map(|(growth, &total)| (growth.pool.domain.domain_id, CapacityUnits::new(total)))
+            .collect::<Vec<_>>();
+        let epochs = match self.logical_admission.set_domain_totals(&updates) {
+            Ok(epochs) => epochs,
+            Err(error) => {
+                for index in 0..planned.len() {
+                    states[index]
+                        .allocator
+                        .remove_extent(planned[index].chunk.ordinal, 0)
+                        .expect("unpublished dynamic chunk free extent remains installed");
+                    let removed = states[index]
+                        .chunks
+                        .remove(&planned[index].chunk.ordinal)
+                        .expect("unpublished dynamic chunk remains installed");
+                    states[index].quarantined.push(QuarantinedDynamicChunk {
+                        backing: removed.backing,
+                        reason: DynamicChunkQuarantineReason::PublicationRejected,
+                    });
+                }
+                return Err(error);
+            }
+        };
+        for (state, &published_total) in states.iter_mut().zip(&published_totals) {
+            state.resident_bytes = published_total;
+        }
+        Ok(DynamicPoolGrowthBatchReceipt {
+            growths: planned
+                .iter()
+                .zip(published_totals)
+                .map(
+                    |(growth, published_capacity_bytes)| DynamicPoolGrowthReceipt {
+                        pool_id: growth.pool.domain.pool_id().clone(),
+                        chunk: growth.chunk.clone(),
+                        chunk_bytes: growth.chunk_bytes,
+                        published_capacity_bytes,
+                        capacity_epoch: epochs.capacity_epoch(),
+                    },
+                )
+                .collect(),
+            capacity_epoch: epochs.capacity_epoch(),
+        })
+    }
+
+    pub(super) fn prepare_claim(
+        &self,
+        requests: &[EvaluatedBackingRequest<'_>],
+    ) -> Result<BackingPrepareDecision<R>, VNextError> {
+        if requests.is_empty() {
+            return Ok(BackingPrepareDecision::Prepared(
+                PreparedBackingClaim::empty(),
+            ));
+        }
+        let mut grouped =
+            BTreeMap::<DynamicBackingPoolId, Vec<&EvaluatedBackingRequest<'_>>>::new();
+        for request in requests {
+            grouped
+                .entry(request.domain.pool_id().clone())
+                .or_default()
+                .push(request);
+        }
+        let mut groups = Vec::with_capacity(grouped.len());
+        for (pool_id, mut requests) in grouped {
+            requests.sort_by(|left, right| {
+                left.descriptor
+                    .base_resource_id()
+                    .cmp(right.descriptor.base_resource_id())
+            });
+            let pool = self.pools.get(&pool_id).cloned().ok_or_else(|| {
+                invalid_resource("dynamic backing reservation references an unknown pool")
+            })?;
+            groups.push((pool, requests));
+        }
+        let segment_generations = groups
+            .iter()
+            .map(|(pool, requests)| {
+                (0..requests.len())
+                    .map(|_| {
+                        pool.next_extent_generation
+                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                                current.checked_add(1)
+                            })
+                            .map_err(|_| {
+                                invalid_resource("dynamic extent generation space is exhausted")
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut states = groups
+            .iter()
+            .map(|(pool, _)| {
+                pool.state
+                    .lock()
+                    .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (group_index, (pool, pool_requests)) in groups.iter().enumerate() {
+            if states[group_index].poisoned {
+                return Err(invalid_resource("dynamic backing pool is fail-closed"));
+            }
+            let quantum = pool.allocation_quantum();
+            for request in pool_requests {
+                if request.domain.pool_id() != pool.domain.pool_id()
+                    || request.descriptor.pool_id() != pool.domain.pool_id()
+                    || request.size_bytes == 0
+                    || request.size_bytes % quantum != 0
+                {
+                    return Err(invalid_resource(
+                        "dynamic backing request violates its exact pool or allocation quantum",
+                    ));
+                }
+            }
+        }
+        let mut selections = groups
+            .iter()
+            .map(|_| Vec::<(&EvaluatedBackingRequest<'_>, u64, Vec<BackingSegment>)>::new())
+            .collect::<Vec<_>>();
+        let mut journals = groups
+            .iter()
+            .map(|_| Vec::<Vec<BackingSegment>>::new())
+            .collect::<Vec<_>>();
+        for group_index in 0..groups.len() {
+            let (pool, pool_requests) = &groups[group_index];
+            let profile = pool.domain.pool.compatibility().profile();
+            for request in pool_requests {
+                let reserved = match match profile.view() {
+                    DynamicStorageView::Contiguous => states[group_index]
+                        .allocator
+                        .allocate_contiguous(pool.domain.pool_id(), request.size_bytes)
+                        .map(|segment| segment.map(|segment| vec![segment])),
+                    DynamicStorageView::PagedRegions { block_bytes } => states[group_index]
+                        .allocator
+                        .allocate_paged(pool.domain.pool_id(), request.size_bytes, block_bytes),
+                } {
+                    Ok(reserved) => reserved,
+                    Err(error) => {
+                        states[group_index].poisoned = true;
+                        rollback_free_extent_journal(&mut states, &journals)?;
+                        return Err(error);
+                    }
+                };
+                let Some(segments) = reserved else {
+                    let blocker = DynamicBackingBlocker {
+                        pool_id: pool.domain.pool_id().clone(),
+                        reason: if states[group_index].allocator.free_bytes < request.size_bytes {
+                            DynamicBackingDeferralReason::GrowthRequired
+                        } else {
+                            DynamicBackingDeferralReason::FragmentedContiguous
+                        },
+                        requested_bytes: request.size_bytes,
+                        free_bytes: states[group_index].allocator.free_bytes,
+                        largest_contiguous_bytes: states[group_index]
+                            .allocator
+                            .largest_contiguous_bytes(),
+                    };
+                    rollback_free_extent_journal(&mut states, &journals)?;
+                    drop(states);
+                    return Ok(BackingPrepareDecision::Deferred(DynamicBackingDeferred {
+                        blockers: vec![blocker],
+                        epochs: self.logical_admission.epochs()?,
+                    }));
+                };
+                journals[group_index].push(segments.clone());
+                let extent_bytes = match segments.iter().try_fold(0_u64, |total, segment| {
+                    total.checked_add(segment.length_bytes()).ok_or_else(|| {
+                        invalid_resource("dynamic backing extent bytes overflow u64")
+                    })
+                }) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        rollback_free_extent_journal(&mut states, &journals)?;
+                        return Err(error);
+                    }
+                };
+                if extent_bytes != request.size_bytes {
+                    rollback_free_extent_journal(&mut states, &journals)?;
+                    return Err(invalid_resource(
+                        "dynamic backing extents differ from their exact logical claim",
+                    ));
+                }
+                let generation = segment_generations[group_index][selections[group_index].len()];
+                selections[group_index].push((request, generation, segments));
+            }
+        }
+
+        let increments = match (0..groups.len())
+            .map(|group_index| {
+                let mut increments = BTreeMap::<u32, u64>::new();
+                for (_, _, segments) in &selections[group_index] {
+                    for segment in segments {
+                        let count = increments.entry(segment.chunk_ordinal()).or_default();
+                        *count = count.checked_add(1).ok_or_else(|| {
+                            invalid_resource("dynamic chunk live extent increment overflows u64")
+                        })?;
+                    }
+                }
+                for (&ordinal, &increment) in &increments {
+                    states[group_index]
+                        .chunks
+                        .get(&ordinal)
+                        .ok_or_else(|| invalid_resource("reserved dynamic chunk disappeared"))?
+                        .live_segments
+                        .checked_add(increment)
+                        .ok_or_else(|| {
+                            invalid_resource("dynamic chunk live extent count overflowed")
+                        })?;
+                }
+                Ok(increments)
+            })
+            .collect::<Result<Vec<_>, VNextError>>()
+        {
+            Ok(increments) => increments,
+            Err(error) => {
+                rollback_free_extent_journal(&mut states, &journals)?;
+                return Err(error);
+            }
+        };
+        for (group_index, increments) in increments.into_iter().enumerate() {
+            for (ordinal, increment) in increments {
+                states[group_index]
+                    .chunks
+                    .get_mut(&ordinal)
+                    .expect("validated reserved dynamic chunk remains installed")
+                    .live_segments += increment;
+            }
+        }
+        drop(states);
+        let slices = groups
+            .into_iter()
+            .zip(selections)
+            .flat_map(|((pool, _), selections)| {
+                selections
+                    .into_iter()
+                    .map(
+                        move |(request, segment_generation, segments)| PreparedBackingSlice {
+                            pool: Arc::clone(&pool),
+                            evidence: LogicalBackingSliceEvidence {
+                                domain_id: pool.domain.domain_id,
+                                pool_id: pool.domain.pool_id().clone(),
+                                resource_id: request.descriptor.base_resource_id().clone(),
+                                pool_instance_id: pool.instance_id,
+                                segment_generation,
+                                segments,
+                                size_bytes: request.size_bytes,
+                                alignment_bytes: request.descriptor.alignment_bytes(),
+                                usage: request.descriptor.usage(),
+                                element_type: request.descriptor.element_type(),
+                                storage_profile: pool.domain.pool.compatibility().profile(),
+                            },
+                        },
+                    )
+            })
+            .collect();
+        Ok(BackingPrepareDecision::Prepared(PreparedBackingClaim {
+            slices,
+            committed: false,
+        }))
+    }
+
+    pub(super) fn view<'lease>(
+        &'lease self,
+        authority: &'lease LogicalBackingSliceAuthority,
+    ) -> Result<LogicalBackingBufferView<'lease, R::Buffer>, VNextError> {
+        let pool = self
+            .pools
+            .get(&authority.evidence.pool_id)
+            .ok_or_else(|| invalid_resource("logical backing authority has no dynamic pool"))?;
+        if pool.instance_id != authority.evidence.pool_instance_id
+            || authority.segment_lease.owner_instance_id != pool.instance_id
+            || authority.segment_lease.owner.instance_id() != pool.instance_id
+            || authority.segment_lease.segment_generation != authority.evidence.segment_generation
+        {
+            return Err(invalid_resource(
+                "logical backing authority belongs to another dynamic pool instance",
+            ));
+        }
+        let state = pool
+            .state
+            .lock()
+            .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))?;
+        if state.poisoned {
+            return Err(invalid_resource("dynamic backing pool is fail-closed"));
+        }
+        let mut bindings = Vec::with_capacity(authority.evidence.segments.len());
+        for segment in &authority.evidence.segments {
+            let chunk = state
+                .chunks
+                .get(&segment.chunk_ordinal())
+                .ok_or_else(|| invalid_resource("logical backing references a missing chunk"))?;
+            if segment.pool_id() != &authority.evidence.pool_id
+                || chunk.backing.identity != *segment.chunk()
+                || segment
+                    .offset_bytes()
+                    .checked_add(segment.length_bytes())
+                    .is_none_or(|end| end > chunk.backing.descriptor.size_bytes)
+            {
+                return Err(invalid_resource(
+                    "logical backing references a stale or out-of-bounds chunk region",
+                ));
+            }
+            bindings.push(LogicalBackingSegmentBinding {
+                segment: segment.clone(),
+                chunk: Arc::clone(&chunk.backing),
+            });
+        }
+        drop(state);
+        Ok(LogicalBackingBufferView {
+            bindings,
+            evidence: &authority.evidence,
+        })
+    }
+}
+
+impl<R> DynamicBackingPool<R>
+where
+    R: DeviceRuntime,
+{
+    fn allocation_quantum(&self) -> u64 {
+        match self.domain.pool.compatibility().profile().allocator() {
+            DynamicStorageAllocator::LinearArena => {
+                self.domain.pool.compatibility().alignment_bytes()
+            }
+            DynamicStorageAllocator::FixedBlockArena { block_bytes } => {
+                block_bytes.max(self.domain.pool.compatibility().alignment_bytes())
+            }
+        }
+    }
+
+    fn cancel_pending_growth(&self, bytes: u64) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.pending_growth_bytes < bytes {
+            state.poisoned = true;
+            return;
+        }
+        state.pending_growth_bytes -= bytes;
+    }
+
+    fn rollback_prepared(&self, segments: &[BackingSegment]) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                state.poisoned = true;
+                return;
+            }
+        };
+        if state.poisoned {
+            return;
+        }
+        for segment in segments.iter().rev() {
+            let valid = state
+                .chunks
+                .get(&segment.chunk_ordinal())
+                .is_some_and(|chunk| {
+                    chunk.backing.identity == *segment.chunk() && chunk.live_segments != 0
+                });
+            if !valid || state.allocator.release(segment).is_err() {
+                state.poisoned = true;
+                return;
+            }
+            state
+                .chunks
+                .get_mut(&segment.chunk_ordinal())
+                .expect("validated prepared chunk remains installed")
+                .live_segments -= 1;
+        }
+        drop(state);
+        if self
+            .logical_admission
+            .notify_domain_availability_changed(self.domain.domain_id)
+            .is_err()
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.poisoned = true;
+        }
+    }
+}
