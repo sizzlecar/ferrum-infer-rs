@@ -3,13 +3,18 @@
 ## 状态与依赖
 
 - 状态：Open
-- 依赖：G01、G02
-- 下游：G04、G08-G10
+- 依赖：S1 从 Qwen3.5-4B CUDA production slice 提取最小 live catalog；S3-S5 随模型扩展；full G03 在 S6 前
+- 下游：S1-S6、G04、G08-G10
 
 ## 目标
 
 用细粒度、版本化 operation contract 替换架构语义化的 `Backend` 大 trait。保留已验证
 CUDA/Metal kernel 实现，但所有调用都通过统一 contract、capability catalog 和 conformance。
+
+operation catalog 不再在 production caller 之前一次性穷举并冻结。S1 只提取 Qwen3.5-4B CUDA
+实际需要的通用 op 和 provider；S3 增加同 semantic fixture 的 Metal provider；S4/S5 仅在模型确实
+需要时增加 MoE/Marlin/full-attention 等 op。novel op 必须同时具有 CPU oracle、目标 backend
+provider、negative fixture 和 live model consumer，planner/runtime 主循环改动仍为 `0`。
 
 ## Operation family
 

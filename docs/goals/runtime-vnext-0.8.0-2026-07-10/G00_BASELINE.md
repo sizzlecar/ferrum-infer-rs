@@ -4,14 +4,28 @@
 
 - 状态：Open
 - 父目标：[`GOAL.md`](GOAL.md)
-- 依赖：无
-- 下游：G01-G10
+- 依赖：G00F 无；G00M1-M3 随对应模型迁移；G00P 在 G09/G10 前完成
+- 下游：G00F -> S0/S1；G00M1-M3 -> 对应模型 parity/legacy 删除；G00P -> G09/G10
 
 ## 目标
 
-在任何 production refactor 前，把当前 `cff4c47765ef3259b8a04890187d99c60da86394`
-的代码、产品行为、性能、编译时间和已知失败冻结成可复现 artifact。G00 不允许通过文档
-推断或旧 summary 代替真实命令。
+把当前 `cff4c47765ef3259b8a04890187d99c60da86394` 的代码、产品行为、性能、编译时间和已知
+失败冻结成可复现 artifact。完整 G00P 必须在正式性能和发布结论前完成，但不再阻塞 S0 contract
+拆分和 S1-S5 production refactor；执行顺序以
+[`EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md`](EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md)
+为准。G00 不允许通过文档推断或旧 summary 代替真实命令。
+
+## 分层与执行时机
+
+- `G00F`：facts checkpoint。只冻结 source/coupling inventory、model/revision/weight、preset、
+  historical catalog 和最小入口事实，是 S0/S1 的唯一前置 baseline。
+- `G00M1/G00M2/G00M3`：逐模型 just-in-time baseline。在删除对应 legacy entry 前采集必要的
+  correctness、token/resource parity 和 performance smoke；未受影响模型不随之重采。
+- `G00P`：本文件后续定义的完整三模型双端、external/legacy、ABBA-BAAB、build timing 和
+  artifact authenticity gate。它只阻塞 G09/G10。
+
+现有 G00 `collecting` root 和 partial lane 全部保留为 historical/diagnostic evidence。策略或 source
+改变后可以 stale，但不得复制为新 PASS，也不得继续阻塞 S0-S5。
 
 ## 工作项
 
@@ -69,7 +83,7 @@ G00 必须同时保存文件路径、内容 SHA256、语言、生产/测试/gene
 所有 LOC、减少比例和 build-input 数量都必须由同一个 checked-in analyzer 从 G00 inventory 与候选
 inventory 计算；手工表格不构成 PASS 证据。
 
-## 验收
+## G00P 完整验收
 
 G00 冻结 legacy 事实，不把 G05/G08 才新增的 v0.8.0 产品合同伪装成 legacy 已有能力。
 `runtime_vnext_legacy_correctness_expectations.json` 是逐 model/backend/scenario/variant 的唯一
@@ -267,7 +281,7 @@ python3 scripts/release/runtime_vnext_blocked_lane.py \
 collector 必须保存并由 final validator 重验 sanitized child env、product PID/PGID/start identity、
 bounded resource receipt、memory/swap preflight、effective config 和精确 unsupported failure signature。
 
-有效执行命令：
+G00P 有效执行命令继续使用现有 canonical lane：
 
 ```text
 python3 scripts/release/run_gate.py vnext-g00 --out <out_dir>
@@ -278,6 +292,16 @@ python3 scripts/release/run_gate.py vnext-g00 --out <out_dir>
 ```text
 FERRUM RUNTIME VNEXT G00 BASELINE PASS: <out_dir>
 FERRUM GATE vnext-g00 PASS: <out_dir>
+```
+
+G00F 和 G00M 的 canonical lane/manifest 在首次需要对应 milestone PASS 前注册到 `run_gate.py`；
+不得为了 S0A mechanical split 先建设 G00P collector。它们的必需 line 为：
+
+```text
+FERRUM RUNTIME VNEXT G00F FACTS PASS: <out_dir>
+FERRUM GATE vnext-g00f PASS: <out_dir>
+FERRUM RUNTIME VNEXT G00M MODEL BASELINE PASS: <out_dir>
+FERRUM GATE vnext-g00m PASS: <out_dir>
 ```
 
 BLOCKED artifact 只允许描述当前不存在的 lane，不等于 G00 PASS。G00 PASS 还要求该 blocker

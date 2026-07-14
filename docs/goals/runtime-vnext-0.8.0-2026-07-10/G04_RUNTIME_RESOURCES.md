@@ -3,14 +3,20 @@
 ## 状态与依赖
 
 - 状态：Open
-- 依赖：G01、G02、G03
-- 下游：G05、G06、G08-G10
+- 依赖：S0A contract split；S0B/S1 actual Qwen3.5-4B CUDA runtime；随 S2-S5 强化
+- 下游：S1-S7、G05、G06、G08-G10
 
 ## 目标
 
 建立唯一共享执行 runtime。模型只描述 program/block/state；runtime 管理 batch、prefill、
 decode、资源、执行次序和退出。解决当前 engine/model/KV manager 多重所有权以及模型复制
 unified runner 的问题。
+
+动态资源、transaction/lease、physical submission、fence/reaper/recovery 是核心 runtime 的不可约
+复杂度，不以缩短总 LOC 为目标。S0A 必须先按 capacity/provisioning、pool/extent、transaction/
+lease、request/sequence/session、step/invocation 和 completion/recovery 所有权拆分；S0B/S1 再允许
+由实际生产 consumer 驱动 breaking rewrite。固定并发、模型/GPU 特判或弱化 defer/resume 合同均不
+属于可接受的“简化”。
 
 ## Runtime 职责
 

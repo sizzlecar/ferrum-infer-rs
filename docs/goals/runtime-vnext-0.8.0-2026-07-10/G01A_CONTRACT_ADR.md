@@ -1,9 +1,12 @@
 # ADR: Runtime vNext Core Contract Boundary
 
-- Status: Pending G01A contract checkpoint; acceptance requires both exact PASS lines in
-  [`G01_CORE_CONTRACTS.md`](G01_CORE_CONTRACTS.md)
+- Status: Historical design input. The 2026-07-13 isolated-contract checkpoint passed, but this ADR
+  no longer defines the active G01A completion contract. S0A/S0B and production acceptance are
+  superseded by
+  [`EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md`](EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md) and
+  [`G01_CORE_CONTRACTS.md`](G01_CORE_CONTRACTS.md).
 - Scope: contract design only
-- Depends on: canonical G00a checkpoint `G00a`
+- Depends on: historical canonical G00a checkpoint `G00a`
 - Decision owner: G01
 - Migration owner: G03 and G08
 - Legacy deletion owner: G08D
@@ -17,9 +20,11 @@ policy, profiling, and unsupported defaults. A method added for one model or one
 backend therefore changes a shared trait, expands the compile surface, and can move a
 failure from planning into a late runtime call.
 
-G01A defines an isolated contract. It does not route `ferrum run` or `ferrum serve`,
-change runtime defaults, migrate a production model, or establish a performance
-result. The authoritative legacy classification is
+The historical G01A checkpoint defines an isolated contract. It does not route
+`ferrum run` or `ferrum serve`, change runtime defaults, migrate a production model,
+or establish a performance result. Its types are candidates for S0A ownership-preserving
+split and S0B production-driven rewrite, not frozen public architecture. The authoritative
+legacy classification is
 [`G01A_LEGACY_CONTRACT_MAP.json`](G01A_LEGACY_CONTRACT_MAP.json).
 
 ## Decision Drivers

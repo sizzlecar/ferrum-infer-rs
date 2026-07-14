@@ -3,14 +3,26 @@
 ## 状态与依赖
 
 - 状态：Open
-- 依赖：G00、G01
-- 下游：G03-G10
+- 依赖：L0 随 S0A contract split；L1/change-impact 随 S1-S2；full historical/matrix evidence 在 S6
+- 下游：S1-S7、G03-G10
 
 ## 目标
 
-在大规模生产迁移前建立可信测试层次和门禁依赖图。PASS 必须证明真实命令执行过，而不是
-仅证明 JSON 中写了 `PASS`。本 Goal 吸收并修复现有 test-architecture、release-hardening、
-scenario 和 change-impact 资产，不再创建平行的第四套 gate。
+随真实生产纵切建立可信测试层次和门禁依赖图，而不是先建设完整 release 设施再接入生产。
+PASS 必须证明真实命令执行过，而不是仅证明 JSON 中写了 `PASS`。本 Goal 吸收并激进重构现有
+test-architecture、release-hardening、scenario 和 change-impact 资产，不再创建平行的第四套 gate。
+
+## 分阶段交付
+
+- S0A：测试按 contract invariant owner 拆分，单 target logical LOC `<=2,000`，bounded focused
+  test 和 aggregate interface test 通过；不追求保留当前 test count。
+- S1：L0/L1 与 Qwen3.5-4B CUDA basic `run`/`serve` smoke 接入 change-impact planner。
+- S2-S5：每个 model/backend 只补齐受影响的 actual scenarios 和 historical mutations。
+- S6：完成本文件后续的 full historical corpus、mutation、matrix consumer 和 PR timing PASS。
+
+测试可以因架构重写而删除、合并或重写；保留依据是 invariant coverage、historical kill、真实产品
+consumer 或 backend conformance，而不是已有测试数量。任何 product-visible change 同时计划
+`run`/`serve` 的规则从 S1 开始生效。
 
 ## 测试层次
 

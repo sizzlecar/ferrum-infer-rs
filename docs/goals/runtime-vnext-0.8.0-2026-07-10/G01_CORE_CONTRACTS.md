@@ -3,37 +3,72 @@
 ## 状态与依赖
 
 - 状态：Open
-- 依赖：G01A 可在 G00a inventory/model-resolution/preset checkpoint 后并行；G01 最终 PASS
-  依赖完整 G00 PASS
+- 依赖：G01A/S0A 只依赖 G00F facts；G01B/S0B 与 S1 Qwen3.5-4B CUDA production slice
+  同里程碑；不依赖完整 G00P
 - 下游：G02-G10
 
 ## 目标
 
-从零设计 vNext 的稳定核心边界，不迁就现有 `Backend` 大 trait 或巨型 architecture match。
-本 Goal 先完成 ADR、type contract、最小 reference implementation 和扩展演练，再允许批量迁移。
+彻底重构 vNext 的稳定核心边界，不迁就现有 `Backend` 大 trait 或巨型 architecture match，也不把
+当前约 46K 行 isolated contract 当作不可修改的既成架构。本 Goal 先保持语义拆分现有 contract/test，
+再由实际 Qwen3.5-4B CUDA `run`/`serve` consumer 驱动 breaking semantic rewrite 和扩展演练。
 
-G01A 只允许新增隔离的 `ferrum-interfaces::vnext` 纯契约、ADR、compile/unit/trybuild test 和
-legacy mapping；不得接管 `run`/`serve` 路由、改变 runtime 默认值或产生性能结论。G01B 在
-G00 PASS 后消费真实 baseline 与 hardware/model lock，完成 reference implementation、扩展演练和
-overhead 测量；二者共同通过才构成 G01 PASS。
+G01A/S0A 只做保持语义的 contract/test 结构拆分，不新增 operation/model/product feature。G01B/S0B
+允许激进修改 public API、typestate、泛型边界、event/profile schema 和测试拓扑，但必须与 S1 actual
+Qwen3.5-4B CUDA production consumer 同一里程碑，完成 reference implementation、扩展演练和
+overhead 测量。二者共同通过才构成新的 G01 PASS。
+
+2026-07-13 的既有 `FERRUM GATE vnext-g01a PASS` 保留为 historical isolated-contract checkpoint；
+它不证明当前 contract split、production wiring 或 G01 完成，也不冻结现有 API。执行顺序和 artifact
+语义以 [`EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md`](EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md)
+为准。
+
+## S0A：保持语义的结构拆分
+
+移动或拆分 `crates/` 文件前先运行 `inventory_tree.py`。S0A 按 identity/error、demand/work、capacity/
+provisioning、pool/extent、transaction/lease、request/sequence/session、step/invocation、completion/
+recovery、event/profile 和 owner-aligned tests 拆分依赖图。
+
+- `resource.rs`、`execution.rs`、`event.rs` 最终单文件 production logical LOC `<=2,500`；作为
+  facade/re-export 时 logical LOC `<=500`。
+- 单个 contract test target logical LOC `<=2,000`；同一 invariant 不因拆分重复成多套测试。
+- lower-level resource contract 反向依赖 scheduler/product/model 数 `0`，新增循环模块依赖数 `0`。
+- public item old path -> new owner map 覆盖 `100%`；S0A 无意删除的 public item 丢失数 `0`。
+- S0A 每个提交执行 bounded focused tests；最终执行 bounded
+  `cargo test -p ferrum-interfaces --all-targets`。paid GPU 和完整 G00P collector 运行次数 `0`。
+
+S0A 的文件大小门是所有权和可审阅性门，不是总 LOC 删除门。capacity-derived admission、dynamic
+pool、transaction/lease、fence/reaper/recovery 和 event/profile invariant 必须原样保留到 S0B 审计。
+
+## S0B/S1：真实 consumer 驱动的语义重构
+
+每个 public abstraction 必须记录 invariant owner、production consumer 或 S1 target、misuse
+prevented、hot-path overhead 和 compile invalidation domain。只有 synthetic self-test 引用、没有
+不可约 invariant 且没有目标 consumer 的 API 必须删除；对架构、性能、扩展和诊断有明确收益的复杂
+contract 允许保留并继续强化。
+
+G01B 必须让 actual Qwen3.5-4B CUDA 请求通过 vNext config/weights/program/plan、共享动态 runtime、
+operation providers，并同时进入 `ferrum run` 和 `ferrum serve`。单向 adapter 可复用已验证 kernel，
+但 legacy scheduler/model runner/resource manager/product composition fallback 数必须为 `0`。
 
 ### Canonical checkpoint
 
-G01A/G01B 是可独立 freshness 校验的 DAG node，不是人工 checklist：
+修订后的 G01A/G01B 是可独立 freshness 校验的 DAG node，不是人工 checklist：
 
 ```text
-python3 scripts/release/run_gate.py vnext-g01a --g00a <g00a-manifest> --out <external-out>
-python3 scripts/release/run_gate.py vnext-g01b --g00 <g00-manifest> --g01a <g01a-manifest> --out <external-out>
+python3 scripts/release/run_gate.py vnext-g01a --g00f <g00f-manifest> --out <external-out>
+python3 scripts/release/run_gate.py vnext-g01b --g00f <g00f-manifest> --g01a <g01a-manifest> \
+  --s1 <qwen35-4b-cuda-production-manifest> --out <external-out>
 python3 scripts/release/run_gate.py vnext-g01 --g01a <g01a-manifest> --g01b <g01b-manifest> --out <external-out>
 ```
 
-G01A manifest 必须引用 G00a manifest/artifact index SHA、ADR/contract/trybuild Git blob SHA 和
-source tree；其 `unlocks` 只能是 `G01B`/`G01`，不得声称 runtime、模型或性能已迁移。G01B 必须
-引用完整 G00 manifest、hardware/model lock、G01A manifest 和相同 contract blob。aggregate G01
-必须逐字节消费两个 child manifest，验证 source/contract/model-input freshness；任一 child stale、
-contract blob 不同或 G00a/G00 facts 不一致时拒绝，不能复制 child summary 重新签发 PASS。
+G01A manifest 必须引用 G00F、inventory、public owner map、拆分前后 API/behavior evidence 和 bounded
+tests。其 `unlocks` 只能是 `G01B`/`S1`，不得声称 runtime、模型或性能已迁移。G01B 必须引用 G00F、
+G01A、actual S1 `run`/`serve` artifact 和相同 contract source。aggregate G01 必须逐字节消费两个 child
+manifest并验证 source/contract/model-input freshness；任一 child stale、contract 不同或 facts 不一致时
+拒绝，不能复制 child summary 重新签发 PASS。
 
-## 必须定义的 contract
+## 必须由生产纵切证明的 contract
 
 1. `DeviceRuntime`：buffer、stream/command、copy、sync、device error。
 2. `OperationContract`：version、shape/dtype/layout、resource、oracle、provider、profile phase。
@@ -88,7 +123,7 @@ contract blob 不同或 G00a/G00 facts 不一致时拒绝，不能复制 child s
 4. reference backend：模型代码改动 `0`。
 5. unsupported backend：在权重分配前返回包含 missing op/version 的结构化错误。
 
-## 验收
+## G01B/G01 验收
 
 - ADR 至少比较“聚合小 capability traits”和“typed operation registry”两种实现，包含
   compile-time、runtime overhead、object safety、错误定位和扩展成本数据。
@@ -199,13 +234,17 @@ method 必须被分类为 stable device primitive、versioned op、model semanti
 以下均为 canonical external `<out_dir>` 下的逻辑路径：
 
 ```text
-g01a-contract-checkpoint/
+g01a-contract-split/
   manifest.json
   adr.md
   contract-map.json
+  public-owner-map.json
+  split-inventory.json
   compile-unit-trybuild.json
 g01b-reference-contract/
   manifest.json
+  qwen35-4b-cuda-production.json
+  run-serve-evidence/
   extension-drills.json
   plan-snapshots/
   overhead.json
@@ -219,9 +258,9 @@ g01-contracts/
 ```
 
 ```text
-FERRUM RUNTIME VNEXT G01A CONTRACT CHECKPOINT PASS: <out_dir>
+FERRUM RUNTIME VNEXT G01A CONTRACT SPLIT PASS: <out_dir>
 FERRUM GATE vnext-g01a PASS: <out_dir>
-FERRUM RUNTIME VNEXT G01B REFERENCE CONTRACT PASS: <out_dir>
+FERRUM RUNTIME VNEXT G01B PRODUCTION REFERENCE CONTRACT PASS: <out_dir>
 FERRUM GATE vnext-g01b PASS: <out_dir>
 FERRUM RUNTIME VNEXT G01 CORE CONTRACTS PASS: <out_dir>
 FERRUM GATE vnext-g01 PASS: <out_dir>

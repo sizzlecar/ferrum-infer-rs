@@ -3,9 +3,9 @@
 ## 状态与依赖
 
 - 状态：Open
-- 总 PASS 依赖：G00、G01、G03
-- G07A 可在 G01 后与 G02-G06 并行；G07B 必须等待 G03 operation catalog/version 冻结
-- 下游：G08-G10
+- 总 PASS 依赖：G00P、live G03 catalog 和 S1 production build graph
+- G07A 在 S1 后立即与 S2/S3 并行，S4 前达到开发反馈目标；G07B 随 live operation catalog/version
+- 下游：S2-S7、G08-G10
 
 ## 目标
 
@@ -20,6 +20,10 @@
 
 G07 总 PASS 必须聚合 G07A/G07B；不能用编译时间 PASS 代替 ABI correctness，也不能用
 native artifact PASS 代替增量构建证据。
+
+G07 不再等待完整 G01/G02/G03 后启动。S1 一旦形成真实 model/runtime/provider/product dependency
+graph，就开始测量并拆分 invalidation domain；否则到 S4 大模型迁移时仍会承受 30 分钟反馈循环。
+普通 model program 修改运行 nvcc 的次数必须在 S4 前降为 `0`。
 
 G07A/G07B 是 canonical DAG checkpoint：
 
