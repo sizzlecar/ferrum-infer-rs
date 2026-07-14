@@ -62,6 +62,11 @@ pub enum WeightEncoding {
 pub struct WeightComponentSpec {
     pub id: WeightId,
     pub role: WeightComponentRole,
+    /// Ordered checkpoint tensors forming this physical component. One entry
+    /// maps directly to that tensor. Multiple entries must have the component
+    /// shape `[source_count, source_shape...]` and are stacked in this exact
+    /// order by the format source; aliases are resolved by the model family
+    /// before it constructs the typed schema.
     pub external_names: Vec<String>,
     pub dimensions: Vec<u64>,
     pub encoding: WeightEncoding,

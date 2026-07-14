@@ -159,35 +159,6 @@ impl WeightComponentSource for SafetensorsArchive {
         &'source self,
         component: &WeightComponentSpec,
     ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
-        let matches = component
-            .external_names
-            .iter()
-            .filter(|name| self.contains(name))
-            .collect::<Vec<_>>();
-        let external_name = match matches.as_slice() {
-            [name] => name.as_str(),
-            [] => {
-                return Err(VNextError::InvalidExecutionPlan {
-                    reason: format!(
-                        "weight component `{}` has no matching safetensors source",
-                        component.id
-                    ),
-                })
-            }
-            _ => {
-                return Err(VNextError::InvalidExecutionPlan {
-                    reason: format!(
-                        "weight component `{}` matches multiple safetensors aliases",
-                        component.id
-                    ),
-                })
-            }
-        };
-        let tensor =
-            self.tensor(external_name)
-                .map_err(|error| VNextError::InvalidExecutionPlan {
-                    reason: error.to_string(),
-                })?;
         let expected_element_type = match component.encoding {
             WeightEncoding::Dense { element_type } => element_type,
             WeightEncoding::Quantized(_) => {
@@ -199,6 +170,76 @@ impl WeightComponentSource for SafetensorsArchive {
                 })
             }
         };
+
+        let [external_name] = component.external_names.as_slice() else {
+            if component.external_names.len() < 2
+                || component.dimensions.first().copied()
+                    != u64::try_from(component.external_names.len()).ok()
+            {
+                return Err(VNextError::InvalidExecutionPlan {
+                    reason: format!(
+                        "stacked component `{}` source count differs from its leading dimension",
+                        component.id
+                    ),
+                });
+            }
+            let source_dimensions = &component.dimensions[1..];
+            let mut source_files = Vec::with_capacity(component.external_names.len());
+            let mut bytes =
+                Vec::with_capacity(usize::try_from(component.physical_bytes()?).map_err(|_| {
+                    VNextError::InvalidExecutionPlan {
+                        reason: format!(
+                            "stacked component `{}` exceeds host address space",
+                            component.id
+                        ),
+                    }
+                })?);
+            for external_name in &component.external_names {
+                let tensor = self.tensor(external_name).map_err(|error| {
+                    VNextError::InvalidExecutionPlan {
+                        reason: error.to_string(),
+                    }
+                })?;
+                let actual_element_type = element_type(tensor.dtype()).ok_or_else(|| {
+                    VNextError::InvalidExecutionPlan {
+                        reason: format!(
+                            "tensor {external_name:?} has unsupported safetensors dtype {:?}",
+                            tensor.dtype()
+                        ),
+                    }
+                })?;
+                if tensor.shape() != source_dimensions {
+                    return Err(VNextError::InvalidExecutionPlan {
+                        reason: format!(
+                            "tensor {external_name:?} shape differs from stacked component `{}` partition shape",
+                            component.id
+                        ),
+                    });
+                }
+                let materialized = transcode_dense_bytes(
+                    tensor.bytes(),
+                    actual_element_type,
+                    expected_element_type,
+                    external_name,
+                )?;
+                source_files.push(tensor.source_file().to_owned());
+                bytes.extend_from_slice(&materialized);
+            }
+            return WeightComponentPayload::from_ordered_sources(
+                component,
+                component.external_names.clone(),
+                source_files,
+                component.dimensions.clone(),
+                expected_element_type,
+                bytes,
+            );
+        };
+
+        let tensor =
+            self.tensor(external_name)
+                .map_err(|error| VNextError::InvalidExecutionPlan {
+                    reason: error.to_string(),
+                })?;
         let actual_element_type =
             element_type(tensor.dtype()).ok_or_else(|| VNextError::InvalidExecutionPlan {
                 reason: format!(
