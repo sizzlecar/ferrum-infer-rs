@@ -337,11 +337,17 @@ def normalize_config(root: Path, raw: dict[str, Any], context: dict[str, Any]) -
     for field in ("server_argv", "version_argv", "revision_argv"):
         require(isinstance(external.get(field), list) and external[field] and all(isinstance(item, str) and item for item in external[field]), f"external.{field} must be argv")
     validate_active_probe(external.get("active_probe"), "external.active_probe")
+    if external["active_probe"]["format"] == resource_sampler.LLAMACPP_LOG_PROBE_FORMAT:
+        require(backend == "metal" and expected_engine == "llama.cpp", "log active probe is only valid for llama.cpp Metal baselines")
     validate_external_server_command(config)
     if context["correctness_status"] == "pass":
         legacy = config.get("legacy")
         require(isinstance(legacy, dict), "config.legacy is required for a comparable lane")
         validate_active_probe(legacy.get("active_probe"), "legacy.active_probe")
+        require(
+            legacy["active_probe"]["format"] != resource_sampler.LLAMACPP_LOG_PROBE_FORMAT,
+            "legacy Ferrum active evidence cannot use the llama.cpp log parser",
+        )
         extra = legacy.setdefault("extra_serve_argv", [])
         require(isinstance(extra, list) and all(isinstance(item, str) and item for item in extra), "legacy.extra_serve_argv must be argv")
     datasets = config.setdefault("datasets", {})
@@ -372,8 +378,18 @@ def normalize_config(root: Path, raw: dict[str, Any], context: dict[str, Any]) -
 
 def validate_active_probe(raw: Any, label: str) -> None:
     require(isinstance(raw, dict), f"{label} is required")
-    require(raw.get("format") in {"json", "prometheus"}, f"{label}.format must be json or prometheus")
-    require(isinstance(raw.get("path"), str) and raw["path"].startswith("/"), f"{label}.path must be absolute")
+    require(
+        raw.get("format") in {"json", "prometheus", resource_sampler.LLAMACPP_LOG_PROBE_FORMAT},
+        f"{label}.format must be json, prometheus, or {resource_sampler.LLAMACPP_LOG_PROBE_FORMAT}",
+    )
+    if raw.get("format") == resource_sampler.LLAMACPP_LOG_PROBE_FORMAT:
+        require(raw.get("path") == "", f"{label}.path must be empty for a log probe")
+        require(
+            raw.get("selector") == resource_sampler.LLAMACPP_LOG_PROBE_SELECTOR,
+            f"{label}.selector must bind the llama.cpp slot lifecycle parser",
+        )
+    else:
+        require(isinstance(raw.get("path"), str) and raw["path"].startswith("/"), f"{label}.path must be absolute")
     require(isinstance(raw.get("selector"), str) and raw["selector"], f"{label}.selector is required")
 
 
@@ -1154,9 +1170,18 @@ def start_resource_sampler(
         "250",
         "--max-duration-sec",
         "7200",
-        "--active-path",
-        probe["path"],
     ]
+    if probe["format"] in {"json", "prometheus"}:
+        argv.extend(
+            [
+                "--active-probe-timeout-ms",
+                str(resource_sampler.ACTIVE_PROBE_TIMEOUT_MS),
+                "--active-probe-max-attempts",
+                str(resource_sampler.ACTIVE_PROBE_MAX_ATTEMPTS),
+                "--active-path",
+                probe["path"],
+            ]
+        )
     stdout_handle = stdout_path.open("x", encoding="utf-8")
     stderr_handle = stderr_path.open("x", encoding="utf-8")
     process: subprocess.Popen[Any] | None = None
@@ -1372,6 +1397,7 @@ def resource_evidence(
         requested_concurrency=record["concurrency"],
         typed_active_cap=config["typed_active_cap"],
         runtime_log_path=session["runtime_log_origin_path"],
+        runtime_log_evidence_path=Path(session["runtime_log_origin_path"]),
     )
     return {
         "collector_sha256": file_sha256(RESOURCE_SAMPLER_PATH),
@@ -2576,6 +2602,7 @@ def self_test() -> int:
                 "url": "",
                 "selector": "process-alive",
                 "semantics": "process-alive",
+                **resource_sampler.active_probe_policy("process"),
             },
         }]
         for sequence in range(4):
@@ -2592,6 +2619,9 @@ def self_test() -> int:
                 "physical_headroom_bytes": 4 * 1024**3,
                 "swap_used_bytes": 0,
                 "active_requests": 1,
+                "active_probe_attempts": 1,
+                "active_probe_duration_ms": 0.0,
+                "active_probe_errors": [],
                 "oom_count": 0,
                 "admission_error_count": 0,
                 "thermal_state": "nominal",
