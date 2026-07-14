@@ -1,111 +1,60 @@
 use super::{
     invalid_resource, sequence_slot_active, sequence_slot_poisoned_drained,
-    sequence_slot_poisoned_undrained, ActiveSequenceAbortDisposition, ActiveSequenceAbortReceipt,
-    AdmittedSequenceResources, Arc, AtomicU64, BTreeMap, BufferDescriptor, CoreOwnedAllocation,
-    DeviceRuntime, LogicalAdmissionCoordinatorId, Mutex, Ordering, PlanRuntimeResources,
-    RequestIdentity, ResourceId, ResourceLeaseEntry, ResourceLeaseState, ResourceReservation,
-    ResourceTransactionIdentity, RunId, SequenceAuthorityId, StaticProvisioningBinding,
-    StreamState, TrustedPlanRuntimeEvidence, VNextError, SEQUENCE_DISPATCH_POISONED_BIT,
+    sequence_slot_poisoned_undrained, Arc, AtomicU64, BTreeMap, DeviceRuntime, Mutex, Ordering,
+    PlanRuntimeResources, RequestIdentity, RunId, SequenceAuthorityId, Serialize, StreamState,
+    TrustedPlanRuntimeEvidence, VNextError, SEQUENCE_DISPATCH_POISONED_BIT,
 };
 
-pub(super) struct OwnedLeaseSlot<B> {
-    pub(super) entry: ResourceLeaseEntry,
-    pub(super) actual_resource_id: Option<ResourceId>,
-    pub(super) actual_generation: Option<u64>,
-    pub(super) descriptor: Option<BufferDescriptor>,
-    pub(super) buffer: Option<B>,
+/// Terminal resource disposition produced by an explicit sequence abort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ActiveSequenceAbortDisposition {
+    SynchronizedAndPoisoned,
+    SequenceSessionTerminalized,
 }
 
-impl<B> OwnedLeaseSlot<B> {
-    pub(super) fn new(reservation: &ResourceReservation) -> Self {
-        Self {
-            entry: ResourceLeaseEntry::from_reservation(reservation, ResourceLeaseState::Active),
-            actual_resource_id: None,
-            actual_generation: None,
-            descriptor: None,
-            buffer: None,
-        }
-    }
-
-    pub(super) fn install(&mut self, allocation: CoreOwnedAllocation<B>) {
-        self.actual_resource_id = Some(allocation.resource_id);
-        self.actual_generation = Some(allocation.generation);
-        self.descriptor = Some(allocation.descriptor);
-        self.buffer = Some(allocation.buffer);
-    }
-
-    pub(super) fn clear(&mut self) {
-        drop(self.buffer.take());
-        self.descriptor.take();
-        self.actual_resource_id.take();
-        self.actual_generation.take();
-    }
-
-    pub(super) fn take_allocation(&mut self) -> Option<CoreOwnedAllocation<B>> {
-        Some(CoreOwnedAllocation {
-            resource_id: self.actual_resource_id.take()?,
-            generation: self.actual_generation.take()?,
-            descriptor: self.descriptor.take()?,
-            buffer: self.buffer.take()?,
-        })
-    }
-
-    pub(super) fn restore_allocation(&mut self, allocation: CoreOwnedAllocation<B>) {
-        debug_assert!(self.buffer.is_none());
-        self.install(allocation);
-    }
+/// Core-signed evidence that the exact active slot epoch was atomically
+/// poisoned. This type is trusted output and has no deserialization or public
+/// construction path.
+#[derive(Debug, Serialize)]
+#[must_use = "sequence abort evidence must be recorded by execution"]
+pub struct ActiveSequenceAbortReceipt {
+    pub(super) plan: TrustedPlanRuntimeEvidence,
+    pub(super) sequence_authority: SequenceAuthorityId,
+    pub(super) run_id: RunId,
+    pub(super) request_id: RequestIdentity,
+    pub(super) activation_epoch: u64,
+    pub(super) runtime_implementation_fingerprint: String,
+    pub(super) disposition: ActiveSequenceAbortDisposition,
 }
 
-/// Borrowed access to a live, active, generation-bound committed buffer.
-pub struct LeasedBufferView<'a, B> {
-    pub(super) identity: &'a ResourceTransactionIdentity,
-    pub(super) admission: &'a StaticProvisioningBinding,
-    pub(super) resource_id: &'a ResourceId,
-    pub(super) generation: u64,
-    pub(super) descriptor: &'a BufferDescriptor,
-    pub(super) buffer: &'a B,
-}
-
-impl<'a, B> LeasedBufferView<'a, B> {
-    pub fn identity(&self) -> &ResourceTransactionIdentity {
-        self.identity
+impl ActiveSequenceAbortReceipt {
+    pub fn plan(&self) -> &TrustedPlanRuntimeEvidence {
+        &self.plan
     }
 
-    pub fn admission(&self) -> &StaticProvisioningBinding {
-        self.admission
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
     }
 
-    pub fn resource_id(&self) -> &ResourceId {
-        self.resource_id
+    pub fn request_id(&self) -> &RequestIdentity {
+        &self.request_id
     }
 
-    pub const fn generation(&self) -> u64 {
-        self.generation
+    pub const fn sequence_authority(&self) -> SequenceAuthorityId {
+        self.sequence_authority
     }
 
-    pub fn committed_descriptor(&self) -> &BufferDescriptor {
-        self.descriptor
+    pub const fn activation_epoch(&self) -> u64 {
+        self.activation_epoch
     }
 
-    pub fn buffer(&self) -> &B {
-        self.buffer
+    pub fn runtime_implementation_fingerprint(&self) -> &str {
+        &self.runtime_implementation_fingerprint
     }
-}
 
-#[derive(Debug)]
-pub enum ExecutionStreamCreationError<E> {
-    Contract(VNextError),
-    Runtime(E),
-}
-
-/// A stream created and owned by one exact admitted runtime instance. Its
-/// runtime and raw stream are private so execution can only proceed through an
-/// active sequence permit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BoundExecutionStreamState {
-    Ready,
-    InUse,
-    Poisoned,
+    pub const fn disposition(&self) -> ActiveSequenceAbortDisposition {
+        self.disposition
+    }
 }
 
 #[derive(Debug)]
@@ -209,7 +158,7 @@ where
         );
     }
 
-    fn attach_stream(&self, key: (u32, u64), stream: R::Stream) {
+    pub(super) fn attach_stream(&self, key: (u32, u64), stream: R::Stream) {
         let mut records = self.lock_records();
         let Some(record) = records.get_mut(&key) else {
             std::mem::forget(stream);
@@ -394,57 +343,6 @@ where
                 return Ok(());
             };
             let _ = self.recover(runtime, slot)?;
-        }
-    }
-}
-
-#[must_use = "an execution stream must be activated through its resource lease"]
-pub struct BoundExecutionStream<R>
-where
-    R: DeviceRuntime,
-{
-    // The raw stream drops or transfers into the recovery registry before this
-    // owning sequence hold can release logical capacity or backing extents.
-    pub(super) runtime: Arc<R>,
-    pub(super) coordinator_id: LogicalAdmissionCoordinatorId,
-    pub(super) sequence_authority: SequenceAuthorityId,
-    pub(super) stream: Option<R::Stream>,
-    pub(super) state: BoundExecutionStreamState,
-    pub(super) sequence_recovery: Arc<SequenceRecoveryRegistry<R>>,
-    pub(super) sequence_dispatch_gate: Arc<AtomicU64>,
-    pub(super) abandoned_sequence: Option<(u32, u64)>,
-    pub(super) resources: Arc<AdmittedSequenceResources<R>>,
-}
-
-impl<R> BoundExecutionStream<R>
-where
-    R: DeviceRuntime,
-{
-    pub(super) fn stream(&self) -> &R::Stream {
-        self.stream
-            .as_ref()
-            .expect("bound execution stream retains its raw stream")
-    }
-
-    pub(super) fn stream_mut(&mut self) -> &mut R::Stream {
-        self.stream
-            .as_mut()
-            .expect("bound execution stream retains its raw stream")
-    }
-}
-
-impl<R> Drop for BoundExecutionStream<R>
-where
-    R: DeviceRuntime,
-{
-    fn drop(&mut self) {
-        let Some(key) = self.abandoned_sequence.take() else {
-            return;
-        };
-        self.sequence_dispatch_gate
-            .fetch_or(SEQUENCE_DISPATCH_POISONED_BIT, Ordering::AcqRel);
-        if let Some(stream) = self.stream.take() {
-            self.sequence_recovery.attach_stream(key, stream);
         }
     }
 }

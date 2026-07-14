@@ -34,7 +34,9 @@ use super::{
 mod contracts;
 pub use contracts::*;
 mod capacity;
-pub use capacity::*;
+use capacity::*;
+mod provisioning;
+pub use provisioning::*;
 mod allocation;
 pub use allocation::*;
 mod ledger;

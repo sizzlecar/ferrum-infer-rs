@@ -1,10 +1,94 @@
 use super::{
     expected_lease_transition, invalid_resource, AdmissionFitPolicy, AdmissionPressureAction, Arc,
     BTreeSet, BufferDescriptor, CoreOwnedAllocation, DeviceRuntime, DynamicResourceShape,
-    LeasedBufferView, OwnedLeaseSlot, ResourceId, ResourceLeaseAction, ResourceLeaseEntry,
-    ResourceLeaseState, ResourceOwnedBuffer, ResourceReservationBatch, ResourceTransactionIdentity,
-    ResourceWorkShape, StaticProvisioningBinding, VNextError,
+    ResourceId, ResourceLeaseAction, ResourceLeaseEntry, ResourceLeaseState, ResourceOwnedBuffer,
+    ResourceReservation, ResourceReservationBatch, ResourceTransactionIdentity, ResourceWorkShape,
+    StaticProvisioningBinding, VNextError,
 };
+
+pub(super) struct OwnedLeaseSlot<B> {
+    pub(super) entry: ResourceLeaseEntry,
+    pub(super) actual_resource_id: Option<ResourceId>,
+    pub(super) actual_generation: Option<u64>,
+    pub(super) descriptor: Option<BufferDescriptor>,
+    pub(super) buffer: Option<B>,
+}
+
+impl<B> OwnedLeaseSlot<B> {
+    pub(super) fn new(reservation: &ResourceReservation) -> Self {
+        Self {
+            entry: ResourceLeaseEntry::from_reservation(reservation, ResourceLeaseState::Active),
+            actual_resource_id: None,
+            actual_generation: None,
+            descriptor: None,
+            buffer: None,
+        }
+    }
+
+    pub(super) fn install(&mut self, allocation: CoreOwnedAllocation<B>) {
+        self.actual_resource_id = Some(allocation.resource_id);
+        self.actual_generation = Some(allocation.generation);
+        self.descriptor = Some(allocation.descriptor);
+        self.buffer = Some(allocation.buffer);
+    }
+
+    pub(super) fn clear(&mut self) {
+        drop(self.buffer.take());
+        self.descriptor.take();
+        self.actual_resource_id.take();
+        self.actual_generation.take();
+    }
+
+    pub(super) fn take_allocation(&mut self) -> Option<CoreOwnedAllocation<B>> {
+        Some(CoreOwnedAllocation {
+            resource_id: self.actual_resource_id.take()?,
+            generation: self.actual_generation.take()?,
+            descriptor: self.descriptor.take()?,
+            buffer: self.buffer.take()?,
+        })
+    }
+
+    pub(super) fn restore_allocation(&mut self, allocation: CoreOwnedAllocation<B>) {
+        debug_assert!(self.buffer.is_none());
+        self.install(allocation);
+    }
+}
+
+/// Borrowed access to a live, active, generation-bound committed buffer.
+pub struct LeasedBufferView<'a, B> {
+    pub(super) identity: &'a ResourceTransactionIdentity,
+    pub(super) admission: &'a StaticProvisioningBinding,
+    pub(super) resource_id: &'a ResourceId,
+    pub(super) generation: u64,
+    pub(super) descriptor: &'a BufferDescriptor,
+    pub(super) buffer: &'a B,
+}
+
+impl<'a, B> LeasedBufferView<'a, B> {
+    pub fn identity(&self) -> &ResourceTransactionIdentity {
+        self.identity
+    }
+
+    pub fn admission(&self) -> &StaticProvisioningBinding {
+        self.admission
+    }
+
+    pub fn resource_id(&self) -> &ResourceId {
+        self.resource_id
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn committed_descriptor(&self) -> &BufferDescriptor {
+        self.descriptor
+    }
+
+    pub fn buffer(&self) -> &B {
+        self.buffer
+    }
+}
 
 #[must_use = "a resource lease is the batch owner of committed buffers"]
 pub struct StaticProvisioningLease<R>

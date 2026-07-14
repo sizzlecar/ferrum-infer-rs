@@ -1,12 +1,11 @@
 use super::{
-    expected_lease_transition, expected_transition, fmt, invalid_resource,
-    new_deferred_device_cleanup_domain, watch, Arc, AtomicBool, AtomicU8, BTreeMap, BTreeSet,
-    BufferDescriptor, CoreOwnedAllocation, DeviceCapacityClaim, DriverCommitAcknowledgement,
-    DynamicPoolMaintenanceController, DynamicPoolSet, ErasedPlanStaticDriver, FailureDomain,
-    FailureEnvelope, Mutex, Ordering, PhantomData, PlanRuntimeResources, PlanRuntimeStatic,
-    PlanStaticResources, RefCell, ResourceAbandonSignal, ResourceActionCursor, ResourceCommitView,
-    ResourceCompensationRecord, ResourceDriverFailure, ResourceFailureId, ResourceFailurePoint,
-    ResourceFailureReceipt, ResourceId, ResourceLeaseAction, ResourceLeaseEntry,
+    core_resource_failure, fmt, invalid_resource, new_deferred_device_cleanup_domain, watch, Arc,
+    AtomicBool, AtomicU8, BTreeMap, BTreeSet, BufferDescriptor, CoreOwnedAllocation,
+    DeviceCapacityClaim, DriverCommitAcknowledgement, DynamicPoolMaintenanceController,
+    DynamicPoolSet, ErasedPlanStaticDriver, Mutex, Ordering, PhantomData, PlanRuntimeResources,
+    PlanRuntimeStatic, PlanStaticResources, RefCell, ResourceAbandonSignal, ResourceActionCursor,
+    ResourceCommitView, ResourceCompensationRecord, ResourceDriverFailure, ResourceFailureId,
+    ResourceFailurePoint, ResourceFailureReceipt, ResourceId, ResourceLeaseAction,
     ResourceLeaseState, ResourceLeaseTransitionReceipt, ResourceLeaseValidationContext,
     ResourceLedgerEntrySnapshot, ResourceLedgerSnapshot, ResourceOwnedBuffer,
     ResourceOwnershipReason, ResourcePoolOwnership, ResourceRecoveryStrategy,
@@ -545,15 +544,6 @@ impl<D: ResourceTransactionDriver, S: TransactionStage> Drop for ResourceTransac
         }
         self.finalized = true;
     }
-}
-
-pub(super) fn core_resource_failure(
-    code: &'static str,
-    message: impl Into<String>,
-    retryable: bool,
-) -> FailureEnvelope {
-    FailureEnvelope::new(FailureDomain::Resource, code, message, retryable)
-        .expect("core-generated resource failure must be valid")
 }
 
 impl<D: ResourceTransactionDriver> ResourceTransaction<D, TransactionNew> {
@@ -1927,188 +1917,4 @@ impl<D: ResourceTransactionDriver> ResourceReleaseTransitionError<D> {
             }
         }
     }
-}
-
-fn same_allocation_entry(left: &ResourceLeaseEntry, right: &ResourceLeaseEntry) -> bool {
-    left.owner_node_id == right.owner_node_id
-        && left.resource_id == right.resource_id
-        && left.size_bytes == right.size_bytes
-        && left.alignment_bytes == right.alignment_bytes
-        && left.usage == right.usage
-        && left.element_type == right.element_type
-        && left.retention_policy == right.retention_policy
-        && left.generation == right.generation
-}
-
-fn validate_context_envelope(
-    identity: &ResourceTransactionIdentity,
-    admission: &StaticProvisioningBinding,
-    before: &[ResourceLedgerEntrySnapshot],
-    after: &[ResourceLedgerEntrySnapshot],
-) -> Result<(), VNextError> {
-    if identity.pool_id != admission.pool_id()
-        || identity.request_id != admission.request_id
-        || admission.pool_identity.plan_id != admission.plan_id
-        || admission.pool_identity.plan_hash != admission.plan_hash
-        || admission.pool_identity.device_id != admission.device_id
-        || admission
-            .pool_identity
-            .device_runtime_implementation_fingerprint
-            != admission.device_runtime_implementation_fingerprint
-        || admission.pool_identity.admission_generation != admission.admission_generation
-        || admission.admission_generation == 0
-        || admission.maximum_active_sequences == 0
-        || admission.device_capacity_bytes == 0
-        || admission.usable_capacity_bytes == 0
-        || admission.usable_capacity_bytes > admission.device_capacity_bytes
-        || admission.plan_static_bytes > admission.usable_capacity_bytes
-        || admission.admitted_bytes == 0
-        || admission.admitted_bytes != admission.plan_static_bytes
-        || admission.admitted_bytes > admission.usable_capacity_bytes
-        || before.is_empty()
-        || before.len() != after.len()
-    {
-        return Err(invalid_resource(
-            "trusted resource validation context has an invalid envelope",
-        ));
-    }
-    let mut resources = BTreeSet::new();
-    let mut total = 0_u64;
-    for (before_entry, after_entry) in before.iter().zip(after) {
-        if !same_allocation_entry(&before_entry.entry, &after_entry.entry)
-            || !resources.insert(before_entry.entry.resource_id.clone())
-            || before_entry.entry.generation != admission.admission_generation
-        {
-            return Err(invalid_resource(
-                "trusted resource validation context changes allocation identity",
-            ));
-        }
-        total = total
-            .checked_add(before_entry.entry.size_bytes)
-            .ok_or_else(|| invalid_resource("validation context bytes overflow u64"))?;
-    }
-    if total != admission.admitted_bytes {
-        return Err(invalid_resource(
-            "validation context does not cover the complete admitted allocation set",
-        ));
-    }
-    Ok(())
-}
-
-pub(super) fn validate_transition_records_against_context(
-    records: &[ResourceTransitionRecord],
-    context: &ResourceTransitionValidationContext,
-) -> Result<(), VNextError> {
-    validate_context_envelope(
-        &context.identity,
-        &context.admission,
-        &context.before,
-        &context.after,
-    )?;
-    let changed = context
-        .before
-        .iter()
-        .zip(&context.after)
-        .enumerate()
-        .filter(|(_, (before, after))| {
-            before.transaction_state != after.transaction_state
-                || before.buffer_present != after.buffer_present
-        })
-        .collect::<Vec<_>>();
-    if changed.is_empty() || changed.len() != records.len() {
-        return Err(invalid_resource(
-            "resource receipt does not cover the exact ledger delta",
-        ));
-    }
-    for (record, (order, (before, after))) in records.iter().zip(changed) {
-        record.validate()?;
-        if !record.matches_identity_and_admission(&context.identity, &context.admission)
-            || record.action != context.action
-            || record.order as usize != order
-            || !record.matches_snapshot(before)
-            || !record.matches_snapshot(after)
-            || record.before != before.transaction_state
-            || record.after != after.transaction_state
-            || expected_transition(context.action, record.before) != Some(record.after)
-        {
-            return Err(invalid_resource(
-                "resource receipt differs from trusted allocation or ledger state",
-            ));
-        }
-        match context.action {
-            ResourceTransactionAction::Commit => {
-                if before.buffer_present || !after.buffer_present {
-                    return Err(invalid_resource(
-                        "commit receipt does not prove buffer acquisition",
-                    ));
-                }
-            }
-            ResourceTransactionAction::Release | ResourceTransactionAction::Quarantine => {
-                if before.transaction_state == ResourceTransactionState::Committed
-                    && (!before.buffer_present || after.buffer_present)
-                {
-                    return Err(invalid_resource(
-                        "cleanup receipt does not prove committed buffer return",
-                    ));
-                }
-            }
-            ResourceTransactionAction::Reserve | ResourceTransactionAction::Rollback => {
-                if before.buffer_present != after.buffer_present {
-                    return Err(invalid_resource(
-                        "non-buffer transition changed buffer ownership",
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn validate_lease_entries_against_context(
-    entries: &[ResourceLeaseEntry],
-    before_state: ResourceLeaseState,
-    after_state: ResourceLeaseState,
-    context: &ResourceLeaseValidationContext,
-) -> Result<(), VNextError> {
-    validate_context_envelope(
-        &context.identity,
-        &context.admission,
-        &context.before,
-        &context.after,
-    )?;
-    if expected_lease_transition(context.action, before_state) != Some(after_state) {
-        return Err(VNextError::InvalidLeaseTransition {
-            lease_id: context.identity.transaction_id.to_string(),
-            from: before_state.as_str(),
-            action: context.action.as_str(),
-        });
-    }
-    let changed = context
-        .before
-        .iter()
-        .zip(&context.after)
-        .filter(|(before, after)| before.entry.state != after.entry.state)
-        .collect::<Vec<_>>();
-    if changed.is_empty() || changed.len() != entries.len() {
-        return Err(invalid_resource(
-            "lease receipt does not cover the exact lease-state delta",
-        ));
-    }
-    for (entry, (before, after)) in entries.iter().zip(changed) {
-        if !same_allocation_entry(entry, &before.entry)
-            || !same_allocation_entry(entry, &after.entry)
-            || before.entry.state != before_state
-            || after.entry.state != after_state
-            || entry.state != after_state
-            || before.transaction_state != after.transaction_state
-            || before.transaction_state != ResourceTransactionState::Committed
-            || before.buffer_present != after.buffer_present
-            || !before.buffer_present
-        {
-            return Err(invalid_resource(
-                "lease receipt differs from trusted allocation or ledger state",
-            ));
-        }
-    }
-    Ok(())
 }

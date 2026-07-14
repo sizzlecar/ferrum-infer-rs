@@ -1,17 +1,71 @@
 use super::{
-    defer_device_cleanup, invalid_resource, sequence_dispatch_is_poisoned,
-    sequence_slot_is_poisoned, AdmissionDecision, AdmissionDeferred, AdmissionFitPolicy,
-    AdmissionPreflightDecision, AdmissionRejected, AllocationLifetime, Arc, AtomicU64, BTreeMap,
-    BackingPrepareDecision, BatchStepId, DeferredDeviceCleanupDisposition,
+    defer_device_cleanup, invalid_resource, AdmissionDecision, AdmissionDeferred,
+    AdmissionFitPolicy, AdmissionPreflightDecision, AdmissionRejected, AllocationLifetime, Arc,
+    AtomicU64, BTreeMap, BackingPrepareDecision, BatchStepId, DeferredDeviceCleanupDisposition,
     DeferredDeviceCleanupTask, DeviceRuntime, Digest, DynamicBackingDeferred, ExecutionFrameId,
     LogicalAdmissionCoordinatorId, LogicalAdmissionLease, LogicalBackingBufferView,
     LogicalBackingSliceAuthority, LogicalBackingSliceEvidence, LogicalRequestLease, ManuallyDrop,
-    Mutex, NonZeroU64, Ordering, ParticipantNodeKey, RequestAuthorityId, RequestIdentity,
-    ResourceId, ResourceWorkShape, RunId, SequenceAuthorityId, SequenceRecoveryRegistry,
-    SequenceResourceAdmissionRequest, Serialize, Sha256, StaticProvisioningLease,
-    TrustedPlanRuntimeBinding, TrustedPlanRuntimeEvidence, VNextError, Weak,
-    SEQUENCE_DISPATCH_POISONED_BIT,
+    Mutex, NonZeroU64, Ordering, ParticipantNodeKey, RequestAdmissionDecision, RequestAuthorityId,
+    RequestIdentity, RequestResourceAdmissionRequest, ResourceId, ResourceWorkShape, RunId,
+    SequenceAuthorityId, SequenceRecoveryRegistry, SequenceResourceAdmissionRequest, Serialize,
+    Sha256, StaticProvisioningLease, TrustedPlanRuntimeBinding, TrustedPlanRuntimeEvidence,
+    VNextError, Weak, SEQUENCE_DISPATCH_POISONED_BIT,
 };
+
+pub(super) const fn sequence_slot_active(epoch: u64) -> u64 {
+    (epoch << 2) | 1
+}
+
+pub(super) const fn sequence_slot_poisoned_drained(epoch: u64) -> u64 {
+    (epoch << 2) | 2
+}
+
+pub(super) const fn sequence_slot_poisoned_undrained(epoch: u64) -> u64 {
+    (epoch << 2) | 3
+}
+
+pub(super) const fn sequence_slot_is_poisoned(state: u64) -> bool {
+    matches!(state & 3, 2 | 3)
+}
+
+const SEQUENCE_DISPATCH_COUNT_MASK: u64 = SEQUENCE_DISPATCH_POISONED_BIT - 1;
+
+pub(super) fn sequence_dispatch_is_poisoned(gate: &AtomicU64) -> bool {
+    gate.load(Ordering::Acquire) & SEQUENCE_DISPATCH_POISONED_BIT != 0
+}
+
+pub(super) struct SequenceDispatchGuard<'a> {
+    gate: &'a AtomicU64,
+}
+
+impl Drop for SequenceDispatchGuard<'_> {
+    fn drop(&mut self) {
+        let previous = self.gate.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous & SEQUENCE_DISPATCH_COUNT_MASK > 0);
+    }
+}
+
+pub(super) fn enter_sequence_dispatch(
+    gate: &AtomicU64,
+) -> Result<SequenceDispatchGuard<'_>, VNextError> {
+    gate.fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+        if state & SEQUENCE_DISPATCH_POISONED_BIT != 0
+            || state & SEQUENCE_DISPATCH_COUNT_MASK == SEQUENCE_DISPATCH_COUNT_MASK
+        {
+            None
+        } else {
+            Some(state + 1)
+        }
+    })
+    .map_err(|state| {
+        if state & SEQUENCE_DISPATCH_POISONED_BIT != 0 {
+            invalid_resource("poisoned resource pool cannot dispatch another operation")
+        } else {
+            invalid_resource("resource pool dispatch counter is exhausted")
+        }
+    })?;
+    Ok(SequenceDispatchGuard { gate })
+}
 
 pub enum RequestResourceAdmissionDecision<R>
 where
@@ -21,6 +75,74 @@ where
     Deferred(AdmissionDeferred),
     BackingDeferred(DynamicBackingDeferred),
     PermanentRejected(AdmissionRejected),
+}
+
+impl<R> TrustedPlanRuntimeBinding<R>
+where
+    R: DeviceRuntime,
+{
+    /// Request-scoped capacity is claimed exactly once before any child
+    /// sequence, stream, provider encode, or device submission exists.
+    pub fn try_admit_request(
+        &self,
+        request: RequestResourceAdmissionRequest,
+        run_id: RunId,
+        request_id: RequestIdentity,
+    ) -> Result<RequestResourceAdmissionDecision<R>, VNextError> {
+        let _lifecycle = self.resources.read_lifecycle("admit a request")?;
+        let RequestResourceAdmissionRequest {
+            work_shape,
+            fit_policy,
+            pressure_action,
+        } = request;
+        let immediate_shape = work_shape.immediate_shape();
+        let fit_shape = match fit_policy {
+            AdmissionFitPolicy::ImmediateOnly => immediate_shape,
+            AdmissionFitPolicy::FullInputMustFit => work_shape.fit_shape(),
+        };
+        let (demand, requested_slices) = self.scoped_demand(
+            AllocationLifetime::Request,
+            None,
+            immediate_shape,
+            fit_shape,
+            fit_policy,
+            pressure_action,
+        )?;
+        let prepared = match self.prepare_backing_slices(requested_slices)? {
+            BackingPrepareDecision::Prepared(prepared) => prepared,
+            BackingPrepareDecision::Deferred(deferred) => {
+                return Ok(RequestResourceAdmissionDecision::BackingDeferred(deferred));
+            }
+        };
+        match self.logical_admission().try_admit_request(&demand)? {
+            RequestAdmissionDecision::Admitted(logical_lease) => {
+                if !self.logical_admission().owns_request(&logical_lease) {
+                    return Err(invalid_resource(
+                        "request admission returned authority from another coordinator",
+                    ));
+                }
+                let slices = prepared.commit();
+                Ok(RequestResourceAdmissionDecision::Admitted(Arc::new(
+                    AdmittedRequestResources::new(
+                        TrustedPlanRuntimeBinding {
+                            resources: Arc::clone(&self.resources),
+                        },
+                        logical_lease,
+                        slices,
+                        work_shape,
+                        run_id,
+                        request_id,
+                    )?,
+                )))
+            }
+            RequestAdmissionDecision::Deferred(deferred) => {
+                Ok(RequestResourceAdmissionDecision::Deferred(deferred))
+            }
+            RequestAdmissionDecision::PermanentRejected(rejected) => Ok(
+                RequestResourceAdmissionDecision::PermanentRejected(rejected),
+            ),
+        }
+    }
 }
 
 /// Request root authority. Request-lifetime state is physically and logically

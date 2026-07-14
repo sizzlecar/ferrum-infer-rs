@@ -1,41 +1,94 @@
 use super::{
-    acquire_session_frames, begin_participant_flights_dispatch, finalize_session_frames, fmt,
-    invalid_resource, issue_batch_invocation_id, issue_batch_step_id, poison_session_frame,
-    prepare_participant_flights, reset_participant_flights_after_definitely_not_submitted,
-    session_frame_candidates, session_participant_key, AbandonedSequenceMetadata,
-    AbandonedSequenceRecoveryError, ActiveInvocationGuard, ActiveSequenceFrame, AdmissionDeferred,
-    AdmissionFitPolicy, AdmissionRejected, AdmittedSequenceResources, AdmittedStepParticipant,
-    AllocationLifetime, Arc, AtomicU64, BackingPrepareDecision, BatchCapacityClaimDecision,
-    BatchInvocationId, BatchParticipantAuthority, BatchParticipantTokenSpan, BatchStepId,
-    BatchWorkShape, BoundExecutionStream, BoundExecutionStreamState, ClaimedBackingTransaction,
+    acquire_session_frames, begin_participant_flights_dispatch, enter_sequence_dispatch,
+    finalize_session_frames, fmt, invalid_resource, issue_batch_invocation_id, issue_batch_step_id,
+    poison_session_frame, prepare_participant_flights,
+    reset_participant_flights_after_definitely_not_submitted, sequence_dispatch_is_poisoned,
+    sequence_slot_active, sequence_slot_is_poisoned, sequence_slot_poisoned_drained,
+    sequence_slot_poisoned_undrained, session_frame_candidates, session_participant_key,
+    AbandonedSequenceMetadata, AbandonedSequenceRecoveryError, ActiveInvocationGuard,
+    ActiveSequenceAbortDisposition, ActiveSequenceAbortReceipt, ActiveSequenceFrame,
+    AdmissionDeferred, AdmissionFitPolicy, AdmissionRejected, AdmittedSequenceResources,
+    AdmittedStepParticipant, AllocationLifetime, Arc, AtomicU64, BackingPrepareDecision,
+    BatchCapacityClaimDecision, BatchInvocationId, BatchParticipantAuthority,
+    BatchParticipantTokenSpan, BatchStepId, BatchWorkShape, ClaimedBackingTransaction,
     DeferredDeviceCleanupDomainId, DeviceRuntime, Digest, DynamicBackingDeferred,
-    ExecutionBatchParticipants, ExecutionStreamCreationError, InvocationRegistry,
-    InvocationResourceAdmissionRequest, LogicalAdmissionCoordinatorId, LogicalBackingBufferView,
-    LogicalBackingSliceAuthority, LogicalBatchCapacityLease, NodeId, Ordering,
-    ParticipantFlightCandidate, ParticipantFlightPhase, ParticipantNodeKey,
-    PreparedParticipantFlightHold, RequestIdentity, ResourceId, RunId, SequenceAuthorityId,
-    SequenceExecutionAuthoritySource, SequenceSessionEpoch, SequenceSessionFingerprint, Serialize,
-    Sha256, StaticProvisioningLease, StepFinalizationFailure, StepParticipantFrameAssignment,
+    ExecutionBatchParticipants, InvocationRegistry, InvocationResourceAdmissionRequest,
+    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSliceAuthority,
+    LogicalBatchCapacityLease, NodeId, Ordering, ParticipantFlightCandidate,
+    ParticipantFlightPhase, ParticipantNodeKey, PreparedParticipantFlightHold, RequestIdentity,
+    ResourceId, RunId, SequenceAuthorityId, SequenceExecutionAuthoritySource,
+    SequenceRecoveryRegistry, SequenceSessionEpoch, SequenceSessionFingerprint, Serialize, Sha256,
+    StaticProvisioningLease, StepFinalizationFailure, StepParticipantFrameAssignment,
     StepParticipantRetirement, StepParticipantRetirementDisposition, StepResourceAdmissionDecision,
-    StepResourceAdmissionRequest, StepRetirementReceipt, StreamState, TokenSpanWork,
-    TrustedPlanRuntimeEvidence, VNextError,
+    StepResourceAdmissionRequest, StepResourceLease, StepRetirementReceipt, StreamState,
+    TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError, SEQUENCE_DISPATCH_POISONED_BIT,
 };
 
-/// Resources whose lifetime is one exact continuous-batch execution frame.
-/// Child invocation leases retain this scope through `Arc`, so shared frame
-/// capacity and every participant authority outlive asynchronous device work.
-#[must_use = "step resources must live through every child invocation"]
-pub struct StepResourceLease<R>
+#[derive(Debug)]
+pub enum ExecutionStreamCreationError<E> {
+    Contract(VNextError),
+    Runtime(E),
+}
+
+/// A stream created and owned by one exact admitted runtime instance. Its
+/// runtime and raw stream are private so execution can only proceed through an
+/// active sequence permit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BoundExecutionStreamState {
+    Ready,
+    InUse,
+    Poisoned,
+}
+
+#[must_use = "an execution stream must be activated through its resource lease"]
+pub struct BoundExecutionStream<R>
 where
     R: DeviceRuntime,
 {
-    // The transaction releases physical extents before its logical claim,
-    // then per-sequence frame guards release before their parent sessions.
-    claimed_backing: ClaimedBackingTransaction,
-    participants: Vec<AdmittedStepParticipant<R>>,
-    invocation_registry: Arc<InvocationRegistry>,
-    batch_step_id: BatchStepId,
-    finalized: bool,
+    // The raw stream drops or transfers into the recovery registry before this
+    // owning sequence hold can release logical capacity or backing extents.
+    pub(super) runtime: Arc<R>,
+    pub(super) coordinator_id: LogicalAdmissionCoordinatorId,
+    pub(super) sequence_authority: SequenceAuthorityId,
+    pub(super) stream: Option<R::Stream>,
+    pub(super) state: BoundExecutionStreamState,
+    pub(super) sequence_recovery: Arc<SequenceRecoveryRegistry<R>>,
+    pub(super) sequence_dispatch_gate: Arc<AtomicU64>,
+    pub(super) abandoned_sequence: Option<(u32, u64)>,
+    pub(super) resources: Arc<AdmittedSequenceResources<R>>,
+}
+
+impl<R> BoundExecutionStream<R>
+where
+    R: DeviceRuntime,
+{
+    pub(super) fn stream(&self) -> &R::Stream {
+        self.stream
+            .as_ref()
+            .expect("bound execution stream retains its raw stream")
+    }
+
+    pub(super) fn stream_mut(&mut self) -> &mut R::Stream {
+        self.stream
+            .as_mut()
+            .expect("bound execution stream retains its raw stream")
+    }
+}
+
+impl<R> Drop for BoundExecutionStream<R>
+where
+    R: DeviceRuntime,
+{
+    fn drop(&mut self) {
+        let Some(key) = self.abandoned_sequence.take() else {
+            return;
+        };
+        self.sequence_dispatch_gate
+            .fetch_or(SEQUENCE_DISPATCH_POISONED_BIT, Ordering::AcqRel);
+        if let Some(stream) = self.stream.take() {
+            self.sequence_recovery.attach_stream(key, stream);
+        }
+    }
 }
 
 impl<R> StepResourceLease<R>
@@ -1020,60 +1073,6 @@ where
     }
 }
 
-pub(super) const fn sequence_slot_active(epoch: u64) -> u64 {
-    (epoch << 2) | 1
-}
-
-pub(super) const fn sequence_slot_poisoned_drained(epoch: u64) -> u64 {
-    (epoch << 2) | 2
-}
-
-pub(super) const fn sequence_slot_poisoned_undrained(epoch: u64) -> u64 {
-    (epoch << 2) | 3
-}
-
-pub(super) const fn sequence_slot_is_poisoned(state: u64) -> bool {
-    matches!(state & 3, 2 | 3)
-}
-
-pub(super) const SEQUENCE_DISPATCH_POISONED_BIT: u64 = 1 << 63;
-const SEQUENCE_DISPATCH_COUNT_MASK: u64 = SEQUENCE_DISPATCH_POISONED_BIT - 1;
-
-pub(super) fn sequence_dispatch_is_poisoned(gate: &AtomicU64) -> bool {
-    gate.load(Ordering::Acquire) & SEQUENCE_DISPATCH_POISONED_BIT != 0
-}
-
-struct SequenceDispatchGuard<'a> {
-    gate: &'a AtomicU64,
-}
-
-impl Drop for SequenceDispatchGuard<'_> {
-    fn drop(&mut self) {
-        let previous = self.gate.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous & SEQUENCE_DISPATCH_COUNT_MASK > 0);
-    }
-}
-
-fn enter_sequence_dispatch(gate: &AtomicU64) -> Result<SequenceDispatchGuard<'_>, VNextError> {
-    gate.fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-        if state & SEQUENCE_DISPATCH_POISONED_BIT != 0
-            || state & SEQUENCE_DISPATCH_COUNT_MASK == SEQUENCE_DISPATCH_COUNT_MASK
-        {
-            None
-        } else {
-            Some(state + 1)
-        }
-    })
-    .map_err(|state| {
-        if state & SEQUENCE_DISPATCH_POISONED_BIT != 0 {
-            invalid_resource("poisoned resource pool cannot dispatch another operation")
-        } else {
-            invalid_resource("resource pool dispatch counter is exhausted")
-        }
-    })?;
-    Ok(SequenceDispatchGuard { gate })
-}
-
 impl<R> AdmittedSequenceResources<R>
 where
     R: DeviceRuntime,
@@ -1592,58 +1591,6 @@ impl ActiveSequenceCompletionReceipt {
 
     pub fn runtime_implementation_fingerprint(&self) -> &str {
         &self.runtime_implementation_fingerprint
-    }
-}
-
-/// Terminal resource disposition produced by an explicit sequence abort.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum ActiveSequenceAbortDisposition {
-    SynchronizedAndPoisoned,
-    SequenceSessionTerminalized,
-}
-
-/// Core-signed evidence that the exact active slot epoch was atomically
-/// poisoned. This type is trusted output and has no deserialization or public
-/// construction path.
-#[derive(Debug, Serialize)]
-#[must_use = "sequence abort evidence must be recorded by execution"]
-pub struct ActiveSequenceAbortReceipt {
-    pub(super) plan: TrustedPlanRuntimeEvidence,
-    pub(super) sequence_authority: SequenceAuthorityId,
-    pub(super) run_id: RunId,
-    pub(super) request_id: RequestIdentity,
-    pub(super) activation_epoch: u64,
-    pub(super) runtime_implementation_fingerprint: String,
-    pub(super) disposition: ActiveSequenceAbortDisposition,
-}
-
-impl ActiveSequenceAbortReceipt {
-    pub fn plan(&self) -> &TrustedPlanRuntimeEvidence {
-        &self.plan
-    }
-
-    pub fn run_id(&self) -> &RunId {
-        &self.run_id
-    }
-
-    pub fn request_id(&self) -> &RequestIdentity {
-        &self.request_id
-    }
-
-    pub const fn sequence_authority(&self) -> SequenceAuthorityId {
-        self.sequence_authority
-    }
-
-    pub const fn activation_epoch(&self) -> u64 {
-        self.activation_epoch
-    }
-
-    pub fn runtime_implementation_fingerprint(&self) -> &str {
-        &self.runtime_implementation_fingerprint
-    }
-
-    pub const fn disposition(&self) -> ActiveSequenceAbortDisposition {
-        self.disposition
     }
 }
 
