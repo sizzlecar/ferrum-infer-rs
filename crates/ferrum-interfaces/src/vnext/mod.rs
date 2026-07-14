@@ -15,6 +15,7 @@ mod operation;
 mod oracle;
 mod resolved;
 mod resource;
+mod weight_source;
 
 pub use admission::*;
 pub use completion::*;
@@ -28,3 +29,4 @@ pub use operation::*;
 pub use oracle::*;
 pub use resolved::*;
 pub use resource::*;
+pub use weight_source::*;

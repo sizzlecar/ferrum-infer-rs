@@ -23,6 +23,7 @@ pub mod loader;
 pub mod lora;
 pub mod native_safetensors;
 pub mod quant_linear;
+pub mod safetensors_archive;
 pub mod traits;
 
 pub use dense::DenseLinear;
@@ -32,6 +33,7 @@ pub use loader::{PrefixedLoader, WeightLoader};
 pub use lora::LoraLinearRef;
 pub use native_safetensors::NativeSafetensorsLoader;
 pub use quant_linear::QuantLinear;
+pub use safetensors_archive::{SafetensorsArchive, SafetensorsTensor};
 pub use traits::Linear;
 
 // Quant config types — populated from safetensors metadata or GGUF header.

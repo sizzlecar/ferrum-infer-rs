@@ -1539,6 +1539,7 @@ name = "ferrum-quantization"
 version = "0.7.7"
 dependencies = [
  "candle-core",
+ "ferrum-interfaces",
  "ferrum-kernels",
  "ferrum-types",
  "half",
