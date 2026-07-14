@@ -5,7 +5,9 @@
 - Work package: S0A, semantics-preserving structural split.
 - Current stage: `resource.rs` production contract split, symbol-level imports, and complete
   dependency-cycle removal validated; the external resource contract target is split by invariant
-  owner; `execution.rs`, `event.rs`, and their oversized contract targets remain open.
+  owner. `execution.rs` now has a semantics-preserving real-module split with explicit production
+  imports; execution owner normalization and cycle removal remain open. `event.rs` and the remaining
+  oversized contract targets also remain open.
 - This map records file ownership, not G01A completion. Public item inventory and the final
   `contract-map.json` remain required before the S0A PASS artifact can be issued.
 
@@ -15,6 +17,10 @@
 - Pre-split logical lines: `13,220`
 - Pre-split SHA256:
   `26b3e035010111b0d1da2f1133b665c207c5802e689ab02b5f3bc35c9933a97d`
+- Pre-split execution source: `crates/ferrum-interfaces/src/vnext/execution.rs`
+- Pre-split execution logical lines: `6,651`
+- Pre-split execution SHA256:
+  `276711236b000f35633df1662751a6acc1182af8e2b98bfe43aa546d18a37f18`
 - Repository inventory: `docs/release/cleanup/20260714-inventory.md`
 - Inventory SHA256:
   `6cce246fc3f62ec058498bdb0a825613d47abaf327fcf8a698c59ece41c79190`
@@ -37,6 +43,14 @@ As a second mechanical-equivalence check, removing only the added `use super::*`
 `rustfmt` produced byte-identical old/new files with SHA256
 `3fac9f1b587513d77fc796538ae40444cfe9be08992bdf0d8b36f1f88168560b`.
 
+The first execution checkpoint applies the same stronger proof. Concatenating the eight production
+fragments in source order, removing only their explicit import preludes and `pub(super)` qualifiers,
+restoring the original facade imports, and applying the same formatter produces identical old/new
+production SHA256 values:
+`70899c1ef6365b65e1df0a34e7b052a1b605d7228b343d17859cac137eb8cac1`.
+The extracted white-box test module independently produces identical old/new SHA256 values:
+`452bdff62ee00cd91473fb61cfcc5758f98c2d407fce24b3317d56ad30e2712e`.
+
 ## Resource Ownership
 
 | Current owner | Lines | Primary responsibility |
@@ -58,6 +72,29 @@ As a second mechanical-equivalence check, removing only the added `use super::*`
 
 `resource.rs` is now a 69-line facade. Every production fragment is below the S0A `2,500`
 logical-line limit and the facade is below `500` lines.
+
+## Execution Ownership Checkpoint
+
+| Current owner | Lines | Primary responsibility |
+|---|---:|---|
+| `execution/contracts.rs` | 466 | Plan identity, provider selection evidence, nodes and allocation contracts |
+| `execution/work.rs` | 614 | Token/page work evidence and bounded dynamic demand formulas |
+| `execution/storage.rs` | 789 | Storage compatibility, dynamic pool specifications and descriptors |
+| `execution/memory.rs` | 928 | Core-derived memory plan, pool/liveness accounting and workspace requirements |
+| `execution/provider.rs` | 789 | Provider resource evidence, node resolution and serialized plan payloads |
+| `execution/plan.rs` | 2,088 | Semantic plan construction, validation and deterministic provider selection |
+| `execution/solver.rs` | 442 | Joint provider/storage solver and checked allocation helpers |
+| `execution/policy.rs` | 86 | Typed runtime policy and planner request boundary |
+
+`execution.rs` is now a 45-line facade. Every production fragment is below `2,500` lines. The
+existing 14 white-box tests are isolated in a 506-line `execution/tests.rs` module and pass with
+`--test-threads=2`.
+
+This is deliberately a structural checkpoint, not the final execution ownership graph. The split
+made former same-module coupling observable: low-level canonical/allocation helpers, provider
+resource evidence, serialized payload validation, and the planner API still form misplaced
+cross-owner dependencies. The next execution change must move those symbols to their lowest valid
+owner and produce a zero-SCC symbol graph before execution splitting is marked complete.
 
 ## Resource Test Ownership
 
@@ -99,7 +136,7 @@ must remain represented after S0B:
 
 ## Dependency Direction
 
-The final graph is acyclic. One valid dependencies-first topological order is:
+The final resource graph is acyclic. One valid dependencies-first topological order is:
 
 ```text
 contracts -> ledger -> capacity -> allocation -> dynamic_pool -> provisioning -> static_lease
@@ -108,8 +145,9 @@ contracts -> ledger -> capacity -> allocation -> dynamic_pool -> provisioning ->
 
 Rust module privacy now separates the owners, all newly shared internals are restricted to the
 resource parent, and production imports are symbol-explicit. The SCC audit reports `0` cycles;
-pairwise and the previously hidden three-module cycle are both eliminated. S0B may later shrink or
-break these contracts only against the real Qwen3.5-4B production consumer.
+pairwise and the previously hidden three-module cycle are both eliminated. Execution production
+imports are also symbol-explicit, but its SCC audit remains an open checkpoint as described above.
+S0B may later shrink or break these contracts only against the real Qwen3.5-4B production consumer.
 
 ## Validation For This Stage
 
@@ -124,6 +162,11 @@ break these contracts only against the real Qwen3.5-4B production consumer.
    `-- --test-threads=2` passes `12/12` parent tests, including the expected isolated panic-child
    fault case and all `311` frozen proof cases.
 7. No paid GPU, model download, performance run, or product migration claim is part of this stage.
+
+For the execution structural checkpoint, `cargo check -p ferrum-interfaces --all-targets` passes,
+and the bounded execution white-box target passes `14/14`. These results establish compile and
+mechanical-equivalence evidence only; the execution zero-SCC and final S0A PASS artifacts remain
+open.
 
 After owner normalization and the zero-SCC audit, the bounded all-target check, `47/47` resource
 library tests, and all seven external resource owner targets pass. The transaction-evidence
