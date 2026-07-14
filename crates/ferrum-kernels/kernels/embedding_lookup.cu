@@ -36,6 +36,30 @@ extern "C" __global__ void embedding_lookup_f16(
     output[b * dim + i] = table[idx * dim + i];
 }
 
+// vNext chunks long prefills at the provider boundary so this hot kernel keeps
+// the division-free 2D indexing used by the validated legacy implementation.
+// Invalid ids are zero-filled to prevent an out-of-bounds device read; the
+// product tokenizer/input boundary remains responsible for rejecting them.
+extern "C" __global__ void vnext_embedding_lookup_f16(
+    const __half* __restrict__ table,      // [vocab_size, dim]
+    const uint32_t* __restrict__ indices, // [tokens]
+    __half* __restrict__ output,           // [tokens, dim]
+    int batch,
+    int dim,
+    uint32_t vocab_size
+) {
+    int token = blockIdx.y;
+    int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token >= batch || column >= dim) return;
+    uint32_t index = indices[token];
+    if (index >= vocab_size) {
+        output[(unsigned long long)token * dim + column] = __float2half(0.0f);
+        return;
+    }
+    output[(unsigned long long)token * dim + column] =
+        table[(unsigned long long)index * dim + column];
+}
+
 // Device-state variant: token id read from a single device slot.
 // Enables CUDA graph capture — the captured graph's scalar args are frozen,
 // so dynamic values (token id that changes every decode step) must live in

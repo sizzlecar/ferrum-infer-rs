@@ -73,6 +73,7 @@ pub mod residual_add;
 pub mod rms_norm;
 pub mod rope;
 pub mod tp_decode;
+pub mod vnext_ops;
 pub mod vnext_runtime;
 pub mod weight_store;
 

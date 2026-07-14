@@ -46,11 +46,11 @@ pub enum CudaDeviceRuntimeError {
 }
 
 impl CudaDeviceRuntimeError {
-    fn contract(message: impl Into<String>) -> Self {
+    pub(super) fn contract(message: impl Into<String>) -> Self {
         Self::Contract(message.into())
     }
 
-    fn driver(operation: &'static str, source: DriverError) -> Self {
+    pub(super) fn driver(operation: &'static str, source: DriverError) -> Self {
         Self::Driver { operation, source }
     }
 
@@ -436,6 +436,10 @@ impl CudaDeviceRuntime {
             allocation_stream,
             quarantined: Mutex::new(Vec::new()),
         })
+    }
+
+    pub(super) fn context(&self) -> &Arc<CudaContext> {
+        &self.context
     }
 
     fn validate_buffer(&self, buffer: &CudaDeviceBuffer) -> Result<(), CudaDeviceRuntimeError> {
