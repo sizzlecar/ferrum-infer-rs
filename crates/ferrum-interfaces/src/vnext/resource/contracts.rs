@@ -4,17 +4,27 @@ use std::fmt;
 
 use super::{
     AllocationKind, AllocationLifetime, BufferDescriptor, BufferUsage, CapacityDomainId,
-    DeviceDescriptor, DeviceId, ElementType, NodeId, PlanHash, PlanId, RequestIdentity,
-    ResourceAllocation, ResourceId, VNextError,
+    DeviceDescriptor, DeviceId, ElementType, FailureDomain, FailureEnvelope, NodeId, PlanHash,
+    PlanId, RequestIdentity, ResourceAllocation, ResourceId, RunId, TransactionId, VNextError,
 };
 
 pub const MAX_RESOURCE_TRANSITION_RECEIPT_WIRE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_RESOURCE_LEASE_RECEIPT_WIRE_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const SEQUENCE_DISPATCH_POISONED_BIT: u64 = 1 << 63;
 
 pub(super) fn invalid_resource(reason: impl Into<String>) -> VNextError {
     VNextError::InvalidExecutionPlan {
         reason: reason.into(),
     }
+}
+
+pub(super) fn core_resource_failure(
+    code: &'static str,
+    message: impl Into<String>,
+    retryable: bool,
+) -> FailureEnvelope {
+    FailureEnvelope::new(FailureDomain::Resource, code, message, retryable)
+        .expect("core-generated resource failure must be valid")
 }
 
 pub(crate) fn validate_runtime_descriptor_for_admission(
@@ -33,6 +43,70 @@ pub(crate) fn validate_runtime_descriptor_for_admission(
         )));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResourceTransactionIdentity {
+    pub(super) pool_id: ResourcePoolId,
+    pub(super) run_id: RunId,
+    pub(super) transaction_id: TransactionId,
+    pub(super) request_id: RequestIdentity,
+}
+
+impl ResourceTransactionIdentity {
+    pub fn for_admission(
+        admission: &StaticProvisioningBinding,
+        run_id: RunId,
+        transaction_id: TransactionId,
+    ) -> Self {
+        Self {
+            pool_id: admission.pool_id(),
+            run_id,
+            transaction_id,
+            request_id: admission.request_id().clone(),
+        }
+    }
+
+    pub const fn pool_id(&self) -> ResourcePoolId {
+        self.pool_id
+    }
+
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    pub fn transaction_id(&self) -> &TransactionId {
+        &self.transaction_id
+    }
+
+    pub fn request_id(&self) -> &RequestIdentity {
+        &self.request_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceDriverFailure {
+    failure: FailureEnvelope,
+}
+
+impl ResourceDriverFailure {
+    pub fn new(failure: FailureEnvelope) -> Result<Self, VNextError> {
+        failure.validate()?;
+        if failure.domain() != FailureDomain::Resource {
+            return Err(invalid_resource(
+                "resource driver failure must use the resource failure domain",
+            ));
+        }
+        Ok(Self { failure })
+    }
+
+    pub fn failure(&self) -> &FailureEnvelope {
+        &self.failure
+    }
+
+    pub fn into_failure(self) -> FailureEnvelope {
+        self.failure
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

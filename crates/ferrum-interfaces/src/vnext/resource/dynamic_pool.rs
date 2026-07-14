@@ -1,13 +1,13 @@
 use super::{
     invalid_resource, validate_runtime_descriptor_for_admission, AllocationSeal, Arc, AtomicU64,
-    BTreeMap, BTreeSet, BufferDescriptor, BufferRequest, CapacityDomainId, CapacityEpochs,
-    CapacityUnits, DeviceAllocationPermit, DeviceCapacityBudget, DeviceCapacityGrant,
-    DeviceCapacityReservation, DeviceRuntime, DynamicBackingPoolId, DynamicPoolDomainSpec,
-    DynamicResourceDescriptor, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView,
-    LogicalAdmissionCoordinator, LogicalBackingBufferView, LogicalBackingSegmentBinding,
-    LogicalBackingSliceAuthority, LogicalBackingSliceEvidence, Mutex, Ordering, PlanNode,
-    ResourceId, ResourceReservation, ResourceRetentionPolicy, ResourceTransactionIdentity, RunId,
-    Serialize, StaticProvisioningBinding, TransactionId, VNextError,
+    BTreeMap, BTreeSet, BufferDescriptor, BufferRequest, BufferUsage, CapacityDomainId,
+    CapacityEpochs, CapacityUnits, DeviceAllocationPermit, DeviceCapacityBudget,
+    DeviceCapacityGrant, DeviceCapacityReservation, DeviceRuntime, DynamicBackingPoolId,
+    DynamicBackingPoolSpec, DynamicResourceDescriptor, DynamicStorageAllocator,
+    DynamicStorageProfile, DynamicStorageView, ElementType, LogicalAdmissionCoordinator, Mutex,
+    Ordering, PlanNode, ResourceId, ResourceReservation, ResourceRetentionPolicy,
+    ResourceTransactionIdentity, RunId, Serialize, StaticProvisioningBinding, TransactionId,
+    VNextError,
 };
 
 static NEXT_DYNAMIC_POOL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -22,6 +22,23 @@ fn align_up_resource(value: u64, alignment: u64) -> Result<u64, VNextError> {
         .checked_add(alignment - 1)
         .map(|rounded| rounded & !(alignment - 1))
         .ok_or_else(|| invalid_resource("dynamic pool aligned bytes overflow u64"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct DynamicPoolDomainSpec {
+    pub(super) domain_id: CapacityDomainId,
+    pub(super) pool: DynamicBackingPoolSpec,
+    pub(super) descriptors: Vec<DynamicResourceDescriptor>,
+}
+
+impl DynamicPoolDomainSpec {
+    pub const fn domain_id(&self) -> CapacityDomainId {
+        self.domain_id
+    }
+
+    pub(super) fn pool_id(&self) -> &DynamicBackingPoolId {
+        self.pool.pool_id()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -1270,6 +1287,133 @@ where
     binding: StaticProvisioningBinding,
     // Backend context must outlive every resident/quarantined buffer above.
     runtime: Arc<R>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LogicalBackingSliceEvidence {
+    pub(super) domain_id: CapacityDomainId,
+    pub(super) pool_id: DynamicBackingPoolId,
+    pub(super) resource_id: ResourceId,
+    pub(super) pool_instance_id: u64,
+    pub(super) segment_generation: u64,
+    pub(super) segments: Vec<BackingSegment>,
+    pub(super) size_bytes: u64,
+    pub(super) alignment_bytes: u64,
+    pub(super) usage: BufferUsage,
+    pub(super) element_type: ElementType,
+    pub(super) storage_profile: DynamicStorageProfile,
+}
+
+impl LogicalBackingSliceEvidence {
+    pub const fn domain_id(&self) -> CapacityDomainId {
+        self.domain_id
+    }
+
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.resource_id
+    }
+
+    pub fn pool_id(&self) -> &DynamicBackingPoolId {
+        &self.pool_id
+    }
+
+    pub const fn pool_instance_id(&self) -> u64 {
+        self.pool_instance_id
+    }
+
+    pub const fn segment_generation(&self) -> u64 {
+        self.segment_generation
+    }
+
+    pub fn segments(&self) -> &[BackingSegment] {
+        &self.segments
+    }
+
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    pub const fn alignment_bytes(&self) -> u64 {
+        self.alignment_bytes
+    }
+
+    pub const fn usage(&self) -> BufferUsage {
+        self.usage
+    }
+
+    pub const fn element_type(&self) -> ElementType {
+        self.element_type
+    }
+
+    pub const fn storage_profile(&self) -> DynamicStorageProfile {
+        self.storage_profile
+    }
+}
+
+#[must_use = "a logical backing authority owns its physical arena extents"]
+pub struct LogicalBackingSliceAuthority {
+    pub(super) evidence: LogicalBackingSliceEvidence,
+    pub(super) segment_lease: BackingSegmentLease,
+}
+
+impl LogicalBackingSliceAuthority {
+    pub fn evidence(&self) -> &LogicalBackingSliceEvidence {
+        &self.evidence
+    }
+
+    pub const fn domain_id(&self) -> CapacityDomainId {
+        self.evidence.domain_id
+    }
+
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.evidence.resource_id
+    }
+
+    pub const fn size_bytes(&self) -> u64 {
+        self.evidence.size_bytes
+    }
+}
+
+pub struct LogicalBackingBufferView<'a, B> {
+    pub(super) bindings: Vec<LogicalBackingSegmentBinding<B>>,
+    pub(super) evidence: &'a LogicalBackingSliceEvidence,
+}
+
+pub(crate) struct LogicalBackingSegmentBinding<B> {
+    pub(super) segment: BackingSegment,
+    pub(super) chunk: Arc<ResidentChunkBacking<B>>,
+}
+
+impl<B> LogicalBackingSegmentBinding<B> {
+    pub(crate) fn segment(&self) -> &BackingSegment {
+        &self.segment
+    }
+
+    pub(crate) fn chunk(&self) -> &BackingChunkIdentity {
+        self.segment.chunk()
+    }
+
+    pub(crate) fn buffer(&self) -> &B {
+        &self.chunk.buffer
+    }
+
+    pub(crate) fn descriptor(&self) -> &BufferDescriptor {
+        &self.chunk.descriptor
+    }
+}
+
+impl<'a, B> LogicalBackingBufferView<'a, B> {
+    pub(crate) fn segment_bindings(&self) -> &[LogicalBackingSegmentBinding<B>] {
+        &self.bindings
+    }
+
+    pub(crate) fn storage_profile(&self) -> DynamicStorageProfile {
+        self.evidence.storage_profile()
+    }
+
+    pub fn slice(&self) -> &'a LogicalBackingSliceEvidence {
+        self.evidence
+    }
 }
 
 impl<R> DynamicPoolSet<R>

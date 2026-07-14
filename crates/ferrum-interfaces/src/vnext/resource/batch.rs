@@ -7,9 +7,26 @@ use super::{
     LogicalBackingSliceEvidence, LogicalBatchCapacityLease, Mutex, NodeId, ParticipantFlightPhase,
     ParticipantNodeKey, RequestAuthorityId, SequenceAuthorityId, SequenceSession,
     SequenceSessionEpoch, SequenceSessionFingerprint, SequenceSessionPhase, SequenceSessionSlot,
-    SequenceSessionSlotState, Serialize, Sha256, StepParticipantFrameAssignment, StepResourceLease,
-    TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError,
+    SequenceSessionSlotState, Serialize, Sha256, StepParticipantFrameAssignment, TokenSpanWork,
+    TrustedPlanRuntimeEvidence, VNextError,
 };
+
+/// Resources whose lifetime is one exact continuous-batch execution frame.
+/// Child invocation leases retain this scope through `Arc`, so shared frame
+/// capacity and every participant authority outlive asynchronous device work.
+#[must_use = "step resources must live through every child invocation"]
+pub struct StepResourceLease<R>
+where
+    R: DeviceRuntime,
+{
+    // The transaction releases physical extents before its logical claim,
+    // then per-sequence frame guards release before their parent sessions.
+    pub(super) claimed_backing: ClaimedBackingTransaction,
+    pub(super) participants: Vec<AdmittedStepParticipant<R>>,
+    pub(super) invocation_registry: Arc<InvocationRegistry>,
+    pub(super) batch_step_id: BatchStepId,
+    pub(super) finalized: bool,
+}
 
 /// Canonical non-empty set selected by the scheduler for one continuous
 /// batch. Membership is exact; capacity shapes may not claim a different

@@ -2,23 +2,20 @@ use super::{
     core_resource_failure, deferred_device_cleanup_status, invalid_resource,
     maintain_deferred_device_cleanups, new_deferred_device_cleanup_domain,
     retire_deferred_device_cleanup_domain, watch, AdmissionDemand, AdmissionFitPolicy,
-    AdmissionPressureAction, AdmittedRequestResources, AllocationLifetime, Arc, AtomicU8,
-    BackingChunkIdentity, BackingPrepareDecision, BackingSegment, BackingSegmentLease,
-    BufferDescriptor, BufferUsage, CapacityDomainId, CapacityEntry, CapacityEpochs, CapacityUnits,
-    CapacityVector, CapacityWaitRecheck, CapacityWaitRegistration, DeferredDeviceCleanupDomainId,
+    AdmissionPressureAction, AllocationLifetime, Arc, AtomicU8, BackingPrepareDecision,
+    CapacityEntry, CapacityEpochs, CapacityUnits, CapacityVector, CapacityWaitRecheck,
+    CapacityWaitRegistration, DeferredDeviceCleanupDomainId,
     DeferredDeviceCleanupMaintenanceReceipt, DeferredDeviceCleanupStatus, DeviceCapacityClaim,
-    DeviceId, DeviceRuntime, DynamicBackingDeferred, DynamicBackingPoolId,
-    DynamicDeferredMaintenanceOutcome, DynamicPoolMaintenanceController, DynamicPoolSet,
-    DynamicResourceShape, DynamicStorageProfile, ElementType, EvaluatedBackingRequest,
-    FailureEnvelope, LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex, NoStatic,
-    NodeId, Ordering, PlanHash, PlanId, PlanNode, RequestAdmissionDecision, RequestIdentity,
-    RequestResourceAdmissionDecision, RequestResourceAdmissionRequest, ResidentChunkBacking,
-    ResourceAbandonSignal, ResourceActionCursor, ResourceDriverFailure, ResourceId,
+    DeviceId, DeviceRuntime, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
+    DynamicPoolMaintenanceController, DynamicPoolSet, DynamicResourceShape,
+    EvaluatedBackingRequest, FailureEnvelope, LogicalAdmissionCoordinator,
+    LogicalAdmissionCoordinatorId, Mutex, NoStatic, NodeId, Ordering, PlanHash, PlanId, PlanNode,
+    ResourceAbandonSignal, ResourceActionCursor, ResourceDriverFailure,
     ResourceLedgerEntrySnapshot, ResourceOwnershipReason, ResourceOwnershipTransferFailure,
     ResourcePoolIdentity, ResourcePoolOwnership, ResourceReservation, ResourceReservationBatch,
     ResourceTransactionAction, ResourceTransactionContext, ResourceTransactionDriver,
-    ResourceTransactionIdentity, ResourceTransactionState, RunId, RwLock, RwLockReadGuard,
-    Serialize, StaticProvisioningBinding, StaticProvisioningLease, VNextError,
+    ResourceTransactionIdentity, ResourceTransactionState, RwLock, RwLockReadGuard, Serialize,
+    StaticProvisioningBinding, StaticProvisioningLease, VNextError,
 };
 
 pub(super) const PLAN_RUNTIME_OPEN: u8 = 0;
@@ -951,195 +948,5 @@ where
             lifecycle_rx,
             resources: Arc::clone(&self.resources),
         })
-    }
-
-    /// Request-scoped capacity is claimed exactly once before any child
-    /// sequence, stream, provider encode, or device submission exists.
-    pub fn try_admit_request(
-        &self,
-        request: RequestResourceAdmissionRequest,
-        run_id: RunId,
-        request_id: RequestIdentity,
-    ) -> Result<RequestResourceAdmissionDecision<R>, VNextError> {
-        let _lifecycle = self.resources.read_lifecycle("admit a request")?;
-        let RequestResourceAdmissionRequest {
-            work_shape,
-            fit_policy,
-            pressure_action,
-        } = request;
-        let immediate_shape = work_shape.immediate_shape();
-        let fit_shape = match fit_policy {
-            AdmissionFitPolicy::ImmediateOnly => immediate_shape,
-            AdmissionFitPolicy::FullInputMustFit => work_shape.fit_shape(),
-        };
-        let (demand, requested_slices) = self.scoped_demand(
-            AllocationLifetime::Request,
-            None,
-            immediate_shape,
-            fit_shape,
-            fit_policy,
-            pressure_action,
-        )?;
-        let prepared = match self.prepare_backing_slices(requested_slices)? {
-            BackingPrepareDecision::Prepared(prepared) => prepared,
-            BackingPrepareDecision::Deferred(deferred) => {
-                return Ok(RequestResourceAdmissionDecision::BackingDeferred(deferred));
-            }
-        };
-        match self.logical_admission().try_admit_request(&demand)? {
-            RequestAdmissionDecision::Admitted(logical_lease) => {
-                if !self.logical_admission().owns_request(&logical_lease) {
-                    return Err(invalid_resource(
-                        "request admission returned authority from another coordinator",
-                    ));
-                }
-                let slices = prepared.commit();
-                Ok(RequestResourceAdmissionDecision::Admitted(Arc::new(
-                    AdmittedRequestResources::new(
-                        TrustedPlanRuntimeBinding {
-                            resources: Arc::clone(&self.resources),
-                        },
-                        logical_lease,
-                        slices,
-                        work_shape,
-                        run_id,
-                        request_id,
-                    )?,
-                )))
-            }
-            RequestAdmissionDecision::Deferred(deferred) => {
-                Ok(RequestResourceAdmissionDecision::Deferred(deferred))
-            }
-            RequestAdmissionDecision::PermanentRejected(rejected) => Ok(
-                RequestResourceAdmissionDecision::PermanentRejected(rejected),
-            ),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct LogicalBackingSliceEvidence {
-    pub(super) domain_id: CapacityDomainId,
-    pub(super) pool_id: DynamicBackingPoolId,
-    pub(super) resource_id: ResourceId,
-    pub(super) pool_instance_id: u64,
-    pub(super) segment_generation: u64,
-    pub(super) segments: Vec<BackingSegment>,
-    pub(super) size_bytes: u64,
-    pub(super) alignment_bytes: u64,
-    pub(super) usage: BufferUsage,
-    pub(super) element_type: ElementType,
-    pub(super) storage_profile: DynamicStorageProfile,
-}
-
-impl LogicalBackingSliceEvidence {
-    pub const fn domain_id(&self) -> CapacityDomainId {
-        self.domain_id
-    }
-
-    pub fn resource_id(&self) -> &ResourceId {
-        &self.resource_id
-    }
-
-    pub fn pool_id(&self) -> &DynamicBackingPoolId {
-        &self.pool_id
-    }
-
-    pub const fn pool_instance_id(&self) -> u64 {
-        self.pool_instance_id
-    }
-
-    pub const fn segment_generation(&self) -> u64 {
-        self.segment_generation
-    }
-
-    pub fn segments(&self) -> &[BackingSegment] {
-        &self.segments
-    }
-
-    pub const fn size_bytes(&self) -> u64 {
-        self.size_bytes
-    }
-
-    pub const fn alignment_bytes(&self) -> u64 {
-        self.alignment_bytes
-    }
-
-    pub const fn usage(&self) -> BufferUsage {
-        self.usage
-    }
-
-    pub const fn element_type(&self) -> ElementType {
-        self.element_type
-    }
-
-    pub const fn storage_profile(&self) -> DynamicStorageProfile {
-        self.storage_profile
-    }
-}
-
-#[must_use = "a logical backing authority owns its physical arena extents"]
-pub struct LogicalBackingSliceAuthority {
-    pub(super) evidence: LogicalBackingSliceEvidence,
-    pub(super) segment_lease: BackingSegmentLease,
-}
-
-impl LogicalBackingSliceAuthority {
-    pub fn evidence(&self) -> &LogicalBackingSliceEvidence {
-        &self.evidence
-    }
-
-    pub const fn domain_id(&self) -> CapacityDomainId {
-        self.evidence.domain_id
-    }
-
-    pub fn resource_id(&self) -> &ResourceId {
-        &self.evidence.resource_id
-    }
-
-    pub const fn size_bytes(&self) -> u64 {
-        self.evidence.size_bytes
-    }
-}
-
-pub struct LogicalBackingBufferView<'a, B> {
-    pub(super) bindings: Vec<LogicalBackingSegmentBinding<B>>,
-    pub(super) evidence: &'a LogicalBackingSliceEvidence,
-}
-
-pub(crate) struct LogicalBackingSegmentBinding<B> {
-    pub(super) segment: BackingSegment,
-    pub(super) chunk: Arc<ResidentChunkBacking<B>>,
-}
-
-impl<B> LogicalBackingSegmentBinding<B> {
-    pub(crate) fn segment(&self) -> &BackingSegment {
-        &self.segment
-    }
-
-    pub(crate) fn chunk(&self) -> &BackingChunkIdentity {
-        self.segment.chunk()
-    }
-
-    pub(crate) fn buffer(&self) -> &B {
-        &self.chunk.buffer
-    }
-
-    pub(crate) fn descriptor(&self) -> &BufferDescriptor {
-        &self.chunk.descriptor
-    }
-}
-
-impl<'a, B> LogicalBackingBufferView<'a, B> {
-    pub(crate) fn segment_bindings(&self) -> &[LogicalBackingSegmentBinding<B>] {
-        &self.bindings
-    }
-
-    pub(crate) fn storage_profile(&self) -> DynamicStorageProfile {
-        self.evidence.storage_profile()
-    }
-
-    pub fn slice(&self) -> &'a LogicalBackingSliceEvidence {
-        self.evidence
     }
 }

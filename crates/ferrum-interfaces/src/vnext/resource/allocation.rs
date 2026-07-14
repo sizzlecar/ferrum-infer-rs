@@ -1,50 +1,10 @@
 use super::{
     invalid_resource, validate_runtime_descriptor_for_admission, Arc, AtomicBool, BufferDescriptor,
-    BufferRequest, DeviceCapacityClaim, DeviceId, DeviceRuntime, FailureDomain, FailureEnvelope,
-    Ordering, PhantomData, RefCell, RequestIdentity, ResourceAbandonSignal, ResourceId,
-    ResourcePoolId, ResourcePoolIdentity, ResourceReservation, ResourceReservationBatch,
-    ResourceTransactionAction, ResourceTransactionState, RunId, Serialize,
-    StaticProvisioningBinding, TransactionId, VNextError,
+    BufferRequest, DeviceCapacityClaim, DeviceId, DeviceRuntime, Ordering, PhantomData, RefCell,
+    ResourceAbandonSignal, ResourceDriverFailure, ResourceId, ResourcePoolIdentity,
+    ResourceReservation, ResourceReservationBatch, ResourceTransactionAction,
+    ResourceTransactionIdentity, ResourceTransactionState, StaticProvisioningBinding, VNextError,
 };
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ResourceTransactionIdentity {
-    pub(super) pool_id: ResourcePoolId,
-    pub(super) run_id: RunId,
-    pub(super) transaction_id: TransactionId,
-    pub(super) request_id: RequestIdentity,
-}
-
-impl ResourceTransactionIdentity {
-    pub fn for_admission(
-        admission: &StaticProvisioningBinding,
-        run_id: RunId,
-        transaction_id: TransactionId,
-    ) -> Self {
-        Self {
-            pool_id: admission.pool_id(),
-            run_id,
-            transaction_id,
-            request_id: admission.request_id().clone(),
-        }
-    }
-
-    pub const fn pool_id(&self) -> ResourcePoolId {
-        self.pool_id
-    }
-
-    pub fn run_id(&self) -> &RunId {
-        &self.run_id
-    }
-
-    pub fn transaction_id(&self) -> &TransactionId {
-        &self.transaction_id
-    }
-
-    pub fn request_id(&self) -> &RequestIdentity {
-        &self.request_id
-    }
-}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ResourceActionCursor {
@@ -309,31 +269,6 @@ impl DriverCommitAcknowledgement {
         self.resource_id == allocation.resource_id
             && self.generation == allocation.generation
             && self.descriptor == allocation.descriptor
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResourceDriverFailure {
-    failure: FailureEnvelope,
-}
-
-impl ResourceDriverFailure {
-    pub fn new(failure: FailureEnvelope) -> Result<Self, VNextError> {
-        failure.validate()?;
-        if failure.domain() != FailureDomain::Resource {
-            return Err(invalid_resource(
-                "resource driver failure must use the resource failure domain",
-            ));
-        }
-        Ok(Self { failure })
-    }
-
-    pub fn failure(&self) -> &FailureEnvelope {
-        &self.failure
-    }
-
-    pub fn into_failure(self) -> FailureEnvelope {
-        self.failure
     }
 }
 

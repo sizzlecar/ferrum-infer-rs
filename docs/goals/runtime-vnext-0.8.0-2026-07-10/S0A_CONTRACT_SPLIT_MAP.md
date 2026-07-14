@@ -3,9 +3,9 @@
 ## Status
 
 - Work package: S0A, semantics-preserving structural split.
-- Current stage: `resource.rs` production contract split and symbol-level imports validated;
-  dependency-cycle removal, `execution.rs`, `event.rs`, and owner-aligned external test targets
-  remain open.
+- Current stage: `resource.rs` production contract split, symbol-level imports, and complete
+  dependency-cycle removal validated; `execution.rs`, `event.rs`, and owner-aligned external test
+  targets remain open.
 - This map records file ownership, not G01A completion. Public item inventory and the final
   `contract-map.json` remain required before the S0A PASS artifact can be issued.
 
@@ -21,16 +21,16 @@
 - Inventory validator result:
   `INVENTORY PASS: /Users/chejinxuan/rust_ws/ferrum-infer-rs/docs/release/cleanup/20260714-inventory.md`
 
-Before module visibility changed, the 13 physical fragments concatenated byte-for-byte with the
+Before module visibility changed, the 13 initial physical fragments concatenated byte-for-byte with the
 original seven-line test-module tail to the pre-split SHA256. The validated implementation now
 uses real child `mod` declarations and facade `pub use` exports; it does not use `include!`.
 Existing public paths remain unchanged. Cross-owner implementation details that were implicitly
 shared by the giant module are now explicitly limited to the `vnext::resource` parent with
 `pub(super)`, so they do not become crate-public API. All 13 production fragments now use explicit
-symbol imports; only the two existing in-module test files retain `use super::*`. The resulting
-symbol graph exposes the monolith's previously hidden bidirectional owner dependencies. S0A must
-move those shared contracts to their lowest valid owner and produce a zero-cycle audit before it
-can pass.
+symbol imports; only the two existing in-module test files retain `use super::*`. Owner
+normalization added a fourteenth production module, `provisioning`, and moved shared contracts to
+their lowest valid owner. The complete symbol graph now has zero multi-module strongly connected
+components. The transition is recorded in `S0A_RESOURCE_DEPENDENCY_AUDIT.md`.
 
 As a second mechanical-equivalence check, removing only the added `use super::*` lines and
 `pub(super)` visibility qualifiers, concatenating the production fragments, and applying the same
@@ -39,23 +39,24 @@ As a second mechanical-equivalence check, removing only the added `use super::*`
 
 ## Resource Ownership
 
-| Original lines | New owner | Lines | Primary responsibility |
-|---:|---|---:|---|
-| 1-513 | `resource/contracts.rs` | 490 | Base identifiers, descriptors, reservation contracts, shared validation |
-| 514-1226 | `resource/capacity.rs` | 728 | Device capacity authority, epochs, static provisioning and admission |
-| 1227-1838 | `resource/allocation.rs` | 620 | Transaction identity, allocation ownership and resource driver contracts |
-| 1839-3307 | `resource/ledger.rs` | 1,485 | Lease state, transition receipts, allocation ledger and failure evidence |
-| 3308-3748 | `resource/recovery.rs` | 450 | Owned lease slots, abandoned-sequence recovery and recovery stream state |
-| 3749-5725 | `resource/dynamic_pool.rs` | 1,988 | Dynamic backing pools, growth, extent/view ownership and quarantine |
-| 5726-6005 | `resource/static_lease.rs` | 287 | Plan-static provisioning lease and typed admission request construction |
-| 6006-6361 | `resource/work.rs` | 363 | Step/invocation work-shape admission requests and checked demand derivation |
-| 6362-7481 | `resource/plan_runtime.rs` | 1,145 | Plan runtime root, close state, capacity wait and logical backing ownership |
-| 7482-8448 | `resource/sequence.rs` | 983 | Request, sequence and session resource lifetime authorities |
-| 8449-9459 | `resource/batch.rs` | 1,028 | Batch participants, physical invocation ledger and step retirement |
-| 9460-11117 | `resource/invocation.rs` | 1,680 | Step/invocation leases, retry authority and active-sequence permits |
-| 11118-13213 | `resource/transaction.rs` | 2,114 | Sealed transaction typestate, commit/rollback/release and receipt validation |
+| Current owner | Lines | Primary responsibility |
+|---|---:|---|
+| `resource/contracts.rs` | 564 | Base identifiers, descriptors, shared error/state encodings and reservation contracts |
+| `resource/capacity.rs` | 360 | Device capacity authority, accounting, epochs and process-wide claims |
+| `resource/provisioning.rs` | 355 | Static/elastic plan provisioning and admission construction |
+| `resource/allocation.rs` | 555 | Allocation ownership and resource driver contracts |
+| `resource/ledger.rs` | 1,668 | Lease state, transition receipts, allocation ledger and receipt validation |
+| `resource/recovery.rs` | 348 | Abandoned-sequence recovery registry and terminal abort evidence |
+| `resource/dynamic_pool.rs` | 2,132 | Dynamic backing pools, growth, extent/view ownership and quarantine |
+| `resource/static_lease.rs` | 371 | Plan-static lease, owned slots, borrowed buffer views and typed admission requests |
+| `resource/work.rs` | 363 | Step/invocation work-shape admission requests and checked demand derivation |
+| `resource/plan_runtime.rs` | 952 | Plan runtime root, close state, capacity waits and pool coordination |
+| `resource/sequence.rs` | 1,105 | Request, sequence and session resource lifetime authorities |
+| `resource/batch.rs` | 1,045 | Batch participants, step ownership, physical invocation ledger and retirement |
+| `resource/invocation.rs` | 1,627 | Invocation leases, bound streams, retry authority and active-sequence permits |
+| `resource/transaction.rs` | 1,920 | Sealed transaction typestate, commit/rollback/release and compensation |
 
-`resource.rs` is now a 67-line facade. Every production fragment is below the S0A `2,500`
+`resource.rs` is now a 69-line facade. Every production fragment is below the S0A `2,500`
 logical-line limit and the facade is below `500` lines.
 
 ## Preserved Dynamic Resource Invariants
@@ -77,26 +78,17 @@ must remain represented after S0B:
 
 ## Dependency Direction
 
-The intended lower-to-higher direction is:
+The final graph is acyclic. One valid dependencies-first topological order is:
 
 ```text
-contracts
-  -> capacity / allocation
-  -> ledger / dynamic_pool / recovery
-  -> static_lease / work
-  -> plan_runtime
-  -> sequence
-  -> batch
-  -> invocation
-  -> transaction facade and validation
+contracts -> ledger -> capacity -> allocation -> dynamic_pool -> provisioning -> static_lease
+-> plan_runtime -> transaction -> work -> recovery -> sequence -> batch -> invocation
 ```
 
 Rust module privacy now separates the owners, all newly shared internals are restricted to the
-resource parent, and production imports are symbol-explicit. The exposed graph still contains
-bidirectional edges, including capacity/pool orchestration, ledger/transaction validation, and
-sequence/batch/invocation lifecycle helpers. Those are recorded defects of the old ownership
-layout, not accepted final dependencies. S0A must relocate them and emit the cycle audit; S0B may
-then shrink or break the resulting contracts against the real Qwen3.5-4B production consumer.
+resource parent, and production imports are symbol-explicit. The SCC audit reports `0` cycles;
+pairwise and the previously hidden three-module cycle are both eliminated. S0B may later shrink or
+break these contracts only against the real Qwen3.5-4B production consumer.
 
 ## Validation For This Stage
 
@@ -112,6 +104,6 @@ then shrink or break the resulting contracts against the real Qwen3.5-4B product
    fault case.
 7. No paid GPU, model download, performance run, or product migration claim is part of this stage.
 
-After replacing all production glob imports with explicit symbol imports, the same bounded
-`cargo check -p ferrum-interfaces --all-targets` passes. The behavioral tests were not repeated
-for this import-only follow-up.
+After owner normalization and the zero-SCC audit, the bounded all-target check, `47/47` resource
+library tests, and `7/7` external resource contract tests pass. The external target's isolated
+panic-child output is expected fault injection; the parent test exits successfully.
