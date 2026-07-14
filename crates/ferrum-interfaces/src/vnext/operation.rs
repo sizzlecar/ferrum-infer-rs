@@ -1290,6 +1290,10 @@ pub enum OracleSpec {
 pub enum ProfilePhase {
     Load,
     Prepare,
+    /// Backend operation shared by prefill and decode. The exact request phase
+    /// is derived from the bound work shape rather than changing operation
+    /// identity or selecting another provider in the hot path.
+    Forward,
     Prefill,
     Decode,
     Transfer,

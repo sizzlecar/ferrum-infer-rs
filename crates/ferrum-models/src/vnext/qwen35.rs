@@ -16,7 +16,7 @@ use ferrum_interfaces::vnext::{
     SpecialTokenCollisionPolicy, SpecialTokenMetadata, SpecialTokenRole, StateCapacityDemand,
     StateId, StateLifetime, StateSpec, TemplateMetadata, TypedFamilyRegistration, VNextError,
     WeightComponentRole, WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId,
-    WeightLayoutId, WeightReference, WeightSchema, WeightTensorSpec,
+    WeightLayoutId, WeightReference, WeightSchema, WeightTensorSpec, TOKEN_EMBEDDING_OPERATION_ID,
 };
 use ferrum_quantization::SafetensorsArchive;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,7 @@ use super::PreparedProductionModel;
 
 pub const FAMILY_ID: &str = "family.qwen3_5.dense_hybrid";
 pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5ForConditionalGeneration";
+const DENSE_MATERIALIZED_ELEMENT_TYPE: ElementType = ElementType::F16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,7 +55,6 @@ struct FamilyWeight {
     role: String,
     external_name: String,
     dimensions: Vec<u64>,
-    element_type: ElementType,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -128,15 +128,6 @@ impl Qwen35FamilyProvider {
                 return Err(invalid_config(
                     "weights",
                     "resolved tensor names, roles, and non-zero shapes must be unique",
-                ));
-            }
-            if !matches!(
-                weight.element_type,
-                ElementType::F16 | ElementType::Bf16 | ElementType::F32
-            ) {
-                return Err(invalid_config(
-                    "weights.element_type",
-                    "dense Qwen3.5 tensors must use a floating-point storage type",
                 ));
             }
             let actual_elements = weight
@@ -254,7 +245,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                     external_names: vec![weight.external_name.clone()],
                     dimensions: weight.dimensions.clone(),
                     encoding: WeightEncoding::Dense {
-                        element_type: weight.element_type,
+                        element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
                     },
                     required: true,
                 })
@@ -267,7 +258,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 Ok(WeightTensorSpec {
                     id: weight_id(weight)?,
                     dimensions: weight.dimensions.clone(),
-                    logical_element_type: weight.element_type,
+                    logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
                     physical_layout: PhysicalWeightLayout::Dense {
                         component_id: component_id(weight)?,
                     },
@@ -293,7 +284,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 Ok(WeightReference {
                     weight_id: weight_id(weight)?,
                     value_id: weight_value_id(weight)?,
-                    tensor: tensor_spec(weight.dimensions.clone(), weight.element_type),
+                    tensor: tensor_spec(weight.dimensions.clone(), DENSE_MATERIALIZED_ELEMENT_TYPE),
                 })
             })
             .collect::<Result<Vec<_>, VNextError>>()?;
@@ -303,7 +294,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         let mut hidden = value_id("value.hidden.embedding")?;
         nodes.push(ProgramNode {
             id: node_id("node.embedding")?,
-            operation_id: operation_id("operation.token_embedding")?,
+            operation_id: operation_id(TOKEN_EMBEDDING_OPERATION_ID)?,
             required_version: ContractVersion::new(1, 0),
             inputs: vec![
                 value_id("value.input.token_ids")?,
@@ -587,19 +578,27 @@ fn append_resolved_weights(
         let tensor = weights
             .tensor(&weight.name)
             .map_err(|error| error.to_string())?;
-        let element_type = tensor.element_type().ok_or_else(|| {
+        let source_element_type = tensor.element_type().ok_or_else(|| {
             format!(
                 "resolved dense Qwen3.5 tensor {:?} has unsupported dtype {:?}",
                 weight.name,
                 tensor.dtype()
             )
         })?;
+        if !matches!(
+            source_element_type,
+            ElementType::F16 | ElementType::Bf16 | ElementType::F32
+        ) {
+            return Err(format!(
+                "resolved dense Qwen3.5 tensor {:?} must have a floating-point source dtype, got {source_element_type:?}",
+                weight.name
+            ));
+        }
         output.push(FamilyWeight {
             layer_index,
             role: weight.role.clone(),
             external_name: weight.name.clone(),
             dimensions: tensor.shape().to_vec(),
-            element_type,
         });
     }
     Ok(())
@@ -905,7 +904,6 @@ mod tests {
                 role: spec.role.clone(),
                 external_name: spec.name.clone(),
                 dimensions: vec![1],
-                element_type: ElementType::F32,
             };
             weight.dimensions = vec![expected_weight_elements(&text, 32, &weight).unwrap()];
             weights.push(weight);
@@ -917,7 +915,6 @@ mod tests {
                     role: spec.role.clone(),
                     external_name: spec.name.clone(),
                     dimensions: vec![1],
-                    element_type: ElementType::F32,
                 };
                 weight.dimensions = vec![expected_weight_elements(&text, 32, &weight).unwrap()];
                 weights.push(weight);
@@ -957,6 +954,11 @@ mod tests {
         assert_eq!(prepared.program().blocks()[0].nodes.len(), 10);
         assert_eq!(prepared.program().states().len(), 7);
         assert_eq!(prepared.program().weights().len(), config.weights.len());
+        assert!(prepared
+            .weight_schema()
+            .components
+            .iter()
+            .all(|component| component.physical_element_type() == ElementType::F16));
         assert_eq!(
             prepared.metadata().special_tokens.eos_token_ids,
             BTreeSet::from([2])

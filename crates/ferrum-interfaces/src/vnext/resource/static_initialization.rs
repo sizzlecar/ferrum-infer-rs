@@ -363,11 +363,6 @@ struct WeightPlacement {
     element_type: ElementType,
 }
 
-struct PreparedWeightUpload<'source> {
-    placement: WeightPlacement,
-    payload: WeightComponentPayload<'source>,
-}
-
 enum InitializationStepFailure<R>
 where
     R: DeviceRuntime,
@@ -412,19 +407,13 @@ where
 {
     preflight_transaction(transaction, family, plan).map_err(contract_failure)?;
     let placements = weight_placements(family, plan).map_err(contract_failure)?;
-    let uploads = prepare_uploads(family, source, &placements).map_err(contract_failure)?;
-    let source_files = uploads
-        .iter()
-        .map(|upload| upload.payload.source_file().to_owned())
-        .collect::<BTreeSet<_>>();
-    let uploaded_bytes = uploads.iter().try_fold(0_u64, |total, upload| {
-        total
-            .checked_add(upload.placement.length_bytes)
-            .ok_or_else(|| {
-                contract_failure(VNextError::InvalidExecutionPlan {
-                    reason: "static initialization upload bytes overflow u64".to_owned(),
-                })
+    let uploaded_component_count = placements.len();
+    let uploaded_bytes = placements.values().try_fold(0_u64, |total, placement| {
+        total.checked_add(placement.length_bytes).ok_or_else(|| {
+            contract_failure(VNextError::InvalidExecutionPlan {
+                reason: "static initialization upload bytes overflow u64".to_owned(),
             })
+        })
     })?;
 
     let runtime = Arc::clone(transaction.lease().runtime());
@@ -440,6 +429,7 @@ where
     let mut pending_staging_bytes = 0_u64;
     let mut submission_batch_count = 0_usize;
     let mut upload_command_count = 0_usize;
+    let mut source_files = BTreeSet::new();
 
     for allocation in plan.payload().memory().static_allocations() {
         let command = with_static_buffer(transaction, allocation.resource_id(), |buffer| {
@@ -458,19 +448,28 @@ where
         }
     }
 
-    for upload in &uploads {
-        let element_bytes = upload.payload.element_type().size_bytes();
+    for component in &family.weight_schema().components {
+        let Some(placement) = placements.get(&component.id) else {
+            continue;
+        };
+        // Materialize one component at a time. Format adapters may own a
+        // converted payload as large as an embedding table; retaining every
+        // converted component until the final submit would duplicate the
+        // entire model in host memory.
+        let upload = prepare_upload(source, component, placement).map_err(contract_failure)?;
+        source_files.insert(upload.source_file().to_owned());
+        let element_bytes = upload.element_type().size_bytes();
         let maximum_chunk_bytes =
             policy.maximum_staging_bytes() - policy.maximum_staging_bytes() % element_bytes;
         if maximum_chunk_bytes == 0 {
             return Err(contract_failure(VNextError::InvalidExecutionPlan {
                 reason: format!(
                     "static staging budget cannot hold one {:?} element",
-                    upload.payload.element_type()
+                    upload.element_type()
                 ),
             }));
         }
-        let bytes = upload.payload.bytes();
+        let bytes = upload.bytes();
         let mut source_offset = 0_usize;
         while source_offset < bytes.len() {
             let remaining = bytes.len() - source_offset;
@@ -485,7 +484,7 @@ where
                 return Err(contract_failure(VNextError::InvalidExecutionPlan {
                     reason: format!(
                         "component `{}` has a partial trailing element",
-                        upload.placement.component_id
+                        placement.component_id
                     ),
                 }));
             }
@@ -505,8 +504,7 @@ where
                 submission_batch_count += 1;
             }
             let source_end = source_offset + chunk_bytes;
-            let destination_offset = upload
-                .placement
+            let destination_offset = placement
                 .offset_bytes
                 .checked_add(source_offset as u64)
                 .ok_or_else(|| {
@@ -514,23 +512,20 @@ where
                         reason: "static upload destination offset overflows".to_owned(),
                     })
                 })?;
-            let layout = HostTransferLayout::new(
-                upload.payload.element_type(),
-                chunk_bytes_u64 / element_bytes,
-            )
-            .map_err(contract_failure)?;
-            let command =
-                with_static_buffer(transaction, &upload.placement.resource_id, |buffer| {
-                    runtime.encode_upload(
-                        &bytes[source_offset..source_end],
-                        layout,
-                        buffer,
-                        destination_offset,
-                    )
-                })
-                .map_err(|error| {
-                    runtime_or_contract_failure(&runtime, error, "static_upload_encode")
-                })?;
+            let layout =
+                HostTransferLayout::new(upload.element_type(), chunk_bytes_u64 / element_bytes)
+                    .map_err(contract_failure)?;
+            let command = with_static_buffer(transaction, &placement.resource_id, |buffer| {
+                runtime.encode_upload(
+                    &bytes[source_offset..source_end],
+                    layout,
+                    buffer,
+                    destination_offset,
+                )
+            })
+            .map_err(|error| {
+                runtime_or_contract_failure(&runtime, error, "static_upload_encode")
+            })?;
             pending.push(command);
             pending_staging_bytes += chunk_bytes_u64;
             upload_command_count += 1;
@@ -549,7 +544,7 @@ where
     }
     Ok(StaticInitializationReceipt {
         initialized_resource_count: plan.payload().memory().static_allocations().len(),
-        uploaded_component_count: uploads.len(),
+        uploaded_component_count,
         uploaded_bytes,
         upload_command_count,
         submission_batch_count,
@@ -805,28 +800,11 @@ fn weight_placements(
     Ok(placements)
 }
 
-fn prepare_uploads<'source>(
-    family: &PreparedModelFamily,
-    source: &'source dyn WeightComponentSource,
-    placements: &BTreeMap<WeightId, WeightPlacement>,
-) -> Result<Vec<PreparedWeightUpload<'source>>, VNextError> {
-    family
-        .weight_schema()
-        .components
-        .iter()
-        .filter_map(|component| {
-            placements
-                .get(&component.id)
-                .map(|placement| prepare_upload(source, component, placement))
-        })
-        .collect()
-}
-
 fn prepare_upload<'source>(
     source: &'source dyn WeightComponentSource,
     component: &WeightComponentSpec,
     placement: &WeightPlacement,
-) -> Result<PreparedWeightUpload<'source>, VNextError> {
+) -> Result<WeightComponentPayload<'source>, VNextError> {
     let payload = source.component(component)?;
     if payload.component_id() != &placement.component_id
         || payload.element_type() != placement.element_type
@@ -839,10 +817,7 @@ fn prepare_upload<'source>(
             ),
         });
     }
-    Ok(PreparedWeightUpload {
-        placement: placement.clone(),
-        payload,
-    })
+    Ok(payload)
 }
 
 enum StaticBufferAccessError<E> {
