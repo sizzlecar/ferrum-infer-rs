@@ -242,3 +242,41 @@ fn error_classifier_panic_preserves_indeterminate_recovery_ownership() {
         .unwrap();
     close(handoff(initialized));
 }
+
+#[test]
+fn dropped_indeterminate_failure_defers_backend_cleanup_until_maintenance() {
+    let (resolved, plan, runtime, trace) = test_plan();
+    trace.lock().unwrap().fence_behavior = FenceBehavior::Indeterminate;
+    let status_before = static_initialization_cleanup_status();
+    let failed = committed_transaction(&plan, Arc::clone(&runtime), "deferred-drop")
+        .initialize_static(
+            &resolved.parts().prepared_family,
+            &plan,
+            &ZeroWeightSource,
+            StaticInitializationPolicy::new(8, 2).unwrap(),
+        );
+    let failure = match failed {
+        Ok(_) => panic!("an indeterminate fence must retain cleanup ownership"),
+        Err(failure) => failure,
+    };
+    assert!(failure.is_indeterminate());
+    drop(failure);
+
+    assert_eq!(trace.lock().unwrap().synchronize_calls, 0);
+    let status_deferred = static_initialization_cleanup_status();
+    assert_eq!(
+        status_deferred.submitted_total(),
+        status_before.submitted_total() + 1
+    );
+    assert_eq!(status_deferred.pending(), status_before.pending() + 1);
+
+    trace.lock().unwrap().fence_behavior = FenceBehavior::Succeeded;
+    let maintenance = maintain_static_initialization_cleanups(1).unwrap();
+    assert_eq!(maintenance.attempted(), 1);
+    assert_eq!(maintenance.completed(), 1);
+    assert_eq!(
+        maintenance.status_after().pending(),
+        status_before.pending()
+    );
+    assert_eq!(trace.lock().unwrap().synchronize_calls, 1);
+}
