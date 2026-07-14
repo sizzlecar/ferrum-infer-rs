@@ -1457,11 +1457,12 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                     {
                         info!("Using Qwen3.5/Qwen3.6 CUDA backend executor");
                         let model_dir = std::path::Path::new(&model_path);
-                        let family_selection =
-                            ferrum_models::vnext::prepare_registered_from_model_dir(model_dir)?;
-                        if let ferrum_models::vnext::ProductionFamilySelection::Prepared(prepared) =
-                            &family_selection
+                        let model_selection =
+                            ferrum_models::vnext::prepare_registered_model_from_dir(model_dir)?;
+                        if let ferrum_models::vnext::ProductionModelSelection::Prepared(prepared) =
+                            &model_selection
                         {
+                            let prepared = prepared.family();
                             let family_fingerprint = prepared
                                 .fingerprint()
                                 .map_err(|error| FerrumError::model(error.to_string()))?;
@@ -1485,15 +1486,15 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                             .to_model_info(config.engine_config.model.model_id.to_string());
                         model_info.dtype = DataType::FP16;
                         model_info.device = config.device.clone();
-                        let executor = match family_selection {
-                            ferrum_models::vnext::ProductionFamilySelection::Prepared(prepared) => {
-                                ferrum_models::LlmExecutor::new_with_vnext_family(
+                        let executor = match model_selection {
+                            ferrum_models::vnext::ProductionModelSelection::Prepared(prepared) => {
+                                ferrum_models::LlmExecutor::new_with_vnext_model(
                                     Box::new(llm),
                                     model_info,
                                     Arc::new(prepared),
                                 )
                             }
-                            ferrum_models::vnext::ProductionFamilySelection::Unmigrated {
+                            ferrum_models::vnext::ProductionModelSelection::Unmigrated {
                                 external_metadata_id,
                             } => {
                                 info!(

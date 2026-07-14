@@ -5,8 +5,8 @@
 //! executor allocates them.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::Path;
 
 use ferrum_interfaces::vnext::{
     AttributeId, ContractVersion, ElementType, ExternalModelMetadataId, ModelFamilyId,
@@ -18,14 +18,15 @@ use ferrum_interfaces::vnext::{
     WeightComponentRole, WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId,
     WeightLayoutId, WeightReference, WeightSchema, WeightTensorSpec,
 };
-use memmap2::Mmap;
-use safetensors::{Dtype, SafeTensors};
+use ferrum_quantization::SafetensorsArchive;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::qwen35_config::{Qwen35LayerType, Qwen35TextConfig};
 use crate::qwen35_weights::{Qwen35ResolvedWeightSpec, Qwen35WeightInventory};
+
+use super::PreparedProductionModel;
 
 pub const FAMILY_ID: &str = "family.qwen3_5.dense_hybrid";
 pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5ForConditionalGeneration";
@@ -497,18 +498,24 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
     }
 }
 
-pub fn prepare_from_model_dir(model_dir: &Path) -> ferrum_types::Result<PreparedModelFamily> {
-    let config = load_family_config(model_dir).map_err(ferrum_types::FerrumError::model)?;
+pub fn prepare_from_model_dir(model_dir: &Path) -> ferrum_types::Result<PreparedProductionModel> {
+    let weights = SafetensorsArchive::open(model_dir)?;
+    let config =
+        load_family_config(model_dir, &weights).map_err(ferrum_types::FerrumError::model)?;
     let raw = serde_json::to_value(config)
         .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
     let provider = Qwen35FamilyProvider::new()
         .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
-    TypedFamilyRegistration::new(provider)
+    let family = TypedFamilyRegistration::new(provider)
         .prepare(&raw)
-        .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))
+        .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
+    Ok(PreparedProductionModel::new(family, weights))
 }
 
-fn load_family_config(model_dir: &Path) -> Result<Qwen35FamilyConfig, String> {
+fn load_family_config(
+    model_dir: &Path,
+    archive: &SafetensorsArchive,
+) -> Result<Qwen35FamilyConfig, String> {
     let hf_config = read_json(&model_dir.join("config.json"))?;
     let text = Qwen35TextConfig::from_hf_config_value(&hf_config)?;
     if text.is_moe() {
@@ -529,16 +536,15 @@ fn load_family_config(model_dir: &Path) -> Result<Qwen35FamilyConfig, String> {
         .to_owned();
     let special_tokens = parse_special_tokens(&hf_config, &tokenizer_config)?;
 
-    let inventory = Qwen35WeightInventory::from_safetensors_dir(model_dir)?;
+    let inventory = Qwen35WeightInventory::from_names(archive.tensor_names());
     let plan = inventory.detect_prefix_and_resolve(&text)?;
-    let headers = load_tensor_headers(model_dir)?;
     let mut weights = Vec::new();
     append_resolved_weights(
         &mut weights,
         &plan.global_tensors,
         None,
         text.tie_word_embeddings,
-        &headers,
+        archive,
     )?;
     for layer in &plan.layers {
         append_resolved_weights(
@@ -546,7 +552,7 @@ fn load_family_config(model_dir: &Path) -> Result<Qwen35FamilyConfig, String> {
             &layer.tensors,
             Some(layer.layer_index as u32),
             text.tie_word_embeddings,
-            &headers,
+            archive,
         )?;
     }
     weights.sort_by(|left, right| {
@@ -567,99 +573,33 @@ fn load_family_config(model_dir: &Path) -> Result<Qwen35FamilyConfig, String> {
     })
 }
 
-#[derive(Debug, Clone)]
-struct TensorHeader {
-    dimensions: Vec<u64>,
-    element_type: ElementType,
-}
-
-fn load_tensor_headers(model_dir: &Path) -> Result<BTreeMap<String, TensorHeader>, String> {
-    let mut headers = BTreeMap::new();
-    for path in discover_safetensors(model_dir)? {
-        let file = File::open(&path).map_err(|error| format!("open {path:?}: {error}"))?;
-        let mmap = unsafe { Mmap::map(&file).map_err(|error| format!("mmap {path:?}: {error}"))? };
-        let tensors =
-            SafeTensors::deserialize(&mmap).map_err(|error| format!("parse {path:?}: {error}"))?;
-        for name in tensors.names() {
-            let view = tensors
-                .tensor(name)
-                .map_err(|error| format!("read tensor header {name:?} in {path:?}: {error}"))?;
-            let header = TensorHeader {
-                dimensions: view.shape().iter().map(|extent| *extent as u64).collect(),
-                element_type: element_type(view.dtype())?,
-            };
-            if headers.insert(name.to_owned(), header).is_some() {
-                return Err(format!(
-                    "tensor {name:?} appears in multiple safetensors shards"
-                ));
-            }
-        }
-    }
-    Ok(headers)
-}
-
-fn discover_safetensors(model_dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let single = model_dir.join("model.safetensors");
-    if single.exists() {
-        return Ok(vec![single]);
-    }
-    let index = model_dir.join("model.safetensors.index.json");
-    if index.exists() {
-        let value = read_json(&index)?;
-        let weight_map = value
-            .get("weight_map")
-            .and_then(Value::as_object)
-            .ok_or_else(|| format!("{index:?} missing weight_map"))?;
-        let files = weight_map
-            .values()
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(|name| model_dir.join(name))
-                    .ok_or_else(|| format!("{index:?} contains a non-string shard name"))
-            })
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        return Ok(files.into_iter().collect());
-    }
-    let mut files = fs::read_dir(model_dir)
-        .map_err(|error| format!("read_dir {model_dir:?}: {error}"))?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "safetensors")
-        })
-        .collect::<Vec<_>>();
-    files.sort();
-    if files.is_empty() {
-        Err(format!("no safetensors files found in {model_dir:?}"))
-    } else {
-        Ok(files)
-    }
-}
-
 fn append_resolved_weights(
     output: &mut Vec<FamilyWeight>,
     resolved: &[Qwen35ResolvedWeightSpec],
     layer_index: Option<u32>,
     tied_embeddings: bool,
-    headers: &BTreeMap<String, TensorHeader>,
+    weights: &SafetensorsArchive,
 ) -> Result<(), String> {
     for weight in resolved
         .iter()
         .filter(|weight| weight.present && !(tied_embeddings && weight.role == "lm_head"))
     {
-        let header = headers.get(&weight.name).ok_or_else(|| {
+        let tensor = weights
+            .tensor(&weight.name)
+            .map_err(|error| error.to_string())?;
+        let element_type = tensor.element_type().ok_or_else(|| {
             format!(
-                "resolved tensor {:?} has no safetensors header",
-                weight.name
+                "resolved dense Qwen3.5 tensor {:?} has unsupported dtype {:?}",
+                weight.name,
+                tensor.dtype()
             )
         })?;
         output.push(FamilyWeight {
             layer_index,
             role: weight.role.clone(),
             external_name: weight.name.clone(),
-            dimensions: header.dimensions.clone(),
-            element_type: header.element_type,
+            dimensions: tensor.shape().to_vec(),
+            element_type,
         });
     }
     Ok(())
@@ -848,17 +788,6 @@ fn required_u64(value: &Value, key: &str) -> Result<u64, String> {
         .and_then(Value::as_u64)
         .filter(|value| *value > 0)
         .ok_or_else(|| format!("{key} must be a positive integer"))
-}
-
-fn element_type(dtype: Dtype) -> Result<ElementType, String> {
-    match dtype {
-        Dtype::F16 => Ok(ElementType::F16),
-        Dtype::BF16 => Ok(ElementType::Bf16),
-        Dtype::F32 => Ok(ElementType::F32),
-        other => Err(format!(
-            "unsupported dense Qwen3.5 safetensors dtype {other:?}"
-        )),
-    }
 }
 
 fn weight_key(weight: &FamilyWeight, prefix: &str) -> String {
