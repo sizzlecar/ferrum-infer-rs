@@ -3542,6 +3542,7 @@ fn failure_recovery_pair(
     (evidence, opened, reserve_event, failed, anchor, recovery)
 }
 
+#[track_caller]
 fn check(passed: &mut usize, condition: bool) {
     assert!(condition);
     *passed += 1;
@@ -4804,11 +4805,11 @@ fn vnext_event_replay_v5_contract() {
             )
             .is_err(),
     );
-    let event_source = include_str!("../src/vnext/event.rs");
+    let event_sink_source = include_str!("../src/vnext/event/sink.rs");
     check(
         &mut passed,
-        event_source.contains("pub struct EventEmissionPermit<'event>")
-            && !event_source.contains("pub fn new_event_emission_permit"),
+        event_sink_source.contains("pub struct EventEmissionPermit<'event>")
+            && !event_sink_source.contains("pub fn new_event_emission_permit"),
     );
 
     let mut pool_cursor = ResourcePoolEventCursor::new(pool_evidence.clone());
@@ -4933,11 +4934,12 @@ fn vnext_event_replay_v5_contract() {
         ResourcePoolEvent::decode_untrusted(&vec![b' '; MAX_RESOURCE_POOL_EVENT_WIRE_BYTES + 1])
             .is_err(),
     );
+    let resource_pool_source = include_str!("../src/vnext/event/resource_pool.rs");
     check(
         &mut passed,
-        event_source.contains(
+        resource_pool_source.contains(
             "#[derive(Debug, Clone, PartialEq, Eq, Serialize)]\npub struct ResourcePoolEvent",
-        ) && event_source.contains("pub struct UnvalidatedResourcePoolEvent"),
+        ) && resource_pool_source.contains("pub struct UnvalidatedResourcePoolEvent"),
     );
 
     let skipped = ResourcePoolEvent::transition(
