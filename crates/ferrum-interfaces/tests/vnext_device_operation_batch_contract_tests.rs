@@ -2,13 +2,17 @@ mod vnext_device_operation_contract;
 
 use vnext_device_operation_contract::*;
 
+fn chunked_token_span() -> TokenSpanWork {
+    TokenSpanWork::from_token_ids(&[10, 11, 12, 13], 2..3).unwrap()
+}
+
 fn admit_batch_step(
     plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
     batch: &ExecutionBatchParticipants<TestRuntime>,
 ) -> Arc<StepResourceLease<TestRuntime>> {
     let request = StepResourceAdmissionRequest::new(
         batch
-            .bind_work_shape(vec![one_token_span(); batch.len() as usize])
+            .bind_work_shape(vec![chunked_token_span(); batch.len() as usize])
             .unwrap(),
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
@@ -34,7 +38,7 @@ fn admit_batch_invocation(
     let request = InvocationResourceAdmissionRequest::for_all_step_participants(
         node_id.clone(),
         step.bind_all_invocation_work_shape(vec![
-            one_token_span();
+            chunked_token_span();
             step.participant_count() as usize
         ])
         .unwrap(),
@@ -100,7 +104,8 @@ fn thirty_two_participant_dispatch_is_one_physical_submission() {
             index as u64..index as u64 + 1
         );
         assert_eq!(range.immediate_tokens(), 1);
-        assert_eq!(range.full_input_tokens(), 1);
+        assert_eq!(range.source_token_range(), 2..3);
+        assert_eq!(range.full_input_tokens(), 4);
     }
     let identities = step
         .participant_frames()

@@ -2,10 +2,10 @@ use super::{
     invalid_plan, is_canonical_sha256, AttributeId, BTreeMap, BTreeSet, CapabilityId,
     ContractVersion, Deserialize, NodeId, OperationId, ProgramValueId,
     ProviderCompatibilityRejectReason, ProviderId, ProviderResourcePlan, ResolvedValueBinding,
-    ResourceId, SemanticValue, Serialize, StateId, TensorAccess, VNextError,
+    ResolvedValueRole, ResourceId, SemanticValue, Serialize, StateId, TensorAccess, VNextError,
 };
 
-pub const EXECUTION_PLAN_SCHEMA: PlanSchemaVersion = PlanSchemaVersion::new(1, 0);
+pub const EXECUTION_PLAN_SCHEMA: PlanSchemaVersion = PlanSchemaVersion::new(2, 0);
 pub const MAX_EXECUTION_PLAN_WIRE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum number of O(graph) static allocations plus dynamic descriptors.
 /// This limit is independent of the concurrency ceiling.
@@ -165,6 +165,84 @@ pub struct PlanStateEffect {
     pub(super) resource_ids: Vec<ResourceId>,
 }
 
+/// Exact resolved binding projection whose one logical axis advances with the
+/// core-issued packed token work shape.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NodeTokenBindingProjection {
+    pub(super) value_id: ProgramValueId,
+    pub(super) role: ResolvedValueRole,
+    pub(super) ordinal: u32,
+    pub(super) axis: u32,
+    pub(super) rank: u32,
+    pub(super) canonical_extent: u64,
+}
+
+impl NodeTokenBindingProjection {
+    pub fn value_id(&self) -> &ProgramValueId {
+        &self.value_id
+    }
+
+    pub const fn role(&self) -> ResolvedValueRole {
+        self.role
+    }
+
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    pub const fn axis(&self) -> u32 {
+        self.axis
+    }
+
+    pub const fn rank(&self) -> u32 {
+        self.rank
+    }
+
+    pub const fn canonical_extent(&self) -> u64 {
+        self.canonical_extent
+    }
+}
+
+/// Core-derived work mapping stored in the immutable execution plan. Token
+/// projections are resolved from one model-declared source dimension through
+/// the operation's symbolic signature, so providers never infer work from a
+/// tensor element count or model family.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeWorkContract {
+    Fixed,
+    Tokens {
+        source: NodeTokenBindingProjection,
+        projections: Vec<NodeTokenBindingProjection>,
+    },
+}
+
+impl NodeWorkContract {
+    pub fn token_source(&self) -> Option<&NodeTokenBindingProjection> {
+        match self {
+            Self::Fixed => None,
+            Self::Tokens { source, .. } => Some(source),
+        }
+    }
+
+    pub fn token_projections(&self) -> &[NodeTokenBindingProjection] {
+        match self {
+            Self::Fixed => &[],
+            Self::Tokens { projections, .. } => projections,
+        }
+    }
+
+    pub fn token_projection(
+        &self,
+        role: ResolvedValueRole,
+        ordinal: u32,
+    ) -> Option<&NodeTokenBindingProjection> {
+        self.token_projections()
+            .iter()
+            .find(|projection| projection.role == role && projection.ordinal == ordinal)
+    }
+}
+
 impl PlanStateEffect {
     pub fn state_id(&self) -> &StateId {
         &self.state_id
@@ -197,6 +275,7 @@ pub struct PlanNode {
     pub(super) provider_implementation_fingerprint: String,
     pub(super) required_capabilities: BTreeSet<CapabilityId>,
     pub(super) attributes: BTreeMap<AttributeId, SemanticValue>,
+    pub(super) work: NodeWorkContract,
     pub(super) selection: ProviderSelection,
     pub(super) provider_resources: ProviderResourcePlan,
     pub(super) values: Vec<ResolvedValueBinding>,
@@ -238,6 +317,10 @@ impl PlanNode {
 
     pub fn attributes(&self) -> &BTreeMap<AttributeId, SemanticValue> {
         &self.attributes
+    }
+
+    pub fn work(&self) -> &NodeWorkContract {
+        &self.work
     }
 
     pub fn selection(&self) -> &ProviderSelection {

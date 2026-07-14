@@ -1,10 +1,10 @@
 use super::{
     AttributeId, BTreeMap, BTreeSet, CapabilityId, ContractVersion, Deserialize, Deserializer,
-    MemoryPlan, ModelFamilyId, NodeId, OperationId, OperationRegistryAuthority, PlanExactAlias,
-    PlanHash, PlanId, PlanNode, PlanProviderRejectReason, PlanSchemaVersion, PlanStateEffect,
-    ProviderId, ProviderResourcePlan, ProviderSelection, ProviderWorkspaceRequirement,
-    QuantizationFormatId, ResolvedValueBinding, ResourceId, SemanticValue, Serialize,
-    WeightFormatId,
+    MemoryPlan, ModelFamilyId, NodeId, NodeWorkContract, OperationId, OperationRegistryAuthority,
+    PlanExactAlias, PlanHash, PlanId, PlanNode, PlanProviderRejectReason, PlanSchemaVersion,
+    PlanStateEffect, ProviderId, ProviderResourcePlan, ProviderSelection,
+    ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedValueBinding, ResourceId,
+    SemanticValue, Serialize, WeightFormatId,
 };
 
 /// Per-node trusted physical resolution. It supplies physical bindings and a
@@ -34,6 +34,7 @@ pub struct ExecutionPlanPayload {
     pub(super) capability_catalog_fingerprint: String,
     pub(super) policy_version: ContractVersion,
     pub(super) policy_fingerprint: String,
+    pub(super) maximum_scheduled_tokens: u64,
     pub(super) weight_format: WeightFormatId,
     pub(super) quantization_formats: BTreeSet<QuantizationFormatId>,
     pub(super) nodes: Vec<PlanNode>,
@@ -81,6 +82,10 @@ impl ExecutionPlanPayload {
         &self.policy_fingerprint
     }
 
+    pub const fn maximum_scheduled_tokens(&self) -> u64 {
+        self.maximum_scheduled_tokens
+    }
+
     pub fn weight_format(&self) -> &WeightFormatId {
         &self.weight_format
     }
@@ -109,6 +114,7 @@ pub(super) struct PlanHashMaterial<'a> {
     pub(super) capability_catalog_fingerprint: &'a str,
     pub(super) policy_version: ContractVersion,
     pub(super) policy_fingerprint: &'a str,
+    pub(super) maximum_scheduled_tokens: u64,
     pub(super) weight_format: &'a WeightFormatId,
     pub(super) quantization_formats: &'a BTreeSet<QuantizationFormatId>,
     pub(super) nodes: &'a [PlanNode],
@@ -128,6 +134,7 @@ impl<'a> From<&'a ExecutionPlanPayload> for PlanHashMaterial<'a> {
             capability_catalog_fingerprint: &payload.capability_catalog_fingerprint,
             policy_version: payload.policy_version,
             policy_fingerprint: &payload.policy_fingerprint,
+            maximum_scheduled_tokens: payload.maximum_scheduled_tokens,
             weight_format: &payload.weight_format,
             quantization_formats: &payload.quantization_formats,
             nodes: &payload.nodes,
@@ -163,6 +170,7 @@ pub struct UnvalidatedPlanNode {
     pub(super) provider_implementation_fingerprint: String,
     pub(super) required_capabilities: BTreeSet<CapabilityId>,
     pub(super) attributes: BTreeMap<AttributeId, SemanticValue>,
+    pub(super) work: NodeWorkContract,
     pub(super) selection: ProviderSelection,
     pub(super) provider_resources: UnvalidatedProviderResourcePlan,
     pub(super) values: Vec<ResolvedValueBinding>,
@@ -186,6 +194,7 @@ pub(super) struct UnvalidatedExecutionPlanPayload {
     pub(super) capability_catalog_fingerprint: String,
     pub(super) policy_version: ContractVersion,
     pub(super) policy_fingerprint: String,
+    pub(super) maximum_scheduled_tokens: u64,
     pub(super) weight_format: WeightFormatId,
     pub(super) quantization_formats: BTreeSet<QuantizationFormatId>,
     pub(super) nodes: Vec<UnvalidatedPlanNode>,

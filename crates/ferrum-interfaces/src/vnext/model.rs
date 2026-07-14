@@ -1605,10 +1605,24 @@ impl SemanticValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramNodeWorkSpec {
+    Fixed,
+    Tokens { value_id: ProgramValueId, axis: u32 },
+}
+
+impl ProgramNodeWorkSpec {
+    pub fn tokens(value_id: ProgramValueId, axis: u32) -> Self {
+        Self::Tokens { value_id, axis }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgramNode {
     pub id: NodeId,
     pub operation_id: OperationId,
     pub required_version: ContractVersion,
+    pub work: ProgramNodeWorkSpec,
     pub inputs: Vec<ProgramValueId>,
     pub outputs: Vec<ProgramValueId>,
     pub attributes: BTreeMap<AttributeId, SemanticValue>,
@@ -1747,6 +1761,26 @@ impl ModelProgram {
                         field: "program.nodes.id".to_owned(),
                         reason: format!("duplicate node `{}`", node.id),
                     });
+                }
+                if let ProgramNodeWorkSpec::Tokens { value_id, .. } = &node.work {
+                    let source_count = node
+                        .inputs
+                        .iter()
+                        .chain(&node.outputs)
+                        .filter(|candidate| *candidate == value_id)
+                        .count();
+                    let is_state_or_weight = states.iter().any(|state| state.value_id == *value_id)
+                        || weights.iter().any(|weight| weight.value_id == *value_id);
+                    if source_count != 1 || is_state_or_weight {
+                        return Err(VNextError::InvalidModelConfig {
+                            family_id: family_id.to_string(),
+                            field: "program.nodes.work".to_owned(),
+                            reason: format!(
+                                "node `{}` token work source must identify one activation binding",
+                                node.id
+                            ),
+                        });
+                    }
                 }
                 if node
                     .inputs

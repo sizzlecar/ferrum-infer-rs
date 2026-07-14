@@ -13,9 +13,9 @@ use super::{
     DeviceCommandBatch, DeviceId, DeviceRuntime, ExecutionIdentityEnvelope, ExecutionLane,
     ExecutionLaneId, IdentifiedFailure, IndeterminateSubmissionHandle, InvocationResourceLease,
     LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId, LogicalBackingBufferView,
-    LogicalBackingSegmentBinding, NodeId, OperationId, ParticipantNodeKey, PlanHash, PlanId,
-    PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
-    ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedModelPlan, ResourceId,
+    LogicalBackingSegmentBinding, NodeId, NodeWorkContract, OperationId, ParticipantNodeKey,
+    PlanHash, PlanId, PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId,
+    ProviderId, ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedModelPlan, ResourceId,
     SemanticValue, SequenceSessionEpoch, SequenceSessionFingerprint,
     StepParticipantFrameAssignment, StepResourceLease, TrustedActiveSequenceBinding,
     TrustedPlanRuntimeEvidence, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
@@ -3207,6 +3207,7 @@ pub struct OperationInvocation<'a, B> {
     views: Vec<OperationBufferView<'a, B>>,
     bindings: Vec<ResolvedValueBinding>,
     attributes: &'a BTreeMap<AttributeId, SemanticValue>,
+    work: &'a NodeWorkContract,
     scratch_view: Option<usize>,
     persistent_view: Option<usize>,
     work_shape: &'a BatchWorkShape,
@@ -3621,6 +3622,7 @@ impl<'a, B> OperationInvocation<'a, B> {
             views,
             bindings,
             attributes: node.attributes(),
+            work: node.work(),
             scratch_view,
             persistent_view,
             work_shape: resources.work_shape()?,
@@ -3654,6 +3656,10 @@ impl<'a, B> OperationInvocation<'a, B> {
 
     pub fn attributes(&self) -> &BTreeMap<AttributeId, SemanticValue> {
         self.attributes
+    }
+
+    pub fn work(&self) -> &NodeWorkContract {
+        self.work
     }
 
     pub fn scratch_view(&self) -> Option<&OperationBufferView<'a, B>> {
@@ -3814,6 +3820,10 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
 
     pub fn work_shape(&self) -> &BatchWorkShape {
         self.participants[0].work_shape()
+    }
+
+    pub fn work_contract(&self) -> &NodeWorkContract {
+        self.participants[0].work()
     }
 
     pub fn participant_token_ranges(&self) -> &[BatchParticipantTokenRange] {

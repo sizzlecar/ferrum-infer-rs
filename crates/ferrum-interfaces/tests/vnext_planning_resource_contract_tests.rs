@@ -239,13 +239,58 @@ fn minimum_runnable_sums_lifetime_minima_and_sequential_invocation_peak() {
     assert_eq!(intermediate.minimum_request_bytes().unwrap(), 16);
     assert_eq!(
         intermediate.theoretical_maximum_request_bytes().unwrap(),
-        16 * 4096
+        16
     );
     assert_eq!(memory.minimum_request_bytes(), 32);
     assert_eq!(memory.minimum_sequence_bytes(), 16);
     assert_eq!(memory.minimum_step_bytes(), 16);
     assert_eq!(memory.minimum_invocation_peak_bytes(), 96);
     assert_eq!(memory.minimum_runnable_request_bytes(), 160);
+}
+
+#[test]
+fn provider_formula_is_policy_invariant_and_core_binds_token_ceiling() {
+    let registry = TestRegistry::new();
+    let family = registry.prepare();
+    let catalog = catalog();
+    let mut provider_evidence = None;
+    let mut bounded_maxima = Vec::new();
+
+    for maximum_scheduled_tokens in [32, 4096] {
+        let policy = policy_with_tokens(1 << 20, 128, 3, maximum_scheduled_tokens).unwrap();
+        let planning =
+            TestPlanningRegistry::new(&catalog, 7, 32, EstimateBehavior::TokenScaledScratch);
+        let resolution = node_resolution(&family, &catalog, &policy, 0, &planning);
+        let resources = &resolution.provider_resource_candidates()[0];
+        let evidence = (
+            resources.estimator_input_fingerprint().to_owned(),
+            resources.estimate_fingerprint().to_owned(),
+            resources.scratch().unwrap().size_formula().clone(),
+        );
+        assert_eq!(
+            provider_evidence.get_or_insert_with(|| evidence.clone()),
+            &evidence
+        );
+
+        let plan = ExecutionPlan::build(
+            PlanBuildRequest::new(&family, &catalog, &policy, vec![resolution]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.payload().maximum_scheduled_tokens(),
+            maximum_scheduled_tokens
+        );
+        let scratch = plan
+            .payload()
+            .memory()
+            .dynamic_descriptors()
+            .iter()
+            .find(|descriptor| matches!(descriptor.kind(), AllocationKind::Scratch { .. }))
+            .unwrap();
+        bounded_maxima.push(scratch.theoretical_maximum_request_bytes().unwrap());
+    }
+
+    assert_eq!(bounded_maxima, vec![7 * 32, 7 * 4096]);
 }
 
 #[test]
@@ -515,7 +560,7 @@ fn provider_workspace_formulas_are_actual_shape_checked_and_wire_closed() {
         .is_err());
 
     let aligned = ProviderWorkspaceRequirement::from_formula(
-        DynamicResourceDemand::actual_sequences(7, 8).unwrap(),
+        ProviderWorkspaceSizeFormula::actual_sequences(7).unwrap(),
         16,
         ProviderWorkspaceScope::Invocation,
         contiguous_storage_requirement(),
@@ -523,21 +568,21 @@ fn provider_workspace_formulas_are_actual_shape_checked_and_wire_closed() {
     .unwrap();
     assert_eq!(aligned.evaluate_bytes(&shape).unwrap(), 32);
     assert!(ProviderWorkspaceRequirement::from_formula(
-        DynamicResourceDemand::tokens(4, 32).unwrap(),
+        ProviderWorkspaceSizeFormula::tokens(4).unwrap(),
         16,
         ProviderWorkspaceScope::Plan,
         contiguous_storage_requirement(),
     )
     .is_err());
     assert!(ProviderWorkspaceRequirement::from_formula(
-        DynamicResourceDemand::actual_sequences(4, 8).unwrap(),
+        ProviderWorkspaceSizeFormula::actual_sequences(4).unwrap(),
         16,
         ProviderWorkspaceScope::Sequence,
         contiguous_storage_requirement(),
     )
     .is_err());
     assert!(ProviderWorkspaceRequirement::from_formula(
-        DynamicResourceDemand::fixed(u64::MAX).unwrap(),
+        ProviderWorkspaceSizeFormula::fixed(u64::MAX).unwrap(),
         16,
         ProviderWorkspaceScope::Invocation,
         contiguous_storage_requirement(),

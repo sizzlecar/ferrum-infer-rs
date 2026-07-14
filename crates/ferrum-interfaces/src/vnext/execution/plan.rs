@@ -6,19 +6,21 @@ use super::{
     validate_active_sequence_ceiling, validate_program_bindings, validate_scheduled_token_ceiling,
     validate_semantic_binding, workspace_base_id, workspace_storage_layout_fingerprint,
     AliasPolicy, AllocationKind, AllocationLifetime, BTreeMap, BTreeSet, BufferUsage,
-    CanonicalValueBinding, CapabilityCatalog, CapabilityId, DynamicResourceDescriptor,
-    DynamicStorageContract, DynamicStorageProfile, DynamicStorageRequirement, ElementType,
-    ExecutionPlanPayload, GlobalValueRange, JointComponentSolution, JointPartialSelection,
-    JointProviderCandidate, JointProviderStorageSelection, JointSelectionObjective, MemoryPlan,
-    NodeId, OperationDescriptor, OperationRegistryAuthority, PlanBuildRequest, PlanExactAlias,
-    PlanExactAliasKind, PlanHash, PlanHashMaterial, PlanId, PlanNode, PlanNodeResolution,
-    PlanProviderRejectReason, PlanStateEffect, PreparedModelFamily, ProgramNode, ProgramValueId,
-    ProviderCompatibilityRequest, ProviderId, ProviderResourcePlan, ProviderSelection,
-    ProviderSelectionReason, ProviderWorkspaceScope, QuantizationFormatId, RejectedProvider,
-    ResolvedValueBinding, ResolvedValueRole, ResourceAllocation, ResourceId, RuntimePolicy,
-    Serialize, StateCapacityDemand, StateDependencyTracker, StateLifetime, TensorAccess,
-    UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, VNextError, ValueAllocationAccumulator,
-    ValueResourceDemand, WeightFormatId, EXECUTION_PLAN_SCHEMA, MAX_EXECUTION_PLAN_WIRE_BYTES,
+    CanonicalValueBinding, CapabilityCatalog, CapabilityId, DimensionConstraint,
+    DynamicResourceDescriptor, DynamicStorageContract, DynamicStorageProfile,
+    DynamicStorageRequirement, ElementType, ExecutionPlanPayload, GlobalValueRange,
+    JointComponentSolution, JointPartialSelection, JointProviderCandidate,
+    JointProviderStorageSelection, JointSelectionObjective, MemoryPlan, NodeId,
+    NodeTokenBindingProjection, NodeWorkContract, OperationDescriptor, OperationRegistryAuthority,
+    PlanBuildRequest, PlanExactAlias, PlanExactAliasKind, PlanHash, PlanHashMaterial, PlanId,
+    PlanNode, PlanNodeResolution, PlanProviderRejectReason, PlanStateEffect, PreparedModelFamily,
+    ProgramNode, ProgramNodeWorkSpec, ProgramValueId, ProviderCompatibilityRequest, ProviderId,
+    ProviderResourcePlan, ProviderSelection, ProviderSelectionReason, ProviderWorkspaceScope,
+    QuantizationFormatId, RejectedProvider, ResolvedValueBinding, ResolvedValueRole,
+    ResourceAllocation, ResourceId, RuntimePolicy, Serialize, StateCapacityDemand,
+    StateDependencyTracker, StateLifetime, TensorAccess, UnvalidatedExecutionPlan,
+    UnvalidatedExecutionPlanWire, VNextError, ValueAllocationAccumulator, ValueResourceDemand,
+    WeightFormatId, EXECUTION_PLAN_SCHEMA, MAX_EXECUTION_PLAN_WIRE_BYTES,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -185,6 +187,7 @@ impl ExecutionPlan {
             capability_catalog_fingerprint,
             policy_version: request.policy.version(),
             policy_fingerprint,
+            maximum_scheduled_tokens,
             weight_format,
             quantization_formats,
             nodes,
@@ -235,6 +238,7 @@ impl ExecutionPlan {
         operation.validate_resolved_bindings(&resolution.values)?;
         validate_program_bindings(program_node, &resolution.values)?;
         let exact_aliases = Self::extract_exact_aliases(operation, &resolution.values)?;
+        let work = Self::derive_node_work_contract(program_node, operation, &resolution.values)?;
         Self::validate_alias_liveness(
             family,
             program_node,
@@ -381,6 +385,7 @@ impl ExecutionPlan {
                 .to_owned(),
             required_capabilities: resolution.required_capabilities,
             attributes: program_node.attributes.clone(),
+            work,
             selection,
             provider_resources,
             values: resolution.values,
@@ -390,6 +395,172 @@ impl ExecutionPlan {
             persistent_resource,
             resources,
         })
+    }
+
+    pub(super) fn derive_node_work_contract(
+        node: &ProgramNode,
+        operation: &OperationDescriptor,
+        bindings: &[ResolvedValueBinding],
+    ) -> Result<NodeWorkContract, VNextError> {
+        let ProgramNodeWorkSpec::Tokens {
+            value_id,
+            axis: source_axis,
+        } = &node.work
+        else {
+            return Ok(NodeWorkContract::Fixed);
+        };
+        let source_binding = bindings
+            .iter()
+            .find(|binding| binding.value_id() == value_id)
+            .ok_or_else(|| invalid_plan("node token work source has no resolved binding"))?;
+        let source_contract = match source_binding.role() {
+            ResolvedValueRole::Input => operation.inputs.get(source_binding.ordinal() as usize),
+            ResolvedValueRole::Output => operation.outputs.get(source_binding.ordinal() as usize),
+        }
+        .ok_or_else(|| invalid_plan("node token work source ordinal is outside its operation"))?;
+        let source_axis_index = usize::try_from(*source_axis)
+            .map_err(|_| invalid_plan("node token work axis exceeds usize"))?;
+        let source_symbol = match source_contract.dimensions().get(source_axis_index) {
+            Some(DimensionConstraint::Symbol(symbol)) => symbol,
+            _ => {
+                return Err(invalid_plan(
+                    "node token work source axis is not one symbolic operation dimension",
+                ))
+            }
+        };
+        if source_binding.usage() != BufferUsage::Activations
+            || source_binding
+                .tensor()
+                .dimensions()
+                .get(source_axis_index)
+                .is_none()
+        {
+            return Err(invalid_plan(
+                "node token work source is not an in-bounds activation axis",
+            ));
+        }
+
+        let mut projections = Vec::new();
+        for binding in bindings {
+            let contract = match binding.role() {
+                ResolvedValueRole::Input => operation.inputs.get(binding.ordinal() as usize),
+                ResolvedValueRole::Output => operation.outputs.get(binding.ordinal() as usize),
+            }
+            .ok_or_else(|| {
+                invalid_plan("resolved work binding ordinal is outside its operation")
+            })?;
+            let matching_axes = contract
+                .dimensions()
+                .iter()
+                .enumerate()
+                .filter(|(_, dimension)| {
+                    matches!(dimension, DimensionConstraint::Symbol(symbol) if symbol == source_symbol)
+                })
+                .map(|(axis, _)| axis)
+                .collect::<Vec<_>>();
+            if matching_axes.len() > 1 {
+                return Err(invalid_plan(
+                    "one resolved binding repeats the node token work dimension",
+                ));
+            }
+            let Some(axis) = matching_axes.first().copied() else {
+                continue;
+            };
+            let dimensions = binding.tensor().dimensions();
+            if binding.usage() != BufferUsage::Activations || dimensions.get(axis).is_none() {
+                return Err(invalid_plan(
+                    "node token work projection is not an in-bounds activation axis",
+                ));
+            }
+            projections.push(NodeTokenBindingProjection {
+                value_id: binding.value_id().clone(),
+                role: binding.role(),
+                ordinal: binding.ordinal(),
+                axis: u32::try_from(axis)
+                    .map_err(|_| invalid_plan("node token projection axis exceeds u32"))?,
+                rank: u32::try_from(dimensions.len())
+                    .map_err(|_| invalid_plan("node token projection rank exceeds u32"))?,
+                canonical_extent: dimensions[axis],
+            });
+        }
+        projections.sort();
+        if projections.is_empty()
+            || projections
+                .windows(2)
+                .any(|pair| pair[0].role == pair[1].role && pair[0].ordinal == pair[1].ordinal)
+        {
+            return Err(invalid_plan(
+                "node token work projections are empty or non-canonical",
+            ));
+        }
+        let source = projections
+            .iter()
+            .find(|projection| projection.value_id == *value_id && projection.axis == *source_axis)
+            .cloned()
+            .ok_or_else(|| invalid_plan("node token work source did not resolve exactly"))?;
+        if projections
+            .iter()
+            .any(|projection| projection.canonical_extent != source.canonical_extent)
+        {
+            return Err(invalid_plan(
+                "node token work projections disagree on canonical extent",
+            ));
+        }
+        Ok(NodeWorkContract::Tokens {
+            source,
+            projections,
+        })
+    }
+
+    fn validate_node_work_contract(node: &PlanNode) -> Result<(), VNextError> {
+        let NodeWorkContract::Tokens {
+            source,
+            projections,
+        } = &node.work
+        else {
+            return Ok(());
+        };
+        if projections.is_empty()
+            || projections.windows(2).any(|pair| pair[0] >= pair[1])
+            || !projections.contains(source)
+            || projections
+                .iter()
+                .any(|projection| projection.canonical_extent != source.canonical_extent)
+        {
+            return Err(invalid_plan(format!(
+                "node `{}` token work contract is empty or non-canonical",
+                node.id
+            )));
+        }
+        for projection in projections {
+            let binding = node
+                .values
+                .iter()
+                .find(|binding| {
+                    binding.role() == projection.role
+                        && binding.ordinal() == projection.ordinal
+                        && binding.value_id() == &projection.value_id
+                })
+                .ok_or_else(|| {
+                    invalid_plan(format!(
+                        "node `{}` token projection has no exact value binding",
+                        node.id
+                    ))
+                })?;
+            let axis = usize::try_from(projection.axis)
+                .map_err(|_| invalid_plan("node token projection axis exceeds usize"))?;
+            if binding.usage() != BufferUsage::Activations
+                || usize::try_from(projection.rank).ok()
+                    != Some(binding.tensor().dimensions().len())
+                || binding.tensor().dimensions().get(axis) != Some(&projection.canonical_extent)
+            {
+                return Err(invalid_plan(format!(
+                    "node `{}` token projection differs from its resolved tensor",
+                    node.id
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn extract_exact_aliases(
@@ -1288,11 +1459,30 @@ impl ExecutionPlan {
                         .offset_bytes()
                         .checked_add(component.length_bytes())
                         .ok_or_else(|| invalid_plan("resource byte range overflows u64"))?;
+                    let token_projection = node
+                        .work
+                        .token_projection(binding.role(), binding.ordinal())
+                        .map(|projection| {
+                            if component.offset_bytes() != 0
+                                || component.length_bytes() % projection.canonical_extent() != 0
+                            {
+                                return Err(invalid_plan(format!(
+                                    "token-scaled resource `{}` is not one exact canonical tensor range",
+                                    component.resource_id()
+                                )));
+                            }
+                            Ok((
+                                component.length_bytes() / projection.canonical_extent(),
+                                projection.canonical_extent(),
+                            ))
+                        })
+                        .transpose()?;
                     let demand = Self::value_resource_demand(
                         family,
                         binding.value_id(),
                         binding.usage(),
                         end,
+                        token_projection,
                         maximum_scheduled_tokens,
                         &program_inputs,
                         &program_outputs,
@@ -1350,7 +1540,9 @@ impl ExecutionPlan {
                 )?;
                 dynamic_descriptors.push(DynamicResourceDescriptor::new(
                     resource_id,
-                    workspace.size_formula.clone(),
+                    workspace
+                        .size_formula
+                        .bind_runtime_limits(maximum_active_sequences, maximum_scheduled_tokens)?,
                     workspace.alignment_bytes,
                     BufferUsage::Scratch,
                     ElementType::U8,
@@ -1425,7 +1617,10 @@ impl ExecutionPlan {
                         )?;
                         dynamic_descriptors.push(DynamicResourceDescriptor::new(
                             resource_id,
-                            workspace.size_formula.clone(),
+                            workspace.size_formula.bind_runtime_limits(
+                                maximum_active_sequences,
+                                maximum_scheduled_tokens,
+                            )?,
                             workspace.alignment_bytes,
                             BufferUsage::Persistent,
                             ElementType::U8,
@@ -1518,6 +1713,7 @@ impl ExecutionPlan {
         value_id: &ProgramValueId,
         usage: BufferUsage,
         minimum_bytes: u64,
+        token_projection: Option<(u64, u64)>,
         maximum_scheduled_tokens: u64,
         program_inputs: &BTreeSet<ProgramValueId>,
         program_outputs: &BTreeSet<ProgramValueId>,
@@ -1536,20 +1732,35 @@ impl ExecutionPlan {
             .iter()
             .find(|state| &state.value_id == value_id);
         let Some(state) = state else {
-            if !program_inputs.contains(value_id)
-                && !program_outputs.contains(value_id)
-                && usage == BufferUsage::Activations
-            {
-                validate_scheduled_token_ceiling(maximum_scheduled_tokens)?;
+            if usage != BufferUsage::Activations {
+                return Err(invalid_plan(format!(
+                    "non-state value `{value_id}` is not backed by activation memory"
+                )));
+            }
+            let lifetime =
+                if program_inputs.contains(value_id) || program_outputs.contains(value_id) {
+                    AllocationLifetime::Request
+                } else {
+                    AllocationLifetime::Step
+                };
+            if let Some((bytes_per_token, canonical_tokens)) = token_projection {
+                if bytes_per_token == 0 || canonical_tokens == 0 {
+                    return Err(invalid_plan(
+                        "token-scaled activation has zero bytes or canonical tokens",
+                    ));
+                }
+                let maximum_tokens = Self::activation_token_capacity(
+                    lifetime,
+                    canonical_tokens,
+                    maximum_scheduled_tokens,
+                )?;
                 return Ok(ValueResourceDemand::TokenScaled {
-                    lifetime: AllocationLifetime::Step,
-                    bytes_per_token: minimum_bytes,
-                    maximum_tokens: maximum_scheduled_tokens,
+                    lifetime,
+                    bytes_per_token,
+                    maximum_tokens,
                 });
             }
-            return Ok(ValueResourceDemand::Fixed {
-                lifetime: AllocationLifetime::Request,
-            });
+            return Ok(ValueResourceDemand::Fixed { lifetime });
         };
         let lifetime = match state.lifetime {
             StateLifetime::Request => AllocationLifetime::Request,
@@ -1574,6 +1785,24 @@ impl ExecutionPlan {
                     maximum_tokens,
                 })
             }
+        }
+    }
+
+    pub(super) fn activation_token_capacity(
+        lifetime: AllocationLifetime,
+        canonical_tokens: u64,
+        maximum_scheduled_tokens: u64,
+    ) -> Result<u64, VNextError> {
+        if canonical_tokens == 0 {
+            return Err(invalid_plan(
+                "token-scaled activation has zero canonical tokens",
+            ));
+        }
+        if lifetime == AllocationLifetime::Request {
+            Ok(canonical_tokens)
+        } else {
+            validate_scheduled_token_ceiling(maximum_scheduled_tokens)?;
+            Ok(maximum_scheduled_tokens)
         }
     }
 
@@ -1611,6 +1840,7 @@ impl ExecutionPlan {
             || !is_canonical_sha256(&self.payload.capability_catalog_fingerprint)
             || !is_canonical_sha256(&self.payload.device_runtime_implementation_fingerprint)
             || !is_canonical_sha256(&self.payload.policy_fingerprint)
+            || self.payload.maximum_scheduled_tokens == 0
         {
             return Err(invalid_plan("plan provenance or node set is invalid"));
         }
@@ -1650,6 +1880,7 @@ impl ExecutionPlan {
         for node in &self.payload.nodes {
             node.provider_resources.validate_shape()?;
             Self::validate_provider_selection_evidence(&node.selection)?;
+            Self::validate_node_work_contract(node)?;
             if !seen_nodes.insert(node.id.clone())
                 || !is_canonical_sha256(&node.provider_implementation_fingerprint)
                 || node
@@ -1766,7 +1997,11 @@ impl ExecutionPlan {
                 let workspace = node.provider_resources.scratch.as_ref().ok_or_else(|| {
                     invalid_plan(format!("node `{}` scratch estimate is missing", node.id))
                 })?;
-                if descriptor.demand != workspace.size_formula
+                if descriptor.demand
+                    != workspace.size_formula.bind_runtime_limits(
+                        self.payload.memory.maximum_active_sequences,
+                        self.payload.maximum_scheduled_tokens,
+                    )?
                     || descriptor.alignment_bytes != workspace.alignment_bytes
                     || descriptor.usage != BufferUsage::Scratch
                     || descriptor.lifetime != AllocationLifetime::Invocation
@@ -1829,7 +2064,11 @@ impl ExecutionPlan {
                                 node.id
                             ))
                         })?;
-                        if descriptor.demand != workspace.size_formula
+                        if descriptor.demand
+                            != workspace.size_formula.bind_runtime_limits(
+                                self.payload.memory.maximum_active_sequences,
+                                self.payload.maximum_scheduled_tokens,
+                            )?
                             || descriptor.alignment_bytes != workspace.alignment_bytes
                             || descriptor.usage != BufferUsage::Persistent
                             || descriptor.lifetime != expected_lifetime
