@@ -793,7 +793,7 @@ where
         &self.resources.dynamic_pools
     }
 
-    fn nodes(&self) -> &[PlanNode] {
+    pub(super) fn nodes(&self) -> &[PlanNode] {
         &self.dynamic_pools().nodes
     }
 
