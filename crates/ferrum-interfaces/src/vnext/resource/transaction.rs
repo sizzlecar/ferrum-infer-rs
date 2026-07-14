@@ -1,4 +1,21 @@
-use super::*;
+use super::{
+    expected_lease_transition, expected_transition, fmt, invalid_resource,
+    new_deferred_device_cleanup_domain, watch, Arc, AtomicBool, AtomicU8, BTreeMap, BTreeSet,
+    BufferDescriptor, CoreOwnedAllocation, DeviceCapacityClaim, DriverCommitAcknowledgement,
+    DynamicPoolMaintenanceController, DynamicPoolSet, ErasedPlanStaticDriver, FailureDomain,
+    FailureEnvelope, Mutex, Ordering, PhantomData, PlanRuntimeResources, PlanRuntimeStatic,
+    PlanStaticResources, RefCell, ResourceAbandonSignal, ResourceActionCursor, ResourceCommitView,
+    ResourceCompensationRecord, ResourceDriverFailure, ResourceFailureId, ResourceFailurePoint,
+    ResourceFailureReceipt, ResourceId, ResourceLeaseAction, ResourceLeaseEntry,
+    ResourceLeaseState, ResourceLeaseTransitionReceipt, ResourceLeaseValidationContext,
+    ResourceLedgerEntrySnapshot, ResourceLedgerSnapshot, ResourceOwnedBuffer,
+    ResourceOwnershipReason, ResourcePoolOwnership, ResourceRecoveryStrategy,
+    ResourceReservationBatch, ResourceTransactionAction, ResourceTransactionContext,
+    ResourceTransactionDriver, ResourceTransactionIdentity, ResourceTransactionState,
+    ResourceTransitionReceipt, ResourceTransitionRecord, ResourceTransitionValidationContext,
+    RwLock, StaticProvisioningBinding, StaticProvisioningLease, StaticProvisioningPermit,
+    VNextError, PLAN_RUNTIME_OPEN,
+};
 
 mod sealed {
     pub trait Sealed {}

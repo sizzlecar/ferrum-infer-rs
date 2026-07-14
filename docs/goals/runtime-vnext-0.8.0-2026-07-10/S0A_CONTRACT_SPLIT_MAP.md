@@ -3,8 +3,9 @@
 ## Status
 
 - Work package: S0A, semantics-preserving structural split.
-- Current stage: `resource.rs` production contract split validated; explicit dependency imports,
-  `execution.rs`, `event.rs`, and owner-aligned external test targets remain open.
+- Current stage: `resource.rs` production contract split and symbol-level imports validated;
+  dependency-cycle removal, `execution.rs`, `event.rs`, and owner-aligned external test targets
+  remain open.
 - This map records file ownership, not G01A completion. Public item inventory and the final
   `contract-map.json` remain required before the S0A PASS artifact can be issued.
 
@@ -25,9 +26,11 @@ original seven-line test-module tail to the pre-split SHA256. The validated impl
 uses real child `mod` declarations and facade `pub use` exports; it does not use `include!`.
 Existing public paths remain unchanged. Cross-owner implementation details that were implicitly
 shared by the giant module are now explicitly limited to the `vnext::resource` parent with
-`pub(super)`, so they do not become crate-public API. The remaining S0A dependency pass must
-replace each temporary `use super::*` internal prelude with explicit owner imports and audit the
-resulting graph before S0A can pass.
+`pub(super)`, so they do not become crate-public API. All 13 production fragments now use explicit
+symbol imports; only the two existing in-module test files retain `use super::*`. The resulting
+symbol graph exposes the monolith's previously hidden bidirectional owner dependencies. S0A must
+move those shared contracts to their lowest valid owner and produce a zero-cycle audit before it
+can pass.
 
 As a second mechanical-equivalence check, removing only the added `use super::*` lines and
 `pub(super)` visibility qualifiers, concatenating the production fragments, and applying the same
@@ -38,19 +41,19 @@ As a second mechanical-equivalence check, removing only the added `use super::*`
 
 | Original lines | New owner | Lines | Primary responsibility |
 |---:|---|---:|---|
-| 1-513 | `resource/contracts.rs` | 482 | Base identifiers, descriptors, reservation contracts, shared validation |
-| 514-1226 | `resource/capacity.rs` | 720 | Device capacity authority, epochs, static provisioning and admission |
-| 1227-1838 | `resource/allocation.rs` | 613 | Transaction identity, allocation ownership and resource driver contracts |
-| 1839-3307 | `resource/ledger.rs` | 1,476 | Lease state, transition receipts, allocation ledger and failure evidence |
-| 3308-3748 | `resource/recovery.rs` | 442 | Owned lease slots, abandoned-sequence recovery and recovery stream state |
-| 3749-5725 | `resource/dynamic_pool.rs` | 1,978 | Dynamic backing pools, growth, extent/view ownership and quarantine |
-| 5726-6005 | `resource/static_lease.rs` | 281 | Plan-static provisioning lease and typed admission request construction |
-| 6006-6361 | `resource/work.rs` | 359 | Step/invocation work-shape admission requests and checked demand derivation |
-| 6362-7481 | `resource/plan_runtime.rs` | 1,124 | Plan runtime root, close state, capacity wait and logical backing ownership |
-| 7482-8448 | `resource/sequence.rs` | 970 | Request, sequence and session resource lifetime authorities |
-| 8449-9459 | `resource/batch.rs` | 1,017 | Batch participants, physical invocation ledger and step retirement |
-| 9460-11117 | `resource/invocation.rs` | 1,659 | Step/invocation leases, retry authority and active-sequence permits |
-| 11118-13213 | `resource/transaction.rs` | 2,097 | Sealed transaction typestate, commit/rollback/release and receipt validation |
+| 1-513 | `resource/contracts.rs` | 490 | Base identifiers, descriptors, reservation contracts, shared validation |
+| 514-1226 | `resource/capacity.rs` | 728 | Device capacity authority, epochs, static provisioning and admission |
+| 1227-1838 | `resource/allocation.rs` | 620 | Transaction identity, allocation ownership and resource driver contracts |
+| 1839-3307 | `resource/ledger.rs` | 1,485 | Lease state, transition receipts, allocation ledger and failure evidence |
+| 3308-3748 | `resource/recovery.rs` | 450 | Owned lease slots, abandoned-sequence recovery and recovery stream state |
+| 3749-5725 | `resource/dynamic_pool.rs` | 1,988 | Dynamic backing pools, growth, extent/view ownership and quarantine |
+| 5726-6005 | `resource/static_lease.rs` | 287 | Plan-static provisioning lease and typed admission request construction |
+| 6006-6361 | `resource/work.rs` | 363 | Step/invocation work-shape admission requests and checked demand derivation |
+| 6362-7481 | `resource/plan_runtime.rs` | 1,145 | Plan runtime root, close state, capacity wait and logical backing ownership |
+| 7482-8448 | `resource/sequence.rs` | 983 | Request, sequence and session resource lifetime authorities |
+| 8449-9459 | `resource/batch.rs` | 1,028 | Batch participants, physical invocation ledger and step retirement |
+| 9460-11117 | `resource/invocation.rs` | 1,680 | Step/invocation leases, retry authority and active-sequence permits |
+| 11118-13213 | `resource/transaction.rs` | 2,114 | Sealed transaction typestate, commit/rollback/release and receipt validation |
 
 `resource.rs` is now a 67-line facade. Every production fragment is below the S0A `2,500`
 logical-line limit and the facade is below `500` lines.
@@ -88,10 +91,12 @@ contracts
   -> transaction facade and validation
 ```
 
-Rust module privacy now separates the owners, and all newly shared internals are restricted to
-the resource parent. The temporary parent glob import still makes dependency edges broader than
-the target graph, so explicit imports and a cycle audit remain an S0A requirement. S0B may then
-shrink or break these internal contracts against the real Qwen3.5-4B production consumer.
+Rust module privacy now separates the owners, all newly shared internals are restricted to the
+resource parent, and production imports are symbol-explicit. The exposed graph still contains
+bidirectional edges, including capacity/pool orchestration, ledger/transaction validation, and
+sequence/batch/invocation lifecycle helpers. Those are recorded defects of the old ownership
+layout, not accepted final dependencies. S0A must relocate them and emit the cycle audit; S0B may
+then shrink or break the resulting contracts against the real Qwen3.5-4B production consumer.
 
 ## Validation For This Stage
 
@@ -106,3 +111,7 @@ shrink or break these internal contracts against the real Qwen3.5-4B production 
    with `-- --test-threads=2` passes `7/7` tests, including the expected isolated panic-child
    fault case.
 7. No paid GPU, model download, performance run, or product migration claim is part of this stage.
+
+After replacing all production glob imports with explicit symbol imports, the same bounded
+`cargo check -p ferrum-interfaces --all-targets` passes. The behavioral tests were not repeated
+for this import-only follow-up.
