@@ -6,8 +6,9 @@
 - Current stage: `resource.rs` production contract split, symbol-level imports, and complete
   dependency-cycle removal validated; the external resource contract target is split by invariant
   owner. `execution.rs` now has a semantics-preserving real-module split, explicit production
-  imports, normalized ownership, and zero multi-module dependency SCCs. `event.rs` and the remaining
-  oversized test targets remain open.
+  imports, normalized ownership, and zero multi-module dependency SCCs. `event.rs` now has the same
+  real-module, explicit-import, zero-SCC production structure. Its oversized aggregate test target
+  and the remaining test targets remain open.
 - This map records file ownership, not G01A completion. Public item inventory and the final
   `contract-map.json` remain required before the S0A PASS artifact can be issued.
 
@@ -21,6 +22,10 @@
 - Pre-split execution logical lines: `6,651`
 - Pre-split execution SHA256:
   `276711236b000f35633df1662751a6acc1182af8e2b98bfe43aa546d18a37f18`
+- Pre-split event source: `crates/ferrum-interfaces/src/vnext/event.rs`
+- Pre-split event logical lines: `4,893`
+- Pre-split event SHA256:
+  `aac28b3bdadf16f15ebcab71ec72d3bab62c3cc28f9b18893c8b8b053c50edcb`
 - Repository inventory: `docs/release/cleanup/20260714-inventory.md`
 - Inventory SHA256:
   `6cce246fc3f62ec058498bdb0a825613d47abaf327fcf8a698c59ece41c79190`
@@ -107,6 +112,24 @@ serialized payload validation, resolution, and the planner API have now moved to
 The complete sixteen-module production graph has zero multi-module SCCs. Public execution paths
 remain re-exported by the facade and no production fragment uses `use super::*`.
 
+## Event Ownership
+
+| Current owner | Lines | Primary responsibility |
+|---|---:|---|
+| `event/foundation.rs` | 127 | Event IDs, phases, timestamps, canonical fingerprints and shared validation |
+| `event/identity.rs` | 243 | Validated and unvalidated execution identity envelopes |
+| `event/topology.rs` | 90 | Trusted immutable execution topology derived from a plan |
+| `event/sequence_binding.rs` | 490 | Active, completed and aborted sequence evidence |
+| `event/execution_event.rs` | 1,596 | Execution event wire boundary, context validation and transactional cursor |
+| `event/resource_pool.rs` | 1,125 | Resource-pool events, receipt validation and pool cursor |
+| `event/replay.rs` | 1,128 | Replay evidence closure, cleanup requirements and replay identity |
+| `event/sink.rs` | 156 | Event sink capability, transactional emitter and disabled sink |
+
+`event.rs` is now a 48-line facade. Public paths remain unchanged, every production import is
+symbol-explicit, and no production fragment uses `use super::*`. The complete eight-module graph
+has zero multi-module SCCs. Replay and sink use typed getters or narrowly scoped parent-private
+proof methods instead of reading another owner's private fields.
+
 ## Resource Test Ownership
 
 The former 4,289-line `vnext_resource_contract_tests` target is replaced by one shared 1,474-line
@@ -166,13 +189,21 @@ foundation -> binding -> work -> workspace -> provider_resource -> contracts -> 
 -> planner
 ```
 
+The event graph is also acyclic. One valid dependencies-first order is:
+
+```text
+foundation -> identity -> topology -> sequence_binding -> execution_event -> resource_pool
+-> replay -> sink
+```
+
 S0B may later shrink or break these contracts only against the real Qwen3.5-4B production consumer.
 
 ## Validation For This Stage
 
-1. Initial reconstructed source SHA256 equals the pre-split source SHA256.
-2. Normalized old/new production source SHA256 values are identical after stripping only the
-   module visibility/prelude additions and applying the same formatter.
+1. The resource and execution initial reconstructed source SHA256 values equal their pre-split
+   source SHA256 values.
+2. Their normalized old/new production source SHA256 values are identical after stripping only
+   the module visibility/prelude additions and applying the same formatter.
 3. `cargo fmt --all -- --check` accepts the fragments and facade.
 4. `CARGO_BUILD_JOBS=4 cargo check -p ferrum-interfaces --all-targets` passes.
 5. `RUST_TEST_THREADS=2 cargo test -p ferrum-interfaces --lib resource:: -- --test-threads=2`
@@ -185,8 +216,15 @@ S0B may later shrink or break these contracts only against the real Qwen3.5-4B p
 For the normalized execution graph, `cargo check -p ferrum-interfaces --all-targets` passes, the
 bounded execution white-box target passes `14/14`, the focused external execution contracts pass
 `51/51 + 12/12`, and all `80` vNext compile-time UI fixtures pass in normal trybuild mode. These
-results establish compile, contract, and structural evidence; the `event.rs` split, remaining test
-ownership work, public owner map, bounded aggregate, and final S0A PASS artifact remain open.
+results establish compile, contract, and structural evidence; remaining test ownership work, the
+public owner map, bounded aggregate, and final S0A PASS artifact remain open.
+
+For the normalized event graph, `cargo check -p ferrum-interfaces --all-targets` passes, the existing
+6,208-line frozen event/replay aggregate passes `1/1`, and all `80` vNext compile-time UI fixtures
+pass without snapshot changes. Two source-shape assertions now inspect their real `sink` and
+`resource_pool` owners, and the aggregate helper uses `#[track_caller]` so later failures identify
+the actual invariant line. Event test ownership, the public owner map, bounded aggregate, and final
+S0A PASS artifact remain open.
 
 After owner normalization and the zero-SCC audit, the bounded all-target check, `47/47` resource
 library tests, and all seven external resource owner targets pass. The transaction-evidence
