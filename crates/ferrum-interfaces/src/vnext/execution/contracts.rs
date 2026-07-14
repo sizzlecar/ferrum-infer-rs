@@ -1,9 +1,8 @@
-use super::solver::quantize_storage_bytes;
 use super::{
-    AttributeId, BTreeMap, BTreeSet, BufferRequest, BufferUsage, CapabilityId, ContractVersion,
-    Deserialize, Digest, DynamicStorageContract, ElementType, NodeId, OperationId, ProgramValueId,
+    invalid_plan, is_canonical_sha256, AttributeId, BTreeMap, BTreeSet, CapabilityId,
+    ContractVersion, Deserialize, NodeId, OperationId, ProgramValueId,
     ProviderCompatibilityRejectReason, ProviderId, ProviderResourcePlan, ResolvedValueBinding,
-    ResourceId, SemanticValue, Serialize, Sha256, StateId, TensorAccess, VNextError,
+    ResourceId, SemanticValue, Serialize, StateId, TensorAccess, VNextError,
 };
 
 pub const EXECUTION_PLAN_SCHEMA: PlanSchemaVersion = PlanSchemaVersion::new(1, 0);
@@ -11,63 +10,6 @@ pub const MAX_EXECUTION_PLAN_WIRE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum number of O(graph) static allocations plus dynamic descriptors.
 /// This limit is independent of the concurrency ceiling.
 pub const MAX_EXECUTION_PLAN_RESOURCE_ROWS: usize = 65_536;
-
-pub(super) fn invalid_plan(reason: impl Into<String>) -> VNextError {
-    VNextError::InvalidExecutionPlan {
-        reason: reason.into(),
-    }
-}
-
-pub(super) fn validate_active_sequence_ceiling(
-    maximum_active_sequences: u32,
-) -> Result<(), VNextError> {
-    if maximum_active_sequences == 0 {
-        return Err(invalid_plan(
-            "maximum active sequences protocol ceiling must be non-zero",
-        ));
-    }
-    Ok(())
-}
-
-pub(super) fn canonical_json(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Array(values) => {
-            serde_json::Value::Array(values.into_iter().map(canonical_json).collect())
-        }
-        serde_json::Value::Object(values) => serde_json::Value::Object(
-            values
-                .into_iter()
-                .map(|(key, value)| (key, canonical_json(value)))
-                .collect::<BTreeMap<_, _>>()
-                .into_iter()
-                .collect(),
-        ),
-        scalar => scalar,
-    }
-}
-
-pub(super) fn canonical_fingerprint<T: Serialize>(
-    value: &T,
-    context: &'static str,
-) -> Result<String, VNextError> {
-    let value = serde_json::to_value(value).map_err(|error| VNextError::Serialization {
-        context,
-        message: error.to_string(),
-    })?;
-    let bytes =
-        serde_json::to_vec(&canonical_json(value)).map_err(|error| VNextError::Serialization {
-            context,
-            message: error.to_string(),
-        })?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
-}
-
-pub(super) fn is_canonical_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanSchemaVersion {
@@ -347,120 +289,4 @@ pub enum AllocationKind {
     Value,
     Scratch { node_id: NodeId },
     Persistent { node_id: NodeId },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceAllocation {
-    pub(super) resource_id: ResourceId,
-    pub(super) per_instance_bytes: u64,
-    pub(super) instance_stride_bytes: u64,
-    pub(super) instance_count: u32,
-    pub(super) size_bytes: u64,
-    pub(super) alignment_bytes: u64,
-    pub(super) usage: BufferUsage,
-    pub(super) element_type: ElementType,
-    pub(super) lifetime: AllocationLifetime,
-    pub(super) kind: AllocationKind,
-    pub(super) storage: DynamicStorageContract,
-}
-
-impl ResourceAllocation {
-    pub(super) fn new(
-        resource_id: ResourceId,
-        per_instance_bytes: u64,
-        alignment_bytes: u64,
-        usage: BufferUsage,
-        element_type: ElementType,
-        kind: AllocationKind,
-        storage: DynamicStorageContract,
-    ) -> Result<Self, VNextError> {
-        if per_instance_bytes == 0 || alignment_bytes == 0 || !alignment_bytes.is_power_of_two() {
-            return Err(invalid_plan(format!(
-                "resource `{resource_id}` has invalid size or alignment"
-            )));
-        }
-        let instance_stride_bytes =
-            quantize_storage_bytes(per_instance_bytes, alignment_bytes, storage.profile())?;
-        Ok(Self {
-            resource_id,
-            per_instance_bytes,
-            instance_stride_bytes,
-            instance_count: 1,
-            size_bytes: instance_stride_bytes,
-            alignment_bytes,
-            usage,
-            element_type,
-            lifetime: AllocationLifetime::Plan,
-            kind,
-            storage,
-        })
-    }
-
-    pub fn resource_id(&self) -> &ResourceId {
-        &self.resource_id
-    }
-
-    pub const fn size_bytes(&self) -> u64 {
-        self.size_bytes
-    }
-
-    pub const fn per_instance_bytes(&self) -> u64 {
-        self.per_instance_bytes
-    }
-
-    pub const fn instance_stride_bytes(&self) -> u64 {
-        self.instance_stride_bytes
-    }
-
-    pub const fn instance_count(&self) -> u32 {
-        self.instance_count
-    }
-
-    pub fn scoped_offset_bytes(
-        &self,
-        base_offset_bytes: u64,
-        _active_sequence_slot: u32,
-    ) -> Result<u64, VNextError> {
-        if base_offset_bytes >= self.per_instance_bytes {
-            return Err(invalid_plan(format!(
-                "resource `{}` base offset is outside its per-instance span",
-                self.resource_id
-            )));
-        }
-        Ok(base_offset_bytes)
-    }
-
-    pub const fn alignment_bytes(&self) -> u64 {
-        self.alignment_bytes
-    }
-
-    pub const fn usage(&self) -> BufferUsage {
-        self.usage
-    }
-
-    pub const fn element_type(&self) -> ElementType {
-        self.element_type
-    }
-
-    pub const fn lifetime(&self) -> AllocationLifetime {
-        self.lifetime
-    }
-
-    pub fn kind(&self) -> &AllocationKind {
-        &self.kind
-    }
-
-    pub fn storage(&self) -> &DynamicStorageContract {
-        &self.storage
-    }
-
-    pub fn buffer_request(&self) -> Result<BufferRequest, VNextError> {
-        BufferRequest::new(
-            self.resource_id.clone(),
-            self.size_bytes,
-            self.alignment_bytes,
-            self.usage,
-            self.element_type,
-        )
-    }
 }

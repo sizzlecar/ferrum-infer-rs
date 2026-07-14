@@ -1,25 +1,24 @@
 use super::{
     canonical_fingerprint, canonical_runtime_policy_fingerprint, invalid_plan, is_canonical_sha256,
-    joint_candidate_components, joint_partial_precedes,
+    joint_candidate_components, joint_partial_precedes, node_weight_requirements,
     provider_resource_estimator_input_fingerprint, static_contiguous_storage_profile,
     storage_incompatible_resource_ids, tensor_storage_layout_fingerprint,
-    validate_active_sequence_ceiling, workspace_storage_layout_fingerprint, AliasPolicy,
-    AllocationKind, AllocationLifetime, BTreeMap, BTreeSet, BufferUsage, CanonicalValueBinding,
-    CapabilityCatalog, CapabilityId, Digest, DynamicResourceDescriptor, DynamicStorageContract,
-    DynamicStorageProfile, DynamicStorageRequirement, ElementType, ExecutionPlanPayload,
-    GlobalValueRange, JointComponentSolution, JointPartialSelection, JointProviderCandidate,
+    validate_active_sequence_ceiling, validate_program_bindings, validate_semantic_binding,
+    workspace_base_id, workspace_storage_layout_fingerprint, AliasPolicy, AllocationKind,
+    AllocationLifetime, BTreeMap, BTreeSet, BufferUsage, CanonicalValueBinding, CapabilityCatalog,
+    CapabilityId, DynamicResourceDescriptor, DynamicStorageContract, DynamicStorageProfile,
+    DynamicStorageRequirement, ElementType, ExecutionPlanPayload, GlobalValueRange,
+    JointComponentSolution, JointPartialSelection, JointProviderCandidate,
     JointProviderStorageSelection, JointSelectionObjective, MemoryPlan, NodeId,
     OperationDescriptor, OperationRegistryAuthority, PlanBuildRequest, PlanExactAlias,
     PlanExactAliasKind, PlanHash, PlanHashMaterial, PlanId, PlanNode, PlanNodeResolution,
-    PlanProviderRejectReason, PlanStateEffect, PreparedModelFamily, ProgramNode, ProgramTensorSpec,
-    ProgramValueId, ProviderCompatibilityRequest, ProviderId, ProviderResourcePlan,
-    ProviderSelection, ProviderSelectionReason, ProviderWorkspaceScope, QuantizationFormatId,
-    RejectedProvider, ResolvedTensorSpec, ResolvedValueBinding, ResolvedValueRole,
-    ResolvedValueStorage, ResourceAllocation, ResourceId, RuntimePolicy, Serialize, Sha256,
-    StateCapacityDemand, StateDependencyTracker, StateLifetime, TensorAccess,
+    PlanProviderRejectReason, PlanStateEffect, PreparedModelFamily, ProgramNode, ProgramValueId,
+    ProviderCompatibilityRequest, ProviderId, ProviderResourcePlan, ProviderSelection,
+    ProviderSelectionReason, ProviderWorkspaceScope, QuantizationFormatId, RejectedProvider,
+    ResolvedValueBinding, ResolvedValueRole, ResourceAllocation, ResourceId, RuntimePolicy,
+    Serialize, StateCapacityDemand, StateDependencyTracker, StateLifetime, TensorAccess,
     UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, VNextError, ValueAllocationAccumulator,
-    ValueResourceDemand, WeightEncoding, WeightFormatId, WeightId, EXECUTION_PLAN_SCHEMA,
-    MAX_EXECUTION_PLAN_WIRE_BYTES,
+    ValueResourceDemand, WeightFormatId, EXECUTION_PLAN_SCHEMA, MAX_EXECUTION_PLAN_WIRE_BYTES,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -231,7 +230,7 @@ impl ExecutionPlan {
         }
         operation.validate_attributes(&program_node.attributes)?;
         operation.validate_resolved_bindings(&resolution.values)?;
-        Self::validate_program_bindings(program_node, &resolution.values)?;
+        validate_program_bindings(program_node, &resolution.values)?;
         let exact_aliases = Self::extract_exact_aliases(operation, &resolution.values)?;
         Self::validate_alias_liveness(
             family,
@@ -244,13 +243,13 @@ impl ExecutionPlan {
         )?;
         let state_effects = Self::derive_state_effects(family, &resolution.values)?;
         for binding in &resolution.values {
-            Self::validate_semantic_binding(family, binding)?;
+            validate_semantic_binding(family, binding)?;
             Self::validate_cross_node_value(binding, canonical_values)?;
             bound_values.insert(binding.value_id().clone());
         }
 
         let (required_weight_formats, required_quantization_formats) =
-            Self::node_weight_requirements(family, &resolution.values)?;
+            node_weight_requirements(family, &resolution.values)?;
         let selection = Self::select_provider(
             program_node,
             operation,
@@ -340,7 +339,7 @@ impl ExecutionPlan {
             .scratch
             .as_ref()
             .map(|_| {
-                Self::workspace_base_id(
+                workspace_base_id(
                     &program_node.id,
                     "scratch",
                     &provider_resources.estimate_fingerprint,
@@ -351,7 +350,7 @@ impl ExecutionPlan {
             .persistent
             .as_ref()
             .map(|_| {
-                Self::workspace_base_id(
+                workspace_base_id(
                     &program_node.id,
                     "persistent",
                     &provider_resources.estimate_fingerprint,
@@ -571,146 +570,6 @@ impl ExecutionPlan {
         }
     }
 
-    pub(super) fn validate_program_bindings(
-        node: &ProgramNode,
-        bindings: &[ResolvedValueBinding],
-    ) -> Result<(), VNextError> {
-        let expected = node
-            .inputs
-            .iter()
-            .enumerate()
-            .map(|(ordinal, value)| (ResolvedValueRole::Input, ordinal as u32, value))
-            .chain(
-                node.outputs
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, value)| (ResolvedValueRole::Output, ordinal as u32, value)),
-            )
-            .collect::<Vec<_>>();
-        if expected.len() != bindings.len()
-            || expected.iter().zip(bindings).any(|(expected, actual)| {
-                expected.0 != actual.role()
-                    || expected.1 != actual.ordinal()
-                    || expected.2 != actual.value_id()
-            })
-        {
-            return Err(invalid_plan(format!(
-                "node `{}` bindings do not match semantic program values",
-                node.id
-            )));
-        }
-        Ok(())
-    }
-
-    pub(super) fn validate_semantic_binding(
-        family: &PreparedModelFamily,
-        binding: &ResolvedValueBinding,
-    ) -> Result<(), VNextError> {
-        if let Some(weight) = family
-            .program()
-            .weights()
-            .iter()
-            .find(|weight| &weight.value_id == binding.value_id())
-        {
-            if binding.usage() != BufferUsage::Weights || binding.access() != TensorAccess::Read {
-                return Err(invalid_plan(format!(
-                    "weight value `{}` is not backed by immutable weight memory",
-                    binding.value_id()
-                )));
-            }
-            Self::validate_program_tensor(&weight.tensor, binding.tensor(), "weight")?;
-            Self::validate_weight_storage(family, &weight.weight_id, binding.storage())?;
-            return Ok(());
-        }
-        if let Some(state) = family
-            .program()
-            .states()
-            .iter()
-            .find(|state| &state.value_id == binding.value_id())
-        {
-            if binding.usage() != BufferUsage::State {
-                return Err(invalid_plan(format!(
-                    "state value `{}` is not backed by state memory",
-                    binding.value_id()
-                )));
-            }
-            Self::validate_program_tensor(&state.tensor, binding.tensor(), "state")?;
-            return Ok(());
-        }
-        if binding.usage() != BufferUsage::Activations {
-            return Err(invalid_plan(format!(
-                "semantic value `{}` must use activation memory",
-                binding.value_id()
-            )));
-        }
-        Ok(())
-    }
-
-    pub(super) fn validate_program_tensor(
-        expected: &ProgramTensorSpec,
-        actual: &ResolvedTensorSpec,
-        kind: &str,
-    ) -> Result<(), VNextError> {
-        if expected.dimensions != actual.dimensions()
-            || expected.element_type != actual.element_type()
-            || &expected.layout != actual.layout()
-        {
-            return Err(invalid_plan(format!(
-                "{kind} binding shape, dtype, or layout differs from model semantics"
-            )));
-        }
-        Ok(())
-    }
-
-    pub(super) fn validate_weight_storage(
-        family: &PreparedModelFamily,
-        weight_id: &WeightId,
-        storage: &ResolvedValueStorage,
-    ) -> Result<(), VNextError> {
-        let expected = family
-            .weight_schema()
-            .physical_component_refs(weight_id)?
-            .into_iter()
-            .map(|component| (component.id.clone(), component))
-            .collect::<BTreeMap<_, _>>();
-        if storage.components().len() != expected.len() {
-            return Err(invalid_plan(format!(
-                "weight `{weight_id}` physical component count differs from its schema"
-            )));
-        }
-        let mut seen = BTreeSet::new();
-        for component in storage.components() {
-            let component_id = component.component_id().ok_or_else(|| {
-                invalid_plan(format!(
-                    "weight `{weight_id}` storage lacks a physical component identity"
-                ))
-            })?;
-            let spec = expected.get(component_id).ok_or_else(|| {
-                invalid_plan(format!(
-                    "weight `{weight_id}` binds unknown physical component `{component_id}`"
-                ))
-            })?;
-            let expected_element_type = match &spec.encoding {
-                WeightEncoding::Dense { element_type } => *element_type,
-                WeightEncoding::Quantized(_) => ElementType::U8,
-            };
-            if !seen.insert(component_id.clone())
-                || component.length_bytes() != spec.physical_bytes()?
-                || component.element_type() != expected_element_type
-            {
-                return Err(invalid_plan(format!(
-                    "weight `{weight_id}` component `{component_id}` byte length or dtype differs from schema"
-                )));
-            }
-        }
-        if seen != expected.keys().cloned().collect() {
-            return Err(invalid_plan(format!(
-                "weight `{weight_id}` physical component identities are incomplete"
-            )));
-        }
-        Ok(())
-    }
-
     pub(super) fn validate_cross_node_value(
         binding: &ResolvedValueBinding,
         values: &mut BTreeMap<ProgramValueId, CanonicalValueBinding>,
@@ -904,40 +763,6 @@ impl ExecutionPlan {
         Ok(())
     }
 
-    pub(super) fn node_weight_requirements(
-        family: &PreparedModelFamily,
-        bindings: &[ResolvedValueBinding],
-    ) -> Result<(BTreeSet<WeightFormatId>, BTreeSet<QuantizationFormatId>), VNextError> {
-        let mut weight_formats = BTreeSet::new();
-        let mut quantization_formats = BTreeSet::new();
-        for binding in bindings
-            .iter()
-            .filter(|binding| binding.usage() == BufferUsage::Weights)
-        {
-            let weight = family
-                .program()
-                .weights()
-                .iter()
-                .find(|weight| weight.value_id == *binding.value_id())
-                .ok_or_else(|| {
-                    invalid_plan(format!(
-                        "weight binding `{}` is not declared by the model program",
-                        binding.value_id()
-                    ))
-                })?;
-            weight_formats.insert(family.weight_schema().format_id.clone());
-            for component in family
-                .weight_schema()
-                .physical_component_refs(&weight.weight_id)?
-            {
-                if let WeightEncoding::Quantized(spec) = &component.encoding {
-                    quantization_formats.insert(spec.format_id.clone());
-                }
-            }
-        }
-        Ok((weight_formats, quantization_formats))
-    }
-
     pub(super) fn available_storage_profiles<P: RuntimePolicy>(
         requirement: &DynamicStorageRequirement,
         catalog: &CapabilityCatalog,
@@ -1030,7 +855,7 @@ impl ExecutionPlan {
                         continue;
                     };
                     let resource_id =
-                        Self::workspace_base_id(&node.id, kind, resources.estimate_fingerprint())?;
+                        workspace_base_id(&node.id, kind, resources.estimate_fingerprint())?;
                     if !Self::merge_storage_constraint(
                         &mut constraints,
                         resource_id,
@@ -1414,21 +1239,6 @@ impl ExecutionPlan {
             )),
         }
         Ok(())
-    }
-
-    pub(super) fn workspace_base_id(
-        node_id: &NodeId,
-        kind: &str,
-        estimate_fingerprint: &str,
-    ) -> Result<ResourceId, VNextError> {
-        if !is_canonical_sha256(estimate_fingerprint) {
-            return Err(invalid_plan(
-                "provider workspace identity has invalid estimate fingerprint",
-            ));
-        }
-        let digest =
-            Sha256::digest(format!("{kind}\0{node_id}\0{estimate_fingerprint}").as_bytes());
-        ResourceId::new(format!("resource/{kind}/sha256/{digest:x}"))
     }
 
     pub(super) fn build_memory_plan(

@@ -10,7 +10,7 @@ error[E0382]: borrow of moved value: `committed`
   |             ^^^^^^^^^ value borrowed here after move
   |
 note: `ferrum_interfaces::vnext::ResourceTransaction::<D, ferrum_interfaces::vnext::TransactionCommitted>::release` takes ownership of the receiver `self`, which moves `committed`
- --> src/vnext/resource.rs
+ --> src/vnext/resource/transaction.rs
   |
   |         mut self,
   |             ^^^^

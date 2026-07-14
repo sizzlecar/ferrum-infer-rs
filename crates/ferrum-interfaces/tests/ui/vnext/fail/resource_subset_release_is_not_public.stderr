@@ -5,7 +5,7 @@ error[E0599]: no method named `release_subset` found for mutable reference `&mut
   |                         ^^^^^^^^^^^^^^
   |
 help: there is a method `release` with a similar name, but with different arguments
- --> src/vnext/resource.rs
+ --> src/vnext/resource/transaction.rs
   |
   | /     pub fn release(
   | |         mut self,

@@ -1,7 +1,6 @@
-use super::contracts::invalid_plan;
 use super::{
-    canonical_fingerprint, CapabilityCatalog, ContractVersion, DynamicStorageProfile,
-    ExecutionPlan, PlanNodeResolution, PreparedModelFamily, Serialize, VNextError,
+    canonical_fingerprint, invalid_plan, CapabilityCatalog, ContractVersion, DynamicStorageProfile,
+    PlanNodeResolution, PreparedModelFamily, Serialize, VNextError,
 };
 
 /// Typed policy selected before planning. Memory capacity is part of the
@@ -72,15 +71,4 @@ impl<'a, P: RuntimePolicy> PlanBuildRequest<'a, P> {
     pub fn policy(&self) -> &P {
         self.policy
     }
-}
-
-/// Pure planner boundary. Execution consumes the immutable plan and performs
-/// no capability/backend selection in the token loop.
-pub trait ExecutionPlanner: Send + Sync {
-    type Policy: RuntimePolicy;
-
-    fn build_plan(
-        &self,
-        request: PlanBuildRequest<'_, Self::Policy>,
-    ) -> Result<ExecutionPlan, VNextError>;
 }
