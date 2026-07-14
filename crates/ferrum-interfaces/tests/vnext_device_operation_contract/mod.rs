@@ -697,8 +697,9 @@ impl DeviceRuntime for TestRuntime {
     fn submit(
         &self,
         _stream: &mut Self::Stream,
-        _command: Self::Command,
+        commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
+        assert!(!commands.is_empty(), "core must not submit an empty batch");
         let (drift, behavior, fence) = {
             let mut trace = self.trace.lock().unwrap();
             trace.submit_calls += 1;

@@ -107,7 +107,7 @@ impl DeviceRuntime for Runtime {
     fn submit(
         &self,
         _stream: &mut Stream,
-        _command: Command,
+        _commands: DeviceCommandBatch<Command>,
     ) -> Result<Fence, DefinitelyNotSubmitted<io::Error>> {
         Ok(Fence)
     }

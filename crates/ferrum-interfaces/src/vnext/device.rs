@@ -721,6 +721,47 @@ impl HostTransferLayout {
     }
 }
 
+/// Core-owned physical submission unit.
+///
+/// Operation providers produce individual commands, while the execution
+/// runtime decides which commands share one ordered device submission and
+/// completion fence. Construction stays private to core so a backend cannot
+/// silently split one admitted lane segment into unrelated submissions.
+#[must_use = "encoded device command batches must be submitted"]
+pub struct DeviceCommandBatch<C> {
+    commands: Vec<C>,
+}
+
+impl<C> DeviceCommandBatch<C> {
+    pub(crate) fn singleton(command: C) -> Self {
+        Self {
+            commands: vec![command],
+        }
+    }
+
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            commands: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub(crate) fn push(&mut self, command: C) {
+        self.commands.push(command);
+    }
+
+    pub fn len(&self) -> usize {
+        self.commands.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+
+    pub fn into_commands(self) -> Vec<C> {
+        self.commands
+    }
+}
+
 /// Stable primitive boundary implemented by a concrete device runtime.
 ///
 /// Associated buffer, stream, command, and error types preserve compile-time
@@ -769,7 +810,9 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         length_bytes: u64,
     ) -> Result<Self::Command, Self::Error>;
 
-    /// Submits one encoded command and returns its exact completion fence.
+    /// Submits one non-empty ordered command batch and returns its exact
+    /// completion fence. A backend must preserve command order and must not
+    /// manufacture intermediate host-visible completion boundaries.
     ///
     /// The error type is intentionally closed over `DefinitelyNotSubmitted`:
     /// an ordinary backend error is not sufficient evidence that invocation
@@ -779,7 +822,7 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     fn submit(
         &self,
         stream: &mut Self::Stream,
-        command: Self::Command,
+        commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>>;
 
     /// Observes a fence without blocking. `Indeterminate` is not terminal and

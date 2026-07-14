@@ -8,8 +8,8 @@ use std::sync::Arc;
 use super::{
     classify_device_error, AllocationLifetime, BatchInvocationId, BatchStepId, BatchWorkShape,
     BufferUsage, CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper,
-    ContractVersion, DefinitelyNotSubmittedRetryAuthority, DeviceId, DeviceRuntime,
-    ExecutionIdentityEnvelope, ExecutionLane, ExecutionLaneId, IdentifiedFailure,
+    ContractVersion, DefinitelyNotSubmittedRetryAuthority, DeviceCommandBatch, DeviceId,
+    DeviceRuntime, ExecutionIdentityEnvelope, ExecutionLane, ExecutionLaneId, IdentifiedFailure,
     IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
     LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, OperationId,
     ParticipantNodeKey, PlanHash, PlanId, ProgramValueId, ProviderId, ProviderWorkspaceRequirement,
@@ -3853,7 +3853,7 @@ impl OperationDispatch {
             .reserve_enqueue()
             .map_err(OperationDispatchError::Contract)?;
         completion.mark_submission_started();
-        match lane_reservation.submit(command) {
+        match lane_reservation.submit(DeviceCommandBatch::singleton(command)) {
             LaneSubmitOutcome::DefinitelyNotSubmitted(error) => {
                 drop(lane_reservation);
                 let retry = completion

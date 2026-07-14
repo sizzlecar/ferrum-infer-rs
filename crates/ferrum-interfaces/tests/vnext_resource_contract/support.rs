@@ -792,8 +792,9 @@ impl DeviceRuntime for TestRuntime {
     fn submit(
         &self,
         stream: &mut Self::Stream,
-        _command: Self::Command,
+        commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
+        assert!(!commands.is_empty(), "core must not submit an empty batch");
         if self.trace.lock().unwrap().drift_on_submit {
             self.use_alternate_descriptor.store(true, Ordering::Release);
         }
