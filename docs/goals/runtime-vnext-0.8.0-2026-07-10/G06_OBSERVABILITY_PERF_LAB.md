@@ -3,14 +3,19 @@
 ## 状态与依赖
 
 - 状态：Open
-- 依赖：G01、G02、G04、G05
-- 下游：G08-G10
+- 依赖：basic/resource identity 随 S1；latency 随 S2；kernel/replay 在 S3 前可用；full G06 在 S6
+- 下游：S1-S7、G08-G10
 
 ## 目标
 
 让正确性、资源、延迟和 kernel 性能使用同一 identity 和 artifact，而不是依赖约 50 个
 隐藏 profile/trace env、stderr regex 和多个互不关联 schema。一次失败必须自动给出首个失败
 阶段和可验证的下一步假设。
+
+profile 是 execution/resource/op contract 的核心组成，不再作为迁移完成后的附加设施。S1 没有
+basic/resource artifact 不能退出；S2 没有 latency 和 first-failure attribution 不能进入大模型迁移；
+S3 前完成 kernel/replay 入口。完整 benchmark catalog、historical attribution 和正式 overhead matrix
+仍在 S6 聚合，避免 profile gate 再次先于 production caller 膨胀。
 
 ## 统一 identity
 

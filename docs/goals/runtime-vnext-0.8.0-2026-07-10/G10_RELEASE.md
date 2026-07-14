@@ -3,7 +3,7 @@
 ## 状态与依赖
 
 - 状态：Open
-- G10A 依赖：G00-G09 development PASS，且在 release-freeze 前未 stale
+- G10A 依赖：S6 的 G00P、G01-G09 development PASS，且在 release-freeze 前未 stale
 - G08-RC/G09-RC 依赖：G10A；二者必须在 G10A 的 release-candidate SHA 和 exact staged binary 上重跑
 - G10B 依赖：fresh G08-RC、G09-RC 和 staged asset gates
 - G10 aggregate 依赖：G10A、G08-RC、G09-RC、G10B 全部 PASS

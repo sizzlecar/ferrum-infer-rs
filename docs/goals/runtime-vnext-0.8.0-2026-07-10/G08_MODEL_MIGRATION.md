@@ -3,8 +3,8 @@
 ## 状态与依赖
 
 - 状态：Open
-- 依赖：G03、G04、G05、G06、G07
-- 内部依赖：G08A -> G08B -> G08C -> G08D；G08 只聚合四个未 stale PASS
+- 依赖：M1 从 S1 live slice 开始；每个模型只依赖其实际需要的 G03-G07 capability；full G08 在 S6 聚合
+- 内部依赖：S1/S2 -> G08A(S3) -> G08B(S4) -> G08C/G08D(S5)；G08 只聚合四个未 stale PASS
 - 下游：G09、G10
 
 ## 目标
@@ -12,6 +12,10 @@
 用三个主模型证明 vNext 不只适合简单 dense decoder：先迁 CUDA，再迁 Metal；每个模型
 parity 后立即删除对应 legacy 路径。最后处置所有其余 support row，使 release binary 只包含
 vNext runtime。
+
+模型迁移不再等待 G03-G07 全部抽象和 full gate 先完成。Qwen3.5-4B CUDA 是 S1/S2 的架构
+consumer，Metal 在 S3 立即跟进；G07A 必须在 S4 前完成。每个模型 milestone 仍必须在同阶段删除
+对应 legacy entry，不能以“先纵切、以后再删”为由保留双 runtime。
 
 ## 迁移顺序
 

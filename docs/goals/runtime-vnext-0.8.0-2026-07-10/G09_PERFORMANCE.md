@@ -3,7 +3,7 @@
 ## 状态与依赖
 
 - 状态：Open
-- 依赖：G00、G06、G07、G08
+- 依赖：G00P、G06、G07、G08；只在 S6 correctness/legacy-zero 后形成正式性能结论
 - 下游：G10
 
 ## 目标
