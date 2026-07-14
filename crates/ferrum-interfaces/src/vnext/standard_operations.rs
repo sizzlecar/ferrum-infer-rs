@@ -18,6 +18,13 @@ pub const DENSE_SWIGLU_OPERATION_ID: &str = "operation.dense_swiglu";
 pub const DENSE_SWIGLU_F16_CAPABILITY_ID: &str = "capability.operation.dense_swiglu.f16";
 pub const RESIDUAL_ADD_OPERATION_ID: &str = "operation.residual_add";
 pub const RESIDUAL_ADD_F16_CAPABILITY_ID: &str = "capability.operation.residual_add.f16";
+pub const GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID: &str =
+    "operation.gated_delta_recurrent_attention";
+pub const GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID: &str =
+    "capability.operation.gated_delta_recurrent_attention.f16";
+pub const CAUSAL_PAGED_ATTENTION_OPERATION_ID: &str = "operation.causal_paged_attention";
+pub const CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID: &str =
+    "capability.operation.causal_paged_attention.f16";
 
 /// One checked-in standard operation contract. Construction stays private so
 /// production registries cannot mutate a descriptor after a provider binds its
@@ -249,6 +256,197 @@ pub fn residual_add_contract() -> Result<StandardOperationContract, VNextError> 
     Ok(StandardOperationContract { descriptor })
 }
 
+/// Gated DeltaNet mixer including input normalization, projections, recurrent
+/// convolution/Delta state update, gated normalization, output projection, and
+/// the attention residual. Weight ordinals are part of the stable contract.
+pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationContract, VNextError> {
+    let descriptor = OperationDescriptor {
+        id: OperationId::new(GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID)?,
+        version: ContractVersion::new(1, 0),
+        inputs: vec![
+            contiguous_tensor(
+                token_hidden_dimensions(),
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("qkv_features"), symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("value_features"), symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("value_heads"), symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("value_heads"), symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("qkv_features"), symbol("conv_kernel")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("value_heads")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("value_heads")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("value_head_dim")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("hidden_size"), symbol("value_features")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("qkv_features"), symbol("conv_state_width")],
+                [ElementType::F16],
+                TensorAccess::ReadWrite,
+            )?,
+            contiguous_tensor(
+                vec![
+                    symbol("value_heads"),
+                    symbol("value_head_dim"),
+                    symbol("key_head_dim"),
+                ],
+                [ElementType::F16],
+                TensorAccess::ReadWrite,
+            )?,
+        ],
+        outputs: vec![contiguous_tensor_with_alias(
+            token_hidden_dimensions(),
+            [ElementType::F16],
+            TensorAccess::Write,
+            AliasPolicy::MayAlias { tensor_index: 0 },
+        )?],
+        attributes: AttributeSchema::new(BTreeMap::from([
+            unsigned_attribute("hidden_size")?,
+            unsigned_attribute("key_heads")?,
+            unsigned_attribute("value_heads")?,
+            unsigned_attribute("key_head_dim")?,
+            unsigned_attribute("value_head_dim")?,
+            unsigned_attribute("qkv_features")?,
+            unsigned_attribute("value_features")?,
+            unsigned_attribute("conv_kernel")?,
+            unsigned_attribute("conv_state_width")?,
+            positive_epsilon_attribute("epsilon")?,
+            nonnegative_unsigned_attribute("layer_index")?,
+        ]))?,
+        resources: attention_resources(),
+        oracle: f16_reference_tolerance()?,
+        provider: provider_requirement(GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID)?,
+        profile_phase: ProfilePhase::Forward,
+    };
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
+
+/// Dense causal attention including input normalization, Q/K normalization,
+/// RoPE, KV update, attention, optional output gate, output projection, and
+/// the attention residual. KV physical paging remains a provider concern.
+pub fn causal_paged_attention_contract() -> Result<StandardOperationContract, VNextError> {
+    let descriptor = OperationDescriptor {
+        id: OperationId::new(CAUSAL_PAGED_ATTENTION_OPERATION_ID)?,
+        version: ContractVersion::new(1, 0),
+        inputs: vec![
+            contiguous_tensor(
+                token_hidden_dimensions(),
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("query_projection_features"), symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("kv_features"), symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("kv_features"), symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("hidden_size"), symbol("query_features")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("head_dim")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("head_dim")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![exact(2), symbol("key_value_heads"), symbol("head_dim")],
+                [ElementType::F16],
+                TensorAccess::ReadWrite,
+            )?,
+        ],
+        outputs: vec![contiguous_tensor_with_alias(
+            token_hidden_dimensions(),
+            [ElementType::F16],
+            TensorAccess::Write,
+            AliasPolicy::MayAlias { tensor_index: 0 },
+        )?],
+        attributes: AttributeSchema::new(BTreeMap::from([
+            unsigned_attribute("hidden_size")?,
+            unsigned_attribute("query_heads")?,
+            unsigned_attribute("key_value_heads")?,
+            unsigned_attribute("head_dim")?,
+            unsigned_attribute("query_features")?,
+            unsigned_attribute("query_projection_features")?,
+            unsigned_attribute("kv_features")?,
+            unsigned_attribute("rope_dim")?,
+            positive_rational_attribute("rope_theta")?,
+            unconstrained_bool_attribute("rope_interleaved")?,
+            unconstrained_bool_attribute("output_gate")?,
+            true_bool_attribute("causal")?,
+            positive_epsilon_attribute("epsilon")?,
+            nonnegative_unsigned_attribute("layer_index")?,
+        ]))?,
+        resources: attention_resources(),
+        oracle: f16_reference_tolerance()?,
+        provider: provider_requirement(CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID)?,
+        profile_phase: ProfilePhase::Forward,
+    };
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
+
 fn contiguous_tensor(
     dimensions: Vec<DimensionConstraint>,
     element_types: impl IntoIterator<Item = ElementType>,
@@ -302,6 +500,22 @@ fn no_auxiliary_resources() -> ResourceRequirements {
     }
 }
 
+fn attention_resources() -> ResourceRequirements {
+    ResourceRequirements {
+        minimum_value_alignment_bytes: 16,
+        scratch: ResourcePresenceRequirement::Required,
+        persistent: ResourcePresenceRequirement::Forbidden,
+    }
+}
+
+fn symbol(name: &str) -> DimensionConstraint {
+    DimensionConstraint::Symbol(name.to_owned())
+}
+
+const fn exact(value: u64) -> DimensionConstraint {
+    DimensionConstraint::Exact(value)
+}
+
 fn provider_requirement(capability: &str) -> Result<ProviderRequirement, VNextError> {
     Ok(ProviderRequirement {
         minimum_version: ContractVersion::new(1, 0),
@@ -324,6 +538,56 @@ fn unsigned_attribute(name: &str) -> Result<(AttributeId, AttributeSpec), VNextE
             constraint: AttributeConstraint::UnsignedRange {
                 minimum: 1,
                 maximum: u32::MAX as u64,
+            },
+        },
+    ))
+}
+
+fn nonnegative_unsigned_attribute(name: &str) -> Result<(AttributeId, AttributeSpec), VNextError> {
+    Ok((
+        AttributeId::new(name)?,
+        AttributeSpec {
+            value_kind: AttributeValueKind::Unsigned,
+            required: true,
+            constraint: AttributeConstraint::UnsignedRange {
+                minimum: 0,
+                maximum: u32::MAX as u64,
+            },
+        },
+    ))
+}
+
+fn unconstrained_bool_attribute(name: &str) -> Result<(AttributeId, AttributeSpec), VNextError> {
+    Ok((
+        AttributeId::new(name)?,
+        AttributeSpec {
+            value_kind: AttributeValueKind::Bool,
+            required: true,
+            constraint: AttributeConstraint::None,
+        },
+    ))
+}
+
+fn true_bool_attribute(name: &str) -> Result<(AttributeId, AttributeSpec), VNextError> {
+    Ok((
+        AttributeId::new(name)?,
+        AttributeSpec {
+            value_kind: AttributeValueKind::Bool,
+            required: true,
+            constraint: AttributeConstraint::BoolEquals(true),
+        },
+    ))
+}
+
+fn positive_rational_attribute(name: &str) -> Result<(AttributeId, AttributeSpec), VNextError> {
+    Ok((
+        AttributeId::new(name)?,
+        AttributeSpec {
+            value_kind: AttributeValueKind::Rational,
+            required: true,
+            constraint: AttributeConstraint::RationalRange {
+                minimum: CanonicalRational::new(1, u64::MAX)?,
+                maximum: CanonicalRational::new(i64::MAX, 1)?,
             },
         },
     ))
@@ -388,6 +652,41 @@ mod tests {
         assert_eq!(
             contracts[3].descriptor().outputs[0].alias(),
             &AliasPolicy::MayAlias { tensor_index: 0 }
+        );
+    }
+
+    #[test]
+    fn attention_contracts_fix_weight_order_state_mutability_and_scratch() {
+        let linear = gated_delta_recurrent_attention_contract().unwrap();
+        let full = causal_paged_attention_contract().unwrap();
+        for contract in [&linear, &full] {
+            let descriptor = contract.descriptor();
+            assert_eq!(
+                descriptor.resources.scratch,
+                ResourcePresenceRequirement::Required
+            );
+            assert_eq!(
+                descriptor.outputs[0].alias(),
+                &AliasPolicy::MayAlias { tensor_index: 0 }
+            );
+            assert_eq!(descriptor.fingerprint().unwrap().len(), 64);
+            contract
+                .validate_signature(&descriptor.inputs, &descriptor.outputs)
+                .unwrap();
+        }
+        assert_eq!(linear.descriptor().inputs.len(), 13);
+        assert_eq!(
+            linear.descriptor().inputs[11].access(),
+            TensorAccess::ReadWrite
+        );
+        assert_eq!(
+            linear.descriptor().inputs[12].access(),
+            TensorAccess::ReadWrite
+        );
+        assert_eq!(full.descriptor().inputs.len(), 9);
+        assert_eq!(
+            full.descriptor().inputs[8].access(),
+            TensorAccess::ReadWrite
         );
     }
 }

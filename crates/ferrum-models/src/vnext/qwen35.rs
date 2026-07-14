@@ -17,7 +17,8 @@ use ferrum_interfaces::vnext::{
     SpecialTokenMetadata, SpecialTokenRole, StateCapacityDemand, StateId, StateLifetime, StateSpec,
     TemplateMetadata, TypedFamilyRegistration, VNextError, WeightComponentRole,
     WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
-    WeightSchema, WeightTensorSpec, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+    WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_LINEAR_OPERATION_ID,
+    DENSE_SWIGLU_OPERATION_ID, GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
     RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
 use ferrum_quantization::SafetensorsArchive;
@@ -351,15 +352,28 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         let mut states = Vec::new();
         for (layer_index, layer_type) in text.layer_types.iter().copied().enumerate() {
             let attention_output = value_id(format!("value.layer.{layer_index}.attention"))?;
-            let mut attention_inputs = vec![hidden.clone()];
-            attention_inputs.extend(
-                layer_weights(config, layer_index as u32, false)
-                    .map(weight_value_id)
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
+            let input_norm = required_weight(config, Some(layer_index as u32), "input_layernorm")?;
+            let mut attention_inputs = vec![hidden.clone(), weight_value_id(input_norm)?];
 
             let (operation, mut attributes) = match layer_type {
                 Qwen35LayerType::LinearAttention => {
+                    for role in [
+                        "linear_attn_qkv",
+                        "linear_attn_z",
+                        "linear_attn_b",
+                        "linear_attn_a",
+                        "linear_attn_conv",
+                        "linear_attn_a_log",
+                        "linear_attn_dt_bias",
+                        "linear_attn_norm",
+                        "linear_attn_out",
+                    ] {
+                        attention_inputs.push(weight_value_id(required_weight(
+                            config,
+                            Some(layer_index as u32),
+                            role,
+                        )?)?);
+                    }
                     let conv_value = value_id(format!("value.state.layer.{layer_index}.conv"))?;
                     let delta_value = value_id(format!("value.state.layer.{layer_index}.delta"))?;
                     attention_inputs.extend([conv_value.clone(), delta_value.clone()]);
@@ -392,7 +406,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                         capacity_demand: StateCapacityDemand::FixedPerScope,
                     });
                     (
-                        "operation.gated_delta_recurrent_attention",
+                        GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
                         BTreeMap::from([
                             attribute("key_heads", text.linear_attention.num_key_heads as u64)?,
                             attribute("value_heads", text.linear_attention.num_value_heads as u64)?,
@@ -401,10 +415,37 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                                 "value_head_dim",
                                 text.linear_attention.value_head_dim as u64,
                             )?,
+                            attribute("hidden_size", text.hidden_size as u64)?,
+                            attribute(
+                                "qkv_features",
+                                (text.linear_qk_total_dim() * 2 + text.linear_value_total_dim())
+                                    as u64,
+                            )?,
+                            attribute("value_features", text.linear_value_total_dim() as u64)?,
+                            attribute("conv_kernel", text.linear_attention.conv_kernel_dim as u64)?,
+                            attribute(
+                                "conv_state_width",
+                                text.linear_attention.conv_kernel_dim.saturating_sub(1) as u64,
+                            )?,
+                            attribute("epsilon", config.rms_norm_epsilon)?,
                         ]),
                     )
                 }
                 Qwen35LayerType::FullAttention => {
+                    for role in [
+                        "self_attn_q",
+                        "self_attn_k",
+                        "self_attn_v",
+                        "self_attn_o",
+                        "self_attn_q_norm",
+                        "self_attn_k_norm",
+                    ] {
+                        attention_inputs.push(weight_value_id(required_weight(
+                            config,
+                            Some(layer_index as u32),
+                            role,
+                        )?)?);
+                    }
                     let kv_value = value_id(format!("value.state.layer.{layer_index}.kv"))?;
                     let kv_dimensions =
                         vec![2, text.num_key_value_heads as u64, text.head_dim as u64];
@@ -421,12 +462,33 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                         },
                     });
                     (
-                        "operation.causal_paged_attention",
+                        CAUSAL_PAGED_ATTENTION_OPERATION_ID,
                         BTreeMap::from([
                             attribute("query_heads", text.num_attention_heads as u64)?,
                             attribute("key_value_heads", text.num_key_value_heads as u64)?,
                             attribute("head_dim", text.head_dim as u64)?,
+                            attribute("hidden_size", text.hidden_size as u64)?,
+                            attribute(
+                                "query_features",
+                                text.full_attention_query_total_dim() as u64,
+                            )?,
+                            attribute(
+                                "query_projection_features",
+                                text.full_attention_q_proj_total_dim() as u64,
+                            )?,
+                            attribute("kv_features", text.full_attention_kv_total_dim() as u64)?,
+                            attribute("rope_dim", text.full_attention_rope_dim() as u64)?,
+                            attribute(
+                                "rope_theta",
+                                canonical_positive_f64(text.rope_parameters.rope_theta)?,
+                            )?,
+                            attribute(
+                                "rope_interleaved",
+                                text.full_attention_text_rope_interleaved(),
+                            )?,
+                            attribute("output_gate", text.attn_output_gate)?,
                             attribute("causal", true)?,
+                            attribute("epsilon", config.rms_norm_epsilon)?,
                         ]),
                     )
                 }
@@ -885,10 +947,22 @@ fn hf_rms_norm_epsilon(hf_config: &Value) -> Result<CanonicalRational, String> {
     let Value::Number(number) = value else {
         return Err("rms_norm_eps must be a JSON number".to_owned());
     };
-    parse_positive_decimal_rational(&number.to_string())
+    let epsilon = parse_positive_decimal_rational(&number.to_string())?;
+    if epsilon.numerator() as u64 > epsilon.denominator() {
+        return Err("rms_norm_eps must not exceed one".to_owned());
+    }
+    Ok(epsilon)
 }
 
 fn parse_positive_decimal_rational(raw: &str) -> Result<CanonicalRational, String> {
+    let value = parse_positive_decimal_rational_unbounded(raw)?;
+    if value.numerator() as u64 > value.denominator() {
+        return Err("rms_norm_eps must not exceed one".to_owned());
+    }
+    Ok(value)
+}
+
+fn parse_positive_decimal_rational_unbounded(raw: &str) -> Result<CanonicalRational, String> {
     let normalized = raw.to_ascii_lowercase();
     let (mantissa, exponent) = match normalized.split_once('e') {
         Some((mantissa, exponent)) => (
@@ -900,7 +974,7 @@ fn parse_positive_decimal_rational(raw: &str) -> Result<CanonicalRational, Strin
         None => (normalized.as_str(), 0),
     };
     if mantissa.starts_with('-') {
-        return Err("rms_norm_eps must be positive".to_owned());
+        return Err("decimal rational must be positive".to_owned());
     }
     let mantissa = mantissa.strip_prefix('+').unwrap_or(mantissa);
     let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
@@ -915,7 +989,7 @@ fn parse_positive_decimal_rational(raw: &str) -> Result<CanonicalRational, Strin
         .parse::<u128>()
         .map_err(|error| format!("decimal numerator overflows: {error}"))?;
     if numerator == 0 {
-        return Err("rms_norm_eps must be positive".to_owned());
+        return Err("decimal rational must be positive".to_owned());
     }
     let fractional_digits = i32::try_from(fraction.len())
         .map_err(|_| "rms_norm_eps has too many fractional digits".to_owned())?;
@@ -940,12 +1014,18 @@ fn parse_positive_decimal_rational(raw: &str) -> Result<CanonicalRational, Strin
         i64::try_from(numerator).map_err(|_| "rms_norm_eps numerator exceeds i64".to_owned())?;
     let denominator = u64::try_from(denominator)
         .map_err(|_| "rms_norm_eps denominator exceeds u64".to_owned())?;
-    let value =
-        CanonicalRational::new(numerator, denominator).map_err(|error| error.to_string())?;
-    if value.numerator() as u64 > value.denominator() {
-        return Err("rms_norm_eps must not exceed one".to_owned());
+    CanonicalRational::new(numerator, denominator).map_err(|error| error.to_string())
+}
+
+fn canonical_positive_f64(value: f64) -> Result<CanonicalRational, VNextError> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(invalid_config(
+            "rope_theta",
+            "rope theta must be finite and positive",
+        ));
     }
-    Ok(value)
+    parse_positive_decimal_rational_unbounded(&value.to_string())
+        .map_err(|reason| invalid_config("rope_theta", reason))
 }
 
 fn weight_key(weight: &FamilyWeight, prefix: &str) -> String {
@@ -1082,11 +1162,33 @@ mod tests {
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
     fn test_weight_dimensions(text: &Qwen35TextConfig, weight: &FamilyWeight) -> Vec<u64> {
+        let hidden = text.hidden_size as u64;
+        let qk = text.linear_qk_total_dim() as u64;
+        let value = text.linear_value_total_dim() as u64;
+        let qkv = qk * 2 + value;
+        let full_query = text.full_attention_query_total_dim() as u64;
+        let full_query_projection = text.full_attention_q_proj_total_dim() as u64;
+        let full_kv = text.full_attention_kv_total_dim() as u64;
         match weight.role.as_str() {
             "embed_tokens" | "lm_head" => vec![32, 16],
             "final_norm" | "input_layernorm" | "post_attention_layernorm" => vec![16],
             "mlp_gate" | "mlp_up" => vec![32, 16],
             "mlp_down" => vec![16, 32],
+            "linear_attn_qkv" => vec![qkv, hidden],
+            "linear_attn_z" => vec![value, hidden],
+            "linear_attn_a" | "linear_attn_b" => {
+                vec![text.linear_attention.num_value_heads as u64, hidden]
+            }
+            "linear_attn_conv" => vec![qkv, text.linear_attention.conv_kernel_dim as u64],
+            "linear_attn_a_log" | "linear_attn_dt_bias" => {
+                vec![text.linear_attention.num_value_heads as u64]
+            }
+            "linear_attn_norm" => vec![text.linear_attention.value_head_dim as u64],
+            "linear_attn_out" => vec![hidden, value],
+            "self_attn_q" => vec![full_query_projection, hidden],
+            "self_attn_k" | "self_attn_v" => vec![full_kv, hidden],
+            "self_attn_o" => vec![hidden, full_query],
+            "self_attn_q_norm" | "self_attn_k_norm" => vec![text.head_dim as u64],
             _ => vec![expected_weight_elements(text, 32, weight).unwrap()],
         }
     }
@@ -1208,6 +1310,67 @@ mod tests {
             .iter()
             .filter(|node| node.operation_id.as_str() == DENSE_SWIGLU_OPERATION_ID)
             .all(|node| node.inputs.len() == 3));
+        let linear_attention = prepared.program().blocks()[0]
+            .nodes
+            .iter()
+            .find(|node| node.operation_id.as_str() == GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID)
+            .unwrap();
+        let linear_inputs = linear_attention
+            .inputs
+            .iter()
+            .map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        for (ordinal, role) in [
+            "input_layernorm",
+            "linear_attn_qkv",
+            "linear_attn_z",
+            "linear_attn_b",
+            "linear_attn_a",
+            "linear_attn_conv",
+            "linear_attn_a_log",
+            "linear_attn_dt_bias",
+            "linear_attn_norm",
+            "linear_attn_out",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(linear_inputs[ordinal + 1].ends_with(role));
+        }
+        assert_eq!(linear_inputs.len(), 13);
+        let full_attention = prepared.program().blocks()[0]
+            .nodes
+            .iter()
+            .find(|node| node.operation_id.as_str() == CAUSAL_PAGED_ATTENTION_OPERATION_ID)
+            .unwrap();
+        let full_inputs = full_attention
+            .inputs
+            .iter()
+            .map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        for (ordinal, role) in [
+            "input_layernorm",
+            "self_attn_q",
+            "self_attn_k",
+            "self_attn_v",
+            "self_attn_o",
+            "self_attn_q_norm",
+            "self_attn_k_norm",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(full_inputs[ordinal + 1].ends_with(role));
+        }
+        assert_eq!(full_inputs.len(), 9);
+        assert_eq!(
+            full_attention
+                .attributes
+                .get(&AttributeId::new("rope_theta").unwrap()),
+            Some(&SemanticValue::Rational(
+                canonical_positive_f64(10_000.0).unwrap()
+            ))
+        );
         assert!(!operation_ids.contains(&"operation.logits_projection"));
         assert_eq!(prepared.program().states().len(), 7);
         assert_eq!(prepared.program().weights().len(), config.weights.len() - 4);
