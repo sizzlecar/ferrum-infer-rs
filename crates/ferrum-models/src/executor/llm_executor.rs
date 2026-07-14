@@ -187,6 +187,7 @@ fn ferrum_device_to_candle(d: &ferrum_types::Device) -> candle_core::Device {
 pub struct LlmExecutor {
     model: Mutex<Box<dyn DecoderOnlyLLM>>,
     info: ModelInfo,
+    vnext_family: Option<Arc<ferrum_interfaces::vnext::PreparedModelFamily>>,
     next_cache_id: AtomicU64,
     total_model_lock_wait_us: AtomicU64,
     model_lock_wait_samples: AtomicU64,
@@ -194,13 +195,34 @@ pub struct LlmExecutor {
 
 impl LlmExecutor {
     pub fn new(model: Box<dyn DecoderOnlyLLM>, info: ModelInfo) -> Self {
+        Self::new_with_optional_vnext_family(model, info, None)
+    }
+
+    pub fn new_with_vnext_family(
+        model: Box<dyn DecoderOnlyLLM>,
+        info: ModelInfo,
+        vnext_family: Arc<ferrum_interfaces::vnext::PreparedModelFamily>,
+    ) -> Self {
+        Self::new_with_optional_vnext_family(model, info, Some(vnext_family))
+    }
+
+    fn new_with_optional_vnext_family(
+        model: Box<dyn DecoderOnlyLLM>,
+        info: ModelInfo,
+        vnext_family: Option<Arc<ferrum_interfaces::vnext::PreparedModelFamily>>,
+    ) -> Self {
         Self {
             model: Mutex::new(model),
             info,
+            vnext_family,
             next_cache_id: AtomicU64::new(0),
             total_model_lock_wait_us: AtomicU64::new(0),
             model_lock_wait_samples: AtomicU64::new(0),
         }
+    }
+
+    pub fn vnext_family(&self) -> Option<&Arc<ferrum_interfaces::vnext::PreparedModelFamily>> {
+        self.vnext_family.as_ref()
     }
 
     fn lock_model(&self) -> MutexGuard<'_, Box<dyn DecoderOnlyLLM>> {

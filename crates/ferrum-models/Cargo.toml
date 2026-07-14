@@ -24,6 +24,7 @@ parking_lot = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 
 # Tokenization (framework-agnostic)
 tokenizers = { workspace = true }

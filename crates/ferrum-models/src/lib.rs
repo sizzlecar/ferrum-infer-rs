@@ -42,6 +42,7 @@ pub mod tensor_wrapper;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod tokenizer;
+pub mod vnext;
 pub mod weight_format;
 
 pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
