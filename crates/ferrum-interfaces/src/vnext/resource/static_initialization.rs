@@ -2,17 +2,52 @@ use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::super::{
     DeviceCommandBatch, DeviceTerminal, HostTransferLayout, PreparedModelFamily,
     WeightComponentPayload, WeightComponentSource, WeightComponentSpec, WeightId,
 };
 use super::{
-    BufferUsage, DeviceRuntime, ElementType, ExecutionPlan, FailureDomain, FailureEnvelope,
-    PlanRuntimeHandoffError, PlanRuntimeResources, ResourceId, ResourceTransaction,
-    ResourceTransactionDriver, TransactionCommitted, VNextError,
+    defer_device_cleanup, deferred_device_cleanup_status, maintain_deferred_device_cleanups,
+    new_deferred_device_cleanup_domain, BufferUsage, DeferredDeviceCleanupDisposition,
+    DeferredDeviceCleanupDomainId, DeferredDeviceCleanupMaintenanceReceipt,
+    DeferredDeviceCleanupStatus, DeferredDeviceCleanupTask, DeviceRuntime, ElementType,
+    ExecutionPlan, FailureDomain, FailureEnvelope, PlanRuntimeHandoffError, PlanRuntimeResources,
+    ResourceId, ResourceTransaction, ResourceTransactionDriver, TransactionCommitted, VNextError,
+    MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
 };
+
+static STATIC_INITIALIZATION_CLEANUP_DOMAIN: OnceLock<DeferredDeviceCleanupDomainId> =
+    OnceLock::new();
+
+fn static_initialization_cleanup_domain() -> DeferredDeviceCleanupDomainId {
+    *STATIC_INITIALIZATION_CLEANUP_DOMAIN.get_or_init(new_deferred_device_cleanup_domain)
+}
+
+/// Process-reachable status for initialization owners whose submission state
+/// was indeterminate and whose explicit failure owner was dropped.
+pub fn static_initialization_cleanup_status() -> DeferredDeviceCleanupStatus {
+    deferred_device_cleanup_status(static_initialization_cleanup_domain())
+}
+
+/// Runs bounded recovery for abandoned static-initialization owners. This may
+/// block in backend synchronization and belongs on a recovery thread.
+pub fn maintain_static_initialization_cleanups(
+    maximum_tasks: usize,
+) -> Result<DeferredDeviceCleanupMaintenanceReceipt, VNextError> {
+    if maximum_tasks == 0 || maximum_tasks > MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS {
+        return Err(VNextError::InvalidExecutionPlan {
+            reason: format!(
+                "static initialization cleanup maintenance size must be in 1..={MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS}"
+            ),
+        });
+    }
+    Ok(maintain_deferred_device_cleanups(
+        static_initialization_cleanup_domain(),
+        maximum_tasks,
+    ))
+}
 
 /// Explicit host-staging budget for cold plan initialization. The composition
 /// root supplies this policy through typed configuration; it is not inferred
@@ -129,7 +164,7 @@ where
 #[must_use = "static initialization failure retains transaction and possibly in-flight ownership"]
 pub struct StaticInitializationFailure<D>
 where
-    D: ResourceTransactionDriver,
+    D: ResourceTransactionDriver + 'static,
 {
     transaction: Option<ResourceTransaction<D, TransactionCommitted>>,
     failure: FailureEnvelope,
@@ -138,7 +173,7 @@ where
 
 impl<D> fmt::Debug for StaticInitializationFailure<D>
 where
-    D: ResourceTransactionDriver,
+    D: ResourceTransactionDriver + 'static,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -151,7 +186,7 @@ where
 
 impl<D> fmt::Display for StaticInitializationFailure<D>
 where
-    D: ResourceTransactionDriver,
+    D: ResourceTransactionDriver + 'static,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -162,11 +197,14 @@ where
     }
 }
 
-impl<D> std::error::Error for StaticInitializationFailure<D> where D: ResourceTransactionDriver {}
+impl<D> std::error::Error for StaticInitializationFailure<D> where
+    D: ResourceTransactionDriver + 'static
+{
+}
 
 impl<D> StaticInitializationFailure<D>
 where
-    D: ResourceTransactionDriver,
+    D: ResourceTransactionDriver + 'static,
 {
     fn new(
         transaction: ResourceTransaction<D, TransactionCommitted>,
@@ -254,15 +292,65 @@ where
 
 impl<D> Drop for StaticInitializationFailure<D>
 where
-    D: ResourceTransactionDriver,
+    D: ResourceTransactionDriver + 'static,
 {
     fn drop(&mut self) {
         if let Some(recovery) = self.recovery.take() {
-            std::mem::forget(recovery);
-            if let Some(transaction) = self.transaction.take() {
-                std::mem::forget(transaction);
-            }
+            let transaction = self
+                .transaction
+                .take()
+                .expect("indeterminate static initialization owns its transaction");
+            defer_device_cleanup(
+                static_initialization_cleanup_domain(),
+                DeferredStaticInitializationCleanup {
+                    transaction: Some(transaction),
+                    recovery: Some(recovery),
+                },
+            );
         }
+    }
+}
+
+struct DeferredStaticInitializationCleanup<D>
+where
+    D: ResourceTransactionDriver + 'static,
+{
+    transaction: Option<ResourceTransaction<D, TransactionCommitted>>,
+    recovery: Option<StaticInitializationRecovery<D::Runtime>>,
+}
+
+impl<D> DeferredDeviceCleanupTask for DeferredStaticInitializationCleanup<D>
+where
+    D: ResourceTransactionDriver + 'static,
+{
+    fn try_cleanup(&mut self) -> DeferredDeviceCleanupDisposition {
+        let transaction = self
+            .transaction
+            .as_ref()
+            .expect("deferred static initialization owns its transaction");
+        let recovery = self
+            .recovery
+            .as_mut()
+            .expect("deferred static initialization owns its recovery stream");
+        let runtime = Arc::clone(transaction.lease().runtime());
+        let synchronized = catch_unwind(AssertUnwindSafe(|| {
+            runtime.synchronize(&mut recovery.stream)
+        }));
+        if !matches!(synchronized, Ok(Ok(()))) {
+            return DeferredDeviceCleanupDisposition::Retryable;
+        }
+        let mut recovery = self
+            .recovery
+            .take()
+            .expect("successful recovery retains its stream and fence");
+        drop(recovery.fence.take());
+        drop(recovery);
+        drop(
+            self.transaction
+                .take()
+                .expect("successful recovery retains its transaction"),
+        );
+        DeferredDeviceCleanupDisposition::Completed
     }
 }
 
@@ -293,7 +381,7 @@ where
 
 impl<D> ResourceTransaction<D, TransactionCommitted>
 where
-    D: ResourceTransactionDriver,
+    D: ResourceTransactionDriver + 'static,
 {
     pub fn initialize_static(
         self,
