@@ -336,11 +336,35 @@ fn pool_catalog(
     maximum_resident_bytes: u64,
     demand: TestDemand,
 ) -> PoolCatalog {
+    pool_catalog_with_options(
+        profile,
+        lifetime,
+        layout_digit,
+        resource_count,
+        maximum_resident_bytes,
+        demand,
+        "state",
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pool_catalog_with_options(
+    profile: DynamicStorageProfile,
+    lifetime: AllocationLifetime,
+    layout_digit: char,
+    resource_count: usize,
+    maximum_resident_bytes: u64,
+    demand: TestDemand,
+    usage: &str,
+    share_step_slot: bool,
+) -> PoolCatalog {
+    assert!(!share_step_slot || lifetime == AllocationLifetime::Step && resource_count > 1);
     let layout_fingerprint = layout_digit.to_string().repeat(64);
     let compatibility = json!({
         "version": {"major": 1, "minor": 0},
         "profile": profile,
-        "usage": "state",
+        "usage": usage,
         "element_type": "u8",
         "logical_layout_fingerprint": layout_fingerprint,
         "alignment_bytes": 16
@@ -367,7 +391,7 @@ fn pool_catalog(
                 "base_resource_id": resource_id,
                 "demand": demand,
                 "alignment_bytes": 16,
-                "usage": "state",
+                "usage": usage,
                 "element_type": "u8",
                 "lifetime": match lifetime {
                     AllocationLifetime::Request => "request",
@@ -390,13 +414,37 @@ fn pool_catalog(
     descriptors.sort_by(|left: &DynamicResourceDescriptor, right| {
         left.base_resource_id().cmp(right.base_resource_id())
     });
-    let minimum = 64 * u64::try_from(resource_count).unwrap();
+    let minimum = if share_step_slot {
+        64
+    } else {
+        64 * u64::try_from(resource_count).unwrap()
+    };
     let theoretical_per_descriptor = match demand {
         TestDemand::Fixed => 64_u128,
         TestDemand::Tokens => 256_u128,
     };
     let theoretical_ceiling =
         theoretical_per_descriptor * 64 * u128::try_from(resource_count).unwrap();
+    let step_resource_slots = if lifetime == AllocationLifetime::Step {
+        if share_step_slot {
+            vec![serde_json::json!({
+                "kind": "ordered_single_fence_step_wave",
+                "resource_ids": resource_ids
+            })]
+        } else {
+            resource_ids
+                .iter()
+                .map(|resource_id| {
+                    serde_json::json!({
+                        "kind": "dedicated",
+                        "resource_ids": [resource_id]
+                    })
+                })
+                .collect::<Vec<_>>()
+        }
+    } else {
+        Vec::new()
+    };
     let pool: DynamicBackingPoolSpec = serde_json::from_value(json!({
             "pool_id": pool_id_text,
             "compatibility": compatibility,
@@ -405,6 +453,7 @@ fn pool_catalog(
             "minimum_sequence_bytes": if lifetime == AllocationLifetime::Sequence { minimum } else { 0 },
             "minimum_step_bytes": if lifetime == AllocationLifetime::Step { minimum } else { 0 },
             "minimum_invocation_peak_bytes": 0,
+            "step_resource_slots": step_resource_slots,
             "theoretical_ceiling_bytes": theoretical_ceiling.to_string(),
             "provisioning": {
                 "mode": "demand_driven_elastic",
@@ -421,6 +470,19 @@ fn pool_catalog(
         pool_id,
         profile,
     }
+}
+
+fn shared_step_activation_catalog(profile: DynamicStorageProfile) -> PoolCatalog {
+    pool_catalog_with_options(
+        profile,
+        AllocationLifetime::Step,
+        'c',
+        2,
+        256,
+        TestDemand::Tokens,
+        "activations",
+        true,
+    )
 }
 
 fn combine_catalogs(catalogs: &[PoolCatalog]) -> PoolCatalog {
@@ -584,13 +646,14 @@ fn shape(tokens: u64) -> DynamicResourceShape {
 }
 
 fn work(tokens: usize) -> ResourceWorkShape {
+    ResourceWorkShape::single(token_span(tokens)).unwrap()
+}
+
+fn token_span(tokens: usize) -> TokenSpanWork {
     let token_ids = (0..tokens)
         .map(|token| u32::try_from(token).unwrap())
         .collect::<Vec<_>>();
-    ResourceWorkShape::single(
-        TokenSpanWork::from_token_ids(&token_ids, 0..token_ids.len()).unwrap(),
-    )
-    .unwrap()
+    TokenSpanWork::from_token_ids(&token_ids, 0..token_ids.len()).unwrap()
 }
 
 fn request_admission() -> RequestResourceAdmissionRequest {
@@ -664,17 +727,33 @@ fn claim_size(
     pool: &Arc<DynamicBackingPool<TestRuntime>>,
     size_bytes: u64,
 ) -> LogicalBackingSliceAuthority {
-    let request = EvaluatedBackingRequest {
-        domain: &pool.domain,
-        descriptor: &pool.domain.descriptors[0],
-        size_bytes,
-    };
+    let request = evaluated_request(pool, size_bytes);
     let BackingPrepareDecision::Prepared(prepared) =
         pools.prepare_claim(std::slice::from_ref(&request)).unwrap()
     else {
         panic!("resident test pool must prepare its exact physical claim")
     };
     prepared.commit().pop().unwrap()
+}
+
+fn evaluated_request<'a>(
+    pool: &'a Arc<DynamicBackingPool<TestRuntime>>,
+    size_bytes: u64,
+) -> EvaluatedBackingRequest<'a> {
+    let descriptor = &pool.domain.descriptors[0];
+    EvaluatedBackingRequest {
+        domain: &pool.domain,
+        claim_identity: PhysicalBackingClaimIdentity::new(
+            pool.domain.pool_id().clone(),
+            vec![descriptor.base_resource_id().clone()],
+        )
+        .unwrap(),
+        size_bytes,
+        projections: vec![EvaluatedBackingProjection {
+            descriptor,
+            size_bytes,
+        }],
+    }
 }
 
 struct CleanupPressureTask {
@@ -1654,6 +1733,78 @@ fn scoped_demand_merges_per_pool_and_release_coalesces_extents() {
 }
 
 #[test]
+fn step_slot_projects_two_logical_activations_from_one_physical_extent() {
+    let catalog = shared_step_activation_catalog(linear_profile());
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let sequence = admitted_sequence(&harness.root, "shared-step-slot");
+    let session = sequence.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let request = StepResourceAdmissionRequest::new(
+        batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let step = match batch.try_begin_step(request).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("resident shared Step slot must admit"),
+    };
+
+    assert_eq!(
+        step.claimed_backing().demand().immediate_claim().entries()[0]
+            .units()
+            .get(),
+        64
+    );
+    assert_eq!(step.backing_slices().len(), 2);
+    assert_eq!(step.claimed_backing().physical_claim_count(), 1);
+    assert!(step.claimed_backing().has_shared_physical_claims());
+    let first = step.backing_slices()[0].evidence();
+    let second = step.backing_slices()[1].evidence();
+    assert_eq!(
+        first.physical_claim_identity(),
+        second.physical_claim_identity()
+    );
+    assert_eq!(first.physical_size_bytes(), 64);
+    assert_eq!(second.physical_size_bytes(), 64);
+    assert_eq!(first.segments(), second.segments());
+    assert_eq!(
+        harness
+            .root
+            .maintenance_controller
+            .status()
+            .unwrap()
+            .pools()[0]
+            .live_segments(),
+        1
+    );
+    let invocation = InvocationResourceAdmissionRequest::for_all_step_participants(
+        NodeId::new("node/shared-step-slot").unwrap(),
+        step.bind_all_invocation_work_shape(vec![token_span(1)])
+            .unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let error = match step.try_admit_invocation(invocation) {
+        Err(error) => error,
+        Ok(_) => panic!("single-node dispatch consumed a wave-only Step slot"),
+    };
+    assert!(error.to_string().contains("single-fence submission wave"));
+
+    step.try_retire_normal().unwrap();
+    let status = harness.root.maintenance_controller.status().unwrap();
+    assert_eq!(status.pools()[0].live_segments(), 0);
+    assert_eq!(status.pools()[0].free_bytes(), 64);
+}
+
+#[test]
 fn contiguous_profile_rejects_fragmented_cross_chunk_claim() {
     let catalog = pool_catalog(
         linear_profile(),
@@ -1675,13 +1826,12 @@ fn contiguous_profile_rejects_fragmented_cross_chunk_claim() {
     let last = claim_size(&harness.root.dynamic_pools, &pool, 64);
     drop(first);
     drop(last);
-    let request = EvaluatedBackingRequest {
-        domain: &pool.domain,
-        descriptor: &pool.domain.descriptors[0],
-        size_bytes: pool.domain.descriptors[0]
+    let request = evaluated_request(
+        &pool,
+        pool.domain.descriptors[0]
             .evaluate_request_bytes(&work(2))
             .unwrap(),
-    };
+    );
     let BackingPrepareDecision::Deferred(deferred) = harness
         .root
         .dynamic_pools
@@ -2084,16 +2234,8 @@ fn multi_pool_invalid_request_and_prepared_drop_have_zero_partial_claim() {
         .unwrap();
     let first = &harness.root.dynamic_pools.pools[&harness.pool_ids[0]];
     let second = &harness.root.dynamic_pools.pools[&harness.pool_ids[1]];
-    let valid = EvaluatedBackingRequest {
-        domain: &first.domain,
-        descriptor: &first.domain.descriptors[0],
-        size_bytes: 64,
-    };
-    let invalid = EvaluatedBackingRequest {
-        domain: &second.domain,
-        descriptor: &second.domain.descriptors[0],
-        size_bytes: 1,
-    };
+    let valid = evaluated_request(first, 64);
+    let invalid = evaluated_request(second, 1);
     assert!(harness
         .root
         .dynamic_pools
@@ -2110,11 +2252,7 @@ fn multi_pool_invalid_request_and_prepared_drop_have_zero_partial_claim() {
         .iter()
         .map(|pool_id| {
             let pool = &harness.root.dynamic_pools.pools[pool_id];
-            EvaluatedBackingRequest {
-                domain: &pool.domain,
-                descriptor: &pool.domain.descriptors[0],
-                size_bytes: 64,
-            }
+            evaluated_request(pool, 64)
         })
         .collect::<Vec<_>>();
     let BackingPrepareDecision::Prepared(prepared) = harness
@@ -2167,11 +2305,7 @@ fn nth_pool_allocator_fault_rolls_back_prior_pool_and_poison_closes_faulted_pool
         .iter()
         .map(|pool_id| {
             let pool = &harness.root.dynamic_pools.pools[pool_id];
-            EvaluatedBackingRequest {
-                domain: &pool.domain,
-                descriptor: &pool.domain.descriptors[0],
-                size_bytes: 64,
-            }
+            evaluated_request(pool, 64)
         })
         .collect::<Vec<_>>();
     assert!(harness.root.dynamic_pools.prepare_claim(&requests).is_err());

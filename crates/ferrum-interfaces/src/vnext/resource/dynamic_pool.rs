@@ -6,8 +6,8 @@ use super::{
     DynamicBackingPoolSpec, DynamicResourceDescriptor, DynamicStorageAllocator,
     DynamicStorageProfile, DynamicStorageView, ElementType, LogicalAdmissionCoordinator, Mutex,
     Ordering, PlanNode, ResourceId, ResourceReservation, ResourceRetentionPolicy,
-    ResourceTransactionIdentity, RunId, Serialize, StaticProvisioningBinding, TransactionId,
-    VNextError,
+    ResourceTransactionIdentity, RunId, Serialize, StaticProvisioningBinding, StepResourceSlotKind,
+    TransactionId, VNextError,
 };
 
 static NEXT_DYNAMIC_POOL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -134,6 +134,39 @@ impl BackingSegment {
     pub const fn length_bytes(&self) -> u64 {
         self.length_bytes
     }
+}
+
+fn backing_segment_prefix(
+    segments: &[BackingSegment],
+    size_bytes: u64,
+) -> Result<Vec<BackingSegment>, VNextError> {
+    if size_bytes == 0 {
+        return Err(invalid_resource(
+            "logical backing projection must have non-zero size",
+        ));
+    }
+    let mut remaining = size_bytes;
+    let mut prefix = Vec::new();
+    for segment in segments {
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(segment.length_bytes());
+        prefix.push(BackingSegment::from_chunk(
+            segment.pool_id(),
+            segment.chunk_ordinal(),
+            segment.chunk_generation(),
+            segment.offset_bytes(),
+            take,
+        )?);
+        remaining -= take;
+    }
+    if remaining != 0 {
+        return Err(invalid_resource(
+            "logical backing projection exceeds its physical extent",
+        ));
+    }
+    Ok(prefix)
 }
 
 pub(super) struct ResidentChunkBacking<B> {
@@ -507,8 +540,10 @@ trait BackingExtentOwner: Send + Sync {
 pub(super) struct BackingSegmentLease {
     owner: Arc<dyn BackingExtentOwner>,
     owner_instance_id: u64,
-    segment_generation: u64,
+    pub(super) claim_identity: PhysicalBackingClaimIdentity,
+    pub(super) segment_generation: u64,
     segments: Vec<BackingSegment>,
+    pub(super) size_bytes: u64,
     released: bool,
 }
 
@@ -1196,25 +1231,71 @@ struct AllocatedDynamicGrowth<B> {
     backing: Arc<ResidentChunkBacking<B>>,
 }
 
-pub(super) struct EvaluatedBackingRequest<'a> {
-    pub(super) domain: &'a DynamicPoolDomainSpec,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct PhysicalBackingClaimIdentity {
+    pool_id: DynamicBackingPoolId,
+    resource_ids: Vec<ResourceId>,
+}
+
+impl PhysicalBackingClaimIdentity {
+    pub(super) fn new(
+        pool_id: DynamicBackingPoolId,
+        mut resource_ids: Vec<ResourceId>,
+    ) -> Result<Self, VNextError> {
+        resource_ids.sort();
+        if resource_ids.is_empty() || resource_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(invalid_resource(
+                "physical backing claim identity requires unique logical resources",
+            ));
+        }
+        Ok(Self {
+            pool_id,
+            resource_ids,
+        })
+    }
+
+    pub fn pool_id(&self) -> &DynamicBackingPoolId {
+        &self.pool_id
+    }
+
+    pub fn resource_ids(&self) -> &[ResourceId] {
+        &self.resource_ids
+    }
+
+    pub const fn is_shared(&self) -> bool {
+        self.resource_ids.len() > 1
+    }
+}
+
+pub(super) struct EvaluatedBackingProjection<'a> {
     pub(super) descriptor: &'a DynamicResourceDescriptor,
     pub(super) size_bytes: u64,
 }
 
-struct PreparedBackingSlice<R>
+pub(super) struct EvaluatedBackingRequest<'a> {
+    pub(super) domain: &'a DynamicPoolDomainSpec,
+    pub(super) claim_identity: PhysicalBackingClaimIdentity,
+    pub(super) size_bytes: u64,
+    pub(super) projections: Vec<EvaluatedBackingProjection<'a>>,
+}
+
+struct PreparedBackingExtent<R>
 where
     R: DeviceRuntime,
 {
     pool: Arc<DynamicBackingPool<R>>,
-    evidence: LogicalBackingSliceEvidence,
+    claim_identity: PhysicalBackingClaimIdentity,
+    segment_generation: u64,
+    segments: Vec<BackingSegment>,
+    size_bytes: u64,
+    projections: Vec<LogicalBackingSliceEvidence>,
 }
 
 pub(super) struct PreparedBackingClaim<R>
 where
     R: DeviceRuntime,
 {
-    slices: Vec<PreparedBackingSlice<R>>,
+    extents: Vec<PreparedBackingExtent<R>>,
     committed: bool,
 }
 
@@ -1224,30 +1305,32 @@ where
 {
     fn empty() -> Self {
         Self {
-            slices: Vec::new(),
+            extents: Vec::new(),
             committed: false,
         }
     }
 
     pub(super) fn commit(mut self) -> Vec<LogicalBackingSliceAuthority> {
-        let slices = std::mem::take(&mut self.slices)
-            .into_iter()
-            .map(|slice| {
-                let owner: Arc<dyn BackingExtentOwner> = slice.pool;
-                let segment_generation = slice.evidence.segment_generation;
-                let segments = slice.evidence.segments.clone();
+        let mut slices = Vec::new();
+        for extent in std::mem::take(&mut self.extents) {
+            let owner: Arc<dyn BackingExtentOwner> = extent.pool;
+            let segment_lease = Arc::new(BackingSegmentLease {
+                owner_instance_id: owner.instance_id(),
+                owner,
+                claim_identity: extent.claim_identity,
+                segment_generation: extent.segment_generation,
+                segments: extent.segments,
+                size_bytes: extent.size_bytes,
+                released: false,
+            });
+            slices.extend(extent.projections.into_iter().map(|evidence| {
                 LogicalBackingSliceAuthority {
-                    evidence: slice.evidence,
-                    segment_lease: BackingSegmentLease {
-                        owner_instance_id: owner.instance_id(),
-                        owner,
-                        segment_generation,
-                        segments,
-                        released: false,
-                    },
+                    evidence,
+                    segment_lease: Arc::clone(&segment_lease),
                 }
-            })
-            .collect();
+            }));
+        }
+        slices.sort_by(|left, right| left.resource_id().cmp(right.resource_id()));
         self.committed = true;
         slices
     }
@@ -1261,8 +1344,8 @@ where
         if self.committed {
             return;
         }
-        for slice in self.slices.iter().rev() {
-            slice.pool.rollback_prepared(&slice.evidence.segments);
+        for extent in self.extents.iter().rev() {
+            extent.pool.rollback_prepared(&extent.segments);
         }
     }
 }
@@ -1295,9 +1378,11 @@ pub struct LogicalBackingSliceEvidence {
     pub(super) pool_id: DynamicBackingPoolId,
     pub(super) resource_id: ResourceId,
     pub(super) pool_instance_id: u64,
+    pub(super) physical_claim_identity: PhysicalBackingClaimIdentity,
     pub(super) segment_generation: u64,
     pub(super) segments: Vec<BackingSegment>,
     pub(super) size_bytes: u64,
+    pub(super) physical_size_bytes: u64,
     pub(super) alignment_bytes: u64,
     pub(super) usage: BufferUsage,
     pub(super) element_type: ElementType,
@@ -1325,12 +1410,20 @@ impl LogicalBackingSliceEvidence {
         self.segment_generation
     }
 
+    pub fn physical_claim_identity(&self) -> &PhysicalBackingClaimIdentity {
+        &self.physical_claim_identity
+    }
+
     pub fn segments(&self) -> &[BackingSegment] {
         &self.segments
     }
 
     pub const fn size_bytes(&self) -> u64 {
         self.size_bytes
+    }
+
+    pub const fn physical_size_bytes(&self) -> u64 {
+        self.physical_size_bytes
     }
 
     pub const fn alignment_bytes(&self) -> u64 {
@@ -1353,7 +1446,7 @@ impl LogicalBackingSliceEvidence {
 #[must_use = "a logical backing authority owns its physical arena extents"]
 pub struct LogicalBackingSliceAuthority {
     pub(super) evidence: LogicalBackingSliceEvidence,
-    pub(super) segment_lease: BackingSegmentLease,
+    pub(super) segment_lease: Arc<BackingSegmentLease>,
 }
 
 impl LogicalBackingSliceAuthority {
@@ -1809,11 +1902,15 @@ where
         }
         let mut groups = Vec::with_capacity(grouped.len());
         for (pool_id, mut requests) in grouped {
-            requests.sort_by(|left, right| {
-                left.descriptor
-                    .base_resource_id()
-                    .cmp(right.descriptor.base_resource_id())
-            });
+            requests.sort_by(|left, right| left.claim_identity.cmp(&right.claim_identity));
+            if requests
+                .windows(2)
+                .any(|pair| pair[0].claim_identity == pair[1].claim_identity)
+            {
+                return Err(invalid_resource(
+                    "dynamic backing reservation contains a duplicate physical claim",
+                ));
+            }
             let pool = self.pools.get(&pool_id).cloned().ok_or_else(|| {
                 invalid_resource("dynamic backing reservation references an unknown pool")
             })?;
@@ -1849,13 +1946,45 @@ where
             }
             let quantum = pool.allocation_quantum();
             for request in pool_requests {
+                let projection_ids = request
+                    .projections
+                    .iter()
+                    .map(|projection| projection.descriptor.base_resource_id().clone())
+                    .collect::<Vec<_>>();
+                let projection_maximum = request
+                    .projections
+                    .iter()
+                    .map(|projection| projection.size_bytes)
+                    .max();
                 if request.domain.pool_id() != pool.domain.pool_id()
-                    || request.descriptor.pool_id() != pool.domain.pool_id()
+                    || request.claim_identity.pool_id() != pool.domain.pool_id()
+                    || request.claim_identity.resource_ids() != projection_ids
+                    || request.projections.is_empty()
+                    || request.projections.windows(2).any(|pair| {
+                        pair[0].descriptor.base_resource_id()
+                            >= pair[1].descriptor.base_resource_id()
+                    })
+                    || request.projections.iter().any(|projection| {
+                        projection.descriptor.pool_id() != pool.domain.pool_id()
+                            || projection.size_bytes == 0
+                            || projection.size_bytes % quantum != 0
+                            || !request
+                                .domain
+                                .descriptors
+                                .iter()
+                                .any(|descriptor| descriptor == projection.descriptor)
+                    })
+                    || request.claim_identity.is_shared()
+                        && !pool.domain.pool.step_resource_slots().iter().any(|slot| {
+                            slot.kind() == StepResourceSlotKind::OrderedSingleFenceStepWave
+                                && slot.resource_ids() == request.claim_identity.resource_ids()
+                        })
                     || request.size_bytes == 0
                     || request.size_bytes % quantum != 0
+                    || projection_maximum != Some(request.size_bytes)
                 {
                     return Err(invalid_resource(
-                        "dynamic backing request violates its exact pool or allocation quantum",
+                        "dynamic backing request violates its physical claim, projection, pool, or allocation quantum",
                     ));
                 }
             }
@@ -1932,6 +2061,17 @@ where
             }
         }
 
+        for group_selections in &selections {
+            for (request, _, segments) in group_selections {
+                for projection in &request.projections {
+                    if let Err(error) = backing_segment_prefix(segments, projection.size_bytes) {
+                        rollback_free_extent_journal(&mut states, &journals)?;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
         let increments = match (0..groups.len())
             .map(|group_index| {
                 let mut increments = BTreeMap::<u32, u64>::new();
@@ -1974,34 +2114,42 @@ where
             }
         }
         drop(states);
-        let slices = groups
-            .into_iter()
-            .zip(selections)
-            .flat_map(|((pool, _), selections)| {
-                selections
-                    .into_iter()
-                    .map(
-                        move |(request, segment_generation, segments)| PreparedBackingSlice {
-                            pool: Arc::clone(&pool),
-                            evidence: LogicalBackingSliceEvidence {
-                                domain_id: pool.domain.domain_id,
-                                pool_id: pool.domain.pool_id().clone(),
-                                resource_id: request.descriptor.base_resource_id().clone(),
-                                pool_instance_id: pool.instance_id,
-                                segment_generation,
-                                segments,
-                                size_bytes: request.size_bytes,
-                                alignment_bytes: request.descriptor.alignment_bytes(),
-                                usage: request.descriptor.usage(),
-                                element_type: request.descriptor.element_type(),
-                                storage_profile: pool.domain.pool.compatibility().profile(),
-                            },
-                        },
-                    )
-            })
-            .collect();
+        let mut extents = Vec::new();
+        for ((pool, _), selections) in groups.into_iter().zip(selections) {
+            for (request, segment_generation, segments) in selections {
+                let projections = request
+                    .projections
+                    .iter()
+                    .map(|projection| {
+                        Ok(LogicalBackingSliceEvidence {
+                            domain_id: pool.domain.domain_id,
+                            pool_id: pool.domain.pool_id().clone(),
+                            resource_id: projection.descriptor.base_resource_id().clone(),
+                            pool_instance_id: pool.instance_id,
+                            physical_claim_identity: request.claim_identity.clone(),
+                            segment_generation,
+                            segments: backing_segment_prefix(&segments, projection.size_bytes)?,
+                            size_bytes: projection.size_bytes,
+                            physical_size_bytes: request.size_bytes,
+                            alignment_bytes: projection.descriptor.alignment_bytes(),
+                            usage: projection.descriptor.usage(),
+                            element_type: projection.descriptor.element_type(),
+                            storage_profile: pool.domain.pool.compatibility().profile(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, VNextError>>()?;
+                extents.push(PreparedBackingExtent {
+                    pool: Arc::clone(&pool),
+                    claim_identity: request.claim_identity.clone(),
+                    segment_generation,
+                    segments,
+                    size_bytes: request.size_bytes,
+                    projections,
+                });
+            }
+        }
         Ok(BackingPrepareDecision::Prepared(PreparedBackingClaim {
-            slices,
+            extents,
             committed: false,
         }))
     }
@@ -2017,10 +2165,31 @@ where
         if pool.instance_id != authority.evidence.pool_instance_id
             || authority.segment_lease.owner_instance_id != pool.instance_id
             || authority.segment_lease.owner.instance_id() != pool.instance_id
+            || authority.segment_lease.claim_identity != authority.evidence.physical_claim_identity
             || authority.segment_lease.segment_generation != authority.evidence.segment_generation
+            || authority.segment_lease.size_bytes != authority.evidence.physical_size_bytes
+            || authority.evidence.domain_id != pool.domain.domain_id
+            || authority.evidence.physical_claim_identity.pool_id() != pool.domain.pool_id()
+            || authority
+                .evidence
+                .physical_claim_identity
+                .resource_ids()
+                .binary_search(&authority.evidence.resource_id)
+                .is_err()
+            || authority.evidence.size_bytes > authority.evidence.physical_size_bytes
+            || authority.evidence.storage_profile != pool.domain.pool.compatibility().profile()
         {
             return Err(invalid_resource(
                 "logical backing authority belongs to another dynamic pool instance",
+            ));
+        }
+        let expected_projection = backing_segment_prefix(
+            &authority.segment_lease.segments,
+            authority.evidence.size_bytes,
+        )?;
+        if expected_projection != authority.evidence.segments {
+            return Err(invalid_resource(
+                "logical backing projection differs from its shared physical extent",
             ));
         }
         let state = pool

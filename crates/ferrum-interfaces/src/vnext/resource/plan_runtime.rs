@@ -8,11 +8,12 @@ use super::{
     DeferredDeviceCleanupMaintenanceReceipt, DeferredDeviceCleanupStatus, DeviceCapacityClaim,
     DeviceId, DeviceRuntime, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
     DynamicPoolMaintenanceController, DynamicPoolSet, DynamicResourceShape,
-    EvaluatedBackingRequest, FailureEnvelope, LogicalAdmissionCoordinator,
-    LogicalAdmissionCoordinatorId, Mutex, NoStatic, NodeId, Ordering, PlanHash, PlanId, PlanNode,
-    ResourceAbandonSignal, ResourceActionCursor, ResourceDriverFailure,
-    ResourceLedgerEntrySnapshot, ResourceOwnershipReason, ResourceOwnershipTransferFailure,
-    ResourcePoolIdentity, ResourcePoolOwnership, ResourceReservation, ResourceReservationBatch,
+    EvaluatedBackingProjection, EvaluatedBackingRequest, FailureEnvelope,
+    LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex, NoStatic, NodeId, Ordering,
+    PhysicalBackingClaimIdentity, PlanHash, PlanId, PlanNode, ResourceAbandonSignal,
+    ResourceActionCursor, ResourceDriverFailure, ResourceLedgerEntrySnapshot,
+    ResourceOwnershipReason, ResourceOwnershipTransferFailure, ResourcePoolIdentity,
+    ResourcePoolOwnership, ResourceReservation, ResourceReservationBatch,
     ResourceTransactionAction, ResourceTransactionContext, ResourceTransactionDriver,
     ResourceTransactionIdentity, ResourceTransactionState, RwLock, RwLockReadGuard, Serialize,
     StaticProvisioningBinding, StaticProvisioningLease, VNextError,
@@ -875,30 +876,89 @@ where
             let mut immediate_pool_bytes = 0_u64;
             let mut fit_pool_bytes = 0_u64;
             let mut matched = false;
-            for descriptor in &domain.descriptors {
-                if descriptor.lifetime() != lifetime
-                    || node_resources
-                        .is_some_and(|resources| !resources.contains(descriptor.base_resource_id()))
-                {
-                    continue;
+            if lifetime == AllocationLifetime::Step {
+                for slot in domain.pool.step_resource_slots() {
+                    let mut projections = Vec::with_capacity(slot.resource_ids().len());
+                    let mut immediate_slot_bytes = 0_u64;
+                    let mut fit_slot_bytes = 0_u64;
+                    for resource_id in slot.resource_ids() {
+                        let descriptor = domain
+                            .descriptors
+                            .iter()
+                            .find(|descriptor| descriptor.base_resource_id() == resource_id)
+                            .ok_or_else(|| {
+                                invalid_resource(
+                                    "step physical slot references a descriptor outside its pool",
+                                )
+                            })?;
+                        if descriptor.lifetime() != AllocationLifetime::Step {
+                            return Err(invalid_resource(
+                                "step physical slot references a non-Step descriptor",
+                            ));
+                        }
+                        let size_bytes =
+                            descriptor.evaluate_request_bytes_for_shape(immediate_shape)?;
+                        let fit_bytes = descriptor.evaluate_request_bytes_for_shape(fit_shape)?;
+                        immediate_slot_bytes = immediate_slot_bytes.max(size_bytes);
+                        fit_slot_bytes = fit_slot_bytes.max(fit_bytes);
+                        projections.push(EvaluatedBackingProjection {
+                            descriptor,
+                            size_bytes,
+                        });
+                    }
+                    immediate_pool_bytes = immediate_pool_bytes
+                        .checked_add(immediate_slot_bytes)
+                        .ok_or_else(|| {
+                        invalid_resource("dynamic pool immediate demand overflows u64")
+                    })?;
+                    fit_pool_bytes = fit_pool_bytes
+                        .checked_add(fit_slot_bytes)
+                        .ok_or_else(|| invalid_resource("dynamic pool fit demand overflows u64"))?;
+                    requested_slices.push(EvaluatedBackingRequest {
+                        domain,
+                        claim_identity: PhysicalBackingClaimIdentity::new(
+                            domain.pool_id().clone(),
+                            slot.resource_ids().to_vec(),
+                        )?,
+                        size_bytes: immediate_slot_bytes,
+                        projections,
+                    });
+                    matched = true;
                 }
-                matched = true;
-                let size_bytes = descriptor.evaluate_request_bytes_for_shape(immediate_shape)?;
-                let fit_bytes = descriptor.evaluate_request_bytes_for_shape(fit_shape)?;
-                immediate_pool_bytes =
-                    immediate_pool_bytes
+            } else {
+                for descriptor in &domain.descriptors {
+                    if descriptor.lifetime() != lifetime
+                        || node_resources.is_some_and(|resources| {
+                            !resources.contains(descriptor.base_resource_id())
+                        })
+                    {
+                        continue;
+                    }
+                    matched = true;
+                    let size_bytes =
+                        descriptor.evaluate_request_bytes_for_shape(immediate_shape)?;
+                    let fit_bytes = descriptor.evaluate_request_bytes_for_shape(fit_shape)?;
+                    immediate_pool_bytes = immediate_pool_bytes
                         .checked_add(size_bytes)
                         .ok_or_else(|| {
                             invalid_resource("dynamic pool immediate demand overflows u64")
                         })?;
-                fit_pool_bytes = fit_pool_bytes
-                    .checked_add(fit_bytes)
-                    .ok_or_else(|| invalid_resource("dynamic pool fit demand overflows u64"))?;
-                requested_slices.push(EvaluatedBackingRequest {
-                    domain,
-                    descriptor,
-                    size_bytes,
-                });
+                    fit_pool_bytes = fit_pool_bytes
+                        .checked_add(fit_bytes)
+                        .ok_or_else(|| invalid_resource("dynamic pool fit demand overflows u64"))?;
+                    requested_slices.push(EvaluatedBackingRequest {
+                        domain,
+                        claim_identity: PhysicalBackingClaimIdentity::new(
+                            domain.pool_id().clone(),
+                            vec![descriptor.base_resource_id().clone()],
+                        )?,
+                        size_bytes,
+                        projections: vec![EvaluatedBackingProjection {
+                            descriptor,
+                            size_bytes,
+                        }],
+                    });
+                }
             }
             if matched {
                 immediate_entries.push(CapacityEntry::new(

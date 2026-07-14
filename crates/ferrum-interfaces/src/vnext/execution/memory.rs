@@ -3,10 +3,11 @@ use super::{
     static_contiguous_storage_profile, validate_active_sequence_ceiling,
     validate_pool_liveness_rows, workspace_storage_layout_fingerprint, AllocationKind,
     AllocationLifetime, BTreeMap, BTreeSet, BufferRequest, BufferUsage, CanonicalU128, Deserialize,
-    Deserializer, DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicResourceDescriptor,
-    ElementType, InvocationLivenessMode, InvocationResourceLiveness, NodeId, PlanNode,
-    PoolAggregateEvidence, PoolCompatibilityKey, ResourceAllocation, ResourceId, Serialize,
-    VNextError, MAX_EXECUTION_PLAN_RESOURCE_ROWS,
+    Deserializer, DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicResourceDemand,
+    DynamicResourceDescriptor, ElementType, InvocationLivenessMode, InvocationResourceLiveness,
+    NodeId, PlanNode, PoolAggregateEvidence, PoolCompatibilityKey, ResourceAllocation, ResourceId,
+    Serialize, StepResourceSlot, StepResourceSlotKind, VNextError,
+    MAX_EXECUTION_PLAN_RESOURCE_ROWS,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -342,9 +343,11 @@ impl MemoryPlan {
                     AllocationLifetime::Sequence,
                     "pool sequence minimum",
                 )?;
-                let minimum_step_bytes = minimum_for_lifetime(
+                let step_resource_slots = Self::derive_pool_step_slots(nodes, &descriptors)?;
+                let minimum_step_bytes = Self::step_slot_bytes(
+                    &step_resource_slots,
                     &descriptors,
-                    AllocationLifetime::Step,
+                    false,
                     "pool step minimum",
                 )?;
                 let theoretical_ceiling_bytes =
@@ -367,6 +370,7 @@ impl MemoryPlan {
                     minimum_sequence_bytes,
                     minimum_step_bytes,
                     invocation_peak,
+                    step_resource_slots,
                     theoretical_ceiling_bytes,
                     dynamic_capacity_bytes,
                     invocation_liveness_mode,
@@ -374,6 +378,167 @@ impl MemoryPlan {
                 )
             })
             .collect()
+    }
+
+    pub(super) fn derive_pool_step_slots(
+        nodes: &[PlanNode],
+        descriptors: &[&DynamicResourceDescriptor],
+    ) -> Result<Vec<StepResourceSlot>, VNextError> {
+        struct Interval<'a> {
+            resource_id: &'a ResourceId,
+            first_user: usize,
+            last_user: usize,
+            reusable: bool,
+        }
+
+        let nodes_by_id = nodes
+            .iter()
+            .map(|node| (node.id.clone(), node))
+            .collect::<BTreeMap<_, _>>();
+        let mut intervals = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.lifetime == AllocationLifetime::Step)
+            .map(|descriptor| {
+                let users = nodes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, node)| {
+                        node.resources
+                            .contains(&descriptor.base_resource_id)
+                            .then_some(index)
+                    })
+                    .collect::<Vec<_>>();
+                let first_user = users.first().copied().ok_or_else(|| {
+                    invalid_plan(format!(
+                        "step resource `{}` is not referenced by a plan node",
+                        descriptor.base_resource_id
+                    ))
+                })?;
+                let last_user = users.last().copied().ok_or_else(|| {
+                    invalid_plan(format!(
+                        "step resource `{}` is not referenced by a plan node",
+                        descriptor.base_resource_id
+                    ))
+                })?;
+                Ok(Interval {
+                    resource_id: &descriptor.base_resource_id,
+                    first_user,
+                    last_user,
+                    reusable: Self::is_reusable_step_activation(descriptor),
+                })
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        intervals.sort_by(|left, right| {
+            (left.first_user, left.last_user, left.resource_id).cmp(&(
+                right.first_user,
+                right.last_user,
+                right.resource_id,
+            ))
+        });
+
+        let ordered_without_overlap = |left: &Interval<'_>, right: &Interval<'_>| {
+            let left_before = left.last_user < right.first_user
+                && node_completion_precedes(
+                    &nodes_by_id,
+                    &nodes[left.last_user].id,
+                    &nodes[right.first_user].id,
+                )?;
+            let right_before = right.last_user < left.first_user
+                && node_completion_precedes(
+                    &nodes_by_id,
+                    &nodes[right.last_user].id,
+                    &nodes[left.first_user].id,
+                )?;
+            Ok::<bool, VNextError>(left_before || right_before)
+        };
+
+        let mut slots = Vec::<Vec<Interval<'_>>>::new();
+        for interval in intervals {
+            if !interval.reusable {
+                slots.push(vec![interval]);
+                continue;
+            }
+            let mut reusable_slot = None;
+            for (index, slot) in slots.iter().enumerate() {
+                let mut reusable = slot.iter().all(|member| member.reusable);
+                if reusable {
+                    for member in slot {
+                        reusable = ordered_without_overlap(member, &interval)?;
+                        if !reusable {
+                            break;
+                        }
+                    }
+                }
+                if reusable {
+                    reusable_slot = Some(index);
+                    break;
+                }
+            }
+            if let Some(index) = reusable_slot {
+                slots[index].push(interval);
+            } else {
+                slots.push(vec![interval]);
+            }
+        }
+        let mut slots = slots
+            .into_iter()
+            .map(|slot| {
+                let resource_ids = slot
+                    .into_iter()
+                    .map(|interval| interval.resource_id.clone())
+                    .collect::<Vec<_>>();
+                if resource_ids.len() == 1 {
+                    Ok(StepResourceSlot::dedicated(
+                        resource_ids
+                            .into_iter()
+                            .next()
+                            .expect("single resource slot"),
+                    ))
+                } else {
+                    StepResourceSlot::ordered_single_fence_wave(resource_ids)
+                }
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        slots.sort_by(|left, right| left.resource_ids.cmp(&right.resource_ids));
+        Ok(slots)
+    }
+
+    fn is_reusable_step_activation(descriptor: &DynamicResourceDescriptor) -> bool {
+        descriptor.lifetime == AllocationLifetime::Step
+            && descriptor.usage == BufferUsage::Activations
+            && matches!(descriptor.kind, AllocationKind::Value)
+            && matches!(descriptor.demand, DynamicResourceDemand::Tokens { .. })
+    }
+
+    fn step_slot_bytes(
+        slots: &[StepResourceSlot],
+        descriptors: &[&DynamicResourceDescriptor],
+        theoretical: bool,
+        overflow_context: &str,
+    ) -> Result<u64, VNextError> {
+        let descriptors = descriptors
+            .iter()
+            .map(|descriptor| (descriptor.base_resource_id.clone(), *descriptor))
+            .collect::<BTreeMap<_, _>>();
+        slots.iter().try_fold(0_u64, |total, slot| {
+            let slot_bytes = slot
+                .resource_ids
+                .iter()
+                .try_fold(0_u64, |maximum, resource_id| {
+                    let descriptor = descriptors.get(resource_id).ok_or_else(|| {
+                        invalid_plan("step slot references a missing dynamic descriptor")
+                    })?;
+                    let bytes = if theoretical {
+                        descriptor.theoretical_maximum_request_bytes()?
+                    } else {
+                        descriptor.minimum_request_bytes()?
+                    };
+                    Ok::<u64, VNextError>(maximum.max(bytes))
+                })?;
+            total
+                .checked_add(slot_bytes)
+                .ok_or_else(|| invalid_plan(format!("{overflow_context} overflows u64")))
+        })
     }
 
     pub(super) fn derive_pool_invocation_liveness(
@@ -544,8 +709,41 @@ impl MemoryPlan {
                 AllocationLifetime::Sequence,
                 "pool sequence minimum",
             )?;
-            let step =
-                minimum_for_lifetime(&members, AllocationLifetime::Step, "pool step minimum")?;
+            let expected_step_resources = members
+                .iter()
+                .filter(|descriptor| descriptor.lifetime == AllocationLifetime::Step)
+                .map(|descriptor| descriptor.base_resource_id.clone())
+                .collect::<BTreeSet<_>>();
+            let actual_step_resources = pool
+                .step_resource_slots
+                .iter()
+                .flat_map(|slot| slot.resource_ids.iter().cloned())
+                .collect::<BTreeSet<_>>();
+            if actual_step_resources != expected_step_resources {
+                return Err(invalid_plan(
+                    "step resource slots do not cover exactly the pool's Step descriptors",
+                ));
+            }
+            for slot in &pool.step_resource_slots {
+                slot.validate()?;
+                if slot.kind == StepResourceSlotKind::OrderedSingleFenceStepWave
+                    && slot.resource_ids.iter().any(|resource_id| {
+                        descriptors
+                            .get(resource_id)
+                            .is_none_or(|descriptor| !Self::is_reusable_step_activation(descriptor))
+                    })
+                {
+                    return Err(invalid_plan(
+                        "shared Step slot contains a non-transient activation resource",
+                    ));
+                }
+            }
+            let step = Self::step_slot_bytes(
+                &pool.step_resource_slots,
+                &members,
+                false,
+                "pool step minimum",
+            )?;
             let theoretical = members.iter().try_fold(0_u128, |total, descriptor| {
                 total
                     .checked_add(

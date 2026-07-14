@@ -1,9 +1,9 @@
 use super::{
     canonical_fingerprint, invalid_plan, is_canonical_sha256, quantize_storage_bytes,
-    validate_active_sequence_ceiling, AllocationKind, AllocationLifetime, BlockedTensorPadding,
-    BufferUsage, ContractVersion, Deserialize, Deserializer, DynamicResourceDemand,
-    DynamicResourceShape, DynamicStorageProfile, ElementType, NodeId, ResolvedTensorLayout,
-    ResourceId, ResourceWorkShape, Serialize, VNextError,
+    validate_active_sequence_ceiling, AllocationKind, AllocationLifetime, BTreeSet,
+    BlockedTensorPadding, BufferUsage, ContractVersion, Deserialize, Deserializer,
+    DynamicResourceDemand, DynamicResourceShape, DynamicStorageProfile, ElementType, NodeId,
+    ResolvedTensorLayout, ResourceId, ResourceWorkShape, Serialize, VNextError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -322,6 +322,7 @@ pub struct DynamicBackingPoolSpec {
     pub(super) minimum_sequence_bytes: u64,
     pub(super) minimum_step_bytes: u64,
     pub(super) minimum_invocation_peak_bytes: u64,
+    pub(super) step_resource_slots: Vec<StepResourceSlot>,
     pub(super) theoretical_ceiling_bytes: CanonicalU128,
     pub(super) provisioning: DynamicPoolProvisioningPolicy,
     pub(super) invocation_liveness_mode: InvocationLivenessMode,
@@ -337,6 +338,7 @@ impl DynamicBackingPoolSpec {
         minimum_sequence_bytes: u64,
         minimum_step_bytes: u64,
         minimum_invocation_peak_bytes: u64,
+        step_resource_slots: Vec<StepResourceSlot>,
         theoretical_ceiling_bytes: u128,
         dynamic_capacity_bytes: u64,
         invocation_liveness_mode: InvocationLivenessMode,
@@ -360,6 +362,7 @@ impl DynamicBackingPoolSpec {
             minimum_sequence_bytes,
             minimum_step_bytes,
             minimum_invocation_peak_bytes,
+            step_resource_slots,
             theoretical_ceiling_bytes: CanonicalU128::new(theoretical_ceiling_bytes),
             provisioning: DynamicPoolProvisioningPolicy::demand_driven(
                 minimum_resident_bytes,
@@ -376,6 +379,9 @@ impl DynamicBackingPoolSpec {
         self.pool_id.validate()?;
         self.compatibility.validate()?;
         self.provisioning.validate()?;
+        for slot in &self.step_resource_slots {
+            slot.validate()?;
+        }
         let minimum_resident_bytes = self
             .minimum_request_bytes
             .checked_add(self.minimum_sequence_bytes)
@@ -388,6 +394,21 @@ impl DynamicBackingPoolSpec {
             || minimum_resident_bytes != self.provisioning.minimum_resident_bytes
             || u128::from(self.provisioning.maximum_resident_bytes)
                 > self.theoretical_ceiling_bytes.get()
+            || self
+                .step_resource_slots
+                .windows(2)
+                .any(|pair| pair[0].resource_ids >= pair[1].resource_ids)
+            || self
+                .step_resource_slots
+                .iter()
+                .flat_map(|slot| slot.resource_ids.iter())
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self
+                    .step_resource_slots
+                    .iter()
+                    .map(|slot| slot.resource_ids.len())
+                    .sum::<usize>()
         {
             return Err(invalid_plan(
                 "dynamic backing pool identity, membership, or bounds are invalid",
@@ -447,6 +468,10 @@ impl DynamicBackingPoolSpec {
         self.minimum_invocation_peak_bytes
     }
 
+    pub fn step_resource_slots(&self) -> &[StepResourceSlot] {
+        &self.step_resource_slots
+    }
+
     pub fn theoretical_ceiling_bytes(&self) -> u128 {
         self.theoretical_ceiling_bytes.get()
     }
@@ -474,6 +499,7 @@ pub(super) struct DynamicBackingPoolSpecWire {
     pub(super) minimum_sequence_bytes: u64,
     pub(super) minimum_step_bytes: u64,
     pub(super) minimum_invocation_peak_bytes: u64,
+    pub(super) step_resource_slots: Vec<StepResourceSlot>,
     pub(super) theoretical_ceiling_bytes: CanonicalU128,
     pub(super) provisioning: DynamicPoolProvisioningPolicy,
     pub(super) invocation_liveness_mode: InvocationLivenessMode,
@@ -494,6 +520,7 @@ impl<'de> Deserialize<'de> for DynamicBackingPoolSpec {
             minimum_sequence_bytes: wire.minimum_sequence_bytes,
             minimum_step_bytes: wire.minimum_step_bytes,
             minimum_invocation_peak_bytes: wire.minimum_invocation_peak_bytes,
+            step_resource_slots: wire.step_resource_slots,
             theoretical_ceiling_bytes: wire.theoretical_ceiling_bytes,
             provisioning: wire.provisioning,
             invocation_liveness_mode: wire.invocation_liveness_mode,
@@ -757,7 +784,7 @@ impl<'de> Deserialize<'de> for CanonicalU128 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InvocationLivenessMode {
     NoInvocationResources,
@@ -768,6 +795,73 @@ pub enum InvocationLivenessMode {
     /// The plan cannot prove that every invocation row completes before the
     /// next one starts. The runnable minimum therefore sums member resources.
     ConservativeConcurrent,
+}
+
+/// A set of Step-scoped logical resources that may project onto one physical
+/// extent. Multi-resource slots are emitted only when plan dependencies prove
+/// that every member's final user completes before the next member starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StepResourceSlot {
+    pub(super) kind: StepResourceSlotKind,
+    pub(super) resource_ids: Vec<ResourceId>,
+}
+
+impl StepResourceSlot {
+    pub(super) fn dedicated(resource_id: ResourceId) -> Self {
+        Self {
+            kind: StepResourceSlotKind::Dedicated,
+            resource_ids: vec![resource_id],
+        }
+    }
+
+    pub(super) fn ordered_single_fence_wave(
+        mut resource_ids: Vec<ResourceId>,
+    ) -> Result<Self, VNextError> {
+        resource_ids.sort();
+        if resource_ids.len() < 2 || resource_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(invalid_plan(
+                "ordered single-fence step slot requires at least two unique resources",
+            ));
+        }
+        Ok(Self {
+            kind: StepResourceSlotKind::OrderedSingleFenceStepWave,
+            resource_ids,
+        })
+    }
+
+    pub(super) fn validate(&self) -> Result<(), VNextError> {
+        if self.resource_ids.is_empty()
+            || self.resource_ids.windows(2).any(|pair| pair[0] >= pair[1])
+            || match self.kind {
+                StepResourceSlotKind::Dedicated => self.resource_ids.len() != 1,
+                StepResourceSlotKind::OrderedSingleFenceStepWave => self.resource_ids.len() < 2,
+            }
+        {
+            return Err(invalid_plan(
+                "step resource slot kind or members are invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    pub const fn kind(&self) -> StepResourceSlotKind {
+        self.kind
+    }
+
+    pub fn resource_ids(&self) -> &[ResourceId] {
+        &self.resource_ids
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepResourceSlotKind {
+    Dedicated,
+    /// Every member is an internal activation and the runtime must submit the
+    /// canonical plan order as one ordered command batch with one terminal
+    /// fence before it may consume this reuse proof.
+    OrderedSingleFenceStepWave,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
