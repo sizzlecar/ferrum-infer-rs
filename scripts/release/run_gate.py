@@ -349,7 +349,25 @@ VNEXT_G01A_RESOURCE_PROOF_LINES = {
     ),
     "vnext_resource_runtime_close_tests": (),
 }
-VNEXT_G01A_REQUIRED_EVENT_TESTS = {"vnext_event_replay_v5_contract"}
+VNEXT_G01A_REQUIRED_EVENT_TESTS_BY_TARGET = {
+    "vnext_event_execution_contract_tests": {"vnext_event_execution_contract"},
+    "vnext_event_sink_contract_tests": {"vnext_event_sink_contract"},
+    "vnext_event_resource_pool_contract_tests": {
+        "vnext_event_resource_pool_contract"
+    },
+    "vnext_event_recovery_contract_tests": {"vnext_event_recovery_contract"},
+    "vnext_event_replay_contract_tests": {"vnext_event_replay_contract"},
+}
+VNEXT_G01A_EVENT_PROOF_LINES = {
+    "vnext_event_execution_contract_tests": ("VNEXT EVENT EXECUTION PASS", 54),
+    "vnext_event_sink_contract_tests": ("VNEXT EVENT SINK PASS", 13),
+    "vnext_event_resource_pool_contract_tests": (
+        "VNEXT EVENT RESOURCE POOL PASS",
+        27,
+    ),
+    "vnext_event_recovery_contract_tests": ("VNEXT EVENT RECOVERY PASS", 20),
+    "vnext_event_replay_contract_tests": ("VNEXT EVENT REPLAY PASS", 47),
+}
 VNEXT_G01A_REQUIRED_RESOLUTION_LIMITS_TESTS = {
     "field_path_count_and_total_bytes_are_bounded_before_parser",
     "json_parser_checks_source_bytes_when_called_directly",
@@ -392,7 +410,7 @@ VNEXT_G01A_REQUIRED_LEGACY_TESTS = {"legacy_backend_methods_are_mapped_82_of_82"
 VNEXT_G01A_REQUIRED_TESTS_BY_TARGET = {
     "vnext_contract_tests": VNEXT_G01A_REQUIRED_UNIT_TESTS,
     **VNEXT_G01A_REQUIRED_RESOURCE_TESTS_BY_TARGET,
-    "vnext_event_contract_tests": VNEXT_G01A_REQUIRED_EVENT_TESTS,
+    **VNEXT_G01A_REQUIRED_EVENT_TESTS_BY_TARGET,
     "vnext_resolution_limits_contract_tests": VNEXT_G01A_REQUIRED_RESOLUTION_LIMITS_TESTS,
     "vnext_device_operation_contract_tests": VNEXT_G01A_REQUIRED_DEVICE_OPERATION_TESTS,
     "vnext_oracle_contract_tests": VNEXT_G01A_REQUIRED_ORACLE_TESTS,
@@ -469,7 +487,7 @@ VNEXT_G01A_EXPECTED_TRYBUILD_PASS_CASES = 2
 VNEXT_G01A_EXPECTED_TRYBUILD_FAIL_CASES = 78
 VNEXT_G01A_TEST_THREADS_ARG = "--test-threads=1"
 VNEXT_G01A_BOUNDED_RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
-VNEXT_G01A_BOUNDED_TEST_COMMAND_COUNT = 32
+VNEXT_G01A_BOUNDED_TEST_COMMAND_COUNT = 40
 VNEXT_G01A_BOUNDED_TEST_ENV_OVERRIDES = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "CARGO_BUILD_JOBS": "2",
@@ -3319,6 +3337,29 @@ def validate_vnext_g01a_provenance(
         resource_total == assertions["resource_transaction_cases"],
         "vnext-g01a resource proof total/assertion mismatch",
     )
+    event_total = 0
+    for target, (prefix, expected) in VNEXT_G01A_EVENT_PROOF_LINES.items():
+        proof_stdout = command_outputs[test_command(target, "--nocapture")].splitlines()
+        pattern = re.compile(
+            rf"^{re.escape(prefix)}: ([1-9][0-9]*)/([1-9][0-9]*)$"
+        )
+        matches = [
+            match for line in proof_stdout if (match := pattern.fullmatch(line))
+        ]
+        require_gate(
+            len(matches) == 1,
+            f"vnext-g01a missing or duplicate event machine proof: {target} {prefix}",
+        )
+        passed, total = (int(value) for value in matches[0].groups())
+        require_gate(
+            passed == total == expected,
+            f"vnext-g01a event proof mismatch: {target} {prefix}",
+        )
+        event_total += total
+    require_gate(
+        event_total == assertions["event_replay_v5_contract_cases"],
+        "vnext-g01a event proof total/assertion mismatch",
+    )
     for assertion_key, target, prefix in (
         (
             "fail_closed_cases",
@@ -3329,11 +3370,6 @@ def validate_vnext_g01a_provenance(
             "model_identity_cases",
             "vnext_contract_tests",
             "VNEXT MODEL IDENTITY PASS",
-        ),
-        (
-            "event_replay_v5_contract_cases",
-            "vnext_event_contract_tests",
-            "VNEXT EVENT/REPLAY V5 PASS",
         ),
         (
             "device_operation_contract_cases",
@@ -5638,6 +5674,10 @@ def self_test() -> int:
         == VNEXT_G01A_REQUIRED_RESOURCE_TESTS_BY_TARGET
         and g01a_checkpoint["RESOURCE_PROOF_LINES"]
         == VNEXT_G01A_RESOURCE_PROOF_LINES
+        and g01a_checkpoint["REQUIRED_EVENT_TESTS_BY_TARGET"]
+        == VNEXT_G01A_REQUIRED_EVENT_TESTS_BY_TARGET
+        and g01a_checkpoint["EVENT_PROOF_LINES"]
+        == VNEXT_G01A_EVENT_PROOF_LINES
         and len(g01a_checkpoint["evidence_command_matrix"]())
         == len(VNEXT_G01A_QUALITY_COMMANDS) + VNEXT_G01A_BOUNDED_TEST_COMMAND_COUNT,
         "vnext-g01a checkpoint/run_gate command matrix drift",
@@ -5680,8 +5720,11 @@ def self_test() -> int:
             VNEXT_G01A_RESOURCE_PANIC_ISOLATION_TARGET
         )
         == [("1", "0", "0", "1"), ("2", "0", "0", "0")]
-        and vnext_g01a_expected_test_summaries("vnext_event_contract_tests")
-        == [("1", "0", "0", "0")],
+        and all(
+            vnext_g01a_expected_test_summaries(target)
+            == [("1", "0", "0", "0")]
+            for target in VNEXT_G01A_REQUIRED_EVENT_TESTS_BY_TARGET
+        ),
         "vnext-g01a outer validator test summary policy drift",
     )
     for checkpoint_name, outer_value in (
