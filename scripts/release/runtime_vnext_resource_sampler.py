@@ -19,17 +19,31 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.error
 import urllib.request
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 COLLECTOR_RELATIVE_PATH = "scripts/release/runtime_vnext_resource_sampler.py"
 PASS_PREFIX = "FERRUM RUNTIME VNEXT RESOURCE SAMPLER PASS"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT RESOURCE SAMPLER SELFTEST PASS"
+ACTIVE_PROBE_TIMEOUT_MS = 400
+ACTIVE_PROBE_MAX_ATTEMPTS = 3
+ACTIVE_PROBE_RETRY_ERROR_BUDGET_PERCENT = 1
+LLAMACPP_LOG_PROBE_FORMAT = "llamacpp-log"
+LLAMACPP_LOG_PROBE_SELECTOR = "llamacpp:slot-task-lifecycle"
+LLAMACPP_TASK_START_RE = re.compile(
+    r"slot\s+launch_slot_:\s+id\s+\d+\s+\|\s+task\s+(\d+)\s+\|\s+processing task"
+)
+LLAMACPP_TASK_RELEASE_RE = re.compile(
+    r"slot\s+release:\s+id\s+\d+\s+\|\s+task\s+(\d+)\s+\|\s+stop processing"
+)
 OOM_RE = re.compile(
     r"(?:out[ -]of[ -]memory|\bcuda\s+oom\b|\bmetal\s+oom\b|"
     r"memory allocation (?:failed|failure)|allocator exhaustion)",
@@ -129,6 +143,20 @@ def require_active_coverage(values: list[int], *, process_probe: bool) -> None:
         _require(max(values) > 0, "HTTP scheduler probe never observed active work in the measured window")
 
 
+def active_probe_policy(probe_format: str) -> dict[str, int]:
+    if probe_format in {"process", LLAMACPP_LOG_PROBE_FORMAT}:
+        return {
+            "timeout_ms": 0,
+            "max_attempts": 1,
+            "retry_error_budget_percent": 0,
+        }
+    return {
+        "timeout_ms": ACTIVE_PROBE_TIMEOUT_MS,
+        "max_attempts": ACTIVE_PROBE_MAX_ATTEMPTS,
+        "retry_error_budget_percent": ACTIVE_PROBE_RETRY_ERROR_BUDGET_PERCENT,
+    }
+
+
 def derive_summary(
     path: Path,
     *,
@@ -148,6 +176,7 @@ def derive_summary(
     requested_concurrency: int,
     typed_active_cap: int,
     runtime_log_path: str,
+    runtime_log_evidence_path: Path | None = None,
 ) -> dict[str, Any]:
     """Validate raw observations and derive the only accepted resource summary."""
 
@@ -180,12 +209,29 @@ def derive_summary(
     _require(50 <= interval_ms <= 1000, "resource sampling interval must be 50..1000 ms")
     probe = header.get("active_probe")
     _require(isinstance(probe, dict), "resource header active_probe must be an object")
-    _require(probe.get("format") in {"json", "prometheus", "process"}, "resource active probe format is invalid")
-    expected_probe_url = "" if probe.get("format") == "process" else f"{base_url.rstrip('/')}{probe.get('path', '')}"
+    _require(
+        probe.get("format") in {"json", "prometheus", "process", LLAMACPP_LOG_PROBE_FORMAT},
+        "resource active probe format is invalid",
+    )
+    expected_probe_url = (
+        ""
+        if probe.get("format") in {"process", LLAMACPP_LOG_PROBE_FORMAT}
+        else f"{base_url.rstrip('/')}{probe.get('path', '')}"
+    )
     _require(probe.get("url") == expected_probe_url, "resource active probe URL/base mismatch")
     _require(isinstance(probe.get("selector"), str) and probe["selector"], "resource active probe selector is missing")
     expected_semantics = "process-alive" if probe.get("format") == "process" else "scheduler-active-high-water"
     _require(probe.get("semantics") == expected_semantics, "resource active probe semantics mismatch")
+    if probe.get("format") == LLAMACPP_LOG_PROBE_FORMAT:
+        _require(probe.get("path") == "", "llama.cpp log probe path must be empty")
+        _require(
+            probe.get("selector") == LLAMACPP_LOG_PROBE_SELECTOR,
+            "llama.cpp log probe selector mismatch",
+        )
+        _nonnegative_int(probe.get("log_start_offset"), "resource active probe log_start_offset")
+    expected_policy = active_probe_policy(probe["format"])
+    for field, expected in expected_policy.items():
+        _require(probe.get(field) == expected, f"resource active probe {field} mismatch")
     _require(header.get("runtime_log_path") == runtime_log_path, "resource runtime log path mismatch")
 
     session_start = _parse_timestamp(session_started_at, "session_started_at")
@@ -221,6 +267,61 @@ def derive_summary(
         headroom = _nonnegative_int(sample.get("physical_headroom_bytes"), f"{label}.physical_headroom_bytes")
         swap = _nonnegative_int(sample.get("swap_used_bytes"), f"{label}.swap_used_bytes")
         active = _nonnegative_int(sample.get("active_requests"), f"{label}.active_requests")
+        probe_attempts = _positive_int(sample.get("active_probe_attempts"), f"{label}.active_probe_attempts")
+        _require(
+            probe_attempts <= expected_policy["max_attempts"],
+            f"{label}.active_probe_attempts exceeds the declared policy",
+        )
+        probe_duration_ms = sample.get("active_probe_duration_ms")
+        _require(
+            isinstance(probe_duration_ms, (int, float))
+            and not isinstance(probe_duration_ms, bool)
+            and math.isfinite(probe_duration_ms)
+            and probe_duration_ms >= 0,
+            f"{label}.active_probe_duration_ms is invalid",
+        )
+        _require(probe_duration_ms <= 2000, f"{label}.active_probe_duration_ms exceeds 2000 ms")
+        probe_errors = sample.get("active_probe_errors")
+        _require(isinstance(probe_errors, list), f"{label}.active_probe_errors must be an array")
+        _require(
+            len(probe_errors) == probe_attempts - 1,
+            f"{label}.active_probe_errors count does not match attempts",
+        )
+        _require(
+            all(
+                isinstance(error, str)
+                and bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9]*(?::[A-Za-z][A-Za-z0-9]*)?", error))
+                for error in probe_errors
+            ),
+            f"{label}.active_probe_errors contains an invalid error class",
+        )
+        if probe.get("format") in {"process", LLAMACPP_LOG_PROBE_FORMAT}:
+            _require(probe_attempts == 1, f"{label} non-HTTP probe attempts must equal one")
+            _require(not probe_errors, f"{label} non-HTTP probe cannot contain retry errors")
+        if probe.get("format") == "process":
+            _require(probe_duration_ms == 0, f"{label} process probe duration must equal zero")
+        if probe.get("format") == LLAMACPP_LOG_PROBE_FORMAT:
+            log_offset = _nonnegative_int(sample.get("active_probe_log_offset"), f"{label}.active_probe_log_offset")
+            started_count = _nonnegative_int(
+                sample.get("active_probe_started_task_count"),
+                f"{label}.active_probe_started_task_count",
+            )
+            released_count = _nonnegative_int(
+                sample.get("active_probe_released_task_count"),
+                f"{label}.active_probe_released_task_count",
+            )
+            _require(released_count <= started_count, f"{label} released task count exceeds starts")
+            _require(started_count - released_count == active, f"{label} lifecycle counts do not equal active requests")
+            task_set_sha256 = sample.get("active_probe_task_set_sha256")
+            _require(
+                isinstance(task_set_sha256, str) and bool(re.fullmatch(r"[0-9a-f]{64}", task_set_sha256)),
+                f"{label}.active_probe_task_set_sha256 is invalid",
+            )
+        else:
+            log_offset = None
+            started_count = None
+            released_count = None
+            task_set_sha256 = None
         oom_count = _nonnegative_int(sample.get("oom_count"), f"{label}.oom_count")
         admission_errors = _nonnegative_int(sample.get("admission_error_count"), f"{label}.admission_error_count")
         if backend == "metal":
@@ -240,10 +341,21 @@ def derive_summary(
                 "_headroom": headroom,
                 "_swap": swap,
                 "_active": active,
+                "_active_probe_attempts": probe_attempts,
+                "_active_probe_duration_ms": float(probe_duration_ms),
+                "_active_probe_errors": probe_errors,
+                "_active_probe_log_offset": log_offset,
+                "_active_probe_started_task_count": started_count,
+                "_active_probe_released_task_count": released_count,
+                "_active_probe_task_set_sha256": task_set_sha256,
                 "_oom": oom_count,
                 "_admission": admission_errors,
             }
         )
+
+    if probe.get("format") == LLAMACPP_LOG_PROBE_FORMAT:
+        _require(runtime_log_evidence_path is not None, "llama.cpp log probe requires local runtime log evidence")
+        _validate_llamacpp_log_samples(Path(runtime_log_evidence_path), probe, normalized)
 
     before = [index for index, row in enumerate(normalized) if row["_timestamp"] <= measure_start]
     after = [index for index, row in enumerate(normalized) if row["_timestamp"] >= measure_finish]
@@ -263,6 +375,15 @@ def derive_summary(
         [row["_active"] for row in covered],
         process_probe=probe.get("format") == "process",
     )
+    retry_errors = [error for row in covered for error in row["_active_probe_errors"]]
+    retry_sample_count = sum(bool(row["_active_probe_errors"]) for row in covered)
+    retry_budget = expected_policy["retry_error_budget_percent"]
+    _require(
+        len(retry_errors) * 100 <= len(covered) * retry_budget,
+        f"active probe retry errors exceed the {retry_budget}% evidence budget",
+    )
+    if probe.get("format") == LLAMACPP_LOG_PROBE_FORMAT:
+        _require(covered[-1]["_active"] == 0, "llama.cpp log probe must bracket the idle state after measurement")
     _require(all(row["_oom"] == 0 for row in covered), "raw resource observations contain OOM events")
     _require(all(row["_admission"] == 0 for row in covered), "raw resource observations contain admission errors")
 
@@ -279,6 +400,11 @@ def derive_summary(
         "oom_count": max(row["_oom"] for row in covered),
         "admission_error_count": max(row["_admission"] for row in covered),
         "observed_max_active": max(row["_active"] for row in covered),
+        "active_probe_retry_error_count": len(retry_errors),
+        "active_probe_retry_sample_count": retry_sample_count,
+        "active_probe_max_attempts_observed": max(row["_active_probe_attempts"] for row in covered),
+        "active_probe_max_duration_ms": max(row["_active_probe_duration_ms"] for row in covered),
+        "active_probe_retry_error_counts": dict(sorted(Counter(retry_errors).items())),
     }
     if backend == "metal":
         summary.update(
@@ -394,8 +520,9 @@ def _json_path(value: Any, selector: str) -> Any:
     return current
 
 
-def _active_requests(url: str, probe_format: str, selector: str) -> int:
-    with urllib.request.urlopen(url, timeout=2.0) as response:
+def _active_requests(url: str, probe_format: str, selector: str, timeout_sec: float) -> int:
+    request = urllib.request.Request(url, headers={"Connection": "close"})
+    with urllib.request.urlopen(request, timeout=timeout_sec) as response:
         _require(response.status == 200, f"active probe returned HTTP {response.status}")
         payload = response.read().decode("utf-8")
     if probe_format == "json":
@@ -413,6 +540,127 @@ def _active_requests(url: str, probe_format: str, selector: str) -> int:
     return int(total)
 
 
+def _probe_error_class(exc: BaseException) -> str:
+    if isinstance(exc, urllib.error.URLError):
+        return f"URLError:{type(exc.reason).__name__}"
+    return type(exc).__name__
+
+
+def _active_requests_with_retry(
+    url: str,
+    probe_format: str,
+    selector: str,
+    *,
+    timeout_ms: int,
+    max_attempts: int,
+    fetch: Callable[[str, str, str, float], int] = _active_requests,
+) -> tuple[int, int, float, list[str]]:
+    started = time.monotonic()
+    errors: list[str] = []
+    for attempt in range(1, max_attempts + 1):
+        try:
+            value = fetch(url, probe_format, selector, timeout_ms / 1000.0)
+            duration_ms = round((time.monotonic() - started) * 1000.0, 3)
+            return value, attempt, duration_ms, errors
+        except urllib.error.HTTPError:
+            raise
+        except (TimeoutError, ConnectionError, urllib.error.URLError) as exc:
+            errors.append(_probe_error_class(exc))
+            if attempt == max_attempts:
+                raise ResourceEvidenceError(
+                    f"active probe exhausted {max_attempts} attempts: {','.join(errors)}"
+                ) from exc
+    raise AssertionError("active probe retry loop exhausted without a result")
+
+
+def _task_set_sha256(active_tasks: set[int]) -> str:
+    payload = ",".join(str(task_id) for task_id in sorted(active_tasks)).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _read_complete_log_increment(path: Path, offset: int) -> tuple[int, str]:
+    _require(path.is_file(), f"runtime log is missing: {path}")
+    size = path.stat().st_size
+    _require(size >= offset, "runtime log was truncated during resource sampling")
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        chunk = handle.read()
+    newline = chunk.rfind(b"\n")
+    if newline < 0:
+        return offset, ""
+    complete = chunk[: newline + 1]
+    return offset + len(complete), complete.decode("utf-8", errors="replace")
+
+
+def _read_log_range(path: Path, start: int, finish: int) -> str:
+    _require(path.is_file(), f"runtime log evidence is missing: {path}")
+    _require(0 <= start <= finish <= path.stat().st_size, "runtime log evidence offset is out of bounds")
+    with path.open("rb") as handle:
+        handle.seek(start)
+        chunk = handle.read(finish - start)
+    _require(len(chunk) == finish - start, "runtime log evidence range is incomplete")
+    _require(not chunk or chunk.endswith(b"\n"), "runtime log evidence offset does not end on a complete line")
+    return chunk.decode("utf-8", errors="replace")
+
+
+def _apply_llamacpp_lifecycle(
+    text: str,
+    active_tasks: set[int],
+    started_count: int,
+    released_count: int,
+) -> tuple[int, int]:
+    for line in text.splitlines():
+        started = LLAMACPP_TASK_START_RE.search(line)
+        if started:
+            task_id = int(started.group(1))
+            _require(task_id not in active_tasks, f"llama.cpp task {task_id} started twice without release")
+            active_tasks.add(task_id)
+            started_count += 1
+        released = LLAMACPP_TASK_RELEASE_RE.search(line)
+        if released:
+            task_id = int(released.group(1))
+            _require(task_id in active_tasks, f"llama.cpp task {task_id} released without a matching start")
+            active_tasks.remove(task_id)
+            released_count += 1
+    return started_count, released_count
+
+
+def _validate_llamacpp_log_samples(
+    runtime_log: Path,
+    probe: dict[str, Any],
+    samples: list[dict[str, Any]],
+) -> None:
+    offset = _nonnegative_int(probe.get("log_start_offset"), "resource active probe log_start_offset")
+    active_tasks: set[int] = set()
+    started_count = 0
+    released_count = 0
+    for index, sample in enumerate(samples):
+        label = f"resource sample[{index}]"
+        target = sample["_active_probe_log_offset"]
+        _require(isinstance(target, int) and target >= offset, f"{label}.active_probe_log_offset regressed")
+        text = _read_log_range(runtime_log, offset, target)
+        started_count, released_count = _apply_llamacpp_lifecycle(
+            text,
+            active_tasks,
+            started_count,
+            released_count,
+        )
+        _require(sample["_active"] == len(active_tasks), f"{label}.active_requests differs from runtime log")
+        _require(
+            sample["_active_probe_started_task_count"] == started_count,
+            f"{label}.active_probe_started_task_count differs from runtime log",
+        )
+        _require(
+            sample["_active_probe_released_task_count"] == released_count,
+            f"{label}.active_probe_released_task_count differs from runtime log",
+        )
+        _require(
+            sample["_active_probe_task_set_sha256"] == _task_set_sha256(active_tasks),
+            f"{label}.active_probe_task_set_sha256 differs from runtime log",
+        )
+        offset = target
+
+
 def _scan_log_increment(
     path: Path,
     offset: int,
@@ -426,11 +674,7 @@ def _scan_log_increment(
         offset = 0
         oom_count = 0
         admission_error_count = 0
-    with path.open("rb") as handle:
-        handle.seek(offset)
-        chunk = handle.read()
-        offset = handle.tell()
-    text = chunk.decode("utf-8", errors="replace")
+    offset, text = _read_complete_log_increment(path, offset)
     return (
         offset,
         oom_count + len(OOM_RE.findall(text)),
@@ -490,10 +734,23 @@ def collect(args: argparse.Namespace) -> None:
 
     signal.signal(signal.SIGINT, stop_handler)
     signal.signal(signal.SIGTERM, stop_handler)
-    probe_path = "" if args.active_probe_format == "process" else (
+    probe_path = "" if args.active_probe_format in {"process", LLAMACPP_LOG_PROBE_FORMAT} else (
         args.active_path if args.active_path.startswith("/") else f"/{args.active_path}"
     )
-    probe_url = "" if args.active_probe_format == "process" else f"{args.base_url.rstrip('/')}{probe_path}"
+    probe_url = (
+        ""
+        if args.active_probe_format in {"process", LLAMACPP_LOG_PROBE_FORMAT}
+        else f"{args.base_url.rstrip('/')}{probe_path}"
+    )
+    active_log_offset = 0
+    active_tasks: set[int] = set()
+    active_started_count = 0
+    active_released_count = 0
+    if args.active_probe_format == LLAMACPP_LOG_PROBE_FORMAT:
+        active_log_offset, initial_log = _read_complete_log_increment(args.runtime_log, 0)
+        initial_active: set[int] = set()
+        _apply_llamacpp_lifecycle(initial_log, initial_active, 0, 0)
+        _require(not initial_active, "llama.cpp log probe must start while all slots are idle")
     started_monotonic = time.monotonic()
     with out.open("x", encoding="utf-8") as handle:
         _append_jsonl(
@@ -521,6 +778,12 @@ def collect(args: argparse.Namespace) -> None:
                     "url": probe_url,
                     "selector": args.active_selector,
                     "semantics": args.active_semantics,
+                    **active_probe_policy(args.active_probe_format),
+                    **(
+                        {"log_start_offset": active_log_offset}
+                        if args.active_probe_format == LLAMACPP_LOG_PROBE_FORMAT
+                        else {}
+                    ),
                 },
             },
         )
@@ -555,9 +818,45 @@ def collect(args: argparse.Namespace) -> None:
                 memory_used = rss
                 thermal, power = _mac_thermal_power()
                 extra = {"thermal_state": thermal, "power_mode": power}
-            active = 1 if args.active_probe_format == "process" else _active_requests(
-                probe_url, args.active_probe_format, args.active_selector
-            )
+            if args.active_probe_format == "process":
+                active = 1
+                active_probe_attempts = 1
+                active_probe_duration_ms = 0.0
+                active_probe_errors: list[str] = []
+                active_probe_extra: dict[str, Any] = {}
+            elif args.active_probe_format == LLAMACPP_LOG_PROBE_FORMAT:
+                probe_started = time.monotonic()
+                active_log_offset, lifecycle_text = _read_complete_log_increment(
+                    args.runtime_log,
+                    active_log_offset,
+                )
+                active_started_count, active_released_count = _apply_llamacpp_lifecycle(
+                    lifecycle_text,
+                    active_tasks,
+                    active_started_count,
+                    active_released_count,
+                )
+                active = len(active_tasks)
+                active_probe_attempts = 1
+                active_probe_duration_ms = round((time.monotonic() - probe_started) * 1000.0, 3)
+                active_probe_errors = []
+                active_probe_extra = {
+                    "active_probe_log_offset": active_log_offset,
+                    "active_probe_started_task_count": active_started_count,
+                    "active_probe_released_task_count": active_released_count,
+                    "active_probe_task_set_sha256": _task_set_sha256(active_tasks),
+                }
+            else:
+                active, active_probe_attempts, active_probe_duration_ms, active_probe_errors = (
+                    _active_requests_with_retry(
+                        probe_url,
+                        args.active_probe_format,
+                        args.active_selector,
+                        timeout_ms=args.active_probe_timeout_ms,
+                        max_attempts=args.active_probe_max_attempts,
+                    )
+                )
+                active_probe_extra = {}
             log_offset, oom_count, admission_errors = _scan_log_increment(
                 args.runtime_log,
                 log_offset,
@@ -579,6 +878,10 @@ def collect(args: argparse.Namespace) -> None:
                     "physical_headroom_bytes": headroom,
                     "swap_used_bytes": swap,
                     "active_requests": active,
+                    "active_probe_attempts": active_probe_attempts,
+                    "active_probe_duration_ms": active_probe_duration_ms,
+                    "active_probe_errors": active_probe_errors,
+                    **active_probe_extra,
                     "oom_count": oom_count,
                     "admission_error_count": admission_errors,
                     **extra,
@@ -612,9 +915,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", choices=("cuda", "metal"))
     parser.add_argument("--hardware-id")
     parser.add_argument("--base-url")
-    parser.add_argument("--active-probe-format", choices=("json", "prometheus", "process"))
+    parser.add_argument(
+        "--active-probe-format",
+        choices=("json", "prometheus", "process", LLAMACPP_LOG_PROBE_FORMAT),
+    )
     parser.add_argument("--active-path")
     parser.add_argument("--active-selector")
+    parser.add_argument("--active-probe-timeout-ms", type=int, default=ACTIVE_PROBE_TIMEOUT_MS)
+    parser.add_argument("--active-probe-max-attempts", type=int, default=ACTIVE_PROBE_MAX_ATTEMPTS)
     parser.add_argument(
         "--active-semantics",
         choices=("scheduler-active-high-water", "process-alive"),
@@ -639,6 +947,93 @@ def self_test() -> int:
         raise ResourceEvidenceError("zero-active HTTP coverage unexpectedly passed")
     except ResourceEvidenceError as exc:
         _require("never observed active work" in str(exc), "zero-active HTTP self-test failed unexpectedly")
+    attempts = 0
+
+    def flaky_probe(_url: str, _probe_format: str, _selector: str, _timeout_sec: float) -> int:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("synthetic timeout")
+        return 3
+
+    active, observed_attempts, _, errors = _active_requests_with_retry(
+        "http://127.0.0.1/selftest",
+        "json",
+        "engine.active",
+        timeout_ms=ACTIVE_PROBE_TIMEOUT_MS,
+        max_attempts=ACTIVE_PROBE_MAX_ATTEMPTS,
+        fetch=flaky_probe,
+    )
+    _require(active == 3 and observed_attempts == 2, "active probe retry self-test returned the wrong value")
+    _require(errors == ["TimeoutError"], "active probe retry self-test lost its audit error")
+    try:
+        _active_requests_with_retry(
+            "http://127.0.0.1/selftest",
+            "json",
+            "engine.active",
+            timeout_ms=ACTIVE_PROBE_TIMEOUT_MS,
+            max_attempts=ACTIVE_PROBE_MAX_ATTEMPTS,
+            fetch=lambda *_args: (_ for _ in ()).throw(TimeoutError("synthetic timeout")),
+        )
+        raise ResourceEvidenceError("exhausted active probe unexpectedly passed")
+    except ResourceEvidenceError as exc:
+        _require("exhausted 3 attempts" in str(exc), "active probe exhaustion self-test failed unexpectedly")
+    active_tasks: set[int] = set()
+    started_count, released_count = _apply_llamacpp_lifecycle(
+        "slot launch_slot_: id  0 | task 41 | processing task, is_child = 0\n"
+        "slot launch_slot_: id  1 | task 42 | processing task, is_child = 0\n"
+        "slot      release: id  0 | task 41 | stop processing: n_tokens = 8, truncated = 0\n",
+        active_tasks,
+        0,
+        0,
+    )
+    _require(
+        active_tasks == {42} and started_count == 2 and released_count == 1,
+        "llama.cpp lifecycle parser self-test failed",
+    )
+    _require(
+        _task_set_sha256(active_tasks) == hashlib.sha256(b"42").hexdigest(),
+        "llama.cpp lifecycle task-set hash self-test failed",
+    )
+    try:
+        _apply_llamacpp_lifecycle(
+            "slot      release: id  0 | task 99 | stop processing: n_tokens = 8, truncated = 0\n",
+            active_tasks,
+            started_count,
+            released_count,
+        )
+        raise ResourceEvidenceError("unmatched llama.cpp release unexpectedly passed")
+    except ResourceEvidenceError as exc:
+        _require("without a matching start" in str(exc), "llama.cpp unmatched release self-test failed")
+    with tempfile.TemporaryDirectory(prefix="ferrum-resource-log-probe-") as temp_dir:
+        runtime_log = Path(temp_dir) / "server.log"
+        start_line = "slot launch_slot_: id  0 | task 41 | processing task, is_child = 0\n"
+        release_line = "slot      release: id  0 | task 41 | stop processing: n_tokens = 8, truncated = 0\n"
+        runtime_log.write_text(start_line + release_line, encoding="utf-8")
+        log_samples = [
+            {
+                "_active": 1,
+                "_active_probe_log_offset": len(start_line.encode("utf-8")),
+                "_active_probe_started_task_count": 1,
+                "_active_probe_released_task_count": 0,
+                "_active_probe_task_set_sha256": hashlib.sha256(b"41").hexdigest(),
+            },
+            {
+                "_active": 0,
+                "_active_probe_log_offset": len((start_line + release_line).encode("utf-8")),
+                "_active_probe_started_task_count": 1,
+                "_active_probe_released_task_count": 1,
+                "_active_probe_task_set_sha256": hashlib.sha256(b"").hexdigest(),
+            },
+        ]
+        _validate_llamacpp_log_samples(runtime_log, {"log_start_offset": 0}, log_samples)
+        forged = [dict(row) for row in log_samples]
+        forged[0]["_active"] = 0
+        try:
+            _validate_llamacpp_log_samples(runtime_log, {"log_start_offset": 0}, forged)
+            raise ResourceEvidenceError("forged llama.cpp active timeline unexpectedly passed")
+        except ResourceEvidenceError as exc:
+            _require("differs from runtime log" in str(exc), "llama.cpp log forgery self-test failed")
     print(SELFTEST_PASS_LINE)
     return 0
 
@@ -677,8 +1072,21 @@ def main() -> int:
         raise ResourceEvidenceError(f"missing required collector arguments: {missing}")
     expected_semantics = "process-alive" if args.active_probe_format == "process" else "scheduler-active-high-water"
     _require(args.active_semantics == expected_semantics, "active probe format/semantics mismatch")
-    if args.active_probe_format != "process":
+    if args.active_probe_format in {"json", "prometheus"}:
         _require(bool(args.active_path), "--active-path is required for HTTP active probes")
+        _require(
+            args.active_probe_timeout_ms == ACTIVE_PROBE_TIMEOUT_MS,
+            f"--active-probe-timeout-ms must equal {ACTIVE_PROBE_TIMEOUT_MS}",
+        )
+        _require(
+            args.active_probe_max_attempts == ACTIVE_PROBE_MAX_ATTEMPTS,
+            f"--active-probe-max-attempts must equal {ACTIVE_PROBE_MAX_ATTEMPTS}",
+        )
+    if args.active_probe_format == LLAMACPP_LOG_PROBE_FORMAT:
+        _require(
+            args.active_selector == LLAMACPP_LOG_PROBE_SELECTOR,
+            f"--active-selector must equal {LLAMACPP_LOG_PROBE_SELECTOR}",
+        )
     _require(50 <= args.interval_ms <= 1000, "--interval-ms must be 50..1000")
     _require(math.isfinite(args.max_duration_sec) and args.max_duration_sec > 0, "--max-duration-sec must be positive")
     collect(args)

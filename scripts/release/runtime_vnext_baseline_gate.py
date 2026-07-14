@@ -3148,6 +3148,7 @@ def validate_server_sessions(
         require_string(session.get("runtime_log_origin_path"), f"{label}[{index}].runtime_log_origin_path")
         session["_pid"] = pid
         session["_pgid"] = pgid
+        session["_runtime_log_path"] = runtime_log
         session["_identity"] = identity
         session["_timeline"] = {
             "started_at": started_at,
@@ -3225,14 +3226,44 @@ def validate_resource_metrics(
     require_option(options, "--max-duration-sec", 7200, f"{label}.sampler_argv")
     require("--stop-file" in options, f"{label}.sampler_argv must use a bounded stop file")
     probe_format = options.get("--active-probe-format")
-    require(probe_format in {"json", "prometheus", "process"}, f"{label}.sampler_argv active probe format missing")
+    require(
+        probe_format in {"json", "prometheus", "process", resource_sampler.LLAMACPP_LOG_PROBE_FORMAT},
+        f"{label}.sampler_argv active probe format missing",
+    )
     if allow_process_probe:
         require(probe_format == "process", f"{label}.sampler_argv one-shot run must use process-alive active evidence")
         require_option(options, "--active-selector", "process-alive", f"{label}.sampler_argv")
         require_option(options, "--active-semantics", "process-alive", f"{label}.sampler_argv")
+    elif probe_format == resource_sampler.LLAMACPP_LOG_PROBE_FORMAT:
+        require(not allow_process_probe, f"{label}.sampler_argv one-shot run cannot use a llama.cpp log probe")
+        require("--active-path" not in options, f"{label}.sampler_argv log probe cannot use an HTTP path")
+        require_option(
+            options,
+            "--active-selector",
+            resource_sampler.LLAMACPP_LOG_PROBE_SELECTOR,
+            f"{label}.sampler_argv",
+        )
+        require_option(
+            options,
+            "--active-semantics",
+            "scheduler-active-high-water",
+            f"{label}.sampler_argv",
+        )
     else:
         require(probe_format != "process", f"{label}.sampler_argv HTTP measurements cannot use process-alive active evidence")
         require("--active-path" in options and "--active-selector" in options, f"{label}.sampler_argv active HTTP probe is incomplete")
+        require_option(
+            options,
+            "--active-probe-timeout-ms",
+            resource_sampler.ACTIVE_PROBE_TIMEOUT_MS,
+            f"{label}.sampler_argv",
+        )
+        require_option(
+            options,
+            "--active-probe-max-attempts",
+            resource_sampler.ACTIVE_PROBE_MAX_ATTEMPTS,
+            f"{label}.sampler_argv",
+        )
         require_option(
             options,
             "--active-semantics",
@@ -3258,6 +3289,11 @@ def validate_resource_metrics(
             requested_concurrency=requested_concurrency,
             typed_active_cap=typed_active_cap,
             runtime_log_path=runtime_log_origin_path,
+            runtime_log_evidence_path=(
+                Path(session["_runtime_log_path"])
+                if probe_format == resource_sampler.LLAMACPP_LOG_PROBE_FORMAT
+                else None
+            ),
         )
     except resource_sampler.ResourceEvidenceError as exc:
         raise BaselineError(f"{label} raw resource evidence rejected: {exc}") from exc
@@ -5467,6 +5503,7 @@ def synthetic_resource_evidence(
             "url": probe_url,
             "selector": "process-alive" if process_probe else "engine.active_requests",
             "semantics": "process-alive" if process_probe else "scheduler-active-high-water",
+            **resource_sampler.active_probe_policy(probe_format),
         },
     }
     active = min(concurrency, cap)
@@ -5485,6 +5522,9 @@ def synthetic_resource_evidence(
             "physical_headroom_bytes": memory_bytes // 2,
             "swap_used_bytes": 0,
             "active_requests": active,
+            "active_probe_attempts": 1,
+            "active_probe_duration_ms": 0.0,
+            "active_probe_errors": [],
             "oom_count": 0,
             "admission_error_count": 0,
         }
@@ -5540,7 +5580,16 @@ def synthetic_resource_evidence(
         "7200",
     ]
     if not process_probe:
-        argv.extend(["--active-path", "/health"])
+        argv.extend(
+            [
+                "--active-path",
+                "/health",
+                "--active-probe-timeout-ms",
+                str(resource_sampler.ACTIVE_PROBE_TIMEOUT_MS),
+                "--active-probe-max-attempts",
+                str(resource_sampler.ACTIVE_PROBE_MAX_ATTEMPTS),
+            ]
+        )
     summary = resource_sampler.derive_summary(
         observation_path,
         session_id=session["session_id"],
