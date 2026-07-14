@@ -457,7 +457,7 @@ where
         // converted component until the final submit would duplicate the
         // entire model in host memory.
         let upload = prepare_upload(source, component, placement).map_err(contract_failure)?;
-        source_files.insert(upload.source_file().to_owned());
+        source_files.extend(upload.source_files().iter().cloned());
         let element_bytes = upload.element_type().size_bytes();
         let maximum_chunk_bytes =
             policy.maximum_staging_bytes() - policy.maximum_staging_bytes() % element_bytes;

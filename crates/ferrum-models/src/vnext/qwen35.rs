@@ -33,6 +33,7 @@ use super::PreparedProductionModel;
 pub const FAMILY_ID: &str = "family.qwen3_5.dense_hybrid";
 pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5ForConditionalGeneration";
 const DENSE_MATERIALIZED_ELEMENT_TYPE: ElementType = ElementType::F16;
+const PACKED_GATE_UP_ROLE: &str = "mlp_gate_up";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -246,41 +247,54 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
     }
 
     fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
-        let components = config
-            .weights
-            .iter()
-            .map(|weight| {
-                Ok(WeightComponentSpec {
-                    id: component_id(weight)?,
-                    role: WeightComponentRole::Values,
-                    external_names: vec![weight.external_name.clone()],
-                    dimensions: weight.dimensions.clone(),
-                    encoding: WeightEncoding::Dense {
-                        element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
-                    },
-                    required: true,
-                })
-            })
-            .collect::<Result<Vec<_>, VNextError>>()?;
-        let tensors = config
-            .weights
-            .iter()
-            .map(|weight| {
-                Ok(WeightTensorSpec {
-                    id: weight_id(weight)?,
-                    dimensions: weight.dimensions.clone(),
-                    logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
-                    physical_layout: PhysicalWeightLayout::Dense {
-                        component_id: component_id(weight)?,
-                    },
-                    required: true,
-                })
-            })
-            .collect::<Result<Vec<_>, VNextError>>()?;
+        let mut components = Vec::with_capacity(config.weights.len());
+        let mut tensors = Vec::with_capacity(config.weights.len());
+        for weight in &config.weights {
+            if weight.role == "mlp_up" {
+                continue;
+            }
+            let (component_id, tensor_id, external_names, dimensions) = if weight.role == "mlp_gate"
+            {
+                let layer_index = weight.layer_index.ok_or_else(|| {
+                    invalid_config("weights.mlp_gate", "dense gate weight has no layer")
+                })?;
+                let up = required_weight(config, Some(layer_index), "mlp_up")?;
+                (
+                    packed_gate_up_component_id(layer_index)?,
+                    packed_gate_up_weight_id(layer_index)?,
+                    vec![weight.external_name.clone(), up.external_name.clone()],
+                    packed_gate_up_dimensions(weight, up)?,
+                )
+            } else {
+                (
+                    component_id(weight)?,
+                    weight_id(weight)?,
+                    vec![weight.external_name.clone()],
+                    weight.dimensions.clone(),
+                )
+            };
+            components.push(WeightComponentSpec {
+                id: component_id.clone(),
+                role: WeightComponentRole::Values,
+                external_names,
+                dimensions: dimensions.clone(),
+                encoding: WeightEncoding::Dense {
+                    element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
+                },
+                required: true,
+            });
+            tensors.push(WeightTensorSpec {
+                id: tensor_id,
+                dimensions,
+                logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
+                physical_layout: PhysicalWeightLayout::Dense { component_id },
+                required: true,
+            });
+        }
         Ok(WeightSchema {
             format_id: WeightFormatId::new("weight-format.safetensors.dense")?,
-            layout_id: WeightLayoutId::new("weight-layout.qwen3_5.dense_hybrid")?,
-            version: ContractVersion::new(1, 0),
+            layout_id: WeightLayoutId::new("weight-layout.qwen3_5.dense_hybrid.packed_gate_up")?,
+            version: ContractVersion::new(1, 1),
             components,
             tensors,
         })
@@ -288,17 +302,32 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
 
     fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
         let text = Self::text_config(config)?;
-        let weight_refs = config
-            .weights
-            .iter()
-            .map(|weight| {
-                Ok(WeightReference {
+        let mut weight_refs = Vec::with_capacity(config.weights.len());
+        for weight in &config.weights {
+            if weight.role == "mlp_up" {
+                continue;
+            }
+            if weight.role == "mlp_gate" {
+                let layer_index = weight.layer_index.ok_or_else(|| {
+                    invalid_config("weights.mlp_gate", "dense gate weight has no layer")
+                })?;
+                let up = required_weight(config, Some(layer_index), "mlp_up")?;
+                weight_refs.push(WeightReference {
+                    weight_id: packed_gate_up_weight_id(layer_index)?,
+                    value_id: packed_gate_up_value_id(layer_index)?,
+                    tensor: tensor_spec(
+                        packed_gate_up_dimensions(weight, up)?,
+                        DENSE_MATERIALIZED_ELEMENT_TYPE,
+                    ),
+                });
+            } else {
+                weight_refs.push(WeightReference {
                     weight_id: weight_id(weight)?,
                     value_id: weight_value_id(weight)?,
                     tensor: tensor_spec(weight.dimensions.clone(), DENSE_MATERIALIZED_ELEMENT_TYPE),
-                })
-            })
-            .collect::<Result<Vec<_>, VNextError>>()?;
+                });
+            }
+        }
 
         let mut nodes = Vec::with_capacity(text.num_hidden_layers * 2 + 2);
         let embedding = required_weight(config, None, "embed_tokens")?;
@@ -449,12 +478,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 required_version: ContractVersion::new(1, 0),
                 inputs: vec![
                     normalized,
-                    weight_value_id(required_weight(
-                        config,
-                        Some(layer_index as u32),
-                        "mlp_gate",
-                    )?)?,
-                    weight_value_id(required_weight(config, Some(layer_index as u32), "mlp_up")?)?,
+                    packed_gate_up_value_id(layer_index as u32)?,
                     weight_value_id(required_weight(
                         config,
                         Some(layer_index as u32),
@@ -918,10 +942,56 @@ fn parse_positive_decimal_rational(raw: &str) -> Result<CanonicalRational, Strin
 }
 
 fn weight_key(weight: &FamilyWeight, prefix: &str) -> String {
-    match weight.layer_index {
-        Some(layer) => format!("{prefix}.layer.{layer}.{}", weight.role),
-        None => format!("{prefix}.global.{}", weight.role),
+    scoped_weight_key(weight.layer_index, &weight.role, prefix)
+}
+
+fn scoped_weight_key(layer_index: Option<u32>, role: &str, prefix: &str) -> String {
+    match layer_index {
+        Some(layer) => format!("{prefix}.layer.{layer}.{role}"),
+        None => format!("{prefix}.global.{role}"),
     }
+}
+
+fn packed_gate_up_dimensions(
+    gate: &FamilyWeight,
+    up: &FamilyWeight,
+) -> Result<Vec<u64>, VNextError> {
+    if gate.role != "mlp_gate"
+        || up.role != "mlp_up"
+        || gate.layer_index != up.layer_index
+        || gate.dimensions != up.dimensions
+        || gate.dimensions.len() != 2
+    {
+        return Err(invalid_config(
+            "weights.mlp_gate_up",
+            "gate/up sources must be same-layer matrices with identical shapes",
+        ));
+    }
+    Ok(vec![2, gate.dimensions[0], gate.dimensions[1]])
+}
+
+fn packed_gate_up_weight_id(layer_index: u32) -> Result<WeightId, VNextError> {
+    WeightId::new(scoped_weight_key(
+        Some(layer_index),
+        PACKED_GATE_UP_ROLE,
+        "weight",
+    ))
+}
+
+fn packed_gate_up_component_id(layer_index: u32) -> Result<WeightId, VNextError> {
+    WeightId::new(scoped_weight_key(
+        Some(layer_index),
+        PACKED_GATE_UP_ROLE,
+        "component",
+    ))
+}
+
+fn packed_gate_up_value_id(layer_index: u32) -> Result<ProgramValueId, VNextError> {
+    ProgramValueId::new(scoped_weight_key(
+        Some(layer_index),
+        PACKED_GATE_UP_ROLE,
+        "value.weight",
+    ))
 }
 
 fn weight_id(weight: &FamilyWeight) -> Result<WeightId, VNextError> {
@@ -1000,6 +1070,19 @@ fn invalid_config(field: impl Into<String>, reason: impl Into<String>) -> VNextE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_interfaces::vnext::WeightComponentSource;
+    use half::f16;
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+    fn test_weight_dimensions(text: &Qwen35TextConfig, weight: &FamilyWeight) -> Vec<u64> {
+        match weight.role.as_str() {
+            "embed_tokens" | "lm_head" => vec![32, 16],
+            "final_norm" | "input_layernorm" | "post_attention_layernorm" => vec![16],
+            "mlp_gate" | "mlp_up" => vec![32, 16],
+            "mlp_down" => vec![16, 32],
+            _ => vec![expected_weight_elements(text, 32, weight).unwrap()],
+        }
+    }
 
     fn test_config() -> Qwen35FamilyConfig {
         let hf_config = serde_json::json!({
@@ -1039,7 +1122,7 @@ mod tests {
                 external_name: spec.name.clone(),
                 dimensions: vec![1],
             };
-            weight.dimensions = vec![expected_weight_elements(&text, 32, &weight).unwrap()];
+            weight.dimensions = test_weight_dimensions(&text, &weight);
             weights.push(weight);
         }
         for layer in &manifest.layers {
@@ -1050,7 +1133,7 @@ mod tests {
                     external_name: spec.name.clone(),
                     dimensions: vec![1],
                 };
-                weight.dimensions = vec![expected_weight_elements(&text, 32, &weight).unwrap()];
+                weight.dimensions = test_weight_dimensions(&text, &weight);
                 weights.push(weight);
             }
         }
@@ -1106,14 +1189,31 @@ mod tests {
                 .count(),
             4
         );
+        assert!(prepared.program().blocks()[0]
+            .nodes
+            .iter()
+            .filter(|node| node.operation_id.as_str() == DENSE_SWIGLU_OPERATION_ID)
+            .all(|node| node.inputs.len() == 3));
         assert!(!operation_ids.contains(&"operation.logits_projection"));
         assert_eq!(prepared.program().states().len(), 7);
-        assert_eq!(prepared.program().weights().len(), config.weights.len());
+        assert_eq!(prepared.program().weights().len(), config.weights.len() - 4);
         assert!(prepared
             .weight_schema()
             .components
             .iter()
             .all(|component| component.physical_element_type() == ElementType::F16));
+        let packed = prepared
+            .weight_schema()
+            .components
+            .iter()
+            .filter(|component| component.external_names.len() == 2)
+            .collect::<Vec<_>>();
+        assert_eq!(packed.len(), 4);
+        assert!(packed.iter().all(|component| {
+            component.dimensions == [2, 32, 16]
+                && component.external_names[0].contains("gate_proj")
+                && component.external_names[1].contains("up_proj")
+        }));
         assert_eq!(
             prepared.metadata().special_tokens.eos_token_ids,
             BTreeSet::from([2])
@@ -1138,5 +1238,60 @@ mod tests {
         assert_eq!(parse_positive_decimal_rational("1e-6").unwrap(), expected);
         assert!(parse_positive_decimal_rational("0").is_err());
         assert!(parse_positive_decimal_rational("1.1").is_err());
+    }
+
+    #[test]
+    fn packs_gate_up_sources_in_schema_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let tensors = [
+            ("gate.weight", [1.0_f32, 2.0, 3.0, 4.0]),
+            ("up.weight", [5.0_f32, 6.0, 7.0, 8.0]),
+        ];
+        let views = tensors
+            .iter()
+            .map(|(name, values)| {
+                let bytes = values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                let bytes: &'static [u8] = Box::leak(bytes);
+                (
+                    (*name).to_owned(),
+                    TensorView::new(Dtype::F32, vec![2, 2], bytes).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        serialize_to_file(
+            views,
+            &None::<std::collections::HashMap<String, String>>,
+            &directory.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let source = SafetensorsArchive::open(directory.path()).unwrap();
+        let component = WeightComponentSpec {
+            id: WeightId::new("component.layer.0.mlp_gate_up").unwrap(),
+            role: WeightComponentRole::Values,
+            external_names: vec!["gate.weight".to_owned(), "up.weight".to_owned()],
+            dimensions: vec![2, 2, 2],
+            encoding: WeightEncoding::Dense {
+                element_type: ElementType::F16,
+            },
+            required: true,
+        };
+        let payload = source.component(&component).unwrap();
+        let actual = payload
+            .bytes()
+            .chunks_exact(2)
+            .map(|bytes| f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            (1..=8).map(|value| value as f32).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            payload.source_files(),
+            ["model.safetensors", "model.safetensors"]
+        );
     }
 }

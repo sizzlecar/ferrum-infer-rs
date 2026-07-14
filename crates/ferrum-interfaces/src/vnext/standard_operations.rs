@@ -185,12 +185,7 @@ pub fn dense_swiglu_contract() -> Result<StandardOperationContract, VNextError> 
                 TensorAccess::Read,
             )?,
             contiguous_tensor(
-                intermediate_hidden_dimensions(),
-                [ElementType::F16],
-                TensorAccess::Read,
-            )?,
-            contiguous_tensor(
-                intermediate_hidden_dimensions(),
+                packed_gate_up_dimensions(),
                 [ElementType::F16],
                 TensorAccess::Read,
             )?,
@@ -284,8 +279,9 @@ fn token_hidden_dimensions() -> Vec<DimensionConstraint> {
     ]
 }
 
-fn intermediate_hidden_dimensions() -> Vec<DimensionConstraint> {
+fn packed_gate_up_dimensions() -> Vec<DimensionConstraint> {
     vec![
+        DimensionConstraint::Exact(2),
         DimensionConstraint::Symbol("intermediate_size".to_owned()),
         DimensionConstraint::Symbol("hidden_size".to_owned()),
     ]
