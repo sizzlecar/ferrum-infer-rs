@@ -1,5 +1,9 @@
 use super::*;
-use crate::vnext::{DynamicStorageAllocator, DynamicStorageView};
+use crate::vnext::{
+    AttributeSchema, DynamicStorageAllocator, DynamicStorageView, LayoutConstraint, OracleSpec,
+    ProfilePhase, ProviderRequirement, ResourcePresenceRequirement, ResourceRequirements,
+    TensorContract,
+};
 
 fn linear_profile() -> DynamicStorageProfile {
     DynamicStorageProfile::new(
@@ -45,6 +49,130 @@ fn joint_candidate(
         allowed_profiles: BTreeMap::from([(resource.clone(), profiles.iter().copied().collect())]),
         is_preferred: provider == "provider/preferred",
     }
+}
+
+fn token_tensor_contract(access: TensorAccess) -> TensorContract {
+    TensorContract::new(
+        vec![
+            DimensionConstraint::Symbol("tokens".to_owned()),
+            DimensionConstraint::Exact(4),
+        ],
+        BTreeSet::from([ElementType::F16]),
+        vec![LayoutConstraint::Contiguous],
+        access,
+        AliasPolicy::NoAlias,
+    )
+    .expect("valid symbolic tensor contract")
+}
+
+fn token_binding(
+    value: &str,
+    role: ResolvedValueRole,
+    access: TensorAccess,
+    resource: &str,
+) -> ResolvedValueBinding {
+    ResolvedValueBinding::new(
+        ProgramValueId::new(value).expect("valid value id"),
+        role,
+        0,
+        ResolvedTensorSpec::new(
+            vec![8, 4],
+            ElementType::F16,
+            ResolvedTensorLayout::Contiguous,
+        )
+        .expect("valid resolved tensor"),
+        access,
+        AliasPolicy::NoAlias,
+        BufferUsage::Activations,
+        ResolvedValueStorage::single(
+            ResourceId::new(resource).expect("valid resource id"),
+            0,
+            64,
+            ElementType::F16,
+        )
+        .expect("valid activation storage"),
+    )
+    .expect("valid resolved binding")
+}
+
+#[test]
+fn node_work_contract_is_derived_from_one_symbolic_activation_axis() {
+    let operation = OperationDescriptor {
+        id: OperationId::new("operation/token-map").expect("valid operation id"),
+        version: ContractVersion::new(1, 0),
+        inputs: vec![token_tensor_contract(TensorAccess::Read)],
+        outputs: vec![token_tensor_contract(TensorAccess::Write)],
+        attributes: AttributeSchema::empty(),
+        resources: ResourceRequirements {
+            minimum_value_alignment_bytes: 16,
+            scratch: ResourcePresenceRequirement::Forbidden,
+            persistent: ResourcePresenceRequirement::Forbidden,
+        },
+        oracle: OracleSpec::Exact,
+        provider: ProviderRequirement {
+            minimum_version: ContractVersion::new(1, 0),
+            required_capabilities: BTreeSet::new(),
+        },
+        profile_phase: ProfilePhase::Forward,
+    };
+    let mut node = ProgramNode {
+        id: NodeId::new("node/token-map").expect("valid node id"),
+        operation_id: operation.id.clone(),
+        required_version: ContractVersion::new(1, 0),
+        work: ProgramNodeWorkSpec::tokens(
+            ProgramValueId::new("value/input").expect("valid value id"),
+            0,
+        ),
+        inputs: vec![ProgramValueId::new("value/input").expect("valid value id")],
+        outputs: vec![ProgramValueId::new("value/output").expect("valid value id")],
+        attributes: BTreeMap::new(),
+    };
+    let bindings = vec![
+        token_binding(
+            "value/input",
+            ResolvedValueRole::Input,
+            TensorAccess::Read,
+            "resource/input",
+        ),
+        token_binding(
+            "value/output",
+            ResolvedValueRole::Output,
+            TensorAccess::Write,
+            "resource/output",
+        ),
+    ];
+
+    let work = ExecutionPlan::derive_node_work_contract(&node, &operation, &bindings)
+        .expect("symbolic token axis must resolve");
+    assert_eq!(
+        work.token_source().unwrap().value_id().as_str(),
+        "value/input"
+    );
+    assert_eq!(work.token_source().unwrap().axis(), 0);
+    assert_eq!(work.token_projections().len(), 2);
+    assert!(work
+        .token_projections()
+        .iter()
+        .all(|projection| projection.axis() == 0 && projection.canonical_extent() == 8));
+
+    node.work = ProgramNodeWorkSpec::tokens(
+        ProgramValueId::new("value/input").expect("valid value id"),
+        1,
+    );
+    assert!(ExecutionPlan::derive_node_work_contract(&node, &operation, &bindings).is_err());
+}
+
+#[test]
+fn request_token_capacity_uses_canonical_extent_while_step_uses_scheduler_ceiling() {
+    assert_eq!(
+        ExecutionPlan::activation_token_capacity(AllocationLifetime::Request, 131_072, 4096)
+            .unwrap(),
+        131_072
+    );
+    assert_eq!(
+        ExecutionPlan::activation_token_capacity(AllocationLifetime::Step, 131_072, 4096).unwrap(),
+        4096
+    );
 }
 
 #[test]
@@ -247,6 +375,7 @@ fn plan_node(id: &str, dependencies: &[&str], resources: &[&str]) -> PlanNode {
         provider_implementation_fingerprint: "5".repeat(64),
         required_capabilities: BTreeSet::new(),
         attributes: BTreeMap::new(),
+        work: NodeWorkContract::Fixed,
         selection: ProviderSelection {
             requested_provider: None,
             selected_provider,

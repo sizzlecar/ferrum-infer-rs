@@ -182,6 +182,7 @@ impl ModelFamilyProvider for TestFamily {
                     id: id("node.main"),
                     operation_id: id("operation.main"),
                     required_version: ContractVersion::new(1, 0),
+                    work: ProgramNodeWorkSpec::Fixed,
                     inputs: vec![id("value.input"), id("value.weight"), id("value.state")],
                     outputs: vec![id("value.output")],
                     attributes: BTreeMap::new(),
@@ -464,6 +465,7 @@ impl ModelFamilyProvider for SequentialScratchFamily {
                         id: id("node.first"),
                         operation_id: id("operation.main"),
                         required_version: ContractVersion::new(1, 0),
+                        work: ProgramNodeWorkSpec::Fixed,
                         inputs: vec![id("value.input"), id("value.weight"), id("value.state")],
                         outputs: vec![id("value.intermediate")],
                         attributes: BTreeMap::new(),
@@ -472,6 +474,7 @@ impl ModelFamilyProvider for SequentialScratchFamily {
                         id: id("node.second"),
                         operation_id: id("operation.main"),
                         required_version: ContractVersion::new(1, 0),
+                        work: ProgramNodeWorkSpec::Fixed,
                         inputs: vec![
                             id("value.intermediate"),
                             id("value.weight"),
@@ -768,6 +771,7 @@ impl OperationContract for TestOperationContract {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EstimateBehavior {
     Correct,
+    TokenScaledScratch,
     WrongEstimatorId,
     WrongEstimatorVersion,
     WrongImplementation,
@@ -928,13 +932,23 @@ impl OperationResourceEstimator for TestEstimator {
             request.input_fingerprint().to_owned()
         };
         let scratch = (self.behavior != EstimateBehavior::MissingScratch).then(|| {
-            ProviderWorkspaceRequirement::new(
-                self.scratch_bytes,
-                16,
-                ProviderWorkspaceScope::Invocation,
-                contiguous_storage_requirement(),
-            )
-            .unwrap()
+            if self.behavior == EstimateBehavior::TokenScaledScratch {
+                ProviderWorkspaceRequirement::from_formula(
+                    ProviderWorkspaceSizeFormula::tokens(self.scratch_bytes).unwrap(),
+                    16,
+                    ProviderWorkspaceScope::Invocation,
+                    contiguous_storage_requirement(),
+                )
+                .unwrap()
+            } else {
+                ProviderWorkspaceRequirement::new(
+                    self.scratch_bytes,
+                    16,
+                    ProviderWorkspaceScope::Invocation,
+                    contiguous_storage_requirement(),
+                )
+                .unwrap()
+            }
         });
         Ok(OperationResourceEstimate::new(
             estimator_id,
@@ -1121,6 +1135,20 @@ pub(crate) fn policy_with(
     reserve_bytes: u64,
     maximum_active_sequences: u32,
 ) -> Result<ResolvedRuntimePolicy, VNextError> {
+    policy_with_tokens(
+        capacity_bytes,
+        reserve_bytes,
+        maximum_active_sequences,
+        4096,
+    )
+}
+
+pub(crate) fn policy_with_tokens(
+    capacity_bytes: u64,
+    reserve_bytes: u64,
+    maximum_active_sequences: u32,
+    maximum_scheduled_tokens: u64,
+) -> Result<ResolvedRuntimePolicy, VNextError> {
     ResolvedRuntimePolicy::new(
         "runtime-policy.test",
         ContractVersion::new(1, 0),
@@ -1133,7 +1161,7 @@ pub(crate) fn policy_with(
         },
         serde_json::from_value(json!({
             "maximum_queue_depth": 8,
-            "maximum_scheduled_tokens": 4096,
+            "maximum_scheduled_tokens": maximum_scheduled_tokens,
             "allow_defer": true,
             "cancellation_check_interval_steps": 1
         }))
@@ -1512,6 +1540,7 @@ impl ModelFamilyProvider for GraphFamily {
             id: id(node_id),
             operation_id: id(operation_id),
             required_version: ContractVersion::new(1, 0),
+            work: ProgramNodeWorkSpec::Fixed,
             inputs: if state {
                 vec![
                     id("value.state"),

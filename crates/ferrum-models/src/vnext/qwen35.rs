@@ -12,13 +12,13 @@ use ferrum_interfaces::vnext::{
     AttributeId, CanonicalRational, ContractVersion, ElementType, ExternalModelMetadataId,
     ModelFamilyId, ModelFamilyProvider, ModelFamilyRegistration, ModelProgram,
     ModelSemanticMetadata, NodeId, OperationId, PhysicalWeightLayout, PreparedModelFamily,
-    ProgramBlock, ProgramNode, ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout,
-    SemanticValue, SpecialTokenCollision, SpecialTokenCollisionPolicy, SpecialTokenMetadata,
-    SpecialTokenRole, StateCapacityDemand, StateId, StateLifetime, StateSpec, TemplateMetadata,
-    TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSpec, WeightEncoding,
-    WeightFormatId, WeightId, WeightLayoutId, WeightReference, WeightSchema, WeightTensorSpec,
-    DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID, RESIDUAL_ADD_OPERATION_ID,
-    RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
+    ProgramBlock, ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId,
+    ResolvedTensorLayout, SemanticValue, SpecialTokenCollision, SpecialTokenCollisionPolicy,
+    SpecialTokenMetadata, SpecialTokenRole, StateCapacityDemand, StateId, StateLifetime, StateSpec,
+    TemplateMetadata, TypedFamilyRegistration, VNextError, WeightComponentRole,
+    WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
+    WeightSchema, WeightTensorSpec, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+    RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
 use ferrum_quantization::SafetensorsArchive;
 use serde::{Deserialize, Serialize};
@@ -336,6 +336,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             id: node_id("node.embedding")?,
             operation_id: operation_id(TOKEN_EMBEDDING_OPERATION_ID)?,
             required_version: ContractVersion::new(1, 0),
+            work: ProgramNodeWorkSpec::tokens(value_id("value.input.token_ids")?, 0),
             inputs: vec![
                 value_id("value.input.token_ids")?,
                 weight_value_id(embedding)?,
@@ -442,6 +443,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 id: node_id(format!("node.layer.{layer_index}.attention"))?,
                 operation_id: operation_id(operation)?,
                 required_version: ContractVersion::new(1, 0),
+                work: ProgramNodeWorkSpec::tokens(hidden.clone(), 0),
                 inputs: attention_inputs,
                 outputs: vec![attention_output.clone()],
                 attributes,
@@ -454,6 +456,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 id: node_id(format!("node.layer.{layer_index}.post_attention_norm"))?,
                 operation_id: operation_id(RMS_NORM_OPERATION_ID)?,
                 required_version: ContractVersion::new(1, 0),
+                work: ProgramNodeWorkSpec::tokens(attention_output.clone(), 0),
                 inputs: vec![
                     attention_output.clone(),
                     weight_value_id(post_attention_norm)?,
@@ -476,6 +479,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 id: node_id(format!("node.layer.{layer_index}.feed_forward"))?,
                 operation_id: operation_id(DENSE_SWIGLU_OPERATION_ID)?,
                 required_version: ContractVersion::new(1, 0),
+                work: ProgramNodeWorkSpec::tokens(normalized.clone(), 0),
                 inputs: vec![
                     normalized,
                     packed_gate_up_value_id(layer_index as u32)?,
@@ -497,6 +501,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 id: node_id(format!("node.layer.{layer_index}.residual"))?,
                 operation_id: operation_id(RESIDUAL_ADD_OPERATION_ID)?,
                 required_version: ContractVersion::new(1, 0),
+                work: ProgramNodeWorkSpec::tokens(attention_output.clone(), 0),
                 inputs: vec![attention_output, mlp_output],
                 outputs: vec![layer_output.clone()],
                 attributes: BTreeMap::from([attribute("hidden_size", text.hidden_size as u64)?]),
@@ -515,6 +520,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             id: node_id("node.final_norm")?,
             operation_id: operation_id(RMS_NORM_OPERATION_ID)?,
             required_version: ContractVersion::new(1, 0),
+            work: ProgramNodeWorkSpec::tokens(hidden.clone(), 0),
             inputs: vec![hidden, weight_value_id(final_norm)?],
             outputs: vec![final_hidden.clone()],
             attributes: BTreeMap::from([
@@ -527,6 +533,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             id: node_id("node.logits")?,
             operation_id: operation_id(DENSE_LINEAR_OPERATION_ID)?,
             required_version: ContractVersion::new(1, 0),
+            work: ProgramNodeWorkSpec::tokens(final_hidden.clone(), 0),
             inputs: vec![final_hidden, weight_value_id(projection)?],
             outputs: vec![logits.clone()],
             attributes: BTreeMap::from([
@@ -1170,6 +1177,13 @@ mod tests {
 
         assert_eq!(prepared.family_id().as_str(), FAMILY_ID);
         assert_eq!(prepared.program().blocks()[0].nodes.len(), 19);
+        assert!(prepared.program().blocks()[0].nodes.iter().all(|node| {
+            matches!(
+                &node.work,
+                ProgramNodeWorkSpec::Tokens { value_id, axis: 0 }
+                    if node.inputs.iter().chain(&node.outputs).any(|value| value == value_id)
+            )
+        }));
         let operation_ids = prepared.program().blocks()[0]
             .nodes
             .iter()

@@ -144,6 +144,7 @@ impl ModelFamilyProvider for TestFamily {
                     id: id("node.main"),
                     operation_id: id("operation.model-wire-test"),
                     required_version: ContractVersion::new(1, 0),
+                    work: ProgramNodeWorkSpec::Fixed,
                     inputs: vec![id("value.input"), id("value.weight"), id("value.state")],
                     outputs: vec![id("value.output")],
                     attributes: BTreeMap::new(),

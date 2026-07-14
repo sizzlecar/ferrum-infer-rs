@@ -142,6 +142,8 @@ pub struct BatchParticipantTokenRange {
     participant: BatchParticipantAuthority,
     immediate_start_token: u64,
     immediate_end_token: u64,
+    source_start_token: u64,
+    source_end_token: u64,
     full_input_tokens: u64,
 }
 
@@ -150,10 +152,14 @@ impl BatchParticipantTokenRange {
         participant: BatchParticipantAuthority,
         immediate_start_token: u64,
         immediate_end_token: u64,
+        source_start_token: u64,
+        source_end_token: u64,
         full_input_tokens: u64,
     ) -> Result<Self, VNextError> {
         if immediate_start_token >= immediate_end_token
-            || full_input_tokens < immediate_end_token - immediate_start_token
+            || source_start_token >= source_end_token
+            || source_end_token > full_input_tokens
+            || immediate_end_token - immediate_start_token != source_end_token - source_start_token
         {
             return Err(invalid_resource(
                 "batch participant packed-token range is empty or exceeds its full input",
@@ -163,6 +169,8 @@ impl BatchParticipantTokenRange {
             participant,
             immediate_start_token,
             immediate_end_token,
+            source_start_token,
+            source_end_token,
             full_input_tokens,
         })
     }
@@ -177,6 +185,10 @@ impl BatchParticipantTokenRange {
 
     pub const fn immediate_tokens(&self) -> u64 {
         self.immediate_end_token - self.immediate_start_token
+    }
+
+    pub fn source_token_range(&self) -> Range<u64> {
+        self.source_start_token..self.source_end_token
     }
 
     pub const fn full_input_tokens(&self) -> u64 {
@@ -242,6 +254,8 @@ impl BatchWorkShape {
                     work.participant(),
                     start,
                     next_token,
+                    work.token_span().immediate_token_range().start,
+                    work.token_span().immediate_token_range().end,
                     work.token_span().full_input_tokens(),
                 )
             })

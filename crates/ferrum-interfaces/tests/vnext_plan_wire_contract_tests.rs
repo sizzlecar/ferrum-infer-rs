@@ -91,7 +91,7 @@ fn breaking_schema_versions_are_rejected_100_of_100() {
     for variant in 0..100 {
         let fixture = plan_fixture(variant);
         let mut value = serde_json::to_value(&fixture.plan).unwrap();
-        value["payload"]["schema"]["major"] = json!(2);
+        value["payload"]["schema"]["major"] = json!(EXECUTION_PLAN_SCHEMA.major + 1);
         rehash_plan_json(&mut value);
         assert!(ExecutionPlan::from_json_validated(
             &serde_json::to_vec(&value).unwrap(),

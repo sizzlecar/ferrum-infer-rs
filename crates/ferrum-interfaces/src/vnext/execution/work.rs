@@ -55,6 +55,8 @@ impl DynamicResourceShape {
 pub struct TokenSpanWork {
     pub(super) immediate_tokens: u64,
     pub(super) full_input_tokens: u64,
+    pub(super) immediate_start_token: u64,
+    pub(super) immediate_end_token: u64,
     pub(super) fingerprint: String,
 }
 
@@ -75,25 +77,23 @@ impl TokenSpanWork {
             .map_err(|_| invalid_plan("immediate token span exceeds u64"))?;
         let full_input_tokens = u64::try_from(full_input.len())
             .map_err(|_| invalid_plan("full token input exceeds u64"))?;
+        let immediate_start_token = u64::try_from(immediate_range.start)
+            .map_err(|_| invalid_plan("token span start exceeds u64"))?;
+        let immediate_end_token = u64::try_from(immediate_range.end)
+            .map_err(|_| invalid_plan("token span end exceeds u64"))?;
         let mut digest = Sha256::new();
-        digest.update(b"ferrum.runtime-vnext.token-span-work.v1\0");
+        digest.update(b"ferrum.runtime-vnext.token-span-work.v2\0");
         digest.update(full_input_tokens.to_le_bytes());
-        digest.update(
-            u64::try_from(immediate_range.start)
-                .map_err(|_| invalid_plan("token span start exceeds u64"))?
-                .to_le_bytes(),
-        );
-        digest.update(
-            u64::try_from(immediate_range.end)
-                .map_err(|_| invalid_plan("token span end exceeds u64"))?
-                .to_le_bytes(),
-        );
+        digest.update(immediate_start_token.to_le_bytes());
+        digest.update(immediate_end_token.to_le_bytes());
         for token in full_input {
             digest.update(token.to_le_bytes());
         }
         Ok(Self {
             immediate_tokens,
             full_input_tokens,
+            immediate_start_token,
+            immediate_end_token,
             fingerprint: format!("{:x}", digest.finalize()),
         })
     }
@@ -104,6 +104,10 @@ impl TokenSpanWork {
 
     pub const fn full_input_tokens(&self) -> u64 {
         self.full_input_tokens
+    }
+
+    pub fn immediate_token_range(&self) -> Range<u64> {
+        self.immediate_start_token..self.immediate_end_token
     }
 
     pub fn fingerprint(&self) -> &str {
@@ -326,9 +330,9 @@ impl<'de> Deserialize<'de> for DynamicResourceShapeBucket {
     }
 }
 
-/// Core-validated sizing formula supplied by a provider. Its maximum shape is
-/// the boundary of one provider invocation, not the scheduler's global active
-/// sequence ceiling; a scheduler may split larger ready sets into batches.
+/// Core-bounded resource demand stored in an immutable memory plan. Provider
+/// estimators use `ProviderWorkspaceSizeFormula`; core adds runtime-policy
+/// bounds only after provider selection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DynamicResourceDemand {
@@ -611,5 +615,3 @@ impl<'de> Deserialize<'de> for DynamicResourceDemand {
         Self::validated(demand).map_err(serde::de::Error::custom)
     }
 }
-
-pub type ProviderWorkspaceSizeFormula = DynamicResourceDemand;
