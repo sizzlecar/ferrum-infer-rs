@@ -20,6 +20,11 @@ pub enum ProviderWorkspaceSizeFormula {
     Tokens {
         bytes_per_token: u64,
     },
+    Affine {
+        fixed_bytes: u64,
+        bytes_per_sequence: u64,
+        bytes_per_token: u64,
+    },
     Pages {
         bytes_per_page: u64,
         maximum_pages: u64,
@@ -39,6 +44,11 @@ enum ProviderWorkspaceSizeFormulaWire {
         bytes_per_sequence: u64,
     },
     Tokens {
+        bytes_per_token: u64,
+    },
+    Affine {
+        fixed_bytes: u64,
+        bytes_per_sequence: u64,
         bytes_per_token: u64,
     },
     Pages {
@@ -61,6 +71,18 @@ impl ProviderWorkspaceSizeFormula {
 
     pub fn tokens(bytes_per_token: u64) -> Result<Self, VNextError> {
         Self::validated(Self::Tokens { bytes_per_token })
+    }
+
+    pub fn affine(
+        fixed_bytes: u64,
+        bytes_per_sequence: u64,
+        bytes_per_token: u64,
+    ) -> Result<Self, VNextError> {
+        Self::validated(Self::Affine {
+            fixed_bytes,
+            bytes_per_sequence,
+            bytes_per_token,
+        })
     }
 
     pub fn pages(bytes_per_page: u64, maximum_pages: u64) -> Result<Self, VNextError> {
@@ -88,6 +110,17 @@ impl ProviderWorkspaceSizeFormula {
             | Self::Tokens {
                 bytes_per_token: bytes_per_sequence,
             } => *bytes_per_sequence > 0,
+            Self::Affine {
+                fixed_bytes,
+                bytes_per_sequence,
+                bytes_per_token,
+            } => {
+                (*bytes_per_sequence > 0 || *bytes_per_token > 0)
+                    && fixed_bytes
+                        .checked_add(*bytes_per_sequence)
+                        .and_then(|bytes| bytes.checked_add(*bytes_per_token))
+                        .is_some()
+            }
             Self::Pages {
                 bytes_per_page,
                 maximum_pages,
@@ -130,6 +163,24 @@ impl ProviderWorkspaceSizeFormula {
             Self::Tokens { bytes_per_token } => bytes_per_token
                 .checked_mul(shape.tokens)
                 .ok_or_else(|| invalid_plan("provider token workspace overflows u64"))?,
+            Self::Affine {
+                fixed_bytes,
+                bytes_per_sequence,
+                bytes_per_token,
+            } => fixed_bytes
+                .checked_add(
+                    bytes_per_sequence
+                        .checked_mul(u64::from(shape.sequences))
+                        .ok_or_else(|| {
+                            invalid_plan("provider affine sequence workspace overflows u64")
+                        })?,
+                )
+                .and_then(|bytes| {
+                    bytes_per_token
+                        .checked_mul(shape.tokens)
+                        .and_then(|token_bytes| bytes.checked_add(token_bytes))
+                })
+                .ok_or_else(|| invalid_plan("provider affine token workspace overflows u64"))?,
             Self::Pages {
                 bytes_per_page,
                 maximum_pages,
@@ -167,6 +218,17 @@ impl ProviderWorkspaceSizeFormula {
             Self::Tokens { bytes_per_token } => {
                 DynamicResourceDemand::tokens(*bytes_per_token, maximum_tokens)
             }
+            Self::Affine {
+                fixed_bytes,
+                bytes_per_sequence,
+                bytes_per_token,
+            } => DynamicResourceDemand::affine(
+                *fixed_bytes,
+                *bytes_per_sequence,
+                maximum_sequences,
+                *bytes_per_token,
+                maximum_tokens,
+            ),
             Self::Pages {
                 bytes_per_page,
                 maximum_pages,
@@ -184,6 +246,9 @@ impl ProviderWorkspaceSizeFormula {
     fn is_valid_for_sequence_scope(&self) -> bool {
         match self {
             Self::Fixed { .. } | Self::Tokens { .. } | Self::Pages { .. } => true,
+            Self::Affine {
+                bytes_per_sequence, ..
+            } => *bytes_per_sequence == 0,
             Self::BoundedShapeBuckets { buckets } => {
                 buckets.iter().all(|bucket| bucket.maximum_sequences() == 1)
             }
@@ -205,6 +270,15 @@ impl<'de> Deserialize<'de> for ProviderWorkspaceSizeFormula {
             ProviderWorkspaceSizeFormulaWire::Tokens { bytes_per_token } => {
                 Self::Tokens { bytes_per_token }
             }
+            ProviderWorkspaceSizeFormulaWire::Affine {
+                fixed_bytes,
+                bytes_per_sequence,
+                bytes_per_token,
+            } => Self::Affine {
+                fixed_bytes,
+                bytes_per_sequence,
+                bytes_per_token,
+            },
             ProviderWorkspaceSizeFormulaWire::Pages {
                 bytes_per_page,
                 maximum_pages,

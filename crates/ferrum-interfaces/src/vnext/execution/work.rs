@@ -347,6 +347,13 @@ pub enum DynamicResourceDemand {
         bytes_per_token: u64,
         maximum_tokens: u64,
     },
+    Affine {
+        fixed_bytes: u64,
+        bytes_per_sequence: u64,
+        maximum_sequences: u32,
+        bytes_per_token: u64,
+        maximum_tokens: u64,
+    },
     Pages {
         bytes_per_page: u64,
         maximum_pages: u64,
@@ -367,6 +374,13 @@ pub(super) enum DynamicResourceDemandWire {
         maximum_sequences: u32,
     },
     Tokens {
+        bytes_per_token: u64,
+        maximum_tokens: u64,
+    },
+    Affine {
+        fixed_bytes: u64,
+        bytes_per_sequence: u64,
+        maximum_sequences: u32,
         bytes_per_token: u64,
         maximum_tokens: u64,
     },
@@ -396,6 +410,22 @@ impl DynamicResourceDemand {
 
     pub fn tokens(bytes_per_token: u64, maximum_tokens: u64) -> Result<Self, VNextError> {
         Self::validated(Self::Tokens {
+            bytes_per_token,
+            maximum_tokens,
+        })
+    }
+
+    pub fn affine(
+        fixed_bytes: u64,
+        bytes_per_sequence: u64,
+        maximum_sequences: u32,
+        bytes_per_token: u64,
+        maximum_tokens: u64,
+    ) -> Result<Self, VNextError> {
+        Self::validated(Self::Affine {
+            fixed_bytes,
+            bytes_per_sequence,
+            maximum_sequences,
             bytes_per_token,
             maximum_tokens,
         })
@@ -439,6 +469,26 @@ impl DynamicResourceDemand {
                 *bytes_per_token > 0
                     && *maximum_tokens > 0
                     && bytes_per_token.checked_mul(*maximum_tokens).is_some()
+            }
+            Self::Affine {
+                fixed_bytes,
+                bytes_per_sequence,
+                maximum_sequences,
+                bytes_per_token,
+                maximum_tokens,
+            } => {
+                (*bytes_per_sequence > 0 || *bytes_per_token > 0)
+                    && *maximum_sequences > 0
+                    && *maximum_tokens > 0
+                    && bytes_per_sequence
+                        .checked_mul(u64::from(*maximum_sequences))
+                        .and_then(|sequence_bytes| fixed_bytes.checked_add(sequence_bytes))
+                        .and_then(|bytes| {
+                            bytes_per_token
+                                .checked_mul(*maximum_tokens)
+                                .and_then(|token_bytes| bytes.checked_add(token_bytes))
+                        })
+                        .is_some()
             }
             Self::Pages {
                 bytes_per_page,
@@ -499,6 +549,28 @@ impl DynamicResourceDemand {
             } if shape.tokens <= *maximum_tokens => bytes_per_token
                 .checked_mul(shape.tokens)
                 .ok_or_else(|| invalid_plan("token-scaled resource request overflows u64"))?,
+            Self::Affine {
+                fixed_bytes,
+                bytes_per_sequence,
+                maximum_sequences,
+                bytes_per_token,
+                maximum_tokens,
+            } if shape.sequences <= *maximum_sequences && shape.tokens <= *maximum_tokens => {
+                fixed_bytes
+                    .checked_add(
+                        bytes_per_sequence
+                            .checked_mul(u64::from(shape.sequences))
+                            .ok_or_else(|| {
+                                invalid_plan("affine sequence resource request overflows u64")
+                            })?,
+                    )
+                    .and_then(|bytes| {
+                        bytes_per_token
+                            .checked_mul(shape.tokens)
+                            .and_then(|token_bytes| bytes.checked_add(token_bytes))
+                    })
+                    .ok_or_else(|| invalid_plan("affine token resource request overflows u64"))?
+            }
             Self::Pages {
                 bytes_per_page,
                 maximum_pages,
@@ -547,6 +619,15 @@ impl DynamicResourceDemand {
                 tokens: *maximum_tokens,
                 pages: 1,
             },
+            Self::Affine {
+                maximum_sequences,
+                maximum_tokens,
+                ..
+            } => DynamicResourceShape {
+                sequences: *maximum_sequences,
+                tokens: *maximum_tokens,
+                pages: 1,
+            },
             Self::Pages { maximum_pages, .. } => DynamicResourceShape {
                 sequences: 1,
                 tokens: 1,
@@ -572,6 +653,9 @@ impl DynamicResourceDemand {
     pub(super) fn is_valid_for_sequence_scope(&self) -> bool {
         match self {
             Self::Fixed { .. } | Self::Tokens { .. } | Self::Pages { .. } => true,
+            Self::Affine {
+                bytes_per_sequence, ..
+            } => *bytes_per_sequence == 0,
             Self::BoundedShapeBuckets { buckets } => {
                 buckets.iter().all(|bucket| bucket.maximum_sequences == 1)
             }
@@ -598,6 +682,19 @@ impl<'de> Deserialize<'de> for DynamicResourceDemand {
                 bytes_per_token,
                 maximum_tokens,
             } => Self::Tokens {
+                bytes_per_token,
+                maximum_tokens,
+            },
+            DynamicResourceDemandWire::Affine {
+                fixed_bytes,
+                bytes_per_sequence,
+                maximum_sequences,
+                bytes_per_token,
+                maximum_tokens,
+            } => Self::Affine {
+                fixed_bytes,
+                bytes_per_sequence,
+                maximum_sequences,
                 bytes_per_token,
                 maximum_tokens,
             },
