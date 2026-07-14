@@ -34,6 +34,10 @@ use super::{
     THREADS_PER_BLOCK, VALUE_ALIGNMENT_BYTES,
 };
 
+mod attention;
+
+pub(super) use attention::CudaGatedDeltaRecurrentAttentionProvider;
+
 const RMS_NORM_PROVIDER_ID: &str = "provider.cuda.rms_norm.f16";
 const RMS_NORM_ESTIMATOR_ID: &str = "resource-estimator.cuda.rms_norm.f16";
 const DENSE_LINEAR_PROVIDER_ID: &str = "provider.cuda.dense_linear.f16.cublas";
@@ -289,7 +293,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaResidualAddProvider {
     }
 }
 
-fn provider_descriptor(
+pub(super) fn provider_descriptor(
     runtime: &CudaDeviceRuntime,
     contract: &dyn OperationContract,
     provider_id: &str,
@@ -329,7 +333,7 @@ fn provider_descriptor(
     .map_err(contract_error)
 }
 
-fn contiguous_bindings(input_count: u32) -> Vec<ProviderStorageBindingRequirement> {
+pub(super) fn contiguous_bindings(input_count: u32) -> Vec<ProviderStorageBindingRequirement> {
     (0..input_count)
         .map(|ordinal| {
             ProviderStorageBindingRequirement::new(
@@ -355,7 +359,7 @@ fn estimate_without_workspace(
     Ok(estimate(descriptor, request.input_fingerprint(), None))
 }
 
-fn ensure_estimator_request(
+pub(super) fn ensure_estimator_request(
     descriptor: &OperationProviderDescriptor,
     request: &OperationResourceEstimateRequest<'_>,
     operation_id: &str,
@@ -371,7 +375,7 @@ fn ensure_estimator_request(
     Ok(())
 }
 
-fn estimate(
+pub(super) fn estimate(
     descriptor: &OperationProviderDescriptor,
     input_fingerprint: &str,
     scratch: Option<ProviderWorkspaceRequirement>,
@@ -795,7 +799,7 @@ fn encode_residual_add(
     .map_err(|error| error.to_string())
 }
 
-fn launch_gemm_f16(
+pub(super) fn launch_gemm_f16(
     blas: &CudaBlas,
     input: cudarc::driver::sys::CUdeviceptr,
     weight: cudarc::driver::sys::CUdeviceptr,
