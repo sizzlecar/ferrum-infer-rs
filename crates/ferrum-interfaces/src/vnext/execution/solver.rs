@@ -414,29 +414,3 @@ impl ValueAllocationAccumulator {
         Some(())
     }
 }
-
-pub(super) fn align_up(value: u64, alignment: u64) -> Result<u64, VNextError> {
-    if alignment == 0 || !alignment.is_power_of_two() {
-        return Err(invalid_plan(
-            "allocation alignment is not a non-zero power of two",
-        ));
-    }
-    value
-        .checked_add(alignment - 1)
-        .map(|rounded| rounded & !(alignment - 1))
-        .ok_or_else(|| invalid_plan("aligned allocation size overflows u64"))
-}
-
-pub(super) fn quantize_storage_bytes(
-    logical_bytes: u64,
-    alignment_bytes: u64,
-    profile: DynamicStorageProfile,
-) -> Result<u64, VNextError> {
-    let aligned = align_up(logical_bytes, alignment_bytes)?;
-    match profile.allocator() {
-        super::DynamicStorageAllocator::LinearArena => Ok(aligned),
-        super::DynamicStorageAllocator::FixedBlockArena { block_bytes } => {
-            align_up(aligned, block_bytes)
-        }
-    }
-}

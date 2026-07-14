@@ -1,10 +1,9 @@
-use super::solver::quantize_storage_bytes;
 use super::{
-    canonical_fingerprint, invalid_plan, is_canonical_sha256, validate_active_sequence_ceiling,
-    AllocationKind, AllocationLifetime, BlockedTensorPadding, BufferUsage, ContractVersion,
-    Deserialize, Deserializer, DynamicResourceDemand, DynamicResourceShape, DynamicStorageProfile,
-    ElementType, NodeId, ResolvedTensorLayout, ResourceId, ResourceWorkShape, Serialize,
-    VNextError,
+    canonical_fingerprint, invalid_plan, is_canonical_sha256, quantize_storage_bytes,
+    validate_active_sequence_ceiling, AllocationKind, AllocationLifetime, BlockedTensorPadding,
+    BufferUsage, ContractVersion, Deserialize, Deserializer, DynamicResourceDemand,
+    DynamicResourceShape, DynamicStorageProfile, ElementType, NodeId, ResolvedTensorLayout,
+    ResourceId, ResourceWorkShape, Serialize, VNextError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]

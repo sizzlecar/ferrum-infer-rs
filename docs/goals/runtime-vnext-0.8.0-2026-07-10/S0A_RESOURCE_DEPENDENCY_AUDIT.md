@@ -97,5 +97,6 @@ RUST_TEST_THREADS=2 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
 
 The external test target includes an isolated panic-child fault injection. Its child panic output
 is expected; the parent test and target both exited successfully. This audit does not claim S0A
-completion: `execution.rs`, `event.rs`, their oversized test targets, the public owner map, and the
-final artifact validator remain open.
+completion: execution normalization is recorded separately in
+`S0A_EXECUTION_DEPENDENCY_AUDIT.md`; `event.rs`, remaining oversized test targets, the public owner
+map, and the final artifact validator remain open.

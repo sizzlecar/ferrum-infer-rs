@@ -1,5 +1,6 @@
-use super::contracts::invalid_plan;
-use super::{Deserialize, Deserializer, Digest, Range, Serialize, Sha256, VNextError};
+use super::{
+    invalid_plan, Deserialize, Deserializer, Digest, Range, Serialize, Sha256, VNextError,
+};
 
 pub const MAX_PROVIDER_WORKSPACE_SHAPE_BUCKETS: usize = 64;
 

@@ -5,9 +5,9 @@
 - Work package: S0A, semantics-preserving structural split.
 - Current stage: `resource.rs` production contract split, symbol-level imports, and complete
   dependency-cycle removal validated; the external resource contract target is split by invariant
-  owner. `execution.rs` now has a semantics-preserving real-module split with explicit production
-  imports; execution owner normalization and cycle removal remain open. `event.rs` and the remaining
-  oversized contract targets also remain open.
+  owner. `execution.rs` now has a semantics-preserving real-module split, explicit production
+  imports, normalized ownership, and zero multi-module dependency SCCs. `event.rs` and the remaining
+  oversized test targets remain open.
 - This map records file ownership, not G01A completion. Public item inventory and the final
   `contract-map.json` remain required before the S0A PASS artifact can be issued.
 
@@ -50,6 +50,9 @@ production SHA256 values:
 `70899c1ef6365b65e1df0a34e7b052a1b605d7228b343d17859cac137eb8cac1`.
 The extracted white-box test module independently produces identical old/new SHA256 values:
 `452bdff62ee00cd91473fb61cfcc5758f98c2d407fce24b3317d56ad30e2712e`.
+The subsequent ownership normalization preserves the parent facade paths while moving misplaced
+helpers and implementations to their lowest valid owner. Its complete dependency transition is
+recorded in `S0A_EXECUTION_DEPENDENCY_AUDIT.md`.
 
 ## Resource Ownership
 
@@ -77,24 +80,32 @@ logical-line limit and the facade is below `500` lines.
 
 | Current owner | Lines | Primary responsibility |
 |---|---:|---|
-| `execution/contracts.rs` | 466 | Plan identity, provider selection evidence, nodes and allocation contracts |
-| `execution/work.rs` | 614 | Token/page work evidence and bounded dynamic demand formulas |
-| `execution/storage.rs` | 789 | Storage compatibility, dynamic pool specifications and descriptors |
-| `execution/memory.rs` | 928 | Core-derived memory plan, pool/liveness accounting and workspace requirements |
-| `execution/provider.rs` | 789 | Provider resource evidence, node resolution and serialized plan payloads |
-| `execution/plan.rs` | 2,088 | Semantic plan construction, validation and deterministic provider selection |
-| `execution/solver.rs` | 442 | Joint provider/storage solver and checked allocation helpers |
-| `execution/policy.rs` | 86 | Typed runtime policy and planner request boundary |
+| `execution/foundation.rs` | 84 | Shared validation, canonical fingerprints, alignment and storage arithmetic |
+| `execution/binding.rs` | 248 | Semantic value/weight binding validation and estimator-input identity |
+| `execution/work.rs` | 615 | Token/page work evidence and bounded dynamic demand formulas |
+| `execution/workspace.rs` | 144 | Provider workspace formula, scope and storage requirement contracts |
+| `execution/provider_resource.rs` | 174 | Bound provider resource estimate evidence and validation |
+| `execution/contracts.rs` | 292 | Plan identity, provider selection evidence and immutable node contracts |
+| `execution/storage.rs` | 788 | Storage compatibility, dynamic pool specifications and descriptors |
+| `execution/allocation.rs` | 121 | Static/dynamic resource allocation contract and validation |
+| `execution/solver.rs` | 416 | Joint provider/storage solver and checked selection helpers |
+| `execution/memory.rs` | 775 | Core-derived memory plan and pool/liveness accounting |
+| `execution/provider.rs` | 242 | Provider selection and serialized execution-plan payload contracts |
+| `execution/policy.rs` | 74 | Typed runtime policy and validated plan-build request boundary |
+| `execution/plan.rs` | 1,898 | Semantic plan construction and deterministic provider/storage selection |
+| `execution/resolution.rs` | 289 | Provider registry resolution into typed per-node evidence |
+| `execution/validation.rs` | 56 | Untrusted execution-plan revalidation boundary |
+| `execution/planner.rs` | 12 | Pure execution planner trait boundary |
 
-`execution.rs` is now a 45-line facade. Every production fragment is below `2,500` lines. The
+`execution.rs` is now a 67-line facade. Every production fragment is below `2,500` lines. The
 existing 14 white-box tests are isolated in a 506-line `execution/tests.rs` module and pass with
 `--test-threads=2`.
 
-This is deliberately a structural checkpoint, not the final execution ownership graph. The split
-made former same-module coupling observable: low-level canonical/allocation helpers, provider
-resource evidence, serialized payload validation, and the planner API still form misplaced
-cross-owner dependencies. The next execution change must move those symbols to their lowest valid
-owner and produce a zero-SCC symbol graph before execution splitting is marked complete.
+The first eight-module split made former same-module coupling observable as one SCC containing all
+eight production owners. Low-level canonical/allocation helpers, provider resource evidence,
+serialized payload validation, resolution, and the planner API have now moved to distinct owners.
+The complete sixteen-module production graph has zero multi-module SCCs. Public execution paths
+remain re-exported by the facade and no production fragment uses `use super::*`.
 
 ## Resource Test Ownership
 
@@ -146,7 +157,15 @@ contracts -> ledger -> capacity -> allocation -> dynamic_pool -> provisioning ->
 Rust module privacy now separates the owners, all newly shared internals are restricted to the
 resource parent, and production imports are symbol-explicit. The SCC audit reports `0` cycles;
 pairwise and the previously hidden three-module cycle are both eliminated. Execution production
-imports are also symbol-explicit, but its SCC audit remains an open checkpoint as described above.
+imports are also symbol-explicit and its complete SCC audit reports `0` cycles. A valid
+dependencies-first execution order is:
+
+```text
+foundation -> binding -> work -> workspace -> provider_resource -> contracts -> storage
+-> allocation -> solver -> memory -> provider -> policy -> plan -> resolution -> validation
+-> planner
+```
+
 S0B may later shrink or break these contracts only against the real Qwen3.5-4B production consumer.
 
 ## Validation For This Stage
@@ -163,10 +182,11 @@ S0B may later shrink or break these contracts only against the real Qwen3.5-4B p
    fault case and all `311` frozen proof cases.
 7. No paid GPU, model download, performance run, or product migration claim is part of this stage.
 
-For the execution structural checkpoint, `cargo check -p ferrum-interfaces --all-targets` passes,
-and the bounded execution white-box target passes `14/14`. These results establish compile and
-mechanical-equivalence evidence only; the execution zero-SCC and final S0A PASS artifacts remain
-open.
+For the normalized execution graph, `cargo check -p ferrum-interfaces --all-targets` passes, the
+bounded execution white-box target passes `14/14`, the focused external execution contracts pass
+`51/51 + 12/12`, and all `80` vNext compile-time UI fixtures pass in normal trybuild mode. These
+results establish compile, contract, and structural evidence; the `event.rs` split, remaining test
+ownership work, public owner map, bounded aggregate, and final S0A PASS artifact remain open.
 
 After owner normalization and the zero-SCC audit, the bounded all-target check, `47/47` resource
 library tests, and all seven external resource owner targets pass. The transaction-evidence
