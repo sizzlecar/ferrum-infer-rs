@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,7 @@ use ferrum_interfaces::vnext::{
     WeightEncoding,
 };
 use ferrum_types::{FerrumError, Result};
+use half::{bf16, f16};
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 
@@ -204,22 +206,94 @@ impl WeightComponentSource for SafetensorsArchive {
                     tensor.dtype()
                 ),
             })?;
-        if actual_element_type != expected_element_type || tensor.shape() != component.dimensions {
+        if tensor.shape() != component.dimensions {
             return Err(VNextError::InvalidExecutionPlan {
                 reason: format!(
-                    "tensor {external_name:?} dtype or shape differs from component `{}`",
+                    "tensor {external_name:?} shape differs from component `{}`",
                     component.id
                 ),
             });
         }
+        let bytes = transcode_dense_bytes(
+            tensor.bytes(),
+            actual_element_type,
+            expected_element_type,
+            external_name,
+        )?;
         WeightComponentPayload::new(
             component,
             tensor.external_name(),
             tensor.source_file(),
             component.dimensions.clone(),
             expected_element_type,
-            tensor.bytes(),
+            bytes,
         )
+    }
+}
+
+fn transcode_dense_bytes<'source>(
+    bytes: &'source [u8],
+    source: ElementType,
+    destination: ElementType,
+    external_name: &str,
+) -> std::result::Result<Cow<'source, [u8]>, VNextError> {
+    if source == destination {
+        return Ok(Cow::Borrowed(bytes));
+    }
+    let source_float = matches!(
+        source,
+        ElementType::F16 | ElementType::Bf16 | ElementType::F32
+    );
+    let destination_float = matches!(
+        destination,
+        ElementType::F16 | ElementType::Bf16 | ElementType::F32
+    );
+    if !source_float || !destination_float || bytes.len() % source.size_bytes() as usize != 0 {
+        return Err(VNextError::InvalidExecutionPlan {
+            reason: format!(
+                "tensor {external_name:?} cannot be materialized from {source:?} as {destination:?}"
+            ),
+        });
+    }
+
+    let element_count = bytes.len() / source.size_bytes() as usize;
+    let mut materialized = Vec::with_capacity(element_count * destination.size_bytes() as usize);
+    for index in 0..element_count {
+        let value = read_float(bytes, source, index);
+        match destination {
+            ElementType::F16 => {
+                materialized.extend_from_slice(&f16::from_f32(value).to_bits().to_le_bytes())
+            }
+            ElementType::Bf16 => {
+                materialized.extend_from_slice(&bf16::from_f32(value).to_bits().to_le_bytes())
+            }
+            ElementType::F32 => materialized.extend_from_slice(&value.to_le_bytes()),
+            _ => unreachable!("non-floating destination was rejected above"),
+        }
+    }
+    Ok(Cow::Owned(materialized))
+}
+
+fn read_float(bytes: &[u8], element_type: ElementType, index: usize) -> f32 {
+    match element_type {
+        ElementType::F16 => {
+            let offset = index * 2;
+            f16::from_bits(u16::from_le_bytes([bytes[offset], bytes[offset + 1]])).to_f32()
+        }
+        ElementType::Bf16 => {
+            let offset = index * 2;
+            bf16::from_bits(u16::from_le_bytes([bytes[offset], bytes[offset + 1]])).to_f32()
+        }
+        ElementType::F32 => {
+            let offset = index * 4;
+            f32::from_le_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ])
+        }
+        _ => unreachable!("non-floating source was rejected before decoding"),
     }
 }
 
@@ -292,5 +366,42 @@ fn element_type(dtype: Dtype) -> Option<ElementType> {
         Dtype::BF16 => Some(ElementType::Bf16),
         Dtype::F32 => Some(ElementType::F32),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_materialization_converts_bf16_and_f32_to_f16() {
+        let bf16_bytes = [
+            bf16::from_f32(1.5).to_bits().to_le_bytes(),
+            bf16::from_f32(-2.25).to_bits().to_le_bytes(),
+        ]
+        .concat();
+        let converted =
+            transcode_dense_bytes(&bf16_bytes, ElementType::Bf16, ElementType::F16, "weight")
+                .unwrap();
+        let expected = [
+            f16::from_f32(1.5).to_bits().to_le_bytes(),
+            f16::from_f32(-2.25).to_bits().to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(converted.as_ref(), expected);
+
+        let f32_bytes = [1.5_f32.to_le_bytes(), (-2.25_f32).to_le_bytes()].concat();
+        let converted =
+            transcode_dense_bytes(&f32_bytes, ElementType::F32, ElementType::F16, "weight")
+                .unwrap();
+        assert_eq!(converted.as_ref(), expected);
+    }
+
+    #[test]
+    fn dense_materialization_borrows_matching_storage() {
+        let bytes = f16::from_f32(1.0).to_bits().to_le_bytes();
+        let converted =
+            transcode_dense_bytes(&bytes, ElementType::F16, ElementType::F16, "weight").unwrap();
+        assert!(matches!(converted, Cow::Borrowed(_)));
     }
 }
