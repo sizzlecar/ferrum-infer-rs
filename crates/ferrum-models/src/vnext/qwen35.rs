@@ -9,14 +9,16 @@ use std::fs;
 use std::path::Path;
 
 use ferrum_interfaces::vnext::{
-    AttributeId, ContractVersion, ElementType, ExternalModelMetadataId, ModelFamilyId,
-    ModelFamilyProvider, ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata, NodeId,
-    OperationId, PhysicalWeightLayout, PreparedModelFamily, ProgramBlock, ProgramNode,
-    ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout, SemanticValue, SpecialTokenCollision,
-    SpecialTokenCollisionPolicy, SpecialTokenMetadata, SpecialTokenRole, StateCapacityDemand,
-    StateId, StateLifetime, StateSpec, TemplateMetadata, TypedFamilyRegistration, VNextError,
-    WeightComponentRole, WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId,
-    WeightLayoutId, WeightReference, WeightSchema, WeightTensorSpec, TOKEN_EMBEDDING_OPERATION_ID,
+    AttributeId, CanonicalRational, ContractVersion, ElementType, ExternalModelMetadataId,
+    ModelFamilyId, ModelFamilyProvider, ModelFamilyRegistration, ModelProgram,
+    ModelSemanticMetadata, NodeId, OperationId, PhysicalWeightLayout, PreparedModelFamily,
+    ProgramBlock, ProgramNode, ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout,
+    SemanticValue, SpecialTokenCollision, SpecialTokenCollisionPolicy, SpecialTokenMetadata,
+    SpecialTokenRole, StateCapacityDemand, StateId, StateLifetime, StateSpec, TemplateMetadata,
+    TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSpec, WeightEncoding,
+    WeightFormatId, WeightId, WeightLayoutId, WeightReference, WeightSchema, WeightTensorSpec,
+    DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID, RESIDUAL_ADD_OPERATION_ID,
+    RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
 use ferrum_quantization::SafetensorsArchive;
 use serde::{Deserialize, Serialize};
@@ -63,6 +65,7 @@ pub struct Qwen35FamilyConfig {
     hf_config: Value,
     vocab_size: u64,
     max_position_embeddings: u64,
+    rms_norm_epsilon: CanonicalRational,
     template: TemplateInput,
     special_tokens: SpecialTokenInput,
     weights: Vec<FamilyWeight>,
@@ -86,6 +89,14 @@ impl Qwen35FamilyProvider {
 
     fn validate_typed_config(&self, config: &Qwen35FamilyConfig) -> Result<(), VNextError> {
         let text = Self::text_config(config)?;
+        let expected_epsilon = hf_rms_norm_epsilon(&config.hf_config)
+            .map_err(|reason| invalid_config("hf_config.text_config.rms_norm_eps", reason))?;
+        if config.rms_norm_epsilon != expected_epsilon {
+            return Err(invalid_config(
+                "rms_norm_epsilon",
+                "typed epsilon differs from Hugging Face metadata",
+            ));
+        }
         if text.is_moe() {
             return Err(invalid_config(
                 "hf_config.text_config.model_type",
@@ -407,27 +418,64 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 attributes,
             });
 
-            let layer_output = value_id(format!("value.layer.{layer_index}.output"))?;
-            let mut mlp_inputs = vec![attention_output];
-            mlp_inputs.extend(
-                layer_weights(config, layer_index as u32, true)
-                    .map(weight_value_id)
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
+            let normalized = value_id(format!("value.layer.{layer_index}.post_attention_norm"))?;
+            let post_attention_norm =
+                required_weight(config, Some(layer_index as u32), "post_attention_layernorm")?;
+            nodes.push(ProgramNode {
+                id: node_id(format!("node.layer.{layer_index}.post_attention_norm"))?,
+                operation_id: operation_id(RMS_NORM_OPERATION_ID)?,
+                required_version: ContractVersion::new(1, 0),
+                inputs: vec![
+                    attention_output.clone(),
+                    weight_value_id(post_attention_norm)?,
+                ],
+                outputs: vec![normalized.clone()],
+                attributes: BTreeMap::from([
+                    attribute("hidden_size", text.hidden_size as u64)?,
+                    attribute("epsilon", config.rms_norm_epsilon)?,
+                ]),
+            });
+
+            let intermediate_size = text.dense_intermediate_size.ok_or_else(|| {
+                invalid_config(
+                    "hf_config.text_config.intermediate_size",
+                    "missing dense FFN size",
+                )
+            })?;
+            let mlp_output = value_id(format!("value.layer.{layer_index}.mlp"))?;
             nodes.push(ProgramNode {
                 id: node_id(format!("node.layer.{layer_index}.feed_forward"))?,
-                operation_id: operation_id("operation.dense_swiglu")?,
+                operation_id: operation_id(DENSE_SWIGLU_OPERATION_ID)?,
                 required_version: ContractVersion::new(1, 0),
-                inputs: mlp_inputs,
-                outputs: vec![layer_output.clone()],
+                inputs: vec![
+                    normalized,
+                    weight_value_id(required_weight(
+                        config,
+                        Some(layer_index as u32),
+                        "mlp_gate",
+                    )?)?,
+                    weight_value_id(required_weight(config, Some(layer_index as u32), "mlp_up")?)?,
+                    weight_value_id(required_weight(
+                        config,
+                        Some(layer_index as u32),
+                        "mlp_down",
+                    )?)?,
+                ],
+                outputs: vec![mlp_output.clone()],
                 attributes: BTreeMap::from([
-                    attribute("layer_index", layer_index as u64)?,
                     attribute("hidden_size", text.hidden_size as u64)?,
-                    attribute(
-                        "intermediate_size",
-                        text.dense_intermediate_size.unwrap_or_default() as u64,
-                    )?,
+                    attribute("intermediate_size", intermediate_size as u64)?,
                 ]),
+            });
+
+            let layer_output = value_id(format!("value.layer.{layer_index}.output"))?;
+            nodes.push(ProgramNode {
+                id: node_id(format!("node.layer.{layer_index}.residual"))?,
+                operation_id: operation_id(RESIDUAL_ADD_OPERATION_ID)?,
+                required_version: ContractVersion::new(1, 0),
+                inputs: vec![attention_output, mlp_output],
+                outputs: vec![layer_output.clone()],
+                attributes: BTreeMap::from([attribute("hidden_size", text.hidden_size as u64)?]),
             });
             hidden = layer_output;
         }
@@ -438,21 +486,28 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             .iter()
             .find(|weight| weight.layer_index.is_none() && weight.role == "lm_head")
             .unwrap_or(embedding);
+        let final_hidden = value_id("value.output.final_hidden")?;
+        nodes.push(ProgramNode {
+            id: node_id("node.final_norm")?,
+            operation_id: operation_id(RMS_NORM_OPERATION_ID)?,
+            required_version: ContractVersion::new(1, 0),
+            inputs: vec![hidden, weight_value_id(final_norm)?],
+            outputs: vec![final_hidden.clone()],
+            attributes: BTreeMap::from([
+                attribute("hidden_size", text.hidden_size as u64)?,
+                attribute("epsilon", config.rms_norm_epsilon)?,
+            ]),
+        });
         let logits = value_id("value.output.logits")?;
         nodes.push(ProgramNode {
             id: node_id("node.logits")?,
-            operation_id: operation_id("operation.logits_projection")?,
+            operation_id: operation_id(DENSE_LINEAR_OPERATION_ID)?,
             required_version: ContractVersion::new(1, 0),
-            inputs: vec![
-                hidden,
-                weight_value_id(final_norm)?,
-                weight_value_id(projection)?,
-            ],
+            inputs: vec![final_hidden, weight_value_id(projection)?],
             outputs: vec![logits.clone()],
             attributes: BTreeMap::from([
-                attribute("hidden_size", text.hidden_size as u64)?,
-                attribute("vocab_size", config.vocab_size)?,
-                attribute("tied_embeddings", text.tie_word_embeddings)?,
+                attribute("in_features", text.hidden_size as u64)?,
+                attribute("out_features", config.vocab_size)?,
             ]),
         });
 
@@ -519,6 +574,7 @@ fn load_family_config(
     let text_value = hf_config.get("text_config").unwrap_or(&hf_config);
     let vocab_size = required_u64(text_value, "vocab_size")?;
     let max_position_embeddings = required_u64(text_value, "max_position_embeddings")?;
+    let rms_norm_epsilon = hf_rms_norm_epsilon(&hf_config)?;
     let tokenizer_config = read_json(&model_dir.join("tokenizer_config.json"))?;
     let template = tokenizer_config
         .get("chat_template")
@@ -554,6 +610,7 @@ fn load_family_config(
         hf_config,
         vocab_size,
         max_position_embeddings,
+        rms_norm_epsilon,
         template: TemplateInput {
             sha256: format!("{:x}", Sha256::digest(template.as_bytes())),
             template,
@@ -789,6 +846,77 @@ fn required_u64(value: &Value, key: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{key} must be a positive integer"))
 }
 
+fn hf_rms_norm_epsilon(hf_config: &Value) -> Result<CanonicalRational, String> {
+    let text = hf_config.get("text_config").unwrap_or(hf_config);
+    let Some(value) = text.get("rms_norm_eps") else {
+        return CanonicalRational::new(1, 1_000_000).map_err(|error| error.to_string());
+    };
+    let Value::Number(number) = value else {
+        return Err("rms_norm_eps must be a JSON number".to_owned());
+    };
+    parse_positive_decimal_rational(&number.to_string())
+}
+
+fn parse_positive_decimal_rational(raw: &str) -> Result<CanonicalRational, String> {
+    let normalized = raw.to_ascii_lowercase();
+    let (mantissa, exponent) = match normalized.split_once('e') {
+        Some((mantissa, exponent)) => (
+            mantissa,
+            exponent
+                .parse::<i32>()
+                .map_err(|error| format!("invalid decimal exponent: {error}"))?,
+        ),
+        None => (normalized.as_str(), 0),
+    };
+    if mantissa.starts_with('-') {
+        return Err("rms_norm_eps must be positive".to_owned());
+    }
+    let mantissa = mantissa.strip_prefix('+').unwrap_or(mantissa);
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!("invalid decimal rational {raw:?}"));
+    }
+    let digits = format!("{whole}{fraction}");
+    let mut numerator = digits
+        .parse::<u128>()
+        .map_err(|error| format!("decimal numerator overflows: {error}"))?;
+    if numerator == 0 {
+        return Err("rms_norm_eps must be positive".to_owned());
+    }
+    let fractional_digits = i32::try_from(fraction.len())
+        .map_err(|_| "rms_norm_eps has too many fractional digits".to_owned())?;
+    let scale = fractional_digits
+        .checked_sub(exponent)
+        .ok_or_else(|| "rms_norm_eps exponent overflows".to_owned())?;
+    let denominator = if scale >= 0 {
+        10_u128
+            .checked_pow(scale as u32)
+            .ok_or_else(|| "rms_norm_eps denominator overflows".to_owned())?
+    } else {
+        numerator = numerator
+            .checked_mul(
+                10_u128
+                    .checked_pow(scale.unsigned_abs())
+                    .ok_or_else(|| "rms_norm_eps numerator scale overflows".to_owned())?,
+            )
+            .ok_or_else(|| "rms_norm_eps numerator overflows".to_owned())?;
+        1
+    };
+    let numerator =
+        i64::try_from(numerator).map_err(|_| "rms_norm_eps numerator exceeds i64".to_owned())?;
+    let denominator = u64::try_from(denominator)
+        .map_err(|_| "rms_norm_eps denominator exceeds u64".to_owned())?;
+    let value =
+        CanonicalRational::new(numerator, denominator).map_err(|error| error.to_string())?;
+    if value.numerator() as u64 > value.denominator() {
+        return Err("rms_norm_eps must not exceed one".to_owned());
+    }
+    Ok(value)
+}
+
 fn weight_key(weight: &FamilyWeight, prefix: &str) -> String {
     match weight.layer_index {
         Some(layer) => format!("{prefix}.layer.{layer}.{}", weight.role),
@@ -845,6 +973,12 @@ impl IntoSemanticValue for u64 {
 impl IntoSemanticValue for bool {
     fn into_semantic_value(self) -> SemanticValue {
         SemanticValue::Bool(self)
+    }
+}
+
+impl IntoSemanticValue for CanonicalRational {
+    fn into_semantic_value(self) -> SemanticValue {
+        SemanticValue::Rational(self)
     }
 }
 
@@ -928,6 +1062,7 @@ mod tests {
             hf_config,
             vocab_size: 32,
             max_position_embeddings: 128,
+            rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
             template: TemplateInput {
                 sha256: format!("{:x}", Sha256::digest(template.as_bytes())),
                 template,
@@ -951,7 +1086,27 @@ mod tests {
             .unwrap();
 
         assert_eq!(prepared.family_id().as_str(), FAMILY_ID);
-        assert_eq!(prepared.program().blocks()[0].nodes.len(), 10);
+        assert_eq!(prepared.program().blocks()[0].nodes.len(), 19);
+        let operation_ids = prepared.program().blocks()[0]
+            .nodes
+            .iter()
+            .map(|node| node.operation_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operation_ids
+                .iter()
+                .filter(|operation| **operation == RMS_NORM_OPERATION_ID)
+                .count(),
+            5
+        );
+        assert_eq!(
+            operation_ids
+                .iter()
+                .filter(|operation| **operation == DENSE_SWIGLU_OPERATION_ID)
+                .count(),
+            4
+        );
+        assert!(!operation_ids.contains(&"operation.logits_projection"));
         assert_eq!(prepared.program().states().len(), 7);
         assert_eq!(prepared.program().weights().len(), config.weights.len());
         assert!(prepared
@@ -971,5 +1126,17 @@ mod tests {
             .prepare(&serde_json::to_value(malformed).unwrap())
             .expect_err("shape drift must fail before backend allocation");
         assert!(error.to_string().contains("elements, expected"), "{error}");
+    }
+
+    #[test]
+    fn parses_rms_norm_epsilon_without_floating_point_rounding() {
+        let expected = CanonicalRational::new(1, 1_000_000).unwrap();
+        assert_eq!(
+            parse_positive_decimal_rational("0.000001").unwrap(),
+            expected
+        );
+        assert_eq!(parse_positive_decimal_rational("1e-6").unwrap(), expected);
+        assert!(parse_positive_decimal_rational("0").is_err());
+        assert!(parse_positive_decimal_rational("1.1").is_err());
     }
 }
