@@ -168,7 +168,25 @@ RESOURCE_PROOF_LINES = {
     ),
     "vnext_resource_runtime_close_tests": (),
 }
-REQUIRED_EVENT_TESTS = {"vnext_event_replay_v5_contract"}
+REQUIRED_EVENT_TESTS_BY_TARGET = {
+    "vnext_event_execution_contract_tests": {"vnext_event_execution_contract"},
+    "vnext_event_sink_contract_tests": {"vnext_event_sink_contract"},
+    "vnext_event_resource_pool_contract_tests": {
+        "vnext_event_resource_pool_contract"
+    },
+    "vnext_event_recovery_contract_tests": {"vnext_event_recovery_contract"},
+    "vnext_event_replay_contract_tests": {"vnext_event_replay_contract"},
+}
+EVENT_PROOF_LINES = {
+    "vnext_event_execution_contract_tests": ("VNEXT EVENT EXECUTION PASS", 54),
+    "vnext_event_sink_contract_tests": ("VNEXT EVENT SINK PASS", 13),
+    "vnext_event_resource_pool_contract_tests": (
+        "VNEXT EVENT RESOURCE POOL PASS",
+        27,
+    ),
+    "vnext_event_recovery_contract_tests": ("VNEXT EVENT RECOVERY PASS", 20),
+    "vnext_event_replay_contract_tests": ("VNEXT EVENT REPLAY PASS", 47),
+}
 REQUIRED_RESOLUTION_LIMITS_TESTS = {
     "field_path_count_and_total_bytes_are_bounded_before_parser",
     "json_parser_checks_source_bytes_when_called_directly",
@@ -211,7 +229,7 @@ REQUIRED_LEGACY_TESTS = {"legacy_backend_methods_are_mapped_82_of_82"}
 REQUIRED_TESTS_BY_TARGET = {
     "vnext_contract_tests": REQUIRED_UNIT_TESTS,
     **REQUIRED_RESOURCE_TESTS_BY_TARGET,
-    "vnext_event_contract_tests": REQUIRED_EVENT_TESTS,
+    **REQUIRED_EVENT_TESTS_BY_TARGET,
     "vnext_resolution_limits_contract_tests": REQUIRED_RESOLUTION_LIMITS_TESTS,
     "vnext_device_operation_contract_tests": REQUIRED_DEVICE_OPERATION_TESTS,
     "vnext_oracle_contract_tests": REQUIRED_ORACLE_TESTS,
@@ -277,7 +295,7 @@ EXPECTED_TRYBUILD_PASS_CASES = 2
 EXPECTED_TRYBUILD_FAIL_CASES = 78
 TEST_THREADS_ARG = "--test-threads=1"
 BOUNDED_RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
-BOUNDED_TEST_COMMAND_COUNT = 32
+BOUNDED_TEST_COMMAND_COUNT = 40
 BOUNDED_TEST_ENV_OVERRIDES = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "CARGO_BUILD_JOBS": "2",
@@ -2261,6 +2279,32 @@ def parse_machine_proofs(target_stdout: dict[str, str]) -> dict[str, int]:
         resource_total == EXPECTED_RESOURCE_CASES,
         f"resource machine proof total changed: expected={EXPECTED_RESOURCE_CASES} actual={resource_total}",
     )
+    event_total = 0
+    for target, (prefix, expected) in EVENT_PROOF_LINES.items():
+        pattern = re.compile(
+            rf"^{re.escape(prefix)}: ([1-9][0-9]*)/([1-9][0-9]*)$"
+        )
+        matches = [
+            match
+            for line in lines_by_target[target]
+            if (match := pattern.fullmatch(line))
+        ]
+        require(
+            len(matches) == 1,
+            f"missing or duplicate event machine proof line: {target} {prefix}",
+        )
+        passed, total = (int(value) for value in matches[0].groups())
+        require(
+            passed == total == expected,
+            f"event machine proof count changed: {target} {prefix} "
+            f"expected={expected}/{expected} actual={passed}/{total}",
+        )
+        event_total += total
+    require(
+        event_total == EXPECTED_EVENT_REPLAY_V5_CASES,
+        "event machine proof total changed: "
+        f"expected={EXPECTED_EVENT_REPLAY_V5_CASES} actual={event_total}",
+    )
     ratio_proofs = {
         "fail_closed_cases": (
             "vnext_contract_tests",
@@ -2271,11 +2315,6 @@ def parse_machine_proofs(target_stdout: dict[str, str]) -> dict[str, int]:
             "vnext_contract_tests",
             "VNEXT MODEL IDENTITY PASS",
             EXPECTED_MODEL_IDENTITY_CASES,
-        ),
-        "event_replay_v5_contract_cases": (
-            "vnext_event_contract_tests",
-            "VNEXT EVENT/REPLAY V5 PASS",
-            EXPECTED_EVENT_REPLAY_V5_CASES,
         ),
         "device_operation_contract_cases": (
             "vnext_device_operation_contract_tests",
@@ -2298,7 +2337,10 @@ def parse_machine_proofs(target_stdout: dict[str, str]) -> dict[str, int]:
             82,
         ),
     }
-    ratios: dict[str, int] = {"resource_transaction_cases": resource_total}
+    ratios: dict[str, int] = {
+        "resource_transaction_cases": resource_total,
+        "event_replay_v5_contract_cases": event_total,
+    }
     for label, (target, prefix, expected) in ratio_proofs.items():
         pattern = re.compile(
             rf"^{re.escape(prefix)}: ([1-9][0-9]*)/([1-9][0-9]*)$"
@@ -3082,10 +3124,6 @@ impl OperationDispatch {
     proof_stdout.update(
         {
             "vnext_contract_tests": contract_proofs,
-            "vnext_event_contract_tests": (
-                f"VNEXT EVENT/REPLAY V5 PASS: "
-                f"{EXPECTED_EVENT_REPLAY_V5_CASES}/{EXPECTED_EVENT_REPLAY_V5_CASES}\n"
-            ),
             "vnext_device_operation_contract_tests": (
                 f"VNEXT DEVICE OPERATION PASS: "
                 f"{EXPECTED_DEVICE_OPERATION_CASES}/{EXPECTED_DEVICE_OPERATION_CASES}\n"
@@ -3104,6 +3142,8 @@ impl OperationDispatch {
         proof_stdout[target] = "".join(
             f"{prefix}: {count}/{count}\n" for prefix, count in resource_proofs
         )
+    for target, (prefix, count) in EVENT_PROOF_LINES.items():
+        proof_stdout[target] = f"{prefix}: {count}/{count}\n"
     proofs = parse_machine_proofs(proof_stdout)
     require(
         proofs["resource_transaction_cases"] == EXPECTED_RESOURCE_CASES
@@ -3146,11 +3186,11 @@ impl OperationDispatch {
         "resource machine proof count changed",
     )
     missing_event = copy.deepcopy(proof_stdout)
-    missing_event["vnext_event_contract_tests"] = ""
+    missing_event["vnext_event_replay_contract_tests"] = ""
     expect_rejected(
         "event proof missing",
         lambda: parse_machine_proofs(missing_event),
-        "event_replay_v5_contract_cases",
+        "missing or duplicate event machine proof line",
     )
     commands = evidence_command_matrix()
     require(

@@ -151,6 +151,26 @@ The frozen aggregated resource proof remains `311` cases:
 transaction-evidence target. G01A checkpoint consumers now validate the exact seven-target test
 matrix and sum the owner proof lines instead of accepting one monolithic `311/311` line.
 
+## Event Test Ownership
+
+The former 6,210-line event/replay target is replaced by five invariant-owner targets and six
+normal Rust fixture modules. No `include!` source assembly is used.
+
+| Target | Owner responsibility | Frozen proof cases |
+|---|---|---:|
+| `vnext_event_execution_contract_tests` | execution identity, wire validation and cursor state | 54 |
+| `vnext_event_sink_contract_tests` | transactional emission, live witness and sink failure | 13 |
+| `vnext_event_resource_pool_contract_tests` | pool event identity, transition and lease cursors | 27 |
+| `vnext_event_recovery_contract_tests` | failure/recovery continuation and root close evidence | 20 |
+| `vnext_event_replay_contract_tests` | replay closure, terminal evidence and no-static cleanup | 47 |
+
+The frozen counted total remains `54 + 13 + 27 + 20 + 47 = 161`. The no-static replay helper also
+retains its direct assertions. Every owner root and every physical fixture module is below 2,000
+lines; the largest owner root is the replay target and the largest fixture module is the execution
+fixture. This physical split does not yet claim the stricter transitive target-LOC gate: all five
+targets currently compile the shared fixture module graph, so fixture dependency reduction or a
+reusable bounded test-support owner remains open before final S0A PASS.
+
 ## Preserved Dynamic Resource Invariants
 
 This split is not permission to simplify the resource model. The following owners and behavior
@@ -219,12 +239,12 @@ bounded execution white-box target passes `14/14`, the focused external executio
 results establish compile, contract, and structural evidence; remaining test ownership work, the
 public owner map, bounded aggregate, and final S0A PASS artifact remain open.
 
-For the normalized event graph, `cargo check -p ferrum-interfaces --all-targets` passes, the existing
-6,208-line frozen event/replay aggregate passes `1/1`, and all `80` vNext compile-time UI fixtures
-pass without snapshot changes. Two source-shape assertions now inspect their real `sink` and
-`resource_pool` owners, and the aggregate helper uses `#[track_caller]` so later failures identify
-the actual invariant line. Event test ownership, the public owner map, bounded aggregate, and final
-S0A PASS artifact remain open.
+For the normalized event graph, `cargo check -p ferrum-interfaces --all-targets` passes and all `80`
+vNext compile-time UI fixtures pass without snapshot changes. The former aggregate is now five
+owner targets whose exact proof lines pass `54/54`, `13/13`, `27/27`, `20/20`, and `47/47`.
+`runtime_vnext_g01a_checkpoint.py` and `run_gate.py` require the exact five-target matrix and sum it
+back to `161`; both validator self-tests pass. Event fixture transitive LOC, the public owner map,
+bounded aggregate, and final S0A PASS artifact remain open.
 
 After owner normalization and the zero-SCC audit, the bounded all-target check, `47/47` resource
 library tests, and all seven external resource owner targets pass. The transaction-evidence
