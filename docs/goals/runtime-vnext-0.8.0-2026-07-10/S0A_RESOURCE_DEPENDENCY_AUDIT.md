@@ -84,11 +84,18 @@ The following validations passed after the ownership corrections:
 CARGO_BUILD_JOBS=4 cargo check -p ferrum-interfaces --all-targets
 RUST_TEST_THREADS=2 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces --lib resource:: -- --test-threads=2
   47 passed; 0 failed
-RUST_TEST_THREADS=2 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces --test vnext_resource_contract_tests -- --test-threads=2
-  7 passed; 0 failed
+RUST_TEST_THREADS=2 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
+  --test vnext_resource_capacity_contract_tests \
+  --test vnext_resource_transaction_lifecycle_tests \
+  --test vnext_resource_transaction_evidence_tests \
+  --test vnext_resource_sequence_activation_tests \
+  --test vnext_resource_sequence_recovery_tests \
+  --test vnext_resource_recovery_authority_tests \
+  --test vnext_resource_runtime_close_tests -- --test-threads=2
+  12 parent tests passed; 0 failed; 311 frozen proof cases preserved
 ```
 
 The external test target includes an isolated panic-child fault injection. Its child panic output
 is expected; the parent test and target both exited successfully. This audit does not claim S0A
-completion: `execution.rs`, `event.rs`, oversized test targets, the public owner map, and the final
-artifact validator remain open.
+completion: `execution.rs`, `event.rs`, their oversized test targets, the public owner map, and the
+final artifact validator remain open.

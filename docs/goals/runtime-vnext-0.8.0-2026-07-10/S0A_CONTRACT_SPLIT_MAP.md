@@ -4,8 +4,8 @@
 
 - Work package: S0A, semantics-preserving structural split.
 - Current stage: `resource.rs` production contract split, symbol-level imports, and complete
-  dependency-cycle removal validated; `execution.rs`, `event.rs`, and owner-aligned external test
-  targets remain open.
+  dependency-cycle removal validated; the external resource contract target is split by invariant
+  owner; `execution.rs`, `event.rs`, and their oversized contract targets remain open.
 - This map records file ownership, not G01A completion. Public item inventory and the final
   `contract-map.json` remain required before the S0A PASS artifact can be issued.
 
@@ -59,6 +59,27 @@ As a second mechanical-equivalence check, removing only the added `use super::*`
 `resource.rs` is now a 69-line facade. Every production fragment is below the S0A `2,500`
 logical-line limit and the facade is below `500` lines.
 
+## Resource Test Ownership
+
+The former 4,289-line `vnext_resource_contract_tests` target is replaced by one shared 1,474-line
+fixture and seven owner targets. The limit below counts the shared fixture against every target;
+it is not hidden from the logical target size.
+
+| Target | Owner lines | With shared fixture | Frozen proof cases |
+|---|---:|---:|---:|
+| `vnext_resource_capacity_contract_tests` | 402 | 1,876 | 33 |
+| `vnext_resource_transaction_lifecycle_tests` | 486 | 1,960 | 70 |
+| `vnext_resource_transaction_evidence_tests` | 503 | 1,977 | 69 |
+| `vnext_resource_sequence_activation_tests` | 376 | 1,850 | 53 |
+| `vnext_resource_sequence_recovery_tests` | 389 | 1,863 | 48 |
+| `vnext_resource_recovery_authority_tests` | 404 | 1,878 | 38 |
+| `vnext_resource_runtime_close_tests` | 424 | 1,898 | standalone close/recovery assertions |
+
+The frozen aggregated resource proof remains `311` cases:
+`13 + 20 + 70 + 69 + 53 + 48 + 38 = 311`. The panic-isolation child stays only in the
+transaction-evidence target. G01A checkpoint consumers now validate the exact seven-target test
+matrix and sum the owner proof lines instead of accepting one monolithic `311/311` line.
+
 ## Preserved Dynamic Resource Invariants
 
 This split is not permission to simplify the resource model. The following owners and behavior
@@ -99,11 +120,13 @@ break these contracts only against the real Qwen3.5-4B production consumer.
 4. `CARGO_BUILD_JOBS=4 cargo check -p ferrum-interfaces --all-targets` passes.
 5. `RUST_TEST_THREADS=2 cargo test -p ferrum-interfaces --lib resource:: -- --test-threads=2`
    passes `47/47` tests.
-6. `RUST_TEST_THREADS=2 cargo test -p ferrum-interfaces --test vnext_resource_contract_tests`
-   with `-- --test-threads=2` passes `7/7` tests, including the expected isolated panic-child
-   fault case.
+6. One bounded cargo invocation with the seven `vnext_resource_*` owner targets and
+   `-- --test-threads=2` passes `12/12` parent tests, including the expected isolated panic-child
+   fault case and all `311` frozen proof cases.
 7. No paid GPU, model download, performance run, or product migration claim is part of this stage.
 
 After owner normalization and the zero-SCC audit, the bounded all-target check, `47/47` resource
-library tests, and `7/7` external resource contract tests pass. The external target's isolated
-panic-child output is expected fault injection; the parent test exits successfully.
+library tests, and all seven external resource owner targets pass. The transaction-evidence
+target's isolated panic-child output is expected fault injection; the parent test exits
+successfully. `runtime_vnext_g01a_checkpoint.py --self-test` and `run_gate.py --self-test` also
+pass with the split matrix.
