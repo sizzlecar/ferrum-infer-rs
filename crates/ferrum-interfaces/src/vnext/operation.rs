@@ -6,15 +6,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::{
-    classify_device_error, AllocationLifetime, BatchInvocationId, BatchParticipantTokenRange,
-    BatchStepId, BatchWorkShape, BufferUsage, CanonicalRational, CapabilityId, CompletionHandle,
-    CompletionReaper, ContractVersion, DefinitelyNotSubmittedRetryAuthority, DeviceCommandBatch,
-    DeviceId, DeviceRuntime, ExecutionIdentityEnvelope, ExecutionLane, ExecutionLaneId,
-    IdentifiedFailure, IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome,
-    LeasedBufferView, LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, OperationId,
-    ParticipantNodeKey, PlanHash, PlanId, ProgramValueId, ProviderId, ProviderWorkspaceRequirement,
-    QuantizationFormatId, ResolvedModelPlan, ResourceId, SemanticValue,
-    TrustedActiveSequenceBinding, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
+    classify_device_error, AdmittedSequenceResources, AllocationLifetime, BatchInvocationId,
+    BatchParticipantTokenRange, BatchStepId, BatchWorkShape, BufferUsage, CanonicalRational,
+    CapabilityId, CompletionHandle, CompletionReaper, ContractVersion,
+    DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
+    DeviceCommandBatch, DeviceId, DeviceRuntime, ExecutionIdentityEnvelope, ExecutionLane,
+    ExecutionLaneId, IdentifiedFailure, IndeterminateSubmissionHandle, InvocationResourceLease,
+    LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId, LogicalBackingBufferView,
+    LogicalBackingSegmentBinding, NodeId, OperationId, ParticipantNodeKey, PlanHash, PlanId,
+    PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
+    ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedModelPlan, ResourceId,
+    SemanticValue, SequenceSessionEpoch, SequenceSessionFingerprint,
+    StepParticipantFrameAssignment, StepResourceLease, TrustedActiveSequenceBinding,
+    TrustedPlanRuntimeEvidence, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
     WeightId,
 };
 
@@ -2729,22 +2733,137 @@ impl BatchOperationParticipantIdentity {
     }
 }
 
-/// One physical batch attempt identity. Participant request identities remain
-/// explicit projections; no canonical leader can stand in for the batch.
+/// One immutable-plan node inside a physical command batch. Participant
+/// identities stay node-local even when several nodes share one submission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BatchOperationNodeIdentity {
+    node_index: u32,
+    node_id: NodeId,
+    operation_id: OperationId,
+    provider_id: ProviderId,
+    work_shape_fingerprint: String,
+    participants: Vec<BatchOperationParticipantIdentity>,
+    fingerprint: String,
+}
+
+impl BatchOperationNodeIdentity {
+    fn from_validated(
+        node_index: u32,
+        node_id: NodeId,
+        operation_id: OperationId,
+        provider_id: ProviderId,
+        work_shape_fingerprint: String,
+        participants: Vec<BatchOperationParticipantIdentity>,
+    ) -> Result<Self, VNextError> {
+        let participant_start = participants
+            .first()
+            .map(BatchOperationParticipantIdentity::participant_index);
+        if participants.is_empty()
+            || participants.iter().enumerate().any(|(index, participant)| {
+                participant_start.and_then(|start| start.checked_add(index as u32))
+                    != Some(participant.participant_index)
+                    || participant.node_key.node_id() != &node_id
+                    || participant.identity.parts().frame_id
+                        != Some(participant.node_key.frame_id())
+                    || participant.identity.parts().node_id.as_ref() != Some(&node_id)
+                    || participant.identity.parts().operation_id.as_ref() != Some(&operation_id)
+                    || participant.identity.parts().provider_id.as_ref() != Some(&provider_id)
+            })
+            || participants
+                .windows(2)
+                .any(|pair| pair[0].node_key >= pair[1].node_key)
+            || !canonical_sha256(&work_shape_fingerprint)
+        {
+            return Err(invalid_operation(
+                "batch node identity is empty, non-canonical, or differs from its participant projections",
+            ));
+        }
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            node_index: u32,
+            node_id: &'a NodeId,
+            operation_id: &'a OperationId,
+            provider_id: &'a ProviderId,
+            work_shape_fingerprint: &'a str,
+            participants: &'a [BatchOperationParticipantIdentity],
+        }
+        let fingerprint = format!(
+            "{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&FingerprintInput {
+                    domain: "ferrum.runtime-vnext.batch-operation-node-identity.v1",
+                    node_index,
+                    node_id: &node_id,
+                    operation_id: &operation_id,
+                    provider_id: &provider_id,
+                    work_shape_fingerprint: &work_shape_fingerprint,
+                    participants: &participants,
+                })
+                .map_err(|error| {
+                    invalid_operation(format!("batch node identity encode failed: {error}"))
+                })?
+            )
+        );
+        Ok(Self {
+            node_index,
+            node_id,
+            operation_id,
+            provider_id,
+            work_shape_fingerprint,
+            participants,
+            fingerprint,
+        })
+    }
+
+    pub const fn node_index(&self) -> u32 {
+        self.node_index
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    pub fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    pub fn work_shape_fingerprint(&self) -> &str {
+        &self.work_shape_fingerprint
+    }
+
+    pub fn participants(&self) -> &[BatchOperationParticipantIdentity] {
+        &self.participants
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    fn contains_identity(&self, identity: &ExecutionIdentityEnvelope) -> bool {
+        self.participants
+            .iter()
+            .any(|participant| participant.identity() == identity)
+    }
+}
+
+/// One physical command-batch attempt identity. It may contain one operation
+/// or the entire immutable-plan wave, but it always maps to one submit/fence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BatchOperationIdentity {
     batch_step_id: BatchStepId,
     batch_invocation_id: BatchInvocationId,
     plan_id: PlanId,
     plan_hash: PlanHash,
-    node_id: NodeId,
-    operation_id: OperationId,
-    provider_id: ProviderId,
     device_id: DeviceId,
     runtime_implementation_fingerprint: String,
     lane_id: ExecutionLaneId,
-    work_shape_fingerprint: String,
     claimed_backing_fingerprint: String,
+    nodes: Vec<BatchOperationNodeIdentity>,
     participants: Vec<BatchOperationParticipantIdentity>,
     fingerprint: String,
 }
@@ -2756,44 +2875,51 @@ impl BatchOperationIdentity {
         batch_invocation_id: BatchInvocationId,
         plan_id: PlanId,
         plan_hash: PlanHash,
-        node_id: NodeId,
-        operation_id: OperationId,
-        provider_id: ProviderId,
         device_id: DeviceId,
         runtime_implementation_fingerprint: String,
         lane_id: ExecutionLaneId,
-        work_shape_fingerprint: String,
         claimed_backing_fingerprint: String,
-        participants: Vec<BatchOperationParticipantIdentity>,
+        nodes: Vec<BatchOperationNodeIdentity>,
     ) -> Result<Self, VNextError> {
-        if participants.is_empty()
-            || participants.iter().enumerate().any(|(index, participant)| {
-                participant.participant_index as usize != index
-                    || participant.node_key.node_id() != &node_id
-                    || participant.identity.parts().frame_id
-                        != Some(participant.node_key.frame_id())
-                    || participant.identity.parts().node_id.as_ref() != Some(&node_id)
-                    || participant.identity.parts().operation_id.as_ref() != Some(&operation_id)
-                    || participant.identity.parts().provider_id.as_ref() != Some(&provider_id)
-                    || participant.identity.parts().plan_id.as_ref() != Some(&plan_id)
-                    || participant.identity.parts().plan_hash.as_ref() != Some(&plan_hash)
-                    || participant.identity.parts().device_id.as_ref() != Some(&device_id)
-                    || participant
-                        .identity
-                        .parts()
-                        .runtime_implementation_fingerprint
-                        .as_deref()
-                        != Some(runtime_implementation_fingerprint.as_str())
+        if nodes.is_empty()
+            || nodes.iter().enumerate().any(|(index, node)| {
+                node.node_index as usize != index
+                    || node.participants.iter().any(|participant| {
+                        participant.identity.parts().plan_id.as_ref() != Some(&plan_id)
+                            || participant.identity.parts().plan_hash.as_ref() != Some(&plan_hash)
+                            || participant.identity.parts().device_id.as_ref() != Some(&device_id)
+                            || participant
+                                .identity
+                                .parts()
+                                .runtime_implementation_fingerprint
+                                .as_deref()
+                                != Some(runtime_implementation_fingerprint.as_str())
+                    })
             })
-            || participants
-                .windows(2)
-                .any(|pair| pair[0].node_key >= pair[1].node_key)
+            || nodes
+                .iter()
+                .map(BatchOperationNodeIdentity::node_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != nodes.len()
             || !canonical_sha256(&runtime_implementation_fingerprint)
-            || !canonical_sha256(&work_shape_fingerprint)
             || !canonical_sha256(&claimed_backing_fingerprint)
         {
             return Err(invalid_operation(
-                "batch operation identity is empty, non-canonical, or differs from its participant projections",
+                "physical batch identity is empty, non-canonical, or differs from its plan/runtime projections",
+            ));
+        }
+        let participants = nodes
+            .iter()
+            .flat_map(|node| node.participants.iter().cloned())
+            .collect::<Vec<_>>();
+        if participants
+            .iter()
+            .enumerate()
+            .any(|(index, participant)| participant.participant_index as usize != index)
+        {
+            return Err(invalid_operation(
+                "physical batch participant indices are not globally contiguous",
             ));
         }
         #[derive(Serialize)]
@@ -2803,38 +2929,30 @@ impl BatchOperationIdentity {
             batch_invocation_id: BatchInvocationId,
             plan_id: &'a PlanId,
             plan_hash: &'a PlanHash,
-            node_id: &'a NodeId,
-            operation_id: &'a OperationId,
-            provider_id: &'a ProviderId,
             device_id: &'a DeviceId,
             runtime_implementation_fingerprint: &'a str,
             lane_id: ExecutionLaneId,
-            work_shape_fingerprint: &'a str,
             claimed_backing_fingerprint: &'a str,
-            participants: &'a [BatchOperationParticipantIdentity],
+            nodes: &'a [BatchOperationNodeIdentity],
         }
         let fingerprint = format!(
             "{:x}",
             Sha256::digest(
                 serde_json::to_vec(&FingerprintInput {
-                    domain: "ferrum.runtime-vnext.batch-operation-identity.v1",
+                    domain: "ferrum.runtime-vnext.physical-command-batch-identity.v1",
                     batch_step_id,
                     batch_invocation_id,
                     plan_id: &plan_id,
                     plan_hash: &plan_hash,
-                    node_id: &node_id,
-                    operation_id: &operation_id,
-                    provider_id: &provider_id,
                     device_id: &device_id,
                     runtime_implementation_fingerprint: &runtime_implementation_fingerprint,
                     lane_id,
-                    work_shape_fingerprint: &work_shape_fingerprint,
                     claimed_backing_fingerprint: &claimed_backing_fingerprint,
-                    participants: &participants,
+                    nodes: &nodes,
                 })
-                .map_err(|error| invalid_operation(format!(
-                    "batch operation identity encode failed: {error}"
-                )))?
+                .map_err(|error| {
+                    invalid_operation(format!("physical batch identity encode failed: {error}"))
+                })?,
             )
         );
         Ok(Self {
@@ -2842,14 +2960,11 @@ impl BatchOperationIdentity {
             batch_invocation_id,
             plan_id,
             plan_hash,
-            node_id,
-            operation_id,
-            provider_id,
             device_id,
             runtime_implementation_fingerprint,
             lane_id,
-            work_shape_fingerprint,
             claimed_backing_fingerprint,
+            nodes,
             participants,
             fingerprint,
         })
@@ -2871,18 +2986,6 @@ impl BatchOperationIdentity {
         &self.plan_hash
     }
 
-    pub fn node_id(&self) -> &NodeId {
-        &self.node_id
-    }
-
-    pub fn operation_id(&self) -> &OperationId {
-        &self.operation_id
-    }
-
-    pub fn provider_id(&self) -> &ProviderId {
-        &self.provider_id
-    }
-
     pub fn device_id(&self) -> &DeviceId {
         &self.device_id
     }
@@ -2895,12 +2998,16 @@ impl BatchOperationIdentity {
         self.lane_id
     }
 
-    pub fn work_shape_fingerprint(&self) -> &str {
-        &self.work_shape_fingerprint
-    }
-
     pub fn claimed_backing_fingerprint(&self) -> &str {
         &self.claimed_backing_fingerprint
+    }
+
+    pub fn nodes(&self) -> &[BatchOperationNodeIdentity] {
+        &self.nodes
+    }
+
+    pub fn single_node(&self) -> Option<&BatchOperationNodeIdentity> {
+        (self.nodes.len() == 1).then(|| &self.nodes[0])
     }
 
     pub fn participants(&self) -> &[BatchOperationParticipantIdentity] {
@@ -2915,6 +3022,174 @@ impl BatchOperationIdentity {
         self.participants
             .iter()
             .any(|participant| participant.identity() == identity)
+    }
+}
+
+enum OperationInvocationResources<'a, R: DeviceRuntime> {
+    Invocation(&'a InvocationResourceLease<R>),
+    Wave {
+        wave: &'a PreparedStepSubmissionWave<R>,
+        node_index: usize,
+    },
+}
+
+impl<R: DeviceRuntime> Copy for OperationInvocationResources<'_, R> {}
+
+impl<R: DeviceRuntime> Clone for OperationInvocationResources<'_, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, R: DeviceRuntime> OperationInvocationResources<'a, R> {
+    fn wave_node(self) -> Result<&'a PreparedStepSubmissionNode<R>, VNextError> {
+        match self {
+            Self::Wave { wave, node_index } => wave
+                .nodes()
+                .get(node_index)
+                .ok_or_else(|| invalid_operation("submission wave node index is out of bounds")),
+            Self::Invocation(_) => Err(invalid_operation(
+                "single-operation resources do not contain a wave node",
+            )),
+        }
+    }
+
+    fn node_id(self) -> Result<&'a NodeId, VNextError> {
+        match self {
+            Self::Invocation(invocation) => Ok(invocation.node_id()),
+            Self::Wave { .. } => Ok(self.wave_node()?.node_id()),
+        }
+    }
+
+    fn participant_count(self) -> Result<usize, VNextError> {
+        match self {
+            Self::Invocation(invocation) => usize::try_from(invocation.participant_count())
+                .map_err(|_| invalid_operation("operation participant count exceeds usize")),
+            Self::Wave { .. } => usize::try_from(self.wave_node()?.participant_count())
+                .map_err(|_| invalid_operation("wave participant count exceeds usize")),
+        }
+    }
+
+    fn prepared_participant_count(self) -> Result<usize, VNextError> {
+        match self {
+            Self::Invocation(invocation) => {
+                usize::try_from(invocation.prepared_participant_count()).map_err(|_| {
+                    invalid_operation("prepared operation participant count exceeds usize")
+                })
+            }
+            Self::Wave { .. } => Ok(self.wave_node()?.participant_session_identities().len()),
+        }
+    }
+
+    fn participant(
+        self,
+        index: usize,
+    ) -> Result<&'a Arc<AdmittedSequenceResources<R>>, VNextError> {
+        match self {
+            Self::Invocation(invocation) => invocation
+                .participants()
+                .nth(index)
+                .ok_or_else(|| invalid_operation("operation participant index is out of range")),
+            Self::Wave { .. } => self
+                .wave_node()?
+                .participants()
+                .nth(index)
+                .ok_or_else(|| invalid_operation("wave participant index is out of range")),
+        }
+    }
+
+    fn participant_frames(self) -> Result<&'a [StepParticipantFrameAssignment], VNextError> {
+        match self {
+            Self::Invocation(invocation) => Ok(invocation.participant_frames()),
+            Self::Wave { .. } => Ok(self.wave_node()?.participant_frames()),
+        }
+    }
+
+    fn participant_session_identity(
+        self,
+        index: usize,
+    ) -> Result<(SequenceSessionEpoch, &'a SequenceSessionFingerprint), VNextError> {
+        match self {
+            Self::Invocation(invocation) => invocation
+                .participant_session_identities()
+                .nth(index)
+                .ok_or_else(|| invalid_operation("operation participant session is missing")),
+            Self::Wave { .. } => self
+                .wave_node()?
+                .participant_session_identities()
+                .nth(index)
+                .ok_or_else(|| invalid_operation("wave participant session is missing")),
+        }
+    }
+
+    fn participant_node_keys(self) -> Result<Vec<ParticipantNodeKey>, VNextError> {
+        match self {
+            Self::Invocation(invocation) => Ok(invocation.participant_node_keys()),
+            Self::Wave { .. } => Ok(self.wave_node()?.participant_node_keys()),
+        }
+    }
+
+    fn batch_step_id(self) -> BatchStepId {
+        match self {
+            Self::Invocation(invocation) => invocation.batch_step_id(),
+            Self::Wave { wave, .. } => wave.batch_step_id(),
+        }
+    }
+
+    fn batch_invocation_id(self) -> BatchInvocationId {
+        match self {
+            Self::Invocation(invocation) => invocation.batch_invocation_id(),
+            Self::Wave { wave, .. } => wave.batch_invocation_id(),
+        }
+    }
+
+    fn coordinator_id(self) -> Result<LogicalAdmissionCoordinatorId, VNextError> {
+        Ok(self.participant(0)?.coordinator_id())
+    }
+
+    fn work_shape(self) -> Result<&'a BatchWorkShape, VNextError> {
+        match self {
+            Self::Invocation(invocation) => Ok(invocation.work_shape()),
+            Self::Wave { .. } => Ok(self.wave_node()?.work_shape()),
+        }
+    }
+
+    fn step_resources(self) -> &'a Arc<StepResourceLease<R>> {
+        match self {
+            Self::Invocation(invocation) => invocation.step_resources(),
+            Self::Wave { wave, .. } => wave.step_resources(),
+        }
+    }
+
+    fn runtime(self) -> &'a Arc<R> {
+        match self {
+            Self::Invocation(invocation) => invocation.runtime(),
+            Self::Wave { wave, .. } => wave.runtime(),
+        }
+    }
+
+    fn plan_evidence(self) -> Result<TrustedPlanRuntimeEvidence, VNextError> {
+        match self {
+            Self::Invocation(invocation) => Ok(invocation.plan_evidence()),
+            Self::Wave { .. } => Ok(self.wave_node()?.plan_evidence()),
+        }
+    }
+
+    fn backing_fingerprint(self) -> &'a str {
+        match self {
+            Self::Invocation(invocation) => invocation.claimed_backing().fingerprint(),
+            Self::Wave { wave, .. } => wave.fingerprint(),
+        }
+    }
+
+    fn backing_view(
+        self,
+        resource_id: &ResourceId,
+    ) -> Result<LogicalBackingBufferView<'a, R::Buffer>, VNextError> {
+        match self {
+            Self::Invocation(invocation) => invocation.backing_view(resource_id),
+            Self::Wave { wave, node_index } => wave.backing_view(node_index, resource_id),
+        }
     }
 }
 
@@ -2942,7 +3217,7 @@ impl<'a, B> OperationInvocation<'a, B> {
         provider: &'a OperationProviderDescriptor,
         identity: &'a ExecutionIdentityEnvelope,
         node_id: &'a NodeId,
-        resources: &'a InvocationResourceLease<R>,
+        resources: OperationInvocationResources<'a, R>,
         active_binding: &TrustedActiveSequenceBinding,
         participant_index: usize,
     ) -> Result<Self, VNextError>
@@ -2961,18 +3236,12 @@ impl<'a, B> OperationInvocation<'a, B> {
             .capabilities
             .operation(node.operation_id())?;
         let parts = identity.parts();
-        let participant = resources
-            .participants()
-            .nth(participant_index)
-            .ok_or_else(|| invalid_operation("operation participant index is out of range"))?;
+        let participant = resources.participant(participant_index)?;
         let participant_frame = resources
-            .participant_frames()
+            .participant_frames()?
             .get(participant_index)
             .ok_or_else(|| invalid_operation("operation participant frame is missing"))?;
-        let participant_session = resources
-            .participant_session_identities()
-            .nth(participant_index)
-            .ok_or_else(|| invalid_operation("operation participant session is missing"))?;
+        let participant_session = resources.participant_session_identity(participant_index)?;
         let static_lease = participant.static_provisioning();
         let lease_identity = static_lease.map(|lease| lease.identity());
         let admission = active_binding.plan().static_provisioning_binding();
@@ -2982,12 +3251,12 @@ impl<'a, B> OperationInvocation<'a, B> {
             .backing_slices()
             .iter()
             .map(|slice| slice.evidence()));
-        if resources.participant_count() != resources.prepared_participant_count()
-            || resources.node_id() != node_id
+        if resources.participant_count()? != resources.prepared_participant_count()?
+            || resources.node_id()? != node_id
             || participant_frame.sequence_authority() != participant.sequence_authority()
             || participant_frame.request_authority() != participant.request_authority()
-            || resources.plan_evidence() != *active_binding.plan()
-            || resources.coordinator_id() != active_binding.coordinator_id()
+            || resources.plan_evidence()? != *active_binding.plan()
+            || resources.coordinator_id()? != active_binding.coordinator_id()
             || participant.sequence_authority() != active_binding.sequence_authority()
             || participant.run_id() != active_binding.run_id()
             || participant.request_id() != active_binding.request_id()
@@ -3173,7 +3442,7 @@ impl<'a, B> OperationInvocation<'a, B> {
                 let evidence = backing.slice();
                 let expected_bytes = match descriptor.lifetime() {
                     AllocationLifetime::Invocation => descriptor.evaluate_request_bytes_for_shape(
-                        resources.work_shape().immediate_shape(),
+                        resources.work_shape()?.immediate_shape(),
                     )?,
                     AllocationLifetime::Step => descriptor.evaluate_request_bytes_for_shape(
                         resources.step_resources().work_shape().immediate_shape(),
@@ -3350,8 +3619,8 @@ impl<'a, B> OperationInvocation<'a, B> {
             attributes: node.attributes(),
             scratch_view,
             persistent_view,
-            work_shape: resources.work_shape(),
-            claimed_backing_fingerprint: resources.claimed_backing().fingerprint(),
+            work_shape: resources.work_shape()?,
+            claimed_backing_fingerprint: resources.backing_fingerprint(),
         })
     }
 
@@ -3405,6 +3674,7 @@ impl<'a, B> OperationInvocation<'a, B> {
 /// may be shared by every projection.
 pub struct BatchedOperationInvocation<'a, B> {
     batch_identity: &'a BatchOperationIdentity,
+    node_identity: &'a BatchOperationNodeIdentity,
     participants: Vec<OperationInvocation<'a, B>>,
 }
 
@@ -3420,20 +3690,70 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
     where
         R: DeviceRuntime<Buffer = B>,
     {
-        let participant_count = usize::try_from(resources.participant_count())
-            .map_err(|_| invalid_operation("operation participant count exceeds usize"))?;
-        let resource_keys = resources.participant_node_keys();
+        let node_identity = batch_identity.single_node().ok_or_else(|| {
+            invalid_operation("single-operation invocation received a multi-node batch identity")
+        })?;
+        Self::from_resources(
+            runtime,
+            resolved,
+            provider,
+            batch_identity,
+            node_identity,
+            OperationInvocationResources::Invocation(resources),
+            active_bindings,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_wave_node<R>(
+        runtime: &R,
+        resolved: &'a ResolvedModelPlan,
+        provider: &'a OperationProviderDescriptor,
+        batch_identity: &'a BatchOperationIdentity,
+        node_identity: &'a BatchOperationNodeIdentity,
+        wave: &'a PreparedStepSubmissionWave<R>,
+        node_index: usize,
+        active_bindings: &'a [TrustedActiveSequenceBinding],
+    ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+    {
+        Self::from_resources(
+            runtime,
+            resolved,
+            provider,
+            batch_identity,
+            node_identity,
+            OperationInvocationResources::Wave { wave, node_index },
+            active_bindings,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_resources<R>(
+        runtime: &R,
+        resolved: &'a ResolvedModelPlan,
+        provider: &'a OperationProviderDescriptor,
+        batch_identity: &'a BatchOperationIdentity,
+        node_identity: &'a BatchOperationNodeIdentity,
+        resources: OperationInvocationResources<'a, R>,
+        active_bindings: &'a [TrustedActiveSequenceBinding],
+    ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime<Buffer = B>,
+    {
+        let participant_count = resources.participant_count()?;
+        let resource_keys = resources.participant_node_keys()?;
         if participant_count == 0
             || participant_count != active_bindings.len()
-            || participant_count != batch_identity.participants().len()
+            || participant_count != node_identity.participants().len()
             || participant_count != resource_keys.len()
             || batch_identity.batch_step_id() != resources.batch_step_id()
             || batch_identity.batch_invocation_id() != resources.batch_invocation_id()
-            || batch_identity.node_id() != resources.node_id()
-            || batch_identity.work_shape_fingerprint() != resources.work_shape().fingerprint()
-            || batch_identity.claimed_backing_fingerprint()
-                != resources.claimed_backing().fingerprint()
-            || batch_identity
+            || node_identity.node_id() != resources.node_id()?
+            || node_identity.work_shape_fingerprint() != resources.work_shape()?.fingerprint()
+            || batch_identity.claimed_backing_fingerprint() != resources.backing_fingerprint()
+            || node_identity
                 .participants()
                 .iter()
                 .zip(&resource_keys)
@@ -3443,7 +3763,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
                 "batched operation identity differs from its exact invocation resources",
             ));
         }
-        let participants = batch_identity
+        let participants = node_identity
             .participants()
             .iter()
             .zip(active_bindings)
@@ -3454,7 +3774,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
                     resolved,
                     provider,
                     participant.identity(),
-                    batch_identity.node_id(),
+                    node_identity.node_id(),
                     resources,
                     active_binding,
                     index,
@@ -3463,6 +3783,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             batch_identity,
+            node_identity,
             participants,
         })
     }
@@ -3480,11 +3801,11 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
     }
 
     pub fn node_id(&self) -> &NodeId {
-        self.batch_identity.node_id()
+        self.node_identity.node_id()
     }
 
     pub fn provider_id(&self) -> &ProviderId {
-        self.batch_identity.provider_id()
+        self.node_identity.provider_id()
     }
 
     pub fn work_shape(&self) -> &BatchWorkShape {
@@ -3569,15 +3890,32 @@ fn validate_workspace<B>(
     }
 }
 
-pub enum OperationDispatchError<R>
+pub trait DispatchRetryAuthority: fmt::Debug {
+    fn prior_attempt(&self) -> BatchInvocationId;
+}
+
+impl<R: DeviceRuntime> DispatchRetryAuthority for DefinitelyNotSubmittedRetryAuthority<R> {
+    fn prior_attempt(&self) -> BatchInvocationId {
+        self.prior_attempt()
+    }
+}
+
+impl<R: DeviceRuntime> DispatchRetryAuthority for DefinitelyNotSubmittedWaveRetryAuthority<R> {
+    fn prior_attempt(&self) -> BatchInvocationId {
+        self.prior_attempt()
+    }
+}
+
+pub enum OperationDispatchError<R, Retry = DefinitelyNotSubmittedRetryAuthority<R>>
 where
     R: DeviceRuntime,
+    Retry: DispatchRetryAuthority,
 {
     Contract(VNextError),
     Provider(OperationFailure),
     DefinitelyNotSubmitted {
         failures: Vec<IdentifiedFailure>,
-        retry: DefinitelyNotSubmittedRetryAuthority<R>,
+        retry: Retry,
     },
     SubmissionIndeterminate {
         recovery: IndeterminateSubmissionHandle<R>,
@@ -3588,9 +3926,13 @@ where
     },
 }
 
-impl<R> fmt::Debug for OperationDispatchError<R>
+pub type SubmissionWaveDispatchError<R> =
+    OperationDispatchError<R, DefinitelyNotSubmittedWaveRetryAuthority<R>>;
+
+impl<R, Retry> fmt::Debug for OperationDispatchError<R, Retry>
 where
     R: DeviceRuntime,
+    Retry: DispatchRetryAuthority,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -3614,9 +3956,10 @@ where
     }
 }
 
-impl<R> fmt::Display for OperationDispatchError<R>
+impl<R, Retry> fmt::Display for OperationDispatchError<R, Retry>
 where
     R: DeviceRuntime,
+    Retry: DispatchRetryAuthority,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -3653,71 +3996,81 @@ where
     }
 }
 
-impl<R> std::error::Error for OperationDispatchError<R> where R: DeviceRuntime {}
+impl<R, Retry> std::error::Error for OperationDispatchError<R, Retry>
+where
+    R: DeviceRuntime,
+    Retry: DispatchRetryAuthority,
+{
+}
 
 /// The only public path from a resolved plan to an operation kernel.
 pub struct OperationDispatch;
 
 impl OperationDispatch {
     #[allow(clippy::too_many_arguments)]
-    pub fn bind_batch_identity<R>(
+    fn bind_node_identity<R>(
         resolved: &ResolvedModelPlan,
         participant_identities: Vec<ExecutionIdentityEnvelope>,
         active_bindings: &[TrustedActiveSequenceBinding],
-        invocation_resources: &InvocationResourceLease<R>,
+        resources: OperationInvocationResources<'_, R>,
         lane: &Arc<ExecutionLane<R>>,
-    ) -> Result<BatchOperationIdentity, VNextError>
+        node_index: u32,
+        participant_start: u32,
+    ) -> Result<BatchOperationNodeIdentity, VNextError>
     where
         R: DeviceRuntime,
     {
         let plan = resolved.execution_plan();
-        let node_id = invocation_resources.node_id();
+        let node_id = resources.node_id()?;
         let node = plan
             .payload()
             .nodes()
             .iter()
             .find(|node| node.id() == node_id)
             .ok_or_else(|| invalid_operation(format!("plan has no node `{node_id}`")))?;
-        let participants = invocation_resources.participants().collect::<Vec<_>>();
-        let frames = invocation_resources.participant_frames();
-        let sessions = invocation_resources
-            .participant_session_identities()
-            .collect::<Vec<_>>();
-        let node_keys = invocation_resources.participant_node_keys();
+        let participant_count = resources.participant_count()?;
+        let participants = (0..participant_count)
+            .map(|index| resources.participant(index))
+            .collect::<Result<Vec<_>, _>>()?;
+        let frames = resources.participant_frames()?;
+        let sessions = (0..participant_count)
+            .map(|index| resources.participant_session_identity(index))
+            .collect::<Result<Vec<_>, _>>()?;
+        let node_keys = resources.participant_node_keys()?;
+        let plan_evidence = resources.plan_evidence()?;
         if participant_identities.is_empty()
             || participant_identities.len() != participants.len()
             || participant_identities.len() != frames.len()
             || participant_identities.len() != sessions.len()
             || participant_identities.len() != node_keys.len()
             || participant_identities.len() != active_bindings.len()
-            || invocation_resources.prepared_participant_count()
-                != invocation_resources.participant_count()
-            || invocation_resources.plan_evidence().plan_id() != plan.payload().plan_id()
-            || invocation_resources.plan_evidence().plan_hash() != plan.plan_hash()
-            || invocation_resources.plan_evidence().device_id() != plan.payload().device_id()
-            || !Arc::ptr_eq(invocation_resources.runtime(), lane.runtime_arc())
+            || resources.prepared_participant_count()? != participant_count
+            || plan_evidence.plan_id() != plan.payload().plan_id()
+            || plan_evidence.plan_hash() != plan.plan_hash()
+            || plan_evidence.device_id() != plan.payload().device_id()
+            || !Arc::ptr_eq(resources.runtime(), lane.runtime_arc())
             || lane.descriptor() != &resolved.parts().device
             || lane.descriptor() != resolved.parts().capabilities.device()
             || lane.descriptor().runtime_implementation_fingerprint
                 != plan.payload().device_runtime_implementation_fingerprint()
         {
             return Err(invalid_operation(
-                "batch identity inputs differ from invocation resources, plan, or lane",
+                "batch node identity inputs differ from submission resources, plan, or lane",
             ));
         }
         let mut participant_projections = Vec::with_capacity(participant_identities.len());
-        for (index, identity) in participant_identities.into_iter().enumerate() {
-            let participant = participants[index];
-            let frame = frames[index];
-            let active = &active_bindings[index];
-            let session = sessions[index];
-            let key = &node_keys[index];
+        for (local_index, identity) in participant_identities.into_iter().enumerate() {
+            let participant = participants[local_index];
+            let frame = frames[local_index];
+            let active = &active_bindings[local_index];
+            let session = sessions[local_index];
+            let key = &node_keys[local_index];
             let parts = identity.parts();
             if key.sequence_authority() != participant.sequence_authority()
                 || key.request_authority() != participant.request_authority()
                 || key.frame_id() != frame.frame_id()
                 || active.sequence_authority() != participant.sequence_authority()
-                || active.coordinator_id() != invocation_resources.coordinator_id()
+                || active.coordinator_id() != resources.coordinator_id()?
                 || active.run_id() != participant.run_id()
                 || active.request_id() != participant.request_id()
                 || !active.matches_sequence_session(session.0, session.1)
@@ -3749,35 +4102,134 @@ impl OperationDispatch {
                 || parts.resource_batch_fingerprint.is_some()
             {
                 return Err(invalid_operation(format!(
-                    "batch participant {index} differs from its exact resource, frame, session, or plan identity"
+                    "batch node {node_index} participant {local_index} differs from its resource, frame, session, or plan identity"
                 )));
             }
+            let local_index = u32::try_from(local_index)
+                .map_err(|_| invalid_operation("batch participant index exceeds u32"))?;
             participant_projections.push(BatchOperationParticipantIdentity {
-                participant_index: u32::try_from(index)
-                    .map_err(|_| invalid_operation("batch participant index exceeds u32"))?,
+                participant_index: participant_start.checked_add(local_index).ok_or_else(|| {
+                    invalid_operation("physical batch participant index overflows u32")
+                })?,
                 node_key: key.clone(),
                 identity,
             });
         }
-        BatchOperationIdentity::from_validated(
-            invocation_resources.batch_step_id(),
-            invocation_resources.batch_invocation_id(),
-            plan.payload().plan_id().clone(),
-            plan.plan_hash().clone(),
+        BatchOperationNodeIdentity::from_validated(
+            node_index,
             node.id().clone(),
             node.operation_id().clone(),
             node.selection().selected_provider().clone(),
+            resources.work_shape()?.fingerprint().to_owned(),
+            participant_projections,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_batch_identity<R>(
+        resolved: &ResolvedModelPlan,
+        participant_identities: Vec<ExecutionIdentityEnvelope>,
+        active_bindings: &[TrustedActiveSequenceBinding],
+        invocation_resources: &InvocationResourceLease<R>,
+        lane: &Arc<ExecutionLane<R>>,
+    ) -> Result<BatchOperationIdentity, VNextError>
+    where
+        R: DeviceRuntime,
+    {
+        let plan = resolved.execution_plan();
+        let resources = OperationInvocationResources::Invocation(invocation_resources);
+        let node_identity = Self::bind_node_identity(
+            resolved,
+            participant_identities,
+            active_bindings,
+            resources,
+            lane,
+            0,
+            0,
+        )?;
+        BatchOperationIdentity::from_validated(
+            resources.batch_step_id(),
+            resources.batch_invocation_id(),
+            plan.payload().plan_id().clone(),
+            plan.plan_hash().clone(),
             plan.payload().device_id().clone(),
             plan.payload()
                 .device_runtime_implementation_fingerprint()
                 .to_owned(),
             lane.id(),
-            invocation_resources.work_shape().fingerprint().to_owned(),
-            invocation_resources
-                .claimed_backing()
-                .fingerprint()
+            resources.backing_fingerprint().to_owned(),
+            vec![node_identity],
+        )
+    }
+
+    pub fn bind_submission_wave_identity<R>(
+        resolved: &ResolvedModelPlan,
+        participant_identities: Vec<Vec<ExecutionIdentityEnvelope>>,
+        active_bindings: &[Vec<TrustedActiveSequenceBinding>],
+        wave: &PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+    ) -> Result<BatchOperationIdentity, VNextError>
+    where
+        R: DeviceRuntime,
+    {
+        let plan = resolved.execution_plan();
+        if wave.nodes().is_empty()
+            || wave.nodes().len() != plan.payload().nodes().len()
+            || participant_identities.len() != wave.nodes().len()
+            || active_bindings.len() != wave.nodes().len()
+            || wave
+                .nodes()
+                .iter()
+                .zip(plan.payload().nodes())
+                .any(|(prepared, planned)| prepared.node_id() != planned.id())
+        {
+            return Err(invalid_operation(
+                "submission wave identity must cover every immutable plan node in order",
+            ));
+        }
+        let mut participant_start = 0_u32;
+        let mut nodes = Vec::with_capacity(wave.nodes().len());
+        for (node_index, ((identities, bindings), _node)) in participant_identities
+            .into_iter()
+            .zip(active_bindings)
+            .zip(wave.nodes())
+            .enumerate()
+        {
+            let node_index = u32::try_from(node_index)
+                .map_err(|_| invalid_operation("submission wave node index exceeds u32"))?;
+            let participant_count = u32::try_from(identities.len())
+                .map_err(|_| invalid_operation("submission wave participant count exceeds u32"))?;
+            let node_identity = Self::bind_node_identity(
+                resolved,
+                identities,
+                bindings,
+                OperationInvocationResources::Wave {
+                    wave,
+                    node_index: node_index as usize,
+                },
+                lane,
+                node_index,
+                participant_start,
+            )?;
+            participant_start = participant_start
+                .checked_add(participant_count)
+                .ok_or_else(|| {
+                    invalid_operation("submission wave participant index space overflows u32")
+                })?;
+            nodes.push(node_identity);
+        }
+        BatchOperationIdentity::from_validated(
+            wave.batch_step_id(),
+            wave.batch_invocation_id(),
+            plan.payload().plan_id().clone(),
+            plan.plan_hash().clone(),
+            plan.payload().device_id().clone(),
+            plan.payload()
+                .device_runtime_implementation_fingerprint()
                 .to_owned(),
-            participant_projections,
+            lane.id(),
+            wave.fingerprint().to_owned(),
+            nodes,
         )
     }
 
@@ -3794,8 +4246,13 @@ impl OperationDispatch {
     where
         R: DeviceRuntime,
     {
+        let node_identity = batch_identity.single_node().ok_or_else(|| {
+            OperationDispatchError::Contract(invalid_operation(
+                "single-operation dispatch requires a one-node batch identity",
+            ))
+        })?;
         provider
-            .validate_binding(resolved, batch_identity.node_id())
+            .validate_binding(resolved, node_identity.node_id())
             .map_err(OperationDispatchError::Contract)?;
         if active_bindings.is_empty()
             || active_bindings.len() != batch_identity.participants().len()
@@ -3893,6 +4350,161 @@ impl OperationDispatch {
                     lane.fail_closed();
                     return Err(OperationDispatchError::PostSubmitContract {
                         error: invalid_operation("operation submit completion runtime drifted"),
+                        completion,
+                    });
+                }
+                Ok(completion)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_wave<R>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &ResolvedModelPlan,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: &[Vec<TrustedActiveSequenceBinding>],
+        mut wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<CompletionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+    {
+        let identity_participant_count = batch_identity.participants().len();
+        let active_participant_count = active_bindings.iter().map(Vec::len).sum::<usize>();
+        if providers.is_empty()
+            || providers.len() != wave.nodes().len()
+            || providers.len() != batch_identity.nodes().len()
+            || providers.len() != active_bindings.len()
+            || identity_participant_count != active_participant_count
+            || batch_identity.batch_step_id() != wave.batch_step_id()
+            || batch_identity.batch_invocation_id() != wave.batch_invocation_id()
+            || batch_identity.claimed_backing_fingerprint() != wave.fingerprint()
+            || lane.id() != batch_identity.lane_id()
+            || lane.descriptor().id != *batch_identity.device_id()
+            || lane.descriptor().runtime_implementation_fingerprint
+                != batch_identity.runtime_implementation_fingerprint()
+        {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "wave execution lane, resources, nodes, or participants differ from batch identity",
+            )));
+        }
+        for ((provider, node_identity), prepared_node) in providers
+            .iter()
+            .zip(batch_identity.nodes())
+            .zip(wave.nodes())
+        {
+            provider
+                .validate_binding(resolved, node_identity.node_id())
+                .map_err(SubmissionWaveDispatchError::Contract)?;
+            if prepared_node.node_id() != node_identity.node_id()
+                || prepared_node.work_shape().fingerprint()
+                    != node_identity.work_shape_fingerprint()
+                || provider.descriptor().provider_id() != node_identity.provider_id()
+                || provider.descriptor().operation_id() != node_identity.operation_id()
+                || node_identity.participants().len()
+                    != usize::try_from(prepared_node.participant_count())
+                        .expect("prepared wave participant count fits usize")
+            {
+                return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "wave provider or node identity differs from its prepared node",
+                )));
+            }
+        }
+        wave.begin_dispatch()
+            .map_err(SubmissionWaveDispatchError::Contract)?;
+        let mut completion =
+            CompletionReaper::reserve_wave(reaper, wave, Arc::clone(lane), batch_identity.clone())
+                .map_err(SubmissionWaveDispatchError::Contract)?;
+        let runtime = lane.runtime();
+        if !lane.current_descriptor_matches_snapshot() {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "wave encode runtime differs from its execution lane snapshot",
+            )));
+        }
+        let mut commands = DeviceCommandBatch::with_capacity(providers.len());
+        for (node_index, ((provider, node_identity), bindings)) in providers
+            .iter()
+            .zip(batch_identity.nodes())
+            .zip(active_bindings)
+            .enumerate()
+        {
+            let invocation = BatchedOperationInvocation::from_wave_node(
+                runtime,
+                resolved,
+                provider.provider.descriptor(),
+                batch_identity,
+                node_identity,
+                completion.wave(),
+                node_index,
+                bindings,
+            )
+            .map_err(SubmissionWaveDispatchError::Contract)?;
+            let expected_phase = invocation.operation().profile_phase;
+            let command = match provider.provider.encode_selected(invocation) {
+                Ok(command) => command,
+                Err(failure)
+                    if node_identity.contains_identity(failure.identity())
+                        && failure.phase() == expected_phase =>
+                {
+                    return Err(SubmissionWaveDispatchError::Provider(failure));
+                }
+                Err(_) => {
+                    return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "wave provider returned a failure for another node identity or profile phase",
+                    )));
+                }
+            };
+            commands.push(command);
+        }
+        if commands.len() != batch_identity.nodes().len()
+            || !lane.current_descriptor_matches_snapshot()
+        {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "wave encode did not produce one command per immutable plan node",
+            )));
+        }
+        let mut lane_reservation = lane
+            .reserve_enqueue()
+            .map_err(SubmissionWaveDispatchError::Contract)?;
+        completion.mark_submission_started();
+        match lane_reservation.submit(commands) {
+            LaneSubmitOutcome::DefinitelyNotSubmitted(error) => {
+                drop(lane_reservation);
+                let retry = completion
+                    .definitely_not_submitted_wave()
+                    .map_err(SubmissionWaveDispatchError::Contract)?;
+                let failures = batch_identity
+                    .participants()
+                    .iter()
+                    .map(|participant| {
+                        classify_device_error(runtime, participant.identity().clone(), &error)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(SubmissionWaveDispatchError::Contract)?;
+                Err(SubmissionWaveDispatchError::DefinitelyNotSubmitted { failures, retry })
+            }
+            LaneSubmitOutcome::PossiblySubmittedPanic => {
+                drop(lane_reservation);
+                let recovery = completion.submission_indeterminate();
+                Err(SubmissionWaveDispatchError::SubmissionIndeterminate { recovery })
+            }
+            LaneSubmitOutcome::Submitted(fence) => {
+                drop(lane_reservation);
+                let completion = match completion.arm(fence) {
+                    Ok(completion) => completion,
+                    Err((error, completion)) => {
+                        return Err(SubmissionWaveDispatchError::PostSubmitContract {
+                            error,
+                            completion,
+                        });
+                    }
+                };
+                if !lane.current_descriptor_matches_snapshot() {
+                    lane.fail_closed();
+                    return Err(SubmissionWaveDispatchError::PostSubmitContract {
+                        error: invalid_operation("wave submit completion runtime drifted"),
                         completion,
                     });
                 }

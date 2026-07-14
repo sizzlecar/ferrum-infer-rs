@@ -1050,6 +1050,18 @@ where
         &self.step
     }
 
+    pub(crate) fn runtime(&self) -> &Arc<R> {
+        self.nodes[0].runtime()
+    }
+
+    pub(crate) fn deferred_cleanup_domain(&self) -> DeferredDeviceCleanupDomainId {
+        self.nodes[0].participants[0]
+            .request
+            .plan
+            .resources
+            .deferred_cleanup_domain
+    }
+
     pub fn has_shared_step_backing(&self) -> bool {
         self.step.claimed_backing().has_shared_physical_claims()
     }

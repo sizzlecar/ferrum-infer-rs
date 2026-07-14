@@ -201,14 +201,24 @@ impl ModelFamilyProvider for TestFamily {
             vec![id("value.input")],
             vec![ProgramBlock {
                 id: "block.main".to_owned(),
-                nodes: vec![ProgramNode {
-                    id: id("node.main"),
-                    operation_id: id("operation.main"),
-                    required_version: ContractVersion::new(1, 0),
-                    inputs: vec![id("value.input"), id("value.weight")],
-                    outputs: vec![id("value.output")],
-                    attributes: BTreeMap::new(),
-                }],
+                nodes: vec![
+                    ProgramNode {
+                        id: id("node.main"),
+                        operation_id: id("operation.main"),
+                        required_version: ContractVersion::new(1, 0),
+                        inputs: vec![id("value.input"), id("value.weight")],
+                        outputs: vec![id("value.intermediate")],
+                        attributes: BTreeMap::new(),
+                    },
+                    ProgramNode {
+                        id: id("node.tail"),
+                        operation_id: id("operation.main"),
+                        required_version: ContractVersion::new(1, 0),
+                        inputs: vec![id("value.intermediate"), id("value.weight")],
+                        outputs: vec![id("value.output")],
+                        attributes: BTreeMap::new(),
+                    },
+                ],
             }],
             Vec::new(),
             vec![WeightReference {
@@ -492,14 +502,19 @@ pub(crate) fn single_binding(
     .unwrap()
 }
 
-pub(crate) fn node_values() -> Vec<ResolvedValueBinding> {
+pub(crate) fn node_values_for(
+    input_value: &str,
+    input_resource: &str,
+    output_value: &str,
+    output_resource: &str,
+) -> Vec<ResolvedValueBinding> {
     vec![
         single_binding(
-            "value.input",
+            input_value,
             ResolvedValueRole::Input,
             0,
             BufferUsage::Activations,
-            "resource.input",
+            input_resource,
         ),
         ResolvedValueBinding::new(
             id("value.weight"),
@@ -531,13 +546,31 @@ pub(crate) fn node_values() -> Vec<ResolvedValueBinding> {
         )
         .unwrap(),
         single_binding(
-            "value.output",
+            output_value,
             ResolvedValueRole::Output,
             0,
             BufferUsage::Activations,
-            "resource.output",
+            output_resource,
         ),
     ]
+}
+
+pub(crate) fn node_values() -> Vec<ResolvedValueBinding> {
+    node_values_for(
+        "value.input",
+        "resource.input",
+        "value.intermediate",
+        "resource.intermediate",
+    )
+}
+
+pub(crate) fn tail_node_values() -> Vec<ResolvedValueBinding> {
+    node_values_for(
+        "value.intermediate",
+        "resource.intermediate",
+        "value.output",
+        "resource.output",
+    )
 }
 
 #[derive(Debug)]
@@ -587,6 +620,7 @@ pub(crate) enum FenceBehavior {
 pub(crate) struct RuntimeTrace {
     pub(crate) allocation_calls: u64,
     pub(crate) submit_calls: u64,
+    pub(crate) submitted_command_counts: Vec<usize>,
     pub(crate) synchronize_calls: u64,
     pub(crate) wait_fence_calls: u64,
     pub(crate) tamper_buffer_descriptor: bool,
@@ -701,9 +735,11 @@ impl DeviceRuntime for TestRuntime {
         commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
         assert!(!commands.is_empty(), "core must not submit an empty batch");
+        let command_count = commands.len();
         let (drift, behavior, fence) = {
             let mut trace = self.trace.lock().unwrap();
             trace.submit_calls += 1;
+            trace.submitted_command_counts.push(command_count);
             trace.next_fence += 1;
             (
                 trace.drift_on_submit,
@@ -1083,23 +1119,57 @@ pub(crate) fn operation_registry(
     .unwrap()
 }
 
-pub(crate) fn node_resolution(
+pub(crate) fn node_resolution_for(
     family: &PreparedModelFamily,
     catalog: &CapabilityCatalog,
     runtime_policy: &ResolvedRuntimePolicy,
     registry: &OperationRuntimeRegistry<TestRuntime>,
+    node_id: &str,
+    values: Vec<ResolvedValueBinding>,
 ) -> PlanNodeResolution {
     PlanNodeResolution::resolve(
         family,
         catalog,
         runtime_policy,
         &registry.planning(),
-        id("node.main"),
-        node_values(),
+        id(node_id),
+        values,
         BTreeSet::new(),
         None,
     )
     .unwrap()
+}
+
+pub(crate) fn node_resolution(
+    family: &PreparedModelFamily,
+    catalog: &CapabilityCatalog,
+    runtime_policy: &ResolvedRuntimePolicy,
+    registry: &OperationRuntimeRegistry<TestRuntime>,
+) -> PlanNodeResolution {
+    node_resolution_for(
+        family,
+        catalog,
+        runtime_policy,
+        registry,
+        "node.main",
+        node_values(),
+    )
+}
+
+pub(crate) fn tail_node_resolution(
+    family: &PreparedModelFamily,
+    catalog: &CapabilityCatalog,
+    runtime_policy: &ResolvedRuntimePolicy,
+    registry: &OperationRuntimeRegistry<TestRuntime>,
+) -> PlanNodeResolution {
+    node_resolution_for(
+        family,
+        catalog,
+        runtime_policy,
+        registry,
+        "node.tail",
+        tail_node_values(),
+    )
 }
 
 pub(crate) fn resolved_model_plan(
@@ -1112,12 +1182,10 @@ pub(crate) fn resolved_model_plan(
         .unwrap();
     let catalog = catalog();
     let runtime_policy = policy();
-    let resolutions = vec![node_resolution(
-        &family,
-        &catalog,
-        &runtime_policy,
-        registry,
-    )];
+    let resolutions = vec![
+        node_resolution(&family, &catalog, &runtime_policy, registry),
+        tail_node_resolution(&family, &catalog, &runtime_policy, registry),
+    ];
     let plan = ExecutionPlan::build(
         PlanBuildRequest::new(&family, &catalog, &runtime_policy, resolutions.clone()).unwrap(),
     )
@@ -1250,12 +1318,10 @@ pub(crate) fn plan_for_registry(registry: &OperationRuntimeRegistry<TestRuntime>
             &family,
             &catalog,
             &runtime_policy,
-            vec![node_resolution(
-                &family,
-                &catalog,
-                &runtime_policy,
-                registry,
-            )],
+            vec![
+                node_resolution(&family, &catalog, &runtime_policy, registry),
+                tail_node_resolution(&family, &catalog, &runtime_policy, registry),
+            ],
         )
         .unwrap(),
     )
@@ -1613,7 +1679,17 @@ pub(crate) fn operation_identity(
     frame_id: ExecutionFrameId,
     invocation_id: NodeInvocationId,
 ) -> ExecutionIdentityEnvelope {
-    let node = &plan.payload().nodes()[0];
+    operation_identity_for_node(plan, 0, active, frame_id, invocation_id)
+}
+
+pub(crate) fn operation_identity_for_node(
+    plan: &ExecutionPlan,
+    node_index: usize,
+    active: &TrustedActiveSequenceBinding,
+    frame_id: ExecutionFrameId,
+    invocation_id: NodeInvocationId,
+) -> ExecutionIdentityEnvelope {
+    let node = &plan.payload().nodes()[node_index];
     let provisioning = active.static_provisioning_identity();
     ExecutionIdentityEnvelope::new(ExecutionIdentityParts {
         version: EXECUTION_IDENTITY_VERSION,
@@ -1645,7 +1721,7 @@ pub(crate) fn operation_identity(
         resource_id: None,
         resource_generation: None,
         resource_batch_fingerprint: None,
-        span_id: id("span.device-operation.node"),
+        span_id: id(format!("span.device-operation.node.{node_index}")),
         parent_span_id: None,
         async_links: Vec::new(),
     })
@@ -1661,8 +1737,11 @@ pub(crate) fn revalidate_plan_for_registry(
         .unwrap();
     let catalog = catalog();
     let runtime_policy = policy();
-    let resolution = node_resolution(&family, &catalog, &runtime_policy, registry);
-    ExecutionPlan::from_json_validated(bytes, &family, &catalog, &runtime_policy, vec![resolution])
+    let resolutions = vec![
+        node_resolution(&family, &catalog, &runtime_policy, registry),
+        tail_node_resolution(&family, &catalog, &runtime_policy, registry),
+    ];
+    ExecutionPlan::from_json_validated(bytes, &family, &catalog, &runtime_policy, resolutions)
         .unwrap()
 }
 

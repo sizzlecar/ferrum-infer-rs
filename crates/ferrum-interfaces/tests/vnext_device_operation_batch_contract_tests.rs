@@ -128,7 +128,10 @@ fn thirty_two_participant_dispatch_is_one_physical_submission() {
     .unwrap();
     assert_eq!(batch_identity.participants().len(), 32);
     assert_eq!(
-        batch_identity.work_shape_fingerprint(),
+        batch_identity
+            .single_node()
+            .expect("single invocation binds one node")
+            .work_shape_fingerprint(),
         invocation.work_shape().fingerprint()
     );
     let handle = OperationDispatch::encode_and_submit(

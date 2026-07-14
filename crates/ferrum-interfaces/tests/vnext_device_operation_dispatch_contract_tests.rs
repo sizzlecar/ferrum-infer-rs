@@ -438,7 +438,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
         provider_trace.lock().unwrap().view_resources
             == BTreeSet::from([
                 id("resource.input"),
-                id("resource.output"),
+                id("resource.intermediate"),
                 id("resource.weight.left"),
                 id("resource.weight.right"),
             ]),
