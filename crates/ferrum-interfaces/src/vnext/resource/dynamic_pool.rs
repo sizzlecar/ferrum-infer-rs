@@ -4,10 +4,10 @@ use super::{
     CapacityEpochs, CapacityUnits, DeviceAllocationPermit, DeviceCapacityBudget,
     DeviceCapacityGrant, DeviceCapacityReservation, DeviceRuntime, DynamicBackingPoolId,
     DynamicBackingPoolSpec, DynamicResourceDescriptor, DynamicStorageAllocator,
-    DynamicStorageProfile, DynamicStorageView, ElementType, LogicalAdmissionCoordinator, Mutex,
-    Ordering, PlanNode, ResourceId, ResourceReservation, ResourceRetentionPolicy,
-    ResourceTransactionIdentity, RunId, Serialize, StaticProvisioningBinding, StepResourceSlotKind,
-    TransactionId, VNextError,
+    DynamicStorageProfile, DynamicStorageView, ElementType, InvocationLivenessMode,
+    LogicalAdmissionCoordinator, Mutex, Ordering, PlanNode, ResourceId, ResourceReservation,
+    ResourceRetentionPolicy, ResourceTransactionIdentity, RunId, Serialize,
+    StaticProvisioningBinding, StepResourceSlotKind, TransactionId, VNextError,
 };
 
 static NEXT_DYNAMIC_POOL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -84,7 +84,7 @@ impl BackingSegment {
         )
     }
 
-    fn from_chunk(
+    pub(super) fn from_chunk(
         pool_id: &DynamicBackingPoolId,
         chunk_ordinal: u32,
         chunk_generation: u64,
@@ -136,37 +136,57 @@ impl BackingSegment {
     }
 }
 
-fn backing_segment_prefix(
+pub(super) fn backing_segment_range(
     segments: &[BackingSegment],
+    physical_offset_bytes: u64,
     size_bytes: u64,
 ) -> Result<Vec<BackingSegment>, VNextError> {
+    let physical_end = physical_offset_bytes
+        .checked_add(size_bytes)
+        .ok_or_else(|| invalid_resource("logical backing projection range overflows u64"))?;
     if size_bytes == 0 {
         return Err(invalid_resource(
             "logical backing projection must have non-zero size",
         ));
     }
-    let mut remaining = size_bytes;
-    let mut prefix = Vec::new();
+    let mut physical_cursor = 0_u64;
+    let mut covered = 0_u64;
+    let mut projection = Vec::new();
     for segment in segments {
-        if remaining == 0 {
+        if physical_cursor >= physical_end {
             break;
         }
-        let take = remaining.min(segment.length_bytes());
-        prefix.push(BackingSegment::from_chunk(
-            segment.pool_id(),
-            segment.chunk_ordinal(),
-            segment.chunk_generation(),
-            segment.offset_bytes(),
-            take,
-        )?);
-        remaining -= take;
+        let segment_end = physical_cursor
+            .checked_add(segment.length_bytes())
+            .ok_or_else(|| invalid_resource("physical backing extent range overflows u64"))?;
+        let overlap_start = physical_cursor.max(physical_offset_bytes);
+        let overlap_end = segment_end.min(physical_end);
+        if overlap_start < overlap_end {
+            let within_segment = overlap_start - physical_cursor;
+            let translated_offset = segment
+                .offset_bytes()
+                .checked_add(within_segment)
+                .ok_or_else(|| invalid_resource("backing projection offset overflows u64"))?;
+            let length = overlap_end - overlap_start;
+            projection.push(BackingSegment::from_chunk(
+                segment.pool_id(),
+                segment.chunk_ordinal(),
+                segment.chunk_generation(),
+                translated_offset,
+                length,
+            )?);
+            covered = covered.checked_add(length).ok_or_else(|| {
+                invalid_resource("logical backing projection coverage overflows u64")
+            })?;
+        }
+        physical_cursor = segment_end;
     }
-    if remaining != 0 {
+    if covered != size_bytes {
         return Err(invalid_resource(
             "logical backing projection exceeds its physical extent",
         ));
     }
-    Ok(prefix)
+    Ok(projection)
 }
 
 pub(super) struct ResidentChunkBacking<B> {
@@ -1269,6 +1289,7 @@ impl PhysicalBackingClaimIdentity {
 
 pub(super) struct EvaluatedBackingProjection<'a> {
     pub(super) descriptor: &'a DynamicResourceDescriptor,
+    pub(super) physical_offset_bytes: u64,
     pub(super) size_bytes: u64,
 }
 
@@ -1381,6 +1402,7 @@ pub struct LogicalBackingSliceEvidence {
     pub(super) physical_claim_identity: PhysicalBackingClaimIdentity,
     pub(super) segment_generation: u64,
     pub(super) segments: Vec<BackingSegment>,
+    pub(super) physical_offset_bytes: u64,
     pub(super) size_bytes: u64,
     pub(super) physical_size_bytes: u64,
     pub(super) alignment_bytes: u64,
@@ -1416,6 +1438,10 @@ impl LogicalBackingSliceEvidence {
 
     pub fn segments(&self) -> &[BackingSegment] {
         &self.segments
+    }
+
+    pub const fn physical_offset_bytes(&self) -> u64 {
+        self.physical_offset_bytes
     }
 
     pub const fn size_bytes(&self) -> u64 {
@@ -1951,11 +1977,25 @@ where
                     .iter()
                     .map(|projection| projection.descriptor.base_resource_id().clone())
                     .collect::<Vec<_>>();
-                let projection_maximum = request
-                    .projections
-                    .iter()
-                    .map(|projection| projection.size_bytes)
-                    .max();
+                let single_projection = request.projections.len() == 1
+                    && request.projections[0].physical_offset_bytes == 0
+                    && request.projections[0].size_bytes == request.size_bytes;
+                let shared_step_slot = request.projections.len() > 1
+                    && request
+                        .projections
+                        .iter()
+                        .all(|projection| projection.physical_offset_bytes == 0)
+                    && request
+                        .projections
+                        .iter()
+                        .map(|projection| projection.size_bytes)
+                        .max()
+                        == Some(request.size_bytes)
+                    && pool.domain.pool.step_resource_slots().iter().any(|slot| {
+                        slot.kind() == StepResourceSlotKind::OrderedSingleFenceStepWave
+                            && slot.resource_ids() == request.claim_identity.resource_ids()
+                    });
+                let invocation_wave = self.validate_invocation_wave_projection(pool, request)?;
                 if request.domain.pool_id() != pool.domain.pool_id()
                     || request.claim_identity.pool_id() != pool.domain.pool_id()
                     || request.claim_identity.resource_ids() != projection_ids
@@ -1968,20 +2008,20 @@ where
                         projection.descriptor.pool_id() != pool.domain.pool_id()
                             || projection.size_bytes == 0
                             || projection.size_bytes % quantum != 0
+                            || projection.physical_offset_bytes % quantum != 0
+                            || projection
+                                .physical_offset_bytes
+                                .checked_add(projection.size_bytes)
+                                .is_none_or(|end| end > request.size_bytes)
                             || !request
                                 .domain
                                 .descriptors
                                 .iter()
                                 .any(|descriptor| descriptor == projection.descriptor)
                     })
-                    || request.claim_identity.is_shared()
-                        && !pool.domain.pool.step_resource_slots().iter().any(|slot| {
-                            slot.kind() == StepResourceSlotKind::OrderedSingleFenceStepWave
-                                && slot.resource_ids() == request.claim_identity.resource_ids()
-                        })
                     || request.size_bytes == 0
                     || request.size_bytes % quantum != 0
-                    || projection_maximum != Some(request.size_bytes)
+                    || !(single_projection || shared_step_slot || invocation_wave)
                 {
                     return Err(invalid_resource(
                         "dynamic backing request violates its physical claim, projection, pool, or allocation quantum",
@@ -2064,7 +2104,11 @@ where
         for group_selections in &selections {
             for (request, _, segments) in group_selections {
                 for projection in &request.projections {
-                    if let Err(error) = backing_segment_prefix(segments, projection.size_bytes) {
+                    if let Err(error) = backing_segment_range(
+                        segments,
+                        projection.physical_offset_bytes,
+                        projection.size_bytes,
+                    ) {
                         rollback_free_extent_journal(&mut states, &journals)?;
                         return Err(error);
                     }
@@ -2128,7 +2172,12 @@ where
                             pool_instance_id: pool.instance_id,
                             physical_claim_identity: request.claim_identity.clone(),
                             segment_generation,
-                            segments: backing_segment_prefix(&segments, projection.size_bytes)?,
+                            segments: backing_segment_range(
+                                &segments,
+                                projection.physical_offset_bytes,
+                                projection.size_bytes,
+                            )?,
+                            physical_offset_bytes: projection.physical_offset_bytes,
                             size_bytes: projection.size_bytes,
                             physical_size_bytes: request.size_bytes,
                             alignment_bytes: projection.descriptor.alignment_bytes(),
@@ -2154,6 +2203,95 @@ where
         }))
     }
 
+    fn validate_invocation_wave_projection(
+        &self,
+        pool: &DynamicBackingPool<R>,
+        request: &EvaluatedBackingRequest<'_>,
+    ) -> Result<bool, VNextError> {
+        let mode = pool.domain.pool.invocation_liveness_mode();
+        if mode == InvocationLivenessMode::NoInvocationResources
+            || request.projections.len() < 2
+            || request.projections.iter().any(|projection| {
+                projection.descriptor.lifetime() != super::AllocationLifetime::Invocation
+            })
+        {
+            return Ok(false);
+        }
+        let mut expected_resources = pool
+            .domain
+            .pool
+            .invocation_liveness()
+            .iter()
+            .flat_map(|row| row.resource_ids().iter().cloned())
+            .collect::<Vec<_>>();
+        expected_resources.sort();
+        if expected_resources.windows(2).any(|pair| pair[0] == pair[1])
+            || expected_resources != request.claim_identity.resource_ids()
+        {
+            return Ok(false);
+        }
+        let projections = request
+            .projections
+            .iter()
+            .map(|projection| (projection.descriptor.base_resource_id().clone(), projection))
+            .collect::<BTreeMap<_, _>>();
+        if projections.len() != request.projections.len() {
+            return Ok(false);
+        }
+        let rows_by_node = pool
+            .domain
+            .pool
+            .invocation_liveness()
+            .iter()
+            .map(|row| (row.node_id(), row))
+            .collect::<BTreeMap<_, _>>();
+        let rows = self
+            .nodes
+            .iter()
+            .filter_map(|node| rows_by_node.get(node.id()).copied())
+            .collect::<Vec<_>>();
+        if rows.len() != rows_by_node.len() {
+            return Ok(false);
+        }
+
+        let mut concurrent_cursor = 0_u64;
+        let mut peak = 0_u64;
+        for row in rows {
+            let row_base = match mode {
+                InvocationLivenessMode::TotalOrderReuse => 0,
+                InvocationLivenessMode::ConservativeConcurrent => concurrent_cursor,
+                InvocationLivenessMode::NoInvocationResources => unreachable!(),
+            };
+            let mut row_cursor = 0_u64;
+            for resource_id in row.resource_ids() {
+                let Some(projection) = projections.get(resource_id) else {
+                    return Ok(false);
+                };
+                let expected_offset = row_base.checked_add(row_cursor).ok_or_else(|| {
+                    invalid_resource("invocation wave projection offset overflows u64")
+                })?;
+                if projection.physical_offset_bytes != expected_offset {
+                    return Ok(false);
+                }
+                row_cursor = row_cursor
+                    .checked_add(projection.size_bytes)
+                    .ok_or_else(|| invalid_resource("invocation wave row size overflows u64"))?;
+            }
+            peak = peak.max(row_cursor);
+            if mode == InvocationLivenessMode::ConservativeConcurrent {
+                concurrent_cursor = concurrent_cursor.checked_add(row_cursor).ok_or_else(|| {
+                    invalid_resource("concurrent invocation wave size overflows u64")
+                })?;
+            }
+        }
+        Ok(request.size_bytes
+            == match mode {
+                InvocationLivenessMode::TotalOrderReuse => peak,
+                InvocationLivenessMode::ConservativeConcurrent => concurrent_cursor,
+                InvocationLivenessMode::NoInvocationResources => 0,
+            })
+    }
+
     pub(super) fn view<'lease>(
         &'lease self,
         authority: &'lease LogicalBackingSliceAuthority,
@@ -2176,15 +2314,20 @@ where
                 .resource_ids()
                 .binary_search(&authority.evidence.resource_id)
                 .is_err()
-            || authority.evidence.size_bytes > authority.evidence.physical_size_bytes
+            || authority
+                .evidence
+                .physical_offset_bytes
+                .checked_add(authority.evidence.size_bytes)
+                .is_none_or(|end| end > authority.evidence.physical_size_bytes)
             || authority.evidence.storage_profile != pool.domain.pool.compatibility().profile()
         {
             return Err(invalid_resource(
                 "logical backing authority belongs to another dynamic pool instance",
             ));
         }
-        let expected_projection = backing_segment_prefix(
+        let expected_projection = backing_segment_range(
             &authority.segment_lease.segments,
+            authority.evidence.physical_offset_bytes,
             authority.evidence.size_bytes,
         )?;
         if expected_projection != authority.evidence.segments {

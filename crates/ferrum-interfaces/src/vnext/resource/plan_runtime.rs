@@ -8,7 +8,7 @@ use super::{
     DeferredDeviceCleanupMaintenanceReceipt, DeferredDeviceCleanupStatus, DeviceCapacityClaim,
     DeviceId, DeviceRuntime, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
     DynamicPoolMaintenanceController, DynamicPoolSet, DynamicResourceShape,
-    EvaluatedBackingProjection, EvaluatedBackingRequest, FailureEnvelope,
+    EvaluatedBackingProjection, EvaluatedBackingRequest, FailureEnvelope, InvocationLivenessMode,
     LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex, NoStatic, NodeId, Ordering,
     PhysicalBackingClaimIdentity, PlanHash, PlanId, PlanNode, ResourceAbandonSignal,
     ResourceActionCursor, ResourceDriverFailure, ResourceLedgerEntrySnapshot,
@@ -903,6 +903,7 @@ where
                         fit_slot_bytes = fit_slot_bytes.max(fit_bytes);
                         projections.push(EvaluatedBackingProjection {
                             descriptor,
+                            physical_offset_bytes: 0,
                             size_bytes,
                         });
                     }
@@ -955,6 +956,7 @@ where
                         size_bytes,
                         projections: vec![EvaluatedBackingProjection {
                             descriptor,
+                            physical_offset_bytes: 0,
                             size_bytes,
                         }],
                     });
@@ -971,6 +973,164 @@ where
                 )?);
             }
         }
+        let immediate = if immediate_entries.is_empty() {
+            CapacityVector::empty()
+        } else {
+            CapacityVector::new(immediate_entries)?
+        };
+        let fit = if fit_entries.is_empty() {
+            CapacityVector::empty()
+        } else {
+            CapacityVector::new(fit_entries)?
+        };
+        Ok((
+            AdmissionDemand::from_plan(immediate, fit, fit_policy, pressure_action)?,
+            requested_slices,
+        ))
+    }
+
+    /// Evaluates all Invocation-scoped resources for one immutable-plan
+    /// submission wave. A total-order pool reuses one physical extent across
+    /// node rows, while a conservative pool retains disjoint row ranges.
+    pub(super) fn submission_wave_demand(
+        &self,
+        node_shapes: &[(NodeId, DynamicResourceShape, DynamicResourceShape)],
+        fit_policy: AdmissionFitPolicy,
+        pressure_action: AdmissionPressureAction,
+    ) -> Result<(AdmissionDemand, Vec<EvaluatedBackingRequest<'_>>), VNextError> {
+        if node_shapes.is_empty()
+            || node_shapes.len() != self.nodes().len()
+            || node_shapes
+                .iter()
+                .zip(self.nodes())
+                .any(|((node_id, _, _), node)| node_id != node.id())
+        {
+            return Err(invalid_resource(
+                "submission wave demand must cover every plan node in immutable plan order",
+            ));
+        }
+
+        let mut immediate_entries = Vec::new();
+        let mut fit_entries = Vec::new();
+        let mut requested_slices = Vec::new();
+        for domain in &self.dynamic_pools().domains {
+            let mode = domain.pool.invocation_liveness_mode();
+            if mode == InvocationLivenessMode::NoInvocationResources {
+                continue;
+            }
+
+            let mut projections = Vec::new();
+            let mut immediate_pool_bytes = 0_u64;
+            let mut fit_pool_bytes = 0_u64;
+            let mut matched_rows = 0_usize;
+            for (node_id, immediate_shape, fit_shape) in node_shapes {
+                let Some(row) = domain
+                    .pool
+                    .invocation_liveness()
+                    .iter()
+                    .find(|row| row.node_id() == node_id)
+                else {
+                    continue;
+                };
+                matched_rows += 1;
+                let row_base = match mode {
+                    InvocationLivenessMode::TotalOrderReuse => 0,
+                    InvocationLivenessMode::ConservativeConcurrent => immediate_pool_bytes,
+                    InvocationLivenessMode::NoInvocationResources => unreachable!(),
+                };
+                let mut immediate_row_bytes = 0_u64;
+                let mut fit_row_bytes = 0_u64;
+                for resource_id in row.resource_ids() {
+                    let descriptor = domain
+                        .descriptors
+                        .iter()
+                        .find(|descriptor| descriptor.base_resource_id() == resource_id)
+                        .ok_or_else(|| {
+                            invalid_resource(
+                                "invocation liveness row references a descriptor outside its pool",
+                            )
+                        })?;
+                    if descriptor.lifetime() != AllocationLifetime::Invocation {
+                        return Err(invalid_resource(
+                            "invocation liveness row references a non-Invocation descriptor",
+                        ));
+                    }
+                    let size_bytes =
+                        descriptor.evaluate_request_bytes_for_shape(*immediate_shape)?;
+                    let fit_bytes = descriptor.evaluate_request_bytes_for_shape(*fit_shape)?;
+                    let physical_offset_bytes =
+                        row_base.checked_add(immediate_row_bytes).ok_or_else(|| {
+                            invalid_resource("invocation wave projection offset overflows u64")
+                        })?;
+                    immediate_row_bytes =
+                        immediate_row_bytes.checked_add(size_bytes).ok_or_else(|| {
+                            invalid_resource("invocation wave row demand overflows u64")
+                        })?;
+                    fit_row_bytes = fit_row_bytes.checked_add(fit_bytes).ok_or_else(|| {
+                        invalid_resource("invocation wave fit row demand overflows u64")
+                    })?;
+                    projections.push(EvaluatedBackingProjection {
+                        descriptor,
+                        physical_offset_bytes,
+                        size_bytes,
+                    });
+                }
+                match mode {
+                    InvocationLivenessMode::TotalOrderReuse => {
+                        immediate_pool_bytes = immediate_pool_bytes.max(immediate_row_bytes);
+                        fit_pool_bytes = fit_pool_bytes.max(fit_row_bytes);
+                    }
+                    InvocationLivenessMode::ConservativeConcurrent => {
+                        immediate_pool_bytes = immediate_pool_bytes
+                            .checked_add(immediate_row_bytes)
+                            .ok_or_else(|| {
+                                invalid_resource("invocation wave pool demand overflows u64")
+                            })?;
+                        fit_pool_bytes =
+                            fit_pool_bytes.checked_add(fit_row_bytes).ok_or_else(|| {
+                                invalid_resource("invocation wave pool fit demand overflows u64")
+                            })?;
+                    }
+                    InvocationLivenessMode::NoInvocationResources => unreachable!(),
+                }
+            }
+            if matched_rows != domain.pool.invocation_liveness().len()
+                || projections.is_empty()
+                || immediate_pool_bytes == 0
+            {
+                return Err(invalid_resource(
+                    "invocation liveness rows do not map exactly onto the submission wave",
+                ));
+            }
+
+            projections.sort_by(|left, right| {
+                left.descriptor
+                    .base_resource_id()
+                    .cmp(right.descriptor.base_resource_id())
+            });
+            let resource_ids = projections
+                .iter()
+                .map(|projection| projection.descriptor.base_resource_id().clone())
+                .collect::<Vec<_>>();
+            requested_slices.push(EvaluatedBackingRequest {
+                domain,
+                claim_identity: PhysicalBackingClaimIdentity::new(
+                    domain.pool_id().clone(),
+                    resource_ids,
+                )?,
+                size_bytes: immediate_pool_bytes,
+                projections,
+            });
+            immediate_entries.push(CapacityEntry::new(
+                domain.domain_id(),
+                CapacityUnits::new(immediate_pool_bytes),
+            )?);
+            fit_entries.push(CapacityEntry::new(
+                domain.domain_id(),
+                CapacityUnits::new(fit_pool_bytes),
+            )?);
+        }
+
         let immediate = if immediate_entries.is_empty() {
             CapacityVector::empty()
         } else {

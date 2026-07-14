@@ -7,18 +7,18 @@ use super::{
     sequence_slot_poisoned_undrained, session_frame_candidates, session_participant_key,
     AbandonedSequenceMetadata, AbandonedSequenceRecoveryError, ActiveInvocationWaveGuard,
     ActiveSequenceAbortDisposition, ActiveSequenceAbortReceipt, ActiveSequenceFrame,
-    AdmissionDeferred, AdmissionFitPolicy, AdmissionRejected, AdmittedSequenceResources,
-    AdmittedStepParticipant, AllocationLifetime, Arc, AtomicU64, BackingPrepareDecision,
-    BatchCapacityClaimDecision, BatchInvocationId, BatchParticipantAuthority,
-    BatchParticipantTokenSpan, BatchStepId, BatchWorkShape, ClaimedBackingTransaction,
-    DeferredDeviceCleanupDomainId, DeviceRuntime, Digest, DynamicBackingDeferred,
-    ExecutionBatchParticipants, InvocationRegistry, InvocationResourceAdmissionRequest,
-    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSliceAuthority,
-    LogicalBatchCapacityLease, NodeId, Ordering, ParticipantFlightCandidate,
-    ParticipantFlightPhase, ParticipantFlightWaveCandidate, ParticipantNodeKey,
-    PreparedParticipantFlightHold, RequestIdentity, ResourceId, RunId, SequenceAuthorityId,
-    SequenceExecutionAuthoritySource, SequenceRecoveryRegistry, SequenceSessionEpoch,
-    SequenceSessionFingerprint, Serialize, Sha256, StaticProvisioningLease,
+    AdmissionDeferred, AdmissionFitPolicy, AdmissionPressureAction, AdmissionRejected,
+    AdmittedSequenceResources, AdmittedStepParticipant, AllocationLifetime, Arc, AtomicU64,
+    BackingPrepareDecision, BatchCapacityClaimDecision, BatchInvocationId,
+    BatchParticipantAuthority, BatchParticipantTokenSpan, BatchStepId, BatchWorkShape,
+    ClaimedBackingTransaction, ClaimedSubmissionWaveBacking, DeferredDeviceCleanupDomainId,
+    DeviceRuntime, Digest, DynamicBackingDeferred, ExecutionBatchParticipants, InvocationRegistry,
+    InvocationResourceAdmissionRequest, LogicalAdmissionCoordinatorId, LogicalBackingBufferView,
+    LogicalBackingSliceAuthority, LogicalBatchCapacityLease, NodeId, Ordering,
+    ParticipantFlightCandidate, ParticipantFlightPhase, ParticipantFlightWaveCandidate,
+    ParticipantNodeKey, PreparedParticipantFlightHold, RequestIdentity, ResourceId, RunId,
+    SequenceAuthorityId, SequenceExecutionAuthoritySource, SequenceRecoveryRegistry,
+    SequenceSessionEpoch, SequenceSessionFingerprint, Serialize, Sha256, StaticProvisioningLease,
     StepFinalizationFailure, StepParticipantFrameAssignment, StepParticipantRetirement,
     StepParticipantRetirementDisposition, StepResourceAdmissionDecision,
     StepResourceAdmissionRequest, StepResourceLease, StepRetirementReceipt, StreamState,
@@ -414,7 +414,6 @@ where
         let PreparedInvocationScope {
             participants,
             participant_frames,
-            participant_session_identities: _,
             node_id,
             claimed_backing,
             flight_candidates,
@@ -476,29 +475,99 @@ where
             ));
         }
 
-        let mut prepared_nodes = Vec::with_capacity(requests.len());
-        for request in requests {
-            match self.prepare_invocation_scope(request)? {
-                PreparedInvocationScopeDecision::Prepared(prepared) => {
-                    prepared_nodes.push(prepared)
+        let fit_policy = requests[0].fit_policy();
+        let pressure_action = requests[0].pressure_action();
+        if requests.iter().any(|request| {
+            request.fit_policy() != fit_policy || request.pressure_action() != pressure_action
+        }) {
+            return Err(invalid_resource(
+                "submission wave nodes require one admission fit and pressure policy",
+            ));
+        }
+
+        let prepared_nodes = requests
+            .into_iter()
+            .map(|request| self.prepare_invocation_metadata(request))
+            .collect::<Result<Vec<_>, _>>()?;
+        let node_shapes = prepared_nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.node_id.clone(),
+                    node.work_shape.immediate_shape(),
+                    match fit_policy {
+                        AdmissionFitPolicy::ImmediateOnly => node.work_shape.immediate_shape(),
+                        AdmissionFitPolicy::FullInputMustFit => node.work_shape.fit_shape(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let (demand, requested_slices) =
+            plan.submission_wave_demand(&node_shapes, fit_policy, pressure_action)?;
+        let prepared_backing = match plan.prepare_backing_slices(requested_slices)? {
+            BackingPrepareDecision::Prepared(prepared) => prepared,
+            BackingPrepareDecision::Deferred(deferred) => {
+                return Ok(StepSubmissionWaveAdmissionDecision::BackingDeferred(
+                    deferred,
+                ));
+            }
+        };
+        let wave_participants = self
+            .participants
+            .iter()
+            .map(|participant| {
+                BatchParticipantAuthority::new(
+                    participant.session.sequence_authority(),
+                    participant.session.request_authority(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let logical_capacity = if demand.immediate_claim().is_empty() {
+            None
+        } else {
+            let parents = self
+                .participants
+                .iter()
+                .map(|participant| &*participant.session.resources().logical_lease)
+                .collect::<Vec<_>>();
+            match plan
+                .logical_admission()
+                .try_claim_for_sequences(&parents, &demand)?
+            {
+                BatchCapacityClaimDecision::Claimed(capacity) => {
+                    if !plan
+                        .logical_admission()
+                        .owns_batch_capacity_claim(&capacity)
+                    {
+                        return Err(invalid_resource(
+                            "submission wave admission returned foreign capacity authority",
+                        ));
+                    }
+                    Some(capacity)
                 }
-                PreparedInvocationScopeDecision::Deferred(deferred) => {
+                BatchCapacityClaimDecision::Deferred(deferred) => {
                     return Ok(StepSubmissionWaveAdmissionDecision::Deferred(deferred));
                 }
-                PreparedInvocationScopeDecision::BackingDeferred(deferred) => {
-                    return Ok(StepSubmissionWaveAdmissionDecision::BackingDeferred(
-                        deferred,
-                    ));
-                }
-                PreparedInvocationScopeDecision::PermanentRejected(rejected) => {
+                BatchCapacityClaimDecision::PermanentRejected(rejected) => {
                     return Ok(StepSubmissionWaveAdmissionDecision::PermanentRejected(
                         rejected,
                     ));
                 }
             }
-        }
-
-        let wave_fingerprint = submission_wave_fingerprint(self, &prepared_nodes)?;
+        };
+        let node_work_shapes = prepared_nodes
+            .iter()
+            .map(|node| (node.node_id.clone(), node.work_shape.clone()))
+            .collect();
+        let claimed_backing = ClaimedSubmissionWaveBacking::new(
+            node_work_shapes,
+            wave_participants,
+            demand,
+            logical_capacity,
+            prepared_backing.commit(),
+        )?;
+        let wave_fingerprint =
+            submission_wave_fingerprint(self, &prepared_nodes, &claimed_backing)?;
         let batch_invocation_id = issue_batch_invocation_id()?;
         let flight_candidates = prepared_nodes
             .iter()
@@ -524,6 +593,7 @@ where
             .collect();
         Ok(StepSubmissionWaveAdmissionDecision::Prepared(
             PreparedStepSubmissionWave {
+                claimed_backing,
                 nodes,
                 prepared_participant_flights,
                 active_wave,
@@ -538,6 +608,95 @@ where
         &self,
         request: InvocationResourceAdmissionRequest,
     ) -> Result<PreparedInvocationScopeDecision<R>, VNextError> {
+        let PreparedInvocationMetadata {
+            participants,
+            participant_frames,
+            participant_session_identities: _,
+            flight_candidates,
+            node_id,
+            work_shape,
+            fit_policy,
+            pressure_action,
+        } = self.prepare_invocation_metadata(request)?;
+        let immediate_shape = work_shape.immediate_shape();
+        let fit_shape = match fit_policy {
+            AdmissionFitPolicy::ImmediateOnly => immediate_shape,
+            AdmissionFitPolicy::FullInputMustFit => work_shape.fit_shape(),
+        };
+        let plan = &participants[0].request.plan;
+        let (demand, requested_slices) = plan.scoped_demand(
+            AllocationLifetime::Invocation,
+            Some(&node_id),
+            immediate_shape,
+            fit_shape,
+            fit_policy,
+            pressure_action,
+        )?;
+        let prepared = match plan.prepare_backing_slices(requested_slices)? {
+            BackingPrepareDecision::Prepared(prepared) => prepared,
+            BackingPrepareDecision::Deferred(deferred) => {
+                return Ok(PreparedInvocationScopeDecision::BackingDeferred(deferred));
+            }
+        };
+        let logical_capacity = if demand.immediate_claim().is_empty() {
+            None
+        } else {
+            let parents = participants
+                .iter()
+                .map(|participant| &*participant.logical_lease)
+                .collect::<Vec<_>>();
+            match plan
+                .logical_admission()
+                .try_claim_for_sequences(&parents, &demand)?
+            {
+                BatchCapacityClaimDecision::Claimed(capacity) => {
+                    let parents_match = capacity
+                        .parents()
+                        .iter()
+                        .map(|parent| (parent.sequence(), parent.request()))
+                        .eq(participants.iter().map(|participant| {
+                            (
+                                participant.sequence_authority(),
+                                participant.request_authority(),
+                            )
+                        }));
+                    if !plan
+                        .logical_admission()
+                        .owns_batch_capacity_claim(&capacity)
+                        || !parents_match
+                    {
+                        return Err(invalid_resource(
+                            "invocation admission returned capacity for another participant set",
+                        ));
+                    }
+                    Some(capacity)
+                }
+                BatchCapacityClaimDecision::Deferred(deferred) => {
+                    return Ok(PreparedInvocationScopeDecision::Deferred(deferred));
+                }
+                BatchCapacityClaimDecision::PermanentRejected(rejected) => {
+                    return Ok(PreparedInvocationScopeDecision::PermanentRejected(rejected));
+                }
+            }
+        };
+        let backing_slices = prepared.commit();
+        let claimed_backing =
+            ClaimedBackingTransaction::new(work_shape, demand, logical_capacity, backing_slices)?;
+        Ok(PreparedInvocationScopeDecision::Prepared(
+            PreparedInvocationScope {
+                participants,
+                participant_frames,
+                node_id,
+                claimed_backing,
+                flight_candidates,
+            },
+        ))
+    }
+
+    fn prepare_invocation_metadata(
+        &self,
+        request: InvocationResourceAdmissionRequest,
+    ) -> Result<PreparedInvocationMetadata<R>, VNextError> {
         let InvocationResourceAdmissionRequest {
             node_id,
             work_shape,
@@ -611,21 +770,6 @@ where
                 "invocation shape sequence count differs from its exact participant set",
             ));
         }
-        let plan = &participants[0].request.plan;
-        let (demand, requested_slices) = plan.scoped_demand(
-            AllocationLifetime::Invocation,
-            Some(&node_id),
-            immediate_shape,
-            fit_shape,
-            fit_policy,
-            pressure_action,
-        )?;
-        let prepared = match plan.prepare_backing_slices(requested_slices)? {
-            BackingPrepareDecision::Prepared(prepared) => prepared,
-            BackingPrepareDecision::Deferred(deferred) => {
-                return Ok(PreparedInvocationScopeDecision::BackingDeferred(deferred));
-            }
-        };
         let participant_authorities = participants
             .iter()
             .map(|participant| {
@@ -640,64 +784,20 @@ where
                 "invocation work authority differs from selected participants",
             ));
         }
-        let logical_capacity = if demand.immediate_claim().is_empty() {
-            None
-        } else {
-            let parents = participants
-                .iter()
-                .map(|participant| &*participant.logical_lease)
-                .collect::<Vec<_>>();
-            match plan
-                .logical_admission()
-                .try_claim_for_sequences(&parents, &demand)?
-            {
-                BatchCapacityClaimDecision::Claimed(capacity) => {
-                    let parents_match = capacity
-                        .parents()
-                        .iter()
-                        .map(|parent| (parent.sequence(), parent.request()))
-                        .eq(participants.iter().map(|participant| {
-                            (
-                                participant.sequence_authority(),
-                                participant.request_authority(),
-                            )
-                        }));
-                    if !plan
-                        .logical_admission()
-                        .owns_batch_capacity_claim(&capacity)
-                        || !parents_match
-                    {
-                        return Err(invalid_resource(
-                            "invocation admission returned capacity for another participant set",
-                        ));
-                    }
-                    Some(capacity)
-                }
-                BatchCapacityClaimDecision::Deferred(deferred) => {
-                    return Ok(PreparedInvocationScopeDecision::Deferred(deferred));
-                }
-                BatchCapacityClaimDecision::PermanentRejected(rejected) => {
-                    return Ok(PreparedInvocationScopeDecision::PermanentRejected(rejected));
-                }
-            }
-        };
-        let backing_slices = prepared.commit();
-        let claimed_backing =
-            ClaimedBackingTransaction::new(work_shape, demand, logical_capacity, backing_slices)?;
         let participant_session_identities = flight_candidates
             .iter()
             .map(|candidate| (candidate.epoch, candidate.fingerprint.clone()))
             .collect();
-        Ok(PreparedInvocationScopeDecision::Prepared(
-            PreparedInvocationScope {
-                participants,
-                participant_frames,
-                participant_session_identities,
-                node_id,
-                claimed_backing,
-                flight_candidates,
-            },
-        ))
+        Ok(PreparedInvocationMetadata {
+            participants,
+            participant_frames,
+            participant_session_identities,
+            flight_candidates,
+            node_id,
+            work_shape,
+            fit_policy,
+            pressure_action,
+        })
     }
 }
 
@@ -741,14 +841,28 @@ where
     claimed_backing: ClaimedBackingTransaction,
     participants: Vec<Arc<AdmittedSequenceResources<R>>>,
     participant_frames: Vec<StepParticipantFrameAssignment>,
-    participant_session_identities: Vec<(SequenceSessionEpoch, SequenceSessionFingerprint)>,
     flight_candidates: Vec<ParticipantFlightCandidate>,
     node_id: NodeId,
 }
 
+struct PreparedInvocationMetadata<R>
+where
+    R: DeviceRuntime,
+{
+    participants: Vec<Arc<AdmittedSequenceResources<R>>>,
+    participant_frames: Vec<StepParticipantFrameAssignment>,
+    participant_session_identities: Vec<(SequenceSessionEpoch, SequenceSessionFingerprint)>,
+    flight_candidates: Vec<ParticipantFlightCandidate>,
+    node_id: NodeId,
+    work_shape: BatchWorkShape,
+    fit_policy: AdmissionFitPolicy,
+    pressure_action: AdmissionPressureAction,
+}
+
 fn submission_wave_fingerprint<R>(
     step: &StepResourceLease<R>,
-    nodes: &[PreparedInvocationScope<R>],
+    nodes: &[PreparedInvocationMetadata<R>],
+    claimed_backing: &ClaimedSubmissionWaveBacking,
 ) -> Result<String, VNextError>
 where
     R: DeviceRuntime,
@@ -758,7 +872,6 @@ where
         node_id: &'a NodeId,
         participant_frames: &'a [StepParticipantFrameAssignment],
         work_fingerprint: &'a str,
-        backing_fingerprint: &'a str,
     }
 
     #[derive(Serialize)]
@@ -766,20 +879,21 @@ where
         domain: &'static str,
         batch_step_id: BatchStepId,
         step_backing_fingerprint: &'a str,
+        invocation_backing_fingerprint: &'a str,
         nodes: Vec<NodeInput<'a>>,
     }
 
     let bytes = serde_json::to_vec(&WaveInput {
-        domain: "ferrum.runtime-vnext.step-submission-wave.v1",
+        domain: "ferrum.runtime-vnext.step-submission-wave.v2",
         batch_step_id: step.batch_step_id,
         step_backing_fingerprint: step.claimed_backing.fingerprint(),
+        invocation_backing_fingerprint: claimed_backing.fingerprint(),
         nodes: nodes
             .iter()
             .map(|node| NodeInput {
                 node_id: &node.node_id,
                 participant_frames: &node.participant_frames,
-                work_fingerprint: node.claimed_backing.work_shape().fingerprint(),
-                backing_fingerprint: node.claimed_backing.fingerprint(),
+                work_fingerprint: node.work_shape.fingerprint(),
             })
             .collect(),
     })
@@ -808,7 +922,7 @@ pub struct PreparedStepSubmissionNode<R>
 where
     R: DeviceRuntime,
 {
-    claimed_backing: ClaimedBackingTransaction,
+    work_shape: BatchWorkShape,
     participants: Vec<Arc<AdmittedSequenceResources<R>>>,
     participant_frames: Vec<StepParticipantFrameAssignment>,
     participant_session_identities: Vec<(SequenceSessionEpoch, SequenceSessionFingerprint)>,
@@ -819,9 +933,9 @@ impl<R> PreparedStepSubmissionNode<R>
 where
     R: DeviceRuntime,
 {
-    fn from_prepared(prepared: PreparedInvocationScope<R>) -> Self {
+    fn from_prepared(prepared: PreparedInvocationMetadata<R>) -> Self {
         Self {
-            claimed_backing: prepared.claimed_backing,
+            work_shape: prepared.work_shape,
             participants: prepared.participants,
             participant_frames: prepared.participant_frames,
             participant_session_identities: prepared.participant_session_identities,
@@ -849,11 +963,7 @@ where
     }
 
     pub fn work_shape(&self) -> &BatchWorkShape {
-        self.claimed_backing.work_shape()
-    }
-
-    pub fn claimed_backing(&self) -> &ClaimedBackingTransaction {
-        &self.claimed_backing
+        &self.work_shape
     }
 
     pub fn plan_evidence(&self) -> TrustedPlanRuntimeEvidence {
@@ -884,26 +994,6 @@ where
             })
             .collect()
     }
-
-    fn backing_view<'wave>(
-        &'wave self,
-        step: &'wave StepResourceLease<R>,
-        resource_id: &ResourceId,
-    ) -> Result<LogicalBackingBufferView<'wave, R::Buffer>, VNextError> {
-        if let Some(authority) = self
-            .claimed_backing
-            .backing_slices()
-            .iter()
-            .find(|authority| authority.resource_id() == resource_id)
-        {
-            return self.participants[0]
-                .request
-                .plan
-                .dynamic_pools()
-                .view(authority);
-        }
-        step.backing_view(resource_id)
-    }
 }
 
 /// Exact all-node command wave for one Step. Its node projections and shared
@@ -914,7 +1004,8 @@ pub struct PreparedStepSubmissionWave<R>
 where
     R: DeviceRuntime,
 {
-    // Drop node-local claims and participant flights before releasing the Step.
+    // Drop wave backing and participant flights before releasing the Step.
+    claimed_backing: ClaimedSubmissionWaveBacking,
     nodes: Vec<PreparedStepSubmissionNode<R>>,
     prepared_participant_flights: Vec<PreparedParticipantFlightHold>,
     active_wave: ActiveInvocationWaveGuard,
@@ -941,6 +1032,10 @@ where
 
     pub fn nodes(&self) -> &[PreparedStepSubmissionNode<R>] {
         &self.nodes
+    }
+
+    pub fn claimed_backing(&self) -> &ClaimedSubmissionWaveBacking {
+        &self.claimed_backing
     }
 
     pub fn node_count(&self) -> usize {
@@ -971,10 +1066,23 @@ where
         node_index: usize,
         resource_id: &ResourceId,
     ) -> Result<LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
-        self.nodes
+        let node = self
+            .nodes
             .get(node_index)
-            .ok_or_else(|| invalid_resource("submission wave node index is out of bounds"))?
-            .backing_view(&self.step, resource_id)
+            .ok_or_else(|| invalid_resource("submission wave node index is out of bounds"))?;
+        if let Some(authority) = self
+            .claimed_backing
+            .backing_slices()
+            .iter()
+            .find(|authority| authority.resource_id() == resource_id)
+        {
+            return node.participants[0]
+                .request
+                .plan
+                .dynamic_pools()
+                .view(authority);
+        }
+        self.step.backing_view(resource_id)
     }
 
     pub(crate) fn begin_dispatch(&mut self) -> Result<(), VNextError> {
