@@ -268,9 +268,41 @@ REQUIRED_RESOLUTION_LIMITS_TESTS = {
     "resolved_wire_limit_accepts_max_and_rejects_max_plus_one_before_serde",
     "source_byte_limit_accepts_max_and_rejects_max_plus_one_before_parser",
 }
-REQUIRED_DEVICE_OPERATION_TESTS = {
-    "completion_reaper_drop_defers_blocking_backend_recovery",
-    "device_and_operation_contract_is_exhaustive",
+REQUIRED_DEVICE_OPERATION_TESTS_BY_TARGET = {
+    "vnext_device_operation_batch_contract_tests": {
+        "thirty_two_participant_dispatch_is_one_physical_submission"
+    },
+    "vnext_device_operation_cancel_contract_tests": {
+        "device_operation_cancel_contract_is_exhaustive"
+    },
+    "vnext_device_operation_completion_contract_tests": {
+        "completion_reaper_drop_defers_blocking_backend_recovery",
+        "device_operation_completion_contract_is_exhaustive",
+    },
+    "vnext_device_operation_dispatch_contract_tests": {
+        "device_operation_dispatch_contract_is_exhaustive"
+    },
+    "vnext_device_operation_legacy_authority_contract_tests": {
+        "device_operation_legacy_authority_contract_is_exhaustive"
+    },
+}
+DEVICE_OPERATION_PROOF_LINES = {
+    "vnext_device_operation_cancel_contract_tests": (
+        "VNEXT DEVICE OPERATION CANCEL PASS",
+        16,
+    ),
+    "vnext_device_operation_completion_contract_tests": (
+        "VNEXT DEVICE OPERATION COMPLETION PASS",
+        200,
+    ),
+    "vnext_device_operation_dispatch_contract_tests": (
+        "VNEXT DEVICE OPERATION DISPATCH PASS",
+        70,
+    ),
+    "vnext_device_operation_legacy_authority_contract_tests": (
+        "VNEXT DEVICE OPERATION LEGACY AUTHORITY PASS",
+        13,
+    ),
 }
 REQUIRED_ORACLE_TESTS = {
     "descriptor_and_request_result_wire_require_explicit_revalidation",
@@ -298,7 +330,7 @@ REQUIRED_TESTS_BY_TARGET = {
     **REQUIRED_RESOURCE_TESTS_BY_TARGET,
     **REQUIRED_EVENT_TESTS_BY_TARGET,
     "vnext_resolution_limits_contract_tests": REQUIRED_RESOLUTION_LIMITS_TESTS,
-    "vnext_device_operation_contract_tests": REQUIRED_DEVICE_OPERATION_TESTS,
+    **REQUIRED_DEVICE_OPERATION_TESTS_BY_TARGET,
     "vnext_oracle_contract_tests": REQUIRED_ORACLE_TESTS,
     "vnext_model_wire_contract_tests": REQUIRED_MODEL_WIRE_TESTS,
     "vnext_compile": REQUIRED_COMPILE_TESTS,
@@ -362,7 +394,7 @@ EXPECTED_TRYBUILD_PASS_CASES = 2
 EXPECTED_TRYBUILD_FAIL_CASES = 78
 TEST_THREADS_ARG = "--test-threads=1"
 BOUNDED_RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
-BOUNDED_TEST_COMMAND_COUNT = 52
+BOUNDED_TEST_COMMAND_COUNT = 60
 BOUNDED_TEST_ENV_OVERRIDES = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "CARGO_BUILD_JOBS": "2",
@@ -2372,6 +2404,32 @@ def parse_machine_proofs(target_stdout: dict[str, str]) -> dict[str, int]:
         "event machine proof total changed: "
         f"expected={EXPECTED_EVENT_REPLAY_V5_CASES} actual={event_total}",
     )
+    device_operation_total = 0
+    for target, (prefix, expected) in DEVICE_OPERATION_PROOF_LINES.items():
+        pattern = re.compile(
+            rf"^{re.escape(prefix)}: ([1-9][0-9]*)/([1-9][0-9]*)$"
+        )
+        matches = [
+            match
+            for line in lines_by_target[target]
+            if (match := pattern.fullmatch(line))
+        ]
+        require(
+            len(matches) == 1,
+            f"missing or duplicate device operation machine proof line: {target} {prefix}",
+        )
+        passed, total = (int(value) for value in matches[0].groups())
+        require(
+            passed == total == expected,
+            f"device operation machine proof count changed: {target} {prefix} "
+            f"expected={expected}/{expected} actual={passed}/{total}",
+        )
+        device_operation_total += total
+    require(
+        device_operation_total == EXPECTED_DEVICE_OPERATION_CASES,
+        "device operation machine proof total changed: "
+        f"expected={EXPECTED_DEVICE_OPERATION_CASES} actual={device_operation_total}",
+    )
     ratio_proofs = {
         "fail_closed_cases": (
             "vnext_resolution_contract_tests",
@@ -2382,11 +2440,6 @@ def parse_machine_proofs(target_stdout: dict[str, str]) -> dict[str, int]:
             "vnext_resolution_contract_tests",
             "VNEXT MODEL IDENTITY PASS",
             EXPECTED_MODEL_IDENTITY_CASES,
-        ),
-        "device_operation_contract_cases": (
-            "vnext_device_operation_contract_tests",
-            "VNEXT DEVICE OPERATION PASS",
-            EXPECTED_DEVICE_OPERATION_CASES,
         ),
         "operation_oracle_contract_cases": (
             "vnext_oracle_contract_tests",
@@ -2407,6 +2460,7 @@ def parse_machine_proofs(target_stdout: dict[str, str]) -> dict[str, int]:
     ratios: dict[str, int] = {
         "resource_transaction_cases": resource_total,
         "event_replay_v5_contract_cases": event_total,
+        "device_operation_contract_cases": device_operation_total,
     }
     for label, (target, prefix, expected) in ratio_proofs.items():
         pattern = re.compile(
@@ -3196,10 +3250,6 @@ impl OperationDispatch {
         {
             "vnext_plan_wire_contract_tests": plan_proofs,
             "vnext_resolution_contract_tests": resolution_proofs,
-            "vnext_device_operation_contract_tests": (
-                f"VNEXT DEVICE OPERATION PASS: "
-                f"{EXPECTED_DEVICE_OPERATION_CASES}/{EXPECTED_DEVICE_OPERATION_CASES}\n"
-            ),
             "vnext_oracle_contract_tests": (
                 f"VNEXT OPERATION ORACLE PASS: {EXPECTED_ORACLE_CASES}/{EXPECTED_ORACLE_CASES}\n"
             ),
@@ -3215,6 +3265,8 @@ impl OperationDispatch {
             f"{prefix}: {count}/{count}\n" for prefix, count in resource_proofs
         )
     for target, (prefix, count) in EVENT_PROOF_LINES.items():
+        proof_stdout[target] = f"{prefix}: {count}/{count}\n"
+    for target, (prefix, count) in DEVICE_OPERATION_PROOF_LINES.items():
         proof_stdout[target] = f"{prefix}: {count}/{count}\n"
     proofs = parse_machine_proofs(proof_stdout)
     require(

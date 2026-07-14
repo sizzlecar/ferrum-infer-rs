@@ -449,9 +449,41 @@ VNEXT_G01A_REQUIRED_RESOLUTION_LIMITS_TESTS = {
     "resolved_wire_limit_accepts_max_and_rejects_max_plus_one_before_serde",
     "source_byte_limit_accepts_max_and_rejects_max_plus_one_before_parser",
 }
-VNEXT_G01A_REQUIRED_DEVICE_OPERATION_TESTS = {
-    "completion_reaper_drop_defers_blocking_backend_recovery",
-    "device_and_operation_contract_is_exhaustive"
+VNEXT_G01A_REQUIRED_DEVICE_OPERATION_TESTS_BY_TARGET = {
+    "vnext_device_operation_batch_contract_tests": {
+        "thirty_two_participant_dispatch_is_one_physical_submission"
+    },
+    "vnext_device_operation_cancel_contract_tests": {
+        "device_operation_cancel_contract_is_exhaustive"
+    },
+    "vnext_device_operation_completion_contract_tests": {
+        "completion_reaper_drop_defers_blocking_backend_recovery",
+        "device_operation_completion_contract_is_exhaustive",
+    },
+    "vnext_device_operation_dispatch_contract_tests": {
+        "device_operation_dispatch_contract_is_exhaustive"
+    },
+    "vnext_device_operation_legacy_authority_contract_tests": {
+        "device_operation_legacy_authority_contract_is_exhaustive"
+    },
+}
+VNEXT_G01A_DEVICE_OPERATION_PROOF_LINES = {
+    "vnext_device_operation_cancel_contract_tests": (
+        "VNEXT DEVICE OPERATION CANCEL PASS",
+        16,
+    ),
+    "vnext_device_operation_completion_contract_tests": (
+        "VNEXT DEVICE OPERATION COMPLETION PASS",
+        200,
+    ),
+    "vnext_device_operation_dispatch_contract_tests": (
+        "VNEXT DEVICE OPERATION DISPATCH PASS",
+        70,
+    ),
+    "vnext_device_operation_legacy_authority_contract_tests": (
+        "VNEXT DEVICE OPERATION LEGACY AUTHORITY PASS",
+        13,
+    ),
 }
 VNEXT_G01A_REQUIRED_ORACLE_TESTS = {
     "descriptor_and_request_result_wire_require_explicit_revalidation",
@@ -479,7 +511,7 @@ VNEXT_G01A_REQUIRED_TESTS_BY_TARGET = {
     **VNEXT_G01A_REQUIRED_RESOURCE_TESTS_BY_TARGET,
     **VNEXT_G01A_REQUIRED_EVENT_TESTS_BY_TARGET,
     "vnext_resolution_limits_contract_tests": VNEXT_G01A_REQUIRED_RESOLUTION_LIMITS_TESTS,
-    "vnext_device_operation_contract_tests": VNEXT_G01A_REQUIRED_DEVICE_OPERATION_TESTS,
+    **VNEXT_G01A_REQUIRED_DEVICE_OPERATION_TESTS_BY_TARGET,
     "vnext_oracle_contract_tests": VNEXT_G01A_REQUIRED_ORACLE_TESTS,
     "vnext_model_wire_contract_tests": VNEXT_G01A_REQUIRED_MODEL_WIRE_TESTS,
     "vnext_compile": VNEXT_G01A_REQUIRED_COMPILE_TESTS,
@@ -554,7 +586,7 @@ VNEXT_G01A_EXPECTED_TRYBUILD_PASS_CASES = 2
 VNEXT_G01A_EXPECTED_TRYBUILD_FAIL_CASES = 78
 VNEXT_G01A_TEST_THREADS_ARG = "--test-threads=1"
 VNEXT_G01A_BOUNDED_RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
-VNEXT_G01A_BOUNDED_TEST_COMMAND_COUNT = 52
+VNEXT_G01A_BOUNDED_TEST_COMMAND_COUNT = 60
 VNEXT_G01A_BOUNDED_TEST_ENV_OVERRIDES = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "CARGO_BUILD_JOBS": "2",
@@ -3427,6 +3459,30 @@ def validate_vnext_g01a_provenance(
         event_total == assertions["event_replay_v5_contract_cases"],
         "vnext-g01a event proof total/assertion mismatch",
     )
+    device_operation_total = 0
+    for target, (prefix, expected) in VNEXT_G01A_DEVICE_OPERATION_PROOF_LINES.items():
+        proof_stdout = command_outputs[test_command(target, "--nocapture")].splitlines()
+        pattern = re.compile(
+            rf"^{re.escape(prefix)}: ([1-9][0-9]*)/([1-9][0-9]*)$"
+        )
+        matches = [
+            match for line in proof_stdout if (match := pattern.fullmatch(line))
+        ]
+        require_gate(
+            len(matches) == 1,
+            "vnext-g01a missing or duplicate device operation machine proof: "
+            f"{target} {prefix}",
+        )
+        passed, total = (int(value) for value in matches[0].groups())
+        require_gate(
+            passed == total == expected,
+            f"vnext-g01a device operation proof mismatch: {target} {prefix}",
+        )
+        device_operation_total += total
+    require_gate(
+        device_operation_total == assertions["device_operation_contract_cases"],
+        "vnext-g01a device operation proof total/assertion mismatch",
+    )
     for assertion_key, target, prefix in (
         (
             "fail_closed_cases",
@@ -3437,11 +3493,6 @@ def validate_vnext_g01a_provenance(
             "model_identity_cases",
             "vnext_resolution_contract_tests",
             "VNEXT MODEL IDENTITY PASS",
-        ),
-        (
-            "device_operation_contract_cases",
-            "vnext_device_operation_contract_tests",
-            "VNEXT DEVICE OPERATION PASS",
         ),
         (
             "operation_oracle_contract_cases",
@@ -5747,6 +5798,10 @@ def self_test() -> int:
         == VNEXT_G01A_REQUIRED_EVENT_TESTS_BY_TARGET
         and g01a_checkpoint["EVENT_PROOF_LINES"]
         == VNEXT_G01A_EVENT_PROOF_LINES
+        and g01a_checkpoint["REQUIRED_DEVICE_OPERATION_TESTS_BY_TARGET"]
+        == VNEXT_G01A_REQUIRED_DEVICE_OPERATION_TESTS_BY_TARGET
+        and g01a_checkpoint["DEVICE_OPERATION_PROOF_LINES"]
+        == VNEXT_G01A_DEVICE_OPERATION_PROOF_LINES
         and len(g01a_checkpoint["evidence_command_matrix"]())
         == len(VNEXT_G01A_QUALITY_COMMANDS) + VNEXT_G01A_BOUNDED_TEST_COMMAND_COUNT,
         "vnext-g01a checkpoint/run_gate command matrix drift",
