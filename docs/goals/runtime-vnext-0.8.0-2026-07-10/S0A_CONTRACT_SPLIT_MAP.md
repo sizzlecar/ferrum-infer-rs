@@ -192,6 +192,24 @@ The exact test-name union is still `51/51`, with no duplicate owner. The plan pr
 require the seven-target matrix. As with the event fixture, physical source owners are bounded but
 the stricter transitive target-LOC accounting remains open before final S0A PASS.
 
+## Device Operation Test Ownership
+
+The former 3,799-line device/operation target is replaced by a 1,672-line shared fixture and five
+owner targets:
+
+| Target | Owner lines | Tests | Frozen proof cases |
+|---|---:|---:|---:|
+| `vnext_device_operation_dispatch_contract_tests` | 652 | 1 | 70 |
+| `vnext_device_operation_cancel_contract_tests` | 168 | 1 | 16 |
+| `vnext_device_operation_legacy_authority_contract_tests` | 115 | 1 | 13 |
+| `vnext_device_operation_completion_contract_tests` | 1,063 | 2 | 200 plus bounded drop |
+| `vnext_device_operation_batch_contract_tests` | 169 | 1 | standalone 32-participant batch |
+
+The exact counted proof remains `70 + 16 + 13 + 200 = 299`. The old aggregate test is gone; the
+checkpoint and outer gate require the six exact test names and sum four machine proof lines. Every
+physical source owner is below 2,000 lines. Shared-fixture transitive LOC remains part of the final
+S0A accounting rather than being hidden by this split.
+
 ## Preserved Dynamic Resource Invariants
 
 This split is not permission to simplify the resource model. The following owners and behavior
