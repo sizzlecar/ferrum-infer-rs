@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
+    dense_linear_contract, dense_swiglu_contract, residual_add_contract, rms_norm_contract,
     token_embedding_contract, AttributeId, BatchedOperationInvocation, CapabilityId,
     ContractVersion, DeviceId, DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile,
     DynamicStorageRequirement, DynamicStorageView, ElementType, OperationContract,
@@ -12,7 +13,9 @@ use ferrum_interfaces::vnext::{
     OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
     OperationRuntimeRegistry, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
     ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError,
-    WeightFormatId, TOKEN_EMBEDDING_F16_CAPABILITY_ID, TOKEN_EMBEDDING_OPERATION_ID,
+    WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
+    RESIDUAL_ADD_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
+    TOKEN_EMBEDDING_OPERATION_ID,
 };
 use sha2::{Digest, Sha256};
 
@@ -20,6 +23,8 @@ use super::vnext_runtime::{
     CudaBufferRegion, CudaDeviceBuffer, CudaDeviceCommand, CudaDeviceRuntime,
     CudaDeviceRuntimeConfig, CudaDeviceRuntimeError,
 };
+
+mod transformer;
 
 const TOKEN_EMBEDDING_PROVIDER_ID: &str = "provider.cuda.token_embedding.f16";
 const TOKEN_EMBEDDING_ESTIMATOR_ID: &str = "resource-estimator.cuda.token_embedding.f16";
@@ -40,7 +45,11 @@ pub fn cuda_vnext_runtime_config(
         runtime_implementation_fingerprint: implementation_fingerprint(&[
             include_str!("vnext_runtime.rs").as_bytes(),
             include_str!("vnext_ops.rs").as_bytes(),
+            include_str!("vnext_ops/transformer.rs").as_bytes(),
             crate::ptx::EMBEDDING_LOOKUP.as_bytes(),
+            crate::ptx::RMS_NORM.as_bytes(),
+            crate::ptx::FUSED_SILU_MUL.as_bytes(),
+            crate::ptx::RESIDUAL_ADD.as_bytes(),
         ]),
         capabilities: cuda_vnext_capabilities()?,
         dynamic_storage_profiles: BTreeSet::from([DynamicStorageProfile::new(
@@ -51,19 +60,37 @@ pub fn cuda_vnext_runtime_config(
 }
 
 pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
-    Ok(BTreeSet::from([CapabilityId::new(
+    [
         TOKEN_EMBEDDING_F16_CAPABILITY_ID,
-    )?]))
+        RMS_NORM_F16_CAPABILITY_ID,
+        DENSE_LINEAR_F16_CAPABILITY_ID,
+        DENSE_SWIGLU_F16_CAPABILITY_ID,
+        RESIDUAL_ADD_F16_CAPABILITY_ID,
+    ]
+    .into_iter()
+    .map(CapabilityId::new)
+    .collect()
 }
 
 /// Build the exact composition root used for both planning and dispatch.
 pub fn cuda_vnext_operation_registry(
     runtime: &CudaDeviceRuntime,
 ) -> Result<OperationRuntimeRegistry<CudaDeviceRuntime>, CudaDeviceRuntimeError> {
-    let contract = token_embedding_contract().map_err(contract_error)?;
-    let provider = CudaTokenEmbeddingProvider::new(runtime)?;
-    OperationRuntimeRegistry::new(vec![Box::new(contract)], vec![Box::new(provider)])
-        .map_err(contract_error)
+    let contracts: Vec<Box<dyn OperationContract>> = vec![
+        Box::new(token_embedding_contract().map_err(contract_error)?),
+        Box::new(rms_norm_contract().map_err(contract_error)?),
+        Box::new(dense_linear_contract().map_err(contract_error)?),
+        Box::new(dense_swiglu_contract().map_err(contract_error)?),
+        Box::new(residual_add_contract().map_err(contract_error)?),
+    ];
+    let providers: Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> = vec![
+        Box::new(CudaTokenEmbeddingProvider::new(runtime)?),
+        Box::new(transformer::CudaRmsNormProvider::new(runtime)?),
+        Box::new(transformer::CudaDenseLinearProvider::new(runtime)?),
+        Box::new(transformer::CudaDenseSwiGluProvider::new(runtime)?),
+        Box::new(transformer::CudaResidualAddProvider::new(runtime)?),
+    ];
+    OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
 }
 
 pub struct CudaTokenEmbeddingProvider {
@@ -185,16 +212,22 @@ fn encode_token_embedding(
         return Err("CUDA token embedding received another or empty operation".to_owned());
     }
 
+    let token_ranges = invocation.participant_token_ranges();
+    if token_ranges.len() != invocation.participants().len() {
+        return Err("CUDA token embedding participant ranges are incomplete".to_owned());
+    }
     let mut regions = Vec::with_capacity(invocation.participants().len() * 3);
     let mut launches = Vec::with_capacity(invocation.participants().len());
-    for participant in invocation.participants() {
+    for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
         let token_ids = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
         let table = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
         let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
         let hidden_size = unsigned_attribute(participant.attributes(), "hidden_size")?;
         let vocabulary_size = unsigned_attribute(participant.attributes(), "vocab_size")?;
-        let token_count =
-            validate_signature(token_ids, table, output, vocabulary_size, hidden_size)?;
+        validate_signature(token_ids, table, output, vocabulary_size, hidden_size)?;
+        let source_range = token_range.source_token_range();
+        let packed_range = token_range.immediate_token_range();
+        let token_count = token_range.immediate_tokens();
         let grid_x = hidden_size
             .div_ceil(THREADS_PER_BLOCK as u64)
             .try_into()
@@ -202,8 +235,20 @@ fn encode_token_embedding(
 
         let first_region = regions.len();
         regions.push(contiguous_region(participant, table, ElementType::F16)?);
-        regions.push(contiguous_region(participant, token_ids, ElementType::U32)?);
-        regions.push(contiguous_region(participant, output, ElementType::F16)?);
+        regions.push(contiguous_token_region(
+            participant,
+            token_ids,
+            ElementType::U32,
+            source_range.start,
+            token_count,
+        )?);
+        regions.push(contiguous_token_region(
+            participant,
+            output,
+            ElementType::F16,
+            packed_range.start,
+            token_count,
+        )?);
         launches.push(EmbeddingLaunch {
             first_region,
             token_count,
@@ -322,7 +367,7 @@ fn binding(
     bindings
         .iter()
         .find(|binding| binding.role() == role && binding.ordinal() == ordinal)
-        .ok_or_else(|| format!("token embedding lacks {role:?} binding {ordinal}"))
+        .ok_or_else(|| format!("CUDA operation lacks {role:?} binding {ordinal}"))
 }
 
 fn unsigned_attribute(
@@ -335,7 +380,7 @@ fn unsigned_attribute(
         .map(|(_, value)| value)
     {
         Some(SemanticValue::Unsigned(value)) => Ok(*value),
-        _ => Err(format!("token embedding lacks unsigned attribute {name:?}")),
+        _ => Err(format!("CUDA operation lacks unsigned attribute {name:?}")),
     }
 }
 
@@ -345,39 +390,106 @@ fn contiguous_region(
     element_type: ElementType,
 ) -> Result<CudaBufferRegion, String> {
     let [component] = binding.storage().components() else {
-        return Err("CUDA token embedding requires one storage component per value".to_owned());
+        return Err("CUDA operation requires one storage component per value".to_owned());
     };
     if component.element_type() != element_type {
+        return Err("CUDA operation storage element type differs from its contract".to_owned());
+    }
+    contiguous_region_range(
+        participant,
+        binding,
+        element_type,
+        component.offset_bytes(),
+        component.length_bytes(),
+    )
+}
+
+fn contiguous_token_region(
+    participant: &OperationInvocation<'_, CudaDeviceBuffer>,
+    binding: &ResolvedValueBinding,
+    element_type: ElementType,
+    token_start: u64,
+    token_count: u64,
+) -> Result<CudaBufferRegion, String> {
+    let [component] = binding.storage().components() else {
+        return Err("CUDA operation requires one storage component per value".to_owned());
+    };
+    let projection = participant
+        .work()
+        .token_projection(binding.role(), binding.ordinal())
+        .ok_or_else(|| "CUDA operation binding has no token work projection".to_owned())?;
+    let dimensions = binding.tensor().dimensions();
+    if projection.axis() != 0
+        || projection.rank() as usize != dimensions.len()
+        || dimensions.first() != Some(&projection.canonical_extent())
+        || component.offset_bytes() != 0
+        || component.length_bytes() % projection.canonical_extent() != 0
+    {
         return Err(
-            "CUDA token embedding storage element type differs from its contract".to_owned(),
+            "CUDA contiguous token projection is not a canonical leading-axis tensor".to_owned(),
         );
+    }
+    let bytes_per_token = component.length_bytes() / projection.canonical_extent();
+    let logical_offset = token_start
+        .checked_mul(bytes_per_token)
+        .ok_or_else(|| "CUDA token region offset overflows".to_owned())?;
+    let logical_length = token_count
+        .checked_mul(bytes_per_token)
+        .ok_or_else(|| "CUDA token region length overflows".to_owned())?;
+    contiguous_region_range(
+        participant,
+        binding,
+        element_type,
+        logical_offset,
+        logical_length,
+    )
+}
+
+fn contiguous_region_range(
+    participant: &OperationInvocation<'_, CudaDeviceBuffer>,
+    binding: &ResolvedValueBinding,
+    element_type: ElementType,
+    logical_offset_bytes: u64,
+    logical_length_bytes: u64,
+) -> Result<CudaBufferRegion, String> {
+    let [component] = binding.storage().components() else {
+        return Err("CUDA operation requires one storage component per value".to_owned());
+    };
+    if component.element_type() != element_type {
+        return Err("CUDA operation storage element type differs from its contract".to_owned());
     }
     let view = participant
         .views()
         .iter()
         .find(|view| view.resource_id() == component.resource_id())
-        .ok_or_else(|| "CUDA token embedding value has no resource view".to_owned())?;
+        .ok_or_else(|| "CUDA operation value has no resource view".to_owned())?;
     // The invocation construction has already proved the resource view and
     // component describe the same allocation. The provider still translates
     // the logical slice instead of assuming an arena base pointer.
     let translated = view
-        .translate(component.offset_bytes(), component.length_bytes())
+        .translate(logical_offset_bytes, logical_length_bytes)
         .map_err(|error| error.to_string())?;
     let mut physical = translated.iter();
     let region = physical
         .next()
-        .ok_or_else(|| "CUDA token embedding translated to no physical region".to_owned())?;
+        .ok_or_else(|| "CUDA operation translated to no physical region".to_owned())?;
     if physical.next().is_some() {
-        return Err("CUDA token embedding requires contiguous physical storage".to_owned());
+        return Err("CUDA operation requires contiguous physical storage".to_owned());
     }
     let (buffer, range) = region.buffer_and_physical_range();
     let region = buffer.region(range).map_err(|error| error.to_string())?;
-    if region.element_type() != element_type || region.length_bytes() != component.length_bytes() {
+    if region.element_type() != element_type || region.length_bytes() != logical_length_bytes {
         return Err(
-            "CUDA token embedding physical region differs from its resolved component".to_owned(),
+            "CUDA operation physical region differs from its resolved component".to_owned(),
         );
     }
     Ok(region)
+}
+
+fn same_physical_region(left: &CudaBufferRegion, right: &CudaBufferRegion) -> bool {
+    left.device_ptr() == right.device_ptr()
+        && left.length_bytes() == right.length_bytes()
+        && left.element_type() == right.element_type()
 }
 
 fn contiguous_bindings() -> Vec<ProviderStorageBindingRequirement> {

@@ -12,6 +12,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use cudarc::cublas::{result::CublasError, CudaBlas};
 use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DriverError};
 use ferrum_interfaces::vnext::{
     BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceClass,
@@ -43,6 +44,10 @@ pub enum CudaDeviceRuntimeError {
         operation: &'static str,
         source: DriverError,
     },
+    Blas {
+        operation: &'static str,
+        source: CublasError,
+    },
 }
 
 impl CudaDeviceRuntimeError {
@@ -54,10 +59,15 @@ impl CudaDeviceRuntimeError {
         Self::Driver { operation, source }
     }
 
+    pub(super) fn blas(operation: &'static str, source: CublasError) -> Self {
+        Self::Blas { operation, source }
+    }
+
     fn driver_code(&self) -> Option<cudarc::driver::sys::CUresult> {
         match self {
             Self::Contract(_) => None,
             Self::Driver { source, .. } => Some(source.0),
+            Self::Blas { .. } => None,
         }
     }
 }
@@ -69,6 +79,9 @@ impl fmt::Display for CudaDeviceRuntimeError {
             Self::Driver { operation, source } => {
                 write!(formatter, "CUDA {operation} failed: {source:?}")
             }
+            Self::Blas { operation, source } => {
+                write!(formatter, "CUDA {operation} failed: {source:?}")
+            }
         }
     }
 }
@@ -78,6 +91,7 @@ impl Error for CudaDeviceRuntimeError {
         match self {
             Self::Contract(_) => None,
             Self::Driver { .. } => None,
+            Self::Blas { source, .. } => Some(source),
         }
     }
 }
@@ -161,7 +175,12 @@ impl CudaBufferRegion {
 }
 
 type EnqueueAction = Box<
-    dyn FnOnce(&CudaStream, &[CudaBufferRegion], &[Box<[u8]>]) -> Result<(), CudaDeviceRuntimeError>
+    dyn FnOnce(
+            &CudaStream,
+            &CudaBlas,
+            &[CudaBufferRegion],
+            &[Box<[u8]>],
+        ) -> Result<(), CudaDeviceRuntimeError>
         + Send
         + 'static,
 >;
@@ -204,8 +223,31 @@ impl CudaDeviceCommand {
             operation,
             regions,
             host_storage: Vec::new(),
-            enqueue: Some(Box::new(move |stream, regions, _host_storage| {
+            enqueue: Some(Box::new(move |stream, _blas, regions, _host_storage| {
                 enqueue(stream, regions)
+            })),
+        })
+    }
+
+    pub(crate) fn operation_with_blas(
+        operation: &'static str,
+        regions: Vec<CudaBufferRegion>,
+        enqueue: impl FnOnce(
+                &CudaStream,
+                &CudaBlas,
+                &[CudaBufferRegion],
+            ) -> Result<(), CudaDeviceRuntimeError>
+            + Send
+            + 'static,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let runtime_instance = common_runtime_instance(&regions)?;
+        Ok(Self {
+            runtime_instance,
+            operation,
+            regions,
+            host_storage: Vec::new(),
+            enqueue: Some(Box::new(move |stream, blas, regions, _host_storage| {
+                enqueue(stream, blas, regions)
             })),
         })
     }
@@ -226,11 +268,15 @@ impl CudaDeviceCommand {
         }
     }
 
-    fn enqueue(&mut self, stream: &CudaStream) -> Result<(), CudaDeviceRuntimeError> {
+    fn enqueue(
+        &mut self,
+        stream: &CudaStream,
+        blas: &CudaBlas,
+    ) -> Result<(), CudaDeviceRuntimeError> {
         let enqueue = self.enqueue.take().ok_or_else(|| {
             CudaDeviceRuntimeError::contract("CUDA command was already submitted")
         })?;
-        enqueue(stream, &self.regions, &self.host_storage)
+        enqueue(stream, blas, &self.regions, &self.host_storage)
     }
 }
 
@@ -254,6 +300,7 @@ pub struct CudaDeviceStream {
     id: u64,
     runtime_instance: u64,
     stream: Arc<CudaStream>,
+    blas: Arc<CudaBlas>,
     state: Arc<CudaStreamState>,
 }
 
@@ -346,6 +393,8 @@ pub struct CudaDeviceFence {
     event: CudaEvent,
     stream_state: Arc<CudaStreamState>,
     terminal_accounted: AtomicBool,
+    _stream: Arc<CudaStream>,
+    _blas: Arc<CudaBlas>,
     _commands: Vec<CudaDeviceCommand>,
 }
 
@@ -369,6 +418,7 @@ impl CudaDeviceFence {
 struct QuarantinedSubmission {
     stream_id: u64,
     _stream: Arc<CudaStream>,
+    _blas: Arc<CudaBlas>,
     _commands: Vec<CudaDeviceCommand>,
 }
 
@@ -470,6 +520,7 @@ impl CudaDeviceRuntime {
         self.quarantined().push(QuarantinedSubmission {
             stream_id: stream.id,
             _stream: Arc::clone(&stream.stream),
+            _blas: Arc::clone(&stream.blas),
             _commands: commands,
         });
     }
@@ -572,10 +623,15 @@ impl DeviceRuntime for CudaDeviceRuntime {
             .context
             .new_stream()
             .map_err(|error| CudaDeviceRuntimeError::driver("stream creation", error))?;
+        let blas = Arc::new(
+            CudaBlas::new(Arc::clone(&stream))
+                .map_err(|error| CudaDeviceRuntimeError::blas("cuBLAS handle creation", error))?,
+        );
         Ok(CudaDeviceStream {
             id,
             runtime_instance: self.runtime_instance,
             stream,
+            blas,
             state: Arc::new(CudaStreamState::new()),
         })
     }
@@ -616,7 +672,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             "device copy",
             regions,
             Vec::new(),
-            Box::new(|stream, regions, _host_storage| {
+            Box::new(|stream, _blas, regions, _host_storage| {
                 let bytes = checked_usize(regions[0].length_bytes, "CUDA copy length")?;
                 unsafe {
                     cudarc::driver::result::memcpy_dtod_async(
@@ -662,7 +718,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             "host upload",
             vec![destination_region],
             host_storage,
-            Box::new(|stream, regions, host_storage| {
+            Box::new(|stream, _blas, regions, host_storage| {
                 unsafe {
                     cudarc::driver::result::memcpy_htod_async(
                         regions[0].device_ptr,
@@ -694,7 +750,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             "device zero",
             vec![destination_region],
             Vec::new(),
-            Box::new(|stream, regions, _host_storage| {
+            Box::new(|stream, _blas, regions, _host_storage| {
                 let bytes = checked_usize(regions[0].length_bytes, "CUDA zero length")?;
                 unsafe {
                     cudarc::driver::result::memset_d8_async(
@@ -743,7 +799,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             return Err(DefinitelyNotSubmitted::new(error));
         }
         for index in 0..commands.len() {
-            if let Err(error) = commands[index].enqueue(&stream.stream) {
+            if let Err(error) = commands[index].enqueue(&stream.stream, &stream.blas) {
                 stream.state.fail();
                 self.quarantine(stream, commands);
                 panic!("CUDA submission became indeterminate while enqueueing its batch: {error}");
@@ -766,6 +822,8 @@ impl DeviceRuntime for CudaDeviceRuntime {
             event,
             stream_state: Arc::clone(&stream.state),
             terminal_accounted: AtomicBool::new(false),
+            _stream: Arc::clone(&stream.stream),
+            _blas: Arc::clone(&stream.blas),
             _commands: commands,
         })
     }
@@ -878,24 +936,32 @@ impl DeviceRuntime for CudaDeviceRuntime {
     }
 
     fn describe_error(&self, error: &Self::Error) -> Result<DeviceErrorReport, VNextError> {
-        let (code, retryable) = match error.driver_code() {
-            Some(cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY) => {
-                ("cuda_out_of_memory", true)
+        let (code, retryable) = match error {
+            CudaDeviceRuntimeError::Blas { source, .. }
+                if source.0 == cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_ALLOC_FAILED =>
+            {
+                ("cuda_blas_allocation_failed", true)
             }
-            Some(code) => (
-                match code {
-                    cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => "cuda_not_ready",
-                    cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_CONTEXT => {
-                        "cuda_invalid_context"
-                    }
-                    cudarc::driver::sys::CUresult::CUDA_ERROR_ILLEGAL_ADDRESS => {
-                        "cuda_illegal_address"
-                    }
-                    _ => "cuda_driver_error",
-                },
-                false,
-            ),
-            None => ("cuda_runtime_contract", false),
+            CudaDeviceRuntimeError::Blas { .. } => ("cuda_blas_error", false),
+            _ => match error.driver_code() {
+                Some(cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY) => {
+                    ("cuda_out_of_memory", true)
+                }
+                Some(code) => (
+                    match code {
+                        cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => "cuda_not_ready",
+                        cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_CONTEXT => {
+                            "cuda_invalid_context"
+                        }
+                        cudarc::driver::sys::CUresult::CUDA_ERROR_ILLEGAL_ADDRESS => {
+                            "cuda_illegal_address"
+                        }
+                        _ => "cuda_driver_error",
+                    },
+                    false,
+                ),
+                None => ("cuda_runtime_contract", false),
+            },
         };
         DeviceErrorReport::new(code, error.to_string(), retryable)
     }
