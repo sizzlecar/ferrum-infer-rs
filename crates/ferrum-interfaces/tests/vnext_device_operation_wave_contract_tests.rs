@@ -71,7 +71,7 @@ fn immutable_plan_nodes_prepare_one_owned_submission_wave() {
     );
     assert_eq!(wave.nodes()[0].work_shape(), step.work_shape());
     assert_eq!(wave.nodes()[0].participant_count(), 1);
-    assert_eq!(wave.nodes()[0].claimed_backing().fingerprint().len(), 64);
+    assert_eq!(wave.claimed_backing().fingerprint().len(), 64);
 
     drop(wave);
     step.try_retire_normal().unwrap();

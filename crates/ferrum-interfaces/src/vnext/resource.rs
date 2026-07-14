@@ -23,12 +23,12 @@ use super::{
     DeferredDeviceCleanupTask, DeviceDescriptor, DeviceId, DeviceRuntime, DynamicBackingPoolId,
     DynamicBackingPoolSpec, DynamicResourceDescriptor, DynamicResourceShape,
     DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView, ElementType,
-    ExecutionFrameId, ExecutionPlan, FailureDomain, FailureEnvelope, LogicalAdmissionCoordinator,
-    LogicalAdmissionCoordinatorId, LogicalAdmissionLease, LogicalBatchCapacityLease,
-    LogicalRequestLease, NodeId, PlanHash, PlanId, PlanNode, RequestAdmissionDecision,
-    RequestAuthorityId, RequestIdentity, ResourceAllocation, ResourceId, ResourceWorkShape, RunId,
-    SequenceAuthorityId, StepResourceSlotKind, StreamState, TokenSpanWork, TransactionId,
-    VNextError, MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
+    ExecutionFrameId, ExecutionPlan, FailureDomain, FailureEnvelope, InvocationLivenessMode,
+    LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, LogicalAdmissionLease,
+    LogicalBatchCapacityLease, LogicalRequestLease, NodeId, PlanHash, PlanId, PlanNode,
+    RequestAdmissionDecision, RequestAuthorityId, RequestIdentity, ResourceAllocation, ResourceId,
+    ResourceWorkShape, RunId, SequenceAuthorityId, StepResourceSlotKind, StreamState,
+    TokenSpanWork, TransactionId, VNextError, MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
 };
 
 mod contracts;

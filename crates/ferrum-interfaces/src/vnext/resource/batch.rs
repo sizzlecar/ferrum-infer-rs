@@ -941,6 +941,101 @@ pub struct ClaimedBackingTransaction {
     fingerprint: String,
 }
 
+fn validate_backing_claim(
+    backing_slices: &[LogicalBackingSliceAuthority],
+    demand: &AdmissionDemand,
+) -> Result<(), VNextError> {
+    let mut backing_by_domain = BTreeMap::<CapacityDomainId, u64>::new();
+    let mut physical_claims = BTreeMap::<
+        PhysicalBackingClaimIdentity,
+        (Arc<super::BackingSegmentLease>, CapacityDomainId, u64),
+    >::new();
+    for slice in backing_slices {
+        let evidence = slice.evidence();
+        let claim_identity = evidence.physical_claim_identity();
+        if claim_identity.pool_id() != evidence.pool_id()
+            || claim_identity
+                .resource_ids()
+                .binary_search(evidence.resource_id())
+                .is_err()
+            || slice.segment_lease.claim_identity != *claim_identity
+            || slice.segment_lease.segment_generation != evidence.segment_generation()
+            || slice.segment_lease.size_bytes != evidence.physical_size_bytes()
+            || evidence
+                .physical_offset_bytes()
+                .checked_add(evidence.size_bytes())
+                .is_none_or(|end| end > evidence.physical_size_bytes())
+        {
+            return Err(invalid_resource(
+                "logical backing projection differs from its physical claim authority",
+            ));
+        }
+        match physical_claims.entry(claim_identity.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let total = backing_by_domain.entry(slice.domain_id()).or_default();
+                *total = total
+                    .checked_add(evidence.physical_size_bytes())
+                    .ok_or_else(|| invalid_resource("claimed backing domain bytes overflow u64"))?;
+                entry.insert((
+                    Arc::clone(&slice.segment_lease),
+                    slice.domain_id(),
+                    evidence.physical_size_bytes(),
+                ));
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                let (lease, domain_id, size_bytes) = entry.get();
+                if !Arc::ptr_eq(lease, &slice.segment_lease)
+                    || *domain_id != slice.domain_id()
+                    || *size_bytes != evidence.physical_size_bytes()
+                {
+                    return Err(invalid_resource(
+                        "shared logical projections do not retain one physical claim",
+                    ));
+                }
+            }
+        }
+    }
+    let backing_claim = if backing_by_domain.is_empty() {
+        CapacityVector::empty()
+    } else {
+        CapacityVector::new(
+            backing_by_domain
+                .into_iter()
+                .map(|(domain, bytes)| CapacityEntry::new(domain, CapacityUnits::new(bytes)))
+                .collect::<Result<Vec<_>, _>>()?,
+        )?
+    };
+    if backing_claim != *demand.immediate_claim() {
+        return Err(invalid_resource(
+            "physical backing differs from the exact evaluated immediate demand",
+        ));
+    }
+    Ok(())
+}
+
+fn logical_capacity_matches(
+    logical_capacity: &Option<LogicalBatchCapacityLease>,
+    demand: &AdmissionDemand,
+    participants: &[BatchParticipantAuthority],
+    backing_slices: &[LogicalBackingSliceAuthority],
+) -> bool {
+    match logical_capacity {
+        Some(capacity) => {
+            capacity.claims() == demand.immediate_claim()
+                && capacity.parents().len() == participants.len()
+                && capacity
+                    .parents()
+                    .iter()
+                    .zip(participants)
+                    .all(|(parent, participant)| {
+                        parent.sequence() == participant.sequence_authority()
+                            && parent.request() == participant.request_authority()
+                    })
+        }
+        None => demand.immediate_claim().is_empty() && backing_slices.is_empty(),
+    }
+}
+
 impl ClaimedBackingTransaction {
     pub(super) fn new(
         work_shape: BatchWorkShape,
@@ -948,88 +1043,16 @@ impl ClaimedBackingTransaction {
         logical_capacity: Option<LogicalBatchCapacityLease>,
         backing_slices: Vec<LogicalBackingSliceAuthority>,
     ) -> Result<Self, VNextError> {
-        let mut backing_by_domain = BTreeMap::<CapacityDomainId, u64>::new();
-        let mut physical_claims = BTreeMap::<
-            PhysicalBackingClaimIdentity,
-            (Arc<super::BackingSegmentLease>, CapacityDomainId, u64),
-        >::new();
-        for slice in &backing_slices {
-            let evidence = slice.evidence();
-            let claim_identity = evidence.physical_claim_identity();
-            if claim_identity.pool_id() != evidence.pool_id()
-                || claim_identity
-                    .resource_ids()
-                    .binary_search(evidence.resource_id())
-                    .is_err()
-                || slice.segment_lease.claim_identity != *claim_identity
-                || slice.segment_lease.segment_generation != evidence.segment_generation()
-                || slice.segment_lease.size_bytes != evidence.physical_size_bytes()
-                || evidence.size_bytes() > evidence.physical_size_bytes()
-            {
-                return Err(invalid_resource(
-                    "logical backing projection differs from its physical claim authority",
-                ));
-            }
-            match physical_claims.entry(claim_identity.clone()) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    let total = backing_by_domain.entry(slice.domain_id()).or_default();
-                    *total = total
-                        .checked_add(evidence.physical_size_bytes())
-                        .ok_or_else(|| {
-                            invalid_resource("claimed backing domain bytes overflow u64")
-                        })?;
-                    entry.insert((
-                        Arc::clone(&slice.segment_lease),
-                        slice.domain_id(),
-                        evidence.physical_size_bytes(),
-                    ));
-                }
-                std::collections::btree_map::Entry::Occupied(entry) => {
-                    let (lease, domain_id, size_bytes) = entry.get();
-                    if !Arc::ptr_eq(lease, &slice.segment_lease)
-                        || *domain_id != slice.domain_id()
-                        || *size_bytes != evidence.physical_size_bytes()
-                    {
-                        return Err(invalid_resource(
-                            "shared logical projections do not retain one physical claim",
-                        ));
-                    }
-                }
-            }
-        }
-        let backing_claim = if backing_by_domain.is_empty() {
-            CapacityVector::empty()
-        } else {
-            CapacityVector::new(
-                backing_by_domain
-                    .into_iter()
-                    .map(|(domain, bytes)| CapacityEntry::new(domain, CapacityUnits::new(bytes)))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )?
-        };
-        if backing_claim != *demand.immediate_claim() {
+        validate_backing_claim(&backing_slices, &demand)?;
+        if !logical_capacity_matches(
+            &logical_capacity,
+            &demand,
+            work_shape.participants(),
+            &backing_slices,
+        ) {
             return Err(invalid_resource(
-                "physical backing differs from the exact evaluated immediate demand",
+                "logical backing claim differs from work participants or evaluated demand",
             ));
-        }
-        match &logical_capacity {
-            Some(capacity)
-                if capacity.claims() == demand.immediate_claim()
-                    && capacity.parents().len() == work_shape.participants().len()
-                    && capacity
-                        .parents()
-                        .iter()
-                        .zip(work_shape.participants())
-                        .all(|(parent, participant)| {
-                            parent.sequence() == participant.sequence_authority()
-                                && parent.request() == participant.request_authority()
-                        }) => {}
-            None if demand.immediate_claim().is_empty() && backing_slices.is_empty() => {}
-            _ => {
-                return Err(invalid_resource(
-                    "logical backing claim differs from work participants or evaluated demand",
-                ))
-            }
         }
         #[derive(Serialize)]
         struct FingerprintInput<'a> {
@@ -1104,6 +1127,162 @@ impl ClaimedBackingTransaction {
         self.backing_slices
             .iter()
             .any(|slice| slice.evidence().physical_claim_identity().is_shared())
+    }
+}
+
+/// One physical/logical Invocation backing transaction shared by every node
+/// in an immutable-plan submission wave. Physical demand is charged once for
+/// the liveness-derived peak and retained until the wave's terminal fence.
+#[must_use = "submission wave backing must remain owned through its device fence"]
+pub struct ClaimedSubmissionWaveBacking {
+    // Physical extents release before the logical capacity claim.
+    backing_slices: Vec<LogicalBackingSliceAuthority>,
+    logical_capacity: Option<LogicalBatchCapacityLease>,
+    node_work_shapes: Vec<(NodeId, BatchWorkShape)>,
+    participants: Vec<BatchParticipantAuthority>,
+    demand: AdmissionDemand,
+    fingerprint: String,
+}
+
+impl ClaimedSubmissionWaveBacking {
+    pub(super) fn new(
+        node_work_shapes: Vec<(NodeId, BatchWorkShape)>,
+        participants: Vec<BatchParticipantAuthority>,
+        demand: AdmissionDemand,
+        logical_capacity: Option<LogicalBatchCapacityLease>,
+        backing_slices: Vec<LogicalBackingSliceAuthority>,
+    ) -> Result<Self, VNextError> {
+        let unique_nodes = node_work_shapes
+            .iter()
+            .map(|(node_id, _)| node_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        if node_work_shapes.is_empty()
+            || unique_nodes.len() != node_work_shapes.len()
+            || participants.is_empty()
+            || participants
+                .windows(2)
+                .any(|pair| pair[0].canonical_key() >= pair[1].canonical_key())
+        {
+            return Err(invalid_resource(
+                "submission wave backing requires ordered unique nodes and participants",
+            ));
+        }
+        let participant_is_in_wave = |candidate: &BatchParticipantAuthority| {
+            participants
+                .binary_search_by_key(&candidate.canonical_key(), |participant| {
+                    participant.canonical_key()
+                })
+                .is_ok()
+        };
+        if node_work_shapes.iter().any(|(_, work_shape)| {
+            work_shape
+                .participants()
+                .iter()
+                .any(|participant| !participant_is_in_wave(participant))
+        }) || participants.iter().any(|participant| {
+            !node_work_shapes.iter().any(|(_, work_shape)| {
+                work_shape
+                    .participants()
+                    .iter()
+                    .any(|candidate| candidate.canonical_key() == participant.canonical_key())
+            })
+        }) {
+            return Err(invalid_resource(
+                "submission wave work does not map exactly onto its participant authority",
+            ));
+        }
+        validate_backing_claim(&backing_slices, &demand)?;
+        if !logical_capacity_matches(&logical_capacity, &demand, &participants, &backing_slices) {
+            return Err(invalid_resource(
+                "submission wave capacity differs from its participants or evaluated demand",
+            ));
+        }
+
+        #[derive(Serialize)]
+        struct NodeInput<'a> {
+            node_id: &'a NodeId,
+            work_fingerprint: &'a str,
+        }
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            nodes: Vec<NodeInput<'a>>,
+            demand: &'a AdmissionDemand,
+            backing: Vec<&'a LogicalBackingSliceEvidence>,
+            capacity_parents: Vec<(SequenceAuthorityId, RequestAuthorityId)>,
+        }
+        let input = FingerprintInput {
+            domain: "ferrum.runtime-vnext.claimed-submission-wave-backing.v1",
+            nodes: node_work_shapes
+                .iter()
+                .map(|(node_id, work_shape)| NodeInput {
+                    node_id,
+                    work_fingerprint: work_shape.fingerprint(),
+                })
+                .collect(),
+            demand: &demand,
+            backing: backing_slices
+                .iter()
+                .map(LogicalBackingSliceAuthority::evidence)
+                .collect(),
+            capacity_parents: logical_capacity
+                .as_ref()
+                .map(|capacity| {
+                    capacity
+                        .parents()
+                        .iter()
+                        .map(|parent| (parent.sequence(), parent.request()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        let bytes = serde_json::to_vec(&input).map_err(|error| {
+            invalid_resource(format!(
+                "submission wave backing fingerprint encode failed: {error}"
+            ))
+        })?;
+        Ok(Self {
+            backing_slices,
+            logical_capacity,
+            node_work_shapes,
+            participants,
+            demand,
+            fingerprint: format!("{:x}", Sha256::digest(bytes)),
+        })
+    }
+
+    pub fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
+        &self.backing_slices
+    }
+
+    pub fn logical_capacity(&self) -> Option<&LogicalBatchCapacityLease> {
+        self.logical_capacity.as_ref()
+    }
+
+    pub fn node_work_shapes(&self) -> impl ExactSizeIterator<Item = (&NodeId, &BatchWorkShape)> {
+        self.node_work_shapes
+            .iter()
+            .map(|(node_id, work_shape)| (node_id, work_shape))
+    }
+
+    pub fn participants(&self) -> &[BatchParticipantAuthority] {
+        &self.participants
+    }
+
+    pub fn demand(&self) -> &AdmissionDemand {
+        &self.demand
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub fn physical_claim_count(&self) -> usize {
+        self.backing_slices
+            .iter()
+            .map(|slice| slice.evidence().physical_claim_identity())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
     }
 }
 

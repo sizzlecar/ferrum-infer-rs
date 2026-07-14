@@ -751,9 +751,37 @@ fn evaluated_request<'a>(
         size_bytes,
         projections: vec![EvaluatedBackingProjection {
             descriptor,
+            physical_offset_bytes: 0,
             size_bytes,
         }],
     }
+}
+
+#[test]
+fn logical_projection_range_crosses_physical_chunks_without_prefix_aliasing() {
+    let catalog = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Request,
+        'd',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let segments = vec![
+        BackingSegment::from_chunk(&catalog.pool_id, 1, 7, 0, 64).unwrap(),
+        BackingSegment::from_chunk(&catalog.pool_id, 2, 8, 0, 64).unwrap(),
+    ];
+
+    let projection = backing_segment_range(&segments, 32, 80).unwrap();
+
+    assert_eq!(projection.len(), 2);
+    assert_eq!(projection[0].chunk_ordinal(), 1);
+    assert_eq!(projection[0].offset_bytes(), 32);
+    assert_eq!(projection[0].length_bytes(), 32);
+    assert_eq!(projection[1].chunk_ordinal(), 2);
+    assert_eq!(projection[1].offset_bytes(), 0);
+    assert_eq!(projection[1].length_bytes(), 48);
+    assert!(backing_segment_range(&segments, 96, 64).is_err());
 }
 
 struct CleanupPressureTask {
