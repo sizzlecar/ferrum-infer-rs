@@ -207,6 +207,26 @@ fn invocation_descriptor(
     .expect("valid invocation descriptor")
 }
 
+fn step_descriptor(
+    resource: &str,
+    bytes_per_token: u64,
+    usage: BufferUsage,
+    storage: DynamicStorageContract,
+) -> DynamicResourceDescriptor {
+    DynamicResourceDescriptor::new(
+        ResourceId::new(resource).expect("valid resource id"),
+        DynamicResourceDemand::tokens(bytes_per_token, 4096).expect("valid demand"),
+        16,
+        usage,
+        ElementType::F16,
+        AllocationLifetime::Step,
+        AllocationKind::Value,
+        storage,
+        1024,
+    )
+    .expect("valid step descriptor")
+}
+
 fn plan_node(id: &str, dependencies: &[&str], resources: &[&str]) -> PlanNode {
     let provider_resources = provider_resources("provider/test");
     let selected_provider = provider_resources.provider_id().clone();
@@ -343,6 +363,95 @@ fn per_pool_unordered_invocations_use_conservative_sum() {
         InvocationLivenessMode::ConservativeConcurrent
     );
     assert_eq!(pools[0].minimum_invocation_peak_bytes(), 192);
+}
+
+#[test]
+fn ordered_step_activations_share_one_single_fence_slot() {
+    let layout = canonical_fingerprint(&"contiguous_v1", "test layout").expect("fingerprint");
+    let storage = DynamicStorageContract::new(linear_profile(), layout).expect("storage");
+    let first = step_descriptor(
+        "resource/activation-a",
+        64,
+        BufferUsage::Activations,
+        storage.clone(),
+    );
+    let second = step_descriptor(
+        "resource/activation-b",
+        128,
+        BufferUsage::Activations,
+        storage,
+    );
+    let nodes = vec![
+        plan_node("node/a", &[], &["resource/activation-a"]),
+        plan_node("node/middle", &["node/a"], &[]),
+        plan_node("node/b", &["node/middle"], &["resource/activation-b"]),
+    ];
+
+    let pools =
+        MemoryPlan::derive_dynamic_pools(&[first, second], &nodes, 1 << 20).expect("derive pools");
+    assert_eq!(pools.len(), 1);
+    assert_eq!(pools[0].minimum_step_bytes(), 128);
+    assert_eq!(pools[0].step_resource_slots().len(), 1);
+    assert_eq!(
+        pools[0].step_resource_slots()[0].kind(),
+        StepResourceSlotKind::OrderedSingleFenceStepWave
+    );
+}
+
+#[test]
+fn overlapping_step_activations_keep_distinct_physical_slots() {
+    let layout = canonical_fingerprint(&"contiguous_v1", "test layout").expect("fingerprint");
+    let storage = DynamicStorageContract::new(linear_profile(), layout).expect("storage");
+    let first = step_descriptor(
+        "resource/activation-a",
+        64,
+        BufferUsage::Activations,
+        storage.clone(),
+    );
+    let second = step_descriptor(
+        "resource/activation-b",
+        128,
+        BufferUsage::Activations,
+        storage,
+    );
+    let nodes = vec![
+        plan_node("node/a", &[], &["resource/activation-a"]),
+        plan_node(
+            "node/b",
+            &["node/a"],
+            &["resource/activation-a", "resource/activation-b"],
+        ),
+    ];
+
+    let pools =
+        MemoryPlan::derive_dynamic_pools(&[first, second], &nodes, 1 << 20).expect("derive pools");
+    assert_eq!(pools[0].minimum_step_bytes(), 192);
+    assert_eq!(pools[0].step_resource_slots().len(), 2);
+    assert!(pools[0]
+        .step_resource_slots()
+        .iter()
+        .all(|slot| slot.kind() == StepResourceSlotKind::Dedicated));
+}
+
+#[test]
+fn ordered_step_state_never_consumes_activation_reuse_proof() {
+    let layout = canonical_fingerprint(&"contiguous_v1", "test layout").expect("fingerprint");
+    let storage = DynamicStorageContract::new(linear_profile(), layout).expect("storage");
+    let first = step_descriptor("resource/state-a", 64, BufferUsage::State, storage.clone());
+    let second = step_descriptor("resource/state-b", 128, BufferUsage::State, storage);
+    let nodes = vec![
+        plan_node("node/a", &[], &["resource/state-a"]),
+        plan_node("node/b", &["node/a"], &["resource/state-b"]),
+    ];
+
+    let pools =
+        MemoryPlan::derive_dynamic_pools(&[first, second], &nodes, 1 << 20).expect("derive pools");
+    assert_eq!(pools[0].minimum_step_bytes(), 192);
+    assert_eq!(pools[0].step_resource_slots().len(), 2);
+    assert!(pools[0]
+        .step_resource_slots()
+        .iter()
+        .all(|slot| slot.kind() == StepResourceSlotKind::Dedicated));
 }
 
 #[test]

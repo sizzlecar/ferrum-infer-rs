@@ -5,10 +5,10 @@ use super::{
     CapacityDomainId, CapacityEntry, CapacityUnits, CapacityVector, DeviceRuntime, Digest,
     DynamicBackingDeferred, ExecutionFrameId, LogicalBackingSliceAuthority,
     LogicalBackingSliceEvidence, LogicalBatchCapacityLease, Mutex, NodeId, ParticipantFlightPhase,
-    ParticipantNodeKey, RequestAuthorityId, SequenceAuthorityId, SequenceSession,
-    SequenceSessionEpoch, SequenceSessionFingerprint, SequenceSessionPhase, SequenceSessionSlot,
-    SequenceSessionSlotState, Serialize, Sha256, StepParticipantFrameAssignment, TokenSpanWork,
-    TrustedPlanRuntimeEvidence, VNextError,
+    ParticipantNodeKey, PhysicalBackingClaimIdentity, RequestAuthorityId, SequenceAuthorityId,
+    SequenceSession, SequenceSessionEpoch, SequenceSessionFingerprint, SequenceSessionPhase,
+    SequenceSessionSlot, SequenceSessionSlotState, Serialize, Sha256,
+    StepParticipantFrameAssignment, TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError,
 };
 
 /// Resources whose lifetime is one exact continuous-batch execution frame.
@@ -892,11 +892,53 @@ impl ClaimedBackingTransaction {
         backing_slices: Vec<LogicalBackingSliceAuthority>,
     ) -> Result<Self, VNextError> {
         let mut backing_by_domain = BTreeMap::<CapacityDomainId, u64>::new();
+        let mut physical_claims = BTreeMap::<
+            PhysicalBackingClaimIdentity,
+            (Arc<super::BackingSegmentLease>, CapacityDomainId, u64),
+        >::new();
         for slice in &backing_slices {
-            let total = backing_by_domain.entry(slice.domain_id()).or_default();
-            *total = total
-                .checked_add(slice.size_bytes())
-                .ok_or_else(|| invalid_resource("claimed backing domain bytes overflow u64"))?;
+            let evidence = slice.evidence();
+            let claim_identity = evidence.physical_claim_identity();
+            if claim_identity.pool_id() != evidence.pool_id()
+                || claim_identity
+                    .resource_ids()
+                    .binary_search(evidence.resource_id())
+                    .is_err()
+                || slice.segment_lease.claim_identity != *claim_identity
+                || slice.segment_lease.segment_generation != evidence.segment_generation()
+                || slice.segment_lease.size_bytes != evidence.physical_size_bytes()
+                || evidence.size_bytes() > evidence.physical_size_bytes()
+            {
+                return Err(invalid_resource(
+                    "logical backing projection differs from its physical claim authority",
+                ));
+            }
+            match physical_claims.entry(claim_identity.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let total = backing_by_domain.entry(slice.domain_id()).or_default();
+                    *total = total
+                        .checked_add(evidence.physical_size_bytes())
+                        .ok_or_else(|| {
+                            invalid_resource("claimed backing domain bytes overflow u64")
+                        })?;
+                    entry.insert((
+                        Arc::clone(&slice.segment_lease),
+                        slice.domain_id(),
+                        evidence.physical_size_bytes(),
+                    ));
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    let (lease, domain_id, size_bytes) = entry.get();
+                    if !Arc::ptr_eq(lease, &slice.segment_lease)
+                        || *domain_id != slice.domain_id()
+                        || *size_bytes != evidence.physical_size_bytes()
+                    {
+                        return Err(invalid_resource(
+                            "shared logical projections do not retain one physical claim",
+                        ));
+                    }
+                }
+            }
         }
         let backing_claim = if backing_by_domain.is_empty() {
             CapacityVector::empty()
@@ -941,7 +983,7 @@ impl ClaimedBackingTransaction {
             capacity_parents: Vec<(SequenceAuthorityId, RequestAuthorityId)>,
         }
         let input = FingerprintInput {
-            domain: "ferrum.runtime-vnext.claimed-backing.v1",
+            domain: "ferrum.runtime-vnext.claimed-backing.v2",
             work_fingerprint: work_shape.fingerprint(),
             demand: &demand,
             backing: backing_slices
@@ -991,6 +1033,20 @@ impl ClaimedBackingTransaction {
 
     pub fn demand(&self) -> &AdmissionDemand {
         &self.demand
+    }
+
+    pub fn physical_claim_count(&self) -> usize {
+        self.backing_slices
+            .iter()
+            .map(|slice| slice.evidence().physical_claim_identity())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
+
+    pub fn has_shared_physical_claims(&self) -> bool {
+        self.backing_slices
+            .iter()
+            .any(|slice| slice.evidence().physical_claim_identity().is_shared())
     }
 }
 

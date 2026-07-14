@@ -27,8 +27,8 @@ use super::{
     LogicalAdmissionCoordinatorId, LogicalAdmissionLease, LogicalBatchCapacityLease,
     LogicalRequestLease, NodeId, PlanHash, PlanId, PlanNode, RequestAdmissionDecision,
     RequestAuthorityId, RequestIdentity, ResourceAllocation, ResourceId, ResourceWorkShape, RunId,
-    SequenceAuthorityId, StreamState, TokenSpanWork, TransactionId, VNextError,
-    MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
+    SequenceAuthorityId, StepResourceSlotKind, StreamState, TokenSpanWork, TransactionId,
+    VNextError, MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
 };
 
 mod contracts;

@@ -389,6 +389,11 @@ where
             .plan
             .resources
             .read_lifecycle("admit a step invocation")?;
+        if self.claimed_backing.has_shared_physical_claims() {
+            return Err(invalid_resource(
+                "shared Step activation backing requires an ordered single-fence submission wave",
+            ));
+        }
         let InvocationResourceAdmissionRequest {
             node_id,
             work_shape,
