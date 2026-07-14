@@ -1,0 +1,16 @@
+{
+  "result": "REJECT",
+  "failure_class": "baseline_lint_blocked_before_cuda_provider",
+  "run_id": 29365232638,
+  "job_id": 87195021979,
+  "workflow": "CI",
+  "git_sha": "d9316acb67e2b378092a5895fc43abba30d5382a",
+  "command": "cargo check --workspace --features cuda",
+  "environment": {
+    "RUSTFLAGS": "-D warnings",
+    "CUDA_COMPUTE_CAP": "80"
+  },
+  "detail": "ferrum-interfaces stopped compilation after 20 existing dead-code warnings were promoted to errors; ferrum-kernels and the vNext embedding provider were not reached",
+  "cuda_provider_compile_reached": false,
+  "url": "https://github.com/sizzlecar/ferrum-infer-rs/actions/runs/29365232638"
+}

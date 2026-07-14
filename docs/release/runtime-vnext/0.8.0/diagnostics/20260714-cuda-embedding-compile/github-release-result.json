@@ -1,0 +1,13 @@
+{
+  "result": "REJECT",
+  "failure_class": "workflow_container_missing_python3",
+  "run_id": 29365643108,
+  "job_id": 87196402271,
+  "workflow": "Release CUDA Binary",
+  "git_sha": "d9316acb67e2b378092a5895fc43abba30d5382a",
+  "failed_step": "Verify native operator source boundary",
+  "failed_command": "python3 scripts/release/native_operator_artifact_gate.py --self-test",
+  "detail": "the CUDA container reported python3: command not found and exited before the release CUDA build step",
+  "cuda_provider_compile_reached": false,
+  "url": "https://github.com/sizzlecar/ferrum-infer-rs/actions/runs/29365643108"
+}
