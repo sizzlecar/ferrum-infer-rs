@@ -141,8 +141,9 @@ impl DeviceRuntime for TestRuntime {
     fn submit(
         &self,
         _stream: &mut Self::Stream,
-        _command: Self::Command,
+        commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
+        assert!(!commands.is_empty(), "core must not submit an empty batch");
         assert!(
             !self.panic_next_submit.swap(false, Ordering::SeqCst),
             "injected event submit panic"

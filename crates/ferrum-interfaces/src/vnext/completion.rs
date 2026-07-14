@@ -301,9 +301,12 @@ pub(crate) struct ExecutionLaneEnqueue<'a, R: DeviceRuntime> {
 }
 
 impl<R: DeviceRuntime> ExecutionLaneEnqueue<'_, R> {
-    pub(crate) fn submit(&mut self, command: R::Command) -> LaneSubmitOutcome<R::Fence, R::Error> {
+    pub(crate) fn submit(
+        &mut self,
+        commands: super::DeviceCommandBatch<R::Command>,
+    ) -> LaneSubmitOutcome<R::Fence, R::Error> {
         let submission = catch_unwind(AssertUnwindSafe(|| {
-            self.lane.runtime.submit(&mut self.state.stream, command)
+            self.lane.runtime.submit(&mut self.state.stream, commands)
         }));
         match submission {
             Ok(Ok(fence)) => {

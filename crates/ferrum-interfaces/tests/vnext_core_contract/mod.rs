@@ -860,7 +860,7 @@ impl DeviceRuntime for PlanningTestRuntime {
     fn submit(
         &self,
         _stream: &mut Self::Stream,
-        _command: Self::Command,
+        _commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
         Ok(())
     }

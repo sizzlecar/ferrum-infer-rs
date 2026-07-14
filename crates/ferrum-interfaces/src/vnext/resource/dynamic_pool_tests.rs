@@ -1,7 +1,7 @@
 use super::*;
 use crate::vnext::{
-    CopyRegion, DefinitelyNotSubmitted, DeviceClass, DeviceErrorReport, DeviceTerminal,
-    FenceIndeterminate, FenceQuery, HostTransferLayout,
+    CopyRegion, DefinitelyNotSubmitted, DeviceClass, DeviceCommandBatch, DeviceErrorReport,
+    DeviceTerminal, FenceIndeterminate, FenceQuery, HostTransferLayout,
 };
 use serde_json::{json, Value};
 use std::error::Error;
@@ -253,7 +253,7 @@ impl DeviceRuntime for TestRuntime {
     fn submit(
         &self,
         _stream: &mut Self::Stream,
-        _command: Self::Command,
+        _commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
         Ok(())
     }
