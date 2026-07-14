@@ -47,6 +47,7 @@ BINARY_LANES = {
 }
 LANES = (
     "vnext-g00a",
+    "vnext-g00f",
     "vnext-g00",
     "vnext-g01a",
     "unit",
@@ -845,25 +846,43 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             expected_source_git_sha=VNEXT_FROZEN_LEGACY_SHA,
             provenance_kind="vnext-g00",
         )
-    if lane == "vnext-g01a":
+    if lane == "vnext-g00f":
         if args.g00a is None:
-            raise GateError("vnext-g01a requires --g00a")
+            raise GateError("vnext-g00f requires --g00a")
         return LaneCommand(
             cmd=[
                 sys.executable,
-                "scripts/release/runtime_vnext_g01a_checkpoint.py",
+                "scripts/release/runtime_vnext_g00f_checkpoint.py",
                 "--g00a",
                 str(args.g00a),
                 "--out",
                 str(out_dir),
             ],
             expected_child_pass_line=(
-                f"FERRUM RUNTIME VNEXT G01A CONTRACT CHECKPOINT PASS: {out_dir}"
+                f"FERRUM RUNTIME VNEXT G00F FACTS PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-g00f",
+        )
+    if lane == "vnext-g01a":
+        if args.g00f is None:
+            raise GateError("vnext-g01a requires --g00f")
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_s0a_contract_split.py",
+                "--g00f",
+                str(args.g00f),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT G01A CONTRACT SPLIT PASS: {out_dir}"
             ),
             child_manifest_path=(
-                out_dir / "g01a-contract-checkpoint" / "manifest.json"
+                out_dir / "g01a-contract-split" / "manifest.json"
             ),
-            provenance_kind="vnext-g01a",
+            provenance_kind="vnext-g01a-s0a",
         )
     if lane in SOURCE_LANES:
         source_lane = SOURCE_LANES[lane]
@@ -2137,6 +2156,541 @@ def validate_vnext_g00a_provenance(
         "catalog_expected_weight_identity_count": expected_weight_identity_count,
         "historical_bug_counts": {"families": 15, "cases": 28},
         "artifact_index_sha256": canonical_json_sha256(child_manifest["artifact_index"]),
+    }
+
+
+def validate_vnext_g00f_provenance(
+    lane_command: LaneCommand,
+    child_manifest: dict[str, Any],
+    child_manifest_sha256: str,
+    *,
+    verify_checkout: bool = True,
+) -> dict[str, Any]:
+    manifest_path = lane_command.child_manifest_path
+    require_gate(manifest_path is not None, "vnext-g00f delegated manifest path is missing")
+    checkpoint_root = manifest_path.parent.resolve()
+    require_gate(
+        manifest_path.resolve() == checkpoint_root / "manifest.json",
+        "vnext-g00f child manifest path mismatch",
+    )
+    require_gate(
+        set(child_manifest)
+        == {
+            "schema_version",
+            "artifact_type",
+            "checkpoint_id",
+            "lane",
+            "status",
+            "canonical",
+            "artifact_dir",
+            "source",
+            "g00a",
+            "unlocks",
+            "does_not_prove",
+            "pass_line",
+        },
+        "vnext-g00f manifest field set mismatch",
+    )
+    require_gate(
+        child_manifest.get("schema_version") == 1
+        and child_manifest.get("artifact_type")
+        == "runtime_vnext_g00f_facts_manifest"
+        and child_manifest.get("checkpoint_id") == "G00F"
+        and child_manifest.get("lane") == "runtime-vnext-g00f"
+        and child_manifest.get("status") == "pass"
+        and child_manifest.get("canonical") is True,
+        "vnext-g00f identity/status mismatch",
+    )
+    require_gate(
+        Path(require_string(child_manifest.get("artifact_dir"), "vnext-g00f artifact_dir")).resolve()
+        == checkpoint_root,
+        "vnext-g00f artifact_dir mismatch",
+    )
+    expected_pass = f"FERRUM RUNTIME VNEXT G00F FACTS PASS: {checkpoint_root}"
+    require_gate(child_manifest.get("pass_line") == expected_pass, "vnext-g00f pass_line mismatch")
+    require_exact_string_set(child_manifest.get("unlocks"), {"S0A", "S1"}, "vnext-g00f unlocks")
+    require_exact_string_set(
+        child_manifest.get("does_not_prove"),
+        {
+            "G00P",
+            "G01",
+            "G01B",
+            "model_migration",
+            "performance",
+            "production_wiring",
+            "release",
+        },
+        "vnext-g00f does_not_prove",
+    )
+
+    source = require_object(child_manifest.get("source"), "vnext-g00f source")
+    require_gate(
+        set(source) == {"git_sha", "git_tree_sha", "dirty", "status_short"}
+        and source.get("dirty") is False
+        and source.get("status_short") == [],
+        "vnext-g00f source shape/dirty state mismatch",
+    )
+    source_sha = require_git_sha(source.get("git_sha"), "vnext-g00f source.git_sha")
+    source_tree = require_git_sha(source.get("git_tree_sha"), "vnext-g00f source.git_tree_sha")
+    if verify_checkout:
+        require_gate(git_sha() == source_sha, "vnext-g00f source SHA is stale")
+        require_gate(
+            git_output(["rev-parse", "HEAD^{tree}"]) == source_tree,
+            "vnext-g00f source tree is stale",
+        )
+        require_gate(not git_dirty_status()["is_dirty"], "vnext-g00f checkout is dirty")
+
+    g00a = require_object(child_manifest.get("g00a"), "vnext-g00f G00a binding")
+    require_gate(
+        set(g00a)
+        == {
+            "outer_manifest",
+            "child_manifest",
+            "artifact_index_sha256",
+            "model_lane_count",
+            "historical_bug_counts",
+            "facts_reused_without_copy",
+        }
+        and g00a.get("facts_reused_without_copy") is True
+        and g00a.get("model_lane_count") == 12
+        and g00a.get("historical_bug_counts") == {"families": 15, "cases": 28},
+        "vnext-g00f G00a binding summary mismatch",
+    )
+    outer_ref = require_object(g00a.get("outer_manifest"), "vnext-g00f G00a outer ref")
+    child_ref = require_object(g00a.get("child_manifest"), "vnext-g00f G00a child ref")
+    require_gate(
+        set(outer_ref) == {"path", "sha256"} and set(child_ref) == {"path", "sha256"},
+        "vnext-g00f G00a reference field set mismatch",
+    )
+    outer_path = Path(require_string(outer_ref.get("path"), "vnext-g00f G00a outer path")).resolve()
+    child_path = Path(require_string(child_ref.get("path"), "vnext-g00f G00a child path")).resolve()
+    require_gate(
+        outer_path.parent == child_path.parent
+        and outer_path.name == "gate.manifest.json"
+        and child_path.name == "manifest.json",
+        "vnext-g00f G00a outer/child paths mismatch",
+    )
+    require_gate(
+        sha256(outer_path) == require_sha256(outer_ref.get("sha256"), "vnext-g00f G00a outer SHA256")
+        and sha256(child_path) == require_sha256(child_ref.get("sha256"), "vnext-g00f G00a child SHA256"),
+        "vnext-g00f G00a manifest identity mismatch",
+    )
+    outer = read_json_object(outer_path, "vnext-g00f bound G00a outer manifest")
+    child = read_json_object(child_path, "vnext-g00f bound G00a child manifest")
+    require_gate(
+        outer.get("lane") == "vnext-g00a"
+        and outer.get("status") == "pass"
+        and outer.get("git_sha") == source_sha
+        and outer.get("dirty_status") == {"is_dirty": False, "status_short": []},
+        "vnext-g00f bound G00a outer manifest is stale",
+    )
+    outer_child = require_object(outer.get("child_artifacts"), "vnext-g00f G00a outer child artifacts")
+    require_gate(
+        outer_child.get("child_manifest") == child_ref
+        and outer_child.get("artifact_index_sha256") == g00a.get("artifact_index_sha256"),
+        "vnext-g00f G00a outer/child binding mismatch",
+    )
+    g00a_provenance = validate_vnext_g00a_provenance(
+        LaneCommand(
+            cmd=[],
+            expected_child_pass_line=child.get("pass_line"),
+            child_manifest_path=child_path,
+            provenance_kind="vnext-g00a",
+        ),
+        child,
+        require_sha256(child_ref.get("sha256"), "vnext-g00f G00a child SHA256"),
+        verify_checkout=verify_checkout,
+    )
+    require_gate(
+        g00a_provenance["artifact_index_sha256"]
+        == require_sha256(g00a.get("artifact_index_sha256"), "vnext-g00f G00a artifact index SHA256"),
+        "vnext-g00f G00a artifact index mismatch",
+    )
+    return {
+        "kind": "vnext-g00f",
+        "child_manifest": {
+            "path": str(manifest_path),
+            "sha256": require_sha256(child_manifest_sha256, "vnext-g00f manifest SHA256"),
+        },
+        "checkpoint": {
+            "id": "G00F",
+            "unlocks": ["S0A", "S1"],
+            "does_not_prove": sorted(
+                {
+                    "G00P",
+                    "G01",
+                    "G01B",
+                    "model_migration",
+                    "performance",
+                    "production_wiring",
+                    "release",
+                }
+            ),
+        },
+        "source": {"git_sha": source_sha, "git_tree_sha": source_tree},
+        "g00a": g00a,
+    }
+
+
+def validate_vnext_g01a_s0a_provenance(
+    lane_command: LaneCommand,
+    child_manifest: dict[str, Any],
+    child_manifest_sha256: str,
+    *,
+    verify_checkout: bool = True,
+) -> dict[str, Any]:
+    manifest_path = lane_command.child_manifest_path
+    require_gate(manifest_path is not None, "vnext-g01a S0A manifest path is missing")
+    checkpoint_root = manifest_path.parent.resolve()
+    output_root = checkpoint_root.parent.resolve()
+    require_gate(
+        manifest_path.resolve() == output_root / "g01a-contract-split/manifest.json",
+        "vnext-g01a S0A child manifest path mismatch",
+    )
+    require_gate(
+        set(child_manifest)
+        == {
+            "schema_version",
+            "artifact_type",
+            "checkpoint_id",
+            "lane",
+            "status",
+            "canonical",
+            "artifact_dir",
+            "output_root",
+            "source",
+            "baseline_commit",
+            "g00f",
+            "inventory_document",
+            "adr_source",
+            "public_owner_evidence",
+            "compile_evidence",
+            "artifact_count",
+            "artifact_index",
+            "unlocks",
+            "does_not_prove",
+            "started_at",
+            "finished_at",
+            "duration_seconds",
+            "pass_line",
+        },
+        "vnext-g01a S0A manifest field set mismatch",
+    )
+    require_gate(
+        child_manifest.get("schema_version") == 1
+        and child_manifest.get("artifact_type")
+        == "runtime_vnext_g01a_contract_split_manifest"
+        and child_manifest.get("checkpoint_id") == "G01A-S0A"
+        and child_manifest.get("lane") == "runtime-vnext-g01a-contract-split"
+        and child_manifest.get("status") == "pass"
+        and child_manifest.get("canonical") is True,
+        "vnext-g01a S0A identity/status mismatch",
+    )
+    require_gate(
+        Path(require_string(child_manifest.get("artifact_dir"), "vnext-g01a S0A artifact_dir")).resolve()
+        == checkpoint_root
+        and Path(require_string(child_manifest.get("output_root"), "vnext-g01a S0A output_root")).resolve()
+        == output_root,
+        "vnext-g01a S0A output path mismatch",
+    )
+    expected_pass = f"FERRUM RUNTIME VNEXT G01A CONTRACT SPLIT PASS: {output_root}"
+    require_gate(child_manifest.get("pass_line") == expected_pass, "vnext-g01a S0A pass_line mismatch")
+    require_gate(
+        child_manifest.get("baseline_commit")
+        == "b5377b12464b60203a3fe57a6de4c9952ed2474b",
+        "vnext-g01a S0A baseline commit mismatch",
+    )
+    require_exact_string_set(child_manifest.get("unlocks"), {"G01B", "S1"}, "vnext-g01a S0A unlocks")
+    require_exact_string_set(
+        child_manifest.get("does_not_prove"),
+        {
+            "G01",
+            "G01B",
+            "model_migration",
+            "performance",
+            "production_wiring",
+            "release",
+        },
+        "vnext-g01a S0A does_not_prove",
+    )
+    source = require_object(child_manifest.get("source"), "vnext-g01a S0A source")
+    require_gate(
+        set(source) == {"git_sha", "git_tree_sha", "dirty", "status_short"}
+        and source.get("dirty") is False
+        and source.get("status_short") == [],
+        "vnext-g01a S0A source shape/dirty state mismatch",
+    )
+    source_sha = require_git_sha(source.get("git_sha"), "vnext-g01a S0A source.git_sha")
+    source_tree = require_git_sha(source.get("git_tree_sha"), "vnext-g01a S0A source.git_tree_sha")
+    if verify_checkout:
+        require_gate(git_sha() == source_sha, "vnext-g01a S0A source SHA is stale")
+        require_gate(
+            git_output(["rev-parse", "HEAD^{tree}"]) == source_tree,
+            "vnext-g01a S0A source tree is stale",
+        )
+        require_gate(not git_dirty_status()["is_dirty"], "vnext-g01a S0A checkout is dirty")
+
+    artifact_index = validate_child_artifact_index(
+        checkpoint_root, child_manifest, role_from_top_level_path=False
+    )
+    required_artifacts = {
+        "adr.md",
+        "contract-map.json",
+        "public-owner-map.json",
+        "split-inventory.json",
+        "compile-unit-trybuild.json",
+    }
+    require_gate(
+        required_artifacts <= set(artifact_index),
+        "vnext-g01a S0A required artifact set mismatch",
+    )
+
+    inventory_ref = require_object(
+        child_manifest.get("inventory_document"), "vnext-g01a S0A inventory document"
+    )
+    inventory_source_path = REPO_ROOT / require_string(
+        inventory_ref.get("path"), "vnext-g01a S0A inventory source path"
+    )
+    require_gate(
+        inventory_source_path
+        == REPO_ROOT / "docs/release/cleanup/20260714-inventory.md"
+        and sha256(inventory_source_path)
+        == require_sha256(inventory_ref.get("sha256"), "vnext-g01a S0A inventory SHA256"),
+        "vnext-g01a S0A inventory source mismatch",
+    )
+    adr_ref = require_object(child_manifest.get("adr_source"), "vnext-g01a S0A ADR source")
+    adr_source_path = REPO_ROOT / require_string(
+        adr_ref.get("path"), "vnext-g01a S0A ADR source path"
+    )
+    adr_digest = require_sha256(adr_ref.get("sha256"), "vnext-g01a S0A ADR source SHA256")
+    require_gate(
+        adr_source_path
+        == REPO_ROOT
+        / "docs/goals/runtime-vnext-0.8.0-2026-07-10/S0A_CONTRACT_SPLIT_MAP.md"
+        and sha256(adr_source_path) == adr_digest
+        and artifact_index["adr.md"]["sha256"] == adr_digest,
+        "vnext-g01a S0A ADR binding mismatch",
+    )
+
+    owner_map = read_json_object(
+        checkpoint_root / "public-owner-map.json", "vnext-g01a S0A public owner map"
+    )
+    require_gate(
+        owner_map.get("summary")
+        == {
+            "baseline_items": 1490,
+            "mapped_items": 1490,
+            "lost_items": 0,
+            "ambiguous_items": 0,
+            "inaccessible_items": 0,
+            "added_items": 0,
+            "excluded_non_public_owner_members": 1,
+            "unsupported_syntax_count": 0,
+            "coverage_percent": 100.0,
+            "pass": True,
+        },
+        "vnext-g01a S0A public owner map acceptance mismatch",
+    )
+    owner_evidence = require_object(
+        child_manifest.get("public_owner_evidence"), "vnext-g01a S0A public owner evidence"
+    )
+    require_gate(
+        owner_evidence.get("summary") == owner_map.get("summary")
+        and isinstance(owner_evidence.get("pass_line"), str)
+        and owner_evidence["pass_line"].startswith(
+            "VNEXT PUBLIC OWNER MAP PASS: mapped=1490/1490"
+        ),
+        "vnext-g01a S0A public owner evidence binding mismatch",
+    )
+
+    split_inventory = read_json_object(
+        checkpoint_root / "split-inventory.json", "vnext-g01a S0A split inventory"
+    )
+    inventory_summary = require_object(
+        split_inventory.get("summary"), "vnext-g01a S0A split inventory summary"
+    )
+    require_gate(
+        split_inventory.get("schema_version") == 1
+        and split_inventory.get("artifact_type")
+        == "runtime_vnext_s0a_split_inventory"
+        and split_inventory.get("source") == source
+        and split_inventory.get("baseline", {}).get("git_commit")
+        == child_manifest.get("baseline_commit")
+        and inventory_summary.get("facade_count") == 3
+        and inventory_summary.get("production_owner_count") == 38
+        and inventory_summary.get("contract_test_target_count") == 24
+        and inventory_summary.get("shared_test_support_owner_count") == 10
+        and inventory_summary.get("maximum_facade_physical_lines", 501) <= 500
+        and inventory_summary.get("maximum_production_owner_physical_lines", 2501) <= 2500
+        and inventory_summary.get("maximum_contract_test_or_support_owner_physical_lines", 2001)
+        <= 2000
+        and inventory_summary.get("include_macro_count") == 0
+        and inventory_summary.get("production_wildcard_parent_import_count") == 0
+        and inventory_summary.get("removed_oversized_target_present_count") == 0,
+        "vnext-g01a S0A split inventory acceptance mismatch",
+    )
+    contract_map = read_json_object(
+        checkpoint_root / "contract-map.json", "vnext-g01a S0A contract map"
+    )
+    contract_summary = require_object(
+        contract_map.get("summary"), "vnext-g01a S0A contract map summary"
+    )
+    require_gate(
+        contract_map.get("schema_version") == 1
+        and contract_map.get("artifact_type") == "runtime_vnext_s0a_contract_map"
+        and contract_map.get("baseline_commit") == child_manifest.get("baseline_commit")
+        and contract_summary.get("production_group_count") == 3
+        and contract_summary.get("multi_module_scc_count") == 0
+        and contract_summary.get("test_target_count") == 24
+        and contract_summary.get("semantic_change_count") == 0,
+        "vnext-g01a S0A contract map acceptance mismatch",
+    )
+    production_groups = require_list(
+        contract_map.get("production_groups"), "vnext-g01a S0A production groups"
+    )
+    require_gate(
+        {row.get("group") for row in production_groups}
+        == {"resource", "execution", "event"}
+        and all(
+            require_object(row.get("dependency_audit"), "vnext-g01a S0A dependency audit").get(
+                "multi_module_scc_count"
+            )
+            == 0
+            for row in production_groups
+        ),
+        "vnext-g01a S0A dependency SCC matrix mismatch",
+    )
+
+    compile_path = checkpoint_root / "compile-unit-trybuild.json"
+    compile_evidence = read_json_object(compile_path, "vnext-g01a S0A compile evidence")
+    tests = require_object(compile_evidence.get("tests"), "vnext-g01a S0A compile tests")
+    require_gate(
+        compile_evidence.get("schema_version") == 1
+        and compile_evidence.get("artifact_type")
+        == "runtime_vnext_s0a_compile_unit_trybuild_evidence"
+        and compile_evidence.get("status") == "pass"
+        and compile_evidence.get("returncode") == 0
+        and compile_evidence.get("env_overrides")
+        == {
+            "CARGO_BUILD_JOBS": "4",
+            "RUST_TEST_THREADS": "2",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        and tests.get("expected_integration_targets") == tests.get("observed_integration_targets")
+        and isinstance(tests.get("reported_passed_test_sum"), int)
+        and tests["reported_passed_test_sum"] >= 100
+        and isinstance(tests.get("machine_proof_line_count"), int)
+        and tests["machine_proof_line_count"] >= 20,
+        "vnext-g01a S0A aggregate compile/test evidence mismatch",
+    )
+    receipt_ref = require_object(compile_evidence.get("receipt"), "vnext-g01a S0A receipt ref")
+    receipt_path, receipt_relative, receipt_digest = require_indexed_artifact(
+        checkpoint_root,
+        artifact_index,
+        receipt_ref.get("path"),
+        receipt_ref.get("sha256"),
+        "vnext-g01a S0A bounded receipt",
+    )
+    receipt = read_json_object(receipt_path, "vnext-g01a S0A bounded receipt")
+    require_gate(
+        receipt_relative == "logs/all-targets.receipt.json"
+        and receipt_digest == artifact_index[receipt_relative]["sha256"]
+        and receipt.get("schema") == "ferrum.bounded-command-receipt.v1"
+        and receipt.get("status") == "pass"
+        and receipt.get("rc") == 0
+        and receipt.get("violation") is None
+        and receipt.get("sampling_errors") == []
+        and receipt.get("cleanup") == {"process_group_gone": True},
+        "vnext-g01a S0A bounded receipt acceptance mismatch",
+    )
+    compile_ref = require_object(
+        child_manifest.get("compile_evidence"), "vnext-g01a S0A compile evidence ref"
+    )
+    require_gate(
+        compile_ref.get("path") == "compile-unit-trybuild.json"
+        and require_sha256(compile_ref.get("sha256"), "vnext-g01a S0A compile SHA256")
+        == artifact_index["compile-unit-trybuild.json"]["sha256"]
+        and compile_ref.get("reported_passed_test_sum") == tests["reported_passed_test_sum"]
+        and compile_ref.get("machine_proof_line_count") == tests["machine_proof_line_count"],
+        "vnext-g01a S0A compile manifest binding mismatch",
+    )
+
+    g00f = require_object(child_manifest.get("g00f"), "vnext-g01a S0A G00F binding")
+    require_gate(
+        set(g00f) == {"outer_manifest", "child_manifest", "source", "g00a"}
+        and g00f.get("source") == {"git_sha": source_sha, "git_tree_sha": source_tree},
+        "vnext-g01a S0A G00F source binding mismatch",
+    )
+    g00f_outer_ref = require_object(g00f.get("outer_manifest"), "vnext-g01a S0A G00F outer ref")
+    g00f_child_ref = require_object(g00f.get("child_manifest"), "vnext-g01a S0A G00F child ref")
+    g00f_outer_path = Path(
+        require_string(g00f_outer_ref.get("path"), "vnext-g01a S0A G00F outer path")
+    ).resolve()
+    g00f_child_path = Path(
+        require_string(g00f_child_ref.get("path"), "vnext-g01a S0A G00F child path")
+    ).resolve()
+    require_gate(
+        sha256(g00f_outer_path)
+        == require_sha256(g00f_outer_ref.get("sha256"), "vnext-g01a S0A G00F outer SHA256")
+        and sha256(g00f_child_path)
+        == require_sha256(g00f_child_ref.get("sha256"), "vnext-g01a S0A G00F child SHA256"),
+        "vnext-g01a S0A G00F manifest identity mismatch",
+    )
+    g00f_outer = read_json_object(g00f_outer_path, "vnext-g01a S0A bound G00F outer")
+    g00f_child = read_json_object(g00f_child_path, "vnext-g01a S0A bound G00F child")
+    require_gate(
+        g00f_outer.get("lane") == "vnext-g00f"
+        and g00f_outer.get("status") == "pass"
+        and g00f_outer.get("git_sha") == source_sha
+        and require_object(g00f_outer.get("child_artifacts"), "vnext-g01a S0A G00F outer artifacts").get(
+            "child_manifest"
+        )
+        == g00f_child_ref,
+        "vnext-g01a S0A bound G00F outer is stale",
+    )
+    validate_vnext_g00f_provenance(
+        LaneCommand(
+            cmd=[],
+            expected_child_pass_line=g00f_child.get("pass_line"),
+            child_manifest_path=g00f_child_path,
+            provenance_kind="vnext-g00f",
+        ),
+        g00f_child,
+        require_sha256(g00f_child_ref.get("sha256"), "vnext-g01a S0A G00F child SHA256"),
+        verify_checkout=verify_checkout,
+    )
+    require_gate(g00f.get("g00a") == g00f_child.get("g00a"), "vnext-g01a S0A G00F/G00a binding drift")
+
+    return {
+        "kind": "vnext-g01a-s0a",
+        "child_manifest": {
+            "path": str(manifest_path),
+            "sha256": require_sha256(child_manifest_sha256, "vnext-g01a S0A manifest SHA256"),
+        },
+        "checkpoint": {
+            "id": "G01A-S0A",
+            "unlocks": ["G01B", "S1"],
+            "does_not_prove": sorted(
+                {
+                    "G01",
+                    "G01B",
+                    "model_migration",
+                    "performance",
+                    "production_wiring",
+                    "release",
+                }
+            ),
+        },
+        "source": {"git_sha": source_sha, "git_tree_sha": source_tree},
+        "public_owner_summary": owner_map["summary"],
+        "split_inventory_summary": inventory_summary,
+        "contract_map_summary": contract_summary,
+        "compile_summary": {
+            "reported_passed_test_sum": tests["reported_passed_test_sum"],
+            "machine_proof_line_count": tests["machine_proof_line_count"],
+            "receipt_peaks": receipt["peaks"],
+        },
+        "artifact_count": len(artifact_index),
     }
 
 
@@ -4080,6 +4634,13 @@ def verify_child_pass_line(
             child_manifest_digest,
             verify_checkout=verify_checkout,
         )
+    if lane_command.provenance_kind == "vnext-g00f":
+        return validate_vnext_g00f_provenance(
+            lane_command,
+            child_manifest,
+            child_manifest_digest,
+            verify_checkout=verify_checkout,
+        )
     if lane_command.provenance_kind == "vnext-g00":
         provenance = validate_vnext_g00_provenance(
             lane_command,
@@ -4092,6 +4653,13 @@ def verify_child_pass_line(
         return provenance
     if lane_command.provenance_kind == "vnext-g01a":
         return validate_vnext_g01a_provenance(
+            lane_command,
+            child_manifest,
+            child_manifest_digest,
+            verify_checkout=verify_checkout,
+        )
+    if lane_command.provenance_kind == "vnext-g01a-s0a":
+        return validate_vnext_g01a_s0a_provenance(
             lane_command,
             child_manifest,
             child_manifest_digest,
@@ -6316,14 +6884,39 @@ def self_test() -> int:
             g00a_manifest,
         )
 
+        g00f_out = (root / "vnext-g00f-dry-run").resolve()
+        g00f = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-g00f",
+                "--g00a",
+                str(g00a_out / "gate.manifest.json"),
+                "--out",
+                str(g00f_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(g00f.returncode == 0, g00f.stderr or g00f.stdout)
+        g00f_manifest = json.loads((g00f_out / "gate.manifest.json").read_text())
+        require_selftest(
+            g00f_manifest["status"] == "dry-run"
+            and g00f_manifest["lane"] == "vnext-g00f"
+            and g00f_manifest["delegated_command_line"][1]
+            == "scripts/release/runtime_vnext_g00f_checkpoint.py"
+            and g00f_manifest["child_pass_line"]
+            == f"FERRUM RUNTIME VNEXT G00F FACTS PASS: {g00f_out}",
+            g00f_manifest,
+        )
+
         g01a_out = (root / "vnext-g01a-dry-run").resolve()
         g01a = run_selftest_command(
             [
                 sys.executable,
                 str(this_script),
                 "vnext-g01a",
-                "--g00a",
-                str(g00a_out / "gate.manifest.json"),
+                "--g00f",
+                str(g00f_out / "gate.manifest.json"),
                 "--out",
                 str(g01a_out),
                 "--dry-run",
@@ -6338,14 +6931,14 @@ def self_test() -> int:
         )
         require_selftest(
             g01a_manifest["delegated_command_line"][1]
-            == "scripts/release/runtime_vnext_g01a_checkpoint.py"
+            == "scripts/release/runtime_vnext_s0a_contract_split.py"
             and g01a_manifest["delegated_command_line"][2:4]
-            == ["--g00a", str(g00a_out / "gate.manifest.json")],
+            == ["--g00f", str(g00f_out / "gate.manifest.json")],
             g01a_manifest,
         )
         require_selftest(
             g01a_manifest["child_pass_line"]
-            == f"FERRUM RUNTIME VNEXT G01A CONTRACT CHECKPOINT PASS: {g01a_out}",
+            == f"FERRUM RUNTIME VNEXT G01A CONTRACT SPLIT PASS: {g01a_out}",
             g01a_manifest,
         )
         in_tree_g01a_out = REPO_ROOT / (
@@ -6356,8 +6949,8 @@ def self_test() -> int:
                 sys.executable,
                 str(this_script),
                 "vnext-g01a",
-                "--g00a",
-                str(g00a_out / "gate.manifest.json"),
+                "--g00f",
+                str(g00f_out / "gate.manifest.json"),
                 "--out",
                 str(in_tree_g01a_out),
                 "--dry-run",
@@ -6925,6 +7518,7 @@ def main() -> int:
     parser.add_argument("--coupling-inventory", type=Path)
     parser.add_argument("--model-resolution", type=Path)
     parser.add_argument("--g00a", type=Path)
+    parser.add_argument("--g00f", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -6939,7 +7533,7 @@ def main() -> int:
         parser.error("--out is required")
 
     out_dir = args.out.resolve() if args.lane.startswith("vnext-") else args.out
-    if args.lane in {"vnext-g00", "vnext-g01a"}:
+    if args.lane in {"vnext-g00", "vnext-g00f", "vnext-g01a"}:
         try:
             require_external_vnext_g00_output(out_dir)
         except GateError as exc:
