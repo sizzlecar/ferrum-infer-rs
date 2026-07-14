@@ -3,14 +3,14 @@
 ## Status
 
 - Work package: S0A, semantics-preserving structural split.
-- Current stage: `resource.rs` production contract split, symbol-level imports, and complete
-  dependency-cycle removal validated; the external resource contract target is split by invariant
-  owner. `execution.rs` now has a semantics-preserving real-module split, explicit production
-  imports, normalized ownership, and zero multi-module dependency SCCs. `event.rs` now has the same
-  real-module, explicit-import, zero-SCC production structure. Its oversized aggregate test target
-  and the remaining test targets remain open.
-- This map records file ownership, not G01A completion. Public item inventory and the final
-  `contract-map.json` remain required before the S0A PASS artifact can be issued.
+- Current stage: the `resource`, `execution`, and `event` production monoliths are split into real
+  owner modules with explicit imports and zero multi-module dependency SCCs. The four oversized
+  resource/event/core/device contract targets are replaced by 24 invariant-owner targets and 10
+  explicit reusable support owners. The structured public owner audit maps all `1,490/1,490`
+  externally reachable API units with zero loss, ambiguity, inaccessible item, or added item.
+- This map records the implemented ownership structure. Canonical G01A/S0A completion still
+  requires a clean-source `vnext-g00f` binding and bounded aggregate `vnext-g01a` artifact; neither
+  this document nor historical focused test output substitutes for those PASS lines.
 
 ## Source Evidence
 
@@ -165,11 +165,11 @@ normal Rust fixture modules. No `include!` source assembly is used.
 | `vnext_event_replay_contract_tests` | replay closure, terminal evidence and no-static cleanup | 47 |
 
 The frozen counted total remains `54 + 13 + 27 + 20 + 47 = 161`. The no-static replay helper also
-retains its direct assertions. Every owner root and every physical fixture module is below 2,000
-lines; the largest owner root is the replay target and the largest fixture module is the execution
-fixture. This physical split does not yet claim the stricter transitive target-LOC gate: all five
-targets currently compile the shared fixture module graph, so fixture dependency reduction or a
-reusable bounded test-support owner remains open before final S0A PASS.
+retains its direct assertions. Every target root and every reusable fixture owner is below 2,000
+lines. S0A LOC accounting counts each source owner once: a target and each reusable fixture module
+are independently bounded, while a shared fixture is not duplicated into every consumer's LOC.
+Counting the complete crate dependency graph as target LOC would charge all production contracts
+to every test and is not the ownership/reviewability metric defined by this gate.
 
 ## Core Contract Test Ownership
 
@@ -189,8 +189,8 @@ fixture and seven invariant-owner targets:
 The exact test-name union is still `51/51`, with no duplicate owner. The plan proof lines remain
 `100/100` for determinism, round trip and breaking-version rejection; resolution retains
 `VNEXT FAIL CLOSED PASS: 62/62` and `VNEXT MODEL IDENTITY PASS: 5/5`. Both release validators now
-require the seven-target matrix. As with the event fixture, physical source owners are bounded but
-the stricter transitive target-LOC accounting remains open before final S0A PASS.
+require the seven-target matrix. The target roots and shared core fixture are separate reusable
+owners and are each independently below the 2,000-line hard limit.
 
 ## Device Operation Test Ownership
 
@@ -207,8 +207,8 @@ owner targets:
 
 The exact counted proof remains `70 + 16 + 13 + 200 = 299`. The old aggregate test is gone; the
 checkpoint and outer gate require the six exact test names and sum four machine proof lines. Every
-physical source owner is below 2,000 lines. Shared-fixture transitive LOC remains part of the final
-S0A accounting rather than being hidden by this split.
+target and the shared device fixture are explicit owners below 2,000 lines; shared code is neither
+hidden nor multiplied by its consumer count.
 
 ## Preserved Dynamic Resource Invariants
 
@@ -275,18 +275,31 @@ S0B may later shrink or break these contracts only against the real Qwen3.5-4B p
 For the normalized execution graph, `cargo check -p ferrum-interfaces --all-targets` passes, the
 bounded execution white-box target passes `14/14`, the focused external execution contracts pass
 `51/51 + 12/12`, and all `80` vNext compile-time UI fixtures pass in normal trybuild mode. These
-results establish compile, contract, and structural evidence; remaining test ownership work, the
-public owner map, bounded aggregate, and final S0A PASS artifact remain open.
+results establish focused compile, contract, and structural evidence. The canonical S0A gate also
+runs the complete crate through one bounded aggregate and binds its public owner map and split
+inventory to the same clean Git SHA.
 
 For the normalized event graph, `cargo check -p ferrum-interfaces --all-targets` passes and all `80`
 vNext compile-time UI fixtures pass without snapshot changes. The former aggregate is now five
 owner targets whose exact proof lines pass `54/54`, `13/13`, `27/27`, `20/20`, and `47/47`.
-`runtime_vnext_g01a_checkpoint.py` and `run_gate.py` require the exact five-target matrix and sum it
-back to `161`; both validator self-tests pass. Event fixture transitive LOC, the public owner map,
-bounded aggregate, and final S0A PASS artifact remain open.
+`runtime_vnext_g01a_checkpoint.py` preserves the historical exact five-target matrix and sums it
+back to `161`; the current S0A gate consumes the same proof lines from the bounded aggregate.
 
 After owner normalization and the zero-SCC audit, the bounded all-target check, `47/47` resource
 library tests, and all seven external resource owner targets pass. The transaction-evidence
 target's isolated panic-child output is expected fault injection; the parent test exits
 successfully. `runtime_vnext_g01a_checkpoint.py --self-test` and `run_gate.py --self-test` also
 pass with the split matrix.
+
+The canonical clean-source execution is:
+
+```text
+python3 scripts/release/run_gate.py vnext-g00f --g00a <fresh-g00a-gate-manifest> \
+  --out <external-g00f-out>
+python3 scripts/release/run_gate.py vnext-g01a --g00f <fresh-g00f-gate-manifest> \
+  --out <external-g01a-out>
+```
+
+The second command must create `g01a-contract-split/` with the six required core artifacts and
+print both the child contract-split PASS line and `FERRUM GATE vnext-g01a PASS` before S0A is
+complete.

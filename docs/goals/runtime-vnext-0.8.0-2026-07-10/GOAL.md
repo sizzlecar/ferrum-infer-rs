@@ -479,7 +479,13 @@ python3 scripts/release/run_gate.py vnext-g00a \
   --coupling-inventory <external-cff4-inventory.json> \
   --model-resolution <external-current-head-resolution.json> \
   --out <external-g00a-out>
+python3 scripts/release/run_gate.py vnext-g00f \
+  --g00a <external-g00a-out>/gate.manifest.json \
+  --out <external-g00f-out>
 ```
+
+`vnext-g00f` 是 G00a 事实 artifact 的 freshness-bound DAG 引用，不复制或重跑同一事实
+collector；它只把开发解锁范围收敛到 `S0A`/`S1`。
 
 checkpoint 必须冻结 12/12 model/backend lane、M1-M3 四类 generation preset、15 个 historical
 bug family/28 个 concrete case 的 catalog 事实和完整 analyzer/catalog/goal source identity。collector
