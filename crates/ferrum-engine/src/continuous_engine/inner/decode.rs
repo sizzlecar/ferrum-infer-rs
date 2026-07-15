@@ -302,6 +302,7 @@ impl EngineInner {
             let tensor = self.tokens_to_tensor(&[resources.last_token.get()])?;
             let input =
                 ferrum_interfaces::model_executor::DecodeInput::new(tensor, resources.kv_cache)
+                    .with_request_id(request_id.clone())
                     .with_metadata(seq.model_decode_metadata())
                     .with_logits_policy(seq.model_decode_logits_policy());
             if let Some(state) = resources.recurrent_state {

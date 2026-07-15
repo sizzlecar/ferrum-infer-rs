@@ -153,6 +153,11 @@ impl GreedyRepetitionPenalty {
 /// Input for prefill phase (processing the initial prompt)
 #[derive(Debug, Clone)]
 pub struct PrefillInput {
+    /// Stable product request identity for executor-owned runtime resources.
+    pub request_id: Option<RequestId>,
+    /// Maximum sequence extent this request may reach, including the prompt.
+    /// Executors use this for fit validation without allocating future pages.
+    pub maximum_sequence_tokens: Option<usize>,
     /// Input token IDs [batch_size, sequence_length]
     pub input_ids: TensorRef,
     /// Attention mask [batch_size, sequence_length] (optional)
@@ -171,6 +176,8 @@ impl PrefillInput {
     /// Create new prefill input
     pub fn new(input_ids: TensorRef) -> Self {
         Self {
+            request_id: None,
+            maximum_sequence_tokens: None,
             input_ids,
             attention_mask: None,
             position_ids: None,
@@ -178,6 +185,17 @@ impl PrefillInput {
             recurrent_state: None,
             metadata: HashMap::new(),
         }
+    }
+
+    /// Attach the typed request boundary consumed by executor-owned runtimes.
+    pub fn with_request_context(
+        mut self,
+        request_id: RequestId,
+        maximum_sequence_tokens: usize,
+    ) -> Self {
+        self.request_id = Some(request_id);
+        self.maximum_sequence_tokens = Some(maximum_sequence_tokens);
+        self
     }
 
     /// Create prefill input with a pre-allocated KV cache handle.
@@ -281,6 +299,8 @@ impl PrefillOutput {
 /// Input for decode phase (generating one token at a time)
 #[derive(Debug, Clone)]
 pub struct DecodeInput {
+    /// Stable product request identity for executor-owned runtime resources.
+    pub request_id: Option<RequestId>,
     /// Input token ID for current step [batch_size, 1]
     pub input_ids: TensorRef,
     /// Existing KV cache from previous steps
@@ -299,6 +319,7 @@ impl DecodeInput {
     /// Create new decode input
     pub fn new(input_ids: TensorRef, kv_cache: Arc<dyn KvCacheHandle>) -> Self {
         Self {
+            request_id: None,
             input_ids,
             kv_cache,
             recurrent_state: None,
@@ -306,6 +327,12 @@ impl DecodeInput {
             metadata: HashMap::new(),
             logits_policy: LogitsReturnPolicy::FullLogits,
         }
+    }
+
+    /// Attach the product request identity to this decode step.
+    pub fn with_request_id(mut self, request_id: RequestId) -> Self {
+        self.request_id = Some(request_id);
+        self
     }
 
     /// Add position IDs

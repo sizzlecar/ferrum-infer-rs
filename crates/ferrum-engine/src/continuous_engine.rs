@@ -1107,6 +1107,14 @@ impl SequenceState {
         metadata
     }
 
+    fn model_maximum_sequence_tokens(&self) -> usize {
+        self.prefill_context_len().max(
+            self.input_tokens
+                .len()
+                .saturating_add(self.sampling_params.max_tokens.saturating_sub(1)),
+        )
+    }
+
     fn take_physical_resources(&mut self) -> SequencePhysicalResources {
         let (kv_allocation, model_cache_id) = self
             .model_kv

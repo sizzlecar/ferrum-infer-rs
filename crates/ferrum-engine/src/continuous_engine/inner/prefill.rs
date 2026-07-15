@@ -362,11 +362,14 @@ impl EngineInner {
     pub(super) async fn run_executor_owned_prefill(&self, request_id: &RequestId) -> Result<()> {
         use ferrum_interfaces::model_executor::PrefillInput;
 
-        let Some((input_tokens, metadata)) = self
-            .sequences
-            .read()
-            .get(request_id)
-            .map(|seq| (seq.prefill_context_tokens(), seq.model_decode_metadata()))
+        let Some((input_tokens, maximum_sequence_tokens, metadata)) =
+            self.sequences.read().get(request_id).map(|seq| {
+                (
+                    seq.prefill_context_tokens(),
+                    seq.model_maximum_sequence_tokens(),
+                    seq.model_decode_metadata(),
+                )
+            })
         else {
             return Ok(());
         };
@@ -374,7 +377,9 @@ impl EngineInner {
             .iter()
             .map(|token| token.get())
             .collect::<Vec<_>>();
-        let input = PrefillInput::new(self.tokens_to_tensor(&token_ids)?).with_metadata(metadata);
+        let input = PrefillInput::new(self.tokens_to_tensor(&token_ids)?)
+            .with_request_context(request_id.clone(), maximum_sequence_tokens)
+            .with_metadata(metadata);
 
         let workspace_lease = self.acquire_backend_workspace_lease(
             vec![request_id.clone()],
