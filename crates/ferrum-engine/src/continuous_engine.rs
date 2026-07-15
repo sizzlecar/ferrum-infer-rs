@@ -16,6 +16,10 @@ use ferrum_interfaces::{
     model_executor::{
         GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy, TokenSelectionMask,
     },
+    vnext::{
+        EventEmissionPermit, ExecutionEvent, ExecutionEventDetail,
+        ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink, ExecutionEventSinkError,
+    },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,
     Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
 };
@@ -2260,8 +2264,8 @@ struct EngineInner {
     /// Prefix cache: shares KV blocks across requests with common prompts.
     prefix_cache: PrefixCache,
     runtime_config: ContinuousEngineRuntimeConfig,
-    scheduler_trace_jsonl: Option<Mutex<std::fs::File>>,
-    legacy_scheduler_trace_jsonl: Option<Mutex<std::fs::File>>,
+    scheduler_trace_jsonl: Option<Arc<Mutex<std::fs::File>>>,
+    legacy_scheduler_trace_jsonl: Option<Arc<Mutex<std::fs::File>>>,
     scheduler_trace_none_streak: AtomicU64,
     resource_lifecycle: Mutex<ResourceLifecycleLedger>,
     resource_trace_event_counter: AtomicU64,
@@ -3290,7 +3294,229 @@ fn avg_duration_ms(total_us: u64, samples: u64) -> f64 {
     }
 }
 
-fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<Mutex<std::fs::File>> {
+fn vnext_execution_event_name(kind: VNextExecutionEventKind) -> &'static str {
+    match kind {
+        VNextExecutionEventKind::RequestAccepted => "request_accepted",
+        VNextExecutionEventKind::PlanBuilt => "plan_built",
+        VNextExecutionEventKind::FrameStarted => "frame_started",
+        VNextExecutionEventKind::NodeStarted => "node_started",
+        VNextExecutionEventKind::OperationSubmitted => "operation_submitted",
+        VNextExecutionEventKind::NodeRetired => "node_retired",
+        VNextExecutionEventKind::FrameCompleted => "frame_completed",
+        VNextExecutionEventKind::FailureObserved => "failure_observed",
+        VNextExecutionEventKind::SequenceCompleted => "sequence_completed",
+        VNextExecutionEventKind::SequenceAborted => "sequence_aborted",
+        VNextExecutionEventKind::RequestCompleted => "request_completed",
+        VNextExecutionEventKind::RequestFailed => "request_failed",
+    }
+}
+
+struct VNextProfileExecutionEventSink {
+    file: Arc<Mutex<std::fs::File>>,
+    entrypoint: ProfileEntrypoint,
+    model: String,
+    backend_device: String,
+    backend_type: String,
+}
+
+impl VNextProfileExecutionEventSink {
+    fn new(
+        file: Arc<Mutex<std::fs::File>>,
+        entrypoint: ProfileEntrypoint,
+        config: &EngineConfig,
+    ) -> Self {
+        Self {
+            file,
+            entrypoint,
+            model: config.model.model_id.to_string(),
+            backend_device: format!("{:?}", config.backend.device),
+            backend_type: format!("{:?}", config.backend.backend_type),
+        }
+    }
+}
+
+impl ExecutionEventSink for VNextProfileExecutionEventSink {
+    fn is_enabled(&self, _kind: VNextExecutionEventKind) -> bool {
+        true
+    }
+
+    fn record(
+        &self,
+        event: &ExecutionEvent,
+        _permit: EventEmissionPermit<'_>,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        let identity = event.identity().parts();
+        let event_name = vnext_execution_event_name(event.kind());
+        let timestamp = chrono::Utc::now();
+        let failure = match event.detail() {
+            ExecutionEventDetail::Failure(failure) => Some(ProfileError {
+                kind: failure.failure().code().to_string(),
+                message: failure.failure().message().to_string(),
+                blocking: true,
+            }),
+            ExecutionEventDetail::FailureTerminal {
+                first_failure_fingerprint,
+            } => Some(ProfileError {
+                kind: "vnext_request_failed".to_string(),
+                message: format!("request terminated after failure {first_failure_fingerprint}"),
+                blocking: true,
+            }),
+            _ => None,
+        };
+        let status = if failure.is_some() {
+            ProfileStatus::Failure
+        } else {
+            ProfileStatus::Ok
+        };
+        let mut shape = BTreeMap::from([(
+            "execution_sequence".to_string(),
+            serde_json::json!(identity.sequence),
+        )]);
+        if let Some(frame_id) = identity.frame_id {
+            shape.insert("frame_id".to_string(), serde_json::json!(frame_id.get()));
+        }
+        if let Some(invocation_id) = identity.node_invocation_id {
+            shape.insert(
+                "node_invocation_id".to_string(),
+                serde_json::json!(invocation_id.get()),
+            );
+        }
+        let mut attributes = BTreeMap::from([
+            (
+                "actual_model_smoke".to_string(),
+                serde_json::json!(matches!(
+                    self.entrypoint,
+                    ProfileEntrypoint::Run | ProfileEntrypoint::Serve
+                )),
+            ),
+            (
+                "backend_device".to_string(),
+                serde_json::json!(self.backend_device),
+            ),
+            (
+                "backend_type".to_string(),
+                serde_json::json!(self.backend_type),
+            ),
+            ("diagnostic_only".to_string(), serde_json::json!(false)),
+            ("l0_only".to_string(), serde_json::json!(false)),
+            ("profile_detail".to_string(), serde_json::json!("basic")),
+            (
+                "execution_event_kind".to_string(),
+                serde_json::json!(event_name),
+            ),
+            (
+                "execution_phase".to_string(),
+                serde_json::json!(format!("{:?}", event.phase()).to_ascii_lowercase()),
+            ),
+            (
+                "execution_trace_source".to_string(),
+                serde_json::json!("vnext"),
+            ),
+            (
+                "monotonic_nanos_since_run_start".to_string(),
+                serde_json::json!(event.timestamp().nanos_since_run_start),
+            ),
+            (
+                "run_id".to_string(),
+                serde_json::json!(identity.run_id.to_string()),
+            ),
+            (
+                "span_id".to_string(),
+                serde_json::json!(identity.span_id.to_string()),
+            ),
+        ]);
+        for (key, value) in [
+            (
+                "plan_id",
+                identity.plan_id.as_ref().map(ToString::to_string),
+            ),
+            (
+                "plan_hash",
+                identity.plan_hash.as_ref().map(ToString::to_string),
+            ),
+            (
+                "node_id",
+                identity.node_id.as_ref().map(ToString::to_string),
+            ),
+            (
+                "operation_id",
+                identity.operation_id.as_ref().map(ToString::to_string),
+            ),
+            (
+                "provider_id",
+                identity.provider_id.as_ref().map(ToString::to_string),
+            ),
+            (
+                "device_id",
+                identity.device_id.as_ref().map(ToString::to_string),
+            ),
+            (
+                "parent_span_id",
+                identity.parent_span_id.as_ref().map(ToString::to_string),
+            ),
+        ] {
+            if let Some(value) = value {
+                attributes.insert(key.to_string(), serde_json::json!(value));
+            }
+        }
+        let profile = FerrumProfileEvent {
+            schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+            ts_unix_nanos: timestamp
+                .timestamp_nanos_opt()
+                .unwrap_or_else(|| timestamp.timestamp_micros() * 1_000),
+            event_id: format!(
+                "evt-vnext-{}-{}-{}",
+                identity.run_id, identity.request_id, identity.sequence
+            ),
+            request_id: identity.request_id.to_string(),
+            correlation_id: Some(identity.request_id.to_string()),
+            entrypoint: self.entrypoint,
+            backend: "actual".to_string(),
+            runtime_preset_hash: ENGINE_RUNTIME_TRACE_PRESET_HASH.to_string(),
+            phase: format!("vnext.{event_name}"),
+            event_kind: if failure.is_some() {
+                ProfileEventKind::Error
+            } else {
+                ProfileEventKind::Instant
+            },
+            timestamp,
+            status,
+            model: Some(self.model.clone()),
+            duration_us: None,
+            memory: None,
+            resource: None,
+            error: failure,
+            replay: None,
+            shape,
+            backend_detail: Some(BTreeMap::from([
+                (
+                    "backend_device".to_string(),
+                    serde_json::json!(self.backend_device),
+                ),
+                (
+                    "backend_type".to_string(),
+                    serde_json::json!(self.backend_type),
+                ),
+            ])),
+            attributes,
+        };
+        profile.validate().map_err(|error| {
+            ExecutionEventSinkError::new(format!("invalid vNext profile event: {error}"))
+        })?;
+        let mut line = serde_json::to_string(&profile).map_err(|error| {
+            ExecutionEventSinkError::new(format!("serialize vNext profile event: {error}"))
+        })?;
+        line.push('\n');
+        self.file
+            .lock()
+            .write_all(line.as_bytes())
+            .map_err(|error| {
+                ExecutionEventSinkError::new(format!("write vNext profile event: {error}"))
+            })
+    }
+}
+
+fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<Arc<Mutex<std::fs::File>>> {
     let path = path?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -3319,7 +3545,7 @@ fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<Mutex<std::fs::Fil
         .append(true)
         .open(path)
     {
-        Ok(file) => Some(Mutex::new(file)),
+        Ok(file) => Some(Arc::new(Mutex::new(file))),
         Err(error) => {
             warn!(
                 "Failed to open scheduler trace JSONL {}: {}",
@@ -3423,6 +3649,19 @@ impl ContinuousBatchEngine {
             create_scheduler_trace_sink(runtime_config.scheduler_trace_jsonl.as_deref());
         let legacy_scheduler_trace_jsonl =
             create_scheduler_trace_sink(runtime_config.legacy_scheduler_trace_jsonl.as_deref());
+        if let Some(file) = scheduler_trace_jsonl.as_ref() {
+            let sink: Arc<dyn ExecutionEventSink> = Arc::new(VNextProfileExecutionEventSink::new(
+                Arc::clone(file),
+                runtime_config
+                    .profile_entrypoint
+                    .unwrap_or(ProfileEntrypoint::Synthetic),
+                &config,
+            ));
+            model_executor.attach_execution_event_sink(Arc::clone(&sink));
+            if let Some(draft_executor) = draft_executor.as_ref() {
+                draft_executor.attach_execution_event_sink(sink);
+            }
+        }
 
         Self {
             inner: Arc::new(EngineInner {

@@ -24,7 +24,7 @@ use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
 use ferrum_types::{
     Device, EngineConfig, FerrumError, ModelInfo, RequestId, Result, SchedulingPolicy,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::vnext::PreparedProductionModel;
@@ -223,6 +223,439 @@ fn reported_allocated_bytes(budget_claimed_bytes: Option<u64>, static_bytes: u64
     budget_claimed_bytes.unwrap_or(static_bytes)
 }
 
+struct VNextExecutionJournal {
+    emitter: ExecutionEventEmitter<'static>,
+    topology: TrustedExecutionTopology,
+    active: TrustedActiveSequenceBinding,
+    started: Instant,
+    last_timestamp_nanos: u64,
+    root_span: SpanId,
+    pending_submission: Option<(SubmittedOperationReceipt, Vec<usize>)>,
+}
+
+impl VNextExecutionJournal {
+    fn error(error: impl fmt::Display) -> ExecutionEventSinkError {
+        ExecutionEventSinkError::new(error.to_string())
+    }
+
+    fn open(
+        sink: Arc<dyn ExecutionEventSink>,
+        plan: &ExecutionPlan,
+        active: TrustedActiveSequenceBinding,
+    ) -> std::result::Result<Self, ExecutionEventSinkError> {
+        let topology = TrustedExecutionTopology::from_plan(plan).map_err(Self::error)?;
+        let root_span =
+            SpanId::new(format!("vnext/request/{}", active.fingerprint())).map_err(Self::error)?;
+        let mut journal = Self {
+            emitter: ExecutionEventEmitter::from_shared(
+                sink,
+                active.run_id().clone(),
+                active.request_id().clone(),
+            ),
+            topology,
+            active,
+            started: Instant::now(),
+            last_timestamp_nanos: 0,
+            root_span,
+            pending_submission: None,
+        };
+        let accepted = journal.event(
+            ExecutionPhase::Resolution,
+            ExecutionEventKind::RequestAccepted,
+            journal.base_parts(1, journal.root_span.clone(), None),
+            ExecutionEventDetail::None,
+        )?;
+        journal.emitter.emit(
+            &accepted,
+            &TrustedExecutionEventContext::pre_plan(
+                journal.active.run_id(),
+                journal.active.request_id(),
+            ),
+        )?;
+        let plan_span = SpanId::new(format!("{}/plan", journal.root_span)).map_err(Self::error)?;
+        let planned_parts =
+            journal.bind_plan(journal.base_parts(2, plan_span, Some(journal.root_span.clone())));
+        let planned = journal.event(
+            ExecutionPhase::Planning,
+            ExecutionEventKind::PlanBuilt,
+            planned_parts,
+            ExecutionEventDetail::None,
+        )?;
+        journal.emitter.emit(
+            &planned,
+            &TrustedExecutionEventContext::bound(
+                journal.active.run_id(),
+                journal.active.request_id(),
+                &journal.topology,
+            ),
+        )?;
+        Ok(journal)
+    }
+
+    fn next_timestamp(&mut self) -> MonotonicTimestamp {
+        let elapsed = self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let next = elapsed.max(self.last_timestamp_nanos.saturating_add(1));
+        self.last_timestamp_nanos = next;
+        MonotonicTimestamp {
+            nanos_since_run_start: next,
+        }
+    }
+
+    fn base_parts(
+        &self,
+        sequence: u64,
+        span_id: SpanId,
+        parent_span_id: Option<SpanId>,
+    ) -> ExecutionIdentityParts {
+        ExecutionIdentityParts {
+            version: EXECUTION_IDENTITY_VERSION,
+            run_id: self.active.run_id().clone(),
+            request_id: self.active.request_id().clone(),
+            sequence,
+            plan_id: None,
+            plan_hash: None,
+            frame_id: None,
+            node_invocation_id: None,
+            node_id: None,
+            operation_id: None,
+            provider_id: None,
+            device_id: None,
+            resource_pool_id: None,
+            resource_pool_identity_fingerprint: None,
+            provisioning_run_id: None,
+            provisioning_request_id: None,
+            transaction_id: None,
+            active_sequence_slot: None,
+            admission_generation: None,
+            activation_epoch: None,
+            runtime_implementation_fingerprint: None,
+            active_sequence_fingerprint: None,
+            completed_sequence_fingerprint: None,
+            aborted_sequence_fingerprint: None,
+            resource_id: None,
+            resource_generation: None,
+            resource_batch_fingerprint: None,
+            span_id,
+            parent_span_id,
+            async_links: Vec::new(),
+        }
+    }
+
+    fn bind_plan(&self, mut parts: ExecutionIdentityParts) -> ExecutionIdentityParts {
+        parts.plan_id = Some(self.topology.plan_id().clone());
+        parts.plan_hash = Some(self.topology.plan_hash().clone());
+        parts.device_id = Some(self.topology.device_id().clone());
+        parts.runtime_implementation_fingerprint = Some(
+            self.topology
+                .device_runtime_implementation_fingerprint()
+                .to_owned(),
+        );
+        parts
+    }
+
+    fn bind_active(&self, mut parts: ExecutionIdentityParts) -> ExecutionIdentityParts {
+        let provisioning = self.active.static_provisioning_identity();
+        parts.resource_pool_id = self.active.static_pool_id();
+        parts.resource_pool_identity_fingerprint = self.active.static_pool_identity_fingerprint();
+        parts.provisioning_run_id = provisioning.map(|identity| identity.run_id().clone());
+        parts.provisioning_request_id = provisioning.map(|identity| identity.request_id().clone());
+        parts.transaction_id = provisioning.map(|identity| identity.transaction_id().clone());
+        parts.active_sequence_slot = Some(self.active.sequence_authority().sparse_id());
+        parts.admission_generation = Some(self.active.sequence_authority().generation());
+        parts.activation_epoch = Some(self.active.activation_epoch());
+        parts.active_sequence_fingerprint = Some(self.active.fingerprint().to_owned());
+        parts
+    }
+
+    fn event(
+        &mut self,
+        phase: ExecutionPhase,
+        kind: ExecutionEventKind,
+        parts: ExecutionIdentityParts,
+        detail: ExecutionEventDetail,
+    ) -> std::result::Result<ExecutionEvent, ExecutionEventSinkError> {
+        let identity = ExecutionIdentityEnvelope::new(parts).map_err(Self::error)?;
+        ExecutionEvent::new(self.next_timestamp(), phase, kind, identity, detail)
+            .map_err(Self::error)
+    }
+
+    fn frame_event(
+        &mut self,
+        operation: &ExecutionIdentityEnvelope,
+        kind: ExecutionEventKind,
+    ) -> std::result::Result<ExecutionEvent, ExecutionEventSinkError> {
+        let operation_parts = operation.parts();
+        let frame_id = operation_parts
+            .frame_id
+            .ok_or_else(|| Self::error("operation identity lacks frame id"))?;
+        let sequence = match kind {
+            ExecutionEventKind::FrameStarted => operation_parts.sequence.checked_sub(2),
+            ExecutionEventKind::FrameCompleted => operation_parts.sequence.checked_add(2),
+            _ => None,
+        }
+        .ok_or_else(|| Self::error("frame event sequence overflow"))?;
+        let frame_span =
+            SpanId::new(format!("{}/frame/{frame_id}", self.root_span)).map_err(Self::error)?;
+        let mut parts = self.bind_active(self.bind_plan(self.base_parts(
+            sequence,
+            frame_span,
+            Some(self.root_span.clone()),
+        )));
+        parts.frame_id = Some(frame_id);
+        self.event(
+            ExecutionPhase::Execution,
+            kind,
+            parts,
+            ExecutionEventDetail::None,
+        )
+    }
+
+    fn node_event(
+        &mut self,
+        operation: &ExecutionIdentityEnvelope,
+        kind: ExecutionEventKind,
+    ) -> std::result::Result<ExecutionEvent, ExecutionEventSinkError> {
+        let mut parts = operation.parts().clone();
+        let node_span = parts
+            .parent_span_id
+            .clone()
+            .ok_or_else(|| Self::error("operation identity lacks node span"))?;
+        let frame_id = parts
+            .frame_id
+            .ok_or_else(|| Self::error("operation identity lacks frame id"))?;
+        parts.sequence = match kind {
+            ExecutionEventKind::NodeStarted => parts.sequence.checked_sub(1),
+            ExecutionEventKind::NodeRetired => parts.sequence.checked_add(1),
+            _ => None,
+        }
+        .ok_or_else(|| Self::error("node event sequence overflow"))?;
+        parts.span_id = node_span;
+        parts.parent_span_id =
+            Some(SpanId::new(format!("{}/frame/{frame_id}", self.root_span)).map_err(Self::error)?);
+        self.event(
+            ExecutionPhase::Execution,
+            kind,
+            parts,
+            ExecutionEventDetail::None,
+        )
+    }
+
+    fn operation_event(
+        &mut self,
+        operation: &ExecutionIdentityEnvelope,
+    ) -> std::result::Result<ExecutionEvent, ExecutionEventSinkError> {
+        ExecutionEvent::new(
+            self.next_timestamp(),
+            ExecutionPhase::Execution,
+            ExecutionEventKind::OperationSubmitted,
+            operation.clone(),
+            ExecutionEventDetail::None,
+        )
+        .map_err(Self::error)
+    }
+
+    fn submitted(
+        &mut self,
+        submission: &SubmittedOperationReceipt,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        if self.pending_submission.is_some() {
+            return Err(Self::error(
+                "execution journal already has an in-flight physical submission",
+            ));
+        }
+        let selected = submission
+            .participants()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, participant)| {
+                let identity = participant.identity().parts();
+                (&identity.run_id == self.active.run_id()
+                    && &identity.request_id == self.active.request_id())
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let Some(&first_index) = selected.first() else {
+            return Err(Self::error(
+                "physical submission has no participant for this request journal",
+            ));
+        };
+        let first_identity = submission.participants()[first_index].identity();
+        let frame_started = self.frame_event(first_identity, ExecutionEventKind::FrameStarted)?;
+        self.emitter.emit(
+            &frame_started,
+            &TrustedExecutionEventContext::active(
+                self.active.run_id(),
+                self.active.request_id(),
+                &self.topology,
+                &self.active,
+            ),
+        )?;
+        let node_started = self.node_event(first_identity, ExecutionEventKind::NodeStarted)?;
+        self.emitter.emit(
+            &node_started,
+            &TrustedExecutionEventContext::active(
+                self.active.run_id(),
+                self.active.request_id(),
+                &self.topology,
+                &self.active,
+            ),
+        )?;
+        let operation_submitted = self.operation_event(first_identity)?;
+        self.emitter.emit(
+            &operation_submitted,
+            &TrustedExecutionEventContext::operation_submitted(
+                self.active.run_id(),
+                self.active.request_id(),
+                &self.topology,
+                &self.active,
+                submission,
+            ),
+        )?;
+        self.pending_submission = Some((submission.clone(), selected));
+        Ok(())
+    }
+
+    fn completed(
+        &mut self,
+        completion: &OperationCompletionReceipt,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        let (submission, selected) = self
+            .pending_submission
+            .take()
+            .ok_or_else(|| Self::error("completion has no journaled physical submission"))?;
+        if completion.submission().fingerprint() != submission.fingerprint() {
+            return Err(Self::error(
+                "completion differs from the journaled physical submission",
+            ));
+        }
+        for (position, participant_index) in selected.iter().copied().enumerate() {
+            let participant = completion
+                .participants()
+                .get(participant_index)
+                .ok_or_else(|| Self::error("completion participant index is missing"))?;
+            let identity = participant.submission().identity();
+            let retired = self.node_event(identity, ExecutionEventKind::NodeRetired)?;
+            self.emitter.emit(
+                &retired,
+                &TrustedExecutionEventContext::node_retired(
+                    self.active.run_id(),
+                    self.active.request_id(),
+                    &self.topology,
+                    &self.active,
+                    participant,
+                ),
+            )?;
+            if let Some(next_index) = selected.get(position + 1).copied() {
+                let next_identity = submission.participants()[next_index].identity();
+                let started = self.node_event(next_identity, ExecutionEventKind::NodeStarted)?;
+                self.emitter.emit(
+                    &started,
+                    &TrustedExecutionEventContext::active(
+                        self.active.run_id(),
+                        self.active.request_id(),
+                        &self.topology,
+                        &self.active,
+                    ),
+                )?;
+                let submitted = self.operation_event(next_identity)?;
+                self.emitter.emit(
+                    &submitted,
+                    &TrustedExecutionEventContext::operation_submitted(
+                        self.active.run_id(),
+                        self.active.request_id(),
+                        &self.topology,
+                        &self.active,
+                        &submission,
+                    ),
+                )?;
+            }
+        }
+        let last_index = *selected
+            .last()
+            .ok_or_else(|| Self::error("completion participant set is empty"))?;
+        let frame_completed = self.frame_event(
+            submission.participants()[last_index].identity(),
+            ExecutionEventKind::FrameCompleted,
+        )?;
+        self.emitter.emit(
+            &frame_completed,
+            &TrustedExecutionEventContext::active(
+                self.active.run_id(),
+                self.active.request_id(),
+                &self.topology,
+                &self.active,
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn complete_sequence(
+        &mut self,
+        receipt: &SequenceSessionTerminalReceipt,
+        input_tokens: u64,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        if self.pending_submission.is_some() {
+            return Err(Self::error(
+                "sequence completed with an in-flight journal submission",
+            ));
+        }
+        let completed =
+            TrustedCompletedSequenceBinding::from_session_receipt(receipt, &self.active)
+                .map_err(Self::error)?;
+        let sequence_number = self.emitter.cursor().last_sequence().saturating_add(1);
+        let sequence_span =
+            SpanId::new(format!("{}/sequence-completed", self.root_span)).map_err(Self::error)?;
+        let mut parts = self.bind_active(self.bind_plan(self.base_parts(
+            sequence_number,
+            sequence_span,
+            Some(self.root_span.clone()),
+        )));
+        parts.completed_sequence_fingerprint = Some(completed.fingerprint().to_owned());
+        let sequence_completed = self.event(
+            ExecutionPhase::Completion,
+            ExecutionEventKind::SequenceCompleted,
+            parts,
+            ExecutionEventDetail::None,
+        )?;
+        self.emitter.emit(
+            &sequence_completed,
+            &TrustedExecutionEventContext::completed(
+                self.active.run_id(),
+                self.active.request_id(),
+                &self.topology,
+                &self.active,
+                &completed,
+            ),
+        )?;
+        let request_sequence = self.emitter.cursor().last_sequence().saturating_add(1);
+        let mut parts = self.bind_active(self.bind_plan(self.base_parts(
+            request_sequence,
+            self.root_span.clone(),
+            None,
+        )));
+        parts.completed_sequence_fingerprint = Some(completed.fingerprint().to_owned());
+        let request_completed = self.event(
+            ExecutionPhase::Completion,
+            ExecutionEventKind::RequestCompleted,
+            parts,
+            ExecutionEventDetail::Counters {
+                input: input_tokens,
+                output: self.emitter.cursor().completed_frames(),
+            },
+        )?;
+        self.emitter.emit(
+            &request_completed,
+            &TrustedExecutionEventContext::completed(
+                self.active.run_id(),
+                self.active.request_id(),
+                &self.topology,
+                &self.active,
+                &completed,
+            ),
+        )
+    }
+}
+
 struct VNextSequence<R: DeviceRuntime> {
     cache_id: String,
     request_id: RequestId,
@@ -231,6 +664,8 @@ struct VNextSequence<R: DeviceRuntime> {
     maximum_tokens: usize,
     active: AtomicBool,
     operation: AsyncMutex<()>,
+    events: Option<Mutex<VNextExecutionJournal>>,
+    prompt_tokens: u64,
 }
 
 impl<R: DeviceRuntime> VNextSequence<R> {
@@ -238,7 +673,12 @@ impl<R: DeviceRuntime> VNextSequence<R> {
         if !self.active.swap(false, Ordering::AcqRel) {
             return;
         }
-        if self.session.try_complete().is_ok() {
+        if let Ok(receipt) = self.session.try_complete() {
+            if let Some(events) = &self.events {
+                let _ = events
+                    .lock()
+                    .complete_sequence(&receipt, self.prompt_tokens);
+            }
             return;
         }
         let _ = self.session.request_cancel();
@@ -400,6 +840,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     program_fingerprint: String,
     static_bytes: u64,
     sequences: Mutex<HashMap<String, Arc<VNextSequence<R>>>>,
+    event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
     metrics: VNextExecutorMetrics,
 }
 
@@ -580,6 +1021,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             program_fingerprint,
             static_bytes,
             sequences: Mutex::new(HashMap::new()),
+            event_sink: RwLock::new(None),
             metrics: VNextExecutorMetrics::default(),
         })
     }
@@ -801,6 +1243,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         sequence
             .open_session()
             .map_err(|error| FerrumError::backend(error.to_string()))
+    }
+
+    fn execution_journal(
+        &self,
+        session: &Arc<SequenceSession<R>>,
+    ) -> Result<Option<VNextExecutionJournal>> {
+        let Some(sink) = self.event_sink.read().clone() else {
+            return Ok(None);
+        };
+        let active = TrustedActiveSequenceBinding::from_session(session)
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
+        VNextExecutionJournal::open(sink, self.executable.execution_plan(), active)
+            .map(Some)
+            .map_err(|error| FerrumError::backend(format!("vNext execution journal: {error}")))
     }
 
     fn extend_sequence(
@@ -1147,18 +1603,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
     async fn execute_step(
         &self,
-        session: &Arc<SequenceSession<R>>,
+        sequence: &Arc<VNextSequence<R>>,
         tokens: &[u32],
         span: TokenSpanWork,
     ) -> Result<Vec<f32>> {
-        let batch = ExecutionBatchParticipants::new(vec![Arc::clone(session)])
+        let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&sequence.session)])
             .map_err(|error| FerrumError::backend(error.to_string()))?;
         let step = self.begin_step(&batch, &span)?;
         let wave = match self.prepare_wave(&step, &span) {
             Ok(wave) => wave,
             Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
         };
-        let dispatch = self.dispatch_wave(session, tokens, &span, wave);
+        let dispatch = self.dispatch_wave(&sequence.session, tokens, &span, wave);
         let completion = match dispatch {
             DispatchOutcome::Submitted(completion) => completion,
             DispatchOutcome::QuiescentFailure(message) => {
@@ -1209,6 +1665,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
             }
         };
+        let mut execution_event_error = sequence.events.as_ref().and_then(|events| {
+            events
+                .lock()
+                .submitted(completion.receipt())
+                .err()
+                .map(|error| error.to_string())
+        });
 
         let readback = CompletionReadbackRequest::new(
             self.io.output_node_id.clone(),
@@ -1235,6 +1698,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 ));
             }
         };
+        if execution_event_error.is_none() {
+            execution_event_error = sequence.events.as_ref().and_then(|events| {
+                events
+                    .lock()
+                    .completed(receipt.completion())
+                    .err()
+                    .map(|error| error.to_string())
+            });
+        }
         if !matches!(
             receipt.completion().disposition(),
             OperationCompletionDisposition::Succeeded
@@ -1270,7 +1742,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         match step.try_retire_normal() {
             Ok(_) => {
                 self.metrics.completed_waves.fetch_add(1, Ordering::Relaxed);
-                Ok(logits)
+                if let Some(error) = execution_event_error {
+                    let message = format!("vNext execution event emission failed: {error}");
+                    self.metrics.record_failure(message.clone());
+                    Err(FerrumError::backend(message))
+                } else {
+                    Ok(logits)
+                }
             }
             Err(failure) => {
                 let message = format!("vNext step retirement failed: {}", failure.error());
@@ -1396,6 +1874,10 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         Some(self.maximum_model_tokens)
     }
 
+    fn attach_execution_event_sink(&self, sink: Arc<dyn ExecutionEventSink>) {
+        *self.event_sink.write() = Some(sink);
+    }
+
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
         let started = Instant::now();
         if input.batch_size() != 1 {
@@ -1433,7 +1915,17 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
             .map_err(|error| FerrumError::backend(error.to_string()))?;
         let identity = RequestIdentity::new(format!("request.product.{request_id}"))
             .map_err(|error| FerrumError::internal(error.to_string()))?;
+        let prompt_tokens = u64::try_from(tokens.len())
+            .map_err(|_| FerrumError::request_validation("prompt token count exceeds u64"))?;
         let session = self.admit_sequence(identity, work)?;
+        let events = match self.execution_journal(&session) {
+            Ok(events) => events,
+            Err(error) => {
+                let _ = session.request_cancel();
+                let _ = session.try_abort();
+                return Err(error);
+            }
+        };
         let sequence = Arc::new(VNextSequence {
             cache_id: cache_id.clone(),
             request_id,
@@ -1442,8 +1934,10 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
             maximum_tokens,
             active: AtomicBool::new(true),
             operation: AsyncMutex::new(()),
+            events: events.map(Mutex::new),
+            prompt_tokens,
         });
-        let logits = match self.execute_step(&sequence.session, &tokens, span).await {
+        let logits = match self.execute_step(&sequence, &tokens, span).await {
             Ok(logits) => logits,
             Err(error) => {
                 sequence.abort();
@@ -1540,10 +2034,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         }
         let step_span = TokenSpanWork::from_token_ids(&tokens, previous_len..tokens.len())
             .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let logits = match self
-            .execute_step(&sequence.session, &tokens, step_span)
-            .await
-        {
+        let logits = match self.execute_step(&sequence, &tokens, step_span).await {
             Ok(logits) => logits,
             Err(error) => {
                 if DecodeFailureDisposition::from_error(&error)
