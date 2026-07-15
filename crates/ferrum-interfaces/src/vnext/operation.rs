@@ -1402,6 +1402,14 @@ impl OperationDescriptor {
                 reason: format!("operation `{}` has a zero provider major version", self.id),
             });
         }
+        if self.provider.minimum_version.major != self.version.major {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: format!(
+                    "operation `{}` version {} and provider minimum version {} have incompatible major versions",
+                    self.id, self.version, self.provider.minimum_version
+                ),
+            });
+        }
         Ok(())
     }
 

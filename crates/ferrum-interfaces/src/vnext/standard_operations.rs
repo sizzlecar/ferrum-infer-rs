@@ -144,7 +144,10 @@ pub fn last_token_dense_linear_contract() -> Result<StandardOperationContract, V
         ]))?,
         resources: no_auxiliary_resources(),
         oracle: f16_reference_tolerance()?,
-        provider: provider_requirement(LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID)?,
+        provider: provider_requirement(
+            LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
+            ContractVersion::new(1, 0),
+        )?,
         profile_phase: ProfilePhase::Forward,
     };
     descriptor.validate()?;
@@ -178,7 +181,7 @@ pub fn rms_norm_contract() -> Result<StandardOperationContract, VNextError> {
         ]))?,
         resources: no_auxiliary_resources(),
         oracle: f16_reference_tolerance()?,
-        provider: provider_requirement(RMS_NORM_F16_CAPABILITY_ID)?,
+        provider: provider_requirement(RMS_NORM_F16_CAPABILITY_ID, ContractVersion::new(1, 0))?,
         profile_phase: ProfilePhase::Forward,
     };
     descriptor.validate()?;
@@ -221,7 +224,7 @@ pub fn dense_linear_contract() -> Result<StandardOperationContract, VNextError> 
         ]))?,
         resources: no_auxiliary_resources(),
         oracle: f16_reference_tolerance()?,
-        provider: provider_requirement(DENSE_LINEAR_F16_CAPABILITY_ID)?,
+        provider: provider_requirement(DENSE_LINEAR_F16_CAPABILITY_ID, ContractVersion::new(1, 0))?,
         profile_phase: ProfilePhase::Forward,
     };
     descriptor.validate()?;
@@ -264,7 +267,7 @@ pub fn dense_swiglu_contract() -> Result<StandardOperationContract, VNextError> 
             persistent: ResourcePresenceRequirement::Forbidden,
         },
         oracle: f16_reference_tolerance()?,
-        provider: provider_requirement(DENSE_SWIGLU_F16_CAPABILITY_ID)?,
+        provider: provider_requirement(DENSE_SWIGLU_F16_CAPABILITY_ID, ContractVersion::new(1, 0))?,
         profile_phase: ProfilePhase::Forward,
     };
     descriptor.validate()?;
@@ -296,7 +299,7 @@ pub fn residual_add_contract() -> Result<StandardOperationContract, VNextError> 
         attributes: AttributeSchema::new(BTreeMap::from([unsigned_attribute("hidden_size")?]))?,
         resources: no_auxiliary_resources(),
         oracle: f16_reference_tolerance()?,
-        provider: provider_requirement(RESIDUAL_ADD_F16_CAPABILITY_ID)?,
+        provider: provider_requirement(RESIDUAL_ADD_F16_CAPABILITY_ID, ContractVersion::new(1, 0))?,
         profile_phase: ProfilePhase::Forward,
     };
     descriptor.validate()?;
@@ -402,7 +405,10 @@ pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationCon
         ]))?,
         resources: attention_resources(),
         oracle: f16_reference_tolerance()?,
-        provider: provider_requirement(GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID)?,
+        provider: provider_requirement(
+            GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+            ContractVersion::new(2, 0),
+        )?,
         profile_phase: ProfilePhase::Forward,
     };
     descriptor.validate()?;
@@ -488,7 +494,10 @@ pub fn causal_paged_attention_contract() -> Result<StandardOperationContract, VN
         ]))?,
         resources: attention_resources(),
         oracle: f16_reference_tolerance()?,
-        provider: provider_requirement(CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID)?,
+        provider: provider_requirement(
+            CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+            ContractVersion::new(2, 0),
+        )?,
         profile_phase: ProfilePhase::Forward,
     };
     descriptor.validate()?;
@@ -564,9 +573,12 @@ const fn exact(value: u64) -> DimensionConstraint {
     DimensionConstraint::Exact(value)
 }
 
-fn provider_requirement(capability: &str) -> Result<ProviderRequirement, VNextError> {
+fn provider_requirement(
+    capability: &str,
+    minimum_version: ContractVersion,
+) -> Result<ProviderRequirement, VNextError> {
     Ok(ProviderRequirement {
-        minimum_version: ContractVersion::new(1, 0),
+        minimum_version,
         required_capabilities: BTreeSet::from([CapabilityId::new(capability)?]),
     })
 }
@@ -730,6 +742,10 @@ mod tests {
         let full = causal_paged_attention_contract().unwrap();
         for contract in [&linear, &full] {
             let descriptor = contract.descriptor();
+            assert_eq!(
+                descriptor.provider.minimum_version,
+                ContractVersion::new(2, 0)
+            );
             assert_eq!(
                 descriptor.resources.scratch,
                 ResourcePresenceRequirement::Required
