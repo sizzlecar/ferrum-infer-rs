@@ -5,11 +5,12 @@ use super::{
     DeferredDeviceCleanupTask, DeviceRuntime, Digest, DynamicBackingDeferred, ExecutionFrameId,
     LogicalAdmissionCoordinatorId, LogicalAdmissionLease, LogicalBackingBufferView,
     LogicalBackingSliceAuthority, LogicalBackingSliceEvidence, LogicalRequestLease, ManuallyDrop,
-    Mutex, NonZeroU64, Ordering, ParticipantNodeKey, RequestAdmissionDecision, RequestAuthorityId,
-    RequestIdentity, RequestResourceAdmissionRequest, ResourceId, ResourceWorkShape, RunId,
-    SequenceAuthorityId, SequenceRecoveryRegistry, SequenceResourceAdmissionRequest, Serialize,
-    Sha256, StaticProvisioningLease, TrustedPlanRuntimeBinding, TrustedPlanRuntimeEvidence,
-    VNextError, Weak, SEQUENCE_DISPATCH_POISONED_BIT,
+    Mutex, NonZeroU64, Ordering, ParticipantNodeKey, PlanRuntimeResources,
+    RequestAdmissionDecision, RequestAuthorityId, RequestIdentity, RequestResourceAdmissionRequest,
+    ResourceId, ResourceWorkShape, RunId, SequenceAuthorityId, SequenceRecoveryRegistry,
+    SequenceResourceAdmissionRequest, Serialize, Sha256, StaticProvisioningLease,
+    TrustedPlanRuntimeBinding, TrustedPlanRuntimeEvidence, VNextError, Weak,
+    SEQUENCE_DISPATCH_POISONED_BIT,
 };
 
 pub(super) const fn sequence_slot_active(epoch: u64) -> u64 {
@@ -219,7 +220,7 @@ where
         self.plan.evidence()
     }
 
-    fn backing_view(
+    pub(super) fn backing_view(
         &self,
         resource_id: &ResourceId,
     ) -> Result<LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
@@ -748,6 +749,84 @@ pub(super) enum SequenceExecutionAuthoritySource {
     FailClosed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct SequenceBackingGeneration(NonZeroU64);
+
+impl SequenceBackingGeneration {
+    const INITIAL: Self = Self(NonZeroU64::MIN);
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Immutable sequence-lifetime backing captured by one scheduler step. Later
+/// generations may append capacity, while an in-flight step retains the exact
+/// generation it submitted until its completion ownership is released.
+#[must_use = "a sequence backing snapshot owns its exact physical extents"]
+pub struct SequenceBackingSnapshot<R>
+where
+    R: DeviceRuntime,
+{
+    generation: SequenceBackingGeneration,
+    backing_slices: Vec<LogicalBackingSliceAuthority>,
+    work_shape: ResourceWorkShape,
+    // Declared last so exact backing extents are released before their device
+    // runtime and pool owner. A snapshot may outlive its sequence while an
+    // in-flight step retains an older generation through a fence.
+    _plan_resources: Arc<PlanRuntimeResources<R>>,
+}
+
+impl<R> SequenceBackingSnapshot<R>
+where
+    R: DeviceRuntime,
+{
+    fn initial(
+        backing_slices: Vec<LogicalBackingSliceAuthority>,
+        work_shape: ResourceWorkShape,
+        plan_resources: Arc<PlanRuntimeResources<R>>,
+    ) -> Result<Self, VNextError> {
+        if work_shape.immediate_sequences() != 1
+            || work_shape.fit_sequences() != 1
+            || backing_slices
+                .windows(2)
+                .any(|pair| pair[0].resource_id() >= pair[1].resource_id())
+        {
+            return Err(invalid_resource(
+                "initial sequence backing must be canonical and single-sequence",
+            ));
+        }
+        Ok(Self {
+            generation: SequenceBackingGeneration::INITIAL,
+            backing_slices,
+            work_shape,
+            _plan_resources: plan_resources,
+        })
+    }
+
+    pub const fn generation(&self) -> SequenceBackingGeneration {
+        self.generation
+    }
+
+    pub fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
+        &self.backing_slices
+    }
+
+    pub fn work_shape(&self) -> &ResourceWorkShape {
+        &self.work_shape
+    }
+
+    pub(super) fn backing_slice(
+        &self,
+        resource_id: &ResourceId,
+    ) -> Option<&LogicalBackingSliceAuthority> {
+        self.backing_slices
+            .binary_search_by(|slice| slice.resource_id().cmp(resource_id))
+            .ok()
+            .map(|index| &self.backing_slices[index])
+    }
+}
+
 /// Sequence authority. There is exactly one state cell for the exact
 /// `SequenceAuthorityId` issued by B1; no ceiling-sized slot vector and no
 /// caller-selected slot allocator exist here.
@@ -759,10 +838,9 @@ where
     // Recovery records own undrained raw streams. They must drop before the
     // backing slices and logical lease can make those resources reusable.
     pub(super) sequence_recovery: ManuallyDrop<Arc<SequenceRecoveryRegistry<R>>>,
-    backing_slices: ManuallyDrop<Vec<LogicalBackingSliceAuthority>>,
+    backing_snapshot: ManuallyDrop<Arc<SequenceBackingSnapshot<R>>>,
     pub(super) logical_lease: ManuallyDrop<LogicalAdmissionLease>,
     pub(super) request: ManuallyDrop<Arc<AdmittedRequestResources<R>>>,
-    work_shape: ResourceWorkShape,
     pub(super) authority_source: Mutex<SequenceExecutionAuthoritySource>,
     session_slot: Arc<SequenceSessionSlot>,
     pub(super) state: Arc<AtomicU64>,
@@ -775,7 +853,7 @@ where
     R: DeviceRuntime,
 {
     sequence_recovery: ManuallyDrop<Arc<SequenceRecoveryRegistry<R>>>,
-    backing_slices: ManuallyDrop<Vec<LogicalBackingSliceAuthority>>,
+    backing_snapshot: ManuallyDrop<Arc<SequenceBackingSnapshot<R>>>,
     logical_lease: ManuallyDrop<LogicalAdmissionLease>,
     request: ManuallyDrop<Arc<AdmittedRequestResources<R>>>,
     completed: bool,
@@ -802,7 +880,7 @@ where
         // them once, in dependency order.
         unsafe {
             ManuallyDrop::drop(&mut self.sequence_recovery);
-            ManuallyDrop::drop(&mut self.backing_slices);
+            ManuallyDrop::drop(&mut self.backing_snapshot);
             ManuallyDrop::drop(&mut self.logical_lease);
             ManuallyDrop::drop(&mut self.request);
         }
@@ -829,14 +907,18 @@ where
             ));
         }
         let plan_resources = Arc::clone(&request.plan.resources);
+        let backing_snapshot = Arc::new(SequenceBackingSnapshot::initial(
+            backing_slices,
+            work_shape,
+            Arc::clone(&plan_resources),
+        )?);
         Ok(Self {
             sequence_recovery: ManuallyDrop::new(Arc::new(SequenceRecoveryRegistry::new(
                 plan_resources,
             ))),
-            backing_slices: ManuallyDrop::new(backing_slices),
+            backing_snapshot: ManuallyDrop::new(backing_snapshot),
             logical_lease: ManuallyDrop::new(logical_lease),
             request: ManuallyDrop::new(request),
-            work_shape,
             authority_source: Mutex::new(SequenceExecutionAuthoritySource::Unselected),
             session_slot: Arc::new(SequenceSessionSlot::new()),
             state: Arc::new(AtomicU64::new(0)),
@@ -866,7 +948,11 @@ where
     }
 
     pub fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
-        &self.backing_slices
+        self.backing_snapshot.backing_slices()
+    }
+
+    pub(crate) fn backing_snapshot(&self) -> Arc<SequenceBackingSnapshot<R>> {
+        Arc::clone(&self.backing_snapshot)
     }
 
     pub fn request_resources(&self) -> &Arc<AdmittedRequestResources<R>> {
@@ -874,18 +960,14 @@ where
     }
 
     pub fn work_shape(&self) -> &ResourceWorkShape {
-        &self.work_shape
+        self.backing_snapshot.work_shape()
     }
 
     pub(crate) fn backing_view(
         &self,
         resource_id: &ResourceId,
     ) -> Result<LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
-        if let Some(authority) = self
-            .backing_slices
-            .iter()
-            .find(|authority| authority.resource_id() == resource_id)
-        {
+        if let Some(authority) = self.backing_snapshot.backing_slice(resource_id) {
             return self.request.plan.dynamic_pools().view(authority);
         }
         self.request.backing_view(resource_id)
@@ -1005,7 +1087,8 @@ where
             .map(LogicalBackingSliceAuthority::evidence)
             .collect();
         let sequence_backing = self
-            .backing_slices
+            .backing_snapshot
+            .backing_slices()
             .iter()
             .map(LogicalBackingSliceAuthority::evidence)
             .collect();
@@ -1081,7 +1164,9 @@ where
                     sequence_recovery: ManuallyDrop::new(ManuallyDrop::take(
                         &mut self.sequence_recovery,
                     )),
-                    backing_slices: ManuallyDrop::new(ManuallyDrop::take(&mut self.backing_slices)),
+                    backing_snapshot: ManuallyDrop::new(ManuallyDrop::take(
+                        &mut self.backing_snapshot,
+                    )),
                     logical_lease: ManuallyDrop::new(ManuallyDrop::take(&mut self.logical_lease)),
                     request: ManuallyDrop::new(ManuallyDrop::take(&mut self.request)),
                     completed: false,
@@ -1096,7 +1181,7 @@ where
         // teardown and performs no backend call.
         unsafe {
             ManuallyDrop::drop(&mut self.sequence_recovery);
-            ManuallyDrop::drop(&mut self.backing_slices);
+            ManuallyDrop::drop(&mut self.backing_snapshot);
             ManuallyDrop::drop(&mut self.logical_lease);
             ManuallyDrop::drop(&mut self.request);
         }

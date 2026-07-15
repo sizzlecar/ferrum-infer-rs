@@ -287,6 +287,46 @@ pub struct PlanNode {
 }
 
 impl PlanNode {
+    #[cfg(test)]
+    pub(crate) fn resource_test_node(id: NodeId) -> Self {
+        let provider_resources = ProviderResourcePlan {
+            provider_id: ProviderId::new("provider/resource-test").expect("valid provider id"),
+            estimator_id: "resource-test-estimator".to_owned(),
+            estimator_version: ContractVersion::new(1, 0),
+            estimator_implementation_fingerprint: "1".repeat(64),
+            estimator_input_fingerprint: "2".repeat(64),
+            estimate_fingerprint: "3".repeat(64),
+            value_alignment_bytes: 16,
+            scratch: None,
+            persistent: None,
+        };
+        let selected_provider = provider_resources.provider_id().clone();
+        Self {
+            id,
+            dependencies: Vec::new(),
+            operation_id: OperationId::new("operation/resource-test").expect("valid operation id"),
+            operation_version: ContractVersion::new(1, 0),
+            operation_fingerprint: "4".repeat(64),
+            provider_implementation_fingerprint: "5".repeat(64),
+            required_capabilities: BTreeSet::new(),
+            attributes: BTreeMap::new(),
+            work: super::NodeWorkContract::Fixed,
+            selection: super::ProviderSelection {
+                requested_provider: None,
+                selected_provider,
+                selection_reason: super::ProviderSelectionReason::DeterministicCompatible,
+                rejected_providers: Vec::new(),
+            },
+            provider_resources,
+            values: Vec::new(),
+            exact_aliases: Vec::new(),
+            state_effects: Vec::new(),
+            scratch_resource: None,
+            persistent_resource: None,
+            resources: Vec::new(),
+        }
+    }
+
     pub fn id(&self) -> &NodeId {
         &self.id
     }

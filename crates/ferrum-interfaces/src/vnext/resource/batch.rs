@@ -6,8 +6,8 @@ use super::{
     DynamicBackingDeferred, ExecutionFrameId, LogicalBackingSliceAuthority,
     LogicalBackingSliceEvidence, LogicalBatchCapacityLease, Mutex, NodeId, ParticipantFlightPhase,
     ParticipantNodeKey, PhysicalBackingClaimIdentity, RequestAuthorityId, SequenceAuthorityId,
-    SequenceSession, SequenceSessionEpoch, SequenceSessionFingerprint, SequenceSessionPhase,
-    SequenceSessionSlot, SequenceSessionSlotState, Serialize, Sha256,
+    SequenceBackingSnapshot, SequenceSession, SequenceSessionEpoch, SequenceSessionFingerprint,
+    SequenceSessionPhase, SequenceSessionSlot, SequenceSessionSlotState, Serialize, Sha256,
     StepParticipantFrameAssignment, TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError,
 };
 
@@ -518,6 +518,9 @@ where
     R: DeviceRuntime,
 {
     pub(super) frame: SessionFrameHold,
+    // Drop the independently retained backing before the session parent. The
+    // snapshot also owns a runtime keepalive for fence/reaper handoff.
+    pub(super) backing_snapshot: Arc<SequenceBackingSnapshot<R>>,
     pub(super) session: Arc<SequenceSession<R>>,
 }
 

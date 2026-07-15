@@ -529,6 +529,22 @@ fn harness(
     usable_capacity_bytes: u64,
     mismatched_coordinator: bool,
 ) -> Harness {
+    harness_with_nodes(
+        runtime,
+        catalog,
+        usable_capacity_bytes,
+        mismatched_coordinator,
+        Arc::from(Vec::<PlanNode>::new()),
+    )
+}
+
+fn harness_with_nodes(
+    runtime: Arc<TestRuntime>,
+    catalog: PoolCatalog,
+    usable_capacity_bytes: u64,
+    mismatched_coordinator: bool,
+    nodes: Arc<[PlanNode]>,
+) -> Harness {
     let generation = issue_generation().unwrap();
     let plan_id = PlanId::new(format!("plan/dynamic-pool-test/{generation}")).unwrap();
     let plan_hash: PlanHash = serde_json::from_value(json!("1".repeat(64))).unwrap();
@@ -598,7 +614,7 @@ fn harness(
             budget,
             logical_admission,
             domains,
-            Arc::from(Vec::<PlanNode>::new()),
+            nodes,
         )
         .unwrap(),
     );
@@ -1818,6 +1834,141 @@ fn request_token_backing_covers_nonzero_chunk_source_range() {
 
     drop(admitted);
     drop(binding);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn step_captures_the_exact_sequence_backing_snapshot() {
+    let catalog = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 256)
+        .unwrap();
+    let sequence = admitted_sequence(&harness.root, "sequence-backing-snapshot");
+    let admitted_snapshot = sequence.backing_snapshot();
+    assert_eq!(admitted_snapshot.generation().get(), 1);
+    assert_eq!(admitted_snapshot.backing_slices().len(), 1);
+    assert_eq!(admitted_snapshot.backing_slices()[0].size_bytes(), 64);
+
+    let session = sequence.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let request = StepResourceAdmissionRequest::new(
+        batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let step = match batch.try_begin_step(request).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("resident sequence snapshot step must admit"),
+    };
+    assert!(Arc::ptr_eq(
+        step.participant_backing_snapshot(BatchParticipantAuthority::new(
+            sequence.sequence_authority(),
+            sequence.request_authority(),
+        ))
+        .unwrap(),
+        &admitted_snapshot
+    ));
+
+    step.try_retire_normal().unwrap();
+    session.try_complete().unwrap();
+    drop(batch);
+    drop(session);
+    drop(sequence);
+    drop(admitted_snapshot);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn invocation_subset_maps_its_local_participant_to_the_step_snapshot() {
+    let catalog = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness_with_nodes(
+        runtime,
+        catalog,
+        256,
+        false,
+        Arc::from(vec![PlanNode::resource_test_node(
+            NodeId::new("node/dynamic-pool-test").unwrap(),
+        )]),
+    );
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 256)
+        .unwrap();
+    let first = admitted_sequence(&harness.root, "snapshot-subset-first");
+    let second = admitted_sequence(&harness.root, "snapshot-subset-second");
+    let first_session = first.open_session().unwrap();
+    let second_session = second.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![
+        Arc::clone(&second_session),
+        Arc::clone(&first_session),
+    ])
+    .unwrap();
+    let step_request = StepResourceAdmissionRequest::new(
+        batch
+            .bind_work_shape(vec![token_span(1), token_span(1)])
+            .unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let step = match batch.try_begin_step(step_request).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("resident two-participant step must admit"),
+    };
+
+    let selected = batch.sessions()[1].resources();
+    let selected_snapshot = selected.backing_snapshot();
+    let unselected_snapshot = batch.sessions()[0].resources().backing_snapshot();
+    let selected_authority =
+        BatchParticipantAuthority::new(selected.sequence_authority(), selected.request_authority());
+    let invocation_request = InvocationResourceAdmissionRequest::new(
+        NodeId::new("node/dynamic-pool-test").unwrap(),
+        step.bind_invocation_work_shape(vec![(selected_authority, token_span(1))])
+            .unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let invocation = match step.try_admit_invocation(invocation_request).unwrap() {
+        InvocationResourceAdmissionDecision::Admitted(invocation) => invocation,
+        _ => panic!("resident invocation subset must admit"),
+    };
+    let captured = invocation.participant_backing_snapshot(0).unwrap();
+    assert!(Arc::ptr_eq(captured, &selected_snapshot));
+    assert!(!Arc::ptr_eq(captured, &unselected_snapshot));
+
+    drop(invocation);
+    step.try_retire_normal().unwrap();
+    first_session.try_complete().unwrap();
+    second_session.try_complete().unwrap();
+    drop(batch);
+    drop(first_session);
+    drop(second_session);
+    drop(first);
+    drop(second);
+    drop(selected_snapshot);
+    drop(unselected_snapshot);
     close_dynamic_test_root(harness.root);
 }
 
