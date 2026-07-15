@@ -1,0 +1,65 @@
+{
+  "artifact_dir": "/private/tmp/runtime-vnext-s1-cuda-2ba8d624-20260716",
+  "binary": {
+    "path": null,
+    "sha256": null
+  },
+  "child_artifacts": {
+    "child_manifest": {
+      "path": "/private/tmp/runtime-vnext-s1-cuda-2ba8d624-20260716/manifest.json",
+      "sha256": "f4038db55f42ebd937e89de60ba9c52edab84a5f198226825cd3ffd114af327f"
+    },
+    "kind": "delegated-manifest"
+  },
+  "child_execution_artifacts": [
+    {
+      "path": "run_gate.child.command.json",
+      "sha256": "61cbe30c4c59168552a47cea4da3d67fe6094e765d7022e58b0352916cf79d34",
+      "size_bytes": 427
+    },
+    {
+      "path": "run_gate.child.stdout",
+      "sha256": "4c6693938db63222e6a985053c2c8795d3e69827b18b739d827a7c55e29082bb",
+      "size_bytes": 100
+    },
+    {
+      "path": "run_gate.child.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0
+    }
+  ],
+  "child_pass_line": "FERRUM RUNTIME VNEXT S1 CUDA BASIC SLICE PASS: /private/tmp/runtime-vnext-s1-cuda-2ba8d624-20260716",
+  "child_returncode": 0,
+  "command_line": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/run_gate.py",
+    "vnext-s1-cuda",
+    "--s1-artifact",
+    "/tmp/s1-vnext-local-validate/s1_cuda_trace_bounded_0a888b9f_20260715T155646Z",
+    "--out",
+    "/tmp/runtime-vnext-s1-cuda-2ba8d624-20260716"
+  ],
+  "delegated_command_line": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/runtime_vnext_s1_cuda_checkpoint.py",
+    "/private/tmp/s1-vnext-local-validate/s1_cuda_trace_bounded_0a888b9f_20260715T155646Z",
+    "--require-bounded-overhead",
+    "--out",
+    "/private/tmp/runtime-vnext-s1-cuda-2ba8d624-20260716"
+  ],
+  "dirty_status": {
+    "is_dirty": false,
+    "status_short": []
+  },
+  "duration_sec": 0.5833511250093579,
+  "error": null,
+  "finished_at": "2026-07-16T01:07:56.047398+08:00",
+  "git_sha": "2ba8d624cae954f5b52f07f0329ea46800167014",
+  "lane": "vnext-s1-cuda",
+  "model": null,
+  "pass_line": "FERRUM GATE vnext-s1-cuda PASS: /private/tmp/runtime-vnext-s1-cuda-2ba8d624-20260716",
+  "sanitized_env": {},
+  "schema_version": 1,
+  "started_at": "2026-07-16T01:07:55.463907+08:00",
+  "status": "pass"
+}
