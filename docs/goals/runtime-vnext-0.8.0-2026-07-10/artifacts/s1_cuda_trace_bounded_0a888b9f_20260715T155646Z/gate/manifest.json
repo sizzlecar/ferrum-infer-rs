@@ -1,0 +1,55 @@
+{
+  "acceptance": {
+    "bench_serve_correctness": true,
+    "bounded_basic_trace": true,
+    "profile_cv_lte_5pct": true,
+    "profile_mean_overhead_lte_2pct": true,
+    "profile_median_overhead_lte_2pct": true,
+    "run_correctness": true,
+    "serve_correctness": true,
+    "stream_correctness": true
+  },
+  "artifact_dir": "/private/tmp/runtime-vnext-s1-cuda-2ba8d624-20260716",
+  "artifact_type": "runtime_vnext_s1_cuda_basic_slice_manifest",
+  "backend": "cuda",
+  "binary_sha256": "1f7e6592138e275e6ab24fe899495245509b057ad072f6fc0ab334afe5191dfe",
+  "checkpoint_id": "S1-CUDA-basic",
+  "does_not_prove": [
+    "S1_milestone",
+    "G01B",
+    "G01",
+    "G06",
+    "full_model_migration",
+    "release"
+  ],
+  "entrypoints": [
+    "ferrum run",
+    "ferrum serve"
+  ],
+  "hardware": "NVIDIA GeForce RTX 4090, 24564 MiB, 580.119.02",
+  "lane": "runtime-vnext-s1-cuda",
+  "metrics": {
+    "basic_completed_requests": 48,
+    "basic_cv": 0.036063875829421284,
+    "failed_requests": 0,
+    "max_trace_bytes_per_request": 854077.3333333334,
+    "mean_overhead_fraction": -0.009412969726030477,
+    "median_overhead_fraction": -0.016779608038842365,
+    "off_completed_requests": 48,
+    "off_cv": 0.046399513033258497
+  },
+  "model_id": "Qwen/Qwen3.5-4B",
+  "pass_line": "FERRUM RUNTIME VNEXT S1 CUDA BASIC SLICE PASS: /private/tmp/runtime-vnext-s1-cuda-2ba8d624-20260716",
+  "raw_artifact_dir": "/private/tmp/s1-vnext-local-validate/s1_cuda_trace_bounded_0a888b9f_20260715T155646Z",
+  "schema_version": 1,
+  "source_git_sha": "0a888b9f21a7e2e540c3a11b3a12fcb08d688895",
+  "status": "pass",
+  "unlocks": [
+    "G01B"
+  ],
+  "validation": {
+    "path": "validation.json",
+    "sha256": "51b289b91ef72824d21dd70cfad80d9b50f29790f12ffafd0a0304d5ce26cb79",
+    "size_bytes": 40180
+  }
+}

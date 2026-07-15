@@ -1,0 +1,14 @@
+{
+  "cmd": [
+    "/opt/homebrew/opt/python@3.14/bin/python3.14",
+    "scripts/release/runtime_vnext_s1_cuda_checkpoint.py",
+    "/private/tmp/s1-vnext-local-validate/s1_cuda_trace_bounded_0a888b9f_20260715T155646Z",
+    "--require-bounded-overhead",
+    "--out",
+    "/private/tmp/runtime-vnext-s1-cuda-2ba8d624-20260716"
+  ],
+  "duration_sec": 0.5824157079914585,
+  "env_overrides": {
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}
