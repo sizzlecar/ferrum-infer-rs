@@ -1070,10 +1070,7 @@ where
                 })?
                 .total()
                 .get();
-            let missing = blocker
-                .requested()
-                .get()
-                .saturating_sub(current_total);
+            let missing = blocker.requested().get().saturating_sub(current_total);
             if missing == 0 {
                 continue;
             }

@@ -8,14 +8,14 @@ use std::sync::Arc;
 use super::{
     classify_device_error, AdmittedSequenceResources, AllocationLifetime, BatchInvocationId,
     BatchParticipantAuthority, BatchParticipantTokenRange, BatchStepId, BatchWorkShape,
-    BufferUsage, CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper,
-    ContractVersion, DefinitelyNotSubmittedRetryAuthority,
+    BufferDescriptor, BufferUsage, CanonicalRational, CapabilityId, CompletionHandle,
+    CompletionReaper, ContractVersion, DefinitelyNotSubmittedRetryAuthority,
     DefinitelyNotSubmittedWaveRetryAuthority, DeviceCommandBatch, DeviceId, DeviceRuntime,
-    ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane,
-    ExecutionLaneId, HostTransferLayout, IdentifiedFailure, IndeterminateSubmissionHandle,
-    InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId,
-    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, NodeInvocationId,
-    NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
+    DynamicResourceDemand, ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts,
+    ExecutionLane, ExecutionLaneId, HostTransferLayout, IdentifiedFailure,
+    IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
+    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId,
+    NodeInvocationId, NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
     PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
     ProviderWorkspaceRequirement, QuantizationFormatId, ResourceId, SemanticValue,
     SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint, SpanId,
@@ -34,6 +34,78 @@ fn invalid_operation(reason: impl Into<String>) -> VNextError {
     VNextError::InvalidExecutionPlan {
         reason: reason.into(),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueBindingPhysicalCoverage {
+    CanonicalComponent,
+    RuntimeTokenView,
+}
+
+fn validate_value_binding_physical_coverage(
+    work: &NodeWorkContract,
+    binding: &ResolvedValueBinding,
+    component: &ResolvedStorageComponent,
+    descriptor: &BufferDescriptor,
+    dynamic_demand: Option<&DynamicResourceDemand>,
+    value_alignment_bytes: u64,
+) -> Result<ValueBindingPhysicalCoverage, VNextError> {
+    let required_end = component
+        .offset_bytes()
+        .checked_add(component.length_bytes())
+        .ok_or_else(|| invalid_operation("bound component range overflows u64"))?;
+    if descriptor.usage != binding.usage()
+        || descriptor.element_type != component.element_type()
+        || descriptor.alignment_bytes < value_alignment_bytes
+        || descriptor.alignment_bytes % value_alignment_bytes != 0
+        || component.offset_bytes() % value_alignment_bytes != 0
+    {
+        return Err(invalid_operation(format!(
+            "resource `{}` differs from its value binding",
+            component.resource_id()
+        )));
+    }
+
+    let Some(projection) = work.token_projection(binding.role(), binding.ordinal()) else {
+        if required_end > descriptor.size_bytes {
+            return Err(invalid_operation(format!(
+                "resource `{}` differs from its value binding",
+                component.resource_id()
+            )));
+        }
+        return Ok(ValueBindingPhysicalCoverage::CanonicalComponent);
+    };
+
+    let axis = usize::try_from(projection.axis())
+        .map_err(|_| invalid_operation("token projection axis exceeds usize"))?;
+    let canonical_extent = projection.canonical_extent();
+    let bytes_per_token = component
+        .length_bytes()
+        .checked_div(canonical_extent)
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| invalid_operation("token projection has zero canonical extent"))?;
+    let demand_matches = matches!(
+        dynamic_demand,
+        Some(DynamicResourceDemand::Tokens {
+            bytes_per_token: planned_bytes_per_token,
+            ..
+        }) if *planned_bytes_per_token == bytes_per_token
+    );
+    if binding.usage() != BufferUsage::Activations
+        || component.offset_bytes() != 0
+        || component.length_bytes() % canonical_extent != 0
+        || usize::try_from(projection.rank()).ok() != Some(binding.tensor().dimensions().len())
+        || binding.tensor().dimensions().get(axis) != Some(&canonical_extent)
+        || !demand_matches
+        || descriptor.size_bytes < bytes_per_token
+    {
+        return Err(invalid_operation(format!(
+            "resource `{}` differs from its token-projected value binding",
+            component.resource_id()
+        )));
+    }
+
+    Ok(ValueBindingPhysicalCoverage::RuntimeTokenView)
 }
 
 fn canonical_sha256(value: &str) -> bool {
@@ -2635,6 +2707,88 @@ mod operation_buffer_region_tests {
     use super::*;
 
     #[test]
+    fn token_projection_validates_runtime_view_instead_of_canonical_extent() {
+        let resource_id = ResourceId::new("resource.activation.token-ids").unwrap();
+        let binding = ResolvedValueBinding::new(
+            ProgramValueId::new("value.input.token-ids").unwrap(),
+            ResolvedValueRole::Input,
+            0,
+            ResolvedTensorSpec::new(
+                vec![128],
+                ElementType::U32,
+                ResolvedTensorLayout::Contiguous,
+            )
+            .unwrap(),
+            TensorAccess::Read,
+            AliasPolicy::NoAlias,
+            BufferUsage::Activations,
+            ResolvedValueStorage::single(resource_id.clone(), 0, 512, ElementType::U32).unwrap(),
+        )
+        .unwrap();
+        let work: NodeWorkContract = serde_json::from_value(serde_json::json!({
+            "tokens": {
+                "source": {
+                    "value_id": "value.input.token-ids",
+                    "role": "input",
+                    "ordinal": 0,
+                    "axis": 0,
+                    "rank": 1,
+                    "canonical_extent": 128
+                },
+                "projections": [{
+                    "value_id": "value.input.token-ids",
+                    "role": "input",
+                    "ordinal": 0,
+                    "axis": 0,
+                    "rank": 1,
+                    "canonical_extent": 128
+                }]
+            }
+        }))
+        .unwrap();
+        let descriptor = BufferDescriptor {
+            resource_id,
+            size_bytes: 160,
+            alignment_bytes: 16,
+            usage: BufferUsage::Activations,
+            element_type: ElementType::U32,
+        };
+        let component = &binding.storage().components()[0];
+        let demand = DynamicResourceDemand::tokens(4, 128).unwrap();
+
+        assert_eq!(
+            validate_value_binding_physical_coverage(
+                &work,
+                &binding,
+                component,
+                &descriptor,
+                Some(&demand),
+                16,
+            )
+            .unwrap(),
+            ValueBindingPhysicalCoverage::RuntimeTokenView
+        );
+        assert!(validate_value_binding_physical_coverage(
+            &NodeWorkContract::Fixed,
+            &binding,
+            component,
+            &descriptor,
+            Some(&demand),
+            16,
+        )
+        .is_err());
+        assert!(validate_value_binding_physical_coverage(
+            &work,
+            &binding,
+            component,
+            &descriptor,
+            Some(&DynamicResourceDemand::tokens(8, 128).unwrap()),
+            16,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn paged_translation_uses_each_chunks_exact_buffer() {
         struct MockBinding<'a> {
             buffer: &'a u8,
@@ -3587,40 +3741,36 @@ impl<'a, B> OperationInvocation<'a, B> {
                 let descriptor = descriptors.get(component.resource_id()).ok_or_else(|| {
                     invalid_operation("value binding lacks a committed resource view")
                 })?;
-                let required_end = component
-                    .offset_bytes()
-                    .checked_add(component.length_bytes())
-                    .ok_or_else(|| invalid_operation("bound component range overflows u64"))?;
-                if required_end > descriptor.size_bytes
-                    || descriptor.usage != binding.usage()
-                    || descriptor.element_type != component.element_type()
-                    || descriptor.alignment_bytes < provider_resources.value_alignment_bytes()
-                    || descriptor.alignment_bytes % provider_resources.value_alignment_bytes() != 0
-                    || component.offset_bytes() % provider_resources.value_alignment_bytes() != 0
-                {
-                    return Err(invalid_operation(format!(
-                        "resource `{}` differs from its value binding",
-                        component.resource_id()
-                    )));
-                }
+                let coverage = validate_value_binding_physical_coverage(
+                    node.work(),
+                    binding,
+                    component,
+                    descriptor,
+                    dynamic_descriptors
+                        .get(component.resource_id())
+                        .map(|descriptor| descriptor.demand()),
+                    provider_resources.value_alignment_bytes(),
+                )?;
                 let view = views
                     .iter()
                     .find(|view| view.resource_id() == component.resource_id())
                     .ok_or_else(|| {
                         invalid_operation("value binding lacks a physical region translator")
                     })?;
-                let translated =
-                    view.translate(component.offset_bytes(), component.length_bytes())?;
-                let translated_bytes = translated.iter().try_fold(0_u64, |total, region| {
-                    total.checked_add(region.length_bytes()).ok_or_else(|| {
-                        invalid_operation("translated value-binding regions overflow u64")
-                    })
-                })?;
-                if translated_bytes != component.length_bytes() {
-                    return Err(invalid_operation(format!(
-                        "resource `{}` does not physically cover its value binding",
-                        component.resource_id()
-                    )));
+                if coverage == ValueBindingPhysicalCoverage::CanonicalComponent {
+                    let translated =
+                        view.translate(component.offset_bytes(), component.length_bytes())?;
+                    let translated_bytes = translated.iter().try_fold(0_u64, |total, region| {
+                        total.checked_add(region.length_bytes()).ok_or_else(|| {
+                            invalid_operation("translated value-binding regions overflow u64")
+                        })
+                    })?;
+                    if translated_bytes != component.length_bytes() {
+                        return Err(invalid_operation(format!(
+                            "resource `{}` does not physically cover its value binding",
+                            component.resource_id()
+                        )));
+                    }
                 }
             }
         }
