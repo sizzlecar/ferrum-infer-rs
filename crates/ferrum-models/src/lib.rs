@@ -49,7 +49,7 @@ pub use common::{DecoderOnlyLLM, LlmRuntimeConfig};
 pub use definition::{ConfigManager, ModelDefinition};
 pub use executor::{
     BertModelExecutor, ClipModelExecutor, LlmExecutor, Qwen35W3Executor, StubModelExecutor,
-    TtsModelExecutor, WhisperModelExecutor,
+    TtsModelExecutor, VNextExecutorConfig, VNextModelExecutor, WhisperModelExecutor,
 };
 pub use hf_download::HfDownloader;
 pub use image_processor::ClipImageProcessor;
