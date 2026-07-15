@@ -533,6 +533,28 @@ G00P。G07A 在 S1 后与 S2/S3 并行，G07B 仍消费已被真实 provider 使
 CUDA 优先顺序：Qwen3.5-4B -> Qwen3.5-35B-A3B -> Qwen3-30B-A3B。Metal 在每个模型
 CUDA contract 稳定后开始，但不得把三个 Metal lane 全部拖到发布前一次性补做。
 
+S1 CUDA 基础纵切的 production evidence 通过统一 gate 固化：
+
+```text
+python3 scripts/release/run_gate.py vnext-s1-cuda \
+  --s1-artifact <qwen35-4b-cuda-raw-artifact> \
+  --out <external-out>
+```
+
+child validator 必须从原始 `run`、`serve`、stream、`bench-serve`、scheduler trace 和 ABBA-BAAB
+样本重新计算结果，不能信任手工摘要。要求 basic trace 每请求只捕获一个完整 execution frame、operation
+identity 完整、terminal token 与 usage 对账、trace `<=1 MiB/request`，并在同一 RTX 4090 上满足均值和
+中位数开销均 `<=2%`、两组样本 CV 均 `<=5%`。精确 PASS 行为：
+
+```text
+FERRUM RUNTIME VNEXT S1 CUDA BASIC SLICE PASS: <out_dir>
+FERRUM GATE vnext-s1-cuda PASS: <out_dir>
+```
+
+该 checkpoint 只解锁 G01B 的 production-reference 重构；它不证明 S1 里程碑、G01B、aggregate
+G01、full G06、完整模型迁移或发布完成。S1 仍须由 G01B 中的共享动态 admission/backpressure 和
+零 legacy runtime fallback 证据闭环。
+
 ## 12. 分支、提交和停止规则
 
 - 每个子 Goal 使用小而可审阅的提交；核心 contract、kernel 优化、release gate 大改不得混在
