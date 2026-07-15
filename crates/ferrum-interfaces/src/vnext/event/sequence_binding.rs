@@ -198,7 +198,7 @@ impl TrustedActiveSequenceBinding {
         )
     }
 
-    pub(super) fn ensure_open_for_emission(&self) -> Result<(), VNextError> {
+    pub(crate) fn ensure_open_for_emission(&self) -> Result<(), VNextError> {
         match &self.authority {
             TrustedActiveSequenceAuthority::StreamActivation => Err(invalid_event(
                 "node execution emission requires typed sequence-session authority",

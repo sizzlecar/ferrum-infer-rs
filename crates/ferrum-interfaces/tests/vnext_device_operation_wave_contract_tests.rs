@@ -56,29 +56,17 @@ fn setup() -> (
     (fixture, sequence, session, batch, step)
 }
 
-fn wave_identity_inputs(
-    plan: &ExecutionPlan,
+fn wave_active_bindings(
     wave: &PreparedStepSubmissionWave<TestRuntime>,
     session: &Arc<SequenceSession<TestRuntime>>,
-) -> (
-    Vec<Vec<ExecutionIdentityEnvelope>>,
-    Vec<Vec<TrustedActiveSequenceBinding>>,
-) {
+) -> Vec<Vec<TrustedActiveSequenceBinding>> {
     let active = TrustedActiveSequenceBinding::from_session(session).unwrap();
-    let mut identities = Vec::with_capacity(wave.node_count());
     let mut active_bindings = Vec::with_capacity(wave.node_count());
-    for (node_index, node) in wave.nodes().iter().enumerate() {
+    for node in wave.nodes() {
         assert_eq!(node.participant_frames().len(), 1);
-        identities.push(vec![operation_identity_for_node(
-            plan,
-            node_index,
-            &active,
-            node.participant_frames()[0].frame_id(),
-            NodeInvocationId::try_from(u64::try_from(node_index).unwrap() + 1).unwrap(),
-        )]);
         active_bindings.push(vec![active.clone()]);
     }
-    (identities, active_bindings)
+    active_bindings
 }
 
 fn teardown(
@@ -173,7 +161,7 @@ fn wrong_wave_topology_rejects_before_legal_wave_can_prepare() {
 fn all_plan_nodes_encode_into_one_submission_and_one_completion() {
     let (fixture, sequence, session, batch, step) = setup();
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
-    let (identities, active_bindings) = wave_identity_inputs(&fixture.plan, &wave, &session);
+    let active_bindings = wave_active_bindings(&wave, &session);
     let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
     let reaper = CompletionReaper::new();
     let providers = fixture
@@ -185,7 +173,6 @@ fn all_plan_nodes_encode_into_one_submission_and_one_completion() {
         .collect::<Vec<_>>();
     let batch_identity = OperationDispatch::bind_submission_wave_identity(
         &fixture.resolved,
-        identities,
         &active_bindings,
         &wave,
         &lane,
@@ -193,6 +180,21 @@ fn all_plan_nodes_encode_into_one_submission_and_one_completion() {
     .unwrap();
     assert_eq!(batch_identity.nodes().len(), 2);
     assert_eq!(batch_identity.participants().len(), 2);
+    let first = batch_identity.nodes()[0].participants()[0]
+        .identity()
+        .parts();
+    let second = batch_identity.nodes()[1].participants()[0]
+        .identity()
+        .parts();
+    assert_eq!(first.sequence, 5);
+    assert_eq!(first.node_invocation_id.unwrap().get(), 1);
+    assert!(first.span_id.as_str().ends_with("/operation"));
+    assert_eq!(
+        first.parent_span_id.as_ref().unwrap().as_str(),
+        &first.span_id.as_str()[..first.span_id.as_str().len() - "/operation".len()]
+    );
+    assert_eq!(second.sequence, 8);
+    assert_eq!(second.node_invocation_id.unwrap().get(), 2);
 
     let handle = OperationDispatch::encode_and_submit_wave(
         &providers,
@@ -233,7 +235,7 @@ fn all_plan_nodes_encode_into_one_submission_and_one_completion() {
 fn typed_input_upload_precedes_the_plan_in_one_submission() {
     let (fixture, sequence, session, batch, step) = setup();
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
-    let (identities, active_bindings) = wave_identity_inputs(&fixture.plan, &wave, &session);
+    let active_bindings = wave_active_bindings(&wave, &session);
     let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
     let reaper = CompletionReaper::new();
     let providers = fixture
@@ -245,7 +247,6 @@ fn typed_input_upload_precedes_the_plan_in_one_submission() {
         .collect::<Vec<_>>();
     let batch_identity = OperationDispatch::bind_submission_wave_identity(
         &fixture.resolved,
-        identities,
         &active_bindings,
         &wave,
         &lane,
@@ -301,7 +302,7 @@ fn terminal_wave_reads_output_before_releasing_backing() {
     )
     .unwrap();
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
-    let (identities, active_bindings) = wave_identity_inputs(&fixture.plan, &wave, &session);
+    let active_bindings = wave_active_bindings(&wave, &session);
     let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
     let reaper = CompletionReaper::new();
     let providers = fixture
@@ -313,7 +314,6 @@ fn terminal_wave_reads_output_before_releasing_backing() {
         .collect::<Vec<_>>();
     let batch_identity = OperationDispatch::bind_submission_wave_identity(
         &executable,
-        identities,
         &active_bindings,
         &wave,
         &lane,
@@ -377,7 +377,7 @@ fn definitely_not_submitted_retries_the_same_whole_wave() {
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
     let first_attempt = wave.batch_invocation_id();
     let topology_fingerprint = wave.fingerprint().to_owned();
-    let (identities, active_bindings) = wave_identity_inputs(&fixture.plan, &wave, &session);
+    let active_bindings = wave_active_bindings(&wave, &session);
     let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
     let reaper = CompletionReaper::new();
     let providers = fixture
@@ -390,7 +390,6 @@ fn definitely_not_submitted_retries_the_same_whole_wave() {
     fixture.runtime_trace.lock().unwrap().submit_behavior = SubmitBehavior::DefinitelyNotSubmitted;
     let first_identity = OperationDispatch::bind_submission_wave_identity(
         &fixture.resolved,
-        identities.clone(),
         &active_bindings,
         &wave,
         &lane,
@@ -422,12 +421,12 @@ fn definitely_not_submitted_retries_the_same_whole_wave() {
     fixture.runtime_trace.lock().unwrap().submit_behavior = SubmitBehavior::Success;
     let retry_identity = OperationDispatch::bind_submission_wave_identity(
         &fixture.resolved,
-        identities,
         &active_bindings,
         &retry_wave,
         &lane,
     )
     .unwrap();
+    assert_eq!(first_identity.nodes(), retry_identity.nodes());
     let handle = OperationDispatch::encode_and_submit_wave(
         &providers,
         &fixture.resolved,

@@ -11,16 +11,17 @@ use super::{
     BufferUsage, CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper,
     ContractVersion, DefinitelyNotSubmittedRetryAuthority,
     DefinitelyNotSubmittedWaveRetryAuthority, DeviceCommandBatch, DeviceId, DeviceRuntime,
-    ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionLane, ExecutionLaneId,
-    HostTransferLayout, IdentifiedFailure, IndeterminateSubmissionHandle, InvocationResourceLease,
-    LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId, LogicalBackingBufferView,
-    LogicalBackingSegmentBinding, NodeId, NodeWorkContract, OperationId, ParticipantNodeKey,
-    PlanHash, PlanId, PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId,
-    ProviderId, ProviderWorkspaceRequirement, QuantizationFormatId, ResourceId, SemanticValue,
-    SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint,
+    ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane,
+    ExecutionLaneId, HostTransferLayout, IdentifiedFailure, IndeterminateSubmissionHandle,
+    InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId,
+    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, NodeInvocationId,
+    NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
+    PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
+    ProviderWorkspaceRequirement, QuantizationFormatId, ResourceId, SemanticValue,
+    SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint, SpanId,
     StepParticipantFrameAssignment, StepResourceLease, TrustedActiveSequenceBinding,
     TrustedPlanRuntimeEvidence, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
-    WeightId,
+    WeightId, EXECUTION_IDENTITY_VERSION,
 };
 
 pub const MAX_OPERATION_CATALOG_ROWS: usize = 4096;
@@ -4116,6 +4117,89 @@ where
 pub struct OperationDispatch;
 
 impl OperationDispatch {
+    fn trusted_submission_node_identity(
+        resolved: &dyn ExecutablePlanView,
+        active: &TrustedActiveSequenceBinding,
+        frame: StepParticipantFrameAssignment,
+        node_index: usize,
+    ) -> Result<ExecutionIdentityEnvelope, VNextError> {
+        active.ensure_open_for_emission()?;
+        let plan = resolved.execution_plan();
+        let node_count = u64::try_from(plan.payload().nodes().len())
+            .map_err(|_| invalid_operation("immutable plan node count exceeds u64"))?;
+        let node_index = u64::try_from(node_index)
+            .map_err(|_| invalid_operation("submission wave node index exceeds u64"))?;
+        let node = plan
+            .payload()
+            .nodes()
+            .get(node_index as usize)
+            .ok_or_else(|| invalid_operation("submission wave node index is out of bounds"))?;
+        let completed_frames = frame.frame_id().get() - 1;
+        let node_invocation = completed_frames
+            .checked_mul(node_count)
+            .and_then(|value| value.checked_add(node_index))
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| invalid_operation("node invocation id space is exhausted"))?;
+        let node_invocation_id = NodeInvocationId::try_from(node_invocation)?;
+
+        // RequestAccepted and PlanBuilt consume the first two journal rows.
+        // Every immutable-plan frame then emits FrameStarted, three rows per
+        // node, and FrameCompleted. This operation identity is therefore the
+        // exact future OperationSubmitted row and remains stable across a
+        // definitely-not-submitted retry of the same frame.
+        let events_per_frame = node_count
+            .checked_mul(3)
+            .and_then(|value| value.checked_add(2))
+            .ok_or_else(|| invalid_operation("execution event sequence space is exhausted"))?;
+        let sequence = completed_frames
+            .checked_mul(events_per_frame)
+            .and_then(|value| value.checked_add(node_index.checked_mul(3)?))
+            .and_then(|value| value.checked_add(5))
+            .ok_or_else(|| invalid_operation("execution event sequence space is exhausted"))?;
+
+        let span_root = format!("vnext/request/{}", active.fingerprint());
+        let node_span = SpanId::new(format!(
+            "{span_root}/frame/{}/node/{node_invocation}",
+            frame.frame_id()
+        ))?;
+        let operation_span = SpanId::new(format!("{node_span}/operation"))?;
+        let provisioning = active.static_provisioning_identity();
+        ExecutionIdentityEnvelope::new(ExecutionIdentityParts {
+            version: EXECUTION_IDENTITY_VERSION,
+            run_id: active.run_id().clone(),
+            request_id: active.request_id().clone(),
+            sequence,
+            plan_id: Some(plan.payload().plan_id().clone()),
+            plan_hash: Some(plan.plan_hash().clone()),
+            frame_id: Some(frame.frame_id()),
+            node_invocation_id: Some(node_invocation_id),
+            node_id: Some(node.id().clone()),
+            operation_id: Some(node.operation_id().clone()),
+            provider_id: Some(node.selection().selected_provider().clone()),
+            device_id: Some(plan.payload().device_id().clone()),
+            resource_pool_id: active.static_pool_id(),
+            resource_pool_identity_fingerprint: active.static_pool_identity_fingerprint(),
+            provisioning_run_id: provisioning.map(|identity| identity.run_id().clone()),
+            provisioning_request_id: provisioning.map(|identity| identity.request_id().clone()),
+            transaction_id: provisioning.map(|identity| identity.transaction_id().clone()),
+            active_sequence_slot: Some(active.sequence_authority().sparse_id()),
+            admission_generation: Some(active.sequence_authority().generation()),
+            activation_epoch: Some(active.activation_epoch()),
+            runtime_implementation_fingerprint: Some(
+                active.runtime_implementation_fingerprint().to_owned(),
+            ),
+            active_sequence_fingerprint: Some(active.fingerprint().to_owned()),
+            completed_sequence_fingerprint: None,
+            aborted_sequence_fingerprint: None,
+            resource_id: None,
+            resource_generation: None,
+            resource_batch_fingerprint: None,
+            span_id: operation_span,
+            parent_span_id: Some(node_span),
+            async_links: Vec::new(),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn bind_node_identity<R>(
         resolved: &dyn ExecutablePlanView,
@@ -4271,7 +4355,7 @@ impl OperationDispatch {
         )
     }
 
-    pub fn bind_submission_wave_identity<R>(
+    fn bind_submission_wave_identity_from_envelopes<R>(
         resolved: &dyn ExecutablePlanView,
         participant_identities: Vec<Vec<ExecutionIdentityEnvelope>>,
         active_bindings: &[Vec<TrustedActiveSequenceBinding>],
@@ -4339,6 +4423,58 @@ impl OperationDispatch {
             lane.id(),
             wave.fingerprint().to_owned(),
             nodes,
+        )
+    }
+
+    /// Binds one immutable-plan submission wave without accepting caller-made
+    /// execution envelopes. Frame, node, provider, provisioning, span, and
+    /// invocation identities are minted from core-owned plan/session evidence.
+    pub fn bind_submission_wave_identity<R>(
+        resolved: &dyn ExecutablePlanView,
+        active_bindings: &[Vec<TrustedActiveSequenceBinding>],
+        wave: &PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+    ) -> Result<BatchOperationIdentity, VNextError>
+    where
+        R: DeviceRuntime,
+    {
+        if active_bindings.len() != wave.nodes().len() {
+            return Err(invalid_operation(
+                "submission wave active bindings must cover every immutable plan node",
+            ));
+        }
+        let participant_identities = wave
+            .nodes()
+            .iter()
+            .zip(active_bindings)
+            .enumerate()
+            .map(|(node_index, (node, bindings))| {
+                if bindings.len() != node.participant_frames().len() {
+                    return Err(invalid_operation(format!(
+                        "submission wave node {node_index} active binding count differs from its participant frames"
+                    )));
+                }
+                node.participant_frames()
+                    .iter()
+                    .copied()
+                    .zip(bindings)
+                    .map(|(frame, active)| {
+                        Self::trusted_submission_node_identity(
+                            resolved,
+                            active,
+                            frame,
+                            node_index,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::bind_submission_wave_identity_from_envelopes(
+            resolved,
+            participant_identities,
+            active_bindings,
+            wave,
+            lane,
         )
     }
 
