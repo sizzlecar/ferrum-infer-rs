@@ -10,8 +10,9 @@
 //! - Preemption support for long-running requests
 
 use crate::vnext::{
-    AdmissionProbeOutcome, AdmissionQueueEvent, AdmissionTickReceipt, AdmissionWakeEpochs,
-    DynamicAdmissionQueue, DynamicAdmissionQueuePolicy, WaitingAdmissionTicket,
+    AdmissionDeferral, AdmissionProbeOutcome, AdmissionQueueEvent, AdmissionTickReceipt,
+    AdmissionWakeEpochs, DynamicAdmissionQueue, DynamicAdmissionQueuePolicy,
+    WaitingAdmissionTicket,
 };
 use crate::{
     BatchHint, BatchPlan, BatchResourceRequirements, PreemptionResult, PreemptionState,
@@ -163,6 +164,16 @@ impl ContinuousBatchRequest {
 pub type ExecutorAdmissionProbeOutcome =
     AdmissionProbeOutcome<ExecutorPrefillAdmissionReceipt, AdmissionRejected, FerrumError>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutorAdmissionQueueObservation {
+    SkippedUnchanged {
+        request_id: RequestId,
+        ticket: u64,
+        deferral: AdmissionDeferral,
+        current: AdmissionWakeEpochs,
+    },
+}
+
 type ExecutorAdmissionQueueEvent = AdmissionQueueEvent<
     ContinuousBatchRequest,
     ExecutorPrefillAdmissionReceipt,
@@ -175,6 +186,7 @@ enum WaitingAdmissionMode<'a> {
     Dynamic {
         wake: AdmissionWakeEpochs,
         probe: &'a mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
+        observer: Option<&'a mut dyn FnMut(ExecutorAdmissionQueueObservation)>,
     },
 }
 
@@ -638,17 +650,28 @@ impl ContinuousBatchScheduler {
         wake: AdmissionWakeEpochs,
         maximum_admissions: usize,
         probe: &mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
+        mut observer: Option<&mut dyn FnMut(ExecutorAdmissionQueueObservation)>,
     ) -> Result<AdmissionTickReceipt> {
         self.dynamic_admission_ticks.fetch_add(1, Ordering::Relaxed);
         let mut waiting = self.waiting_queue.write();
         let maximum_probes = waiting.len();
         let mut events = self.dynamic_admission_events.lock();
         let receipt = waiting
-            .schedule_into(
+            .schedule_into_observed(
                 wake,
                 maximum_probes,
                 maximum_admissions,
                 &mut events,
+                |request, ticket, deferral| {
+                    if let Some(observer) = observer.as_deref_mut() {
+                        observer(ExecutorAdmissionQueueObservation::SkippedUnchanged {
+                            request_id: request.inner.request.id.clone(),
+                            ticket: ticket.get(),
+                            deferral,
+                            current: wake,
+                        });
+                    }
+                },
                 |request| probe(&request.inner.request),
             )
             .map_err(|error| FerrumError::scheduler(error.to_string()))?;
@@ -715,7 +738,28 @@ impl ContinuousBatchScheduler {
     ) -> Result<Option<BatchPlan>> {
         self.create_iteration_batch_with_admission(
             hint,
-            WaitingAdmissionMode::Dynamic { wake, probe },
+            WaitingAdmissionMode::Dynamic {
+                wake,
+                probe,
+                observer: None,
+            },
+        )
+    }
+
+    pub fn next_batch_with_dynamic_admission_observed(
+        &self,
+        hint: BatchHint,
+        wake: AdmissionWakeEpochs,
+        probe: &mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
+        observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
+    ) -> Result<Option<BatchPlan>> {
+        self.create_iteration_batch_with_admission(
+            hint,
+            WaitingAdmissionMode::Dynamic {
+                wake,
+                probe,
+                observer: Some(observer),
+            },
         )
     }
 
@@ -1680,8 +1724,12 @@ impl ContinuousBatchScheduler {
                     self.promote_to_prefill_with_empty_retry(&req_id, empty_retry_epoch);
                 }
             }
-            WaitingAdmissionMode::Dynamic { wake, probe } => {
-                self.admit_waiting_dynamically(wake, available_slots, probe)?;
+            WaitingAdmissionMode::Dynamic {
+                wake,
+                probe,
+                observer,
+            } => {
+                self.admit_waiting_dynamically(wake, available_slots, probe, observer)?;
             }
         }
 
@@ -2395,13 +2443,30 @@ mod tests {
                 request_id: request.id.clone(),
             })
         };
+        let mut observations = Vec::new();
         let unchanged = scheduler
-            .next_batch_with_dynamic_admission(BatchHint::simple(2), wake0, &mut unchanged_probe)
+            .next_batch_with_dynamic_admission_observed(
+                BatchHint::simple(2),
+                wake0,
+                &mut unchanged_probe,
+                &mut |observation| observations.push(observation),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(unchanged_probe_count, 0);
         assert_eq!(unchanged.requests.len(), 1);
         assert_eq!(unchanged.requests[0].request.id, small_id);
+        assert!(matches!(
+            observations.as_slice(),
+            [ExecutorAdmissionQueueObservation::SkippedUnchanged {
+                request_id,
+                deferral,
+                current,
+                ..
+            }] if request_id == &large_id
+                && deferral.observed() == wake0
+                && *current == wake0
+        ));
 
         let wake1 = AdmissionWakeEpochs::new(NonZeroU64::new(19).unwrap(), 1, 0, 0);
         let mut released_probe_count = 0;

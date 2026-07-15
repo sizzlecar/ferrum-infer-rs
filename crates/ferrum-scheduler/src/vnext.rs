@@ -438,6 +438,28 @@ impl<T> DynamicAdmissionQueue<T> {
         maximum_probes: usize,
         maximum_admissions: usize,
         events: &mut Vec<AdmissionQueueEvent<T, A, R, E>>,
+        probe: impl FnMut(&mut T) -> AdmissionProbeOutcome<A, R, E>,
+    ) -> Result<AdmissionTickReceipt, DynamicAdmissionQueueError> {
+        self.schedule_into_observed(
+            wake,
+            maximum_probes,
+            maximum_admissions,
+            events,
+            |_, _, _| {},
+            probe,
+        )
+    }
+
+    /// Variant of [`Self::schedule_into`] that exposes unchanged-epoch skips
+    /// without moving or cloning the queued request. The observer must remain
+    /// non-blocking because it runs while this queue is exclusively borrowed.
+    pub fn schedule_into_observed<A, R, E>(
+        &mut self,
+        wake: AdmissionWakeEpochs,
+        maximum_probes: usize,
+        maximum_admissions: usize,
+        events: &mut Vec<AdmissionQueueEvent<T, A, R, E>>,
+        mut observe_skipped_unchanged: impl FnMut(&T, WaitingAdmissionTicket, AdmissionDeferral),
         mut probe: impl FnMut(&mut T) -> AdmissionProbeOutcome<A, R, E>,
     ) -> Result<AdmissionTickReceipt, DynamicAdmissionQueueError> {
         events.clear();
@@ -487,6 +509,7 @@ impl<T> DynamicAdmissionQueue<T> {
                 }
                 if !wake.changed_since(deferral.observed) {
                     receipt.skipped_unchanged += 1;
+                    observe_skipped_unchanged(&entry.request, entry.ticket, deferral);
                     if aged {
                         receipt.fairness_barrier = Some(entry.ticket);
                         admission_closed = true;
@@ -626,15 +649,26 @@ mod tests {
             })
             .unwrap();
         let mut probes = 0;
+        let mut skipped = Vec::new();
         let receipt = queue
-            .schedule_into(wake(3, 4, 0), 1, 1, &mut events, |_| {
-                probes += 1;
-                AdmissionProbeOutcome::<(), (), ()>::Admitted(())
-            })
+            .schedule_into_observed(
+                wake(3, 4, 0),
+                1,
+                1,
+                &mut events,
+                |request, ticket, deferral| skipped.push((*request, ticket, deferral)),
+                |_| {
+                    probes += 1;
+                    AdmissionProbeOutcome::<(), (), ()>::Admitted(())
+                },
+            )
             .unwrap();
 
         assert_eq!(probes, 0);
         assert_eq!(receipt.skipped_unchanged(), 1);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].0, 1);
+        assert_eq!(skipped[0].2.observed(), wake(3, 4, 0));
         assert_eq!(queue.len(), 1);
     }
 

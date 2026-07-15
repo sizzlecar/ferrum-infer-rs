@@ -520,6 +520,54 @@ impl EngineInner {
         );
     }
 
+    fn trace_executor_admission_queue_observation(
+        &self,
+        observation: ExecutorAdmissionQueueObservation,
+    ) {
+        let ExecutorAdmissionQueueObservation::SkippedUnchanged {
+            request_id,
+            ticket,
+            deferral,
+            current,
+        } = observation;
+        let epochs = |value: AdmissionWakeEpochs| {
+            serde_json::json!({
+                "coordinator_id": value.coordinator_id().get(),
+                "release_epoch": value.release_epoch(),
+                "capacity_epoch": value.capacity_epoch(),
+                "policy_epoch": value.policy_epoch(),
+            })
+        };
+        self.write_executor_scheduler_profile_event(
+            &request_id,
+            "vnext.prefill_admission_skipped_unchanged",
+            ProfileEventKind::Instant,
+            ProfileStatus::Ok,
+            None,
+            BTreeMap::from([
+                (
+                    "decision".to_string(),
+                    serde_json::json!("skipped_unchanged"),
+                ),
+                ("waiting_ticket".to_string(), serde_json::json!(ticket)),
+                (
+                    "prefill_submit_observed".to_string(),
+                    serde_json::json!(false),
+                ),
+                ("probe_performed".to_string(), serde_json::json!(false)),
+            ]),
+            BTreeMap::from([(
+                "deferral_evidence".to_string(),
+                serde_json::json!({
+                    "action": deferral.action(),
+                    "observed": epochs(deferral.observed()),
+                    "current": epochs(current),
+                }),
+            )]),
+            None,
+        );
+    }
+
     fn validate_executor_prefill_maintenance(
         &self,
         deferral: &ExecutorPrefillMaintenanceDeferral,
@@ -950,6 +998,7 @@ impl EngineInner {
             );
             let capture_trace = self.scheduler_trace_jsonl.is_some();
             let mut admission_traces = capture_trace.then(Vec::new);
+            let mut admission_queue_observations = capture_trace.then(Vec::new);
             let mut probe = |request: &InferenceRequest| {
                 let result = self.probe_executor_prefill_admission(request, capture_trace);
                 if let Some(maintenance) = result.maintenance {
@@ -960,13 +1009,26 @@ impl EngineInner {
                 }
                 result.outcome
             };
-            let scheduled = self
-                .scheduler
-                .next_batch_with_dynamic_admission(hint, wake, &mut probe);
+            let scheduled = if let Some(observations) = &mut admission_queue_observations {
+                self.scheduler.next_batch_with_dynamic_admission_observed(
+                    hint,
+                    wake,
+                    &mut probe,
+                    &mut |observation| observations.push(observation),
+                )
+            } else {
+                self.scheduler
+                    .next_batch_with_dynamic_admission(hint, wake, &mut probe)
+            };
             drop(probe);
             if let Some(traces) = admission_traces {
                 for trace in traces {
                     self.trace_executor_prefill_admission(trace);
+                }
+            }
+            if let Some(observations) = admission_queue_observations {
+                for observation in observations {
+                    self.trace_executor_admission_queue_observation(observation);
                 }
             }
             if scheduled.is_err() {

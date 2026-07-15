@@ -7,7 +7,7 @@ pub mod priority;
 // Re-export implementations
 pub use continuous::{
     ContinuousBatchConfig, ContinuousBatchRequest, ContinuousBatchScheduler,
-    ExecutorAdmissionProbeOutcome, RequestPhase,
+    ExecutorAdmissionProbeOutcome, ExecutorAdmissionQueueObservation, RequestPhase,
 };
 pub use fifo::FifoScheduler;
 pub use priority::PriorityScheduler;

@@ -30,7 +30,8 @@ use ferrum_interfaces::{
 use ferrum_kv::cache::prefix::PrefixCache;
 use ferrum_sampler::json_mode::JsonModeProcessor;
 use ferrum_scheduler::implementations::{
-    ContinuousBatchScheduler, ExecutorAdmissionProbeOutcome, RequestPhase,
+    ContinuousBatchScheduler, ExecutorAdmissionProbeOutcome, ExecutorAdmissionQueueObservation,
+    RequestPhase,
 };
 use ferrum_scheduler::vnext::{AdmissionDeferral, AdmissionProbeOutcome, AdmissionWakeEpochs};
 use ferrum_types::{
