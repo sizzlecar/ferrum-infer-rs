@@ -914,6 +914,52 @@ fn zero_initial_capacity_defers_until_typed_initialization() {
 }
 
 #[test]
+fn backing_deferral_reports_the_whole_pool_shortfall() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'a',
+        3,
+        192,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 192);
+    let harness = harness(runtime, catalog, 192, false);
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    let admission = || {
+        binding
+            .try_admit_request(
+                request_admission(),
+                RunId::new("run/batch-shortfall").unwrap(),
+                RequestIdentity::new("request/batch-shortfall").unwrap(),
+            )
+            .unwrap()
+    };
+    let RequestResourceAdmissionDecision::BackingDeferred(deferred) = admission() else {
+        panic!("zero-resident pool must expose its complete batch shortfall")
+    };
+    assert_eq!(deferred.blockers().len(), 1);
+    assert_eq!(deferred.blockers()[0].requested_bytes(), 192);
+    assert_eq!(deferred.blockers()[0].free_bytes(), 0);
+
+    let DynamicDeferredMaintenanceOutcome::Maintained(receipt) = harness
+        .root
+        .maintenance_controller
+        .maintain_for_deferred(&deferred)
+        .unwrap()
+    else {
+        panic!("current batch shortfall must grow its pool")
+    };
+    assert_eq!(receipt.growths().len(), 1);
+    assert_eq!(receipt.growths()[0].chunk_bytes(), 192);
+    assert_eq!(harness.runtime.allocate_calls(), 1);
+    assert!(matches!(
+        admission(),
+        RequestResourceAdmissionDecision::Admitted(_)
+    ));
+}
+
+#[test]
 fn capacity_waiter_retains_root_and_close_rejects_new_work() {
     let catalog = pool_catalog(
         linear_profile(),
