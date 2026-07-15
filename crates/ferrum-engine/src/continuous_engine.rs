@@ -716,11 +716,14 @@ impl SequenceModelKvState {
         &self.model_cache_id
     }
 
-    fn into_physical_resources(self, request_id: RequestId) -> (SequenceKvAllocation, String) {
-        (
-            SequenceKvAllocation::new(request_id, self.resource_blocks),
-            self.model_cache_id,
-        )
+    fn into_physical_resources(
+        self,
+        request_id: RequestId,
+    ) -> (Option<SequenceKvAllocation>, String) {
+        let allocation = self
+            .resource_blocks
+            .map(|blocks| SequenceKvAllocation::new(request_id, Some(blocks)));
+        (allocation, self.model_cache_id)
     }
 }
 
@@ -1111,7 +1114,7 @@ impl SequenceState {
             .map(|state| {
                 let (kv_allocation, model_cache_id) =
                     state.into_physical_resources(self.request_id.clone());
-                (Some(kv_allocation), Some(model_cache_id))
+                (kv_allocation, Some(model_cache_id))
             })
             .unwrap_or((None, None));
         let draft_kv_allocation = self.draft_kv.take().map(SequenceDraftKvState::allocation);
