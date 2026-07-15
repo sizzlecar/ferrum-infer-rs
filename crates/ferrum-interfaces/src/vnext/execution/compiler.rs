@@ -296,18 +296,37 @@ fn infer_value_tensors(
         // an AttributeId and a DimensionConstraint::Symbol.
         let mut symbols = TensorSymbols::default();
 
-        for (value_id, contract) in node.inputs.iter().zip(&operation.inputs) {
+        for (ordinal, (value_id, contract)) in node.inputs.iter().zip(&operation.inputs).enumerate()
+        {
             let tensor = tensors.get(value_id).ok_or_else(|| {
                 invalid_plan(format!(
                     "node `{}` input `{value_id}` has no concrete tensor",
                     node.id
                 ))
             })?;
-            unify_tensor(contract, tensor, &mut symbols, &node.id)?;
+            unify_tensor(
+                contract,
+                tensor,
+                &mut symbols,
+                &node.id,
+                "input",
+                ordinal,
+                value_id,
+            )?;
         }
-        for (value_id, contract) in node.outputs.iter().zip(&operation.outputs) {
+        for (ordinal, (value_id, contract)) in
+            node.outputs.iter().zip(&operation.outputs).enumerate()
+        {
             if let Some(tensor) = tensors.get(value_id) {
-                unify_tensor(contract, tensor, &mut symbols, &node.id)?;
+                unify_tensor(
+                    contract,
+                    tensor,
+                    &mut symbols,
+                    &node.id,
+                    "output",
+                    ordinal,
+                    value_id,
+                )?;
             }
         }
         for (value_id, contract) in node.outputs.iter().zip(&operation.outputs) {
@@ -365,23 +384,33 @@ fn unify_tensor(
     tensor: &ResolvedTensorSpec,
     symbols: &mut TensorSymbols,
     node_id: &NodeId,
+    role: &str,
+    ordinal: usize,
+    value_id: &ProgramValueId,
 ) -> Result<(), VNextError> {
+    let context = format!("node `{node_id}` {role}[{ordinal}] `{value_id}`");
     if !contract.element_types().contains(&tensor.element_type())
         || contract.dimensions().len() != tensor.dimensions().len()
     {
         return Err(invalid_plan(format!(
-            "node `{node_id}` tensor rank or dtype differs from its operation contract"
+            "{context} rank or dtype differs from its operation contract: actual rank={} dtype={:?}, expected rank={} dtypes={:?}",
+            tensor.dimensions().len(),
+            tensor.element_type(),
+            contract.dimensions().len(),
+            contract.element_types()
         )));
     }
     unify_dimensions(
         contract.dimensions(),
         tensor.dimensions(),
         &mut symbols.dimensions,
-        node_id,
+        &context,
     )?;
     if !layout_matches(contract.layouts(), tensor.layout(), &mut symbols.strides)? {
         return Err(invalid_plan(format!(
-            "node `{node_id}` tensor layout differs from its operation contract"
+            "{context} layout {:?} differs from its operation contract {:?}",
+            tensor.layout(),
+            contract.layouts()
         )));
     }
     Ok(())
@@ -391,9 +420,9 @@ fn unify_dimensions(
     constraints: &[DimensionConstraint],
     dimensions: &[u64],
     symbols: &mut BTreeMap<String, u64>,
-    node_id: &NodeId,
+    context: &str,
 ) -> Result<(), VNextError> {
-    for (constraint, extent) in constraints.iter().zip(dimensions) {
+    for (axis, (constraint, extent)) in constraints.iter().zip(dimensions).enumerate() {
         let valid = match constraint {
             DimensionConstraint::Exact(expected) => expected == extent,
             DimensionConstraint::Range { minimum, maximum } => {
@@ -403,7 +432,7 @@ fn unify_dimensions(
         };
         if !valid {
             return Err(invalid_plan(format!(
-                "node `{node_id}` tensor dimension violates `{constraint:?}`"
+                "{context} dimension[{axis}]={extent} violates `{constraint:?}`"
             )));
         }
     }
