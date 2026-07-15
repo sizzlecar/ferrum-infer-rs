@@ -7,13 +7,13 @@ use super::{
     CapacityWaitRecheck, CapacityWaitRegistration, DeferredDeviceCleanupDomainId,
     DeferredDeviceCleanupMaintenanceReceipt, DeferredDeviceCleanupStatus, DeviceCapacityClaim,
     DeviceId, DeviceRuntime, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
-    DynamicPoolMaintenanceController, DynamicPoolSet, DynamicResourceShape,
-    EvaluatedBackingProjection, EvaluatedBackingRequest, FailureEnvelope, InvocationLivenessMode,
-    LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex, NoStatic, NodeId, Ordering,
-    PhysicalBackingClaimIdentity, PlanHash, PlanId, PlanNode, ResourceAbandonSignal,
-    ResourceActionCursor, ResourceDriverFailure, ResourceLedgerEntrySnapshot,
-    ResourceOwnershipReason, ResourceOwnershipTransferFailure, ResourcePoolIdentity,
-    ResourcePoolOwnership, ResourceReservation, ResourceReservationBatch,
+    DynamicPoolMaintenanceController, DynamicPoolMaintenanceStatus, DynamicPoolSet,
+    DynamicResourceShape, EvaluatedBackingProjection, EvaluatedBackingRequest, FailureEnvelope,
+    InvocationLivenessMode, LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex,
+    NoStatic, NodeId, Ordering, PhysicalBackingClaimIdentity, PlanHash, PlanId, PlanNode,
+    ResourceAbandonSignal, ResourceActionCursor, ResourceDriverFailure,
+    ResourceLedgerEntrySnapshot, ResourceOwnershipReason, ResourceOwnershipTransferFailure,
+    ResourcePoolIdentity, ResourcePoolOwnership, ResourceReservation, ResourceReservationBatch,
     ResourceTransactionAction, ResourceTransactionContext, ResourceTransactionDriver,
     ResourceTransactionIdentity, ResourceTransactionState, RwLock, RwLockReadGuard, Serialize,
     StaticProvisioningBinding, StaticProvisioningLease, VNextError,
@@ -682,6 +682,14 @@ where
     ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
         let _lifecycle = self.read_lifecycle("maintain deferred dynamic backing")?;
         self.maintenance_controller.maintain_for_deferred(deferred)
+    }
+
+    /// Returns a point-in-time view of the exact dynamic pools owned by this
+    /// plan. Product telemetry consumes this instead of maintaining a second
+    /// allocator ledger that can drift from admission decisions.
+    pub fn dynamic_pool_status(&self) -> Result<DynamicPoolMaintenanceStatus, VNextError> {
+        let _lifecycle = self.read_lifecycle("observe dynamic pool status")?;
+        self.maintenance_controller.status()
     }
 
     pub fn is_closing(&self) -> bool {

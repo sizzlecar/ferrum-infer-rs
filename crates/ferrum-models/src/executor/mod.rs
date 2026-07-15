@@ -12,6 +12,7 @@ pub mod llm_executor;
 pub mod qwen35_executor;
 pub mod stub_executor;
 pub mod tts_executor;
+pub mod vnext_executor;
 pub mod whisper_executor;
 
 pub use bert_executor::BertModelExecutor;
@@ -20,4 +21,5 @@ pub use llm_executor::LlmExecutor;
 pub use qwen35_executor::Qwen35W3Executor;
 pub use stub_executor::StubModelExecutor;
 pub use tts_executor::TtsModelExecutor;
+pub use vnext_executor::{VNextExecutorConfig, VNextModelExecutor};
 pub use whisper_executor::WhisperModelExecutor;
