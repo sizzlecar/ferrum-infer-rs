@@ -54,8 +54,30 @@ impl QuantizationSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WeightEncoding {
-    Dense { element_type: ElementType },
+    Dense {
+        element_type: ElementType,
+    },
+    /// Dense floating-point values materialized after applying
+    /// `logical = physical * scale + bias` element-wise. This keeps checkpoint
+    /// representation semantics in the typed weight schema rather than in a
+    /// backend provider or model-name branch.
+    DenseAffine {
+        element_type: ElementType,
+        scale: CanonicalRational,
+        bias: CanonicalRational,
+    },
     Quantized(QuantizationSpec),
+}
+
+impl WeightEncoding {
+    pub const fn dense_element_type(&self) -> Option<ElementType> {
+        match self {
+            Self::Dense { element_type } | Self::DenseAffine { element_type, .. } => {
+                Some(*element_type)
+            }
+            Self::Quantized(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,7 +105,8 @@ impl WeightComponentSpec {
                 reason: format!("physical component `{}` size overflows u64", self.id),
             })?;
         match &self.encoding {
-            WeightEncoding::Dense { element_type } => elements
+            WeightEncoding::Dense { element_type }
+            | WeightEncoding::DenseAffine { element_type, .. } => elements
                 .checked_mul(element_type.size_bytes())
                 .ok_or_else(|| VNextError::InvalidExecutionPlan {
                     reason: format!("physical component `{}` byte size overflows u64", self.id),
@@ -93,10 +116,7 @@ impl WeightComponentSpec {
     }
 
     pub fn dense_element_type(&self) -> Option<ElementType> {
-        match &self.encoding {
-            WeightEncoding::Dense { element_type } => Some(*element_type),
-            WeightEncoding::Quantized(_) => None,
-        }
+        self.encoding.dense_element_type()
     }
 
     pub fn physical_element_type(&self) -> ElementType {
@@ -367,6 +387,23 @@ impl WeightSchema {
             if let WeightEncoding::Quantized(quantization) = &component.encoding {
                 quantization.validate()?;
             }
+            if let WeightEncoding::DenseAffine { element_type, .. } = &component.encoding {
+                if component.role != WeightComponentRole::Values
+                    || !matches!(
+                        element_type,
+                        ElementType::F16 | ElementType::Bf16 | ElementType::F32
+                    )
+                {
+                    return Err(VNextError::InvalidModelConfig {
+                        family_id: family_id.to_string(),
+                        field: "weight_schema.components.encoding".to_owned(),
+                        reason: format!(
+                            "affine dense component `{}` must be a floating-point value component",
+                            component.id
+                        ),
+                    });
+                }
+            }
             component
                 .physical_bytes()
                 .map_err(|error| VNextError::InvalidModelConfig {
@@ -453,7 +490,7 @@ impl WeightSchema {
             .iter()
             .filter_map(|component| match &component.encoding {
                 WeightEncoding::Quantized(spec) => Some(spec.format_id.clone()),
-                WeightEncoding::Dense { .. } => None,
+                WeightEncoding::Dense { .. } | WeightEncoding::DenseAffine { .. } => None,
             })
             .collect()
     }

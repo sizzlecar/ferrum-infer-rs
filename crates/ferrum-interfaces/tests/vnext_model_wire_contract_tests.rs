@@ -221,6 +221,41 @@ impl ModelFamilyRegistry for TestRegistry {
     }
 }
 
+#[test]
+fn affine_dense_encoding_wire_preserves_transform_identity() {
+    let encoding = WeightEncoding::DenseAffine {
+        element_type: ElementType::F16,
+        scale: CanonicalRational::new(1, 1).unwrap(),
+        bias: CanonicalRational::new(1, 1).unwrap(),
+    };
+    let wire = serde_json::to_value(&encoding).unwrap();
+    assert_eq!(
+        wire,
+        json!({
+            "dense_affine": {
+                "element_type": "f16",
+                "scale": {"numerator": 1, "denominator": 1},
+                "bias": {"numerator": 1, "denominator": 1}
+            }
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<WeightEncoding>(wire.clone()).unwrap(),
+        encoding
+    );
+
+    let changed_bias = WeightEncoding::DenseAffine {
+        element_type: ElementType::F16,
+        scale: CanonicalRational::new(1, 1).unwrap(),
+        bias: CanonicalRational::new(0, 1).unwrap(),
+    };
+    assert_ne!(
+        serde_json::to_vec(&encoding).unwrap(),
+        serde_json::to_vec(&changed_bias).unwrap(),
+        "affine semantics must alter prepared-family fingerprint input"
+    );
+}
+
 struct RejectingRegistry;
 
 impl ModelFamilyRegistry for RejectingRegistry {
