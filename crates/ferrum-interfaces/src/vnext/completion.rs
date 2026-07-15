@@ -8,12 +8,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use super::{
-    classify_device_error, defer_device_cleanup, BatchOperationIdentity,
-    DeferredDeviceCleanupDisposition, DeferredDeviceCleanupDomainId, DeferredDeviceCleanupTask,
-    DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
-    DeviceDescriptor, DeviceRuntime, DeviceTerminal, ExecutionIdentityEnvelope, FenceQuery,
-    IdentifiedFailure, InvocationResourceLease, PreparedStepSubmissionWave, StreamState,
-    VNextError,
+    classify_device_error, defer_device_cleanup, BatchOperationIdentity, BatchParticipantAuthority,
+    BufferUsage, CopyRegion, DeferredDeviceCleanupDisposition, DeferredDeviceCleanupDomainId,
+    DeferredDeviceCleanupTask, DefinitelyNotSubmittedRetryAuthority,
+    DefinitelyNotSubmittedWaveRetryAuthority, DeviceDescriptor, DeviceRuntime, DeviceTerminal,
+    ExecutionIdentityEnvelope, FenceQuery, HostTransferLayout, IdentifiedFailure,
+    InvocationResourceLease, LogicalBackingBufferView, NodeId, PreparedStepSubmissionWave,
+    ResourceId, StreamState, VNextError,
 };
 
 fn invalid_completion(reason: impl Into<String>) -> VNextError {
@@ -52,6 +53,11 @@ struct ExecutionLaneState<S> {
     stream: S,
     in_flight: u64,
     fail_closed: bool,
+}
+
+enum LaneReadbackError<E> {
+    Contract(VNextError),
+    Device(E),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -251,6 +257,137 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
         } else {
             Ok(())
         }
+    }
+
+    fn readback_activation(
+        &self,
+        backing: &LogicalBackingBufferView<'_, R::Buffer>,
+        logical_offset_bytes: u64,
+        output_layout: HostTransferLayout,
+    ) -> Result<Vec<u8>, LaneReadbackError<R::Error>> {
+        let output_bytes = output_layout
+            .byte_len()
+            .map_err(LaneReadbackError::Contract)?;
+        let logical_end = logical_offset_bytes
+            .checked_add(output_bytes)
+            .ok_or_else(|| {
+                LaneReadbackError::Contract(invalid_completion(
+                    "completion readback logical range overflows u64",
+                ))
+            })?;
+        let element_bytes = output_layout.element_type().size_bytes();
+        if backing.usage() != BufferUsage::Activations
+            || backing.element_type() != output_layout.element_type()
+            || logical_end > backing.size_bytes()
+            || logical_offset_bytes % element_bytes != 0
+            || output_bytes % element_bytes != 0
+        {
+            return Err(LaneReadbackError::Contract(invalid_completion(
+                "completion readback must select an aligned activation range with matching element type",
+            )));
+        }
+        if self.fail_closed.load(Ordering::Acquire) || !self.current_descriptor_matches_snapshot() {
+            return Err(LaneReadbackError::Contract(invalid_completion(
+                "completion readback requires its original reusable execution lane",
+            )));
+        }
+        let mut state = self.state.lock().map_err(|_| {
+            LaneReadbackError::Contract(invalid_completion(
+                "execution lane state mutex is poisoned during completion readback",
+            ))
+        })?;
+        if state.fail_closed
+            || !matches!(
+                self.runtime.stream_state(&state.stream),
+                StreamState::Ready | StreamState::Submitted
+            )
+        {
+            return Err(LaneReadbackError::Contract(invalid_completion(
+                "completion readback lane is failed or not readable",
+            )));
+        }
+
+        let output_capacity = usize::try_from(output_bytes).map_err(|_| {
+            LaneReadbackError::Contract(invalid_completion(
+                "completion readback output exceeds host address space",
+            ))
+        })?;
+        let mut output = Vec::with_capacity(output_capacity);
+        let mut logical_cursor = 0_u64;
+        for binding in backing.segment_bindings() {
+            let segment = binding.segment();
+            let segment_logical_end = logical_cursor
+                .checked_add(segment.length_bytes())
+                .ok_or_else(|| {
+                    LaneReadbackError::Contract(invalid_completion(
+                        "completion readback backing coverage overflows u64",
+                    ))
+                })?;
+            let overlap_start = logical_cursor.max(logical_offset_bytes);
+            let overlap_end = segment_logical_end.min(logical_end);
+            if overlap_start < overlap_end {
+                let within_segment = overlap_start - logical_cursor;
+                let source_offset = segment
+                    .offset_bytes()
+                    .checked_add(within_segment)
+                    .ok_or_else(|| {
+                        LaneReadbackError::Contract(invalid_completion(
+                            "completion readback physical offset overflows u64",
+                        ))
+                    })?;
+                let length = overlap_end - overlap_start;
+                if source_offset % element_bytes != 0 || length % element_bytes != 0 {
+                    return Err(LaneReadbackError::Contract(invalid_completion(
+                        "completion readback backing segments split an element",
+                    )));
+                }
+                let actual = self.runtime.buffer_descriptor(binding.buffer());
+                if &actual != binding.descriptor()
+                    || source_offset
+                        .checked_add(length)
+                        .is_none_or(|end| end > actual.size_bytes)
+                {
+                    return Err(LaneReadbackError::Contract(invalid_completion(
+                        "completion readback backing descriptor differs from its committed extent",
+                    )));
+                }
+                let piece_layout =
+                    HostTransferLayout::new(output_layout.element_type(), length / element_bytes)
+                        .map_err(LaneReadbackError::Contract)?;
+                let region = CopyRegion::new(source_offset, 0, length)
+                    .map_err(LaneReadbackError::Contract)?;
+                let piece = match self.runtime.readback(
+                    &mut state.stream,
+                    binding.buffer(),
+                    region,
+                    piece_layout,
+                ) {
+                    Ok(piece) => piece,
+                    Err(error) => {
+                        state.fail_closed = true;
+                        self.fail_closed.store(true, Ordering::Release);
+                        return Err(LaneReadbackError::Device(error));
+                    }
+                };
+                if piece.len() != usize::try_from(length).unwrap_or(usize::MAX) {
+                    state.fail_closed = true;
+                    self.fail_closed.store(true, Ordering::Release);
+                    return Err(LaneReadbackError::Contract(invalid_completion(
+                        "device runtime returned an invalid completion readback byte count",
+                    )));
+                }
+                output.extend_from_slice(&piece);
+            }
+            logical_cursor = segment_logical_end;
+        }
+        if output.len() != output_capacity || !self.current_descriptor_matches_snapshot() {
+            state.fail_closed = true;
+            self.fail_closed.store(true, Ordering::Release);
+            return Err(LaneReadbackError::Contract(invalid_completion(
+                "completion readback did not cover its exact logical output",
+            )));
+        }
+        Ok(output)
     }
 
     fn drain(&self, retires_submitted_fence: bool) -> bool {
@@ -751,6 +888,82 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
             Self::Wave(wave) => wave.mark_submission_fence_installed(),
         }
     }
+
+    fn backing_view(
+        &self,
+        node_id: &NodeId,
+        participant_index: u32,
+        resource_id: &ResourceId,
+    ) -> Result<LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
+        let participant_index = usize::try_from(participant_index).map_err(|_| {
+            invalid_completion("completion readback participant index exceeds host address space")
+        })?;
+        match self {
+            Self::Invocation(invocation) => {
+                if invocation.node_id() != node_id {
+                    return Err(invalid_completion(
+                        "completion readback node differs from its invocation",
+                    ));
+                }
+                let is_shared = invocation
+                    .backing_slices()
+                    .iter()
+                    .chain(invocation.step_resources().backing_slices())
+                    .any(|authority| authority.resource_id() == resource_id);
+                if is_shared {
+                    return invocation.backing_view(resource_id);
+                }
+                let participant = invocation
+                    .participants()
+                    .nth(participant_index)
+                    .ok_or_else(|| {
+                        invalid_completion(
+                            "completion readback participant is absent from its invocation",
+                        )
+                    })?;
+                invocation.step_resources().participant_backing_view(
+                    BatchParticipantAuthority::new(
+                        participant.sequence_authority(),
+                        participant.request_authority(),
+                    ),
+                    resource_id,
+                )
+            }
+            Self::Wave(wave) => {
+                let node_index = wave
+                    .nodes()
+                    .iter()
+                    .position(|node| node.node_id() == node_id)
+                    .ok_or_else(|| {
+                        invalid_completion("completion readback node is absent from its wave")
+                    })?;
+                let is_shared = wave
+                    .claimed_backing()
+                    .backing_slices()
+                    .iter()
+                    .chain(wave.step_resources().backing_slices())
+                    .any(|authority| authority.resource_id() == resource_id);
+                if is_shared {
+                    return wave.backing_view(node_index, resource_id);
+                }
+                let participant = wave.nodes()[node_index]
+                    .participants()
+                    .nth(participant_index)
+                    .ok_or_else(|| {
+                        invalid_completion(
+                            "completion readback participant is absent from its wave node",
+                        )
+                    })?;
+                wave.step_resources().participant_backing_view(
+                    BatchParticipantAuthority::new(
+                        participant.sequence_authority(),
+                        participant.request_authority(),
+                    ),
+                    resource_id,
+                )
+            }
+        }
+    }
 }
 
 enum CompletionRecord<R: DeviceRuntime> {
@@ -773,6 +986,18 @@ enum CompletionRecord<R: DeviceRuntime> {
         receipt: CompletionQuarantineReceipt,
     },
     Reaped,
+}
+
+enum BoundCompletionObservation<T> {
+    Pending,
+    Terminal {
+        completion: OperationCompletionReceipt,
+        terminal: T,
+    },
+    Indeterminate(Vec<IdentifiedFailure>),
+    SubmissionIndeterminate,
+    ObservationPanicked,
+    Quarantined(CompletionQuarantineReceipt),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1093,21 +1318,88 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         &self,
         slot_id: CompletionSlotId,
     ) -> Result<CompletionObservation, VNextError> {
-        self.observe_bound(slot_id, false)
+        Self::map_plain_observation(self.observe_bound_with(slot_id, false, |_, _, _, _| ())?)
     }
 
     pub(crate) fn wait_bound(
         &self,
         slot_id: CompletionSlotId,
     ) -> Result<CompletionObservation, VNextError> {
-        self.observe_bound(slot_id, true)
+        Self::map_plain_observation(self.observe_bound_with(slot_id, true, |_, _, _, _| ())?)
     }
 
-    fn observe_bound(
+    pub(crate) fn wait_bound_with_readback(
+        &self,
+        slot_id: CompletionSlotId,
+        request: CompletionReadbackRequest,
+    ) -> Result<CompletionReadbackObservation, VNextError> {
+        let observation = self.observe_bound_with(
+            slot_id,
+            true,
+            |resources, lane, batch_identity, disposition| {
+                attempt_completion_readback(resources, lane, batch_identity, disposition, request)
+            },
+        )?;
+        Ok(match observation {
+            BoundCompletionObservation::Pending => CompletionReadbackObservation::Pending,
+            BoundCompletionObservation::Terminal {
+                completion,
+                terminal,
+            } => CompletionReadbackObservation::Terminal(CompletionReadbackReceipt::new(
+                completion, terminal,
+            )),
+            BoundCompletionObservation::Indeterminate(failures) => {
+                CompletionReadbackObservation::Indeterminate(failures)
+            }
+            BoundCompletionObservation::SubmissionIndeterminate => {
+                CompletionReadbackObservation::SubmissionIndeterminate
+            }
+            BoundCompletionObservation::ObservationPanicked => {
+                CompletionReadbackObservation::ObservationPanicked
+            }
+            BoundCompletionObservation::Quarantined(receipt) => {
+                CompletionReadbackObservation::Quarantined(receipt)
+            }
+        })
+    }
+
+    fn map_plain_observation(
+        observation: BoundCompletionObservation<()>,
+    ) -> Result<CompletionObservation, VNextError> {
+        Ok(match observation {
+            BoundCompletionObservation::Pending => CompletionObservation::Pending,
+            BoundCompletionObservation::Terminal { completion, .. } => {
+                CompletionObservation::Terminal(completion)
+            }
+            BoundCompletionObservation::Indeterminate(failures) => {
+                CompletionObservation::Indeterminate(failures)
+            }
+            BoundCompletionObservation::SubmissionIndeterminate => {
+                CompletionObservation::SubmissionIndeterminate
+            }
+            BoundCompletionObservation::ObservationPanicked => {
+                CompletionObservation::ObservationPanicked
+            }
+            BoundCompletionObservation::Quarantined(receipt) => {
+                CompletionObservation::Quarantined(receipt)
+            }
+        })
+    }
+
+    fn observe_bound_with<T, F>(
         &self,
         slot_id: CompletionSlotId,
         blocking: bool,
-    ) -> Result<CompletionObservation, VNextError> {
+        terminal_action: F,
+    ) -> Result<BoundCompletionObservation<T>, VNextError>
+    where
+        F: FnOnce(
+            &CompletionResourceLease<R>,
+            &Arc<ExecutionLane<R>>,
+            &BatchOperationIdentity,
+            &OperationCompletionDisposition,
+        ) -> T,
+    {
         let record = self.lookup(slot_id)?;
         let mut guard = record
             .lock()
@@ -1209,28 +1501,44 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         }
         if let FenceObservation::Terminal(mut disposition) = observation {
             let old = std::mem::replace(&mut *guard, CompletionRecord::Reaped);
-            let CompletionRecord::InFlight { lane, receipt, .. } = old else {
+            let CompletionRecord::InFlight {
+                resources,
+                lane,
+                batch_identity,
+                receipt,
+                ..
+            } = old
+            else {
                 unreachable!("terminal observation came from an in-flight record")
             };
+            let terminal = terminal_action(&resources, &lane, &batch_identity, &disposition);
             if let Err(failure) = lane.finish_one_terminal() {
                 disposition = OperationCompletionDisposition::ContractFailedButQuiescent(failure);
             }
             drop(guard);
             self.remove_exact(slot_id, &record);
-            return OperationCompletionReceipt::new(receipt, disposition)
-                .map(CompletionObservation::Terminal);
+            return OperationCompletionReceipt::new(receipt, disposition).map(|completion| {
+                BoundCompletionObservation::Terminal {
+                    completion,
+                    terminal,
+                }
+            });
         }
         Ok(match observation {
-            FenceObservation::Pending => CompletionObservation::Pending,
+            FenceObservation::Pending => BoundCompletionObservation::Pending,
             FenceObservation::Indeterminate(failure) => {
-                CompletionObservation::Indeterminate(failure)
+                BoundCompletionObservation::Indeterminate(failure)
             }
             FenceObservation::SubmissionIndeterminate => {
-                CompletionObservation::SubmissionIndeterminate
+                BoundCompletionObservation::SubmissionIndeterminate
             }
-            FenceObservation::ObservationPanicked => CompletionObservation::ObservationPanicked,
+            FenceObservation::ObservationPanicked => {
+                BoundCompletionObservation::ObservationPanicked
+            }
             FenceObservation::ContractIndeterminate(error) => return Err(error),
-            FenceObservation::Quarantined(receipt) => CompletionObservation::Quarantined(receipt),
+            FenceObservation::Quarantined(receipt) => {
+                BoundCompletionObservation::Quarantined(receipt)
+            }
             FenceObservation::Terminal(_) => {
                 unreachable!("terminal observation returned through the reaping branch")
             }
@@ -1564,6 +1872,254 @@ impl<R: DeviceRuntime> Drop for CompletionReaper<R> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[must_use = "a completion readback request identifies one exact logical activation range"]
+pub struct CompletionReadbackRequest {
+    node_id: NodeId,
+    participant_index: u32,
+    resource_id: ResourceId,
+    logical_offset_bytes: u64,
+    output_layout: HostTransferLayout,
+}
+
+impl CompletionReadbackRequest {
+    pub fn new(
+        node_id: NodeId,
+        participant_index: u32,
+        resource_id: ResourceId,
+        logical_offset_bytes: u64,
+        output_layout: HostTransferLayout,
+    ) -> Result<Self, VNextError> {
+        let output_bytes = output_layout.byte_len()?;
+        if logical_offset_bytes.checked_add(output_bytes).is_none() {
+            return Err(invalid_completion(
+                "completion readback logical range overflows u64",
+            ));
+        }
+        Ok(Self {
+            node_id,
+            participant_index,
+            resource_id,
+            logical_offset_bytes,
+            output_layout,
+        })
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.resource_id
+    }
+
+    pub const fn participant_index(&self) -> u32 {
+        self.participant_index
+    }
+
+    pub const fn logical_offset_bytes(&self) -> u64 {
+        self.logical_offset_bytes
+    }
+
+    pub const fn output_layout(&self) -> HostTransferLayout {
+        self.output_layout
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[must_use = "successful completion output bytes are exact readback evidence"]
+pub struct CompletionReadbackOutput {
+    request: CompletionReadbackRequest,
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+impl CompletionReadbackOutput {
+    fn new(request: CompletionReadbackRequest, bytes: Vec<u8>) -> Result<Self, VNextError> {
+        request.output_layout.validate_bytes(bytes.len())?;
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        Ok(Self {
+            request,
+            bytes,
+            sha256,
+        })
+    }
+
+    pub fn request(&self) -> &CompletionReadbackRequest {
+        &self.request
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "detail")]
+pub enum CompletionReadbackDisposition {
+    Succeeded(CompletionReadbackOutput),
+    NotAttempted(CompletionReadbackRequest),
+    FailedButQuiescent {
+        request: CompletionReadbackRequest,
+        failures: Vec<IdentifiedFailure>,
+    },
+    ContractFailedButQuiescent {
+        request: CompletionReadbackRequest,
+        failure: QuiescentCompletionContractFailure,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[must_use = "a terminal readback receipt couples output evidence to its exact completion"]
+pub struct CompletionReadbackReceipt {
+    completion: OperationCompletionReceipt,
+    disposition: CompletionReadbackDisposition,
+    fingerprint: String,
+}
+
+impl CompletionReadbackReceipt {
+    fn new(
+        completion: OperationCompletionReceipt,
+        disposition: CompletionReadbackDisposition,
+    ) -> Self {
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            completion_fingerprint: &'a str,
+            request: &'a CompletionReadbackRequest,
+            output_sha256: Option<&'a str>,
+            failures: Option<&'a [IdentifiedFailure]>,
+            contract_failure: Option<&'a str>,
+        }
+        let (request, output_sha256, failures, contract_failure) = match &disposition {
+            CompletionReadbackDisposition::Succeeded(output) => {
+                (output.request(), Some(output.sha256()), None, None)
+            }
+            CompletionReadbackDisposition::NotAttempted(request) => (request, None, None, None),
+            CompletionReadbackDisposition::FailedButQuiescent { request, failures } => {
+                (request, None, Some(failures.as_slice()), None)
+            }
+            CompletionReadbackDisposition::ContractFailedButQuiescent { request, failure } => {
+                (request, None, None, Some(failure.reason()))
+            }
+        };
+        let fingerprint = canonical_completion_fingerprint(&FingerprintInput {
+            domain: "ferrum.runtime-vnext.completion-readback.v1",
+            completion_fingerprint: completion.fingerprint(),
+            request,
+            output_sha256,
+            failures,
+            contract_failure,
+        });
+        Self {
+            completion,
+            disposition,
+            fingerprint,
+        }
+    }
+
+    pub fn completion(&self) -> &OperationCompletionReceipt {
+        &self.completion
+    }
+
+    pub fn disposition(&self) -> &CompletionReadbackDisposition {
+        &self.disposition
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
+fn attempt_completion_readback<R: DeviceRuntime>(
+    resources: &CompletionResourceLease<R>,
+    lane: &Arc<ExecutionLane<R>>,
+    batch_identity: &BatchOperationIdentity,
+    completion_disposition: &OperationCompletionDisposition,
+    request: CompletionReadbackRequest,
+) -> CompletionReadbackDisposition {
+    if !matches!(
+        completion_disposition,
+        OperationCompletionDisposition::Succeeded
+    ) {
+        return CompletionReadbackDisposition::NotAttempted(request);
+    }
+    let backing = match resources.backing_view(
+        request.node_id(),
+        request.participant_index(),
+        request.resource_id(),
+    ) {
+        Ok(backing) => backing,
+        Err(error) => {
+            return CompletionReadbackDisposition::ContractFailedButQuiescent {
+                request,
+                failure: QuiescentCompletionContractFailure::new(error.to_string()),
+            };
+        }
+    };
+    let readback = catch_unwind(AssertUnwindSafe(|| {
+        lane.readback_activation(
+            &backing,
+            request.logical_offset_bytes(),
+            request.output_layout(),
+        )
+    }));
+    match readback {
+        Ok(Ok(bytes)) => match CompletionReadbackOutput::new(request.clone(), bytes) {
+            Ok(output) => CompletionReadbackDisposition::Succeeded(output),
+            Err(error) => CompletionReadbackDisposition::ContractFailedButQuiescent {
+                request,
+                failure: QuiescentCompletionContractFailure::new(error.to_string()),
+            },
+        },
+        Ok(Err(LaneReadbackError::Contract(error))) => {
+            CompletionReadbackDisposition::ContractFailedButQuiescent {
+                request,
+                failure: QuiescentCompletionContractFailure::new(error.to_string()),
+            }
+        }
+        Ok(Err(LaneReadbackError::Device(error))) => {
+            match classify_batch_device_error(lane.runtime(), batch_identity, &error) {
+                Ok(failures) => {
+                    CompletionReadbackDisposition::FailedButQuiescent { request, failures }
+                }
+                Err(error) => CompletionReadbackDisposition::ContractFailedButQuiescent {
+                    request,
+                    failure: QuiescentCompletionContractFailure::new(error.to_string()),
+                },
+            }
+        }
+        Err(_) => {
+            lane.fail_closed();
+            CompletionReadbackDisposition::ContractFailedButQuiescent {
+                request,
+                failure: QuiescentCompletionContractFailure::new(
+                    "device runtime panicked during completion readback",
+                ),
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+#[must_use = "nonterminal completion readback observations retain invocation ownership"]
+pub enum CompletionReadbackObservation {
+    Pending,
+    Terminal(CompletionReadbackReceipt),
+    Indeterminate(Vec<IdentifiedFailure>),
+    SubmissionIndeterminate,
+    ObservationPanicked,
+    Quarantined(CompletionQuarantineReceipt),
+}
+
 #[derive(Debug)]
 #[must_use = "nonterminal completion observations retain invocation ownership"]
 pub enum CompletionObservation {
@@ -1665,6 +2221,16 @@ impl<R: DeviceRuntime> CompletionHandle<R> {
             .upgrade()
             .ok_or_else(|| invalid_completion("completion reaper owner was dropped"))?
             .wait_bound(self.slot_id())
+    }
+
+    pub fn wait_with_readback(
+        &self,
+        request: CompletionReadbackRequest,
+    ) -> Result<CompletionReadbackObservation, VNextError> {
+        self.reaper
+            .upgrade()
+            .ok_or_else(|| invalid_completion("completion reaper owner was dropped"))?
+            .wait_bound_with_readback(self.slot_id(), request)
     }
 }
 

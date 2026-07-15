@@ -623,6 +623,8 @@ pub(crate) struct RuntimeTrace {
     pub(crate) allocation_calls: u64,
     pub(crate) submit_calls: u64,
     pub(crate) submitted_command_counts: Vec<usize>,
+    pub(crate) readback_calls: u64,
+    pub(crate) readback_lengths: Vec<u64>,
     pub(crate) synchronize_calls: u64,
     pub(crate) wait_fence_calls: u64,
     pub(crate) tamper_buffer_descriptor: bool,
@@ -831,9 +833,12 @@ impl DeviceRuntime for TestRuntime {
         &self,
         _stream: &mut Self::Stream,
         _source: &Self::Buffer,
-        _region: CopyRegion,
+        region: CopyRegion,
         output_layout: HostTransferLayout,
     ) -> Result<Vec<u8>, Self::Error> {
+        let mut trace = self.trace.lock().unwrap();
+        trace.readback_calls += 1;
+        trace.readback_lengths.push(region.length_bytes());
         Ok(vec![0; output_layout.byte_len().unwrap() as usize])
     }
 
