@@ -17,7 +17,7 @@ use ferrum_interfaces::{
         GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy, TokenSelectionMask,
     },
     vnext::{
-        EventEmissionPermit, ExecutionEvent, ExecutionEventDetail,
+        EventEmissionPermit, ExecutionEvent, ExecutionEventCapturePolicy, ExecutionEventDetail,
         ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink, ExecutionEventSinkError,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,
@@ -3340,6 +3340,10 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
         true
     }
 
+    fn capture_policy(&self) -> ExecutionEventCapturePolicy {
+        ExecutionEventCapturePolicy::FirstFramePerRequest
+    }
+
     fn record(
         &self,
         event: &ExecutionEvent,
@@ -3381,6 +3385,10 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
                 serde_json::json!(invocation_id.get()),
             );
         }
+        if let ExecutionEventDetail::Counters { input, output } = event.detail() {
+            shape.insert("event_input_count".to_string(), serde_json::json!(input));
+            shape.insert("event_output_count".to_string(), serde_json::json!(output));
+        }
         let mut attributes = BTreeMap::from([
             (
                 "actual_model_smoke".to_string(),
@@ -3400,6 +3408,10 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
             ("diagnostic_only".to_string(), serde_json::json!(false)),
             ("l0_only".to_string(), serde_json::json!(false)),
             ("profile_detail".to_string(), serde_json::json!("basic")),
+            (
+                "execution_capture_policy".to_string(),
+                serde_json::json!(self.capture_policy().as_str()),
+            ),
             (
                 "execution_event_kind".to_string(),
                 serde_json::json!(event_name),

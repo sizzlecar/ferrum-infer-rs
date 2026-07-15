@@ -223,14 +223,26 @@ fn reported_allocated_bytes(budget_claimed_bytes: Option<u64>, static_bytes: u64
     budget_claimed_bytes.unwrap_or(static_bytes)
 }
 
+enum JournaledSubmission {
+    Captured {
+        receipt: SubmittedOperationReceipt,
+        selected: Vec<usize>,
+    },
+    Suppressed {
+        slot_id: CompletionSlotId,
+    },
+}
+
 struct VNextExecutionJournal {
     emitter: ExecutionEventEmitter<'static>,
     topology: TrustedExecutionTopology,
     active: TrustedActiveSequenceBinding,
+    capture_policy: ExecutionEventCapturePolicy,
+    completed_frames: u64,
     started: Instant,
     last_timestamp_nanos: u64,
     root_span: SpanId,
-    pending_submission: Option<(SubmittedOperationReceipt, Vec<usize>)>,
+    pending_submission: Option<JournaledSubmission>,
 }
 
 impl VNextExecutionJournal {
@@ -246,6 +258,7 @@ impl VNextExecutionJournal {
         let topology = TrustedExecutionTopology::from_plan(plan).map_err(Self::error)?;
         let root_span =
             SpanId::new(format!("vnext/request/{}", active.fingerprint())).map_err(Self::error)?;
+        let capture_policy = sink.capture_policy();
         let mut journal = Self {
             emitter: ExecutionEventEmitter::from_shared(
                 sink,
@@ -254,6 +267,8 @@ impl VNextExecutionJournal {
             ),
             topology,
             active,
+            capture_policy,
+            completed_frames: 0,
             started: Instant::now(),
             last_timestamp_nanos: 0,
             root_span,
@@ -463,6 +478,12 @@ impl VNextExecutionJournal {
                 "execution journal already has an in-flight physical submission",
             ));
         }
+        if !self.capture_policy.captures_frame(self.completed_frames) {
+            self.pending_submission = Some(JournaledSubmission::Suppressed {
+                slot_id: submission.slot_id(),
+            });
+            return Ok(());
+        }
         let selected = submission
             .participants()
             .iter()
@@ -511,7 +532,10 @@ impl VNextExecutionJournal {
                 submission,
             ),
         )?;
-        self.pending_submission = Some((submission.clone(), selected));
+        self.pending_submission = Some(JournaledSubmission::Captured {
+            receipt: submission.clone(),
+            selected,
+        });
         Ok(())
     }
 
@@ -519,10 +543,26 @@ impl VNextExecutionJournal {
         &mut self,
         completion: &OperationCompletionReceipt,
     ) -> std::result::Result<(), ExecutionEventSinkError> {
-        let (submission, selected) = self
+        let pending = self
             .pending_submission
             .take()
             .ok_or_else(|| Self::error("completion has no journaled physical submission"))?;
+        let JournaledSubmission::Captured {
+            receipt: submission,
+            selected,
+        } = pending
+        else {
+            let JournaledSubmission::Suppressed { slot_id } = pending else {
+                unreachable!();
+            };
+            if completion.submission().slot_id() != slot_id {
+                return Err(Self::error(
+                    "completion differs from the suppressed journal submission",
+                ));
+            }
+            self.completed_frames = self.completed_frames.saturating_add(1);
+            return Ok(());
+        };
         if completion.submission().fingerprint() != submission.fingerprint() {
             return Err(Self::error(
                 "completion differs from the journaled physical submission",
@@ -586,6 +626,7 @@ impl VNextExecutionJournal {
                 &self.active,
             ),
         )?;
+        self.completed_frames = self.completed_frames.saturating_add(1);
         Ok(())
     }
 
@@ -640,7 +681,7 @@ impl VNextExecutionJournal {
             parts,
             ExecutionEventDetail::Counters {
                 input: input_tokens,
-                output: self.emitter.cursor().completed_frames(),
+                output: self.completed_frames,
             },
         )?;
         self.emitter.emit(
