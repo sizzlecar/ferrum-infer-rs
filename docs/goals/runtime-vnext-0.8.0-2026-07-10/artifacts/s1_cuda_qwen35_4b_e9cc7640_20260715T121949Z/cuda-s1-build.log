@@ -1,0 +1,250 @@
+   Compiling ferrum-interfaces v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-interfaces)
+   Compiling ferrum-kernels v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kernels)
+warning: method `set_domain_total` is never used
+    --> crates/ferrum-interfaces/src/vnext/admission.rs:1500:19
+     |
+ 946 | impl LogicalAdmissionCoordinator {
+     | -------------------------------- method in this implementation
+...
+1500 |     pub(crate) fn set_domain_total(
+     |                   ^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `fence`, `batch_identity`, and `submission` are never read
+    --> crates/ferrum-interfaces/src/vnext/completion.rs:1014:9
+     |
+1011 |     InFlight {
+     |     -------- fields in this variant
+...
+1014 |         fence: R::Fence,
+     |         ^^^^^
+1015 |         batch_identity: BatchOperationIdentity,
+     |         ^^^^^^^^^^^^^^
+1016 |         submission: SubmittedOperationReceipt,
+     |         ^^^^^^^^^^
+
+warning: field `batch_identity` is never read
+    --> crates/ferrum-interfaces/src/vnext/completion.rs:1021:9
+     |
+1018 |     SubmissionIndeterminate {
+     |     ----------------------- field in this variant
+...
+1021 |         batch_identity: BatchOperationIdentity,
+     |         ^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+  --> crates/ferrum-interfaces/src/vnext/execution/work.rs:17:19
+   |
+16 | impl DynamicResourceShape {
+   | ------------------------- associated function in this implementation
+17 |     pub(crate) fn new(sequences: u32, tokens: u64, pages: u64) -> Result<Self, VNextError> {
+   |                   ^^^
+
+warning: associated function `new` is never used
+   --> crates/ferrum-interfaces/src/vnext/execution/work.rs:146:19
+    |
+145 | impl CommittedPageWork {
+    | ---------------------- associated function in this implementation
+146 |     pub(crate) fn new(pages: u64, fingerprint: String) -> Result<Self, VNextError> {
+    |                   ^^^
+
+warning: methods `is_fixed` and `is_valid_for_sequence_scope` are never used
+   --> crates/ferrum-interfaces/src/vnext/execution/work.rs:670:19
+    |
+417 | impl DynamicResourceDemand {
+    | -------------------------- methods in this implementation
+...
+670 |     pub(super) fn is_fixed(&self) -> bool {
+    |                   ^^^^^^^^
+...
+674 |     pub(super) fn is_valid_for_sequence_scope(&self) -> bool {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+  --> crates/ferrum-interfaces/src/vnext/resource/dynamic_pool.rs:74:19
+   |
+73 | impl BackingSegment {
+   | ------------------- associated function in this implementation
+74 |     pub(crate) fn new(
+   |                   ^^^
+
+warning: methods `immediate_shape` and `fit_shape` are never used
+   --> crates/ferrum-interfaces/src/vnext/resource/static_lease.rs:352:33
+    |
+328 |         impl $name {
+    |         ---------- methods in this implementation
+...
+352 |             pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
+    |                                 ^^^^^^^^^^^^^^^
+...
+356 |             pub(crate) const fn fit_shape(&self) -> DynamicResourceShape {
+    |                                 ^^^^^^^^^
+...
+374 | scoped_resource_admission_request!(RequestResourceAdmissionRequest, false);
+    | -------------------------------------------------------------------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `scoped_resource_admission_request` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: methods `immediate_shape` and `fit_shape` are never used
+   --> crates/ferrum-interfaces/src/vnext/resource/static_lease.rs:352:33
+    |
+328 |         impl $name {
+    |         ---------- methods in this implementation
+...
+352 |             pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
+    |                                 ^^^^^^^^^^^^^^^
+...
+356 |             pub(crate) const fn fit_shape(&self) -> DynamicResourceShape {
+    |                                 ^^^^^^^^^
+...
+375 | scoped_resource_admission_request!(SequenceResourceAdmissionRequest, true);
+    | -------------------------------------------------------------------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `scoped_resource_admission_request` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: methods `immediate_shape` and `fit_shape` are never used
+  --> crates/ferrum-interfaces/src/vnext/resource/work.rs:32:25
+   |
+15 | impl StepResourceAdmissionRequest {
+   | --------------------------------- methods in this implementation
+...
+32 |     pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
+   |                         ^^^^^^^^^^^^^^^
+...
+36 |     pub(crate) const fn fit_shape(&self) -> DynamicResourceShape {
+   |                         ^^^^^^^^^
+
+warning: method `canonical_key` is never used
+   --> crates/ferrum-interfaces/src/vnext/resource/work.rs:390:14
+    |
+362 | impl StepParticipantFrameAssignment {
+    | ----------------------------------- method in this implementation
+...
+390 |     const fn canonical_key(self) -> (u32, u64, u32, u64) {
+    |              ^^^^^^^^^^^^^
+
+warning: methods `immediate_shape` and `fit_shape` are never used
+   --> crates/ferrum-interfaces/src/vnext/resource/work.rs:435:25
+    |
+403 | impl InvocationResourceAdmissionRequest {
+    | --------------------------------------- methods in this implementation
+...
+435 |     pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
+    |                         ^^^^^^^^^^^^^^^
+...
+439 |     pub(crate) const fn fit_shape(&self) -> DynamicResourceShape {
+    |                         ^^^^^^^^^
+
+warning: constant `SEQUENCE_DISPATCH_COUNT_MASK` is never used
+  --> crates/ferrum-interfaces/src/vnext/resource/sequence.rs:34:7
+   |
+34 | const SEQUENCE_DISPATCH_COUNT_MASK: u64 = SEQUENCE_DISPATCH_POISONED_BIT - 1;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `SequenceDispatchGuard` is never constructed
+  --> crates/ferrum-interfaces/src/vnext/resource/sequence.rs:40:19
+   |
+40 | pub(super) struct SequenceDispatchGuard<'a> {
+   |                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `enter_sequence_dispatch` is never used
+  --> crates/ferrum-interfaces/src/vnext/resource/sequence.rs:51:15
+   |
+51 | pub(super) fn enter_sequence_dispatch(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `0` is never read
+   --> crates/ferrum-interfaces/src/vnext/resource/sequence.rs:443:14
+    |
+443 |     Terminal(SequenceSessionTerminalReceipt),
+    |     -------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |     |
+    |     field in this variant
+    |
+    = note: `SequenceSessionSlotState` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+    |
+443 -     Terminal(SequenceSessionTerminalReceipt),
+443 +     Terminal(()),
+    |
+
+warning: method `ensure_live_identity` is never used
+   --> crates/ferrum-interfaces/src/vnext/resource/sequence.rs:543:19
+    |
+487 | impl SequenceSessionLiveWitness {
+    | ------------------------------- method in this implementation
+...
+543 |     pub(crate) fn ensure_live_identity(
+    |                   ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `acquire_session_frames` is never used
+   --> crates/ferrum-interfaces/src/vnext/resource/batch.rs:543:15
+    |
+543 | pub(super) fn acquire_session_frames(
+    |               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `session_frame_candidates` is never used
+   --> crates/ferrum-interfaces/src/vnext/resource/batch.rs:623:15
+    |
+623 | pub(super) fn session_frame_candidates<R: DeviceRuntime>(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `participant_backing_views` is never used
+   --> crates/ferrum-interfaces/src/vnext/resource/invocation.rs:415:19
+    |
+ 96 | / impl<R> StepResourceLease<R>
+ 97 | | where
+ 98 | |     R: DeviceRuntime,
+    | |_____________________- method in this implementation
+...
+415 |       pub(crate) fn participant_backing_views(
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `participant_node_keys` is never used
+    --> crates/ferrum-interfaces/src/vnext/resource/invocation.rs:1122:19
+     |
+1070 | / impl<R> PreparedStepSubmissionWave<R>
+1071 | | where
+1072 | |     R: DeviceRuntime,
+     | |_____________________- method in this implementation
+...
+1122 |       pub(crate) fn participant_node_keys(&self) -> Vec<ParticipantNodeKey> {
+     |                     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `participant_backing_snapshot` and `participant_backing_views` are never used
+    --> crates/ferrum-interfaces/src/vnext/resource/invocation.rs:1480:19
+     |
+1266 | / impl<R> InvocationResourceLease<R>
+1267 | | where
+1268 | |     R: DeviceRuntime,
+     | |_____________________- methods in this implementation
+...
+1480 |       pub(crate) fn participant_backing_snapshot(
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1547 |       pub(crate) fn participant_backing_views(
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `with_runtime_and_stream` is never used
+    --> crates/ferrum-interfaces/src/vnext/resource/invocation.rs:1983:19
+     |
+1947 | / impl<'resources, 'exec, R> ActiveSequencePermit<'resources, 'exec, R>
+1948 | | where
+1949 | |     R: DeviceRuntime,
+     | |_____________________- method in this implementation
+...
+1983 |       pub(crate) fn with_runtime_and_stream<T>(
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^
+
+   Compiling ferrum-kv v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-kv)
+   Compiling ferrum-sampler v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-sampler)
+   Compiling ferrum-tokenizer v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-tokenizer)
+   Compiling ferrum-scheduler v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-scheduler)
+warning: `ferrum-interfaces` (lib) generated 23 warnings
+   Compiling ferrum-quantization v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-quantization)
+   Compiling ferrum-models v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-models)
+   Compiling ferrum-engine v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-engine)
+   Compiling ferrum-server v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-server)
+   Compiling ferrum-cli v0.7.7 (/workspace/ferrum-infer-rs/crates/ferrum-cli)
+    Finished `release` profile [optimized] target(s) in 20m 55s

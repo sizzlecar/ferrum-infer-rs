@@ -1,0 +1,5 @@
+started_at=2026-07-15T12:22:26Z
+git_sha=e9cc76403d8f69004a49199a407e90ff7007f88b
+NVIDIA GeForce RTX 4090, 24564 MiB, 580.119.02
+command=CARGO_BUILD_JOBS=8 cargo build --release -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
+finished_at=2026-07-15T12:43:21Z

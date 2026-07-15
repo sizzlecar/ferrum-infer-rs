@@ -1,0 +1,11 @@
+{
+  "id": 44965014,
+  "cur_state": "stopped",
+  "actual_status": "exited",
+  "gpu_name": "RTX 4090",
+  "num_gpus": 1,
+  "gpu_ram_mib": 24564,
+  "hourly_rate_usd": 0.41666666666666663,
+  "image": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+  "cleanup_verified_at": "2026-07-15T12:55:47Z"
+}

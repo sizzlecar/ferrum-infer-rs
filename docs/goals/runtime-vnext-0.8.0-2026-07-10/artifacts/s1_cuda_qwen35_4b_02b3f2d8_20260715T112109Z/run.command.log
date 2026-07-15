@@ -1,0 +1,6 @@
+started_at=2026-07-15T11:27:33Z
+git_sha=02b3f2d8e6edba9ecfba910e95245abe0c1142bd
+git_status=
+3cb183714f3aa2851f618136309d009e36fc5f7fb20eb031c26b88795ac69e4b  target/release/ferrum
+command=target/release/ferrum run /workspace/hf-cache/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a --backend cuda --prompt What\ is\ the\ capital\ of\ France\?\ Answer\ in\ one\ word. --max-tokens 16 --output-format jsonl --profile-jsonl /workspace/artifacts/s1_cuda_qwen35_4b_02b3f2d8_20260715T112109Z/run.profile.jsonl --profile-detail basic --scheduler-trace-jsonl /workspace/artifacts/s1_cuda_qwen35_4b_02b3f2d8_20260715T112109Z/run.scheduler-trace.jsonl 
+finished_at=2026-07-15T11:28:49Z
