@@ -6,8 +6,9 @@ use ferrum_interfaces::kv_cache::{
 use ferrum_interfaces::tokenizer::{TokenizerInfo, TokenizerType};
 use ferrum_interfaces::{
     model_executor::{
-        DecodeInput, DecodeOutput, ExecutorCapabilities, ExecutorStatus, PrefillInput,
-        PrefillOutput, UnifiedBatch,
+        DecodeInput, DecodeOutput, ExecutorAdmissionEpochs, ExecutorCapabilities,
+        ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
+        ExecutorPrefillAdmissionReceipt, ExecutorStatus, PrefillInput, PrefillOutput, UnifiedBatch,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateManager, RecurrentStateSpec,
     RecurrentStateTensorSpec, TensorRef,
@@ -15,6 +16,105 @@ use ferrum_interfaces::{
 use ferrum_models::{DecoderOnlyLLM, LlmExecutor, LlmRuntimeConfig};
 use ferrum_testkit::{MockKvCacheManager, MockModelExecutor, MockTensor, MockTensorFactory};
 use std::time::Duration;
+
+struct ExecutorManagedAdmissionTestExecutor {
+    inner: MockModelExecutor,
+    retained: std::sync::Mutex<HashSet<RequestId>>,
+    admission_probes: AtomicU64,
+    prefill_calls: AtomicU64,
+}
+
+impl ExecutorManagedAdmissionTestExecutor {
+    fn new(vocab_size: usize) -> Self {
+        Self {
+            inner: MockModelExecutor::instant(vocab_size),
+            retained: std::sync::Mutex::new(HashSet::new()),
+            admission_probes: AtomicU64::new(0),
+            prefill_calls: AtomicU64::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelExecutor for ExecutorManagedAdmissionTestExecutor {
+    fn info(&self) -> &ferrum_types::ModelInfo {
+        self.inner.info()
+    }
+
+    fn execution_resource_ownership(&self) -> ExecutionResourceOwnership {
+        ExecutionResourceOwnership::ExecutorManaged
+    }
+
+    fn prefill_admission_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
+        Ok(Some(ExecutorAdmissionEpochs::new(
+            std::num::NonZeroU64::new(41).unwrap(),
+            0,
+            0,
+        )))
+    }
+
+    fn try_admit_prefill(
+        &self,
+        input: ExecutorPrefillAdmission<'_>,
+    ) -> Result<ExecutorPrefillAdmissionDecision> {
+        self.admission_probes.fetch_add(1, Ordering::Relaxed);
+        let inserted = self
+            .retained
+            .lock()
+            .expect("retained admission mutex poisoned")
+            .insert(input.request_id.clone());
+        if !inserted {
+            return Err(FerrumError::already_exists("duplicate test admission"));
+        }
+        Ok(ExecutorPrefillAdmissionDecision::Admitted(
+            ExecutorPrefillAdmissionReceipt {
+                request_id: input.request_id.clone(),
+            },
+        ))
+    }
+
+    fn cancel_prefill_admission(&self, request_id: &RequestId) -> bool {
+        self.retained
+            .lock()
+            .expect("retained admission mutex poisoned")
+            .remove(request_id)
+    }
+
+    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
+        let request_id = input
+            .request_id
+            .as_ref()
+            .ok_or_else(|| FerrumError::request_validation("missing request id"))?;
+        if !self
+            .retained
+            .lock()
+            .expect("retained admission mutex poisoned")
+            .remove(request_id)
+        {
+            return Err(FerrumError::internal(
+                "test prefill reached submit without retained admission",
+            ));
+        }
+        self.prefill_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.prefill(input).await
+    }
+
+    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+        self.inner.decode(input).await
+    }
+
+    fn release_cache(&self, cache_id: &str) {
+        self.inner.release_cache(cache_id);
+    }
+
+    fn capabilities(&self) -> ExecutorCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn status(&self) -> ExecutorStatus {
+        self.inner.status()
+    }
+}
 
 #[derive(Debug, Clone)]
 struct TestRecurrentStateHandle {
@@ -1607,6 +1707,44 @@ fn test_continuous_engine_with_config(config: EngineConfig) -> ContinuousBatchEn
         model_executor,
         tensor_factory,
     )
+}
+
+#[tokio::test]
+async fn executor_managed_product_path_requires_typed_admission_before_prefill() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
+    let executor = Arc::new(ExecutorManagedAdmissionTestExecutor::new(128));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let engine = ContinuousBatchEngine::new(
+        config,
+        Arc::clone(&scheduler),
+        tokenizer,
+        sampler,
+        kv_cache,
+        executor.clone(),
+        tensor_factory,
+    );
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 1;
+
+    let response = engine.infer(request).await.unwrap();
+
+    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
+    assert!(executor
+        .retained
+        .lock()
+        .expect("retained admission mutex poisoned")
+        .is_empty());
+    let trace = scheduler.trace_snapshot();
+    assert_eq!(trace.legacy_waiting_admission_ticks, 0);
+    assert!(trace.dynamic_admission_ticks >= 1);
 }
 
 #[test]

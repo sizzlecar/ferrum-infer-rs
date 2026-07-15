@@ -193,6 +193,12 @@ impl EngineInner {
             sequence.take_completion_resources()
         };
 
+        if self.model_executor.execution_resource_ownership()
+            == ExecutionResourceOwnership::ExecutorManaged
+        {
+            self.model_executor.cancel_prefill_admission(request_id);
+        }
+
         let released_waiting_capacity = self.scheduler.trace_phase(request_id)
             == Some(RequestPhase::Waiting)
             && !completion_resources.physical.is_empty();
@@ -273,6 +279,12 @@ impl EngineInner {
                 return Ok(());
             }
         };
+
+        if self.model_executor.execution_resource_ownership()
+            == ExecutionResourceOwnership::ExecutorManaged
+        {
+            self.model_executor.cancel_prefill_admission(request_id);
+        }
 
         self.release_sequence_physical_resources(request_id, completion_resources.physical)
             .await;

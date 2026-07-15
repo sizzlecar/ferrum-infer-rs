@@ -174,6 +174,46 @@ mod tests {
 }
 
 impl EngineInner {
+    fn probe_executor_prefill_admission(
+        &self,
+        request: &InferenceRequest,
+    ) -> ExecutorAdmissionProbeOutcome {
+        let Some((input_tokens, maximum_sequence_tokens)) =
+            self.sequences.read().get(&request.id).map(|sequence| {
+                (
+                    sequence.prefill_context_tokens(),
+                    sequence.model_maximum_sequence_tokens(),
+                )
+            })
+        else {
+            return AdmissionProbeOutcome::Faulted(FerrumError::internal(format!(
+                "request {} reached typed admission before its sequence state was published",
+                request.id
+            )));
+        };
+        match self
+            .model_executor
+            .try_admit_prefill(ExecutorPrefillAdmission::new(
+                &request.id,
+                &input_tokens,
+                maximum_sequence_tokens,
+            )) {
+            Ok(ExecutorPrefillAdmissionDecision::Admitted(receipt)) => {
+                AdmissionProbeOutcome::Admitted(receipt)
+            }
+            Ok(ExecutorPrefillAdmissionDecision::Deferred(deferred)) => {
+                AdmissionProbeOutcome::Deferred(AdmissionDeferral::from_admission(&deferred, 0))
+            }
+            Ok(ExecutorPrefillAdmissionDecision::BackingDeferred(deferred)) => {
+                AdmissionProbeOutcome::Deferred(AdmissionDeferral::from_backing(&deferred, 0))
+            }
+            Ok(ExecutorPrefillAdmissionDecision::PermanentRejected(rejected)) => {
+                AdmissionProbeOutcome::PermanentRejected(rejected)
+            }
+            Err(error) => AdmissionProbeOutcome::Faulted(error),
+        }
+    }
+
     // ── tensor helper ──────────────────────────────────────────────────
 
     pub(super) fn tokens_to_tensor(&self, token_ids: &[u32]) -> Result<TensorRef> {
@@ -322,7 +362,12 @@ impl EngineInner {
                 Some(RequestPhase::Preempted) => {
                     stats.preempted_items += 1;
                 }
-                Some(RequestPhase::Completed | RequestPhase::Cancelled) | None => {
+                Some(
+                    RequestPhase::Completed
+                    | RequestPhase::Cancelled
+                    | RequestPhase::AdmissionFailed,
+                )
+                | None => {
                     stats.unknown_items += 1;
                 }
             }
@@ -405,7 +450,40 @@ impl EngineInner {
         let nb_prof = self.runtime_config.next_batch_prof;
         let sched_t0 = Instant::now();
         let nb_t0 = if nb_prof { Some(Instant::now()) } else { None };
-        let nb_result = self.scheduler.next_batch(hint).await;
+        let nb_result = if self.model_executor.execution_resource_ownership()
+            == ExecutionResourceOwnership::ExecutorManaged
+        {
+            let epochs = self
+                .model_executor
+                .prefill_admission_epochs()?
+                .ok_or_else(|| {
+                    FerrumError::scheduler(
+                        "executor-managed runtime did not expose typed admission epochs",
+                    )
+                })?;
+            let wake = AdmissionWakeEpochs::new(
+                epochs.coordinator_id,
+                epochs.release_epoch,
+                epochs.capacity_epoch,
+                0,
+            );
+            let mut probe =
+                |request: &InferenceRequest| self.probe_executor_prefill_admission(request);
+            self.scheduler
+                .next_batch_with_dynamic_admission(hint, wake, &mut probe)?
+        } else {
+            self.scheduler.next_batch(hint).await
+        };
+        for (request_id, error) in self.scheduler.take_admission_failures() {
+            warn!(
+                request_id = %request_id,
+                error = %error,
+                "Typed prefill admission failed before device submission"
+            );
+            self.model_executor.cancel_prefill_admission(&request_id);
+            self.complete_request(&request_id, FinishReason::Error)
+                .await?;
+        }
         let sched_elapsed = sched_t0.elapsed();
         self.record_scheduling_time(sched_elapsed);
         if let Some(t0) = nb_t0 {
