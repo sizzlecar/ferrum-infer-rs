@@ -18,5 +18,9 @@ The strict stale check remains required. The source fix must retain the parent r
 authority across maintenance, rather than ignoring release or capacity epoch changes.
 The exact next-run stop condition is recorded in `reject-summary.json`.
 
-The uncompressed 161,922,071-byte trace is represented by its SHA256 and the checked-in
-3,391,711-byte gzip. `raw/collection.json` is the collector's machine-readable REJECT.
+The canonical external artifact is
+`/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-s1/s1_cuda_capacity_reject_cfd7f479_20260715T212402Z.tar.gz`
+(`afbb8b01ae616898f78e315e060b509d14b004a83d6a7093d32aee662b2823ae`, 1,317,193 bytes).
+It contains the collector's machine-readable REJECT and the 161,922,071-byte trace as a
+gzip with both uncompressed and compressed SHA256 values. The repository retains only
+this conclusion and its compact machine-readable summary.

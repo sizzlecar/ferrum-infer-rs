@@ -26,6 +26,12 @@
     "manual_stop_after_seconds": 120.852540942,
     "reason": "bounded stop after deterministic zero-progress admission loop"
   },
+  "canonical_artifact": {
+    "path": "/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-s1/s1_cuda_capacity_reject_cfd7f479_20260715T212402Z.tar.gz",
+    "bytes": 1317193,
+    "sha256": "afbb8b01ae616898f78e315e060b509d14b004a83d6a7093d32aee662b2823ae",
+    "file_index": "/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-s1/s1_cuda_capacity_reject_cfd7f479_20260715T212402Z/artifact-files.sha256"
+  },
   "trace": {
     "rows": 77003,
     "uncompressed_bytes": 161922071,
