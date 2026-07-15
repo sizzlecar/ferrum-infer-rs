@@ -17,10 +17,10 @@ use super::{
     LogicalBackingSliceAuthority, LogicalBatchCapacityLease, NodeId, Ordering,
     ParticipantFlightCandidate, ParticipantFlightPhase, ParticipantFlightWaveCandidate,
     ParticipantNodeKey, PreparedParticipantFlightHold, RequestIdentity, ResourceId, RunId,
-    SequenceAuthorityId, SequenceExecutionAuthoritySource, SequenceRecoveryRegistry,
-    SequenceSessionEpoch, SequenceSessionFingerprint, Serialize, Sha256, StaticProvisioningLease,
-    StepFinalizationFailure, StepParticipantFrameAssignment, StepParticipantRetirement,
-    StepParticipantRetirementDisposition, StepResourceAdmissionDecision,
+    SequenceAuthorityId, SequenceBackingSnapshot, SequenceExecutionAuthoritySource,
+    SequenceRecoveryRegistry, SequenceSessionEpoch, SequenceSessionFingerprint, Serialize, Sha256,
+    StaticProvisioningLease, StepFinalizationFailure, StepParticipantFrameAssignment,
+    StepParticipantRetirement, StepParticipantRetirementDisposition, StepResourceAdmissionDecision,
     StepResourceAdmissionRequest, StepResourceLease, StepRetirementReceipt, StreamState,
     TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError, SEQUENCE_DISPATCH_POISONED_BIT,
 };
@@ -244,6 +244,53 @@ where
             .map(|participant| participant.session.resources())
     }
 
+    pub(crate) fn participant_backing_snapshot(
+        &self,
+        participant: BatchParticipantAuthority,
+    ) -> Result<&Arc<SequenceBackingSnapshot<R>>, VNextError> {
+        let index = self
+            .participants
+            .binary_search_by_key(&participant.canonical_key(), |candidate| {
+                session_participant_key(&candidate.session)
+            })
+            .map_err(|_| invalid_resource("step does not own that backing participant"))?;
+        self.participants
+            .get(index)
+            .map(|participant| &participant.backing_snapshot)
+            .ok_or_else(|| invalid_resource("step backing participant mapping is inconsistent"))
+    }
+
+    pub(crate) fn participant_backing_view(
+        &self,
+        authority: BatchParticipantAuthority,
+        resource_id: &ResourceId,
+    ) -> Result<LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
+        let index = self
+            .participants
+            .binary_search_by_key(&authority.canonical_key(), |candidate| {
+                session_participant_key(&candidate.session)
+            })
+            .map_err(|_| invalid_resource("step does not own that backing participant"))?;
+        let participant = self
+            .participants
+            .get(index)
+            .ok_or_else(|| invalid_resource("step backing participant mapping is inconsistent"))?;
+        if let Some(authority) = participant.backing_snapshot.backing_slice(resource_id) {
+            return participant
+                .session
+                .resources()
+                .request
+                .plan
+                .dynamic_pools()
+                .view(authority);
+        }
+        participant
+            .session
+            .resources()
+            .request
+            .backing_view(resource_id)
+    }
+
     pub fn participant_frames(
         &self,
     ) -> impl ExactSizeIterator<Item = StepParticipantFrameAssignment> + '_ {
@@ -371,9 +418,13 @@ where
         self.participants
             .iter()
             .map(|participant| {
+                let authority = BatchParticipantAuthority::new(
+                    participant.session.sequence_authority(),
+                    participant.session.request_authority(),
+                );
                 Ok((
                     participant.session.sequence_authority(),
-                    participant.session.resources().backing_view(resource_id)?,
+                    self.participant_backing_view(authority, resource_id)?,
                 ))
             })
             .collect()
@@ -1424,6 +1475,20 @@ where
         &self.step
     }
 
+    pub(crate) fn participant_backing_snapshot(
+        &self,
+        index: usize,
+    ) -> Result<&Arc<SequenceBackingSnapshot<R>>, VNextError> {
+        let participant = self.participants.get(index).ok_or_else(|| {
+            invalid_resource("invocation backing participant index is out of range")
+        })?;
+        self.step
+            .participant_backing_snapshot(BatchParticipantAuthority::new(
+                participant.sequence_authority(),
+                participant.request_authority(),
+            ))
+    }
+
     pub fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
         self.claimed_backing.backing_slices()
     }
@@ -1485,9 +1550,13 @@ where
         self.participants
             .iter()
             .map(|participant| {
+                let authority = BatchParticipantAuthority::new(
+                    participant.sequence_authority(),
+                    participant.request_authority(),
+                );
                 Ok((
                     participant.sequence_authority(),
-                    participant.backing_view(resource_id)?,
+                    self.step.participant_backing_view(authority, resource_id)?,
                 ))
             })
             .collect()
@@ -1660,7 +1729,14 @@ where
             .iter()
             .cloned()
             .zip(frames)
-            .map(|(session, frame)| AdmittedStepParticipant { frame, session })
+            .map(|(session, frame)| {
+                let backing_snapshot = session.resources().backing_snapshot();
+                AdmittedStepParticipant {
+                    frame,
+                    backing_snapshot,
+                    session,
+                }
+            })
             .collect();
         Ok(StepResourceAdmissionDecision::Admitted(Arc::new(
             StepResourceLease::new(participants, batch_step_id, claimed_backing)?,

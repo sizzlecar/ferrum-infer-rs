@@ -7,16 +7,17 @@ use std::sync::Arc;
 
 use super::{
     classify_device_error, AdmittedSequenceResources, AllocationLifetime, BatchInvocationId,
-    BatchParticipantTokenRange, BatchStepId, BatchWorkShape, BufferUsage, CanonicalRational,
-    CapabilityId, CompletionHandle, CompletionReaper, ContractVersion,
-    DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
-    DeviceCommandBatch, DeviceId, DeviceRuntime, ExecutionIdentityEnvelope, ExecutionLane,
-    ExecutionLaneId, IdentifiedFailure, IndeterminateSubmissionHandle, InvocationResourceLease,
-    LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId, LogicalBackingBufferView,
-    LogicalBackingSegmentBinding, NodeId, NodeWorkContract, OperationId, ParticipantNodeKey,
-    PlanHash, PlanId, PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId,
-    ProviderId, ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedModelPlan, ResourceId,
-    SemanticValue, SequenceSessionEpoch, SequenceSessionFingerprint,
+    BatchParticipantAuthority, BatchParticipantTokenRange, BatchStepId, BatchWorkShape,
+    BufferUsage, CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper,
+    ContractVersion, DefinitelyNotSubmittedRetryAuthority,
+    DefinitelyNotSubmittedWaveRetryAuthority, DeviceCommandBatch, DeviceId, DeviceRuntime,
+    ExecutionIdentityEnvelope, ExecutionLane, ExecutionLaneId, IdentifiedFailure,
+    IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
+    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId,
+    NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
+    PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
+    ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedModelPlan, ResourceId,
+    SemanticValue, SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint,
     StepParticipantFrameAssignment, StepResourceLease, TrustedActiveSequenceBinding,
     TrustedPlanRuntimeEvidence, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
     WeightId,
@@ -3102,6 +3103,33 @@ impl<'a, R: DeviceRuntime> OperationInvocationResources<'a, R> {
         }
     }
 
+    fn participant_backing_snapshot(
+        self,
+        index: usize,
+    ) -> Result<&'a Arc<SequenceBackingSnapshot<R>>, VNextError> {
+        let participant = self.participant(index)?;
+        self.step_resources()
+            .participant_backing_snapshot(BatchParticipantAuthority::new(
+                participant.sequence_authority(),
+                participant.request_authority(),
+            ))
+    }
+
+    fn participant_backing_view(
+        self,
+        index: usize,
+        resource_id: &ResourceId,
+    ) -> Result<LogicalBackingBufferView<'a, R::Buffer>, VNextError> {
+        let participant = self.participant(index)?;
+        self.step_resources().participant_backing_view(
+            BatchParticipantAuthority::new(
+                participant.sequence_authority(),
+                participant.request_authority(),
+            ),
+            resource_id,
+        )
+    }
+
     fn participant_frames(self) -> Result<&'a [StepParticipantFrameAssignment], VNextError> {
         match self {
             Self::Invocation(invocation) => Ok(invocation.participant_frames()),
@@ -3242,6 +3270,7 @@ impl<'a, B> OperationInvocation<'a, B> {
             .operation(node.operation_id())?;
         let parts = identity.parts();
         let participant = resources.participant(participant_index)?;
+        let participant_backing = resources.participant_backing_snapshot(participant_index)?;
         let participant_frame = resources
             .participant_frames()?
             .get(participant_index)
@@ -3252,10 +3281,14 @@ impl<'a, B> OperationInvocation<'a, B> {
         let admission = active_binding.plan().static_provisioning_binding();
         let pool_fingerprint = active_binding.static_pool_identity_fingerprint();
         let memory = plan.payload().memory();
-        let participant_backing_matches = active_binding.backing_slices().iter().eq(participant
-            .backing_slices()
-            .iter()
-            .map(|slice| slice.evidence()));
+        let participant_backing_matches =
+            active_binding
+                .backing_slices()
+                .iter()
+                .eq(participant_backing
+                    .backing_slices()
+                    .iter()
+                    .map(|slice| slice.evidence()));
         if resources.participant_count()? != resources.prepared_participant_count()?
             || resources.node_id()? != node_id
             || participant_frame.sequence_authority() != participant.sequence_authority()
@@ -3441,9 +3474,9 @@ impl<'a, B> OperationInvocation<'a, B> {
                     source: OperationBufferSource::Static(leased),
                 });
             } else if let Some(descriptor) = dynamic_descriptors.get(resource_id) {
-                let backing = resources
-                    .backing_view(resource_id)
-                    .or_else(|_| participant.backing_view(resource_id))?;
+                let backing = resources.backing_view(resource_id).or_else(|_| {
+                    resources.participant_backing_view(participant_index, resource_id)
+                })?;
                 let evidence = backing.slice();
                 let expected_bytes = match descriptor.lifetime() {
                     AllocationLifetime::Invocation => descriptor.evaluate_request_bytes_for_shape(
@@ -3453,7 +3486,7 @@ impl<'a, B> OperationInvocation<'a, B> {
                         resources.step_resources().work_shape().immediate_shape(),
                     )?,
                     AllocationLifetime::Sequence => {
-                        descriptor.evaluate_request_bytes(participant.work_shape())?
+                        descriptor.evaluate_request_bytes(participant_backing.work_shape())?
                     }
                     AllocationLifetime::Request => descriptor
                         .evaluate_fit_request_bytes(participant.request_resources().work_shape())?,
