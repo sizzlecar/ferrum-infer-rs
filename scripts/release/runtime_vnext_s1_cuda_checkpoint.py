@@ -6,7 +6,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
+import shlex
+import statistics
 import sys
 import tempfile
 from collections import Counter, defaultdict
@@ -15,6 +18,7 @@ from typing import Any
 
 
 PASS_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA TRACE CHECKPOINT PASS"
+BASIC_SLICE_PASS_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA BASIC SLICE PASS"
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 REQUIRED_EVENTS = {
@@ -47,6 +51,27 @@ FORBIDDEN_PATTERNS = (
     "differs from its value binding",
     "segmentation fault",
 )
+PROFILE_SLOT_ORDER = (
+    "off1",
+    "basic1",
+    "basic2",
+    "off2",
+    "basic3",
+    "off3",
+    "off4",
+    "basic4",
+)
+OFF_PROFILE_SLOTS = ("off1", "off2", "off3", "off4")
+BASIC_PROFILE_SLOTS = ("basic1", "basic2", "basic3", "basic4")
+PROFILE_REPEAT_COUNT = 3
+PROFILE_REQUESTS_PER_REPEAT = 4
+PROFILE_WARMUP_REQUESTS = 1
+PROFILE_EXPECTED_REQUESTS_PER_SLOT = 15
+PROFILE_EXPECTED_NODES_PER_REQUEST = 131
+PROFILE_EXPECTED_EVENTS_PER_REQUEST = 399
+PROFILE_MAX_BYTES_PER_REQUEST = 1024 * 1024
+PROFILE_MAX_OVERHEAD = 0.02
+PROFILE_MAX_CV = 0.05
 
 
 class ValidationError(RuntimeError):
@@ -341,6 +366,497 @@ def validate(root: Path, expected_git_sha: str | None) -> dict[str, Any]:
     return summary
 
 
+def command_tokens(path: Path) -> list[str]:
+    try:
+        tokens = shlex.split(read_text(path))
+    except ValueError as error:
+        raise ValidationError(f"malformed command receipt {path}: {error}") from error
+    require(tokens, f"empty command receipt: {path}")
+    require(
+        not any(token.startswith("FERRUM_") and "=" in token for token in tokens),
+        f"hidden FERRUM environment override in command receipt: {path}",
+    )
+    return tokens
+
+
+def require_option(tokens: list[str], option: str, expected: str, label: str) -> None:
+    positions = [index for index, token in enumerate(tokens) if token == option]
+    require(len(positions) == 1, f"{label}: expected exactly one {option}")
+    index = positions[0]
+    require(index + 1 < len(tokens), f"{label}: {option} lacks a value")
+    require(tokens[index + 1] == expected, f"{label}: {option} is not {expected!r}")
+
+
+def require_zero_quality(report: dict[str, Any], label: str) -> None:
+    expected = [0] * PROFILE_REPEAT_COUNT
+    for key in (
+        "bad_output_per_run",
+        "duplicate_done_per_run",
+        "http_500_per_run",
+        "malformed_stream_per_run",
+        "missing_done_per_run",
+        "panic_per_run",
+        "stream_bulk_flush_per_run",
+        "zero_output_tokens_per_run",
+    ):
+        require(report.get(key) == expected, f"{label}: non-zero or malformed {key}")
+    quality = report.get("quality_issues_per_run")
+    require(
+        isinstance(quality, list)
+        and len(quality) == PROFILE_REPEAT_COUNT
+        and all(
+            isinstance(row, dict)
+            and row
+            and all(isinstance(value, int) and value == 0 for value in row.values())
+            for row in quality
+        ),
+        f"{label}: non-zero or malformed quality_issues_per_run",
+    )
+
+
+def validate_profile_report(directory: Path, slot: str, mode: str) -> dict[str, Any]:
+    label = f"profile-overhead/{slot}"
+    require_zero_exit(directory / "server.exit")
+    require_zero_exit(directory / "bench.exit")
+    server_tokens = command_tokens(directory / "server.command")
+    require("serve" in server_tokens, f"{label}: server command is not ferrum serve")
+    serve_index = server_tokens.index("serve")
+    require(serve_index + 1 < len(server_tokens), f"{label}: serve command lacks a model")
+    model_path = server_tokens[serve_index + 1]
+    require(
+        "models--Qwen--Qwen3.5-4B/snapshots/" in model_path,
+        f"{label}: model is not Qwen3.5-4B",
+    )
+    require_option(server_tokens, "--backend", "cuda", label)
+    require_option(server_tokens, "--profile-detail", mode, label)
+    if mode == "off":
+        require("--profile-jsonl" not in server_tokens, f"{label}: off command writes profile JSONL")
+        require(
+            "--scheduler-trace-jsonl" not in server_tokens,
+            f"{label}: off command writes scheduler trace",
+        )
+    else:
+        require_option(server_tokens, "--profile-sample-rate", "1.0", label)
+        require("--profile-jsonl" in server_tokens, f"{label}: basic command lacks profile JSONL")
+        require(
+            "--scheduler-trace-jsonl" in server_tokens,
+            f"{label}: basic command lacks scheduler trace",
+        )
+
+    bench_tokens = command_tokens(directory / "bench.command")
+    require("bench-serve" in bench_tokens, f"{label}: benchmark is not ferrum bench-serve")
+    require("--require-ci" in bench_tokens, f"{label}: benchmark lacks --require-ci")
+    require("--fail-on-error" in bench_tokens, f"{label}: benchmark lacks --fail-on-error")
+    for option, expected in (
+        ("--target-backend", "cuda"),
+        ("--concurrency", "1"),
+        ("--dataset", "random"),
+        ("--random-input-len", "128"),
+        ("--random-output-len", "64"),
+        ("--num-prompts", str(PROFILE_REQUESTS_PER_REPEAT)),
+        ("--warmup-requests", str(PROFILE_WARMUP_REQUESTS)),
+        ("--n-repeats", str(PROFILE_REPEAT_COUNT)),
+        ("--seed", "9271"),
+    ):
+        require_option(bench_tokens, option, expected, label)
+
+    report = read_json(directory / "bench.json")
+    require(report.get("n_repeats") == PROFILE_REPEAT_COUNT, f"{label}: wrong repeat count")
+    require(
+        report.get("n_requests_per_run") == PROFILE_REQUESTS_PER_REPEAT,
+        f"{label}: wrong request count",
+    )
+    require(
+        report.get("warmup_requests") == PROFILE_WARMUP_REQUESTS,
+        f"{label}: wrong warmup count",
+    )
+    require(
+        report.get("completed_per_run") == [PROFILE_REQUESTS_PER_REPEAT] * PROFILE_REPEAT_COUNT,
+        f"{label}: incomplete measured requests",
+    )
+    require(report.get("errored_per_run") == [0] * PROFILE_REPEAT_COUNT, f"{label}: request errors")
+    require(report.get("output_token_count_source") == "usage", f"{label}: token source is not usage")
+    require_zero_quality(report, label)
+    repeats = report.get("repeat_metrics")
+    require(
+        isinstance(repeats, list) and len(repeats) == PROFILE_REPEAT_COUNT,
+        f"{label}: malformed repeat metrics",
+    )
+    throughput: list[float] = []
+    for index, row in enumerate(repeats, 1):
+        require(isinstance(row, dict), f"{label}: repeat {index} is not an object")
+        require(row.get("repeat") == index, f"{label}: repeat ordinal mismatch")
+        require(row.get("completed_requests") == PROFILE_REQUESTS_PER_REPEAT, f"{label}: repeat incomplete")
+        require(row.get("errored_requests") == 0, f"{label}: repeat has errors")
+        require(row.get("warmup_completed") == PROFILE_WARMUP_REQUESTS, f"{label}: warmup incomplete")
+        require(row.get("warmup_errored") == 0, f"{label}: warmup errors")
+        require(row.get("output_token_count_source") == "usage", f"{label}: repeat token source")
+        value = row.get("output_throughput_tps")
+        require(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and float(value) > 0,
+            f"{label}: invalid output throughput",
+        )
+        throughput.append(float(value))
+    return {"model_path": model_path, "report": report, "throughput": throughput}
+
+
+def validate_product_commands(root: Path) -> dict[str, Any]:
+    run_tokens = command_tokens(root / "run" / "command")
+    require("run" in run_tokens, "run command is not ferrum run")
+    run_index = run_tokens.index("run")
+    require(run_index + 1 < len(run_tokens), "run command lacks a model")
+    run_model = run_tokens[run_index + 1]
+    require(
+        "models--Qwen--Qwen3.5-4B/snapshots/" in run_model,
+        "run model is not Qwen3.5-4B",
+    )
+    require_option(run_tokens, "--backend", "cuda", "run")
+    require_option(run_tokens, "--profile-detail", "basic", "run")
+    require_option(run_tokens, "--profile-sample-rate", "1.0", "run")
+    require("--profile-jsonl" in run_tokens, "run command lacks profile JSONL")
+    require("--scheduler-trace-jsonl" in run_tokens, "run command lacks scheduler trace")
+
+    serve_tokens = command_tokens(root / "serve" / "command")
+    require("serve" in serve_tokens, "serve command is not ferrum serve")
+    serve_index = serve_tokens.index("serve")
+    require(serve_index + 1 < len(serve_tokens), "serve command lacks a model")
+    serve_model = serve_tokens[serve_index + 1]
+    require(serve_model == run_model, "run and serve use different model snapshots")
+    require_option(serve_tokens, "--backend", "cuda", "serve")
+    require_option(serve_tokens, "--profile-detail", "basic", "serve")
+    require_option(serve_tokens, "--profile-sample-rate", "1.0", "serve")
+    require("--profile-jsonl" in serve_tokens, "serve command lacks profile JSONL")
+    require("--scheduler-trace-jsonl" in serve_tokens, "serve command lacks scheduler trace")
+
+    bench_tokens = command_tokens(root / "serve" / "bench.command")
+    require("bench-serve" in bench_tokens, "serve smoke is not ferrum bench-serve")
+    require("--fail-on-error" in bench_tokens, "serve smoke lacks --fail-on-error")
+    require_option(bench_tokens, "--target-backend", "cuda", "serve smoke")
+    require_option(bench_tokens, "--seed", "9271", "serve smoke")
+    return {
+        "model_id": "Qwen/Qwen3.5-4B",
+        "model_snapshot_path": run_model,
+        "backend": "cuda",
+        "entrypoints": ["ferrum run", "ferrum serve"],
+        "hidden_ferrum_environment_overrides": 0,
+    }
+
+
+def validate_bounded_profile_trace(
+    directory: Path,
+    slot: str,
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    label = f"profile-overhead/{slot}"
+    path = directory / "scheduler-trace.jsonl"
+    rows = read_jsonl(path)
+    events = [
+        row
+        for row in rows
+        if row.get("phase", "").startswith("vnext.")
+        and (row.get("attributes") or {}).get("execution_trace_source") == "vnext"
+    ]
+    by_request: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    terminals: list[int] = []
+    counts: Counter[str] = Counter()
+    operation_identity_omissions = 0
+    for event in events:
+        attributes = event.get("attributes")
+        shape = event.get("shape")
+        request_id = event.get("request_id")
+        require(isinstance(attributes, dict), f"{label}: event lacks attributes")
+        require(isinstance(shape, dict), f"{label}: event lacks shape")
+        require(isinstance(request_id, str) and request_id, f"{label}: event lacks request id")
+        require(
+            attributes.get("execution_capture_policy") == "first_frame_per_request",
+            f"{label}: event is not bounded first-frame capture",
+        )
+        kind = attributes.get("execution_event_kind")
+        require(isinstance(kind, str), f"{label}: event lacks kind")
+        counts[kind] += 1
+        by_request[request_id].append(event)
+        if kind == "operation_submitted":
+            operation_identity_omissions += int(
+                any(not attributes.get(field) for field in OPERATION_IDENTITY_FIELDS)
+            )
+        if kind == "request_completed":
+            output = shape.get("event_output_count")
+            require(
+                isinstance(output, int) and 0 < output <= 64,
+                f"{label}: terminal output count is outside 1..64",
+            )
+            terminals.append(output)
+
+    require(
+        len(by_request) == PROFILE_EXPECTED_REQUESTS_PER_SLOT,
+        f"{label}: expected {PROFILE_EXPECTED_REQUESTS_PER_SLOT} typed requests",
+    )
+    for request_id, request_events in by_request.items():
+        sequences = [event["shape"].get("execution_sequence") for event in request_events]
+        require(
+            sequences == list(range(1, PROFILE_EXPECTED_EVENTS_PER_REQUEST + 1)),
+            f"{label}: non-contiguous or wrong event count for {request_id}",
+        )
+        request_counts = Counter(
+            str(event["attributes"].get("execution_event_kind")) for event in request_events
+        )
+        for kind in (
+            "request_accepted",
+            "plan_built",
+            "frame_started",
+            "frame_completed",
+            "sequence_completed",
+            "request_completed",
+        ):
+            require(request_counts[kind] == 1, f"{label}: {request_id} has wrong {kind} count")
+        for kind in ("node_started", "operation_submitted", "node_retired"):
+            require(
+                request_counts[kind] == PROFILE_EXPECTED_NODES_PER_REQUEST,
+                f"{label}: {request_id} has wrong {kind} count",
+            )
+    require(operation_identity_omissions == 0, f"{label}: operation identity omission")
+    require(
+        len(events) == PROFILE_EXPECTED_EVENTS_PER_REQUEST * PROFILE_EXPECTED_REQUESTS_PER_SLOT,
+        f"{label}: wrong total typed event count",
+    )
+    require(
+        counts["frame_started"] == counts["frame_completed"] == PROFILE_EXPECTED_REQUESTS_PER_SLOT,
+        f"{label}: repeated or imbalanced frame capture",
+    )
+    stride = PROFILE_WARMUP_REQUESTS + PROFILE_REQUESTS_PER_REPEAT
+    require(len(terminals) == PROFILE_REPEAT_COUNT * stride, f"{label}: terminal count mismatch")
+    repeats = report["repeat_metrics"]
+    for repeat in range(PROFILE_REPEAT_COUNT):
+        start = repeat * stride + PROFILE_WARMUP_REQUESTS
+        measured = terminals[start : start + PROFILE_REQUESTS_PER_REPEAT]
+        require(
+            sum(measured) == repeats[repeat].get("output_tokens"),
+            f"{label}: terminal counts differ from usage for repeat {repeat + 1}",
+        )
+    bytes_per_request = path.stat().st_size / len(by_request)
+    require(
+        bytes_per_request <= PROFILE_MAX_BYTES_PER_REQUEST,
+        f"{label}: trace bytes/request exceeds {PROFILE_MAX_BYTES_PER_REQUEST}",
+    )
+    return {
+        "typed_requests": len(by_request),
+        "typed_events": len(events),
+        "nodes_per_request": PROFILE_EXPECTED_NODES_PER_REQUEST,
+        "captured_frames_per_request": 1,
+        "terminal_output_counts": terminals,
+        "usage_reconciled": True,
+        "operation_identity_omissions": operation_identity_omissions,
+        "trace_bytes": path.stat().st_size,
+        "bytes_per_request": bytes_per_request,
+    }
+
+
+def scalar_stats(values: list[float]) -> dict[str, Any]:
+    require(len(values) >= 2, "profile overhead needs at least two samples")
+    mean = statistics.fmean(values)
+    standard_deviation = statistics.stdev(values)
+    return {
+        "values": values,
+        "n": len(values),
+        "mean": mean,
+        "median": statistics.median(values),
+        "sample_stddev": standard_deviation,
+        "cv": standard_deviation / mean,
+    }
+
+
+def validate_profile_overhead(root: Path) -> dict[str, Any]:
+    performance = root / "profile-overhead"
+    require(
+        read_text(performance / "slot-order").split() == list(PROFILE_SLOT_ORDER),
+        "profile overhead slot order is not ABBA-BAAB",
+    )
+    reports: dict[str, dict[str, Any]] = {}
+    traces: dict[str, dict[str, Any]] = {}
+    for slot in PROFILE_SLOT_ORDER:
+        mode = "basic" if slot in BASIC_PROFILE_SLOTS else "off"
+        result = validate_profile_report(performance / slot, slot, mode)
+        reports[slot] = result
+        if mode == "basic":
+            traces[slot] = validate_bounded_profile_trace(
+                performance / slot,
+                slot,
+                result["report"],
+            )
+    model_paths = {result["model_path"] for result in reports.values()}
+    require(len(model_paths) == 1, "profile slots use different model snapshots")
+
+    off = scalar_stats(
+        [value for slot in OFF_PROFILE_SLOTS for value in reports[slot]["throughput"]]
+    )
+    basic = scalar_stats(
+        [value for slot in BASIC_PROFILE_SLOTS for value in reports[slot]["throughput"]]
+    )
+    mean_overhead = (off["mean"] - basic["mean"]) / off["mean"]
+    median_overhead = (off["median"] - basic["median"]) / off["median"]
+    require(off["cv"] <= PROFILE_MAX_CV, f"profile off CV {off['cv']:.6f} exceeds 0.05")
+    require(basic["cv"] <= PROFILE_MAX_CV, f"profile basic CV {basic['cv']:.6f} exceeds 0.05")
+    require(
+        mean_overhead <= PROFILE_MAX_OVERHEAD,
+        f"basic mean overhead {mean_overhead:.6f} exceeds 0.02",
+    )
+    require(
+        median_overhead <= PROFILE_MAX_OVERHEAD,
+        f"basic median overhead {median_overhead:.6f} exceeds 0.02",
+    )
+    require(read_json(performance / "overhead.json").get("status") == "pass", "overhead summary rejects")
+    require(
+        read_json(performance / "trace-boundedness.json").get("status") == "pass",
+        "trace boundedness summary rejects",
+    )
+    initial = read_json(performance / "overhead.abba.reject.json")
+    require(
+        initial.get("status") == "reject" and initial.get("noise_pass") is False,
+        "initial noisy ABBA rejection was not preserved",
+    )
+    return {
+        "status": "pass",
+        "protocol": {
+            "comparison": "ABBA-BAAB",
+            "slot_order": list(PROFILE_SLOT_ORDER),
+            "concurrency": 1,
+            "random_input_len": 128,
+            "random_output_len": 64,
+            "requests_per_repeat": PROFILE_REQUESTS_PER_REPEAT,
+            "repeats_per_slot": PROFILE_REPEAT_COUNT,
+            "seed": 9271,
+            "require_ci": True,
+            "fail_on_error": True,
+            "model_snapshot_path": next(iter(model_paths)),
+        },
+        "off": off,
+        "basic": basic,
+        "mean_overhead": mean_overhead,
+        "median_overhead": median_overhead,
+        "max_overhead": PROFILE_MAX_OVERHEAD,
+        "max_cv": PROFILE_MAX_CV,
+        "completed_requests": {"off": 48, "basic": 48},
+        "failed_requests": {"off": 0, "basic": 0},
+        "bounded_traces": traces,
+    }
+
+
+def artifact_index(root: Path) -> dict[str, dict[str, Any]]:
+    excluded = {"validation.json"}
+    files = [
+        path
+        for path in root.rglob("*")
+        if path.is_file() and path.name not in excluded and not path.is_symlink()
+    ]
+    return {
+        str(path.relative_to(root)): {"sha256": sha256(path), "size_bytes": path.stat().st_size}
+        for path in sorted(files)
+    }
+
+
+def canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def write_basic_slice_evidence(
+    root: Path,
+    out: Path,
+    correctness: dict[str, Any],
+    performance: dict[str, Any],
+) -> None:
+    root = root.resolve()
+    out = out.resolve()
+    require(out != root, "bounded slice output must not overwrite the raw artifact")
+    out.mkdir(parents=True, exist_ok=True)
+    validation_path = out / "validation.json"
+    raw_index = artifact_index(root)
+    product = validate_product_commands(root)
+    validation = {
+        "schema_version": 1,
+        "artifact_type": "runtime_vnext_s1_cuda_basic_slice_validation",
+        "status": "pass",
+        "raw_artifact_dir": str(root),
+        "source_git_sha": correctness["source_git_sha"],
+        "binary_sha256": correctness["binary_sha256"],
+        "hardware": correctness["hardware"],
+        "product": product,
+        "correctness": {
+            "run": correctness["run"],
+            "serve": correctness["serve"],
+        },
+        "profile_overhead": performance,
+        "raw_artifact_count": len(raw_index),
+        "raw_artifact_index_sha256": canonical_json_sha256(raw_index),
+        "raw_artifact_index": raw_index,
+    }
+    write_json(validation_path, validation)
+    pass_line = f"{BASIC_SLICE_PASS_PREFIX}: {out}"
+    manifest = {
+        "schema_version": 1,
+        "artifact_type": "runtime_vnext_s1_cuda_basic_slice_manifest",
+        "checkpoint_id": "S1-CUDA-basic",
+        "lane": "runtime-vnext-s1-cuda",
+        "status": "pass",
+        "pass_line": pass_line,
+        "artifact_dir": str(out),
+        "raw_artifact_dir": str(root),
+        "source_git_sha": correctness["source_git_sha"],
+        "binary_sha256": correctness["binary_sha256"],
+        "hardware": correctness["hardware"],
+        "model_id": product["model_id"],
+        "backend": product["backend"],
+        "entrypoints": product["entrypoints"],
+        "validation": {
+            "path": "validation.json",
+            "sha256": sha256(validation_path),
+            "size_bytes": validation_path.stat().st_size,
+        },
+        "acceptance": {
+            "run_correctness": True,
+            "serve_correctness": True,
+            "stream_correctness": True,
+            "bench_serve_correctness": True,
+            "bounded_basic_trace": True,
+            "profile_mean_overhead_lte_2pct": True,
+            "profile_median_overhead_lte_2pct": True,
+            "profile_cv_lte_5pct": True,
+        },
+        "metrics": {
+            "mean_overhead_fraction": performance["mean_overhead"],
+            "median_overhead_fraction": performance["median_overhead"],
+            "off_cv": performance["off"]["cv"],
+            "basic_cv": performance["basic"]["cv"],
+            "off_completed_requests": performance["completed_requests"]["off"],
+            "basic_completed_requests": performance["completed_requests"]["basic"],
+            "failed_requests": 0,
+            "max_trace_bytes_per_request": max(
+                trace["bytes_per_request"]
+                for trace in performance["bounded_traces"].values()
+            ),
+        },
+        "unlocks": ["G01B"],
+        "does_not_prove": [
+            "S1_milestone",
+            "G01B",
+            "G01",
+            "G06",
+            "full_model_migration",
+            "release",
+        ],
+    }
+    write_json(out / "manifest.json", manifest)
+    print(pass_line)
+
+
 def profile_event(sequence: int, kind: str, entrypoint: str) -> dict[str, Any]:
     attrs: dict[str, Any] = {
         "execution_trace_source": "vnext",
@@ -476,6 +992,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("artifact_dir", nargs="?", type=Path)
     parser.add_argument("--expected-git-sha")
+    parser.add_argument("--require-bounded-overhead", action="store_true")
+    parser.add_argument("--out", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     try:
@@ -483,12 +1001,28 @@ def main() -> int:
             return self_test()
         require(args.artifact_dir is not None, "artifact_dir is required")
         summary = validate(args.artifact_dir, args.expected_git_sha)
+        if args.require_bounded_overhead:
+            require(args.out is not None, "--out is required with --require-bounded-overhead")
+            performance = validate_profile_overhead(args.artifact_dir.resolve())
+            write_basic_slice_evidence(
+                args.artifact_dir,
+                args.out,
+                summary,
+                performance,
+            )
+            return 0
+        require(args.out is None, "--out requires --require-bounded-overhead")
         output = args.artifact_dir.resolve() / "validation.json"
-        output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        write_json(output, summary)
         print(f"{PASS_PREFIX}: {args.artifact_dir.resolve()}")
         return 0
     except (OSError, ValidationError) as error:
-        print(f"FERRUM RUNTIME VNEXT S1 CUDA TRACE CHECKPOINT FAIL: {error}", file=sys.stderr)
+        fail_prefix = (
+            "FERRUM RUNTIME VNEXT S1 CUDA BASIC SLICE FAIL"
+            if args.require_bounded_overhead
+            else "FERRUM RUNTIME VNEXT S1 CUDA TRACE CHECKPOINT FAIL"
+        )
+        print(f"{fail_prefix}: {error}", file=sys.stderr)
         return 1
 
 

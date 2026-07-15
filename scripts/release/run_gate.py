@@ -50,6 +50,7 @@ LANES = (
     "vnext-g00f",
     "vnext-g00",
     "vnext-g01a",
+    "vnext-s1-cuda",
     "unit",
     "metal",
     "cuda-smoke",
@@ -883,6 +884,24 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
                 out_dir / "g01a-contract-split" / "manifest.json"
             ),
             provenance_kind="vnext-g01a-s0a",
+        )
+    if lane == "vnext-s1-cuda":
+        if args.s1_artifact is None:
+            raise GateError("vnext-s1-cuda requires --s1-artifact")
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_s1_cuda_checkpoint.py",
+                str(args.s1_artifact.resolve()),
+                "--require-bounded-overhead",
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT S1 CUDA BASIC SLICE PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-s1-cuda",
         )
     if lane in SOURCE_LANES:
         source_lane = SOURCE_LANES[lane]
@@ -7519,6 +7538,7 @@ def main() -> int:
     parser.add_argument("--model-resolution", type=Path)
     parser.add_argument("--g00a", type=Path)
     parser.add_argument("--g00f", type=Path)
+    parser.add_argument("--s1-artifact", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
