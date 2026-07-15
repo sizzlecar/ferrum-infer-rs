@@ -230,6 +230,80 @@ fn all_plan_nodes_encode_into_one_submission_and_one_completion() {
 }
 
 #[test]
+fn terminal_wave_reads_output_before_releasing_backing() {
+    let (fixture, sequence, session, batch, step) = setup();
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let (identities, active_bindings) = wave_identity_inputs(&fixture.plan, &wave, &session);
+    let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        identities,
+        &active_bindings,
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let handle = OperationDispatch::encode_and_submit_wave(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        &active_bindings,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    let request = CompletionReadbackRequest::new(
+        id("node.tail"),
+        0,
+        id("resource.output"),
+        0,
+        HostTransferLayout::new(ElementType::F32, 4).unwrap(),
+    )
+    .unwrap();
+    let receipt = match handle.wait_with_readback(request).unwrap() {
+        CompletionReadbackObservation::Terminal(receipt) => receipt,
+        other => panic!("wave output readback did not terminate: {other:?}"),
+    };
+    assert!(matches!(
+        receipt.completion().disposition(),
+        OperationCompletionDisposition::Succeeded
+    ));
+    let output = match receipt.disposition() {
+        CompletionReadbackDisposition::Succeeded(output) => output,
+        other => panic!("wave output readback failed: {other:?}"),
+    };
+    assert_eq!(output.request().node_id(), &id("node.tail"));
+    assert_eq!(output.request().resource_id(), &id("resource.output"));
+    assert_eq!(output.bytes(), &[0; 16]);
+    assert_eq!(output.sha256().len(), 64);
+    assert_eq!(receipt.fingerprint().len(), 64);
+    {
+        let trace = fixture.runtime_trace.lock().unwrap();
+        assert!(trace.readback_calls >= 1);
+        assert_eq!(trace.readback_lengths.iter().sum::<u64>(), 16);
+    }
+    assert_eq!(lane.in_flight_count(), 0);
+    assert_eq!(reaper.retained_count(), 0);
+    assert!(handle.wait().is_err(), "terminal slot must be reaped once");
+
+    drop(handle);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
 fn definitely_not_submitted_retries_the_same_whole_wave() {
     let (fixture, sequence, session, batch, step) = setup();
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
