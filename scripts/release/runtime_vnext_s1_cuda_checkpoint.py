@@ -284,14 +284,23 @@ def validate_serve(root: Path) -> dict[str, Any]:
     for key in (
         "bad_output_per_run",
         "duplicate_done_per_run",
+        "http_500_per_run",
         "malformed_stream_per_run",
         "missing_done_per_run",
         "panic_per_run",
-        "quality_issues_per_run",
         "stream_bulk_flush_per_run",
         "zero_output_tokens_per_run",
     ):
         require(report.get(key) == [0], f"serve: bench protocol failure in {key}")
+    quality_issues = report.get("quality_issues_per_run")
+    require(
+        isinstance(quality_issues, list)
+        and len(quality_issues) == 1
+        and isinstance(quality_issues[0], dict)
+        and quality_issues[0]
+        and all(value == 0 for value in quality_issues[0].values()),
+        "serve: bench quality issue counters are non-zero or malformed",
+    )
     require(report.get("output_token_count_source") == "usage", "serve: bench token source is not usage")
     summary["bench_smoke"] = {
         "completed_requests": expected,
@@ -417,10 +426,22 @@ def create_selftest_fixture(root: Path) -> None:
                 "errored_per_run": [0],
                 "bad_output_per_run": [0],
                 "duplicate_done_per_run": [0],
+                "http_500_per_run": [0],
                 "malformed_stream_per_run": [0],
                 "missing_done_per_run": [0],
                 "panic_per_run": [0],
-                "quality_issues_per_run": [0],
+                "quality_issues_per_run": [
+                    {
+                        "bad_output": 0,
+                        "malformed_stream": 0,
+                        "missing_done": 0,
+                        "duplicate_done": 0,
+                        "zero_output_tokens": 0,
+                        "stream_bulk_flush": 0,
+                        "http_500": 0,
+                        "panic": 0,
+                    }
+                ],
                 "stream_bulk_flush_per_run": [0],
                 "zero_output_tokens_per_run": [0],
                 "output_token_count_source": "usage",
