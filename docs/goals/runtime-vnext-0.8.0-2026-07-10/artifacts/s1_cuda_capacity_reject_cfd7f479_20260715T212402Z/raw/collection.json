@@ -1,0 +1,8 @@
+{
+  "artifact_type": "runtime_vnext_s1_cuda_capacity_pressure_collection",
+  "error": "ferrum run failed: {'returncode': -15, 'started_wall_ns': 1784152867981836759, 'finished_wall_ns': 1784152988834377701, 'timed_out': False}",
+  "finished_wall_ns": 1784152988834972284,
+  "provenance": "provenance.json",
+  "schema_version": 1,
+  "status": "reject"
+}

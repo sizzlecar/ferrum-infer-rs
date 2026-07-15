@@ -1,0 +1,35 @@
+{
+  "binary_path": "/workspace/ferrum-infer-rs/target/release/ferrum",
+  "binary_sha256": "517ad790f6c016c46e7ff633da0b34257f37b4514a994c31ada60764cad0e50c",
+  "command_line": [
+    "scripts/release/runtime_vnext_s1_cuda_capacity.py",
+    "collect",
+    "--repo",
+    "/workspace/ferrum-infer-rs",
+    "--binary",
+    "/workspace/ferrum-infer-rs/target/release/ferrum",
+    "--model",
+    "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+    "--out",
+    "/workspace/artifacts/vnext_capacity_cfd7f479_20260715T212402Z/raw",
+    "--port",
+    "18120",
+    "--startup-timeout",
+    "600",
+    "--request-timeout",
+    "300",
+    "--deferral-timeout",
+    "30"
+  ],
+  "dirty_status": "",
+  "git_sha": "cfd7f479f9614510667e3059fb9a91565ad663de",
+  "model_path": "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+  "nvidia_smi": [
+    "NVIDIA GeForce RTX 4090, GPU-b2b0cfa5-f09a-bfa4-b0e9-f84e4c5e1a02, 23028 MiB, 595.45.04"
+  ],
+  "sanitized_env": {
+    "LD_LIBRARY_PATH": "/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+  },
+  "schema_version": 1,
+  "started_wall_ns": 1784152867981135632
+}

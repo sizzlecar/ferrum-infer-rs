@@ -1,0 +1,1 @@
+FERRUM RUNTIME VNEXT S1 CUDA CAPACITY PRESSURE REJECT: /workspace/artifacts/vnext_capacity_cfd7f479_20260715T212402Z/raw: ferrum run failed: {'returncode': -15, 'started_wall_ns': 1784152867981836759, 'finished_wall_ns': 1784152988834377701, 'timed_out': False}
