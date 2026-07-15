@@ -2274,6 +2274,18 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         }
     }
 
+    pub(crate) fn backing_view(
+        &self,
+        node_id: &NodeId,
+        participant_index: u32,
+        resource_id: &ResourceId,
+    ) -> Result<LogicalBackingBufferView<'_, R::Buffer>, VNextError> {
+        self.resources
+            .as_ref()
+            .expect("live completion reservation owns submission resources")
+            .backing_view(node_id, participant_index, resource_id)
+    }
+
     pub(crate) fn mark_submission_started(&mut self) {
         self.submission_may_have_happened = true;
     }
