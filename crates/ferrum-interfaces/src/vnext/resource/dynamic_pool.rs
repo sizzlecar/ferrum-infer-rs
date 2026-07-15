@@ -1982,22 +1982,6 @@ where
             })?;
             groups.push((pool, requests));
         }
-        let segment_generations = groups
-            .iter()
-            .map(|(pool, requests)| {
-                (0..requests.len())
-                    .map(|_| {
-                        pool.next_extent_generation
-                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                                current.checked_add(1)
-                            })
-                            .map_err(|_| {
-                                invalid_resource("dynamic extent generation space is exhausted")
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let mut states = groups
             .iter()
             .map(|(pool, _)| {
@@ -2069,6 +2053,53 @@ where
                 }
             }
         }
+        let blockers = groups
+            .iter()
+            .enumerate()
+            .map(|(group_index, (pool, pool_requests))| {
+                let requested_bytes = pool_requests.iter().try_fold(0_u64, |total, request| {
+                    total
+                        .checked_add(request.size_bytes)
+                        .ok_or_else(|| invalid_resource("dynamic backing batch bytes overflow u64"))
+                })?;
+                let state = &states[group_index];
+                Ok(
+                    (state.allocator.free_bytes < requested_bytes).then(|| DynamicBackingBlocker {
+                        pool_id: pool.domain.pool_id().clone(),
+                        reason: DynamicBackingDeferralReason::GrowthRequired,
+                        requested_bytes: requested_bytes - state.allocator.free_bytes,
+                        free_bytes: state.allocator.free_bytes,
+                        largest_contiguous_bytes: state.allocator.largest_contiguous_bytes(),
+                    }),
+                )
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if !blockers.is_empty() {
+            drop(states);
+            return Ok(BackingPrepareDecision::Deferred(DynamicBackingDeferred {
+                blockers,
+                epochs: self.logical_admission.epochs()?,
+            }));
+        }
+        let segment_generations = groups
+            .iter()
+            .map(|(pool, requests)| {
+                (0..requests.len())
+                    .map(|_| {
+                        pool.next_extent_generation
+                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                                current.checked_add(1)
+                            })
+                            .map_err(|_| {
+                                invalid_resource("dynamic extent generation space is exhausted")
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut selections = groups
             .iter()
             .map(|_| Vec::<(&EvaluatedBackingRequest<'_>, u64, Vec<BackingSegment>)>::new())
