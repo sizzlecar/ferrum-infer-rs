@@ -2604,6 +2604,111 @@ fn controller_maintains_current_deferral_and_retries_stale_epoch_without_growth(
 }
 
 #[test]
+fn sequence_backing_deferral_remains_current_while_parent_request_is_retained() {
+    let request_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'd',
+        1,
+        64,
+        TestDemand::Fixed,
+    );
+    let sequence_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        'e',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let request_pool_id = request_catalog.pool_id.clone();
+    let sequence_pool_id = sequence_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[request_catalog, sequence_catalog]);
+    let runtime = new_runtime(&catalog, 192);
+    let harness = harness(Arc::clone(&runtime), catalog, 192, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&request_pool_id)
+        .unwrap();
+    let request = admitted_request(&harness.root, "retained-parent-deferral");
+    let admission = SequenceResourceAdmissionRequest::new(
+        work(1),
+        AdmissionFitPolicy::FullInputMustFit,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let SequenceResourceAdmissionDecision::BackingDeferred(deferred) =
+        request.try_admit_sequence(admission).unwrap()
+    else {
+        panic!("zero-resident sequence backing must defer")
+    };
+
+    let DynamicDeferredMaintenanceOutcome::Maintained(receipt) =
+        harness.root.maintain_for_deferred(&deferred).unwrap()
+    else {
+        panic!("retained parent must keep the child backing evidence current")
+    };
+    assert_eq!(receipt.growths().len(), 1);
+    assert_eq!(receipt.growths()[0].pool_id(), &sequence_pool_id);
+    assert_eq!(runtime.allocate_calls(), 2);
+
+    drop(request);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn sequence_backing_deferral_becomes_stale_after_parent_request_release() {
+    let request_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'f',
+        1,
+        64,
+        TestDemand::Fixed,
+    );
+    let sequence_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        '1',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let request_pool_id = request_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[request_catalog, sequence_catalog]);
+    let runtime = new_runtime(&catalog, 192);
+    let harness = harness(Arc::clone(&runtime), catalog, 192, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&request_pool_id)
+        .unwrap();
+    let request = admitted_request(&harness.root, "released-parent-deferral");
+    let admission = SequenceResourceAdmissionRequest::new(
+        work(1),
+        AdmissionFitPolicy::FullInputMustFit,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let SequenceResourceAdmissionDecision::BackingDeferred(deferred) =
+        request.try_admit_sequence(admission).unwrap()
+    else {
+        panic!("zero-resident sequence backing must defer")
+    };
+    drop(request);
+
+    let DynamicDeferredMaintenanceOutcome::RetryWithoutGrowth { current_epochs } =
+        harness.root.maintain_for_deferred(&deferred).unwrap()
+    else {
+        panic!("released parent must invalidate the child backing evidence")
+    };
+    assert_ne!(current_epochs, deferred.epochs());
+    assert_eq!(runtime.allocate_calls(), 1);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
 fn descriptor_mismatch_is_observable_and_explicit_cleanup_returns_its_grant() {
     let catalog = pool_catalog(
         linear_profile(),
