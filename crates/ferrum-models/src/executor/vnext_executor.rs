@@ -668,6 +668,25 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         Ok(())
     }
 
+    fn maintain_admission_growth(
+        &self,
+        scope: &str,
+        deferred: &AdmissionDeferred,
+        attempts: &mut u32,
+    ) -> Result<bool> {
+        if deferred.action() != DeferredAction::AwaitBackingGrowth {
+            return Ok(false);
+        }
+        if *attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
+            return Err(Self::deferred(scope, deferred));
+        }
+        *attempts += 1;
+        self.plan_resources
+            .maintain_for_admission_deferred(deferred)
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
+        Ok(true)
+    }
+
     fn deferred(scope: &str, deferred: &AdmissionDeferred) -> FerrumError {
         FerrumError::resource_exhausted(format!(
             "vNext {scope} deferred with action {:?} until capacity epoch changes: {:?}",
@@ -709,6 +728,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.metrics
                         .request_deferrals
                         .fetch_add(1, Ordering::Relaxed);
+                    if self.maintain_admission_growth(
+                        "request admission",
+                        &deferred,
+                        &mut backing_attempts,
+                    )? {
+                        continue;
+                    }
                     return Err(Self::deferred("request admission", &deferred));
                 }
                 RequestResourceAdmissionDecision::BackingDeferred(deferred) => {
@@ -746,6 +772,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.metrics
                         .sequence_deferrals
                         .fetch_add(1, Ordering::Relaxed);
+                    if self.maintain_admission_growth(
+                        "sequence admission",
+                        &deferred,
+                        &mut backing_attempts,
+                    )? {
+                        continue;
+                    }
                     return Err(Self::deferred("sequence admission", &deferred));
                 }
                 SequenceResourceAdmissionDecision::BackingDeferred(deferred) => {
@@ -808,6 +841,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.metrics
                         .extension_deferrals
                         .fetch_add(1, Ordering::Relaxed);
+                    if self.maintain_admission_growth(
+                        "sequence extension",
+                        &deferred,
+                        &mut backing_attempts,
+                    )? {
+                        continue;
+                    }
                     return Err(Self::deferred("sequence extension", &deferred));
                 }
                 SequenceResourceExtensionDecision::BackingDeferred(deferred) => {
@@ -851,6 +891,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 StepResourceAdmissionDecision::Admitted(step) => return Ok(step),
                 StepResourceAdmissionDecision::Deferred(deferred) => {
                     self.metrics.step_deferrals.fetch_add(1, Ordering::Relaxed);
+                    if self.maintain_admission_growth(
+                        "step admission",
+                        &deferred,
+                        &mut backing_attempts,
+                    )? {
+                        continue;
+                    }
                     return Err(Self::deferred("step admission", &deferred));
                 }
                 StepResourceAdmissionDecision::BackingDeferred(deferred) => {
@@ -902,6 +949,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 StepSubmissionWaveAdmissionDecision::Prepared(wave) => return Ok(wave),
                 StepSubmissionWaveAdmissionDecision::Deferred(deferred) => {
                     self.metrics.wave_deferrals.fetch_add(1, Ordering::Relaxed);
+                    if self.maintain_admission_growth(
+                        "submission wave",
+                        &deferred,
+                        &mut backing_attempts,
+                    )? {
+                        continue;
+                    }
                     return Err(Self::deferred("submission wave", &deferred));
                 }
                 StepSubmissionWaveAdmissionDecision::BackingDeferred(deferred) => {
