@@ -1,0 +1,987 @@
+#!/usr/bin/env python3
+"""Collect and validate the bounded S1 CUDA capacity-pressure product slice."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import http.client
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+PASS_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA CAPACITY PRESSURE PASS"
+GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+FORBIDDEN_PATTERNS = (
+    "panic",
+    "panicked",
+    "segmentation fault",
+    "cuda out of memory",
+    "invalid utf-8",
+    "<unk>",
+    "[pad",
+    "missing data: [done]",
+)
+
+
+class CapacityGateError(RuntimeError):
+    pass
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise CapacityGateError(message)
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(errors="strict"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise CapacityGateError(f"invalid JSON {path}: {error}") from error
+    require(isinstance(value, dict), f"JSON root is not an object: {path}")
+    return value
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def command_output(argv: list[str], cwd: Path) -> str:
+    result = subprocess.run(
+        argv,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    require(result.returncode == 0, f"command failed ({argv!r}): {result.stdout}")
+    return result.stdout.strip()
+
+
+def http_json(port: int, path: str, timeout: float = 5.0) -> dict[str, Any]:
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}{path}", timeout=timeout
+        ) as response:
+            value = json.loads(response.read().decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, urllib.error.URLError) as error:
+        raise CapacityGateError(f"GET {path} failed: {error}") from error
+    require(isinstance(value, dict), f"GET {path} did not return an object")
+    return value
+
+
+def find_executor_snapshot(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        if value.get("schema") == "ferrum.runtime-vnext.executor-trace.v1":
+            return value
+        for child in value.values():
+            found = find_executor_snapshot(child)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = find_executor_snapshot(child)
+            if found is not None:
+                return found
+    return None
+
+
+def read_trace(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    for raw in path.read_text(errors="replace").splitlines():
+        if not raw.strip():
+            continue
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            rows.append(value)
+    return rows
+
+
+def request_identity_matches(observed: Any, request_id: str) -> bool:
+    return observed == request_id or observed == f"request.product.{request_id}"
+
+
+def collect_run_smoke(
+    *, repo: Path, binary: Path, model: Path, out_dir: Path, timeout: float
+) -> dict[str, Any]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    trace = out_dir / "scheduler-trace.jsonl"
+    profile = out_dir / "profile.jsonl"
+    command = [
+        str(binary),
+        "run",
+        str(model),
+        "--backend",
+        "cuda",
+        "--prompt",
+        "Respond with only the city name: What is the capital of France?",
+        "--max-tokens",
+        "16",
+        "--temperature",
+        "0",
+        "--seed",
+        "9271",
+        "--output-format",
+        "jsonl",
+        "--profile-detail",
+        "basic",
+        "--profile-sample-rate",
+        "1.0",
+        "--profile-jsonl",
+        str(profile),
+        "--scheduler-trace-jsonl",
+        str(trace),
+    ]
+    write_json(out_dir / "command.json", {"argv": command})
+    started = time.time_ns()
+    try:
+        result = subprocess.run(
+            command,
+            cwd=repo,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+        summary = {
+            "returncode": result.returncode,
+            "started_wall_ns": started,
+            "finished_wall_ns": time.time_ns(),
+            "timed_out": False,
+        }
+        (out_dir / "stdout.jsonl").write_text(result.stdout)
+        (out_dir / "stderr.log").write_text(result.stderr)
+    except subprocess.TimeoutExpired as error:
+        summary = {
+            "returncode": None,
+            "started_wall_ns": started,
+            "finished_wall_ns": time.time_ns(),
+            "timed_out": True,
+        }
+        (out_dir / "stdout.jsonl").write_text(error.stdout or "")
+        (out_dir / "stderr.log").write_text(error.stderr or "")
+    write_json(out_dir / "result.json", summary)
+    require(summary["returncode"] == 0, f"ferrum run failed: {summary}")
+    rows = [
+        json.loads(line)
+        for line in (out_dir / "stdout.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    require(rows and all(isinstance(row, dict) for row in rows), "ferrum run JSONL is empty")
+    assistant = next((row for row in rows if row.get("event") == "assistant"), None)
+    require(isinstance(assistant, dict), "ferrum run emitted no assistant row")
+    require("paris" in str(assistant.get("content", "")).lower(), "ferrum run answer is not Paris")
+    require(assistant.get("n_tokens", 0) > 0, "ferrum run emitted no output tokens")
+    phases = {row.get("phase") for row in read_trace(trace)}
+    require("vnext.operation_submitted" in phases, "ferrum run has no vNext submission trace")
+    require("vnext.request_completed" in phases, "ferrum run has no vNext completion trace")
+    return summary
+
+
+def stream_request(
+    *,
+    port: int,
+    model: str,
+    role: str,
+    max_tokens: int,
+    out_dir: Path,
+    first_content: threading.Event,
+    timeout: float,
+) -> dict[str, Any]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    started_wall_ns = time.time_ns()
+    result: dict[str, Any] = {
+        "role": role,
+        "max_tokens": max_tokens,
+        "started_wall_ns": started_wall_ns,
+        "first_content_wall_ns": None,
+        "finished_wall_ns": None,
+        "http_status": None,
+        "stream_id": None,
+        "content_chunks": 0,
+        "done_count": 0,
+        "usage_count": 0,
+        "completion_tokens": None,
+        "error": None,
+    }
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        f"Capacity lane {role}. Emit deterministic short words until the token "
+                        "limit; do not explain the task."
+                    ),
+                }
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "seed": 9271,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "ignore_eos": True,
+            "user": f"runtime-vnext-capacity-{role}",
+        }
+    ).encode("utf-8")
+    raw_path = out_dir / f"{role}.sse"
+    events_path = out_dir / f"{role}.events.jsonl"
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        result["http_status"] = response.status
+        with raw_path.open("w") as raw_file, events_path.open("w") as events_file:
+            while True:
+                line_bytes = response.readline()
+                if not line_bytes:
+                    break
+                line = line_bytes.decode("utf-8", errors="replace")
+                raw_file.write(line)
+                stripped = line.strip()
+                if not stripped.startswith("data:"):
+                    continue
+                payload = stripped[5:].strip()
+                now_ns = time.time_ns()
+                if payload == "[DONE]":
+                    result["done_count"] += 1
+                    events_file.write(
+                        json.dumps({"wall_ns": now_ns, "kind": "done"}) + "\n"
+                    )
+                    continue
+                try:
+                    chunk = json.loads(payload)
+                except json.JSONDecodeError as error:
+                    raise CapacityGateError(
+                        f"{role} returned malformed SSE JSON: {error}"
+                    ) from error
+                if isinstance(chunk.get("id"), str):
+                    result["stream_id"] = chunk["id"]
+                usage = chunk.get("usage")
+                if isinstance(usage, dict):
+                    result["usage_count"] += 1
+                    result["completion_tokens"] = usage.get("completion_tokens")
+                content = ""
+                choices = chunk.get("choices")
+                if isinstance(choices, list):
+                    for choice in choices:
+                        if not isinstance(choice, dict):
+                            continue
+                        delta = choice.get("delta")
+                        if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                            content += delta["content"]
+                if content:
+                    result["content_chunks"] += 1
+                    if result["first_content_wall_ns"] is None:
+                        result["first_content_wall_ns"] = now_ns
+                        first_content.set()
+                    events_file.write(
+                        json.dumps(
+                            {
+                                "wall_ns": now_ns,
+                                "kind": "content",
+                                "chars": len(content),
+                            }
+                        )
+                        + "\n"
+                    )
+        if response.status != 200:
+            raise CapacityGateError(f"{role} returned HTTP {response.status}")
+    except Exception as error:  # The artifact must retain client-side failures.
+        result["error"] = str(error)
+    finally:
+        result["finished_wall_ns"] = time.time_ns()
+        first_content.set()
+        connection.close()
+        write_json(out_dir / f"{role}.result.json", result)
+    return result
+
+
+class StreamTask:
+    def __init__(
+        self,
+        *,
+        port: int,
+        model: str,
+        role: str,
+        max_tokens: int,
+        out_dir: Path,
+        timeout: float,
+    ) -> None:
+        self.first_content = threading.Event()
+        self.result: dict[str, Any] | None = None
+        self.thread = threading.Thread(
+            target=self._run,
+            kwargs={
+                "port": port,
+                "model": model,
+                "role": role,
+                "max_tokens": max_tokens,
+                "out_dir": out_dir,
+                "first_content": self.first_content,
+                "timeout": timeout,
+            },
+            daemon=True,
+        )
+
+    def _run(self, **kwargs: Any) -> None:
+        self.result = stream_request(**kwargs)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def wait_first(self, timeout: float) -> None:
+        require(self.first_content.wait(timeout), "stream did not produce a first-content signal")
+        if self.result is not None and self.result.get("error"):
+            raise CapacityGateError(str(self.result["error"]))
+
+    def join(self, timeout: float) -> dict[str, Any]:
+        self.thread.join(timeout)
+        require(not self.thread.is_alive(), "stream request exceeded the bounded timeout")
+        require(self.result is not None, "stream request produced no result")
+        return self.result
+
+
+class ServerSession:
+    def __init__(
+        self,
+        *,
+        repo: Path,
+        binary: Path,
+        model: Path,
+        port: int,
+        out_dir: Path,
+        runtime_budget: int | None,
+        startup_timeout: float,
+    ) -> None:
+        self.repo = repo
+        self.port = port
+        self.out_dir = out_dir
+        self.trace_path = out_dir / "scheduler-trace.jsonl"
+        self.profile_path = out_dir / "profile.jsonl"
+        self.proc: subprocess.Popen[str] | None = None
+        self.stdout_file: Any = None
+        self.stderr_file: Any = None
+        command = [
+            str(binary),
+            "serve",
+            str(model),
+            "--backend",
+            "cuda",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--max-model-len",
+            "512",
+            "--max-num-seqs",
+            "4",
+            "--max-num-batched-tokens",
+            "1024",
+            "--scheduler-prefill-first-until-active",
+            "4",
+            "--profile-detail",
+            "basic",
+            "--profile-sample-rate",
+            "1.0",
+            "--profile-jsonl",
+            str(self.profile_path),
+            "--scheduler-trace-jsonl",
+            str(self.trace_path),
+        ]
+        if runtime_budget is not None:
+            command.extend(["--runtime-memory-budget-bytes", str(runtime_budget)])
+        self.command = command
+        out_dir.mkdir(parents=True, exist_ok=True)
+        write_json(out_dir / "server.command.json", {"argv": command})
+        self.stdout_file = (out_dir / "server.stdout.log").open("w")
+        self.stderr_file = (out_dir / "server.stderr.log").open("w")
+        self.proc = subprocess.Popen(
+            command,
+            cwd=repo,
+            text=True,
+            stdout=self.stdout_file,
+            stderr=self.stderr_file,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + startup_timeout
+            last_error = "server did not answer"
+            while time.monotonic() < deadline:
+                if self.proc.poll() is not None:
+                    raise CapacityGateError(
+                        f"server exited during startup with {self.proc.returncode}"
+                    )
+                try:
+                    health = http_json(port, "/health")
+                    if health.get("status") == "healthy":
+                        models = http_json(port, "/v1/models")
+                        write_json(out_dir / "health.start.json", health)
+                        write_json(out_dir / "models.json", models)
+                        data = models.get("data")
+                        require(isinstance(data, list) and data, "model list is empty")
+                        model_id = data[0].get("id") if isinstance(data[0], dict) else None
+                        require(isinstance(model_id, str) and model_id, "model id is missing")
+                        self.model_id = model_id
+                        return
+                except CapacityGateError as error:
+                    last_error = str(error)
+                time.sleep(1)
+            raise CapacityGateError(f"server startup timed out: {last_error}")
+        except Exception:
+            self.stop()
+            raise
+
+    def health(self, name: str) -> dict[str, Any]:
+        value = http_json(self.port, "/health")
+        write_json(self.out_dir / name, value)
+        return value
+
+    def stop(self) -> None:
+        if self.proc is None:
+            return
+        if self.proc.poll() is None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGINT)
+                self.proc.wait(timeout=20)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                if self.proc.poll() is None:
+                    os.killpg(self.proc.pid, signal.SIGKILL)
+                    self.proc.wait(timeout=10)
+        write_json(
+            self.out_dir / "server.exit.json",
+            {"returncode": self.proc.returncode, "stopped_wall_ns": time.time_ns()},
+        )
+        self.stdout_file.close()
+        self.stderr_file.close()
+        self.proc = None
+
+
+def require_stream_success(result: dict[str, Any], label: str) -> None:
+    require(result.get("error") is None, f"{label}: {result.get('error')}")
+    require(result.get("http_status") == 200, f"{label}: HTTP status is not 200")
+    require(result.get("done_count") == 1, f"{label}: expected exactly one [DONE]")
+    require(result.get("usage_count") == 1, f"{label}: expected exactly one usage chunk")
+    require(
+        isinstance(result.get("completion_tokens"), int)
+        and result["completion_tokens"] > 0,
+        f"{label}: missing positive completion token count",
+    )
+    require(result.get("content_chunks", 0) > 0, f"{label}: no content chunks")
+
+
+def run_capacity_pair(
+    server: ServerSession,
+    out_dir: Path,
+    timeout: float,
+    prefix: str,
+) -> dict[str, Any]:
+    a = StreamTask(
+        port=server.port,
+        model=server.model_id,
+        role=f"{prefix}-A",
+        max_tokens=128,
+        out_dir=out_dir,
+        timeout=timeout,
+    )
+    a.start()
+    a.wait_first(timeout)
+    c = StreamTask(
+        port=server.port,
+        model=server.model_id,
+        role=f"{prefix}-C",
+        max_tokens=16,
+        out_dir=out_dir,
+        timeout=timeout,
+    )
+    c.start()
+    c_result = c.join(timeout)
+    a_result = a.join(timeout)
+    require_stream_success(a_result, f"{prefix}-A")
+    require_stream_success(c_result, f"{prefix}-C")
+    require(
+        c_result["started_wall_ns"] < a_result["finished_wall_ns"],
+        f"{prefix}: A and C did not overlap",
+    )
+    return {"A": a_result, "C": c_result}
+
+
+def wait_for_deferral(
+    trace_path: Path,
+    baseline_rows: int,
+    started_wall_ns: int,
+    timeout: float,
+) -> tuple[str, dict[str, Any]]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rows = read_trace(trace_path)
+        for row in rows[baseline_rows:]:
+            shape = row.get("shape")
+            decision = shape.get("decision") if isinstance(shape, dict) else None
+            if (
+                row.get("phase") == "vnext.prefill_admission"
+                and decision in {"deferred", "maintenance_deferred"}
+                and isinstance(row.get("request_id"), str)
+                and row.get("ts_unix_nanos", 0) >= started_wall_ns
+            ):
+                return row["request_id"], row
+        time.sleep(0.02)
+    raise CapacityGateError("B did not produce a typed admission deferral before timeout")
+
+
+def collect(args: argparse.Namespace) -> int:
+    repo = args.repo.resolve()
+    binary = args.binary.resolve()
+    model = args.model.resolve()
+    out = args.out.resolve()
+    require(not out.exists(), f"collection output already exists: {out}")
+    require(binary.is_file(), f"missing binary: {binary}")
+    require(model.is_dir(), f"missing model directory: {model}")
+    require(args.port < 65535, "base port leaves no target-server port")
+    out.mkdir(parents=True)
+    provenance = {
+        "schema_version": 1,
+        "command_line": sys.argv,
+        "git_sha": command_output(["git", "rev-parse", "HEAD"], repo),
+        "dirty_status": command_output(["git", "status", "--short"], repo),
+        "binary_path": str(binary),
+        "binary_sha256": sha256(binary),
+        "model_path": str(model),
+        "nvidia_smi": command_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,uuid,memory.total,driver_version",
+                "--format=csv,noheader",
+            ],
+            repo,
+        ).splitlines(),
+        "sanitized_env": {
+            key: os.environ[key]
+            for key in ("CUDA_VISIBLE_DEVICES", "HF_HOME", "LD_LIBRARY_PATH", "RUST_LOG")
+            if key in os.environ
+        },
+        "started_wall_ns": time.time_ns(),
+    }
+    write_json(out / "provenance.json", provenance)
+    require(GIT_SHA_RE.fullmatch(provenance["git_sha"]) is not None, "invalid git SHA")
+    require(not provenance["dirty_status"], "CUDA capacity evidence requires a clean checkout")
+    sessions: list[ServerSession] = []
+    collection: dict[str, Any] = {
+        "schema_version": 1,
+        "artifact_type": "runtime_vnext_s1_cuda_capacity_pressure_collection",
+        "status": "reject",
+        "provenance": "provenance.json",
+        "error": None,
+    }
+    try:
+        run_summary = collect_run_smoke(
+            repo=repo,
+            binary=binary,
+            model=model,
+            out_dir=out / "run",
+            timeout=args.request_timeout,
+        )
+        calibration = ServerSession(
+            repo=repo,
+            binary=binary,
+            model=model,
+            port=args.port,
+            out_dir=out / "calibration",
+            runtime_budget=None,
+            startup_timeout=args.startup_timeout,
+        )
+        sessions.append(calibration)
+        calibration_clients = run_capacity_pair(
+            calibration, out / "calibration" / "clients", args.request_timeout, "calibration"
+        )
+        calibration_health = calibration.health("health.final.json")
+        executor = find_executor_snapshot(calibration_health)
+        require(executor is not None, "calibration health has no vNext executor snapshot")
+        static_bytes = executor.get("static_bytes")
+        pools = executor.get("dynamic_pools", {}).get("pools", [])
+        require(isinstance(static_bytes, int) and static_bytes > 0, "invalid static bytes")
+        require(isinstance(pools, list) and pools, "calibration dynamic pools are missing")
+        resident_bytes = sum(
+            pool.get("resident_bytes", 0) for pool in pools if isinstance(pool, dict)
+        )
+        require(resident_bytes > 0, "calibration did not install dynamic backing")
+        exact_budget = static_bytes + resident_bytes
+        calibration.stop()
+
+        target = ServerSession(
+            repo=repo,
+            binary=binary,
+            model=model,
+            port=args.port + 1,
+            out_dir=out / "target",
+            runtime_budget=exact_budget,
+            startup_timeout=args.startup_timeout,
+        )
+        sessions.append(target)
+        warmup_clients = run_capacity_pair(
+            target, out / "target" / "warmup", args.request_timeout, "warmup"
+        )
+        warmup_health = target.health("health.warmup.json")
+
+        pressure_dir = out / "target" / "pressure"
+        a = StreamTask(
+            port=target.port,
+            model=target.model_id,
+            role="pressure-A",
+            max_tokens=128,
+            out_dir=pressure_dir,
+            timeout=args.request_timeout,
+        )
+        a.start()
+        a.wait_first(args.request_timeout)
+        baseline_rows = len(read_trace(target.trace_path))
+        b = StreamTask(
+            port=target.port,
+            model=target.model_id,
+            role="pressure-B",
+            max_tokens=128,
+            out_dir=pressure_dir,
+            timeout=args.request_timeout,
+        )
+        b_started = time.time_ns()
+        b.start()
+        b_request_id, b_deferral = wait_for_deferral(
+            target.trace_path,
+            baseline_rows,
+            b_started,
+            args.deferral_timeout,
+        )
+        c = StreamTask(
+            port=target.port,
+            model=target.model_id,
+            role="pressure-C",
+            max_tokens=16,
+            out_dir=pressure_dir,
+            timeout=args.request_timeout,
+        )
+        c.start()
+        c_result = c.join(args.request_timeout)
+        a_result = a.join(args.request_timeout)
+        b_result = b.join(args.request_timeout)
+        for label, result in (("pressure-A", a_result), ("pressure-B", b_result), ("pressure-C", c_result)):
+            require_stream_success(result, label)
+        final_health = target.health("health.final.json")
+        target.stop()
+        collection.update(
+            {
+                "status": "collected",
+                "error": None,
+                "source_git_sha": provenance["git_sha"],
+                "binary_sha256": provenance["binary_sha256"],
+                "model_path": str(model),
+                "run": run_summary,
+                "calibration": {
+                    "static_bytes": static_bytes,
+                    "resident_bytes": resident_bytes,
+                    "exact_budget_bytes": exact_budget,
+                    "clients": calibration_clients,
+                },
+                "target": {
+                    "warmup_clients": warmup_clients,
+                    "pressure_clients": {
+                        "A": a_result,
+                        "B": b_result,
+                        "C": c_result,
+                    },
+                    "b_request_id": b_request_id,
+                    "b_deferral": b_deferral,
+                    "health_warmup": "target/health.warmup.json",
+                    "health_final": "target/health.final.json",
+                    "trace": "target/scheduler-trace.jsonl",
+                },
+                "finished_wall_ns": time.time_ns(),
+            }
+        )
+        write_json(out / "collection.json", collection)
+        print(f"FERRUM RUNTIME VNEXT S1 CUDA CAPACITY PRESSURE COLLECTED: {out}")
+        return 0
+    except Exception as error:
+        collection["error"] = str(error)
+        collection["finished_wall_ns"] = time.time_ns()
+        write_json(out / "collection.json", collection)
+        print(f"FERRUM RUNTIME VNEXT S1 CUDA CAPACITY PRESSURE REJECT: {out}: {error}", file=sys.stderr)
+        return 1
+    finally:
+        for session in reversed(sessions):
+            session.stop()
+
+
+def event_wall_ns(row: dict[str, Any]) -> int:
+    value = row.get("ts_unix_nanos")
+    require(isinstance(value, int) and value > 0, "trace event has no wall timestamp")
+    return value
+
+
+def validate_stream(result: dict[str, Any], label: str) -> None:
+    require_stream_success(result, label)
+    require(
+        result["completion_tokens"] == result["max_tokens"],
+        f"{label}: ignore_eos request did not reach its exact token limit",
+    )
+    require(
+        isinstance(result.get("first_content_wall_ns"), int),
+        f"{label}: first-content timestamp is missing",
+    )
+
+
+def validate(root: Path, out: Path) -> int:
+    root = root.resolve()
+    out = out.resolve()
+    require(root.is_dir(), f"missing collection directory: {root}")
+    out.mkdir(parents=True, exist_ok=True)
+    collection = read_json(root / "collection.json")
+    provenance = read_json(root / "provenance.json")
+    require(collection.get("status") == "collected", f"collection is not usable: {collection.get('error')}")
+    source_git_sha = collection.get("source_git_sha")
+    require(GIT_SHA_RE.fullmatch(str(source_git_sha)) is not None, "invalid source git SHA")
+    require(source_git_sha == provenance.get("git_sha"), "collection/provenance git SHA mismatch")
+    require(not provenance.get("dirty_status"), "capacity artifact used a dirty checkout")
+    require(SHA256_RE.fullmatch(str(collection.get("binary_sha256"))) is not None, "invalid binary SHA256")
+    gpu_rows = provenance.get("nvidia_smi", [])
+    require(
+        isinstance(gpu_rows, list) and len(gpu_rows) == 1 and "RTX 4090" in gpu_rows[0],
+        "artifact is not from exactly one RTX 4090",
+    )
+    require("Qwen3.5-4B" in str(collection.get("model_path")), "artifact model is not Qwen3.5-4B")
+
+    calibration = collection.get("calibration")
+    target = collection.get("target")
+    require(isinstance(calibration, dict) and isinstance(target, dict), "missing scenario summaries")
+    exact_budget = calibration.get("exact_budget_bytes")
+    require(
+        exact_budget == calibration.get("static_bytes", 0) + calibration.get("resident_bytes", 0),
+        "exact budget is not static plus calibrated concurrent backing",
+    )
+    require(calibration.get("resident_bytes", 0) > 0, "calibrated backing is empty")
+    for label, result in calibration.get("clients", {}).items():
+        validate_stream(result, f"calibration-{label}")
+    for label, result in target.get("warmup_clients", {}).items():
+        validate_stream(result, f"warmup-{label}")
+    pressure = target.get("pressure_clients")
+    require(isinstance(pressure, dict) and set(pressure) == {"A", "B", "C"}, "invalid pressure client set")
+    for label, result in pressure.items():
+        validate_stream(result, f"pressure-{label}")
+
+    a, b, c = pressure["A"], pressure["B"], pressure["C"]
+    b_request_id = target.get("b_request_id")
+    require(isinstance(b_request_id, str) and b_request_id, "B request identity is missing")
+    rows = read_trace(root / str(target.get("trace")))
+    require(rows, "target scheduler trace is empty")
+    b_rows = [
+        row
+        for row in rows
+        if request_identity_matches(row.get("request_id"), b_request_id)
+    ]
+    deferred = [
+        row
+        for row in b_rows
+        if row.get("phase") == "vnext.prefill_admission"
+        and isinstance(row.get("shape"), dict)
+        and row["shape"].get("decision") == "deferred"
+    ]
+    require(deferred, "B never entered typed WaitForRelease admission")
+    defer_row = deferred[0]
+    evidence = defer_row.get("attributes", {}).get("admission_evidence", {})
+    require(evidence.get("action") == "wait_for_release", "B deferral is not WaitForRelease")
+    defer_ns = event_wall_ns(defer_row)
+    skipped = [
+        row
+        for row in b_rows
+        if row.get("phase") == "vnext.prefill_admission_skipped_unchanged"
+    ]
+    require(skipped, "B has no unchanged-epoch skip evidence")
+    require(
+        all(row.get("shape", {}).get("probe_performed") is False for row in skipped),
+        "unchanged-epoch skip performed a probe",
+    )
+    admitted = [
+        row
+        for row in b_rows
+        if row.get("phase") == "vnext.prefill_admission"
+        and row.get("shape", {}).get("decision") == "admitted"
+        and event_wall_ns(row) > defer_ns
+    ]
+    require(admitted, "B was not admitted after a release epoch")
+    admitted_ns = event_wall_ns(admitted[0])
+    submitted = [row for row in b_rows if str(row.get("phase", "")).endswith("operation_submitted")]
+    require(submitted, "B has no operation submission evidence")
+    require(
+        min(event_wall_ns(row) for row in submitted) >= admitted_ns,
+        "B submitted work before typed admission",
+    )
+    require(
+        any(str(row.get("phase", "")).endswith("request_completed") for row in b_rows),
+        "B has no vNext request completion",
+    )
+
+    require(a["started_wall_ns"] < b["started_wall_ns"] < c["started_wall_ns"], "client arrival order is not A/B/C")
+    require(b["started_wall_ns"] <= defer_ns <= c["started_wall_ns"], "C did not arrive after B was deferred")
+    a_events = root / "target" / "pressure" / "pressure-A.events.jsonl"
+    a_client_events = [
+        json.loads(line) for line in a_events.read_text().splitlines() if line.strip()
+    ]
+    a_content_times = [
+        row["wall_ns"] for row in a_client_events if row.get("kind") == "content"
+    ]
+    require(any(defer_ns < value < admitted_ns for value in a_content_times), "active A decode made no progress while B waited")
+    require(c["finished_wall_ns"] < b["first_content_wall_ns"], "eligible C did not bypass deferred B")
+
+    final_health = read_json(root / str(target.get("health_final")))
+    final_executor = find_executor_snapshot(final_health)
+    require(final_executor is not None, "final health has no vNext executor snapshot")
+    final_pools = final_executor.get("dynamic_pools", {})
+    final_epochs = final_pools.get("epochs", {})
+    require(
+        final_epochs.get("release_epoch", 0) > evidence.get("release_epoch", 0),
+        "final capacity release epoch did not advance beyond B's observation",
+    )
+    require(final_executor.get("active_sequences") == 0, "final executor still has active sequences")
+    require(final_executor.get("pending_sequences") == 0, "final executor still has pending sequences")
+    require(final_executor.get("pending_prefill_maintenance") == 0, "final executor still has maintenance state")
+    require(final_health.get("engine", {}).get("active_requests") == 0, "final engine has active requests")
+    require(final_health.get("engine", {}).get("queued_requests") == 0, "final engine has queued requests")
+    policy = final_executor.get("runtime_memory_policy", {})
+    require(
+        policy.get("capacity_bytes", 0) - policy.get("reserve_bytes", 0) == exact_budget,
+        "target runtime did not use the calibrated exact memory budget",
+    )
+
+    run_result = read_json(root / "run" / "result.json")
+    require(run_result.get("returncode") == 0, "ferrum run smoke failed")
+    run_rows = [
+        json.loads(line)
+        for line in (root / "run" / "stdout.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    require(
+        any("paris" in str(row.get("content", "")).lower() for row in run_rows),
+        "ferrum run smoke did not return Paris",
+    )
+    run_phases = {
+        row.get("phase") for row in read_trace(root / "run" / "scheduler-trace.jsonl")
+    }
+    require("vnext.operation_submitted" in run_phases, "ferrum run did not use vNext execution")
+    require("vnext.request_completed" in run_phases, "ferrum run did not complete vNext execution")
+
+    for path in [*root.rglob("*.log"), *root.rglob("*.sse")]:
+        text = path.read_text(errors="replace").lower()
+        require("\ufffd" not in text, f"Unicode replacement character in {path}")
+        for pattern in FORBIDDEN_PATTERNS:
+            require(pattern not in text, f"forbidden pattern {pattern!r} in {path}")
+
+    pass_line = f"{PASS_PREFIX}: {out}"
+    manifest = {
+        "schema_version": 1,
+        "artifact_type": "runtime_vnext_s1_cuda_capacity_pressure_validation",
+        "status": "pass",
+        "source_git_sha": source_git_sha,
+        "binary_sha256": collection["binary_sha256"],
+        "model_path": collection["model_path"],
+        "source_artifact": str(root),
+        "source_collection_sha256": sha256(root / "collection.json"),
+        "exact_budget_bytes": exact_budget,
+        "b_request_id": b_request_id,
+        "b_wait_for_release_events": len(deferred),
+        "b_unchanged_epoch_skips": len(skipped),
+        "capacity_release_epoch_before": evidence["release_epoch"],
+        "capacity_release_epoch_after": final_epochs["release_epoch"],
+        "does_not_prove": ["G01B", "S1", "performance", "release"],
+        "pass_line": pass_line,
+    }
+    write_json(out / "validation.json", manifest)
+    write_json(out / "manifest.json", manifest)
+    print(pass_line)
+    return 0
+
+
+def self_test() -> int:
+    snapshot = {
+        "cache": {
+            "prefix_cache": {
+                "schema": "ferrum.runtime-vnext.executor-trace.v1",
+                "static_bytes": 7,
+            }
+        }
+    }
+    require(find_executor_snapshot(snapshot) == snapshot["cache"]["prefix_cache"], "snapshot discovery failed")
+    require(request_identity_matches("request.product.abc", "abc"), "request identity mapping failed")
+    with __import__("tempfile").TemporaryDirectory() as temp:
+        trace = Path(temp) / "trace.jsonl"
+        trace.write_text('{"phase":"complete"}\n{"phase":')
+        require(read_trace(trace) == [{"phase": "complete"}], "partial trace handling failed")
+    print("FERRUM RUNTIME VNEXT S1 CUDA CAPACITY SELFTEST PASS")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--self-test", action="store_true")
+    subparsers = parser.add_subparsers(dest="command")
+    collect_parser = subparsers.add_parser("collect")
+    collect_parser.add_argument("--repo", type=Path, default=Path.cwd())
+    collect_parser.add_argument("--binary", type=Path, required=True)
+    collect_parser.add_argument("--model", type=Path, required=True)
+    collect_parser.add_argument("--out", type=Path, required=True)
+    collect_parser.add_argument("--port", type=int, default=18120)
+    collect_parser.add_argument("--startup-timeout", type=float, default=600)
+    collect_parser.add_argument("--request-timeout", type=float, default=300)
+    collect_parser.add_argument("--deferral-timeout", type=float, default=30)
+    validate_parser = subparsers.add_parser("validate")
+    validate_parser.add_argument("artifact", type=Path)
+    validate_parser.add_argument("--out", type=Path, required=True)
+    args = parser.parse_args()
+    try:
+        if args.self_test:
+            return self_test()
+        if args.command == "collect":
+            return collect(args)
+        if args.command == "validate":
+            return validate(args.artifact, args.out)
+        parser.error("a command is required")
+    except CapacityGateError as error:
+        target = getattr(args, "out", Path("."))
+        print(f"FERRUM RUNTIME VNEXT S1 CUDA CAPACITY PRESSURE FAIL: {target}: {error}", file=sys.stderr)
+        return 1
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
