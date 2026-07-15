@@ -11,13 +11,15 @@ use std::path::Path;
 use ferrum_interfaces::vnext::{
     AttributeId, CanonicalRational, ContractVersion, ElementType, ExternalModelMetadataId,
     ModelFamilyId, ModelFamilyProvider, ModelFamilyRegistration, ModelProgram,
-    ModelSemanticMetadata, NodeId, OperationId, PhysicalWeightLayout, PreparedModelFamily,
-    ProgramBlock, ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId,
-    ResolvedTensorLayout, SemanticValue, SpecialTokenCollision, SpecialTokenCollisionPolicy,
-    SpecialTokenMetadata, SpecialTokenRole, StateCapacityDemand, StateId, StateLifetime, StateSpec,
-    TemplateMetadata, TypedFamilyRegistration, VNextError, WeightComponentRole,
-    WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
-    WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+    ModelSemanticMetadata, NodeId, OperationId, PhysicalStorageLayout,
+    PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
+    PreparedModelFamily, ProgramBlock, ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec,
+    ProgramValueId, ResolvedTensorLayout, SemanticValue, SpecialTokenCollision,
+    SpecialTokenCollisionPolicy, SpecialTokenMetadata, SpecialTokenRole, StateCapacityDemand,
+    StateId, StateLifetime, StateSpec, TemplateMetadata, TypedFamilyRegistration, VNextError,
+    WeightComponentRole, WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId,
+    WeightLayoutId, WeightReference, WeightSchema, WeightTensorSpec,
+    CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
     RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
@@ -254,31 +256,34 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             if weight.role == "mlp_up" {
                 continue;
             }
-            let (component_id, tensor_id, external_names, dimensions) = if weight.role == "mlp_gate"
-            {
-                let layer_index = weight.layer_index.ok_or_else(|| {
-                    invalid_config("weights.mlp_gate", "dense gate weight has no layer")
-                })?;
-                let up = required_weight(config, Some(layer_index), "mlp_up")?;
-                (
-                    packed_gate_up_component_id(layer_index)?,
-                    packed_gate_up_weight_id(layer_index)?,
-                    vec![weight.external_name.clone(), up.external_name.clone()],
-                    packed_gate_up_dimensions(weight, up)?,
-                )
-            } else {
-                (
-                    component_id(weight)?,
-                    weight_id(weight)?,
-                    vec![weight.external_name.clone()],
-                    weight.dimensions.clone(),
-                )
-            };
+            let (component_id, tensor_id, external_names, physical_dimensions, logical_dimensions) =
+                if weight.role == "mlp_gate" {
+                    let layer_index = weight.layer_index.ok_or_else(|| {
+                        invalid_config("weights.mlp_gate", "dense gate weight has no layer")
+                    })?;
+                    let up = required_weight(config, Some(layer_index), "mlp_up")?;
+                    let dimensions = packed_gate_up_dimensions(weight, up)?;
+                    (
+                        packed_gate_up_component_id(layer_index)?,
+                        packed_gate_up_weight_id(layer_index)?,
+                        vec![weight.external_name.clone(), up.external_name.clone()],
+                        dimensions.clone(),
+                        dimensions,
+                    )
+                } else {
+                    (
+                        component_id(weight)?,
+                        weight_id(weight)?,
+                        vec![weight.external_name.clone()],
+                        weight.dimensions.clone(),
+                        logical_weight_dimensions(weight)?,
+                    )
+                };
             components.push(WeightComponentSpec {
                 id: component_id.clone(),
                 role: WeightComponentRole::Values,
                 external_names,
-                dimensions: dimensions.clone(),
+                dimensions: physical_dimensions.clone(),
                 encoding: dense_weight_encoding(if weight.role == "mlp_gate" {
                     PACKED_GATE_UP_ROLE
                 } else {
@@ -293,9 +298,13 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             });
             tensors.push(WeightTensorSpec {
                 id: tensor_id,
-                dimensions,
+                dimensions: logical_dimensions.clone(),
                 logical_element_type: element_type,
-                physical_layout: PhysicalWeightLayout::Dense { component_id },
+                physical_layout: physical_weight_layout(
+                    component_id,
+                    &physical_dimensions,
+                    &logical_dimensions,
+                )?,
                 required: true,
             });
         }
@@ -333,7 +342,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                     weight_id: weight_id(weight)?,
                     value_id: weight_value_id(weight)?,
                     tensor: tensor_spec(
-                        weight.dimensions.clone(),
+                        logical_weight_dimensions(weight)?,
                         materialized_element_type(&weight.role),
                     ),
                 });
@@ -808,6 +817,58 @@ fn materialized_element_type(role: &str) -> ElementType {
     }
 }
 
+fn logical_weight_dimensions(weight: &FamilyWeight) -> Result<Vec<u64>, VNextError> {
+    if weight.role != "linear_attn_conv" {
+        return Ok(weight.dimensions.clone());
+    }
+    match weight.dimensions.as_slice() {
+        [channels, kernel] => Ok(vec![*channels, *kernel]),
+        [channels, 1, kernel] => Ok(vec![*channels, *kernel]),
+        dimensions => Err(invalid_config(
+            "weights.dimensions",
+            format!(
+                "linear attention convolution weight must be [channels, kernel] or [channels, 1, kernel], got {dimensions:?}"
+            ),
+        )),
+    }
+}
+
+fn physical_weight_layout(
+    component_id: WeightId,
+    physical_dimensions: &[u64],
+    logical_dimensions: &[u64],
+) -> Result<PhysicalWeightLayout, VNextError> {
+    if physical_dimensions == logical_dimensions {
+        return Ok(PhysicalWeightLayout::Dense { component_id });
+    }
+    let mut strides_in_elements = vec![0_u64; logical_dimensions.len()];
+    let mut stride = 1_u64;
+    for (axis, extent) in logical_dimensions.iter().enumerate().rev() {
+        strides_in_elements[axis] = stride;
+        stride = stride.checked_mul(*extent).ok_or_else(|| {
+            invalid_config("weights.dimensions", "logical weight stride overflows u64")
+        })?;
+    }
+    let physical_elements = physical_dimensions
+        .iter()
+        .try_fold(1_u64, |total, extent| total.checked_mul(*extent));
+    if physical_elements != Some(stride) {
+        return Err(invalid_config(
+            "weights.dimensions",
+            "physical and logical weight shapes have different element counts",
+        ));
+    }
+    Ok(PhysicalWeightLayout::Stored {
+        component: PhysicalWeightComponentBinding {
+            component_id,
+            storage: PhysicalStorageLayout::Strided {
+                strides_in_elements,
+                padding: PhysicalWeightPadding::Exact,
+            },
+        },
+    })
+}
+
 fn dense_weight_encoding(role: &str) -> Result<WeightEncoding, VNextError> {
     let element_type = materialized_element_type(role);
     if matches!(
@@ -1196,7 +1257,9 @@ fn invalid_config(field: impl Into<String>, reason: impl Into<String>) -> VNextE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_interfaces::vnext::WeightComponentSource;
+    use ferrum_interfaces::vnext::{
+        gated_delta_recurrent_attention_contract, OperationContract, WeightComponentSource,
+    };
     use half::f16;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 
@@ -1218,7 +1281,9 @@ mod tests {
             "linear_attn_a" | "linear_attn_b" => {
                 vec![text.linear_attention.num_value_heads as u64, hidden]
             }
-            "linear_attn_conv" => vec![qkv, text.linear_attention.conv_kernel_dim as u64],
+            "linear_attn_conv" => {
+                vec![qkv, 1, text.linear_attention.conv_kernel_dim as u64]
+            }
             "linear_attn_a_log" | "linear_attn_dt_bias" => {
                 vec![text.linear_attention.num_value_heads as u64]
             }
@@ -1498,6 +1563,57 @@ mod tests {
             .prepare(&serde_json::to_value(malformed).unwrap())
             .expect_err("shape drift must fail before backend allocation");
         assert!(error.to_string().contains("elements, expected"), "{error}");
+    }
+
+    #[test]
+    fn linear_attention_semantic_inputs_match_the_standard_contract() {
+        let config = test_config();
+        let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(&config).unwrap())
+            .unwrap();
+        let program = prepared.program();
+        let node = program.blocks()[0]
+            .nodes
+            .iter()
+            .find(|node| node.id.as_str() == "node.layer.0.attention")
+            .unwrap();
+        let contract = gated_delta_recurrent_attention_contract().unwrap();
+        let descriptor = contract.descriptor();
+        let known_tensors = program
+            .weights()
+            .iter()
+            .map(|weight| (&weight.value_id, &weight.tensor))
+            .chain(
+                program
+                    .states()
+                    .iter()
+                    .map(|state| (&state.value_id, &state.tensor)),
+            )
+            .collect::<BTreeMap<_, _>>();
+        let hidden = tensor_spec(vec![config.max_position_embeddings, 16], ElementType::F16);
+
+        for (ordinal, (value_id, expected)) in
+            node.inputs.iter().zip(&descriptor.inputs).enumerate()
+        {
+            let actual = if ordinal == 0 {
+                &hidden
+            } else {
+                known_tensors.get(value_id).copied().unwrap()
+            };
+            assert_eq!(
+                actual.dimensions.len(),
+                expected.dimensions().len(),
+                "input[{ordinal}] `{value_id}` rank mismatch: actual={:?}, expected={:?}",
+                actual.dimensions,
+                expected.dimensions()
+            );
+            assert!(
+                expected.element_types().contains(&actual.element_type),
+                "input[{ordinal}] `{value_id}` dtype mismatch: actual={:?}, expected={:?}",
+                actual.element_type,
+                expected.element_types()
+            );
+        }
     }
 
     #[test]
