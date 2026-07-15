@@ -2356,6 +2356,85 @@ async fn scheduler_trace_jsonl_resource_events_balance_successful_infer() {
 }
 
 #[test]
+fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
+    use ferrum_interfaces::vnext::{
+        ExecutionEventDetail, ExecutionEventEmitter, ExecutionEventKind, ExecutionIdentityEnvelope,
+        ExecutionIdentityParts, ExecutionPhase, MonotonicTimestamp, RequestIdentity, RunId, SpanId,
+        TrustedExecutionEventContext, EXECUTION_IDENTITY_VERSION,
+    };
+
+    let trace_path = resource_trace_temp_path("vnext-execution-event");
+    let _ = std::fs::remove_file(&trace_path);
+    let file = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
+    let config = EngineConfig::default();
+    let sink = VNextProfileExecutionEventSink::new(file, ProfileEntrypoint::Run, &config);
+    let run_id = RunId::new("run.vnext.engine-profile-test").unwrap();
+    let request_id = RequestIdentity::new("request.vnext.engine-profile-test").unwrap();
+    let event = ExecutionEvent::new(
+        MonotonicTimestamp {
+            nanos_since_run_start: 1,
+        },
+        ExecutionPhase::Resolution,
+        ExecutionEventKind::RequestAccepted,
+        ExecutionIdentityEnvelope::new(ExecutionIdentityParts {
+            version: EXECUTION_IDENTITY_VERSION,
+            run_id: run_id.clone(),
+            request_id: request_id.clone(),
+            sequence: 1,
+            plan_id: None,
+            plan_hash: None,
+            frame_id: None,
+            node_invocation_id: None,
+            node_id: None,
+            operation_id: None,
+            provider_id: None,
+            device_id: None,
+            resource_pool_id: None,
+            resource_pool_identity_fingerprint: None,
+            provisioning_run_id: None,
+            provisioning_request_id: None,
+            transaction_id: None,
+            active_sequence_slot: None,
+            admission_generation: None,
+            activation_epoch: None,
+            runtime_implementation_fingerprint: None,
+            active_sequence_fingerprint: None,
+            completed_sequence_fingerprint: None,
+            aborted_sequence_fingerprint: None,
+            resource_id: None,
+            resource_generation: None,
+            resource_batch_fingerprint: None,
+            span_id: SpanId::new("vnext/request/engine-profile-test").unwrap(),
+            parent_span_id: None,
+            async_links: Vec::new(),
+        })
+        .unwrap(),
+        ExecutionEventDetail::None,
+    )
+    .unwrap();
+    let mut emitter = ExecutionEventEmitter::new(&sink, run_id.clone(), request_id.clone());
+    emitter
+        .emit(
+            &event,
+            &TrustedExecutionEventContext::pre_plan(&run_id, &request_id),
+        )
+        .unwrap();
+
+    let rows = std::fs::read_to_string(&trace_path).unwrap();
+    let profile: FerrumProfileEvent = serde_json::from_str(rows.trim()).unwrap();
+    profile.validate().unwrap();
+    assert_eq!(profile.phase, "vnext.request_accepted");
+    assert_eq!(profile.event_kind, ProfileEventKind::Instant);
+    assert_eq!(profile.request_id, request_id.to_string());
+    assert_eq!(
+        profile.attributes.get("execution_trace_source"),
+        Some(&serde_json::json!("vnext"))
+    );
+
+    let _ = std::fs::remove_file(trace_path);
+}
+
+#[test]
 fn request_context_capacity_uses_executor_kv_capacity_when_smaller() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 2048;

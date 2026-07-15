@@ -4,7 +4,7 @@ use vnext_event_contract::*;
 
 #[test]
 fn vnext_event_sink_contract() {
-    const EXPECTED_CASES: usize = 13;
+    const EXPECTED_CASES: usize = 14;
     let mut passed = 0_usize;
     let runtime_catalog = catalog();
     let operation_registry = make_operation_registry(&runtime_catalog);
@@ -57,6 +57,23 @@ fn vnext_event_sink_contract() {
         sink.kinds.lock().unwrap().as_slice() == [ExecutionEventKind::RequestAccepted],
     );
     check(&mut passed, emitter.cursor().last_sequence() == 1);
+    let shared_sink = std::sync::Arc::new(RecordingSink::default());
+    let durable_sink: std::sync::Arc<dyn ExecutionEventSink> = shared_sink.clone();
+    let mut durable_emitter = ExecutionEventEmitter::from_shared(
+        durable_sink,
+        active.run_id().clone(),
+        active.request_id().clone(),
+    );
+    durable_emitter
+        .emit(
+            accepted,
+            &TrustedExecutionEventContext::pre_plan(active.run_id(), active.request_id()),
+        )
+        .unwrap();
+    check(
+        &mut passed,
+        shared_sink.kinds.lock().unwrap().as_slice() == [ExecutionEventKind::RequestAccepted],
+    );
     let mut failed_emitter = ExecutionEventEmitter::new(
         &FailingSink,
         active.run_id().clone(),

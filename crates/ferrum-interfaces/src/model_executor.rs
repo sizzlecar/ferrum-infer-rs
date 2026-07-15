@@ -523,6 +523,13 @@ pub trait ModelExecutor: Send + Sync {
         None
     }
 
+    /// Installs the product-owned execution event sink before requests start.
+    ///
+    /// Legacy executors have no typed execution journal and keep the default
+    /// no-op. Executors backed by the vNext runtime retain this sink with each
+    /// admitted request so node/operation events share the product artifact.
+    fn attach_execution_event_sink(&self, _sink: Arc<dyn crate::vnext::ExecutionEventSink>) {}
+
     /// Reserve model-owned KV slots before a forward is dispatched.
     ///
     /// This is the executor-level admission hook for vLLM-style paged KV. The

@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use super::{
     has_active, ExecutionEvent, ExecutionEventCursor, ExecutionEventKind, RequestIdentity, RunId,
@@ -58,8 +59,22 @@ pub trait ExecutionEventSink: Send + Sync {
     ) -> Result<(), ExecutionEventSinkError>;
 }
 
+enum ExecutionEventSinkHandle<'sink> {
+    Borrowed(&'sink dyn ExecutionEventSink),
+    Shared(Arc<dyn ExecutionEventSink>),
+}
+
+impl ExecutionEventSinkHandle<'_> {
+    fn as_sink(&self) -> &dyn ExecutionEventSink {
+        match self {
+            Self::Borrowed(sink) => *sink,
+            Self::Shared(sink) => sink.as_ref(),
+        }
+    }
+}
+
 pub struct ExecutionEventEmitter<'sink> {
-    sink: &'sink dyn ExecutionEventSink,
+    sink: ExecutionEventSinkHandle<'sink>,
     cursor: ExecutionEventCursor,
     sink_failed: bool,
 }
@@ -71,7 +86,23 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         request_id: RequestIdentity,
     ) -> Self {
         Self {
-            sink,
+            sink: ExecutionEventSinkHandle::Borrowed(sink),
+            cursor: ExecutionEventCursor::new(run_id, request_id),
+            sink_failed: false,
+        }
+    }
+
+    /// Creates a durable emitter that may be owned by a request/session.
+    ///
+    /// The borrowed constructor remains useful for bounded validation. Product
+    /// runtimes use this form so event authority cannot outlive its sink.
+    pub fn from_shared(
+        sink: Arc<dyn ExecutionEventSink>,
+        run_id: RunId,
+        request_id: RequestIdentity,
+    ) -> ExecutionEventEmitter<'static> {
+        ExecutionEventEmitter {
+            sink: ExecutionEventSinkHandle::Shared(sink),
             cursor: ExecutionEventCursor::new(run_id, request_id),
             sink_failed: false,
         }
@@ -115,12 +146,12 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         next_cursor
             .observe_against(event, context)
             .map_err(|error| ExecutionEventSinkError::new(error.to_string()))?;
-        if self.sink.is_enabled(event.kind()) {
+        if self.sink.as_sink().is_enabled(event.kind()) {
             let permit = EventEmissionPermit {
                 event,
                 _seal: event_sink_seal::Seal,
             };
-            if let Err(error) = self.sink.record(event, permit) {
+            if let Err(error) = self.sink.as_sink().record(event, permit) {
                 self.sink_failed = true;
                 return Err(error);
             }
