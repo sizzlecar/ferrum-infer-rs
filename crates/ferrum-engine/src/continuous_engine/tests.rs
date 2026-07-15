@@ -1748,7 +1748,7 @@ async fn sequence_take_physical_resources_for_recompute_clears_owned_resources()
 }
 
 #[test]
-fn sequence_take_physical_resources_keeps_manager_handle_without_trace_blocks() {
+fn sequence_take_physical_resources_skips_manager_without_owned_blocks() {
     let request = policy_request();
     let request_id = request.id.clone();
     let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
@@ -1762,10 +1762,7 @@ fn sequence_take_physical_resources_keeps_manager_handle_without_trace_blocks() 
     sequence.install_model_kv_without_owned_blocks(model_kv);
     let resources = sequence.take_physical_resources();
 
-    assert_eq!(
-        resources.kv_allocation,
-        Some(SequenceKvAllocation::new(request_id, None))
-    );
+    assert!(resources.kv_allocation.is_none());
     assert!(resources.draft_kv_allocation.is_none());
     assert!(resources.recurrent_state_allocation.is_none());
     assert_eq!(resources.model_cache_id(), Some(model_cache_id.as_str()));
