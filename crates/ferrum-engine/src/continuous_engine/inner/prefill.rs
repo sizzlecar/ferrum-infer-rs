@@ -359,6 +359,84 @@ impl EngineInner {
 
     // ── batch prefill ─────────────────────────────────────────────────
 
+    pub(super) async fn run_executor_owned_prefill(&self, request_id: &RequestId) -> Result<()> {
+        use ferrum_interfaces::model_executor::PrefillInput;
+
+        let Some((input_tokens, metadata)) = self
+            .sequences
+            .read()
+            .get(request_id)
+            .map(|seq| (seq.prefill_context_tokens(), seq.model_decode_metadata()))
+        else {
+            return Ok(());
+        };
+        let token_ids = input_tokens
+            .iter()
+            .map(|token| token.get())
+            .collect::<Vec<_>>();
+        let input = PrefillInput::new(self.tokens_to_tensor(&token_ids)?).with_metadata(metadata);
+
+        let workspace_lease = self.acquire_backend_workspace_lease(
+            vec![request_id.clone()],
+            "executor_owned_prefill_workspace",
+            "executor_owned_prefill_workspace_release",
+        );
+        let output = match self.model_executor.prefill(&input).await {
+            Ok(output) => {
+                workspace_lease.release();
+                output
+            }
+            Err(error) => {
+                drop(workspace_lease);
+                return Err(error);
+            }
+        };
+        let cache_id = output.kv_cache.cache_id();
+        let commit_result = (|| {
+            let last_logits = output.last_token_logits()?;
+            let mut logits = last_logits.to_vec_f32()?;
+            let mut sequences = self.sequences.write();
+            let Some(seq) = sequences.get_mut(request_id) else {
+                return Ok(None);
+            };
+            seq.reset_guided_processors()?;
+            let token = seq.sample_with_processors_with_tokenizer(
+                &mut logits,
+                Some(self.tokenizer.as_ref()),
+            )?;
+            seq.generated_tokens.push(token);
+            let update = seq.commit_executor_owned_prefill_resources(output.kv_cache.clone());
+            Ok::<Option<(TokenId, ModelCacheRefUpdate)>, FerrumError>(Some((token, update)))
+        })();
+        let Some((first_token, model_cache_update)) = (match commit_result {
+            Ok(value) => value,
+            Err(error) => {
+                self.model_executor.release_cache(&cache_id);
+                return Err(error);
+            }
+        }) else {
+            self.model_executor.release_cache(&cache_id);
+            return Ok(());
+        };
+
+        self.apply_model_cache_ref_update(request_id, model_cache_update);
+        self.scheduler
+            .mark_prefill_complete(request_id, input_tokens.len());
+        self.total_prefill_tokens
+            .fetch_add(input_tokens.len() as u64, Ordering::Relaxed);
+        counter!("ferrum.engine.prefill_tokens_total").increment(input_tokens.len() as u64);
+        counter!("ferrum.engine.prefills_total").increment(1);
+
+        let stop_reason = self.stop_reason_for_request(request_id);
+        if self.should_stream_generated_token(stop_reason) {
+            self.send_stream_update(request_id, first_token).await;
+        }
+        if let Some(reason) = stop_reason {
+            self.complete_request(request_id, reason).await?;
+        }
+        Ok(())
+    }
+
     /// Run prefill for multiple requests as ONE batched forward pass.
     ///
     /// Replaces the serial `for rid in prefill_ids { run_prefill }` loop

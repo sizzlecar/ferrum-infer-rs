@@ -7,6 +7,12 @@ impl EngineInner {
         &self,
         batch: &ferrum_interfaces::BatchPlan,
     ) -> Result<()> {
+        if self.model_executor.execution_resource_ownership()
+            == ferrum_interfaces::model_executor::ExecutionResourceOwnership::ExecutorManaged
+        {
+            return self.process_batch_executor_owned(batch).await;
+        }
+
         // Single-shot unified path: prefill + decode items go through ONE
         // `model_executor.unified_decode` call. Phase-2/3 redesign goal —
         // prefill chunks and decode tokens are co-batched at the kernel
@@ -31,6 +37,67 @@ impl EngineInner {
             return self.process_batch_legacy_split(batch).await;
         }
         self.process_batch_unified(batch).await
+    }
+
+    /// Product path for runtimes that own request/sequence/session resources.
+    /// Fresh prefill enters the executor without a legacy KV or recurrent
+    /// allocation, and decode preserves the opaque executor handle returned by
+    /// the preceding step. Resource pressure therefore has one authority and
+    /// is surfaced to the scheduler before another request is dispatched.
+    async fn process_batch_executor_owned(
+        &self,
+        batch: &ferrum_interfaces::BatchPlan,
+    ) -> Result<()> {
+        let mut prefill_ids = Vec::new();
+        let mut decode_ids = Vec::new();
+        {
+            let mut sequences = self.sequences.write();
+            for scheduled_req in &batch.requests {
+                let rid = &scheduled_req.request.id;
+                let seq = sequences.entry(rid.clone()).or_insert_with(|| {
+                    let input_tokens = self
+                        .tokenizer
+                        .encode(&scheduled_req.request.prompt, true)
+                        .unwrap_or_else(|_| vec![TokenId::new(0)]);
+                    SequenceState::new_with_tokenizer_and_model_vocab_size(
+                        scheduled_req.request.clone(),
+                        input_tokens,
+                        Some(self.tokenizer.clone()),
+                        Some(self.model_executor.info().vocab_size),
+                    )
+                });
+                if seq.prefill_complete {
+                    decode_ids.push(rid.clone());
+                } else {
+                    prefill_ids.push(rid.clone());
+                }
+            }
+        }
+
+        for rid in &prefill_ids {
+            if let Err(error) = self.run_executor_owned_prefill(rid).await {
+                warn!("Executor-owned prefill failed for {}: {}", rid, error);
+                if is_resource_exhausted_error(&error) {
+                    self.defer_prefill_for_capacity(rid).await;
+                    continue;
+                }
+                self.complete_request(rid, FinishReason::Error).await?;
+            }
+        }
+
+        // Until the executor-owned mixed-batch result carries updated opaque
+        // handles, decode stays per request. This preserves the single resource
+        // authority and the scheduler's dynamic wait semantics.
+        for rid in self.decode_ready_request_ids(&decode_ids) {
+            if let Err(error) = self.run_decode_step(&rid).await {
+                warn!("Executor-owned decode failed for {}: {}", rid, error);
+                if is_resource_exhausted_error(&error) {
+                    continue;
+                }
+                self.complete_request(&rid, FinishReason::Error).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Legacy split path: separate prefill (batched via run_batch_prefill)

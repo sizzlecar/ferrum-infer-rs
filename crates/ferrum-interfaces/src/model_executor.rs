@@ -451,11 +451,32 @@ impl DecodeOutput {
     }
 }
 
+/// Declares which side owns request-lifetime accelerator resources.
+///
+/// This is a lifecycle boundary, not a capacity limit. Executor-managed
+/// runtimes still make dynamic admission decisions from then-live capacity;
+/// the engine must not reserve a second KV or recurrent-state allocation for
+/// the same request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionResourceOwnership {
+    EngineManaged,
+    ExecutorManaged,
+}
+
 /// Core model executor trait focusing on tensor operations
 #[async_trait]
 pub trait ModelExecutor: Send + Sync {
     /// Get model information and metadata
     fn info(&self) -> &ModelInfo;
+
+    /// Selects the single authority for request-lifetime model resources.
+    /// Existing executors remain engine-managed by default. A runtime that
+    /// returns `ExecutorManaged` must return its own opaque cache handle from
+    /// prefill/decode and release that authority from `release_cache`.
+    fn execution_resource_ownership(&self) -> ExecutionResourceOwnership {
+        ExecutionResourceOwnership::EngineManaged
+    }
 
     /// Whether this executor's backend can run the unified mixed prefill+decode
     /// forward natively. When false, the engine routes Qwen3-MoE batches through
