@@ -17,7 +17,8 @@ use ferrum_interfaces::kv_cache::{BlockTable, CacheHandleStats};
 use ferrum_interfaces::model_executor::{
     AttentionType, DecodeInput, DecodeOutput, ExecutionResourceOwnership, ExecutorAdmissionEpochs,
     ExecutorCapabilities, ExecutorMemoryUsage, ExecutorPrefillAdmission,
-    ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt, ExecutorState,
+    ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
+    ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome, ExecutorState,
     ExecutorStatus, MemoryRequirements, PrefillInput, PrefillOutput,
 };
 use ferrum_interfaces::vnext::*;
@@ -871,9 +872,15 @@ enum VNextSequenceAdmissionDecision<R: DeviceRuntime> {
     PermanentRejected(AdmissionRejected),
 }
 
+enum PendingPrefillMaintenance {
+    Logical(AdmissionDeferred),
+    Backing(DynamicBackingDeferred),
+}
+
 struct VNextSequenceRegistry<R: DeviceRuntime> {
     pending: HashMap<RequestId, Arc<VNextSequence<R>>>,
     active: HashMap<String, Arc<VNextSequence<R>>>,
+    prefill_maintenance: HashMap<RequestId, PendingPrefillMaintenance>,
 }
 
 impl<R: DeviceRuntime> Default for VNextSequenceRegistry<R> {
@@ -881,13 +888,14 @@ impl<R: DeviceRuntime> Default for VNextSequenceRegistry<R> {
         Self {
             pending: HashMap::new(),
             active: HashMap::new(),
+            prefill_maintenance: HashMap::new(),
         }
     }
 }
 
 impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
     fn total_len(&self) -> usize {
-        self.pending.len() + self.active.len()
+        self.pending.len() + self.active.len() + self.prefill_maintenance.len()
     }
 
     fn remove_pending_if(
@@ -1217,6 +1225,44 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .maintain_for_deferred(deferred)
             .map_err(|error| FerrumError::backend(error.to_string()))?;
         Ok(())
+    }
+
+    fn retain_prefill_maintenance(
+        &self,
+        request_id: &RequestId,
+        pending: PendingPrefillMaintenance,
+    ) -> Result<ExecutorPrefillMaintenanceDeferral> {
+        let projection = match &pending {
+            PendingPrefillMaintenance::Logical(deferred) => {
+                ExecutorPrefillMaintenanceDeferral::from_admission(request_id, deferred)?
+            }
+            PendingPrefillMaintenance::Backing(deferred) => {
+                ExecutorPrefillMaintenanceDeferral::from_backing(request_id, deferred)?
+            }
+        };
+        let mut sequences = self.sequences.lock();
+        if sequences.pending.contains_key(request_id)
+            || sequences.prefill_maintenance.contains_key(request_id)
+            || sequences
+                .active
+                .values()
+                .any(|sequence| sequence.request_id == *request_id)
+        {
+            return Err(FerrumError::already_exists(format!(
+                "vNext request `{request_id}` already retained admission state"
+            )));
+        }
+        sequences
+            .prefill_maintenance
+            .insert(request_id.clone(), pending);
+        Ok(projection)
+    }
+
+    fn current_prefill_admission_epochs(&self) -> Result<ExecutorAdmissionEpochs> {
+        self.plan_resources
+            .dynamic_pool_status()
+            .map(|status| ExecutorAdmissionEpochs::from_capacity(status.epochs()))
+            .map_err(|error| FerrumError::backend(error.to_string()))
     }
 
     fn maintain_admission_growth(
@@ -1906,6 +1952,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .ok()
             .and_then(|status| serde_json::to_value(status).ok());
         let cleanup = serde_json::to_value(self.plan_resources.deferred_cleanup_status()).ok();
+        let (pending_sequences, active_sequences, pending_prefill_maintenance) = {
+            let sequences = self.sequences.lock();
+            (
+                sequences.pending.len(),
+                sequences.active.len(),
+                sequences.prefill_maintenance.len(),
+            )
+        };
         serde_json::json!({
             "schema": "ferrum.runtime-vnext.executor-trace.v1",
             "model_id": self.info.model_id.to_string(),
@@ -1918,8 +1972,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             "device_id": self.runtime.descriptor().id.to_string(),
             "runtime_fingerprint": self.runtime.descriptor().runtime_implementation_fingerprint,
             "maximum_model_tokens": self.maximum_model_tokens,
-            "pending_sequences": self.sequences.lock().pending.len(),
-            "active_sequences": self.sequences.lock().active.len(),
+            "pending_sequences": pending_sequences,
+            "active_sequences": active_sequences,
+            "pending_prefill_maintenance": pending_prefill_maintenance,
             "static_bytes": self.static_bytes,
             "counters": {
                 "prefill_operations": self.metrics.prefill_operations.load(Ordering::Relaxed),
@@ -1991,6 +2046,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         {
             let sequences = self.sequences.lock();
             if sequences.pending.contains_key(input.request_id)
+                || sequences.prefill_maintenance.contains_key(input.request_id)
                 || sequences
                     .active
                     .values()
@@ -2021,10 +2077,25 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         let session = match self.try_admit_sequence(identity, work)? {
             VNextSequenceAdmissionDecision::Admitted(session) => session,
             VNextSequenceAdmissionDecision::Deferred(deferred) => {
+                if deferred.action() == DeferredAction::AwaitBackingGrowth {
+                    let projection = self.retain_prefill_maintenance(
+                        input.request_id,
+                        PendingPrefillMaintenance::Logical(deferred),
+                    )?;
+                    return Ok(ExecutorPrefillAdmissionDecision::MaintenanceDeferred(
+                        projection,
+                    ));
+                }
                 return Ok(ExecutorPrefillAdmissionDecision::Deferred(deferred));
             }
             VNextSequenceAdmissionDecision::BackingDeferred(deferred) => {
-                return Ok(ExecutorPrefillAdmissionDecision::BackingDeferred(deferred));
+                let projection = self.retain_prefill_maintenance(
+                    input.request_id,
+                    PendingPrefillMaintenance::Backing(deferred),
+                )?;
+                return Ok(ExecutorPrefillAdmissionDecision::MaintenanceDeferred(
+                    projection,
+                ));
             }
             VNextSequenceAdmissionDecision::PermanentRejected(rejected) => {
                 return Ok(ExecutorPrefillAdmissionDecision::PermanentRejected(
@@ -2056,6 +2127,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         let raced = {
             let mut sequences = self.sequences.lock();
             if sequences.pending.contains_key(input.request_id)
+                || sequences.prefill_maintenance.contains_key(input.request_id)
                 || sequences.active.contains_key(&sequence.cache_id)
             {
                 true
@@ -2081,12 +2153,59 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     fn cancel_prefill_admission(&self, request_id: &RequestId) -> bool {
-        let pending = self.sequences.lock().pending.remove(request_id);
+        let (pending, maintenance) = {
+            let mut sequences = self.sequences.lock();
+            (
+                sequences.pending.remove(request_id),
+                sequences.prefill_maintenance.remove(request_id),
+            )
+        };
+        let removed = pending.is_some() || maintenance.is_some();
         if let Some(sequence) = pending {
             sequence.abort();
-            true
-        } else {
-            false
+        }
+        removed
+    }
+
+    fn maintain_prefill_backing(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<ExecutorPrefillMaintenanceOutcome> {
+        let pending = self.sequences.lock().prefill_maintenance.remove(request_id);
+        let Some(pending) = pending else {
+            return Ok(ExecutorPrefillMaintenanceOutcome::NoLongerPending);
+        };
+        let outcome = match pending {
+            PendingPrefillMaintenance::Logical(deferred) => self
+                .plan_resources
+                .maintain_for_admission_deferred(&deferred),
+            PendingPrefillMaintenance::Backing(deferred) => {
+                self.plan_resources.maintain_for_deferred(&deferred)
+            }
+        }
+        .map_err(|error| FerrumError::backend(error.to_string()))?;
+        match outcome {
+            DynamicDeferredMaintenanceOutcome::RetryWithoutGrowth { current_epochs } => {
+                Ok(ExecutorPrefillMaintenanceOutcome::RetryWithoutGrowth {
+                    current: ExecutorAdmissionEpochs::from_capacity(current_epochs),
+                })
+            }
+            DynamicDeferredMaintenanceOutcome::Maintained(receipt) => {
+                let allocated_bytes = receipt
+                    .growths()
+                    .iter()
+                    .try_fold(0_u64, |total, growth| {
+                        total.checked_add(growth.chunk_bytes())
+                    })
+                    .ok_or_else(|| {
+                        FerrumError::internal("vNext prefill maintenance byte count overflow")
+                    })?;
+                Ok(ExecutorPrefillMaintenanceOutcome::Maintained {
+                    current: self.current_prefill_admission_epochs()?,
+                    pools_grown: receipt.growths().len(),
+                    allocated_bytes,
+                })
+            }
         }
     }
 

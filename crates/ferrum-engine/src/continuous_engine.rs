@@ -14,11 +14,14 @@ use ferrum_interfaces::{
     engine::{InferenceEngine, LlmInferenceEngine},
     kv_cache::AllocationRequest,
     model_executor::{
-        ExecutionResourceOwnership, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
+        ExecutionResourceOwnership, ExecutorAdmissionEpochs, ExecutorPrefillAdmission,
+        ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
+        ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome,
         GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy, TokenSelectionMask,
     },
     vnext::{
-        EventEmissionPermit, ExecutionEvent, ExecutionEventCapturePolicy, ExecutionEventDetail,
+        AdmissionDeferred, AdmissionRejected, DeferredAction, EventEmissionPermit, ExecutionEvent,
+        ExecutionEventCapturePolicy, ExecutionEventDetail,
         ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink, ExecutionEventSinkError,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,

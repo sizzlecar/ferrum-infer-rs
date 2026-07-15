@@ -206,6 +206,7 @@ pub struct ContinuousSchedulerTraceSnapshot {
     pub dynamic_admission_probes: u64,
     pub dynamic_admission_skipped_unchanged: u64,
     pub dynamic_admission_deferred: u64,
+    pub dynamic_backing_growth_requested: u64,
     pub dynamic_admission_failed: u64,
 }
 
@@ -261,6 +262,7 @@ pub struct ContinuousBatchScheduler {
     dynamic_admission_probes: AtomicU64,
     dynamic_admission_skipped_unchanged: AtomicU64,
     dynamic_admission_deferred: AtomicU64,
+    dynamic_backing_growth_requested: AtomicU64,
     dynamic_admission_failed: AtomicU64,
 
     /// Start time
@@ -398,6 +400,7 @@ impl ContinuousBatchScheduler {
             dynamic_admission_probes: AtomicU64::new(0),
             dynamic_admission_skipped_unchanged: AtomicU64::new(0),
             dynamic_admission_deferred: AtomicU64::new(0),
+            dynamic_backing_growth_requested: AtomicU64::new(0),
             dynamic_admission_failed: AtomicU64::new(0),
             start_time: Instant::now(),
             metrics_tracker: Arc::new(ContinuousBatchMetrics::new()),
@@ -479,6 +482,9 @@ impl ContinuousBatchScheduler {
                 .dynamic_admission_skipped_unchanged
                 .load(Ordering::Relaxed),
             dynamic_admission_deferred: self.dynamic_admission_deferred.load(Ordering::Relaxed),
+            dynamic_backing_growth_requested: self
+                .dynamic_backing_growth_requested
+                .load(Ordering::Relaxed),
             dynamic_admission_failed: self.dynamic_admission_failed.load(Ordering::Relaxed),
         }
     }
@@ -654,6 +660,8 @@ impl ContinuousBatchScheduler {
             .fetch_add(receipt.skipped_unchanged() as u64, Ordering::Relaxed);
         self.dynamic_admission_deferred
             .fetch_add(receipt.deferred() as u64, Ordering::Relaxed);
+        self.dynamic_backing_growth_requested
+            .fetch_add(receipt.backing_growth_requested() as u64, Ordering::Relaxed);
 
         for event in events.drain(..) {
             match event {
@@ -672,6 +680,7 @@ impl ContinuousBatchScheduler {
                     self.fail_typed_admission(request, error)
                 }
                 AdmissionQueueEvent::PreemptionRequested { .. } => {}
+                AdmissionQueueEvent::BackingGrowthRequested { .. } => {}
             }
         }
         Ok(receipt)
@@ -679,6 +688,23 @@ impl ContinuousBatchScheduler {
 
     pub fn take_admission_failures(&self) -> Vec<(RequestId, FerrumError)> {
         self.admission_failures.lock().drain(..).collect()
+    }
+
+    /// Fail one still-waiting typed admission after executor maintenance
+    /// returned a terminal error. The queue entry is removed before any
+    /// completion or backend work can run.
+    pub fn fail_waiting_admission(&self, request_id: &RequestId, error: FerrumError) -> bool {
+        let request = {
+            let mut waiting = self.waiting_queue.write();
+            waiting
+                .position(|request| request.inner.request.id == *request_id)
+                .and_then(|position| waiting.remove(position))
+        };
+        let Some(request) = request else {
+            return false;
+        };
+        self.fail_typed_admission(request, error);
+        true
     }
 
     pub fn next_batch_with_dynamic_admission(
