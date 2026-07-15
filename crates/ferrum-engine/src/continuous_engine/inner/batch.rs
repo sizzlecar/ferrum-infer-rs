@@ -78,8 +78,10 @@ impl EngineInner {
             if let Err(error) = self.run_executor_owned_prefill(rid).await {
                 warn!("Executor-owned prefill failed for {}: {}", rid, error);
                 if is_resource_exhausted_error(&error) {
-                    self.defer_prefill_for_capacity(rid).await;
-                    continue;
+                    warn!(
+                        request_id = %rid,
+                        "Executor-owned prefill crossed typed admission with insufficient capacity"
+                    );
                 }
                 self.complete_request(rid, FinishReason::Error).await?;
             }

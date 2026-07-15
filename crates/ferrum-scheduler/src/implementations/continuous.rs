@@ -9,17 +9,23 @@
 //! - Memory-aware scheduling based on KV cache usage
 //! - Preemption support for long-running requests
 
+use crate::vnext::{
+    AdmissionProbeOutcome, AdmissionQueueEvent, AdmissionTickReceipt, AdmissionWakeEpochs,
+    DynamicAdmissionQueue, DynamicAdmissionQueuePolicy, WaitingAdmissionTicket,
+};
 use crate::{
     BatchHint, BatchPlan, BatchResourceRequirements, PreemptionResult, PreemptionState,
     ScheduledRequest, Scheduler,
 };
 use async_trait::async_trait;
+use ferrum_interfaces::model_executor::ExecutorPrefillAdmissionReceipt;
 use ferrum_interfaces::scheduler::SchedulerMetrics;
+use ferrum_interfaces::vnext::AdmissionRejected;
 use ferrum_types::{
     BatchId, FerrumError, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState,
     Result, SchedulerConfig, PROMPT_TOKENS_METADATA_KEY,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -71,6 +77,8 @@ pub enum RequestPhase {
     Preempted,
     /// Request was cancelled
     Cancelled,
+    /// Typed admission failed before prefill submission.
+    AdmissionFailed,
 }
 
 /// Extended scheduled request with continuous batching metadata
@@ -104,6 +112,8 @@ pub struct ContinuousBatchRequest {
     pub capacity_deferred_empty_retry_epoch: Option<u64>,
     /// True when a decode request was evicted to waiting and must recompute KV.
     pub capacity_deferred_from_decode: bool,
+    /// Stable identity retained across waiting -> active -> waiting cycles.
+    pub waiting_admission_ticket: Option<WaitingAdmissionTicket>,
 }
 
 impl ContinuousBatchRequest {
@@ -124,6 +134,7 @@ impl ContinuousBatchRequest {
             capacity_deferred_mixed_attempt_epoch: None,
             capacity_deferred_empty_retry_epoch: None,
             capacity_deferred_from_decode: false,
+            waiting_admission_ticket: None,
         }
     }
 
@@ -144,9 +155,27 @@ impl ContinuousBatchRequest {
     pub fn is_finished(&self) -> bool {
         matches!(
             self.phase,
-            RequestPhase::Completed | RequestPhase::Cancelled
+            RequestPhase::Completed | RequestPhase::Cancelled | RequestPhase::AdmissionFailed
         )
     }
+}
+
+pub type ExecutorAdmissionProbeOutcome =
+    AdmissionProbeOutcome<ExecutorPrefillAdmissionReceipt, AdmissionRejected, FerrumError>;
+
+type ExecutorAdmissionQueueEvent = AdmissionQueueEvent<
+    ContinuousBatchRequest,
+    ExecutorPrefillAdmissionReceipt,
+    AdmissionRejected,
+    FerrumError,
+>;
+
+enum WaitingAdmissionMode<'a> {
+    Legacy,
+    Dynamic {
+        wake: AdmissionWakeEpochs,
+        probe: &'a mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
+    },
 }
 
 /// Read-only scheduler counters for explicit engine diagnostics.
@@ -172,6 +201,12 @@ pub struct ContinuousSchedulerTraceSnapshot {
     pub capacity_mixed_recompute_blocked_until_epoch: u64,
     pub capacity_mixed_recompute_required_blocks_per_slot: Option<usize>,
     pub capacity_mixed_recompute_observed_free_blocks: Option<usize>,
+    pub legacy_waiting_admission_ticks: u64,
+    pub dynamic_admission_ticks: u64,
+    pub dynamic_admission_probes: u64,
+    pub dynamic_admission_skipped_unchanged: u64,
+    pub dynamic_admission_deferred: u64,
+    pub dynamic_admission_failed: u64,
 }
 
 /// Continuous batching scheduler
@@ -183,7 +218,7 @@ pub struct ContinuousBatchScheduler {
     config: SchedulerConfig,
 
     /// Waiting queue (requests waiting to start)
-    waiting_queue: RwLock<VecDeque<ContinuousBatchRequest>>,
+    waiting_queue: RwLock<DynamicAdmissionQueue<ContinuousBatchRequest>>,
 
     /// Prefill queue (requests in prefill phase)
     prefill_queue: RwLock<VecDeque<ContinuousBatchRequest>>,
@@ -193,6 +228,11 @@ pub struct ContinuousBatchScheduler {
 
     /// Preempted requests (can be resumed)
     preempted_requests: RwLock<HashMap<RequestId, ContinuousBatchRequest>>,
+
+    /// Requests removed from waiting by a permanent/faulted typed admission.
+    admission_failed_requests: RwLock<HashMap<RequestId, ContinuousBatchRequest>>,
+    admission_failures: Mutex<VecDeque<(RequestId, FerrumError)>>,
+    dynamic_admission_events: Mutex<Vec<ExecutorAdmissionQueueEvent>>,
 
     /// Request lookup table
     request_index: RwLock<HashMap<RequestId, RequestPhase>>,
@@ -216,6 +256,12 @@ pub struct ContinuousBatchScheduler {
     capacity_mixed_recompute_required_blocks_per_slot: AtomicUsize,
     capacity_mixed_recompute_observed_free_blocks: AtomicUsize,
     total_wait_time_us: AtomicU64,
+    legacy_waiting_admission_ticks: AtomicU64,
+    dynamic_admission_ticks: AtomicU64,
+    dynamic_admission_probes: AtomicU64,
+    dynamic_admission_skipped_unchanged: AtomicU64,
+    dynamic_admission_deferred: AtomicU64,
+    dynamic_admission_failed: AtomicU64,
 
     /// Start time
     start_time: Instant,
@@ -321,10 +367,15 @@ impl ContinuousBatchScheduler {
 
         Self {
             config,
-            waiting_queue: RwLock::new(VecDeque::new()),
+            waiting_queue: RwLock::new(DynamicAdmissionQueue::new(
+                DynamicAdmissionQueuePolicy::default(),
+            )),
             prefill_queue: RwLock::new(VecDeque::new()),
             decode_queue: RwLock::new(HashMap::new()),
             preempted_requests: RwLock::new(HashMap::new()),
+            admission_failed_requests: RwLock::new(HashMap::new()),
+            admission_failures: Mutex::new(VecDeque::new()),
+            dynamic_admission_events: Mutex::new(Vec::new()),
             request_index: RwLock::new(HashMap::new()),
             current_iteration: AtomicU64::new(0),
             completed_counter: AtomicU64::new(0),
@@ -342,6 +393,12 @@ impl ContinuousBatchScheduler {
             capacity_mixed_recompute_required_blocks_per_slot: AtomicUsize::new(0),
             capacity_mixed_recompute_observed_free_blocks: AtomicUsize::new(usize::MAX),
             total_wait_time_us: AtomicU64::new(0),
+            legacy_waiting_admission_ticks: AtomicU64::new(0),
+            dynamic_admission_ticks: AtomicU64::new(0),
+            dynamic_admission_probes: AtomicU64::new(0),
+            dynamic_admission_skipped_unchanged: AtomicU64::new(0),
+            dynamic_admission_deferred: AtomicU64::new(0),
+            dynamic_admission_failed: AtomicU64::new(0),
             start_time: Instant::now(),
             metrics_tracker: Arc::new(ContinuousBatchMetrics::new()),
             cb_config,
@@ -413,12 +470,70 @@ impl ContinuousBatchScheduler {
                 usize::MAX => None,
                 value => Some(value),
             },
+            legacy_waiting_admission_ticks: self
+                .legacy_waiting_admission_ticks
+                .load(Ordering::Relaxed),
+            dynamic_admission_ticks: self.dynamic_admission_ticks.load(Ordering::Relaxed),
+            dynamic_admission_probes: self.dynamic_admission_probes.load(Ordering::Relaxed),
+            dynamic_admission_skipped_unchanged: self
+                .dynamic_admission_skipped_unchanged
+                .load(Ordering::Relaxed),
+            dynamic_admission_deferred: self.dynamic_admission_deferred.load(Ordering::Relaxed),
+            dynamic_admission_failed: self.dynamic_admission_failed.load(Ordering::Relaxed),
         }
     }
 
     /// Return the scheduler phase for trace-only plan classification.
     pub fn trace_phase(&self, request_id: &RequestId) -> Option<RequestPhase> {
         self.request_index.read().get(request_id).copied()
+    }
+
+    fn requeue_waiting_request(
+        &self,
+        waiting_queue: &mut DynamicAdmissionQueue<ContinuousBatchRequest>,
+        request_index: &mut HashMap<RequestId, RequestPhase>,
+        mut request: ContinuousBatchRequest,
+    ) -> bool {
+        let request_id = request.inner.request.id.clone();
+        let Some(ticket) = request.waiting_admission_ticket else {
+            let error = FerrumError::scheduler(format!(
+                "request {request_id} lost its waiting admission identity"
+            ));
+            request.phase = RequestPhase::AdmissionFailed;
+            request.inner.state = RequestState::Failed;
+            request_index.insert(request_id.clone(), RequestPhase::AdmissionFailed);
+            self.admission_failed_requests
+                .write()
+                .insert(request_id.clone(), request);
+            self.admission_failures
+                .lock()
+                .push_back((request_id, error));
+            self.dynamic_admission_failed
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        let result = waiting_queue.requeue(ticket, request);
+        match result {
+            Ok(()) => {
+                request_index.insert(request_id, RequestPhase::Waiting);
+                true
+            }
+            Err((error, mut request)) => {
+                let error = FerrumError::scheduler(error.to_string());
+                request.phase = RequestPhase::AdmissionFailed;
+                request.inner.state = RequestState::Failed;
+                request_index.insert(request_id.clone(), RequestPhase::AdmissionFailed);
+                self.admission_failed_requests
+                    .write()
+                    .insert(request_id.clone(), request);
+                self.admission_failures
+                    .lock()
+                    .push_back((request_id, error));
+                self.dynamic_admission_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
     }
 
     fn promote_to_prefill_with_empty_retry(
@@ -430,10 +545,9 @@ impl ContinuousBatchScheduler {
         let mut prefill_queue = self.prefill_queue.write();
         let mut request_index = self.request_index.write();
 
-        if let Some(pos) = waiting_queue
-            .iter()
-            .position(|r| r.inner.request.id == *request_id)
-        {
+        let waiting_position =
+            waiting_queue.position(|request| request.inner.request.id == *request_id);
+        if let Some(pos) = waiting_position {
             let mut req = waiting_queue.remove(pos).unwrap();
             if let Some(epoch) = empty_retry_epoch {
                 req.capacity_deferred_empty_retry_epoch = Some(epoch);
@@ -459,6 +573,124 @@ impl ContinuousBatchScheduler {
         } else {
             false
         }
+    }
+
+    fn promote_admitted_request(
+        &self,
+        mut request: ContinuousBatchRequest,
+        receipt: &ExecutorPrefillAdmissionReceipt,
+    ) {
+        let request_id = request.inner.request.id.clone();
+        if receipt.request_id != request_id {
+            self.fail_typed_admission(
+                request,
+                FerrumError::scheduler(format!(
+                    "executor admission receipt belongs to {}, expected {}",
+                    receipt.request_id, request_id
+                )),
+            );
+            return;
+        }
+        request.phase = RequestPhase::Prefilling;
+        request.inner.state = RequestState::Running;
+        let started_at = chrono::Utc::now();
+        let wait_us = started_at
+            .signed_duration_since(request.inner.submitted_at)
+            .num_microseconds()
+            .unwrap_or(0)
+            .max(0) as u64;
+        request.inner.started_at = Some(started_at);
+        self.total_wait_time_us
+            .fetch_add(wait_us, Ordering::Relaxed);
+        self.admitted_counter.fetch_add(1, Ordering::Relaxed);
+        self.request_index
+            .write()
+            .insert(request_id.clone(), RequestPhase::Prefilling);
+        self.prefill_queue.write().push_back(request);
+        debug!("Typed admission promoted request {} to prefill", request_id);
+    }
+
+    fn fail_typed_admission(&self, mut request: ContinuousBatchRequest, error: FerrumError) {
+        let request_id = request.inner.request.id.clone();
+        request.phase = RequestPhase::AdmissionFailed;
+        request.inner.state = RequestState::Failed;
+        self.request_index
+            .write()
+            .insert(request_id.clone(), RequestPhase::AdmissionFailed);
+        self.admission_failed_requests
+            .write()
+            .insert(request_id.clone(), request);
+        self.admission_failures
+            .lock()
+            .push_back((request_id, error));
+        self.dynamic_admission_failed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn admit_waiting_dynamically(
+        &self,
+        wake: AdmissionWakeEpochs,
+        maximum_admissions: usize,
+        probe: &mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
+    ) -> Result<AdmissionTickReceipt> {
+        self.dynamic_admission_ticks.fetch_add(1, Ordering::Relaxed);
+        let mut waiting = self.waiting_queue.write();
+        let maximum_probes = waiting.len();
+        let mut events = self.dynamic_admission_events.lock();
+        let receipt = waiting
+            .schedule_into(
+                wake,
+                maximum_probes,
+                maximum_admissions,
+                &mut events,
+                |request| probe(&request.inner.request),
+            )
+            .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+        drop(waiting);
+
+        self.dynamic_admission_probes
+            .fetch_add(receipt.probed() as u64, Ordering::Relaxed);
+        self.dynamic_admission_skipped_unchanged
+            .fetch_add(receipt.skipped_unchanged() as u64, Ordering::Relaxed);
+        self.dynamic_admission_deferred
+            .fetch_add(receipt.deferred() as u64, Ordering::Relaxed);
+
+        for event in events.drain(..) {
+            match event {
+                AdmissionQueueEvent::Admitted {
+                    request, admission, ..
+                } => self.promote_admitted_request(request, &admission),
+                AdmissionQueueEvent::PermanentRejected {
+                    request, rejection, ..
+                } => self.fail_typed_admission(
+                    request,
+                    FerrumError::request_validation(format!(
+                        "request cannot fit the vNext runtime: {rejection:?}"
+                    )),
+                ),
+                AdmissionQueueEvent::Faulted { request, error, .. } => {
+                    self.fail_typed_admission(request, error)
+                }
+                AdmissionQueueEvent::PreemptionRequested { .. } => {}
+            }
+        }
+        Ok(receipt)
+    }
+
+    pub fn take_admission_failures(&self) -> Vec<(RequestId, FerrumError)> {
+        self.admission_failures.lock().drain(..).collect()
+    }
+
+    pub fn next_batch_with_dynamic_admission(
+        &self,
+        hint: BatchHint,
+        wake: AdmissionWakeEpochs,
+        probe: &mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
+    ) -> Result<Option<BatchPlan>> {
+        self.create_iteration_batch_with_admission(
+            hint,
+            WaitingAdmissionMode::Dynamic { wake, probe },
+        )
     }
 
     fn capacity_backpressure_admit_limit(&self) -> Option<usize> {
@@ -768,8 +1000,9 @@ impl ContinuousBatchScheduler {
                     Some(self.capacity_mixed_recompute_epoch.load(Ordering::Relaxed));
             }
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
-            request_index.insert(request_id.clone(), RequestPhase::Waiting);
-            waiting_queue.push_back(req);
+            if !self.requeue_waiting_request(&mut waiting_queue, &mut request_index, req) {
+                return false;
+            }
             self.record_capacity_defer_feedback(attempted_prefill_width);
             debug!("Deferred prefill request {} back to waiting", request_id);
             true
@@ -823,8 +1056,9 @@ impl ContinuousBatchScheduler {
             req.capacity_deferred_empty_retry_epoch = None;
             req.capacity_deferred_from_decode = true;
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
-            request_index.insert(request_id.clone(), RequestPhase::Waiting);
-            waiting_queue.push_back(req);
+            if !self.requeue_waiting_request(&mut waiting_queue, &mut request_index, req) {
+                return false;
+            }
             self.record_capacity_defer_feedback(attempted_decode_width.max(1));
             self.record_decode_capacity_pressure(
                 attempted_decode_width.max(1),
@@ -1223,6 +1457,20 @@ impl ContinuousBatchScheduler {
 
     /// Create batch plan for current iteration
     fn create_iteration_batch(&self, hint: BatchHint) -> Option<BatchPlan> {
+        match self.create_iteration_batch_with_admission(hint, WaitingAdmissionMode::Legacy) {
+            Ok(batch) => batch,
+            Err(error) => {
+                warn!("Legacy waiting admission failed: {}", error);
+                None
+            }
+        }
+    }
+
+    fn create_iteration_batch_with_admission(
+        &self,
+        hint: BatchHint,
+        waiting_admission: WaitingAdmissionMode<'_>,
+    ) -> Result<Option<BatchPlan>> {
         let iteration = self.current_iteration.fetch_add(1, Ordering::Relaxed);
         self.metrics_tracker.record_iteration();
 
@@ -1348,8 +1596,7 @@ impl ContinuousBatchScheduler {
             capacity_mixed_recompute_epoch,
         );
 
-        // Check if we should admit new requests from waiting queue
-        let waiting_queue = self.waiting_queue.read();
+        // Check if we should admit new requests from waiting queue.
         let active_capacity = self
             .config
             .max_running_requests
@@ -1363,44 +1610,53 @@ impl ContinuousBatchScheduler {
             .capacity_backpressure_admit_limit()
             .map(|limit| available_slots.min(limit))
             .unwrap_or(available_slots);
-        let active_count_for_capacity_wait = self.active_count();
-
-        let mut requests_to_admit = Vec::new();
-        let mut release_blocked_capacity_deferred_admissions = 0usize;
-        for req in waiting_queue.iter() {
-            if requests_to_admit.len() >= available_slots {
-                break;
+        match waiting_admission {
+            WaitingAdmissionMode::Legacy => {
+                self.legacy_waiting_admission_ticks
+                    .fetch_add(1, Ordering::Relaxed);
+                let waiting_queue = self.waiting_queue.read();
+                let active_count_for_capacity_wait = self.active_count();
+                let mut requests_to_admit = Vec::new();
+                let mut release_blocked_capacity_deferred_admissions = 0usize;
+                for req in waiting_queue.iter() {
+                    if requests_to_admit.len() >= available_slots {
+                        break;
+                    }
+                    let budgeted_capacity_deferred =
+                        Self::should_budget_capacity_deferred_mixed_recompute(
+                            req,
+                            active_decode_prefill_chunk,
+                        );
+                    let release_ready =
+                        req.capacity_deferred_until_release_epoch <= capacity_release_epoch;
+                    let empty_scheduler_retry = active_count_for_capacity_wait == 0
+                        && !release_ready
+                        && req.capacity_deferred_empty_retry_epoch != Some(capacity_release_epoch);
+                    if release_ready && !budgeted_capacity_deferred {
+                        requests_to_admit.push((req.inner.request.id.clone(), None));
+                    } else if empty_scheduler_retry && !budgeted_capacity_deferred {
+                        requests_to_admit
+                            .push((req.inner.request.id.clone(), Some(capacity_release_epoch)));
+                    } else if req.capacity_deferred_mixed_attempt_epoch
+                        == Some(capacity_mixed_recompute_epoch)
+                    {
+                        continue;
+                    } else if allow_capacity_deferred_mixed_recompute
+                        && release_blocked_capacity_deferred_admissions
+                            < capacity_deferred_mixed_recompute_slots_remaining.unwrap_or(0)
+                    {
+                        requests_to_admit.push((req.inner.request.id.clone(), None));
+                        release_blocked_capacity_deferred_admissions += 1;
+                    }
+                }
+                drop(waiting_queue);
+                for (req_id, empty_retry_epoch) in requests_to_admit {
+                    self.promote_to_prefill_with_empty_retry(&req_id, empty_retry_epoch);
+                }
             }
-            let budgeted_capacity_deferred = Self::should_budget_capacity_deferred_mixed_recompute(
-                req,
-                active_decode_prefill_chunk,
-            );
-            let release_ready = req.capacity_deferred_until_release_epoch <= capacity_release_epoch;
-            let empty_scheduler_retry = active_count_for_capacity_wait == 0
-                && !release_ready
-                && req.capacity_deferred_empty_retry_epoch != Some(capacity_release_epoch);
-            if release_ready && !budgeted_capacity_deferred {
-                requests_to_admit.push((req.inner.request.id.clone(), None));
-            } else if empty_scheduler_retry && !budgeted_capacity_deferred {
-                requests_to_admit
-                    .push((req.inner.request.id.clone(), Some(capacity_release_epoch)));
-            } else if req.capacity_deferred_mixed_attempt_epoch
-                == Some(capacity_mixed_recompute_epoch)
-            {
-                continue;
-            } else if allow_capacity_deferred_mixed_recompute
-                && release_blocked_capacity_deferred_admissions
-                    < capacity_deferred_mixed_recompute_slots_remaining.unwrap_or(0)
-            {
-                requests_to_admit.push((req.inner.request.id.clone(), None));
-                release_blocked_capacity_deferred_admissions += 1;
+            WaitingAdmissionMode::Dynamic { wake, probe } => {
+                self.admit_waiting_dynamically(wake, available_slots, probe)?;
             }
-        }
-        drop(waiting_queue);
-
-        // Promote waiting requests to prefill
-        for (req_id, empty_retry_epoch) in requests_to_admit {
-            self.promote_to_prefill_with_empty_retry(&req_id, empty_retry_epoch);
         }
 
         // vLLM's scheduler spends the remaining per-step token budget on
@@ -1462,7 +1718,7 @@ impl ContinuousBatchScheduler {
                     );
                 }
             }
-            return None;
+            return Ok(None);
         }
 
         let batch_id = BatchId::new();
@@ -1479,7 +1735,7 @@ impl ContinuousBatchScheduler {
             total_tokens
         );
 
-        Some(BatchPlan {
+        Ok(Some(BatchPlan {
             batch_id,
             requests: batch_requests,
             max_sequence_length: max_seq_len,
@@ -1493,7 +1749,7 @@ impl ContinuousBatchScheduler {
                 compute_units: 1,
             },
             created_at: chrono::Utc::now(),
-        })
+        }))
     }
 
     /// Mark a request as having completed prefill
@@ -1606,7 +1862,13 @@ impl Scheduler for ContinuousBatchScheduler {
         let mut req = cb_request;
         req.inner.queue_position = Some(queue_position);
 
-        waiting_queue.push_back(req);
+        let ticket = waiting_queue
+            .enqueue(req)
+            .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+        waiting_queue
+            .request_mut(ticket)
+            .expect("newly enqueued admission ticket remains present")
+            .waiting_admission_ticket = Some(ticket);
 
         // Update index
         self.request_index
@@ -1680,6 +1942,18 @@ impl Scheduler for ContinuousBatchScheduler {
                 self.record_capacity_release_progress();
                 return Ok(());
             }
+            drop(prefill_queue);
+
+            if self
+                .admission_failed_requests
+                .write()
+                .remove(&request_id)
+                .is_some()
+            {
+                self.request_index.write().remove(&request_id);
+                self.failed_counter.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
 
             warn!("Attempted to complete unknown request: {}", request_id);
             Err(FerrumError::scheduler(format!(
@@ -1695,10 +1969,9 @@ impl Scheduler for ContinuousBatchScheduler {
         // Check and remove from waiting queue
         {
             let mut waiting_queue = self.waiting_queue.write();
-            if let Some(pos) = waiting_queue
-                .iter()
-                .position(|r| r.inner.request.id == request_id)
-            {
+            let waiting_position =
+                waiting_queue.position(|request| request.inner.request.id == request_id);
+            if let Some(pos) = waiting_position {
                 waiting_queue.remove(pos);
                 self.request_index.write().remove(&request_id);
                 self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
@@ -1733,6 +2006,18 @@ impl Scheduler for ContinuousBatchScheduler {
                 warn!("Request {} cancelled during decode", request_id);
                 return Ok(true);
             }
+            drop(decode_queue);
+        }
+
+        if self
+            .admission_failed_requests
+            .write()
+            .remove(&request_id)
+            .is_some()
+        {
+            self.request_index.write().remove(&request_id);
+            self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
+            return Ok(true);
         }
 
         warn!("Request {} not found for cancellation", request_id);
@@ -1748,9 +2033,8 @@ impl Scheduler for ContinuousBatchScheduler {
         // Update in waiting queue
         {
             let mut waiting_queue = self.waiting_queue.write();
-            if let Some(req) = waiting_queue
-                .iter_mut()
-                .find(|r| r.inner.request.id == request_id)
+            if let Some(req) =
+                waiting_queue.find_mut(|request| request.inner.request.id == request_id)
             {
                 req.inner.request.priority = priority;
                 return Ok(());
@@ -1837,6 +2121,7 @@ impl Scheduler for ContinuousBatchScheduler {
                 RequestPhase::Completed => RequestState::Completed,
                 RequestPhase::Preempted => RequestState::Preempted,
                 RequestPhase::Cancelled => RequestState::Cancelled,
+                RequestPhase::AdmissionFailed => RequestState::Failed,
             })
     }
 
@@ -1954,10 +2239,15 @@ mod tests {
 
     fn enqueue_waiting(scheduler: &ContinuousBatchScheduler, request: InferenceRequest) {
         let request_id = request.id.clone();
-        scheduler
-            .waiting_queue
-            .write()
-            .push_back(ContinuousBatchRequest::new(request));
+        let mut waiting = scheduler.waiting_queue.write();
+        let ticket = waiting
+            .enqueue(ContinuousBatchRequest::new(request))
+            .unwrap();
+        waiting
+            .request_mut(ticket)
+            .unwrap()
+            .waiting_admission_ticket = Some(ticket);
+        drop(waiting);
         scheduler
             .request_index
             .write()
@@ -2027,6 +2317,89 @@ mod tests {
             scheduler.trace_phase(&request_id),
             Some(RequestPhase::Prefilling)
         );
+    }
+
+    #[tokio::test]
+    async fn typed_dynamic_admission_defers_without_blocking_decode_or_smaller_work() {
+        use ferrum_interfaces::vnext::DeferredAction;
+        use std::num::NonZeroU64;
+
+        let mut config = SchedulerConfig::default();
+        config.max_running_requests = 2;
+        let scheduler = ContinuousBatchScheduler::new(config);
+        let large = create_test_request_with_prompt_tokens(Priority::Normal, 512);
+        let large_id = large.id.clone();
+        let small = create_test_request_with_prompt_tokens(Priority::Normal, 8);
+        let small_id = small.id.clone();
+        scheduler.submit(large).await.unwrap();
+        scheduler.submit(small).await.unwrap();
+
+        let wake0 = AdmissionWakeEpochs::new(NonZeroU64::new(19).unwrap(), 0, 0, 0);
+        let mut first_probes = Vec::new();
+        let mut first_probe = |request: &InferenceRequest| {
+            first_probes.push(request.id.clone());
+            if request.id == large_id {
+                AdmissionProbeOutcome::Deferred(crate::vnext::AdmissionDeferral::new(
+                    DeferredAction::WaitForRelease,
+                    wake0,
+                ))
+            } else {
+                AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                    request_id: request.id.clone(),
+                })
+            }
+        };
+        let first = scheduler
+            .next_batch_with_dynamic_admission(BatchHint::simple(2), wake0, &mut first_probe)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_probes, vec![large_id.clone(), small_id.clone()]);
+        assert_eq!(first.requests.len(), 1);
+        assert_eq!(first.requests[0].request.id, small_id);
+        assert_eq!(
+            scheduler.trace_phase(&large_id),
+            Some(RequestPhase::Waiting)
+        );
+
+        scheduler.mark_prefill_complete(&small_id, 8);
+        let mut unchanged_probe_count = 0;
+        let mut unchanged_probe = |request: &InferenceRequest| {
+            unchanged_probe_count += 1;
+            AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                request_id: request.id.clone(),
+            })
+        };
+        let unchanged = scheduler
+            .next_batch_with_dynamic_admission(BatchHint::simple(2), wake0, &mut unchanged_probe)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged_probe_count, 0);
+        assert_eq!(unchanged.requests.len(), 1);
+        assert_eq!(unchanged.requests[0].request.id, small_id);
+
+        let wake1 = AdmissionWakeEpochs::new(NonZeroU64::new(19).unwrap(), 1, 0, 0);
+        let mut released_probe_count = 0;
+        let mut released_probe = |request: &InferenceRequest| {
+            released_probe_count += 1;
+            AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                request_id: request.id.clone(),
+            })
+        };
+        let released = scheduler
+            .next_batch_with_dynamic_admission(BatchHint::simple(2), wake1, &mut released_probe)
+            .unwrap()
+            .unwrap();
+        assert_eq!(released_probe_count, 1);
+        assert_eq!(released.requests.len(), 2);
+        assert!(released
+            .requests
+            .iter()
+            .any(|request| request.request.id == large_id));
+        let trace = scheduler.trace_snapshot();
+        assert_eq!(trace.legacy_waiting_admission_ticks, 0);
+        assert_eq!(trace.dynamic_admission_probes, 3);
+        assert_eq!(trace.dynamic_admission_skipped_unchanged, 1);
+        assert_eq!(trace.dynamic_admission_deferred, 1);
     }
 
     #[tokio::test]

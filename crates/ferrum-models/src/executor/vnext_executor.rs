@@ -15,9 +15,10 @@ use std::time::Instant;
 
 use ferrum_interfaces::kv_cache::{BlockTable, CacheHandleStats};
 use ferrum_interfaces::model_executor::{
-    AttentionType, DecodeInput, DecodeOutput, ExecutionResourceOwnership, ExecutorCapabilities,
-    ExecutorMemoryUsage, ExecutorState, ExecutorStatus, MemoryRequirements, PrefillInput,
-    PrefillOutput,
+    AttentionType, DecodeInput, DecodeOutput, ExecutionResourceOwnership, ExecutorAdmissionEpochs,
+    ExecutorCapabilities, ExecutorMemoryUsage, ExecutorPrefillAdmission,
+    ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt, ExecutorState,
+    ExecutorStatus, MemoryRequirements, PrefillInput, PrefillOutput,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -863,6 +864,73 @@ enum DispatchOutcome<R: DeviceRuntime> {
     },
 }
 
+enum VNextSequenceAdmissionDecision<R: DeviceRuntime> {
+    Admitted(Arc<SequenceSession<R>>),
+    Deferred(AdmissionDeferred),
+    BackingDeferred(DynamicBackingDeferred),
+    PermanentRejected(AdmissionRejected),
+}
+
+struct VNextSequenceRegistry<R: DeviceRuntime> {
+    pending: HashMap<RequestId, Arc<VNextSequence<R>>>,
+    active: HashMap<String, Arc<VNextSequence<R>>>,
+}
+
+impl<R: DeviceRuntime> Default for VNextSequenceRegistry<R> {
+    fn default() -> Self {
+        Self {
+            pending: HashMap::new(),
+            active: HashMap::new(),
+        }
+    }
+}
+
+impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
+    fn total_len(&self) -> usize {
+        self.pending.len() + self.active.len()
+    }
+
+    fn remove_pending_if(
+        &mut self,
+        request_id: &RequestId,
+        expected: &Arc<VNextSequence<R>>,
+    ) -> Option<Arc<VNextSequence<R>>> {
+        if self
+            .pending
+            .get(request_id)
+            .is_some_and(|sequence| Arc::ptr_eq(sequence, expected))
+        {
+            self.pending.remove(request_id)
+        } else {
+            None
+        }
+    }
+
+    fn activate(&mut self, request_id: &RequestId, sequence: &Arc<VNextSequence<R>>) -> Result<()> {
+        if !self
+            .pending
+            .get(request_id)
+            .is_some_and(|pending| Arc::ptr_eq(pending, sequence))
+        {
+            return Err(FerrumError::cancelled(format!(
+                "vNext prefill admission for `{request_id}` is no longer active"
+            )));
+        }
+        if self.active.contains_key(&sequence.cache_id) {
+            return Err(FerrumError::already_exists(format!(
+                "vNext cache `{}` raced with another prefill",
+                sequence.cache_id
+            )));
+        }
+        let pending = self
+            .pending
+            .remove(request_id)
+            .expect("pointer-checked pending sequence remains present");
+        self.active.insert(sequence.cache_id.clone(), pending);
+        Ok(())
+    }
+}
+
 /// Backend-neutral executor over one concrete device runtime and operation
 /// registry. CUDA and Metal factories differ only in composition creation.
 pub struct VNextModelExecutor<R: DeviceRuntime> {
@@ -880,7 +948,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     family_fingerprint: String,
     program_fingerprint: String,
     static_bytes: u64,
-    sequences: Mutex<HashMap<String, Arc<VNextSequence<R>>>>,
+    sequences: Mutex<VNextSequenceRegistry<R>>,
     event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
     metrics: VNextExecutorMetrics,
 }
@@ -896,7 +964,7 @@ impl<R: DeviceRuntime> fmt::Debug for VNextModelExecutor<R> {
             )
             .field("device", &self.runtime.descriptor().id)
             .field("maximum_model_tokens", &self.maximum_model_tokens)
-            .field("active_sequences", &self.sequences.lock().len())
+            .field("retained_sequences", &self.sequences.lock().total_len())
             .finish_non_exhaustive()
     }
 }
@@ -1061,7 +1129,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             family_fingerprint,
             program_fingerprint,
             static_bytes,
-            sequences: Mutex::new(HashMap::new()),
+            sequences: Mutex::new(VNextSequenceRegistry::default()),
             event_sink: RwLock::new(None),
             metrics: VNextExecutorMetrics::default(),
         })
@@ -1185,105 +1253,74 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         ))
     }
 
-    fn admit_sequence(
+    fn try_admit_sequence(
         &self,
         request_id: RequestIdentity,
         work: ResourceWorkShape,
-    ) -> Result<Arc<SequenceSession<R>>> {
+    ) -> Result<VNextSequenceAdmissionDecision<R>> {
         let binding = self
             .plan_resources
             .trusted_runtime_binding()
             .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let mut backing_attempts = 0;
-        let request = loop {
-            let admission = RequestResourceAdmissionRequest::new(
-                work.clone(),
-                AdmissionFitPolicy::FullInputMustFit,
-                AdmissionPressureAction::WaitForRelease,
-            )
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
-            match binding
-                .try_admit_request(admission, self.run_id.clone(), request_id.clone())
-                .map_err(|error| FerrumError::backend(error.to_string()))?
-            {
-                RequestResourceAdmissionDecision::Admitted(request) => break request,
-                RequestResourceAdmissionDecision::Deferred(deferred) => {
-                    self.metrics
-                        .request_deferrals
-                        .fetch_add(1, Ordering::Relaxed);
-                    if self.maintain_admission_growth(
-                        "request admission",
-                        &deferred,
-                        &mut backing_attempts,
-                    )? {
-                        continue;
-                    }
-                    return Err(Self::deferred("request admission", &deferred));
-                }
-                RequestResourceAdmissionDecision::BackingDeferred(deferred) => {
-                    self.metrics
-                        .backing_deferrals
-                        .fetch_add(1, Ordering::Relaxed);
-                    if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        return Err(Self::backing_deferred("request admission", &deferred));
-                    }
-                    backing_attempts += 1;
-                    self.maintain_backing(&deferred)?;
-                }
-                RequestResourceAdmissionDecision::PermanentRejected(rejected) => {
-                    return Err(FerrumError::request_validation(format!(
-                        "vNext request cannot fit this runtime: {rejected:?}"
-                    )))
-                }
+        let admission = RequestResourceAdmissionRequest::new(
+            work.clone(),
+            AdmissionFitPolicy::FullInputMustFit,
+            AdmissionPressureAction::WaitForRelease,
+        )
+        .map_err(|error| FerrumError::backend(error.to_string()))?;
+        let request = match binding
+            .try_admit_request(admission, self.run_id.clone(), request_id)
+            .map_err(|error| FerrumError::backend(error.to_string()))?
+        {
+            RequestResourceAdmissionDecision::Admitted(request) => request,
+            RequestResourceAdmissionDecision::Deferred(deferred) => {
+                self.metrics
+                    .request_deferrals
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(VNextSequenceAdmissionDecision::Deferred(deferred));
+            }
+            RequestResourceAdmissionDecision::BackingDeferred(deferred) => {
+                self.metrics
+                    .backing_deferrals
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(VNextSequenceAdmissionDecision::BackingDeferred(deferred));
+            }
+            RequestResourceAdmissionDecision::PermanentRejected(rejected) => {
+                return Ok(VNextSequenceAdmissionDecision::PermanentRejected(rejected));
             }
         };
 
-        backing_attempts = 0;
-        let sequence = loop {
-            let admission = SequenceResourceAdmissionRequest::new(
-                work.clone(),
-                AdmissionFitPolicy::FullInputMustFit,
-                AdmissionPressureAction::WaitForRelease,
-            )
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
-            match request
-                .try_admit_sequence(admission)
-                .map_err(|error| FerrumError::backend(error.to_string()))?
-            {
-                SequenceResourceAdmissionDecision::Admitted(sequence) => break sequence,
-                SequenceResourceAdmissionDecision::Deferred(deferred) => {
-                    self.metrics
-                        .sequence_deferrals
-                        .fetch_add(1, Ordering::Relaxed);
-                    if self.maintain_admission_growth(
-                        "sequence admission",
-                        &deferred,
-                        &mut backing_attempts,
-                    )? {
-                        continue;
-                    }
-                    return Err(Self::deferred("sequence admission", &deferred));
-                }
-                SequenceResourceAdmissionDecision::BackingDeferred(deferred) => {
-                    self.metrics
-                        .backing_deferrals
-                        .fetch_add(1, Ordering::Relaxed);
-                    if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        return Err(Self::backing_deferred("sequence admission", &deferred));
-                    }
-                    backing_attempts += 1;
-                    self.maintain_backing(&deferred)?;
-                }
-                SequenceResourceAdmissionDecision::PermanentRejected(rejected) => {
-                    return Err(FerrumError::request_validation(format!(
-                        "vNext sequence cannot fit this runtime: {rejected:?}"
-                    )))
-                }
+        let admission = SequenceResourceAdmissionRequest::new(
+            work,
+            AdmissionFitPolicy::FullInputMustFit,
+            AdmissionPressureAction::WaitForRelease,
+        )
+        .map_err(|error| FerrumError::backend(error.to_string()))?;
+        let sequence = match request
+            .try_admit_sequence(admission)
+            .map_err(|error| FerrumError::backend(error.to_string()))?
+        {
+            SequenceResourceAdmissionDecision::Admitted(sequence) => sequence,
+            SequenceResourceAdmissionDecision::Deferred(deferred) => {
+                self.metrics
+                    .sequence_deferrals
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(VNextSequenceAdmissionDecision::Deferred(deferred));
+            }
+            SequenceResourceAdmissionDecision::BackingDeferred(deferred) => {
+                self.metrics
+                    .backing_deferrals
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(VNextSequenceAdmissionDecision::BackingDeferred(deferred));
+            }
+            SequenceResourceAdmissionDecision::PermanentRejected(rejected) => {
+                return Ok(VNextSequenceAdmissionDecision::PermanentRejected(rejected));
             }
         };
-        sequence
+        let session = sequence
             .open_session()
-            .map_err(|error| FerrumError::backend(error.to_string()))
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
+        Ok(VNextSequenceAdmissionDecision::Admitted(session))
     }
 
     fn execution_journal(
@@ -1852,9 +1889,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     }
 
     fn sequence_for_cache(&self, cache_id: &str) -> Result<Arc<VNextSequence<R>>> {
-        self.sequences.lock().get(cache_id).cloned().ok_or_else(|| {
-            FerrumError::not_found(format!("vNext cache `{cache_id}` is not active"))
-        })
+        self.sequences
+            .lock()
+            .active
+            .get(cache_id)
+            .cloned()
+            .ok_or_else(|| {
+                FerrumError::not_found(format!("vNext cache `{cache_id}` is not active"))
+            })
     }
 
     fn metrics_snapshot(&self) -> serde_json::Value {
@@ -1876,7 +1918,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             "device_id": self.runtime.descriptor().id.to_string(),
             "runtime_fingerprint": self.runtime.descriptor().runtime_implementation_fingerprint,
             "maximum_model_tokens": self.maximum_model_tokens,
-            "active_sequences": self.sequences.lock().len(),
+            "pending_sequences": self.sequences.lock().pending.len(),
+            "active_sequences": self.sequences.lock().active.len(),
             "static_bytes": self.static_bytes,
             "counters": {
                 "prefill_operations": self.metrics.prefill_operations.load(Ordering::Relaxed),
@@ -1919,6 +1962,134 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         *self.event_sink.write() = Some(sink);
     }
 
+    fn prefill_admission_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
+        self.plan_resources
+            .dynamic_pool_status()
+            .map(|status| Some(ExecutorAdmissionEpochs::from_capacity(status.epochs())))
+            .map_err(|error| FerrumError::backend(error.to_string()))
+    }
+
+    fn try_admit_prefill(
+        &self,
+        input: ExecutorPrefillAdmission<'_>,
+    ) -> Result<ExecutorPrefillAdmissionDecision> {
+        if input.input_tokens.is_empty() {
+            return Err(FerrumError::request_validation(
+                "executor-owned vNext prefill admission requires at least one input token",
+            ));
+        }
+        if input.maximum_sequence_tokens < input.input_tokens.len()
+            || input.maximum_sequence_tokens > self.maximum_model_tokens
+        {
+            return Err(FerrumError::request_validation(format!(
+                "request sequence ceiling {} must cover prompt {} and not exceed {}",
+                input.maximum_sequence_tokens,
+                input.input_tokens.len(),
+                self.maximum_model_tokens
+            )));
+        }
+        {
+            let sequences = self.sequences.lock();
+            if sequences.pending.contains_key(input.request_id)
+                || sequences
+                    .active
+                    .values()
+                    .any(|sequence| sequence.request_id == *input.request_id)
+            {
+                return Err(FerrumError::already_exists(format!(
+                    "vNext request `{}` already retained an admission",
+                    input.request_id
+                )));
+            }
+        }
+
+        let tokens = input
+            .input_tokens
+            .iter()
+            .map(|token| token.get())
+            .collect::<Vec<_>>();
+        let span = TokenSpanWork::from_token_ids_with_fit(
+            &tokens,
+            0..tokens.len(),
+            input.maximum_sequence_tokens,
+        )
+        .map_err(|error| FerrumError::backend(error.to_string()))?;
+        let work = ResourceWorkShape::single(span)
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
+        let identity = RequestIdentity::new(format!("request.product.{}", input.request_id))
+            .map_err(|error| FerrumError::internal(error.to_string()))?;
+        let session = match self.try_admit_sequence(identity, work)? {
+            VNextSequenceAdmissionDecision::Admitted(session) => session,
+            VNextSequenceAdmissionDecision::Deferred(deferred) => {
+                return Ok(ExecutorPrefillAdmissionDecision::Deferred(deferred));
+            }
+            VNextSequenceAdmissionDecision::BackingDeferred(deferred) => {
+                return Ok(ExecutorPrefillAdmissionDecision::BackingDeferred(deferred));
+            }
+            VNextSequenceAdmissionDecision::PermanentRejected(rejected) => {
+                return Ok(ExecutorPrefillAdmissionDecision::PermanentRejected(
+                    rejected,
+                ));
+            }
+        };
+        let events = match self.execution_journal(&session) {
+            Ok(events) => events,
+            Err(error) => {
+                let _ = session.request_cancel();
+                let _ = session.try_abort();
+                return Err(error);
+            }
+        };
+        let prompt_tokens = u64::try_from(tokens.len())
+            .map_err(|_| FerrumError::request_validation("prompt token count exceeds u64"))?;
+        let sequence = Arc::new(VNextSequence {
+            cache_id: format!("vnext-cache-{}", input.request_id),
+            request_id: input.request_id.clone(),
+            session,
+            tokens: Mutex::new(tokens),
+            maximum_tokens: input.maximum_sequence_tokens,
+            active: AtomicBool::new(true),
+            operation: AsyncMutex::new(()),
+            events: events.map(Mutex::new),
+            prompt_tokens,
+        });
+        let raced = {
+            let mut sequences = self.sequences.lock();
+            if sequences.pending.contains_key(input.request_id)
+                || sequences.active.contains_key(&sequence.cache_id)
+            {
+                true
+            } else {
+                sequences
+                    .pending
+                    .insert(input.request_id.clone(), sequence.clone());
+                false
+            }
+        };
+        if raced {
+            sequence.abort();
+            return Err(FerrumError::already_exists(format!(
+                "vNext request `{}` raced with another admission",
+                input.request_id
+            )));
+        }
+        Ok(ExecutorPrefillAdmissionDecision::Admitted(
+            ExecutorPrefillAdmissionReceipt {
+                request_id: input.request_id.clone(),
+            },
+        ))
+    }
+
+    fn cancel_prefill_admission(&self, request_id: &RequestId) -> bool {
+        let pending = self.sequences.lock().pending.remove(request_id);
+        if let Some(sequence) = pending {
+            sequence.abort();
+            true
+        } else {
+            false
+        }
+    }
+
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
         let started = Instant::now();
         if input.batch_size() != 1 {
@@ -1944,43 +2115,34 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                 self.maximum_model_tokens
             )));
         }
-        let cache_id = format!("vnext-cache-{request_id}");
-        if self.sequences.lock().contains_key(&cache_id) {
-            return Err(FerrumError::already_exists(format!(
-                "vNext request `{request_id}` already has an active sequence"
+        let sequence = self
+            .sequences
+            .lock()
+            .pending
+            .get(&request_id)
+            .cloned()
+            .ok_or_else(|| {
+                FerrumError::request_validation(format!(
+                    "vNext prefill for `{request_id}` has no retained admission authority"
+                ))
+            })?;
+        if sequence.maximum_tokens != maximum_tokens || *sequence.tokens.lock() != tokens {
+            self.sequences
+                .lock()
+                .remove_pending_if(&request_id, &sequence);
+            sequence.abort();
+            return Err(FerrumError::request_validation(format!(
+                "vNext prefill input for `{request_id}` differs from its admitted work"
             )));
         }
         let span = TokenSpanWork::from_token_ids_with_fit(&tokens, 0..tokens.len(), maximum_tokens)
             .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let work = ResourceWorkShape::single(span.clone())
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let identity = RequestIdentity::new(format!("request.product.{request_id}"))
-            .map_err(|error| FerrumError::internal(error.to_string()))?;
-        let prompt_tokens = u64::try_from(tokens.len())
-            .map_err(|_| FerrumError::request_validation("prompt token count exceeds u64"))?;
-        let session = self.admit_sequence(identity, work)?;
-        let events = match self.execution_journal(&session) {
-            Ok(events) => events,
-            Err(error) => {
-                let _ = session.request_cancel();
-                let _ = session.try_abort();
-                return Err(error);
-            }
-        };
-        let sequence = Arc::new(VNextSequence {
-            cache_id: cache_id.clone(),
-            request_id,
-            session,
-            tokens: Mutex::new(tokens.clone()),
-            maximum_tokens,
-            active: AtomicBool::new(true),
-            operation: AsyncMutex::new(()),
-            events: events.map(Mutex::new),
-            prompt_tokens,
-        });
         let logits = match self.execute_step(&sequence, &tokens, span).await {
             Ok(logits) => logits,
             Err(error) => {
+                self.sequences
+                    .lock()
+                    .remove_pending_if(&request_id, &sequence);
                 sequence.abort();
                 return Err(error);
             }
@@ -1988,19 +2150,19 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         let logits = match self.prefill_tensor(logits) {
             Ok(logits) => logits,
             Err(error) => {
+                self.sequences
+                    .lock()
+                    .remove_pending_if(&request_id, &sequence);
                 sequence.abort();
                 return Err(error);
             }
         };
-        {
-            let mut sequences = self.sequences.lock();
-            if sequences.contains_key(&cache_id) {
-                sequence.abort();
-                return Err(FerrumError::already_exists(format!(
-                    "vNext cache `{cache_id}` raced with another prefill"
-                )));
-            }
-            sequences.insert(cache_id.clone(), Arc::clone(&sequence));
+        if let Err(error) = self.sequences.lock().activate(&request_id, &sequence) {
+            self.sequences
+                .lock()
+                .remove_pending_if(&request_id, &sequence);
+            sequence.abort();
+            return Err(error);
         }
         self.metrics
             .prefill_operations
@@ -2068,7 +2230,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
             if DecodeFailureDisposition::from_error(&error)
                 == DecodeFailureDisposition::AbortSequence
             {
-                self.sequences.lock().remove(&cache_id);
+                self.sequences.lock().active.remove(&cache_id);
                 sequence.abort();
             }
             return Err(error);
@@ -2081,7 +2243,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                 if DecodeFailureDisposition::from_error(&error)
                     == DecodeFailureDisposition::AbortSequence
                 {
-                    self.sequences.lock().remove(&cache_id);
+                    self.sequences.lock().active.remove(&cache_id);
                     sequence.abort();
                 }
                 return Err(error);
@@ -2105,7 +2267,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     fn release_cache(&self, cache_id: &str) {
-        if let Some(sequence) = self.sequences.lock().remove(cache_id) {
+        if let Some(sequence) = self.sequences.lock().active.remove(cache_id) {
             sequence.complete();
         }
     }
@@ -2156,13 +2318,13 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         let used_bytes = self.static_bytes.saturating_add(used_dynamic);
         let capacity = self.policy.memory().capacity_bytes;
         ExecutorStatus {
-            state: if self.sequences.lock().is_empty() {
+            state: if self.sequences.lock().total_len() == 0 {
                 ExecutorState::Ready
             } else {
                 ExecutorState::Busy
             },
             is_ready: !self.plan_resources.is_closing(),
-            current_batch_size: self.sequences.lock().len(),
+            current_batch_size: self.sequences.lock().active.len(),
             prefill_operations,
             decode_operations,
             avg_prefill_time_ms: VNextExecutorMetrics::average_ms(

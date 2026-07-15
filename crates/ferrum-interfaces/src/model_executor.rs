@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
     hash::{Hash, Hasher},
+    num::NonZeroU64,
     sync::Arc,
 };
 
@@ -491,6 +492,82 @@ pub enum ExecutionResourceOwnership {
     ExecutorManaged,
 }
 
+/// Borrowed, already-tokenized input used to probe executor-owned prefill
+/// admission before the request can enter a device submission batch.
+///
+/// This carries semantic token identity rather than an aggregate token count:
+/// vNext derives the exact resource work shape and its fingerprint from this
+/// boundary. The request remains owned by the scheduler while the executor
+/// retains any admitted authority internally until [`ModelExecutor::prefill`]
+/// consumes it or cancellation releases it.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutorPrefillAdmission<'a> {
+    pub request_id: &'a RequestId,
+    pub input_tokens: &'a [TokenId],
+    pub maximum_sequence_tokens: usize,
+}
+
+impl<'a> ExecutorPrefillAdmission<'a> {
+    pub const fn new(
+        request_id: &'a RequestId,
+        input_tokens: &'a [TokenId],
+        maximum_sequence_tokens: usize,
+    ) -> Self {
+        Self {
+            request_id,
+            input_tokens,
+            maximum_sequence_tokens,
+        }
+    }
+}
+
+/// Scheduler-visible proof that an executor retained the request/sequence
+/// authority required by one exact prefill.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExecutorPrefillAdmissionReceipt {
+    pub request_id: RequestId,
+}
+
+/// Stable scheduler-facing projection of one executor-owned capacity domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ExecutorAdmissionEpochs {
+    pub coordinator_id: NonZeroU64,
+    pub release_epoch: u64,
+    pub capacity_epoch: u64,
+}
+
+impl ExecutorAdmissionEpochs {
+    pub const fn new(coordinator_id: NonZeroU64, release_epoch: u64, capacity_epoch: u64) -> Self {
+        Self {
+            coordinator_id,
+            release_epoch,
+            capacity_epoch,
+        }
+    }
+
+    pub fn from_capacity(epochs: crate::vnext::CapacityEpochs) -> Self {
+        Self::new(
+            NonZeroU64::new(epochs.coordinator_id().get())
+                .expect("core-issued admission coordinator ids are non-zero"),
+            epochs.release_epoch(),
+            epochs.capacity_epoch(),
+        )
+    }
+}
+
+/// Typed result of probing executor-owned prefill capacity.
+///
+/// `Deferred` and `BackingDeferred` preserve the capacity domains and epochs
+/// required by the plan-local dynamic admission queue. They must never be
+/// flattened into a generic resource error at the scheduler boundary.
+#[derive(Debug, Clone)]
+pub enum ExecutorPrefillAdmissionDecision {
+    Admitted(ExecutorPrefillAdmissionReceipt),
+    Deferred(crate::vnext::AdmissionDeferred),
+    BackingDeferred(crate::vnext::DynamicBackingDeferred),
+    PermanentRejected(crate::vnext::AdmissionRejected),
+}
+
 /// Core model executor trait focusing on tensor operations
 #[async_trait]
 pub trait ModelExecutor: Send + Sync {
@@ -529,6 +606,32 @@ pub trait ModelExecutor: Send + Sync {
     /// no-op. Executors backed by the vNext runtime retain this sink with each
     /// admitted request so node/operation events share the product artifact.
     fn attach_execution_event_sink(&self, _sink: Arc<dyn crate::vnext::ExecutionEventSink>) {}
+
+    /// Current plan-local capacity evidence for scheduler wake suppression.
+    /// Engine-managed executors return `None`; an executor declaring
+    /// [`ExecutionResourceOwnership::ExecutorManaged`] must return `Some`.
+    fn prefill_admission_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
+        Ok(None)
+    }
+
+    /// Probe and retain the exact request/sequence authority needed by a
+    /// future prefill. No provider encode, kernel launch, or device submit may
+    /// occur in this method.
+    fn try_admit_prefill(
+        &self,
+        _input: ExecutorPrefillAdmission<'_>,
+    ) -> Result<ExecutorPrefillAdmissionDecision> {
+        Err(ferrum_types::FerrumError::unsupported(
+            "executor-owned prefill admission is not implemented",
+        ))
+    }
+
+    /// Release an admitted but not yet active prefill authority.
+    ///
+    /// Returns true only when a retained authority was found and released.
+    fn cancel_prefill_admission(&self, _request_id: &RequestId) -> bool {
+        false
+    }
 
     /// Reserve model-owned KV slots before a forward is dispatched.
     ///

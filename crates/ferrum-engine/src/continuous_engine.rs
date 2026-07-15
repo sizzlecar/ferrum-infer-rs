@@ -14,6 +14,7 @@ use ferrum_interfaces::{
     engine::{InferenceEngine, LlmInferenceEngine},
     kv_cache::AllocationRequest,
     model_executor::{
+        ExecutionResourceOwnership, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
         GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy, TokenSelectionMask,
     },
     vnext::{
@@ -25,7 +26,10 @@ use ferrum_interfaces::{
 };
 use ferrum_kv::cache::prefix::PrefixCache;
 use ferrum_sampler::json_mode::JsonModeProcessor;
-use ferrum_scheduler::implementations::{ContinuousBatchScheduler, RequestPhase};
+use ferrum_scheduler::implementations::{
+    ContinuousBatchScheduler, ExecutorAdmissionProbeOutcome, RequestPhase,
+};
+use ferrum_scheduler::vnext::{AdmissionDeferral, AdmissionProbeOutcome, AdmissionWakeEpochs};
 use ferrum_types::{
     DataType, Device, EngineConfig, EngineStatus, FerrumError, FerrumProfileEvent, FinishReason,
     InferenceRequest, InferenceResponse, Priority, ProfileEntrypoint, ProfileError,
@@ -3812,28 +3816,57 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
             serde_json::Value::from(input_tokens.len() as u64),
         );
 
-        // Submit to scheduler
-        let mut request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
-        if let Err(error) = self.inner.scheduler.submit(request.clone()).await {
-            request_slot.reject(&self.inner, error.to_string());
-            return Err(error);
-        }
-        request_slot.admit(&self.inner);
-
-        // Create sequence state with oneshot channel
+        // Publish the tokenized sequence and scheduler item atomically with
+        // respect to the iteration driver. Typed admission must never observe
+        // one without the other.
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
         let mut seq_state = SequenceState::new_with_tokenizer_and_model_vocab_size(
-            request,
+            request.clone(),
             input_tokens,
             Some(self.inner.tokenizer.clone()),
             Some(self.inner.model_executor.info().vocab_size),
         );
         seq_state.response_sender = Some(resp_tx);
         seq_state.request_slot = Some(request_slot);
-        self.inner
-            .sequences
-            .write()
-            .insert(request_id.clone(), seq_state);
+        {
+            let _iteration = self.inner.iteration_lock.lock().await;
+            {
+                let mut sequences = self.inner.sequences.write();
+                if sequences.contains_key(&request_id) {
+                    let error = FerrumError::already_exists(format!(
+                        "request {} is already active",
+                        request_id
+                    ));
+                    if let Some(request_slot) = seq_state.request_slot.take() {
+                        request_slot.reject(&self.inner, error.to_string());
+                    }
+                    gauge!("ferrum.engine.active_requests").decrement(1.0);
+                    return Err(error);
+                }
+                sequences.insert(request_id.clone(), seq_state);
+            }
+            if let Err(error) = self.inner.scheduler.submit(request).await {
+                let mut sequence = self
+                    .inner
+                    .sequences
+                    .write()
+                    .remove(&request_id)
+                    .expect("just-published sequence remains present after submit failure");
+                if let Some(request_slot) = sequence.request_slot.take() {
+                    request_slot.reject(&self.inner, error.to_string());
+                }
+                gauge!("ferrum.engine.active_requests").decrement(1.0);
+                return Err(error);
+            }
+            self.inner
+                .sequences
+                .write()
+                .get_mut(&request_id)
+                .and_then(|sequence| sequence.request_slot.as_mut())
+                .expect("submitted sequence retains its request slot")
+                .admit(&self.inner);
+        }
 
         // Make sure the single shared bg loop is running, then just wait
         // for our oneshot to fire. Avoids per-request drive_to_completion
@@ -3891,27 +3924,53 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
             serde_json::Value::from(input_tokens.len() as u64),
         );
 
-        // Submit to scheduler
-        let mut request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
-        if let Err(error) = self.inner.scheduler.submit(request.clone()).await {
-            request_slot.reject(&self.inner, error.to_string());
-            return Err(error);
-        }
-        request_slot.admit(&self.inner);
-
-        // Create sequence state with stream sender
+        // Publish tokenized state and the scheduler item under the same
+        // iteration boundary; see the non-streaming path above.
+        let request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
         let mut seq_state = SequenceState::new_with_tokenizer_and_model_vocab_size(
-            request,
+            request.clone(),
             input_tokens,
             Some(self.inner.tokenizer.clone()),
             Some(self.inner.model_executor.info().vocab_size),
         );
         seq_state.stream_sender = Some(tx);
         seq_state.request_slot = Some(request_slot);
-        self.inner
-            .sequences
-            .write()
-            .insert(request_id.clone(), seq_state);
+        {
+            let _iteration = self.inner.iteration_lock.lock().await;
+            {
+                let mut sequences = self.inner.sequences.write();
+                if sequences.contains_key(&request_id) {
+                    let error = FerrumError::already_exists(format!(
+                        "request {} is already active",
+                        request_id
+                    ));
+                    if let Some(request_slot) = seq_state.request_slot.take() {
+                        request_slot.reject(&self.inner, error.to_string());
+                    }
+                    return Err(error);
+                }
+                sequences.insert(request_id.clone(), seq_state);
+            }
+            if let Err(error) = self.inner.scheduler.submit(request).await {
+                let mut sequence = self
+                    .inner
+                    .sequences
+                    .write()
+                    .remove(&request_id)
+                    .expect("just-published sequence remains present after submit failure");
+                if let Some(request_slot) = sequence.request_slot.take() {
+                    request_slot.reject(&self.inner, error.to_string());
+                }
+                return Err(error);
+            }
+            self.inner
+                .sequences
+                .write()
+                .get_mut(&request_id)
+                .and_then(|sequence| sequence.request_slot.as_mut())
+                .expect("submitted sequence retains its request slot")
+                .admit(&self.inner);
+        }
 
         // Single shared bg loop drives iters; per-request stream just
         // consumes from `rx`. Used to spawn a per-request drive_to_completion

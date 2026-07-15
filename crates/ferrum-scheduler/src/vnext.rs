@@ -243,6 +243,7 @@ impl AdmissionTickReceipt {
 pub enum DynamicAdmissionQueueError {
     InvalidPolicy(&'static str),
     IdentityExhausted,
+    DuplicateTicket(WaitingAdmissionTicket),
     ForeignCoordinator { expected: u64, actual: u64 },
     EpochRegression,
 }
@@ -254,6 +255,11 @@ impl fmt::Display for DynamicAdmissionQueueError {
             Self::IdentityExhausted => {
                 formatter.write_str("waiting admission identity space is exhausted")
             }
+            Self::DuplicateTicket(ticket) => write!(
+                formatter,
+                "waiting admission ticket {} is already queued",
+                ticket.get()
+            ),
             Self::ForeignCoordinator { expected, actual } => write!(
                 formatter,
                 "admission wake belongs to coordinator {actual}, expected {expected}"
@@ -314,6 +320,59 @@ impl<T> DynamicAdmissionQueue<T> {
 
     pub fn is_empty(&self) -> bool {
         self.waiting.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.waiting.iter().map(|entry| &entry.request)
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.waiting.iter_mut().map(|entry| &mut entry.request)
+    }
+
+    pub fn request_mut(&mut self, ticket: WaitingAdmissionTicket) -> Option<&mut T> {
+        self.waiting
+            .iter_mut()
+            .find(|entry| entry.ticket == ticket)
+            .map(|entry| &mut entry.request)
+    }
+
+    pub fn position(&self, predicate: impl FnMut(&T) -> bool) -> Option<usize> {
+        self.waiting
+            .iter()
+            .map(|entry| &entry.request)
+            .position(predicate)
+    }
+
+    pub fn find_mut(&mut self, mut predicate: impl FnMut(&T) -> bool) -> Option<&mut T> {
+        self.waiting
+            .iter_mut()
+            .find(|entry| predicate(&entry.request))
+            .map(|entry| &mut entry.request)
+    }
+
+    pub fn remove(&mut self, index: usize) -> Option<T> {
+        self.waiting.remove(index).map(|entry| entry.request)
+    }
+
+    /// Return a previously admitted lifecycle item to this queue without
+    /// minting a second waiting identity.
+    pub fn requeue(
+        &mut self,
+        ticket: WaitingAdmissionTicket,
+        request: T,
+    ) -> Result<(), (DynamicAdmissionQueueError, T)> {
+        if self.waiting.iter().any(|entry| entry.ticket == ticket) {
+            return Err((DynamicAdmissionQueueError::DuplicateTicket(ticket), request));
+        }
+        self.waiting.push_back(WaitingEntry {
+            ticket,
+            request,
+            deferral: None,
+            bypass_release_epochs: 0,
+            last_bypass_release_epoch: None,
+        });
+        Ok(())
     }
 
     pub fn enqueue(
