@@ -230,6 +230,69 @@ fn all_plan_nodes_encode_into_one_submission_and_one_completion() {
 }
 
 #[test]
+fn typed_input_upload_precedes_the_plan_in_one_submission() {
+    let (fixture, sequence, session, batch, step) = setup();
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let (identities, active_bindings) = wave_identity_inputs(&fixture.plan, &wave, &session);
+    let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        identities,
+        &active_bindings,
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let upload = SubmissionWaveInputUpload::new(
+        id("node.main"),
+        0,
+        0,
+        0,
+        HostTransferLayout::new(ElementType::F32, 4).unwrap(),
+        vec![0; 16],
+    )
+    .unwrap();
+    let handle = OperationDispatch::encode_and_submit_wave_with_inputs(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        &active_bindings,
+        &[upload],
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    assert_eq!(
+        fixture
+            .runtime_trace
+            .lock()
+            .unwrap()
+            .submitted_command_counts,
+        vec![3]
+    );
+    assert!(matches!(
+        handle.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+
+    drop(handle);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
 fn terminal_wave_reads_output_before_releasing_backing() {
     let (fixture, sequence, session, batch, step) = setup();
     let executable = ExecutablePlan::new(
