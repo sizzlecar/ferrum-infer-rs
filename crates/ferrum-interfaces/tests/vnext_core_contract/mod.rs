@@ -771,6 +771,7 @@ impl OperationContract for TestOperationContract {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EstimateBehavior {
     Correct,
+    ArenaAlignment64,
     TokenScaledScratch,
     WrongEstimatorId,
     WrongEstimatorVersion,
@@ -950,16 +951,29 @@ impl OperationResourceEstimator for TestEstimator {
                 .unwrap()
             }
         });
+        let value_alignment_bytes = if self.behavior == EstimateBehavior::InvalidAlignment {
+            3
+        } else if self.behavior == EstimateBehavior::ArenaAlignment64
+            && request.values().iter().any(|binding| {
+                binding.usage() == BufferUsage::Weights
+                    && binding.storage().components().iter().any(|component| {
+                        component
+                            .resource_id()
+                            .as_str()
+                            .starts_with("resource/weight-arena/sha256/")
+                    })
+            })
+        {
+            64
+        } else {
+            16
+        };
         Ok(OperationResourceEstimate::new(
             estimator_id,
             estimator_version,
             implementation,
             input,
-            if self.behavior == EstimateBehavior::InvalidAlignment {
-                3
-            } else {
-                16
-            },
+            value_alignment_bytes,
             scratch,
             Some(
                 ProviderWorkspaceRequirement::new(
