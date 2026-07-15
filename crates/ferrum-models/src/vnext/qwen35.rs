@@ -279,15 +279,22 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 role: WeightComponentRole::Values,
                 external_names,
                 dimensions: dimensions.clone(),
-                encoding: WeightEncoding::Dense {
-                    element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
-                },
+                encoding: dense_weight_encoding(if weight.role == "mlp_gate" {
+                    PACKED_GATE_UP_ROLE
+                } else {
+                    &weight.role
+                })?,
                 required: true,
+            });
+            let element_type = materialized_element_type(if weight.role == "mlp_gate" {
+                PACKED_GATE_UP_ROLE
+            } else {
+                &weight.role
             });
             tensors.push(WeightTensorSpec {
                 id: tensor_id,
                 dimensions,
-                logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
+                logical_element_type: element_type,
                 physical_layout: PhysicalWeightLayout::Dense { component_id },
                 required: true,
             });
@@ -295,7 +302,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         Ok(WeightSchema {
             format_id: WeightFormatId::new("weight-format.safetensors.dense")?,
             layout_id: WeightLayoutId::new("weight-layout.qwen3_5.dense_hybrid.packed_gate_up")?,
-            version: ContractVersion::new(1, 1),
+            version: ContractVersion::new(1, 2),
             components,
             tensors,
         })
@@ -318,14 +325,17 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                     value_id: packed_gate_up_value_id(layer_index)?,
                     tensor: tensor_spec(
                         packed_gate_up_dimensions(weight, up)?,
-                        DENSE_MATERIALIZED_ELEMENT_TYPE,
+                        materialized_element_type(PACKED_GATE_UP_ROLE),
                     ),
                 });
             } else {
                 weight_refs.push(WeightReference {
                     weight_id: weight_id(weight)?,
                     value_id: weight_value_id(weight)?,
-                    tensor: tensor_spec(weight.dimensions.clone(), DENSE_MATERIALIZED_ELEMENT_TYPE),
+                    tensor: tensor_spec(
+                        weight.dimensions.clone(),
+                        materialized_element_type(&weight.role),
+                    ),
                 });
             }
         }
@@ -355,7 +365,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             let input_norm = required_weight(config, Some(layer_index as u32), "input_layernorm")?;
             let mut attention_inputs = vec![hidden.clone(), weight_value_id(input_norm)?];
 
-            let (operation, mut attributes) = match layer_type {
+            let (operation, required_version, mut attributes) = match layer_type {
                 Qwen35LayerType::LinearAttention => {
                     for role in [
                         "linear_attn_qkv",
@@ -407,6 +417,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                     });
                     (
                         GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
+                        ContractVersion::new(2, 0),
                         BTreeMap::from([
                             attribute("key_heads", text.linear_attention.num_key_heads as u64)?,
                             attribute("value_heads", text.linear_attention.num_value_heads as u64)?,
@@ -463,6 +474,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                     });
                     (
                         CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+                        ContractVersion::new(1, 0),
                         BTreeMap::from([
                             attribute("query_heads", text.num_attention_heads as u64)?,
                             attribute("key_value_heads", text.num_key_value_heads as u64)?,
@@ -504,7 +516,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             nodes.push(ProgramNode {
                 id: node_id(format!("node.layer.{layer_index}.attention"))?,
                 operation_id: operation_id(operation)?,
-                required_version: ContractVersion::new(1, 0),
+                required_version,
                 work: ProgramNodeWorkSpec::tokens(hidden.clone(), 0),
                 inputs: attention_inputs,
                 outputs: vec![attention_output.clone()],
@@ -786,6 +798,32 @@ fn required_weight<'a>(
         .iter()
         .find(|weight| weight.layer_index == layer_index && weight.role == role)
         .ok_or_else(|| invalid_config("weights", format!("missing role {role:?}")))
+}
+
+fn materialized_element_type(role: &str) -> ElementType {
+    match role {
+        "linear_attn_a_log" | "linear_attn_dt_bias" | "linear_attn_norm" => ElementType::F32,
+        _ => DENSE_MATERIALIZED_ELEMENT_TYPE,
+    }
+}
+
+fn dense_weight_encoding(role: &str) -> Result<WeightEncoding, VNextError> {
+    let element_type = materialized_element_type(role);
+    if matches!(
+        role,
+        "final_norm"
+            | "input_layernorm"
+            | "post_attention_layernorm"
+            | "self_attn_q_norm"
+            | "self_attn_k_norm"
+    ) {
+        return Ok(WeightEncoding::DenseAffine {
+            element_type,
+            scale: CanonicalRational::new(1, 1)?,
+            bias: CanonicalRational::new(1, 1)?,
+        });
+    }
+    Ok(WeightEncoding::Dense { element_type })
 }
 
 fn expected_weight_elements(
@@ -1320,6 +1358,10 @@ mod tests {
             .iter()
             .map(|value| value.as_str())
             .collect::<Vec<_>>();
+        assert_eq!(
+            linear_attention.required_version,
+            ContractVersion::new(2, 0)
+        );
         for (ordinal, role) in [
             "input_layernorm",
             "linear_attn_qkv",
@@ -1348,6 +1390,7 @@ mod tests {
             .iter()
             .map(|value| value.as_str())
             .collect::<Vec<_>>();
+        assert_eq!(full_attention.required_version, ContractVersion::new(1, 0));
         for (ordinal, role) in [
             "input_layernorm",
             "self_attn_q",
@@ -1374,11 +1417,45 @@ mod tests {
         assert!(!operation_ids.contains(&"operation.logits_projection"));
         assert_eq!(prepared.program().states().len(), 7);
         assert_eq!(prepared.program().weights().len(), config.weights.len() - 4);
-        assert!(prepared
+        assert_eq!(prepared.weight_schema().version, ContractVersion::new(1, 2));
+        for component in prepared
             .weight_schema()
             .components
             .iter()
-            .all(|component| component.physical_element_type() == ElementType::F16));
+            .filter(|component| component.external_names.len() == 1)
+        {
+            let weight = config
+                .weights
+                .iter()
+                .find(|weight| weight.external_name == component.external_names[0])
+                .unwrap();
+            let expected_type = materialized_element_type(&weight.role);
+            assert_eq!(component.physical_element_type(), expected_type);
+            if matches!(
+                weight.role.as_str(),
+                "final_norm"
+                    | "input_layernorm"
+                    | "post_attention_layernorm"
+                    | "self_attn_q_norm"
+                    | "self_attn_k_norm"
+            ) {
+                assert_eq!(
+                    component.encoding,
+                    WeightEncoding::DenseAffine {
+                        element_type: expected_type,
+                        scale: CanonicalRational::new(1, 1).unwrap(),
+                        bias: CanonicalRational::new(1, 1).unwrap(),
+                    }
+                );
+            } else {
+                assert_eq!(
+                    component.encoding,
+                    WeightEncoding::Dense {
+                        element_type: expected_type,
+                    }
+                );
+            }
+        }
         let packed = prepared
             .weight_schema()
             .components
@@ -1390,6 +1467,10 @@ mod tests {
             component.dimensions == [2, 32, 16]
                 && component.external_names[0].contains("gate_proj")
                 && component.external_names[1].contains("up_proj")
+                && component.encoding
+                    == WeightEncoding::Dense {
+                        element_type: ElementType::F16,
+                    }
         }));
         assert_eq!(
             prepared.metadata().special_tokens.eos_token_ids,

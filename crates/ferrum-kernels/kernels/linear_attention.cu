@@ -397,6 +397,36 @@ extern "C" __global__ void linear_attention_prepare_varlen_f16_to_f32_state_f16(
       value_dim, conv_kernel);
 }
 
+extern "C" __global__ void linear_attention_prepare_varlen_f16_params_f32_state_f16(
+    const __half* __restrict__ mixed_qkv_raw,
+    const __half* __restrict__ conv_weight,
+    const __half* __restrict__ initial_conv_states,
+    const __half* __restrict__ a_raw,
+    const __half* __restrict__ b_raw,
+    const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias,
+    const unsigned int* __restrict__ cu_seqlens,
+    const unsigned int* __restrict__ token_seq_indices,
+    float* __restrict__ query,
+    float* __restrict__ key,
+    float* __restrict__ value,
+    float* __restrict__ g,
+    float* __restrict__ beta,
+    __half* __restrict__ final_conv_states,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int conv_kernel) {
+  linear_attention_prepare_varlen_impl<__half, float, __half>(
+      mixed_qkv_raw, conv_weight, initial_conv_states, a_raw, b_raw, a_log,
+      dt_bias, cu_seqlens, token_seq_indices, query, key, value, g, beta,
+      final_conv_states, batch, total_tokens, key_heads, value_heads, key_dim,
+      value_dim, conv_kernel);
+}
+
 template <typename InputT, typename ParamT>
 static __device__ void linear_attention_prepare_varlen_packed_qkvz_ba_impl(
     const InputT* __restrict__ mixed_qkvz_raw,

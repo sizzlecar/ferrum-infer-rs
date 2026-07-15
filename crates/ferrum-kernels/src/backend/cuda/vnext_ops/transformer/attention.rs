@@ -33,11 +33,11 @@ const PROVIDER_ID: &str = "provider.cuda.gated_delta_recurrent_attention.f16";
 const ESTIMATOR_ID: &str = "resource-estimator.cuda.gated_delta_recurrent_attention.f16";
 
 const RMS_NORM_FUNCTION: &str = "rms_norm_f16";
-const PREPARE_FUNCTION: &str = "linear_attention_prepare_varlen_f16_to_f32_state_f16";
+const PREPARE_FUNCTION: &str = "linear_attention_prepare_varlen_f16_params_f32_state_f16";
 const QK_NORM_FUNCTION: &str = "linear_attention_qk_l2norm_f32";
 const DELTA_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_f32_state_f16";
 const DELTA_TILED_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_tiled16_f32_state_f16";
-const GATED_NORM_FUNCTION: &str = "gated_rms_norm_f16_to_f32";
+const GATED_NORM_FUNCTION: &str = "gated_rms_norm_f16_z_f32_weight";
 const F32_TO_F16_FUNCTION: &str = "f32_to_activation_f16";
 const RESIDUAL_ADD_FUNCTION: &str = "residual_add_f16";
 
@@ -93,7 +93,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 .fingerprint()
                 .map_err(contract_error)?,
             provider_fingerprint,
-            ContractVersion::new(1, 0),
+            ContractVersion::new(2, 0),
             runtime.descriptor().id.clone(),
             BTreeSet::from([capability]),
             BTreeSet::from([
@@ -581,16 +581,16 @@ fn encode_attention(
 
     let mut regions = Vec::new();
     let shared = SharedRegions {
-        input_norm: push_shared_weight(&mut regions, &invocation, 1)?,
-        qkv: push_shared_weight(&mut regions, &invocation, 2)?,
-        z: push_shared_weight(&mut regions, &invocation, 3)?,
-        b: push_shared_weight(&mut regions, &invocation, 4)?,
-        a: push_shared_weight(&mut regions, &invocation, 5)?,
-        conv: push_shared_weight(&mut regions, &invocation, 6)?,
-        a_log: push_shared_weight(&mut regions, &invocation, 7)?,
-        dt_bias: push_shared_weight(&mut regions, &invocation, 8)?,
-        norm: push_shared_weight(&mut regions, &invocation, 9)?,
-        output: push_shared_weight(&mut regions, &invocation, 10)?,
+        input_norm: push_shared_weight(&mut regions, &invocation, 1, ElementType::F16)?,
+        qkv: push_shared_weight(&mut regions, &invocation, 2, ElementType::F16)?,
+        z: push_shared_weight(&mut regions, &invocation, 3, ElementType::F16)?,
+        b: push_shared_weight(&mut regions, &invocation, 4, ElementType::F16)?,
+        a: push_shared_weight(&mut regions, &invocation, 5, ElementType::F16)?,
+        conv: push_shared_weight(&mut regions, &invocation, 6, ElementType::F16)?,
+        a_log: push_shared_weight(&mut regions, &invocation, 7, ElementType::F32)?,
+        dt_bias: push_shared_weight(&mut regions, &invocation, 8, ElementType::F32)?,
+        norm: push_shared_weight(&mut regions, &invocation, 9, ElementType::F32)?,
+        output: push_shared_weight(&mut regions, &invocation, 10, ElementType::F16)?,
         scratch: {
             let index = regions.len();
             regions.push(shared_scratch_region(&invocation, layout.required_bytes)?);
@@ -1206,20 +1206,49 @@ fn validate_signature(
         return Err("recurrent attention hidden input is not two-dimensional".to_owned());
     };
     let expected = [
-        (value(1)?, vec![shape.hidden_size]),
-        (value(2)?, vec![shape.qkv_features, shape.hidden_size]),
-        (value(3)?, vec![shape.value_features, shape.hidden_size]),
-        (value(4)?, vec![shape.value_heads, shape.hidden_size]),
-        (value(5)?, vec![shape.value_heads, shape.hidden_size]),
-        (value(6)?, vec![shape.qkv_features, shape.conv_kernel]),
-        (value(7)?, vec![shape.value_heads]),
-        (value(8)?, vec![shape.value_heads]),
-        (value(9)?, vec![shape.value_head_dim]),
-        (value(10)?, vec![shape.hidden_size, shape.value_features]),
-        (value(11)?, vec![shape.qkv_features, shape.conv_state_width]),
+        (value(1)?, vec![shape.hidden_size], ElementType::F16),
+        (
+            value(2)?,
+            vec![shape.qkv_features, shape.hidden_size],
+            ElementType::F16,
+        ),
+        (
+            value(3)?,
+            vec![shape.value_features, shape.hidden_size],
+            ElementType::F16,
+        ),
+        (
+            value(4)?,
+            vec![shape.value_heads, shape.hidden_size],
+            ElementType::F16,
+        ),
+        (
+            value(5)?,
+            vec![shape.value_heads, shape.hidden_size],
+            ElementType::F16,
+        ),
+        (
+            value(6)?,
+            vec![shape.qkv_features, shape.conv_kernel],
+            ElementType::F16,
+        ),
+        (value(7)?, vec![shape.value_heads], ElementType::F32),
+        (value(8)?, vec![shape.value_heads], ElementType::F32),
+        (value(9)?, vec![shape.value_head_dim], ElementType::F32),
+        (
+            value(10)?,
+            vec![shape.hidden_size, shape.value_features],
+            ElementType::F16,
+        ),
+        (
+            value(11)?,
+            vec![shape.qkv_features, shape.conv_state_width],
+            ElementType::F16,
+        ),
         (
             value(12)?,
             vec![shape.value_heads, shape.value_head_dim, shape.key_head_dim],
+            ElementType::F16,
         ),
     ];
     if *tokens == 0
@@ -1227,8 +1256,9 @@ fn validate_signature(
         || output.tensor().dimensions() != [*tokens, shape.hidden_size]
         || !f16_contiguous(hidden)
         || !f16_contiguous(output)
-        || expected.iter().any(|(binding, dimensions)| {
-            binding.tensor().dimensions() != dimensions.as_slice() || !f16_contiguous(binding)
+        || expected.iter().any(|(binding, dimensions, element_type)| {
+            binding.tensor().dimensions() != dimensions.as_slice()
+                || !contiguous(binding, *element_type)
         })
     {
         return Err("recurrent attention signature differs from its resolved shape".to_owned());
@@ -1240,13 +1270,14 @@ fn push_shared_weight(
     regions: &mut Vec<CudaBufferRegion>,
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ordinal: u32,
+    element_type: ElementType,
 ) -> Result<usize, String> {
     let index = regions.len();
     regions.push(super::shared_full_region(
         invocation,
         ResolvedValueRole::Input,
         ordinal,
-        ElementType::F16,
+        element_type,
     )?);
     Ok(index)
 }
@@ -1294,7 +1325,11 @@ fn scratch_region(
 }
 
 fn f16_contiguous(binding: &ResolvedValueBinding) -> bool {
-    binding.tensor().element_type() == ElementType::F16
+    contiguous(binding, ElementType::F16)
+}
+
+fn contiguous(binding: &ResolvedValueBinding, element_type: ElementType) -> bool {
+    binding.tensor().element_type() == element_type
         && matches!(binding.tensor().layout(), ResolvedTensorLayout::Contiguous)
 }
 
