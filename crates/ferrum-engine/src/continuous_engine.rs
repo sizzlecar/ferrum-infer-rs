@@ -1210,6 +1210,17 @@ impl SequenceState {
         model_cache_update
     }
 
+    fn commit_executor_owned_prefill_resources(
+        &mut self,
+        kv_cache: Arc<dyn KvCacheHandle>,
+    ) -> ModelCacheRefUpdate {
+        let model_cache_update = self.install_model_kv_without_owned_blocks(kv_cache);
+        self.recurrent_state = None;
+        self.prefill_complete = true;
+        self.phase = RequestPhase::Decoding;
+        model_cache_update
+    }
+
     fn commit_prefill_chunk_physical_resources(
         &mut self,
         kv_cache: Arc<dyn KvCacheHandle>,
