@@ -1480,6 +1480,13 @@ impl LogicalBackingSliceAuthority {
         &self.evidence
     }
 
+    pub(super) fn retained(&self) -> Self {
+        Self {
+            evidence: self.evidence.clone(),
+            segment_lease: Arc::clone(&self.segment_lease),
+        }
+    }
+
     pub const fn domain_id(&self) -> CapacityDomainId {
         self.evidence.domain_id
     }
@@ -1495,7 +1502,12 @@ impl LogicalBackingSliceAuthority {
 
 pub struct LogicalBackingBufferView<'a, B> {
     pub(super) bindings: Vec<LogicalBackingSegmentBinding<B>>,
-    pub(super) evidence: &'a LogicalBackingSliceEvidence,
+    authorities: &'a [LogicalBackingSliceAuthority],
+    size_bytes: u64,
+    alignment_bytes: u64,
+    usage: BufferUsage,
+    element_type: ElementType,
+    storage_profile: DynamicStorageProfile,
 }
 
 pub(crate) struct LogicalBackingSegmentBinding<B> {
@@ -1526,12 +1538,40 @@ impl<'a, B> LogicalBackingBufferView<'a, B> {
         &self.bindings
     }
 
-    pub(crate) fn storage_profile(&self) -> DynamicStorageProfile {
-        self.evidence.storage_profile()
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
     }
 
+    pub const fn alignment_bytes(&self) -> u64 {
+        self.alignment_bytes
+    }
+
+    pub const fn usage(&self) -> BufferUsage {
+        self.usage
+    }
+
+    pub const fn element_type(&self) -> ElementType {
+        self.element_type
+    }
+
+    pub const fn storage_profile(&self) -> DynamicStorageProfile {
+        self.storage_profile
+    }
+
+    pub fn committed_evidence_segments(&self) -> impl Iterator<Item = &BackingSegment> {
+        self.authorities
+            .iter()
+            .flat_map(|authority| authority.evidence.segments())
+    }
+
+    /// Compatibility accessor for callers that construct a single-slice view.
+    /// Multi-extent callers must use the aggregate metadata and segment iterator.
     pub fn slice(&self) -> &'a LogicalBackingSliceEvidence {
-        self.evidence
+        &self
+            .authorities
+            .first()
+            .expect("logical backing views always contain an authority")
+            .evidence
     }
 }
 
@@ -2296,10 +2336,88 @@ where
         &'lease self,
         authority: &'lease LogicalBackingSliceAuthority,
     ) -> Result<LogicalBackingBufferView<'lease, R::Buffer>, VNextError> {
+        self.view_many(std::slice::from_ref(authority))
+    }
+
+    pub(super) fn view_many<'lease>(
+        &'lease self,
+        authorities: &'lease [LogicalBackingSliceAuthority],
+    ) -> Result<LogicalBackingBufferView<'lease, R::Buffer>, VNextError> {
+        let first = authorities
+            .first()
+            .ok_or_else(|| invalid_resource("logical backing view requires an authority"))?;
         let pool = self
             .pools
-            .get(&authority.evidence.pool_id)
+            .get(&first.evidence.pool_id)
             .ok_or_else(|| invalid_resource("logical backing authority has no dynamic pool"))?;
+        let mut size_bytes = 0_u64;
+        let mut segment_count = 0_usize;
+        for authority in authorities {
+            if authority.evidence.pool_id != first.evidence.pool_id
+                || authority.evidence.resource_id != first.evidence.resource_id
+                || authority.evidence.storage_profile != first.evidence.storage_profile
+                || authority.evidence.alignment_bytes != first.evidence.alignment_bytes
+                || authority.evidence.usage != first.evidence.usage
+                || authority.evidence.element_type != first.evidence.element_type
+            {
+                return Err(invalid_resource(
+                    "logical backing authorities have incompatible resource metadata",
+                ));
+            }
+            Self::validate_authority(pool, authority)?;
+            size_bytes = size_bytes
+                .checked_add(authority.evidence.size_bytes)
+                .ok_or_else(|| invalid_resource("logical backing view size overflows u64"))?;
+            segment_count = segment_count
+                .checked_add(authority.evidence.segments.len())
+                .ok_or_else(|| invalid_resource("logical backing segment count overflows usize"))?;
+        }
+        let state = pool
+            .state
+            .lock()
+            .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))?;
+        if state.poisoned {
+            return Err(invalid_resource("dynamic backing pool is fail-closed"));
+        }
+        let mut bindings = Vec::with_capacity(segment_count);
+        for authority in authorities {
+            for segment in &authority.evidence.segments {
+                let chunk = state.chunks.get(&segment.chunk_ordinal()).ok_or_else(|| {
+                    invalid_resource("logical backing references a missing chunk")
+                })?;
+                if segment.pool_id() != &authority.evidence.pool_id
+                    || chunk.backing.identity != *segment.chunk()
+                    || segment
+                        .offset_bytes()
+                        .checked_add(segment.length_bytes())
+                        .is_none_or(|end| end > chunk.backing.descriptor.size_bytes)
+                {
+                    return Err(invalid_resource(
+                        "logical backing references a stale or out-of-bounds chunk region",
+                    ));
+                }
+                bindings.push(LogicalBackingSegmentBinding {
+                    segment: segment.clone(),
+                    chunk: Arc::clone(&chunk.backing),
+                });
+            }
+        }
+        drop(state);
+        Ok(LogicalBackingBufferView {
+            bindings,
+            authorities,
+            size_bytes,
+            alignment_bytes: first.evidence.alignment_bytes,
+            usage: first.evidence.usage,
+            element_type: first.evidence.element_type,
+            storage_profile: first.evidence.storage_profile,
+        })
+    }
+
+    fn validate_authority(
+        pool: &DynamicBackingPool<R>,
+        authority: &LogicalBackingSliceAuthority,
+    ) -> Result<(), VNextError> {
         if pool.instance_id != authority.evidence.pool_instance_id
             || authority.segment_lease.owner_instance_id != pool.instance_id
             || authority.segment_lease.owner.instance_id() != pool.instance_id
@@ -2335,40 +2453,7 @@ where
                 "logical backing projection differs from its shared physical extent",
             ));
         }
-        let state = pool
-            .state
-            .lock()
-            .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))?;
-        if state.poisoned {
-            return Err(invalid_resource("dynamic backing pool is fail-closed"));
-        }
-        let mut bindings = Vec::with_capacity(authority.evidence.segments.len());
-        for segment in &authority.evidence.segments {
-            let chunk = state
-                .chunks
-                .get(&segment.chunk_ordinal())
-                .ok_or_else(|| invalid_resource("logical backing references a missing chunk"))?;
-            if segment.pool_id() != &authority.evidence.pool_id
-                || chunk.backing.identity != *segment.chunk()
-                || segment
-                    .offset_bytes()
-                    .checked_add(segment.length_bytes())
-                    .is_none_or(|end| end > chunk.backing.descriptor.size_bytes)
-            {
-                return Err(invalid_resource(
-                    "logical backing references a stale or out-of-bounds chunk region",
-                ));
-            }
-            bindings.push(LogicalBackingSegmentBinding {
-                segment: segment.clone(),
-                chunk: Arc::clone(&chunk.backing),
-            });
-        }
-        drop(state);
-        Ok(LogicalBackingBufferView {
-            bindings,
-            evidence: &authority.evidence,
-        })
+        Ok(())
     }
 }
 

@@ -2576,14 +2576,12 @@ impl<'a, B> OperationBufferView<'a, B> {
             }),
             OperationBufferSource::Backing(view) => {
                 let bindings = view.segment_bindings();
-                let evidence_segments = view.slice().segments();
-                if bindings.len() != evidence_segments.len()
-                    || bindings
-                        .iter()
-                        .zip(evidence_segments)
-                        .any(|(binding, segment)| {
+                if bindings.len() != view.committed_evidence_segments().count()
+                    || bindings.iter().zip(view.committed_evidence_segments()).any(
+                        |(binding, segment)| {
                             binding.segment() != segment || binding.chunk() != segment.chunk()
-                        })
+                        },
+                    )
                 {
                     return Err(invalid_operation(
                         "dynamic backing bindings differ from committed segment evidence",
@@ -3281,14 +3279,6 @@ impl<'a, B> OperationInvocation<'a, B> {
         let admission = active_binding.plan().static_provisioning_binding();
         let pool_fingerprint = active_binding.static_pool_identity_fingerprint();
         let memory = plan.payload().memory();
-        let participant_backing_matches =
-            active_binding
-                .backing_slices()
-                .iter()
-                .eq(participant_backing
-                    .backing_slices()
-                    .iter()
-                    .map(|slice| slice.evidence()));
         if resources.participant_count()? != resources.prepared_participant_count()?
             || resources.node_id()? != node_id
             || participant_frame.sequence_authority() != participant.sequence_authority()
@@ -3300,7 +3290,6 @@ impl<'a, B> OperationInvocation<'a, B> {
             || participant.request_id() != active_binding.request_id()
             || !active_binding
                 .matches_sequence_session(participant_session.0, participant_session.1)
-            || !participant_backing_matches
             || runtime.descriptor() != &resolved.parts().device
             || runtime.descriptor() != resolved.parts().capabilities.device()
             || runtime.descriptor().runtime_implementation_fingerprint
@@ -3477,7 +3466,6 @@ impl<'a, B> OperationInvocation<'a, B> {
                 let backing = resources.backing_view(resource_id).or_else(|_| {
                     resources.participant_backing_view(participant_index, resource_id)
                 })?;
-                let evidence = backing.slice();
                 let expected_bytes = match descriptor.lifetime() {
                     AllocationLifetime::Invocation => descriptor.evaluate_request_bytes_for_shape(
                         resources.work_shape()?.immediate_shape(),
@@ -3485,9 +3473,8 @@ impl<'a, B> OperationInvocation<'a, B> {
                     AllocationLifetime::Step => descriptor.evaluate_request_bytes_for_shape(
                         resources.step_resources().work_shape().immediate_shape(),
                     )?,
-                    AllocationLifetime::Sequence => {
-                        descriptor.evaluate_request_bytes(participant_backing.work_shape())?
-                    }
+                    AllocationLifetime::Sequence => descriptor
+                        .evaluate_request_bytes_for_shape(participant_backing.committed_shape())?,
                     AllocationLifetime::Request => descriptor
                         .evaluate_fit_request_bytes(participant.request_resources().work_shape())?,
                     AllocationLifetime::Plan => {
@@ -3496,10 +3483,14 @@ impl<'a, B> OperationInvocation<'a, B> {
                         )))
                     }
                 };
-                if evidence.size_bytes() != expected_bytes
-                    || evidence.alignment_bytes() != descriptor.alignment_bytes()
-                    || evidence.usage() != descriptor.usage()
-                    || evidence.element_type() != descriptor.element_type()
+                let size_matches = match descriptor.lifetime() {
+                    AllocationLifetime::Sequence => backing.size_bytes() >= expected_bytes,
+                    _ => backing.size_bytes() == expected_bytes,
+                };
+                if !size_matches
+                    || backing.alignment_bytes() != descriptor.alignment_bytes()
+                    || backing.usage() != descriptor.usage()
+                    || backing.element_type() != descriptor.element_type()
                     || backing.storage_profile() != descriptor.storage().profile()
                 {
                     return Err(invalid_operation(format!(
@@ -3509,10 +3500,10 @@ impl<'a, B> OperationInvocation<'a, B> {
                 views.push(OperationBufferView {
                     descriptor: super::BufferDescriptor {
                         resource_id: resource_id.clone(),
-                        size_bytes: evidence.size_bytes(),
-                        alignment_bytes: evidence.alignment_bytes(),
-                        usage: evidence.usage(),
-                        element_type: evidence.element_type(),
+                        size_bytes: backing.size_bytes(),
+                        alignment_bytes: backing.alignment_bytes(),
+                        usage: backing.usage(),
+                        element_type: backing.element_type(),
                     },
                     source: OperationBufferSource::Backing(backing),
                 });
@@ -3541,9 +3532,11 @@ impl<'a, B> OperationInvocation<'a, B> {
                 OperationBufferSource::Backing(backing_view) => {
                     let bindings = backing_view.segment_bindings();
                     if bindings.is_empty()
-                        || bindings.len() != backing_view.slice().segments().len()
-                        || bindings.iter().zip(backing_view.slice().segments()).any(
-                            |(binding, evidence)| {
+                        || bindings.len() != backing_view.committed_evidence_segments().count()
+                        || bindings
+                            .iter()
+                            .zip(backing_view.committed_evidence_segments())
+                            .any(|(binding, evidence)| {
                                 let actual = runtime.buffer_descriptor(binding.buffer());
                                 binding.segment() != evidence
                                     || binding.chunk() != evidence.chunk()
@@ -3553,8 +3546,7 @@ impl<'a, B> OperationInvocation<'a, B> {
                                         .offset_bytes()
                                         .checked_add(binding.segment().length_bytes())
                                         .is_none_or(|end| end > binding.descriptor().size_bytes)
-                            },
-                        )
+                            })
                     {
                         return Err(invalid_operation(format!(
                             "runtime descriptor differs from a committed backing chunk for `{}`",

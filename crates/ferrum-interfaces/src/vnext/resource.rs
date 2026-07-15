@@ -16,8 +16,8 @@ use super::{
     AdmissionDeferred, AdmissionDemand, AdmissionFitPolicy, AdmissionPreflightDecision,
     AdmissionPressureAction, AdmissionRejected, AllocationKind, AllocationLifetime,
     BatchCapacityClaimDecision, BatchInvocationId, BatchStepId, BufferDescriptor, BufferRequest,
-    BufferUsage, CapacityDomainId, CapacityDomainSpec, CapacityEntry, CapacityEpochs,
-    CapacityUnits, CapacityVector, CapacityWaitRecheck, CapacityWaitRegistration,
+    BufferUsage, CapacityClaimDecision, CapacityDomainId, CapacityDomainSpec, CapacityEntry,
+    CapacityEpochs, CapacityUnits, CapacityVector, CapacityWaitRecheck, CapacityWaitRegistration,
     DeferredDeviceCleanupDisposition, DeferredDeviceCleanupDomainId,
     DeferredDeviceCleanupMaintenanceReceipt, DeferredDeviceCleanupStatus,
     DeferredDeviceCleanupTask, DeviceDescriptor, DeviceId, DeviceRuntime, DynamicBackingPoolId,
@@ -25,9 +25,9 @@ use super::{
     DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView, ElementType,
     ExecutionFrameId, ExecutionPlan, FailureDomain, FailureEnvelope, InvocationLivenessMode,
     LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, LogicalAdmissionLease,
-    LogicalBatchCapacityLease, LogicalRequestLease, NodeId, PlanHash, PlanId, PlanNode,
-    RequestAdmissionDecision, RequestAuthorityId, RequestIdentity, ResourceAllocation, ResourceId,
-    ResourceWorkShape, RunId, SequenceAuthorityId, StepResourceSlotKind, StreamState,
+    LogicalBatchCapacityLease, LogicalCapacityLease, LogicalRequestLease, NodeId, PlanHash, PlanId,
+    PlanNode, RequestAdmissionDecision, RequestAuthorityId, RequestIdentity, ResourceAllocation,
+    ResourceId, ResourceWorkShape, RunId, SequenceAuthorityId, StepResourceSlotKind, StreamState,
     TokenSpanWork, TransactionId, VNextError, MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
 };
 

@@ -1,10 +1,10 @@
 use super::{
     core_resource_failure, deferred_device_cleanup_status, invalid_resource,
     maintain_deferred_device_cleanups, new_deferred_device_cleanup_domain,
-    retire_deferred_device_cleanup_domain, watch, AdmissionDemand, AdmissionFitPolicy,
-    AdmissionPressureAction, AllocationLifetime, Arc, AtomicU8, BackingPrepareDecision,
-    CapacityEntry, CapacityEpochs, CapacityUnits, CapacityVector, CapacityWaitRecheck,
-    CapacityWaitRegistration, DeferredDeviceCleanupDomainId,
+    retire_deferred_device_cleanup_domain, watch, AdmissionDeferred, AdmissionDemand,
+    AdmissionFitPolicy, AdmissionPressureAction, AllocationLifetime, Arc, AtomicU8,
+    BackingPrepareDecision, CapacityEntry, CapacityEpochs, CapacityUnits, CapacityVector,
+    CapacityWaitRecheck, CapacityWaitRegistration, DeferredDeviceCleanupDomainId,
     DeferredDeviceCleanupMaintenanceReceipt, DeferredDeviceCleanupStatus, DeviceCapacityClaim,
     DeviceId, DeviceRuntime, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
     DynamicPoolMaintenanceController, DynamicPoolSet, DynamicResourceShape,
@@ -989,6 +989,89 @@ where
         ))
     }
 
+    /// Derives the exact additional physical/logical claim needed to advance
+    /// one sequence's committed frontier. Existing extents remain owned by the
+    /// prior snapshot; only paged storage can append disjoint extents.
+    pub(super) fn sequence_extension_demand(
+        &self,
+        committed: DynamicResourceShape,
+        target: DynamicResourceShape,
+        pressure_action: AdmissionPressureAction,
+    ) -> Result<(AdmissionDemand, Vec<EvaluatedBackingRequest<'_>>), VNextError> {
+        if committed.sequences() != 1
+            || target.sequences() != 1
+            || target.tokens() < committed.tokens()
+            || target.pages() < committed.pages()
+        {
+            return Err(invalid_resource(
+                "sequence extension target must monotonically advance one committed sequence",
+            ));
+        }
+
+        let mut entries = Vec::new();
+        let mut requested_slices = Vec::new();
+        for domain in &self.dynamic_pools().domains {
+            let mut pool_delta = 0_u64;
+            for descriptor in &domain.descriptors {
+                if descriptor.lifetime() != AllocationLifetime::Sequence {
+                    continue;
+                }
+                let committed_bytes = descriptor.evaluate_request_bytes_for_shape(committed)?;
+                let target_bytes = descriptor.evaluate_request_bytes_for_shape(target)?;
+                let delta_bytes = target_bytes.checked_sub(committed_bytes).ok_or_else(|| {
+                    invalid_resource("sequence extension descriptor capacity regressed")
+                })?;
+                if delta_bytes == 0 {
+                    continue;
+                }
+                if !matches!(
+                    descriptor.storage().profile().view(),
+                    super::DynamicStorageView::PagedRegions { .. }
+                ) {
+                    return Err(invalid_resource(
+                        "sequence backing extension requires a paged storage profile",
+                    ));
+                }
+                pool_delta = pool_delta.checked_add(delta_bytes).ok_or_else(|| {
+                    invalid_resource("sequence extension pool demand overflows u64")
+                })?;
+                requested_slices.push(EvaluatedBackingRequest {
+                    domain,
+                    claim_identity: PhysicalBackingClaimIdentity::new(
+                        domain.pool_id().clone(),
+                        vec![descriptor.base_resource_id().clone()],
+                    )?,
+                    size_bytes: delta_bytes,
+                    projections: vec![EvaluatedBackingProjection {
+                        descriptor,
+                        physical_offset_bytes: 0,
+                        size_bytes: delta_bytes,
+                    }],
+                });
+            }
+            if pool_delta != 0 {
+                entries.push(CapacityEntry::new(
+                    domain.domain_id(),
+                    CapacityUnits::new(pool_delta),
+                )?);
+            }
+        }
+        let delta = if entries.is_empty() {
+            CapacityVector::empty()
+        } else {
+            CapacityVector::new(entries)?
+        };
+        Ok((
+            AdmissionDemand::from_plan(
+                delta.clone(),
+                delta,
+                AdmissionFitPolicy::ImmediateOnly,
+                pressure_action,
+            )?,
+            requested_slices,
+        ))
+    }
+
     /// Evaluates all Invocation-scoped resources for one immutable-plan
     /// submission wave. A total-order pool reuses one physical extent across
     /// node rows, while a conservative pool retains disjoint row ranges.
@@ -1159,6 +1242,24 @@ where
         deferred: &DynamicBackingDeferred,
     ) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
         let _lifecycle = self.resources.read_lifecycle("register a backing waiter")?;
+        let lifecycle_rx = self.resources.lifecycle_tx.subscribe();
+        let registration = self
+            .logical_admission()
+            .register_waiter(deferred.epochs())?;
+        Ok(PlanCapacityWaitRegistration {
+            registration,
+            lifecycle_rx,
+            resources: Arc::clone(&self.resources),
+        })
+    }
+
+    pub fn register_admission_waiter(
+        &self,
+        deferred: &AdmissionDeferred,
+    ) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
+        let _lifecycle = self
+            .resources
+            .read_lifecycle("register an admission waiter")?;
         let lifecycle_rx = self.resources.lifecycle_tx.subscribe();
         let registration = self
             .logical_admission()
