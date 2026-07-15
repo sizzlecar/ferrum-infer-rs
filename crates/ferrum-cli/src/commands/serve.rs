@@ -82,6 +82,11 @@ pub struct ServeCommand {
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
 
+    /// Exact device-wide memory budget available to runtime weights and
+    /// dynamic resources. This is the same typed ceiling used by `run`.
+    #[arg(long, value_name = "BYTES")]
+    pub runtime_memory_budget_bytes: Option<std::num::NonZeroUsize>,
+
     /// vLLM-compatible alias for `FERRUM_MAX_MODEL_LEN`.
     #[arg(long, value_name = "N")]
     pub max_model_len: Option<usize>,
@@ -279,6 +284,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         spec_draft,
         spec_tokens,
         gpu_memory_utilization,
+        runtime_memory_budget_bytes,
         max_model_len,
         max_num_seqs,
         max_num_batched_tokens,
@@ -708,6 +714,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         max_model_len,
         max_num_seqs,
         max_num_batched_tokens,
+        runtime_memory_budget_bytes.map(std::num::NonZeroUsize::get),
         scheduler_prefill_first_until_active,
         scheduler_prefill_step_chunk,
         scheduler_active_decode_prefill_chunk,
@@ -1379,6 +1386,7 @@ fn serve_cli_runtime_entries(
     max_model_len: Option<usize>,
     max_num_seqs: Option<usize>,
     max_num_batched_tokens: Option<usize>,
+    runtime_memory_budget_bytes: Option<usize>,
     scheduler_prefill_first_until_active: Option<usize>,
     scheduler_prefill_step_chunk: Option<usize>,
     scheduler_active_decode_prefill_chunk: Option<usize>,
@@ -1406,6 +1414,11 @@ fn serve_cli_runtime_entries(
         &mut entries,
         "FERRUM_MAX_BATCHED_TOKENS",
         max_num_batched_tokens,
+    );
+    push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES",
+        runtime_memory_budget_bytes,
     );
     push_cli_runtime_usize(
         &mut entries,
@@ -2318,6 +2331,7 @@ mod tests {
             Some(4096),
             Some(64),
             Some(2048),
+            Some(12_345),
             Some(8),
             Some(16),
             Some(24),
@@ -2358,6 +2372,16 @@ mod tests {
         );
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "64");
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "2048");
+        assert_eq!(
+            entry("FERRUM_RUNTIME_MEMORY_BUDGET_BYTES").effective_value,
+            "12345"
+        );
+        assert!(entry("FERRUM_RUNTIME_MEMORY_BUDGET_BYTES")
+            .affects
+            .contains(&ferrum_types::RuntimeConfigEffect::Memory));
+        assert!(entry("FERRUM_RUNTIME_MEMORY_BUDGET_BYTES")
+            .affects
+            .contains(&ferrum_types::RuntimeConfigEffect::Correctness));
         assert_eq!(
             entry("FERRUM_SCHED_PREFILL_FIRST_UNTIL_ACTIVE").effective_value,
             "8"
@@ -2442,6 +2466,7 @@ mod tests {
         .runtime_config_entries();
         let cli_entries = serve_cli_runtime_entries(
             Some("int8"),
+            None,
             None,
             None,
             None,
@@ -2549,6 +2574,7 @@ mod tests {
             Some(4096),
             Some(8),
             Some(512),
+            None,
             Some(8),
             Some(16),
             Some(32),
@@ -3251,6 +3277,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let snapshot = merge_runtime_config_sources(Vec::new(), env_snapshot, cli_entries);
@@ -3293,6 +3320,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             prefix_cache_cli_override(true, false, false, false),
             None,
             None,
@@ -3307,6 +3335,7 @@ mod tests {
             None,
         );
         let product_enabled_entries = serve_cli_runtime_entries(
+            None,
             None,
             None,
             None,
@@ -3341,6 +3370,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             prefix_cache_cli_override(false, true, false, false),
             None,
             None,
@@ -3355,6 +3385,7 @@ mod tests {
             None,
         );
         let product_disabled_entries = serve_cli_runtime_entries(
+            None,
             None,
             None,
             None,

@@ -76,6 +76,12 @@ impl EngineConfig {
             self.scheduler.max_running_requests =
                 parse_required_positive_usize("FERRUM_PAGED_MAX_SEQS", value)?;
         }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES") {
+            self.memory.usable_capacity_bytes = Some(parse_required_positive_usize(
+                "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES",
+                value,
+            )?);
+        }
         // Engine runtime knobs (previously read by the engine from env). The
         // CLI/autosizer resolves these into the snapshot; the engine reads the
         // typed `runtime` field instead of `std::env::vars()`.
@@ -444,6 +450,11 @@ impl KvCacheDtype {
 pub struct MemoryConfig {
     /// Memory pool size in bytes
     pub pool_size: Option<usize>,
+    /// Exact device-wide usable runtime budget in bytes. When present this
+    /// overrides the pressure-threshold calculation without changing the raw
+    /// device or pool capacity.
+    #[serde(default)]
+    pub usable_capacity_bytes: Option<usize>,
     /// Enable memory pooling
     pub enable_pooling: bool,
     /// Memory alignment in bytes
@@ -460,10 +471,66 @@ pub struct MemoryConfig {
     pub pressure_critical_threshold: f32,
 }
 
+/// Resolved device-wide memory budget consumed by runtime planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryCapacityBudget {
+    pub capacity_bytes: u64,
+    pub usable_capacity_bytes: u64,
+    pub reserve_bytes: u64,
+}
+
+impl MemoryConfig {
+    pub fn resolve_capacity_budget(
+        &self,
+        device_capacity_bytes: u64,
+    ) -> std::result::Result<MemoryCapacityBudget, String> {
+        if device_capacity_bytes == 0 {
+            return Err("runtime device memory capacity must be greater than zero".to_string());
+        }
+        let capacity_bytes = self
+            .pool_size
+            .map(|bytes| bytes as u64)
+            .unwrap_or(device_capacity_bytes)
+            .min(device_capacity_bytes);
+        if capacity_bytes == 0 {
+            return Err("runtime memory capacity must be greater than zero".to_string());
+        }
+
+        let usable_capacity_bytes = if let Some(bytes) = self.usable_capacity_bytes {
+            let bytes = bytes as u64;
+            if bytes == 0 || bytes > capacity_bytes {
+                return Err(format!(
+                    "memory.usable_capacity_bytes must be in 1..={capacity_bytes}, got {bytes}"
+                ));
+            }
+            bytes
+        } else {
+            let critical = self.pressure_critical_threshold;
+            if !critical.is_finite() || critical <= 0.0 || critical > 1.0 {
+                return Err(format!(
+                    "memory.pressure_critical_threshold must be in (0, 1], got {critical}"
+                ));
+            }
+            let threshold_bytes = ((capacity_bytes as f64) * f64::from(critical)).floor() as u64;
+            capacity_bytes.saturating_sub(
+                capacity_bytes
+                    .saturating_sub(threshold_bytes)
+                    .min(capacity_bytes - 1),
+            )
+        };
+        Ok(MemoryCapacityBudget {
+            capacity_bytes,
+            usable_capacity_bytes,
+            reserve_bytes: capacity_bytes - usable_capacity_bytes,
+        })
+    }
+}
+
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             pool_size: None,
+            usable_capacity_bytes: None,
             enable_pooling: true,
             alignment: 256,
             enable_defragmentation: false,

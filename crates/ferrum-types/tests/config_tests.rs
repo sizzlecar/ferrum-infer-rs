@@ -9,6 +9,56 @@ fn engine_config_default_sane() {
     assert_eq!(cfg.batching.max_num_batched_tokens, 2048);
     assert!(cfg.scheduler.prompt_token_estimate);
     assert!(cfg.monitoring.enable_metrics);
+    assert_eq!(cfg.memory.usable_capacity_bytes, None);
+}
+
+#[test]
+fn memory_config_resolves_exact_usable_capacity_without_float_rounding() {
+    let mut memory = MemoryConfig::default();
+    memory.usable_capacity_bytes = Some(777);
+
+    let budget = memory.resolve_capacity_budget(1_000).unwrap();
+
+    assert_eq!(budget.capacity_bytes, 1_000);
+    assert_eq!(budget.usable_capacity_bytes, 777);
+    assert_eq!(budget.reserve_bytes, 223);
+}
+
+#[test]
+fn memory_config_rejects_exact_usable_capacity_above_pool_ceiling() {
+    let mut memory = MemoryConfig::default();
+    memory.pool_size = Some(512);
+    memory.usable_capacity_bytes = Some(513);
+
+    let error = memory.resolve_capacity_budget(1_000).unwrap_err();
+
+    assert!(error.contains("1..=512"));
+}
+
+#[test]
+fn memory_config_preserves_threshold_based_default_budget() {
+    let memory = MemoryConfig::default();
+
+    let budget = memory.resolve_capacity_budget(1_000).unwrap();
+
+    assert_eq!(budget.capacity_bytes, 1_000);
+    // Preserve the historical f32 threshold behavior exactly. Callers that
+    // need byte-exact capacity use `usable_capacity_bytes` instead.
+    assert_eq!(budget.usable_capacity_bytes, 949);
+    assert_eq!(budget.reserve_bytes, 51);
+}
+
+#[test]
+fn memory_config_missing_exact_budget_uses_backward_compatible_default() {
+    let mut value = serde_json::to_value(MemoryConfig::default()).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("usable_capacity_bytes");
+
+    let memory: MemoryConfig = serde_json::from_value(value).unwrap();
+
+    assert_eq!(memory.usable_capacity_bytes, None);
 }
 
 #[test]
@@ -21,6 +71,11 @@ fn engine_config_applies_runtime_snapshot() {
             RuntimeConfigSource::Env,
         ),
         RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "7", RuntimeConfigSource::Env),
+        RuntimeConfigEntry::new(
+            "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES",
+            "12345",
+            RuntimeConfigSource::Cli,
+        ),
         RuntimeConfigEntry::new(
             "FERRUM_SCHED_PROMPT_TOKEN_ESTIMATE",
             "1",
@@ -39,6 +94,7 @@ fn engine_config_applies_runtime_snapshot() {
     assert_eq!(cfg.kv_cache.max_blocks, 4096);
     assert_eq!(cfg.batching.max_num_batched_tokens, 8192);
     assert_eq!(cfg.scheduler.max_running_requests, 7);
+    assert_eq!(cfg.memory.usable_capacity_bytes, Some(12_345));
     assert!(cfg.scheduler.prompt_token_estimate);
     assert_eq!(
         cfg.runtime.scheduler_trace_jsonl.as_deref(),
