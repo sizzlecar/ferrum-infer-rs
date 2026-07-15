@@ -1,7 +1,7 @@
 use super::*;
 use crate::vnext::{
-    CopyRegion, DefinitelyNotSubmitted, DeviceClass, DeviceCommandBatch, DeviceErrorReport,
-    DeviceTerminal, FenceIndeterminate, FenceQuery, HostTransferLayout,
+    CopyRegion, DeferredAction, DefinitelyNotSubmitted, DeviceClass, DeviceCommandBatch,
+    DeviceErrorReport, DeviceTerminal, FenceIndeterminate, FenceQuery, HostTransferLayout,
     TrustedActiveSequenceBinding,
 };
 use serde_json::{json, Value};
@@ -956,6 +956,56 @@ fn backing_deferral_reports_the_whole_pool_shortfall() {
     assert!(matches!(
         admission(),
         RequestResourceAdmissionDecision::Admitted(_)
+    ));
+}
+
+#[test]
+fn logical_fit_deferral_grows_unclaimed_backing_capacity() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let request = admitted_request(&harness.root, "logical-fit-growth");
+    let admission = SequenceResourceAdmissionRequest::new(
+        chunked_work(4, 0..1),
+        AdmissionFitPolicy::FullInputMustFit,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let SequenceResourceAdmissionDecision::Deferred(deferred) =
+        request.try_admit_sequence(admission.clone()).unwrap()
+    else {
+        panic!("full-fit capacity above current residency must request logical growth")
+    };
+    assert_eq!(deferred.action(), DeferredAction::AwaitBackingGrowth);
+    assert_eq!(deferred.blockers().len(), 1);
+    assert_eq!(deferred.blockers()[0].requested().get(), 256);
+    assert_eq!(deferred.blockers()[0].current_total().get(), 64);
+
+    let DynamicDeferredMaintenanceOutcome::Maintained(receipt) = harness
+        .root
+        .maintain_for_admission_deferred(&deferred)
+        .unwrap()
+    else {
+        panic!("current logical growth deferral must materialize fit capacity")
+    };
+    assert_eq!(receipt.growths().len(), 1);
+    assert_eq!(receipt.growths()[0].chunk_bytes(), 192);
+    assert_eq!(receipt.growths()[0].published_capacity_bytes(), 256);
+    assert!(matches!(
+        request.try_admit_sequence(admission).unwrap(),
+        SequenceResourceAdmissionDecision::Admitted(_)
     ));
 }
 

@@ -1,7 +1,7 @@
 use super::{
-    invalid_resource, validate_runtime_descriptor_for_admission, AllocationSeal, Arc, AtomicU64,
-    BTreeMap, BTreeSet, BufferDescriptor, BufferRequest, BufferUsage, CapacityDomainId,
-    CapacityEpochs, CapacityUnits, DeviceAllocationPermit, DeviceCapacityBudget,
+    invalid_resource, validate_runtime_descriptor_for_admission, AdmissionDeferred, AllocationSeal,
+    Arc, AtomicU64, BTreeMap, BTreeSet, BufferDescriptor, BufferRequest, BufferUsage,
+    CapacityDomainId, CapacityEpochs, CapacityUnits, DeviceAllocationPermit, DeviceCapacityBudget,
     DeviceCapacityGrant, DeviceCapacityReservation, DeviceRuntime, DynamicBackingPoolId,
     DynamicBackingPoolSpec, DynamicResourceDescriptor, DynamicStorageAllocator,
     DynamicStorageProfile, DynamicStorageView, ElementType, InvocationLivenessMode,
@@ -9,6 +9,7 @@ use super::{
     ResourceRetentionPolicy, ResourceTransactionIdentity, RunId, Serialize,
     StaticProvisioningBinding, StepResourceSlotKind, TransactionId, VNextError,
 };
+use crate::vnext::{CapacityShortfallKind, DeferredAction};
 
 static NEXT_DYNAMIC_POOL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1014,6 +1015,75 @@ where
                 .entry(blocker.pool_id().clone())
                 .and_modify(|bytes| *bytes = (*bytes).max(blocker.requested_bytes()))
                 .or_insert(blocker.requested_bytes());
+        }
+        let receipt = self.grow_pools(
+            requested_by_pool
+                .into_iter()
+                .map(|(pool_id, bytes)| DynamicPoolGrowthRequest::new(pool_id, bytes))
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        Ok(DynamicDeferredMaintenanceOutcome::Maintained(receipt))
+    }
+
+    /// Materializes fit capacity that logical admission identified as
+    /// growable but that immediate backing preparation does not yet claim.
+    pub fn maintain_for_admission_deferred(
+        &self,
+        deferred: &AdmissionDeferred,
+    ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        let current_epochs = self.pools.logical_admission.epochs()?;
+        if current_epochs.coordinator_id() != deferred.epochs().coordinator_id() {
+            return Err(invalid_resource(
+                "logical admission deferral belongs to another coordinator",
+            ));
+        }
+        if deferred.action() != DeferredAction::AwaitBackingGrowth {
+            return Err(invalid_resource(
+                "logical admission deferral does not request backing growth",
+            ));
+        }
+        let pools_by_domain = self
+            .pools
+            .pools
+            .values()
+            .map(|pool| (pool.domain.domain_id, pool.domain.pool_id().clone()))
+            .collect::<BTreeMap<_, _>>();
+        let current = self.pools.logical_admission.snapshot()?;
+        let mut requested_by_pool = BTreeMap::<DynamicBackingPoolId, u64>::new();
+        for blocker in deferred
+            .blockers()
+            .iter()
+            .filter(|blocker| blocker.kind() == CapacityShortfallKind::BackingGrowthRequired)
+        {
+            let domain = blocker.domain().ok_or_else(|| {
+                invalid_resource("backing-growth blocker contains no capacity domain")
+            })?;
+            let pool_id = pools_by_domain.get(&domain).ok_or_else(|| {
+                invalid_resource("backing-growth blocker references a non-pool domain")
+            })?;
+            let current_total = current
+                .domains()
+                .iter()
+                .find(|snapshot| snapshot.domain() == domain)
+                .ok_or_else(|| {
+                    invalid_resource("backing-growth blocker references an unknown domain")
+                })?
+                .total()
+                .get();
+            let missing = blocker
+                .requested()
+                .get()
+                .saturating_sub(current_total);
+            if missing == 0 {
+                continue;
+            }
+            requested_by_pool
+                .entry(pool_id.clone())
+                .and_modify(|bytes| *bytes = (*bytes).max(missing))
+                .or_insert(missing);
+        }
+        if requested_by_pool.is_empty() {
+            return Ok(DynamicDeferredMaintenanceOutcome::RetryWithoutGrowth { current_epochs });
         }
         let receipt = self.grow_pools(
             requested_by_pool

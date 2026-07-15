@@ -684,6 +684,15 @@ where
         self.maintenance_controller.maintain_for_deferred(deferred)
     }
 
+    pub fn maintain_for_admission_deferred(
+        self: &Arc<Self>,
+        deferred: &AdmissionDeferred,
+    ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        let _lifecycle = self.read_lifecycle("maintain deferred logical backing growth")?;
+        self.maintenance_controller
+            .maintain_for_admission_deferred(deferred)
+    }
+
     /// Returns a point-in-time view of the exact dynamic pools owned by this
     /// plan. Product telemetry consumes this instead of maintaining a second
     /// allocator ledger that can drift from admission decisions.
