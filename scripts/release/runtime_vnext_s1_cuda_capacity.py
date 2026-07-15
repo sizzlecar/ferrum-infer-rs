@@ -107,6 +107,109 @@ def find_executor_snapshot(value: Any) -> dict[str, Any] | None:
     return None
 
 
+def quiescent_pool_snapshot(executor: dict[str, Any], label: str) -> dict[str, Any]:
+    static_bytes = executor.get("static_bytes")
+    dynamic_pools = executor.get("dynamic_pools")
+    require(isinstance(static_bytes, int) and static_bytes > 0, f"{label}: invalid static bytes")
+    require(isinstance(dynamic_pools, dict), f"{label}: dynamic pools are missing")
+    pools = dynamic_pools.get("pools")
+    budget_claimed_bytes = dynamic_pools.get("budget_claimed_bytes")
+    require(isinstance(pools, list) and pools, f"{label}: dynamic pool list is empty")
+    require(
+        isinstance(budget_claimed_bytes, int) and budget_claimed_bytes >= static_bytes,
+        f"{label}: invalid budget claimed bytes",
+    )
+    residency: dict[str, int] = {}
+    envelopes: dict[str, dict[str, Any]] = {}
+    for pool in pools:
+        require(isinstance(pool, dict), f"{label}: invalid dynamic pool status")
+        pool_id = pool.get("pool_id")
+        resident_bytes = pool.get("resident_bytes")
+        resident_chunks = pool.get("resident_chunks")
+        largest_contiguous_bytes = pool.get("largest_contiguous_bytes")
+        storage_profile = pool.get("storage_profile")
+        require(isinstance(pool_id, str) and pool_id, f"{label}: pool id is missing")
+        require(pool_id not in residency, f"{label}: duplicate pool id {pool_id}")
+        require(
+            isinstance(resident_bytes, int) and resident_bytes >= 0,
+            f"{label}: invalid resident bytes for {pool_id}",
+        )
+        require(
+            isinstance(resident_chunks, int)
+            and resident_chunks >= 0
+            and (resident_bytes == 0) == (resident_chunks == 0),
+            f"{label}: invalid resident chunk count for {pool_id}",
+        )
+        require(
+            isinstance(largest_contiguous_bytes, int)
+            and 0 <= largest_contiguous_bytes <= resident_bytes,
+            f"{label}: invalid contiguous capacity for {pool_id}",
+        )
+        require(isinstance(storage_profile, dict), f"{label}: storage profile is missing for {pool_id}")
+        require(pool.get("pending_growth_bytes") == 0, f"{label}: pending growth remains in {pool_id}")
+        require(pool.get("live_segments") == 0, f"{label}: live segments remain in {pool_id}")
+        require(
+            pool.get("free_bytes") == resident_bytes,
+            f"{label}: quiescent pool {pool_id} is not fully free",
+        )
+        require(pool.get("quarantined_bytes") == 0, f"{label}: quarantined bytes remain in {pool_id}")
+        require(pool.get("quarantined_chunks") == 0, f"{label}: quarantined chunks remain in {pool_id}")
+        require(
+            pool.get("descriptor_mismatch_chunks") == 0,
+            f"{label}: descriptor mismatch remains in {pool_id}",
+        )
+        require(
+            pool.get("publication_rejected_chunks") == 0,
+            f"{label}: rejected publication remains in {pool_id}",
+        )
+        require(pool.get("poisoned") is False, f"{label}: pool {pool_id} is poisoned")
+        residency[pool_id] = resident_bytes
+        envelopes[pool_id] = {
+            "resident_bytes": resident_bytes,
+            "resident_chunks": resident_chunks,
+            "largest_contiguous_bytes": largest_contiguous_bytes,
+            "storage_profile": storage_profile,
+        }
+    resident_bytes = sum(residency.values())
+    require(resident_bytes > 0, f"{label}: no dynamic backing was installed")
+    require(
+        budget_claimed_bytes == static_bytes + resident_bytes,
+        f"{label}: budget claim is not static plus installed backing",
+    )
+    return {
+        "static_bytes": static_bytes,
+        "resident_bytes": resident_bytes,
+        "budget_claimed_bytes": budget_claimed_bytes,
+        "pool_resident_bytes": dict(sorted(residency.items())),
+        "pool_envelopes": dict(sorted(envelopes.items())),
+    }
+
+
+def require_replayed_pool_snapshot(
+    calibration: dict[str, Any], replay: dict[str, Any], exact_budget: int
+) -> None:
+    require(
+        replay.get("static_bytes") == calibration.get("static_bytes"),
+        "replay static bytes differ from calibration",
+    )
+    require(
+        replay.get("resident_bytes") == calibration.get("resident_bytes"),
+        "replay aggregate resident bytes differ from calibration",
+    )
+    require(
+        replay.get("pool_resident_bytes") == calibration.get("pool_resident_bytes"),
+        "replay per-pool residency differs from calibration",
+    )
+    require(
+        replay.get("pool_envelopes") == calibration.get("pool_envelopes"),
+        "replay per-pool allocation envelope differs from calibration",
+    )
+    require(
+        replay.get("budget_claimed_bytes") == exact_budget,
+        "replay budget claim differs from the calibrated exact budget",
+    )
+
+
 def read_trace(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
@@ -125,6 +228,14 @@ def read_trace(path: Path) -> list[dict[str, Any]]:
 
 def request_identity_matches(observed: Any, request_id: str) -> bool:
     return observed == request_id or observed == f"request.product.{request_id}"
+
+
+def capacity_prompt(workload_slot: str) -> str:
+    require(workload_slot in {"A", "B", "C"}, "invalid capacity workload slot")
+    return (
+        f"Capacity lane slot {workload_slot}. Emit deterministic short words until the token "
+        "limit; do not explain the task."
+    )
 
 
 def collect_run_smoke(
@@ -210,6 +321,7 @@ def stream_request(
     port: int,
     model: str,
     role: str,
+    workload_slot: str,
     max_tokens: int,
     out_dir: Path,
     first_content: threading.Event,
@@ -217,8 +329,11 @@ def stream_request(
 ) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     started_wall_ns = time.time_ns()
+    prompt = capacity_prompt(workload_slot)
     result: dict[str, Any] = {
         "role": role,
+        "workload_slot": workload_slot,
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "max_tokens": max_tokens,
         "started_wall_ns": started_wall_ns,
         "first_content_wall_ns": None,
@@ -228,7 +343,9 @@ def stream_request(
         "content_chunks": 0,
         "done_count": 0,
         "usage_count": 0,
+        "prompt_tokens": None,
         "completion_tokens": None,
+        "total_tokens": None,
         "error": None,
     }
     body = json.dumps(
@@ -237,10 +354,7 @@ def stream_request(
             "messages": [
                 {
                     "role": "user",
-                    "content": (
-                        f"Capacity lane {role}. Emit deterministic short words until the token "
-                        "limit; do not explain the task."
-                    ),
+                    "content": prompt,
                 }
             ],
             "max_tokens": max_tokens,
@@ -293,7 +407,9 @@ def stream_request(
                 usage = chunk.get("usage")
                 if isinstance(usage, dict):
                     result["usage_count"] += 1
+                    result["prompt_tokens"] = usage.get("prompt_tokens")
                     result["completion_tokens"] = usage.get("completion_tokens")
+                    result["total_tokens"] = usage.get("total_tokens")
                 content = ""
                 choices = chunk.get("choices")
                 if isinstance(choices, list):
@@ -337,6 +453,7 @@ class StreamTask:
         port: int,
         model: str,
         role: str,
+        workload_slot: str,
         max_tokens: int,
         out_dir: Path,
         timeout: float,
@@ -349,6 +466,7 @@ class StreamTask:
                 "port": port,
                 "model": model,
                 "role": role,
+                "workload_slot": workload_slot,
                 "max_tokens": max_tokens,
                 "out_dir": out_dir,
                 "first_content": self.first_content,
@@ -496,11 +614,19 @@ def require_stream_success(result: dict[str, Any], label: str) -> None:
     require(result.get("done_count") == 1, f"{label}: expected exactly one [DONE]")
     require(result.get("usage_count") == 1, f"{label}: expected exactly one usage chunk")
     require(
+        isinstance(result.get("prompt_tokens"), int) and result["prompt_tokens"] > 0,
+        f"{label}: missing positive prompt token count",
+    )
+    require(
         isinstance(result.get("completion_tokens"), int)
         and result["completion_tokens"] > 0,
         f"{label}: missing positive completion token count",
     )
     require(result.get("content_chunks", 0) > 0, f"{label}: no content chunks")
+    require(
+        result.get("total_tokens") == result["prompt_tokens"] + result["completion_tokens"],
+        f"{label}: usage token counts do not reconcile",
+    )
 
 
 def run_capacity_pair(
@@ -513,6 +639,7 @@ def run_capacity_pair(
         port=server.port,
         model=server.model_id,
         role=f"{prefix}-A",
+        workload_slot="A",
         max_tokens=128,
         out_dir=out_dir,
         timeout=timeout,
@@ -523,6 +650,7 @@ def run_capacity_pair(
         port=server.port,
         model=server.model_id,
         role=f"{prefix}-C",
+        workload_slot="C",
         max_tokens=16,
         out_dir=out_dir,
         timeout=timeout,
@@ -630,14 +758,9 @@ def collect(args: argparse.Namespace) -> int:
         calibration_health = calibration.health("health.final.json")
         executor = find_executor_snapshot(calibration_health)
         require(executor is not None, "calibration health has no vNext executor snapshot")
-        static_bytes = executor.get("static_bytes")
-        pools = executor.get("dynamic_pools", {}).get("pools", [])
-        require(isinstance(static_bytes, int) and static_bytes > 0, "invalid static bytes")
-        require(isinstance(pools, list) and pools, "calibration dynamic pools are missing")
-        resident_bytes = sum(
-            pool.get("resident_bytes", 0) for pool in pools if isinstance(pool, dict)
-        )
-        require(resident_bytes > 0, "calibration did not install dynamic backing")
+        calibration_pool_snapshot = quiescent_pool_snapshot(executor, "calibration")
+        static_bytes = calibration_pool_snapshot["static_bytes"]
+        resident_bytes = calibration_pool_snapshot["resident_bytes"]
         exact_budget = static_bytes + resident_bytes
         calibration.stop()
 
@@ -655,12 +778,19 @@ def collect(args: argparse.Namespace) -> int:
             target, out / "target" / "warmup", args.request_timeout, "warmup"
         )
         warmup_health = target.health("health.warmup.json")
+        warmup_executor = find_executor_snapshot(warmup_health)
+        require(warmup_executor is not None, "warmup health has no vNext executor snapshot")
+        warmup_pool_snapshot = quiescent_pool_snapshot(warmup_executor, "warmup replay")
+        require_replayed_pool_snapshot(
+            calibration_pool_snapshot, warmup_pool_snapshot, exact_budget
+        )
 
         pressure_dir = out / "target" / "pressure"
         a = StreamTask(
             port=target.port,
             model=target.model_id,
             role="pressure-A",
+            workload_slot="A",
             max_tokens=128,
             out_dir=pressure_dir,
             timeout=args.request_timeout,
@@ -672,6 +802,7 @@ def collect(args: argparse.Namespace) -> int:
             port=target.port,
             model=target.model_id,
             role="pressure-B",
+            workload_slot="B",
             max_tokens=128,
             out_dir=pressure_dir,
             timeout=args.request_timeout,
@@ -688,6 +819,7 @@ def collect(args: argparse.Namespace) -> int:
             port=target.port,
             model=target.model_id,
             role="pressure-C",
+            workload_slot="C",
             max_tokens=16,
             out_dir=pressure_dir,
             timeout=args.request_timeout,
@@ -712,10 +844,12 @@ def collect(args: argparse.Namespace) -> int:
                     "static_bytes": static_bytes,
                     "resident_bytes": resident_bytes,
                     "exact_budget_bytes": exact_budget,
+                    "pool_snapshot": calibration_pool_snapshot,
                     "clients": calibration_clients,
                 },
                 "target": {
                     "warmup_clients": warmup_clients,
+                    "warmup_pool_snapshot": warmup_pool_snapshot,
                     "pressure_clients": {
                         "A": a_result,
                         "B": b_result,
@@ -762,6 +896,38 @@ def validate_stream(result: dict[str, Any], label: str) -> None:
     )
 
 
+def validate_replayed_workload(
+    workload_slot: str, labeled_results: dict[str, dict[str, Any]]
+) -> None:
+    prompt_hashes: set[str] = set()
+    prompt_token_counts: set[int] = set()
+    for label, result in labeled_results.items():
+        require(
+            result.get("workload_slot") == workload_slot,
+            f"{label}: workload slot does not match {workload_slot}",
+        )
+        prompt_hash = result.get("prompt_sha256")
+        require(
+            isinstance(prompt_hash, str) and SHA256_RE.fullmatch(prompt_hash) is not None,
+            f"{label}: prompt SHA256 is missing",
+        )
+        prompt_hashes.add(prompt_hash)
+        prompt_tokens = result.get("prompt_tokens")
+        require(
+            isinstance(prompt_tokens, int) and prompt_tokens > 0,
+            f"{label}: prompt token count is missing",
+        )
+        prompt_token_counts.add(prompt_tokens)
+    require(
+        len(prompt_hashes) == 1,
+        f"workload slot {workload_slot} changed its model-visible prompt across phases",
+    )
+    require(
+        len(prompt_token_counts) == 1,
+        f"workload slot {workload_slot} changed its tokenized prompt length across phases",
+    )
+
+
 def validate(root: Path, out: Path) -> int:
     root = root.resolve()
     out = out.resolve()
@@ -791,6 +957,32 @@ def validate(root: Path, out: Path) -> int:
         "exact budget is not static plus calibrated concurrent backing",
     )
     require(calibration.get("resident_bytes", 0) > 0, "calibrated backing is empty")
+    calibration_health = read_json(root / "calibration" / "health.final.json")
+    warmup_health = read_json(root / "target" / "health.warmup.json")
+    calibration_executor = find_executor_snapshot(calibration_health)
+    warmup_executor = find_executor_snapshot(warmup_health)
+    require(
+        calibration_executor is not None and warmup_executor is not None,
+        "raw calibration/warmup executor snapshots are missing",
+    )
+    calibration_pool_snapshot = quiescent_pool_snapshot(
+        calibration_executor, "raw calibration"
+    )
+    warmup_pool_snapshot = quiescent_pool_snapshot(warmup_executor, "raw warmup replay")
+    require(
+        calibration_pool_snapshot.get("static_bytes") == calibration.get("static_bytes")
+        and calibration_pool_snapshot.get("resident_bytes") == calibration.get("resident_bytes")
+        and calibration_pool_snapshot.get("budget_claimed_bytes") == exact_budget,
+        "calibration pool snapshot does not reconcile with the exact budget",
+    )
+    require(
+        calibration.get("pool_snapshot") == calibration_pool_snapshot
+        and target.get("warmup_pool_snapshot") == warmup_pool_snapshot,
+        "collection pool summaries do not match raw health evidence",
+    )
+    require_replayed_pool_snapshot(
+        calibration_pool_snapshot, warmup_pool_snapshot, exact_budget
+    )
     for label, result in calibration.get("clients", {}).items():
         validate_stream(result, f"calibration-{label}")
     for label, result in target.get("warmup_clients", {}).items():
@@ -799,6 +991,30 @@ def validate(root: Path, out: Path) -> int:
     require(isinstance(pressure, dict) and set(pressure) == {"A", "B", "C"}, "invalid pressure client set")
     for label, result in pressure.items():
         validate_stream(result, f"pressure-{label}")
+
+    calibration_clients = calibration.get("clients", {})
+    warmup_clients = target.get("warmup_clients", {})
+    require(
+        isinstance(calibration_clients, dict)
+        and isinstance(warmup_clients, dict)
+        and {"A", "C"}.issubset(calibration_clients)
+        and {"A", "C"}.issubset(warmup_clients),
+        "calibration/warmup replay client set is incomplete",
+    )
+    for workload_slot in ("A", "C"):
+        validate_replayed_workload(
+            workload_slot,
+            {
+                "calibration": calibration_clients[workload_slot],
+                "warmup": warmup_clients[workload_slot],
+                "pressure": pressure[workload_slot],
+            },
+        )
+    validate_replayed_workload("B", {"pressure": pressure["B"]})
+    require(
+        len({result["prompt_sha256"] for result in pressure.values()}) == 3,
+        "capacity slots do not have distinct model-visible prompts",
+    )
 
     a, b, c = pressure["A"], pressure["B"], pressure["C"]
     b_request_id = target.get("b_request_id")
@@ -943,6 +1159,97 @@ def self_test() -> int:
     }
     require(find_executor_snapshot(snapshot) == snapshot["cache"]["prefix_cache"], "snapshot discovery failed")
     require(request_identity_matches("request.product.abc", "abc"), "request identity mapping failed")
+    executor = {
+        "static_bytes": 7,
+        "dynamic_pools": {
+            "budget_claimed_bytes": 19,
+            "pools": [
+                {
+                    "pool_id": "pool-a",
+                    "resident_bytes": 5,
+                    "resident_chunks": 1,
+                    "free_bytes": 5,
+                    "largest_contiguous_bytes": 5,
+                    "pending_growth_bytes": 0,
+                    "live_segments": 0,
+                    "quarantined_bytes": 0,
+                    "quarantined_chunks": 0,
+                    "descriptor_mismatch_chunks": 0,
+                    "publication_rejected_chunks": 0,
+                    "poisoned": False,
+                    "storage_profile": {"allocator": "linear", "view": "contiguous"},
+                },
+                {
+                    "pool_id": "pool-b",
+                    "resident_bytes": 7,
+                    "resident_chunks": 1,
+                    "free_bytes": 7,
+                    "largest_contiguous_bytes": 7,
+                    "pending_growth_bytes": 0,
+                    "live_segments": 0,
+                    "quarantined_bytes": 0,
+                    "quarantined_chunks": 0,
+                    "descriptor_mismatch_chunks": 0,
+                    "publication_rejected_chunks": 0,
+                    "poisoned": False,
+                    "storage_profile": {"allocator": "linear", "view": "contiguous"},
+                },
+            ],
+        },
+    }
+    pool_snapshot = quiescent_pool_snapshot(executor, "self-test")
+    require_replayed_pool_snapshot(pool_snapshot, pool_snapshot, 19)
+    drifted = json.loads(json.dumps(pool_snapshot))
+    drifted["pool_resident_bytes"] = {"pool-a": 6, "pool-b": 6}
+    try:
+        require_replayed_pool_snapshot(pool_snapshot, drifted, 19)
+        raise AssertionError("per-pool replay drift unexpectedly passed")
+    except CapacityGateError:
+        pass
+    prompt_hashes = {
+        slot: hashlib.sha256(capacity_prompt(slot).encode("utf-8")).hexdigest()
+        for slot in ("A", "B", "C")
+    }
+    require(len(set(prompt_hashes.values())) == 3, "capacity workload prompts are not slot-specific")
+    validate_replayed_workload(
+        "A",
+        {
+            "calibration": {
+                "workload_slot": "A",
+                "prompt_sha256": prompt_hashes["A"],
+                "prompt_tokens": 32,
+            },
+            "warmup": {
+                "workload_slot": "A",
+                "prompt_sha256": prompt_hashes["A"],
+                "prompt_tokens": 32,
+            },
+            "pressure": {
+                "workload_slot": "A",
+                "prompt_sha256": prompt_hashes["A"],
+                "prompt_tokens": 32,
+            },
+        },
+    )
+    try:
+        validate_replayed_workload(
+            "A",
+            {
+                "calibration": {
+                    "workload_slot": "A",
+                    "prompt_sha256": prompt_hashes["A"],
+                    "prompt_tokens": 32,
+                },
+                "warmup": {
+                    "workload_slot": "A",
+                    "prompt_sha256": prompt_hashes["B"],
+                    "prompt_tokens": 32,
+                },
+            },
+        )
+        raise AssertionError("mismatched replay prompt unexpectedly passed")
+    except CapacityGateError:
+        pass
     with __import__("tempfile").TemporaryDirectory() as temp:
         trace = Path(temp) / "trace.jsonl"
         trace.write_text('{"phase":"complete"}\n{"phase":')

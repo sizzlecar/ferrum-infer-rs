@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "status": "reject",
+  "failure_class": "exact_budget_replay_prompt_mismatch",
+  "lane": "vnext-s1-cuda-capacity",
+  "git_sha": "47b34c78d2166f618ee025c107640474d37e02c2",
+  "dirty_status": "",
+  "binary_sha256": "0a155dcb1b540cb18505d9f110baffcfd8d6dd8b8bb5d00dbf31a0fee5695586",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_count": 1,
+    "gpu_memory_mib": 23028,
+    "driver_version": "595.45.04"
+  },
+  "model": {
+    "id": "Qwen/Qwen3.5-4B",
+    "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+  },
+  "collector": {
+    "status": "reject",
+    "duration_seconds": 111.212329726,
+    "reason": "warmup-C emitted finish_reason=error and zero completion tokens"
+  },
+  "run_entrypoint": {
+    "status": "pass",
+    "answer": "Paris",
+    "completion_tokens": 2,
+    "generation_ms": 501.880875,
+    "trace_rows": 425,
+    "operation_submitted": 131,
+    "request_completed": 1
+  },
+  "serve_entrypoint": {
+    "status": "reject",
+    "request_id": "5c382788-0be7-427c-816a-fceb2718fd85",
+    "http_status": 200,
+    "done_count": 1,
+    "usage_count": 1,
+    "completion_tokens": 0,
+    "finish_reason": "error"
+  },
+  "calibrated_budget": {
+    "static_bytes": 8411511808,
+    "dynamic_resident_bytes": 62697808,
+    "exact_budget_bytes": 8474209616,
+    "calibration_prompt_tokens": 32,
+    "target_prompt_tokens": 33
+  },
+  "failure": {
+    "claimed_bytes": 8473823968,
+    "requested_bytes": 496640,
+    "available_bytes": 385648,
+    "shortfall_bytes": 110992,
+    "failed_growth_pool": "dynamic-pool/sha256/cadf5f305d86eb5cbde5218a79625ea5bdba7f4a1a7f3c2dff8b652c11e67d75",
+    "mismatched_residency_pool": "dynamic-pool/sha256/93e3960471a6b3c6304897687ba98265004fe4dd5f30e18c2d9ae2282873c472",
+    "calibration_mismatched_pool_bytes": 3273232,
+    "target_mismatched_pool_bytes": 3384224
+  },
+  "classification": {
+    "cuda_oom": false,
+    "allocator_exhaustion": false,
+    "model_load_failure": false,
+    "kernel_failure": false,
+    "previous_epoch_livelock_reproduced": false,
+    "cause": "the collector embedded phase-specific role labels in the model-visible prompt, so calibration and exact-budget replay used different tokenized workloads"
+  },
+  "canonical_artifact": {
+    "path": "/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-s1/vnext_capacity_47b34c78_20260715T225200Z.tar.gz",
+    "bytes": 135198,
+    "sha256": "393c1ad615e2f5d3ad5fdf46de74972d45019ec1446cc930cef92c7aa2b10685",
+    "file_index": "/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-s1/vnext_capacity_47b34c78_20260715T225200Z/artifact-files.sha256"
+  },
+  "next_hypothesis": {
+    "source_change": "separate artifact/client labels from stable A/B/C model-visible workload slots and validate prompt SHA256 equality across calibration, warmup, and pressure phases",
+    "expected_signal": "calibration and target A/C prompt token counts match, warmup-C completes 16 tokens without budget failure, and collection reaches the A/B/C pressure phase",
+    "reject_threshold": "any cross-phase prompt hash mismatch, prompt token count mismatch, or exact-budget failure before the pressure phase; do not add unmeasured budget slack"
+  }
+}
