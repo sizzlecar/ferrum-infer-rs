@@ -28,8 +28,10 @@ pub use kv_cache::{
 pub use kv_dtype::{KvBf16, KvDtypeKind, KvFp16, KvFp8, KvInt8};
 pub use model_executor::{
     DecodeInput, DecodeOutput, ExecutorAdmissionEpochs, ExecutorPrefillAdmission,
-    ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt, ModelExecutor, PrefillInput,
-    PrefillOutput,
+    ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
+    ExecutorPrefillMaintenanceBlocker, ExecutorPrefillMaintenanceDeferral,
+    ExecutorPrefillMaintenanceOutcome, ExecutorPrefillMaintenanceStage, ModelExecutor,
+    PrefillInput, PrefillOutput,
 };
 pub use recurrent_state::{
     RecurrentStateHandle, RecurrentStateHandleStats, RecurrentStateManager,

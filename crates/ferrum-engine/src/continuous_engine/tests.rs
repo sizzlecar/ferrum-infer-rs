@@ -8,7 +8,9 @@ use ferrum_interfaces::{
     model_executor::{
         DecodeInput, DecodeOutput, ExecutorAdmissionEpochs, ExecutorCapabilities,
         ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
-        ExecutorPrefillAdmissionReceipt, ExecutorStatus, PrefillInput, PrefillOutput, UnifiedBatch,
+        ExecutorPrefillAdmissionReceipt, ExecutorPrefillMaintenanceBlocker,
+        ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome,
+        ExecutorPrefillMaintenanceStage, ExecutorStatus, PrefillInput, PrefillOutput, UnifiedBatch,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateManager, RecurrentStateSpec,
     RecurrentStateTensorSpec, TensorRef,
@@ -96,6 +98,195 @@ impl ModelExecutor for ExecutorManagedAdmissionTestExecutor {
             ));
         }
         self.prefill_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.prefill(input).await
+    }
+
+    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+        self.inner.decode(input).await
+    }
+
+    fn release_cache(&self, cache_id: &str) {
+        self.inner.release_cache(cache_id);
+    }
+
+    fn capabilities(&self) -> ExecutorCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn status(&self) -> ExecutorStatus {
+        self.inner.status()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TestMaintenanceBehavior {
+    Advance,
+    StaleEpoch,
+    Fail,
+}
+
+struct ExecutorManagedMaintenanceTestExecutor {
+    inner: MockModelExecutor,
+    retained: std::sync::Mutex<HashSet<RequestId>>,
+    capacity_epoch: AtomicU64,
+    admission_probes: AtomicU64,
+    maintenance_calls: AtomicU64,
+    prefill_calls: AtomicU64,
+    call_order: std::sync::Mutex<Vec<&'static str>>,
+    maintenance_behavior: TestMaintenanceBehavior,
+}
+
+impl ExecutorManagedMaintenanceTestExecutor {
+    fn new(vocab_size: usize) -> Self {
+        Self::with_behavior(vocab_size, TestMaintenanceBehavior::Advance)
+    }
+
+    fn with_behavior(vocab_size: usize, maintenance_behavior: TestMaintenanceBehavior) -> Self {
+        Self {
+            inner: MockModelExecutor::instant(vocab_size),
+            retained: std::sync::Mutex::new(HashSet::new()),
+            capacity_epoch: AtomicU64::new(0),
+            admission_probes: AtomicU64::new(0),
+            maintenance_calls: AtomicU64::new(0),
+            prefill_calls: AtomicU64::new(0),
+            call_order: std::sync::Mutex::new(Vec::new()),
+            maintenance_behavior,
+        }
+    }
+
+    fn epochs(&self) -> ExecutorAdmissionEpochs {
+        ExecutorAdmissionEpochs::new(
+            std::num::NonZeroU64::new(43).unwrap(),
+            0,
+            self.capacity_epoch.load(Ordering::Acquire),
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelExecutor for ExecutorManagedMaintenanceTestExecutor {
+    fn info(&self) -> &ferrum_types::ModelInfo {
+        self.inner.info()
+    }
+
+    fn execution_resource_ownership(&self) -> ExecutionResourceOwnership {
+        ExecutionResourceOwnership::ExecutorManaged
+    }
+
+    fn prefill_admission_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
+        Ok(Some(self.epochs()))
+    }
+
+    fn try_admit_prefill(
+        &self,
+        input: ExecutorPrefillAdmission<'_>,
+    ) -> Result<ExecutorPrefillAdmissionDecision> {
+        self.admission_probes.fetch_add(1, Ordering::Relaxed);
+        let inserted = self
+            .retained
+            .lock()
+            .expect("retained admission mutex poisoned")
+            .insert(input.request_id.clone());
+        if !inserted {
+            return Err(FerrumError::already_exists("duplicate test admission"));
+        }
+        if self.capacity_epoch.load(Ordering::Acquire) == 0 {
+            self.call_order
+                .lock()
+                .expect("call order mutex poisoned")
+                .push("defer");
+            return Ok(ExecutorPrefillAdmissionDecision::MaintenanceDeferred(
+                ExecutorPrefillMaintenanceDeferral::new(
+                    input.request_id.clone(),
+                    self.epochs(),
+                    ExecutorPrefillMaintenanceStage::LogicalCapacity,
+                    vec![ExecutorPrefillMaintenanceBlocker::Capacity {
+                        domain_id: Some(1),
+                        kind:
+                            ferrum_interfaces::vnext::CapacityShortfallKind::BackingGrowthRequired,
+                        requested: 4096,
+                        available: 0,
+                        current_total: 0,
+                        maximum_total: 4096,
+                    }],
+                )?,
+            ));
+        }
+        self.call_order
+            .lock()
+            .expect("call order mutex poisoned")
+            .push("admit");
+        Ok(ExecutorPrefillAdmissionDecision::Admitted(
+            ExecutorPrefillAdmissionReceipt {
+                request_id: input.request_id.clone(),
+            },
+        ))
+    }
+
+    fn cancel_prefill_admission(&self, request_id: &RequestId) -> bool {
+        self.retained
+            .lock()
+            .expect("retained admission mutex poisoned")
+            .remove(request_id)
+    }
+
+    fn maintain_prefill_backing(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<ExecutorPrefillMaintenanceOutcome> {
+        if !self
+            .retained
+            .lock()
+            .expect("retained admission mutex poisoned")
+            .remove(request_id)
+        {
+            return Ok(ExecutorPrefillMaintenanceOutcome::NoLongerPending);
+        }
+        self.maintenance_calls.fetch_add(1, Ordering::Relaxed);
+        self.call_order
+            .lock()
+            .expect("call order mutex poisoned")
+            .push("maintain");
+        match self.maintenance_behavior {
+            TestMaintenanceBehavior::Advance => {
+                self.capacity_epoch.store(1, Ordering::Release);
+                Ok(ExecutorPrefillMaintenanceOutcome::Maintained {
+                    current: self.epochs(),
+                    pools_grown: 1,
+                    allocated_bytes: 4096,
+                })
+            }
+            TestMaintenanceBehavior::StaleEpoch => {
+                Ok(ExecutorPrefillMaintenanceOutcome::RetryWithoutGrowth {
+                    current: self.epochs(),
+                })
+            }
+            TestMaintenanceBehavior::Fail => {
+                Err(FerrumError::backend("synthetic backing allocation failure"))
+            }
+        }
+    }
+
+    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
+        let request_id = input
+            .request_id
+            .as_ref()
+            .ok_or_else(|| FerrumError::request_validation("missing request id"))?;
+        if !self
+            .retained
+            .lock()
+            .expect("retained admission mutex poisoned")
+            .remove(request_id)
+        {
+            return Err(FerrumError::internal(
+                "test prefill reached submit without retained admission",
+            ));
+        }
+        self.prefill_calls.fetch_add(1, Ordering::Relaxed);
+        self.call_order
+            .lock()
+            .expect("call order mutex poisoned")
+            .push("prefill");
         self.inner.prefill(input).await
     }
 
@@ -1745,6 +1936,147 @@ async fn executor_managed_product_path_requires_typed_admission_before_prefill()
     let trace = scheduler.trace_snapshot();
     assert_eq!(trace.legacy_waiting_admission_ticks, 0);
     assert!(trace.dynamic_admission_ticks >= 1);
+}
+
+#[tokio::test]
+async fn executor_managed_backing_maintenance_advances_epoch_before_prefill() {
+    let trace_path = resource_trace_temp_path("executor-prefill-maintenance");
+    let _ = std::fs::remove_file(&trace_path);
+    let mut config = EngineConfig::default();
+    config.runtime.scheduler_trace_jsonl = Some(trace_path.clone());
+    config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Serve);
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
+    let executor = Arc::new(ExecutorManagedMaintenanceTestExecutor::new(128));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let engine = ContinuousBatchEngine::new(
+        config,
+        Arc::clone(&scheduler),
+        tokenizer,
+        sampler,
+        kv_cache,
+        executor.clone(),
+        tensor_factory,
+    );
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 1;
+    let request_id = request.id.clone();
+
+    let response = engine.infer(request).await.unwrap();
+
+    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 2);
+    assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        *executor
+            .call_order
+            .lock()
+            .expect("call order mutex poisoned"),
+        vec!["defer", "maintain", "admit", "prefill"]
+    );
+    assert!(executor
+        .retained
+        .lock()
+        .expect("retained admission mutex poisoned")
+        .is_empty());
+    let snapshot = scheduler.trace_snapshot();
+    assert_eq!(snapshot.legacy_waiting_admission_ticks, 0);
+    assert_eq!(snapshot.dynamic_backing_growth_requested, 1);
+    assert_eq!(snapshot.dynamic_admission_deferred, 1);
+
+    let events = read_engine_profile_events(&trace_path);
+    let deferred_index = events
+        .iter()
+        .position(|event| {
+            event.request_id == request_id.to_string()
+                && event.phase == "vnext.prefill_admission"
+                && event.shape.get("decision") == Some(&serde_json::json!("maintenance_deferred"))
+        })
+        .expect("maintenance deferral trace event");
+    let maintenance_index = events
+        .iter()
+        .position(|event| {
+            event.request_id == request_id.to_string()
+                && event.phase == "vnext.prefill_backing_maintenance"
+                && event.shape.get("outcome") == Some(&serde_json::json!("maintained"))
+        })
+        .expect("maintenance completion trace event");
+    let admitted_index = events
+        .iter()
+        .position(|event| {
+            event.request_id == request_id.to_string()
+                && event.phase == "vnext.prefill_admission"
+                && event.shape.get("decision") == Some(&serde_json::json!("admitted"))
+        })
+        .expect("admitted trace event");
+    assert!(deferred_index < maintenance_index);
+    assert!(maintenance_index < admitted_index);
+    assert_eq!(
+        events[deferred_index].shape.get("prefill_submit_observed"),
+        Some(&serde_json::json!(false))
+    );
+    assert!(events[deferred_index]
+        .attributes
+        .get("monotonic_nanos")
+        .and_then(serde_json::Value::as_u64)
+        .is_some());
+
+    let _ = std::fs::remove_file(trace_path);
+}
+
+#[tokio::test]
+async fn executor_managed_invalid_maintenance_fails_waiting_request_without_retry_loop() {
+    for behavior in [
+        TestMaintenanceBehavior::StaleEpoch,
+        TestMaintenanceBehavior::Fail,
+    ] {
+        let mut config = EngineConfig::default();
+        config.kv_cache.max_blocks = 128;
+        let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+        let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+            Arc::new(ferrum_testkit::MockTokenizer::new(128));
+        let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+        let kv_cache: Arc<dyn KvCacheManager + Send + Sync> =
+            Arc::new(MockKvCacheManager::new(128));
+        let executor = Arc::new(ExecutorManagedMaintenanceTestExecutor::with_behavior(
+            128, behavior,
+        ));
+        let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+        let engine = ContinuousBatchEngine::new(
+            config,
+            Arc::clone(&scheduler),
+            tokenizer,
+            sampler,
+            kv_cache,
+            executor.clone(),
+            tensor_factory,
+        );
+        let mut request = policy_request();
+        request.sampling_params.max_tokens = 1;
+
+        let response = tokio::time::timeout(Duration::from_secs(2), engine.infer(request))
+            .await
+            .expect("invalid maintenance must not leave the request waiting forever")
+            .unwrap();
+
+        assert_eq!(response.finish_reason, FinishReason::Error);
+        assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 1);
+        assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(scheduler.waiting_count(), 0);
+        assert_eq!(scheduler.trace_snapshot().dynamic_admission_failed, 1);
+        assert!(executor
+            .retained
+            .lock()
+            .expect("retained admission mutex poisoned")
+            .is_empty());
+        engine.shutdown().await.unwrap();
+    }
 }
 
 #[test]

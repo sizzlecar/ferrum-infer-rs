@@ -555,16 +555,170 @@ impl ExecutorAdmissionEpochs {
     }
 }
 
+/// Stage that must advance before an executor-owned prefill can be admitted.
+///
+/// This is scheduler evidence, not allocator authority. The executor retains
+/// the sealed logical or physical deferral that authorizes maintenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorPrefillMaintenanceStage {
+    LogicalCapacity,
+    PhysicalBacking,
+}
+
+/// Scheduler-visible reason that a prefill needs executor-owned backing
+/// maintenance. These values are projections only and cannot allocate memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum ExecutorPrefillMaintenanceBlocker {
+    Capacity {
+        domain_id: Option<u32>,
+        kind: crate::vnext::CapacityShortfallKind,
+        requested: u64,
+        available: u64,
+        current_total: u64,
+        maximum_total: u64,
+    },
+    Backing {
+        pool_id: String,
+        reason: crate::vnext::DynamicBackingDeferralReason,
+        requested_bytes: u64,
+        free_bytes: u64,
+        largest_contiguous_bytes: u64,
+    },
+}
+
+/// Non-authoritative projection of executor-owned maintenance work.
+///
+/// The request id is the only handle returned to the engine. Implementations
+/// must retain the sealed deferral internally and validate it again when
+/// [`ModelExecutor::maintain_prefill_backing`] is called.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExecutorPrefillMaintenanceDeferral {
+    request_id: RequestId,
+    observed: ExecutorAdmissionEpochs,
+    stage: ExecutorPrefillMaintenanceStage,
+    blockers: Vec<ExecutorPrefillMaintenanceBlocker>,
+}
+
+impl ExecutorPrefillMaintenanceDeferral {
+    pub fn new(
+        request_id: RequestId,
+        observed: ExecutorAdmissionEpochs,
+        stage: ExecutorPrefillMaintenanceStage,
+        blockers: Vec<ExecutorPrefillMaintenanceBlocker>,
+    ) -> Result<Self> {
+        if blockers.is_empty() {
+            return Err(ferrum_types::FerrumError::request_validation(
+                "executor prefill maintenance deferral requires at least one blocker",
+            ));
+        }
+        Ok(Self {
+            request_id,
+            observed,
+            stage,
+            blockers,
+        })
+    }
+
+    pub fn from_admission(
+        request_id: &RequestId,
+        deferred: &crate::vnext::AdmissionDeferred,
+    ) -> Result<Self> {
+        if deferred.action() != crate::vnext::DeferredAction::AwaitBackingGrowth {
+            return Err(ferrum_types::FerrumError::internal(
+                "logical prefill maintenance projection requires AwaitBackingGrowth",
+            ));
+        }
+        let blockers = deferred
+            .blockers()
+            .iter()
+            .map(|blocker| ExecutorPrefillMaintenanceBlocker::Capacity {
+                domain_id: blocker.domain().map(|domain| domain.get()),
+                kind: blocker.kind(),
+                requested: blocker.requested().get(),
+                available: blocker.available().get(),
+                current_total: blocker.current_total().get(),
+                maximum_total: blocker.maximum_total().get(),
+            })
+            .collect();
+        Self::new(
+            request_id.clone(),
+            ExecutorAdmissionEpochs::from_capacity(deferred.epochs()),
+            ExecutorPrefillMaintenanceStage::LogicalCapacity,
+            blockers,
+        )
+    }
+
+    pub fn from_backing(
+        request_id: &RequestId,
+        deferred: &crate::vnext::DynamicBackingDeferred,
+    ) -> Result<Self> {
+        let blockers = deferred
+            .blockers()
+            .iter()
+            .map(|blocker| ExecutorPrefillMaintenanceBlocker::Backing {
+                pool_id: blocker.pool_id().as_str().to_string(),
+                reason: blocker.reason(),
+                requested_bytes: blocker.requested_bytes(),
+                free_bytes: blocker.free_bytes(),
+                largest_contiguous_bytes: blocker.largest_contiguous_bytes(),
+            })
+            .collect();
+        Self::new(
+            request_id.clone(),
+            ExecutorAdmissionEpochs::from_capacity(deferred.epochs()),
+            ExecutorPrefillMaintenanceStage::PhysicalBacking,
+            blockers,
+        )
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub const fn observed(&self) -> ExecutorAdmissionEpochs {
+        self.observed
+    }
+
+    pub const fn stage(&self) -> ExecutorPrefillMaintenanceStage {
+        self.stage
+    }
+
+    pub fn blockers(&self) -> &[ExecutorPrefillMaintenanceBlocker] {
+        &self.blockers
+    }
+}
+
+/// Result of one bounded executor-owned backing maintenance attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ExecutorPrefillMaintenanceOutcome {
+    /// Cancellation won the race before the maintenance task consumed the
+    /// retained deferral.
+    NoLongerPending,
+    /// Another release or growth advanced the observed epochs first. The
+    /// scheduler should probe again without allocating duplicate backing.
+    RetryWithoutGrowth { current: ExecutorAdmissionEpochs },
+    /// The executor installed real backing and published the resulting
+    /// capacity epoch.
+    Maintained {
+        current: ExecutorAdmissionEpochs,
+        pools_grown: usize,
+        allocated_bytes: u64,
+    },
+}
+
 /// Typed result of probing executor-owned prefill capacity.
 ///
-/// `Deferred` and `BackingDeferred` preserve the capacity domains and epochs
-/// required by the plan-local dynamic admission queue. They must never be
-/// flattened into a generic resource error at the scheduler boundary.
+/// `Deferred` and `MaintenanceDeferred` preserve the capacity domains and
+/// epochs required by the plan-local dynamic admission queue. They must never
+/// be flattened into a generic resource error at the scheduler boundary.
 #[derive(Debug, Clone)]
 pub enum ExecutorPrefillAdmissionDecision {
     Admitted(ExecutorPrefillAdmissionReceipt),
     Deferred(crate::vnext::AdmissionDeferred),
-    BackingDeferred(crate::vnext::DynamicBackingDeferred),
+    MaintenanceDeferred(ExecutorPrefillMaintenanceDeferral),
     PermanentRejected(crate::vnext::AdmissionRejected),
 }
 
@@ -631,6 +785,19 @@ pub trait ModelExecutor: Send + Sync {
     /// Returns true only when a retained authority was found and released.
     fn cancel_prefill_admission(&self, _request_id: &RequestId) -> bool {
         false
+    }
+
+    /// Consume one retained logical/physical backing deferral after the
+    /// scheduler waiting lock has been released. Implementations must perform
+    /// at most one bounded maintenance attempt and publish capacity epochs only
+    /// after real backing is installed.
+    fn maintain_prefill_backing(
+        &self,
+        _request_id: &RequestId,
+    ) -> Result<ExecutorPrefillMaintenanceOutcome> {
+        Err(ferrum_types::FerrumError::unsupported(
+            "executor-owned prefill backing maintenance is not implemented",
+        ))
     }
 
     /// Reserve model-owned KV slots before a forward is dispatched.

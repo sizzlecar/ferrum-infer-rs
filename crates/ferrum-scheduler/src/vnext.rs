@@ -186,6 +186,12 @@ pub enum AdmissionQueueEvent<T, A, R, E> {
         ticket: WaitingAdmissionTicket,
         deferral: AdmissionDeferral,
     },
+    /// The request remains queued while the executor performs one bounded
+    /// backing-maintenance attempt outside the queue lock.
+    BackingGrowthRequested {
+        ticket: WaitingAdmissionTicket,
+        deferral: AdmissionDeferral,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +203,7 @@ pub struct AdmissionTickReceipt {
     permanent_rejected: usize,
     faulted: usize,
     preemption_requested: usize,
+    backing_growth_requested: usize,
     waiting_after: usize,
     fairness_barrier: Option<WaitingAdmissionTicket>,
 }
@@ -228,6 +235,10 @@ impl AdmissionTickReceipt {
 
     pub const fn preemption_requested(self) -> usize {
         self.preemption_requested
+    }
+
+    pub const fn backing_growth_requested(self) -> usize {
+        self.backing_growth_requested
     }
 
     pub const fn waiting_after(self) -> usize {
@@ -442,6 +453,7 @@ impl<T> DynamicAdmissionQueue<T> {
             permanent_rejected: 0,
             faulted: 0,
             preemption_requested: 0,
+            backing_growth_requested: 0,
             waiting_after: 0,
             fairness_barrier: None,
         };
@@ -524,6 +536,12 @@ impl<T> DynamicAdmissionQueue<T> {
                     if deferral.action == DeferredAction::PreemptAndRecompute {
                         receipt.preemption_requested += 1;
                         events.push(AdmissionQueueEvent::PreemptionRequested {
+                            ticket: entry.ticket,
+                            deferral,
+                        });
+                    } else if deferral.action == DeferredAction::AwaitBackingGrowth {
+                        receipt.backing_growth_requested += 1;
+                        events.push(AdmissionQueueEvent::BackingGrowthRequested {
                             ticket: entry.ticket,
                             deferral,
                         });
@@ -703,6 +721,33 @@ mod tests {
             })
             .unwrap();
         assert_eq!(second.preemption_requested(), 0);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn backing_growth_is_signalled_once_per_unchanged_epoch() {
+        let mut queue = DynamicAdmissionQueue::new(DynamicAdmissionQueuePolicy::default());
+        let ticket = queue.enqueue(11_u64).unwrap();
+        let mut events = Vec::new();
+        let growth = AdmissionDeferral::new(DeferredAction::AwaitBackingGrowth, wake(5, 2, 0));
+        let first = queue
+            .schedule_into(wake(5, 2, 0), 1, 1, &mut events, |_| {
+                AdmissionProbeOutcome::<(), (), ()>::Deferred(growth)
+            })
+            .unwrap();
+        assert_eq!(first.backing_growth_requested(), 1);
+        assert!(matches!(
+            events[0],
+            AdmissionQueueEvent::BackingGrowthRequested { ticket: actual, .. }
+                if actual == ticket
+        ));
+
+        let second = queue
+            .schedule_into(wake(5, 2, 0), 1, 1, &mut events, |_| {
+                panic!("unchanged capacity must not request duplicate growth")
+            })
+            .unwrap();
+        assert_eq!(second.backing_growth_requested(), 0);
         assert!(events.is_empty());
     }
 
