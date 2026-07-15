@@ -7,14 +7,15 @@ use super::{
     AliasPolicy, AttributeId, BlockedTensorPadding, BufferRequest, BufferUsage, CapabilityCatalog,
     CapabilityId, ContractVersion, DeviceDescriptor, DeviceId, DimensionConstraint,
     DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
-    ElementType, ModelFamilyId, NodeId, OperationDescriptor, OperationId, OperationPlanningHandle,
-    OperationPlanningRegistry, OperationProviderDescriptor, OperationRegistryAuthority,
-    OperationResourceEstimate, OperationResourceEstimateRequest, PlanId, PreparedModelFamily,
-    ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId,
-    ProviderCompatibilityRejectReason, ProviderCompatibilityRequest, ProviderId,
-    QuantizationFormatId, ResolvedTensorLayout, ResolvedTensorSpec, ResolvedValueBinding,
-    ResolvedValueRole, ResolvedValueStorage, ResourceId, SemanticValue, StateCapacityDemand,
-    StateId, StateLifetime, TensorAccess, VNextError, WeightEncoding, WeightFormatId, WeightId,
+    ElementType, LayoutConstraint, ModelFamilyId, NodeId, OperationDescriptor, OperationId,
+    OperationPlanningHandle, OperationPlanningRegistry, OperationProviderDescriptor,
+    OperationRegistryAuthority, OperationResourceEstimate, OperationResourceEstimateRequest,
+    PlanId, PreparedModelFamily, ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec,
+    ProgramValueId, ProviderCompatibilityRejectReason, ProviderCompatibilityRequest, ProviderId,
+    QuantizationFormatId, ResolvedStorageComponent, ResolvedTensorLayout, ResolvedTensorSpec,
+    ResolvedValueBinding, ResolvedValueRole, ResolvedValueStorage, ResourceId, SemanticValue,
+    StateCapacityDemand, StateId, StateLifetime, StrideConstraint, TensorAccess, TensorContract,
+    VNextError, WeightEncoding, WeightFormatId, WeightId,
 };
 
 mod foundation;
@@ -62,6 +63,9 @@ mod validation;
 
 mod planner;
 pub use planner::*;
+
+mod compiler;
+pub use compiler::*;
 
 #[cfg(test)]
 #[path = "execution/tests.rs"]
