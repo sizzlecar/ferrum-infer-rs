@@ -76,27 +76,10 @@ impl VNextExecutorConfig {
             ));
         }
 
-        let capacity_bytes = engine
+        let memory_budget = engine
             .memory
-            .pool_size
-            .map(|bytes| bytes as u64)
-            .unwrap_or(descriptor.total_memory_bytes)
-            .min(descriptor.total_memory_bytes);
-        if capacity_bytes == 0 {
-            return Err(FerrumError::config(
-                "vNext runtime memory capacity must be greater than zero",
-            ));
-        }
-        let critical = engine.memory.pressure_critical_threshold;
-        if !critical.is_finite() || critical <= 0.0 || critical > 1.0 {
-            return Err(FerrumError::config(format!(
-                "memory.pressure_critical_threshold must be in (0, 1], got {critical}"
-            )));
-        }
-        let usable_bytes = ((capacity_bytes as f64) * f64::from(critical)).floor() as u64;
-        let reserve_bytes = capacity_bytes
-            .saturating_sub(usable_bytes)
-            .min(capacity_bytes - 1);
+            .resolve_capacity_budget(descriptor.total_memory_bytes)
+            .map_err(FerrumError::config)?;
 
         let maximum_active_sequences = u32::try_from(engine.scheduler.max_running_requests)
             .map_err(|_| {
@@ -130,8 +113,8 @@ impl VNextExecutorConfig {
             POLICY_VERSION,
             scheduling,
             RuntimeMemoryPolicy {
-                capacity_bytes,
-                reserve_bytes,
+                capacity_bytes: memory_budget.capacity_bytes,
+                reserve_bytes: memory_budget.reserve_bytes,
                 maximum_active_sequences,
                 dynamic_storage_profile_order,
             },
@@ -1972,6 +1955,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             "device_id": self.runtime.descriptor().id.to_string(),
             "runtime_fingerprint": self.runtime.descriptor().runtime_implementation_fingerprint,
             "maximum_model_tokens": self.maximum_model_tokens,
+            "runtime_memory_policy": self.policy.memory(),
             "pending_sequences": pending_sequences,
             "active_sequences": active_sequences,
             "pending_prefill_maintenance": pending_prefill_maintenance,

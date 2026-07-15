@@ -320,6 +320,12 @@ pub struct RunCommand {
     #[arg(long, default_value = "0.9")]
     pub gpu_memory_utilization: f32,
 
+    /// Exact device-wide memory budget available to runtime weights and
+    /// dynamic resources. This is a typed capacity ceiling shared by `run`
+    /// and `serve`; omit it to use the normal pressure-threshold policy.
+    #[arg(long, value_name = "BYTES")]
+    pub runtime_memory_budget_bytes: Option<std::num::NonZeroUsize>,
+
     /// vLLM-compatible alias for `FERRUM_MAX_MODEL_LEN`.
     #[arg(long, value_name = "N")]
     pub max_model_len: Option<usize>,
@@ -2070,6 +2076,12 @@ fn run_startup_cli_runtime_entries(
         "FERRUM_MAX_BATCHED_TOKENS",
         cmd.max_num_batched_tokens,
     );
+    crate::runtime_env::push_cli_runtime_usize(
+        &mut entries,
+        "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES",
+        cmd.runtime_memory_budget_bytes
+            .map(std::num::NonZeroUsize::get),
+    );
     if let Some(enabled) = bool_cli_override(cmd.batched_graph, cmd.disable_batched_graph) {
         entries.push(RuntimeConfigEntry::new(
             "FERRUM_BATCHED_GRAPH",
@@ -2255,6 +2267,7 @@ mod tests {
             repeat_last_n: 64,
             seed: None,
             gpu_memory_utilization: 0.9,
+            runtime_memory_budget_bytes: None,
             max_model_len: None,
             max_num_seqs: None,
             max_num_batched_tokens: None,
@@ -2323,6 +2336,24 @@ mod tests {
             .find(|entry| entry.key == "FERRUM_KV_DTYPE")
             .expect("missing kv dtype entry");
         assert_eq!(entry.effective_value, "int8");
+        assert_eq!(entry.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn run_effective_runtime_config_records_memory_budget() {
+        let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
+        let mut cmd = test_run_cmd();
+        cmd.runtime_memory_budget_bytes = std::num::NonZeroUsize::new(12_345);
+
+        let effective =
+            run_effective_runtime_config(&snapshot, &run_startup_cli_runtime_entries(&cmd, None));
+        let entry = effective
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES")
+            .expect("missing runtime memory budget entry");
+
+        assert_eq!(entry.effective_value, "12345");
         assert_eq!(entry.source, RuntimeConfigSource::Cli);
     }
 

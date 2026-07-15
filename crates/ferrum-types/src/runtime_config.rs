@@ -241,6 +241,7 @@ fn infer_effects(key: &str) -> Vec<RuntimeConfigEffect> {
     if key.contains("PREFIX_CACHE")
         || key.contains("MODEL_PATH")
         || key.contains("MODEL_LEN")
+        || key.contains("RUNTIME_MEMORY_BUDGET")
         || key.contains("NATIVE")
         || key.contains("ARTIFACT")
         || key.contains("SPEC_")
