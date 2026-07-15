@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "status": "reject",
+  "failure_class": "physical_backing_deferral_self_stale_livelock",
+  "lane": "vnext-s1-cuda-capacity",
+  "git_sha": "cfd7f479f9614510667e3059fb9a91565ad663de",
+  "dirty_status": "",
+  "binary_sha256": "517ad790f6c016c46e7ff633da0b34257f37b4514a994c31ada60764cad0e50c",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_count": 1,
+    "gpu_memory_mib": 23028,
+    "driver_version": "595.45.04"
+  },
+  "model": {
+    "id": "Qwen/Qwen3.5-4B",
+    "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+    "safetensors_files": 2,
+    "safetensors_bytes": 9319828096
+  },
+  "product_entrypoint": "ferrum run",
+  "request_id": "47115697-c0d3-4008-a486-5d4bacb18db8",
+  "collector": {
+    "status": "reject",
+    "returncode": -15,
+    "manual_stop_after_seconds": 120.852540942,
+    "reason": "bounded stop after deterministic zero-progress admission loop"
+  },
+  "trace": {
+    "rows": 77003,
+    "uncompressed_bytes": 161922071,
+    "uncompressed_sha256": "39ff5e66c0aad018a136bf06ff2a9a5d6ed06d9884a24b636eedeab0cfc4125a",
+    "compressed_bytes": 3391711,
+    "compressed_sha256": "231e21454b55cc61712a8c91eaf244873c461b938774e9e338e190bf952a765d",
+    "trace_duration_seconds": 83.123612268,
+    "phase_counts": {
+      "engine_request_open": 1,
+      "engine_request_slot_reserve": 1,
+      "engine_request_slot_commit": 1,
+      "vnext.prefill_admission": 38500,
+      "vnext.prefill_backing_maintenance": 38500,
+      "vnext.operation_submitted": 0
+    },
+    "maintenance_outcomes": {
+      "maintained": 1,
+      "retry_without_growth": 38499
+    },
+    "dynamic_admission_skipped_unchanged": 0,
+    "error_status_events": 0
+  },
+  "first_sequence_backing_deferral": {
+    "observed": {
+      "coordinator_id": 1,
+      "release_epoch": 1,
+      "capacity_epoch": 2
+    },
+    "blockers": [
+      {
+        "pool_id": "dynamic-pool/sha256/6354a0c93aee30176b11beba3cc5d12a2d82c476598cade458843fe746211d88",
+        "requested_bytes": 26345472,
+        "free_bytes": 0
+      },
+      {
+        "pool_id": "dynamic-pool/sha256/e5b7440344d486aec0a6b475fa90c50945ea4cae53de11bd93aeafd8af5d5147",
+        "requested_bytes": 1048576,
+        "free_bytes": 0
+      }
+    ],
+    "maintenance_current": {
+      "coordinator_id": 1,
+      "release_epoch": 2,
+      "capacity_epoch": 4
+    }
+  },
+  "last_observation": {
+    "scheduler_iteration": 38500,
+    "release_epoch": 38500,
+    "capacity_epoch": 77000,
+    "waiting_queue_len": 1,
+    "active_len": 0,
+    "admitted_total": 0,
+    "completed_total": 0,
+    "prefill_submit_observed": false
+  },
+  "classification": {
+    "cuda_oom": false,
+    "allocator_exhaustion": false,
+    "model_load_failure": false,
+    "kernel_failure": false,
+    "cause": "sequence-level DynamicBackingDeferred captured epochs while its temporary parent request authority was alive; returning the deferral dropped that authority and advanced release/capacity epochs before maintenance consumed the evidence"
+  },
+  "next_hypothesis": {
+    "source_change": "retain the admitted parent request as sealed staged prefill state across ordinary waits and backing maintenance; preserve the strict stale-epoch check",
+    "expected_signal": "sequence backing maintenance is maintained once, release_epoch does not self-advance per scheduler tick, vnext.operation_submitted appears, and ferrum run completes",
+    "reject_threshold": "any repeated retry_without_growth sequence with matching blocker set and monotonically self-advanced release_epoch before the first prefill submission"
+  }
+}
