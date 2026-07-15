@@ -180,10 +180,10 @@ pub(super) fn validate_weight_storage(
                 "weight `{weight_id}` binds unknown physical component `{component_id}`"
             ))
         })?;
-        let expected_element_type = match &spec.encoding {
-            WeightEncoding::Dense { element_type } => *element_type,
-            WeightEncoding::Quantized(_) => ElementType::U8,
-        };
+        let expected_element_type = spec
+            .encoding
+            .dense_element_type()
+            .unwrap_or(ElementType::U8);
         if !seen.insert(component_id.clone())
             || component.length_bytes() != spec.physical_bytes()?
             || component.element_type() != expected_element_type

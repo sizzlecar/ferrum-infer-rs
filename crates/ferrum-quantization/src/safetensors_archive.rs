@@ -4,8 +4,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use ferrum_interfaces::vnext::{
-    ElementType, VNextError, WeightComponentPayload, WeightComponentSource, WeightComponentSpec,
-    WeightEncoding,
+    CanonicalRational, ElementType, VNextError, WeightComponentPayload, WeightComponentSource,
+    WeightComponentSpec, WeightEncoding,
 };
 use ferrum_types::{FerrumError, Result};
 use half::{bf16, f16};
@@ -159,8 +159,13 @@ impl WeightComponentSource for SafetensorsArchive {
         &'source self,
         component: &WeightComponentSpec,
     ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
-        let expected_element_type = match component.encoding {
-            WeightEncoding::Dense { element_type } => element_type,
+        let (expected_element_type, affine) = match component.encoding {
+            WeightEncoding::Dense { element_type } => (element_type, None),
+            WeightEncoding::DenseAffine {
+                element_type,
+                scale,
+                bias,
+            } => (element_type, Some((scale, bias))),
             WeightEncoding::Quantized(_) => {
                 return Err(VNextError::InvalidExecutionPlan {
                     reason: format!(
@@ -221,6 +226,7 @@ impl WeightComponentSource for SafetensorsArchive {
                     actual_element_type,
                     expected_element_type,
                     external_name,
+                    affine,
                 )?;
                 source_files.push(tensor.source_file().to_owned());
                 bytes.extend_from_slice(&materialized);
@@ -260,6 +266,7 @@ impl WeightComponentSource for SafetensorsArchive {
             actual_element_type,
             expected_element_type,
             external_name,
+            affine,
         )?;
         WeightComponentPayload::new(
             component,
@@ -277,8 +284,9 @@ fn transcode_dense_bytes<'source>(
     source: ElementType,
     destination: ElementType,
     external_name: &str,
+    affine: Option<(CanonicalRational, CanonicalRational)>,
 ) -> std::result::Result<Cow<'source, [u8]>, VNextError> {
-    if source == destination {
+    if source == destination && affine.is_none() {
         return Ok(Cow::Borrowed(bytes));
     }
     let source_float = matches!(
@@ -299,8 +307,24 @@ fn transcode_dense_bytes<'source>(
 
     let element_count = bytes.len() / source.size_bytes() as usize;
     let mut materialized = Vec::with_capacity(element_count * destination.size_bytes() as usize);
+    let affine = affine.map(|(scale, bias)| {
+        (
+            scale.numerator() as f64 / scale.denominator() as f64,
+            bias.numerator() as f64 / bias.denominator() as f64,
+        )
+    });
     for index in 0..element_count {
-        let value = read_float(bytes, source, index);
+        let mut value = read_float(bytes, source, index);
+        if let Some((scale, bias)) = affine {
+            value = (f64::from(value) * scale + bias) as f32;
+            if !value.is_finite() {
+                return Err(VNextError::InvalidExecutionPlan {
+                    reason: format!(
+                        "tensor {external_name:?} affine materialization produced a non-finite value at element {index}"
+                    ),
+                });
+            }
+        }
         match destination {
             ElementType::F16 => {
                 materialized.extend_from_slice(&f16::from_f32(value).to_bits().to_le_bytes())
@@ -421,9 +445,14 @@ mod tests {
             bf16::from_f32(-2.25).to_bits().to_le_bytes(),
         ]
         .concat();
-        let converted =
-            transcode_dense_bytes(&bf16_bytes, ElementType::Bf16, ElementType::F16, "weight")
-                .unwrap();
+        let converted = transcode_dense_bytes(
+            &bf16_bytes,
+            ElementType::Bf16,
+            ElementType::F16,
+            "weight",
+            None,
+        )
+        .unwrap();
         let expected = [
             f16::from_f32(1.5).to_bits().to_le_bytes(),
             f16::from_f32(-2.25).to_bits().to_le_bytes(),
@@ -432,9 +461,14 @@ mod tests {
         assert_eq!(converted.as_ref(), expected);
 
         let f32_bytes = [1.5_f32.to_le_bytes(), (-2.25_f32).to_le_bytes()].concat();
-        let converted =
-            transcode_dense_bytes(&f32_bytes, ElementType::F32, ElementType::F16, "weight")
-                .unwrap();
+        let converted = transcode_dense_bytes(
+            &f32_bytes,
+            ElementType::F32,
+            ElementType::F16,
+            "weight",
+            None,
+        )
+        .unwrap();
         assert_eq!(converted.as_ref(), expected);
     }
 
@@ -442,7 +476,47 @@ mod tests {
     fn dense_materialization_borrows_matching_storage() {
         let bytes = f16::from_f32(1.0).to_bits().to_le_bytes();
         let converted =
-            transcode_dense_bytes(&bytes, ElementType::F16, ElementType::F16, "weight").unwrap();
+            transcode_dense_bytes(&bytes, ElementType::F16, ElementType::F16, "weight", None)
+                .unwrap();
         assert!(matches!(converted, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn affine_dense_materialization_applies_logical_transform() {
+        let bytes = [(-0.5_f32).to_le_bytes(), 2.0_f32.to_le_bytes()].concat();
+        let converted = transcode_dense_bytes(
+            &bytes,
+            ElementType::F32,
+            ElementType::F16,
+            "norm.weight",
+            Some((
+                CanonicalRational::new(1, 1).unwrap(),
+                CanonicalRational::new(1, 1).unwrap(),
+            )),
+        )
+        .unwrap();
+        let actual = converted
+            .chunks_exact(2)
+            .map(|bytes| f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, [0.5, 3.0]);
+        assert!(matches!(converted, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn affine_dense_materialization_rejects_non_finite_results() {
+        let bytes = f32::MAX.to_le_bytes();
+        let error = transcode_dense_bytes(
+            &bytes,
+            ElementType::F32,
+            ElementType::F32,
+            "weight",
+            Some((
+                CanonicalRational::new(i64::MAX, 1).unwrap(),
+                CanonicalRational::new(0, 1).unwrap(),
+            )),
+        )
+        .expect_err("overflowing affine values must not enter device storage");
+        assert!(error.to_string().contains("non-finite"), "{error}");
     }
 }
