@@ -1,10 +1,11 @@
 use super::{
-    acquire_session_frames, begin_participant_flights_dispatch, enter_sequence_dispatch,
-    finalize_session_frames, fmt, invalid_resource, issue_batch_invocation_id, issue_batch_step_id,
-    poison_session_frame, prepare_participant_flight_wave, prepare_participant_flights,
+    acquire_session_frames_with_backing, begin_participant_flights_dispatch,
+    enter_sequence_dispatch, finalize_session_frames, fmt, invalid_resource,
+    issue_batch_invocation_id, issue_batch_step_id, poison_session_frame,
+    prepare_participant_flight_wave, prepare_participant_flights,
     reset_participant_flights_after_definitely_not_submitted, sequence_dispatch_is_poisoned,
     sequence_slot_active, sequence_slot_is_poisoned, sequence_slot_poisoned_drained,
-    sequence_slot_poisoned_undrained, session_frame_candidates, session_participant_key,
+    sequence_slot_poisoned_undrained, session_frame_capture_candidates, session_participant_key,
     AbandonedSequenceMetadata, AbandonedSequenceRecoveryError, ActiveInvocationWaveGuard,
     ActiveSequenceAbortDisposition, ActiveSequenceAbortReceipt, ActiveSequenceFrame,
     AdmissionDeferred, AdmissionFitPolicy, AdmissionPressureAction, AdmissionRejected,
@@ -275,14 +276,15 @@ where
             .participants
             .get(index)
             .ok_or_else(|| invalid_resource("step backing participant mapping is inconsistent"))?;
-        if let Some(authority) = participant.backing_snapshot.backing_slice(resource_id) {
+        let authorities = participant.backing_snapshot.backing_slices_for(resource_id);
+        if !authorities.is_empty() {
             return participant
                 .session
                 .resources()
                 .request
                 .plan
                 .dynamic_pools()
-                .view(authority);
+                .view_many(authorities);
         }
         participant
             .session
@@ -579,7 +581,7 @@ where
             let parents = self
                 .participants
                 .iter()
-                .map(|participant| &*participant.session.resources().logical_lease)
+                .map(|participant| participant.session.resources().logical_lease())
                 .collect::<Vec<_>>();
             match plan
                 .logical_admission()
@@ -694,7 +696,7 @@ where
         } else {
             let parents = participants
                 .iter()
-                .map(|participant| &*participant.logical_lease)
+                .map(|participant| participant.logical_lease())
                 .collect::<Vec<_>>();
             match plan
                 .logical_admission()
@@ -1685,7 +1687,7 @@ where
             let parents = self
                 .sessions
                 .iter()
-                .map(|session| &*session.resources().logical_lease)
+                .map(|session| session.resources().logical_lease())
                 .collect::<Vec<_>>();
             match plan
                 .logical_admission()
@@ -1722,20 +1724,17 @@ where
         let claimed_backing =
             ClaimedBackingTransaction::new(work_shape, demand, logical_capacity, backing_slices)?;
         let batch_step_id = issue_batch_step_id()?;
-        let candidates = session_frame_candidates(&self.sessions);
-        let frames = acquire_session_frames(&candidates, batch_step_id)?;
+        let candidates = session_frame_capture_candidates(&self.sessions);
+        let captured_frames = acquire_session_frames_with_backing(&candidates, batch_step_id)?;
         let participants = self
             .sessions
             .iter()
             .cloned()
-            .zip(frames)
-            .map(|(session, frame)| {
-                let backing_snapshot = session.resources().backing_snapshot();
-                AdmittedStepParticipant {
-                    frame,
-                    backing_snapshot,
-                    session,
-                }
+            .zip(captured_frames)
+            .map(|(session, captured)| AdmittedStepParticipant {
+                frame: captured.hold,
+                backing_snapshot: captured.backing_snapshot,
+                session,
             })
             .collect();
         Ok(StepResourceAdmissionDecision::Admitted(Arc::new(
@@ -1853,6 +1852,7 @@ where
                 ));
             }
         };
+        let backing_snapshot = self.backing_snapshot()?;
         let epoch = match self.next_activation_epoch.fetch_update(
             Ordering::AcqRel,
             Ordering::Acquire,
@@ -1902,6 +1902,7 @@ where
         *authority_source = SequenceExecutionAuthoritySource::LegacyStream;
         Ok(ActiveSequencePermit {
             resources: self,
+            backing_snapshot,
             epoch,
             state: Arc::clone(&self.state),
             stream,
@@ -1934,6 +1935,7 @@ where
     R: DeviceRuntime,
 {
     resources: &'resources AdmittedSequenceResources<R>,
+    backing_snapshot: Arc<SequenceBackingSnapshot<R>>,
     epoch: u64,
     state: Arc<AtomicU64>,
     stream: &'exec mut BoundExecutionStream<R>,
@@ -1967,7 +1969,7 @@ where
     }
 
     pub fn backing_slices(&self) -> &[LogicalBackingSliceAuthority] {
-        self.resources.backing_slices()
+        self.backing_snapshot.backing_slices()
     }
 
     pub const fn activation_epoch(&self) -> u64 {

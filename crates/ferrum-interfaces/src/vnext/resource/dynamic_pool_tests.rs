@@ -2,6 +2,7 @@ use super::*;
 use crate::vnext::{
     CopyRegion, DefinitelyNotSubmitted, DeviceClass, DeviceCommandBatch, DeviceErrorReport,
     DeviceTerminal, FenceIndeterminate, FenceQuery, HostTransferLayout,
+    TrustedActiveSequenceBinding,
 };
 use serde_json::{json, Value};
 use std::error::Error;
@@ -1855,7 +1856,7 @@ fn step_captures_the_exact_sequence_backing_snapshot() {
         .grow_pool(&harness.pool_ids[0], 256)
         .unwrap();
     let sequence = admitted_sequence(&harness.root, "sequence-backing-snapshot");
-    let admitted_snapshot = sequence.backing_snapshot();
+    let admitted_snapshot = sequence.backing_snapshot().unwrap();
     assert_eq!(admitted_snapshot.generation().get(), 1);
     assert_eq!(admitted_snapshot.backing_slices().len(), 1);
     assert_eq!(admitted_snapshot.backing_slices()[0].size_bytes(), 64);
@@ -1887,6 +1888,218 @@ fn step_captures_the_exact_sequence_backing_snapshot() {
     drop(session);
     drop(sequence);
     drop(admitted_snapshot);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn sequence_backing_extension_publishes_atomically_between_frames() {
+    let catalog = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 256)
+        .unwrap();
+    let sequence = admitted_sequence(&harness.root, "sequence-backing-extension");
+    let initial = sequence.backing_snapshot().unwrap();
+    let session = sequence.open_session().unwrap();
+    let active_before = TrustedActiveSequenceBinding::from_session(&session).unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let participant =
+        BatchParticipantAuthority::new(sequence.sequence_authority(), sequence.request_authority());
+
+    let first_step = match batch
+        .try_begin_step(
+            StepResourceAdmissionRequest::new(
+                batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("resident first frame must admit"),
+    };
+    let first_captured = Arc::clone(
+        first_step
+            .participant_backing_snapshot(participant)
+            .unwrap(),
+    );
+    match session
+        .try_extend_backing(
+            SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
+                .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::RetryRequired(current) => {
+            assert!(Arc::ptr_eq(&current, &initial));
+        }
+        _ => panic!("an active frame must defer sequence backing publication"),
+    }
+    first_step.try_retire_normal().unwrap();
+
+    let extended = match session
+        .try_extend_backing(
+            SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
+                .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::Extended(snapshot) => snapshot,
+        _ => panic!("resident paged capacity must extend after frame retirement"),
+    };
+    assert_eq!(initial.generation().get(), 1);
+    assert_eq!(first_captured.generation().get(), 1);
+    assert_eq!(extended.generation().get(), 2);
+    assert_eq!(extended.committed_tokens(), 2);
+    assert_eq!(extended.backing_slices().len(), 2);
+    assert_eq!(
+        extended
+            .backing_slices()
+            .iter()
+            .map(LogicalBackingSliceAuthority::size_bytes)
+            .sum::<u64>(),
+        128
+    );
+    let active_after = TrustedActiveSequenceBinding::from_session(&session).unwrap();
+    assert_eq!(active_before.fingerprint(), active_after.fingerprint());
+
+    let second_step = match batch
+        .try_begin_step(
+            StepResourceAdmissionRequest::new(
+                batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("resident second frame must admit"),
+    };
+    assert!(Arc::ptr_eq(
+        second_step
+            .participant_backing_snapshot(participant)
+            .unwrap(),
+        &extended
+    ));
+    let resource_id = extended.backing_slices()[0].resource_id().clone();
+    let view = second_step
+        .participant_backing_view(participant, &resource_id)
+        .unwrap();
+    assert_eq!(view.size_bytes(), 128);
+    assert_eq!(view.segment_bindings().len(), 2);
+
+    second_step.try_retire_normal().unwrap();
+    session.try_complete().unwrap();
+    drop(active_after);
+    drop(active_before);
+    drop(batch);
+    drop(session);
+    drop(sequence);
+    drop(first_captured);
+    drop(initial);
+    drop(extended);
+    let released = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .snapshot()
+        .unwrap();
+    assert!(!released.poisoned());
+    assert_eq!(released.active_child_claims(), 0);
+    assert_eq!(released.active_sequences(), 0);
+    assert_eq!(released.active_requests(), 0);
+    assert!(released
+        .domains()
+        .iter()
+        .all(|domain| domain.used().get() == 0));
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn sequence_backing_extension_waits_for_released_capacity_then_retries() {
+    let catalog = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        128,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 128);
+    let harness = harness(runtime, catalog, 128, false);
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 128)
+        .unwrap();
+    let first = admitted_sequence(&harness.root, "extension-wait-first");
+    let second = admitted_sequence(&harness.root, "extension-wait-second");
+    let session = first.open_session().unwrap();
+
+    let deferred = match session
+        .try_extend_backing(
+            SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
+                .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("resident sequence backing pressure must wait for release"),
+    };
+    let waiter = session.register_backing_waiter(&deferred).unwrap();
+    assert!(!waiter.recheck().unwrap().should_retry());
+
+    drop(second);
+    assert!(waiter.recheck().unwrap().should_retry());
+    drop(waiter);
+
+    let extended = match session
+        .try_extend_backing(
+            SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
+                .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::Extended(snapshot) => snapshot,
+        _ => panic!("released backing capacity must admit the pending extension"),
+    };
+    assert_eq!(extended.generation().get(), 2);
+    assert_eq!(extended.committed_tokens(), 2);
+    assert_eq!(extended.backing_slices().len(), 2);
+
+    session.request_cancel().unwrap();
+    session.try_abort().unwrap();
+    drop(session);
+    drop(first);
+    drop(extended);
+    let released = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .snapshot()
+        .unwrap();
+    assert!(!released.poisoned());
+    assert_eq!(released.active_child_claims(), 0);
+    assert_eq!(released.active_sequences(), 0);
+    assert_eq!(released.active_requests(), 0);
+    assert!(released
+        .domains()
+        .iter()
+        .all(|domain| domain.used().get() == 0));
     close_dynamic_test_root(harness.root);
 }
 
@@ -1938,8 +2151,8 @@ fn invocation_subset_maps_its_local_participant_to_the_step_snapshot() {
     };
 
     let selected = batch.sessions()[1].resources();
-    let selected_snapshot = selected.backing_snapshot();
-    let unselected_snapshot = batch.sessions()[0].resources().backing_snapshot();
+    let selected_snapshot = selected.backing_snapshot().unwrap();
+    let unselected_snapshot = batch.sessions()[0].resources().backing_snapshot().unwrap();
     let selected_authority =
         BatchParticipantAuthority::new(selected.sequence_authority(), selected.request_authority());
     let invocation_request = InvocationResourceAdmissionRequest::new(

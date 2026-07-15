@@ -32,7 +32,8 @@ pub struct TrustedActiveSequenceBinding {
     authority: TrustedActiveSequenceAuthority,
     runtime_implementation_fingerprint: String,
     static_entries: Vec<ResourceLeaseEntry>,
-    backing_slices: Vec<LogicalBackingSliceEvidence>,
+    #[serde(rename = "backing_slices")]
+    legacy_backing_slices: Option<Vec<LogicalBackingSliceEvidence>>,
     #[serde(skip)]
     fingerprint: String,
 }
@@ -79,11 +80,13 @@ impl TrustedActiveSequenceBinding {
                 .runtime_implementation_fingerprint()
                 .to_owned(),
             static_entries,
-            backing_slices: permit
-                .backing_slices()
-                .iter()
-                .map(|slice| slice.evidence().clone())
-                .collect(),
+            legacy_backing_slices: Some(
+                permit
+                    .backing_slices()
+                    .iter()
+                    .map(|slice| slice.evidence().clone())
+                    .collect(),
+            ),
             fingerprint: String::new(),
         };
         binding.fingerprint = canonical_fingerprint(&binding);
@@ -128,11 +131,9 @@ impl TrustedActiveSequenceBinding {
             },
             runtime_implementation_fingerprint: runtime_fingerprint,
             static_entries,
-            backing_slices: resources
-                .backing_slices()
-                .iter()
-                .map(|slice| slice.evidence().clone())
-                .collect(),
+            // A session identity is stable across dynamic backing generations.
+            // The exact physical authority belongs to each captured Step.
+            legacy_backing_slices: None,
             fingerprint: String::new(),
         };
         binding.fingerprint = canonical_fingerprint(&binding);
@@ -243,8 +244,12 @@ impl TrustedActiveSequenceBinding {
         &self.static_entries
     }
 
+    pub fn legacy_backing_slices(&self) -> Option<&[LogicalBackingSliceEvidence]> {
+        self.legacy_backing_slices.as_deref()
+    }
+
     pub fn backing_slices(&self) -> &[LogicalBackingSliceEvidence] {
-        &self.backing_slices
+        self.legacy_backing_slices.as_deref().unwrap_or_default()
     }
 
     pub fn fingerprint(&self) -> &str {

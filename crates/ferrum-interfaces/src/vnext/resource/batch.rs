@@ -152,6 +152,14 @@ pub(super) struct SequenceFrameCandidate {
     pub(super) fingerprint: SequenceSessionFingerprint,
 }
 
+pub(super) struct SequenceFrameCaptureCandidate<R>
+where
+    R: DeviceRuntime,
+{
+    frame: SequenceFrameCandidate,
+    resources: Arc<AdmittedSequenceResources<R>>,
+}
+
 pub(super) struct SessionFrameHold {
     pub(super) slot: Arc<SequenceSessionSlot>,
     pub(super) epoch: SequenceSessionEpoch,
@@ -159,6 +167,14 @@ pub(super) struct SessionFrameHold {
     pub(super) frame_id: ExecutionFrameId,
     pub(super) batch_step_id: BatchStepId,
     pub(super) finalized: bool,
+}
+
+pub(super) struct CapturedSessionFrame<R>
+where
+    R: DeviceRuntime,
+{
+    pub(super) hold: SessionFrameHold,
+    pub(super) backing_snapshot: Arc<SequenceBackingSnapshot<R>>,
 }
 
 #[derive(Clone)]
@@ -613,6 +629,117 @@ pub(super) fn session_frame_candidates<R: DeviceRuntime>(
             slot: Arc::clone(&session.slot),
             epoch: session.epoch,
             fingerprint: session.fingerprint.clone(),
+        })
+        .collect()
+}
+
+pub(super) fn acquire_session_frames_with_backing<R>(
+    candidates: &[SequenceFrameCaptureCandidate<R>],
+    batch_step_id: BatchStepId,
+) -> Result<Vec<CapturedSessionFrame<R>>, VNextError>
+where
+    R: DeviceRuntime,
+{
+    if candidates.is_empty()
+        || candidates.iter().enumerate().any(|(index, candidate)| {
+            candidates[..index]
+                .iter()
+                .any(|prior| Arc::ptr_eq(&prior.frame.slot, &candidate.frame.slot))
+        })
+    {
+        return Err(invalid_resource(
+            "step frame acquisition requires non-empty unique session slots",
+        ));
+    }
+    let mut states = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .frame
+                .slot
+                .state
+                .lock()
+                .map_err(|_| invalid_resource("sequence session state mutex is poisoned"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (candidate, state) in candidates.iter().zip(&states) {
+        match &**state {
+            SequenceSessionSlotState::Active(active)
+                if active.epoch == candidate.frame.epoch
+                    && active.fingerprint == candidate.frame.fingerprint
+                    && active.phase == SequenceSessionPhase::Open
+                    && active.active_frame.is_none()
+                    && active.next_frame.is_some() => {}
+            SequenceSessionSlotState::Active(active)
+                if active.epoch != candidate.frame.epoch
+                    || active.fingerprint != candidate.frame.fingerprint =>
+            {
+                return Err(invalid_resource("stale sequence session frame authority"));
+            }
+            SequenceSessionSlotState::Active(_) => {
+                return Err(invalid_resource(
+                    "sequence session cannot acquire a frame in its current phase",
+                ));
+            }
+            _ => {
+                return Err(invalid_resource(
+                    "inactive or terminal sequence session cannot acquire a frame",
+                ));
+            }
+        }
+    }
+    // Frame capture and extension publication use the same slot -> backing
+    // lock order. Allocator, device, copy, and fence work stay outside it.
+    let backing_states = candidates
+        .iter()
+        .map(|candidate| candidate.resources.lock_backing_state())
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut captured = Vec::with_capacity(candidates.len());
+    for ((candidate, state), backing_state) in
+        candidates.iter().zip(&mut states).zip(&backing_states)
+    {
+        let SequenceSessionSlotState::Active(active) = &mut **state else {
+            unreachable!("all session frame candidates were validated");
+        };
+        let frame_id = active
+            .next_frame
+            .take()
+            .expect("validated session has a next execution frame");
+        active.next_frame = frame_id
+            .get()
+            .checked_add(1)
+            .and_then(|next| ExecutionFrameId::try_from(next).ok());
+        active.active_frame = Some(ActiveSequenceFrame {
+            frame_id,
+            batch_step_id,
+        });
+        captured.push(CapturedSessionFrame {
+            hold: SessionFrameHold {
+                slot: Arc::clone(&candidate.frame.slot),
+                epoch: candidate.frame.epoch,
+                fingerprint: candidate.frame.fingerprint.clone(),
+                frame_id,
+                batch_step_id,
+                finalized: false,
+            },
+            backing_snapshot: Arc::clone(&backing_state.current),
+        });
+    }
+    Ok(captured)
+}
+
+pub(super) fn session_frame_capture_candidates<R: DeviceRuntime>(
+    sessions: &[Arc<SequenceSession<R>>],
+) -> Vec<SequenceFrameCaptureCandidate<R>> {
+    sessions
+        .iter()
+        .map(|session| SequenceFrameCaptureCandidate {
+            frame: SequenceFrameCandidate {
+                slot: Arc::clone(&session.slot),
+                epoch: session.epoch,
+                fingerprint: session.fingerprint.clone(),
+            },
+            resources: Arc::clone(session.resources()),
         })
         .collect()
 }

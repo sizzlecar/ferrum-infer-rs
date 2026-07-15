@@ -61,10 +61,7 @@ fn logical_sequence_activation_completion_contract(plan: &ExecutionPlan, passed:
         passed,
         request_resources.backing_slices().len() == expected_request_slices,
     ); // 8
-    check(
-        passed,
-        resources.backing_slices().len() == expected_sequence_slices,
-    ); // 9
+    check(passed, resources.backing_generation().unwrap().get() == 1); // 9
 
     let evidence = resources.plan_evidence();
     check(passed, evidence.plan_id() == plan.payload().plan_id()); // 10
@@ -94,7 +91,7 @@ fn logical_sequence_activation_completion_contract(plan: &ExecutionPlan, passed:
     ); // 19
     check(
         passed,
-        permit.backing_slices().len() == resources.backing_slices().len(),
+        permit.backing_slices().len() == expected_sequence_slices,
     ); // 20
     check(
         passed,
