@@ -219,6 +219,10 @@ impl VNextExecutorMetrics {
     }
 }
 
+fn reported_allocated_bytes(budget_claimed_bytes: Option<u64>, static_bytes: u64) -> u64 {
+    budget_claimed_bytes.unwrap_or(static_bytes)
+}
+
 struct VNextSequence<R: DeviceRuntime> {
     cache_id: String,
     request_id: RequestId,
@@ -1549,11 +1553,12 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         let prefill_operations = self.metrics.prefill_operations.load(Ordering::Relaxed);
         let decode_operations = self.metrics.decode_operations.load(Ordering::Relaxed);
         let pool_status = self.plan_resources.dynamic_pool_status().ok();
-        let allocated_bytes = pool_status
-            .as_ref()
-            .map(|status| status.budget_claimed_bytes())
-            .unwrap_or(0)
-            .saturating_add(self.static_bytes);
+        let allocated_bytes = reported_allocated_bytes(
+            pool_status
+                .as_ref()
+                .map(|status| status.budget_claimed_bytes()),
+            self.static_bytes,
+        );
         let used_dynamic = pool_status
             .as_ref()
             .map(|status| {
@@ -1603,7 +1608,13 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeFailureDisposition, FerrumError};
+    use super::{reported_allocated_bytes, DecodeFailureDisposition, FerrumError};
+
+    #[test]
+    fn allocated_memory_does_not_count_static_claim_twice() {
+        assert_eq!(reported_allocated_bytes(Some(64), 64), 64);
+        assert_eq!(reported_allocated_bytes(None, 64), 64);
+    }
 
     #[test]
     fn decode_capacity_deferral_preserves_executor_owned_sequence() {
