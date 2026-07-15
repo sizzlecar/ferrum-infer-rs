@@ -368,7 +368,7 @@ pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationCon
 pub fn causal_paged_attention_contract() -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
         id: OperationId::new(CAUSAL_PAGED_ATTENTION_OPERATION_ID)?,
-        version: ContractVersion::new(1, 0),
+        version: ContractVersion::new(2, 0),
         inputs: vec![
             contiguous_tensor(
                 token_hidden_dimensions(),
@@ -431,6 +431,7 @@ pub fn causal_paged_attention_contract() -> Result<StandardOperationContract, VN
             unsigned_attribute("query_projection_features")?,
             unsigned_attribute("kv_features")?,
             unsigned_attribute("rope_dim")?,
+            unsigned_attribute("maximum_context_tokens")?,
             positive_rational_attribute("rope_theta")?,
             unconstrained_bool_attribute("rope_interleaved")?,
             unconstrained_bool_attribute("output_gate")?,
@@ -691,6 +692,7 @@ mod tests {
             TensorAccess::ReadWrite
         );
         assert_eq!(full.descriptor().inputs.len(), 9);
+        assert_eq!(full.descriptor().version, ContractVersion::new(2, 0));
         assert_eq!(
             full.descriptor().inputs[8].access(),
             TensorAccess::ReadWrite

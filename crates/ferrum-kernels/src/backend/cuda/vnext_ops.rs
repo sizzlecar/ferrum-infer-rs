@@ -5,15 +5,16 @@ use std::collections::BTreeSet;
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
-    dense_linear_contract, dense_swiglu_contract, gated_delta_recurrent_attention_contract,
-    residual_add_contract, rms_norm_contract, token_embedding_contract, AttributeId,
-    BatchedOperationInvocation, CapabilityId, ContractVersion, DeviceId, DeviceRuntime,
-    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
-    ElementType, OperationContract, OperationFailure, OperationInvocation, OperationProvider,
-    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
-    OperationResourceEstimator, OperationRuntimeRegistry, ProfilePhase, ProviderId,
-    ProviderStorageBindingRequirement, ResolvedTensorLayout, ResolvedValueBinding,
-    ResolvedValueRole, SemanticValue, VNextError, WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID,
+    causal_paged_attention_contract, dense_linear_contract, dense_swiglu_contract,
+    gated_delta_recurrent_attention_contract, residual_add_contract, rms_norm_contract,
+    token_embedding_contract, AttributeId, BatchedOperationInvocation, CapabilityId,
+    ContractVersion, DeviceId, DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile,
+    DynamicStorageRequirement, DynamicStorageView, ElementType, OperationContract,
+    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
+    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
+    OperationRuntimeRegistry, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
+    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError,
+    WeightFormatId, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
     DENSE_SWIGLU_F16_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     RESIDUAL_ADD_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
     TOKEN_EMBEDDING_OPERATION_ID,
@@ -34,6 +35,7 @@ const EMBEDDING_FUNCTION_NAME: &str = "vnext_embedding_lookup_f16";
 const VALUE_ALIGNMENT_BYTES: u64 = 16;
 const THREADS_PER_BLOCK: u32 = 256;
 const MAXIMUM_TOKENS_PER_LAUNCH: u64 = u16::MAX as u64;
+pub(super) const VNEXT_KV_PAGE_BYTES: u64 = 64 * 1024;
 
 /// Typed CUDA runtime input for the currently installed vNext provider bundle.
 pub fn cuda_vnext_runtime_config(
@@ -48,6 +50,7 @@ pub fn cuda_vnext_runtime_config(
             include_str!("vnext_ops.rs").as_bytes(),
             include_str!("vnext_ops/transformer.rs").as_bytes(),
             include_str!("vnext_ops/transformer/attention.rs").as_bytes(),
+            include_str!("vnext_ops/transformer/causal_attention.rs").as_bytes(),
             crate::ptx::EMBEDDING_LOOKUP.as_bytes(),
             crate::ptx::RMS_NORM.as_bytes(),
             crate::ptx::FUSED_SILU_MUL.as_bytes(),
@@ -55,12 +58,23 @@ pub fn cuda_vnext_runtime_config(
             crate::ptx::SANDWICH_NORM.as_bytes(),
             crate::ptx::LINEAR_ATTENTION.as_bytes(),
             crate::ptx::GATED_DELTA_RULE.as_bytes(),
+            crate::ptx::VNEXT_CAUSAL_ATTENTION.as_bytes(),
         ]),
         capabilities: cuda_vnext_capabilities()?,
-        dynamic_storage_profiles: BTreeSet::from([DynamicStorageProfile::new(
-            DynamicStorageAllocator::LinearArena,
-            DynamicStorageView::Contiguous,
-        )?]),
+        dynamic_storage_profiles: BTreeSet::from([
+            DynamicStorageProfile::new(
+                DynamicStorageAllocator::LinearArena,
+                DynamicStorageView::Contiguous,
+            )?,
+            DynamicStorageProfile::new(
+                DynamicStorageAllocator::FixedBlockArena {
+                    block_bytes: VNEXT_KV_PAGE_BYTES,
+                },
+                DynamicStorageView::PagedRegions {
+                    block_bytes: VNEXT_KV_PAGE_BYTES,
+                },
+            )?,
+        ]),
     })
 }
 
@@ -72,6 +86,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         DENSE_SWIGLU_F16_CAPABILITY_ID,
         RESIDUAL_ADD_F16_CAPABILITY_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+        CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
     ]
     .into_iter()
     .map(CapabilityId::new)
@@ -89,6 +104,7 @@ pub fn cuda_vnext_operation_registry(
         Box::new(dense_swiglu_contract().map_err(contract_error)?),
         Box::new(residual_add_contract().map_err(contract_error)?),
         Box::new(gated_delta_recurrent_attention_contract().map_err(contract_error)?),
+        Box::new(causal_paged_attention_contract().map_err(contract_error)?),
     ];
     let providers: Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> = vec![
         Box::new(CudaTokenEmbeddingProvider::new(runtime)?),
@@ -99,6 +115,7 @@ pub fn cuda_vnext_operation_registry(
         Box::new(transformer::CudaGatedDeltaRecurrentAttentionProvider::new(
             runtime,
         )?),
+        Box::new(transformer::CudaCausalPagedAttentionProvider::new(runtime)?),
     ];
     OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
 }
