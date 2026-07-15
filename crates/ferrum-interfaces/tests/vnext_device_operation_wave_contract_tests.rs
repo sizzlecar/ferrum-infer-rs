@@ -232,6 +232,11 @@ fn all_plan_nodes_encode_into_one_submission_and_one_completion() {
 #[test]
 fn terminal_wave_reads_output_before_releasing_backing() {
     let (fixture, sequence, session, batch, step) = setup();
+    let executable = ExecutablePlan::new(
+        fixture.plan.clone(),
+        fixture.resolved.parts().capabilities.clone(),
+    )
+    .unwrap();
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
     let (identities, active_bindings) = wave_identity_inputs(&fixture.plan, &wave, &session);
     let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
@@ -241,10 +246,10 @@ fn terminal_wave_reads_output_before_releasing_backing() {
         .payload()
         .nodes()
         .iter()
-        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .map(|node| fixture.registry.bind(&executable, node.id()).unwrap())
         .collect::<Vec<_>>();
     let batch_identity = OperationDispatch::bind_submission_wave_identity(
-        &fixture.resolved,
+        &executable,
         identities,
         &active_bindings,
         &wave,
@@ -253,7 +258,7 @@ fn terminal_wave_reads_output_before_releasing_backing() {
     .unwrap();
     let handle = OperationDispatch::encode_and_submit_wave(
         &providers,
-        &fixture.resolved,
+        &executable,
         &batch_identity,
         &active_bindings,
         wave,

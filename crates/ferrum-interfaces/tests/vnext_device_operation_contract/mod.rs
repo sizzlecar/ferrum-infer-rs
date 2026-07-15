@@ -1602,6 +1602,13 @@ pub(crate) fn fixture() -> Fixture {
         Arc::clone(&provider_behavior),
         Arc::clone(&provider_trace),
     );
+    let derived_catalog = registry
+        .capability_catalog(
+            catalog.device().clone(),
+            catalog.engine_providers().values().cloned().collect(),
+        )
+        .unwrap();
+    assert_eq!(derived_catalog, catalog);
     let (resolved, plan) = resolved_model_plan(&registry);
     let impostor_registry = operation_registry(
         &catalog,

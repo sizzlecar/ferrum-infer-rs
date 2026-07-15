@@ -11,13 +11,13 @@ use super::{
     BufferUsage, CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper,
     ContractVersion, DefinitelyNotSubmittedRetryAuthority,
     DefinitelyNotSubmittedWaveRetryAuthority, DeviceCommandBatch, DeviceId, DeviceRuntime,
-    ExecutionIdentityEnvelope, ExecutionLane, ExecutionLaneId, IdentifiedFailure,
-    IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
-    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId,
-    NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
-    PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
-    ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedModelPlan, ResourceId,
-    SemanticValue, SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint,
+    ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionLane, ExecutionLaneId,
+    IdentifiedFailure, IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome,
+    LeasedBufferView, LogicalAdmissionCoordinatorId, LogicalBackingBufferView,
+    LogicalBackingSegmentBinding, NodeId, NodeWorkContract, OperationId, ParticipantNodeKey,
+    PlanHash, PlanId, PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId,
+    ProviderId, ProviderWorkspaceRequirement, QuantizationFormatId, ResourceId, SemanticValue,
+    SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint,
     StepParticipantFrameAssignment, StepResourceLease, TrustedActiveSequenceBinding,
     TrustedPlanRuntimeEvidence, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
     WeightId,
@@ -3244,7 +3244,7 @@ impl<'a, B> OperationInvocation<'a, B> {
     #[allow(clippy::too_many_arguments)]
     fn from_resolved<R>(
         runtime: &R,
-        resolved: &'a ResolvedModelPlan,
+        resolved: &'a dyn ExecutablePlanView,
         provider: &'a OperationProviderDescriptor,
         identity: &'a ExecutionIdentityEnvelope,
         node_id: &'a NodeId,
@@ -3262,10 +3262,7 @@ impl<'a, B> OperationInvocation<'a, B> {
             .iter()
             .find(|node| node.id() == node_id)
             .ok_or_else(|| invalid_operation(format!("plan has no node `{node_id}`")))?;
-        let operation = resolved
-            .parts()
-            .capabilities
-            .operation(node.operation_id())?;
+        let operation = resolved.capabilities().operation(node.operation_id())?;
         let parts = identity.parts();
         let participant = resources.participant(participant_index)?;
         let participant_backing = resources.participant_backing_snapshot(participant_index)?;
@@ -3290,8 +3287,8 @@ impl<'a, B> OperationInvocation<'a, B> {
             || participant.request_id() != active_binding.request_id()
             || !active_binding
                 .matches_sequence_session(participant_session.0, participant_session.1)
-            || runtime.descriptor() != &resolved.parts().device
-            || runtime.descriptor() != resolved.parts().capabilities.device()
+            || runtime.descriptor() != resolved.device()
+            || runtime.descriptor() != resolved.capabilities().device()
             || runtime.descriptor().runtime_implementation_fingerprint
                 != plan.payload().device_runtime_implementation_fingerprint()
             || parts.plan_id.as_ref() != Some(plan.payload().plan_id())
@@ -3344,8 +3341,7 @@ impl<'a, B> OperationInvocation<'a, B> {
             ));
         }
         let registered = resolved
-            .parts()
-            .capabilities
+            .capabilities()
             .providers_for(node.operation_id())?
             .iter()
             .find(|candidate| candidate.provider_id() == provider.provider_id())
@@ -3716,7 +3712,7 @@ pub struct BatchedOperationInvocation<'a, B> {
 impl<'a, B> BatchedOperationInvocation<'a, B> {
     fn from_resolved<R>(
         runtime: &R,
-        resolved: &'a ResolvedModelPlan,
+        resolved: &'a dyn ExecutablePlanView,
         provider: &'a OperationProviderDescriptor,
         batch_identity: &'a BatchOperationIdentity,
         resources: &'a InvocationResourceLease<R>,
@@ -3742,7 +3738,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
     #[allow(clippy::too_many_arguments)]
     fn from_wave_node<R>(
         runtime: &R,
-        resolved: &'a ResolvedModelPlan,
+        resolved: &'a dyn ExecutablePlanView,
         provider: &'a OperationProviderDescriptor,
         batch_identity: &'a BatchOperationIdentity,
         node_identity: &'a BatchOperationNodeIdentity,
@@ -3767,7 +3763,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
     #[allow(clippy::too_many_arguments)]
     fn from_resources<R>(
         runtime: &R,
-        resolved: &'a ResolvedModelPlan,
+        resolved: &'a dyn ExecutablePlanView,
         provider: &'a OperationProviderDescriptor,
         batch_identity: &'a BatchOperationIdentity,
         node_identity: &'a BatchOperationNodeIdentity,
@@ -4048,7 +4044,7 @@ pub struct OperationDispatch;
 impl OperationDispatch {
     #[allow(clippy::too_many_arguments)]
     fn bind_node_identity<R>(
-        resolved: &ResolvedModelPlan,
+        resolved: &dyn ExecutablePlanView,
         participant_identities: Vec<ExecutionIdentityEnvelope>,
         active_bindings: &[TrustedActiveSequenceBinding],
         resources: OperationInvocationResources<'_, R>,
@@ -4088,8 +4084,8 @@ impl OperationDispatch {
             || plan_evidence.plan_hash() != plan.plan_hash()
             || plan_evidence.device_id() != plan.payload().device_id()
             || !Arc::ptr_eq(resources.runtime(), lane.runtime_arc())
-            || lane.descriptor() != &resolved.parts().device
-            || lane.descriptor() != resolved.parts().capabilities.device()
+            || lane.descriptor() != resolved.device()
+            || lane.descriptor() != resolved.capabilities().device()
             || lane.descriptor().runtime_implementation_fingerprint
                 != plan.payload().device_runtime_implementation_fingerprint()
         {
@@ -4166,7 +4162,7 @@ impl OperationDispatch {
 
     #[allow(clippy::too_many_arguments)]
     pub fn bind_batch_identity<R>(
-        resolved: &ResolvedModelPlan,
+        resolved: &dyn ExecutablePlanView,
         participant_identities: Vec<ExecutionIdentityEnvelope>,
         active_bindings: &[TrustedActiveSequenceBinding],
         invocation_resources: &InvocationResourceLease<R>,
@@ -4202,7 +4198,7 @@ impl OperationDispatch {
     }
 
     pub fn bind_submission_wave_identity<R>(
-        resolved: &ResolvedModelPlan,
+        resolved: &dyn ExecutablePlanView,
         participant_identities: Vec<Vec<ExecutionIdentityEnvelope>>,
         active_bindings: &[Vec<TrustedActiveSequenceBinding>],
         wave: &PreparedStepSubmissionWave<R>,
@@ -4275,7 +4271,7 @@ impl OperationDispatch {
     #[allow(clippy::too_many_arguments)]
     pub fn encode_and_submit<R>(
         provider: &BoundOperationProvider<'_, R>,
-        resolved: &ResolvedModelPlan,
+        resolved: &dyn ExecutablePlanView,
         batch_identity: &BatchOperationIdentity,
         active_bindings: &[TrustedActiveSequenceBinding],
         mut invocation_resources: InvocationResourceLease<R>,
@@ -4400,7 +4396,7 @@ impl OperationDispatch {
     #[allow(clippy::too_many_arguments)]
     pub fn encode_and_submit_wave<R>(
         providers: &[BoundOperationProvider<'_, R>],
-        resolved: &ResolvedModelPlan,
+        resolved: &dyn ExecutablePlanView,
         batch_identity: &BatchOperationIdentity,
         active_bindings: &[Vec<TrustedActiveSequenceBinding>],
         mut wave: PreparedStepSubmissionWave<R>,
@@ -4817,6 +4813,38 @@ where
         })
     }
 
+    /// Derives the planning catalog from the exact contract/provider objects
+    /// retained for dispatch, preventing descriptor drift between two
+    /// independently assembled registries.
+    pub fn capability_catalog(
+        &self,
+        device: super::DeviceDescriptor,
+        engine_providers: Vec<EngineProviderDescriptor>,
+    ) -> Result<CapabilityCatalog, VNextError> {
+        let operations = self
+            .contracts
+            .values()
+            .map(|contract| contract.descriptor().clone())
+            .collect::<Vec<_>>();
+        let mut providers = self
+            .contracts
+            .keys()
+            .cloned()
+            .map(|operation_id| (operation_id, Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+        for provider in self.providers.values() {
+            providers
+                .get_mut(provider.descriptor().operation_id())
+                .ok_or_else(|| {
+                    invalid_operation(
+                        "runtime provider operation is absent while deriving its catalog",
+                    )
+                })?
+                .push(provider.descriptor().clone());
+        }
+        CapabilityCatalog::new(device, operations, providers, engine_providers)
+    }
+
     pub fn planning(&self) -> OperationPlanningHandle<'_> {
         OperationPlanningHandle {
             registry: self,
@@ -4826,7 +4854,7 @@ where
 
     pub fn bind<'registry>(
         &'registry self,
-        resolved: &ResolvedModelPlan,
+        resolved: &dyn ExecutablePlanView,
         node_id: &NodeId,
     ) -> Result<BoundOperationProvider<'registry, R>, VNextError> {
         let plan = resolved.execution_plan();
@@ -4851,8 +4879,7 @@ where
                 ))
             })?;
         let catalog_provider = resolved
-            .parts()
-            .capabilities
+            .capabilities()
             .providers_for(node.operation_id())?
             .iter()
             .find(|candidate| candidate.provider_id() == provider.descriptor().provider_id())
@@ -4912,7 +4939,7 @@ where
 {
     fn validate_binding(
         &self,
-        resolved: &ResolvedModelPlan,
+        resolved: &dyn ExecutablePlanView,
         node_id: &NodeId,
     ) -> Result<(), VNextError> {
         let plan = resolved.execution_plan();

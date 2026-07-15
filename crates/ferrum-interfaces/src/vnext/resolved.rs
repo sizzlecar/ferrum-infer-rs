@@ -8,10 +8,11 @@ use std::io::{self, Write};
 
 use super::model::PreparedModelFamilyWire;
 use super::{
-    CapabilityCatalog, ContractVersion, DeviceDescriptor, DynamicStorageProfile, ExecutionPlan,
-    ModelFamilyRegistry, PlanNodeResolution, PreparedModelFamily, ProviderId, RuntimePolicy,
-    SpecialTokenRole, TokenizerDescriptor, UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire,
-    UnvalidatedPreparedModelFamily, VNextError,
+    CapabilityCatalog, ContractVersion, DeviceDescriptor, DynamicStorageProfile,
+    ExecutablePlanView, ExecutionPlan, ModelFamilyRegistry, PlanNodeResolution,
+    PreparedModelFamily, ProviderId, RuntimePolicy, SpecialTokenRole, TokenizerDescriptor,
+    UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, UnvalidatedPreparedModelFamily,
+    VNextError,
 };
 
 /// Maximum raw byte length accepted for one resolution source artifact.
@@ -2208,6 +2209,20 @@ impl<'a> ResolvedPlanValidationContext<'a> {
 pub struct ResolvedModelPlan {
     parts: ResolvedModelPlanParts,
     fingerprint: ResolutionFingerprint,
+}
+
+impl ExecutablePlanView for ResolvedModelPlan {
+    fn execution_plan(&self) -> &ExecutionPlan {
+        &self.parts.execution_plan
+    }
+
+    fn device(&self) -> &DeviceDescriptor {
+        &self.parts.device
+    }
+
+    fn capabilities(&self) -> &CapabilityCatalog {
+        &self.parts.capabilities
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
