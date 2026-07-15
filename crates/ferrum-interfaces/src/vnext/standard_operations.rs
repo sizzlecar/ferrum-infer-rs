@@ -10,6 +10,9 @@ use super::{
 
 pub const TOKEN_EMBEDDING_OPERATION_ID: &str = "operation.token_embedding";
 pub const TOKEN_EMBEDDING_F16_CAPABILITY_ID: &str = "capability.operation.token_embedding.f16";
+pub const LAST_TOKEN_DENSE_LINEAR_OPERATION_ID: &str = "operation.last_token_dense_linear";
+pub const LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID: &str =
+    "capability.operation.last_token_dense_linear.f16";
 pub const RMS_NORM_OPERATION_ID: &str = "operation.rms_norm";
 pub const RMS_NORM_F16_CAPABILITY_ID: &str = "capability.operation.rms_norm.f16";
 pub const DENSE_LINEAR_OPERATION_ID: &str = "operation.dense_linear";
@@ -98,6 +101,50 @@ pub fn token_embedding_contract() -> Result<StandardOperationContract, VNextErro
                 TOKEN_EMBEDDING_F16_CAPABILITY_ID,
             )?]),
         },
+        profile_phase: ProfilePhase::Forward,
+    };
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
+
+/// Projects only the final row of a non-empty token-major tensor. Keeping this
+/// semantic fusion explicit prevents materializing prompt-length vocabulary
+/// logits while leaving providers free to use a pointer offset, row gather,
+/// or a fused kernel.
+pub fn last_token_dense_linear_contract() -> Result<StandardOperationContract, VNextError> {
+    let descriptor = OperationDescriptor {
+        id: OperationId::new(LAST_TOKEN_DENSE_LINEAR_OPERATION_ID)?,
+        version: ContractVersion::new(1, 0),
+        inputs: vec![
+            contiguous_tensor(
+                token_hidden_dimensions(),
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![
+                    DimensionConstraint::Symbol("out_features".to_owned()),
+                    DimensionConstraint::Symbol("hidden_size".to_owned()),
+                ],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+        ],
+        outputs: vec![contiguous_tensor(
+            vec![
+                DimensionConstraint::Exact(1),
+                DimensionConstraint::Symbol("out_features".to_owned()),
+            ],
+            [ElementType::F16],
+            TensorAccess::Write,
+        )?],
+        attributes: AttributeSchema::new(BTreeMap::from([
+            unsigned_attribute("hidden_size")?,
+            unsigned_attribute("out_features")?,
+        ]))?,
+        resources: no_auxiliary_resources(),
+        oracle: f16_reference_tolerance()?,
+        provider: provider_requirement(LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID)?,
         profile_phase: ProfilePhase::Forward,
     };
     descriptor.validate()?;
@@ -622,6 +669,27 @@ mod tests {
             .to_ascii_lowercase()
             .contains("qwen"));
         assert_eq!(descriptor.fingerprint().unwrap().len(), 64);
+        contract
+            .validate_signature(&descriptor.inputs, &descriptor.outputs)
+            .unwrap();
+    }
+
+    #[test]
+    fn last_token_dense_linear_contract_is_backend_and_model_neutral() {
+        let contract = last_token_dense_linear_contract().unwrap();
+        let descriptor = contract.descriptor();
+        assert_eq!(descriptor.id.as_str(), LAST_TOKEN_DENSE_LINEAR_OPERATION_ID);
+        assert_eq!(
+            descriptor.outputs[0].dimensions(),
+            &[
+                DimensionConstraint::Exact(1),
+                DimensionConstraint::Symbol("out_features".to_owned()),
+            ]
+        );
+        assert!(!serde_json::to_string(descriptor)
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("qwen"));
         contract
             .validate_signature(&descriptor.inputs, &descriptor.outputs)
             .unwrap();

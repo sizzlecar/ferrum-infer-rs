@@ -7,17 +7,18 @@ use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, dense_linear_contract, dense_swiglu_contract,
-    gated_delta_recurrent_attention_contract, residual_add_contract, rms_norm_contract,
-    token_embedding_contract, AttributeId, BatchedOperationInvocation, CapabilityCatalog,
-    CapabilityId, ContractVersion, DeviceId, DeviceRuntime, DynamicStorageAllocator,
-    DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView, ElementType,
-    EngineProviderDescriptor, OperationContract, OperationFailure, OperationInvocation,
-    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    gated_delta_recurrent_attention_contract, last_token_dense_linear_contract,
+    residual_add_contract, rms_norm_contract, token_embedding_contract, AttributeId,
+    BatchedOperationInvocation, CapabilityCatalog, CapabilityId, ContractVersion, DeviceId,
+    DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement,
+    DynamicStorageView, ElementType, EngineProviderDescriptor, OperationContract, OperationFailure,
+    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, OperationRuntimeRegistry,
     ProfilePhase, ProviderId, ProviderStorageBindingRequirement, ResolvedTensorLayout,
     ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
     DENSE_SWIGLU_F16_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+    LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
     RESIDUAL_ADD_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
     TOKEN_EMBEDDING_OPERATION_ID,
 };
@@ -32,6 +33,10 @@ mod transformer;
 
 const TOKEN_EMBEDDING_PROVIDER_ID: &str = "provider.cuda.token_embedding.f16";
 const TOKEN_EMBEDDING_ESTIMATOR_ID: &str = "resource-estimator.cuda.token_embedding.f16";
+const LAST_TOKEN_DENSE_LINEAR_PROVIDER_ID: &str =
+    "provider.cuda.last_token_dense_linear.f16.cublas";
+const LAST_TOKEN_DENSE_LINEAR_ESTIMATOR_ID: &str =
+    "resource-estimator.cuda.last_token_dense_linear.f16.cublas";
 const CUDA_ENGINE_PROVIDER_ID: &str = "provider.engine.cuda.vnext";
 const DENSE_SAFETENSORS_FORMAT_ID: &str = "weight-format.safetensors.dense";
 const EMBEDDING_FUNCTION_NAME: &str = "vnext_embedding_lookup_f16";
@@ -84,6 +89,7 @@ pub fn cuda_vnext_runtime_config(
 pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
     [
         TOKEN_EMBEDDING_F16_CAPABILITY_ID,
+        LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
         RMS_NORM_F16_CAPABILITY_ID,
         DENSE_LINEAR_F16_CAPABILITY_ID,
         DENSE_SWIGLU_F16_CAPABILITY_ID,
@@ -102,6 +108,7 @@ pub fn cuda_vnext_operation_registry(
 ) -> Result<OperationRuntimeRegistry<CudaDeviceRuntime>, CudaDeviceRuntimeError> {
     let contracts: Vec<Box<dyn OperationContract>> = vec![
         Box::new(token_embedding_contract().map_err(contract_error)?),
+        Box::new(last_token_dense_linear_contract().map_err(contract_error)?),
         Box::new(rms_norm_contract().map_err(contract_error)?),
         Box::new(dense_linear_contract().map_err(contract_error)?),
         Box::new(dense_swiglu_contract().map_err(contract_error)?),
@@ -111,6 +118,7 @@ pub fn cuda_vnext_operation_registry(
     ];
     let providers: Vec<Box<dyn OperationProvider<CudaDeviceRuntime>>> = vec![
         Box::new(CudaTokenEmbeddingProvider::new(runtime)?),
+        Box::new(CudaLastTokenDenseLinearProvider::new(runtime)?),
         Box::new(transformer::CudaRmsNormProvider::new(runtime)?),
         Box::new(transformer::CudaDenseLinearProvider::new(runtime)?),
         Box::new(transformer::CudaDenseSwiGluProvider::new(runtime)?),
@@ -278,8 +286,197 @@ impl OperationProvider<CudaDeviceRuntime> for CudaTokenEmbeddingProvider {
     ) -> Result<CudaDeviceCommand, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
         encode_token_embedding(&self.function, invocation)
-            .map_err(|message| provider_failure(identity, message))
+            .map_err(|message| provider_failure(identity, "cuda.token_embedding.encode", message))
     }
+}
+
+pub struct CudaLastTokenDenseLinearProvider {
+    descriptor: OperationProviderDescriptor,
+}
+
+impl CudaLastTokenDenseLinearProvider {
+    pub fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        let contract = last_token_dense_linear_contract().map_err(contract_error)?;
+        let descriptor = transformer::provider_descriptor(
+            runtime,
+            &contract,
+            LAST_TOKEN_DENSE_LINEAR_PROVIDER_ID,
+            LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
+            LAST_TOKEN_DENSE_LINEAR_ESTIMATOR_ID,
+            transformer::contiguous_bindings(2),
+            implementation_fingerprint(&[
+                include_str!("vnext_ops.rs").as_bytes(),
+                LAST_TOKEN_DENSE_LINEAR_PROVIDER_ID.as_bytes(),
+            ]),
+        )?;
+        Ok(Self { descriptor })
+    }
+}
+
+impl OperationResourceEstimator for CudaLastTokenDenseLinearProvider {
+    fn descriptor(&self) -> &OperationProviderDescriptor {
+        &self.descriptor
+    }
+
+    fn estimate_resources(
+        &self,
+        request: OperationResourceEstimateRequest<'_>,
+    ) -> Result<OperationResourceEstimate, VNextError> {
+        transformer::ensure_estimator_request(
+            &self.descriptor,
+            &request,
+            LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+        )?;
+        Ok(transformer::estimate(
+            &self.descriptor,
+            request.input_fingerprint(),
+            None,
+        ))
+    }
+}
+
+impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
+    fn encode_selected(
+        &self,
+        invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<CudaDeviceCommand, OperationFailure> {
+        let identity = invocation.participants()[0].identity().clone();
+        encode_last_token_dense_linear(invocation).map_err(|message| {
+            provider_failure(identity, "cuda.last_token_dense_linear.encode", message)
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LastTokenDenseLinearLaunch {
+    input_region: usize,
+    output_region: usize,
+}
+
+fn encode_last_token_dense_linear(
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<CudaDeviceCommand, String> {
+    if invocation.operation().id.as_str() != LAST_TOKEN_DENSE_LINEAR_OPERATION_ID
+        || invocation.participants().is_empty()
+    {
+        return Err("CUDA last-token dense-linear received another or empty operation".to_owned());
+    }
+    let token_ranges = invocation.participant_token_ranges();
+    if token_ranges.len() != invocation.participants().len() {
+        return Err("CUDA last-token dense-linear participant ranges are incomplete".to_owned());
+    }
+    let first = &invocation.participants()[0];
+    let hidden_size = unsigned_attribute(first.attributes(), "hidden_size")?;
+    let out_features = unsigned_attribute(first.attributes(), "out_features")?;
+    let input_shared = transformer::token_binding_is_shared(
+        &invocation,
+        ResolvedValueRole::Input,
+        0,
+        ElementType::F16,
+    )?;
+    let mut regions = vec![transformer::shared_full_region(
+        &invocation,
+        ResolvedValueRole::Input,
+        1,
+        ElementType::F16,
+    )?];
+    let mut launches = Vec::with_capacity(invocation.participants().len());
+    for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
+        let input = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
+        let participant_weight = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
+        let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
+        if unsigned_attribute(participant.attributes(), "hidden_size")? != hidden_size
+            || unsigned_attribute(participant.attributes(), "out_features")? != out_features
+        {
+            return Err("CUDA last-token dense-linear participant attributes disagree".to_owned());
+        }
+        validate_last_token_dense_linear_signature(
+            input,
+            participant_weight,
+            output,
+            hidden_size,
+            out_features,
+        )?;
+        let source_range = token_range.source_token_range();
+        let packed_range = token_range.immediate_token_range();
+        let selected_range = if input_shared {
+            packed_range
+        } else {
+            source_range
+        };
+        if selected_range.is_empty() {
+            return Err("CUDA last-token dense-linear cannot select from an empty span".to_owned());
+        }
+        let last_token = selected_range.end - 1;
+        let input_region = regions.len();
+        let source = contiguous_token_region(participant, input, ElementType::F16, last_token, 1)?;
+        regions.push(source);
+        let output_region = regions.len();
+        let destination = contiguous_region(participant, output, ElementType::F16)?;
+        regions.push(destination);
+        launches.push(LastTokenDenseLinearLaunch {
+            input_region,
+            output_region,
+        });
+    }
+
+    let rows = 1_i32;
+    let hidden_size = i32::try_from(hidden_size)
+        .map_err(|_| "last-token dense-linear hidden size exceeds i32".to_owned())?;
+    let out_features = i32::try_from(out_features)
+        .map_err(|_| "last-token dense-linear output width exceeds i32".to_owned())?;
+    CudaDeviceCommand::operation_with_blas(
+        "vnext_last_token_dense_linear",
+        regions,
+        move |_stream, blas, regions| {
+            let weight = regions[0].device_ptr();
+            for launch in launches {
+                transformer::launch_gemm_f16(
+                    blas,
+                    regions[launch.input_region].device_ptr(),
+                    weight,
+                    regions[launch.output_region].device_ptr(),
+                    rows,
+                    out_features,
+                    hidden_size,
+                    "vNext last-token dense-linear GEMM",
+                )?;
+            }
+            Ok(())
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn validate_last_token_dense_linear_signature(
+    input: &ResolvedValueBinding,
+    weight: &ResolvedValueBinding,
+    output: &ResolvedValueBinding,
+    hidden_size: u64,
+    out_features: u64,
+) -> Result<(), String> {
+    let contiguous = |binding: &ResolvedValueBinding| {
+        matches!(binding.tensor().layout(), ResolvedTensorLayout::Contiguous)
+    };
+    let input_dimensions = input.tensor().dimensions();
+    if input.tensor().element_type() != ElementType::F16
+        || weight.tensor().element_type() != ElementType::F16
+        || output.tensor().element_type() != ElementType::F16
+        || input_dimensions.len() != 2
+        || input_dimensions[0] == 0
+        || input_dimensions[1] != hidden_size
+        || weight.tensor().dimensions() != [out_features, hidden_size]
+        || output.tensor().dimensions() != [1, out_features]
+        || !contiguous(input)
+        || !contiguous(weight)
+        || !contiguous(output)
+    {
+        return Err(
+            "CUDA last-token dense-linear invocation differs from its resolved signature"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -600,17 +797,12 @@ fn contiguous_bindings() -> Vec<ProviderStorageBindingRequirement> {
 
 fn provider_failure(
     identity: ferrum_interfaces::vnext::ExecutionIdentityEnvelope,
+    stage: &'static str,
     message: String,
 ) -> OperationFailure {
     let message = message.chars().take(2048).collect::<String>();
-    OperationFailure::new(
-        identity,
-        ProfilePhase::Forward,
-        "cuda.token_embedding.encode",
-        message,
-        false,
-    )
-    .expect("core-issued CUDA operation identity must form a valid provider failure")
+    OperationFailure::new(identity, ProfilePhase::Forward, stage, message, false)
+        .expect("core-issued CUDA operation identity must form a valid provider failure")
 }
 
 fn implementation_fingerprint(parts: &[&[u8]]) -> String {

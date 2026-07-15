@@ -17,8 +17,8 @@ use ferrum_interfaces::vnext::{
     SpecialTokenMetadata, SpecialTokenRole, StateCapacityDemand, StateId, StateLifetime, StateSpec,
     TemplateMetadata, TypedFamilyRegistration, VNextError, WeightComponentRole,
     WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
-    WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_LINEAR_OPERATION_ID,
-    DENSE_SWIGLU_OPERATION_ID, GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
+    WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
     RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
 use ferrum_quantization::SafetensorsArchive;
@@ -340,7 +340,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             }
         }
 
-        let mut nodes = Vec::with_capacity(text.num_hidden_layers * 2 + 2);
+        let mut nodes = Vec::with_capacity(text.num_hidden_layers * 4 + 3);
         let embedding = required_weight(config, None, "embed_tokens")?;
         let mut hidden = value_id("value.hidden.embedding")?;
         nodes.push(ProgramNode {
@@ -606,13 +606,13 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         let logits = value_id("value.output.logits")?;
         nodes.push(ProgramNode {
             id: node_id("node.logits")?,
-            operation_id: operation_id(DENSE_LINEAR_OPERATION_ID)?,
+            operation_id: operation_id(LAST_TOKEN_DENSE_LINEAR_OPERATION_ID)?,
             required_version: ContractVersion::new(1, 0),
             work: ProgramNodeWorkSpec::tokens(final_hidden.clone(), 0),
             inputs: vec![final_hidden, weight_value_id(projection)?],
             outputs: vec![logits.clone()],
             attributes: BTreeMap::from([
-                attribute("in_features", text.hidden_size as u64)?,
+                attribute("hidden_size", text.hidden_size as u64)?,
                 attribute("out_features", config.vocab_size)?,
             ]),
         });
@@ -1343,6 +1343,13 @@ mod tests {
                 .filter(|operation| **operation == DENSE_SWIGLU_OPERATION_ID)
                 .count(),
             4
+        );
+        assert_eq!(
+            operation_ids
+                .iter()
+                .filter(|operation| **operation == LAST_TOKEN_DENSE_LINEAR_OPERATION_ID)
+                .count(),
+            1
         );
         assert!(prepared.program().blocks()[0]
             .nodes
