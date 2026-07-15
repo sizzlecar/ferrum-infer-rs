@@ -5,9 +5,9 @@ use std::ops::Range;
 
 use super::{
     AliasPolicy, AttributeId, BlockedTensorPadding, BufferRequest, BufferUsage, CapabilityCatalog,
-    CapabilityId, ContractVersion, DeviceId, DimensionConstraint, DynamicStorageAllocator,
-    DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView, ElementType,
-    ModelFamilyId, NodeId, OperationDescriptor, OperationId, OperationPlanningHandle,
+    CapabilityId, ContractVersion, DeviceDescriptor, DeviceId, DimensionConstraint,
+    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
+    ElementType, ModelFamilyId, NodeId, OperationDescriptor, OperationId, OperationPlanningHandle,
     OperationPlanningRegistry, OperationProviderDescriptor, OperationRegistryAuthority,
     OperationResourceEstimate, OperationResourceEstimateRequest, PlanId, PreparedModelFamily,
     ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId,

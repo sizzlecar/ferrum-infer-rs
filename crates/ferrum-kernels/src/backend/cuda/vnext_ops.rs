@@ -1,20 +1,22 @@
 //! CUDA providers for backend-neutral vNext operation contracts.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, dense_linear_contract, dense_swiglu_contract,
     gated_delta_recurrent_attention_contract, residual_add_contract, rms_norm_contract,
-    token_embedding_contract, AttributeId, BatchedOperationInvocation, CapabilityId,
-    ContractVersion, DeviceId, DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile,
-    DynamicStorageRequirement, DynamicStorageView, ElementType, OperationContract,
-    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    OperationRuntimeRegistry, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
-    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError,
-    WeightFormatId, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
+    token_embedding_contract, AttributeId, BatchedOperationInvocation, CapabilityCatalog,
+    CapabilityId, ContractVersion, DeviceId, DeviceRuntime, DynamicStorageAllocator,
+    DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView, ElementType,
+    EngineProviderDescriptor, OperationContract, OperationFailure, OperationInvocation,
+    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, OperationRuntimeRegistry,
+    ProfilePhase, ProviderId, ProviderStorageBindingRequirement, ResolvedTensorLayout,
+    ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
+    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
     DENSE_SWIGLU_F16_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     RESIDUAL_ADD_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
     TOKEN_EMBEDDING_OPERATION_ID,
@@ -30,6 +32,7 @@ mod transformer;
 
 const TOKEN_EMBEDDING_PROVIDER_ID: &str = "provider.cuda.token_embedding.f16";
 const TOKEN_EMBEDDING_ESTIMATOR_ID: &str = "resource-estimator.cuda.token_embedding.f16";
+const CUDA_ENGINE_PROVIDER_ID: &str = "provider.engine.cuda.vnext";
 const DENSE_SAFETENSORS_FORMAT_ID: &str = "weight-format.safetensors.dense";
 const EMBEDDING_FUNCTION_NAME: &str = "vnext_embedding_lookup_f16";
 const VALUE_ALIGNMENT_BYTES: u64 = 16;
@@ -118,6 +121,65 @@ pub fn cuda_vnext_operation_registry(
         Box::new(transformer::CudaCausalPagedAttentionProvider::new(runtime)?),
     ];
     OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
+}
+
+/// One CUDA composition root shared by planning, provisioning, and dispatch.
+/// The capability catalog is derived from the retained registry objects rather
+/// than reconstructed from a second descriptor list.
+pub struct CudaVNextComposition {
+    runtime: Arc<CudaDeviceRuntime>,
+    registry: OperationRuntimeRegistry<CudaDeviceRuntime>,
+    catalog: CapabilityCatalog,
+}
+
+impl CudaVNextComposition {
+    pub fn create(ordinal: usize, device_id: DeviceId) -> Result<Self, CudaDeviceRuntimeError> {
+        let config = cuda_vnext_runtime_config(ordinal, device_id).map_err(contract_error)?;
+        let runtime = Arc::new(CudaDeviceRuntime::new(config)?);
+        let registry = cuda_vnext_operation_registry(&runtime)?;
+        let engine = EngineProviderDescriptor::new(
+            ProviderId::new(CUDA_ENGINE_PROVIDER_ID).map_err(contract_error)?,
+            ContractVersion::new(1, 0),
+            implementation_fingerprint(&[
+                include_str!("vnext_ops.rs").as_bytes(),
+                include_str!("vnext_runtime.rs").as_bytes(),
+                CUDA_ENGINE_PROVIDER_ID.as_bytes(),
+            ]),
+            runtime.descriptor().id.clone(),
+            runtime.descriptor().capabilities.clone(),
+        )
+        .map_err(contract_error)?;
+        let catalog = registry
+            .capability_catalog(runtime.descriptor().clone(), vec![engine])
+            .map_err(contract_error)?;
+        Ok(Self {
+            runtime,
+            registry,
+            catalog,
+        })
+    }
+
+    pub fn runtime(&self) -> &Arc<CudaDeviceRuntime> {
+        &self.runtime
+    }
+
+    pub fn registry(&self) -> &OperationRuntimeRegistry<CudaDeviceRuntime> {
+        &self.registry
+    }
+
+    pub fn catalog(&self) -> &CapabilityCatalog {
+        &self.catalog
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Arc<CudaDeviceRuntime>,
+        OperationRuntimeRegistry<CudaDeviceRuntime>,
+        CapabilityCatalog,
+    ) {
+        (self.runtime, self.registry, self.catalog)
+    }
 }
 
 pub struct CudaTokenEmbeddingProvider {
