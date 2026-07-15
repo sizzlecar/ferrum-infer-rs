@@ -6,6 +6,19 @@ fn chunked_token_span() -> TokenSpanWork {
     TokenSpanWork::from_token_ids(&[10, 11, 12, 13], 2..3).unwrap()
 }
 
+#[test]
+fn token_work_separates_current_backing_from_request_fit_ceiling() {
+    let span = TokenSpanWork::from_token_ids_with_fit(&[10, 11, 12], 2..3, 128).unwrap();
+    assert_eq!(span.immediate_tokens(), 1);
+    assert_eq!(span.full_input_tokens(), 3);
+    assert_eq!(span.fit_input_tokens(), 128);
+
+    let shape = ResourceWorkShape::single(span).unwrap();
+    assert_eq!(shape.immediate_tokens(), 1);
+    assert_eq!(shape.fit_tokens(), 128);
+    assert!(TokenSpanWork::from_token_ids_with_fit(&[10, 11, 12], 2..3, 2).is_err());
+}
+
 fn admit_batch_step(
     plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
     batch: &ExecutionBatchParticipants<TestRuntime>,

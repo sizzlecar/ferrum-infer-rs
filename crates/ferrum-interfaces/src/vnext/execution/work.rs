@@ -55,6 +55,7 @@ impl DynamicResourceShape {
 pub struct TokenSpanWork {
     pub(super) immediate_tokens: u64,
     pub(super) full_input_tokens: u64,
+    pub(super) fit_input_tokens: u64,
     pub(super) immediate_start_token: u64,
     pub(super) immediate_end_token: u64,
     pub(super) fingerprint: String,
@@ -65,25 +66,40 @@ impl TokenSpanWork {
         full_input: &[u32],
         immediate_range: Range<usize>,
     ) -> Result<Self, VNextError> {
+        Self::from_token_ids_with_fit(full_input, immediate_range, full_input.len())
+    }
+
+    /// Binds exact token evidence to a larger request fit ceiling. The fit
+    /// ceiling participates in logical admission only; current backing and
+    /// provider execution remain derived from the real token slice.
+    pub fn from_token_ids_with_fit(
+        full_input: &[u32],
+        immediate_range: Range<usize>,
+        fit_input_tokens: usize,
+    ) -> Result<Self, VNextError> {
         if full_input.is_empty()
             || immediate_range.start >= immediate_range.end
             || immediate_range.end > full_input.len()
+            || fit_input_tokens < full_input.len()
         {
             return Err(invalid_plan(
-                "token work requires a non-empty in-bounds immediate span",
+                "token work requires a non-empty in-bounds immediate span and a non-regressing fit ceiling",
             ));
         }
         let immediate_tokens = u64::try_from(immediate_range.len())
             .map_err(|_| invalid_plan("immediate token span exceeds u64"))?;
         let full_input_tokens = u64::try_from(full_input.len())
             .map_err(|_| invalid_plan("full token input exceeds u64"))?;
+        let fit_input_tokens = u64::try_from(fit_input_tokens)
+            .map_err(|_| invalid_plan("fit token input exceeds u64"))?;
         let immediate_start_token = u64::try_from(immediate_range.start)
             .map_err(|_| invalid_plan("token span start exceeds u64"))?;
         let immediate_end_token = u64::try_from(immediate_range.end)
             .map_err(|_| invalid_plan("token span end exceeds u64"))?;
         let mut digest = Sha256::new();
-        digest.update(b"ferrum.runtime-vnext.token-span-work.v2\0");
+        digest.update(b"ferrum.runtime-vnext.token-span-work.v3\0");
         digest.update(full_input_tokens.to_le_bytes());
+        digest.update(fit_input_tokens.to_le_bytes());
         digest.update(immediate_start_token.to_le_bytes());
         digest.update(immediate_end_token.to_le_bytes());
         for token in full_input {
@@ -92,6 +108,7 @@ impl TokenSpanWork {
         Ok(Self {
             immediate_tokens,
             full_input_tokens,
+            fit_input_tokens,
             immediate_start_token,
             immediate_end_token,
             fingerprint: format!("{:x}", digest.finalize()),
@@ -104,6 +121,10 @@ impl TokenSpanWork {
 
     pub const fn full_input_tokens(&self) -> u64 {
         self.full_input_tokens
+    }
+
+    pub const fn fit_input_tokens(&self) -> u64 {
+        self.fit_input_tokens
     }
 
     pub fn immediate_token_range(&self) -> Range<u64> {
@@ -179,8 +200,8 @@ impl ResourceWorkShape {
         })?;
         let fit_tokens = token_spans.iter().try_fold(0_u64, |total, span| {
             total
-                .checked_add(span.full_input_tokens())
-                .ok_or_else(|| invalid_plan("resource work full-input tokens overflow u64"))
+                .checked_add(span.fit_input_tokens())
+                .ok_or_else(|| invalid_plan("resource work fit-input tokens overflow u64"))
         })?;
         let pages = committed_pages.iter().try_fold(0_u64, |total, page_work| {
             total
