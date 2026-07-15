@@ -1579,6 +1579,39 @@ mod tests {
             .unwrap();
         let contract = gated_delta_recurrent_attention_contract().unwrap();
         let descriptor = contract.descriptor();
+        let text = Qwen35TextConfig::from_hf_config_value(&config.hf_config).unwrap();
+        let conv_channels = (text.linear_qk_total_dim() * 2 + text.linear_value_total_dim()) as u64;
+        let conv_component = prepared
+            .weight_schema()
+            .components
+            .iter()
+            .find(|component| component.external_names[0].contains("layers.0.linear_attn.conv1d"))
+            .unwrap();
+        assert_eq!(conv_component.dimensions, [conv_channels, 1, 4]);
+        let conv_tensor = prepared
+            .weight_schema()
+            .tensors
+            .iter()
+            .find(|tensor| match &tensor.physical_layout {
+                PhysicalWeightLayout::Stored { component } => {
+                    component.component_id == conv_component.id
+                }
+                _ => false,
+            })
+            .unwrap();
+        assert_eq!(conv_tensor.dimensions, [conv_channels, 4]);
+        assert!(matches!(
+            &conv_tensor.physical_layout,
+            PhysicalWeightLayout::Stored {
+                component: PhysicalWeightComponentBinding {
+                    storage: PhysicalStorageLayout::Strided {
+                        strides_in_elements,
+                        padding: PhysicalWeightPadding::Exact,
+                    },
+                    ..
+                }
+            } if strides_in_elements == &[4, 1]
+        ));
         let known_tensors = program
             .weights()
             .iter()
