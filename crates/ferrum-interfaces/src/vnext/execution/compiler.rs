@@ -947,11 +947,15 @@ mod tests {
         )
         .unwrap();
         let mut symbols = TensorSymbols::default();
+        let value_id = ProgramValueId::new("value.symbol-domains").unwrap();
         unify_tensor(
             &contract,
             &tensor,
             &mut symbols,
             &NodeId::new("node.symbol-domains").unwrap(),
+            "input",
+            0,
+            &value_id,
         )
         .unwrap();
         assert_eq!(symbols.dimensions.get("shared"), Some(&4));
