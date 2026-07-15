@@ -474,7 +474,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                     });
                     (
                         CAUSAL_PAGED_ATTENTION_OPERATION_ID,
-                        ContractVersion::new(1, 0),
+                        ContractVersion::new(2, 0),
                         BTreeMap::from([
                             attribute("query_heads", text.num_attention_heads as u64)?,
                             attribute("key_value_heads", text.num_key_value_heads as u64)?,
@@ -490,6 +490,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                             )?,
                             attribute("kv_features", text.full_attention_kv_total_dim() as u64)?,
                             attribute("rope_dim", text.full_attention_rope_dim() as u64)?,
+                            attribute("maximum_context_tokens", config.max_position_embeddings)?,
                             attribute(
                                 "rope_theta",
                                 canonical_positive_f64(text.rope_parameters.rope_theta)?,
@@ -1390,7 +1391,13 @@ mod tests {
             .iter()
             .map(|value| value.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(full_attention.required_version, ContractVersion::new(1, 0));
+        assert_eq!(full_attention.required_version, ContractVersion::new(2, 0));
+        assert_eq!(
+            full_attention
+                .attributes
+                .get(&AttributeId::new("maximum_context_tokens").unwrap()),
+            Some(&SemanticValue::Unsigned(config.max_position_embeddings))
+        );
         for (ordinal, role) in [
             "input_layernorm",
             "self_attn_q",

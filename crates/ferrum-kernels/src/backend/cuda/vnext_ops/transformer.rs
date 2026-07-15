@@ -35,8 +35,10 @@ use super::{
 };
 
 mod attention;
+mod causal_attention;
 
 pub(super) use attention::CudaGatedDeltaRecurrentAttentionProvider;
+pub(super) use causal_attention::CudaCausalPagedAttentionProvider;
 
 const RMS_NORM_PROVIDER_ID: &str = "provider.cuda.rms_norm.f16";
 const RMS_NORM_ESTIMATOR_ID: &str = "resource-estimator.cuda.rms_norm.f16";
@@ -989,7 +991,7 @@ fn shared_token_region(
     Ok(region)
 }
 
-fn token_binding_is_shared(
+pub(super) fn token_binding_is_shared(
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     role: ResolvedValueRole,
     ordinal: u32,
@@ -1018,7 +1020,7 @@ fn token_binding_is_shared(
     Ok(true)
 }
 
-fn shared_full_region(
+pub(super) fn shared_full_region(
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     role: ResolvedValueRole,
     ordinal: u32,
@@ -1045,7 +1047,7 @@ fn shared_full_region(
     Ok(region)
 }
 
-fn shared_scratch_region(
+pub(super) fn shared_scratch_region(
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     required_bytes: u64,
 ) -> Result<CudaBufferRegion, String> {
