@@ -4,7 +4,7 @@ use vnext_event_contract::*;
 
 #[test]
 fn vnext_event_sink_contract() {
-    const EXPECTED_CASES: usize = 14;
+    const EXPECTED_CASES: usize = 16;
     let mut passed = 0_usize;
     let runtime_catalog = catalog();
     let operation_registry = make_operation_registry(&runtime_catalog);
@@ -44,6 +44,15 @@ fn vnext_event_sink_contract() {
     );
 
     let sink = RecordingSink::default();
+    check(
+        &mut passed,
+        sink.capture_policy() == ExecutionEventCapturePolicy::AllFrames,
+    );
+    check(
+        &mut passed,
+        ExecutionEventCapturePolicy::FirstFramePerRequest.captures_frame(0)
+            && !ExecutionEventCapturePolicy::FirstFramePerRequest.captures_frame(1),
+    );
     let mut emitter =
         ExecutionEventEmitter::new(&sink, active.run_id().clone(), active.request_id().clone());
     emitter

@@ -49,8 +49,35 @@ impl<'event> EventEmissionPermit<'event> {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExecutionEventCapturePolicy {
+    #[default]
+    AllFrames,
+    FirstFramePerRequest,
+}
+
+impl ExecutionEventCapturePolicy {
+    pub const fn captures_frame(self, completed_frames: u64) -> bool {
+        match self {
+            Self::AllFrames => true,
+            Self::FirstFramePerRequest => completed_frames == 0,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AllFrames => "all_frames",
+            Self::FirstFramePerRequest => "first_frame_per_request",
+        }
+    }
+}
+
 pub trait ExecutionEventSink: Send + Sync {
     fn is_enabled(&self, kind: ExecutionEventKind) -> bool;
+
+    fn capture_policy(&self) -> ExecutionEventCapturePolicy {
+        ExecutionEventCapturePolicy::AllFrames
+    }
 
     fn record(
         &self,

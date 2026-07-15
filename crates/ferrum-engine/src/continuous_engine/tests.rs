@@ -2368,6 +2368,11 @@ fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
     let file = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
     let config = EngineConfig::default();
     let sink = VNextProfileExecutionEventSink::new(file, ProfileEntrypoint::Run, &config);
+    assert_eq!(
+        sink.capture_policy(),
+        ExecutionEventCapturePolicy::FirstFramePerRequest
+    );
+    assert_eq!(sink.capture_policy().as_str(), "first_frame_per_request");
     let run_id = RunId::new("run.vnext.engine-profile-test").unwrap();
     let request_id = RequestIdentity::new("request.vnext.engine-profile-test").unwrap();
     let event = ExecutionEvent::new(
@@ -2429,6 +2434,10 @@ fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
     assert_eq!(
         profile.attributes.get("execution_trace_source"),
         Some(&serde_json::json!("vnext"))
+    );
+    assert_eq!(
+        profile.attributes.get("execution_capture_policy"),
+        Some(&serde_json::json!("first_frame_per_request"))
     );
 
     let _ = std::fs::remove_file(trace_path);
