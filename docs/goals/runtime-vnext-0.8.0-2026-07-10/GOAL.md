@@ -555,6 +555,29 @@ FERRUM GATE vnext-s1-cuda PASS: <out_dir>
 G01、full G06、完整模型迁移或发布完成。S1 仍须由 G01B 中的共享动态 admission/backpressure 和
 零 legacy runtime fallback 证据闭环。
 
+S1 的共享动态 admission/backpressure 使用独立的有界 CUDA capacity-pressure lane，避免为一次
+容量语义诊断重跑 ABBA/BAAB 性能 sweep：
+
+```text
+python3 scripts/release/runtime_vnext_s1_cuda_capacity.py collect \
+  --binary target/release/ferrum --model <qwen35-4b-model-dir> --out <raw-out>
+python3 scripts/release/run_gate.py vnext-s1-cuda-capacity \
+  --s1-artifact <raw-out> --out <external-out>
+```
+
+collector 必须先在同一 clean SHA/binary 上通过真实 `ferrum run`，再用 `serve` 校准 A+C 的已安装
+backing 并通过 typed `--runtime-memory-budget-bytes` 重放精确预算。压力序列固定为 A active、B 先到
+但 `WaitForRelease`、C 后到且先完成；B 在 unchanged epoch 下 probe/submit 增量为 `0`，A 在等待窗
+继续 decode，release epoch 前进后 B admission/submit/completion。stream 必须各有且仅有一个
+`[DONE]` 和 usage，最终 active/queued/pending/maintenance 均为 `0`。精确 PASS 行为：
+
+```text
+FERRUM RUNTIME VNEXT S1 CUDA CAPACITY PRESSURE PASS: <out_dir>
+FERRUM GATE vnext-s1-cuda-capacity PASS: <out_dir>
+```
+
+该 lane 只证明当前 SHA 的 Qwen3.5-4B CUDA 容量压力纵切，不单独证明 G01B、S1、性能或发布完成。
+
 ## 12. 分支、提交和停止规则
 
 - 每个子 Goal 使用小而可审阅的提交；核心 contract、kernel 优化、release gate 大改不得混在
