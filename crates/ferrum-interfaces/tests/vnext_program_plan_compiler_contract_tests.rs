@@ -68,6 +68,30 @@ fn compilation_rejects_missing_or_guessed_product_input_capacity() {
 }
 
 #[test]
+fn compilation_reports_the_exact_tensor_binding_on_signature_mismatch() {
+    let family = TestRegistry::new().prepare();
+    let catalog = catalog();
+    let policy = policy(4096);
+    let registry = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::Correct);
+    let planning = registry.planning();
+    let options = ProgramPlanCompileOptions::new(BTreeMap::from([(
+        id("value.input"),
+        ProgramTensorSpec {
+            dimensions: vec![4],
+            element_type: ElementType::U32,
+            layout: ResolvedTensorLayout::Contiguous,
+        },
+    )]))
+    .unwrap();
+
+    let error =
+        ProgramPlanCompiler::compile(&family, &catalog, &policy, &planning, &options).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("input[0] `value.input`"), "{message}");
+    assert!(message.contains("dtype=U32"), "{message}");
+}
+
+#[test]
 fn weight_arena_reaches_provider_alignment_fixed_point() {
     let family = TestRegistry::new().prepare();
     let catalog = catalog();
