@@ -262,7 +262,7 @@ pub fn residual_add_contract() -> Result<StandardOperationContract, VNextError> 
 pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
         id: OperationId::new(GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID)?,
-        version: ContractVersion::new(1, 0),
+        version: ContractVersion::new(2, 0),
         inputs: vec![
             contiguous_tensor(
                 token_hidden_dimensions(),
@@ -301,17 +301,17 @@ pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationCon
             )?,
             contiguous_tensor(
                 vec![symbol("value_heads")],
-                [ElementType::F16],
+                [ElementType::F32],
                 TensorAccess::Read,
             )?,
             contiguous_tensor(
                 vec![symbol("value_heads")],
-                [ElementType::F16],
+                [ElementType::F32],
                 TensorAccess::Read,
             )?,
             contiguous_tensor(
                 vec![symbol("value_head_dim")],
-                [ElementType::F16],
+                [ElementType::F32],
                 TensorAccess::Read,
             )?,
             contiguous_tensor(
@@ -675,6 +675,13 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(linear.descriptor().inputs.len(), 13);
+        assert_eq!(linear.descriptor().version, ContractVersion::new(2, 0));
+        for ordinal in [7, 8, 9] {
+            assert_eq!(
+                linear.descriptor().inputs[ordinal].element_types(),
+                &BTreeSet::from([ElementType::F32])
+            );
+        }
         assert_eq!(
             linear.descriptor().inputs[11].access(),
             TensorAccess::ReadWrite
