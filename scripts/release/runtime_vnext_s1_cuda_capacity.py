@@ -17,12 +17,22 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 PASS_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA CAPACITY PRESSURE PASS"
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+MAX_PRESSURE_NO_PROGRESS_SECONDS = 30.0
+MAX_PRESSURE_UNCHANGED_SKIPS = 512
+MAX_PRESSURE_TRACE_BYTES = 16 * 1024 * 1024
+MAX_PRESSURE_JOINT_STREAM_SECONDS = 300.0
+PRESSURE_STOP_POLICY = {
+    "no_progress_timeout_seconds": MAX_PRESSURE_NO_PROGRESS_SECONDS,
+    "max_unchanged_epoch_skips": MAX_PRESSURE_UNCHANGED_SKIPS,
+    "max_pressure_trace_bytes": MAX_PRESSURE_TRACE_BYTES,
+    "joint_stream_timeout_seconds": MAX_PRESSURE_JOINT_STREAM_SECONDS,
+}
 FORBIDDEN_PATTERNS = (
     "panic",
     "panicked",
@@ -42,6 +52,71 @@ class CapacityGateError(RuntimeError):
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise CapacityGateError(message)
+
+
+def bounded_remaining_timeout(
+    *,
+    deadline_monotonic: float,
+    requested_timeout: float,
+    now_monotonic: float,
+    label: str,
+) -> float:
+    require(requested_timeout > 0, f"{label} timeout must be positive")
+    remaining = deadline_monotonic - now_monotonic
+    require(remaining > 0, f"{label} exceeded the joint pressure lifecycle timeout")
+    return min(requested_timeout, remaining)
+
+
+def max_stream_silence_seconds(
+    result: dict[str, Any],
+    content_wall_ns: list[int],
+    *,
+    monitored_from_wall_ns: int,
+) -> float:
+    started_wall_ns = result.get("started_wall_ns")
+    finished_wall_ns = result.get("finished_wall_ns")
+    require(
+        isinstance(started_wall_ns, int) and started_wall_ns > 0,
+        "stream result has no start timestamp",
+    )
+    require(
+        isinstance(finished_wall_ns, int) and finished_wall_ns >= started_wall_ns,
+        "stream result has no valid finish timestamp",
+    )
+    require(monitored_from_wall_ns > 0, "stream monitor has no start timestamp")
+    interval_start = max(started_wall_ns, monitored_from_wall_ns)
+    if finished_wall_ns <= interval_start:
+        return 0.0
+    progress_points = sorted(
+        wall_ns
+        for wall_ns in content_wall_ns
+        if interval_start <= wall_ns <= finished_wall_ns
+    )
+    boundaries = [interval_start, *progress_points, finished_wall_ns]
+    return max(
+        (right - left) / 1_000_000_000
+        for left, right in zip(boundaries, boundaries[1:])
+    )
+
+
+def read_stream_content_times(path: Path) -> list[int]:
+    require(path.is_file(), f"missing stream event file: {path}")
+    content_times: list[int] = []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise CapacityGateError(f"invalid stream event JSON {path}: {error}") from error
+        if isinstance(row, dict) and row.get("kind") == "content":
+            wall_ns = row.get("wall_ns")
+            require(
+                isinstance(wall_ns, int) and wall_ns > 0,
+                f"stream content event has no timestamp: {path}",
+            )
+            content_times.append(wall_ns)
+    return content_times
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -226,6 +301,131 @@ def read_trace(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def trace_bytes_at_or_after(path: Path, started_wall_ns: int) -> int:
+    require(path.is_file(), f"missing trace file: {path}")
+    require(started_wall_ns > 0, "pressure trace boundary has no wall timestamp")
+    total_bytes = path.stat().st_size
+    offset = 0
+    with path.open("rb") as handle:
+        for raw in handle:
+            try:
+                row = json.loads(raw.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                offset += len(raw)
+                continue
+            if (
+                isinstance(row, dict)
+                and isinstance(row.get("ts_unix_nanos"), int)
+                and row["ts_unix_nanos"] >= started_wall_ns
+            ):
+                return total_bytes - offset
+            offset += len(raw)
+    return 0
+
+
+class PressureStopGuard:
+    def __init__(
+        self,
+        *,
+        initial_progress: dict[str, int],
+        started_monotonic: float,
+        no_progress_timeout: float,
+        max_unchanged_skips: int,
+        max_trace_bytes: int,
+    ) -> None:
+        self.last_progress = dict(initial_progress)
+        self.last_progress_monotonic_by_role = {
+            role: started_monotonic for role in initial_progress
+        }
+        self.max_stall_seconds_by_role = {role: 0.0 for role in initial_progress}
+        self.no_progress_timeout = no_progress_timeout
+        self.max_unchanged_skips = max_unchanged_skips
+        self.max_trace_bytes = max_trace_bytes
+
+    def observe(
+        self,
+        *,
+        progress: dict[str, int],
+        unchanged_skips: int,
+        trace_bytes: int,
+        now_monotonic: float,
+        active_roles: set[str],
+    ) -> None:
+        require(
+            unchanged_skips <= self.max_unchanged_skips,
+            "unchanged-epoch skip limit exceeded: "
+            f"{unchanged_skips} > {self.max_unchanged_skips}",
+        )
+        require(
+            trace_bytes <= self.max_trace_bytes,
+            f"pressure trace byte limit exceeded: {trace_bytes} > {self.max_trace_bytes}",
+        )
+        require(set(progress) == set(self.last_progress), "stream progress roles changed")
+        require(active_roles.issubset(progress), "active stream role has no progress counter")
+        for role, content_chunks in progress.items():
+            require(
+                content_chunks >= self.last_progress[role],
+                f"stream token progress moved backwards for role {role}",
+            )
+            if content_chunks > self.last_progress[role]:
+                self.last_progress[role] = content_chunks
+                self.last_progress_monotonic_by_role[role] = now_monotonic
+            if role in active_roles:
+                stalled_seconds = (
+                    now_monotonic - self.last_progress_monotonic_by_role[role]
+                )
+                self.max_stall_seconds_by_role[role] = max(
+                    self.max_stall_seconds_by_role[role], stalled_seconds
+                )
+                require(
+                    stalled_seconds < self.no_progress_timeout,
+                    "stream token progress timeout exceeded for role "
+                    f"{role}: {stalled_seconds:.3f}s >= "
+                    f"{self.no_progress_timeout:.3f}s",
+                )
+
+
+class IncrementalTracePhaseCounter:
+    def __init__(self, path: Path, *, phase: str, request_id: str) -> None:
+        self.path = path
+        self.phase = phase
+        self.request_id = request_id
+        self.offset = 0
+        self.partial = b""
+        self.count = 0
+
+    def poll(self) -> int:
+        if not self.path.is_file():
+            return self.count
+        size = self.path.stat().st_size
+        if size < self.offset:
+            self.offset = 0
+            self.partial = b""
+            self.count = 0
+        with self.path.open("rb") as handle:
+            handle.seek(self.offset)
+            appended = handle.read()
+        self.offset += len(appended)
+        if not appended:
+            return self.count
+        rows = (self.partial + appended).split(b"\n")
+        self.partial = rows.pop()
+        for raw in rows:
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(raw.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(row, dict)
+                and row.get("phase") == self.phase
+                and request_identity_matches(row.get("request_id"), self.request_id)
+            ):
+                self.count += 1
+        return self.count
+
+
 def request_identity_matches(observed: Any, request_id: str) -> bool:
     return observed == request_id or observed == f"request.product.{request_id}"
 
@@ -326,6 +526,7 @@ def stream_request(
     out_dir: Path,
     first_content: threading.Event,
     timeout: float,
+    on_content: Callable[[int], None] | None = None,
 ) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     started_wall_ns = time.time_ns()
@@ -421,6 +622,8 @@ def stream_request(
                             content += delta["content"]
                 if content:
                     result["content_chunks"] += 1
+                    if on_content is not None:
+                        on_content(now_ns)
                     if result["first_content_wall_ns"] is None:
                         result["first_content_wall_ns"] = now_ns
                         first_content.set()
@@ -460,6 +663,8 @@ class StreamTask:
     ) -> None:
         self.first_content = threading.Event()
         self.result: dict[str, Any] | None = None
+        self._progress_lock = threading.Lock()
+        self._content_chunks = 0
         self.thread = threading.Thread(
             target=self._run,
             kwargs={
@@ -471,15 +676,27 @@ class StreamTask:
                 "out_dir": out_dir,
                 "first_content": self.first_content,
                 "timeout": timeout,
+                "on_content": self._record_content,
             },
             daemon=True,
         )
+
+    def _record_content(self, _wall_ns: int) -> None:
+        with self._progress_lock:
+            self._content_chunks += 1
+
+    def live_content_chunks(self) -> int:
+        with self._progress_lock:
+            return self._content_chunks
 
     def _run(self, **kwargs: Any) -> None:
         self.result = stream_request(**kwargs)
 
     def start(self) -> None:
         self.thread.start()
+
+    def is_alive(self) -> bool:
+        return self.thread.is_alive()
 
     def wait_first(self, timeout: float) -> None:
         require(self.first_content.wait(timeout), "stream did not produce a first-content signal")
@@ -491,6 +708,10 @@ class StreamTask:
         require(not self.thread.is_alive(), "stream request exceeded the bounded timeout")
         require(self.result is not None, "stream request produced no result")
         return self.result
+
+    def settle(self, timeout: float) -> bool:
+        self.thread.join(max(0.0, timeout))
+        return not self.thread.is_alive()
 
 
 class ServerSession:
@@ -690,6 +911,104 @@ def wait_for_deferral(
     raise CapacityGateError("B did not produce a typed admission deferral before timeout")
 
 
+def wait_for_pressure_streams(
+    *,
+    tasks: dict[str, StreamTask],
+    trace_path: Path,
+    trace_baseline_bytes: int,
+    deferred_request_id: str,
+    timeout: float,
+    no_progress_timeout: float,
+    max_unchanged_skips: int,
+    max_trace_bytes: int,
+    poll_interval: float = 0.05,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    require(set(tasks) == {"A", "B", "C"}, "pressure wait requires exactly A/B/C tasks")
+    require(timeout > 0, "pressure stream timeout must be positive")
+    require(no_progress_timeout > 0, "pressure progress timeout must be positive")
+    require(max_unchanged_skips > 0, "pressure unchanged-skip limit must be positive")
+    require(max_trace_bytes > 0, "pressure trace byte limit must be positive")
+    require(poll_interval > 0, "pressure poll interval must be positive")
+    require(trace_baseline_bytes >= 0, "pressure trace baseline must not be negative")
+
+    started = time.monotonic()
+    started_wall_ns = time.time_ns()
+    deadline = started + timeout
+    initial_progress = {
+        role: task.live_content_chunks() for role, task in tasks.items()
+    }
+    guard = PressureStopGuard(
+        initial_progress=initial_progress,
+        started_monotonic=started,
+        no_progress_timeout=no_progress_timeout,
+        max_unchanged_skips=max_unchanged_skips,
+        max_trace_bytes=max_trace_bytes,
+    )
+    skipped = IncrementalTracePhaseCounter(
+        trace_path,
+        phase="vnext.prefill_admission_skipped_unchanged",
+        request_id=deferred_request_id,
+    )
+
+    while True:
+        now = time.monotonic()
+        active_roles = {role for role, task in tasks.items() if task.is_alive()}
+        for role, task in tasks.items():
+            result = getattr(task, "result", None)
+            if role not in active_roles and isinstance(result, dict) and result.get("error"):
+                raise CapacityGateError(f"pressure-{role}: {result['error']}")
+        progress = {
+            role: task.live_content_chunks() for role, task in tasks.items()
+        }
+        target_trace_bytes = trace_path.stat().st_size if trace_path.is_file() else 0
+        require(
+            target_trace_bytes >= trace_baseline_bytes,
+            "target trace was truncated during pressure collection",
+        )
+        pressure_trace_bytes = target_trace_bytes - trace_baseline_bytes
+        unchanged_skips = skipped.poll()
+        guard.observe(
+            progress=progress,
+            unchanged_skips=unchanged_skips,
+            trace_bytes=pressure_trace_bytes,
+            now_monotonic=now,
+            active_roles=active_roles,
+        )
+        if not active_roles:
+            break
+        require(
+            now < deadline,
+            f"pressure streams exceeded the joint bounded timeout: {timeout:.3f}s",
+        )
+        time.sleep(min(poll_interval, max(0.0, deadline - now)))
+
+    results = {role: task.join(0) for role, task in tasks.items()}
+    return results, {
+        "duration_seconds": time.monotonic() - started,
+        "monitor_started_wall_ns": started_wall_ns,
+        "content_chunks_by_role": {
+            role: task.live_content_chunks() for role, task in tasks.items()
+        },
+        "max_stall_seconds_by_role": guard.max_stall_seconds_by_role,
+        "unchanged_epoch_skips": skipped.poll(),
+        "pressure_trace_bytes": (
+            trace_path.stat().st_size - trace_baseline_bytes
+            if trace_path.is_file()
+            else 0
+        ),
+        "target_trace_bytes": trace_path.stat().st_size if trace_path.is_file() else 0,
+    }
+
+
+def settle_stream_tasks(tasks: dict[str, StreamTask], *, timeout: float) -> list[str]:
+    deadline = time.monotonic() + max(0.0, timeout)
+    unsettled = []
+    for role, task in tasks.items():
+        if not task.settle(deadline - time.monotonic()):
+            unsettled.append(role)
+    return unsettled
+
+
 def collect(args: argparse.Namespace) -> int:
     repo = args.repo.resolve()
     binary = args.binary.resolve()
@@ -699,6 +1018,15 @@ def collect(args: argparse.Namespace) -> int:
     require(binary.is_file(), f"missing binary: {binary}")
     require(model.is_dir(), f"missing model directory: {model}")
     require(args.port < 65535, "base port leaves no target-server port")
+    require(
+        0 < args.request_timeout <= MAX_PRESSURE_JOINT_STREAM_SECONDS,
+        "request timeout must be within the canonical 300-second ceiling",
+    )
+    require(
+        0 < args.deferral_timeout <= MAX_PRESSURE_NO_PROGRESS_SECONDS,
+        "deferral timeout must be within the canonical 30-second ceiling",
+    )
+    pressure_stop_policy = dict(PRESSURE_STOP_POLICY)
     out.mkdir(parents=True)
     provenance = {
         "schema_version": 1,
@@ -727,11 +1055,13 @@ def collect(args: argparse.Namespace) -> int:
     require(GIT_SHA_RE.fullmatch(provenance["git_sha"]) is not None, "invalid git SHA")
     require(not provenance["dirty_status"], "CUDA capacity evidence requires a clean checkout")
     sessions: list[ServerSession] = []
+    pressure_tasks: dict[str, StreamTask] = {}
     collection: dict[str, Any] = {
         "schema_version": 1,
         "artifact_type": "runtime_vnext_s1_cuda_capacity_pressure_collection",
         "status": "reject",
         "provenance": "provenance.json",
+        "pressure_stop_policy": pressure_stop_policy,
         "error": None,
     }
     try:
@@ -786,6 +1116,15 @@ def collect(args: argparse.Namespace) -> int:
         )
 
         pressure_dir = out / "target" / "pressure"
+        pressure_trace_start_bytes = (
+            target.trace_path.stat().st_size if target.trace_path.is_file() else 0
+        )
+        pressure_started_monotonic = time.monotonic()
+        pressure_started_wall_ns = time.time_ns()
+        pressure_deadline = (
+            pressure_started_monotonic
+            + pressure_stop_policy["joint_stream_timeout_seconds"]
+        )
         a = StreamTask(
             port=target.port,
             model=target.model_id,
@@ -796,7 +1135,15 @@ def collect(args: argparse.Namespace) -> int:
             timeout=args.request_timeout,
         )
         a.start()
-        a.wait_first(args.request_timeout)
+        pressure_tasks["A"] = a
+        a.wait_first(
+            bounded_remaining_timeout(
+                deadline_monotonic=pressure_deadline,
+                requested_timeout=args.request_timeout,
+                now_monotonic=time.monotonic(),
+                label="pressure A first content",
+            )
+        )
         baseline_rows = len(read_trace(target.trace_path))
         b = StreamTask(
             port=target.port,
@@ -809,11 +1156,17 @@ def collect(args: argparse.Namespace) -> int:
         )
         b_started = time.time_ns()
         b.start()
+        pressure_tasks["B"] = b
         b_request_id, b_deferral = wait_for_deferral(
             target.trace_path,
             baseline_rows,
             b_started,
-            args.deferral_timeout,
+            bounded_remaining_timeout(
+                deadline_monotonic=pressure_deadline,
+                requested_timeout=args.deferral_timeout,
+                now_monotonic=time.monotonic(),
+                label="pressure B deferral",
+            ),
         )
         c = StreamTask(
             port=target.port,
@@ -825,11 +1178,73 @@ def collect(args: argparse.Namespace) -> int:
             timeout=args.request_timeout,
         )
         c.start()
-        c_result = c.join(args.request_timeout)
-        a_result = a.join(args.request_timeout)
-        b_result = b.join(args.request_timeout)
-        for label, result in (("pressure-A", a_result), ("pressure-B", b_result), ("pressure-C", c_result)):
+        pressure_tasks["C"] = c
+        pressure_results, pressure_stop_observed = wait_for_pressure_streams(
+            tasks={"A": a, "B": b, "C": c},
+            trace_path=target.trace_path,
+            trace_baseline_bytes=pressure_trace_start_bytes,
+            deferred_request_id=b_request_id,
+            timeout=bounded_remaining_timeout(
+                deadline_monotonic=pressure_deadline,
+                requested_timeout=pressure_stop_policy[
+                    "joint_stream_timeout_seconds"
+                ],
+                now_monotonic=time.monotonic(),
+                label="pressure A/B/C streams",
+            ),
+            no_progress_timeout=pressure_stop_policy["no_progress_timeout_seconds"],
+            max_unchanged_skips=pressure_stop_policy["max_unchanged_epoch_skips"],
+            max_trace_bytes=pressure_stop_policy["max_pressure_trace_bytes"],
+        )
+        pressure_stop_observed.update(
+            {
+                "lifecycle_duration_seconds": (
+                    time.monotonic() - pressure_started_monotonic
+                ),
+                "lifecycle_started_wall_ns": pressure_started_wall_ns,
+                "trace_baseline_bytes": pressure_trace_start_bytes,
+            }
+        )
+        a_result = pressure_results["A"]
+        b_result = pressure_results["B"]
+        c_result = pressure_results["C"]
+        for label, result in (
+            ("pressure-A", a_result),
+            ("pressure-B", b_result),
+            ("pressure-C", c_result),
+        ):
             require_stream_success(result, label)
+        raw_max_silence_seconds_by_role = {}
+        for role, result in pressure_results.items():
+            content_times = read_stream_content_times(
+                pressure_dir / f"pressure-{role}.events.jsonl"
+            )
+            raw_max_silence_seconds_by_role[role] = max_stream_silence_seconds(
+                result,
+                content_times,
+                monitored_from_wall_ns=pressure_stop_observed[
+                    "monitor_started_wall_ns"
+                ],
+            )
+            require(
+                raw_max_silence_seconds_by_role[role]
+                < pressure_stop_policy["no_progress_timeout_seconds"],
+                "raw stream token progress timeout exceeded for role "
+                f"{role}: {raw_max_silence_seconds_by_role[role]:.3f}s",
+            )
+            require(
+                pressure_stop_observed["content_chunks_by_role"][role]
+                == result["content_chunks"],
+                f"live content progress does not match result for role {role}",
+            )
+        pressure_stop_observed["raw_max_silence_seconds_by_role"] = (
+            raw_max_silence_seconds_by_role
+        )
+        require(
+            pressure_stop_observed["lifecycle_duration_seconds"]
+            < pressure_stop_policy["joint_stream_timeout_seconds"],
+            "pressure lifecycle exceeded the joint bounded timeout",
+        )
         final_health = target.health("health.final.json")
         target.stop()
         collection.update(
@@ -857,6 +1272,7 @@ def collect(args: argparse.Namespace) -> int:
                     },
                     "b_request_id": b_request_id,
                     "b_deferral": b_deferral,
+                    "pressure_stop_observed": pressure_stop_observed,
                     "health_warmup": "target/health.warmup.json",
                     "health_final": "target/health.final.json",
                     "trace": "target/scheduler-trace.jsonl",
@@ -868,6 +1284,19 @@ def collect(args: argparse.Namespace) -> int:
         print(f"FERRUM RUNTIME VNEXT S1 CUDA CAPACITY PRESSURE COLLECTED: {out}")
         return 0
     except Exception as error:
+        cleanup_errors = []
+        for session in reversed(sessions):
+            try:
+                session.stop()
+            except Exception as cleanup_error:
+                cleanup_errors.append(str(cleanup_error))
+        unsettled_roles = settle_stream_tasks(pressure_tasks, timeout=10.0)
+        collection["pressure_failure_cleanup"] = {
+            "client_roles": sorted(pressure_tasks),
+            "unsettled_client_roles": unsettled_roles,
+            "server_cleanup_errors": cleanup_errors,
+            "finished_wall_ns": time.time_ns(),
+        }
         collection["error"] = str(error)
         collection["finished_wall_ns"] = time.time_ns()
         write_json(out / "collection.json", collection)
@@ -875,7 +1304,13 @@ def collect(args: argparse.Namespace) -> int:
         return 1
     finally:
         for session in reversed(sessions):
-            session.stop()
+            try:
+                session.stop()
+            except Exception as cleanup_error:
+                print(
+                    f"capacity session cleanup failed: {cleanup_error}",
+                    file=sys.stderr,
+                )
 
 
 def event_wall_ns(row: dict[str, Any]) -> int:
@@ -936,6 +1371,11 @@ def validate(root: Path, out: Path) -> int:
     collection = read_json(root / "collection.json")
     provenance = read_json(root / "provenance.json")
     require(collection.get("status") == "collected", f"collection is not usable: {collection.get('error')}")
+    pressure_stop_policy = collection.get("pressure_stop_policy")
+    require(
+        pressure_stop_policy == PRESSURE_STOP_POLICY,
+        "collection did not use the canonical pressure stop policy",
+    )
     source_git_sha = collection.get("source_git_sha")
     require(GIT_SHA_RE.fullmatch(str(source_git_sha)) is not None, "invalid source git SHA")
     require(source_git_sha == provenance.get("git_sha"), "collection/provenance git SHA mismatch")
@@ -991,6 +1431,32 @@ def validate(root: Path, out: Path) -> int:
     require(isinstance(pressure, dict) and set(pressure) == {"A", "B", "C"}, "invalid pressure client set")
     for label, result in pressure.items():
         validate_stream(result, f"pressure-{label}")
+    pressure_stop_observed = target.get("pressure_stop_observed")
+    require(
+        isinstance(pressure_stop_observed, dict),
+        "pressure stop observations are missing",
+    )
+    observed_lifecycle_seconds = pressure_stop_observed.get(
+        "lifecycle_duration_seconds"
+    )
+    require(
+        isinstance(observed_lifecycle_seconds, (int, float))
+        and not isinstance(observed_lifecycle_seconds, bool)
+        and 0 <= observed_lifecycle_seconds
+        < pressure_stop_policy["joint_stream_timeout_seconds"],
+        "observed pressure lifecycle exceeds the joint timeout",
+    )
+    observed_content_chunks = pressure_stop_observed.get("content_chunks_by_role")
+    require(
+        isinstance(observed_content_chunks, dict)
+        and set(observed_content_chunks) == {"A", "B", "C"},
+        "observed pressure content progress is incomplete",
+    )
+    for role, result in pressure.items():
+        require(
+            observed_content_chunks.get(role) == result.get("content_chunks"),
+            f"observed pressure content progress differs for role {role}",
+        )
 
     calibration_clients = calibration.get("clients", {})
     warmup_clients = target.get("warmup_clients", {})
@@ -1019,8 +1485,26 @@ def validate(root: Path, out: Path) -> int:
     a, b, c = pressure["A"], pressure["B"], pressure["C"]
     b_request_id = target.get("b_request_id")
     require(isinstance(b_request_id, str) and b_request_id, "B request identity is missing")
-    rows = read_trace(root / str(target.get("trace")))
+    target_trace_path = root / str(target.get("trace"))
+    rows = read_trace(target_trace_path)
     require(rows, "target scheduler trace is empty")
+    target_trace_bytes = target_trace_path.stat().st_size
+    pressure_trace_bytes = trace_bytes_at_or_after(
+        target_trace_path, a["started_wall_ns"]
+    )
+    require(
+        pressure_trace_bytes <= pressure_stop_policy["max_pressure_trace_bytes"],
+        "pressure trace exceeds the artifact stop-policy ceiling",
+    )
+    observed_pressure_trace_bytes = pressure_stop_observed.get(
+        "pressure_trace_bytes"
+    )
+    require(
+        isinstance(observed_pressure_trace_bytes, int)
+        and 0 <= observed_pressure_trace_bytes
+        <= pressure_stop_policy["max_pressure_trace_bytes"],
+        "observed pressure trace bytes are invalid",
+    )
     b_rows = [
         row
         for row in rows
@@ -1044,6 +1528,14 @@ def validate(root: Path, out: Path) -> int:
         if row.get("phase") == "vnext.prefill_admission_skipped_unchanged"
     ]
     require(skipped, "B has no unchanged-epoch skip evidence")
+    require(
+        len(skipped) <= pressure_stop_policy["max_unchanged_epoch_skips"],
+        "B unchanged-epoch skips exceed the artifact stop-policy ceiling",
+    )
+    require(
+        pressure_stop_observed.get("unchanged_epoch_skips") == len(skipped),
+        "observed B unchanged-epoch skips differ from raw trace",
+    )
     require(
         all(row.get("shape", {}).get("probe_performed") is False for row in skipped),
         "unchanged-epoch skip performed a probe",
@@ -1070,13 +1562,33 @@ def validate(root: Path, out: Path) -> int:
 
     require(a["started_wall_ns"] < b["started_wall_ns"] < c["started_wall_ns"], "client arrival order is not A/B/C")
     require(b["started_wall_ns"] <= defer_ns <= c["started_wall_ns"], "C did not arrive after B was deferred")
+    raw_max_silence_seconds_by_role = {}
+    for role, result in pressure.items():
+        content_times = read_stream_content_times(
+            root / "target" / "pressure" / f"pressure-{role}.events.jsonl"
+        )
+        raw_max_silence_seconds_by_role[role] = max_stream_silence_seconds(
+            result,
+            content_times,
+            monitored_from_wall_ns=c["started_wall_ns"],
+        )
+        require(
+            raw_max_silence_seconds_by_role[role]
+            < pressure_stop_policy["no_progress_timeout_seconds"],
+            "raw stream token progress timeout exceeded for role "
+            f"{role}: {raw_max_silence_seconds_by_role[role]:.3f}s",
+        )
+    raw_lifecycle_seconds = (
+        max(result["finished_wall_ns"] for result in pressure.values())
+        - a["started_wall_ns"]
+    ) / 1_000_000_000
+    require(
+        raw_lifecycle_seconds
+        < pressure_stop_policy["joint_stream_timeout_seconds"],
+        "raw pressure lifecycle exceeds the joint timeout",
+    )
     a_events = root / "target" / "pressure" / "pressure-A.events.jsonl"
-    a_client_events = [
-        json.loads(line) for line in a_events.read_text().splitlines() if line.strip()
-    ]
-    a_content_times = [
-        row["wall_ns"] for row in a_client_events if row.get("kind") == "content"
-    ]
+    a_content_times = read_stream_content_times(a_events)
     require(any(defer_ns < value < admitted_ns for value in a_content_times), "active A decode made no progress while B waited")
     require(c["finished_wall_ns"] < b["first_content_wall_ns"], "eligible C did not bypass deferred B")
 
@@ -1137,6 +1649,16 @@ def validate(root: Path, out: Path) -> int:
         "b_request_id": b_request_id,
         "b_wait_for_release_events": len(deferred),
         "b_unchanged_epoch_skips": len(skipped),
+        "target_trace_bytes": target_trace_bytes,
+        "pressure_trace_bytes": pressure_trace_bytes,
+        "pressure_stop_policy": pressure_stop_policy,
+        "pressure_stop_observed": pressure_stop_observed,
+        "pressure_stop_recomputed": {
+            "lifecycle_duration_seconds": raw_lifecycle_seconds,
+            "max_silence_seconds_by_role": raw_max_silence_seconds_by_role,
+            "unchanged_epoch_skips": len(skipped),
+            "pressure_trace_bytes": pressure_trace_bytes,
+        },
         "capacity_release_epoch_before": evidence["release_epoch"],
         "capacity_release_epoch_after": final_epochs["release_epoch"],
         "does_not_prove": ["G01B", "S1", "performance", "release"],
@@ -1250,10 +1772,168 @@ def self_test() -> int:
         raise AssertionError("mismatched replay prompt unexpectedly passed")
     except CapacityGateError:
         pass
+    def expect_gate_error(action: Callable[[], Any], expected: str) -> None:
+        try:
+            action()
+        except CapacityGateError as error:
+            require(expected in str(error), f"unexpected gate error: {error}")
+            return
+        raise AssertionError(f"expected gate error containing {expected!r}")
+
     with __import__("tempfile").TemporaryDirectory() as temp:
         trace = Path(temp) / "trace.jsonl"
         trace.write_text('{"phase":"complete"}\n{"phase":')
         require(read_trace(trace) == [{"phase": "complete"}], "partial trace handling failed")
+
+        phase = "vnext.prefill_admission_skipped_unchanged"
+        warmup_row = json.dumps({"phase": "warmup"}) + "\n"
+        trace.write_text(
+            warmup_row
+            + json.dumps({"phase": phase, "request_id": "B"})
+            + "\n"
+            + '{"phase":"vnext.prefill_admission_skipped_unchanged","request_id":"'
+        )
+        baseline = len(warmup_row.encode())
+        counter = IncrementalTracePhaseCounter(trace, phase=phase, request_id="B")
+        require(counter.poll() == 1, "incremental trace counter missed a row")
+        with trace.open("a") as handle:
+            handle.write('B"}\n' + json.dumps({"phase": phase, "request_id": "C"}) + "\n")
+        require(counter.poll() == 2, "incremental trace counter lost a partial row")
+
+        timed_trace = Path(temp) / "timed-trace.jsonl"
+        warmup = json.dumps({"ts_unix_nanos": 100, "phase": "warmup"}) + "\n"
+        pressure = json.dumps({"ts_unix_nanos": 200, "phase": "pressure"}) + "\n"
+        timed_trace.write_text(warmup + pressure)
+        require(
+            trace_bytes_at_or_after(timed_trace, 150) == len(pressure.encode()),
+            "pressure trace bytes included warmup",
+        )
+
+        task = StreamTask(
+            port=1,
+            model="self-test",
+            role="self-test",
+            workload_slot="A",
+            max_tokens=1,
+            out_dir=Path(temp),
+            timeout=1.0,
+        )
+        task._record_content(123)
+        require(task.live_content_chunks() == 1, "live stream progress was not published")
+
+        class FinishedTask:
+            result = None
+
+            def __init__(self, role: str) -> None:
+                self.role = role
+
+            def is_alive(self) -> bool:
+                return False
+
+            def live_content_chunks(self) -> int:
+                return 1
+
+            def join(self, timeout: float) -> dict[str, Any]:
+                return {"role": self.role}
+
+        results, observed = wait_for_pressure_streams(
+            tasks={role: FinishedTask(role) for role in ("A", "B", "C")},
+            trace_path=trace,
+            trace_baseline_bytes=baseline,
+            deferred_request_id="B",
+            timeout=1.0,
+            no_progress_timeout=0.5,
+            max_unchanged_skips=2,
+            max_trace_bytes=trace.stat().st_size - baseline,
+            poll_interval=0.001,
+        )
+        require(set(results) == {"A", "B", "C"}, "bounded wait lost a result")
+        require(observed["unchanged_epoch_skips"] == 2, "bounded wait lost skip evidence")
+        require(
+            observed["pressure_trace_bytes"] == trace.stat().st_size - baseline,
+            "bounded wait counted warmup trace bytes",
+        )
+
+    require(
+        bounded_remaining_timeout(
+            deadline_monotonic=150.0,
+            requested_timeout=300.0,
+            now_monotonic=100.0,
+            label="self-test",
+        )
+        == 50.0,
+        "joint deadline did not cap a phase timeout",
+    )
+    expect_gate_error(
+        lambda: bounded_remaining_timeout(
+            deadline_monotonic=100.0,
+            requested_timeout=30.0,
+            now_monotonic=100.0,
+            label="self-test",
+        ),
+        "joint pressure lifecycle timeout",
+    )
+    stream_result = {
+        "started_wall_ns": 90_000_000_000,
+        "finished_wall_ns": 140_000_000_000,
+    }
+    require(
+        max_stream_silence_seconds(
+            stream_result,
+            [110_000_000_000, 125_000_000_000],
+            monitored_from_wall_ns=100_000_000_000,
+        )
+        == 15.0,
+        "stream silence used the wrong interval",
+    )
+
+    def new_guard() -> Any:
+        return PressureStopGuard(
+            initial_progress={"A": 1, "B": 0},
+            started_monotonic=100.0,
+            no_progress_timeout=30.0,
+            max_unchanged_skips=512,
+            max_trace_bytes=16 * 1024 * 1024,
+        )
+
+    guard = new_guard()
+    guard.observe(
+        progress={"A": 2, "B": 0},
+        unchanged_skips=512,
+        trace_bytes=16 * 1024 * 1024,
+        now_monotonic=129.5,
+        active_roles={"A", "B"},
+    )
+    expect_gate_error(
+        lambda: guard.observe(
+            progress={"A": 3, "B": 0},
+            unchanged_skips=512,
+            trace_bytes=16 * 1024 * 1024,
+            now_monotonic=130.0,
+            active_roles={"A", "B"},
+        ),
+        "role B",
+    )
+    expect_gate_error(
+        lambda: new_guard().observe(
+            progress={"A": 1, "B": 0},
+            unchanged_skips=513,
+            trace_bytes=0,
+            now_monotonic=100.0,
+            active_roles=set(),
+        ),
+        "skip limit exceeded",
+    )
+    expect_gate_error(
+        lambda: new_guard().observe(
+            progress={"A": 1, "B": 0},
+            unchanged_skips=0,
+            trace_bytes=MAX_PRESSURE_TRACE_BYTES + 1,
+            now_monotonic=100.0,
+            active_roles=set(),
+        ),
+        "trace byte limit exceeded",
+    )
     print("FERRUM RUNTIME VNEXT S1 CUDA CAPACITY SELFTEST PASS")
     return 0
 
