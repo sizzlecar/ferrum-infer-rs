@@ -743,7 +743,12 @@ struct VNextKvCacheHandle<R: DeviceRuntime> {
 }
 
 impl<R: DeviceRuntime> VNextKvCacheHandle<R> {
-    fn new(sequence: &Arc<VNextSequence<R>>, info: &ModelInfo, tokens: usize) -> Self {
+    fn new(
+        sequence: &Arc<VNextSequence<R>>,
+        info: &ModelInfo,
+        attention_head_dimension: usize,
+        tokens: usize,
+    ) -> Self {
         let mut block_table = BlockTable::new(16);
         block_table.sequence_length = tokens;
         Self {
@@ -753,7 +758,7 @@ impl<R: DeviceRuntime> VNextKvCacheHandle<R> {
             device: info.device.clone(),
             num_layers: info.num_layers,
             num_heads: info.num_kv_heads,
-            head_dim: info.hidden_size / info.num_heads.max(1),
+            head_dim: attention_head_dimension,
             maximum_tokens: sequence.maximum_tokens,
         }
     }
@@ -1005,6 +1010,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     reaper: Arc<CompletionReaper<R>>,
     io: VNextIoBinding,
     maximum_model_tokens: usize,
+    attention_head_dimension: usize,
     run_id: RunId,
     family_fingerprint: String,
     program_fingerprint: String,
@@ -1039,6 +1045,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         registry: OperationRuntimeRegistry<R>,
         catalog: CapabilityCatalog,
     ) -> Result<Self> {
+        let attention_head_dimension = prepared.descriptor().attention_head_dimension();
         let config =
             VNextExecutorConfig::from_engine_config(engine_config, &info, runtime.as_ref())?;
         let family = prepared.family();
@@ -1186,6 +1193,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             reaper,
             io,
             maximum_model_tokens: config.maximum_model_tokens,
+            attention_head_dimension,
             run_id,
             family_fingerprint,
             program_fingerprint,
@@ -2064,7 +2072,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         sequence: &Arc<VNextSequence<R>>,
         tokens: usize,
     ) -> Arc<dyn KvCacheHandle> {
-        Arc::new(VNextKvCacheHandle::new(sequence, &self.info, tokens))
+        Arc::new(VNextKvCacheHandle::new(
+            sequence,
+            &self.info,
+            self.attention_head_dimension,
+            tokens,
+        ))
     }
 
     fn sequence_for_cache(&self, cache_id: &str) -> Result<Arc<VNextSequence<R>>> {
@@ -2662,7 +2675,6 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {
-        let head_dim = self.info.hidden_size / self.info.num_heads.max(1);
         ExecutorCapabilities {
             max_batch_size: self.policy.memory().maximum_active_sequences as usize,
             max_sequence_length: self.maximum_model_tokens,
@@ -2678,7 +2690,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                 parameter_memory: self.static_bytes,
                 activation_memory_per_token: self.info.hidden_size * self.info.dtype.size_bytes(),
                 kv_cache_memory_per_token: self.info.num_kv_heads
-                    * head_dim
+                    * self.attention_head_dimension
                     * 2
                     * self.info.dtype.size_bytes(),
                 overhead_memory: self.policy.memory().reserve_bytes,
