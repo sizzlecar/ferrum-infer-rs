@@ -9,7 +9,9 @@ use super::{
     ResourceRetentionPolicy, ResourceTransactionIdentity, RunId, Serialize,
     StaticProvisioningBinding, StepResourceSlotKind, TransactionId, VNextError,
 };
-use crate::vnext::{CapacityShortfallKind, DeferredAction};
+use crate::vnext::{
+    CapacityShortfallKind, DeferredAction, DeviceCapacityPressure, DeviceCapacityPressureScope,
+};
 
 static NEXT_DYNAMIC_POOL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -765,7 +767,13 @@ impl DynamicPoolMaintenanceStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum DynamicDeferredMaintenanceOutcome {
-    RetryWithoutGrowth { current_epochs: CapacityEpochs },
+    RetryWithoutGrowth {
+        current_epochs: CapacityEpochs,
+    },
+    WaitForRelease {
+        current_epochs: CapacityEpochs,
+        pressure: DeviceCapacityPressure,
+    },
     Maintained(DynamicPoolGrowthBatchReceipt),
 }
 
@@ -1016,13 +1024,31 @@ where
                 .and_modify(|bytes| *bytes = (*bytes).max(blocker.requested_bytes()))
                 .or_insert(blocker.requested_bytes());
         }
-        let receipt = self.grow_pools(
+        let growth = self.grow_pools(
             requested_by_pool
                 .into_iter()
                 .map(|(pool_id, bytes)| DynamicPoolGrowthRequest::new(pool_id, bytes))
                 .collect::<Result<Vec<_>, _>>()?,
-        )?;
-        Ok(DynamicDeferredMaintenanceOutcome::Maintained(receipt))
+        );
+        match growth {
+            Ok(receipt) => Ok(DynamicDeferredMaintenanceOutcome::Maintained(receipt)),
+            Err(VNextError::DeviceCapacityUnavailable(pressure))
+                if pressure.scope() == &DeviceCapacityPressureScope::PlanBudget =>
+            {
+                let after_pressure = self.pools.logical_admission.epochs()?;
+                if after_pressure != current_epochs {
+                    Ok(DynamicDeferredMaintenanceOutcome::RetryWithoutGrowth {
+                        current_epochs: after_pressure,
+                    })
+                } else {
+                    Ok(DynamicDeferredMaintenanceOutcome::WaitForRelease {
+                        current_epochs: after_pressure,
+                        pressure,
+                    })
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Materializes fit capacity that logical admission identified as
@@ -1082,13 +1108,31 @@ where
         if requested_by_pool.is_empty() {
             return Ok(DynamicDeferredMaintenanceOutcome::RetryWithoutGrowth { current_epochs });
         }
-        let receipt = self.grow_pools(
+        let growth = self.grow_pools(
             requested_by_pool
                 .into_iter()
                 .map(|(pool_id, bytes)| DynamicPoolGrowthRequest::new(pool_id, bytes))
                 .collect::<Result<Vec<_>, _>>()?,
-        )?;
-        Ok(DynamicDeferredMaintenanceOutcome::Maintained(receipt))
+        );
+        match growth {
+            Ok(receipt) => Ok(DynamicDeferredMaintenanceOutcome::Maintained(receipt)),
+            Err(VNextError::DeviceCapacityUnavailable(pressure))
+                if pressure.scope() == &DeviceCapacityPressureScope::PlanBudget =>
+            {
+                let after_pressure = self.pools.logical_admission.epochs()?;
+                if after_pressure != current_epochs {
+                    Ok(DynamicDeferredMaintenanceOutcome::RetryWithoutGrowth {
+                        current_epochs: after_pressure,
+                    })
+                } else {
+                    Ok(DynamicDeferredMaintenanceOutcome::WaitForRelease {
+                        current_epochs: after_pressure,
+                        pressure,
+                    })
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Explicitly releases only unclaimable quarantined chunks. Resident

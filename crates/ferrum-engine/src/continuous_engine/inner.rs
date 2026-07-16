@@ -612,6 +612,18 @@ impl EngineInner {
                     )));
                 }
             }
+            ExecutorPrefillMaintenanceOutcome::WaitForRelease { current, pressure } => {
+                validate_current(*current)?;
+                if pressure.scope() != &DeviceCapacityPressureScope::PlanBudget
+                    || pressure.requested_bytes() == 0
+                    || pressure.available_bytes() >= pressure.requested_bytes()
+                {
+                    return Err(FerrumError::internal(format!(
+                        "executor maintenance for {} reported invalid device pressure",
+                        deferral.request_id()
+                    )));
+                }
+            }
             ExecutorPrefillMaintenanceOutcome::Maintained {
                 current,
                 pools_grown,
@@ -649,6 +661,11 @@ impl EngineInner {
             ),
             Ok(ExecutorPrefillMaintenanceOutcome::RetryWithoutGrowth { .. }) => (
                 "retry_without_growth",
+                serde_json::to_value(result.as_ref().unwrap()).unwrap_or(serde_json::Value::Null),
+                None,
+            ),
+            Ok(ExecutorPrefillMaintenanceOutcome::WaitForRelease { .. }) => (
+                "wait_for_release",
                 serde_json::to_value(result.as_ref().unwrap()).unwrap_or(serde_json::Value::Null),
                 None,
             ),
@@ -707,6 +724,29 @@ impl EngineInner {
                 .maintain_prefill_backing(deferral.request_id())
                 .and_then(|outcome| {
                     self.validate_executor_prefill_maintenance(&deferral, &outcome)?;
+                    if let ExecutorPrefillMaintenanceOutcome::WaitForRelease { current, .. } =
+                        &outcome
+                    {
+                        let observed = AdmissionWakeEpochs::new(
+                            current.coordinator_id,
+                            current.release_epoch,
+                            current.capacity_epoch,
+                            0,
+                        );
+                        let transitioned = self.scheduler.wait_for_release_after_backing_pressure(
+                            deferral.request_id(),
+                            observed,
+                        )?;
+                        if !transitioned
+                            && self.scheduler.trace_phase(deferral.request_id())
+                                == Some(RequestPhase::Waiting)
+                        {
+                            return Err(FerrumError::internal(format!(
+                                "waiting request {} lost its backing-growth deferral",
+                                deferral.request_id()
+                            )));
+                        }
+                    }
                     Ok(outcome)
                 });
             self.trace_executor_prefill_maintenance(

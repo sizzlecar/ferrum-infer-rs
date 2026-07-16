@@ -255,8 +255,15 @@ pub enum DynamicAdmissionQueueError {
     InvalidPolicy(&'static str),
     IdentityExhausted,
     DuplicateTicket(WaitingAdmissionTicket),
-    ForeignCoordinator { expected: u64, actual: u64 },
+    ForeignCoordinator {
+        expected: u64,
+        actual: u64,
+    },
     EpochRegression,
+    InvalidDeferralTransition {
+        expected: DeferredAction,
+        actual: Option<DeferredAction>,
+    },
 }
 
 impl fmt::Display for DynamicAdmissionQueueError {
@@ -276,6 +283,10 @@ impl fmt::Display for DynamicAdmissionQueueError {
                 "admission wake belongs to coordinator {actual}, expected {expected}"
             ),
             Self::EpochRegression => formatter.write_str("admission wake epochs regressed"),
+            Self::InvalidDeferralTransition { expected, actual } => write!(
+                formatter,
+                "waiting admission deferral transition expected {expected:?}, found {actual:?}"
+            ),
         }
     }
 }
@@ -411,6 +422,42 @@ impl<T> DynamicAdmissionQueue<T> {
             .iter()
             .position(|entry| entry.ticket == ticket)?;
         self.waiting.remove(index).map(|entry| entry.request)
+    }
+
+    /// Convert a completed backing-growth attempt into an epoch-driven wait
+    /// without moving the request or minting a new fairness identity.
+    pub fn wait_for_release_after_backing_pressure(
+        &mut self,
+        mut predicate: impl FnMut(&T) -> bool,
+        observed: AdmissionWakeEpochs,
+    ) -> Result<bool, DynamicAdmissionQueueError> {
+        self.validate_wake(observed)?;
+        let Some(entry) = self
+            .waiting
+            .iter_mut()
+            .find(|entry| predicate(&entry.request))
+        else {
+            return Ok(false);
+        };
+        let actual = entry.deferral.map(AdmissionDeferral::action);
+        if actual != Some(DeferredAction::AwaitBackingGrowth) {
+            return Err(DynamicAdmissionQueueError::InvalidDeferralTransition {
+                expected: DeferredAction::AwaitBackingGrowth,
+                actual,
+            });
+        }
+        let prior = entry
+            .deferral
+            .expect("validated backing-growth deferral remains present")
+            .observed();
+        if !observed.is_monotonic_after(prior) {
+            return Err(DynamicAdmissionQueueError::EpochRegression);
+        }
+        entry.deferral = Some(AdmissionDeferral::new(
+            DeferredAction::WaitForRelease,
+            observed,
+        ));
+        Ok(true)
     }
 
     fn validate_wake(&self, wake: AdmissionWakeEpochs) -> Result<(), DynamicAdmissionQueueError> {
@@ -783,6 +830,41 @@ mod tests {
             .unwrap();
         assert_eq!(second.backing_growth_requested(), 0);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn backing_pressure_preserves_ticket_and_waits_for_release_epoch() {
+        let mut queue = DynamicAdmissionQueue::new(DynamicAdmissionQueuePolicy::default());
+        let ticket = queue.enqueue(11_u64).unwrap();
+        let mut events = Vec::new();
+        let growth = AdmissionDeferral::new(DeferredAction::AwaitBackingGrowth, wake(5, 2, 0));
+        queue
+            .schedule_into(wake(5, 2, 0), 1, 1, &mut events, |_| {
+                AdmissionProbeOutcome::<(), (), ()>::Deferred(growth)
+            })
+            .unwrap();
+
+        assert!(queue
+            .wait_for_release_after_backing_pressure(|request| *request == 11, wake(5, 2, 0))
+            .unwrap());
+        let unchanged = queue
+            .schedule_into(wake(5, 2, 0), 1, 1, &mut events, |_| {
+                panic!("device pressure must not spin at unchanged epochs")
+            })
+            .unwrap();
+        assert_eq!(unchanged.skipped_unchanged(), 1);
+
+        let released = queue
+            .schedule_into(wake(6, 2, 0), 1, 1, &mut events, |_| {
+                AdmissionProbeOutcome::<(), (), ()>::Admitted(())
+            })
+            .unwrap();
+        assert_eq!(released.admitted(), 1);
+        assert!(queue.is_empty());
+        assert!(matches!(
+            events.as_slice(),
+            [AdmissionQueueEvent::Admitted { ticket: actual, .. }] if *actual == ticket
+        ));
     }
 
     #[test]

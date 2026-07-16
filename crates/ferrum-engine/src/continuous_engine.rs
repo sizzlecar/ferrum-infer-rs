@@ -20,8 +20,8 @@ use ferrum_interfaces::{
         GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy, TokenSelectionMask,
     },
     vnext::{
-        AdmissionDeferred, AdmissionRejected, DeferredAction, EventEmissionPermit, ExecutionEvent,
-        ExecutionEventCapturePolicy, ExecutionEventDetail,
+        AdmissionDeferred, AdmissionRejected, DeferredAction, DeviceCapacityPressureScope,
+        EventEmissionPermit, ExecutionEvent, ExecutionEventCapturePolicy, ExecutionEventDetail,
         ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink, ExecutionEventSinkError,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,

@@ -730,6 +730,22 @@ impl ContinuousBatchScheduler {
         true
     }
 
+    /// Preserve one waiting request after backing growth hit live device
+    /// pressure. The original queue ticket and fairness age remain unchanged.
+    pub fn wait_for_release_after_backing_pressure(
+        &self,
+        request_id: &RequestId,
+        observed: AdmissionWakeEpochs,
+    ) -> Result<bool> {
+        self.waiting_queue
+            .write()
+            .wait_for_release_after_backing_pressure(
+                |request| request.inner.request.id == *request_id,
+                observed,
+            )
+            .map_err(|error| FerrumError::scheduler(error.to_string()))
+    }
+
     pub fn next_batch_with_dynamic_admission(
         &self,
         hint: BatchHint,

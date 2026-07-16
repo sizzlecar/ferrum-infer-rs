@@ -2352,6 +2352,13 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                     current: ExecutorAdmissionEpochs::from_capacity(current_epochs),
                 })
             }
+            DynamicDeferredMaintenanceOutcome::WaitForRelease {
+                current_epochs,
+                pressure,
+            } => Ok(ExecutorPrefillMaintenanceOutcome::WaitForRelease {
+                current: ExecutorAdmissionEpochs::from_capacity(current_epochs),
+                pressure,
+            }),
             DynamicDeferredMaintenanceOutcome::Maintained(receipt) => {
                 let allocated_bytes = receipt
                     .growths()

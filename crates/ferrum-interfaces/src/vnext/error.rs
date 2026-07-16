@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Maximum encoded size accepted by the untrusted failure-envelope decoder.
 pub const MAX_FAILURE_ENVELOPE_WIRE_BYTES: usize = 8 * 1024;
@@ -155,6 +156,135 @@ pub enum DynamicAdmissionFaultKind {
     AllocationFailure,
 }
 
+/// Capacity boundary that rejected one otherwise valid dynamic growth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceCapacityPressureScope {
+    PlanBudget,
+    ProcessWide,
+}
+
+/// Exact device-wide pressure observed while trying to grow dynamic backing.
+///
+/// This is retry evidence, not an allocation authority. Plan-budget pressure
+/// can be paired with plan-local release epochs; process-wide pressure requires
+/// device-wide coordination. Contract and allocator failures remain terminal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceCapacityPressure {
+    scope: DeviceCapacityPressureScope,
+    device_id: String,
+    requested_bytes: u64,
+    plan_claimed_bytes: u64,
+    plan_usable_bytes: u64,
+    process_claimed_bytes: u64,
+    process_usable_bytes: u64,
+}
+
+impl DeviceCapacityPressure {
+    pub fn new(
+        scope: DeviceCapacityPressureScope,
+        device_id: String,
+        requested_bytes: u64,
+        plan_claimed_bytes: u64,
+        plan_usable_bytes: u64,
+        process_claimed_bytes: u64,
+        process_usable_bytes: u64,
+    ) -> Result<Self, VNextError> {
+        let pressure = Self {
+            scope,
+            device_id,
+            requested_bytes,
+            plan_claimed_bytes,
+            plan_usable_bytes,
+            process_claimed_bytes,
+            process_usable_bytes,
+        };
+        let plan_available = pressure
+            .plan_usable_bytes
+            .checked_sub(pressure.plan_claimed_bytes);
+        let process_available = pressure
+            .process_usable_bytes
+            .checked_sub(pressure.process_claimed_bytes);
+        let scope_matches = match pressure.scope {
+            DeviceCapacityPressureScope::PlanBudget => {
+                plan_available.is_some_and(|available| available < pressure.requested_bytes)
+            }
+            DeviceCapacityPressureScope::ProcessWide => {
+                plan_available.is_some_and(|available| available >= pressure.requested_bytes)
+                    && process_available
+                        .is_some_and(|available| available < pressure.requested_bytes)
+            }
+        };
+        if pressure.device_id.trim().is_empty()
+            || pressure.requested_bytes == 0
+            || process_available.is_none()
+            || !scope_matches
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "device capacity pressure evidence is inconsistent".to_owned(),
+            });
+        }
+        Ok(pressure)
+    }
+
+    pub fn scope(&self) -> &DeviceCapacityPressureScope {
+        &self.scope
+    }
+
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    pub const fn requested_bytes(&self) -> u64 {
+        self.requested_bytes
+    }
+
+    pub const fn plan_claimed_bytes(&self) -> u64 {
+        self.plan_claimed_bytes
+    }
+
+    pub const fn plan_usable_bytes(&self) -> u64 {
+        self.plan_usable_bytes
+    }
+
+    pub const fn process_claimed_bytes(&self) -> u64 {
+        self.process_claimed_bytes
+    }
+
+    pub const fn process_usable_bytes(&self) -> u64 {
+        self.process_usable_bytes
+    }
+
+    pub const fn available_bytes(&self) -> u64 {
+        let plan_available = self
+            .plan_usable_bytes
+            .saturating_sub(self.plan_claimed_bytes);
+        let process_available = self
+            .process_usable_bytes
+            .saturating_sub(self.process_claimed_bytes);
+        if plan_available < process_available {
+            plan_available
+        } else {
+            process_available
+        }
+    }
+}
+
+impl fmt::Display for DeviceCapacityPressure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "device `{}` capacity is temporarily unavailable: requested {}, plan claimed {}/{}, process claimed {}/{}",
+            self.device_id,
+            self.requested_bytes,
+            self.plan_claimed_bytes,
+            self.plan_usable_bytes,
+            self.process_claimed_bytes,
+            self.process_usable_bytes
+        )
+    }
+}
+
 /// Structured, fail-closed errors produced by the vNext contracts.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum VNextError {
@@ -212,6 +342,8 @@ pub enum VNextError {
         kind: DynamicAdmissionFaultKind,
         reason: String,
     },
+    #[error("{0}")]
+    DeviceCapacityUnavailable(DeviceCapacityPressure),
     #[error(
         "dynamic resource admission is not connected: {descriptor_count} descriptors require at least {minimum_sequence_bytes} bytes for one runnable sequence"
     )]
