@@ -13,14 +13,16 @@ use super::{
     BackingPrepareDecision, BatchCapacityClaimDecision, BatchInvocationId,
     BatchParticipantAuthority, BatchParticipantTokenSpan, BatchStepId, BatchWorkShape,
     ClaimedBackingTransaction, ClaimedSubmissionWaveBacking, DeferredDeviceCleanupDomainId,
-    DeviceRuntime, Digest, DynamicBackingDeferred, ExecutionBatchParticipants, InvocationRegistry,
-    InvocationResourceAdmissionRequest, LogicalAdmissionCoordinatorId, LogicalBackingBufferView,
-    LogicalBackingSliceAuthority, LogicalBatchCapacityLease, NodeId, Ordering,
-    ParticipantFlightCandidate, ParticipantFlightPhase, ParticipantFlightWaveCandidate,
-    ParticipantNodeKey, PreparedParticipantFlightHold, RequestIdentity, ResourceId, RunId,
-    SequenceAuthorityId, SequenceBackingSnapshot, SequenceExecutionAuthoritySource,
-    SequenceRecoveryRegistry, SequenceSessionEpoch, SequenceSessionFingerprint, Serialize, Sha256,
-    StaticProvisioningLease, StepFinalizationFailure, StepParticipantFrameAssignment,
+    DeviceRuntime, Digest, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
+    ExecutionBatchParticipants, InvocationRegistry, InvocationResourceAdmissionRequest,
+    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSliceAuthority,
+    LogicalBatchCapacityLease, NodeId, Ordering, ParticipantFlightCandidate,
+    ParticipantFlightPhase, ParticipantFlightWaveCandidate, ParticipantNodeKey,
+    PlanBackingDeferral, PlanCapacityWaitRegistration, PreparedParticipantFlightHold,
+    RequestIdentity, ResourceId, RunId, SequenceAuthorityId, SequenceBackingSnapshot,
+    SequenceExecutionAuthoritySource, SequenceRecoveryRegistry, SequenceSessionEpoch,
+    SequenceSessionFingerprint, Serialize, Sha256, StaticProvisioningLease,
+    StepAdmissionBackingDeferral, StepFinalizationFailure, StepParticipantFrameAssignment,
     StepParticipantRetirement, StepParticipantRetirementDisposition, StepResourceAdmissionDecision,
     StepResourceAdmissionRequest, StepResourceLease, StepRetirementReceipt, StreamState,
     TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError, SEQUENCE_DISPATCH_POISONED_BIT,
@@ -448,6 +450,8 @@ where
                 "shared Step activation backing requires an ordered single-fence submission wave",
             ));
         }
+        let deferred_node_id = request.node_id().clone();
+        let deferred_work_fingerprint = request.work_shape().fingerprint().to_owned();
         let prepared = match self.prepare_invocation_scope(request)? {
             PreparedInvocationScopeDecision::Prepared(prepared) => prepared,
             PreparedInvocationScopeDecision::Deferred(deferred) => {
@@ -455,7 +459,12 @@ where
             }
             PreparedInvocationScopeDecision::BackingDeferred(deferred) => {
                 return Ok(InvocationResourceAdmissionDecision::BackingDeferred(
-                    deferred,
+                    InvocationAdmissionBackingDeferral::new(
+                        Arc::clone(self),
+                        deferred,
+                        deferred_node_id,
+                        deferred_work_fingerprint,
+                    )?,
                 ));
             }
             PreparedInvocationScopeDecision::PermanentRejected(rejected) => {
@@ -555,13 +564,26 @@ where
                 )
             })
             .collect::<Vec<_>>();
+        let deferred_node_work_fingerprints = prepared_nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.node_id.clone(),
+                    node.work_shape.fingerprint().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
         let (demand, requested_slices) =
             plan.submission_wave_demand(&node_shapes, fit_policy, pressure_action)?;
         let prepared_backing = match plan.prepare_backing_slices(requested_slices)? {
             BackingPrepareDecision::Prepared(prepared) => prepared,
             BackingPrepareDecision::Deferred(deferred) => {
                 return Ok(StepSubmissionWaveAdmissionDecision::BackingDeferred(
-                    deferred,
+                    StepSubmissionWaveBackingDeferral::new(
+                        Arc::clone(self),
+                        deferred,
+                        deferred_node_work_fingerprints,
+                    )?,
                 ));
             }
         };
@@ -873,8 +895,73 @@ where
 {
     Admitted(InvocationResourceLease<R>),
     Deferred(AdmissionDeferred),
-    BackingDeferred(DynamicBackingDeferred),
+    BackingDeferred(InvocationAdmissionBackingDeferral<R>),
     PermanentRejected(AdmissionRejected),
+}
+
+/// Non-cloneable backing authority for one exact node invocation under one
+/// live step.
+#[must_use = "invocation backing deferral retains its exact step parent"]
+pub struct InvocationAdmissionBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    backing: PlanBackingDeferral<R>,
+    step: Arc<StepResourceLease<R>>,
+    node_id: NodeId,
+    work_fingerprint: String,
+}
+
+impl<R> InvocationAdmissionBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    fn new(
+        step: Arc<StepResourceLease<R>>,
+        evidence: DynamicBackingDeferred,
+        node_id: NodeId,
+        work_fingerprint: String,
+    ) -> Result<Self, VNextError> {
+        let resources = Arc::clone(
+            &step.participants[0]
+                .session
+                .resources()
+                .request
+                .plan
+                .resources,
+        );
+        Ok(Self {
+            backing: PlanBackingDeferral::new(resources, evidence)?,
+            step,
+            node_id,
+            work_fingerprint,
+        })
+    }
+
+    pub fn evidence(&self) -> &DynamicBackingDeferred {
+        self.backing.evidence()
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+
+    pub fn work_fingerprint(&self) -> &str {
+        &self.work_fingerprint
+    }
+
+    pub fn maintain(&self) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        if self.step.finalized {
+            return Err(invalid_resource(
+                "finalized step cannot maintain invocation backing",
+            ));
+        }
+        self.backing.maintain()
+    }
+
+    pub fn register_waiter(&self) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
+        self.backing.register_waiter()
+    }
 }
 
 enum PreparedInvocationScopeDecision<R>
@@ -964,8 +1051,65 @@ where
 {
     Prepared(PreparedStepSubmissionWave<R>),
     Deferred(AdmissionDeferred),
-    BackingDeferred(DynamicBackingDeferred),
+    BackingDeferred(StepSubmissionWaveBackingDeferral<R>),
     PermanentRejected(AdmissionRejected),
+}
+
+/// Non-cloneable backing authority for one immutable-plan submission wave.
+#[must_use = "submission-wave backing deferral retains its exact step parent"]
+pub struct StepSubmissionWaveBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    backing: PlanBackingDeferral<R>,
+    step: Arc<StepResourceLease<R>>,
+    node_work_fingerprints: Vec<(NodeId, String)>,
+}
+
+impl<R> StepSubmissionWaveBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    fn new(
+        step: Arc<StepResourceLease<R>>,
+        evidence: DynamicBackingDeferred,
+        node_work_fingerprints: Vec<(NodeId, String)>,
+    ) -> Result<Self, VNextError> {
+        let resources = Arc::clone(
+            &step.participants[0]
+                .session
+                .resources()
+                .request
+                .plan
+                .resources,
+        );
+        Ok(Self {
+            backing: PlanBackingDeferral::new(resources, evidence)?,
+            step,
+            node_work_fingerprints,
+        })
+    }
+
+    pub fn evidence(&self) -> &DynamicBackingDeferred {
+        self.backing.evidence()
+    }
+
+    pub fn node_work_fingerprints(&self) -> &[(NodeId, String)] {
+        &self.node_work_fingerprints
+    }
+
+    pub fn maintain(&self) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        if self.step.finalized {
+            return Err(invalid_resource(
+                "finalized step cannot maintain submission-wave backing",
+            ));
+        }
+        self.backing.maintain()
+    }
+
+    pub fn register_waiter(&self) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
+        self.backing.register_waiter()
+    }
 }
 
 /// One immutable-plan node projection inside a prepared physical submission
@@ -1646,6 +1790,7 @@ where
             fit_policy,
             pressure_action,
         } = request;
+        let work_fingerprint = work_shape.fingerprint().to_owned();
         let expected_participants = self
             .sessions
             .iter()
@@ -1678,7 +1823,13 @@ where
         let prepared = match plan.prepare_backing_slices(requested_slices)? {
             BackingPrepareDecision::Prepared(prepared) => prepared,
             BackingPrepareDecision::Deferred(deferred) => {
-                return Ok(StepResourceAdmissionDecision::BackingDeferred(deferred));
+                return Ok(StepResourceAdmissionDecision::BackingDeferred(
+                    StepAdmissionBackingDeferral::new(
+                        deferred,
+                        self.sessions.clone(),
+                        work_fingerprint,
+                    )?,
+                ));
             }
         };
         let logical_capacity = if demand.immediate_claim().is_empty() {

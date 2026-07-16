@@ -7,14 +7,13 @@ use super::{
     DynamicResourceShape, ExecutionFrameId, LogicalAdmissionCoordinatorId, LogicalAdmissionLease,
     LogicalBackingBufferView, LogicalBackingSliceAuthority, LogicalBackingSliceEvidence,
     LogicalCapacityLease, LogicalRequestLease, ManuallyDrop, Mutex, NonZeroU64, Ordering,
-    ParticipantNodeKey, PlanCapacityWaitRegistration, PreparedBackingClaim,
+    ParticipantNodeKey, PlanBackingDeferral, PlanCapacityWaitRegistration, PreparedBackingClaim,
     RequestAdmissionDecision, RequestAuthorityId, RequestIdentity, RequestResourceAdmissionRequest,
     ResourceId, ResourceWorkShape, RunId, SequenceAuthorityId, SequenceRecoveryRegistry,
     SequenceResourceAdmissionRequest, Serialize, Sha256, StaticProvisioningLease,
     TrustedPlanRuntimeBinding, TrustedPlanRuntimeEvidence, VNextError, Weak,
     SEQUENCE_DISPATCH_POISONED_BIT,
 };
-use std::ops::Deref;
 
 pub(super) const fn sequence_slot_active(epoch: u64) -> u64 {
     (epoch << 2) | 1
@@ -120,16 +119,9 @@ where
         self.plan
             .maintain_request_backing_for_deferred(&self.evidence)
     }
-}
 
-impl<R> Deref for RequestBackingDeferral<R>
-where
-    R: DeviceRuntime,
-{
-    type Target = DynamicBackingDeferred;
-
-    fn deref(&self) -> &Self::Target {
-        &self.evidence
+    pub fn register_waiter(&self) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
+        self.plan.register_backing_waiter(&self.evidence)
     }
 }
 
@@ -465,16 +457,9 @@ where
         self.parent
             .maintain_sequence_backing_for_deferred(&self.evidence)
     }
-}
 
-impl<R> Deref for SequenceAdmissionBackingDeferral<R>
-where
-    R: DeviceRuntime,
-{
-    type Target = DynamicBackingDeferred;
-
-    fn deref(&self) -> &Self::Target {
-        &self.evidence
+    pub fn register_waiter(&self) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
+        self.parent.plan.register_backing_waiter(&self.evidence)
     }
 }
 
@@ -768,22 +753,12 @@ where
             .register_admission_waiter(deferred)
     }
 
-    pub fn register_backing_waiter(
-        &self,
-        deferred: &DynamicBackingDeferred,
-    ) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
-        self.resources
-            .request
-            .plan
-            .register_backing_waiter(deferred)
-    }
-
     /// Advances the sequence-owned committed backing frontier without making
     /// an in-flight frame observe a different physical generation. Expensive
     /// preparation happens outside the session/backing locks; publication is
     /// one short slot -> backing critical section.
     pub fn try_extend_backing(
-        &self,
+        self: &Arc<Self>,
         request: SequenceResourceExtensionRequest,
     ) -> Result<SequenceResourceExtensionDecision<R>, VNextError> {
         let _lifecycle = self
@@ -792,6 +767,7 @@ where
             .plan
             .resources
             .read_lifecycle("extend sequence backing")?;
+        let target_fingerprint = request.target_work.fingerprint().to_owned();
         let target = request.target_work.fit_shape();
 
         let expected = {
@@ -860,7 +836,17 @@ where
             let prepared = match plan.prepare_backing_slices(requested_slices)? {
                 BackingPrepareDecision::Prepared(prepared) => prepared,
                 BackingPrepareDecision::Deferred(deferred) => {
-                    return Ok(SequenceResourceExtensionDecision::BackingDeferred(deferred));
+                    return Ok(SequenceResourceExtensionDecision::BackingDeferred(
+                        SequenceExtensionBackingDeferral {
+                            backing: PlanBackingDeferral::new(
+                                Arc::clone(&plan.resources),
+                                deferred,
+                            )?,
+                            session: Arc::clone(self),
+                            expected_generation: expected.generation(),
+                            target_fingerprint,
+                        },
+                    ));
                 }
             };
             let capacity = match plan
@@ -1356,8 +1342,56 @@ where
     Extended(Arc<SequenceBackingSnapshot<R>>),
     RetryRequired(Arc<SequenceBackingSnapshot<R>>),
     Deferred(AdmissionDeferred),
-    BackingDeferred(DynamicBackingDeferred),
+    BackingDeferred(SequenceExtensionBackingDeferral<R>),
     PermanentRejected(AdmissionRejected),
+}
+
+/// Non-cloneable authority for backing growth of one exact open sequence
+/// generation and target work shape.
+#[must_use = "sequence extension backing must be maintained or explicitly dropped"]
+pub struct SequenceExtensionBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    backing: PlanBackingDeferral<R>,
+    session: Arc<SequenceSession<R>>,
+    expected_generation: SequenceBackingGeneration,
+    target_fingerprint: String,
+}
+
+impl<R> SequenceExtensionBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    pub fn evidence(&self) -> &DynamicBackingDeferred {
+        self.backing.evidence()
+    }
+
+    pub fn expected_generation(&self) -> SequenceBackingGeneration {
+        self.expected_generation
+    }
+
+    pub fn target_fingerprint(&self) -> &str {
+        &self.target_fingerprint
+    }
+
+    pub fn maintain(&self) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        self.session.ensure_open_identity()?;
+        let current_generation = self
+            .session
+            .resources
+            .lock_backing_state()?
+            .current
+            .generation();
+        if current_generation != self.expected_generation {
+            return self.backing.retry_admission();
+        }
+        self.backing.maintain()
+    }
+
+    pub fn register_waiter(&self) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
+        self.backing.register_waiter()
+    }
 }
 
 /// Sequence authority. There is exactly one state cell for the exact

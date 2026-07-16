@@ -999,15 +999,6 @@ where
         )
     }
 
-    fn observe_wait_condition(
-        &self,
-        wait_condition: &CapacityWaitCondition,
-    ) -> Result<(CapacityEpochs, bool), VNextError> {
-        let mut availability = Vec::with_capacity(self.pools.domains.len() + 3);
-        let epochs = self.pools.write_capacity_availability(&mut availability)?;
-        Ok((epochs, wait_condition.changed_since(&availability)?))
-    }
-
     fn wait_snapshot_for_pool_ids<'a>(
         &self,
         pool_ids: impl IntoIterator<Item = &'a DynamicBackingPoolId>,
@@ -1045,67 +1036,6 @@ where
             wait_condition,
             pressure: blocked.pressure,
         })
-    }
-
-    /// Resolves a still-current physical deferral by pool identity. If any
-    /// release or capacity event happened since observation, no allocation is
-    /// performed and the caller must retry admission against the new state.
-    pub fn maintain_for_deferred(
-        &self,
-        deferred: &DynamicBackingDeferred,
-    ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
-        let coordinator_id = self.pools.logical_admission.id();
-        if coordinator_id != deferred.epochs().coordinator_id()
-            || coordinator_id != deferred.wait_condition().coordinator_id()
-        {
-            return Err(invalid_resource(
-                "dynamic backing deferral belongs to another admission coordinator",
-            ));
-        }
-        let (current_epochs, availability_changed) =
-            self.observe_wait_condition(deferred.wait_condition())?;
-        if availability_changed {
-            return Ok(DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs });
-        }
-        if deferred.blockers().is_empty() {
-            return Err(invalid_resource(
-                "dynamic backing deferral contains no blocking pool",
-            ));
-        }
-        let mut requested_by_pool = BTreeMap::<DynamicBackingPoolId, u64>::new();
-        for blocker in deferred.blockers() {
-            if !self.pools.pools.contains_key(blocker.pool_id()) {
-                return Err(invalid_resource(
-                    "dynamic backing deferral belongs to another plan owner",
-                ));
-            }
-            requested_by_pool
-                .entry(blocker.pool_id().clone())
-                .and_modify(|bytes| *bytes = (*bytes).max(blocker.requested_bytes()))
-                .or_insert(blocker.requested_bytes());
-        }
-        let requests = requested_by_pool
-            .into_iter()
-            .map(|(pool_id, bytes)| DynamicPoolGrowthRequest::new(pool_id, bytes))
-            .collect::<Result<Vec<_>, _>>()?;
-        let logical_snapshot =
-            self.wait_snapshot_for_pool_ids(requests.iter().map(|request| request.pool_id()))?;
-        let mut capacity_blocked = None;
-        let growth = self.pools.maintain_pools_observed(
-            requests
-                .into_iter()
-                .map(DynamicPoolGrowthIntent::Additional)
-                .collect(),
-            &mut capacity_blocked,
-        );
-        match growth {
-            Ok(receipt) => Ok(DynamicDeferredMaintenanceOutcome::Maintained(receipt)),
-            Err(VNextError::DeviceCapacityUnavailable(_)) => self.capacity_wait_outcome(
-                logical_snapshot,
-                capacity_blocked.expect("typed capacity failure retains its exact observation"),
-            ),
-            Err(error) => Err(error),
-        }
     }
 
     /// Revalidates a physical deferral while its exact typed owner remains

@@ -191,7 +191,7 @@ pub(crate) fn logical_resources(
                     "event request admission did not converge after bounded maintenance"
                 );
                 request_maintenance_attempts += 1;
-                plan_resources.maintain_for_deferred(&deferred).unwrap();
+                deferred.maintain().unwrap();
             }
             RequestResourceAdmissionDecision::Deferred(_) => {
                 panic!("event fixture request admission deferred")
@@ -220,7 +220,7 @@ pub(crate) fn logical_resources(
                     "event sequence admission did not converge after bounded maintenance"
                 );
                 sequence_maintenance_attempts += 1;
-                plan_resources.maintain_for_deferred(&deferred).unwrap();
+                deferred.maintain().unwrap();
             }
             SequenceResourceAdmissionDecision::Deferred(_) => {
                 panic!("event fixture sequence admission deferred")
@@ -233,7 +233,7 @@ pub(crate) fn logical_resources(
 }
 
 pub(crate) fn begin_single_participant_step(
-    plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
+    _plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
     batch: &ExecutionBatchParticipants<TestRuntime>,
 ) -> Arc<StepResourceLease<TestRuntime>> {
     let request = StepResourceAdmissionRequest::new(
@@ -248,7 +248,7 @@ pub(crate) fn begin_single_participant_step(
             StepResourceAdmissionDecision::BackingDeferred(deferred)
                 if attempt < MAX_EVENT_MAINTENANCE_ATTEMPTS =>
             {
-                plan_resources.maintain_for_deferred(&deferred).unwrap();
+                deferred.maintain().unwrap();
             }
             StepResourceAdmissionDecision::BackingDeferred(_) => {
                 panic!("event step backing did not converge after bounded maintenance")
@@ -265,7 +265,7 @@ pub(crate) fn begin_single_participant_step(
 }
 
 pub(crate) fn admit_single_participant_invocation(
-    plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
+    _plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
     step: &Arc<StepResourceLease<TestRuntime>>,
     node_id: &NodeId,
 ) -> InvocationResourceLease<TestRuntime> {
@@ -283,7 +283,7 @@ pub(crate) fn admit_single_participant_invocation(
             InvocationResourceAdmissionDecision::BackingDeferred(deferred)
                 if attempt < MAX_EVENT_MAINTENANCE_ATTEMPTS =>
             {
-                plan_resources.maintain_for_deferred(&deferred).unwrap();
+                deferred.maintain().unwrap();
             }
             InvocationResourceAdmissionDecision::BackingDeferred(_) => {
                 panic!("event invocation backing did not converge after bounded maintenance")

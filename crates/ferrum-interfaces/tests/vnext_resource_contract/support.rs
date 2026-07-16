@@ -1303,7 +1303,7 @@ pub(crate) fn admit_logical_request(
         {
             RequestResourceAdmissionDecision::Admitted(resources) => return resources,
             RequestResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
-                root.maintain_for_deferred(&deferred).unwrap();
+                deferred.maintain().unwrap();
             }
             RequestResourceAdmissionDecision::BackingDeferred(_) => {
                 panic!("request backing did not converge after bounded maintenance")
@@ -1335,7 +1335,7 @@ pub(crate) fn admit_logical_sequence(
         match request.try_admit_sequence(sequence.clone()).unwrap() {
             SequenceResourceAdmissionDecision::Admitted(resources) => return resources,
             SequenceResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
-                root.maintain_for_deferred(&deferred).unwrap();
+                deferred.maintain().unwrap();
             }
             SequenceResourceAdmissionDecision::BackingDeferred(_) => {
                 panic!("sequence backing did not converge after bounded maintenance")
@@ -1352,7 +1352,7 @@ pub(crate) fn admit_logical_sequence(
 }
 
 pub(crate) fn admit_logical_child_sequence(
-    root: &Arc<PlanRuntimeResources<TestRuntime>>,
+    _root: &Arc<PlanRuntimeResources<TestRuntime>>,
     request: &Arc<AdmittedRequestResources<TestRuntime>>,
 ) -> Arc<AdmittedSequenceResources<TestRuntime>> {
     let admission = SequenceResourceAdmissionRequest::new(
@@ -1365,7 +1365,7 @@ pub(crate) fn admit_logical_child_sequence(
         match request.try_admit_sequence(admission.clone()).unwrap() {
             SequenceResourceAdmissionDecision::Admitted(resources) => return resources,
             SequenceResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
-                root.maintain_for_deferred(&deferred).unwrap();
+                deferred.maintain().unwrap();
             }
             SequenceResourceAdmissionDecision::BackingDeferred(_) => {
                 panic!("child sequence backing did not converge after bounded maintenance")

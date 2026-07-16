@@ -168,7 +168,7 @@ fn closing_error(error: &VNextError) -> bool {
 }
 
 fn begin_single_participant_step(
-    root: &Arc<PlanRuntimeResources<TestRuntime>>,
+    _root: &Arc<PlanRuntimeResources<TestRuntime>>,
     batch: &ExecutionBatchParticipants<TestRuntime>,
 ) -> Arc<StepResourceLease<TestRuntime>> {
     let request = StepResourceAdmissionRequest::new(
@@ -181,7 +181,7 @@ fn begin_single_participant_step(
         match batch.try_begin_step(request.clone()).unwrap() {
             StepResourceAdmissionDecision::Admitted(step) => return step,
             StepResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
-                root.maintain_for_deferred(&deferred).unwrap();
+                deferred.maintain().unwrap();
             }
             StepResourceAdmissionDecision::BackingDeferred(_) => {
                 panic!("step backing did not converge after bounded maintenance")

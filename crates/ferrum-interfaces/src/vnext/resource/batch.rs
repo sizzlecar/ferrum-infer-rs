@@ -3,9 +3,10 @@ use super::{
     AdmissionRejected, AdmittedSequenceResources, Arc, BTreeMap, BatchInvocationId,
     BatchParticipantAuthority, BatchParticipantTokenSpan, BatchStepId, BatchWorkShape,
     CapacityDomainId, CapacityEntry, CapacityUnits, CapacityVector, DeviceRuntime, Digest,
-    DynamicBackingDeferred, ExecutionFrameId, LogicalBackingSliceAuthority,
-    LogicalBackingSliceEvidence, LogicalBatchCapacityLease, Mutex, NodeId, ParticipantFlightPhase,
-    ParticipantNodeKey, PhysicalBackingClaimIdentity, RequestAuthorityId, SequenceAuthorityId,
+    DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome, ExecutionFrameId,
+    LogicalBackingSliceAuthority, LogicalBackingSliceEvidence, LogicalBatchCapacityLease, Mutex,
+    NodeId, ParticipantFlightPhase, ParticipantNodeKey, PhysicalBackingClaimIdentity,
+    PlanBackingDeferral, PlanCapacityWaitRegistration, RequestAuthorityId, SequenceAuthorityId,
     SequenceBackingSnapshot, SequenceSession, SequenceSessionEpoch, SequenceSessionFingerprint,
     SequenceSessionPhase, SequenceSessionSlot, SequenceSessionSlotState, Serialize, Sha256,
     StepParticipantFrameAssignment, TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError,
@@ -1031,8 +1032,71 @@ where
 {
     Admitted(Arc<StepResourceLease<R>>),
     Deferred(AdmissionDeferred),
-    BackingDeferred(DynamicBackingDeferred),
+    BackingDeferred(StepAdmissionBackingDeferral<R>),
     PermanentRejected(AdmissionRejected),
+}
+
+/// Non-cloneable physical-backing authority for one exact batch participant
+/// set and immutable step work shape.
+#[must_use = "step backing deferral retains its exact participant parents"]
+pub struct StepAdmissionBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    backing: PlanBackingDeferral<R>,
+    participants: Vec<Arc<SequenceSession<R>>>,
+    work_fingerprint: String,
+}
+
+impl<R> StepAdmissionBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    pub(super) fn new(
+        evidence: DynamicBackingDeferred,
+        participants: Vec<Arc<SequenceSession<R>>>,
+        work_fingerprint: String,
+    ) -> Result<Self, VNextError> {
+        let first = participants
+            .first()
+            .ok_or_else(|| invalid_resource("step backing deferral requires participants"))?;
+        let resources = Arc::clone(&first.resources().request.plan.resources);
+        if participants.iter().any(|participant| {
+            !Arc::ptr_eq(&resources, &participant.resources().request.plan.resources)
+        }) {
+            return Err(invalid_resource(
+                "step backing deferral participants belong to different plans",
+            ));
+        }
+        Ok(Self {
+            backing: PlanBackingDeferral::new(resources, evidence)?,
+            participants,
+            work_fingerprint,
+        })
+    }
+
+    pub fn evidence(&self) -> &DynamicBackingDeferred {
+        self.backing.evidence()
+    }
+
+    pub fn participant_count(&self) -> usize {
+        self.participants.len()
+    }
+
+    pub fn work_fingerprint(&self) -> &str {
+        &self.work_fingerprint
+    }
+
+    pub fn maintain(&self) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        for participant in &self.participants {
+            participant.ensure_open_identity()?;
+        }
+        self.backing.maintain()
+    }
+
+    pub fn register_waiter(&self) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
+        self.backing.register_waiter()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
