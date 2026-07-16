@@ -4687,14 +4687,14 @@ impl OperationDispatch {
         let invocation = BatchedOperationInvocation::from_resolved(
             runtime,
             resolved,
-            provider.provider.descriptor(),
+            provider.provider().descriptor(),
             batch_identity,
             completion.invocation(),
             active_bindings,
         )
         .map_err(OperationDispatchError::Contract)?;
         let expected_phase = invocation.operation().profile_phase;
-        let command = match provider.provider.encode_selected(invocation) {
+        let command = match provider.provider().encode_selected(invocation) {
             Ok(command) => command,
             Err(failure)
                 if batch_identity.contains_identity(failure.identity())
@@ -4872,7 +4872,7 @@ impl OperationDispatch {
             let invocation = BatchedOperationInvocation::from_wave_node(
                 runtime,
                 resolved,
-                provider.provider.descriptor(),
+                provider.provider().descriptor(),
                 batch_identity,
                 node_identity,
                 completion.wave(),
@@ -4881,7 +4881,7 @@ impl OperationDispatch {
             )
             .map_err(SubmissionWaveDispatchError::Contract)?;
             let expected_phase = invocation.operation().profile_phase;
-            let command = match provider.provider.encode_selected(invocation) {
+            let command = match provider.provider().encode_selected(invocation) {
                 Ok(command) => command,
                 Err(failure)
                     if node_identity.contains_identity(failure.identity())
@@ -5363,7 +5363,7 @@ where
 {
     authority: OperationRegistryAuthority,
     contracts: BTreeMap<OperationId, Box<dyn OperationContract>>,
-    providers: BTreeMap<ProviderId, Box<dyn OperationProvider<R>>>,
+    providers: BTreeMap<ProviderId, Arc<dyn OperationProvider<R>>>,
 }
 
 impl<R> OperationRuntimeRegistry<R>
@@ -5393,7 +5393,7 @@ where
                 )));
             }
         }
-        let mut provider_map = BTreeMap::new();
+        let mut provider_map: BTreeMap<ProviderId, Arc<dyn OperationProvider<R>>> = BTreeMap::new();
         for provider in providers {
             let descriptor = provider.descriptor();
             let contract = contract_map.get(descriptor.operation_id()).ok_or_else(|| {
@@ -5409,7 +5409,10 @@ where
                 )));
             }
             let provider_id = descriptor.provider_id().clone();
-            if provider_map.insert(provider_id.clone(), provider).is_some() {
+            if provider_map
+                .insert(provider_id.clone(), Arc::from(provider))
+                .is_some()
+            {
                 return Err(invalid_operation(format!(
                     "operation runtime registry has duplicate or byte-identical provider `{provider_id}`"
                 )));
@@ -5466,6 +5469,54 @@ where
         resolved: &dyn ExecutablePlanView,
         node_id: &NodeId,
     ) -> Result<BoundOperationProvider<'registry, R>, VNextError> {
+        let provider = self.selected_provider(resolved, node_id)?;
+        let plan = resolved.execution_plan();
+        Ok(BoundOperationProvider {
+            provider: BoundOperationProviderSource::Borrowed(provider.as_ref()),
+            plan_id: plan.payload().plan_id().clone(),
+            plan_hash: plan.plan_hash().clone(),
+            node_id: node_id.clone(),
+        })
+    }
+
+    /// Binds every selected provider once in immutable plan-node order.
+    ///
+    /// The returned handles own their provider objects, so execution can drop
+    /// the composition registry and cannot re-enter provider lookup from the
+    /// token loop.
+    pub fn bind_plan(
+        &self,
+        resolved: &dyn ExecutablePlanView,
+    ) -> Result<BoundOperationProviderSet<R>, VNextError> {
+        let providers = resolved
+            .execution_plan()
+            .payload()
+            .nodes()
+            .iter()
+            .map(|node| {
+                let provider = self.selected_provider(resolved, node.id())?;
+                let plan = resolved.execution_plan();
+                Ok(BoundOperationProvider {
+                    provider: BoundOperationProviderSource::Owned(Arc::clone(provider)),
+                    plan_id: plan.payload().plan_id().clone(),
+                    plan_hash: plan.plan_hash().clone(),
+                    node_id: node.id().clone(),
+                })
+            })
+            .collect::<Result<Vec<BoundOperationProvider<'static, R>>, _>>()?;
+        if providers.is_empty() {
+            return Err(invalid_operation(
+                "executable plan cannot bind an empty provider set",
+            ));
+        }
+        Ok(BoundOperationProviderSet { providers })
+    }
+
+    fn selected_provider(
+        &self,
+        resolved: &dyn ExecutablePlanView,
+        node_id: &NodeId,
+    ) -> Result<&Arc<dyn OperationProvider<R>>, VNextError> {
         let plan = resolved.execution_plan();
         if plan.operation_registry_authority() != &self.authority {
             return Err(invalid_operation(
@@ -5502,12 +5553,7 @@ where
                 "runtime provider is not the exact registry object selected by the resolved plan",
             ));
         }
-        Ok(BoundOperationProvider {
-            provider: provider.as_ref(),
-            plan_id: plan.payload().plan_id().clone(),
-            plan_hash: plan.plan_hash().clone(),
-            node_id: node_id.clone(),
-        })
+        Ok(provider)
     }
 }
 
@@ -5530,13 +5576,34 @@ where
     }
 }
 
+enum BoundOperationProviderSource<'registry, R>
+where
+    R: DeviceRuntime,
+{
+    Borrowed(&'registry dyn OperationProvider<R>),
+    Owned(Arc<dyn OperationProvider<R>>),
+}
+
+impl<R> BoundOperationProviderSource<'_, R>
+where
+    R: DeviceRuntime,
+{
+    fn provider(&self) -> &dyn OperationProvider<R> {
+        match self {
+            Self::Borrowed(provider) => *provider,
+            Self::Owned(provider) => provider.as_ref(),
+        }
+    }
+}
+
 /// Unforgeable per-node provider authority. Its provider object and plan/node
-/// binding are private and remain borrowed from one composition-root registry.
+/// binding are private. Normal bindings borrow the composition registry;
+/// immutable plan bindings own the same selected provider object.
 pub struct BoundOperationProvider<'registry, R>
 where
     R: DeviceRuntime,
 {
-    provider: &'registry dyn OperationProvider<R>,
+    provider: BoundOperationProviderSource<'registry, R>,
     plan_id: PlanId,
     plan_hash: PlanHash,
     node_id: NodeId,
@@ -5546,6 +5613,10 @@ impl<R> BoundOperationProvider<'_, R>
 where
     R: DeviceRuntime,
 {
+    fn provider(&self) -> &dyn OperationProvider<R> {
+        self.provider.provider()
+    }
+
     fn validate_binding(
         &self,
         resolved: &dyn ExecutablePlanView,
@@ -5564,7 +5635,36 @@ where
     }
 
     pub fn descriptor(&self) -> &OperationProviderDescriptor {
-        self.provider.descriptor()
+        self.provider().descriptor()
+    }
+}
+
+/// Immutable provider selection for every node in one executable plan.
+///
+/// Construction is restricted to [`OperationRuntimeRegistry::bind_plan`],
+/// which checks registry authority, catalog identity, provider fingerprint,
+/// and node order before the runtime begins executing requests.
+pub struct BoundOperationProviderSet<R>
+where
+    R: DeviceRuntime,
+{
+    providers: Vec<BoundOperationProvider<'static, R>>,
+}
+
+impl<R> BoundOperationProviderSet<R>
+where
+    R: DeviceRuntime,
+{
+    pub fn providers(&self) -> &[BoundOperationProvider<'static, R>] {
+        &self.providers
+    }
+
+    pub fn len(&self) -> usize {
+        self.providers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
     }
 }
 
