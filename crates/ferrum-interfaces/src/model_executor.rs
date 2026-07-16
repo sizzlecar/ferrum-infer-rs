@@ -698,8 +698,8 @@ impl<'a> ExecutorPrefillAdmission<'a> {
     }
 }
 
-/// Scheduler-visible proof that an executor retained the request/sequence
-/// authority required by one exact prefill.
+/// Scheduler-visible proof that an executor retained the request, sequence,
+/// step, and prepared submission-wave authority required by one exact prefill.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutorPrefillAdmissionReceipt {
     pub request_id: RequestId,
