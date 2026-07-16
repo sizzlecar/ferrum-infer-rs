@@ -1,4 +1,5 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
@@ -39,6 +40,7 @@ struct OwnerMap {
     baseline_scope: Vec<String>,
     current_scope: Vec<String>,
     item_scope: ItemScope,
+    migration_manifest: MigrationManifestEvidence,
     modules: Vec<ModuleMap>,
     summary: Summary,
     diagnostics: Vec<String>,
@@ -74,6 +76,50 @@ struct ItemMapping {
     match_count: usize,
     status: &'static str,
     macro_contract: Option<String>,
+    migration: Option<AppliedMigration>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationManifest {
+    schema_version: u32,
+    baseline_commit: String,
+    expected_added_items: usize,
+    expected_added_items_sha256: String,
+    migrations: Vec<IntentionalMigration>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct IntentionalMigration {
+    old_path: String,
+    old_kind: String,
+    replacement_targets: Vec<MigrationTarget>,
+    introduced_by_commit: String,
+    rationale: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationTarget {
+    path: String,
+    kind: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AppliedMigration {
+    replacement_targets: Vec<MigrationTarget>,
+    introduced_by_commit: String,
+    rationale: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MigrationManifestEvidence {
+    path: String,
+    sha256: String,
+    migration_count: usize,
+    expected_added_items: usize,
+    expected_added_items_sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -88,6 +134,7 @@ struct AddedItem {
 struct ModuleSummary {
     baseline_items: usize,
     mapped_items: usize,
+    migrated_items: usize,
     lost_items: usize,
     ambiguous_items: usize,
     inaccessible_items: usize,
@@ -100,10 +147,12 @@ struct ModuleSummary {
 struct Summary {
     baseline_items: usize,
     mapped_items: usize,
+    migrated_items: usize,
     lost_items: usize,
     ambiguous_items: usize,
     inaccessible_items: usize,
     added_items: usize,
+    added_items_sha256: String,
     excluded_non_public_owner_members: usize,
     unsupported_syntax_count: usize,
     coverage_percent: f64,
@@ -125,9 +174,9 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args = env::args().skip(1).collect::<Vec<_>>();
-    if args.len() != 4 {
+    if args.len() != 5 {
         return Err(format!(
-            "usage: vnext_public_owner_map <baseline-commit> <baseline-dir> <current-vnext-dir> <output-json>; got {} arguments",
+            "usage: vnext_public_owner_map <baseline-commit> <baseline-dir> <current-vnext-dir> <migration-manifest> <output-json>; got {} arguments",
             args.len()
         ));
     }
@@ -135,7 +184,40 @@ fn run() -> Result<(), String> {
     let baseline_commit = args[0].clone();
     let baseline_dir = PathBuf::from(&args[1]);
     let current_root = PathBuf::from(&args[2]);
-    let output_path = PathBuf::from(&args[3]);
+    let migration_manifest_path = PathBuf::from(&args[3]);
+    let output_path = PathBuf::from(&args[4]);
+    let migration_manifest_bytes = fs::read(&migration_manifest_path).map_err(|error| {
+        format!(
+            "read migration manifest {}: {error}",
+            migration_manifest_path.display()
+        )
+    })?;
+    let migration_manifest = serde_json::from_slice::<MigrationManifest>(&migration_manifest_bytes)
+        .map_err(|error| {
+            format!(
+                "parse migration manifest {}: {error}",
+                migration_manifest_path.display()
+            )
+        })?;
+    validate_migration_manifest(&migration_manifest, &baseline_commit)?;
+    let migration_manifest_sha256 = format!("{:x}", Sha256::digest(&migration_manifest_bytes));
+    let mut migrations_by_key = migration_manifest
+        .migrations
+        .iter()
+        .map(|migration| {
+            (
+                SymbolKey {
+                    public_path: migration.old_path.clone(),
+                    kind: migration.old_kind.clone(),
+                    macro_contract: None,
+                },
+                migration,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if migrations_by_key.len() != migration_manifest.migrations.len() {
+        return Err("migration manifest contains duplicate old path/kind entries".to_string());
+    }
     let mut diagnostics = Vec::new();
     let mut module_maps = Vec::new();
     let mut baseline_scope = Vec::new();
@@ -206,12 +288,41 @@ fn run() -> Result<(), String> {
                 .filter(|candidate| publicly_accessible(candidate, &current_public_roots))
                 .copied()
                 .collect::<Vec<_>>();
-            let (new_owner, status, preserved) = match (matches.len(), accessible.len()) {
-                (0, _) => (None, "lost", false),
-                (1, 0) => (Some(matches[0].owner.clone()), "inaccessible", false),
-                (1, 1) => (Some(accessible[0].owner.clone()), "mapped", true),
-                (_, 1) => (Some(accessible[0].owner.clone()), "ambiguous", false),
-                (_, _) => (None, "ambiguous", false),
+            let migration = migrations_by_key.remove(&old.key);
+            let (new_owner, status, preserved, applied_migration) = match (
+                matches.len(),
+                accessible.len(),
+                migration,
+            ) {
+                (0, _, Some(migration)) => {
+                    let owners = validate_migration_targets(
+                        migration,
+                        &current_by_key,
+                        &current_public_roots,
+                    )?;
+                    (
+                        Some(owners.join(",")),
+                        "migrated",
+                        false,
+                        Some(AppliedMigration {
+                            replacement_targets: migration.replacement_targets.clone(),
+                            introduced_by_commit: migration.introduced_by_commit.clone(),
+                            rationale: migration.rationale.clone(),
+                        }),
+                    )
+                }
+                (_, _, Some(_)) => {
+                    let message = format!(
+                        "migration manifest entry is redundant because the old symbol still maps: {} ({})",
+                        old.key.public_path, old.key.kind
+                    );
+                    return Err(message);
+                }
+                (0, _, None) => (None, "lost", false, None),
+                (1, 0, None) => (Some(matches[0].owner.clone()), "inaccessible", false, None),
+                (1, 1, None) => (Some(accessible[0].owner.clone()), "mapped", true, None),
+                (_, 1, None) => (Some(accessible[0].owner.clone()), "ambiguous", false, None),
+                (_, _, None) => (None, "ambiguous", false, None),
             };
             mappings.push(ItemMapping {
                 old_path: old.key.public_path.clone(),
@@ -222,6 +333,7 @@ fn run() -> Result<(), String> {
                 match_count: matches.len(),
                 status,
                 macro_contract: old.key.macro_contract.clone(),
+                migration: applied_migration,
             });
         }
         mappings.sort_by(|left, right| {
@@ -250,16 +362,21 @@ fn run() -> Result<(), String> {
             .iter()
             .filter(|mapping| mapping.status == "mapped")
             .count();
+        let migrated_items = mappings
+            .iter()
+            .filter(|mapping| mapping.status == "migrated")
+            .count();
         let baseline_items = mappings.len();
         let module_summary = ModuleSummary {
             baseline_items,
             mapped_items,
+            migrated_items,
             lost_items: count_status(&mappings, "lost"),
             ambiguous_items: count_status(&mappings, "ambiguous"),
             inaccessible_items: count_status(&mappings, "inaccessible"),
             added_items: added_items.len(),
             excluded_non_public_owner_members,
-            coverage_percent: percentage(mapped_items, baseline_items),
+            coverage_percent: percentage(mapped_items + migrated_items, baseline_items),
         };
         module_maps.push(ModuleMap {
             module: loaded.module,
@@ -276,6 +393,16 @@ fn run() -> Result<(), String> {
     current_scope.dedup();
     diagnostics.sort();
     diagnostics.dedup();
+    if !migrations_by_key.is_empty() {
+        let unused = migrations_by_key
+            .keys()
+            .map(|key| format!("{} ({})", key.public_path, key.kind))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "migration manifest entries do not identify baseline symbols: {unused}"
+        ));
+    }
     let baseline_items = module_maps
         .iter()
         .map(|module| module.summary.baseline_items)
@@ -283,6 +410,10 @@ fn run() -> Result<(), String> {
     let mapped_items = module_maps
         .iter()
         .map(|module| module.summary.mapped_items)
+        .sum();
+    let migrated_items = module_maps
+        .iter()
+        .map(|module| module.summary.migrated_items)
         .sum();
     let lost_items = module_maps
         .iter()
@@ -300,16 +431,19 @@ fn run() -> Result<(), String> {
         .iter()
         .map(|module| module.summary.added_items)
         .sum();
+    let added_items_sha256 = added_items_sha256(&module_maps);
     let excluded_non_public_owner_members = module_maps
         .iter()
         .map(|module| module.summary.excluded_non_public_owner_members)
         .sum();
     let pass = baseline_items > 0
-        && mapped_items == baseline_items
+        && mapped_items + migrated_items == baseline_items
+        && migrated_items == migration_manifest.migrations.len()
         && lost_items == 0
         && ambiguous_items == 0
         && inaccessible_items == 0
-        && added_items == 0
+        && added_items == migration_manifest.expected_added_items
+        && added_items_sha256 == migration_manifest.expected_added_items_sha256
         && diagnostics.is_empty();
     let output = OwnerMap {
         schema_version: 1,
@@ -327,17 +461,26 @@ fn run() -> Result<(), String> {
                 "scoped_resource_admission_request".to_string(),
             ],
         },
+        migration_manifest: MigrationManifestEvidence {
+            path: migration_manifest_path.display().to_string(),
+            sha256: migration_manifest_sha256,
+            migration_count: migration_manifest.migrations.len(),
+            expected_added_items: migration_manifest.expected_added_items,
+            expected_added_items_sha256: migration_manifest.expected_added_items_sha256.clone(),
+        },
         modules: module_maps,
         summary: Summary {
             baseline_items,
             mapped_items,
+            migrated_items,
             lost_items,
             ambiguous_items,
             inaccessible_items,
             added_items,
+            added_items_sha256: added_items_sha256.clone(),
             excluded_non_public_owner_members,
             unsupported_syntax_count: diagnostics.len(),
-            coverage_percent: percentage(mapped_items, baseline_items),
+            coverage_percent: percentage(mapped_items + migrated_items, baseline_items),
             pass,
         },
         diagnostics,
@@ -353,14 +496,16 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("write {}: {error}", output_path.display()))?;
 
     println!(
-        "VNEXT PUBLIC OWNER MAP {}: mapped={}/{} lost={} ambiguous={} inaccessible={} added={} unsupported={} output={}",
+        "VNEXT PUBLIC OWNER MAP {}: mapped={}/{} migrated={} lost={} ambiguous={} inaccessible={} added={} added_sha256={} unsupported={} output={}",
         if pass { "PASS" } else { "FAIL" },
         mapped_items,
         baseline_items,
+        migrated_items,
         lost_items,
         ambiguous_items,
         inaccessible_items,
         added_items,
+        added_items_sha256,
         output.summary.unsupported_syntax_count,
         output_path.display()
     );
@@ -369,6 +514,124 @@ fn run() -> Result<(), String> {
     } else {
         Err("owner map acceptance criteria failed; inspect the emitted JSON".to_string())
     }
+}
+
+fn validate_migration_manifest(
+    manifest: &MigrationManifest,
+    baseline_commit: &str,
+) -> Result<(), String> {
+    if manifest.schema_version != 1 {
+        return Err(format!(
+            "unsupported migration manifest schema version {}",
+            manifest.schema_version
+        ));
+    }
+    if manifest.baseline_commit != baseline_commit {
+        return Err(format!(
+            "migration manifest baseline {} differs from requested baseline {baseline_commit}",
+            manifest.baseline_commit
+        ));
+    }
+    if manifest.expected_added_items == 0
+        || manifest.expected_added_items_sha256.len() != 64
+        || !manifest
+            .expected_added_items_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("migration manifest added-item expectation is invalid".to_string());
+    }
+    if manifest.migrations.is_empty() {
+        return Err("migration manifest contains no migrations".to_string());
+    }
+    for migration in &manifest.migrations {
+        if migration.old_path.is_empty()
+            || migration.old_kind.is_empty()
+            || migration.replacement_targets.is_empty()
+            || migration.introduced_by_commit.len() != 40
+            || !migration
+                .introduced_by_commit
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || migration.rationale.trim().is_empty()
+        {
+            return Err(format!(
+                "migration manifest entry is incomplete: {} ({})",
+                migration.old_path, migration.old_kind
+            ));
+        }
+        let targets = migration
+            .replacement_targets
+            .iter()
+            .map(|target| (&target.path, &target.kind))
+            .collect::<BTreeSet<_>>();
+        if targets.len() != migration.replacement_targets.len()
+            || targets
+                .iter()
+                .any(|(path, kind)| path.is_empty() || kind.is_empty())
+        {
+            return Err(format!(
+                "migration manifest entry has invalid replacement targets: {} ({})",
+                migration.old_path, migration.old_kind
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_migration_targets(
+    migration: &IntentionalMigration,
+    current_by_key: &BTreeMap<SymbolKey, Vec<&Symbol>>,
+    current_public_roots: &BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let mut owners = BTreeSet::new();
+    for target in &migration.replacement_targets {
+        let key = SymbolKey {
+            public_path: target.path.clone(),
+            kind: target.kind.clone(),
+            macro_contract: None,
+        };
+        let matches = current_by_key
+            .get(&key)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let accessible = matches
+            .iter()
+            .filter(|candidate| publicly_accessible(candidate, current_public_roots))
+            .copied()
+            .collect::<Vec<_>>();
+        if matches.len() != 1 || accessible.len() != 1 {
+            return Err(format!(
+                "migration target must resolve to one public symbol: {} ({}) matches={} accessible={}",
+                target.path,
+                target.kind,
+                matches.len(),
+                accessible.len()
+            ));
+        }
+        owners.insert(accessible[0].owner.clone());
+    }
+    Ok(owners.into_iter().collect())
+}
+
+fn added_items_sha256(modules: &[ModuleMap]) -> String {
+    let mut rows = modules
+        .iter()
+        .flat_map(|module| {
+            module.added_items.iter().map(|item| {
+                format!(
+                    "{}\t{}\t{}\t{}\t{}\n",
+                    module.module,
+                    item.public_path,
+                    item.kind,
+                    item.owner,
+                    item.macro_contract.as_deref().unwrap_or("")
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    format!("{:x}", Sha256::digest(rows.concat().as_bytes()))
 }
 
 fn load_module(

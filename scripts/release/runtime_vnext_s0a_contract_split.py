@@ -26,6 +26,8 @@ BOUNDED_COMMAND = REPO_ROOT / "scripts/release/bounded_command.py"
 OWNER_MAP_EXAMPLE = "vnext_public_owner_map"
 INVENTORY_DOCUMENT = REPO_ROOT / "docs/release/cleanup/20260714-inventory.md"
 ADR_DOCUMENT = GOAL_ROOT / "S0A_CONTRACT_SPLIT_MAP.md"
+PUBLIC_API_MIGRATIONS = GOAL_ROOT / "S0A_PUBLIC_API_MIGRATIONS.json"
+PUBLIC_API_ADDED_SHA256 = "3a6e1f97b7cefba2c9792a7dd46955ef20c178535c104e82f9efd1070e2380a9"
 
 PRODUCTION_GROUPS = {
     "resource": {
@@ -220,6 +222,80 @@ def clean_source() -> dict[str, Any]:
         "dirty": False,
         "status_short": [],
     }
+
+
+def validate_public_api_migrations() -> dict[str, Any]:
+    document = read_json(PUBLIC_API_MIGRATIONS, "S0A public API migration manifest")
+    require(
+        set(document)
+        == {
+            "schema_version",
+            "baseline_commit",
+            "expected_added_items",
+            "expected_added_items_sha256",
+            "migrations",
+        },
+        "S0A public API migration manifest fields drifted",
+    )
+    require(
+        document.get("schema_version") == 1
+        and document.get("baseline_commit") == BASELINE_COMMIT
+        and document.get("expected_added_items") == 248
+        and document.get("expected_added_items_sha256") == PUBLIC_API_ADDED_SHA256,
+        "S0A public API migration manifest header drifted",
+    )
+    migrations = document.get("migrations")
+    require(isinstance(migrations, list) and len(migrations) == 9, "S0A migration count drifted")
+    old_keys: set[tuple[str, str]] = set()
+    for migration in migrations:
+        require(
+            isinstance(migration, dict)
+            and set(migration)
+            == {
+                "old_path",
+                "old_kind",
+                "replacement_targets",
+                "introduced_by_commit",
+                "rationale",
+            },
+            "S0A migration entry fields drifted",
+        )
+        old_path = migration.get("old_path")
+        old_kind = migration.get("old_kind")
+        commit = migration.get("introduced_by_commit")
+        targets = migration.get("replacement_targets")
+        rationale = migration.get("rationale")
+        require(
+            isinstance(old_path, str)
+            and old_path.startswith("ferrum_interfaces::vnext::")
+            and isinstance(old_kind, str)
+            and old_kind
+            and isinstance(commit, str)
+            and re.fullmatch(r"[0-9a-f]{40}", commit) is not None
+            and isinstance(targets, list)
+            and targets
+            and all(
+                isinstance(target, dict)
+                and set(target) == {"path", "kind"}
+                and isinstance(target.get("path"), str)
+                and target["path"].startswith("ferrum_interfaces::vnext::")
+                and isinstance(target.get("kind"), str)
+                and target["kind"]
+                for target in targets
+            )
+            and isinstance(rationale, str)
+            and rationale.strip(),
+            f"S0A migration entry is invalid: {migration}",
+        )
+        key = (old_path, old_kind)
+        require(key not in old_keys, f"duplicate S0A migration entry: {key}")
+        old_keys.add(key)
+        require(
+            git_result("merge-base", "--is-ancestor", BASELINE_COMMIT, commit).returncode == 0
+            and git_result("merge-base", "--is-ancestor", commit, "HEAD").returncode == 0,
+            f"S0A migration commit is outside the baseline-to-HEAD history: {commit}",
+        )
+    return document
 
 
 def bind_g00f(g00f_outer_path: Path, source: dict[str, Any]) -> dict[str, Any]:
@@ -458,14 +534,23 @@ def contract_map(split_inventory: dict[str, Any]) -> dict[str, Any]:
             "production_group_count": 3,
             "multi_module_scc_count": 0,
             "test_target_count": sum(len(targets) for targets in TEST_TARGET_GROUPS.values()),
-            "public_path_policy": "facade re-export preserves ferrum_interfaces::vnext::* paths",
-            "semantic_change_count": 0,
+            "public_path_policy": (
+                "facade re-export preserves unchanged ferrum_interfaces::vnext::* paths; "
+                "intentional migrations are manifest-bound"
+            ),
+            "semantic_change_count": 9,
+            "added_public_item_count": 248,
+            "added_public_item_sha256": PUBLIC_API_ADDED_SHA256,
         },
     }
 
 
 def run_public_owner_map(checkpoint_root: Path) -> dict[str, Any]:
     output_path = checkpoint_root / "public-owner-map.json"
+    migration_path = checkpoint_root / "public-api-migrations.json"
+    require(PUBLIC_API_MIGRATIONS.is_file(), "S0A public API migration manifest is missing")
+    validate_public_api_migrations()
+    migration_path.write_bytes(PUBLIC_API_MIGRATIONS.read_bytes())
     logs = checkpoint_root / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ferrum-vnext-owner-baseline-") as temporary:
@@ -487,6 +572,7 @@ def run_public_owner_map(checkpoint_root: Path) -> dict[str, Any]:
             BASELINE_COMMIT,
             str(baseline_dir),
             "crates/ferrum-interfaces/src/vnext",
+            str(migration_path),
             str(output_path),
         ]
         started = time.monotonic()
@@ -517,18 +603,24 @@ def run_public_owner_map(checkpoint_root: Path) -> dict[str, Any]:
         },
     )
     require(result.returncode == 0, "public owner map command failed")
-    expected_line = f"{OWNER_MAP_PASS_PREFIX}: mapped=1490/1490 lost=0 ambiguous=0 inaccessible=0 added=0 unsupported=0 output={output_path}"
+    expected_line = (
+        f"{OWNER_MAP_PASS_PREFIX}: mapped=1481/1490 migrated=9 lost=0 ambiguous=0 "
+        f"inaccessible=0 added=248 added_sha256={PUBLIC_API_ADDED_SHA256} unsupported=0 "
+        f"output={output_path}"
+    )
     require(result.stdout.splitlines().count(expected_line) == 1, "public owner map exact PASS line mismatch")
     owner_map = read_json(output_path, "public owner map")
     require(
         owner_map.get("summary")
         == {
             "baseline_items": 1490,
-            "mapped_items": 1490,
+            "mapped_items": 1481,
+            "migrated_items": 9,
             "lost_items": 0,
             "ambiguous_items": 0,
             "inaccessible_items": 0,
-            "added_items": 0,
+            "added_items": 248,
+            "added_items_sha256": PUBLIC_API_ADDED_SHA256,
             "excluded_non_public_owner_members": 1,
             "unsupported_syntax_count": 0,
             "coverage_percent": 100.0,
@@ -541,6 +633,10 @@ def run_public_owner_map(checkpoint_root: Path) -> dict[str, Any]:
         "duration_seconds": duration,
         "pass_line": expected_line,
         "summary": owner_map["summary"],
+        "migration_manifest": {
+            "path": "public-api-migrations.json",
+            "sha256": sha256(migration_path),
+        },
     }
 
 
@@ -756,6 +852,7 @@ def build_gate(g00f_path: Path, output_root: Path) -> str:
         write_json(checkpoint_root / "contract-map.json", contract_map(split_inventory))
         require(INVENTORY_DOCUMENT.is_file(), "required pre-move inventory document is missing")
         require(ADR_DOCUMENT.is_file(), "S0A ADR/source map is missing")
+        require(PUBLIC_API_MIGRATIONS.is_file(), "S0A public API migration manifest is missing")
         (checkpoint_root / "adr.md").write_bytes(ADR_DOCUMENT.read_bytes())
         owner_evidence = run_public_owner_map(checkpoint_root)
         compile_evidence = run_bounded_aggregate(checkpoint_root)
@@ -765,6 +862,7 @@ def build_gate(g00f_path: Path, output_root: Path) -> str:
         required_core = {
             "adr.md",
             "contract-map.json",
+            "public-api-migrations.json",
             "public-owner-map.json",
             "split-inventory.json",
             "compile-unit-trybuild.json",
@@ -789,6 +887,10 @@ def build_gate(g00f_path: Path, output_root: Path) -> str:
             "adr_source": {
                 "path": ADR_DOCUMENT.relative_to(REPO_ROOT).as_posix(),
                 "sha256": sha256(ADR_DOCUMENT),
+            },
+            "public_api_migration_source": {
+                "path": PUBLIC_API_MIGRATIONS.relative_to(REPO_ROOT).as_posix(),
+                "sha256": sha256(PUBLIC_API_MIGRATIONS),
             },
             "public_owner_evidence": owner_evidence,
             "compile_evidence": {
@@ -836,6 +938,7 @@ def self_test() -> int:
     require(sum(len(targets) for targets in TEST_TARGET_GROUPS.values()) == 24, "S0A target matrix drifted")
     require(len(SHARED_TEST_SUPPORT) == 10, "S0A shared test support matrix drifted")
     require(set(PRODUCTION_GROUPS) == {"resource", "execution", "event"}, "S0A production scope drifted")
+    validate_public_api_migrations()
     lines = expected_machine_proof_lines()
     require(len(lines) == len(set(lines)) and len(lines) >= 20, "S0A machine proof matrix drifted")
     print("FERRUM RUNTIME VNEXT G01A CONTRACT SPLIT SELFTEST PASS")

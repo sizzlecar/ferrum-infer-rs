@@ -1,0 +1,196 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "b5377b12464b60203a3fe57a6de4c9952ed2474b",
+  "expected_added_items": 248,
+  "expected_added_items_sha256": "3a6e1f97b7cefba2c9792a7dd46955ef20c178535c104e82f9efd1070e2380a9",
+  "migrations": [
+    {
+      "old_path": "ferrum_interfaces::vnext::AdmittedSequenceResources::backing_slices",
+      "old_kind": "inherent_method",
+      "replacement_targets": [
+        {
+          "path": "ferrum_interfaces::vnext::SequenceBackingSnapshot::backing_slices",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::AdmittedSequenceResources::backing_generation",
+          "kind": "inherent_method"
+        }
+      ],
+      "introduced_by_commit": "08a0d1de81f92d5d4b2996932ccc92a2f9507256",
+      "rationale": "Sequence backing is generation-owned. Returning a borrowed slice from the mutable sequence owner cannot retain the exact submitted generation; immutable snapshots now own that access."
+    },
+    {
+      "old_path": "ferrum_interfaces::vnext::AdmittedSequenceResources::work_shape",
+      "old_kind": "inherent_method",
+      "replacement_targets": [
+        {
+          "path": "ferrum_interfaces::vnext::SequenceBackingSnapshot::committed_tokens",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::SequenceBackingSnapshot::committed_pages",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::SequenceBackingSnapshot::generation",
+          "kind": "inherent_method"
+        }
+      ],
+      "introduced_by_commit": "08a0d1de81f92d5d4b2996932ccc92a2f9507256",
+      "rationale": "One fixed admission-time work shape became incorrect after sequence backing could grow between frames. Each immutable generation now reports its committed frontier."
+    },
+    {
+      "old_path": "ferrum_interfaces::vnext::DynamicDeferredMaintenanceOutcome::RetryWithoutGrowth",
+      "old_kind": "enum_variant",
+      "replacement_targets": [
+        {
+          "path": "ferrum_interfaces::vnext::DynamicDeferredMaintenanceOutcome::RetryAdmission",
+          "kind": "enum_variant"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::DynamicDeferredMaintenanceOutcome::WaitForRelease",
+          "kind": "enum_variant"
+        }
+      ],
+      "introduced_by_commit": "1ac8ee7ede1b2a1b2519a69ae4f7255d515c7694",
+      "rationale": "A stale retry and a live device-capacity wait are different scheduler actions and must not share an ambiguous outcome."
+    },
+    {
+      "old_path": "ferrum_interfaces::vnext::DynamicDeferredMaintenanceOutcome::RetryWithoutGrowth::current_epochs",
+      "old_kind": "enum_field",
+      "replacement_targets": [
+        {
+          "path": "ferrum_interfaces::vnext::DynamicDeferredMaintenanceOutcome::RetryAdmission::current_epochs",
+          "kind": "enum_field"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::DynamicDeferredMaintenanceOutcome::WaitForRelease::current_epochs",
+          "kind": "enum_field"
+        }
+      ],
+      "introduced_by_commit": "1ac8ee7ede1b2a1b2519a69ae4f7255d515c7694",
+      "rationale": "Both explicit retry and wait outcomes retain the exact current capacity epochs used for register-then-recheck."
+    },
+    {
+      "old_path": "ferrum_interfaces::vnext::DynamicPoolMaintenanceController::maintain_for_deferred",
+      "old_kind": "inherent_method",
+      "replacement_targets": [
+        {
+          "path": "ferrum_interfaces::vnext::RequestBackingDeferral::maintain",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::SequenceAdmissionBackingDeferral::maintain",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::SequenceExtensionBackingDeferral::maintain",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::StepAdmissionBackingDeferral::maintain",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::InvocationAdmissionBackingDeferral::maintain",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::StepSubmissionWaveBackingDeferral::maintain",
+          "kind": "inherent_method"
+        }
+      ],
+      "introduced_by_commit": "32080bce24c22fa199c595b0756acd42b0bba7e5",
+      "rationale": "Raw pool maintenance accepted detached evidence. Non-cloneable scope-owned deferrals now retain the exact request, sequence, step, or invocation authority."
+    },
+    {
+      "old_path": "ferrum_interfaces::vnext::PlanRuntimeResources::maintain_for_deferred",
+      "old_kind": "inherent_method",
+      "replacement_targets": [
+        {
+          "path": "ferrum_interfaces::vnext::RequestBackingDeferral::maintain",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::SequenceAdmissionBackingDeferral::maintain",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::SequenceExtensionBackingDeferral::maintain",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::StepAdmissionBackingDeferral::maintain",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::InvocationAdmissionBackingDeferral::maintain",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::StepSubmissionWaveBackingDeferral::maintain",
+          "kind": "inherent_method"
+        }
+      ],
+      "introduced_by_commit": "32080bce24c22fa199c595b0756acd42b0bba7e5",
+      "rationale": "Maintenance is invoked through the typed owner that keeps its exact lifecycle parent live instead of through a root accepting detached evidence."
+    },
+    {
+      "old_path": "ferrum_interfaces::vnext::TrustedPlanRuntimeBinding::register_backing_waiter",
+      "old_kind": "inherent_method",
+      "replacement_targets": [
+        {
+          "path": "ferrum_interfaces::vnext::RequestBackingDeferral::register_waiter",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::SequenceAdmissionBackingDeferral::register_waiter",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::SequenceExtensionBackingDeferral::register_waiter",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::StepAdmissionBackingDeferral::register_waiter",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::InvocationAdmissionBackingDeferral::register_waiter",
+          "kind": "inherent_method"
+        },
+        {
+          "path": "ferrum_interfaces::vnext::StepSubmissionWaveBackingDeferral::register_waiter",
+          "kind": "inherent_method"
+        }
+      ],
+      "introduced_by_commit": "32080bce24c22fa199c595b0756acd42b0bba7e5",
+      "rationale": "Wait registration moved onto the exact typed deferral so callers cannot pair evidence with the wrong plan or outlive its owner."
+    },
+    {
+      "old_path": "ferrum_interfaces::vnext::ProviderWorkspaceRequirement::theoretical_maximum_bytes",
+      "old_kind": "inherent_method",
+      "replacement_targets": [
+        {
+          "path": "ferrum_interfaces::vnext::ProviderWorkspaceRequirement::evaluate_fit_bytes",
+          "kind": "inherent_method"
+        }
+      ],
+      "introduced_by_commit": "926a3678e59c9b5dfa0d9b6201c8044021c083d1",
+      "rationale": "Provider formulas no longer embed scheduler ceilings. Core evaluates the formula against the selected fit shape after runtime policy is known."
+    },
+    {
+      "old_path": "ferrum_interfaces::vnext::ProviderWorkspaceSizeFormula",
+      "old_kind": "type_alias",
+      "replacement_targets": [
+        {
+          "path": "ferrum_interfaces::vnext::ProviderWorkspaceSizeFormula",
+          "kind": "enum"
+        }
+      ],
+      "introduced_by_commit": "926a3678e59c9b5dfa0d9b6201c8044021c083d1",
+      "rationale": "The public path is retained but the alias was replaced by a provider-owned typed formula that excludes scheduler-specific ceilings."
+    }
+  ]
+}

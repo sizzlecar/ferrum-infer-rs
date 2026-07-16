@@ -33,7 +33,9 @@ recovery、event/profile 和 owner-aligned tests 拆分依赖图。
   facade/re-export 时 logical LOC `<=500`。
 - 单个 contract test target logical LOC `<=2,000`；同一 invariant 不因拆分重复成多套测试。
 - lower-level resource contract 反向依赖 scheduler/product/model 数 `0`，新增循环模块依赖数 `0`。
-- public item old path -> new owner map 覆盖 `100%`；S0A 无意删除的 public item 丢失数 `0`。
+- public item old path 的原路径映射或显式 migration 覆盖 `100%`；未解释的 public item 丢失数
+  `0`。显式 migration 必须绑定替代目标、理由和引入提交；新增公开项必须全量入 artifact 并由
+  digest 冻结，不能通过放宽计数静默漂移。
 - S0A 每个提交执行 bounded focused tests；最终执行 bounded
   `cargo test -p ferrum-interfaces --all-targets`。paid GPU 和完整 G00P collector 运行次数 `0`。
 

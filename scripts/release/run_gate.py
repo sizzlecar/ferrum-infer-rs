@@ -80,6 +80,9 @@ SAFETENSORS_SHARD_RE = re.compile(
     r"-(\d{5,6})-of-(\d{5,6})\.safetensors$"
 )
 VNEXT_FROZEN_LEGACY_SHA = "cff4c47765ef3259b8a04890187d99c60da86394"
+VNEXT_S0A_PUBLIC_API_ADDED_SHA256 = (
+    "3a6e1f97b7cefba2c9792a7dd46955ef20c178535c104e82f9efd1070e2380a9"
+)
 VNEXT_G00_FULL_SELFTEST_PASS = (
     "FERRUM RUNTIME VNEXT G00 BASELINE FULL SELFTEST PASS"
 )
@@ -2474,6 +2477,7 @@ def validate_vnext_g01a_s0a_provenance(
     required_artifacts = {
         "adr.md",
         "contract-map.json",
+        "public-api-migrations.json",
         "public-owner-map.json",
         "split-inventory.json",
         "compile-unit-trybuild.json",
@@ -2510,6 +2514,25 @@ def validate_vnext_g01a_s0a_provenance(
         "vnext-g01a S0A ADR binding mismatch",
     )
 
+    migration_ref = require_object(
+        child_manifest.get("public_api_migration_source"),
+        "vnext-g01a S0A public API migration source",
+    )
+    migration_source_path = REPO_ROOT / require_string(
+        migration_ref.get("path"), "vnext-g01a S0A public API migration source path"
+    )
+    migration_digest = require_sha256(
+        migration_ref.get("sha256"), "vnext-g01a S0A public API migration SHA256"
+    )
+    require_gate(
+        migration_source_path
+        == REPO_ROOT
+        / "docs/goals/runtime-vnext-0.8.0-2026-07-10/S0A_PUBLIC_API_MIGRATIONS.json"
+        and sha256(migration_source_path) == migration_digest
+        and artifact_index["public-api-migrations.json"]["sha256"] == migration_digest,
+        "vnext-g01a S0A public API migration binding mismatch",
+    )
+
     owner_map = read_json_object(
         checkpoint_root / "public-owner-map.json", "vnext-g01a S0A public owner map"
     )
@@ -2517,11 +2540,13 @@ def validate_vnext_g01a_s0a_provenance(
         owner_map.get("summary")
         == {
             "baseline_items": 1490,
-            "mapped_items": 1490,
+            "mapped_items": 1481,
+            "migrated_items": 9,
             "lost_items": 0,
             "ambiguous_items": 0,
             "inaccessible_items": 0,
-            "added_items": 0,
+            "added_items": 248,
+            "added_items_sha256": VNEXT_S0A_PUBLIC_API_ADDED_SHA256,
             "excluded_non_public_owner_members": 1,
             "unsupported_syntax_count": 0,
             "coverage_percent": 100.0,
@@ -2532,13 +2557,31 @@ def validate_vnext_g01a_s0a_provenance(
     owner_evidence = require_object(
         child_manifest.get("public_owner_evidence"), "vnext-g01a S0A public owner evidence"
     )
+    owner_migration = require_object(
+        owner_evidence.get("migration_manifest"),
+        "vnext-g01a S0A public owner migration evidence",
+    )
+    owner_map_migration = require_object(
+        owner_map.get("migration_manifest"),
+        "vnext-g01a S0A public owner migration manifest",
+    )
     require_gate(
         owner_evidence.get("summary") == owner_map.get("summary")
         and isinstance(owner_evidence.get("pass_line"), str)
         and owner_evidence["pass_line"].startswith(
-            "VNEXT PUBLIC OWNER MAP PASS: mapped=1490/1490"
+            "VNEXT PUBLIC OWNER MAP PASS: mapped=1481/1490 migrated=9"
         ),
         "vnext-g01a S0A public owner evidence binding mismatch",
+    )
+    require_gate(
+        owner_migration
+        == {"path": "public-api-migrations.json", "sha256": migration_digest}
+        and owner_map_migration.get("sha256") == migration_digest
+        and owner_map_migration.get("migration_count") == 9
+        and owner_map_migration.get("expected_added_items") == 248
+        and owner_map_migration.get("expected_added_items_sha256")
+        == VNEXT_S0A_PUBLIC_API_ADDED_SHA256,
+        "vnext-g01a S0A public owner migration evidence mismatch",
     )
 
     split_inventory = read_json_object(
@@ -2580,7 +2623,10 @@ def validate_vnext_g01a_s0a_provenance(
         and contract_summary.get("production_group_count") == 3
         and contract_summary.get("multi_module_scc_count") == 0
         and contract_summary.get("test_target_count") == 24
-        and contract_summary.get("semantic_change_count") == 0,
+        and contract_summary.get("semantic_change_count") == 9
+        and contract_summary.get("added_public_item_count") == 248
+        and contract_summary.get("added_public_item_sha256")
+        == VNEXT_S0A_PUBLIC_API_ADDED_SHA256,
         "vnext-g01a S0A contract map acceptance mismatch",
     )
     production_groups = require_list(
