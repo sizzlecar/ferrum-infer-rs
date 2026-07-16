@@ -126,16 +126,19 @@ impl EngineInner {
             }
         }
 
-        // Until the plan-runtime mixed-batch result carries updated opaque
-        // handles, decode stays per request. This preserves the single resource
-        // authority and the scheduler's dynamic wait semantics.
-        for rid in self.decode_ready_request_ids(&decode_ids) {
-            if let Err(error) = self.run_decode_step(&rid).await {
-                warn!("Plan-runtime decode failed for {}: {}", rid, error);
-                if is_resource_exhausted_error(&error) {
-                    continue;
+        let decode_ids = self.decode_ready_request_ids(&decode_ids);
+        if !decode_ids.is_empty() {
+            if let Err(error) = self.run_plan_runtime_batch_decode(&decode_ids).await {
+                warn!(
+                    "Plan-runtime batch decode failed for {} request(s): {}",
+                    decode_ids.len(),
+                    error
+                );
+                if !is_resource_exhausted_error(&error) {
+                    for rid in &decode_ids {
+                        self.complete_request(rid, FinishReason::Error).await?;
+                    }
                 }
-                self.complete_request(&rid, FinishReason::Error).await?;
             }
         }
         Ok(())

@@ -27,6 +27,88 @@ struct PlanRuntimeAdmissionTestExecutor {
     prefill_calls: AtomicU64,
 }
 
+#[derive(Clone, Copy)]
+enum PlanRuntimeBatchDecodeBehavior {
+    Exact,
+    Short,
+    WrongFirstCache,
+}
+
+struct PlanRuntimeBatchDecodeTestExecutor {
+    inner: MockModelExecutor,
+    behavior: PlanRuntimeBatchDecodeBehavior,
+    decode_calls: AtomicU64,
+    batch_decode_calls: AtomicU64,
+}
+
+impl PlanRuntimeBatchDecodeTestExecutor {
+    fn new(behavior: PlanRuntimeBatchDecodeBehavior) -> Self {
+        Self {
+            inner: MockModelExecutor::instant(64),
+            behavior,
+            decode_calls: AtomicU64::new(0),
+            batch_decode_calls: AtomicU64::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
+    fn info(&self) -> &ferrum_types::ModelInfo {
+        self.inner.info()
+    }
+
+    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
+        ExecutionResourceAuthority::PlanRuntime
+    }
+
+    fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
+        PlanRuntimeResourceSnapshot::new(1_000, 900, 700, 700, 400, 300, 200, 0, 0).map(Some)
+    }
+
+    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
+        self.inner.prefill(input).await
+    }
+
+    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+        self.decode_calls.fetch_add(1, Ordering::Relaxed);
+        self.inner.decode(input).await
+    }
+
+    async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
+        self.batch_decode_calls.fetch_add(1, Ordering::Relaxed);
+        let mut outputs = self.inner.batch_decode(inputs).await?;
+        match self.behavior {
+            PlanRuntimeBatchDecodeBehavior::Exact => {}
+            PlanRuntimeBatchDecodeBehavior::Short => {
+                outputs.pop();
+            }
+            PlanRuntimeBatchDecodeBehavior::WrongFirstCache => {
+                if let Some(output) = outputs.first_mut() {
+                    output.kv_cache = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+                        RequestId::new(),
+                        1,
+                        1,
+                    ));
+                }
+            }
+        }
+        Ok(outputs)
+    }
+
+    fn release_cache(&self, cache_id: &str) {
+        self.inner.release_cache(cache_id);
+    }
+
+    fn capabilities(&self) -> ExecutorCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn status(&self) -> ExecutorStatus {
+        self.inner.status()
+    }
+}
+
 impl PlanRuntimeAdmissionTestExecutor {
     fn new(vocab_size: usize) -> Self {
         Self {
@@ -2211,6 +2293,171 @@ fn resource_composition_rejects_unpaired_or_mismatched_speculation() {
     assert!(mismatched
         .to_string()
         .contains("does not match target authority"));
+}
+
+fn plan_runtime_batch_decode_test_engine(
+    behavior: PlanRuntimeBatchDecodeBehavior,
+) -> (
+    ContinuousBatchEngine,
+    Arc<ContinuousBatchScheduler>,
+    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<dyn Tokenizer + Send + Sync>,
+) {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
+    let executor = Arc::new(PlanRuntimeBatchDecodeTestExecutor::new(behavior));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let engine = ContinuousBatchEngine::new_plan_runtime(
+        config,
+        scheduler.clone(),
+        tokenizer.clone(),
+        sampler,
+        executor.clone(),
+        tensor_factory,
+    )
+    .unwrap();
+    (engine, scheduler, executor, tokenizer)
+}
+
+async fn install_plan_runtime_decode_cohort(
+    engine: &ContinuousBatchEngine,
+    scheduler: &ContinuousBatchScheduler,
+    tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+) -> (Vec<RequestId>, Vec<TokenId>, Vec<String>) {
+    let mut requests = Vec::new();
+    for prompt in ["test", "ok"] {
+        let mut request = policy_request();
+        request.prompt = prompt.to_string();
+        request.sampling_params.max_tokens = 4;
+        scheduler.submit(request.clone()).await.unwrap();
+        requests.push(request);
+    }
+    let initial_batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(2))
+        .await
+        .expect("decode cohort should first be scheduled as prefill");
+    assert_eq!(initial_batch.requests.len(), requests.len());
+
+    let mut request_ids = Vec::with_capacity(requests.len());
+    let mut initial_tokens = Vec::with_capacity(requests.len());
+    let mut cache_ids = Vec::with_capacity(requests.len());
+    for (index, request) in requests.into_iter().enumerate() {
+        let request_id = request.id.clone();
+        let token = TokenId::new(5 + index as u32);
+        let cache_id = format!("plan-runtime-batch-cache-{index}");
+        scheduler.mark_prefill_complete(&request_id, 1);
+        let kv_cache = engine
+            .inner
+            .make_model_kv_handle_with_seq(cache_id.clone(), 1);
+        let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
+            request,
+            vec![token],
+            Some(tokenizer.clone()),
+            Some(64),
+        );
+        sequence.generated_tokens.push(token);
+        sequence.prefill_complete = true;
+        sequence.prefill_tokens_processed = 1;
+        sequence.install_runtime_managed_model_kv(kv_cache);
+        sequence.phase = RequestPhase::Decoding;
+        engine
+            .inner
+            .sequences
+            .write()
+            .insert(request_id.clone(), sequence);
+        request_ids.push(request_id);
+        initial_tokens.push(token);
+        cache_ids.push(cache_id);
+    }
+    (request_ids, initial_tokens, cache_ids)
+}
+
+fn assert_plan_runtime_decode_cohort_unchanged(
+    engine: &ContinuousBatchEngine,
+    request_ids: &[RequestId],
+    initial_tokens: &[TokenId],
+    cache_ids: &[String],
+) {
+    let sequences = engine.inner.sequences.read();
+    for ((request_id, initial_token), cache_id) in
+        request_ids.iter().zip(initial_tokens).zip(cache_ids)
+    {
+        let sequence = sequences.get(request_id).expect("decode sequence");
+        assert_eq!(sequence.generated_tokens, vec![*initial_token]);
+        assert_eq!(sequence.model_cache_id(), Some(cache_id.as_str()));
+        assert_eq!(sequence.tokens_this_iteration, 0);
+    }
+}
+
+#[tokio::test]
+async fn plan_runtime_batch_decode_process_batch_submits_one_cohort() {
+    let (engine, scheduler, executor, tokenizer) =
+        plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::Exact);
+    let (request_ids, initial_tokens, cache_ids) =
+        install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
+    let decode_batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(2))
+        .await
+        .expect("ready decode cohort");
+
+    engine.inner.process_batch(&decode_batch).await.unwrap();
+
+    assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
+    let sequences = engine.inner.sequences.read();
+    for ((request_id, initial_token), cache_id) in
+        request_ids.iter().zip(initial_tokens).zip(cache_ids)
+    {
+        let sequence = sequences.get(request_id).expect("decoded sequence");
+        assert_eq!(sequence.generated_tokens.first(), Some(&initial_token));
+        assert_eq!(sequence.generated_tokens.len(), 2);
+        assert_eq!(sequence.model_cache_id(), Some(cache_id.as_str()));
+        assert_eq!(sequence.tokens_this_iteration, 1);
+    }
+}
+
+#[tokio::test]
+async fn plan_runtime_batch_decode_rejects_short_output_before_state_commit() {
+    let (engine, scheduler, executor, tokenizer) =
+        plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::Short);
+    let (request_ids, initial_tokens, cache_ids) =
+        install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
+
+    let error = engine
+        .inner
+        .run_plan_runtime_batch_decode(&request_ids)
+        .await
+        .expect_err("short output must fail closed");
+
+    assert!(error
+        .to_string()
+        .contains("returned 1 outputs for 2 requests"));
+    assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
+    assert_plan_runtime_decode_cohort_unchanged(&engine, &request_ids, &initial_tokens, &cache_ids);
+}
+
+#[tokio::test]
+async fn plan_runtime_batch_decode_rejects_changed_cache_before_state_commit() {
+    let (engine, scheduler, executor, tokenizer) =
+        plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::WrongFirstCache);
+    let (request_ids, initial_tokens, cache_ids) =
+        install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
+
+    let error = engine
+        .inner
+        .run_plan_runtime_batch_decode(&request_ids)
+        .await
+        .expect_err("changed cache authority must fail closed");
+
+    assert!(error.to_string().contains("output 0 returned cache"));
+    assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
+    assert_plan_runtime_decode_cohort_unchanged(&engine, &request_ids, &initial_tokens, &cache_ids);
 }
 
 #[tokio::test]

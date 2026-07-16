@@ -1127,8 +1127,14 @@ pub trait ModelExecutor: Send + Sync {
 
     /// Batch decode: process multiple sequences in one forward pass.
     ///
-    /// Default implementation falls back to per-request `decode()`.
-    /// Executors with batched CUDA runners should override this.
+    /// A successful result must contain exactly one output per input, in the
+    /// original input order, and each output cache must retain the identity of
+    /// its corresponding input cache. Implementations must not expose partial
+    /// success as a shorter or reordered vector.
+    ///
+    /// The default implementation falls back to serial per-request `decode()`.
+    /// Executors with a typed batch submission path should override this so one
+    /// call maps to one resource step and one terminal submission fence.
     async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
         let mut outputs = Vec::with_capacity(inputs.len());
         for input in inputs {
