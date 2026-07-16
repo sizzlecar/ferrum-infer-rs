@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "status": "reject",
+  "failure_class": "plan_budget_pressure_terminated_instead_of_waiting",
+  "lane": "vnext-s1-cuda-capacity",
+  "git_sha": "d05776caf963bc2a193b05e4ff9164823428517d",
+  "dirty_status": "",
+  "binary_sha256": "0a155dcb1b540cb18505d9f110baffcfd8d6dd8b8bb5d00dbf31a0fee5695586",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 4090",
+    "gpu_count": 1,
+    "gpu_memory_mib": 23028,
+    "driver_version": "595.45.04"
+  },
+  "model": {
+    "id": "Qwen/Qwen3.5-4B",
+    "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+  },
+  "collector": {
+    "status": "reject",
+    "duration_seconds": 115.950883309,
+    "reason": "pressure-B: missing positive completion token count"
+  },
+  "run_entrypoint": {
+    "status": "pass",
+    "answer": "Paris",
+    "completion_tokens": 2,
+    "generation_ms": 480.376942
+  },
+  "workload_identity": {
+    "a_prompt_sha256": "e979f692dd73f3d2469ec1152bc012476f205098ca6748b309574cf3f0fb2dc1",
+    "c_prompt_sha256": "e3135728e0cc1a68b6c7af061931d5be5fe9dd4bb1ae40e1e778ea2b0fac325c",
+    "calibration_a_prompt_tokens": 32,
+    "target_a_prompt_tokens": 32,
+    "calibration_c_prompt_tokens": 32,
+    "target_c_prompt_tokens": 32
+  },
+  "pressure_results": {
+    "a_completion_tokens": 128,
+    "a_done_count": 1,
+    "b_completion_tokens": 0,
+    "b_done_count": 1,
+    "b_usage_count": 1,
+    "b_finish_reason": "error",
+    "c_completion_tokens": 16,
+    "c_done_count": 1
+  },
+  "failure": {
+    "request_id": "62ce20a0-4419-434f-85f2-43dbb46bfae7",
+    "coordinator_id": 1,
+    "release_epoch": 308,
+    "capacity_epoch": 841,
+    "active_sequence_count": 1,
+    "pool_id": "dynamic-pool/sha256/eeae5efc2087781158c188814a80ee059a6b7c665be3570896ea6c7f3339ffbd",
+    "requested_bytes": 448,
+    "free_bytes": 192,
+    "largest_contiguous_bytes": 192,
+    "plan_claimed_bytes": 8474209616,
+    "plan_usable_bytes": 8474209616,
+    "maintenance_duration_us": 9,
+    "device_submission_observed": false
+  },
+  "calibrated_budget": {
+    "static_bytes": 8411511808,
+    "dynamic_resident_bytes": 62697808,
+    "exact_budget_bytes": 8474209616
+  },
+  "classification": {
+    "cuda_oom": false,
+    "allocator_exhaustion": false,
+    "model_load_failure": false,
+    "kernel_failure": false,
+    "cause": "recoverable live plan-budget pressure was flattened into a terminal executor maintenance error before device submission"
+  },
+  "canonical_artifact": {
+    "path": "/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-s1/vnext_capacity_d05776ca_20260715T233856Z.tar.gz",
+    "bytes": 210379,
+    "sha256": "81c754c78d4fcf96ea31fe94cfde11eea8331826b0d847064739f26cb4da06c6",
+    "file_index": "/Users/chejinxuan/ferrum-bench/artifacts/runtime-vnext-s1/vnext_capacity_d05776ca_20260715T233856Z/artifact-files.sha256"
+  },
+  "next_hypothesis": {
+    "source_change": "carry typed plan-budget pressure through deferred maintenance, retain staged request ownership, transition the same scheduler ticket from AwaitBackingGrowth to WaitForRelease, and wake only after a later plan release/capacity epoch",
+    "expected_signal": "B stays waiting with zero unchanged-epoch probe/submit delta while A progresses, C bypasses and completes first, then B completes after A releases backing",
+    "reject_threshold": "B emits error or zero tokens, any missing or duplicate DONE, any unchanged-epoch B probe or submit, or A/C correctness failure"
+  }
+}

@@ -1,8 +1,8 @@
 use super::*;
 use crate::vnext::{
-    CopyRegion, DeferredAction, DefinitelyNotSubmitted, DeviceClass, DeviceCommandBatch,
-    DeviceErrorReport, DeviceTerminal, FenceIndeterminate, FenceQuery, HostTransferLayout,
-    TrustedActiveSequenceBinding,
+    CopyRegion, DeferredAction, DefinitelyNotSubmitted, DeviceCapacityPressureScope, DeviceClass,
+    DeviceCommandBatch, DeviceErrorReport, DeviceTerminal, FenceIndeterminate, FenceQuery,
+    HostTransferLayout, TrustedActiveSequenceBinding,
 };
 use serde_json::{json, Value};
 use std::error::Error;
@@ -1007,6 +1007,169 @@ fn logical_fit_deferral_grows_unclaimed_backing_capacity() {
         request.try_admit_sequence(admission).unwrap(),
         SequenceResourceAdmissionDecision::Admitted(_)
     ));
+}
+
+#[test]
+fn full_plan_budget_returns_typed_wait_and_reuses_backing_after_availability_change() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'a',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 64);
+    let harness = harness(Arc::clone(&runtime), catalog, 64, false);
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let pool = Arc::clone(&harness.root.dynamic_pools.pools[&harness.pool_ids[0]]);
+    let held_backing = claim_size(&harness.root.dynamic_pools, &pool, 64);
+    let deferred = match binding
+        .try_admit_request(
+            request_admission(),
+            RunId::new("run/capacity-wait-second").unwrap(),
+            RequestIdentity::new("request/capacity-wait-second").unwrap(),
+        )
+        .unwrap()
+    {
+        RequestResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("occupied resident backing must ask for physical growth"),
+    };
+    let before = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .epochs()
+        .unwrap();
+    let allocations_before = runtime.allocate_calls();
+
+    let DynamicDeferredMaintenanceOutcome::WaitForRelease {
+        current_epochs,
+        pressure,
+    } = harness
+        .root
+        .maintenance_controller
+        .maintain_for_deferred(&deferred)
+        .unwrap()
+    else {
+        panic!("a full live plan budget must become typed release pressure")
+    };
+    assert_eq!(current_epochs, before);
+    assert_eq!(pressure.scope(), &DeviceCapacityPressureScope::PlanBudget);
+    assert_eq!(pressure.requested_bytes(), 64);
+    assert_eq!(pressure.available_bytes(), 0);
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+    let status = harness.root.maintenance_controller.status().unwrap();
+    assert_eq!(status.process_claimed_bytes(), 64);
+    assert_eq!(status.budget_claimed_bytes(), 64);
+    assert_eq!(status.pools()[0].pending_growth_bytes(), 0);
+
+    drop(held_backing);
+    let after_release = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .epochs()
+        .unwrap();
+    assert!(after_release.capacity_epoch() > before.capacity_epoch());
+    assert!(matches!(
+        binding
+            .try_admit_request(
+                request_admission(),
+                RunId::new("run/capacity-wait-second-retry").unwrap(),
+                RequestIdentity::new("request/capacity-wait-second-retry").unwrap(),
+            )
+            .unwrap(),
+        RequestResourceAdmissionDecision::Admitted(_)
+    ));
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+}
+
+#[test]
+fn plan_budget_wait_retains_staged_parent_and_reuses_released_sequence_backing() {
+    let request_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        '2',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let sequence_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        '3',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let request_pool_id = request_catalog.pool_id.clone();
+    let sequence_pool_id = sequence_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[request_catalog, sequence_catalog]);
+    let runtime = new_runtime(&catalog, 192);
+    let harness = harness(Arc::clone(&runtime), catalog, 192, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&request_pool_id)
+        .unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&sequence_pool_id)
+        .unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&request_pool_id, 64)
+        .unwrap();
+
+    let active = admitted_sequence(&harness.root, "capacity-wait-active");
+    let staged = admitted_request(&harness.root, "capacity-wait-staged");
+    let admission = SequenceResourceAdmissionRequest::new(
+        work(1),
+        AdmissionFitPolicy::FullInputMustFit,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let SequenceResourceAdmissionDecision::BackingDeferred(deferred) =
+        staged.try_admit_sequence(admission.clone()).unwrap()
+    else {
+        panic!("active sequence must occupy the staged request's sequence backing")
+    };
+    let allocations_before = runtime.allocate_calls();
+    let DynamicDeferredMaintenanceOutcome::WaitForRelease {
+        current_epochs,
+        pressure,
+    } = harness.root.maintain_for_deferred(&deferred).unwrap()
+    else {
+        panic!("full plan budget must wait for the active sequence release")
+    };
+    assert_eq!(pressure.scope(), &DeviceCapacityPressureScope::PlanBudget);
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+
+    drop(active);
+    let released_epochs = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .epochs()
+        .unwrap();
+    assert!(released_epochs.capacity_epoch() > current_epochs.capacity_epoch());
+    let admitted = match staged.try_admit_sequence(admission).unwrap() {
+        SequenceResourceAdmissionDecision::Admitted(sequence) => sequence,
+        _ => panic!("retained staged parent must reuse released sequence backing"),
+    };
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+
+    drop(admitted);
+    drop(staged);
+    close_dynamic_test_root(harness.root);
 }
 
 #[test]
@@ -2494,11 +2657,37 @@ fn two_plans_contend_on_one_process_wide_device_account() {
     assert_eq!(first_status.process_claimed_bytes(), 96);
     assert_eq!(first_status.budget_claimed_bytes(), 96);
     assert_eq!(second_status.budget_claimed_bytes(), 0);
-    assert!(second
+    let second_deferred = match second
         .root
-        .maintenance_controller
-        .grow_pool(&second.pool_ids[0], 64)
-        .is_err());
+        .trusted_runtime_binding()
+        .unwrap()
+        .try_admit_request(
+            request_admission(),
+            RunId::new("run/process-wide-deferred").unwrap(),
+            RequestIdentity::new("request/process-wide-deferred").unwrap(),
+        )
+        .unwrap()
+    {
+        RequestResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("zero-resident second plan must defer its own backing"),
+    };
+    assert!(matches!(
+        second.root.maintain_for_deferred(&second_deferred),
+        Err(VNextError::DeviceCapacityUnavailable(pressure))
+            if pressure.scope() == &DeviceCapacityPressureScope::ProcessWide
+                && pressure.requested_bytes() == 64
+                && pressure.available_bytes() == 0
+    ));
+    assert!(matches!(
+        second
+            .root
+            .maintenance_controller
+            .grow_pool(&second.pool_ids[0], 64),
+        Err(VNextError::DeviceCapacityUnavailable(pressure))
+            if pressure.scope() == &DeviceCapacityPressureScope::ProcessWide
+                && pressure.requested_bytes() == 64
+                && pressure.available_bytes() == 0
+    ));
     drop(first);
     second
         .root

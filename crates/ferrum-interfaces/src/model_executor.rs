@@ -700,6 +700,13 @@ pub enum ExecutorPrefillMaintenanceOutcome {
     /// Another release or growth advanced the observed epochs first. The
     /// scheduler should probe again without allocating duplicate backing.
     RetryWithoutGrowth { current: ExecutorAdmissionEpochs },
+    /// The requested backing is valid but cannot be installed while current
+    /// device claims remain live. The scheduler must wait for release evidence
+    /// rather than completing the request as an error.
+    WaitForRelease {
+        current: ExecutorAdmissionEpochs,
+        pressure: crate::vnext::DeviceCapacityPressure,
+    },
     /// The executor installed real backing and published the resulting
     /// capacity epoch.
     Maintained {

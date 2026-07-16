@@ -118,9 +118,10 @@ impl ModelExecutor for ExecutorManagedAdmissionTestExecutor {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum TestMaintenanceBehavior {
     Advance,
+    WaitForRelease,
     StaleEpoch,
     Fail,
 }
@@ -128,6 +129,7 @@ enum TestMaintenanceBehavior {
 struct ExecutorManagedMaintenanceTestExecutor {
     inner: MockModelExecutor,
     retained: std::sync::Mutex<HashSet<RequestId>>,
+    release_epoch: AtomicU64,
     capacity_epoch: AtomicU64,
     admission_probes: AtomicU64,
     maintenance_calls: AtomicU64,
@@ -145,6 +147,7 @@ impl ExecutorManagedMaintenanceTestExecutor {
         Self {
             inner: MockModelExecutor::instant(vocab_size),
             retained: std::sync::Mutex::new(HashSet::new()),
+            release_epoch: AtomicU64::new(0),
             capacity_epoch: AtomicU64::new(0),
             admission_probes: AtomicU64::new(0),
             maintenance_calls: AtomicU64::new(0),
@@ -157,7 +160,7 @@ impl ExecutorManagedMaintenanceTestExecutor {
     fn epochs(&self) -> ExecutorAdmissionEpochs {
         ExecutorAdmissionEpochs::new(
             std::num::NonZeroU64::new(43).unwrap(),
-            0,
+            self.release_epoch.load(Ordering::Acquire),
             self.capacity_epoch.load(Ordering::Acquire),
         )
     }
@@ -190,7 +193,10 @@ impl ModelExecutor for ExecutorManagedMaintenanceTestExecutor {
         if !inserted {
             return Err(FerrumError::already_exists("duplicate test admission"));
         }
-        if self.capacity_epoch.load(Ordering::Acquire) == 0 {
+        if self.capacity_epoch.load(Ordering::Acquire) == 0
+            && !(self.maintenance_behavior == TestMaintenanceBehavior::WaitForRelease
+                && self.release_epoch.load(Ordering::Acquire) > 0)
+        {
             self.call_order
                 .lock()
                 .expect("call order mutex poisoned")
@@ -254,6 +260,21 @@ impl ModelExecutor for ExecutorManagedMaintenanceTestExecutor {
                     current: self.epochs(),
                     pools_grown: 1,
                     allocated_bytes: 4096,
+                })
+            }
+            TestMaintenanceBehavior::WaitForRelease => {
+                Ok(ExecutorPrefillMaintenanceOutcome::WaitForRelease {
+                    current: self.epochs(),
+                    pressure: ferrum_interfaces::vnext::DeviceCapacityPressure::new(
+                        ferrum_interfaces::vnext::DeviceCapacityPressureScope::PlanBudget,
+                        "device.test-capacity-pressure".to_owned(),
+                        4096,
+                        4096,
+                        4096,
+                        4096,
+                        4096,
+                    )
+                    .unwrap(),
                 })
             }
             TestMaintenanceBehavior::StaleEpoch => {
@@ -2027,6 +2048,69 @@ async fn executor_managed_backing_maintenance_advances_epoch_before_prefill() {
         .is_some());
 
     let _ = std::fs::remove_file(trace_path);
+}
+
+#[tokio::test]
+async fn executor_managed_capacity_pressure_waits_without_spinning_then_retries_on_release() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
+    let executor = Arc::new(ExecutorManagedMaintenanceTestExecutor::with_behavior(
+        128,
+        TestMaintenanceBehavior::WaitForRelease,
+    ));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let engine = Arc::new(ContinuousBatchEngine::new(
+        config,
+        Arc::clone(&scheduler),
+        tokenizer,
+        sampler,
+        kv_cache,
+        executor.clone(),
+        tensor_factory,
+    ));
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 1;
+    let infer_engine = Arc::clone(&engine);
+    let inference = tokio::spawn(async move { infer_engine.infer(request).await });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while executor.maintenance_calls.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("typed capacity maintenance must run");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(scheduler.waiting_count(), 1);
+    assert_eq!(scheduler.trace_snapshot().dynamic_admission_failed, 0);
+
+    executor.release_epoch.store(1, Ordering::Release);
+    let response = tokio::time::timeout(Duration::from_secs(2), inference)
+        .await
+        .expect("release epoch must wake the waiting request")
+        .expect("inference task must not panic")
+        .unwrap();
+    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 2);
+    assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(scheduler.waiting_count(), 0);
+    assert_eq!(
+        *executor
+            .call_order
+            .lock()
+            .expect("call order mutex poisoned"),
+        vec!["defer", "maintain", "admit", "prefill"]
+    );
+    engine.shutdown().await.unwrap();
 }
 
 #[tokio::test]

@@ -2,6 +2,7 @@ use super::{
     invalid_resource, Arc, AtomicU64, BTreeMap, BatchInvocationId, BatchStepId, DeviceId, Mutex,
     OnceLock, Ordering, VNextError, Weak,
 };
+use crate::vnext::{DeviceCapacityPressure, DeviceCapacityPressureScope};
 
 static NEXT_ADMISSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_BATCH_STEP_ID: AtomicU64 = AtomicU64::new(1);
@@ -121,33 +122,33 @@ impl DeviceCapacityAccount {
             .budgets
             .get(&budget.budget_id)
             .ok_or_else(|| invalid_resource("device capacity budget is stale"))?;
-        let next_budget_claimed = budget_record
-            .claimed_bytes
+        let plan_claimed_bytes = budget_record.claimed_bytes;
+        let process_claimed_bytes = state.claimed_bytes;
+        let next_budget_claimed = plan_claimed_bytes
             .checked_add(bytes)
-            .filter(|next| *next <= budget.device_wide_usable_ceiling_bytes)
-            .ok_or_else(|| {
-                invalid_resource(format!(
-                    "device `{}` plan budget exceeds usable capacity: claimed {}, requested {}, usable {}",
-                    self.device_id,
-                    budget_record.claimed_bytes,
-                    bytes,
-                    budget.device_wide_usable_ceiling_bytes
-                ))
-            })?;
-        let next = state
-            .claimed_bytes
+            .ok_or_else(|| invalid_resource("device plan capacity claim overflows u64"))?;
+        let next = process_claimed_bytes
             .checked_add(bytes)
-            .filter(|next| *next <= effective_usable_capacity)
-            .ok_or_else(|| {
-                invalid_resource(format!(
-                    "device `{}` resource admission exceeds live usable capacity: claimed {}, requested {}, effective usable {}, raw capacity {}",
-                    self.device_id,
-                    state.claimed_bytes,
+            .ok_or_else(|| invalid_resource("device process capacity claim overflows u64"))?;
+        if next_budget_claimed > budget.device_wide_usable_ceiling_bytes
+            || next > effective_usable_capacity
+        {
+            return Err(VNextError::DeviceCapacityUnavailable(
+                DeviceCapacityPressure::new(
+                    if next_budget_claimed > budget.device_wide_usable_ceiling_bytes {
+                        DeviceCapacityPressureScope::PlanBudget
+                    } else {
+                        DeviceCapacityPressureScope::ProcessWide
+                    },
+                    self.device_id.to_string(),
                     bytes,
+                    plan_claimed_bytes,
+                    budget.device_wide_usable_ceiling_bytes,
+                    process_claimed_bytes,
                     effective_usable_capacity,
-                    self.device_capacity_bytes
-                ))
-            })?;
+                )?,
+            ));
+        }
         state.claimed_bytes = next;
         state
             .budgets
