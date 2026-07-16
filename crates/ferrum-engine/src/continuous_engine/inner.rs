@@ -301,6 +301,7 @@ impl EngineInner {
                         observed.capacity_epoch,
                         0,
                     ),
+                    deferred.wait_condition().clone(),
                 ));
                 ExecutorPrefillProbeResult {
                     trace: capture_trace.then(|| ExecutorPrefillAdmissionTrace {
@@ -601,20 +602,21 @@ impl EngineInner {
                     )));
                 }
             }
-            ExecutorPrefillMaintenanceOutcome::RetryWithoutGrowth { current } => {
+            ExecutorPrefillMaintenanceOutcome::RetryAdmission { current } => {
                 validate_current(*current)?;
-                if current.release_epoch == observed.release_epoch
-                    && current.capacity_epoch == observed.capacity_epoch
-                {
-                    return Err(FerrumError::internal(format!(
-                        "executor maintenance for {} requested retry without advancing epochs",
-                        deferral.request_id()
-                    )));
-                }
             }
-            ExecutorPrefillMaintenanceOutcome::WaitForRelease { current, pressure } => {
+            ExecutorPrefillMaintenanceOutcome::WaitForRelease {
+                current,
+                wait_condition,
+                pressure,
+            } => {
                 validate_current(*current)?;
-                if pressure.scope() != &DeviceCapacityPressureScope::PlanBudget
+                if wait_condition.coordinator_id().get() != current.coordinator_id.get()
+                    || !matches!(
+                        pressure.scope(),
+                        DeviceCapacityPressureScope::PlanBudget
+                            | DeviceCapacityPressureScope::ProcessWide
+                    )
                     || pressure.requested_bytes() == 0
                     || pressure.available_bytes() >= pressure.requested_bytes()
                 {
@@ -659,8 +661,8 @@ impl EngineInner {
                 serde_json::to_value(result.as_ref().unwrap()).unwrap_or(serde_json::Value::Null),
                 None,
             ),
-            Ok(ExecutorPrefillMaintenanceOutcome::RetryWithoutGrowth { .. }) => (
-                "retry_without_growth",
+            Ok(ExecutorPrefillMaintenanceOutcome::RetryAdmission { .. }) => (
+                "retry_admission",
                 serde_json::to_value(result.as_ref().unwrap()).unwrap_or(serde_json::Value::Null),
                 None,
             ),
@@ -724,28 +726,46 @@ impl EngineInner {
                 .maintain_prefill_backing(deferral.request_id())
                 .and_then(|outcome| {
                     self.validate_executor_prefill_maintenance(&deferral, &outcome)?;
-                    if let ExecutorPrefillMaintenanceOutcome::WaitForRelease { current, .. } =
-                        &outcome
-                    {
-                        let observed = AdmissionWakeEpochs::new(
-                            current.coordinator_id,
-                            current.release_epoch,
-                            current.capacity_epoch,
-                            0,
-                        );
-                        let transitioned = self.scheduler.wait_for_release_after_backing_pressure(
-                            deferral.request_id(),
-                            observed,
-                        )?;
-                        if !transitioned
-                            && self.scheduler.trace_phase(deferral.request_id())
-                                == Some(RequestPhase::Waiting)
-                        {
-                            return Err(FerrumError::internal(format!(
-                                "waiting request {} lost its backing-growth deferral",
-                                deferral.request_id()
-                            )));
+                    let transitioned = match &outcome {
+                        ExecutorPrefillMaintenanceOutcome::RetryAdmission { current } => {
+                            let observed = AdmissionWakeEpochs::new(
+                                current.coordinator_id,
+                                current.release_epoch,
+                                current.capacity_epoch,
+                                0,
+                            );
+                            Some(
+                                self.scheduler
+                                    .retry_after_backing_recheck(deferral.request_id(), observed)?,
+                            )
                         }
+                        ExecutorPrefillMaintenanceOutcome::WaitForRelease {
+                            current,
+                            wait_condition,
+                            ..
+                        } => {
+                            let observed = AdmissionWakeEpochs::new(
+                                current.coordinator_id,
+                                current.release_epoch,
+                                current.capacity_epoch,
+                                0,
+                            );
+                            Some(self.scheduler.wait_for_release_after_backing_pressure(
+                                deferral.request_id(),
+                                observed,
+                                wait_condition.clone(),
+                            )?)
+                        }
+                        _ => None,
+                    };
+                    if transitioned == Some(false)
+                        && self.scheduler.trace_phase(deferral.request_id())
+                            == Some(RequestPhase::Waiting)
+                    {
+                        return Err(FerrumError::internal(format!(
+                            "waiting request {} lost its backing-growth deferral",
+                            deferral.request_id()
+                        )));
                     }
                     Ok(outcome)
                 });
@@ -975,7 +995,7 @@ impl EngineInner {
     // ── iteration loop ─────────────────────────────────────────────────
 
     /// Run one iteration: ask the scheduler for a batch, then process it.
-    pub(super) async fn run_iteration(&self) -> Result<()> {
+    pub(super) async fn run_iteration(&self) -> Result<EngineIterationOutcome> {
         self.cancel_abandoned_requests().await?;
 
         let iteration = self.iteration_count.fetch_add(1, Ordering::Relaxed);
@@ -1019,23 +1039,25 @@ impl EngineInner {
         let sched_t0 = Instant::now();
         let nb_t0 = if nb_prof { Some(Instant::now()) } else { None };
         let mut prefill_maintenance = Vec::new();
-        let nb_result = if self.model_executor.execution_resource_ownership()
-            == ExecutionResourceOwnership::ExecutorManaged
-        {
+        let executor_managed = self.model_executor.execution_resource_ownership()
+            == ExecutionResourceOwnership::ExecutorManaged;
+        let nb_result = if executor_managed {
+            let mut availability = self.dynamic_admission_availability.lock();
             let epochs = self
                 .model_executor
-                .prefill_admission_epochs()?
+                .write_prefill_admission_snapshot(&mut availability)?
                 .ok_or_else(|| {
                     FerrumError::scheduler(
                         "executor-managed runtime did not expose typed admission epochs",
                     )
                 })?;
-            let wake = AdmissionWakeEpochs::new(
+            let wake_epochs = AdmissionWakeEpochs::new(
                 epochs.coordinator_id,
                 epochs.release_epoch,
                 epochs.capacity_epoch,
                 0,
             );
+            let wake = AdmissionWakeSnapshot::new(wake_epochs, &availability);
             let capture_trace = self.scheduler_trace_jsonl.is_some();
             let mut admission_traces = capture_trace.then(Vec::new);
             let mut admission_queue_observations = capture_trace.then(Vec::new);
@@ -1060,6 +1082,7 @@ impl EngineInner {
                 self.scheduler
                     .next_batch_with_dynamic_admission(hint, wake, &mut probe)
             };
+            drop(availability);
             drop(probe);
             if let Some(traces) = admission_traces {
                 for trace in traces {
@@ -1149,8 +1172,27 @@ impl EngineInner {
                         }));
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                return Ok(());
+                if self.scheduler.active_count() > 0 {
+                    return Ok(EngineIterationOutcome::Progressed);
+                }
+                if executor_managed {
+                    if let Some(observed) = self.scheduler.passive_capacity_wait_condition()? {
+                        let registration = self
+                            .model_executor
+                            .register_prefill_capacity_waiter(&observed)?
+                            .ok_or_else(|| {
+                                FerrumError::scheduler(
+                                    "executor-managed runtime did not register its capacity waiter",
+                                )
+                            })?;
+                        return Ok(EngineIterationOutcome::CapacityBlocked(registration));
+                    }
+                }
+                return if self.scheduler.waiting_count() == 0 {
+                    Ok(EngineIterationOutcome::Idle)
+                } else {
+                    Ok(EngineIterationOutcome::Progressed)
+                };
             }
         };
         let trace_none_since_last_some = if trace_enabled {
@@ -1240,6 +1282,7 @@ impl EngineInner {
                 }
             }
         }
-        r
+        r?;
+        Ok(EngineIterationOutcome::Progressed)
     }
 }

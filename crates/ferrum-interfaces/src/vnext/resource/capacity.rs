@@ -1,8 +1,11 @@
 use super::{
-    invalid_resource, Arc, AtomicU64, BTreeMap, BatchInvocationId, BatchStepId, DeviceId, Mutex,
-    OnceLock, Ordering, VNextError, Weak,
+    invalid_resource, watch, Arc, AtomicU64, BTreeMap, BatchInvocationId, BatchStepId,
+    CapacityAvailabilityEpoch, DeviceId, Mutex, OnceLock, Ordering, VNextError, Weak,
 };
-use crate::vnext::{DeviceCapacityPressure, DeviceCapacityPressureScope};
+use crate::vnext::{
+    CapacityAvailabilitySource, DeviceCapacityPressure, DeviceCapacityPressureScope,
+    DynamicAdmissionFaultKind,
+};
 
 static NEXT_ADMISSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_BATCH_STEP_ID: AtomicU64 = AtomicU64::new(1);
@@ -32,6 +35,47 @@ pub(super) struct DeviceCapacityAccount {
     pub(super) device_runtime_implementation_fingerprint: String,
     pub(super) device_capacity_bytes: u64,
     pub(super) state: Mutex<DeviceCapacityState>,
+    process_availability_tx: watch::Sender<DeviceCapacitySignal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DeviceCapacitySignal {
+    Live(u64),
+    FailClosed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DeviceCapacityAvailabilitySnapshot {
+    plan_epoch: u64,
+    process_epoch: u64,
+}
+
+impl DeviceCapacityAvailabilitySnapshot {
+    pub(super) const fn plan_epoch(self) -> u64 {
+        self.plan_epoch
+    }
+
+    pub(super) const fn process_epoch(self) -> u64 {
+        self.process_epoch
+    }
+
+    pub(super) fn epoch_for_pressure(
+        self,
+        pressure: &DeviceCapacityPressure,
+    ) -> CapacityAvailabilityEpoch {
+        let (source, epoch) = match pressure.scope() {
+            DeviceCapacityPressureScope::PlanBudget => (
+                CapacityAvailabilitySource::PlanDeviceBudget,
+                self.plan_epoch,
+            ),
+            DeviceCapacityPressureScope::ProcessWide => (
+                CapacityAvailabilitySource::ProcessDeviceCapacity,
+                self.process_epoch,
+            ),
+        };
+        CapacityAvailabilityEpoch::new(source, epoch)
+            .expect("live device capacity generations are non-zero")
+    }
 }
 
 #[derive(Debug)]
@@ -40,13 +84,79 @@ pub(super) struct DeviceCapacityBudgetRecord {
     /// not an additive plan share.
     pub(super) device_wide_usable_ceiling_bytes: u64,
     pub(super) claimed_bytes: u64,
+    availability_epoch: u64,
+    availability_tx: watch::Sender<DeviceCapacitySignal>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct DeviceCapacityState {
     pub(super) claimed_bytes: u64,
     pub(super) next_budget_id: u64,
     pub(super) budgets: BTreeMap<u64, DeviceCapacityBudgetRecord>,
+    process_availability_epoch: u64,
+    poisoned: bool,
+}
+
+fn capacity_fault(kind: DynamicAdmissionFaultKind, reason: impl Into<String>) -> VNextError {
+    VNextError::DynamicAdmissionContract {
+        kind,
+        reason: reason.into(),
+    }
+}
+
+fn poison_capacity_account(account: &DeviceCapacityAccount, state: &mut DeviceCapacityState) {
+    state.poisoned = true;
+    for record in state.budgets.values() {
+        record
+            .availability_tx
+            .send_replace(DeviceCapacitySignal::FailClosed);
+    }
+    account
+        .process_availability_tx
+        .send_replace(DeviceCapacitySignal::FailClosed);
+}
+
+fn publish_capacity_release(
+    account: &DeviceCapacityAccount,
+    state: &mut DeviceCapacityState,
+    budget_id: u64,
+) {
+    let next_plan_epoch = state
+        .budgets
+        .get(&budget_id)
+        .and_then(|record| record.availability_epoch.checked_add(1));
+    let next_process_epoch = state.process_availability_epoch.checked_add(1);
+    let (Some(next_plan_epoch), Some(next_process_epoch)) = (next_plan_epoch, next_process_epoch)
+    else {
+        poison_capacity_account(account, state);
+        return;
+    };
+    let record = state
+        .budgets
+        .get_mut(&budget_id)
+        .expect("live device claim retains its budget record");
+    record.availability_epoch = next_plan_epoch;
+    state.process_availability_epoch = next_process_epoch;
+    record
+        .availability_tx
+        .send_replace(DeviceCapacitySignal::Live(next_plan_epoch));
+    account
+        .process_availability_tx
+        .send_replace(DeviceCapacitySignal::Live(next_process_epoch));
+}
+
+fn publish_process_capacity_increase(
+    account: &DeviceCapacityAccount,
+    state: &mut DeviceCapacityState,
+) {
+    let Some(next_process_epoch) = state.process_availability_epoch.checked_add(1) else {
+        poison_capacity_account(account, state);
+        return;
+    };
+    state.process_availability_epoch = next_process_epoch;
+    account
+        .process_availability_tx
+        .send_replace(DeviceCapacitySignal::Live(next_process_epoch));
 }
 
 impl DeviceCapacityAccount {
@@ -65,6 +175,12 @@ impl DeviceCapacityAccount {
             .state
             .lock()
             .map_err(|_| invalid_resource("device capacity account is poisoned"))?;
+        if state.poisoned {
+            return Err(capacity_fault(
+                DynamicAdmissionFaultKind::Poisoned,
+                "device capacity account is fail-closed",
+            ));
+        }
         let effective = state
             .budgets
             .values()
@@ -84,17 +200,21 @@ impl DeviceCapacityAccount {
             .checked_add(1)
             .ok_or_else(|| invalid_resource("device capacity budget id space is exhausted"))?;
         state.next_budget_id = budget_id;
+        let (availability_tx, _) = watch::channel(DeviceCapacitySignal::Live(1));
         state.budgets.insert(
             budget_id,
             DeviceCapacityBudgetRecord {
                 device_wide_usable_ceiling_bytes,
                 claimed_bytes: 0,
+                availability_epoch: 1,
+                availability_tx: availability_tx.clone(),
             },
         );
         Ok(Arc::new(DeviceCapacityBudget {
             account: Arc::clone(self),
             budget_id,
             device_wide_usable_ceiling_bytes,
+            availability_tx,
         }))
     }
 
@@ -112,6 +232,12 @@ impl DeviceCapacityAccount {
             .state
             .lock()
             .map_err(|_| invalid_resource("device capacity account is poisoned"))?;
+        if state.poisoned {
+            return Err(capacity_fault(
+                DynamicAdmissionFaultKind::Poisoned,
+                "device capacity account is fail-closed",
+            ));
+        }
         let effective_usable_capacity = state
             .budgets
             .values()
@@ -166,6 +292,57 @@ pub(super) struct DeviceCapacityBudget {
     pub(super) account: Arc<DeviceCapacityAccount>,
     pub(super) budget_id: u64,
     pub(super) device_wide_usable_ceiling_bytes: u64,
+    availability_tx: watch::Sender<DeviceCapacitySignal>,
+}
+
+impl DeviceCapacityBudget {
+    pub(super) fn availability_snapshot(
+        &self,
+    ) -> Result<DeviceCapacityAvailabilitySnapshot, VNextError> {
+        let state = self
+            .account
+            .state
+            .lock()
+            .map_err(|_| invalid_resource("device capacity account is poisoned"))?;
+        if state.poisoned {
+            return Err(capacity_fault(
+                DynamicAdmissionFaultKind::Poisoned,
+                "device capacity account is fail-closed",
+            ));
+        }
+        let record = state
+            .budgets
+            .get(&self.budget_id)
+            .ok_or_else(|| invalid_resource("device capacity budget is stale"))?;
+        Ok(DeviceCapacityAvailabilitySnapshot {
+            plan_epoch: record.availability_epoch,
+            process_epoch: state.process_availability_epoch,
+        })
+    }
+
+    pub(super) fn write_availability_epochs(
+        &self,
+        out: &mut Vec<CapacityAvailabilityEpoch>,
+    ) -> Result<DeviceCapacityAvailabilitySnapshot, VNextError> {
+        let snapshot = self.availability_snapshot()?;
+        out.push(CapacityAvailabilityEpoch::new(
+            CapacityAvailabilitySource::PlanDeviceBudget,
+            snapshot.plan_epoch,
+        )?);
+        out.push(CapacityAvailabilityEpoch::new(
+            CapacityAvailabilitySource::ProcessDeviceCapacity,
+            snapshot.process_epoch,
+        )?);
+        Ok(snapshot)
+    }
+
+    pub(super) fn subscribe_plan_availability(&self) -> watch::Receiver<DeviceCapacitySignal> {
+        self.availability_tx.subscribe()
+    }
+
+    pub(super) fn subscribe_process_availability(&self) -> watch::Receiver<DeviceCapacitySignal> {
+        self.account.process_availability_tx.subscribe()
+    }
 }
 
 impl Drop for DeviceCapacityBudget {
@@ -174,6 +351,12 @@ impl Drop for DeviceCapacityBudget {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let previous_effective = state
+            .budgets
+            .values()
+            .map(|budget| budget.device_wide_usable_ceiling_bytes)
+            .min()
+            .unwrap_or(self.account.device_capacity_bytes);
         let record = state
             .budgets
             .remove(&self.budget_id)
@@ -182,6 +365,15 @@ impl Drop for DeviceCapacityBudget {
             record.claimed_bytes, 0,
             "device capacity budget dropped while physical grants remain live"
         );
+        let current_effective = state
+            .budgets
+            .values()
+            .map(|budget| budget.device_wide_usable_ceiling_bytes)
+            .min()
+            .unwrap_or(self.account.device_capacity_bytes);
+        if !state.poisoned && !state.budgets.is_empty() && current_effective > previous_effective {
+            publish_process_capacity_increase(&self.account, &mut state);
+        }
     }
 }
 
@@ -210,12 +402,20 @@ pub(super) fn device_capacity_account(
             account
         }
         None => {
+            let (process_availability_tx, _) = watch::channel(DeviceCapacitySignal::Live(1));
             let account = Arc::new(DeviceCapacityAccount {
                 device_id: device_id.clone(),
                 device_runtime_implementation_fingerprint:
                     device_runtime_implementation_fingerprint.to_owned(),
                 device_capacity_bytes,
-                state: Mutex::new(DeviceCapacityState::default()),
+                state: Mutex::new(DeviceCapacityState {
+                    claimed_bytes: 0,
+                    next_budget_id: 0,
+                    budgets: BTreeMap::new(),
+                    process_availability_epoch: 1,
+                    poisoned: false,
+                }),
+                process_availability_tx,
             });
             registry.insert(device_id.clone(), Arc::downgrade(&account));
             account
@@ -270,6 +470,7 @@ impl DeviceCapacityClaim {
                 "device plan capacity claim was returned more than once"
             );
             record.claimed_bytes -= bytes;
+            publish_capacity_release(account, &mut state, budget.budget_id);
         }
         self.bytes -= bytes;
         if self.bytes == 0 {
@@ -358,4 +559,72 @@ pub(super) fn issue_generation() -> Result<u64, VNextError> {
             current.checked_add(1)
         })
         .map_err(|_| invalid_resource("resource admission generation space is exhausted"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(capacity_bytes: u64) -> Arc<DeviceCapacityAccount> {
+        let generation = issue_generation().unwrap();
+        device_capacity_account(
+            &DeviceId::new(format!("device.capacity-signal-test-{generation}")).unwrap(),
+            "capacity-signal-test-runtime",
+            capacity_bytes,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn releasing_one_plan_advances_its_plan_and_process_generations() {
+        let account = account(128);
+        let first = account.register_budget(128).unwrap();
+        let second = account.register_budget(128).unwrap();
+        let first_before = first.availability_snapshot().unwrap();
+        let second_before = second.availability_snapshot().unwrap();
+        let reservation = DeviceCapacityReservation::reserve(&first, 64).unwrap();
+
+        drop(reservation);
+
+        let first_after = first.availability_snapshot().unwrap();
+        let second_after = second.availability_snapshot().unwrap();
+        assert_eq!(first_after.plan_epoch(), first_before.plan_epoch() + 1);
+        assert_eq!(
+            first_after.process_epoch(),
+            first_before.process_epoch() + 1
+        );
+        assert_eq!(second_after.plan_epoch(), second_before.plan_epoch());
+        assert_eq!(
+            second_after.process_epoch(),
+            second_before.process_epoch() + 1
+        );
+    }
+
+    #[test]
+    fn pressure_scope_selects_the_exact_capacity_generation() {
+        let account = account(128);
+        let first = account.register_budget(128).unwrap();
+        let second = account.register_budget(96).unwrap();
+        let held = DeviceCapacityReservation::reserve(&first, 96).unwrap();
+        let second_snapshot = second.availability_snapshot().unwrap();
+
+        let pressure = match DeviceCapacityReservation::reserve(&second, 64) {
+            Err(VNextError::DeviceCapacityUnavailable(pressure)) => pressure,
+            _ => panic!("shared device pressure must remain typed"),
+        };
+        assert_eq!(pressure.scope(), &DeviceCapacityPressureScope::ProcessWide);
+        assert_eq!(
+            second_snapshot.epoch_for_pressure(&pressure),
+            CapacityAvailabilityEpoch::new(
+                CapacityAvailabilitySource::ProcessDeviceCapacity,
+                second_snapshot.process_epoch(),
+            )
+            .unwrap()
+        );
+
+        drop(held);
+        let after = second.availability_snapshot().unwrap();
+        assert_eq!(after.plan_epoch(), second_snapshot.plan_epoch());
+        assert!(after.process_epoch() > second_snapshot.process_epoch());
+    }
 }

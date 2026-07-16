@@ -18,8 +18,9 @@ use ferrum_interfaces::model_executor::{
     AttentionType, DecodeInput, DecodeOutput, ExecutionResourceOwnership, ExecutorAdmissionEpochs,
     ExecutorCapabilities, ExecutorMemoryUsage, ExecutorPrefillAdmission,
     ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
-    ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome, ExecutorState,
-    ExecutorStatus, MemoryRequirements, PrefillInput, PrefillOutput,
+    ExecutorPrefillCapacityWaitRegistration, ExecutorPrefillMaintenanceDeferral,
+    ExecutorPrefillMaintenanceOutcome, ExecutorState, ExecutorStatus, MemoryRequirements,
+    PrefillInput, PrefillOutput,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -854,23 +855,60 @@ enum VNextSequenceAdmissionDecision<R: DeviceRuntime> {
         deferred: AdmissionDeferred,
         staged_request: Option<Arc<AdmittedRequestResources<R>>>,
     },
-    BackingDeferred {
-        deferred: DynamicBackingDeferred,
-        staged_request: Option<Arc<AdmittedRequestResources<R>>>,
-    },
+    BackingDeferred(VNextPrefillBackingDeferral<R>),
     PermanentRejected(AdmissionRejected),
 }
 
-enum PendingPrefillMaintenance {
-    Logical(AdmissionDeferred),
-    Backing(DynamicBackingDeferred),
+enum VNextPrefillBackingDeferral<R: DeviceRuntime> {
+    Request(RequestBackingDeferral<R>),
+    Sequence(SequenceAdmissionBackingDeferral<R>),
+}
+
+impl<R: DeviceRuntime> VNextPrefillBackingDeferral<R> {
+    fn evidence(&self) -> &DynamicBackingDeferred {
+        match self {
+            Self::Request(deferred) => deferred.evidence(),
+            Self::Sequence(deferred) => deferred.evidence(),
+        }
+    }
+
+    fn parent(&self) -> Option<&Arc<AdmittedRequestResources<R>>> {
+        match self {
+            Self::Request(_) => None,
+            Self::Sequence(deferred) => Some(deferred.parent()),
+        }
+    }
+
+    fn maintain(&self) -> std::result::Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        match self {
+            Self::Request(deferred) => deferred.maintain(),
+            Self::Sequence(deferred) => deferred.maintain(),
+        }
+    }
+}
+
+enum PendingPrefillMaintenance<R: DeviceRuntime> {
+    Logical {
+        deferred: AdmissionDeferred,
+        parent: Option<Arc<AdmittedRequestResources<R>>>,
+    },
+    Backing(VNextPrefillBackingDeferral<R>),
+}
+
+impl<R: DeviceRuntime> PendingPrefillMaintenance<R> {
+    fn parent(&self) -> Option<&Arc<AdmittedRequestResources<R>>> {
+        match self {
+            Self::Logical { parent, .. } => parent.as_ref(),
+            Self::Backing(deferred) => deferred.parent(),
+        }
+    }
 }
 
 struct VNextSequenceRegistry<R: DeviceRuntime> {
     pending: HashMap<RequestId, Arc<VNextSequence<R>>>,
     active: HashMap<String, Arc<VNextSequence<R>>>,
     staged_prefill: HashMap<RequestId, Arc<AdmittedRequestResources<R>>>,
-    prefill_maintenance: HashMap<RequestId, PendingPrefillMaintenance>,
+    prefill_maintenance: HashMap<RequestId, PendingPrefillMaintenance<R>>,
 }
 
 impl<R: DeviceRuntime> Default for VNextSequenceRegistry<R> {
@@ -1276,17 +1314,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     fn retain_prefill_maintenance(
         &self,
         request_id: &RequestId,
-        pending: PendingPrefillMaintenance,
-        staged_request: Option<Arc<AdmittedRequestResources<R>>>,
+        pending: PendingPrefillMaintenance<R>,
     ) -> Result<ExecutorPrefillMaintenanceDeferral> {
         let projection = match &pending {
-            PendingPrefillMaintenance::Logical(deferred) => {
+            PendingPrefillMaintenance::Logical { deferred, .. } => {
                 ExecutorPrefillMaintenanceDeferral::from_admission(request_id, deferred)?
             }
             PendingPrefillMaintenance::Backing(deferred) => {
-                ExecutorPrefillMaintenanceDeferral::from_backing(request_id, deferred)?
+                ExecutorPrefillMaintenanceDeferral::from_backing(request_id, deferred.evidence())?
             }
         };
+        let staged_request = pending.parent().cloned();
         let mut sequences = self.sequences.lock();
         if sequences.pending.contains_key(request_id)
             || sequences.prefill_maintenance.contains_key(request_id)
@@ -1408,10 +1446,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.metrics
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
-                    return Ok(VNextSequenceAdmissionDecision::BackingDeferred {
-                        deferred,
-                        staged_request: None,
-                    });
+                    return Ok(VNextSequenceAdmissionDecision::BackingDeferred(
+                        VNextPrefillBackingDeferral::Request(deferred),
+                    ));
                 }
                 RequestResourceAdmissionDecision::PermanentRejected(rejected) => {
                     return Ok(VNextSequenceAdmissionDecision::PermanentRejected(rejected));
@@ -1443,10 +1480,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 self.metrics
                     .backing_deferrals
                     .fetch_add(1, Ordering::Relaxed);
-                return Ok(VNextSequenceAdmissionDecision::BackingDeferred {
-                    deferred,
-                    staged_request: Some(request),
-                });
+                return Ok(VNextSequenceAdmissionDecision::BackingDeferred(
+                    VNextPrefillBackingDeferral::Sequence(deferred),
+                ));
             }
             SequenceResourceAdmissionDecision::PermanentRejected(rejected) => {
                 return Ok(VNextSequenceAdmissionDecision::PermanentRejected(rejected));
@@ -2121,6 +2157,35 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
             .map_err(|error| FerrumError::backend(error.to_string()))
     }
 
+    fn write_prefill_admission_snapshot(
+        &self,
+        availability: &mut Vec<ferrum_interfaces::vnext::CapacityAvailabilityEpoch>,
+    ) -> Result<Option<ExecutorAdmissionEpochs>> {
+        self.plan_resources
+            .write_dynamic_capacity_availability(availability)
+            .map(|epochs| Some(ExecutorAdmissionEpochs::from_capacity(epochs)))
+            .map_err(|error| FerrumError::backend(error.to_string()))
+    }
+
+    fn register_prefill_capacity_waiter(
+        &self,
+        observed: &CapacityWaitCondition,
+    ) -> Result<Option<ExecutorPrefillCapacityWaitRegistration>> {
+        let registration = self
+            .plan_resources
+            .register_capacity_waiter(observed)
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
+        Ok(Some(ExecutorPrefillCapacityWaitRegistration::new(
+            async move {
+                registration
+                    .wait_for_change()
+                    .await
+                    .map(ExecutorAdmissionEpochs::from_capacity)
+                    .map_err(|error| FerrumError::backend(error.to_string()))
+            },
+        )))
+    }
+
     fn try_admit_prefill(
         &self,
         input: ExecutorPrefillAdmission<'_>,
@@ -2192,8 +2257,10 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                 if deferred.action() == DeferredAction::AwaitBackingGrowth {
                     let projection = self.retain_prefill_maintenance(
                         input.request_id,
-                        PendingPrefillMaintenance::Logical(deferred),
-                        staged_request,
+                        PendingPrefillMaintenance::Logical {
+                            deferred,
+                            parent: staged_request,
+                        },
                     )?;
                     return Ok(ExecutorPrefillAdmissionDecision::MaintenanceDeferred(
                         projection,
@@ -2204,14 +2271,10 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                 }
                 return Ok(ExecutorPrefillAdmissionDecision::Deferred(deferred));
             }
-            VNextSequenceAdmissionDecision::BackingDeferred {
-                deferred,
-                staged_request,
-            } => {
+            VNextSequenceAdmissionDecision::BackingDeferred(deferred) => {
                 let projection = self.retain_prefill_maintenance(
                     input.request_id,
                     PendingPrefillMaintenance::Backing(deferred),
-                    staged_request,
                 )?;
                 return Ok(ExecutorPrefillAdmissionDecision::MaintenanceDeferred(
                     projection,
@@ -2312,51 +2375,44 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         &self,
         request_id: &RequestId,
     ) -> Result<ExecutorPrefillMaintenanceOutcome> {
-        let (pending, staged_guard) = {
+        let pending = {
             let mut sequences = self.sequences.lock();
-            let pending = sequences.prefill_maintenance.remove(request_id);
-            let staged_guard = pending
-                .as_ref()
-                .and_then(|_| sequences.staged_prefill.get(request_id).cloned());
-            (pending, staged_guard)
+            sequences.prefill_maintenance.remove(request_id)
         };
         let Some(pending) = pending else {
             return Ok(ExecutorPrefillMaintenanceOutcome::NoLongerPending);
         };
+        let exact_parent = pending.parent().cloned();
         let outcome = match &pending {
-            PendingPrefillMaintenance::Logical(deferred) => self
+            PendingPrefillMaintenance::Logical { deferred, .. } => self
                 .plan_resources
                 .maintain_for_admission_deferred(deferred),
-            PendingPrefillMaintenance::Backing(deferred) => {
-                self.plan_resources.maintain_for_deferred(deferred)
-            }
+            PendingPrefillMaintenance::Backing(deferred) => deferred.maintain(),
         };
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
-                if let Some(staged) = &staged_guard {
+                if let Some(staged) = &exact_parent {
                     self.sequences
                         .lock()
                         .remove_staged_prefill_if(request_id, staged);
                 }
-                drop(staged_guard);
                 return Err(FerrumError::backend(error.to_string()));
             }
         };
-        // The parent request authority must outlive the strict epoch check in
-        // maintain_for_deferred; releasing it earlier makes its own evidence stale.
-        drop(staged_guard);
         match outcome {
-            DynamicDeferredMaintenanceOutcome::RetryWithoutGrowth { current_epochs } => {
-                Ok(ExecutorPrefillMaintenanceOutcome::RetryWithoutGrowth {
+            DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs } => {
+                Ok(ExecutorPrefillMaintenanceOutcome::RetryAdmission {
                     current: ExecutorAdmissionEpochs::from_capacity(current_epochs),
                 })
             }
             DynamicDeferredMaintenanceOutcome::WaitForRelease {
                 current_epochs,
+                wait_condition,
                 pressure,
             } => Ok(ExecutorPrefillMaintenanceOutcome::WaitForRelease {
                 current: ExecutorAdmissionEpochs::from_capacity(current_epochs),
+                wait_condition,
                 pressure,
             }),
             DynamicDeferredMaintenanceOutcome::Maintained(receipt) => {

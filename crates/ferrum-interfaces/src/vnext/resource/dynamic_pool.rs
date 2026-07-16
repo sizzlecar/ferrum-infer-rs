@@ -1,16 +1,17 @@
 use super::{
-    invalid_resource, validate_runtime_descriptor_for_admission, AdmissionDeferred, AllocationSeal,
-    Arc, AtomicU64, BTreeMap, BTreeSet, BufferDescriptor, BufferRequest, BufferUsage,
-    CapacityDomainId, CapacityEpochs, CapacityUnits, DeviceAllocationPermit, DeviceCapacityBudget,
-    DeviceCapacityGrant, DeviceCapacityReservation, DeviceRuntime, DynamicBackingPoolId,
-    DynamicBackingPoolSpec, DynamicResourceDescriptor, DynamicStorageAllocator,
-    DynamicStorageProfile, DynamicStorageView, ElementType, InvocationLivenessMode,
-    LogicalAdmissionCoordinator, Mutex, Ordering, PlanNode, ResourceId, ResourceReservation,
-    ResourceRetentionPolicy, ResourceTransactionIdentity, RunId, Serialize,
-    StaticProvisioningBinding, StepResourceSlotKind, TransactionId, VNextError,
+    invalid_resource, validate_runtime_descriptor_for_admission, AdmissionDeferred,
+    AllocationLifetime, AllocationSeal, Arc, AtomicU64, BTreeMap, BTreeSet, BufferDescriptor,
+    BufferRequest, BufferUsage, CapacityAvailabilityEpoch, CapacityDomainId, CapacityEpochs,
+    CapacityUnits, CapacityWaitCondition, DeviceAllocationPermit,
+    DeviceCapacityAvailabilitySnapshot, DeviceCapacityBudget, DeviceCapacityGrant,
+    DeviceCapacityReservation, DeviceRuntime, DynamicBackingPoolId, DynamicBackingPoolSpec,
+    DynamicResourceDescriptor, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView,
+    ElementType, InvocationLivenessMode, LogicalAdmissionCoordinator, Mutex, Ordering, PlanNode,
+    ResourceId, ResourceReservation, ResourceRetentionPolicy, ResourceTransactionIdentity, RunId,
+    Serialize, StaticProvisioningBinding, StepResourceSlotKind, TransactionId, VNextError,
 };
 use crate::vnext::{
-    CapacityShortfallKind, DeferredAction, DeviceCapacityPressure, DeviceCapacityPressureScope,
+    CapacityShortfallKind, CapacityWaitSnapshot, DeferredAction, DeviceCapacityPressure,
 };
 
 static NEXT_DYNAMIC_POOL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -767,14 +768,21 @@ impl DynamicPoolMaintenanceStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum DynamicDeferredMaintenanceOutcome {
-    RetryWithoutGrowth {
+    RetryAdmission {
         current_epochs: CapacityEpochs,
     },
     WaitForRelease {
         current_epochs: CapacityEpochs,
+        wait_condition: CapacityWaitCondition,
         pressure: DeviceCapacityPressure,
     },
     Maintained(DynamicPoolGrowthBatchReceipt),
+}
+
+struct DynamicDeviceCapacityBlocked {
+    pressure: DeviceCapacityPressure,
+    availability: DeviceCapacityAvailabilitySnapshot,
+    planned_domains: Vec<CapacityDomainId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -991,6 +999,54 @@ where
         )
     }
 
+    fn observe_wait_condition(
+        &self,
+        wait_condition: &CapacityWaitCondition,
+    ) -> Result<(CapacityEpochs, bool), VNextError> {
+        let mut availability = Vec::with_capacity(self.pools.domains.len() + 3);
+        let epochs = self.pools.write_capacity_availability(&mut availability)?;
+        Ok((epochs, wait_condition.changed_since(&availability)?))
+    }
+
+    fn wait_snapshot_for_pool_ids<'a>(
+        &self,
+        pool_ids: impl IntoIterator<Item = &'a DynamicBackingPoolId>,
+    ) -> Result<CapacityWaitSnapshot, VNextError> {
+        self.pools.logical_admission.wait_snapshot_for_domains(
+            pool_ids
+                .into_iter()
+                .map(|pool_id| {
+                    self.pools
+                        .pools
+                        .get(pool_id)
+                        .map(|pool| pool.domain.domain_id)
+                        .ok_or_else(|| {
+                            invalid_resource("dynamic maintenance references an unknown pool")
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+    }
+
+    fn capacity_wait_outcome(
+        &self,
+        logical_snapshot: CapacityWaitSnapshot,
+        blocked: DynamicDeviceCapacityBlocked,
+    ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        let logical_snapshot = logical_snapshot.narrow_to_domains(blocked.planned_domains)?;
+        let mut observed = logical_snapshot.wait_condition().observed().to_vec();
+        observed.push(blocked.availability.epoch_for_pressure(&blocked.pressure));
+        let wait_condition = CapacityWaitCondition::new(
+            logical_snapshot.wait_condition().coordinator_id(),
+            observed,
+        )?;
+        Ok(DynamicDeferredMaintenanceOutcome::WaitForRelease {
+            current_epochs: logical_snapshot.epochs(),
+            wait_condition,
+            pressure: blocked.pressure,
+        })
+    }
+
     /// Resolves a still-current physical deferral by pool identity. If any
     /// release or capacity event happened since observation, no allocation is
     /// performed and the caller must retry admission against the new state.
@@ -998,14 +1054,18 @@ where
         &self,
         deferred: &DynamicBackingDeferred,
     ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
-        let current_epochs = self.pools.logical_admission.epochs()?;
-        if current_epochs.coordinator_id() != deferred.epochs().coordinator_id() {
+        let coordinator_id = self.pools.logical_admission.id();
+        if coordinator_id != deferred.epochs().coordinator_id()
+            || coordinator_id != deferred.wait_condition().coordinator_id()
+        {
             return Err(invalid_resource(
                 "dynamic backing deferral belongs to another admission coordinator",
             ));
         }
-        if current_epochs != deferred.epochs() {
-            return Ok(DynamicDeferredMaintenanceOutcome::RetryWithoutGrowth { current_epochs });
+        let (current_epochs, availability_changed) =
+            self.observe_wait_condition(deferred.wait_condition())?;
+        if availability_changed {
+            return Ok(DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs });
         }
         if deferred.blockers().is_empty() {
             return Err(invalid_resource(
@@ -1024,29 +1084,78 @@ where
                 .and_modify(|bytes| *bytes = (*bytes).max(blocker.requested_bytes()))
                 .or_insert(blocker.requested_bytes());
         }
-        let growth = self.grow_pools(
-            requested_by_pool
+        let requests = requested_by_pool
+            .into_iter()
+            .map(|(pool_id, bytes)| DynamicPoolGrowthRequest::new(pool_id, bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let logical_snapshot =
+            self.wait_snapshot_for_pool_ids(requests.iter().map(|request| request.pool_id()))?;
+        let mut capacity_blocked = None;
+        let growth = self.pools.maintain_pools_observed(
+            requests
                 .into_iter()
-                .map(|(pool_id, bytes)| DynamicPoolGrowthRequest::new(pool_id, bytes))
-                .collect::<Result<Vec<_>, _>>()?,
+                .map(DynamicPoolGrowthIntent::Additional)
+                .collect(),
+            &mut capacity_blocked,
         );
         match growth {
             Ok(receipt) => Ok(DynamicDeferredMaintenanceOutcome::Maintained(receipt)),
-            Err(VNextError::DeviceCapacityUnavailable(pressure))
-                if pressure.scope() == &DeviceCapacityPressureScope::PlanBudget =>
-            {
-                let after_pressure = self.pools.logical_admission.epochs()?;
-                if after_pressure != current_epochs {
-                    Ok(DynamicDeferredMaintenanceOutcome::RetryWithoutGrowth {
-                        current_epochs: after_pressure,
-                    })
-                } else {
-                    Ok(DynamicDeferredMaintenanceOutcome::WaitForRelease {
-                        current_epochs: after_pressure,
-                        pressure,
-                    })
-                }
+            Err(VNextError::DeviceCapacityUnavailable(_)) => self.capacity_wait_outcome(
+                logical_snapshot,
+                capacity_blocked.expect("typed capacity failure retains its exact observation"),
+            ),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Revalidates a physical deferral while its exact typed owner remains
+    /// live. Unrelated capacity epochs may advance between admission and this
+    /// bounded maintenance attempt, so growth is recomputed from current pool
+    /// state instead of trusting the stale byte snapshot.
+    pub(super) fn maintain_for_live_deferred(
+        &self,
+        deferred: &DynamicBackingDeferred,
+    ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        let coordinator_id = self.pools.logical_admission.id();
+        if coordinator_id != deferred.epochs().coordinator_id()
+            || coordinator_id != deferred.wait_condition().coordinator_id()
+        {
+            return Err(invalid_resource(
+                "dynamic backing deferral belongs to another admission coordinator",
+            ));
+        }
+        if deferred.blockers().is_empty() {
+            return Err(invalid_resource(
+                "dynamic backing deferral contains no blocking pool",
+            ));
+        }
+        let logical_snapshot = self.wait_snapshot_for_pool_ids(
+            deferred
+                .blockers()
+                .iter()
+                .map(DynamicBackingBlocker::pool_id),
+        )?;
+        let mut capacity_blocked = None;
+        let growth = self.pools.maintain_pools_observed(
+            deferred
+                .blockers()
+                .iter()
+                .cloned()
+                .map(DynamicPoolGrowthIntent::RevalidatedDeferral)
+                .collect(),
+            &mut capacity_blocked,
+        );
+        match growth {
+            Ok(receipt) if receipt.growths().is_empty() => {
+                Ok(DynamicDeferredMaintenanceOutcome::RetryAdmission {
+                    current_epochs: self.pools.logical_admission.epochs()?,
+                })
             }
+            Ok(receipt) => Ok(DynamicDeferredMaintenanceOutcome::Maintained(receipt)),
+            Err(VNextError::DeviceCapacityUnavailable(_)) => self.capacity_wait_outcome(
+                logical_snapshot,
+                capacity_blocked.expect("typed capacity failure retains its exact observation"),
+            ),
             Err(error) => Err(error),
         }
     }
@@ -1057,8 +1166,10 @@ where
         &self,
         deferred: &AdmissionDeferred,
     ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
-        let current_epochs = self.pools.logical_admission.epochs()?;
-        if current_epochs.coordinator_id() != deferred.epochs().coordinator_id() {
+        let coordinator_id = self.pools.logical_admission.id();
+        if coordinator_id != deferred.epochs().coordinator_id()
+            || coordinator_id != deferred.wait_condition().coordinator_id()
+        {
             return Err(invalid_resource(
                 "logical admission deferral belongs to another coordinator",
             ));
@@ -1106,31 +1217,30 @@ where
                 .or_insert(missing);
         }
         if requested_by_pool.is_empty() {
-            return Ok(DynamicDeferredMaintenanceOutcome::RetryWithoutGrowth { current_epochs });
+            return Ok(DynamicDeferredMaintenanceOutcome::RetryAdmission {
+                current_epochs: self.pools.logical_admission.epochs()?,
+            });
         }
-        let growth = self.grow_pools(
-            requested_by_pool
+        let requests = requested_by_pool
+            .into_iter()
+            .map(|(pool_id, bytes)| DynamicPoolGrowthRequest::new(pool_id, bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let logical_snapshot =
+            self.wait_snapshot_for_pool_ids(requests.iter().map(|request| request.pool_id()))?;
+        let mut capacity_blocked = None;
+        let growth = self.pools.maintain_pools_observed(
+            requests
                 .into_iter()
-                .map(|(pool_id, bytes)| DynamicPoolGrowthRequest::new(pool_id, bytes))
-                .collect::<Result<Vec<_>, _>>()?,
+                .map(DynamicPoolGrowthIntent::Additional)
+                .collect(),
+            &mut capacity_blocked,
         );
         match growth {
             Ok(receipt) => Ok(DynamicDeferredMaintenanceOutcome::Maintained(receipt)),
-            Err(VNextError::DeviceCapacityUnavailable(pressure))
-                if pressure.scope() == &DeviceCapacityPressureScope::PlanBudget =>
-            {
-                let after_pressure = self.pools.logical_admission.epochs()?;
-                if after_pressure != current_epochs {
-                    Ok(DynamicDeferredMaintenanceOutcome::RetryWithoutGrowth {
-                        current_epochs: after_pressure,
-                    })
-                } else {
-                    Ok(DynamicDeferredMaintenanceOutcome::WaitForRelease {
-                        current_epochs: after_pressure,
-                        pressure,
-                    })
-                }
-            }
+            Err(VNextError::DeviceCapacityUnavailable(_)) => self.capacity_wait_outcome(
+                logical_snapshot,
+                capacity_blocked.expect("typed capacity failure retains its exact observation"),
+            ),
             Err(error) => Err(error),
         }
     }
@@ -1272,6 +1382,7 @@ pub enum DynamicBackingDeferralReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DynamicBackingBlocker {
     pool_id: DynamicBackingPoolId,
+    domain_id: CapacityDomainId,
     reason: DynamicBackingDeferralReason,
     requested_bytes: u64,
     free_bytes: u64,
@@ -1281,6 +1392,10 @@ pub struct DynamicBackingBlocker {
 impl DynamicBackingBlocker {
     pub fn pool_id(&self) -> &DynamicBackingPoolId {
         &self.pool_id
+    }
+
+    pub const fn domain_id(&self) -> CapacityDomainId {
+        self.domain_id
     }
 
     pub const fn reason(&self) -> DynamicBackingDeferralReason {
@@ -1304,6 +1419,8 @@ impl DynamicBackingBlocker {
 pub struct DynamicBackingDeferred {
     blockers: Vec<DynamicBackingBlocker>,
     epochs: CapacityEpochs,
+    wait_condition: CapacityWaitCondition,
+    lifetime: AllocationLifetime,
 }
 
 impl DynamicBackingDeferred {
@@ -1322,6 +1439,14 @@ impl DynamicBackingDeferred {
     pub const fn epochs(&self) -> CapacityEpochs {
         self.epochs
     }
+
+    pub fn wait_condition(&self) -> &CapacityWaitCondition {
+        &self.wait_condition
+    }
+
+    pub const fn lifetime(&self) -> AllocationLifetime {
+        self.lifetime
+    }
 }
 
 impl DynamicPoolGrowthBatchReceipt {
@@ -1337,6 +1462,7 @@ impl DynamicPoolGrowthBatchReceipt {
 enum DynamicPoolGrowthIntent {
     Additional(DynamicPoolGrowthRequest),
     Minimum(DynamicBackingPoolId),
+    RevalidatedDeferral(DynamicBackingBlocker),
 }
 
 impl DynamicPoolGrowthIntent {
@@ -1344,6 +1470,7 @@ impl DynamicPoolGrowthIntent {
         match self {
             Self::Additional(request) => request.pool_id(),
             Self::Minimum(pool_id) => pool_id,
+            Self::RevalidatedDeferral(blocker) => blocker.pool_id(),
         }
     }
 }
@@ -1739,9 +1866,30 @@ where
         })
     }
 
+    pub(super) fn write_capacity_availability(
+        &self,
+        out: &mut Vec<CapacityAvailabilityEpoch>,
+    ) -> Result<CapacityEpochs, VNextError> {
+        let epochs = self.logical_admission.write_availability_epochs(out)?;
+        self.budget.write_availability_epochs(out)?;
+        debug_assert!(out
+            .windows(2)
+            .all(|pair| pair[0].source() < pair[1].source()));
+        Ok(epochs)
+    }
+
     fn maintain_pools(
         &self,
+        intents: Vec<DynamicPoolGrowthIntent>,
+    ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
+        let mut ignored_capacity_block = None;
+        self.maintain_pools_observed(intents, &mut ignored_capacity_block)
+    }
+
+    fn maintain_pools_observed(
+        &self,
         mut intents: Vec<DynamicPoolGrowthIntent>,
+        capacity_blocked: &mut Option<DynamicDeviceCapacityBlocked>,
     ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
         intents.sort_by(|left, right| left.pool_id().cmp(right.pool_id()));
         if intents
@@ -1794,6 +1942,32 @@ where
                             continue;
                         }
                         minimum - current
+                    }
+                    DynamicPoolGrowthIntent::RevalidatedDeferral(blocker) => {
+                        match blocker.reason() {
+                            DynamicBackingDeferralReason::GrowthRequired => {
+                                let required_free = blocker
+                                    .free_bytes()
+                                    .checked_add(blocker.requested_bytes())
+                                    .ok_or_else(|| {
+                                        invalid_resource(
+                                            "dynamic backing deferred requirement overflows u64",
+                                        )
+                                    })?;
+                                if state.allocator.free_bytes >= required_free {
+                                    continue;
+                                }
+                                required_free - state.allocator.free_bytes
+                            }
+                            DynamicBackingDeferralReason::FragmentedContiguous => {
+                                if state.allocator.largest_contiguous_bytes()
+                                    >= blocker.requested_bytes()
+                                {
+                                    continue;
+                                }
+                                blocker.requested_bytes()
+                            }
+                        }
                     }
                 }
             };
@@ -1867,7 +2041,22 @@ where
                 .checked_add(growth.chunk_bytes)
                 .ok_or_else(|| invalid_resource("dynamic maintenance batch bytes overflow u64"))
         })?;
-        let reservation = DeviceCapacityReservation::reserve(&self.budget, total_bytes)?;
+        let capacity_availability = self.budget.availability_snapshot()?;
+        let reservation = match DeviceCapacityReservation::reserve(&self.budget, total_bytes) {
+            Ok(reservation) => reservation,
+            Err(VNextError::DeviceCapacityUnavailable(pressure)) => {
+                *capacity_blocked = Some(DynamicDeviceCapacityBlocked {
+                    pressure: pressure.clone(),
+                    availability: capacity_availability,
+                    planned_domains: planned
+                        .iter()
+                        .map(|growth| growth.pool.domain.domain_id)
+                        .collect(),
+                });
+                return Err(VNextError::DeviceCapacityUnavailable(pressure));
+            }
+            Err(error) => return Err(error),
+        };
         let grants = reservation.commit_split(
             &planned
                 .iter()
@@ -2069,6 +2258,11 @@ where
                 PreparedBackingClaim::empty(),
             ));
         }
+        let lifetime = requests
+            .first()
+            .and_then(|request| request.projections.first())
+            .map(|projection| projection.descriptor.lifetime())
+            .ok_or_else(|| invalid_resource("dynamic backing request has no projection"))?;
         let mut grouped =
             BTreeMap::<DynamicBackingPoolId, Vec<&EvaluatedBackingRequest<'_>>>::new();
         for request in requests {
@@ -2093,295 +2287,366 @@ where
             })?;
             groups.push((pool, requests));
         }
-        let mut states = groups
-            .iter()
-            .map(|(pool, _)| {
-                pool.state
-                    .lock()
-                    .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        for (group_index, (pool, pool_requests)) in groups.iter().enumerate() {
-            if states[group_index].poisoned {
-                return Err(invalid_resource("dynamic backing pool is fail-closed"));
-            }
-            let quantum = pool.allocation_quantum();
-            for request in pool_requests {
-                let projection_ids = request
-                    .projections
-                    .iter()
-                    .map(|projection| projection.descriptor.base_resource_id().clone())
-                    .collect::<Vec<_>>();
-                let single_projection = request.projections.len() == 1
-                    && request.projections[0].physical_offset_bytes == 0
-                    && request.projections[0].size_bytes == request.size_bytes;
-                let shared_step_slot = request.projections.len() > 1
-                    && request
+        'prepare: loop {
+            let mut states = groups
+                .iter()
+                .map(|(pool, _)| {
+                    pool.state
+                        .lock()
+                        .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for (group_index, (pool, pool_requests)) in groups.iter().enumerate() {
+                if states[group_index].poisoned {
+                    return Err(invalid_resource("dynamic backing pool is fail-closed"));
+                }
+                let quantum = pool.allocation_quantum();
+                for request in pool_requests {
+                    let projection_ids = request
                         .projections
                         .iter()
-                        .all(|projection| projection.physical_offset_bytes == 0)
-                    && request
-                        .projections
-                        .iter()
-                        .map(|projection| projection.size_bytes)
-                        .max()
-                        == Some(request.size_bytes)
-                    && pool.domain.pool.step_resource_slots().iter().any(|slot| {
-                        slot.kind() == StepResourceSlotKind::OrderedSingleFenceStepWave
-                            && slot.resource_ids() == request.claim_identity.resource_ids()
-                    });
-                let invocation_wave = self.validate_invocation_wave_projection(pool, request)?;
-                if request.domain.pool_id() != pool.domain.pool_id()
-                    || request.claim_identity.pool_id() != pool.domain.pool_id()
-                    || request.claim_identity.resource_ids() != projection_ids
-                    || request.projections.is_empty()
-                    || request.projections.windows(2).any(|pair| {
-                        pair[0].descriptor.base_resource_id()
-                            >= pair[1].descriptor.base_resource_id()
-                    })
-                    || request.projections.iter().any(|projection| {
-                        projection.descriptor.pool_id() != pool.domain.pool_id()
-                            || projection.size_bytes == 0
-                            || projection.size_bytes % quantum != 0
-                            || projection.physical_offset_bytes % quantum != 0
-                            || projection
-                                .physical_offset_bytes
-                                .checked_add(projection.size_bytes)
-                                .is_none_or(|end| end > request.size_bytes)
-                            || !request
-                                .domain
-                                .descriptors
-                                .iter()
-                                .any(|descriptor| descriptor == projection.descriptor)
-                    })
-                    || request.size_bytes == 0
-                    || request.size_bytes % quantum != 0
-                    || !(single_projection || shared_step_slot || invocation_wave)
-                {
-                    return Err(invalid_resource(
+                        .map(|projection| projection.descriptor.base_resource_id().clone())
+                        .collect::<Vec<_>>();
+                    let single_projection = request.projections.len() == 1
+                        && request.projections[0].physical_offset_bytes == 0
+                        && request.projections[0].size_bytes == request.size_bytes;
+                    let shared_step_slot = request.projections.len() > 1
+                        && request
+                            .projections
+                            .iter()
+                            .all(|projection| projection.physical_offset_bytes == 0)
+                        && request
+                            .projections
+                            .iter()
+                            .map(|projection| projection.size_bytes)
+                            .max()
+                            == Some(request.size_bytes)
+                        && pool.domain.pool.step_resource_slots().iter().any(|slot| {
+                            slot.kind() == StepResourceSlotKind::OrderedSingleFenceStepWave
+                                && slot.resource_ids() == request.claim_identity.resource_ids()
+                        });
+                    let invocation_wave =
+                        self.validate_invocation_wave_projection(pool, request)?;
+                    if request.domain.pool_id() != pool.domain.pool_id()
+                        || request.claim_identity.pool_id() != pool.domain.pool_id()
+                        || request.claim_identity.resource_ids() != projection_ids
+                        || request.projections.is_empty()
+                        || request.projections.windows(2).any(|pair| {
+                            pair[0].descriptor.base_resource_id()
+                                >= pair[1].descriptor.base_resource_id()
+                        })
+                        || request.projections.iter().any(|projection| {
+                            projection.descriptor.pool_id() != pool.domain.pool_id()
+                                || projection.descriptor.lifetime() != lifetime
+                                || projection.size_bytes == 0
+                                || projection.size_bytes % quantum != 0
+                                || projection.physical_offset_bytes % quantum != 0
+                                || projection
+                                    .physical_offset_bytes
+                                    .checked_add(projection.size_bytes)
+                                    .is_none_or(|end| end > request.size_bytes)
+                                || !request
+                                    .domain
+                                    .descriptors
+                                    .iter()
+                                    .any(|descriptor| descriptor == projection.descriptor)
+                        })
+                        || request.size_bytes == 0
+                        || request.size_bytes % quantum != 0
+                        || !(single_projection || shared_step_slot || invocation_wave)
+                    {
+                        return Err(invalid_resource(
                         "dynamic backing request violates its physical claim, projection, pool, or allocation quantum",
                     ));
+                    }
                 }
             }
-        }
-        let blockers = groups
-            .iter()
-            .enumerate()
-            .map(|(group_index, (pool, pool_requests))| {
-                let requested_bytes = pool_requests.iter().try_fold(0_u64, |total, request| {
-                    total
-                        .checked_add(request.size_bytes)
-                        .ok_or_else(|| invalid_resource("dynamic backing batch bytes overflow u64"))
-                })?;
-                let state = &states[group_index];
-                Ok(
-                    (state.allocator.free_bytes < requested_bytes).then(|| DynamicBackingBlocker {
-                        pool_id: pool.domain.pool_id().clone(),
-                        reason: DynamicBackingDeferralReason::GrowthRequired,
-                        requested_bytes: requested_bytes - state.allocator.free_bytes,
-                        free_bytes: state.allocator.free_bytes,
-                        largest_contiguous_bytes: state.allocator.largest_contiguous_bytes(),
-                    }),
-                )
-            })
-            .collect::<Result<Vec<_>, VNextError>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        if !blockers.is_empty() {
-            drop(states);
-            return Ok(BackingPrepareDecision::Deferred(DynamicBackingDeferred {
-                blockers,
-                epochs: self.logical_admission.epochs()?,
-            }));
-        }
-        let segment_generations = groups
-            .iter()
-            .map(|(pool, requests)| {
-                (0..requests.len())
-                    .map(|_| {
-                        pool.next_extent_generation
-                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                                current.checked_add(1)
+            let blockers = groups
+                .iter()
+                .enumerate()
+                .map(|(group_index, (pool, pool_requests))| {
+                    let requested_bytes =
+                        pool_requests.iter().try_fold(0_u64, |total, request| {
+                            total.checked_add(request.size_bytes).ok_or_else(|| {
+                                invalid_resource("dynamic backing batch bytes overflow u64")
                             })
-                            .map_err(|_| {
-                                invalid_resource("dynamic extent generation space is exhausted")
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut selections = groups
-            .iter()
-            .map(|_| Vec::<(&EvaluatedBackingRequest<'_>, u64, Vec<BackingSegment>)>::new())
-            .collect::<Vec<_>>();
-        let mut journals = groups
-            .iter()
-            .map(|_| Vec::<Vec<BackingSegment>>::new())
-            .collect::<Vec<_>>();
-        for group_index in 0..groups.len() {
-            let (pool, pool_requests) = &groups[group_index];
-            let profile = pool.domain.pool.compatibility().profile();
-            for request in pool_requests {
-                let reserved = match match profile.view() {
-                    DynamicStorageView::Contiguous => states[group_index]
-                        .allocator
-                        .allocate_contiguous(pool.domain.pool_id(), request.size_bytes)
-                        .map(|segment| segment.map(|segment| vec![segment])),
-                    DynamicStorageView::PagedRegions { block_bytes } => states[group_index]
-                        .allocator
-                        .allocate_paged(pool.domain.pool_id(), request.size_bytes, block_bytes),
-                } {
-                    Ok(reserved) => reserved,
-                    Err(error) => {
-                        states[group_index].poisoned = true;
+                        })?;
+                    let state = &states[group_index];
+                    Ok((state.allocator.free_bytes < requested_bytes).then(|| {
+                        DynamicBackingBlocker {
+                            pool_id: pool.domain.pool_id().clone(),
+                            domain_id: pool.domain.domain_id,
+                            reason: DynamicBackingDeferralReason::GrowthRequired,
+                            requested_bytes: requested_bytes - state.allocator.free_bytes,
+                            free_bytes: state.allocator.free_bytes,
+                            largest_contiguous_bytes: state.allocator.largest_contiguous_bytes(),
+                        }
+                    }))
+                })
+                .collect::<Result<Vec<_>, VNextError>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            if !blockers.is_empty() {
+                drop(states);
+                if let Some(deferred) = self.confirm_backing_deferral(blockers, lifetime)? {
+                    return Ok(BackingPrepareDecision::Deferred(deferred));
+                }
+                continue 'prepare;
+            }
+            let segment_generations = groups
+                .iter()
+                .map(|(pool, requests)| {
+                    (0..requests.len())
+                        .map(|_| {
+                            pool.next_extent_generation
+                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                                    current.checked_add(1)
+                                })
+                                .map_err(|_| {
+                                    invalid_resource("dynamic extent generation space is exhausted")
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut selections = groups
+                .iter()
+                .map(|_| Vec::<(&EvaluatedBackingRequest<'_>, u64, Vec<BackingSegment>)>::new())
+                .collect::<Vec<_>>();
+            let mut journals = groups
+                .iter()
+                .map(|_| Vec::<Vec<BackingSegment>>::new())
+                .collect::<Vec<_>>();
+            for group_index in 0..groups.len() {
+                let (pool, pool_requests) = &groups[group_index];
+                let profile = pool.domain.pool.compatibility().profile();
+                for request in pool_requests {
+                    let reserved = match match profile.view() {
+                        DynamicStorageView::Contiguous => states[group_index]
+                            .allocator
+                            .allocate_contiguous(pool.domain.pool_id(), request.size_bytes)
+                            .map(|segment| segment.map(|segment| vec![segment])),
+                        DynamicStorageView::PagedRegions { block_bytes } => states[group_index]
+                            .allocator
+                            .allocate_paged(pool.domain.pool_id(), request.size_bytes, block_bytes),
+                    } {
+                        Ok(reserved) => reserved,
+                        Err(error) => {
+                            states[group_index].poisoned = true;
+                            rollback_free_extent_journal(&mut states, &journals)?;
+                            return Err(error);
+                        }
+                    };
+                    let Some(segments) = reserved else {
                         rollback_free_extent_journal(&mut states, &journals)?;
-                        return Err(error);
-                    }
-                };
-                let Some(segments) = reserved else {
-                    let blocker = DynamicBackingBlocker {
-                        pool_id: pool.domain.pool_id().clone(),
-                        reason: if states[group_index].allocator.free_bytes < request.size_bytes {
+                        let requested_group_bytes =
+                            pool_requests.iter().try_fold(0_u64, |total, request| {
+                                total.checked_add(request.size_bytes).ok_or_else(|| {
+                                    invalid_resource("dynamic backing batch bytes overflow u64")
+                                })
+                            })?;
+                        let free_bytes = states[group_index].allocator.free_bytes;
+                        let reason = if free_bytes < requested_group_bytes {
                             DynamicBackingDeferralReason::GrowthRequired
                         } else {
                             DynamicBackingDeferralReason::FragmentedContiguous
-                        },
-                        requested_bytes: request.size_bytes,
-                        free_bytes: states[group_index].allocator.free_bytes,
-                        largest_contiguous_bytes: states[group_index]
-                            .allocator
-                            .largest_contiguous_bytes(),
+                        };
+                        let blocker = DynamicBackingBlocker {
+                            pool_id: pool.domain.pool_id().clone(),
+                            domain_id: pool.domain.domain_id,
+                            reason,
+                            requested_bytes: match reason {
+                                DynamicBackingDeferralReason::GrowthRequired => {
+                                    requested_group_bytes - free_bytes
+                                }
+                                DynamicBackingDeferralReason::FragmentedContiguous => {
+                                    request.size_bytes
+                                }
+                            },
+                            free_bytes,
+                            largest_contiguous_bytes: states[group_index]
+                                .allocator
+                                .largest_contiguous_bytes(),
+                        };
+                        drop(states);
+                        if let Some(deferred) =
+                            self.confirm_backing_deferral(vec![blocker], lifetime)?
+                        {
+                            return Ok(BackingPrepareDecision::Deferred(deferred));
+                        }
+                        continue 'prepare;
                     };
-                    rollback_free_extent_journal(&mut states, &journals)?;
-                    drop(states);
-                    return Ok(BackingPrepareDecision::Deferred(DynamicBackingDeferred {
-                        blockers: vec![blocker],
-                        epochs: self.logical_admission.epochs()?,
-                    }));
-                };
-                journals[group_index].push(segments.clone());
-                let extent_bytes = match segments.iter().try_fold(0_u64, |total, segment| {
-                    total.checked_add(segment.length_bytes()).ok_or_else(|| {
-                        invalid_resource("dynamic backing extent bytes overflow u64")
-                    })
-                }) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
+                    journals[group_index].push(segments.clone());
+                    let extent_bytes = match segments.iter().try_fold(0_u64, |total, segment| {
+                        total.checked_add(segment.length_bytes()).ok_or_else(|| {
+                            invalid_resource("dynamic backing extent bytes overflow u64")
+                        })
+                    }) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            rollback_free_extent_journal(&mut states, &journals)?;
+                            return Err(error);
+                        }
+                    };
+                    if extent_bytes != request.size_bytes {
                         rollback_free_extent_journal(&mut states, &journals)?;
-                        return Err(error);
+                        return Err(invalid_resource(
+                            "dynamic backing extents differ from their exact logical claim",
+                        ));
                     }
-                };
-                if extent_bytes != request.size_bytes {
-                    rollback_free_extent_journal(&mut states, &journals)?;
-                    return Err(invalid_resource(
-                        "dynamic backing extents differ from their exact logical claim",
-                    ));
+                    let generation =
+                        segment_generations[group_index][selections[group_index].len()];
+                    selections[group_index].push((request, generation, segments));
                 }
-                let generation = segment_generations[group_index][selections[group_index].len()];
-                selections[group_index].push((request, generation, segments));
             }
-        }
 
-        for group_selections in &selections {
-            for (request, _, segments) in group_selections {
-                for projection in &request.projections {
-                    if let Err(error) = backing_segment_range(
-                        segments,
-                        projection.physical_offset_bytes,
-                        projection.size_bytes,
-                    ) {
-                        rollback_free_extent_journal(&mut states, &journals)?;
-                        return Err(error);
+            for group_selections in &selections {
+                for (request, _, segments) in group_selections {
+                    for projection in &request.projections {
+                        if let Err(error) = backing_segment_range(
+                            segments,
+                            projection.physical_offset_bytes,
+                            projection.size_bytes,
+                        ) {
+                            rollback_free_extent_journal(&mut states, &journals)?;
+                            return Err(error);
+                        }
                     }
                 }
             }
-        }
 
-        let increments = match (0..groups.len())
-            .map(|group_index| {
-                let mut increments = BTreeMap::<u32, u64>::new();
-                for (_, _, segments) in &selections[group_index] {
-                    for segment in segments {
-                        let count = increments.entry(segment.chunk_ordinal()).or_default();
-                        *count = count.checked_add(1).ok_or_else(|| {
-                            invalid_resource("dynamic chunk live extent increment overflows u64")
-                        })?;
+            let increments = match (0..groups.len())
+                .map(|group_index| {
+                    let mut increments = BTreeMap::<u32, u64>::new();
+                    for (_, _, segments) in &selections[group_index] {
+                        for segment in segments {
+                            let count = increments.entry(segment.chunk_ordinal()).or_default();
+                            *count = count.checked_add(1).ok_or_else(|| {
+                                invalid_resource(
+                                    "dynamic chunk live extent increment overflows u64",
+                                )
+                            })?;
+                        }
                     }
+                    for (&ordinal, &increment) in &increments {
+                        states[group_index]
+                            .chunks
+                            .get(&ordinal)
+                            .ok_or_else(|| invalid_resource("reserved dynamic chunk disappeared"))?
+                            .live_segments
+                            .checked_add(increment)
+                            .ok_or_else(|| {
+                                invalid_resource("dynamic chunk live extent count overflowed")
+                            })?;
+                    }
+                    Ok(increments)
+                })
+                .collect::<Result<Vec<_>, VNextError>>()
+            {
+                Ok(increments) => increments,
+                Err(error) => {
+                    rollback_free_extent_journal(&mut states, &journals)?;
+                    return Err(error);
                 }
-                for (&ordinal, &increment) in &increments {
+            };
+            for (group_index, increments) in increments.into_iter().enumerate() {
+                for (ordinal, increment) in increments {
                     states[group_index]
                         .chunks
-                        .get(&ordinal)
-                        .ok_or_else(|| invalid_resource("reserved dynamic chunk disappeared"))?
-                        .live_segments
-                        .checked_add(increment)
-                        .ok_or_else(|| {
-                            invalid_resource("dynamic chunk live extent count overflowed")
-                        })?;
+                        .get_mut(&ordinal)
+                        .expect("validated reserved dynamic chunk remains installed")
+                        .live_segments += increment;
                 }
-                Ok(increments)
-            })
-            .collect::<Result<Vec<_>, VNextError>>()
-        {
-            Ok(increments) => increments,
-            Err(error) => {
-                rollback_free_extent_journal(&mut states, &journals)?;
-                return Err(error);
             }
-        };
-        for (group_index, increments) in increments.into_iter().enumerate() {
-            for (ordinal, increment) in increments {
-                states[group_index]
-                    .chunks
-                    .get_mut(&ordinal)
-                    .expect("validated reserved dynamic chunk remains installed")
-                    .live_segments += increment;
-            }
-        }
-        drop(states);
-        let mut extents = Vec::new();
-        for ((pool, _), selections) in groups.into_iter().zip(selections) {
-            for (request, segment_generation, segments) in selections {
-                let projections = request
-                    .projections
-                    .iter()
-                    .map(|projection| {
-                        Ok(LogicalBackingSliceEvidence {
-                            domain_id: pool.domain.domain_id,
-                            pool_id: pool.domain.pool_id().clone(),
-                            resource_id: projection.descriptor.base_resource_id().clone(),
-                            pool_instance_id: pool.instance_id,
-                            physical_claim_identity: request.claim_identity.clone(),
-                            segment_generation,
-                            segments: backing_segment_range(
-                                &segments,
-                                projection.physical_offset_bytes,
-                                projection.size_bytes,
-                            )?,
-                            physical_offset_bytes: projection.physical_offset_bytes,
-                            size_bytes: projection.size_bytes,
-                            physical_size_bytes: request.size_bytes,
-                            alignment_bytes: projection.descriptor.alignment_bytes(),
-                            usage: projection.descriptor.usage(),
-                            element_type: projection.descriptor.element_type(),
-                            storage_profile: pool.domain.pool.compatibility().profile(),
+            drop(states);
+            let mut extents = Vec::new();
+            for ((pool, _), selections) in groups.into_iter().zip(selections) {
+                for (request, segment_generation, segments) in selections {
+                    let projections = request
+                        .projections
+                        .iter()
+                        .map(|projection| {
+                            Ok(LogicalBackingSliceEvidence {
+                                domain_id: pool.domain.domain_id,
+                                pool_id: pool.domain.pool_id().clone(),
+                                resource_id: projection.descriptor.base_resource_id().clone(),
+                                pool_instance_id: pool.instance_id,
+                                physical_claim_identity: request.claim_identity.clone(),
+                                segment_generation,
+                                segments: backing_segment_range(
+                                    &segments,
+                                    projection.physical_offset_bytes,
+                                    projection.size_bytes,
+                                )?,
+                                physical_offset_bytes: projection.physical_offset_bytes,
+                                size_bytes: projection.size_bytes,
+                                physical_size_bytes: request.size_bytes,
+                                alignment_bytes: projection.descriptor.alignment_bytes(),
+                                usage: projection.descriptor.usage(),
+                                element_type: projection.descriptor.element_type(),
+                                storage_profile: pool.domain.pool.compatibility().profile(),
+                            })
                         })
-                    })
-                    .collect::<Result<Vec<_>, VNextError>>()?;
-                extents.push(PreparedBackingExtent {
-                    pool: Arc::clone(&pool),
-                    claim_identity: request.claim_identity.clone(),
-                    segment_generation,
-                    segments,
-                    size_bytes: request.size_bytes,
-                    projections,
-                });
+                        .collect::<Result<Vec<_>, VNextError>>()?;
+                    extents.push(PreparedBackingExtent {
+                        pool: Arc::clone(&pool),
+                        claim_identity: request.claim_identity.clone(),
+                        segment_generation,
+                        segments,
+                        size_bytes: request.size_bytes,
+                        projections,
+                    });
+                }
+            }
+            return Ok(BackingPrepareDecision::Prepared(PreparedBackingClaim {
+                extents,
+                committed: false,
+            }));
+        }
+    }
+
+    /// Publishes a physical deferral with the event-subscription ordering
+    /// required to avoid a lost release:
+    ///
+    /// 1. observe the exact coordinator generations after the failed check;
+    /// 2. recheck the physical allocator observations;
+    /// 3. publish only if those observations are still current.
+    ///
+    /// A release before step 1 is visible to step 2. A release after step 1
+    /// advances the returned predicate (or is visible to step 2 before its
+    /// coordinator notification), so the scheduler cannot sleep forever on a
+    /// stale blocker.
+    fn confirm_backing_deferral(
+        &self,
+        blockers: Vec<DynamicBackingBlocker>,
+        lifetime: AllocationLifetime,
+    ) -> Result<Option<DynamicBackingDeferred>, VNextError> {
+        let wait_snapshot = self
+            .logical_admission
+            .wait_snapshot_for_domains(blockers.iter().map(|blocker| blocker.domain_id))?;
+        for blocker in &blockers {
+            let pool = self.pools.get(blocker.pool_id()).ok_or_else(|| {
+                invalid_resource("dynamic backing blocker references an unknown pool")
+            })?;
+            let state = pool
+                .state
+                .lock()
+                .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))?;
+            if state.poisoned {
+                return Err(invalid_resource("dynamic backing pool is fail-closed"));
+            }
+            if state.allocator.free_bytes != blocker.free_bytes
+                || state.allocator.largest_contiguous_bytes() != blocker.largest_contiguous_bytes
+            {
+                return Ok(None);
             }
         }
-        Ok(BackingPrepareDecision::Prepared(PreparedBackingClaim {
-            extents,
-            committed: false,
+        Ok(Some(DynamicBackingDeferred {
+            blockers,
+            epochs: wait_snapshot.epochs(),
+            wait_condition: wait_snapshot.wait_condition().clone(),
+            lifetime,
         }))
     }
 

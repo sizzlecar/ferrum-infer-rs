@@ -11,7 +11,7 @@
 
 use crate::vnext::{
     AdmissionDeferral, AdmissionProbeOutcome, AdmissionQueueEvent, AdmissionTickReceipt,
-    AdmissionWakeEpochs, DynamicAdmissionQueue, DynamicAdmissionQueuePolicy,
+    AdmissionWakeEpochs, AdmissionWakeSnapshot, DynamicAdmissionQueue, DynamicAdmissionQueuePolicy,
     WaitingAdmissionTicket,
 };
 use crate::{
@@ -184,7 +184,7 @@ type ExecutorAdmissionQueueEvent = AdmissionQueueEvent<
 enum WaitingAdmissionMode<'a> {
     Legacy,
     Dynamic {
-        wake: AdmissionWakeEpochs,
+        wake: AdmissionWakeSnapshot<'a>,
         probe: &'a mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
         observer: Option<&'a mut dyn FnMut(ExecutorAdmissionQueueObservation)>,
     },
@@ -431,6 +431,18 @@ impl ContinuousBatchScheduler {
         self.waiting_queue.read().len()
     }
 
+    /// Returns an aggregate exact wait predicate only when all waiting work is
+    /// blocked on passive release evidence. Active maintenance and first-probe
+    /// work deliberately return `None` so the engine keeps driving iterations.
+    pub fn passive_capacity_wait_condition(
+        &self,
+    ) -> Result<Option<ferrum_interfaces::vnext::CapacityWaitCondition>> {
+        self.waiting_queue
+            .read()
+            .passive_wait_condition()
+            .map_err(|error| FerrumError::scheduler(error.to_string()))
+    }
+
     /// Get number of decoding requests
     pub fn decoding_count(&self) -> usize {
         self.decode_queue.read().len()
@@ -647,7 +659,7 @@ impl ContinuousBatchScheduler {
 
     fn admit_waiting_dynamically(
         &self,
-        wake: AdmissionWakeEpochs,
+        wake: AdmissionWakeSnapshot<'_>,
         maximum_admissions: usize,
         probe: &mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
         mut observer: Option<&mut dyn FnMut(ExecutorAdmissionQueueObservation)>,
@@ -667,8 +679,8 @@ impl ContinuousBatchScheduler {
                         observer(ExecutorAdmissionQueueObservation::SkippedUnchanged {
                             request_id: request.inner.request.id.clone(),
                             ticket: ticket.get(),
-                            deferral,
-                            current: wake,
+                            deferral: deferral.clone(),
+                            current: wake.epochs(),
                         });
                     }
                 },
@@ -701,6 +713,9 @@ impl ContinuousBatchScheduler {
                 ),
                 AdmissionQueueEvent::Faulted { request, error, .. } => {
                     self.fail_typed_admission(request, error)
+                }
+                AdmissionQueueEvent::ContractFaulted { request, error, .. } => {
+                    self.fail_typed_admission(request, FerrumError::scheduler(error.to_string()))
                 }
                 AdmissionQueueEvent::PreemptionRequested { .. } => {}
                 AdmissionQueueEvent::BackingGrowthRequested { .. } => {}
@@ -736,10 +751,26 @@ impl ContinuousBatchScheduler {
         &self,
         request_id: &RequestId,
         observed: AdmissionWakeEpochs,
+        wait_condition: ferrum_interfaces::vnext::CapacityWaitCondition,
     ) -> Result<bool> {
         self.waiting_queue
             .write()
             .wait_for_release_after_backing_pressure(
+                |request| request.inner.request.id == *request_id,
+                observed,
+                wait_condition,
+            )
+            .map_err(|error| FerrumError::scheduler(error.to_string()))
+    }
+
+    pub fn retry_after_backing_recheck(
+        &self,
+        request_id: &RequestId,
+        observed: AdmissionWakeEpochs,
+    ) -> Result<bool> {
+        self.waiting_queue
+            .write()
+            .retry_after_backing_recheck(
                 |request| request.inner.request.id == *request_id,
                 observed,
             )
@@ -749,7 +780,7 @@ impl ContinuousBatchScheduler {
     pub fn next_batch_with_dynamic_admission(
         &self,
         hint: BatchHint,
-        wake: AdmissionWakeEpochs,
+        wake: AdmissionWakeSnapshot<'_>,
         probe: &mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
     ) -> Result<Option<BatchPlan>> {
         self.create_iteration_batch_with_admission(
@@ -765,7 +796,7 @@ impl ContinuousBatchScheduler {
     pub fn next_batch_with_dynamic_admission_observed(
         &self,
         hint: BatchHint,
-        wake: AdmissionWakeEpochs,
+        wake: AdmissionWakeSnapshot<'_>,
         probe: &mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
         observer: &mut dyn FnMut(ExecutorAdmissionQueueObservation),
     ) -> Result<Option<BatchPlan>> {
@@ -2438,7 +2469,10 @@ mod tests {
 
     #[tokio::test]
     async fn typed_dynamic_admission_defers_without_blocking_decode_or_smaller_work() {
-        use ferrum_interfaces::vnext::DeferredAction;
+        use ferrum_interfaces::vnext::{
+            CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
+            DeferredAction,
+        };
         use std::num::NonZeroU64;
 
         let mut config = SchedulerConfig::default();
@@ -2452,6 +2486,13 @@ mod tests {
         scheduler.submit(small).await.unwrap();
 
         let wake0 = AdmissionWakeEpochs::new(NonZeroU64::new(19).unwrap(), 0, 0, 0);
+        let availability0 =
+            [
+                CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::ActiveSequenceSlots, 1)
+                    .unwrap(),
+            ];
+        let condition0 =
+            CapacityWaitCondition::from_observation(19, availability0.to_vec()).unwrap();
         let mut first_probes = Vec::new();
         let mut first_probe = |request: &InferenceRequest| {
             first_probes.push(request.id.clone());
@@ -2459,6 +2500,7 @@ mod tests {
                 AdmissionProbeOutcome::Deferred(crate::vnext::AdmissionDeferral::new(
                     DeferredAction::WaitForRelease,
                     wake0,
+                    condition0.clone(),
                 ))
             } else {
                 AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
@@ -2467,7 +2509,11 @@ mod tests {
             }
         };
         let first = scheduler
-            .next_batch_with_dynamic_admission(BatchHint::simple(2), wake0, &mut first_probe)
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(2),
+                AdmissionWakeSnapshot::new(wake0, &availability0),
+                &mut first_probe,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(first_probes, vec![large_id.clone(), small_id.clone()]);
@@ -2490,7 +2536,7 @@ mod tests {
         let unchanged = scheduler
             .next_batch_with_dynamic_admission_observed(
                 BatchHint::simple(2),
-                wake0,
+                AdmissionWakeSnapshot::new(wake0, &availability0),
                 &mut unchanged_probe,
                 &mut |observation| observations.push(observation),
             )
@@ -2512,6 +2558,11 @@ mod tests {
         ));
 
         let wake1 = AdmissionWakeEpochs::new(NonZeroU64::new(19).unwrap(), 1, 0, 0);
+        let availability1 =
+            [
+                CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::ActiveSequenceSlots, 2)
+                    .unwrap(),
+            ];
         let mut released_probe_count = 0;
         let mut released_probe = |request: &InferenceRequest| {
             released_probe_count += 1;
@@ -2520,7 +2571,11 @@ mod tests {
             })
         };
         let released = scheduler
-            .next_batch_with_dynamic_admission(BatchHint::simple(2), wake1, &mut released_probe)
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(2),
+                AdmissionWakeSnapshot::new(wake1, &availability1),
+                &mut released_probe,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(released_probe_count, 1);
@@ -2538,7 +2593,10 @@ mod tests {
 
     #[tokio::test]
     async fn typed_wait_for_release_does_not_make_prefill_first_starve_decode() {
-        use ferrum_interfaces::vnext::DeferredAction;
+        use ferrum_interfaces::vnext::{
+            CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
+            DeferredAction,
+        };
         use std::num::NonZeroU64;
 
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
@@ -2554,19 +2612,30 @@ mod tests {
         scheduler.submit(runnable).await.unwrap();
 
         let wake = AdmissionWakeEpochs::new(NonZeroU64::new(23).unwrap(), 7, 11, 0);
+        let availability =
+            [
+                CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::ActiveSequenceSlots, 19)
+                    .unwrap(),
+            ];
+        let condition = CapacityWaitCondition::from_observation(23, availability.to_vec()).unwrap();
         let first = scheduler
-            .next_batch_with_dynamic_admission(BatchHint::simple(2), wake, &mut |request| {
-                if request.id == blocked_id {
-                    AdmissionProbeOutcome::Deferred(crate::vnext::AdmissionDeferral::new(
-                        DeferredAction::WaitForRelease,
-                        wake,
-                    ))
-                } else {
-                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
-                        request_id: request.id.clone(),
-                    })
-                }
-            })
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(2),
+                AdmissionWakeSnapshot::new(wake, &availability),
+                &mut |request| {
+                    if request.id == blocked_id {
+                        AdmissionProbeOutcome::Deferred(crate::vnext::AdmissionDeferral::new(
+                            DeferredAction::WaitForRelease,
+                            wake,
+                            condition.clone(),
+                        ))
+                    } else {
+                        AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                            request_id: request.id.clone(),
+                        })
+                    }
+                },
+            )
             .unwrap()
             .unwrap();
         assert_eq!(first.requests.len(), 1);
@@ -2578,7 +2647,7 @@ mod tests {
         let unchanged = scheduler
             .next_batch_with_dynamic_admission_observed(
                 BatchHint::simple(2),
-                wake,
+                AdmissionWakeSnapshot::new(wake, &availability),
                 &mut |request| {
                     probes += 1;
                     AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
