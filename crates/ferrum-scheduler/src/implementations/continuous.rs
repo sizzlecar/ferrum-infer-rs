@@ -1552,6 +1552,38 @@ impl ContinuousBatchScheduler {
         }
     }
 
+    fn add_decode_requests_to_batch(
+        &self,
+        hint: &BatchHint,
+        batch_requests: &mut Vec<ScheduledRequest>,
+        total_tokens: &mut usize,
+        scheduled_request_ids: &mut HashSet<RequestId>,
+    ) {
+        let decode_batch_limit = if self.decode_capacity_deferred_backlog_len() > 0 {
+            hint.max_batch_size
+        } else {
+            self.decode_capacity_backpressure_limit()
+                .map(|limit| hint.max_batch_size.min(limit.max(1)))
+                .unwrap_or(hint.max_batch_size)
+        };
+        let decode_queue = self.decode_queue.read();
+        for (_, req) in decode_queue.iter() {
+            if batch_requests.len() >= decode_batch_limit || *total_tokens >= hint.max_tokens {
+                break;
+            }
+            if scheduled_request_ids.contains(&req.inner.request.id) {
+                continue;
+            }
+
+            let mut scheduled = req.inner.clone();
+            scheduled.tokens_processed = req.total_tokens();
+            scheduled.tokens_to_process = Some(1);
+            scheduled_request_ids.insert(scheduled.request.id.clone());
+            batch_requests.push(scheduled);
+            *total_tokens += 1;
+        }
+    }
+
     fn create_iteration_batch_with_admission(
         &self,
         hint: BatchHint,
@@ -1586,30 +1618,12 @@ impl ContinuousBatchScheduler {
         // reaches the requested target, reducing early mixed prefill+decode
         // spikes in c=32 closed-loop runs.
         if !skip_decode_for_prefill_first {
-            let decode_batch_limit = if self.decode_capacity_deferred_backlog_len() > 0 {
-                hint.max_batch_size
-            } else {
-                self.decode_capacity_backpressure_limit()
-                    .map(|limit| hint.max_batch_size.min(limit.max(1)))
-                    .unwrap_or(hint.max_batch_size)
-            };
-            let decode_queue = self.decode_queue.read();
-            for (_, req) in decode_queue.iter() {
-                if batch_requests.len() >= decode_batch_limit {
-                    break;
-                }
-
-                // Each decode step is 1 token per request
-                if total_tokens < hint.max_tokens {
-                    let mut scheduled = req.inner.clone();
-                    scheduled.tokens_processed = req.total_tokens();
-                    scheduled.tokens_to_process = Some(1);
-                    scheduled_request_ids.insert(scheduled.request.id.clone());
-                    batch_requests.push(scheduled);
-                    total_tokens += 1;
-                }
-            }
-            drop(decode_queue);
+            self.add_decode_requests_to_batch(
+                &hint,
+                &mut batch_requests,
+                &mut total_tokens,
+                &mut scheduled_request_ids,
+            );
         }
         let scheduled_decode_count = batch_requests.len();
         let active_decode_prefill_chunk =
@@ -1766,6 +1780,19 @@ impl ContinuousBatchScheduler {
             capacity_release_epoch,
             capacity_mixed_recompute_epoch,
         );
+
+        // Fill-first is a throughput policy, not permission to deadlock. A
+        // typed WaitForRelease request may need active decodes to retire before
+        // its epoch can advance. If admission produced no runnable prefill,
+        // restore decode work so the release condition can become true.
+        if skip_decode_for_prefill_first && batch_requests.is_empty() {
+            self.add_decode_requests_to_batch(
+                &hint,
+                &mut batch_requests,
+                &mut total_tokens,
+                &mut scheduled_request_ids,
+            );
+        }
 
         // FERRUM_SCHED_NONE_PROF=1: log when next_batch is about to return SOME.
         if self.runtime_config.scheduler_none_prof && !batch_requests.is_empty() {
@@ -2507,6 +2534,74 @@ mod tests {
         assert_eq!(trace.dynamic_admission_probes, 3);
         assert_eq!(trace.dynamic_admission_skipped_unchanged, 1);
         assert_eq!(trace.dynamic_admission_deferred, 1);
+    }
+
+    #[tokio::test]
+    async fn typed_wait_for_release_does_not_make_prefill_first_starve_decode() {
+        use ferrum_interfaces::vnext::DeferredAction;
+        use std::num::NonZeroU64;
+
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 2,
+            prefill_first_until_active: Some(2),
+            ..SchedulerConfig::default()
+        });
+        let blocked = create_test_request(Priority::Normal);
+        let blocked_id = blocked.id.clone();
+        let runnable = create_test_request(Priority::Normal);
+        let runnable_id = runnable.id.clone();
+        scheduler.submit(blocked).await.unwrap();
+        scheduler.submit(runnable).await.unwrap();
+
+        let wake = AdmissionWakeEpochs::new(NonZeroU64::new(23).unwrap(), 7, 11, 0);
+        let first = scheduler
+            .next_batch_with_dynamic_admission(BatchHint::simple(2), wake, &mut |request| {
+                if request.id == blocked_id {
+                    AdmissionProbeOutcome::Deferred(crate::vnext::AdmissionDeferral::new(
+                        DeferredAction::WaitForRelease,
+                        wake,
+                    ))
+                } else {
+                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                        request_id: request.id.clone(),
+                    })
+                }
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.requests.len(), 1);
+        assert_eq!(first.requests[0].request.id, runnable_id);
+        scheduler.mark_prefill_complete(&runnable_id, 1);
+
+        let mut probes = 0;
+        let mut observations = Vec::new();
+        let unchanged = scheduler
+            .next_batch_with_dynamic_admission_observed(
+                BatchHint::simple(2),
+                wake,
+                &mut |request| {
+                    probes += 1;
+                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                        request_id: request.id.clone(),
+                    })
+                },
+                &mut |observation| observations.push(observation),
+            )
+            .unwrap()
+            .expect("unchanged capacity wait must not suppress runnable decode work");
+
+        assert_eq!(probes, 0);
+        assert_eq!(unchanged.requests.len(), 1);
+        assert_eq!(unchanged.requests[0].request.id, runnable_id);
+        assert_eq!(unchanged.requests[0].tokens_to_process, Some(1));
+        assert!(matches!(
+            observations.as_slice(),
+            [ExecutorAdmissionQueueObservation::SkippedUnchanged {
+                request_id,
+                current,
+                ..
+            }] if request_id == &blocked_id && *current == wake
+        ));
     }
 
     #[tokio::test]
