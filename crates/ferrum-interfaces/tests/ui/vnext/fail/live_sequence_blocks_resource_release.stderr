@@ -1,5 +1,5 @@
-error[E0616]: field `logical_lease` of struct `ferrum_interfaces::vnext::AdmittedSequenceResources` is private
+error[E0609]: no field `logical_lease` on type `&mut ferrum_interfaces::vnext::AdmittedSequenceResources<R>`
  --> tests/ui/vnext/fail/live_sequence_blocks_resource_release.rs:4:27
   |
 4 |     let _ = &mut sequence.logical_lease;
-  |                           ^^^^^^^^^^^^^ private field
+  |                           ^^^^^^^^^^^^^ unknown field
