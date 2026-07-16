@@ -56,14 +56,32 @@ impl PreparedProductionModel {
     }
 }
 
-/// Explicit migration result. An unregistered family remains on its current
-/// path without letting the engine infer model identity from an architecture
-/// enum, model name, backend, or device size.
+/// Explicit migration result keyed only by external model metadata.
+///
+/// Product paths that require vNext must consume this through
+/// [`ProductionModelSelection::into_required`]. Keeping `Unmigrated` typed
+/// prevents callers from inferring a family from a model name, backend, or
+/// device size while still allowing migration tooling to inspect the result.
 pub enum ProductionModelSelection {
     Prepared(PreparedProductionModel),
     Unmigrated {
         external_metadata_id: ExternalModelMetadataId,
     },
+}
+
+impl ProductionModelSelection {
+    /// Requires a registered vNext production package and fails closed instead
+    /// of allowing a product caller to fall back to a legacy executor.
+    pub fn into_required(self) -> ferrum_types::Result<PreparedProductionModel> {
+        match self {
+            Self::Prepared(prepared) => Ok(prepared),
+            Self::Unmigrated {
+                external_metadata_id,
+            } => Err(ferrum_types::FerrumError::unsupported(format!(
+                "model family metadata {external_metadata_id} has no registered vNext production package; legacy runtime fallback is forbidden"
+            ))),
+        }
+    }
 }
 
 pub fn prepare_registered_model_from_dir(
@@ -110,4 +128,34 @@ fn external_metadata_id_from_model_dir(
     })?;
     ExternalModelMetadataId::new(format!("hf.architecture.{architecture}"))
         .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_production_selection_rejects_unmigrated_family() {
+        let metadata = ExternalModelMetadataId::new(
+            "hf.architecture.UnregisteredQwenForConditionalGeneration",
+        )
+        .unwrap();
+        let selection = ProductionModelSelection::Unmigrated {
+            external_metadata_id: metadata,
+        };
+
+        let error = match selection.into_required() {
+            Ok(_) => panic!("unmigrated family unexpectedly entered the vNext product path"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(
+            error.contains("hf.architecture.UnregisteredQwenForConditionalGeneration"),
+            "{error}"
+        );
+        assert!(
+            error.contains("legacy runtime fallback is forbidden"),
+            "{error}"
+        );
+    }
 }
