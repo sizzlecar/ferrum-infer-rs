@@ -3,6 +3,149 @@ use super::*;
 impl EngineInner {
     // ── batch decode ──────────────────────────────────────────────────
 
+    /// Executes one PlanRuntime decode cohort through the typed batch API.
+    /// Output cardinality and cache identity are validated before any request
+    /// publishes a sampled token or updated physical-resource handle.
+    pub(in crate::continuous_engine) async fn run_plan_runtime_batch_decode(
+        &self,
+        request_ids: &[RequestId],
+    ) -> Result<()> {
+        let mut rids = Vec::with_capacity(request_ids.len());
+        let mut inputs = Vec::with_capacity(request_ids.len());
+        {
+            let sequences = self.sequences.read();
+            for rid in request_ids {
+                let Some(sequence) = sequences.get(rid) else {
+                    continue;
+                };
+                let Some(resources) = sequence.ready_decode_resources(rid) else {
+                    continue;
+                };
+                let tensor = self.tokens_to_tensor(&[resources.last_token.get()])?;
+                let input =
+                    ferrum_interfaces::model_executor::DecodeInput::new(tensor, resources.kv_cache)
+                        .with_request_id(rid.clone())
+                        .with_metadata(sequence.model_decode_metadata())
+                        .with_logits_policy(sequence.model_decode_logits_policy());
+                inputs.push(if let Some(state) = resources.recurrent_state {
+                    input.with_recurrent_state(state)
+                } else {
+                    input
+                });
+                rids.push(rid.clone());
+            }
+        }
+        if inputs.is_empty() {
+            return Ok(());
+        }
+
+        let input_cache_ids = inputs
+            .iter()
+            .map(|input| input.kv_cache.cache_id())
+            .collect::<Vec<_>>();
+        let input_recurrent_states = inputs
+            .iter()
+            .map(|input| input.recurrent_state.clone())
+            .collect::<Vec<_>>();
+        let workspace_lease = self.acquire_backend_workspace_lease(
+            rids.clone(),
+            "engine_plan_runtime_batch_decode_workspace",
+            "engine_plan_runtime_batch_decode_workspace_release",
+        );
+        let outputs = match self.model_executor.batch_decode(&inputs).await {
+            Ok(outputs) => {
+                workspace_lease.release();
+                outputs
+            }
+            Err(error) => {
+                drop(workspace_lease);
+                return Err(error);
+            }
+        };
+        if outputs.len() != rids.len() {
+            return Err(FerrumError::internal(format!(
+                "PlanRuntime batch_decode returned {} outputs for {} requests",
+                outputs.len(),
+                rids.len()
+            )));
+        }
+        for (index, (output, expected_cache_id)) in outputs.iter().zip(&input_cache_ids).enumerate()
+        {
+            let actual_cache_id = output.kv_cache.cache_id();
+            if &actual_cache_id != expected_cache_id {
+                return Err(FerrumError::internal(format!(
+                    "PlanRuntime batch_decode output {index} returned cache `{actual_cache_id}`, expected `{expected_cache_id}`"
+                )));
+            }
+        }
+        let logits = outputs
+            .iter()
+            .map(|output| output.logits.to_vec_f32())
+            .collect::<Result<Vec<_>>>()?;
+
+        for (((rid, output), input_recurrent_state), mut logits) in rids
+            .iter()
+            .zip(outputs)
+            .zip(input_recurrent_states)
+            .zip(logits)
+        {
+            let next_token_result = {
+                let mut sequences = self.sequences.write();
+                sequences.get_mut(rid).map(|sequence| {
+                    let token = if logits.len() == 1 {
+                        let token = TokenId::new(logits[0] as u32);
+                        sequence.accept_model_greedy_argmax_token(
+                            Some(self.tokenizer.as_ref()),
+                            token,
+                        )?;
+                        token
+                    } else {
+                        sequence.sample_with_processors_with_tokenizer(
+                            &mut logits,
+                            Some(self.tokenizer.as_ref()),
+                        )?
+                    };
+                    sequence.generated_tokens.push(token);
+                    sequence.commit_decode_step_physical_resources(output.kv_cache.clone())?;
+                    sequence.commit_decode_recurrent_state(
+                        output.recurrent_state.clone().or(input_recurrent_state),
+                    );
+                    Ok::<TokenId, FerrumError>(token)
+                })
+            };
+            let Some(next_token_result) = next_token_result else {
+                continue;
+            };
+            let next_token = match next_token_result {
+                Ok(token) => token,
+                Err(error) => {
+                    warn!("PlanRuntime batch decode post-process failed for {rid}: {error}");
+                    self.complete_request(rid, FinishReason::Error).await?;
+                    continue;
+                }
+            };
+
+            let generated_count = self
+                .sequences
+                .read()
+                .get(rid)
+                .map(|sequence| sequence.generated_tokens.len())
+                .unwrap_or(0);
+            self.scheduler.update_decode_progress(rid, generated_count);
+            self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);
+            counter!("ferrum.engine.decode_tokens_total").increment(1);
+
+            let stop_reason = self.stop_reason_for_request(rid);
+            if self.should_stream_generated_token(stop_reason) {
+                self.send_stream_update(rid, next_token).await;
+            }
+            if let Some(reason) = stop_reason {
+                self.complete_request(rid, reason).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) async fn run_batch_decode_adaptive(&self, request_ids: &[RequestId]) -> Result<()> {
         self.run_batch_decode_adaptive_inner(request_ids, true)
             .await

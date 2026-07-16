@@ -715,6 +715,19 @@ struct PreparedVNextPrefill<R: DeviceRuntime> {
     wave: PreparedStepSubmissionWave<R>,
 }
 
+struct VNextExecutionParticipant<'a, R: DeviceRuntime> {
+    sequence: &'a Arc<VNextSequence<R>>,
+    tokens: &'a [u32],
+    span: &'a TokenSpanWork,
+}
+
+struct VNextDecodeCandidate<R: DeviceRuntime> {
+    original_index: usize,
+    sequence: Arc<VNextSequence<R>>,
+    cache_id: String,
+    next_token: u32,
+}
+
 impl<R: DeviceRuntime> VNextSequence<R> {
     fn staged_prefill_step(&self) -> Option<Arc<StepResourceLease<R>>> {
         self.prefill_execution.lock().step.clone()
@@ -2110,9 +2123,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         batch: &ExecutionBatchParticipants<R>,
         span: &TokenSpanWork,
     ) -> Result<StepResourceAdmissionDecision<R>> {
+        self.try_begin_step_for_spans(batch, std::slice::from_ref(span))
+    }
+
+    fn try_begin_step_for_spans(
+        &self,
+        batch: &ExecutionBatchParticipants<R>,
+        spans: &[TokenSpanWork],
+    ) -> Result<StepResourceAdmissionDecision<R>> {
         let request = StepResourceAdmissionRequest::new(
             batch
-                .bind_work_shape(vec![span.clone()])
+                .bind_work_shape(spans.to_vec())
                 .map_err(|error| FerrumError::backend(error.to_string()))?,
             AdmissionFitPolicy::ImmediateOnly,
             AdmissionPressureAction::WaitForRelease,
@@ -2128,9 +2149,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         batch: &ExecutionBatchParticipants<R>,
         span: &TokenSpanWork,
     ) -> Result<Arc<StepResourceLease<R>>> {
+        self.begin_step_for_spans(batch, std::slice::from_ref(span))
+    }
+
+    fn begin_step_for_spans(
+        &self,
+        batch: &ExecutionBatchParticipants<R>,
+        spans: &[TokenSpanWork],
+    ) -> Result<Arc<StepResourceLease<R>>> {
         let mut backing_attempts = 0;
         loop {
-            match self.try_begin_step_once(batch, span)? {
+            match self.try_begin_step_for_spans(batch, spans)? {
                 StepResourceAdmissionDecision::Admitted(step) => return Ok(step),
                 StepResourceAdmissionDecision::Deferred(deferred) => {
                     self.metrics.step_deferrals.fetch_add(1, Ordering::Relaxed);
@@ -2172,6 +2201,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         step: &Arc<StepResourceLease<R>>,
         span: &TokenSpanWork,
     ) -> Result<StepSubmissionWaveAdmissionDecision<R>> {
+        self.try_prepare_wave_for_spans(step, std::slice::from_ref(span))
+    }
+
+    fn try_prepare_wave_for_spans(
+        &self,
+        step: &Arc<StepResourceLease<R>>,
+        spans: &[TokenSpanWork],
+    ) -> Result<StepSubmissionWaveAdmissionDecision<R>> {
         let requests = self
             .executable
             .execution_plan()
@@ -2181,7 +2218,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .map(|node| {
                 InvocationResourceAdmissionRequest::for_all_step_participants(
                     node.id().clone(),
-                    step.bind_all_invocation_work_shape(vec![span.clone()])?,
+                    step.bind_all_invocation_work_shape(spans.to_vec())?,
                     AdmissionFitPolicy::ImmediateOnly,
                     AdmissionPressureAction::WaitForRelease,
                 )
@@ -2197,9 +2234,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         step: &Arc<StepResourceLease<R>>,
         span: &TokenSpanWork,
     ) -> Result<PreparedStepSubmissionWave<R>> {
+        self.prepare_wave_for_spans(step, std::slice::from_ref(span))
+    }
+
+    fn prepare_wave_for_spans(
+        &self,
+        step: &Arc<StepResourceLease<R>>,
+        spans: &[TokenSpanWork],
+    ) -> Result<PreparedStepSubmissionWave<R>> {
         let mut backing_attempts = 0;
         loop {
-            match self.try_prepare_wave_once(step, span)? {
+            match self.try_prepare_wave_for_spans(step, spans)? {
                 StepSubmissionWaveAdmissionDecision::Prepared(wave) => return Ok(wave),
                 StepSubmissionWaveAdmissionDecision::Deferred(deferred) => {
                     self.metrics.wave_deferrals.fetch_add(1, Ordering::Relaxed);
@@ -2236,64 +2281,87 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
-    fn dispatch_wave(
+    fn dispatch_participant_wave(
         &self,
-        session: &Arc<SequenceSession<R>>,
-        tokens: &[u32],
-        span: &TokenSpanWork,
+        participants: &[VNextExecutionParticipant<'_, R>],
         wave: PreparedStepSubmissionWave<R>,
     ) -> DispatchOutcome<R> {
-        let active = match TrustedActiveSequenceBinding::from_session(session) {
+        if participants.is_empty() {
+            return DispatchOutcome::QuiescentFailure(
+                "vNext submission wave requires at least one participant".to_owned(),
+            );
+        }
+        let active = match participants
+            .iter()
+            .map(|participant| {
+                TrustedActiveSequenceBinding::from_session(&participant.sequence.session)
+            })
+            .collect::<std::result::Result<Vec<_>, VNextError>>()
+        {
             Ok(active) => active,
             Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
         };
         let active_bindings = wave
             .nodes()
             .iter()
-            .map(|_| vec![active.clone()])
+            .map(|_| active.clone())
             .collect::<Vec<_>>();
-        let range = span.immediate_token_range();
-        let host_range = Range {
-            start: range.start as usize,
-            end: range.end as usize,
-        };
-        let Some(host_tokens) = tokens.get(host_range.clone()) else {
-            return DispatchOutcome::QuiescentFailure(format!(
-                "vNext token upload range {host_range:?} exceeds host token length {}",
-                tokens.len()
-            ));
-        };
-        let host_bytes = host_tokens
+        let uploads = match participants
             .iter()
-            .flat_map(|token| token.to_le_bytes())
-            .collect::<Vec<_>>();
-        let logical_offset_bytes = match range.start.checked_mul(ElementType::U32.size_bytes()) {
-            Some(offset) => offset,
-            None => {
-                return DispatchOutcome::QuiescentFailure(
-                    "vNext token upload offset overflows u64".to_owned(),
+            .enumerate()
+            .map(|(participant_index, participant)| {
+                let range = participant.span.immediate_token_range();
+                let host_range = Range {
+                    start: usize::try_from(range.start).map_err(|_| {
+                        FerrumError::backend("vNext token upload start exceeds host address space")
+                    })?,
+                    end: usize::try_from(range.end).map_err(|_| {
+                        FerrumError::backend("vNext token upload end exceeds host address space")
+                    })?,
+                };
+                let host_tokens = participant.tokens.get(host_range.clone()).ok_or_else(|| {
+                    FerrumError::backend(format!(
+                        "vNext token upload range {host_range:?} exceeds host token length {}",
+                        participant.tokens.len()
+                    ))
+                })?;
+                let host_bytes = host_tokens
+                    .iter()
+                    .flat_map(|token| token.to_le_bytes())
+                    .collect::<Vec<_>>();
+                let logical_offset_bytes = range
+                    .start
+                    .checked_mul(ElementType::U32.size_bytes())
+                    .ok_or_else(|| {
+                    FerrumError::backend("vNext token upload offset overflows u64")
+                })?;
+                let source_layout =
+                    HostTransferLayout::new(ElementType::U32, participant.span.immediate_tokens())
+                        .map_err(|error| FerrumError::backend(error.to_string()))?;
+                let participant_index = u32::try_from(participant_index).map_err(|_| {
+                    FerrumError::backend("vNext token upload participant index exceeds u32")
+                })?;
+                SubmissionWaveInputUpload::new(
+                    self.io.input_node_id.clone(),
+                    participant_index,
+                    self.io.input_ordinal,
+                    logical_offset_bytes,
+                    source_layout,
+                    host_bytes,
                 )
-            }
-        };
-        let source_layout = match HostTransferLayout::new(ElementType::U32, span.immediate_tokens())
+                .map_err(|error| FerrumError::backend(error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()
         {
-            Ok(layout) => layout,
+            Ok(uploads) => uploads,
             Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
         };
-        let upload = match SubmissionWaveInputUpload::new(
-            self.io.input_node_id.clone(),
-            0,
-            self.io.input_ordinal,
-            logical_offset_bytes,
-            source_layout,
-            host_bytes,
-        ) {
-            Ok(upload) => upload,
-            Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
-        };
+        let uploaded_bytes = uploads.iter().fold(0_u64, |total, upload| {
+            total.saturating_add(upload.source_layout().byte_len().unwrap_or(0))
+        });
         self.metrics
             .uploaded_bytes
-            .fetch_add(source_layout.byte_len().unwrap_or(0), Ordering::Relaxed);
+            .fetch_add(uploaded_bytes, Ordering::Relaxed);
 
         let mut wave = wave;
         let mut retries = 0;
@@ -2312,7 +2380,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 &self.executable,
                 &identity,
                 &active_bindings,
-                std::slice::from_ref(&upload),
+                &uploads,
                 wave,
                 &self.lane,
                 &self.reaper,
@@ -2409,6 +2477,46 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .await
     }
 
+    async fn execute_batch_step(
+        &self,
+        batch: &ExecutionBatchParticipants<R>,
+        sequences: &[Arc<VNextSequence<R>>],
+        token_batches: &[Vec<u32>],
+        spans: &[TokenSpanWork],
+    ) -> Result<Vec<Vec<f32>>> {
+        if sequences.is_empty()
+            || sequences.len() != token_batches.len()
+            || sequences.len() != spans.len()
+            || sequences.len() != batch.sessions().len()
+            || batch
+                .sessions()
+                .iter()
+                .zip(sequences)
+                .any(|(session, sequence)| !Arc::ptr_eq(session, &sequence.session))
+        {
+            return Err(FerrumError::internal(
+                "vNext decode batch differs from its canonical participant set",
+            ));
+        }
+        let step = self.begin_step_for_spans(batch, spans)?;
+        let wave = match self.prepare_wave_for_spans(&step, spans) {
+            Ok(wave) => wave,
+            Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
+        };
+        let participants = sequences
+            .iter()
+            .zip(token_batches)
+            .zip(spans)
+            .map(|((sequence, tokens), span)| VNextExecutionParticipant {
+                sequence,
+                tokens,
+                span,
+            })
+            .collect::<Vec<_>>();
+        self.execute_prepared_participants(&participants, PreparedVNextPrefill { step, wave })
+            .await
+    }
+
     async fn execute_prepared_step(
         &self,
         sequence: &Arc<VNextSequence<R>>,
@@ -2416,8 +2524,26 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         span: TokenSpanWork,
         prepared: PreparedVNextPrefill<R>,
     ) -> Result<Vec<f32>> {
+        let participant = VNextExecutionParticipant {
+            sequence,
+            tokens,
+            span: &span,
+        };
+        let mut logits = self
+            .execute_prepared_participants(std::slice::from_ref(&participant), prepared)
+            .await?;
+        logits
+            .pop()
+            .ok_or_else(|| FerrumError::internal("vNext single execution returned no logits"))
+    }
+
+    async fn execute_prepared_participants(
+        &self,
+        participants: &[VNextExecutionParticipant<'_, R>],
+        prepared: PreparedVNextPrefill<R>,
+    ) -> Result<Vec<Vec<f32>>> {
         let PreparedVNextPrefill { step, wave } = prepared;
-        let dispatch = self.dispatch_wave(&sequence.session, tokens, &span, wave);
+        let dispatch = self.dispatch_participant_wave(participants, wave);
         let completion = match dispatch {
             DispatchOutcome::Submitted(completion) => completion,
             DispatchOutcome::QuiescentFailure(message) => {
@@ -2468,31 +2594,42 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
             }
         };
-        let mut execution_event_error = sequence.events.as_ref().and_then(|events| {
-            events
-                .lock()
-                .submitted(completion.receipt())
-                .err()
-                .map(|error| error.to_string())
-        });
+        let mut execution_event_error = None;
+        for participant in participants {
+            if let Some(events) = &participant.sequence.events {
+                if let Err(error) = events.lock().submitted(completion.receipt()) {
+                    execution_event_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
 
-        let readback = CompletionReadbackRequest::new(
-            self.io.output_node_id.clone(),
-            0,
-            self.io.output_resource_id.clone(),
-            self.io.output_offset_bytes,
-            self.io.output_layout,
-        )
-        .map_err(|error| FerrumError::backend(error.to_string()))?;
+        let readbacks = participants
+            .iter()
+            .enumerate()
+            .map(|(participant_index, _)| {
+                CompletionReadbackRequest::new(
+                    self.io.output_node_id.clone(),
+                    u32::try_from(participant_index).map_err(|_| {
+                        FerrumError::backend("vNext readback participant index exceeds u32")
+                    })?,
+                    self.io.output_resource_id.clone(),
+                    self.io.output_offset_bytes,
+                    self.io.output_layout,
+                )
+                .map_err(|error| FerrumError::backend(error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let readbacks = CompletionReadbackBatchRequest::new(readbacks)
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
         let observation =
-            tokio::task::spawn_blocking(move || completion.wait_with_readback(readback))
+            tokio::task::spawn_blocking(move || completion.wait_with_readbacks(readbacks))
                 .await
                 .map_err(|error| {
                     FerrumError::backend(format!("vNext completion task failed: {error}"))
                 })?
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
         let receipt = match observation {
-            CompletionReadbackObservation::Terminal(receipt) => receipt,
+            CompletionReadbackBatchObservation::Terminal(receipt) => receipt,
             other => {
                 self.metrics
                     .record_failure(format!("vNext completion remained nonterminal: {other:?}"));
@@ -2501,14 +2638,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 ));
             }
         };
-        if execution_event_error.is_none() {
-            execution_event_error = sequence.events.as_ref().and_then(|events| {
-                events
-                    .lock()
-                    .completed(receipt.completion())
-                    .err()
-                    .map(|error| error.to_string())
-            });
+        for participant in participants {
+            if let Some(events) = &participant.sequence.events {
+                if let Err(error) = events.lock().completed(receipt.completion()) {
+                    execution_event_error.get_or_insert_with(|| error.to_string());
+                }
+            }
         }
         if !matches!(
             receipt.completion().disposition(),
@@ -2521,26 +2656,34 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             drop(receipt);
             return Err(self.abort_step(step, message).await);
         }
-        let logits = match receipt.disposition() {
-            CompletionReadbackDisposition::Succeeded(output) => {
-                match Self::decode_logits(output.bytes(), self.io.output_element_type) {
-                    Ok(logits) => logits,
-                    Err(error) => {
-                        drop(receipt);
-                        return Err(self.abort_step(step, error.to_string()).await);
-                    }
+        let logits = receipt
+            .dispositions()
+            .iter()
+            .map(|disposition| match disposition {
+                CompletionReadbackDisposition::Succeeded(output) => {
+                    Self::decode_logits(output.bytes(), self.io.output_element_type)
                 }
-            }
-            disposition => {
-                let message = format!("vNext logits readback failed: {disposition:?}");
+                disposition => Err(FerrumError::backend(format!(
+                    "vNext logits readback failed: {disposition:?}"
+                ))),
+            })
+            .collect::<Result<Vec<_>>>();
+        let logits = match logits {
+            Ok(logits) => logits,
+            Err(error) => {
                 drop(receipt);
-                return Err(self.abort_step(step, message).await);
+                return Err(self.abort_step(step, error.to_string()).await);
             }
         };
-        self.metrics.readback_bytes.fetch_add(
-            self.io.output_layout.byte_len().unwrap_or(0),
-            Ordering::Relaxed,
-        );
+        let readback_bytes = self
+            .io
+            .output_layout
+            .byte_len()
+            .unwrap_or(0)
+            .saturating_mul(participants.len() as u64);
+        self.metrics
+            .readback_bytes
+            .fetch_add(readback_bytes, Ordering::Relaxed);
         drop(receipt);
         match step.try_retire_normal() {
             Ok(_) => {
@@ -2627,6 +2770,220 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .ok_or_else(|| {
                 FerrumError::not_found(format!("vNext cache `{cache_id}` is not active"))
             })
+    }
+
+    fn abort_decode_candidates(&self, candidates: &[VNextDecodeCandidate<R>]) {
+        {
+            let mut registry = self.sequences.lock();
+            for candidate in candidates {
+                if registry
+                    .active
+                    .get(&candidate.cache_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &candidate.sequence))
+                {
+                    registry.active.remove(&candidate.cache_id);
+                }
+            }
+        }
+        for candidate in candidates {
+            candidate.sequence.abort();
+        }
+    }
+
+    async fn execute_decode_batch(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
+        let started = Instant::now();
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut candidates = Vec::with_capacity(inputs.len());
+        for (original_index, input) in inputs.iter().enumerate() {
+            if input.batch_size() != 1 {
+                return Err(FerrumError::unsupported(
+                    "each vNext batch-decode input must contain exactly one sequence",
+                ));
+            }
+            let cache_id = input.kv_cache.cache_id();
+            let sequence = self.sequence_for_cache(&cache_id)?;
+            if input
+                .request_id
+                .as_ref()
+                .is_some_and(|request_id| request_id != &sequence.request_id)
+            {
+                return Err(FerrumError::request_validation(
+                    "vNext batch-decode request identity differs from its cache owner",
+                ));
+            }
+            let next = common::tensor_to_tokens(&input.input_ids)?;
+            let [next_token] = next.as_slice() else {
+                return Err(FerrumError::request_validation(
+                    "each vNext batch-decode participant requires exactly one input token",
+                ));
+            };
+            candidates.push(VNextDecodeCandidate {
+                original_index,
+                sequence,
+                cache_id,
+                next_token: *next_token,
+            });
+        }
+
+        let batch = ExecutionBatchParticipants::new(
+            candidates
+                .iter()
+                .map(|candidate| Arc::clone(&candidate.sequence.session))
+                .collect(),
+        )
+        .map_err(|error| FerrumError::request_validation(error.to_string()))?;
+        let mut candidates_by_authority = BTreeMap::new();
+        for candidate in candidates {
+            let authority = candidate.sequence.session.sequence_authority();
+            if candidates_by_authority
+                .insert(authority, candidate)
+                .is_some()
+            {
+                return Err(FerrumError::request_validation(
+                    "vNext batch-decode inputs contain a duplicate sequence",
+                ));
+            }
+        }
+        let canonical_candidates = batch
+            .sessions()
+            .iter()
+            .map(|session| {
+                candidates_by_authority
+                    .remove(&session.sequence_authority())
+                    .ok_or_else(|| {
+                        FerrumError::internal(
+                            "vNext canonical decode participant is absent from its input batch",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !candidates_by_authority.is_empty() {
+            return Err(FerrumError::internal(
+                "vNext decode input is absent from its canonical participant batch",
+            ));
+        }
+
+        let mut operation_guards = Vec::with_capacity(canonical_candidates.len());
+        for candidate in &canonical_candidates {
+            operation_guards.push(candidate.sequence.operation.lock().await);
+        }
+
+        let mut token_batches = Vec::with_capacity(canonical_candidates.len());
+        let mut previous_lengths = Vec::with_capacity(canonical_candidates.len());
+        let mut spans = Vec::with_capacity(canonical_candidates.len());
+        for candidate in &canonical_candidates {
+            if !candidate.sequence.active.load(Ordering::Acquire) {
+                return Err(FerrumError::cancelled(format!(
+                    "vNext cache `{}` is no longer active",
+                    candidate.cache_id
+                )));
+            }
+            let (tokens, previous_len) = {
+                let current = candidate.sequence.tokens.lock();
+                let previous_len = current.len();
+                if previous_len >= candidate.sequence.maximum_tokens {
+                    return Err(FerrumError::request_validation(format!(
+                        "vNext sequence reached its {} token ceiling",
+                        candidate.sequence.maximum_tokens
+                    )));
+                }
+                let mut tokens = current.clone();
+                tokens.push(candidate.next_token);
+                (tokens, previous_len)
+            };
+            let extension_span = TokenSpanWork::from_token_ids(&tokens, 0..tokens.len())
+                .map_err(|error| FerrumError::backend(error.to_string()))?;
+            let extension = ResourceWorkShape::single(extension_span)
+                .map_err(|error| FerrumError::backend(error.to_string()))?;
+            if let Err(error) = self.extend_sequence(&candidate.sequence, extension) {
+                if DecodeFailureDisposition::from_error(&error)
+                    == DecodeFailureDisposition::AbortSequence
+                {
+                    self.abort_decode_candidates(std::slice::from_ref(candidate));
+                }
+                return Err(error);
+            }
+            let span = TokenSpanWork::from_token_ids(&tokens, previous_len..tokens.len())
+                .map_err(|error| FerrumError::backend(error.to_string()))?;
+            token_batches.push(tokens);
+            previous_lengths.push(previous_len);
+            spans.push(span);
+        }
+
+        let sequences = canonical_candidates
+            .iter()
+            .map(|candidate| Arc::clone(&candidate.sequence))
+            .collect::<Vec<_>>();
+        let logits = match self
+            .execute_batch_step(&batch, &sequences, &token_batches, &spans)
+            .await
+        {
+            Ok(logits) => logits,
+            Err(error) => {
+                if DecodeFailureDisposition::from_error(&error)
+                    == DecodeFailureDisposition::AbortSequence
+                {
+                    self.abort_decode_candidates(&canonical_candidates);
+                }
+                return Err(error);
+            }
+        };
+        if logits.len() != canonical_candidates.len() {
+            self.abort_decode_candidates(&canonical_candidates);
+            return Err(FerrumError::internal(format!(
+                "vNext batch decode returned {} logits rows for {} participants",
+                logits.len(),
+                canonical_candidates.len()
+            )));
+        }
+
+        let logits = match logits
+            .into_iter()
+            .map(|logits| self.decode_tensor(logits))
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(logits) => logits,
+            Err(error) => {
+                self.abort_decode_candidates(&canonical_candidates);
+                return Err(error);
+            }
+        };
+        let mut ordered_outputs = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
+        for (((candidate, tokens), previous_len), logits) in canonical_candidates
+            .iter()
+            .zip(token_batches)
+            .zip(previous_lengths)
+            .zip(logits)
+        {
+            if candidate.sequence.active.load(Ordering::Acquire) {
+                *candidate.sequence.tokens.lock() = tokens;
+            }
+            let cache = self.cache_handle(&candidate.sequence, previous_len + 1);
+            ordered_outputs[candidate.original_index] = Some(DecodeOutput::new(logits, cache));
+        }
+
+        let participant_count = u64::try_from(inputs.len()).unwrap_or(u64::MAX);
+        self.metrics
+            .decode_operations
+            .fetch_add(participant_count, Ordering::Relaxed);
+        let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        self.metrics.total_decode_us.fetch_add(
+            elapsed_us.saturating_mul(participant_count),
+            Ordering::Relaxed,
+        );
+        ordered_outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| {
+                    FerrumError::internal(
+                        "vNext batch decode lost the original participant ordering",
+                    )
+                })
+            })
+            .collect()
     }
 
     fn metrics_snapshot(&self) -> serde_json::Value {
@@ -3137,7 +3494,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
-        futures::future::try_join_all(inputs.iter().map(|input| self.decode(input))).await
+        self.execute_decode_batch(inputs).await
     }
 
     fn release_cache(&self, cache_id: &str) {
