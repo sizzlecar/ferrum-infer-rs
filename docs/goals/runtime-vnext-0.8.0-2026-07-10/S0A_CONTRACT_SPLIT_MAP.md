@@ -64,22 +64,27 @@ recorded in `S0A_EXECUTION_DEPENDENCY_AUDIT.md`.
 | Current owner | Lines | Primary responsibility |
 |---|---:|---|
 | `resource/contracts.rs` | 564 | Base identifiers, descriptors, shared error/state encodings and reservation contracts |
-| `resource/capacity.rs` | 360 | Device capacity authority, accounting, epochs and process-wide claims |
+| `resource/backing_extent.rs` | 434 | Backing chunk/segment identity, range projection, free-extent indexes, allocation and rollback |
+| `resource/capacity.rs` | 630 | Device capacity authority, accounting, epochs and process-wide claims |
 | `resource/provisioning.rs` | 355 | Static/elastic plan provisioning and admission construction |
 | `resource/allocation.rs` | 555 | Allocation ownership and resource driver contracts |
 | `resource/ledger.rs` | 1,668 | Lease state, transition receipts, allocation ledger and receipt validation |
 | `resource/recovery.rs` | 348 | Abandoned-sequence recovery registry and terminal abort evidence |
-| `resource/dynamic_pool.rs` | 2,132 | Dynamic backing pools, growth, extent/view ownership and quarantine |
-| `resource/static_lease.rs` | 371 | Plan-static lease, owned slots, borrowed buffer views and typed admission requests |
-| `resource/work.rs` | 363 | Step/invocation work-shape admission requests and checked demand derivation |
-| `resource/plan_runtime.rs` | 952 | Plan runtime root, close state, capacity waits and pool coordination |
-| `resource/sequence.rs` | 1,105 | Request, sequence and session resource lifetime authorities |
-| `resource/batch.rs` | 1,045 | Batch participants, step ownership, physical invocation ledger and retirement |
-| `resource/invocation.rs` | 1,627 | Invocation leases, bound streams, retry authority and active-sequence permits |
+| `resource/dynamic_pool.rs` | 2,454 | Dynamic pool state, backing authority, growth/claim transactions, maintenance and quarantine |
+| `resource/runtime_driver.rs` | 185 | Dynamic runtime-driver binding and allocation bridge |
+| `resource/static_lease.rs` | 375 | Plan-static lease, owned slots, borrowed buffer views and typed admission requests |
+| `resource/work.rs` | 453 | Step/invocation work-shape admission requests and checked demand derivation |
+| `resource/plan_runtime.rs` | 1,418 | Plan runtime root, close state, capacity waits and pool coordination |
+| `resource/sequence.rs` | 1,750 | Request, sequence and session resource lifetime authorities |
+| `resource/static_initialization.rs` | 944 | Static resource initialization transaction and installation evidence |
+| `resource/batch.rs` | 1,531 | Batch participants, step ownership, physical invocation ledger and retirement |
+| `resource/invocation.rs` | 2,451 | Invocation leases, bound streams, retry authority and active-sequence permits |
 | `resource/transaction.rs` | 1,920 | Sealed transaction typestate, commit/rollback/release and compensation |
 
-`resource.rs` is now a 69-line facade. Every production fragment is below the S0A `2,500`
-logical-line limit and the facade is below `500` lines.
+`resource.rs` is now a 77-line facade. Every production owner is below the S0A `2,500`
+physical-line limit and the facade is below `500` physical lines. The largest owners are
+`dynamic_pool.rs` at 2,454 lines and `invocation.rs` at 2,451 lines; the gate records the exact
+offending path and line count if either bound regresses.
 
 ## Execution Ownership Checkpoint
 
@@ -215,8 +220,9 @@ hidden nor multiplied by its consumer count.
 This split is not permission to simplify the resource model. The following owners and behavior
 must remain represented after S0B:
 
-- `capacity.rs` and `dynamic_pool.rs`: effective capacity is published only from installed,
-  committed backing; growth and release advance monotonic epochs.
+- `capacity.rs`, `backing_extent.rs`, and `dynamic_pool.rs`: effective capacity is published only
+  from installed, committed backing; extent rollback is journaled and growth/release advance
+  monotonic epochs.
 - `work.rs`, `plan_runtime.rs`, and `transaction.rs`: no provider encode, prefill, or device submit
   is reachable before a committed lease; temporary pressure remains typed defer and permanent
   over-capacity remains typed impossible/reject.
@@ -232,8 +238,9 @@ must remain represented after S0B:
 The final resource graph is acyclic. One valid dependencies-first topological order is:
 
 ```text
-contracts -> ledger -> capacity -> allocation -> dynamic_pool -> provisioning -> static_lease
--> plan_runtime -> transaction -> work -> recovery -> sequence -> batch -> invocation
+contracts -> backing_extent -> capacity -> ledger -> work -> allocation -> dynamic_pool
+-> runtime_driver -> static_lease -> provisioning -> plan_runtime -> recovery -> transaction
+-> sequence -> static_initialization -> batch -> invocation
 ```
 
 Rust module privacy now separates the owners, all newly shared internals are restricted to the
@@ -266,7 +273,7 @@ S0B may later shrink or break these contracts only against the real Qwen3.5-4B p
 3. `cargo fmt --all -- --check` accepts the fragments and facade.
 4. `CARGO_BUILD_JOBS=4 cargo check -p ferrum-interfaces --all-targets` passes.
 5. `RUST_TEST_THREADS=2 cargo test -p ferrum-interfaces --lib resource:: -- --test-threads=2`
-   passes `47/47` tests.
+   passes `66/66` tests.
 6. One bounded cargo invocation with the seven `vnext_resource_*` owner targets and
    `-- --test-threads=2` passes `12/12` parent tests, including the expected isolated panic-child
    fault case and all `311` frozen proof cases.

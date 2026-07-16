@@ -44,7 +44,8 @@ This cycle was not visible in a pairwise-only audit.
 | Transaction identity and driver failure envelope | `contracts` | Lower-level identity/error contract shared by allocation and ledger |
 | Context/lease receipt validation | `ledger` | Validation is defined by ledger records, not transaction orchestration |
 | Elastic plan provisioning | `provisioning` | Separates admission/provision construction from capacity arithmetic |
-| Logical backing evidence, authority, and views | `dynamic_pool` | These types describe physical backing ownership and translation |
+| Backing chunk identity, segment projection, and free-extent index | `backing_extent` | This is the leaf owner for physical range translation and allocation journal rollback |
+| Logical backing evidence, authority, and views | `dynamic_pool` | These contracts bind allocated extents to request and invocation lifetimes |
 | Dynamic pool domain specification | `dynamic_pool` | Pool identity and membership are pool-owned facts |
 | Core resource failure constructor and dispatch poison bit | `contracts` | Shared wire/state encoding with no higher-level owner dependency |
 | Step lease storage | `batch` | A step owns one exact continuous-batch frame and its participants |
@@ -59,7 +60,7 @@ Sibling-only implementation access uses `pub(super)` and does not widen the crat
 
 ## Final Result
 
-The final production graph contains fourteen modules and zero strongly connected components with
+The final production graph contains seventeen modules and zero strongly connected components with
 more than one member:
 
 ```text
@@ -69,8 +70,9 @@ resource_dependency_scc_count=0
 One valid dependencies-first topological order is:
 
 ```text
-contracts -> ledger -> capacity -> allocation -> dynamic_pool -> provisioning -> static_lease
--> plan_runtime -> transaction -> work -> recovery -> sequence -> batch -> invocation
+contracts -> backing_extent -> capacity -> ledger -> work -> allocation -> dynamic_pool
+-> runtime_driver -> static_lease -> provisioning -> plan_runtime -> recovery -> transaction
+-> sequence -> static_initialization -> batch -> invocation
 ```
 
 This order is evidence that the graph is acyclic, not a requirement that unrelated modules share
@@ -83,7 +85,7 @@ The following validations passed after the ownership corrections:
 ```text
 CARGO_BUILD_JOBS=4 cargo check -p ferrum-interfaces --all-targets
 RUST_TEST_THREADS=2 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces --lib resource:: -- --test-threads=2
-  47 passed; 0 failed
+  66 passed; 0 failed
 RUST_TEST_THREADS=2 CARGO_BUILD_JOBS=4 cargo test -p ferrum-interfaces \
   --test vnext_resource_capacity_contract_tests \
   --test vnext_resource_transaction_lifecycle_tests \

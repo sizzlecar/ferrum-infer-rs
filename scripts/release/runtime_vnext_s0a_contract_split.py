@@ -31,17 +31,20 @@ PRODUCTION_GROUPS = {
     "resource": {
         "topological_order": [
             "contracts",
-            "ledger",
+            "backing_extent",
             "capacity",
+            "ledger",
+            "work",
             "allocation",
             "dynamic_pool",
-            "provisioning",
+            "runtime_driver",
             "static_lease",
+            "provisioning",
             "plan_runtime",
-            "transaction",
-            "work",
             "recovery",
+            "transaction",
             "sequence",
+            "static_initialization",
             "batch",
             "invocation",
         ],
@@ -320,17 +323,20 @@ def collect_split_inventory(source: dict[str, Any]) -> dict[str, Any]:
             )
     support_rows = [source_row(REPO_ROOT / path, "shared_test_support_owner") for path in SHARED_TEST_SUPPORT]
 
-    require(
-        max(row["physical_lines"] for row in facade_rows) <= 500,
-        "production facade exceeds 500 physical lines",
-    )
-    require(
-        max(row["physical_lines"] for row in production_rows) <= 2500,
-        "production owner exceeds 2500 physical lines",
-    )
-    require(
-        max(row["physical_lines"] for row in target_rows + support_rows) <= 2000,
-        "contract test or reusable support owner exceeds 2000 physical lines",
+    def require_bounded(rows: list[dict[str, Any]], limit: int, label: str) -> None:
+        largest = max(rows, key=lambda row: row["physical_lines"])
+        require(
+            largest["physical_lines"] <= limit,
+            f"{label} exceeds {limit} physical lines: "
+            f"path={largest['path']} lines={largest['physical_lines']}",
+        )
+
+    require_bounded(facade_rows, 500, "production facade")
+    require_bounded(production_rows, 2500, "production owner")
+    require_bounded(
+        target_rows + support_rows,
+        2000,
+        "contract test or reusable support owner",
     )
     for removed in REMOVED_OVERSIZED_TARGETS:
         require(not (REPO_ROOT / removed).exists(), f"removed oversized target reappeared: {removed}")
