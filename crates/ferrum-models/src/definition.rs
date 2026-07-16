@@ -380,16 +380,19 @@ impl ConfigManager {
             .as_object()
             .ok_or_else(|| FerrumError::model("config.json root is not an object"))?;
 
-        // Try model_type field
-        if let Some(model_type) = obj.get("model_type").and_then(|v| v.as_str()) {
-            return Ok(Architecture::from_str(model_type));
-        }
-
-        // Try architectures array
+        // The concrete Hugging Face class is the product identity used by the
+        // vNext/legacy registries. Keep the transitional parser on that same
+        // authority when a broad `model_type` label is also present.
         if let Some(architectures) = obj.get("architectures").and_then(|v| v.as_array()) {
             if let Some(arch) = architectures.first().and_then(|v| v.as_str()) {
                 return Ok(Architecture::from_str(arch));
             }
+        }
+
+        // Older local fixtures without a concrete class retain their legacy
+        // model_type fallback outside the registered product path.
+        if let Some(model_type) = obj.get("model_type").and_then(|v| v.as_str()) {
+            return Ok(Architecture::from_str(model_type));
         }
 
         warn!("Could not detect architecture, using default (Llama)");
@@ -405,6 +408,20 @@ impl ConfigManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concrete_architecture_identity_precedes_broad_model_type() {
+        let manager = ConfigManager::new();
+        let config = serde_json::json!({
+            "model_type": "qwen3",
+            "architectures": ["LlamaForCausalLM"]
+        });
+
+        assert_eq!(
+            manager.detect_architecture(&config).unwrap(),
+            Architecture::Llama
+        );
+    }
 
     const QWEN35_ARTIFACT_ROOT: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),

@@ -1111,6 +1111,61 @@ where
     }
 }
 
+fn create_registered_vnext_executor(
+    config: &ComponentConfig,
+    model_path: &std::path::Path,
+    registration: ferrum_models::vnext::RegisteredProductionModel,
+) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
+    use ferrum_models::vnext::ProductionExecutionKind;
+
+    match (registration.execution_kind(), &config.device) {
+        (ProductionExecutionKind::CausalLanguage, Device::CUDA(ordinal)) => {
+            #[cfg(feature = "cuda")]
+            {
+                let prepared = registration.prepare(model_path)?;
+                let model_info = prepared.model_info(
+                    config.engine_config.model.model_id.clone(),
+                    config.device.clone(),
+                );
+                let family = prepared.family();
+                let family_fingerprint = family
+                    .fingerprint()
+                    .map_err(|error| FerrumError::model(error.to_string()))?;
+                let program_fingerprint = family
+                    .program()
+                    .fingerprint()
+                    .map_err(|error| FerrumError::model(error.to_string()))?;
+                info!(
+                    external_metadata_id = %registration.external_metadata_id(),
+                    family_id = %family.family_id(),
+                    family_fingerprint,
+                    program_fingerprint,
+                    backend = "cuda",
+                    "Building registered model from a typed vNext execution plan"
+                );
+                let executor = ferrum_models::VNextModelExecutor::create_cuda(
+                    *ordinal,
+                    prepared,
+                    model_info,
+                    &config.engine_config,
+                )?;
+                Ok(Arc::new(executor))
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (ordinal, model_path);
+                Err(FerrumError::device(
+                    "registered vNext CUDA composition requires the 'cuda' feature",
+                ))
+            }
+        }
+        (kind, device) => Err(FerrumError::unsupported(format!(
+            "registered vNext model metadata {} requires a {kind:?} backend composition, but {device} is not registered",
+            registration.external_metadata_id()
+        ))),
+    }
+}
+
 /// Back-compat alias; retained so external test fixtures referencing
 /// the old name continue to compile while we sweep call sites.
 #[deprecated(note = "use `LlmExecutorFactory` (renamed PR A — Dim 1/3 cleanup)")]
@@ -1163,9 +1218,52 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             return Ok(Arc::new(ferrum_models::LlmExecutor::new(llm, model_info)));
         }
 
-        // Safetensors path — re-use ConfigManager to extract Architecture
-        // + dims from `config.json`, then dispatch over Dim 1 (arch) +
-        // Dim 4 (device) below.
+        // Registered vNext packages resolve from immutable external metadata
+        // before the legacy ConfigManager/Architecture cascade. Backend
+        // compatibility is checked before the package opens model weights;
+        // once a package is registered, any preparation error fails closed and
+        // cannot fall back to a legacy executor.
+        let legacy_reference_enabled = config
+            .get_option::<bool>("qwen35_reference")
+            .unwrap_or(false);
+        let production_registration = ferrum_models::vnext::resolve_registered_model_from_dir(
+            std::path::Path::new(&model_path),
+        )?;
+        if legacy_reference_enabled && !production_registration.allows_legacy_reference() {
+            return Err(FerrumError::unsupported(format!(
+                "--qwen35-reference is not permitted for model metadata {}",
+                production_registration.external_metadata_id()
+            )));
+        }
+        if legacy_reference_enabled {
+            info!(
+                external_metadata_id = %production_registration.external_metadata_id(),
+                "Entering the explicitly allowed Qwen3.5 CPU reference path"
+            );
+        } else {
+            match production_registration {
+                ferrum_models::vnext::ProductionModelRegistration::Registered(registration) => {
+                    return create_registered_vnext_executor(
+                        config,
+                        std::path::Path::new(&model_path),
+                        registration,
+                    );
+                }
+                ferrum_models::vnext::ProductionModelRegistration::LegacyRegistered {
+                    external_metadata_id,
+                    ..
+                } => {
+                    info!(
+                        %external_metadata_id,
+                        "Entering the explicitly registered legacy model path"
+                    );
+                }
+            }
+        }
+
+        // Explicitly registered legacy safetensors and the diagnostic CPU
+        // reference path continue through the old registry until each family
+        // migration deletes its legacy row and architecture branch together.
         let mut config_manager = ferrum_models::ConfigManager::new();
         let model_def = config_manager
             .load_from_path(std::path::Path::new(&model_path))
@@ -1442,60 +1540,11 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 Ok(Arc::new(executor))
             }
             ferrum_models::Architecture::Qwen35 | ferrum_models::Architecture::Qwen35Moe => {
-                let reference_enabled = config
-                    .get_option::<bool>("qwen35_reference")
-                    .unwrap_or(false);
-                if !reference_enabled {
-                    if !matches!(config.device, Device::CUDA(_)) {
-                        return Err(FerrumError::unsupported(
-                            "Qwen3.5/Qwen3.6 product execution is CUDA-only in the W3 path. \
-                             CPU is available only through explicit --qwen35-reference for \
-                             correctness bring-up; CPU product execution is not wired yet.",
-                        ));
-                    }
-                    #[cfg(feature = "cuda")]
-                    {
-                        info!("Resolving Qwen3.5/Qwen3.6 CUDA production executor");
-                        let model_dir = std::path::Path::new(&model_path);
-                        let prepared =
-                            ferrum_models::vnext::prepare_registered_model_from_dir(model_dir)?
-                                .into_required()?;
-                        let mut model_info = model_def
-                            .to_model_info(config.engine_config.model.model_id.to_string());
-                        model_info.dtype = DataType::FP16;
-                        model_info.device = config.device.clone();
-                        let family = prepared.family();
-                        let family_fingerprint = family
-                            .fingerprint()
-                            .map_err(|error| FerrumError::model(error.to_string()))?;
-                        let program_fingerprint = family
-                            .program()
-                            .fingerprint()
-                            .map_err(|error| FerrumError::model(error.to_string()))?;
-                        let ordinal = match &config.device {
-                            Device::CUDA(ordinal) => *ordinal,
-                            _ => unreachable!("Qwen3.5 CUDA branch validated its device"),
-                        };
-                        info!(
-                            family_id = %family.family_id(),
-                            family_fingerprint,
-                            program_fingerprint,
-                            "Building Qwen3.5 from the typed vNext CUDA execution plan"
-                        );
-                        let executor = ferrum_models::VNextModelExecutor::create_cuda(
-                            ordinal,
-                            prepared,
-                            model_info,
-                            &config.engine_config,
-                        )?;
-                        return Ok(Arc::new(executor));
-                    }
-                    #[cfg(not(feature = "cuda"))]
-                    {
-                        return Err(FerrumError::device(
-                            "CUDA requested but 'cuda' feature not enabled",
-                        ));
-                    }
+                if !legacy_reference_enabled {
+                    return Err(FerrumError::unsupported(format!(
+                        "model metadata for {:?} is registered for legacy reference execution only; enable --qwen35-reference with CPU/FP32 or migrate the family to vNext",
+                        model_def.architecture
+                    )));
                 }
                 if config.device != Device::CPU || dtype != DType::F32 {
                     return Err(FerrumError::unsupported(
@@ -1885,17 +1934,41 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_registry_requires_explicit_reference_option() {
+    fn qwen35_registry_routes_registered_package_before_legacy_loading() {
         let dir = write_qwen35_reference_model_dir();
+        std::fs::remove_file(dir.join("model.safetensors")).unwrap();
         let config = qwen35_reference_component_config(&dir, false);
 
         let err = match tokio_test::block_on(LlmExecutorFactory.create(&config)) {
-            Ok(_) => panic!("Qwen3.5 product loading must remain opt-in"),
+            Ok(_) => panic!("registered Qwen3.5 package unexpectedly accepted CPU execution"),
             Err(err) => err.to_string(),
         };
 
-        assert!(err.contains("--qwen35-reference"), "{err}");
-        assert!(err.contains("not wired yet"), "{err}");
+        assert!(
+            err.contains(ferrum_models::vnext::qwen35::EXTERNAL_METADATA_ID),
+            "{err}"
+        );
+        assert!(err.contains("but cpu is not registered"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn qwen35_reference_option_is_rejected_for_other_model_metadata() {
+        let dir = write_qwen35_reference_model_dir();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"]}"#,
+        )
+        .unwrap();
+        let config = qwen35_reference_component_config(&dir, true);
+
+        let err = match tokio_test::block_on(LlmExecutorFactory.create(&config)) {
+            Ok(_) => panic!("Qwen3.5 reference option unexpectedly accepted Llama metadata"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("--qwen35-reference is not permitted"), "{err}");
+        assert!(err.contains("hf.architecture.LlamaForCausalLM"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

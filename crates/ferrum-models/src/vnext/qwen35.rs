@@ -24,6 +24,7 @@ use ferrum_interfaces::vnext::{
     RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
 use ferrum_quantization::SafetensorsArchive;
+use ferrum_types::DataType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -31,7 +32,7 @@ use sha2::{Digest, Sha256};
 use crate::qwen35_config::{Qwen35LayerType, Qwen35TextConfig};
 use crate::qwen35_weights::{Qwen35ResolvedWeightSpec, Qwen35WeightInventory};
 
-use super::PreparedProductionModel;
+use super::{CausalLanguageModelDescriptor, PreparedProductionModel};
 
 pub const FAMILY_ID: &str = "family.qwen3_5.dense_hybrid";
 pub const EXTERNAL_METADATA_ID: &str = "hf.architecture.Qwen3_5ForConditionalGeneration";
@@ -663,6 +664,7 @@ pub fn prepare_from_model_dir(model_dir: &Path) -> ferrum_types::Result<Prepared
     let weights = SafetensorsArchive::open(model_dir)?;
     let config =
         load_family_config(model_dir, &weights).map_err(ferrum_types::FerrumError::model)?;
+    let descriptor = production_descriptor(&config).map_err(ferrum_types::FerrumError::model)?;
     let raw = serde_json::to_value(config)
         .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
     let provider = Qwen35FamilyProvider::new()
@@ -670,7 +672,48 @@ pub fn prepare_from_model_dir(model_dir: &Path) -> ferrum_types::Result<Prepared
     let family = TypedFamilyRegistration::new(provider)
         .prepare(&raw)
         .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
-    Ok(PreparedProductionModel::new(family, weights))
+    Ok(PreparedProductionModel::new(family, weights, descriptor))
+}
+
+fn production_descriptor(
+    config: &Qwen35FamilyConfig,
+) -> Result<CausalLanguageModelDescriptor, String> {
+    let text = Qwen35TextConfig::from_hf_config_value(&config.hf_config)?;
+    let parameter_count = config.weights.iter().try_fold(0_u64, |total, weight| {
+        let elements = weight
+            .dimensions
+            .iter()
+            .try_fold(1_u64, |product, dimension| {
+                product.checked_mul(*dimension).ok_or_else(|| {
+                    format!(
+                        "parameter count overflow for weight {:?}",
+                        weight.external_name
+                    )
+                })
+            })?;
+        total.checked_add(elements).ok_or_else(|| {
+            format!(
+                "parameter count overflow after weight {:?}",
+                weight.external_name
+            )
+        })
+    })?;
+    let vocabulary_size =
+        usize::try_from(config.vocab_size).map_err(|_| "vocab_size exceeds usize".to_owned())?;
+    let maximum_sequence_tokens = usize::try_from(config.max_position_embeddings)
+        .map_err(|_| "max_position_embeddings exceeds usize".to_owned())?;
+    CausalLanguageModelDescriptor::new(
+        parameter_count,
+        text.hidden_size,
+        text.num_hidden_layers,
+        text.num_attention_heads,
+        text.num_key_value_heads,
+        text.head_dim,
+        vocabulary_size,
+        maximum_sequence_tokens,
+        DataType::FP16,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn load_family_config(
@@ -1376,6 +1419,23 @@ mod tests {
     #[test]
     fn prepares_dense_hybrid_program_and_rejects_shape_drift() {
         let config = test_config();
+        let descriptor = production_descriptor(&config).unwrap();
+        assert_eq!(descriptor.hidden_size(), 16);
+        assert_eq!(descriptor.layer_count(), 4);
+        assert_eq!(descriptor.attention_head_count(), 2);
+        assert_eq!(descriptor.kv_head_count(), 1);
+        assert_eq!(descriptor.attention_head_dimension(), 4);
+        assert_eq!(descriptor.vocabulary_size(), 32);
+        assert_eq!(descriptor.maximum_sequence_tokens(), 128);
+        assert_eq!(descriptor.execution_dtype(), DataType::FP16);
+        assert_eq!(
+            descriptor.parameter_count(),
+            config
+                .weights
+                .iter()
+                .map(|weight| weight.dimensions.iter().product::<u64>())
+                .sum::<u64>()
+        );
         let raw = serde_json::to_value(&config).unwrap();
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
             .prepare(&raw)
