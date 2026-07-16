@@ -68,6 +68,7 @@ PRODUCTION_GROUPS = {
             "resolution",
             "validation",
             "planner",
+            "compiler",
         ],
         "audit": "S0A_EXECUTION_DEPENDENCY_AUDIT.md",
     },
@@ -411,6 +412,18 @@ def contract_map(split_inventory: dict[str, Any]) -> dict[str, Any]:
             for path, row in inventory_by_path.items()
             if path.startswith(owner_prefix) and row["category"] == "production_owner"
         ]
+        owner_names = sorted(Path(row["path"]).stem for row in owners)
+        topological_order = policy["topological_order"]
+        require(
+            len(topological_order) == len(set(topological_order)),
+            f"{group} dependency topology contains duplicate owners",
+        )
+        require(
+            set(owner_names) == set(topological_order),
+            f"{group} dependency topology differs from production owners: "
+            f"missing={sorted(set(owner_names) - set(topological_order))} "
+            f"stale={sorted(set(topological_order) - set(owner_names))}",
+        )
         audit_path = GOAL_ROOT / policy["audit"]
         require(audit_path.is_file(), f"dependency audit is missing: {audit_path}")
         groups.append(
@@ -423,7 +436,7 @@ def contract_map(split_inventory: dict[str, Any]) -> dict[str, Any]:
                     "path": audit_path.relative_to(REPO_ROOT).as_posix(),
                     "sha256": sha256(audit_path),
                     "multi_module_scc_count": 0,
-                    "topological_order": policy["topological_order"],
+                    "topological_order": topological_order,
                 },
             }
         )

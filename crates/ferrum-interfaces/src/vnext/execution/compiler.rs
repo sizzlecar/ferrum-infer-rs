@@ -1,4 +1,15 @@
-use super::*;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+
+use super::{
+    invalid_plan, AliasPolicy, BlockedTensorPadding, BufferUsage, CapabilityCatalog, CapabilityId,
+    DimensionConstraint, ElementType, ExecutablePlan, ExecutionPlan, LayoutConstraint, NodeId,
+    OperationPlanningHandle, PlanBuildRequest, PlanNodeResolution, PreparedModelFamily,
+    ProgramTensorSpec, ProgramValueId, ProviderId, ProviderResourcePlan, ResolvedStorageComponent,
+    ResolvedTensorLayout, ResolvedTensorSpec, ResolvedValueBinding, ResolvedValueRole,
+    ResolvedValueStorage, ResourceId, RuntimePolicy, StrideConstraint, TensorContract, VNextError,
+    WeightId,
+};
 
 /// Explicit semantic inputs and per-node selection preferences for compiling a
 /// model program. Product input capacities are required because they bound
@@ -924,7 +935,13 @@ fn resolved_binding(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::vnext::TensorAccess;
+
+    use super::{
+        infer_tensor, unify_tensor, AliasPolicy, BTreeSet, DimensionConstraint, ElementType,
+        LayoutConstraint, NodeId, ProgramValueId, ResolvedTensorLayout, ResolvedTensorSpec,
+        StrideConstraint, TensorContract, TensorSymbols,
+    };
 
     #[test]
     fn dimension_and_stride_symbols_are_independent_domains() {
