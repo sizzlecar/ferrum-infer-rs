@@ -14,7 +14,7 @@ use ferrum_interfaces::{
     engine::{InferenceEngine, LlmInferenceEngine},
     kv_cache::AllocationRequest,
     model_executor::{
-        ExecutionResourceOwnership, ExecutorAdmissionEpochs, ExecutorPrefillAdmission,
+        ExecutionResourceAuthority, ExecutorAdmissionEpochs, ExecutorPrefillAdmission,
         ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
         ExecutorPrefillCapacityWaitRegistration, ExecutorPrefillMaintenanceDeferral,
         ExecutorPrefillMaintenanceOutcome, GreedyRepetitionPenalty, KvSlotRequest,
@@ -1237,7 +1237,7 @@ impl SequenceState {
         model_cache_update
     }
 
-    fn commit_executor_owned_prefill_resources(
+    fn commit_plan_runtime_prefill_resources(
         &mut self,
         kv_cache: Arc<dyn KvCacheHandle>,
     ) -> ModelCacheRefUpdate {
@@ -2256,6 +2256,40 @@ enum EngineIterationOutcome {
     CapacityBlocked(ExecutorPrefillCapacityWaitRegistration),
 }
 
+enum EngineResourceComposition {
+    LegacyEngine {
+        kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
+        recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
+    },
+    PlanRuntime,
+}
+
+impl EngineResourceComposition {
+    const fn authority(&self) -> ExecutionResourceAuthority {
+        match self {
+            Self::LegacyEngine { .. } => ExecutionResourceAuthority::LegacyEngine,
+            Self::PlanRuntime => ExecutionResourceAuthority::PlanRuntime,
+        }
+    }
+
+    fn kv_cache(&self) -> Option<&Arc<dyn KvCacheManager + Send + Sync>> {
+        match self {
+            Self::LegacyEngine { kv_cache, .. } => Some(kv_cache),
+            Self::PlanRuntime => None,
+        }
+    }
+
+    fn recurrent_state_manager(&self) -> Option<&Arc<dyn RecurrentStateManager + Send + Sync>> {
+        match self {
+            Self::LegacyEngine {
+                recurrent_state_manager,
+                ..
+            } => recurrent_state_manager.as_ref(),
+            Self::PlanRuntime => None,
+        }
+    }
+}
+
 struct EngineInner {
     config: EngineConfig,
     scheduler: Arc<ContinuousBatchScheduler>,
@@ -2263,8 +2297,7 @@ struct EngineInner {
     #[allow(dead_code)]
     // Retained for constructor API; sampling now uses per-request SamplingConfig
     sampler: Arc<dyn Sampler + Send + Sync>,
-    kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
-    recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
+    resource_composition: EngineResourceComposition,
     model_executor: Arc<dyn ModelExecutor + Send + Sync>,
     /// Optional draft executor for speculative decoding. When set alongside
     /// `spec_config`, `run_single_decode` routes through `SpeculativeRunner`.
@@ -2308,6 +2341,18 @@ struct EngineInner {
 }
 
 impl EngineInner {
+    fn engine_managed_kv_cache(&self) -> Result<&Arc<dyn KvCacheManager + Send + Sync>> {
+        self.resource_composition.kv_cache().ok_or_else(|| {
+            FerrumError::internal(
+                "plan runtime attempted to use the legacy engine KV-cache manager",
+            )
+        })
+    }
+
+    fn recurrent_state_manager(&self) -> Option<&Arc<dyn RecurrentStateManager + Send + Sync>> {
+        self.resource_composition.recurrent_state_manager()
+    }
+
     fn record_iteration_lock_wait(&self, duration: Duration) {
         self.total_iteration_lock_wait_us
             .fetch_add(duration_to_us(duration), Ordering::Relaxed);
@@ -2954,7 +2999,7 @@ impl EngineInner {
         tokens: usize,
     ) -> Result<KvAllocationLease> {
         debug_assert_eq!(allocation_request_id, request.request_id);
-        let handle = self.kv_cache.allocate(request).await?;
+        let handle = self.engine_managed_kv_cache()?.allocate(request).await?;
         let blocks = self.kv_resource_blocks_for_tokens(tokens);
         self.trace_kv_allocate(owner_request_id, blocks);
         Ok(KvAllocationLease::new(
@@ -3071,11 +3116,19 @@ impl EngineInner {
         allocation_request_id: RequestId,
         blocks: Option<usize>,
     ) {
-        match self
-            .kv_cache
-            .deallocate(allocation_request_id.clone())
-            .await
-        {
+        let kv_cache = match self.engine_managed_kv_cache() {
+            Ok(kv_cache) => kv_cache,
+            Err(error) => {
+                warn!(
+                    owner_request_id = %owner_request_id,
+                    allocation_request_id = %allocation_request_id,
+                    error = %error,
+                    "Legacy engine KV allocation reached a plan-runtime composition"
+                );
+                return;
+            }
+        };
+        match kv_cache.deallocate(allocation_request_id.clone()).await {
             Ok(()) => {
                 if let Some(blocks) = blocks {
                     self.trace_kv_release(owner_request_id, blocks);
@@ -3162,7 +3215,7 @@ impl EngineInner {
     }
 
     async fn release_recurrent_allocation(&self, request_id: &RequestId, slots: Option<usize>) {
-        if let Some(manager) = &self.recurrent_state_manager {
+        if let Some(manager) = self.recurrent_state_manager() {
             let capacity = manager.stats().total_batch_slots;
             match manager.deallocate(request_id.clone()).await {
                 Ok(()) => {
@@ -3209,7 +3262,7 @@ impl EngineInner {
         };
 
         debug_assert_eq!(&spec.request_id, request_id);
-        let Some(manager) = &self.recurrent_state_manager else {
+        let Some(manager) = self.recurrent_state_manager() else {
             return Err(FerrumError::config(format!(
                 "model '{}' requires recurrent state for request {}, but no recurrent-state manager is configured",
                 self.model_executor.info().model_id, request_id
@@ -3613,7 +3666,7 @@ impl ContinuousBatchEngine {
         kv_cache: Arc<dyn KvCacheManager + Send + Sync>,
         model_executor: Arc<dyn ModelExecutor + Send + Sync>,
         tensor_factory: Arc<dyn TensorFactory>,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_with_speculation(
             config,
             scheduler,
@@ -3640,7 +3693,7 @@ impl ContinuousBatchEngine {
         tensor_factory: Arc<dyn TensorFactory>,
         draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
         spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::new_with_speculation_and_recurrent_state_manager(
             config,
             scheduler,
@@ -3669,11 +3722,87 @@ impl ContinuousBatchEngine {
         draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
         spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
         recurrent_state_manager: Option<Arc<dyn RecurrentStateManager + Send + Sync>>,
-    ) -> Self {
+    ) -> Result<Self> {
+        Self::new_with_resource_composition(
+            config,
+            scheduler,
+            tokenizer,
+            sampler,
+            EngineResourceComposition::LegacyEngine {
+                kv_cache,
+                recurrent_state_manager,
+            },
+            model_executor,
+            tensor_factory,
+            draft_executor,
+            spec_config,
+        )
+    }
+
+    /// Build an engine bound to the shared plan runtime, which is the sole
+    /// owner of request-lifetime KV, recurrent state, and backing capacity.
+    /// The model executor adapts that runtime but does not own a second
+    /// resource manager; no legacy engine manager is created or retained.
+    pub fn new_plan_runtime(
+        config: EngineConfig,
+        scheduler: Arc<ContinuousBatchScheduler>,
+        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+        sampler: Arc<dyn Sampler + Send + Sync>,
+        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+        tensor_factory: Arc<dyn TensorFactory>,
+    ) -> Result<Self> {
+        Self::new_with_resource_composition(
+            config,
+            scheduler,
+            tokenizer,
+            sampler,
+            EngineResourceComposition::PlanRuntime,
+            model_executor,
+            tensor_factory,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_resource_composition(
+        config: EngineConfig,
+        scheduler: Arc<ContinuousBatchScheduler>,
+        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+        sampler: Arc<dyn Sampler + Send + Sync>,
+        resource_composition: EngineResourceComposition,
+        model_executor: Arc<dyn ModelExecutor + Send + Sync>,
+        tensor_factory: Arc<dyn TensorFactory>,
+        draft_executor: Option<Arc<dyn ModelExecutor + Send + Sync>>,
+        spec_config: Option<crate::speculative::SpeculativeDecodingConfig>,
+    ) -> Result<Self> {
+        let executor_authority = model_executor.execution_resource_authority();
+        if draft_executor.is_some() != spec_config.is_some() {
+            return Err(FerrumError::config(
+                "speculative decoding requires both a draft executor and its configuration",
+            ));
+        }
+        if let Some(draft_executor) = draft_executor.as_ref() {
+            let draft_authority = draft_executor.execution_resource_authority();
+            if draft_authority != executor_authority {
+                return Err(FerrumError::config(format!(
+                    "draft executor authority {draft_authority:?} does not match target authority {executor_authority:?}"
+                )));
+            }
+        }
+        if resource_composition.authority() != executor_authority {
+            return Err(FerrumError::config(format!(
+                "engine resource composition {:?} does not match executor authority {:?}",
+                resource_composition.authority(),
+                executor_authority
+            )));
+        }
+        let recurrent_state_manager = resource_composition.recurrent_state_manager().is_some();
         info!(
+            ?executor_authority,
             "Creating ContinuousBatchEngine (speculative_decoding={}, recurrent_state_manager={})",
             draft_executor.is_some() && spec_config.is_some(),
-            recurrent_state_manager.is_some()
+            recurrent_state_manager
         );
         let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
         let scheduler_trace_jsonl =
@@ -3694,14 +3823,13 @@ impl ContinuousBatchEngine {
             }
         }
 
-        Self {
+        Ok(Self {
             inner: Arc::new(EngineInner {
                 config,
                 scheduler,
                 tokenizer,
                 sampler,
-                kv_cache,
-                recurrent_state_manager,
+                resource_composition,
                 model_executor,
                 draft_executor,
                 spec_config,
@@ -3732,7 +3860,7 @@ impl ContinuousBatchEngine {
                 model_execution_time_samples: AtomicU64::new(0),
                 bg_loop_spawned: AtomicBool::new(false),
             }),
-        }
+        })
     }
 
     /// Spawn the background iteration loop on first request. Without this,
@@ -4028,9 +4156,42 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
 impl InferenceEngine for ContinuousBatchEngine {
     async fn status(&self) -> EngineStatus {
         let metrics = self.inner.scheduler.metrics();
-        let kv_stats = self.inner.kv_cache.stats();
-        let total_bytes = kv_stats.total_memory_bytes;
-        let used_bytes = kv_stats.used_memory_bytes;
+        let (total_bytes, used_bytes, cache_memory_bytes, resource_status_ready) =
+            match &self.inner.resource_composition {
+                EngineResourceComposition::LegacyEngine { kv_cache, .. } => {
+                    let kv_stats = kv_cache.stats();
+                    (
+                        kv_stats.total_memory_bytes,
+                        kv_stats.used_memory_bytes,
+                        kv_stats.used_memory_bytes,
+                        true,
+                    )
+                }
+                EngineResourceComposition::PlanRuntime => {
+                    match self.inner.model_executor.plan_runtime_resource_snapshot() {
+                        Ok(Some(snapshot)) => {
+                            let total_bytes = usize::try_from(snapshot.usable_capacity_bytes())
+                                .unwrap_or(usize::MAX);
+                            let used_bytes = snapshot
+                                .used_bytes()
+                                .ok()
+                                .and_then(|bytes| usize::try_from(bytes).ok())
+                                .unwrap_or(usize::MAX);
+                            let dynamic_used_bytes = usize::try_from(snapshot.dynamic_used_bytes())
+                                .unwrap_or(usize::MAX);
+                            (total_bytes, used_bytes, dynamic_used_bytes, true)
+                        }
+                        Ok(None) => {
+                            warn!("Plan runtime did not expose its required resource snapshot");
+                            (0, 0, 0, false)
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "Plan-runtime resource snapshot failed");
+                            (0, 0, 0, false)
+                        }
+                    }
+                }
+            };
         let free_bytes = total_bytes.saturating_sub(used_bytes);
         let mut memory_usage = ferrum_types::MemoryUsage {
             total_bytes,
@@ -4045,12 +4206,12 @@ impl InferenceEngine for ContinuousBatchEngine {
                 .then_some(used_bytes),
             cpu_memory_bytes: matches!(self.inner.config.backend.device, Device::CPU)
                 .then_some(used_bytes),
-            cache_memory_bytes: used_bytes,
+            cache_memory_bytes,
             utilization_percent: 0.0,
         };
         memory_usage.calculate_utilization();
         EngineStatus {
-            is_ready: self.inner.is_running.load(Ordering::SeqCst),
+            is_ready: resource_status_ready && self.inner.is_running.load(Ordering::SeqCst),
             loaded_models: vec![self.inner.config.model.model_id.clone()],
             active_requests: metrics.running_requests,
             queued_requests: metrics.waiting_requests,

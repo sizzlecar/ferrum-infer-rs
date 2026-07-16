@@ -140,12 +140,16 @@ impl ActualMemoryStageObservation {
 
     pub fn with_engine_cache_status(mut self, status: &ferrum_types::EngineStatus) -> Self {
         let memory = &status.memory_usage;
+        let dynamic_capacity_bytes = memory.cache_memory_bytes.saturating_add(memory.free_bytes);
         self.attributes.extend([
             (
                 "kv_cache_total_bytes".to_string(),
-                json!(memory.total_bytes),
+                json!(dynamic_capacity_bytes),
             ),
-            ("kv_cache_used_bytes".to_string(), json!(memory.used_bytes)),
+            (
+                "kv_cache_used_bytes".to_string(),
+                json!(memory.cache_memory_bytes),
+            ),
             ("kv_cache_free_bytes".to_string(), json!(memory.free_bytes)),
             (
                 "cache_memory_bytes".to_string(),
@@ -155,6 +159,12 @@ impl ActualMemoryStageObservation {
                 "available_kv_or_state_bytes".to_string(),
                 json!(memory.free_bytes),
             ),
+            (
+                "resource_total_bytes".to_string(),
+                json!(memory.total_bytes),
+            ),
+            ("resource_used_bytes".to_string(), json!(memory.used_bytes)),
+            ("resource_free_bytes".to_string(), json!(memory.free_bytes)),
         ]);
         self
     }
@@ -1861,6 +1871,36 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_cache_observation_does_not_report_static_weights_as_kv() {
+        let status = ferrum_types::EngineStatus {
+            is_ready: true,
+            loaded_models: vec![ferrum_types::ModelId::from("test-model")],
+            active_requests: 0,
+            queued_requests: 0,
+            memory_usage: ferrum_types::MemoryUsage {
+                total_bytes: 900,
+                used_bytes: 500,
+                free_bytes: 400,
+                gpu_memory_bytes: Some(500),
+                cpu_memory_bytes: None,
+                cache_memory_bytes: 100,
+                utilization_percent: 500.0 / 9.0,
+            },
+            uptime_seconds: 0,
+            last_heartbeat: chrono::Utc::now(),
+            version: "test".to_string(),
+        };
+
+        let observation = ActualMemoryStageObservation::new("test", "cache_allocated", None, None)
+            .with_engine_cache_status(&status);
+
+        assert_eq!(observation.attributes["kv_cache_total_bytes"], 500);
+        assert_eq!(observation.attributes["kv_cache_used_bytes"], 100);
+        assert_eq!(observation.attributes["resource_total_bytes"], 900);
+        assert_eq!(observation.attributes["resource_used_bytes"], 500);
+    }
 
     #[test]
     fn synthetic_product_observability_writes_profile_paths() {

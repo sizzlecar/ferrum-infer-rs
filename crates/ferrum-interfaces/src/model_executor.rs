@@ -156,7 +156,7 @@ impl GreedyRepetitionPenalty {
 /// Input for prefill phase (processing the initial prompt)
 #[derive(Debug, Clone)]
 pub struct PrefillInput {
-    /// Stable product request identity for executor-owned runtime resources.
+    /// Stable product request identity for plan-runtime resources.
     pub request_id: Option<RequestId>,
     /// Maximum sequence extent this request may reach, including the prompt.
     /// Executors use this for fit validation without allocating future pages.
@@ -190,7 +190,7 @@ impl PrefillInput {
         }
     }
 
-    /// Attach the typed request boundary consumed by executor-owned runtimes.
+    /// Attach the typed request boundary consumed by plan runtimes.
     pub fn with_request_context(
         mut self,
         request_id: RequestId,
@@ -302,7 +302,7 @@ impl PrefillOutput {
 /// Input for decode phase (generating one token at a time)
 #[derive(Debug, Clone)]
 pub struct DecodeInput {
-    /// Stable product request identity for executor-owned runtime resources.
+    /// Stable product request identity for plan-runtime resources.
     pub request_id: Option<RequestId>,
     /// Input token ID for current step [batch_size, 1]
     pub input_ids: TensorRef,
@@ -481,20 +481,195 @@ impl DecodeOutput {
     }
 }
 
-/// Declares which side owns request-lifetime accelerator resources.
+/// Declares the authoritative runtime for request-lifetime accelerator resources.
 ///
-/// This is a lifecycle boundary, not a capacity limit. Executor-managed
-/// runtimes still make dynamic admission decisions from then-live capacity;
-/// the engine must not reserve a second KV or recurrent-state allocation for
-/// the same request.
+/// This is a lifecycle boundary, not a capacity limit. `PlanRuntime` means the
+/// shared execution runtime owns admission, allocation, fences, and release;
+/// a model executor may adapt those operations but is not their owner. The
+/// engine must not reserve a second KV or recurrent-state allocation for the
+/// same request. `LegacyEngine` exists only while old executors are migrated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ExecutionResourceOwnership {
-    EngineManaged,
-    ExecutorManaged,
+pub enum ExecutionResourceAuthority {
+    LegacyEngine,
+    PlanRuntime,
 }
 
-/// Borrowed, already-tokenized input used to probe executor-owned prefill
+/// Point-in-time memory evidence emitted by the shared plan runtime.
+///
+/// Static model allocations are separated from dynamic request resources so
+/// product telemetry never reports model weights as KV or recurrent-state
+/// usage. Process-wide claims are included because another live plan can
+/// consume capacity visible to this runtime. Dynamic free bytes remain
+/// reusable by this plan; quarantined and other claimed bytes do not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanRuntimeResourceSnapshot {
+    device_capacity_bytes: u64,
+    usable_capacity_bytes: u64,
+    process_claimed_bytes: u64,
+    plan_claimed_bytes: u64,
+    static_bytes: u64,
+    dynamic_resident_bytes: u64,
+    dynamic_free_bytes: u64,
+    pending_growth_bytes: u64,
+    quarantined_bytes: u64,
+}
+
+impl PlanRuntimeResourceSnapshot {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        device_capacity_bytes: u64,
+        usable_capacity_bytes: u64,
+        process_claimed_bytes: u64,
+        plan_claimed_bytes: u64,
+        static_bytes: u64,
+        dynamic_resident_bytes: u64,
+        dynamic_free_bytes: u64,
+        pending_growth_bytes: u64,
+        quarantined_bytes: u64,
+    ) -> Result<Self> {
+        if usable_capacity_bytes > device_capacity_bytes {
+            return Err(ferrum_types::FerrumError::internal(format!(
+                "plan runtime usable capacity {usable_capacity_bytes} exceeds device capacity {device_capacity_bytes}"
+            )));
+        }
+        if process_claimed_bytes > usable_capacity_bytes {
+            return Err(ferrum_types::FerrumError::internal(format!(
+                "plan runtime process claims {process_claimed_bytes} exceed usable capacity {usable_capacity_bytes}"
+            )));
+        }
+        if plan_claimed_bytes > process_claimed_bytes {
+            return Err(ferrum_types::FerrumError::internal(format!(
+                "plan runtime plan claims {plan_claimed_bytes} exceed process claims {process_claimed_bytes}"
+            )));
+        }
+        if dynamic_free_bytes > dynamic_resident_bytes {
+            return Err(ferrum_types::FerrumError::internal(format!(
+                "plan runtime dynamic free bytes {dynamic_free_bytes} exceed resident bytes {dynamic_resident_bytes}"
+            )));
+        }
+        let minimum_plan_claim = static_bytes
+            .checked_add(dynamic_resident_bytes)
+            .and_then(|bytes| bytes.checked_add(quarantined_bytes))
+            .ok_or_else(|| {
+                ferrum_types::FerrumError::internal(
+                    "plan runtime static, resident, and quarantined bytes overflow u64",
+                )
+            })?;
+        if minimum_plan_claim > plan_claimed_bytes {
+            return Err(ferrum_types::FerrumError::internal(format!(
+                "plan runtime accounted plan bytes {minimum_plan_claim} exceed plan claims {plan_claimed_bytes}"
+            )));
+        }
+        Ok(Self {
+            device_capacity_bytes,
+            usable_capacity_bytes,
+            process_claimed_bytes,
+            plan_claimed_bytes,
+            static_bytes,
+            dynamic_resident_bytes,
+            dynamic_free_bytes,
+            pending_growth_bytes,
+            quarantined_bytes,
+        })
+    }
+
+    pub const fn device_capacity_bytes(&self) -> u64 {
+        self.device_capacity_bytes
+    }
+
+    pub const fn usable_capacity_bytes(&self) -> u64 {
+        self.usable_capacity_bytes
+    }
+
+    pub const fn process_claimed_bytes(&self) -> u64 {
+        self.process_claimed_bytes
+    }
+
+    pub const fn plan_claimed_bytes(&self) -> u64 {
+        self.plan_claimed_bytes
+    }
+
+    pub const fn static_bytes(&self) -> u64 {
+        self.static_bytes
+    }
+
+    pub const fn dynamic_resident_bytes(&self) -> u64 {
+        self.dynamic_resident_bytes
+    }
+
+    pub const fn dynamic_free_bytes(&self) -> u64 {
+        self.dynamic_free_bytes
+    }
+
+    pub const fn dynamic_used_bytes(&self) -> u64 {
+        self.dynamic_resident_bytes - self.dynamic_free_bytes
+    }
+
+    pub const fn pending_growth_bytes(&self) -> u64 {
+        self.pending_growth_bytes
+    }
+
+    pub const fn quarantined_bytes(&self) -> u64 {
+        self.quarantined_bytes
+    }
+
+    /// Capacity immediately reusable by this plan without reclaiming another
+    /// plan: process-wide unclaimed bytes plus free extents already resident
+    /// in this plan's dynamic pools.
+    pub fn available_bytes(&self) -> Result<u64> {
+        self.usable_capacity_bytes
+            .checked_sub(self.process_claimed_bytes)
+            .and_then(|bytes| bytes.checked_add(self.dynamic_free_bytes))
+            .ok_or_else(|| {
+                ferrum_types::FerrumError::internal(
+                    "plan runtime available capacity calculation overflowed",
+                )
+            })
+    }
+
+    pub fn used_bytes(&self) -> Result<u64> {
+        self.available_bytes().and_then(|available| {
+            self.usable_capacity_bytes
+                .checked_sub(available)
+                .ok_or_else(|| {
+                    ferrum_types::FerrumError::internal(
+                        "plan runtime available bytes exceed usable capacity",
+                    )
+                })
+        })
+    }
+}
+
+#[cfg(test)]
+mod plan_runtime_resource_snapshot_tests {
+    use super::PlanRuntimeResourceSnapshot;
+
+    #[test]
+    fn separates_static_and_dynamic_usage() {
+        let snapshot =
+            PlanRuntimeResourceSnapshot::new(1_000, 900, 710, 710, 400, 300, 200, 20, 10).unwrap();
+
+        assert_eq!(snapshot.available_bytes().unwrap(), 390);
+        assert_eq!(snapshot.used_bytes().unwrap(), 510);
+        assert_eq!(snapshot.dynamic_resident_bytes(), 300);
+        assert_eq!(snapshot.dynamic_used_bytes(), 100);
+        assert_eq!(snapshot.dynamic_free_bytes(), 200);
+        assert_eq!(snapshot.pending_growth_bytes(), 20);
+        assert_eq!(snapshot.quarantined_bytes(), 10);
+    }
+
+    #[test]
+    fn rejects_incoherent_capacity_evidence() {
+        assert!(PlanRuntimeResourceSnapshot::new(1_000, 1_001, 0, 0, 0, 0, 0, 0, 0).is_err());
+        assert!(PlanRuntimeResourceSnapshot::new(1_000, 900, 901, 0, 0, 0, 0, 0, 0).is_err());
+        assert!(PlanRuntimeResourceSnapshot::new(1_000, 900, 500, 501, 0, 0, 0, 0, 0).is_err());
+        assert!(PlanRuntimeResourceSnapshot::new(1_000, 900, 100, 100, 0, 100, 101, 0, 0).is_err());
+        assert!(PlanRuntimeResourceSnapshot::new(1_000, 900, 500, 500, 400, 100, 0, 0, 1).is_err());
+    }
+}
+
+/// Borrowed, already-tokenized input used to probe plan-runtime prefill
 /// admission before the request can enter a device submission batch.
 ///
 /// This carries semantic token identity rather than an aggregate token count:
@@ -530,7 +705,7 @@ pub struct ExecutorPrefillAdmissionReceipt {
     pub request_id: RequestId,
 }
 
-/// Stable scheduler-facing projection of one executor-owned capacity domain.
+/// Stable scheduler-facing projection of one plan-runtime capacity domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ExecutorAdmissionEpochs {
     pub coordinator_id: NonZeroU64,
@@ -560,7 +735,7 @@ impl ExecutorAdmissionEpochs {
 type ExecutorPrefillCapacityWaitFuture =
     Pin<Box<dyn Future<Output = Result<ExecutorAdmissionEpochs>> + Send + 'static>>;
 
-/// Type-erased, single-use registration for one executor-owned capacity wait.
+/// Type-erased, single-use registration for one plan-runtime capacity wait.
 ///
 /// Registration is created synchronously so the executor can subscribe before
 /// the engine releases its iteration lock. Awaiting it never grants resources;
@@ -586,7 +761,7 @@ impl ExecutorPrefillCapacityWaitRegistration {
     }
 }
 
-/// Stage that must advance before an executor-owned prefill can be admitted.
+/// Stage that must advance before a plan-runtime prefill can be admitted.
 ///
 /// This is scheduler evidence, not allocator authority. The executor retains
 /// the sealed logical or physical deferral that authorizes maintenance.
@@ -597,7 +772,7 @@ pub enum ExecutorPrefillMaintenanceStage {
     PhysicalBacking,
 }
 
-/// Scheduler-visible reason that a prefill needs executor-owned backing
+/// Scheduler-visible reason that a prefill needs plan-runtime backing
 /// maintenance. These values are projections only and cannot allocate memory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
@@ -621,7 +796,7 @@ pub enum ExecutorPrefillMaintenanceBlocker {
     },
 }
 
-/// Non-authoritative projection of executor-owned maintenance work.
+/// Non-authoritative projection of plan-runtime maintenance work.
 ///
 /// The request id is the only handle returned to the engine. Implementations
 /// must retain the sealed deferral internally and validate it again when
@@ -739,7 +914,7 @@ impl ExecutorPrefillMaintenanceDeferral {
     }
 }
 
-/// Result of one bounded executor-owned backing maintenance attempt.
+/// Result of one bounded plan-runtime backing maintenance attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ExecutorPrefillMaintenanceOutcome {
@@ -768,7 +943,7 @@ pub enum ExecutorPrefillMaintenanceOutcome {
     },
 }
 
-/// Typed result of probing executor-owned prefill capacity.
+/// Typed result of probing plan-runtime prefill capacity.
 ///
 /// `Deferred` and `MaintenanceDeferred` preserve the capacity domains and
 /// epochs required by the plan-local dynamic admission queue. They must never
@@ -788,11 +963,19 @@ pub trait ModelExecutor: Send + Sync {
     fn info(&self) -> &ModelInfo;
 
     /// Selects the single authority for request-lifetime model resources.
-    /// Existing executors remain engine-managed by default. A runtime that
-    /// returns `ExecutorManaged` must return its own opaque cache handle from
-    /// prefill/decode and release that authority from `release_cache`.
-    fn execution_resource_ownership(&self) -> ExecutionResourceOwnership {
-        ExecutionResourceOwnership::EngineManaged
+    /// Existing executors remain on the transitional legacy-engine path by
+    /// default. A runtime that returns `PlanRuntime` must return the shared
+    /// runtime's opaque cache handle from prefill/decode and delegate release
+    /// of that authority from `release_cache`.
+    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
+        ExecutionResourceAuthority::LegacyEngine
+    }
+
+    /// Returns the authoritative memory breakdown for a shared plan runtime.
+    /// `LegacyEngine` executors return `None`; `PlanRuntime` executors must
+    /// return `Some` while they are ready.
+    fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
+        Ok(None)
     }
 
     /// Whether this executor's backend can run the unified mixed prefill+decode
@@ -821,8 +1004,8 @@ pub trait ModelExecutor: Send + Sync {
     fn attach_execution_event_sink(&self, _sink: Arc<dyn crate::vnext::ExecutionEventSink>) {}
 
     /// Current plan-local capacity evidence for scheduler wake suppression.
-    /// Engine-managed executors return `None`; an executor declaring
-    /// [`ExecutionResourceOwnership::ExecutorManaged`] must return `Some`.
+    /// Legacy-engine executors return `None`; an executor declaring
+    /// [`ExecutionResourceAuthority::PlanRuntime`] must return `Some`.
     fn prefill_admission_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
         Ok(None)
     }
@@ -843,8 +1026,8 @@ pub trait ModelExecutor: Send + Sync {
     /// wait. The returned registration must remain alive until it is awaited or
     /// deliberately cancelled by being dropped.
     ///
-    /// Engine-managed executors return `None`. An executor declaring
-    /// [`ExecutionResourceOwnership::ExecutorManaged`] must return `Some` for a
+    /// Legacy-engine executors return `None`. An executor declaring
+    /// [`ExecutionResourceAuthority::PlanRuntime`] must return `Some` for a
     /// wait condition issued by its own admission coordinator.
     fn register_prefill_capacity_waiter(
         &self,
@@ -861,7 +1044,7 @@ pub trait ModelExecutor: Send + Sync {
         _input: ExecutorPrefillAdmission<'_>,
     ) -> Result<ExecutorPrefillAdmissionDecision> {
         Err(ferrum_types::FerrumError::unsupported(
-            "executor-owned prefill admission is not implemented",
+            "plan-runtime prefill admission is not implemented",
         ))
     }
 
@@ -881,7 +1064,7 @@ pub trait ModelExecutor: Send + Sync {
         _request_id: &RequestId,
     ) -> Result<ExecutorPrefillMaintenanceOutcome> {
         Err(ferrum_types::FerrumError::unsupported(
-            "executor-owned prefill backing maintenance is not implemented",
+            "plan-runtime prefill backing maintenance is not implemented",
         ))
     }
 

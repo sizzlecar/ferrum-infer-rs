@@ -14,7 +14,7 @@ use ferrum_interfaces::{
     KvCacheManager, ModelExecutor, RecurrentStateManager, Sampler, SchedulerInterface as Scheduler,
     TensorFactory, Tokenizer,
 };
-use ferrum_types::{EngineConfig, FerrumError, Result, SchedulingPolicy};
+use ferrum_types::{EngineConfig, FerrumError, Result};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -172,22 +172,6 @@ impl EngineBuilder {
         "multinomial".to_string()
     }
 
-    /// Determine which scheduler to use based on config and overrides
-    fn resolve_scheduler_name(&self) -> String {
-        if let Some(ref name) = self.scheduler_name {
-            return name.clone();
-        }
-
-        match self.config.scheduler.policy {
-            SchedulingPolicy::FCFS => "fifo".to_string(),
-            SchedulingPolicy::Priority => "priority".to_string(),
-            SchedulingPolicy::FairShare => "fifo".to_string(), // Fallback
-            SchedulingPolicy::SJF => "fifo".to_string(),       // Fallback
-            SchedulingPolicy::RoundRobin => "fifo".to_string(), // Fallback
-            SchedulingPolicy::ContinuousBatch => "continuous".to_string(),
-        }
-    }
-
     /// Determine which KV cache to use based on config and overrides
     fn resolve_kv_cache_name(&self) -> String {
         if let Some(ref name) = self.kv_cache_name {
@@ -231,12 +215,18 @@ impl EngineBuilder {
             self.config.model.model_id
         );
 
+        if self.scheduler_name.is_some() || self.custom_scheduler.is_some() {
+            return Err(FerrumError::config(
+                "EngineBuilder scheduler component overrides are no longer accepted; configure the typed EngineConfig.scheduler used by ContinuousBatchScheduler",
+            ));
+        }
+
         // Pre-compute all component names before consuming self
         let tokenizer_name = self.resolve_tokenizer_name();
         let sampler_name = self.resolve_sampler_name();
-        let scheduler_name = self.resolve_scheduler_name();
         let kv_cache_name = self.resolve_kv_cache_name();
         let executor_name = self.resolve_executor_name();
+        let explicit_kv_cache_override = self.kv_cache_name.is_some();
 
         let component_config = ComponentConfig::from_engine_config(&self.config);
         validate_layer_split_plan(&component_config)?;
@@ -252,7 +242,6 @@ impl EngineBuilder {
         // `CandleTensorFactory` directly from the registry.
         let custom_tokenizer = self.custom_tokenizer;
         let custom_sampler = self.custom_sampler;
-        let custom_scheduler = self.custom_scheduler;
         let custom_kv_cache = self.custom_kv_cache;
         let custom_recurrent_state_manager = self.custom_recurrent_state_manager;
         let custom_executor = self.custom_executor;
@@ -299,29 +288,9 @@ impl EngineBuilder {
                 .await?
         };
 
-        // 4. Create or use provided scheduler
-        let scheduler = if let Some(scheduler) = custom_scheduler {
-            debug!("Using custom scheduler");
-            scheduler
-        } else {
-            debug!("Creating scheduler: {}", scheduler_name);
-            registry
-                .create_scheduler(&scheduler_name, &component_config)
-                .await?
-        };
-
-        // 5. Create or use provided KV cache
-        let kv_cache = if let Some(kv_cache) = custom_kv_cache {
-            debug!("Using custom KV cache");
-            kv_cache
-        } else {
-            debug!("Creating KV cache: {}", kv_cache_name);
-            registry
-                .create_kv_cache(&kv_cache_name, &component_config)
-                .await?
-        };
-
-        // 6. Create or use provided executor
+        // 4. Resolve the executor before resource managers. Its typed
+        // authority decides whether engine-side KV/recurrent managers may
+        // exist at all.
         let executor = if let Some(executor) = custom_executor {
             debug!("Using custom executor");
             executor
@@ -351,14 +320,41 @@ impl EngineBuilder {
                 }
             }
         };
+        let execution_resource_authority = executor.execution_resource_authority();
 
-        // 7. Create the engine — always ContinuousBatchEngine.
+        let (kv_cache, recurrent_state_manager) = match execution_resource_authority {
+            ferrum_interfaces::model_executor::ExecutionResourceAuthority::PlanRuntime => {
+                if explicit_kv_cache_override || custom_kv_cache.is_some() {
+                    return Err(FerrumError::config(
+                        "plan runtime cannot be combined with a legacy engine KV-cache override",
+                    ));
+                }
+                if custom_recurrent_state_manager.is_some() {
+                    return Err(FerrumError::config(
+                        "plan runtime cannot be combined with a legacy engine recurrent-state manager",
+                    ));
+                }
+                (None, None)
+            }
+            ferrum_interfaces::model_executor::ExecutionResourceAuthority::LegacyEngine => {
+                let kv_cache = if let Some(kv_cache) = custom_kv_cache {
+                    debug!("Using custom KV cache");
+                    kv_cache
+                } else {
+                    debug!("Creating KV cache: {}", kv_cache_name);
+                    registry
+                        .create_kv_cache(&kv_cache_name, &component_config)
+                        .await?
+                };
+                let recurrent_state_manager = custom_recurrent_state_manager
+                    .or_else(|| default_recurrent_state_manager(&config, &component_config));
+                (Some(kv_cache), recurrent_state_manager)
+            }
+        };
+
+        // 5. Create the engine — always ContinuousBatchEngine.
         info!("All components created, building ContinuousBatchEngine");
 
-        // The registry-resolved scheduler from steps 4 was used by the
-        // legacy DefaultInferenceEngine path that Phase 5b deleted; the
-        // ContinuousBatchEngine needs a concrete ContinuousBatchScheduler.
-        let _ = scheduler;
         let cb_scheduler = Arc::new(
             ferrum_scheduler::implementations::ContinuousBatchScheduler::new(
                 config.scheduler.clone(),
@@ -378,6 +374,14 @@ impl EngineBuilder {
         let spec_draft = component_config
             .get_string_option("spec_draft")
             .or_else(|| config.runtime.spec_draft.clone());
+        if execution_resource_authority
+            == ferrum_interfaces::model_executor::ExecutionResourceAuthority::PlanRuntime
+            && spec_draft.is_some()
+        {
+            return Err(FerrumError::unsupported(
+                "speculative decoding is not yet part of the plan-runtime contract",
+            ));
+        }
         let spec_n = component_config
             .get_option::<usize>("spec_n")
             .unwrap_or(config.runtime.spec_n.unwrap_or(4));
@@ -389,38 +393,59 @@ impl EngineBuilder {
                     "model_path".to_string(),
                     serde_json::Value::String(draft_path.to_string()),
                 );
-                match registry.create_executor(&executor_name, &draft_cfg).await {
-                    Ok(draft) => (
-                        Some(draft),
-                        Some(crate::speculative::SpeculativeDecodingConfig {
-                            num_speculative_tokens: spec_n,
-                            temperature: 1.0,
-                        }),
-                    ),
-                    Err(e) => {
-                        tracing::warn!("Speculative decoding disabled — draft load failed: {e}");
-                        (None, None)
-                    }
+                let draft = registry
+                    .create_executor(&executor_name, &draft_cfg)
+                    .await
+                    .map_err(|error| {
+                        FerrumError::config(format!(
+                            "requested speculative draft executor failed to load: {error}"
+                        ))
+                    })?;
+                if draft.execution_resource_authority() != execution_resource_authority {
+                    return Err(FerrumError::config(
+                        "target and speculative draft executors declare different resource authority",
+                    ));
                 }
+                (
+                    Some(draft),
+                    Some(crate::speculative::SpeculativeDecodingConfig {
+                        num_speculative_tokens: spec_n,
+                        temperature: 1.0,
+                    }),
+                )
             }
             _ => (None, None),
         };
 
-        let recurrent_state_manager = custom_recurrent_state_manager
-            .or_else(|| default_recurrent_state_manager(&config, &component_config));
-
-        let engine = crate::ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
-            config,
-            cb_scheduler,
-            tokenizer,
-            sampler,
-            kv_cache,
-            executor,
-            tensor_factory,
-            draft_executor,
-            spec_config,
-            recurrent_state_manager,
-        );
+        let engine = match execution_resource_authority {
+            ferrum_interfaces::model_executor::ExecutionResourceAuthority::PlanRuntime => {
+                crate::ContinuousBatchEngine::new_plan_runtime(
+                    config,
+                    cb_scheduler,
+                    tokenizer,
+                    sampler,
+                    executor,
+                    tensor_factory,
+                )?
+            }
+            ferrum_interfaces::model_executor::ExecutionResourceAuthority::LegacyEngine => {
+                let kv_cache = kv_cache.ok_or_else(|| {
+                    FerrumError::internal("legacy-engine composition lost its KV-cache manager")
+                })?;
+                crate::ContinuousBatchEngine::new_with_speculation_and_recurrent_state_manager(
+                    config,
+                    cb_scheduler,
+                    tokenizer,
+                    sampler,
+                    kv_cache,
+                    executor,
+                    tensor_factory,
+                    draft_executor,
+                    spec_config,
+                    recurrent_state_manager,
+                )?
+            }
+        };
         Ok(Box::new(engine))
     }
 }
@@ -521,13 +546,74 @@ pub async fn create_engine(
 mod tests {
     use super::*;
     use ferrum_interfaces::{
+        model_executor::{
+            DecodeInput, DecodeOutput, ExecutionResourceAuthority, ExecutorCapabilities,
+            ExecutorStatus, PlanRuntimeResourceSnapshot, PrefillInput, PrefillOutput,
+        },
         RecurrentStateHandle, RecurrentStateManager, RecurrentStateManagerStats,
         RecurrentStateSpec, RecurrentStateTensorSpec,
     };
     use ferrum_types::{DataType, Device, RequestId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug)]
     struct NoopRecurrentStateManager;
+
+    struct PlanRuntimeBuilderExecutor {
+        inner: ferrum_testkit::MockModelExecutor,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelExecutor for PlanRuntimeBuilderExecutor {
+        fn info(&self) -> &ferrum_types::ModelInfo {
+            self.inner.info()
+        }
+
+        fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
+            ExecutionResourceAuthority::PlanRuntime
+        }
+
+        fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
+            PlanRuntimeResourceSnapshot::new(1_000, 900, 700, 700, 400, 300, 200, 0, 0).map(Some)
+        }
+
+        async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
+            self.inner.prefill(input).await
+        }
+
+        async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+            self.inner.decode(input).await
+        }
+
+        fn capabilities(&self) -> ExecutorCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn status(&self) -> ExecutorStatus {
+            self.inner.status()
+        }
+    }
+
+    struct CountingKvFactory {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::registry::ComponentFactory<Arc<dyn KvCacheManager + Send + Sync>>
+        for CountingKvFactory
+    {
+        async fn create(
+            &self,
+            _config: &ComponentConfig,
+        ) -> Result<Arc<dyn KvCacheManager + Send + Sync>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Arc::new(ferrum_testkit::MockKvCacheManager::new(8)))
+        }
+
+        fn metadata(&self) -> crate::registry::ComponentMetadata {
+            crate::registry::ComponentMetadata::default()
+        }
+    }
 
     #[async_trait::async_trait]
     impl RecurrentStateManager for NoopRecurrentStateManager {
@@ -826,8 +912,6 @@ mod tests {
         let builder = EngineBuilder::new(config);
 
         assert_eq!(builder.resolve_sampler_name(), "multinomial");
-        // Default SchedulerConfig uses Priority policy
-        assert_eq!(builder.resolve_scheduler_name(), "priority");
         assert_eq!(builder.resolve_kv_cache_name(), "default");
     }
 
@@ -838,5 +922,51 @@ mod tests {
 
         // Should succeed with stub components
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn plan_runtime_build_does_not_invoke_legacy_kv_factory() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(ComponentRegistry::with_defaults());
+        registry.register_kv_cache_factory(
+            "default",
+            Arc::new(CountingKvFactory {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(PlanRuntimeBuilderExecutor {
+            inner: ferrum_testkit::MockModelExecutor::instant(128),
+        });
+
+        let result = EngineBuilder::with_registry(EngineConfig::default(), registry)
+            .with_custom_executor(executor)
+            .build()
+            .await;
+
+        if let Err(error) = result {
+            panic!("plan-runtime build failed: {error}");
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn plan_runtime_build_rejects_legacy_resource_override() {
+        let executor: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(PlanRuntimeBuilderExecutor {
+            inner: ferrum_testkit::MockModelExecutor::instant(128),
+        });
+        let kv_cache: Arc<dyn KvCacheManager + Send + Sync> =
+            Arc::new(ferrum_testkit::MockKvCacheManager::new(8));
+
+        let error = EngineBuilder::new(EngineConfig::default())
+            .with_custom_executor(executor)
+            .with_custom_kv_cache(kv_cache)
+            .build()
+            .await
+            .err()
+            .expect("plan runtime must reject a legacy KV manager override");
+
+        assert!(error
+            .to_string()
+            .contains("cannot be combined with a legacy engine KV-cache override"));
     }
 }

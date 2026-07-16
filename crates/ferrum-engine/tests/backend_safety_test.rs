@@ -31,6 +31,7 @@ fn engine() -> ContinuousBatchEngine {
         Arc::new(MockModelExecutor::instant(VOCAB)),
         Arc::new(MockTensorFactory),
     )
+    .expect("legacy engine composition must match executor authority")
 }
 
 fn engine_with_executor(
@@ -46,7 +47,8 @@ fn engine_with_executor(
         kv.clone(),
         executor,
         Arc::new(MockTensorFactory),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
     (eng, kv)
 }
 

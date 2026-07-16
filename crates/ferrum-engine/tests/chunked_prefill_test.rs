@@ -32,6 +32,7 @@ fn make_engine() -> ContinuousBatchEngine {
         executor,
         tensor_factory,
     )
+    .expect("legacy engine composition must match executor authority")
 }
 
 fn make_long_prompt(word_count: usize) -> String {

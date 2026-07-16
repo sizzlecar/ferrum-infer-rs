@@ -359,7 +359,7 @@ impl EngineInner {
 
     // ── batch prefill ─────────────────────────────────────────────────
 
-    pub(super) async fn run_executor_owned_prefill(&self, request_id: &RequestId) -> Result<()> {
+    pub(super) async fn run_plan_runtime_prefill(&self, request_id: &RequestId) -> Result<()> {
         use ferrum_interfaces::model_executor::PrefillInput;
 
         let Some((input_tokens, maximum_sequence_tokens, metadata)) =
@@ -383,8 +383,8 @@ impl EngineInner {
 
         let workspace_lease = self.acquire_backend_workspace_lease(
             vec![request_id.clone()],
-            "executor_owned_prefill_workspace",
-            "executor_owned_prefill_workspace_release",
+            "plan_runtime_prefill_workspace",
+            "plan_runtime_prefill_workspace_release",
         );
         let output = match self.model_executor.prefill(&input).await {
             Ok(output) => {
@@ -410,7 +410,7 @@ impl EngineInner {
                 Some(self.tokenizer.as_ref()),
             )?;
             seq.generated_tokens.push(token);
-            let update = seq.commit_executor_owned_prefill_resources(output.kv_cache.clone());
+            let update = seq.commit_plan_runtime_prefill_resources(output.kv_cache.clone());
             Ok::<Option<(TokenId, ModelCacheRefUpdate)>, FerrumError>(Some((token, update)))
         })();
         let Some((first_token, model_cache_update)) = (match commit_result {

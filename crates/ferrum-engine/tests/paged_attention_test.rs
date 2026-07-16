@@ -59,7 +59,8 @@ fn make_engine() -> (ContinuousBatchEngine, Arc<PagedKvCacheManager>) {
         kv_manager.clone(),
         executor,
         tensor_factory,
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     (engine, kv_manager)
 }
@@ -148,7 +149,8 @@ async fn paged_executor_tracks_operations() {
         kv_manager,
         executor.clone(),
         tensor_factory,
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     assert_eq!(executor.prefill_count(), 0);
     assert_eq!(executor.decode_count(), 0);
@@ -229,15 +231,18 @@ fn make_tight_engine() -> (Arc<ContinuousBatchEngine>, Arc<PagedKvCacheManager>)
     let sampler = Arc::new(MockSampler);
     let tensor_factory = Arc::new(MockTensorFactory);
 
-    let engine = Arc::new(ContinuousBatchEngine::new(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        kv_manager.clone(),
-        executor,
-        tensor_factory,
-    ));
+    let engine = Arc::new(
+        ContinuousBatchEngine::new(
+            config,
+            scheduler,
+            tokenizer,
+            sampler,
+            kv_manager.clone(),
+            executor,
+            tensor_factory,
+        )
+        .expect("legacy engine composition must match executor authority"),
+    );
 
     (engine, kv_manager)
 }

@@ -31,6 +31,7 @@ fn make_engine_with_executor(
         executor,
         tensor_factory,
     )
+    .expect("legacy engine composition must match executor authority")
 }
 
 fn make_engine() -> ContinuousBatchEngine {

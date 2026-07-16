@@ -36,6 +36,7 @@ fn make_engine_with_latency(prefill_ms: u64, decode_ms: u64) -> ContinuousBatchE
         executor,
         tensor_factory,
     )
+    .expect("legacy engine composition must match executor authority")
 }
 
 fn make_request(prompt: &str, max_tokens: usize) -> InferenceRequest {
@@ -208,6 +209,7 @@ async fn throughput_scaling() {
             executor,
             tensor_factory,
         )
+        .expect("legacy engine composition must match executor authority")
     });
 
     let start = Instant::now();
