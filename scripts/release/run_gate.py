@@ -2404,6 +2404,7 @@ def validate_vnext_g01a_s0a_provenance(
             "g00f",
             "inventory_document",
             "adr_source",
+            "public_api_migration_source",
             "public_owner_evidence",
             "compile_evidence",
             "artifact_count",
