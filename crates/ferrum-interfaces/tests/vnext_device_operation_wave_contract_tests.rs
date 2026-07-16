@@ -91,6 +91,42 @@ fn teardown(
 }
 
 #[test]
+fn immutable_plan_prebinds_owned_providers_in_node_order() {
+    let fixture = fixture();
+    let providers = fixture.registry.bind_plan(&fixture.resolved).unwrap();
+    let expected = fixture
+        .resolved
+        .execution_plan()
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| node.selection().selected_provider())
+        .collect::<Vec<_>>();
+    let actual = providers
+        .providers()
+        .iter()
+        .map(|provider| provider.descriptor().provider_id())
+        .collect::<Vec<_>>();
+
+    assert_eq!(providers.len(), expected.len());
+    assert_eq!(actual, expected);
+
+    drop(fixture.registry);
+    assert_eq!(
+        providers.providers()[0].descriptor().provider_id(),
+        expected[0]
+    );
+
+    drop(providers);
+    drop(fixture.impostor_registry);
+    drop(fixture.runtime);
+    assert!(matches!(
+        PlanRuntimeResources::close(fixture.plan_resources),
+        Ok(PlanRuntimeCloseOutcome::Closed(_))
+    ));
+}
+
+#[test]
 fn immutable_plan_nodes_prepare_one_owned_submission_wave() {
     let (fixture, sequence, session, batch, step) = setup();
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);

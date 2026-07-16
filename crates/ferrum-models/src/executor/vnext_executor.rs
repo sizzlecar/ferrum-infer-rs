@@ -1334,7 +1334,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     info: ModelInfo,
     executable: ExecutablePlan,
     runtime: Arc<R>,
-    registry: OperationRuntimeRegistry<R>,
+    providers: BoundOperationProviderSet<R>,
     policy: ResolvedRuntimePolicy,
     plan_resources: Arc<PlanRuntimeResources<R>>,
     lane: Arc<ExecutionLane<R>>,
@@ -1418,6 +1418,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         )
         .map_err(|error| FerrumError::model(format!("vNext plan compile: {error}")))?;
         let (executable, _, _) = compilation.into_parts();
+        let providers = registry
+            .bind_plan(&executable)
+            .map_err(|error| FerrumError::model(format!("vNext provider binding: {error}")))?;
         let io = Self::resolve_io(&executable, &input_id, &output_id, info.vocab_size)?;
         let family_fingerprint = family
             .fingerprint()
@@ -1517,7 +1520,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             info,
             executable,
             runtime,
-            registry,
+            providers,
             policy: config.runtime_policy,
             plan_resources,
             lane,
@@ -2249,18 +2252,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .iter()
             .map(|_| vec![active.clone()])
             .collect::<Vec<_>>();
-        let providers = match self
-            .executable
-            .execution_plan()
-            .payload()
-            .nodes()
-            .iter()
-            .map(|node| self.registry.bind(&self.executable, node.id()))
-            .collect::<std::result::Result<Vec<_>, VNextError>>()
-        {
-            Ok(providers) => providers,
-            Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
-        };
         let range = span.immediate_token_range();
         let host_range = Range {
             start: range.start as usize,
@@ -2317,7 +2308,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
             };
             match OperationDispatch::encode_and_submit_wave_with_inputs(
-                &providers,
+                self.providers.providers(),
                 &self.executable,
                 &identity,
                 &active_bindings,
