@@ -2,12 +2,15 @@
 
 ## Status
 
-- Work package: S0A, semantics-preserving structural split.
+- Work package: S0A structural split plus an explicit baseline-to-current API migration ledger.
 - Current stage: the `resource`, `execution`, and `event` production monoliths are split into real
   owner modules with explicit imports and zero multi-module dependency SCCs. The four oversized
   resource/event/core/device contract targets are replaced by 24 invariant-owner targets and 10
-  explicit reusable support owners. The structured public owner audit maps all `1,490/1,490`
-  externally reachable API units with zero loss, ambiguity, inaccessible item, or added item.
+  explicit reusable support owners. The structured public owner audit accounts for all `1,490`
+  baseline API units: `1,481` preserve the original path/kind and `9` are explicit migrations with
+  verified public replacement targets. Unexplained loss, ambiguity, and inaccessible count are `0`.
+  All `248` added public units are retained in the artifact and frozen by SHA256
+  `3a6e1f97b7cefba2c9792a7dd46955ef20c178535c104e82f9efd1070e2380a9`.
 - This map records the implemented ownership structure. Canonical G01A/S0A completion still
   requires a clean-source `vnext-g00f` binding and bounded aggregate `vnext-g01a` artifact; neither
   this document nor historical focused test output substitutes for those PASS lines.
@@ -35,13 +38,14 @@
 Before module visibility changed, the 13 initial physical fragments concatenated byte-for-byte with the
 original seven-line test-module tail to the pre-split SHA256. The validated implementation now
 uses real child `mod` declarations and facade `pub use` exports; it does not use `include!`.
-Existing public paths remain unchanged. Cross-owner implementation details that were implicitly
-shared by the giant module are now explicitly limited to the `vnext::resource` parent with
-`pub(super)`, so they do not become crate-public API. All 13 production fragments now use explicit
-symbol imports; only the two existing in-module test files retain `use super::*`. Owner
-normalization added a fourteenth production module, `provisioning`, and moved shared contracts to
-their lowest valid owner. The complete symbol graph now has zero multi-module strongly connected
-components. The transition is recorded in `S0A_RESOURCE_DEPENDENCY_AUDIT.md`.
+Unchanged public paths remain available through the facades. Nine deliberate post-split semantic
+changes are recorded in `S0A_PUBLIC_API_MIGRATIONS.json`; the owner audit rejects an absent target,
+an unexplained removal, a redundant migration, or any added-item digest drift. Cross-owner
+implementation details that were implicitly shared by the giant module are explicitly limited to
+the `vnext::resource` parent with `pub(super)`, so they do not become crate-public API. All current
+production owners use explicit symbol imports. Resource normalization now has 17 production owners
+and the complete symbol graph has zero multi-module strongly connected components. The transition
+is recorded in `S0A_RESOURCE_DEPENDENCY_AUDIT.md`.
 
 As a second mechanical-equivalence check, removing only the added `use super::*` lines and
 `pub(super)` visibility qualifiers, concatenating the production fragments, and applying the same
