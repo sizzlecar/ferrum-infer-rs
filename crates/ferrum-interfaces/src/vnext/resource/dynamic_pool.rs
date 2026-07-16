@@ -15,6 +15,7 @@ use super::{
 use crate::vnext::{
     CapacityShortfallKind, CapacityWaitSnapshot, DeferredAction, DeviceCapacityPressure,
 };
+use sha2::{Digest, Sha256};
 
 static NEXT_DYNAMIC_POOL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -28,6 +29,86 @@ fn align_up_resource(value: u64, alignment: u64) -> Result<u64, VNextError> {
         .checked_add(alignment - 1)
         .map(|rounded| rounded & !(alignment - 1))
         .ok_or_else(|| invalid_resource("dynamic pool aligned bytes overflow u64"))
+}
+
+fn free_extent_layout_fingerprint(allocator: &FreeExtentIndex) -> String {
+    let mut hasher = Sha256::new();
+    for (&(chunk_ordinal, offset_bytes), extent) in &allocator.by_offset {
+        hasher.update(chunk_ordinal.to_be_bytes());
+        hasher.update(extent.chunk_generation.to_be_bytes());
+        hasher.update(offset_bytes.to_be_bytes());
+        hasher.update(extent.length_bytes.to_be_bytes());
+    }
+    format!("sha256/{:x}", hasher.finalize())
+}
+
+fn unused_simulation_chunk_ordinal(allocator: &FreeExtentIndex) -> Result<u32, VNextError> {
+    let mut candidate = u32::MAX;
+    loop {
+        if !allocator
+            .by_offset
+            .keys()
+            .any(|(chunk_ordinal, _)| *chunk_ordinal == candidate)
+        {
+            return Ok(candidate);
+        }
+        candidate = candidate.checked_sub(1).ok_or_else(|| {
+            invalid_resource("contiguous packing simulation exhausted chunk identities")
+        })?;
+    }
+}
+
+/// Returns one additional chunk size that makes the canonical
+/// best-fit-decreasing transaction packable. This only runs after physical
+/// deferral; successful hot-path claims still touch the allocator once.
+fn contiguous_packing_growth_bytes(
+    allocator: &FreeExtentIndex,
+    pool_id: &DynamicBackingPoolId,
+    claim_bytes_descending: &[u64],
+) -> Result<u64, VNextError> {
+    if claim_bytes_descending.is_empty()
+        || claim_bytes_descending.iter().any(|bytes| *bytes == 0)
+        || claim_bytes_descending
+            .windows(2)
+            .any(|pair| pair[0] < pair[1])
+    {
+        return Err(invalid_resource(
+            "contiguous packing demand is empty, zero-sized, or non-canonical",
+        ));
+    }
+    let maximum_growth = claim_bytes_descending
+        .iter()
+        .try_fold(0_u64, |total, bytes| total.checked_add(*bytes))
+        .ok_or_else(|| invalid_resource("contiguous packing demand overflows u64"))?;
+    let synthetic_chunk = unused_simulation_chunk_ordinal(allocator)?;
+    let mut growth_bytes = 0_u64;
+    loop {
+        let mut simulation = allocator.clone();
+        if growth_bytes != 0 {
+            simulation.insert_extent(synthetic_chunk, u64::MAX, 0, growth_bytes)?;
+        }
+        let mut failed_claim = None;
+        for &claim_bytes in claim_bytes_descending {
+            if simulation
+                .allocate_contiguous(pool_id, claim_bytes)?
+                .is_none()
+            {
+                failed_claim = Some(claim_bytes);
+                break;
+            }
+        }
+        let Some(failed_claim) = failed_claim else {
+            return Ok(growth_bytes);
+        };
+        growth_bytes = growth_bytes
+            .checked_add(failed_claim)
+            .ok_or_else(|| invalid_resource("contiguous packing growth overflows u64"))?;
+        if growth_bytes > maximum_growth {
+            return Err(invalid_resource(
+                "contiguous packing planner exceeded its guaranteed growth bound",
+            ));
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -664,9 +745,13 @@ where
         );
         match growth {
             Ok(receipt) if receipt.growths().is_empty() => {
-                Ok(DynamicDeferredMaintenanceOutcome::RetryAdmission {
-                    current_epochs: self.pools.logical_admission.epochs()?,
-                })
+                let current_epochs = self.pools.logical_admission.epochs()?;
+                if current_epochs == deferred.epochs() {
+                    return Err(invalid_resource(
+                        "dynamic backing maintenance made no progress on an unchanged deferral",
+                    ));
+                }
+                Ok(DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs })
             }
             Ok(receipt) => Ok(DynamicDeferredMaintenanceOutcome::Maintained(receipt)),
             Err(VNextError::DeviceCapacityUnavailable(_)) => self.capacity_wait_outcome(
@@ -904,6 +989,9 @@ pub struct DynamicBackingBlocker {
     requested_bytes: u64,
     free_bytes: u64,
     largest_contiguous_bytes: u64,
+    free_extent_layout_fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contiguous_claim_bytes_descending: Option<Vec<u64>>,
 }
 
 impl DynamicBackingBlocker {
@@ -929,6 +1017,14 @@ impl DynamicBackingBlocker {
 
     pub const fn largest_contiguous_bytes(&self) -> u64 {
         self.largest_contiguous_bytes
+    }
+
+    pub fn free_extent_layout_fingerprint(&self) -> &str {
+        &self.free_extent_layout_fingerprint
+    }
+
+    pub fn contiguous_claim_bytes_descending(&self) -> Option<&[u64]> {
+        self.contiguous_claim_bytes_descending.as_deref()
     }
 }
 
@@ -1461,28 +1557,37 @@ where
                         minimum - current
                     }
                     DynamicPoolGrowthIntent::RevalidatedDeferral(blocker) => {
-                        match blocker.reason() {
-                            DynamicBackingDeferralReason::GrowthRequired => {
-                                let required_free = blocker
-                                    .free_bytes()
-                                    .checked_add(blocker.requested_bytes())
-                                    .ok_or_else(|| {
-                                        invalid_resource(
+                        if let Some(claim_bytes) = blocker.contiguous_claim_bytes_descending() {
+                            let required_growth = contiguous_packing_growth_bytes(
+                                &state.allocator,
+                                pool.domain.pool_id(),
+                                claim_bytes,
+                            )?;
+                            if required_growth == 0 {
+                                continue;
+                            }
+                            required_growth
+                        } else {
+                            match blocker.reason() {
+                                DynamicBackingDeferralReason::GrowthRequired => {
+                                    let required_free = blocker
+                                        .free_bytes()
+                                        .checked_add(blocker.requested_bytes())
+                                        .ok_or_else(|| {
+                                            invalid_resource(
                                             "dynamic backing deferred requirement overflows u64",
                                         )
-                                    })?;
-                                if state.allocator.free_bytes >= required_free {
-                                    continue;
+                                        })?;
+                                    if state.allocator.free_bytes >= required_free {
+                                        continue;
+                                    }
+                                    required_free - state.allocator.free_bytes
                                 }
-                                required_free - state.allocator.free_bytes
-                            }
-                            DynamicBackingDeferralReason::FragmentedContiguous => {
-                                if state.allocator.largest_contiguous_bytes()
-                                    >= blocker.requested_bytes()
-                                {
-                                    continue;
+                                DynamicBackingDeferralReason::FragmentedContiguous => {
+                                    return Err(invalid_resource(
+                                        "fragmented contiguous blocker lost its transaction demand",
+                                    ));
                                 }
-                                blocker.requested_bytes()
                             }
                         }
                     }
@@ -1883,22 +1988,57 @@ where
                 .iter()
                 .enumerate()
                 .map(|(group_index, (pool, pool_requests))| {
-                    let requested_bytes =
+                    let requested_group_bytes =
                         pool_requests.iter().try_fold(0_u64, |total, request| {
                             total.checked_add(request.size_bytes).ok_or_else(|| {
                                 invalid_resource("dynamic backing batch bytes overflow u64")
                             })
                         })?;
                     let state = &states[group_index];
-                    Ok((state.allocator.free_bytes < requested_bytes).then(|| {
-                        DynamicBackingBlocker {
-                            pool_id: pool.domain.pool_id().clone(),
-                            domain_id: pool.domain.domain_id,
-                            reason: DynamicBackingDeferralReason::GrowthRequired,
-                            requested_bytes: requested_bytes - state.allocator.free_bytes,
-                            free_bytes: state.allocator.free_bytes,
-                            largest_contiguous_bytes: state.allocator.largest_contiguous_bytes(),
-                        }
+                    if state.allocator.free_bytes >= requested_group_bytes {
+                        return Ok(None);
+                    }
+                    let (reason, requested_bytes, contiguous_claim_bytes_descending) =
+                        match pool.domain.pool.compatibility().profile().view() {
+                            DynamicStorageView::Contiguous => {
+                                let mut claim_bytes = pool_requests
+                                    .iter()
+                                    .map(|request| request.size_bytes)
+                                    .collect::<Vec<_>>();
+                                claim_bytes.sort_unstable_by(|left, right| right.cmp(left));
+                                let growth = contiguous_packing_growth_bytes(
+                                    &state.allocator,
+                                    pool.domain.pool_id(),
+                                    &claim_bytes,
+                                )?;
+                                if growth == 0 {
+                                    return Err(invalid_resource(
+                                    "insufficient contiguous capacity produced zero packing growth",
+                                ));
+                                }
+                                (
+                                    DynamicBackingDeferralReason::GrowthRequired,
+                                    growth,
+                                    Some(claim_bytes),
+                                )
+                            }
+                            DynamicStorageView::PagedRegions { .. } => (
+                                DynamicBackingDeferralReason::GrowthRequired,
+                                requested_group_bytes - state.allocator.free_bytes,
+                                None,
+                            ),
+                        };
+                    Ok(Some(DynamicBackingBlocker {
+                        pool_id: pool.domain.pool_id().clone(),
+                        domain_id: pool.domain.domain_id,
+                        reason,
+                        requested_bytes,
+                        free_bytes: state.allocator.free_bytes,
+                        largest_contiguous_bytes: state.allocator.largest_contiguous_bytes(),
+                        free_extent_layout_fingerprint: free_extent_layout_fingerprint(
+                            &state.allocator,
+                        ),
+                        contiguous_claim_bytes_descending,
                     }))
                 })
                 .collect::<Result<Vec<_>, VNextError>>()?
@@ -1939,7 +2079,14 @@ where
             for group_index in 0..groups.len() {
                 let (pool, pool_requests) = &groups[group_index];
                 let profile = pool.domain.pool.compatibility().profile();
-                for request in pool_requests {
+                let mut allocation_requests = pool_requests.clone();
+                allocation_requests.sort_by(|left, right| {
+                    right
+                        .size_bytes
+                        .cmp(&left.size_bytes)
+                        .then_with(|| left.claim_identity.cmp(&right.claim_identity))
+                });
+                for request in allocation_requests {
                     let reserved = match match profile.view() {
                         DynamicStorageView::Contiguous => states[group_index]
                             .allocator
@@ -1958,34 +2105,42 @@ where
                     };
                     let Some(segments) = reserved else {
                         rollback_free_extent_journal(&mut states, &journals)?;
-                        let requested_group_bytes =
-                            pool_requests.iter().try_fold(0_u64, |total, request| {
-                                total.checked_add(request.size_bytes).ok_or_else(|| {
-                                    invalid_resource("dynamic backing batch bytes overflow u64")
-                                })
-                            })?;
+                        if !matches!(profile.view(), DynamicStorageView::Contiguous) {
+                            states[group_index].poisoned = true;
+                            return Err(invalid_resource(
+                                "paged backing allocation failed after its aggregate fit check",
+                            ));
+                        }
                         let free_bytes = states[group_index].allocator.free_bytes;
-                        let reason = if free_bytes < requested_group_bytes {
-                            DynamicBackingDeferralReason::GrowthRequired
-                        } else {
-                            DynamicBackingDeferralReason::FragmentedContiguous
-                        };
+                        let reason = DynamicBackingDeferralReason::FragmentedContiguous;
+                        let mut claim_bytes_descending = pool_requests
+                            .iter()
+                            .map(|request| request.size_bytes)
+                            .collect::<Vec<_>>();
+                        claim_bytes_descending.sort_unstable_by(|left, right| right.cmp(left));
+                        let requested_bytes = contiguous_packing_growth_bytes(
+                            &states[group_index].allocator,
+                            pool.domain.pool_id(),
+                            &claim_bytes_descending,
+                        )?;
+                        if requested_bytes == 0 {
+                            return Err(invalid_resource(
+                                "contiguous packing failed without a progress-producing growth",
+                            ));
+                        }
                         let blocker = DynamicBackingBlocker {
                             pool_id: pool.domain.pool_id().clone(),
                             domain_id: pool.domain.domain_id,
                             reason,
-                            requested_bytes: match reason {
-                                DynamicBackingDeferralReason::GrowthRequired => {
-                                    requested_group_bytes - free_bytes
-                                }
-                                DynamicBackingDeferralReason::FragmentedContiguous => {
-                                    request.size_bytes
-                                }
-                            },
+                            requested_bytes,
                             free_bytes,
                             largest_contiguous_bytes: states[group_index]
                                 .allocator
                                 .largest_contiguous_bytes(),
+                            free_extent_layout_fingerprint: free_extent_layout_fingerprint(
+                                &states[group_index].allocator,
+                            ),
+                            contiguous_claim_bytes_descending: Some(claim_bytes_descending),
                         };
                         drop(states);
                         if let Some(deferred) =
@@ -2156,6 +2311,8 @@ where
             }
             if state.allocator.free_bytes != blocker.free_bytes
                 || state.allocator.largest_contiguous_bytes() != blocker.largest_contiguous_bytes
+                || free_extent_layout_fingerprint(&state.allocator)
+                    != blocker.free_extent_layout_fingerprint
             {
                 return Ok(None);
             }
