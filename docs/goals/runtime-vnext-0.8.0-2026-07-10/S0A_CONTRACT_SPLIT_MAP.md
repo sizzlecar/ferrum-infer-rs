@@ -65,7 +65,7 @@ recorded in `S0A_EXECUTION_DEPENDENCY_AUDIT.md`.
 |---|---:|---|
 | `resource/contracts.rs` | 564 | Base identifiers, descriptors, shared error/state encodings and reservation contracts |
 | `resource/backing_extent.rs` | 434 | Backing chunk/segment identity, range projection, free-extent indexes, allocation and rollback |
-| `resource/capacity.rs` | 630 | Device capacity authority, accounting, epochs and process-wide claims |
+| `resource/capacity.rs` | 634 | Device capacity authority, accounting, epochs and process-wide claims |
 | `resource/provisioning.rs` | 355 | Static/elastic plan provisioning and admission construction |
 | `resource/allocation.rs` | 555 | Allocation ownership and resource driver contracts |
 | `resource/ledger.rs` | 1,668 | Lease state, transition receipts, allocation ledger and receipt validation |
@@ -90,31 +90,32 @@ offending path and line count if either bound regresses.
 
 | Current owner | Lines | Primary responsibility |
 |---|---:|---|
-| `execution/foundation.rs` | 84 | Shared validation, canonical fingerprints, alignment and storage arithmetic |
+| `execution/foundation.rs` | 95 | Shared validation, canonical fingerprints, alignment and storage arithmetic |
 | `execution/binding.rs` | 248 | Semantic value/weight binding validation and estimator-input identity |
-| `execution/work.rs` | 615 | Token/page work evidence and bounded dynamic demand formulas |
-| `execution/workspace.rs` | 144 | Provider workspace formula, scope and storage requirement contracts |
+| `execution/work.rs` | 735 | Token/page work evidence and bounded dynamic demand formulas |
+| `execution/workspace.rs` | 429 | Provider workspace formula, scope and storage requirement contracts |
 | `execution/provider_resource.rs` | 174 | Bound provider resource estimate evidence and validation |
-| `execution/contracts.rs` | 292 | Plan identity, provider selection evidence and immutable node contracts |
-| `execution/storage.rs` | 788 | Storage compatibility, dynamic pool specifications and descriptors |
+| `execution/contracts.rs` | 415 | Plan identity, provider selection evidence and immutable node contracts |
+| `execution/storage.rs` | 882 | Storage compatibility, dynamic pool specifications and descriptors |
 | `execution/allocation.rs` | 121 | Static/dynamic resource allocation contract and validation |
 | `execution/solver.rs` | 416 | Joint provider/storage solver and checked selection helpers |
-| `execution/memory.rs` | 775 | Core-derived memory plan and pool/liveness accounting |
-| `execution/provider.rs` | 242 | Provider selection and serialized execution-plan payload contracts |
-| `execution/policy.rs` | 74 | Typed runtime policy and validated plan-build request boundary |
-| `execution/plan.rs` | 1,898 | Semantic plan construction and deterministic provider/storage selection |
-| `execution/resolution.rs` | 289 | Provider registry resolution into typed per-node evidence |
+| `execution/memory.rs` | 973 | Core-derived memory plan and pool/liveness accounting |
+| `execution/provider.rs` | 251 | Provider selection and serialized execution-plan payload contracts |
+| `execution/policy.rs` | 79 | Typed runtime policy and validated plan-build request boundary |
+| `execution/plan.rs` | 2,177 | Semantic plan construction and deterministic provider/storage selection |
+| `execution/resolution.rs` | 291 | Provider registry resolution into typed per-node evidence |
 | `execution/validation.rs` | 56 | Untrusted execution-plan revalidation boundary |
-| `execution/planner.rs` | 12 | Pure execution planner trait boundary |
+| `execution/planner.rs` | 66 | Pure execution planner trait boundary |
+| `execution/compiler.rs` | 1,014 | Semantic-program compilation into immutable executable plan and node resolutions |
 
-`execution.rs` is now a 67-line facade. Every production fragment is below `2,500` lines. The
-existing 14 white-box tests are isolated in a 506-line `execution/tests.rs` module and pass with
+`execution.rs` is now a 72-line facade. Every production fragment is below `2,500` lines. The
+existing 14 white-box tests are isolated in a 744-line `execution/tests.rs` module and pass with
 `--test-threads=2`.
 
 The first eight-module split made former same-module coupling observable as one SCC containing all
 eight production owners. Low-level canonical/allocation helpers, provider resource evidence,
 serialized payload validation, resolution, and the planner API have now moved to distinct owners.
-The complete sixteen-module production graph has zero multi-module SCCs. Public execution paths
+The complete seventeen-module production graph has zero multi-module SCCs. Public execution paths
 remain re-exported by the facade and no production fragment uses `use super::*`.
 
 ## Event Ownership
@@ -252,7 +253,7 @@ dependencies-first execution order is:
 ```text
 foundation -> binding -> work -> workspace -> provider_resource -> contracts -> storage
 -> allocation -> solver -> memory -> provider -> policy -> plan -> resolution -> validation
--> planner
+-> planner -> compiler
 ```
 
 The event graph is also acyclic. One valid dependencies-first order is:

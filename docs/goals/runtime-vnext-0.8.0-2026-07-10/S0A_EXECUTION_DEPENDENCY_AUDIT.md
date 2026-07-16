@@ -39,13 +39,14 @@ dependency boundary.
 | Per-node provider resolution | `resolution` | Registry lookup is an input-producing boundary, not provider payload data |
 | Untrusted execution-plan revalidation | `validation` | Revalidation consumes a completed plan instead of being mixed into provider data |
 | Pure planner trait | `planner` | The public orchestration boundary depends on plan and policy, not vice versa |
+| Semantic-program compiler | `compiler` | Terminal consumer that turns model semantics and provider evidence into an immutable executable plan |
 
 No public execution path changed. The parent facade continues to re-export public contracts;
 sibling-only implementation access remains private to the execution parent.
 
 ## Final Graph
 
-The final production graph has sixteen modules and zero strongly connected components with more
+The final production graph has seventeen modules and zero strongly connected components with more
 than one member:
 
 ```text
@@ -57,6 +58,7 @@ The complete importer-to-owner edge set is:
 ```text
 allocation: contracts, foundation, storage
 binding: foundation
+compiler: binding, contracts, foundation, plan, policy, provider_resource, resolution, storage
 contracts: foundation, provider_resource
 foundation:
 memory: allocation, contracts, foundation, solver, storage
@@ -79,7 +81,7 @@ One valid dependencies-first topological order is:
 ```text
 foundation -> binding -> work -> workspace -> provider_resource -> contracts -> storage
 -> allocation -> solver -> memory -> provider -> policy -> plan -> resolution -> validation
--> planner
+-> planner -> compiler
 ```
 
 This order proves acyclicity; it does not force unrelated branches into one runtime layer.

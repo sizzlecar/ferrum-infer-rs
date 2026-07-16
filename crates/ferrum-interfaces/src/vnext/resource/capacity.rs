@@ -563,7 +563,11 @@ pub(super) fn issue_generation() -> Result<u64, VNextError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        device_capacity_account, issue_generation, Arc, CapacityAvailabilityEpoch,
+        CapacityAvailabilitySource, DeviceCapacityAccount, DeviceCapacityPressureScope,
+        DeviceCapacityReservation, DeviceId, VNextError,
+    };
 
     fn account(capacity_bytes: u64) -> Arc<DeviceCapacityAccount> {
         let generation = issue_generation().unwrap();
