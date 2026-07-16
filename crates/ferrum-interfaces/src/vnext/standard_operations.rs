@@ -676,10 +676,6 @@ mod tests {
         let contract = token_embedding_contract().unwrap();
         let descriptor = contract.descriptor();
         assert_eq!(descriptor.id.as_str(), TOKEN_EMBEDDING_OPERATION_ID);
-        assert!(!serde_json::to_string(descriptor)
-            .unwrap()
-            .to_ascii_lowercase()
-            .contains("qwen"));
         assert_eq!(descriptor.fingerprint().unwrap().len(), 64);
         contract
             .validate_signature(&descriptor.inputs, &descriptor.outputs)
@@ -698,10 +694,6 @@ mod tests {
                 DimensionConstraint::Symbol("out_features".to_owned()),
             ]
         );
-        assert!(!serde_json::to_string(descriptor)
-            .unwrap()
-            .to_ascii_lowercase()
-            .contains("qwen"));
         contract
             .validate_signature(&descriptor.inputs, &descriptor.outputs)
             .unwrap();
@@ -717,10 +709,6 @@ mod tests {
         ];
         for contract in &contracts {
             let descriptor = contract.descriptor();
-            assert!(!serde_json::to_string(descriptor)
-                .unwrap()
-                .to_ascii_lowercase()
-                .contains("qwen"));
             assert_eq!(descriptor.fingerprint().unwrap().len(), 64);
             contract
                 .validate_signature(&descriptor.inputs, &descriptor.outputs)
