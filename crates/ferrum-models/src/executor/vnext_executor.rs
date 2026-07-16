@@ -1273,13 +1273,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         })
     }
 
-    fn maintain_backing(&self, deferred: &DynamicBackingDeferred) -> Result<()> {
-        self.plan_resources
-            .maintain_for_deferred(deferred)
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
-        Ok(())
-    }
-
     fn retain_staged_prefill_request(
         &self,
         request_id: &RequestId,
@@ -1560,10 +1553,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
                     if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        return Err(Self::backing_deferred("sequence extension", &deferred));
+                        return Err(Self::backing_deferred(
+                            "sequence extension",
+                            deferred.evidence(),
+                        ));
                     }
                     backing_attempts += 1;
-                    self.maintain_backing(&deferred)?;
+                    deferred
+                        .maintain()
+                        .map_err(|error| FerrumError::backend(error.to_string()))?;
                 }
                 SequenceResourceExtensionDecision::PermanentRejected(rejected) => {
                     return Err(FerrumError::request_validation(format!(
@@ -1610,10 +1608,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
                     if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        return Err(Self::backing_deferred("step admission", &deferred));
+                        return Err(Self::backing_deferred(
+                            "step admission",
+                            deferred.evidence(),
+                        ));
                     }
                     backing_attempts += 1;
-                    self.maintain_backing(&deferred)?;
+                    deferred
+                        .maintain()
+                        .map_err(|error| FerrumError::backend(error.to_string()))?;
                 }
                 StepResourceAdmissionDecision::PermanentRejected(rejected) => {
                     return Err(FerrumError::backend(format!(
@@ -1668,10 +1671,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         .backing_deferrals
                         .fetch_add(1, Ordering::Relaxed);
                     if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-                        return Err(Self::backing_deferred("submission wave", &deferred));
+                        return Err(Self::backing_deferred(
+                            "submission wave",
+                            deferred.evidence(),
+                        ));
                     }
                     backing_attempts += 1;
-                    self.maintain_backing(&deferred)?;
+                    deferred
+                        .maintain()
+                        .map_err(|error| FerrumError::backend(error.to_string()))?;
                 }
                 StepSubmissionWaveAdmissionDecision::PermanentRejected(rejected) => {
                     return Err(FerrumError::backend(format!(

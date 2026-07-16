@@ -20,7 +20,7 @@ fn token_work_separates_current_backing_from_request_fit_ceiling() {
 }
 
 fn admit_batch_step(
-    plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
+    _plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
     batch: &ExecutionBatchParticipants<TestRuntime>,
 ) -> Arc<StepResourceLease<TestRuntime>> {
     let request = StepResourceAdmissionRequest::new(
@@ -35,7 +35,7 @@ fn admit_batch_step(
         match batch.try_begin_step(request.clone()).unwrap() {
             StepResourceAdmissionDecision::Admitted(step) => return step,
             StepResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
-                plan_resources.maintain_for_deferred(&deferred).unwrap();
+                deferred.maintain().unwrap();
             }
             _ => panic!("batch step admission did not converge"),
         }
@@ -44,7 +44,7 @@ fn admit_batch_step(
 }
 
 fn admit_batch_invocation(
-    plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
+    _plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
     step: &Arc<StepResourceLease<TestRuntime>>,
     node_id: &NodeId,
 ) -> InvocationResourceLease<TestRuntime> {
@@ -63,7 +63,7 @@ fn admit_batch_invocation(
         match step.try_admit_invocation(request.clone()).unwrap() {
             InvocationResourceAdmissionDecision::Admitted(invocation) => return invocation,
             InvocationResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
-                plan_resources.maintain_for_deferred(&deferred).unwrap();
+                deferred.maintain().unwrap();
             }
             _ => panic!("batch invocation admission did not converge"),
         }

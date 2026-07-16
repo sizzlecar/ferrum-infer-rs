@@ -3,7 +3,7 @@ mod vnext_device_operation_contract;
 use vnext_device_operation_contract::*;
 
 fn prepare_wave(
-    plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
+    _plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
     plan: &ExecutionPlan,
     step: &Arc<StepResourceLease<TestRuntime>>,
 ) -> PreparedStepSubmissionWave<TestRuntime> {
@@ -29,7 +29,7 @@ fn prepare_wave(
         match step.try_prepare_submission_wave(requests.clone()).unwrap() {
             StepSubmissionWaveAdmissionDecision::Prepared(wave) => return wave,
             StepSubmissionWaveAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
-                plan_resources.maintain_for_deferred(&deferred).unwrap();
+                deferred.maintain().unwrap();
             }
             _ => panic!("submission wave admission did not converge"),
         }

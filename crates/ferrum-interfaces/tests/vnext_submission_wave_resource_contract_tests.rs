@@ -69,7 +69,6 @@ fn sequential_scratch_plan() -> (
 }
 
 fn begin_step(
-    root: &Arc<PlanRuntimeResources<resource_support::TestRuntime>>,
     batch: &ExecutionBatchParticipants<resource_support::TestRuntime>,
 ) -> Arc<StepResourceLease<resource_support::TestRuntime>> {
     let request = StepResourceAdmissionRequest::new(
@@ -84,7 +83,7 @@ fn begin_step(
         match batch.try_begin_step(request.clone()).unwrap() {
             StepResourceAdmissionDecision::Admitted(step) => return step,
             StepResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
-                root.maintain_for_deferred(&deferred).unwrap();
+                deferred.maintain().unwrap();
             }
             _ => panic!("sequential scratch step admission did not converge"),
         }
@@ -92,13 +91,11 @@ fn begin_step(
     unreachable!("bounded step admission returns or panics")
 }
 
-fn prepare_wave(
-    root: &Arc<PlanRuntimeResources<resource_support::TestRuntime>>,
+fn submission_requests(
     plan: &ExecutionPlan,
     step: &Arc<StepResourceLease<resource_support::TestRuntime>>,
-) -> PreparedStepSubmissionWave<resource_support::TestRuntime> {
-    let requests = plan
-        .payload()
+) -> Vec<InvocationResourceAdmissionRequest> {
+    plan.payload()
         .nodes()
         .iter()
         .map(|node| {
@@ -111,12 +108,19 @@ fn prepare_wave(
             )
             .unwrap()
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn prepare_wave(
+    plan: &ExecutionPlan,
+    step: &Arc<StepResourceLease<resource_support::TestRuntime>>,
+) -> PreparedStepSubmissionWave<resource_support::TestRuntime> {
+    let requests = submission_requests(plan, step);
     for attempt in 0..=3 {
         match step.try_prepare_submission_wave(requests.clone()).unwrap() {
             StepSubmissionWaveAdmissionDecision::Prepared(wave) => return wave,
             StepSubmissionWaveAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
-                root.maintain_for_deferred(&deferred).unwrap();
+                deferred.maintain().unwrap();
             }
             _ => panic!("sequential scratch wave admission did not converge"),
         }
@@ -137,9 +141,9 @@ fn total_order_invocation_scratch_claims_peak_once_for_the_whole_wave() {
     );
     let session = sequence.open_session().unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
-    let step = begin_step(&root, &batch);
+    let step = begin_step(&batch);
 
-    let wave = prepare_wave(&root, &plan, &step);
+    let wave = prepare_wave(&plan, &step);
     let claimed = wave.claimed_backing();
     let immediate_bytes = claimed
         .demand()
@@ -169,6 +173,80 @@ fn total_order_invocation_scratch_claims_peak_once_for_the_whole_wave() {
     session.try_complete().unwrap();
     drop(session);
     drop(sequence);
+    drop(registry);
+    resource_support::close_plan_runtime(root);
+}
+
+#[test]
+fn submission_wave_backing_deferral_retains_step_until_exact_retry() {
+    let (plan, registry) = sequential_scratch_plan();
+    let (driver, _trace) = resource_support::configured_driver(&plan, &[], &[]);
+    let root = resource_support::plan_runtime(&plan, driver, "submission-wave-deferral-owner");
+    let first_sequence = resource_support::admit_logical_sequence(
+        &root,
+        "run.submission-wave-deferral-owner-first",
+        "request.submission-wave-deferral-owner-first",
+    );
+    let first_session = first_sequence.open_session().unwrap();
+    let first_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&first_session)]).unwrap();
+    let first_step = begin_step(&first_batch);
+    let first_wave = prepare_wave(&plan, &first_step);
+
+    let second_sequence = resource_support::admit_logical_sequence(
+        &root,
+        "run.submission-wave-deferral-owner-second",
+        "request.submission-wave-deferral-owner-second",
+    );
+    let second_session = second_sequence.open_session().unwrap();
+    let second_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&second_session)]).unwrap();
+    let step = begin_step(&second_batch);
+    let requests = submission_requests(&plan, &step);
+
+    let deferred = match step.try_prepare_submission_wave(requests.clone()).unwrap() {
+        StepSubmissionWaveAdmissionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("zero-resident invocation backing must defer the submission wave"),
+    };
+    assert_eq!(
+        deferred.node_work_fingerprints().len(),
+        plan.payload().nodes().len()
+    );
+    assert!(deferred
+        .node_work_fingerprints()
+        .iter()
+        .zip(plan.payload().nodes())
+        .all(|((node_id, _), node)| node_id == node.id()));
+
+    let failure = step
+        .try_retire_normal()
+        .expect_err("the deferred wave must retain the exact step parent");
+    assert!(failure
+        .error()
+        .to_string()
+        .contains("step cannot finalize while an invocation or scheduler clone retains it"));
+    let step = failure.into_step();
+    assert!(matches!(
+        deferred.maintain().unwrap(),
+        DynamicDeferredMaintenanceOutcome::Maintained(_)
+    ));
+    drop(deferred);
+
+    let wave = match step.try_prepare_submission_wave(requests).unwrap() {
+        StepSubmissionWaveAdmissionDecision::Prepared(wave) => wave,
+        _ => panic!("maintained invocation backing must prepare the exact wave"),
+    };
+    drop(wave);
+    step.try_retire_normal().unwrap();
+    drop(second_batch);
+    second_session.try_complete().unwrap();
+    drop(second_session);
+    drop(second_sequence);
+
+    drop(first_wave);
+    first_step.try_retire_normal().unwrap();
+    drop(first_batch);
+    first_session.try_complete().unwrap();
+    drop(first_session);
+    drop(first_sequence);
     drop(registry);
     resource_support::close_plan_runtime(root);
 }

@@ -894,9 +894,9 @@ fn zero_initial_capacity_defers_until_typed_initialization() {
     let RequestResourceAdmissionDecision::BackingDeferred(deferred) = decision else {
         panic!("zero-resident pool must defer")
     };
-    assert_eq!(deferred.blockers().len(), 1);
+    assert_eq!(deferred.evidence().blockers().len(), 1);
     assert_eq!(
-        deferred.blockers()[0].reason(),
+        deferred.evidence().blockers()[0].reason(),
         DynamicBackingDeferralReason::GrowthRequired
     );
     assert_eq!(harness.runtime.allocate_calls(), 0);
@@ -939,15 +939,11 @@ fn backing_deferral_reports_the_whole_pool_shortfall() {
     let RequestResourceAdmissionDecision::BackingDeferred(deferred) = admission() else {
         panic!("zero-resident pool must expose its complete batch shortfall")
     };
-    assert_eq!(deferred.blockers().len(), 1);
-    assert_eq!(deferred.blockers()[0].requested_bytes(), 192);
-    assert_eq!(deferred.blockers()[0].free_bytes(), 0);
+    assert_eq!(deferred.evidence().blockers().len(), 1);
+    assert_eq!(deferred.evidence().blockers()[0].requested_bytes(), 192);
+    assert_eq!(deferred.evidence().blockers()[0].free_bytes(), 0);
 
-    let DynamicDeferredMaintenanceOutcome::Maintained(receipt) = harness
-        .root
-        .maintenance_controller
-        .maintain_for_deferred(&deferred)
-        .unwrap()
+    let DynamicDeferredMaintenanceOutcome::Maintained(receipt) = deferred.maintain().unwrap()
     else {
         panic!("current batch shortfall must grow its pool")
     };
@@ -1060,9 +1056,7 @@ fn full_plan_budget_returns_typed_wait_and_reuses_backing_after_availability_cha
         current_epochs,
         pressure,
         ..
-    } = binding
-        .maintain_request_backing_for_deferred(&deferred)
-        .unwrap()
+    } = deferred.maintain().unwrap()
     else {
         panic!("unrelated epoch churn must preserve typed request backing pressure")
     };
@@ -1153,7 +1147,7 @@ fn plan_budget_wait_retains_staged_parent_and_reuses_released_sequence_backing()
         .root
         .trusted_runtime_binding()
         .unwrap()
-        .maintain_request_backing_for_deferred(&deferred)
+        .maintain_request_backing_for_deferred(deferred.evidence())
         .is_err());
     let churned = harness
         .root
@@ -1165,7 +1159,7 @@ fn plan_budget_wait_retains_staged_parent_and_reuses_released_sequence_backing()
                 .domain_id,
         )
         .unwrap();
-    assert_ne!(churned, deferred.epochs());
+    assert_ne!(churned, deferred.evidence().epochs());
     let allocations_before = runtime.allocate_calls();
     let DynamicDeferredMaintenanceOutcome::WaitForRelease {
         current_epochs,
@@ -1225,7 +1219,7 @@ fn capacity_waiter_retains_root_and_close_rejects_new_work() {
         RequestResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
         _ => panic!("zero-resident pool must defer before waiter registration"),
     };
-    let waiter = binding.register_backing_waiter(&deferred).unwrap();
+    let waiter = deferred.register_waiter().unwrap();
     drop(binding);
 
     let first_close = match PlanRuntimeResources::close(harness.root) {
@@ -1247,7 +1241,7 @@ fn capacity_waiter_retains_root_and_close_rejects_new_work() {
     };
     assert!(root.is_closing());
     assert!(root.trusted_runtime_binding().is_err());
-    assert!(root.maintain_for_deferred(&deferred).is_err());
+    assert!(deferred.maintain().is_err());
     assert!(matches!(
         waiter.recheck(),
         Err(VNextError::InvalidExecutionPlan { reason })
@@ -1294,7 +1288,7 @@ async fn closing_root_wakes_capacity_waiter_without_lost_notification() {
         RequestResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
         _ => panic!("zero-resident pool must defer before async waiter registration"),
     };
-    let waiter = binding.register_backing_waiter(&deferred).unwrap();
+    let waiter = deferred.register_waiter().unwrap();
     drop(binding);
     let task = tokio::spawn(waiter.wait_for_change());
 
@@ -1476,7 +1470,7 @@ fn lifecycle_gate_linearizes_maintenance_before_close() {
     };
     assert!(closing_root.is_closing());
     assert!(closing_root.trusted_runtime_binding().is_err());
-    assert!(closing_root.maintain_for_deferred(&deferred).is_err());
+    assert!(deferred.maintain().is_err());
     drop(deferred);
     drop(root);
     match PlanRuntimeResources::close(closing_root) {
@@ -2183,6 +2177,64 @@ fn step_captures_the_exact_sequence_backing_snapshot() {
 }
 
 #[test]
+fn step_backing_deferral_retains_exact_participant_session_until_retry() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'b',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 128);
+    let harness = harness(runtime, catalog, 128, false);
+    let sequence = admitted_sequence(&harness.root, "step-deferral-parent");
+    let session = sequence.open_session().unwrap();
+    let session_weak = Arc::downgrade(&session);
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let request = StepResourceAdmissionRequest::new(
+        batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+
+    let deferred = match batch.try_begin_step(request.clone()).unwrap() {
+        StepResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("zero-resident step backing must defer"),
+    };
+    assert_eq!(deferred.participant_count(), 1);
+    assert_eq!(
+        deferred.work_fingerprint(),
+        request.work_shape().fingerprint()
+    );
+    drop(batch);
+    drop(session);
+    assert!(session_weak.upgrade().is_some());
+
+    assert!(matches!(
+        deferred.maintain().unwrap(),
+        DynamicDeferredMaintenanceOutcome::Maintained(_)
+    ));
+    let retained_session = session_weak
+        .upgrade()
+        .expect("step backing authority retains its exact participant session");
+    drop(deferred);
+    let retry_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&retained_session)]).unwrap();
+    let step = match retry_batch.try_begin_step(request).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("maintained step backing must admit for the retained participant"),
+    };
+    step.try_retire_normal().unwrap();
+    retained_session.try_complete().unwrap();
+    drop(retry_batch);
+    drop(retained_session);
+    assert!(session_weak.upgrade().is_none());
+    drop(sequence);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
 fn sequence_backing_extension_publishes_atomically_between_frames() {
     let catalog = pool_catalog(
         paged_profile(),
@@ -2351,12 +2403,13 @@ fn sequence_backing_extension_waits_for_released_capacity_then_retries() {
         SequenceResourceExtensionDecision::BackingDeferred(deferred) => deferred,
         _ => panic!("resident sequence backing pressure must wait for release"),
     };
-    let waiter = session.register_backing_waiter(&deferred).unwrap();
+    let waiter = deferred.register_waiter().unwrap();
     assert!(!waiter.recheck().unwrap().should_retry());
 
     drop(second);
     assert!(waiter.recheck().unwrap().should_retry());
     drop(waiter);
+    drop(deferred);
 
     let extended = match session
         .try_extend_backing(
@@ -2391,6 +2444,80 @@ fn sequence_backing_extension_waits_for_released_capacity_then_retries() {
         .domains()
         .iter()
         .all(|domain| domain.used().get() == 0));
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn sequence_extension_deferral_retains_exact_session_and_rejects_stale_generation() {
+    let catalog = pool_catalog(
+        paged_profile(),
+        AllocationLifetime::Sequence,
+        'b',
+        1,
+        128,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 128);
+    let harness = harness(runtime, catalog, 128, false);
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 128)
+        .unwrap();
+    let first = admitted_sequence(&harness.root, "extension-owner-first");
+    let second = admitted_sequence(&harness.root, "extension-owner-second");
+    let session = first.open_session().unwrap();
+    let target = work(2);
+
+    let deferred = match session
+        .try_extend_backing(
+            SequenceResourceExtensionRequest::new(
+                target.clone(),
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("occupied backing must defer the exact sequence extension"),
+    };
+    assert_eq!(deferred.expected_generation().get(), 1);
+    assert_eq!(deferred.target_fingerprint(), target.fingerprint());
+
+    let session_weak = Arc::downgrade(&session);
+    drop(session);
+    assert!(session_weak.upgrade().is_some());
+    drop(second);
+
+    let retained_session = session_weak
+        .upgrade()
+        .expect("the deferred authority retains its exact session");
+    let extended = match retained_session
+        .try_extend_backing(
+            SequenceResourceExtensionRequest::new(target, AdmissionPressureAction::WaitForRelease)
+                .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::Extended(snapshot) => snapshot,
+        _ => panic!("released backing must extend through the retained session"),
+    };
+    assert_eq!(extended.generation().get(), 2);
+    assert!(matches!(
+        deferred.maintain().unwrap(),
+        DynamicDeferredMaintenanceOutcome::RetryAdmission { .. }
+    ));
+
+    retained_session.request_cancel().unwrap();
+    let terminal = retained_session.try_abort().unwrap();
+    assert!(deferred.maintain().is_err());
+    drop(terminal);
+    drop(deferred);
+    drop(retained_session);
+    assert!(session_weak.upgrade().is_none());
+    drop(first);
+    drop(extended);
     close_dynamic_test_root(harness.root);
 }
 
@@ -2668,11 +2795,9 @@ fn two_plans_contend_on_one_process_wide_device_account() {
         RequestResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
         _ => panic!("zero-resident first plan must defer"),
     };
-    assert!(second
-        .root
-        .maintenance_controller
-        .maintain_for_deferred(&foreign)
-        .is_err());
+    assert!(
+        PlanBackingDeferral::new(Arc::clone(&second.root), foreign.evidence().clone(),).is_err()
+    );
     let first_status = &first.root.maintenance_controller.status().unwrap();
     let second_status = &second.root.maintenance_controller.status().unwrap();
     assert_eq!(first_status.effective_device_usable_ceiling_bytes(), 96);
@@ -2707,7 +2832,7 @@ fn two_plans_contend_on_one_process_wide_device_account() {
         wait_condition,
         pressure,
         ..
-    } = second.root.maintain_for_deferred(&second_deferred).unwrap()
+    } = second_deferred.maintain().unwrap()
     else {
         panic!("process-wide pressure must become a typed capacity wait")
     };
@@ -2817,25 +2942,18 @@ fn controller_maintains_current_deferral_and_retries_stale_epoch_without_growth(
     assert_eq!(before.pools()[0].resident_bytes(), 0);
     assert_eq!(before.budget_claimed_bytes(), 0);
 
-    let DynamicDeferredMaintenanceOutcome::Maintained(receipt) = harness
-        .root
-        .maintenance_controller
-        .maintain_for_deferred(&deferred)
-        .unwrap()
+    let DynamicDeferredMaintenanceOutcome::Maintained(receipt) = deferred.maintain().unwrap()
     else {
         panic!("current deferral must be maintained")
     };
     assert_eq!(receipt.growths().len(), 1);
     assert_eq!(runtime.allocate_calls(), 1);
-    let DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs } = harness
-        .root
-        .maintenance_controller
-        .maintain_for_deferred(&deferred)
-        .unwrap()
+    let DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs } =
+        deferred.maintain().unwrap()
     else {
         panic!("stale deferral must retry without another growth")
     };
-    assert_ne!(current_epochs, deferred.epochs());
+    assert_ne!(current_epochs, deferred.evidence().epochs());
     assert_eq!(runtime.allocate_calls(), 1);
 }
 

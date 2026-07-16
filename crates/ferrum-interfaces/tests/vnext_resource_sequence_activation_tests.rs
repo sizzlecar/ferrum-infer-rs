@@ -195,7 +195,7 @@ fn deferred_admission_has_no_execution_authority(_plan: &ExecutionPlan, passed: 
                 break;
             }
             SequenceResourceAdmissionDecision::BackingDeferred(backing) if attempt < 3 => {
-                root.maintain_for_deferred(&backing).unwrap();
+                backing.maintain().unwrap();
             }
             SequenceResourceAdmissionDecision::BackingDeferred(_) => {
                 panic!("deferred admission backing did not converge after bounded maintenance")

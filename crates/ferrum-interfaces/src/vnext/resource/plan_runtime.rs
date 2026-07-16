@@ -356,6 +356,69 @@ where
     pub(super) resources: Arc<PlanRuntimeResources<R>>,
 }
 
+/// Internal owning capability that binds non-authoritative backing evidence to
+/// the one plan runtime allowed to revalidate it. Public scope-specific handles
+/// embed this value and retain any additional request/session/step parent.
+pub(super) struct PlanBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    evidence: DynamicBackingDeferred,
+    resources: Arc<PlanRuntimeResources<R>>,
+}
+
+impl<R> PlanBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    pub(super) fn new(
+        resources: Arc<PlanRuntimeResources<R>>,
+        evidence: DynamicBackingDeferred,
+    ) -> Result<Self, VNextError> {
+        {
+            let _lifecycle = resources.read_lifecycle("bind deferred backing to its plan")?;
+            if evidence.wait_condition().coordinator_id()
+                != resources.dynamic_pools.logical_admission.id()
+            {
+                return Err(invalid_resource(
+                    "deferred backing belongs to another plan coordinator",
+                ));
+            }
+        }
+        Ok(Self {
+            evidence,
+            resources,
+        })
+    }
+
+    pub(super) fn evidence(&self) -> &DynamicBackingDeferred {
+        &self.evidence
+    }
+
+    pub(super) fn maintain(&self) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        let _lifecycle = self
+            .resources
+            .read_lifecycle("maintain plan-owned deferred backing")?;
+        self.resources
+            .maintenance_controller
+            .maintain_for_live_deferred(&self.evidence)
+    }
+
+    pub(super) fn retry_admission(&self) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        let mut availability = Vec::with_capacity(self.resources.dynamic_pools.domains.len() + 3);
+        let current_epochs = self
+            .resources
+            .dynamic_pools
+            .write_capacity_availability(&mut availability)?;
+        Ok(DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs })
+    }
+
+    pub(super) fn register_waiter(&self) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
+        self.resources
+            .register_capacity_waiter(self.evidence.wait_condition())
+    }
+}
+
 /// A capacity wait registration that keeps its exact plan runtime alive until
 /// the waiter either observes a retry epoch or is cancelled by being dropped.
 #[must_use = "capacity wait registrations must be awaited, rechecked, or dropped"]
@@ -728,18 +791,6 @@ where
         Ok(TrustedPlanRuntimeBinding {
             resources: Arc::clone(self),
         })
-    }
-
-    /// Resolves physical backing pressure for this plan while retaining the
-    /// owning root for the full maintenance operation. A close racing before
-    /// the second phase check is rejected; a close racing after it observes
-    /// this operation's `Arc` and cannot release the root underneath it.
-    pub fn maintain_for_deferred(
-        self: &Arc<Self>,
-        deferred: &DynamicBackingDeferred,
-    ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
-        let _lifecycle = self.read_lifecycle("maintain deferred dynamic backing")?;
-        self.maintenance_controller.maintain_for_deferred(deferred)
     }
 
     pub fn maintain_for_admission_deferred(
@@ -1349,7 +1400,7 @@ where
         self.dynamic_pools().prepare_claim(&requested_slices)
     }
 
-    pub fn register_backing_waiter(
+    pub(super) fn register_backing_waiter(
         &self,
         deferred: &DynamicBackingDeferred,
     ) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
