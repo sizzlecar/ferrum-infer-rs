@@ -55,6 +55,7 @@ fn make_engine_speculative(
         Some(draft),
         Some(cfg),
     )
+    .expect("legacy engine composition must match executor authority")
 }
 
 fn make_request(prompt: &str, max_tokens: usize) -> InferenceRequest {
@@ -139,6 +140,7 @@ async fn speculative_output_matches_non_speculative_for_identical_models() {
             executor,
             tensor_factory,
         )
+        .expect("legacy engine composition must match executor authority")
     };
     let baseline_resp = baseline_engine
         .infer(make_request("hi", 4))

@@ -30,6 +30,7 @@ fn make_engine() -> ContinuousBatchEngine {
         executor,
         tensor_factory,
     )
+    .expect("legacy engine composition must match executor authority")
 }
 
 fn make_request(prompt: &str) -> InferenceRequest {
@@ -165,7 +166,8 @@ async fn kv_cache_allocated_and_deallocated() {
         kv_cache.clone(),
         executor,
         tensor_factory,
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     // Before: no active caches
     assert_eq!(kv_cache.active_count(), 0);
@@ -195,7 +197,8 @@ async fn mock_executor_tracks_operations() {
         kv_cache,
         executor.clone(),
         tensor_factory,
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     assert_eq!(executor.prefill_count(), 0);
     assert_eq!(executor.decode_count(), 0);
@@ -230,7 +233,8 @@ async fn engine_with_latency_still_completes() {
         kv_cache,
         executor,
         tensor_factory,
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let request = make_request("Latency test");
     let response = engine.infer(request).await.unwrap();
@@ -283,15 +287,18 @@ async fn concurrent_requests_deallocate_kv() {
     let executor = Arc::new(MockModelExecutor::instant(VOCAB_SIZE));
     let tensor_factory = Arc::new(MockTensorFactory);
 
-    let engine = Arc::new(ContinuousBatchEngine::new(
-        config,
-        scheduler,
-        tokenizer,
-        sampler,
-        kv_cache.clone(),
-        executor,
-        tensor_factory,
-    ));
+    let engine = Arc::new(
+        ContinuousBatchEngine::new(
+            config,
+            scheduler,
+            tokenizer,
+            sampler,
+            kv_cache.clone(),
+            executor,
+            tensor_factory,
+        )
+        .expect("legacy engine composition must match executor authority"),
+    );
 
     assert_eq!(kv_cache.active_count(), 0);
 
@@ -385,7 +392,8 @@ async fn prefix_cache_avoids_second_prefill() {
         kv_cache,
         executor.clone(),
         tensor_factory,
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     // First request — cache miss, runs real prefill
     let req1 = make_request("Identical prompt for prefix cache");

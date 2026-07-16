@@ -29,6 +29,7 @@ fn make_engine_with_blocks(max_blocks: usize) -> ContinuousBatchEngine {
         executor,
         tensor_factory,
     )
+    .expect("legacy engine composition must match executor authority")
 }
 
 fn make_request(id: usize, max_tokens: usize) -> InferenceRequest {

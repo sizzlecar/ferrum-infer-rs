@@ -62,6 +62,7 @@ fn build_engine_with_tokenizer(
         executor,
         tensor_factory,
     )
+    .expect("legacy engine composition must match executor authority")
 }
 
 fn greedy_request(prompt: &str, max_tokens: usize) -> InferenceRequest {

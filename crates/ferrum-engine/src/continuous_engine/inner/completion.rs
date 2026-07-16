@@ -193,8 +193,8 @@ impl EngineInner {
             sequence.take_completion_resources()
         };
 
-        if self.model_executor.execution_resource_ownership()
-            == ExecutionResourceOwnership::ExecutorManaged
+        if self.model_executor.execution_resource_authority()
+            == ExecutionResourceAuthority::PlanRuntime
         {
             self.model_executor.cancel_prefill_admission(request_id);
         }
@@ -280,8 +280,8 @@ impl EngineInner {
             }
         };
 
-        if self.model_executor.execution_resource_ownership()
-            == ExecutionResourceOwnership::ExecutorManaged
+        if self.model_executor.execution_resource_authority()
+            == ExecutionResourceAuthority::PlanRuntime
         {
             self.model_executor.cancel_prefill_admission(request_id);
         }

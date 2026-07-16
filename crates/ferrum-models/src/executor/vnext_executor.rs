@@ -15,12 +15,12 @@ use std::time::Instant;
 
 use ferrum_interfaces::kv_cache::{BlockTable, CacheHandleStats};
 use ferrum_interfaces::model_executor::{
-    AttentionType, DecodeInput, DecodeOutput, ExecutionResourceOwnership, ExecutorAdmissionEpochs,
+    AttentionType, DecodeInput, DecodeOutput, ExecutionResourceAuthority, ExecutorAdmissionEpochs,
     ExecutorCapabilities, ExecutorMemoryUsage, ExecutorPrefillAdmission,
     ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
     ExecutorPrefillCapacityWaitRegistration, ExecutorPrefillMaintenanceDeferral,
     ExecutorPrefillMaintenanceOutcome, ExecutorState, ExecutorStatus, MemoryRequirements,
-    PrefillInput, PrefillOutput,
+    PlanRuntimeResourceSnapshot, PrefillInput, PrefillOutput,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -2146,8 +2146,45 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         &self.info
     }
 
-    fn execution_resource_ownership(&self) -> ExecutionResourceOwnership {
-        ExecutionResourceOwnership::ExecutorManaged
+    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
+        ExecutionResourceAuthority::PlanRuntime
+    }
+
+    fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
+        let status = self
+            .plan_resources
+            .dynamic_pool_status()
+            .map_err(|error| FerrumError::internal(error.to_string()))?;
+        let mut resident_bytes = 0_u64;
+        let mut free_bytes = 0_u64;
+        let mut pending_growth_bytes = 0_u64;
+        let mut quarantined_bytes = 0_u64;
+        for pool in status.pools() {
+            resident_bytes = resident_bytes
+                .checked_add(pool.resident_bytes())
+                .ok_or_else(|| FerrumError::internal("dynamic resident bytes overflow u64"))?;
+            free_bytes = free_bytes
+                .checked_add(pool.free_bytes())
+                .ok_or_else(|| FerrumError::internal("dynamic free bytes overflow u64"))?;
+            pending_growth_bytes = pending_growth_bytes
+                .checked_add(pool.pending_growth_bytes())
+                .ok_or_else(|| FerrumError::internal("pending growth bytes overflow u64"))?;
+            quarantined_bytes = quarantined_bytes
+                .checked_add(pool.quarantined_bytes())
+                .ok_or_else(|| FerrumError::internal("quarantined bytes overflow u64"))?;
+        }
+        PlanRuntimeResourceSnapshot::new(
+            status.device_capacity_bytes(),
+            status.effective_device_usable_ceiling_bytes(),
+            status.process_claimed_bytes(),
+            status.budget_claimed_bytes(),
+            self.static_bytes,
+            resident_bytes,
+            free_bytes,
+            pending_growth_bytes,
+            quarantined_bytes,
+        )
+        .map(Some)
     }
 
     fn kv_capacity(&self) -> Option<usize> {
@@ -2200,7 +2237,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     ) -> Result<ExecutorPrefillAdmissionDecision> {
         if input.input_tokens.is_empty() {
             return Err(FerrumError::request_validation(
-                "executor-owned vNext prefill admission requires at least one input token",
+                "plan-runtime vNext prefill admission requires at least one input token",
             ));
         }
         if input.maximum_sequence_tokens < input.input_tokens.len()
@@ -2451,13 +2488,13 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         }
         let request_id = input.request_id.clone().ok_or_else(|| {
             FerrumError::request_validation(
-                "executor-owned vNext prefill requires a typed request_id",
+                "plan-runtime vNext prefill requires a typed request_id",
             )
         })?;
         let tokens = common::tensor_to_tokens(&input.input_ids)?;
         let maximum_tokens = input.maximum_sequence_tokens.ok_or_else(|| {
             FerrumError::request_validation(
-                "executor-owned vNext prefill requires maximum_sequence_tokens",
+                "plan-runtime vNext prefill requires maximum_sequence_tokens",
             )
         })?;
         if maximum_tokens < tokens.len() || maximum_tokens > self.maximum_model_tokens {
@@ -2717,7 +2754,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_capacity_deferral_preserves_executor_owned_sequence() {
+    fn decode_capacity_deferral_preserves_plan_runtime_sequence() {
         let error = FerrumError::resource_exhausted("dynamic pool is waiting for release");
 
         assert_eq!(
@@ -2727,7 +2764,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_permanent_failure_aborts_executor_owned_sequence() {
+    fn decode_permanent_failure_aborts_plan_runtime_sequence() {
         let error = FerrumError::request_validation("sequence exceeds its configured ceiling");
 
         assert_eq!(

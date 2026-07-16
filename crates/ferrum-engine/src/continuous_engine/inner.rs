@@ -1039,17 +1039,15 @@ impl EngineInner {
         let sched_t0 = Instant::now();
         let nb_t0 = if nb_prof { Some(Instant::now()) } else { None };
         let mut prefill_maintenance = Vec::new();
-        let executor_managed = self.model_executor.execution_resource_ownership()
-            == ExecutionResourceOwnership::ExecutorManaged;
-        let nb_result = if executor_managed {
+        let plan_runtime_managed = self.model_executor.execution_resource_authority()
+            == ExecutionResourceAuthority::PlanRuntime;
+        let nb_result = if plan_runtime_managed {
             let mut availability = self.dynamic_admission_availability.lock();
             let epochs = self
                 .model_executor
                 .write_prefill_admission_snapshot(&mut availability)?
                 .ok_or_else(|| {
-                    FerrumError::scheduler(
-                        "executor-managed runtime did not expose typed admission epochs",
-                    )
+                    FerrumError::scheduler("plan runtime did not expose typed admission epochs")
                 })?;
             let wake_epochs = AdmissionWakeEpochs::new(
                 epochs.coordinator_id,
@@ -1175,14 +1173,14 @@ impl EngineInner {
                 if self.scheduler.active_count() > 0 {
                     return Ok(EngineIterationOutcome::Progressed);
                 }
-                if executor_managed {
+                if plan_runtime_managed {
                     if let Some(observed) = self.scheduler.passive_capacity_wait_condition()? {
                         let registration = self
                             .model_executor
                             .register_prefill_capacity_waiter(&observed)?
                             .ok_or_else(|| {
                                 FerrumError::scheduler(
-                                    "executor-managed runtime did not register its capacity waiter",
+                                    "plan runtime did not register its capacity waiter",
                                 )
                             })?;
                         return Ok(EngineIterationOutcome::CapacityBlocked(registration));

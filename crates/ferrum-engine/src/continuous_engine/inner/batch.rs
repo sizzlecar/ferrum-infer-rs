@@ -7,10 +7,10 @@ impl EngineInner {
         &self,
         batch: &ferrum_interfaces::BatchPlan,
     ) -> Result<()> {
-        if self.model_executor.execution_resource_ownership()
-            == ferrum_interfaces::model_executor::ExecutionResourceOwnership::ExecutorManaged
+        if self.model_executor.execution_resource_authority()
+            == ferrum_interfaces::model_executor::ExecutionResourceAuthority::PlanRuntime
         {
-            return self.process_batch_executor_owned(batch).await;
+            return self.process_batch_plan_runtime(batch).await;
         }
 
         // Single-shot unified path: prefill + decode items go through ONE
@@ -44,10 +44,7 @@ impl EngineInner {
     /// allocation, and decode preserves the opaque executor handle returned by
     /// the preceding step. Resource pressure therefore has one authority and
     /// is surfaced to the scheduler before another request is dispatched.
-    async fn process_batch_executor_owned(
-        &self,
-        batch: &ferrum_interfaces::BatchPlan,
-    ) -> Result<()> {
+    async fn process_batch_plan_runtime(&self, batch: &ferrum_interfaces::BatchPlan) -> Result<()> {
         let mut prefill_ids = Vec::new();
         let mut decode_ids = Vec::new();
         {
@@ -75,24 +72,24 @@ impl EngineInner {
         }
 
         for rid in &prefill_ids {
-            if let Err(error) = self.run_executor_owned_prefill(rid).await {
-                warn!("Executor-owned prefill failed for {}: {}", rid, error);
+            if let Err(error) = self.run_plan_runtime_prefill(rid).await {
+                warn!("Plan-runtime prefill failed for {}: {}", rid, error);
                 if is_resource_exhausted_error(&error) {
                     warn!(
                         request_id = %rid,
-                        "Executor-owned prefill crossed typed admission with insufficient capacity"
+                        "Plan-runtime prefill crossed typed admission with insufficient capacity"
                     );
                 }
                 self.complete_request(rid, FinishReason::Error).await?;
             }
         }
 
-        // Until the executor-owned mixed-batch result carries updated opaque
+        // Until the plan-runtime mixed-batch result carries updated opaque
         // handles, decode stays per request. This preserves the single resource
         // authority and the scheduler's dynamic wait semantics.
         for rid in self.decode_ready_request_ids(&decode_ids) {
             if let Err(error) = self.run_decode_step(&rid).await {
-                warn!("Executor-owned decode failed for {}: {}", rid, error);
+                warn!("Plan-runtime decode failed for {}: {}", rid, error);
                 if is_resource_exhausted_error(&error) {
                     continue;
                 }
@@ -337,9 +334,10 @@ impl EngineInner {
             }
 
             if existing_recurrent_state.is_none() {
-                if let (Some(spec), Some(manager)) =
-                    (recurrent_state_spec.as_ref(), &self.recurrent_state_manager)
-                {
+                if let (Some(spec), Some(manager)) = (
+                    recurrent_state_spec.as_ref(),
+                    self.recurrent_state_manager(),
+                ) {
                     if !manager.can_allocate(spec) {
                         warn!(
                             "Unified prefill recurrent-state alloc deferred for {}: insufficient capacity",
@@ -1005,8 +1003,7 @@ impl EngineInner {
             "request_id": request_id.to_string(),
             "scheduler": self.scheduler.trace_snapshot(),
             "recurrent_state": self
-                .recurrent_state_manager
-                .as_ref()
+                .recurrent_state_manager()
                 .map(|manager| manager.stats()),
         }));
         self.trace_scheduler_defer(

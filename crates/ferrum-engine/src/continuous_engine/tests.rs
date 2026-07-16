@@ -11,7 +11,7 @@ use ferrum_interfaces::{
         ExecutorPrefillAdmissionReceipt, ExecutorPrefillCapacityWaitRegistration,
         ExecutorPrefillMaintenanceBlocker, ExecutorPrefillMaintenanceDeferral,
         ExecutorPrefillMaintenanceOutcome, ExecutorPrefillMaintenanceStage, ExecutorStatus,
-        PrefillInput, PrefillOutput, UnifiedBatch,
+        PlanRuntimeResourceSnapshot, PrefillInput, PrefillOutput, UnifiedBatch,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateManager, RecurrentStateSpec,
     RecurrentStateTensorSpec, TensorRef,
@@ -20,14 +20,14 @@ use ferrum_models::{DecoderOnlyLLM, LlmExecutor, LlmRuntimeConfig};
 use ferrum_testkit::{MockKvCacheManager, MockModelExecutor, MockTensor, MockTensorFactory};
 use std::time::Duration;
 
-struct ExecutorManagedAdmissionTestExecutor {
+struct PlanRuntimeAdmissionTestExecutor {
     inner: MockModelExecutor,
     retained: std::sync::Mutex<HashSet<RequestId>>,
     admission_probes: AtomicU64,
     prefill_calls: AtomicU64,
 }
 
-impl ExecutorManagedAdmissionTestExecutor {
+impl PlanRuntimeAdmissionTestExecutor {
     fn new(vocab_size: usize) -> Self {
         Self {
             inner: MockModelExecutor::instant(vocab_size),
@@ -39,13 +39,17 @@ impl ExecutorManagedAdmissionTestExecutor {
 }
 
 #[async_trait::async_trait]
-impl ModelExecutor for ExecutorManagedAdmissionTestExecutor {
+impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.inner.info()
     }
 
-    fn execution_resource_ownership(&self) -> ExecutionResourceOwnership {
-        ExecutionResourceOwnership::ExecutorManaged
+    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
+        ExecutionResourceAuthority::PlanRuntime
+    }
+
+    fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
+        PlanRuntimeResourceSnapshot::new(1_000, 900, 700, 700, 400, 300, 200, 0, 0).map(Some)
     }
 
     fn prefill_admission_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
@@ -127,7 +131,7 @@ enum TestMaintenanceBehavior {
     Fail,
 }
 
-struct ExecutorManagedMaintenanceTestExecutor {
+struct PlanRuntimeMaintenanceTestExecutor {
     inner: MockModelExecutor,
     retained: std::sync::Mutex<HashSet<RequestId>>,
     release_epoch: AtomicU64,
@@ -141,7 +145,7 @@ struct ExecutorManagedMaintenanceTestExecutor {
     capacity_signal: tokio::sync::watch::Sender<u64>,
 }
 
-impl ExecutorManagedMaintenanceTestExecutor {
+impl PlanRuntimeMaintenanceTestExecutor {
     fn new(vocab_size: usize) -> Self {
         Self::with_behavior(vocab_size, TestMaintenanceBehavior::Advance)
     }
@@ -196,13 +200,17 @@ impl ExecutorManagedMaintenanceTestExecutor {
 }
 
 #[async_trait::async_trait]
-impl ModelExecutor for ExecutorManagedMaintenanceTestExecutor {
+impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
     fn info(&self) -> &ferrum_types::ModelInfo {
         self.inner.info()
     }
 
-    fn execution_resource_ownership(&self) -> ExecutionResourceOwnership {
-        ExecutionResourceOwnership::ExecutorManaged
+    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
+        ExecutionResourceAuthority::PlanRuntime
+    }
+
+    fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
+        PlanRuntimeResourceSnapshot::new(1_000, 900, 700, 700, 400, 300, 200, 0, 0).map(Some)
     }
 
     fn prefill_admission_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
@@ -1724,7 +1732,8 @@ async fn process_batch_unified_forwards_prefill_logits_policy() {
         kv_cache,
         executor,
         tensor_factory,
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
     let mut request = policy_request();
     request.sampling_params.max_tokens = 1;
 
@@ -1779,7 +1788,8 @@ async fn process_batch_unified_honors_runtime_chunked_prefill() {
         kv_cache,
         executor,
         tensor_factory,
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
     let mut request = policy_request();
     request.prompt = "test ok".to_string();
     request.sampling_params.max_tokens = 1;
@@ -1826,7 +1836,8 @@ async fn process_batch_unified_co_batches_active_decode_with_fresh_prefill_chunk
         kv_cache,
         executor,
         tensor_factory,
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut decode_request = policy_request();
     decode_request.prompt = "test".to_string();
@@ -1966,7 +1977,8 @@ fn performance_breakdown_reports_engine_timing_counters() {
         kv_cache,
         model_executor,
         tensor_factory,
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     engine
         .inner
@@ -2017,6 +2029,7 @@ fn test_continuous_engine_with_config(config: EngineConfig) -> ContinuousBatchEn
         model_executor,
         tensor_factory,
     )
+    .expect("legacy engine composition must match executor authority")
 }
 
 #[tokio::test]
@@ -2077,26 +2090,147 @@ async fn shutdown_wakes_an_idle_background_loop() {
         .expect("background loop must not panic");
 }
 
+#[test]
+fn resource_composition_mismatch_is_a_configuration_error() {
+    let config = EngineConfig::default();
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+
+    let legacy_executor: Arc<dyn ModelExecutor + Send + Sync> =
+        Arc::new(MockModelExecutor::instant(128));
+    let plan_runtime_error = ContinuousBatchEngine::new_plan_runtime(
+        config.clone(),
+        Arc::clone(&scheduler),
+        Arc::clone(&tokenizer),
+        Arc::clone(&sampler),
+        legacy_executor,
+        Arc::clone(&tensor_factory),
+    )
+    .err()
+    .expect("legacy executor must not enter a plan-runtime composition");
+    assert!(plan_runtime_error
+        .to_string()
+        .contains("does not match executor authority"));
+
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
+    let plan_runtime_executor: Arc<dyn ModelExecutor + Send + Sync> =
+        Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
+    let legacy_error = ContinuousBatchEngine::new(
+        config,
+        scheduler,
+        tokenizer,
+        sampler,
+        kv_cache,
+        plan_runtime_executor,
+        tensor_factory,
+    )
+    .err()
+    .expect("plan-runtime executor must not enter a legacy composition");
+    assert!(legacy_error
+        .to_string()
+        .contains("does not match executor authority"));
+}
+
+#[test]
+fn resource_composition_rejects_unpaired_or_mismatched_speculation() {
+    let config = EngineConfig::default();
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
+    let legacy_executor: Arc<dyn ModelExecutor + Send + Sync> =
+        Arc::new(MockModelExecutor::instant(128));
+    let plan_runtime_draft: Arc<dyn ModelExecutor + Send + Sync> =
+        Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+
+    let unpaired = ContinuousBatchEngine::new_with_speculation(
+        config.clone(),
+        Arc::clone(&scheduler),
+        Arc::clone(&tokenizer),
+        Arc::clone(&sampler),
+        Arc::clone(&kv_cache),
+        Arc::clone(&legacy_executor),
+        Arc::clone(&tensor_factory),
+        None,
+        Some(crate::speculative::SpeculativeDecodingConfig::default()),
+    )
+    .err()
+    .expect("an unpaired speculative configuration must fail");
+    assert!(unpaired
+        .to_string()
+        .contains("requires both a draft executor and its configuration"));
+
+    let mismatched = ContinuousBatchEngine::new_with_speculation(
+        config,
+        scheduler,
+        tokenizer,
+        sampler,
+        kv_cache,
+        legacy_executor,
+        tensor_factory,
+        Some(plan_runtime_draft),
+        Some(crate::speculative::SpeculativeDecodingConfig::default()),
+    )
+    .err()
+    .expect("draft and target resource authorities must match");
+    assert!(mismatched
+        .to_string()
+        .contains("does not match target authority"));
+}
+
 #[tokio::test]
-async fn executor_managed_product_path_requires_typed_admission_before_prefill() {
+async fn plan_runtime_status_separates_static_and_dynamic_memory() {
+    let config = EngineConfig::default();
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let executor: Arc<dyn ModelExecutor + Send + Sync> =
+        Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let engine = ContinuousBatchEngine::new_plan_runtime(
+        config,
+        scheduler,
+        tokenizer,
+        sampler,
+        executor,
+        tensor_factory,
+    )
+    .unwrap();
+
+    let status = engine.status().await;
+
+    assert_eq!(status.memory_usage.total_bytes, 900);
+    assert_eq!(status.memory_usage.used_bytes, 500);
+    assert_eq!(status.memory_usage.free_bytes, 400);
+    assert_eq!(status.memory_usage.cache_memory_bytes, 100);
+    assert!((status.memory_usage.utilization_percent - 55.555557).abs() < 0.001);
+}
+
+#[tokio::test]
+async fn plan_runtime_product_path_requires_typed_admission_before_prefill() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
-    let executor = Arc::new(ExecutorManagedAdmissionTestExecutor::new(128));
+    let executor = Arc::new(PlanRuntimeAdmissionTestExecutor::new(128));
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new(
+    let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
-        kv_cache,
         executor.clone(),
         tensor_factory,
-    );
+    )
+    .unwrap();
     let mut request = policy_request();
     request.sampling_params.max_tokens = 1;
 
@@ -2116,7 +2250,7 @@ async fn executor_managed_product_path_requires_typed_admission_before_prefill()
 }
 
 #[tokio::test]
-async fn executor_managed_backing_maintenance_advances_epoch_before_prefill() {
+async fn plan_runtime_backing_maintenance_advances_epoch_before_prefill() {
     let trace_path = resource_trace_temp_path("executor-prefill-maintenance");
     let _ = std::fs::remove_file(&trace_path);
     let mut config = EngineConfig::default();
@@ -2127,18 +2261,17 @@ async fn executor_managed_backing_maintenance_advances_epoch_before_prefill() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
-    let executor = Arc::new(ExecutorManagedMaintenanceTestExecutor::new(128));
+    let executor = Arc::new(PlanRuntimeMaintenanceTestExecutor::new(128));
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new(
+    let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
-        kv_cache,
         executor.clone(),
         tensor_factory,
-    );
+    )
+    .unwrap();
     let mut request = policy_request();
     request.sampling_params.max_tokens = 1;
     let request_id = request.id.clone();
@@ -2207,28 +2340,29 @@ async fn executor_managed_backing_maintenance_advances_epoch_before_prefill() {
 }
 
 #[tokio::test]
-async fn executor_managed_capacity_pressure_waits_without_spinning_then_retries_on_release() {
+async fn plan_runtime_capacity_pressure_waits_without_spinning_then_retries_on_release() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
-    let executor = Arc::new(ExecutorManagedMaintenanceTestExecutor::with_behavior(
+    let executor = Arc::new(PlanRuntimeMaintenanceTestExecutor::with_behavior(
         128,
         TestMaintenanceBehavior::WaitForRelease,
     ));
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = Arc::new(ContinuousBatchEngine::new(
-        config,
-        Arc::clone(&scheduler),
-        tokenizer,
-        sampler,
-        kv_cache,
-        executor.clone(),
-        tensor_factory,
-    ));
+    let engine = Arc::new(
+        ContinuousBatchEngine::new_plan_runtime(
+            config,
+            Arc::clone(&scheduler),
+            tokenizer,
+            sampler,
+            executor.clone(),
+            tensor_factory,
+        )
+        .unwrap(),
+    );
     let mut request = policy_request();
     request.sampling_params.max_tokens = 1;
     let infer_engine = Arc::clone(&engine);
@@ -2278,28 +2412,27 @@ async fn executor_managed_capacity_pressure_waits_without_spinning_then_retries_
 }
 
 #[tokio::test]
-async fn executor_managed_retry_admission_does_not_require_a_published_epoch() {
+async fn plan_runtime_retry_admission_does_not_require_a_published_epoch() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(ferrum_testkit::MockTokenizer::new(128));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
-    let executor = Arc::new(ExecutorManagedMaintenanceTestExecutor::with_behavior(
+    let executor = Arc::new(PlanRuntimeMaintenanceTestExecutor::with_behavior(
         128,
         TestMaintenanceBehavior::RetryAdmission,
     ));
     let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-    let engine = ContinuousBatchEngine::new(
+    let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         Arc::clone(&scheduler),
         tokenizer,
         sampler,
-        kv_cache,
         executor.clone(),
         tensor_factory,
-    );
+    )
+    .unwrap();
     let mut request = policy_request();
     request.sampling_params.max_tokens = 1;
 
@@ -2318,7 +2451,7 @@ async fn executor_managed_retry_admission_does_not_require_a_published_epoch() {
 }
 
 #[tokio::test]
-async fn executor_managed_invalid_maintenance_fails_waiting_request_without_retry_loop() {
+async fn plan_runtime_invalid_maintenance_fails_waiting_request_without_retry_loop() {
     for behavior in [TestMaintenanceBehavior::Fail] {
         let mut config = EngineConfig::default();
         config.kv_cache.max_blocks = 128;
@@ -2326,21 +2459,19 @@ async fn executor_managed_invalid_maintenance_fails_waiting_request_without_retr
         let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
             Arc::new(ferrum_testkit::MockTokenizer::new(128));
         let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
-        let kv_cache: Arc<dyn KvCacheManager + Send + Sync> =
-            Arc::new(MockKvCacheManager::new(128));
-        let executor = Arc::new(ExecutorManagedMaintenanceTestExecutor::with_behavior(
+        let executor = Arc::new(PlanRuntimeMaintenanceTestExecutor::with_behavior(
             128, behavior,
         ));
         let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
-        let engine = ContinuousBatchEngine::new(
+        let engine = ContinuousBatchEngine::new_plan_runtime(
             config,
             Arc::clone(&scheduler),
             tokenizer,
             sampler,
-            kv_cache,
             executor.clone(),
             tensor_factory,
-        );
+        )
+        .unwrap();
         let mut request = policy_request();
         request.sampling_params.max_tokens = 1;
 
@@ -2763,7 +2894,8 @@ async fn kv_release_failure_traces_reject_without_successful_release() {
         kv_cache,
         model_executor,
         tensor_factory,
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let request_id = RequestId::new();
     engine.inner.trace_kv_allocate(&request_id, 2);
@@ -2832,7 +2964,8 @@ async fn recurrent_release_failure_traces_reject_without_successful_release() {
         None,
         None,
         Some(recurrent_manager),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let request_id = RequestId::new();
     engine
@@ -3264,7 +3397,8 @@ async fn engine_allocates_and_deallocates_model_declared_recurrent_state() {
         None,
         None,
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
     let mut request = policy_request();
     request.sampling_params.max_tokens = 1;
 
@@ -3307,7 +3441,8 @@ async fn run_iteration_cancels_disconnected_client_and_releases_recurrent_state(
         None,
         None,
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let request = policy_request();
     let request_id = request.id.clone();
@@ -3399,7 +3534,8 @@ async fn engine_status_reports_kv_cache_memory_from_manager_stats() {
         kv_cache,
         executor,
         tensor_factory,
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let status = engine.status().await;
 
@@ -3461,7 +3597,8 @@ async fn engine_allocates_and_deallocates_llm_executor_declared_recurrent_state(
         None,
         None,
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
     let mut request = policy_request();
     request.sampling_params.max_tokens = 1;
 
@@ -3506,7 +3643,8 @@ async fn process_batch_unified_defers_prefill_for_recurrent_state_capacity() {
         None,
         None,
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut victim_request = policy_request();
     victim_request.prompt = "test".to_string();
@@ -3612,7 +3750,8 @@ async fn process_batch_unified_releases_recurrent_state_when_kv_alloc_defers() {
         None,
         None,
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test".to_string();
@@ -3671,7 +3810,8 @@ async fn process_batch_unified_kv_defer_does_not_preempt_decode_for_fresh_prefil
         None,
         None,
         None,
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut decode_request = policy_request();
     decode_request.prompt = "test".to_string();
@@ -3790,7 +3930,8 @@ async fn process_batch_unified_reserve_defer_requeues_decode_for_recompute() {
         None,
         None,
         Some(recurrent_manager),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut first_decode_request = policy_request();
     first_decode_request.prompt = "test".to_string();
@@ -3939,7 +4080,8 @@ async fn process_batch_unified_structured_pressure_reopens_capacity_recompute_ne
         None,
         None,
         Some(recurrent_manager),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut requests = Vec::new();
     for _ in 0..4 {
@@ -4051,7 +4193,8 @@ async fn process_batch_unified_capacity_defer_releases_existing_kv() {
         None,
         None,
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test ok".to_string();
@@ -4145,7 +4288,8 @@ async fn process_batch_unified_kv_defer_moves_active_prefill_back_to_waiting() {
         None,
         None,
         Some(recurrent_manager),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test".to_string();
@@ -4217,7 +4361,8 @@ async fn process_batch_releases_kv_and_recurrent_state_when_model_admission_fail
         None,
         Some(crate::speculative::SpeculativeDecodingConfig::default()),
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test".to_string();
@@ -4299,7 +4444,8 @@ async fn process_batch_chunked_prefill_postprocess_error_releases_kv_and_recurre
         None,
         Some(crate::speculative::SpeculativeDecodingConfig::default()),
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test ok".to_string();
@@ -4361,7 +4507,8 @@ async fn process_batch_batch_prefill_len_mismatch_releases_kv_and_recurrent_stat
         None,
         Some(crate::speculative::SpeculativeDecodingConfig::default()),
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test".to_string();
@@ -4426,7 +4573,8 @@ async fn process_batch_batch_prefill_postprocess_error_releases_kv_and_recurrent
         None,
         Some(crate::speculative::SpeculativeDecodingConfig::default()),
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test".to_string();
@@ -4486,7 +4634,8 @@ async fn process_batch_chunked_prefill_tensor_error_releases_kv_and_recurrent_st
         None,
         Some(crate::speculative::SpeculativeDecodingConfig::default()),
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test ok".to_string();
@@ -4545,7 +4694,8 @@ async fn process_batch_batch_prefill_tensor_error_releases_kv_and_recurrent_stat
         None,
         Some(crate::speculative::SpeculativeDecodingConfig::default()),
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test".to_string();
@@ -4599,7 +4749,8 @@ async fn process_batch_speculative_draft_tensor_error_releases_target_and_draft_
         Some(draft_executor),
         Some(crate::speculative::SpeculativeDecodingConfig::default()),
         None,
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test".to_string();
@@ -4696,7 +4847,8 @@ async fn process_batch_unified_reserve_resource_exhausted_defers_without_fallbac
         None,
         None,
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test".to_string();
@@ -4766,7 +4918,8 @@ async fn process_batch_unified_reserve_resource_exhausted_defers_existing_kv_pre
         None,
         None,
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test ok".to_string();
@@ -4879,7 +5032,8 @@ async fn process_batch_unified_forward_resource_exhausted_defers_existing_kv_pre
         None,
         None,
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test ok".to_string();
@@ -5034,7 +5188,8 @@ async fn process_batch_unified_forward_failure_then_fallback_kv_defer_releases_r
         None,
         None,
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test".to_string();
@@ -5099,7 +5254,8 @@ async fn process_batch_unified_result_len_mismatch_releases_recurrent_state() {
         None,
         None,
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test".to_string();
@@ -5169,7 +5325,8 @@ async fn process_batch_unified_missing_final_prefill_result_releases_fresh_kv() 
         None,
         None,
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test".to_string();
@@ -5233,7 +5390,8 @@ async fn process_batch_unified_prefill_postprocess_error_releases_fresh_kv() {
         None,
         None,
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test".to_string();
@@ -5296,7 +5454,8 @@ async fn process_batch_unified_decode_postprocess_error_releases_recurrent_state
         None,
         None,
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test".to_string();
@@ -5385,7 +5544,8 @@ async fn process_batch_single_decode_resource_exhausted_keeps_recurrent_state_wa
         None,
         Some(crate::speculative::SpeculativeDecodingConfig::default()),
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test".to_string();
@@ -5477,7 +5637,8 @@ async fn process_batch_unified_decode_resource_exhausted_keeps_recurrent_state_w
         None,
         None,
         Some(recurrent_manager.clone()),
-    );
+    )
+    .expect("legacy engine composition must match executor authority");
 
     let mut request = policy_request();
     request.prompt = "test".to_string();
