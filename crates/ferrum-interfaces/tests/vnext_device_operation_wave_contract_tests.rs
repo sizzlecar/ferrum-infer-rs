@@ -373,6 +373,37 @@ fn terminal_wave_reads_output_before_releasing_backing() {
         HostTransferLayout::new(ElementType::F32, 4).unwrap(),
     )
     .unwrap();
+    let duplicate = CompletionReadbackBatchRequest::new(vec![request.clone(), request.clone()]);
+    assert!(duplicate.is_err());
+    assert_eq!(reaper.retained_count(), 1);
+
+    let out_of_range = CompletionReadbackBatchRequest::new(vec![
+        request.clone(),
+        CompletionReadbackRequest::new(
+            id("node.tail"),
+            1,
+            id("resource.output"),
+            0,
+            HostTransferLayout::new(ElementType::F32, 4).unwrap(),
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    assert!(handle.wait_with_readbacks(out_of_range).is_err());
+    assert_eq!(reaper.retained_count(), 1);
+
+    let foreign = CompletionReadbackBatchRequest::new(vec![CompletionReadbackRequest::new(
+        id("node.foreign"),
+        0,
+        id("resource.output"),
+        0,
+        HostTransferLayout::new(ElementType::F32, 4).unwrap(),
+    )
+    .unwrap()])
+    .unwrap();
+    assert!(handle.wait_with_readbacks(foreign).is_err());
+    assert_eq!(reaper.retained_count(), 1);
+
     let receipt = match handle.wait_with_readback(request).unwrap() {
         CompletionReadbackObservation::Terminal(receipt) => receipt,
         other => panic!("wave output readback did not terminate: {other:?}"),

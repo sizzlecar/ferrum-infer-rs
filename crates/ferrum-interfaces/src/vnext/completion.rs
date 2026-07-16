@@ -1363,6 +1363,66 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         })
     }
 
+    pub(crate) fn wait_bound_with_readbacks(
+        &self,
+        slot_id: CompletionSlotId,
+        request: CompletionReadbackBatchRequest,
+    ) -> Result<CompletionReadbackBatchObservation, VNextError> {
+        self.validate_bound_readback_batch(slot_id, &request)?;
+        let observation = self.observe_bound_with(
+            slot_id,
+            true,
+            |resources, lane, batch_identity, disposition| {
+                attempt_completion_readbacks(resources, lane, batch_identity, disposition, request)
+            },
+        )?;
+        Ok(match observation {
+            BoundCompletionObservation::Pending => CompletionReadbackBatchObservation::Pending,
+            BoundCompletionObservation::Terminal {
+                completion,
+                terminal,
+            } => CompletionReadbackBatchObservation::Terminal(CompletionReadbackBatchReceipt::new(
+                completion, terminal,
+            )),
+            BoundCompletionObservation::Indeterminate(failures) => {
+                CompletionReadbackBatchObservation::Indeterminate(failures)
+            }
+            BoundCompletionObservation::SubmissionIndeterminate => {
+                CompletionReadbackBatchObservation::SubmissionIndeterminate
+            }
+            BoundCompletionObservation::ObservationPanicked => {
+                CompletionReadbackBatchObservation::ObservationPanicked
+            }
+            BoundCompletionObservation::Quarantined(receipt) => {
+                CompletionReadbackBatchObservation::Quarantined(receipt)
+            }
+        })
+    }
+
+    fn validate_bound_readback_batch(
+        &self,
+        slot_id: CompletionSlotId,
+        request: &CompletionReadbackBatchRequest,
+    ) -> Result<(), VNextError> {
+        let record = self.lookup(slot_id)?;
+        let guard = record
+            .lock()
+            .map_err(|_| invalid_completion("completion slot mutex is poisoned"))?;
+        match &*guard {
+            CompletionRecord::InFlight { batch_identity, .. }
+            | CompletionRecord::SubmissionIndeterminate { batch_identity, .. } => {
+                request.validate_for(batch_identity)
+            }
+            CompletionRecord::Reserved => Err(invalid_completion(
+                "completion slot has not reached submission",
+            )),
+            CompletionRecord::Quarantined { .. } => Ok(()),
+            CompletionRecord::Reaped => {
+                Err(invalid_completion("completion slot is already reaped"))
+            }
+        }
+    }
+
     fn map_plain_observation(
         observation: BoundCompletionObservation<()>,
     ) -> Result<CompletionObservation, VNextError> {
@@ -1927,6 +1987,66 @@ impl CompletionReadbackRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[must_use = "a completion readback batch must cover one exact plan-node participant set"]
+pub struct CompletionReadbackBatchRequest {
+    requests: Vec<CompletionReadbackRequest>,
+}
+
+impl CompletionReadbackBatchRequest {
+    pub fn new(requests: Vec<CompletionReadbackRequest>) -> Result<Self, VNextError> {
+        let Some(first) = requests.first() else {
+            return Err(invalid_completion(
+                "completion readback batch cannot be empty",
+            ));
+        };
+        if requests.iter().enumerate().any(|(index, request)| {
+            usize::try_from(request.participant_index()).ok() != Some(index)
+                || request.node_id() != first.node_id()
+                || request.resource_id() != first.resource_id()
+                || request.output_layout() != first.output_layout()
+        }) {
+            return Err(invalid_completion(
+                "completion readback batch must use canonical participant order and one node/resource/layout",
+            ));
+        }
+        Ok(Self { requests })
+    }
+
+    pub fn requests(&self) -> &[CompletionReadbackRequest] {
+        &self.requests
+    }
+
+    pub fn len(&self) -> usize {
+        self.requests.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
+    fn validate_for(&self, batch_identity: &BatchOperationIdentity) -> Result<(), VNextError> {
+        let node_id = self.requests[0].node_id();
+        let node = batch_identity
+            .nodes()
+            .iter()
+            .find(|node| node.node_id() == node_id)
+            .ok_or_else(|| {
+                invalid_completion("completion readback batch node is absent from its submission")
+            })?;
+        if node.participants().len() != self.requests.len() {
+            return Err(invalid_completion(
+                "completion readback batch must cover every submitted node participant exactly once",
+            ));
+        }
+        Ok(())
+    }
+
+    fn into_requests(self) -> Vec<CompletionReadbackRequest> {
+        self.requests
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[must_use = "successful completion output bytes are exact readback evidence"]
 pub struct CompletionReadbackOutput {
     request: CompletionReadbackRequest,
@@ -2039,6 +2159,50 @@ impl CompletionReadbackReceipt {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[must_use = "a terminal batch readback receipt owns all participant output evidence"]
+pub struct CompletionReadbackBatchReceipt {
+    completion: OperationCompletionReceipt,
+    dispositions: Vec<CompletionReadbackDisposition>,
+    fingerprint: String,
+}
+
+impl CompletionReadbackBatchReceipt {
+    fn new(
+        completion: OperationCompletionReceipt,
+        dispositions: Vec<CompletionReadbackDisposition>,
+    ) -> Self {
+        #[derive(Serialize)]
+        struct FingerprintInput<'a> {
+            domain: &'static str,
+            completion_fingerprint: &'a str,
+            dispositions: &'a [CompletionReadbackDisposition],
+        }
+        let fingerprint = canonical_completion_fingerprint(&FingerprintInput {
+            domain: "ferrum.runtime-vnext.completion-readback-batch.v1",
+            completion_fingerprint: completion.fingerprint(),
+            dispositions: &dispositions,
+        });
+        Self {
+            completion,
+            dispositions,
+            fingerprint,
+        }
+    }
+
+    pub fn completion(&self) -> &OperationCompletionReceipt {
+        &self.completion
+    }
+
+    pub fn dispositions(&self) -> &[CompletionReadbackDisposition] {
+        &self.dispositions
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
 fn attempt_completion_readback<R: DeviceRuntime>(
     resources: &CompletionResourceLease<R>,
     lane: &Arc<ExecutionLane<R>>,
@@ -2109,11 +2273,44 @@ fn attempt_completion_readback<R: DeviceRuntime>(
     }
 }
 
+fn attempt_completion_readbacks<R: DeviceRuntime>(
+    resources: &CompletionResourceLease<R>,
+    lane: &Arc<ExecutionLane<R>>,
+    batch_identity: &BatchOperationIdentity,
+    completion_disposition: &OperationCompletionDisposition,
+    request: CompletionReadbackBatchRequest,
+) -> Vec<CompletionReadbackDisposition> {
+    request
+        .into_requests()
+        .into_iter()
+        .map(|request| {
+            attempt_completion_readback(
+                resources,
+                lane,
+                batch_identity,
+                completion_disposition,
+                request,
+            )
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 #[must_use = "nonterminal completion readback observations retain invocation ownership"]
 pub enum CompletionReadbackObservation {
     Pending,
     Terminal(CompletionReadbackReceipt),
+    Indeterminate(Vec<IdentifiedFailure>),
+    SubmissionIndeterminate,
+    ObservationPanicked,
+    Quarantined(CompletionQuarantineReceipt),
+}
+
+#[derive(Debug)]
+#[must_use = "nonterminal batch readback observations retain invocation ownership"]
+pub enum CompletionReadbackBatchObservation {
+    Pending,
+    Terminal(CompletionReadbackBatchReceipt),
     Indeterminate(Vec<IdentifiedFailure>),
     SubmissionIndeterminate,
     ObservationPanicked,
@@ -2231,6 +2428,16 @@ impl<R: DeviceRuntime> CompletionHandle<R> {
             .upgrade()
             .ok_or_else(|| invalid_completion("completion reaper owner was dropped"))?
             .wait_bound_with_readback(self.slot_id(), request)
+    }
+
+    pub fn wait_with_readbacks(
+        &self,
+        request: CompletionReadbackBatchRequest,
+    ) -> Result<CompletionReadbackBatchObservation, VNextError> {
+        self.reaper
+            .upgrade()
+            .ok_or_else(|| invalid_completion("completion reaper owner was dropped"))?
+            .wait_bound_with_readbacks(self.slot_id(), request)
     }
 }
 

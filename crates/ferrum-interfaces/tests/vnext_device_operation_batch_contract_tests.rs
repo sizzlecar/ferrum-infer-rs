@@ -175,15 +175,42 @@ fn thirty_two_participant_dispatch_is_one_physical_submission() {
         .iter()
         .all(|participant| participant.batch_submission_fingerprint()
             == handle.receipt().fingerprint()));
-    let completion = match handle.poll().unwrap() {
-        CompletionObservation::Terminal(completion) => completion,
+    let readbacks = CompletionReadbackBatchRequest::new(
+        (0..32)
+            .map(|participant_index| {
+                CompletionReadbackRequest::new(
+                    node.id().clone(),
+                    participant_index,
+                    id("resource.intermediate"),
+                    0,
+                    HostTransferLayout::new(ElementType::F32, 4).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect(),
+    )
+    .unwrap();
+    let readback = match handle.wait_with_readbacks(readbacks).unwrap() {
+        CompletionReadbackBatchObservation::Terminal(readback) => readback,
         other => panic!("32-participant batch did not complete: {other:?}"),
     };
+    let completion = readback.completion();
     assert_eq!(completion.participants().len(), 32);
     assert!(completion
         .participants()
         .iter()
         .all(|participant| participant.batch_completion_fingerprint() == completion.fingerprint()));
+    assert_eq!(readback.dispositions().len(), 32);
+    assert!(readback
+        .dispositions()
+        .iter()
+        .all(|disposition| matches!(disposition, CompletionReadbackDisposition::Succeeded(_))));
+    assert_eq!(readback.fingerprint().len(), 64);
+    {
+        let trace = runtime_trace.lock().unwrap();
+        assert_eq!(trace.readback_calls, 32);
+        assert_eq!(trace.readback_lengths.iter().sum::<u64>(), 32 * 16);
+    }
     assert_eq!(lane.in_flight_count(), 0);
     assert_eq!(reaper.retained_count(), 0);
     drop(handle);
