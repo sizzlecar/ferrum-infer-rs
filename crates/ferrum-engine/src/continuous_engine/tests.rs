@@ -1855,7 +1855,7 @@ async fn process_batch_unified_co_batches_active_decode_with_fresh_prefill_chunk
     decode_seq.generated_tokens.push(TokenId::new(6));
     decode_seq.prefill_complete = true;
     decode_seq.prefill_tokens_processed = 1;
-    decode_seq.install_model_kv_without_owned_blocks(decode_kv);
+    decode_seq.install_runtime_managed_model_kv(decode_kv);
     decode_seq.phase = RequestPhase::Decoding;
     {
         let mut sequences = engine.inner.sequences.write();
@@ -1879,7 +1879,11 @@ async fn process_batch_unified_co_batches_active_decode_with_fresh_prefill_chunk
         created_at: chrono::Utc::now(),
     };
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .inner
+        .process_batch_with_test_sequences(&batch)
+        .await
+        .unwrap();
 
     let captured = captured.lock().expect("capture mutex poisoned");
     assert_eq!(captured.len(), 1, "mixed work must use one unified call");
@@ -2088,6 +2092,32 @@ async fn shutdown_wakes_an_idle_background_loop() {
         .await
         .expect("shutdown must wake the idle loop")
         .expect("background loop must not panic");
+}
+
+#[tokio::test]
+async fn process_batch_rejects_a_scheduler_item_without_published_sequence_state() {
+    let engine = test_continuous_engine_with_config(EngineConfig::default());
+    let request = policy_request();
+    let request_id = request.id.clone();
+    let batch = ferrum_interfaces::BatchPlan {
+        batch_id: ferrum_types::BatchId::new(),
+        requests: vec![ferrum_interfaces::scheduler::ScheduledRequest::new(request)],
+        max_sequence_length: 1,
+        estimated_time_ms: None,
+        resource_requirements: ferrum_interfaces::scheduler::BatchResourceRequirements::default(),
+        created_at: chrono::Utc::now(),
+    };
+
+    let error = engine
+        .inner
+        .process_batch(&batch)
+        .await
+        .expect_err("batch processing must not create a second tokenized request state");
+
+    assert!(error
+        .to_string()
+        .contains("without atomically published sequence state"));
+    assert!(!engine.inner.sequences.read().contains_key(&request_id));
 }
 
 #[test]
@@ -2514,12 +2544,14 @@ fn sequence_state_drop_with_owned_request_slot_panics_in_tests() {
 #[test]
 #[should_panic(expected = "unified prefill resources dropped without explicit release or commit")]
 fn unified_prefill_owned_resources_drop_without_release_or_commit_panics_in_tests() {
-    let _resources = UnifiedPrefillOwnedResources::default().with_fresh_kv(RequestId::new(), 1);
+    let _resources = UnifiedPrefillOwnedResources::default()
+        .with_fresh_kv(SequenceKvAllocation::new(RequestId::new(), 1));
 }
 
 #[test]
 fn unified_prefill_owned_resources_commit_consumes_transaction() {
-    let mut resources = UnifiedPrefillOwnedResources::default().with_fresh_kv(RequestId::new(), 1);
+    let mut resources = UnifiedPrefillOwnedResources::default()
+        .with_fresh_kv(SequenceKvAllocation::new(RequestId::new(), 1));
     assert!(!resources.is_empty());
 
     std::mem::take(&mut resources).commit();
@@ -2539,7 +2571,10 @@ fn sequence_take_completion_resources_moves_request_slot_and_physical_resources_
         1,
     ));
     let model_cache_id = model_kv.cache_id();
-    sequence.install_model_kv(model_kv, Some(2));
+    sequence.install_legacy_allocated_model_kv(
+        model_kv,
+        SequenceKvAllocation::new(request_id.clone(), 2),
+    );
 
     let mut request_slot = RequestSlotLease::open(&engine.inner, request_id.clone());
     request_slot.admit(&engine.inner);
@@ -2548,8 +2583,8 @@ fn sequence_take_completion_resources_moves_request_slot_and_physical_resources_
     let completion_resources = sequence.take_completion_resources();
 
     assert_eq!(
-        completion_resources.physical.kv_allocation,
-        Some(SequenceKvAllocation::new(request_id.clone(), Some(2)))
+        completion_resources.physical.legacy_kv_allocation,
+        Some(SequenceKvAllocation::new(request_id.clone(), 2))
     );
     assert_eq!(
         completion_resources.physical.model_cache_id(),
@@ -2578,7 +2613,10 @@ async fn sequence_take_physical_resources_for_recompute_clears_owned_resources()
         1,
     ));
     let model_cache_id = model_kv.cache_id();
-    sequence.install_model_kv(model_kv, Some(2));
+    sequence.install_legacy_allocated_model_kv(
+        model_kv,
+        SequenceKvAllocation::new(request_id.clone(), 2),
+    );
     sequence.commit_draft_kv_allocation(
         Arc::new(ferrum_testkit::MockKvCacheHandle::new(
             draft_request_id.clone(),
@@ -2610,12 +2648,12 @@ async fn sequence_take_physical_resources_for_recompute_clears_owned_resources()
     let resources = sequence.take_physical_resources_for_recompute();
 
     assert_eq!(
-        resources.kv_allocation,
-        Some(SequenceKvAllocation::new(request_id.clone(), Some(2)))
+        resources.legacy_kv_allocation,
+        Some(SequenceKvAllocation::new(request_id.clone(), 2))
     );
     assert_eq!(
-        resources.draft_kv_allocation,
-        Some(SequenceKvAllocation::new(draft_request_id, Some(3)))
+        resources.legacy_draft_kv_allocation,
+        Some(SequenceKvAllocation::new(draft_request_id, 3))
     );
     assert_eq!(
         resources.recurrent_state_allocation,
@@ -2634,7 +2672,7 @@ async fn sequence_take_physical_resources_for_recompute_clears_owned_resources()
 }
 
 #[test]
-fn sequence_take_physical_resources_skips_manager_without_owned_blocks() {
+fn sequence_take_physical_resources_keeps_runtime_managed_kv_out_of_legacy_manager() {
     let request = policy_request();
     let request_id = request.id.clone();
     let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
@@ -2645,11 +2683,11 @@ fn sequence_take_physical_resources_skips_manager_without_owned_blocks() {
     ));
     let model_cache_id = model_kv.cache_id();
 
-    sequence.install_model_kv_without_owned_blocks(model_kv);
+    sequence.install_runtime_managed_model_kv(model_kv);
     let resources = sequence.take_physical_resources();
 
-    assert!(resources.kv_allocation.is_none());
-    assert!(resources.draft_kv_allocation.is_none());
+    assert!(resources.legacy_kv_allocation.is_none());
+    assert!(resources.legacy_draft_kv_allocation.is_none());
     assert!(resources.recurrent_state_allocation.is_none());
     assert_eq!(resources.model_cache_id(), Some(model_cache_id.as_str()));
     assert!(sequence.kv_cache_handle().is_none());
@@ -2657,20 +2695,37 @@ fn sequence_take_physical_resources_skips_manager_without_owned_blocks() {
 }
 
 #[test]
-#[should_panic(expected = "draft KV cache updated without owned allocation metadata")]
 fn sequence_speculative_decode_commit_rejects_draft_kv_without_allocation_metadata() {
     let request = policy_request();
     let request_id = request.id.clone();
     let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
-    let target_kv: Arc<dyn KvCacheHandle> =
-        Arc::new(ferrum_testkit::MockKvCacheHandle::new(request_id, 1, 1));
+    let installed_target: Arc<dyn KvCacheHandle> = Arc::new(
+        ferrum_testkit::MockKvCacheHandle::new(request_id.clone(), 1, 1),
+    );
+    let replacement_target: Arc<dyn KvCacheHandle> =
+        Arc::new(ferrum_testkit::MockKvCacheHandle::new(request_id, 1, 2));
     let draft_kv: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
         RequestId::new(),
         1,
         1,
     ));
 
-    sequence.commit_speculative_decode_physical_resources(target_kv, draft_kv);
+    sequence.install_runtime_managed_model_kv(installed_target);
+    let error = sequence
+        .commit_speculative_decode_physical_resources(replacement_target, draft_kv)
+        .expect_err("speculative decode must retain the exact draft allocation lease");
+    assert!(error
+        .to_string()
+        .contains("draft KV cache updated without owned allocation metadata"));
+    assert_eq!(
+        sequence
+            .kv_cache_handle()
+            .expect("target lease must remain installed")
+            .block_table()
+            .sequence_length,
+        1,
+        "failed speculative commit must not partially replace the target handle"
+    );
 }
 
 #[test]
@@ -2685,7 +2740,7 @@ fn sequence_prefill_commit_helpers_keep_resource_metadata_together() {
     ));
     let model_cache_id = model_kv.cache_id();
 
-    sequence.install_model_kv_without_owned_blocks(model_kv.clone());
+    sequence.install_runtime_managed_model_kv(model_kv.clone());
     assert!(sequence.kv_cache_handle().is_some());
     assert_eq!(sequence.model_cache_id(), Some(model_cache_id.as_str()));
     assert!(sequence.kv_resource_blocks().is_none());
@@ -2743,8 +2798,15 @@ fn sequence_prefill_chunk_commit_tracks_partial_and_final_state() {
     ));
     let partial_cache_id = partial_kv.cache_id();
     let recurrent_state = test_recurrent_state_handle(request_id.clone(), 3);
+    let allocation = SequenceKvAllocation::new(request_id.clone(), 2);
     sequence.commit_recurrent_state_admission(recurrent_state, 3);
-    sequence.commit_prefill_chunk_physical_resources(partial_kv, Some(2), None, 1, false);
+    sequence.commit_prefill_chunk_physical_resources(
+        partial_kv,
+        allocation.clone(),
+        None,
+        1,
+        false,
+    );
 
     assert_eq!(sequence.model_cache_id(), Some(partial_cache_id.as_str()));
     assert!(sequence.kv_cache_handle().is_some());
@@ -2758,10 +2820,10 @@ fn sequence_prefill_chunk_commit_tracks_partial_and_final_state() {
     let final_kv: Arc<dyn KvCacheHandle> =
         Arc::new(ferrum_testkit::MockKvCacheHandle::new(request_id, 1, 4));
     let final_cache_id = final_kv.cache_id();
-    sequence.commit_prefill_chunk_physical_resources(final_kv, None, None, 2, true);
+    sequence.commit_prefill_chunk_physical_resources(final_kv, allocation, None, 2, true);
 
     assert_eq!(sequence.model_cache_id(), Some(final_cache_id.as_str()));
-    assert_eq!(sequence.kv_resource_blocks(), None);
+    assert_eq!(sequence.kv_resource_blocks(), Some(2));
     assert_eq!(sequence.prefill_tokens_processed, 2);
     assert!(sequence.prefill_complete);
     assert_eq!(sequence.phase, RequestPhase::Decoding);
@@ -2783,7 +2845,7 @@ fn sequence_decode_commit_helpers_keep_resource_metadata_together() {
         2,
     ));
     let decode_cache_id = decode_kv.cache_id();
-    sequence.install_model_kv_without_owned_blocks(decode_kv.clone());
+    sequence.install_runtime_managed_model_kv(decode_kv.clone());
     sequence.generated_tokens.push(TokenId::new(7));
     assert_eq!(
         sequence.decode_model_cache_id_or_request_id(&request_id),
@@ -2791,7 +2853,9 @@ fn sequence_decode_commit_helpers_keep_resource_metadata_together() {
     );
     assert_eq!(sequence.decode_model_kv_len_after_last_generated_token(), 2);
 
-    sequence.commit_decode_step_physical_resources(decode_kv);
+    sequence
+        .commit_decode_step_physical_resources(decode_kv)
+        .unwrap();
     assert!(sequence.kv_cache_handle().is_some());
     assert_eq!(sequence.tokens_this_iteration, 1);
     assert_eq!(sequence.model_cache_id(), Some(decode_cache_id.as_str()));
@@ -2820,12 +2884,76 @@ fn sequence_decode_commit_helpers_keep_resource_metadata_together() {
         3,
     ));
     sequence.commit_draft_kv_allocation(draft_kv.clone(), draft_request_id.clone(), 0);
-    sequence.commit_speculative_decode_physical_resources(target_kv, draft_kv);
+    sequence
+        .commit_speculative_decode_physical_resources(target_kv, draft_kv)
+        .unwrap();
     assert!(sequence.kv_cache_handle().is_some());
     let draft = sequence.draft_kv.as_ref().expect("draft kv state");
     assert_eq!(draft.request_id, draft_request_id);
     assert_eq!(draft.resource_blocks, 1);
     assert!(sequence.draft_kv_cache_handle().is_some());
+}
+
+#[test]
+fn sequence_decode_commit_rejects_missing_or_changed_cache_authority() {
+    let request = policy_request();
+    let request_id = request.id.clone();
+    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
+    let first: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        request_id.clone(),
+        1,
+        1,
+    ));
+    let first_cache_id = first.cache_id();
+
+    let missing = sequence
+        .commit_decode_step_physical_resources(first.clone())
+        .expect_err("decode must not invent a KV release authority");
+    assert!(missing
+        .to_string()
+        .contains("without an active model KV lease"));
+
+    sequence.install_runtime_managed_model_kv(first);
+    let replacement: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        RequestId::new(),
+        1,
+        2,
+    ));
+    let changed = sequence
+        .commit_decode_step_physical_resources(replacement)
+        .expect_err("decode must not replace one cache authority with another");
+    assert!(changed
+        .to_string()
+        .contains("decode replaced model cache authority"));
+    assert_eq!(
+        sequence.model_cache_id().map(str::to_string),
+        Some(first_cache_id)
+    );
+    assert_eq!(sequence.tokens_this_iteration, 0);
+}
+
+#[test]
+fn sequence_decode_commit_preserves_exact_legacy_allocation() {
+    let request = policy_request();
+    let request_id = request.id.clone();
+    let mut sequence = SequenceState::new(request, vec![TokenId::new(1)]);
+    let initial: Arc<dyn KvCacheHandle> = Arc::new(ferrum_testkit::MockKvCacheHandle::new(
+        request_id.clone(),
+        1,
+        1,
+    ));
+    let allocation = SequenceKvAllocation::new(request_id.clone(), 3);
+    sequence.install_legacy_allocated_model_kv(initial, allocation.clone());
+    let replacement: Arc<dyn KvCacheHandle> =
+        Arc::new(ferrum_testkit::MockKvCacheHandle::new(request_id, 1, 2));
+
+    sequence
+        .commit_decode_step_physical_resources(replacement)
+        .unwrap();
+    let resources = sequence.take_physical_resources();
+
+    assert_eq!(resources.legacy_kv_allocation, Some(allocation));
+    assert!(resources.model_cache_id.is_some());
 }
 
 #[tokio::test]
@@ -2901,7 +3029,7 @@ async fn kv_release_failure_traces_reject_without_successful_release() {
     engine.inner.trace_kv_allocate(&request_id, 2);
     engine
         .inner
-        .release_kv_allocation(&request_id, request_id.clone(), Some(2))
+        .release_kv_allocation(&request_id, request_id.clone(), 2)
         .await;
 
     let resources: Vec<_> = read_engine_profile_events(&trace_path)
@@ -3124,7 +3252,7 @@ fn decode_ready_request_ids_skip_preempted_sequences_without_kv() {
     let mut ready_seq = SequenceState::new(ready_request, vec![TokenId::new(1)]);
     ready_seq.generated_tokens.push(TokenId::new(2));
     ready_seq.prefill_complete = true;
-    ready_seq.install_model_kv_without_owned_blocks(ready_kv);
+    ready_seq.install_runtime_managed_model_kv(ready_kv);
 
     let mut preempted_seq = SequenceState::new(preempted_request, vec![TokenId::new(1)]);
     preempted_seq.generated_tokens.push(TokenId::new(2));
@@ -3671,7 +3799,7 @@ async fn process_batch_unified_defers_prefill_for_recurrent_state_capacity() {
     victim_seq.generated_tokens.push(TokenId::new(6));
     victim_seq.prefill_complete = true;
     victim_seq.prefill_tokens_processed = 1;
-    victim_seq.install_model_kv_without_owned_blocks(victim_kv);
+    victim_seq.install_runtime_managed_model_kv(victim_kv);
     victim_seq.commit_recurrent_state_admission(victim_recurrent_state, 1);
     victim_seq.phase = RequestPhase::Decoding;
     {
@@ -3694,7 +3822,11 @@ async fn process_batch_unified_defers_prefill_for_recurrent_state_capacity() {
         created_at: chrono::Utc::now(),
     };
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .inner
+        .process_batch_with_test_sequences(&batch)
+        .await
+        .unwrap();
 
     let stats = recurrent_manager.stats();
     assert_eq!(stats.allocation_count, 1);
@@ -3766,7 +3898,11 @@ async fn process_batch_unified_releases_recurrent_state_when_kv_alloc_defers() {
         created_at: chrono::Utc::now(),
     };
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .inner
+        .process_batch_with_test_sequences(&batch)
+        .await
+        .unwrap();
 
     let recurrent_stats = recurrent_manager.stats();
     assert_eq!(recurrent_stats.allocation_count, 1);
@@ -3848,7 +3984,12 @@ async fn process_batch_unified_kv_defer_does_not_preempt_decode_for_fresh_prefil
     decode_seq.generated_tokens.push(TokenId::new(6));
     decode_seq.prefill_complete = true;
     decode_seq.prefill_tokens_processed = 1;
-    decode_seq.install_model_kv_without_owned_blocks(decode_kv);
+    let decode_blocks = engine.inner.kv_resource_blocks_for_tokens(1);
+    engine.inner.trace_kv_allocate(&decode_id, decode_blocks);
+    decode_seq.install_legacy_allocated_model_kv(
+        decode_kv,
+        SequenceKvAllocation::new(decode_id.clone(), decode_blocks),
+    );
     decode_seq.phase = RequestPhase::Decoding;
     engine
         .inner
@@ -3867,7 +4008,11 @@ async fn process_batch_unified_kv_defer_does_not_preempt_decode_for_fresh_prefil
         .expect("mixed decode/fresh prefill batch should be scheduled");
     assert_eq!(batch.requests.len(), 2);
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .inner
+        .process_batch_with_test_sequences(&batch)
+        .await
+        .unwrap();
 
     let trace = scheduler.trace_snapshot();
     assert_eq!(
@@ -3985,7 +4130,7 @@ async fn process_batch_unified_reserve_defer_requeues_decode_for_recompute() {
         sequence.generated_tokens.push(token);
         sequence.prefill_complete = true;
         sequence.prefill_tokens_processed = 1;
-        sequence.install_model_kv_without_owned_blocks(kv);
+        sequence.install_runtime_managed_model_kv(kv);
         sequence.phase = RequestPhase::Decoding;
         engine.inner.sequences.write().insert(request_id, sequence);
     }
@@ -4001,7 +4146,11 @@ async fn process_batch_unified_reserve_defer_requeues_decode_for_recompute() {
         .expect("mixed decode/fresh prefill batch should be scheduled");
     assert_eq!(mixed_batch.requests.len(), 3);
 
-    engine.inner.process_batch(&mixed_batch).await.unwrap();
+    engine
+        .inner
+        .process_batch_with_test_sequences(&mixed_batch)
+        .await
+        .unwrap();
 
     let trace = scheduler.trace_snapshot();
     assert_eq!(
@@ -4111,7 +4260,7 @@ async fn process_batch_unified_structured_pressure_reopens_capacity_recompute_ne
         sequence.generated_tokens.push(TokenId::new(6));
         sequence.prefill_complete = true;
         sequence.prefill_tokens_processed = 1;
-        sequence.install_model_kv_without_owned_blocks(kv);
+        sequence.install_runtime_managed_model_kv(kv);
         sequence.phase = RequestPhase::Decoding;
         engine
             .inner
@@ -4149,7 +4298,11 @@ async fn process_batch_unified_structured_pressure_reopens_capacity_recompute_ne
         "the first mixed attempt must contain the capacity-deferred recompute"
     );
 
-    engine.inner.process_batch(&mixed_batch).await.unwrap();
+    engine
+        .inner
+        .process_batch_with_test_sequences(&mixed_batch)
+        .await
+        .unwrap();
 
     let retry_batch = scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(4))
@@ -4226,7 +4379,14 @@ async fn process_batch_unified_capacity_defer_releases_existing_kv() {
         Some(tokenizer),
         Some(64),
     );
-    sequence.install_model_kv_without_owned_blocks(allocated_kv);
+    let allocated_blocks = engine.inner.kv_resource_blocks_for_tokens(1);
+    engine
+        .inner
+        .trace_kv_allocate(&request_id, allocated_blocks);
+    sequence.install_legacy_allocated_model_kv(
+        allocated_kv,
+        SequenceKvAllocation::new(request_id.clone(), allocated_blocks),
+    );
     sequence.prefill_tokens_processed = 1;
     sequence.phase = RequestPhase::Prefilling;
     engine
@@ -4235,7 +4395,11 @@ async fn process_batch_unified_capacity_defer_releases_existing_kv() {
         .write()
         .insert(request_id.clone(), sequence);
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .inner
+        .process_batch_with_test_sequences(&batch)
+        .await
+        .unwrap();
 
     let deferred = scheduler.trace_snapshot();
     assert_eq!(deferred.waiting_queue_len, 1);
@@ -4304,7 +4468,11 @@ async fn process_batch_unified_kv_defer_moves_active_prefill_back_to_waiting() {
     assert_eq!(active.prefill_queue_len, 1);
     assert_eq!(active.active_len, 1);
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .inner
+        .process_batch_with_test_sequences(&batch)
+        .await
+        .unwrap();
 
     let deferred = scheduler.trace_snapshot();
     assert_eq!(deferred.waiting_queue_len, 1);
@@ -4359,7 +4527,7 @@ async fn process_batch_releases_kv_and_recurrent_state_when_model_admission_fail
         executor,
         tensor_factory,
         None,
-        Some(crate::speculative::SpeculativeDecodingConfig::default()),
+        None,
         Some(recurrent_manager.clone()),
     )
     .expect("legacy engine composition must match executor authority");
@@ -4377,7 +4545,11 @@ async fn process_batch_releases_kv_and_recurrent_state_when_model_admission_fail
         created_at: chrono::Utc::now(),
     };
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .inner
+        .process_batch_legacy_split_with_test_sequences(&batch)
+        .await
+        .unwrap();
 
     let active_kv = kv_cache.list_handles();
     assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
@@ -4442,7 +4614,7 @@ async fn process_batch_chunked_prefill_postprocess_error_releases_kv_and_recurre
         executor,
         tensor_factory,
         None,
-        Some(crate::speculative::SpeculativeDecodingConfig::default()),
+        None,
         Some(recurrent_manager.clone()),
     )
     .expect("legacy engine composition must match executor authority");
@@ -4460,7 +4632,10 @@ async fn process_batch_chunked_prefill_postprocess_error_releases_kv_and_recurre
         created_at: chrono::Utc::now(),
     };
 
-    let _ = engine.inner.process_batch(&batch).await;
+    let _ = engine
+        .inner
+        .process_batch_legacy_split_with_test_sequences(&batch)
+        .await;
 
     let active_kv = kv_cache.list_handles();
     assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
@@ -4505,7 +4680,7 @@ async fn process_batch_batch_prefill_len_mismatch_releases_kv_and_recurrent_stat
         executor,
         tensor_factory,
         None,
-        Some(crate::speculative::SpeculativeDecodingConfig::default()),
+        None,
         Some(recurrent_manager.clone()),
     )
     .expect("legacy engine composition must match executor authority");
@@ -4523,7 +4698,11 @@ async fn process_batch_batch_prefill_len_mismatch_releases_kv_and_recurrent_stat
         created_at: chrono::Utc::now(),
     };
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .inner
+        .process_batch_legacy_split_with_test_sequences(&batch)
+        .await
+        .unwrap();
 
     let active_kv = kv_cache.list_handles();
     assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
@@ -4571,7 +4750,7 @@ async fn process_batch_batch_prefill_postprocess_error_releases_kv_and_recurrent
         executor,
         tensor_factory,
         None,
-        Some(crate::speculative::SpeculativeDecodingConfig::default()),
+        None,
         Some(recurrent_manager.clone()),
     )
     .expect("legacy engine composition must match executor authority");
@@ -4589,7 +4768,10 @@ async fn process_batch_batch_prefill_postprocess_error_releases_kv_and_recurrent
         created_at: chrono::Utc::now(),
     };
 
-    let _ = engine.inner.process_batch(&batch).await;
+    let _ = engine
+        .inner
+        .process_batch_legacy_split_with_test_sequences(&batch)
+        .await;
 
     let active_kv = kv_cache.list_handles();
     assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
@@ -4632,7 +4814,7 @@ async fn process_batch_chunked_prefill_tensor_error_releases_kv_and_recurrent_st
         executor,
         tensor_factory,
         None,
-        Some(crate::speculative::SpeculativeDecodingConfig::default()),
+        None,
         Some(recurrent_manager.clone()),
     )
     .expect("legacy engine composition must match executor authority");
@@ -4650,7 +4832,10 @@ async fn process_batch_chunked_prefill_tensor_error_releases_kv_and_recurrent_st
         created_at: chrono::Utc::now(),
     };
 
-    let _ = engine.inner.process_batch(&batch).await;
+    let _ = engine
+        .inner
+        .process_batch_legacy_split_with_test_sequences(&batch)
+        .await;
 
     let active_kv = kv_cache.list_handles();
     assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
@@ -4692,7 +4877,7 @@ async fn process_batch_batch_prefill_tensor_error_releases_kv_and_recurrent_stat
         executor,
         tensor_factory,
         None,
-        Some(crate::speculative::SpeculativeDecodingConfig::default()),
+        None,
         Some(recurrent_manager.clone()),
     )
     .expect("legacy engine composition must match executor authority");
@@ -4710,7 +4895,10 @@ async fn process_batch_batch_prefill_tensor_error_releases_kv_and_recurrent_stat
         created_at: chrono::Utc::now(),
     };
 
-    let _ = engine.inner.process_batch(&batch).await;
+    let _ = engine
+        .inner
+        .process_batch_legacy_split_with_test_sequences(&batch)
+        .await;
 
     let active_kv = kv_cache.list_handles();
     assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
@@ -4777,7 +4965,12 @@ async fn process_batch_speculative_draft_tensor_error_releases_target_and_draft_
     sequence.generated_tokens.push(TokenId::new(6));
     sequence.prefill_complete = true;
     sequence.prefill_tokens_processed = 1;
-    sequence.install_model_kv_without_owned_blocks(target_kv);
+    let target_blocks = engine.inner.kv_resource_blocks_for_tokens(1);
+    engine.inner.trace_kv_allocate(&request_id, target_blocks);
+    sequence.install_legacy_allocated_model_kv(
+        target_kv,
+        SequenceKvAllocation::new(request_id.clone(), target_blocks),
+    );
     sequence.phase = RequestPhase::Decoding;
     engine
         .inner
@@ -4794,7 +4987,7 @@ async fn process_batch_speculative_draft_tensor_error_releases_target_and_draft_
         created_at: chrono::Utc::now(),
     };
 
-    let _ = engine.inner.process_batch(&batch).await;
+    let _ = engine.inner.process_batch_with_test_sequences(&batch).await;
 
     let stats = kv_cache.stats();
     assert_eq!(
@@ -4863,7 +5056,11 @@ async fn process_batch_unified_reserve_resource_exhausted_defers_without_fallbac
         created_at: chrono::Utc::now(),
     };
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .inner
+        .process_batch_with_test_sequences(&batch)
+        .await
+        .unwrap();
 
     let active_kv = kv_cache.list_handles();
     assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
@@ -4954,7 +5151,14 @@ async fn process_batch_unified_reserve_resource_exhausted_defers_existing_kv_pre
         Some(tokenizer),
         Some(64),
     );
-    sequence.install_model_kv_without_owned_blocks(allocated_kv);
+    let allocated_blocks = engine.inner.kv_resource_blocks_for_tokens(1);
+    engine
+        .inner
+        .trace_kv_allocate(&request_id, allocated_blocks);
+    sequence.install_legacy_allocated_model_kv(
+        allocated_kv,
+        SequenceKvAllocation::new(request_id.clone(), allocated_blocks),
+    );
     sequence.prefill_tokens_processed = 1;
     sequence.phase = RequestPhase::Prefilling;
     engine
@@ -4963,7 +5167,11 @@ async fn process_batch_unified_reserve_resource_exhausted_defers_existing_kv_pre
         .write()
         .insert(request_id.clone(), sequence);
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .inner
+        .process_batch_with_test_sequences(&batch)
+        .await
+        .unwrap();
 
     let deferred = scheduler.trace_snapshot();
     assert_eq!(deferred.waiting_queue_len, 1);
@@ -5068,7 +5276,14 @@ async fn process_batch_unified_forward_resource_exhausted_defers_existing_kv_pre
         Some(tokenizer),
         Some(64),
     );
-    sequence.install_model_kv_without_owned_blocks(allocated_kv);
+    let allocated_blocks = engine.inner.kv_resource_blocks_for_tokens(1);
+    engine
+        .inner
+        .trace_kv_allocate(&request_id, allocated_blocks);
+    sequence.install_legacy_allocated_model_kv(
+        allocated_kv,
+        SequenceKvAllocation::new(request_id.clone(), allocated_blocks),
+    );
     sequence.prefill_tokens_processed = 1;
     sequence.phase = RequestPhase::Prefilling;
     engine
@@ -5078,7 +5293,11 @@ async fn process_batch_unified_forward_resource_exhausted_defers_existing_kv_pre
         .insert(request_id.clone(), sequence);
 
     engine.inner.trace_model_cache_ref_acquire(&request_id);
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .inner
+        .process_batch_with_test_sequences(&batch)
+        .await
+        .unwrap();
 
     let deferred = scheduler.trace_snapshot();
     assert_eq!(deferred.waiting_queue_len, 1);
@@ -5204,7 +5423,11 @@ async fn process_batch_unified_forward_failure_then_fallback_kv_defer_releases_r
         created_at: chrono::Utc::now(),
     };
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .inner
+        .process_batch_with_test_sequences(&batch)
+        .await
+        .unwrap();
 
     let active_kv = kv_cache.list_handles();
     assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
@@ -5270,7 +5493,11 @@ async fn process_batch_unified_result_len_mismatch_releases_recurrent_state() {
         created_at: chrono::Utc::now(),
     };
 
-    let err = engine.inner.process_batch(&batch).await.unwrap_err();
+    let err = engine
+        .inner
+        .process_batch_with_test_sequences(&batch)
+        .await
+        .unwrap_err();
     assert!(
         err.to_string().contains("unified_decode returned"),
         "unexpected error: {err}"
@@ -5341,7 +5568,7 @@ async fn process_batch_unified_missing_final_prefill_result_releases_fresh_kv() 
         created_at: chrono::Utc::now(),
     };
 
-    let _ = engine.inner.process_batch(&batch).await;
+    let _ = engine.inner.process_batch_with_test_sequences(&batch).await;
 
     let active_kv = kv_cache.list_handles();
     assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
@@ -5407,7 +5634,7 @@ async fn process_batch_unified_prefill_postprocess_error_releases_fresh_kv() {
         created_at: chrono::Utc::now(),
     };
 
-    let _ = engine.inner.process_batch(&batch).await;
+    let _ = engine.inner.process_batch_with_test_sequences(&batch).await;
 
     let active_kv = kv_cache.list_handles();
     assert_eq!(active_kv.len(), 0, "active kv handles: {active_kv:?}");
@@ -5483,7 +5710,7 @@ async fn process_batch_unified_decode_postprocess_error_releases_recurrent_state
     sequence.generated_tokens.push(TokenId::new(6));
     sequence.prefill_complete = true;
     sequence.prefill_tokens_processed = 1;
-    sequence.install_model_kv_without_owned_blocks(kv);
+    sequence.install_runtime_managed_model_kv(kv);
     sequence.commit_recurrent_state_admission(recurrent_state, 1);
     sequence.phase = RequestPhase::Decoding;
     engine
@@ -5501,7 +5728,7 @@ async fn process_batch_unified_decode_postprocess_error_releases_recurrent_state
         created_at: chrono::Utc::now(),
     };
 
-    let _ = engine.inner.process_batch(&batch).await;
+    let _ = engine.inner.process_batch_with_test_sequences(&batch).await;
 
     assert!(
         !engine.inner.sequences.read().contains_key(&request_id),
@@ -5542,7 +5769,7 @@ async fn process_batch_single_decode_resource_exhausted_keeps_recurrent_state_wa
         executor,
         tensor_factory,
         None,
-        Some(crate::speculative::SpeculativeDecodingConfig::default()),
+        None,
         Some(recurrent_manager.clone()),
     )
     .expect("legacy engine composition must match executor authority");
@@ -5572,7 +5799,7 @@ async fn process_batch_single_decode_resource_exhausted_keeps_recurrent_state_wa
     sequence.generated_tokens.push(TokenId::new(6));
     sequence.prefill_complete = true;
     sequence.prefill_tokens_processed = 1;
-    sequence.install_model_kv_without_owned_blocks(kv);
+    sequence.install_runtime_managed_model_kv(kv);
     sequence.commit_recurrent_state_admission(recurrent_state, 1);
     sequence.phase = RequestPhase::Decoding;
     engine
@@ -5590,7 +5817,11 @@ async fn process_batch_single_decode_resource_exhausted_keeps_recurrent_state_wa
         created_at: chrono::Utc::now(),
     };
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .inner
+        .process_batch_legacy_split_with_test_sequences(&batch)
+        .await
+        .unwrap();
 
     let sequences = engine.inner.sequences.read();
     let sequence = sequences
@@ -5673,7 +5904,7 @@ async fn process_batch_unified_decode_resource_exhausted_keeps_recurrent_state_w
     sequence.generated_tokens.push(TokenId::new(6));
     sequence.prefill_complete = true;
     sequence.prefill_tokens_processed = 1;
-    sequence.install_model_kv_without_owned_blocks(kv);
+    sequence.install_runtime_managed_model_kv(kv);
     sequence.commit_recurrent_state_admission(recurrent_state, 1);
     sequence.phase = RequestPhase::Decoding;
     engine
@@ -5688,7 +5919,11 @@ async fn process_batch_unified_decode_resource_exhausted_keeps_recurrent_state_w
         .expect("decode request should be scheduled");
     assert_eq!(batch.requests.len(), 1);
 
-    engine.inner.process_batch(&batch).await.unwrap();
+    engine
+        .inner
+        .process_batch_with_test_sequences(&batch)
+        .await
+        .unwrap();
 
     let trace = scheduler.trace_snapshot();
     assert_eq!(trace.cancelled_total, 0);

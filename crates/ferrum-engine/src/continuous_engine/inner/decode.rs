@@ -199,7 +199,7 @@ impl EngineInner {
                 let cache_id = seq.decode_model_cache_id_or_request_id(rid);
                 let kv_len = seq.decode_model_kv_len_after_last_generated_token();
                 let model_kv = self.make_model_kv_handle_with_seq(cache_id, kv_len);
-                seq.commit_decode_step_physical_resources(model_kv);
+                seq.commit_decode_step_physical_resources(model_kv)?;
                 // pos_offset is sourced from SequenceState bookkeeping
                 // (see process_batch_unified). The engine-side KV handle's
                 // sequence_length is not used for position tracking
@@ -347,7 +347,7 @@ impl EngineInner {
                 )?
             };
             seq.generated_tokens.push(token);
-            seq.commit_decode_step_physical_resources(decode_output.kv_cache.clone());
+            seq.commit_decode_step_physical_resources(decode_output.kv_cache.clone())?;
             seq.commit_decode_recurrent_state(
                 decode_output
                     .recurrent_state
@@ -621,7 +621,7 @@ impl EngineInner {
                 seq.commit_speculative_decode_physical_resources(
                     target_kv_aligned,
                     draft_kv_aligned,
-                );
+                )?;
             }
         }
         let _ = last_emitted;

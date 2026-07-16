@@ -683,40 +683,52 @@ pub struct SequenceState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SequenceKvAllocation {
     request_id: RequestId,
-    blocks: Option<usize>,
+    blocks: usize,
 }
 
 impl SequenceKvAllocation {
-    fn new(request_id: RequestId, blocks: Option<usize>) -> Self {
+    fn new(request_id: RequestId, blocks: usize) -> Self {
         Self {
             request_id,
-            blocks: blocks.map(|blocks| blocks.max(1)),
+            blocks: blocks.max(1),
         }
     }
 }
 
 #[derive(Debug, Clone)]
+enum SequenceKvRelease {
+    /// The model runtime is the only release authority. This covers vNext
+    /// plan-runtime leases and cloned prefix-cache references; neither has a
+    /// second allocation in the legacy engine KV manager.
+    RuntimeManaged,
+    /// Transitional legacy composition: release the model cache reference and
+    /// the exact engine KV-manager allocation together.
+    LegacyAllocated(SequenceKvAllocation),
+}
+
+#[derive(Debug, Clone)]
 struct SequenceModelKvState {
     cache: Arc<dyn KvCacheHandle>,
-    resource_blocks: Option<usize>,
     model_cache_id: String,
+    release: SequenceKvRelease,
 }
 
 impl SequenceModelKvState {
-    fn new(cache: Arc<dyn KvCacheHandle>, resource_blocks: Option<usize>) -> Self {
+    fn runtime_managed(cache: Arc<dyn KvCacheHandle>) -> Self {
         let model_cache_id = cache.cache_id();
-        Self::new_with_model_cache_id(cache, resource_blocks, model_cache_id)
-    }
-
-    fn new_with_model_cache_id(
-        cache: Arc<dyn KvCacheHandle>,
-        resource_blocks: Option<usize>,
-        model_cache_id: String,
-    ) -> Self {
         Self {
             cache,
-            resource_blocks: resource_blocks.map(|blocks| blocks.max(1)),
             model_cache_id,
+            release: SequenceKvRelease::RuntimeManaged,
+        }
+    }
+
+    fn legacy_allocated(cache: Arc<dyn KvCacheHandle>, allocation: SequenceKvAllocation) -> Self {
+        let model_cache_id = cache.cache_id();
+        Self {
+            cache,
+            model_cache_id,
+            release: SequenceKvRelease::LegacyAllocated(allocation),
         }
     }
 
@@ -724,22 +736,41 @@ impl SequenceModelKvState {
         self.cache.clone()
     }
 
-    fn resource_blocks(&self) -> Option<usize> {
-        self.resource_blocks
+    fn legacy_allocation(&self) -> Option<&SequenceKvAllocation> {
+        match &self.release {
+            SequenceKvRelease::RuntimeManaged => None,
+            SequenceKvRelease::LegacyAllocated(allocation) => Some(allocation),
+        }
     }
 
     fn model_cache_id(&self) -> &str {
         &self.model_cache_id
     }
 
-    fn into_physical_resources(
-        self,
-        request_id: RequestId,
-    ) -> (Option<SequenceKvAllocation>, String) {
-        let allocation = self
-            .resource_blocks
-            .map(|blocks| SequenceKvAllocation::new(request_id, Some(blocks)));
-        (allocation, self.model_cache_id)
+    fn validate_replacement_cache(&self, cache: &Arc<dyn KvCacheHandle>) -> Result<()> {
+        let replacement_cache_id = cache.cache_id();
+        if replacement_cache_id != self.model_cache_id() {
+            return Err(FerrumError::internal(format!(
+                "decode replaced model cache authority {} with {}",
+                self.model_cache_id(),
+                replacement_cache_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn replace_cache_handle(&mut self, cache: Arc<dyn KvCacheHandle>) -> Result<()> {
+        self.validate_replacement_cache(&cache)?;
+        self.cache = cache;
+        Ok(())
+    }
+
+    fn into_physical_resources(self) -> (Option<SequenceKvAllocation>, String) {
+        let legacy_allocation = match self.release {
+            SequenceKvRelease::RuntimeManaged => None,
+            SequenceKvRelease::LegacyAllocated(allocation) => Some(allocation),
+        };
+        (legacy_allocation, self.model_cache_id)
     }
 }
 
@@ -796,14 +827,14 @@ impl SequenceDraftKvState {
     }
 
     fn allocation(self) -> SequenceKvAllocation {
-        SequenceKvAllocation::new(self.request_id, Some(self.resource_blocks))
+        SequenceKvAllocation::new(self.request_id, self.resource_blocks)
     }
 }
 
 #[derive(Debug, Default)]
 struct SequencePhysicalResources {
-    kv_allocation: Option<SequenceKvAllocation>,
-    draft_kv_allocation: Option<SequenceKvAllocation>,
+    legacy_kv_allocation: Option<SequenceKvAllocation>,
+    legacy_draft_kv_allocation: Option<SequenceKvAllocation>,
     recurrent_state_allocation: Option<SequenceRecurrentAllocation>,
     model_cache_id: Option<String>,
 }
@@ -824,13 +855,13 @@ struct SequenceCompletionResources {
 #[derive(Debug, Default)]
 #[must_use = "unified prefill owned resources must be released or committed"]
 struct UnifiedPrefillOwnedResources {
-    kv_allocation: Option<SequenceKvAllocation>,
+    legacy_kv_allocation: Option<SequenceKvAllocation>,
     recurrent_state_allocation: Option<SequenceRecurrentAllocation>,
 }
 
 impl UnifiedPrefillOwnedResources {
-    fn with_fresh_kv(mut self, request_id: RequestId, blocks: usize) -> Self {
-        self.kv_allocation = Some(SequenceKvAllocation::new(request_id, Some(blocks)));
+    fn with_fresh_kv(mut self, allocation: SequenceKvAllocation) -> Self {
+        self.legacy_kv_allocation = Some(allocation);
         self
     }
 
@@ -840,16 +871,16 @@ impl UnifiedPrefillOwnedResources {
     }
 
     fn commit(mut self) {
-        self.kv_allocation = None;
+        self.legacy_kv_allocation = None;
         self.recurrent_state_allocation = None;
     }
 
     fn is_empty(&self) -> bool {
-        self.kv_allocation.is_none() && self.recurrent_state_allocation.is_none()
+        self.legacy_kv_allocation.is_none() && self.recurrent_state_allocation.is_none()
     }
 
     async fn release(mut self, engine: &EngineInner, owner_request_id: &RequestId) {
-        if let Some(kv_allocation) = self.kv_allocation.take() {
+        if let Some(kv_allocation) = self.legacy_kv_allocation.take() {
             engine
                 .release_kv_allocation(
                     owner_request_id,
@@ -889,7 +920,7 @@ impl Drop for UnifiedPrefillOwnedResources {
         }
         let message = "unified prefill resources dropped without explicit release or commit";
         warn!(
-            kv_allocation = ?self.kv_allocation,
+            legacy_kv_allocation = ?self.legacy_kv_allocation,
             recurrent_state_allocation = ?self.recurrent_state_allocation,
             "{message}"
         );
@@ -912,7 +943,7 @@ struct SequenceDecodeResources {
 #[derive(Debug, Clone)]
 struct SequencePrefillResources {
     kv_cache: Option<Arc<dyn KvCacheHandle>>,
-    kv_resource_blocks: Option<usize>,
+    legacy_kv_allocation: Option<SequenceKvAllocation>,
     recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
     prefill_tokens_processed: usize,
 }
@@ -924,7 +955,9 @@ impl SequencePrefillResources {
     }
 
     fn kv_resource_blocks(&self) -> Option<usize> {
-        self.kv_resource_blocks
+        self.legacy_kv_allocation
+            .as_ref()
+            .map(|allocation| allocation.blocks)
     }
 }
 
@@ -1132,19 +1165,18 @@ impl SequenceState {
     }
 
     fn take_physical_resources(&mut self) -> SequencePhysicalResources {
-        let (kv_allocation, model_cache_id) = self
+        let (legacy_kv_allocation, model_cache_id) = self
             .model_kv
             .take()
             .map(|state| {
-                let (kv_allocation, model_cache_id) =
-                    state.into_physical_resources(self.request_id.clone());
-                (kv_allocation, Some(model_cache_id))
+                let (legacy_kv_allocation, model_cache_id) = state.into_physical_resources();
+                (legacy_kv_allocation, Some(model_cache_id))
             })
             .unwrap_or((None, None));
-        let draft_kv_allocation = self.draft_kv.take().map(SequenceDraftKvState::allocation);
+        let legacy_draft_kv_allocation = self.draft_kv.take().map(SequenceDraftKvState::allocation);
         let resources = SequencePhysicalResources {
-            kv_allocation,
-            draft_kv_allocation,
+            legacy_kv_allocation,
+            legacy_draft_kv_allocation,
             recurrent_state_allocation: self
                 .recurrent_state
                 .take()
@@ -1188,26 +1220,26 @@ impl SequenceState {
         }
     }
 
-    fn install_model_kv(
-        &mut self,
-        kv_cache: Arc<dyn KvCacheHandle>,
-        kv_resource_blocks: Option<usize>,
-    ) -> ModelCacheRefUpdate {
-        let model_cache_id = kv_cache.cache_id();
+    fn install_model_kv_state(&mut self, state: SequenceModelKvState) -> ModelCacheRefUpdate {
+        let model_cache_id = state.model_cache_id().to_string();
         let model_cache_update = self.model_cache_ref_update_for(&model_cache_id);
-        self.model_kv = Some(SequenceModelKvState::new_with_model_cache_id(
-            kv_cache,
-            kv_resource_blocks,
-            model_cache_id,
-        ));
+        self.model_kv = Some(state);
         model_cache_update
     }
 
-    fn install_model_kv_without_owned_blocks(
+    fn install_runtime_managed_model_kv(
         &mut self,
         kv_cache: Arc<dyn KvCacheHandle>,
     ) -> ModelCacheRefUpdate {
-        self.install_model_kv(kv_cache, None)
+        self.install_model_kv_state(SequenceModelKvState::runtime_managed(kv_cache))
+    }
+
+    fn install_legacy_allocated_model_kv(
+        &mut self,
+        kv_cache: Arc<dyn KvCacheHandle>,
+        allocation: SequenceKvAllocation,
+    ) -> ModelCacheRefUpdate {
+        self.install_model_kv_state(SequenceModelKvState::legacy_allocated(kv_cache, allocation))
     }
 
     fn commit_cached_prefill_physical_resources(
@@ -1215,7 +1247,7 @@ impl SequenceState {
         kv_cache: Arc<dyn KvCacheHandle>,
         prefill_tokens_processed: usize,
     ) -> ModelCacheRefUpdate {
-        let model_cache_update = self.install_model_kv_without_owned_blocks(kv_cache);
+        let model_cache_update = self.install_runtime_managed_model_kv(kv_cache);
         self.prefill_tokens_processed = prefill_tokens_processed;
         self.prefill_complete = true;
         self.phase = RequestPhase::Decoding;
@@ -1229,7 +1261,8 @@ impl SequenceState {
         recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
         recurrent_state_slots: Option<usize>,
     ) -> ModelCacheRefUpdate {
-        let model_cache_update = self.install_model_kv(kv_cache, Some(kv_resource_blocks));
+        let allocation = SequenceKvAllocation::new(self.request_id.clone(), kv_resource_blocks);
+        let model_cache_update = self.install_legacy_allocated_model_kv(kv_cache, allocation);
         self.recurrent_state =
             recurrent_state.map(|state| SequenceRecurrentState::new(state, recurrent_state_slots));
         self.prefill_complete = true;
@@ -1241,7 +1274,7 @@ impl SequenceState {
         &mut self,
         kv_cache: Arc<dyn KvCacheHandle>,
     ) -> ModelCacheRefUpdate {
-        let model_cache_update = self.install_model_kv_without_owned_blocks(kv_cache);
+        let model_cache_update = self.install_runtime_managed_model_kv(kv_cache);
         self.recurrent_state = None;
         self.prefill_complete = true;
         self.phase = RequestPhase::Decoding;
@@ -1251,12 +1284,13 @@ impl SequenceState {
     fn commit_prefill_chunk_physical_resources(
         &mut self,
         kv_cache: Arc<dyn KvCacheHandle>,
-        kv_resource_blocks: Option<usize>,
+        legacy_kv_allocation: SequenceKvAllocation,
         recurrent_state: Option<Arc<dyn RecurrentStateHandle>>,
         prefill_tokens_processed: usize,
         is_final_chunk: bool,
     ) -> ModelCacheRefUpdate {
-        let model_cache_update = self.install_model_kv(kv_cache, kv_resource_blocks);
+        let model_cache_update =
+            self.install_legacy_allocated_model_kv(kv_cache, legacy_kv_allocation);
         let existing_slots = self.recurrent_state.as_ref().and_then(|state| state.slots);
         self.recurrent_state =
             recurrent_state.map(|state| SequenceRecurrentState::new(state, existing_slots));
@@ -1314,10 +1348,11 @@ impl SequenceState {
     fn prefill_resources(&self) -> SequencePrefillResources {
         SequencePrefillResources {
             kv_cache: self.model_kv.as_ref().map(SequenceModelKvState::handle),
-            kv_resource_blocks: self
+            legacy_kv_allocation: self
                 .model_kv
                 .as_ref()
-                .and_then(SequenceModelKvState::resource_blocks),
+                .and_then(SequenceModelKvState::legacy_allocation)
+                .cloned(),
             recurrent_state: self
                 .recurrent_state
                 .as_ref()
@@ -1347,7 +1382,8 @@ impl SequenceState {
     fn kv_resource_blocks(&self) -> Option<usize> {
         self.model_kv
             .as_ref()
-            .and_then(SequenceModelKvState::resource_blocks)
+            .and_then(SequenceModelKvState::legacy_allocation)
+            .map(|allocation| allocation.blocks)
     }
 
     fn model_cache_id(&self) -> Option<&str> {
@@ -1361,10 +1397,18 @@ impl SequenceState {
         self.model_kv = None;
     }
 
-    fn commit_decode_step_physical_resources(&mut self, kv_cache: Arc<dyn KvCacheHandle>) {
-        let existing_blocks = self.kv_resource_blocks();
-        self.model_kv = Some(SequenceModelKvState::new(kv_cache, existing_blocks));
+    fn commit_decode_step_physical_resources(
+        &mut self,
+        kv_cache: Arc<dyn KvCacheHandle>,
+    ) -> Result<()> {
+        self.model_kv
+            .as_mut()
+            .ok_or_else(|| {
+                FerrumError::internal("decode completed without an active model KV lease")
+            })?
+            .replace_cache_handle(kv_cache)?;
         self.tokens_this_iteration += 1;
+        Ok(())
     }
 
     fn commit_decode_recurrent_state(
@@ -1392,19 +1436,38 @@ impl SequenceState {
         &mut self,
         target_kv_cache: Arc<dyn KvCacheHandle>,
         draft_kv_cache: Arc<dyn KvCacheHandle>,
-    ) {
-        let existing_blocks = self.kv_resource_blocks();
-        self.model_kv = Some(SequenceModelKvState::new(target_kv_cache, existing_blocks));
-        if let Some(draft) = &mut self.draft_kv {
-            draft.cache = draft_kv_cache;
-        } else {
-            let message = "draft KV cache updated without owned allocation metadata";
-            warn!(request_id = %self.request_id, "{message}");
-            #[cfg(test)]
-            if !std::thread::panicking() {
-                panic!("{message}");
+    ) -> Result<()> {
+        self.model_kv
+            .as_ref()
+            .ok_or_else(|| {
+                FerrumError::internal(
+                    "speculative decode completed without an active target KV lease",
+                )
+            })?
+            .validate_replacement_cache(&target_kv_cache)?;
+        if let Some(draft) = &self.draft_kv {
+            let replacement_cache_id = draft_kv_cache.cache_id();
+            if replacement_cache_id != draft.cache.cache_id() {
+                return Err(FerrumError::internal(format!(
+                    "speculative decode replaced draft cache authority {} with {}",
+                    draft.cache.cache_id(),
+                    replacement_cache_id
+                )));
             }
+        } else {
+            return Err(FerrumError::internal(
+                "draft KV cache updated without owned allocation metadata",
+            ));
         }
+        self.model_kv
+            .as_mut()
+            .expect("validated target KV lease remains installed")
+            .replace_cache_handle(target_kv_cache)?;
+        self.draft_kv
+            .as_mut()
+            .expect("validated draft KV lease remains installed")
+            .cache = draft_kv_cache;
+        Ok(())
     }
 
     fn commit_draft_kv_allocation(
@@ -2008,7 +2071,7 @@ impl KvAllocationLease {
             .release_kv_allocation(
                 &self.owner_request_id,
                 self.allocation_request_id.clone(),
-                Some(self.blocks),
+                self.blocks,
             )
             .await;
         self.armed = false;
@@ -3114,7 +3177,7 @@ impl EngineInner {
         &self,
         owner_request_id: &RequestId,
         allocation_request_id: RequestId,
-        blocks: Option<usize>,
+        blocks: usize,
     ) {
         let kv_cache = match self.engine_managed_kv_cache() {
             Ok(kv_cache) => kv_cache,
@@ -3130,9 +3193,7 @@ impl EngineInner {
         };
         match kv_cache.deallocate(allocation_request_id.clone()).await {
             Ok(()) => {
-                if let Some(blocks) = blocks {
-                    self.trace_kv_release(owner_request_id, blocks);
-                }
+                self.trace_kv_release(owner_request_id, blocks);
             }
             Err(error) => {
                 warn!(
@@ -3141,15 +3202,13 @@ impl EngineInner {
                     error = %error,
                     "KV allocation release failed"
                 );
-                if blocks.is_some() {
-                    self.trace_resource_release_failure(
-                        owner_request_id,
-                        "kv_block",
-                        "engine_kv_block_release_failed",
-                        Some(self.config.kv_cache.max_blocks),
-                        format!("kv release failed for {allocation_request_id}: {error}"),
-                    );
-                }
+                self.trace_resource_release_failure(
+                    owner_request_id,
+                    "kv_block",
+                    "engine_kv_block_release_failed",
+                    Some(self.config.kv_cache.max_blocks),
+                    format!("kv release failed for {allocation_request_id}: {error}"),
+                );
             }
         }
     }
@@ -3162,11 +3221,11 @@ impl EngineInner {
         if let Some(cache_id) = resources.model_cache_id {
             self.release_model_cache_ref(request_id, &cache_id);
         }
-        if let Some(kv_allocation) = resources.kv_allocation {
+        if let Some(kv_allocation) = resources.legacy_kv_allocation {
             self.release_kv_allocation(request_id, kv_allocation.request_id, kv_allocation.blocks)
                 .await;
         }
-        if let Some(draft_kv_allocation) = resources.draft_kv_allocation {
+        if let Some(draft_kv_allocation) = resources.legacy_draft_kv_allocation {
             self.release_kv_allocation(
                 request_id,
                 draft_kv_allocation.request_id,
