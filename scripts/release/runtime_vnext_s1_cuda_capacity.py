@@ -1319,6 +1319,296 @@ def event_wall_ns(row: dict[str, Any]) -> int:
     return value
 
 
+def validate_admission_epochs(value: Any, label: str) -> dict[str, int]:
+    require(isinstance(value, dict), f"{label} epochs are missing")
+    coordinator_id = value.get("coordinator_id")
+    release_epoch = value.get("release_epoch")
+    capacity_epoch = value.get("capacity_epoch")
+    require(
+        isinstance(coordinator_id, int) and coordinator_id > 0,
+        f"{label} coordinator is invalid",
+    )
+    require(
+        isinstance(release_epoch, int) and release_epoch >= 0,
+        f"{label} release epoch is invalid",
+    )
+    require(
+        isinstance(capacity_epoch, int) and capacity_epoch >= 0,
+        f"{label} capacity epoch is invalid",
+    )
+    return {
+        "coordinator_id": coordinator_id,
+        "release_epoch": release_epoch,
+        "capacity_epoch": capacity_epoch,
+    }
+
+
+def validate_capacity_wait_condition(
+    value: Any, *, coordinator_id: int, label: str
+) -> dict[str, Any]:
+    require(isinstance(value, dict), f"{label} wait condition is missing")
+    require(
+        value.get("coordinator_id") == coordinator_id,
+        f"{label} wait condition belongs to a different coordinator",
+    )
+    observed = value.get("observed")
+    require(
+        isinstance(observed, list) and observed,
+        f"{label} wait condition has no exact availability source",
+    )
+    seen_sources: set[str] = set()
+    for entry in observed:
+        require(isinstance(entry, dict), f"{label} wait source is invalid")
+        source = entry.get("source")
+        if isinstance(source, dict):
+            require(
+                set(source) == {"domain"}
+                and isinstance(source.get("domain"), int)
+                and source["domain"] > 0,
+                f"{label} domain wait source is invalid",
+            )
+        else:
+            require(
+                source
+                in {
+                    "active_sequence_slots",
+                    "plan_device_budget",
+                    "process_device_capacity",
+                },
+                f"{label} wait source is unknown",
+            )
+        source_key = json.dumps(source, sort_keys=True, separators=(",", ":"))
+        require(source_key not in seen_sources, f"{label} wait source is duplicated")
+        seen_sources.add(source_key)
+        require(
+            isinstance(entry.get("epoch"), int) and entry["epoch"] > 0,
+            f"{label} wait source epoch is invalid",
+        )
+    return value
+
+
+def validate_device_capacity_pressure(value: Any, label: str) -> dict[str, Any]:
+    require(isinstance(value, dict), f"{label} pressure evidence is missing")
+    scope = value.get("scope")
+    require(
+        scope in {"plan_budget", "process_wide"},
+        f"{label} pressure scope is invalid",
+    )
+    require(
+        isinstance(value.get("device_id"), str) and value["device_id"].strip(),
+        f"{label} pressure device is invalid",
+    )
+    requested = value.get("requested_bytes")
+    plan_claimed = value.get("plan_claimed_bytes")
+    plan_usable = value.get("plan_usable_bytes")
+    process_claimed = value.get("process_claimed_bytes")
+    process_usable = value.get("process_usable_bytes")
+    require(
+        isinstance(requested, int) and requested > 0,
+        f"{label} requested bytes are invalid",
+    )
+    require(
+        all(
+            isinstance(item, int) and item >= 0
+            for item in (plan_claimed, plan_usable, process_claimed, process_usable)
+        ),
+        f"{label} capacity totals are invalid",
+    )
+    require(
+        plan_claimed <= plan_usable and process_claimed <= process_usable,
+        f"{label} claimed capacity exceeds usable capacity",
+    )
+    plan_available = plan_usable - plan_claimed
+    process_available = process_usable - process_claimed
+    if scope == "plan_budget":
+        require(
+            plan_available < requested,
+            f"{label} plan pressure does not block the requested bytes",
+        )
+    else:
+        require(
+            plan_available >= requested and process_available < requested,
+            f"{label} process pressure does not match the capacity totals",
+        )
+    return value
+
+
+def typed_wait_for_release_transitions(
+    rows: list[dict[str, Any]], request_id: str
+) -> list[dict[str, Any]]:
+    transitions: list[dict[str, Any]] = []
+    pending_maintenance: dict[str, Any] | None = None
+    for row in rows:
+        phase = row.get("phase")
+        shape = row.get("shape")
+        if not isinstance(shape, dict):
+            continue
+        if phase == "vnext.prefill_admission":
+            decision = shape.get("decision")
+            if decision == "maintenance_deferred":
+                require(
+                    pending_maintenance is None,
+                    "B produced a second maintenance deferral before completing the first",
+                )
+                require(
+                    shape.get("maintenance_required") is True
+                    and shape.get("execution_authority_retained") is False
+                    and shape.get("prefill_submit_observed") is False,
+                    "B maintenance deferral has inconsistent authority evidence",
+                )
+                evidence = row.get("attributes", {}).get("admission_evidence")
+                require(
+                    isinstance(evidence, dict),
+                    "B maintenance deferral has no typed admission evidence",
+                )
+                require(
+                    evidence.get("request_id") == request_id,
+                    "B maintenance deferral evidence has the wrong request identity",
+                )
+                require(
+                    evidence.get("stage") in {"logical_capacity", "physical_backing"},
+                    "B maintenance deferral stage is invalid",
+                )
+                observed = validate_admission_epochs(
+                    evidence.get("observed"), "B maintenance deferral"
+                )
+                validate_capacity_wait_condition(
+                    evidence.get("wait_condition"),
+                    coordinator_id=observed["coordinator_id"],
+                    label="B maintenance deferral",
+                )
+                require(
+                    isinstance(evidence.get("blockers"), list) and evidence["blockers"],
+                    "B maintenance deferral has no blockers",
+                )
+                pending_maintenance = {
+                    "row": row,
+                    "observed": observed,
+                    "wall_ns": event_wall_ns(row),
+                }
+            elif decision == "deferred":
+                require(
+                    pending_maintenance is None,
+                    "B direct deferral raced an unfinished maintenance deferral",
+                )
+                require(
+                    shape.get("maintenance_required") is False
+                    and shape.get("execution_authority_retained") is False
+                    and shape.get("prefill_submit_observed") is False,
+                    "B direct deferral has inconsistent authority evidence",
+                )
+                evidence = row.get("attributes", {}).get("admission_evidence")
+                require(isinstance(evidence, dict), "B direct deferral evidence is missing")
+                require(
+                    evidence.get("action") == "wait_for_release",
+                    "B direct deferral is not WaitForRelease",
+                )
+                available = evidence.get("available")
+                require(
+                    isinstance(available, dict),
+                    "B direct deferral has no capacity snapshot",
+                )
+                epochs = validate_admission_epochs(
+                    {
+                        "coordinator_id": available.get("coordinator_id"),
+                        "release_epoch": evidence.get("release_epoch"),
+                        "capacity_epoch": evidence.get("capacity_epoch"),
+                    },
+                    "B direct deferral",
+                )
+                wait_condition = validate_capacity_wait_condition(
+                    evidence.get("wait_condition"),
+                    coordinator_id=epochs["coordinator_id"],
+                    label="B direct deferral",
+                )
+                transitions.append(
+                    {
+                        "source": "direct_admission",
+                        "wall_ns": event_wall_ns(row),
+                        "epochs": epochs,
+                        "wait_condition": wait_condition,
+                    }
+                )
+            elif decision in {"admitted", "permanent_rejected", "faulted"}:
+                require(
+                    pending_maintenance is None,
+                    "B admission completed before retained maintenance produced an outcome",
+                )
+        elif phase == "vnext.prefill_backing_maintenance":
+            require(
+                pending_maintenance is not None,
+                "B backing maintenance has no preceding typed maintenance deferral",
+            )
+            maintenance_ns = event_wall_ns(row)
+            require(
+                maintenance_ns > pending_maintenance["wall_ns"],
+                "B backing maintenance did not follow its typed deferral",
+            )
+            outcome = shape.get("outcome")
+            if outcome == "wait_for_release":
+                require(
+                    row.get("status") == "ok" and row.get("error") is None,
+                    "B WaitForRelease maintenance event is not successful",
+                )
+                evidence = row.get("attributes", {}).get("maintenance_evidence")
+                require(
+                    isinstance(evidence, dict),
+                    "B WaitForRelease maintenance evidence is missing",
+                )
+                require(
+                    evidence.get("outcome") == "wait_for_release",
+                    "B maintenance shape/evidence outcome mismatch",
+                )
+                current = validate_admission_epochs(
+                    evidence.get("current"), "B WaitForRelease maintenance"
+                )
+                observed = pending_maintenance["observed"]
+                require(
+                    current["coordinator_id"] == observed["coordinator_id"],
+                    "B maintenance changed admission coordinator",
+                )
+                require(
+                    current["release_epoch"] >= observed["release_epoch"]
+                    and current["capacity_epoch"] >= observed["capacity_epoch"],
+                    "B maintenance regressed admission epochs",
+                )
+                wait_condition = validate_capacity_wait_condition(
+                    evidence.get("wait_condition"),
+                    coordinator_id=current["coordinator_id"],
+                    label="B WaitForRelease maintenance",
+                )
+                pressure = validate_device_capacity_pressure(
+                    evidence.get("pressure"), "B WaitForRelease maintenance"
+                )
+                required_source = (
+                    "plan_device_budget"
+                    if pressure["scope"] == "plan_budget"
+                    else "process_device_capacity"
+                )
+                require(
+                    any(
+                        entry.get("source") == required_source
+                        for entry in wait_condition["observed"]
+                    ),
+                    "B maintenance wait condition omits its pressure source",
+                )
+                transitions.append(
+                    {
+                        "source": "backing_maintenance",
+                        "wall_ns": maintenance_ns,
+                        "epochs": current,
+                        "wait_condition": wait_condition,
+                    }
+                )
+            pending_maintenance = None
+    require(
+        pending_maintenance is None,
+        "B trace ended with unfinished typed backing maintenance",
+    )
+    require(transitions, "B never entered typed WaitForRelease admission")
+    return transitions
+
+
 def validate_stream(result: dict[str, Any], label: str) -> None:
     require_stream_success(result, label)
     require(
@@ -1510,22 +1800,13 @@ def validate(root: Path, out: Path) -> int:
         for row in rows
         if request_identity_matches(row.get("request_id"), b_request_id)
     ]
-    deferred = [
-        row
-        for row in b_rows
-        if row.get("phase") == "vnext.prefill_admission"
-        and isinstance(row.get("shape"), dict)
-        and row["shape"].get("decision") == "deferred"
-    ]
-    require(deferred, "B never entered typed WaitForRelease admission")
-    defer_row = deferred[0]
-    evidence = defer_row.get("attributes", {}).get("admission_evidence", {})
-    require(evidence.get("action") == "wait_for_release", "B deferral is not WaitForRelease")
-    defer_ns = event_wall_ns(defer_row)
+    wait_transitions = typed_wait_for_release_transitions(b_rows, b_request_id)
+    defer_ns = min(transition["wall_ns"] for transition in wait_transitions)
     skipped = [
         row
         for row in b_rows
         if row.get("phase") == "vnext.prefill_admission_skipped_unchanged"
+        and event_wall_ns(row) > defer_ns
     ]
     require(skipped, "B has no unchanged-epoch skip evidence")
     require(
@@ -1598,7 +1879,11 @@ def validate(root: Path, out: Path) -> int:
     final_pools = final_executor.get("dynamic_pools", {})
     final_epochs = final_pools.get("epochs", {})
     require(
-        final_epochs.get("release_epoch", 0) > evidence.get("release_epoch", 0),
+        final_epochs.get("release_epoch", 0)
+        > max(
+            transition["epochs"]["release_epoch"]
+            for transition in wait_transitions
+        ),
         "final capacity release epoch did not advance beyond B's observation",
     )
     require(final_executor.get("active_sequences") == 0, "final executor still has active sequences")
@@ -1647,7 +1932,10 @@ def validate(root: Path, out: Path) -> int:
         "source_collection_sha256": sha256(root / "collection.json"),
         "exact_budget_bytes": exact_budget,
         "b_request_id": b_request_id,
-        "b_wait_for_release_events": len(deferred),
+        "b_wait_for_release_events": len(wait_transitions),
+        "b_wait_for_release_sources": sorted(
+            {transition["source"] for transition in wait_transitions}
+        ),
         "b_unchanged_epoch_skips": len(skipped),
         "target_trace_bytes": target_trace_bytes,
         "pressure_trace_bytes": pressure_trace_bytes,
@@ -1659,7 +1947,10 @@ def validate(root: Path, out: Path) -> int:
             "unchanged_epoch_skips": len(skipped),
             "pressure_trace_bytes": pressure_trace_bytes,
         },
-        "capacity_release_epoch_before": evidence["release_epoch"],
+        "capacity_release_epoch_before": max(
+            transition["epochs"]["release_epoch"]
+            for transition in wait_transitions
+        ),
         "capacity_release_epoch_after": final_epochs["release_epoch"],
         "does_not_prove": ["G01B", "S1", "performance", "release"],
         "pass_line": pass_line,
@@ -1779,6 +2070,125 @@ def self_test() -> int:
             require(expected in str(error), f"unexpected gate error: {error}")
             return
         raise AssertionError(f"expected gate error containing {expected!r}")
+
+    wait_condition = {
+        "coordinator_id": 7,
+        "observed": [
+            {"source": {"domain": 5}, "epoch": 3},
+            {"source": "plan_device_budget", "epoch": 2},
+        ],
+    }
+    direct_wait = {
+        "ts_unix_nanos": 10,
+        "phase": "vnext.prefill_admission",
+        "shape": {
+            "decision": "deferred",
+            "execution_authority_retained": False,
+            "maintenance_required": False,
+            "prefill_submit_observed": False,
+        },
+        "attributes": {
+            "admission_evidence": {
+                "action": "wait_for_release",
+                "available": {"coordinator_id": 7},
+                "release_epoch": 11,
+                "capacity_epoch": 13,
+                "wait_condition": wait_condition,
+            }
+        },
+    }
+    direct_transitions = typed_wait_for_release_transitions([direct_wait], "B")
+    require(
+        len(direct_transitions) == 1
+        and direct_transitions[0]["source"] == "direct_admission",
+        "direct WaitForRelease transition was not recognized",
+    )
+
+    maintenance_deferred = {
+        "ts_unix_nanos": 20,
+        "phase": "vnext.prefill_admission",
+        "shape": {
+            "decision": "maintenance_deferred",
+            "execution_authority_retained": False,
+            "maintenance_required": True,
+            "prefill_submit_observed": False,
+        },
+        "attributes": {
+            "admission_evidence": {
+                "request_id": "B",
+                "observed": {
+                    "coordinator_id": 7,
+                    "release_epoch": 11,
+                    "capacity_epoch": 13,
+                },
+                "wait_condition": {
+                    "coordinator_id": 7,
+                    "observed": [{"source": {"domain": 5}, "epoch": 3}],
+                },
+                "stage": "physical_backing",
+                "blockers": [{"source": "backing"}],
+            }
+        },
+    }
+    maintenance_wait = {
+        "ts_unix_nanos": 30,
+        "phase": "vnext.prefill_backing_maintenance",
+        "status": "ok",
+        "error": None,
+        "shape": {"outcome": "wait_for_release"},
+        "attributes": {
+            "maintenance_evidence": {
+                "outcome": "wait_for_release",
+                "current": {
+                    "coordinator_id": 7,
+                    "release_epoch": 12,
+                    "capacity_epoch": 14,
+                },
+                "wait_condition": wait_condition,
+                "pressure": {
+                    "scope": "plan_budget",
+                    "device_id": "device.cuda.0",
+                    "requested_bytes": 8,
+                    "plan_claimed_bytes": 100,
+                    "plan_usable_bytes": 100,
+                    "process_claimed_bytes": 100,
+                    "process_usable_bytes": 200,
+                },
+            }
+        },
+    }
+    maintenance_transitions = typed_wait_for_release_transitions(
+        [maintenance_deferred, maintenance_wait], "B"
+    )
+    require(
+        len(maintenance_transitions) == 1
+        and maintenance_transitions[0]["source"] == "backing_maintenance",
+        "two-stage WaitForRelease transition was not recognized",
+    )
+    missing_evidence = json.loads(json.dumps(maintenance_wait))
+    missing_evidence["attributes"] = {}
+    expect_gate_error(
+        lambda: typed_wait_for_release_transitions(
+            [maintenance_deferred, missing_evidence], "B"
+        ),
+        "maintenance evidence is missing",
+    )
+    expect_gate_error(
+        lambda: typed_wait_for_release_transitions(
+            [maintenance_wait, maintenance_deferred], "B"
+        ),
+        "no preceding typed maintenance deferral",
+    )
+    mismatched_outcome = json.loads(json.dumps(maintenance_wait))
+    mismatched_outcome["attributes"]["maintenance_evidence"]["outcome"] = (
+        "retry_admission"
+    )
+    expect_gate_error(
+        lambda: typed_wait_for_release_transitions(
+            [maintenance_deferred, mismatched_outcome], "B"
+        ),
+        "shape/evidence outcome mismatch",
+    )
 
     with __import__("tempfile").TemporaryDirectory() as temp:
         trace = Path(temp) / "trace.jsonl"
