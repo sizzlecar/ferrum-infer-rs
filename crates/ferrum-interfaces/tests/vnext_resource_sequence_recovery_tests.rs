@@ -171,11 +171,27 @@ fn forgotten_live_permit_fails_closed(plan: &ExecutionPlan, passed: &mut usize) 
     ); // 15/16
 
     drop(sequence);
-    let close = close_plan_runtime(root);
+    // Forgetting the active permit intentionally leaks its exact backing
+    // snapshot. That snapshot must retain the logical owner and plan root;
+    // closing here would release device resources still covered by the leaked
+    // dispatch authority.
+    let (root, strong_count, deferred_cleanup) = match PlanRuntimeResources::close(root) {
+        Ok(PlanRuntimeCloseOutcome::Referenced {
+            resources,
+            strong_count,
+            deferred_cleanup,
+        }) => (resources, strong_count, deferred_cleanup),
+        Ok(PlanRuntimeCloseOutcome::Closed(_)) => {
+            panic!("forgotten permit backing unexpectedly allowed root close")
+        }
+        Err(failure) => panic!("forgotten permit close failed: {:?}", failure.failure()),
+    };
     let final_trace = trace.lock().unwrap();
     check(
         passed,
-        close.released_static_resources() == plan_resources(plan).len()
+        strong_count == 2
+            && root.is_closing()
+            && deferred_cleanup.pending() == 0
             && final_trace.runtime_synchronize_calls == 1
             && final_trace.stream_drops == 1
             && final_trace.abandon.is_empty(),
