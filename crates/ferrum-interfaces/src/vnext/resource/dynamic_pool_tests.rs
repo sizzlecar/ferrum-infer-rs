@@ -766,7 +766,15 @@ fn evaluated_request<'a>(
     pool: &'a Arc<DynamicBackingPool<TestRuntime>>,
     size_bytes: u64,
 ) -> EvaluatedBackingRequest<'a> {
-    let descriptor = &pool.domain.descriptors[0];
+    evaluated_descriptor_request(pool, 0, size_bytes)
+}
+
+fn evaluated_descriptor_request<'a>(
+    pool: &'a Arc<DynamicBackingPool<TestRuntime>>,
+    descriptor_index: usize,
+    size_bytes: u64,
+) -> EvaluatedBackingRequest<'a> {
+    let descriptor = &pool.domain.descriptors[descriptor_index];
     EvaluatedBackingRequest {
         domain: &pool.domain,
         claim_identity: PhysicalBackingClaimIdentity::new(
@@ -2733,6 +2741,121 @@ fn contiguous_profile_rejects_fragmented_cross_chunk_claim() {
     let authority = prepared.commit().pop().unwrap();
     assert_eq!(authority.evidence().segments().len(), 1);
     assert_eq!(authority.evidence().segments()[0].length_bytes(), 128);
+}
+
+#[test]
+fn contiguous_batch_deferral_retains_whole_packing_demand_and_grows_to_progress() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'c',
+        2,
+        2_048,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 2_048);
+    let harness = harness(runtime, catalog, 2_048, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.grow_pool(&harness.pool_ids[0], 640).unwrap();
+    maintenance.grow_pool(&harness.pool_ids[0], 256).unwrap();
+    let pool = Arc::clone(&harness.root.dynamic_pools.pools[&harness.pool_ids[0]]);
+    let requests = vec![
+        evaluated_descriptor_request(&pool, 0, 448),
+        evaluated_descriptor_request(&pool, 1, 448),
+    ];
+
+    let BackingPrepareDecision::Deferred(deferred) =
+        harness.root.dynamic_pools.prepare_claim(&requests).unwrap()
+    else {
+        panic!("640+256 free bytes cannot initially pack two 448-byte claims")
+    };
+    let blocker = &deferred.blockers()[0];
+    assert_eq!(
+        blocker.reason(),
+        DynamicBackingDeferralReason::FragmentedContiguous
+    );
+    assert_eq!(blocker.free_bytes(), 896);
+    assert_eq!(blocker.largest_contiguous_bytes(), 640);
+    assert_eq!(blocker.requested_bytes(), 448);
+    assert_eq!(
+        blocker.contiguous_claim_bytes_descending(),
+        Some([448, 448].as_slice())
+    );
+    assert!(blocker
+        .free_extent_layout_fingerprint()
+        .starts_with("sha256/"));
+
+    let DynamicDeferredMaintenanceOutcome::Maintained(growth) =
+        maintenance.maintain_for_live_deferred(&deferred).unwrap()
+    else {
+        panic!("whole-transaction fragmentation must grow or wait, never retry unchanged")
+    };
+    assert_eq!(growth.growths().len(), 1);
+    assert_eq!(growth.growths()[0].chunk_bytes(), 448);
+
+    let BackingPrepareDecision::Prepared(prepared) =
+        harness.root.dynamic_pools.prepare_claim(&requests).unwrap()
+    else {
+        panic!("the progress-producing growth must make the exact batch packable")
+    };
+    let authorities = prepared.commit();
+    assert_eq!(authorities.len(), 2);
+    drop(authorities);
+    let status = maintenance.status().unwrap();
+    assert_eq!(status.pools()[0].resident_bytes(), 1_344);
+    assert_eq!(status.pools()[0].free_bytes(), 1_344);
+}
+
+#[test]
+fn contiguous_batch_shortfall_grows_for_packability_not_aggregate_bytes() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'd',
+        3,
+        4_096,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 4_096);
+    let harness = harness(runtime, catalog, 4_096, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.grow_pool(&harness.pool_ids[0], 368).unwrap();
+    let pool = Arc::clone(&harness.root.dynamic_pools.pools[&harness.pool_ids[0]]);
+    let requests = vec![
+        evaluated_descriptor_request(&pool, 0, 720),
+        evaluated_descriptor_request(&pool, 1, 720),
+        evaluated_descriptor_request(&pool, 2, 720),
+    ];
+
+    let BackingPrepareDecision::Deferred(deferred) =
+        harness.root.dynamic_pools.prepare_claim(&requests).unwrap()
+    else {
+        panic!("one undersized chunk cannot hold three contiguous claims")
+    };
+    let blocker = &deferred.blockers()[0];
+    assert_eq!(
+        blocker.reason(),
+        DynamicBackingDeferralReason::GrowthRequired
+    );
+    assert_eq!(blocker.free_bytes(), 368);
+    assert_eq!(blocker.largest_contiguous_bytes(), 368);
+    assert_eq!(blocker.requested_bytes(), 2_160);
+    assert_ne!(blocker.requested_bytes(), 2_160 - 368);
+
+    let DynamicDeferredMaintenanceOutcome::Maintained(growth) =
+        maintenance.maintain_for_live_deferred(&deferred).unwrap()
+    else {
+        panic!("contiguous shortfall must install one transaction-packable chunk")
+    };
+    assert_eq!(growth.growths()[0].chunk_bytes(), 2_160);
+    let BackingPrepareDecision::Prepared(prepared) =
+        harness.root.dynamic_pools.prepare_claim(&requests).unwrap()
+    else {
+        panic!("one transaction-packable growth must satisfy all three claims")
+    };
+    let authorities = prepared.commit();
+    assert_eq!(authorities.len(), 3);
+    drop(authorities);
 }
 
 #[test]

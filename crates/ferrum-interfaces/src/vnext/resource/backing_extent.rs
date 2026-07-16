@@ -172,7 +172,7 @@ pub(super) struct FreeExtent {
     pub(super) length_bytes: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct FreeExtentIndex {
     pub(super) by_offset: BTreeMap<(u32, u64), FreeExtent>,
     pub(super) by_size: BTreeSet<(u64, u32, u64, u64)>,
