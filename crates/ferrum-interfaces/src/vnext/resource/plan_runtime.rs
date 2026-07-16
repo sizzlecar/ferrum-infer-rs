@@ -3,10 +3,11 @@ use super::{
     maintain_deferred_device_cleanups, new_deferred_device_cleanup_domain,
     retire_deferred_device_cleanup_domain, watch, AdmissionDeferred, AdmissionDemand,
     AdmissionFitPolicy, AdmissionPressureAction, AllocationLifetime, Arc, AtomicU8,
-    BackingPrepareDecision, CapacityEntry, CapacityEpochs, CapacityUnits, CapacityVector,
-    CapacityWaitRecheck, CapacityWaitRegistration, DeferredDeviceCleanupDomainId,
-    DeferredDeviceCleanupMaintenanceReceipt, DeferredDeviceCleanupStatus, DeviceCapacityClaim,
-    DeviceId, DeviceRuntime, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
+    BackingPrepareDecision, CapacityAvailabilityEpoch, CapacityEntry, CapacityEpochs,
+    CapacityUnits, CapacityVector, CapacityWaitCondition, CapacityWaitRecheck,
+    DeferredDeviceCleanupDomainId, DeferredDeviceCleanupMaintenanceReceipt,
+    DeferredDeviceCleanupStatus, DeviceCapacityClaim, DeviceCapacitySignal, DeviceId,
+    DeviceRuntime, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
     DynamicPoolMaintenanceController, DynamicPoolMaintenanceStatus, DynamicPoolSet,
     DynamicResourceShape, EvaluatedBackingProjection, EvaluatedBackingRequest, FailureEnvelope,
     InvocationLivenessMode, LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex,
@@ -362,7 +363,11 @@ pub struct PlanCapacityWaitRegistration<R>
 where
     R: DeviceRuntime,
 {
-    registration: CapacityWaitRegistration,
+    observed: CapacityWaitCondition,
+    registered: CapacityWaitCondition,
+    logical_rx: watch::Receiver<CapacityEpochs>,
+    plan_capacity_rx: watch::Receiver<DeviceCapacitySignal>,
+    process_capacity_rx: watch::Receiver<DeviceCapacitySignal>,
     lifecycle_rx: watch::Receiver<u8>,
     resources: Arc<PlanRuntimeResources<R>>,
 }
@@ -373,32 +378,85 @@ where
 {
     pub fn recheck(&self) -> Result<CapacityWaitRecheck, VNextError> {
         let _lifecycle = self.resources.read_lifecycle("recheck a capacity waiter")?;
-        self.registration.recheck()
+        let mut availability = Vec::with_capacity(self.resources.dynamic_pools.domains.len() + 3);
+        let current = self
+            .resources
+            .dynamic_pools
+            .write_capacity_availability(&mut availability)?;
+        Ok(CapacityWaitRecheck::new(
+            current,
+            self.observed.changed_since(&availability)?,
+            self.registered.changed_since(&availability)?,
+        ))
     }
 
     pub async fn wait_for_change(self) -> Result<CapacityEpochs, VNextError> {
         let Self {
-            registration,
+            observed,
+            registered,
+            mut logical_rx,
+            mut plan_capacity_rx,
+            mut process_capacity_rx,
             mut lifecycle_rx,
             resources,
         } = self;
-        let admission_wait = registration.wait_for_change();
-        tokio::pin!(admission_wait);
-        tokio::select! {
-            result = &mut admission_wait => result,
-            changed = lifecycle_rx.changed() => {
-                changed.map_err(|_| invalid_resource(
-                    "plan runtime lifecycle signal closed while a capacity waiter was live",
-                ))?;
-                if *lifecycle_rx.borrow_and_update() == PLAN_RUNTIME_CLOSING {
-                    Err(invalid_resource(
-                        "closing plan runtime cancelled its capacity waiter",
-                    ))
-                } else {
-                    drop(resources);
-                    Err(invalid_resource(
+        loop {
+            let recheck = {
+                let _lifecycle = match resources.read_lifecycle("recheck a capacity waiter") {
+                    Ok(lifecycle) => lifecycle,
+                    Err(_) if resources.is_closing() => {
+                        return Err(invalid_resource(
+                            "closing plan runtime cancelled its capacity waiter",
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                };
+                let mut availability =
+                    Vec::with_capacity(resources.dynamic_pools.domains.len() + 3);
+                let current = resources
+                    .dynamic_pools
+                    .write_capacity_availability(&mut availability)?;
+                CapacityWaitRecheck::new(
+                    current,
+                    observed.changed_since(&availability)?,
+                    registered.changed_since(&availability)?,
+                )
+            };
+            if recheck.should_retry() {
+                return Ok(recheck.current());
+            }
+            tokio::select! {
+                biased;
+                changed = lifecycle_rx.changed() => {
+                    changed.map_err(|_| invalid_resource(
+                        "plan runtime lifecycle signal closed while a capacity waiter was live",
+                    ))?;
+                    if *lifecycle_rx.borrow_and_update() == PLAN_RUNTIME_CLOSING {
+                        return Err(invalid_resource(
+                            "closing plan runtime cancelled its capacity waiter",
+                        ));
+                    }
+                    return Err(invalid_resource(
                         "capacity waiter observed an invalid plan runtime lifecycle transition",
-                    ))
+                    ));
+                }
+                changed = logical_rx.changed() => {
+                    changed.map_err(|_| invalid_resource(
+                        "logical capacity signal closed while a plan waiter was live",
+                    ))?;
+                    logical_rx.borrow_and_update();
+                }
+                changed = plan_capacity_rx.changed() => {
+                    changed.map_err(|_| invalid_resource(
+                        "plan device-capacity signal closed while a waiter was live",
+                    ))?;
+                    plan_capacity_rx.borrow_and_update();
+                }
+                changed = process_capacity_rx.changed() => {
+                    changed.map_err(|_| invalid_resource(
+                        "process device-capacity signal closed while a waiter was live",
+                    ))?;
+                    process_capacity_rx.borrow_and_update();
                 }
             }
         }
@@ -699,6 +757,43 @@ where
     pub fn dynamic_pool_status(&self) -> Result<DynamicPoolMaintenanceStatus, VNextError> {
         let _lifecycle = self.read_lifecycle("observe dynamic pool status")?;
         self.maintenance_controller.status()
+    }
+
+    pub fn write_dynamic_capacity_availability(
+        &self,
+        out: &mut Vec<CapacityAvailabilityEpoch>,
+    ) -> Result<CapacityEpochs, VNextError> {
+        let _lifecycle = self.read_lifecycle("observe dynamic capacity availability")?;
+        self.dynamic_pools.write_capacity_availability(out)
+    }
+
+    pub fn register_capacity_waiter(
+        self: &Arc<Self>,
+        observed: &CapacityWaitCondition,
+    ) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
+        let _lifecycle = self.read_lifecycle("register a capacity waiter")?;
+        if observed.coordinator_id() != self.dynamic_pools.logical_admission.id() {
+            return Err(invalid_resource(
+                "capacity wait condition belongs to another plan coordinator",
+            ));
+        }
+        let logical_rx = self.dynamic_pools.logical_admission.subscribe_epochs();
+        let plan_capacity_rx = self.dynamic_pools.budget.subscribe_plan_availability();
+        let process_capacity_rx = self.dynamic_pools.budget.subscribe_process_availability();
+        let lifecycle_rx = self.lifecycle_tx.subscribe();
+        let mut availability = Vec::with_capacity(self.dynamic_pools.domains.len() + 3);
+        self.dynamic_pools
+            .write_capacity_availability(&mut availability)?;
+        let registered = observed.refreshed_from(&availability)?;
+        Ok(PlanCapacityWaitRegistration {
+            observed: observed.clone(),
+            registered,
+            logical_rx,
+            plan_capacity_rx,
+            process_capacity_rx,
+            lifecycle_rx,
+            resources: Arc::clone(self),
+        })
     }
 
     pub fn is_closing(&self) -> bool {
@@ -1258,33 +1353,15 @@ where
         &self,
         deferred: &DynamicBackingDeferred,
     ) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
-        let _lifecycle = self.resources.read_lifecycle("register a backing waiter")?;
-        let lifecycle_rx = self.resources.lifecycle_tx.subscribe();
-        let registration = self
-            .logical_admission()
-            .register_waiter(deferred.epochs())?;
-        Ok(PlanCapacityWaitRegistration {
-            registration,
-            lifecycle_rx,
-            resources: Arc::clone(&self.resources),
-        })
+        self.resources
+            .register_capacity_waiter(deferred.wait_condition())
     }
 
     pub fn register_admission_waiter(
         &self,
         deferred: &AdmissionDeferred,
     ) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
-        let _lifecycle = self
-            .resources
-            .read_lifecycle("register an admission waiter")?;
-        let lifecycle_rx = self.resources.lifecycle_tx.subscribe();
-        let registration = self
-            .logical_admission()
-            .register_waiter(deferred.epochs())?;
-        Ok(PlanCapacityWaitRegistration {
-            registration,
-            lifecycle_rx,
-            resources: Arc::clone(&self.resources),
-        })
+        self.resources
+            .register_capacity_waiter(deferred.wait_condition())
     }
 }

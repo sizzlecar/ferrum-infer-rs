@@ -294,19 +294,22 @@ not connect it to a product entrypoint.
   overcommit policy.
 - Dynamic admission has three typed outcomes: `Admitted` with a committed logical lease,
   temporary `Deferred` with exact immediate/fit vectors, per-domain requested/available/maximum
-  shortfalls, retry action, release epoch and capacity epoch, or permanent `Impossible` when the
-  request cannot fit even exclusive maximum backing or violates a typed ceiling. A deferred or
-  impossible value cannot construct the sealed authority accepted by provider encode, device
-  submit or prefill. A large deferred request does not mutate capacity and cannot prevent a later
-  eligible request from admission.
+  shortfalls, retry action, global audit epochs and a canonical exact-source `CapacityWaitCondition`,
+  or permanent `Impossible` when the request cannot fit even exclusive maximum backing or violates
+  a typed ceiling. A deferred or impossible value cannot construct the sealed authority accepted by
+  provider encode, device submit or prefill. A large deferred request does not mutate capacity and
+  cannot prevent a later eligible request from admission.
 - Active-sequence authority is a sparse coordinator-issued id plus a monotonically changing
   generation; callers cannot choose an index. Coordinator storage grows only with actual live or
   reusable records and never allocates a `Vec` from the configured ceiling. Releasing a logical
-  claim returns its exact capacity-domain units and increments `release_epoch`. A backing grow or
-  any other change to effective available capacity increments `capacity_epoch`. A waiter first
-  installs a listener, then rechecks both epochs before parking; either epoch change notifies that
-  listener. This closes the check/register/park lost-wakeup window without polling, a busy loop or
-  a global head-of-line block.
+  claim returns its exact capacity-domain units, increments that domain's availability generation
+  and advances global audit `release_epoch`; sequence release also advances the active-slot
+  generation. A backing grow, extent availability change or other increase to effective capacity
+  advances the relevant domain generation and global audit `capacity_epoch`. A waiter installs the
+  shared listener, snapshots the exact sources, rechecks its own generations, then parks. Global
+  epoch changes may notify all listeners, but only a relevant source or policy change permits an
+  admission probe. This closes the check/register/park lost-wakeup window without polling, a busy
+  loop, unrelated-domain retry amplification or a global head-of-line block.
 - `AdmittedRequestResources` owns Request-scoped physical/logical state once. Each
   `AdmittedSequenceResources` owns an `Arc` parent and a coordinator-issued sparse id/generation.
   Each admitted sequence also owns one fail-closed execution-authority source selector. The first

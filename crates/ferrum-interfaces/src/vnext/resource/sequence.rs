@@ -3,17 +3,18 @@ use super::{
     AdmissionFitPolicy, AdmissionPreflightDecision, AdmissionPressureAction, AdmissionRejected,
     AllocationLifetime, Arc, AtomicU64, BTreeMap, BackingPrepareDecision, BatchStepId,
     CapacityClaimDecision, DeferredDeviceCleanupDisposition, DeferredDeviceCleanupTask,
-    DeviceRuntime, Digest, DynamicBackingDeferred, DynamicResourceShape, ExecutionFrameId,
-    LogicalAdmissionCoordinatorId, LogicalAdmissionLease, LogicalBackingBufferView,
-    LogicalBackingSliceAuthority, LogicalBackingSliceEvidence, LogicalCapacityLease,
-    LogicalRequestLease, ManuallyDrop, Mutex, NonZeroU64, Ordering, ParticipantNodeKey,
-    PlanCapacityWaitRegistration, PreparedBackingClaim, RequestAdmissionDecision,
-    RequestAuthorityId, RequestIdentity, RequestResourceAdmissionRequest, ResourceId,
-    ResourceWorkShape, RunId, SequenceAuthorityId, SequenceRecoveryRegistry,
+    DeviceRuntime, Digest, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
+    DynamicResourceShape, ExecutionFrameId, LogicalAdmissionCoordinatorId, LogicalAdmissionLease,
+    LogicalBackingBufferView, LogicalBackingSliceAuthority, LogicalBackingSliceEvidence,
+    LogicalCapacityLease, LogicalRequestLease, ManuallyDrop, Mutex, NonZeroU64, Ordering,
+    ParticipantNodeKey, PlanCapacityWaitRegistration, PreparedBackingClaim,
+    RequestAdmissionDecision, RequestAuthorityId, RequestIdentity, RequestResourceAdmissionRequest,
+    ResourceId, ResourceWorkShape, RunId, SequenceAuthorityId, SequenceRecoveryRegistry,
     SequenceResourceAdmissionRequest, Serialize, Sha256, StaticProvisioningLease,
     TrustedPlanRuntimeBinding, TrustedPlanRuntimeEvidence, VNextError, Weak,
     SEQUENCE_DISPATCH_POISONED_BIT,
 };
+use std::ops::Deref;
 
 pub(super) const fn sequence_slot_active(epoch: u64) -> u64 {
     (epoch << 2) | 1
@@ -76,14 +77,85 @@ where
 {
     Admitted(Arc<AdmittedRequestResources<R>>),
     Deferred(AdmissionDeferred),
-    BackingDeferred(DynamicBackingDeferred),
+    BackingDeferred(RequestBackingDeferral<R>),
     PermanentRejected(AdmissionRejected),
+}
+
+/// Non-cloneable authority for one exact request-admission backing attempt.
+/// The embedded evidence can be projected to schedulers and traces, but only
+/// this handle can invoke live revalidation.
+#[must_use = "request backing deferral owns its exact admission attempt"]
+pub struct RequestBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    evidence: DynamicBackingDeferred,
+    plan: TrustedPlanRuntimeBinding<R>,
+    work_shape: ResourceWorkShape,
+    run_id: RunId,
+    request_id: RequestIdentity,
+}
+
+impl<R> RequestBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    pub fn evidence(&self) -> &DynamicBackingDeferred {
+        &self.evidence
+    }
+
+    pub fn work_shape(&self) -> &ResourceWorkShape {
+        &self.work_shape
+    }
+
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    pub fn request_id(&self) -> &RequestIdentity {
+        &self.request_id
+    }
+
+    pub fn maintain(&self) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        self.plan
+            .maintain_request_backing_for_deferred(&self.evidence)
+    }
+}
+
+impl<R> Deref for RequestBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    type Target = DynamicBackingDeferred;
+
+    fn deref(&self) -> &Self::Target {
+        &self.evidence
+    }
 }
 
 impl<R> TrustedPlanRuntimeBinding<R>
 where
     R: DeviceRuntime,
 {
+    /// Maintains a request-lifetime physical deferral while this exact plan
+    /// binding proves that no child authority is required for validity.
+    pub(super) fn maintain_request_backing_for_deferred(
+        &self,
+        deferred: &DynamicBackingDeferred,
+    ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        if deferred.lifetime() != AllocationLifetime::Request {
+            return Err(invalid_resource(
+                "request backing maintenance requires a request-lifetime deferral",
+            ));
+        }
+        let _lifecycle = self
+            .resources
+            .read_lifecycle("maintain deferred request backing")?;
+        self.resources
+            .maintenance_controller
+            .maintain_for_live_deferred(deferred)
+    }
+
     /// Request-scoped capacity is claimed exactly once before any child
     /// sequence, stream, provider encode, or device submission exists.
     pub fn try_admit_request(
@@ -113,7 +185,17 @@ where
         let prepared = match self.prepare_backing_slices(requested_slices)? {
             BackingPrepareDecision::Prepared(prepared) => prepared,
             BackingPrepareDecision::Deferred(deferred) => {
-                return Ok(RequestResourceAdmissionDecision::BackingDeferred(deferred));
+                return Ok(RequestResourceAdmissionDecision::BackingDeferred(
+                    RequestBackingDeferral {
+                        evidence: deferred,
+                        plan: TrustedPlanRuntimeBinding {
+                            resources: Arc::clone(&self.resources),
+                        },
+                        work_shape,
+                        run_id,
+                        request_id,
+                    },
+                ));
             }
         };
         match self.logical_admission().try_admit_request(&demand)? {
@@ -218,6 +300,27 @@ where
         self.plan.static_provisioning()
     }
 
+    /// Maintains a sequence-lifetime physical deferral while this request
+    /// authority keeps the exact parent logical and backing claims alive.
+    pub(super) fn maintain_sequence_backing_for_deferred(
+        &self,
+        deferred: &DynamicBackingDeferred,
+    ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        if deferred.lifetime() != AllocationLifetime::Sequence {
+            return Err(invalid_resource(
+                "sequence backing maintenance requires a sequence-lifetime deferral",
+            ));
+        }
+        let _lifecycle = self
+            .plan
+            .resources
+            .read_lifecycle("maintain deferred sequence backing")?;
+        self.plan
+            .resources
+            .maintenance_controller
+            .maintain_for_live_deferred(deferred)
+    }
+
     pub fn plan_evidence(&self) -> TrustedPlanRuntimeEvidence {
         self.plan.evidence()
     }
@@ -279,7 +382,12 @@ where
         let prepared = match self.plan.prepare_backing_slices(requested_slices)? {
             BackingPrepareDecision::Prepared(prepared) => prepared,
             BackingPrepareDecision::Deferred(deferred) => {
-                return Ok(SequenceResourceAdmissionDecision::BackingDeferred(deferred));
+                return Ok(SequenceResourceAdmissionDecision::BackingDeferred(
+                    SequenceAdmissionBackingDeferral {
+                        evidence: deferred,
+                        parent: Arc::clone(self),
+                    },
+                ));
             }
         };
         match self
@@ -321,8 +429,53 @@ where
 {
     Admitted(Arc<AdmittedSequenceResources<R>>),
     Deferred(AdmissionDeferred),
-    BackingDeferred(DynamicBackingDeferred),
+    BackingDeferred(SequenceAdmissionBackingDeferral<R>),
     PermanentRejected(AdmissionRejected),
+}
+
+/// Non-cloneable authority for one sequence-admission backing attempt. Holding
+/// it keeps the exact parent request alive; a sibling request cannot maintain
+/// or substitute for that parent.
+#[must_use = "sequence backing deferral owns its exact request parent"]
+pub struct SequenceAdmissionBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    evidence: DynamicBackingDeferred,
+    parent: Arc<AdmittedRequestResources<R>>,
+}
+
+impl<R> SequenceAdmissionBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    pub fn evidence(&self) -> &DynamicBackingDeferred {
+        &self.evidence
+    }
+
+    pub fn parent(&self) -> &Arc<AdmittedRequestResources<R>> {
+        &self.parent
+    }
+
+    pub fn into_parent(self) -> Arc<AdmittedRequestResources<R>> {
+        self.parent
+    }
+
+    pub fn maintain(&self) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        self.parent
+            .maintain_sequence_backing_for_deferred(&self.evidence)
+    }
+}
+
+impl<R> Deref for SequenceAdmissionBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    type Target = DynamicBackingDeferred;
+
+    fn deref(&self) -> &Self::Target {
+        &self.evidence
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]

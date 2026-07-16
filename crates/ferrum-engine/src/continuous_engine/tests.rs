@@ -8,9 +8,10 @@ use ferrum_interfaces::{
     model_executor::{
         DecodeInput, DecodeOutput, ExecutorAdmissionEpochs, ExecutorCapabilities,
         ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
-        ExecutorPrefillAdmissionReceipt, ExecutorPrefillMaintenanceBlocker,
-        ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome,
-        ExecutorPrefillMaintenanceStage, ExecutorStatus, PrefillInput, PrefillOutput, UnifiedBatch,
+        ExecutorPrefillAdmissionReceipt, ExecutorPrefillCapacityWaitRegistration,
+        ExecutorPrefillMaintenanceBlocker, ExecutorPrefillMaintenanceDeferral,
+        ExecutorPrefillMaintenanceOutcome, ExecutorPrefillMaintenanceStage, ExecutorStatus,
+        PrefillInput, PrefillOutput, UnifiedBatch,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateManager, RecurrentStateSpec,
     RecurrentStateTensorSpec, TensorRef,
@@ -122,7 +123,7 @@ impl ModelExecutor for ExecutorManagedAdmissionTestExecutor {
 enum TestMaintenanceBehavior {
     Advance,
     WaitForRelease,
-    StaleEpoch,
+    RetryAdmission,
     Fail,
 }
 
@@ -133,9 +134,11 @@ struct ExecutorManagedMaintenanceTestExecutor {
     capacity_epoch: AtomicU64,
     admission_probes: AtomicU64,
     maintenance_calls: AtomicU64,
+    capacity_wait_registrations: AtomicU64,
     prefill_calls: AtomicU64,
     call_order: std::sync::Mutex<Vec<&'static str>>,
     maintenance_behavior: TestMaintenanceBehavior,
+    capacity_signal: tokio::sync::watch::Sender<u64>,
 }
 
 impl ExecutorManagedMaintenanceTestExecutor {
@@ -144,6 +147,7 @@ impl ExecutorManagedMaintenanceTestExecutor {
     }
 
     fn with_behavior(vocab_size: usize, maintenance_behavior: TestMaintenanceBehavior) -> Self {
+        let (capacity_signal, _) = tokio::sync::watch::channel(0);
         Self {
             inner: MockModelExecutor::instant(vocab_size),
             retained: std::sync::Mutex::new(HashSet::new()),
@@ -151,10 +155,17 @@ impl ExecutorManagedMaintenanceTestExecutor {
             capacity_epoch: AtomicU64::new(0),
             admission_probes: AtomicU64::new(0),
             maintenance_calls: AtomicU64::new(0),
+            capacity_wait_registrations: AtomicU64::new(0),
             prefill_calls: AtomicU64::new(0),
             call_order: std::sync::Mutex::new(Vec::new()),
             maintenance_behavior,
+            capacity_signal,
         }
+    }
+
+    fn publish_release(&self) {
+        let release_epoch = self.release_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.capacity_signal.send_replace(release_epoch);
     }
 
     fn epochs(&self) -> ExecutorAdmissionEpochs {
@@ -163,6 +174,24 @@ impl ExecutorManagedMaintenanceTestExecutor {
             self.release_epoch.load(Ordering::Acquire),
             self.capacity_epoch.load(Ordering::Acquire),
         )
+    }
+
+    fn wait_condition(&self) -> ferrum_interfaces::vnext::CapacityWaitCondition {
+        ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(
+            43,
+            vec![ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(
+                ferrum_interfaces::vnext::CapacityAvailabilitySource::Domain(
+                    ferrum_interfaces::vnext::CapacityDomainId::new(1).unwrap(),
+                ),
+                self.release_epoch
+                    .load(Ordering::Acquire)
+                    .checked_add(self.capacity_epoch.load(Ordering::Acquire))
+                    .and_then(|epoch| epoch.checked_add(1))
+                    .unwrap(),
+            )
+            .unwrap()],
+        )
+        .unwrap()
     }
 }
 
@@ -178,6 +207,71 @@ impl ModelExecutor for ExecutorManagedMaintenanceTestExecutor {
 
     fn prefill_admission_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
         Ok(Some(self.epochs()))
+    }
+
+    fn write_prefill_admission_snapshot(
+        &self,
+        availability: &mut Vec<ferrum_interfaces::vnext::CapacityAvailabilityEpoch>,
+    ) -> Result<Option<ExecutorAdmissionEpochs>> {
+        availability.clear();
+        availability.extend_from_slice(self.wait_condition().observed());
+        Ok(Some(self.epochs()))
+    }
+
+    fn register_prefill_capacity_waiter(
+        &self,
+        observed: &ferrum_interfaces::vnext::CapacityWaitCondition,
+    ) -> Result<Option<ExecutorPrefillCapacityWaitRegistration>> {
+        if observed.coordinator_id().get() != 43 {
+            return Err(FerrumError::internal(
+                "test capacity waiter received a foreign coordinator",
+            ));
+        }
+        let expected_source = ferrum_interfaces::vnext::CapacityAvailabilitySource::Domain(
+            ferrum_interfaces::vnext::CapacityDomainId::new(1).unwrap(),
+        );
+        if observed
+            .observed()
+            .iter()
+            .any(|entry| entry.source() != expected_source)
+        {
+            return Err(FerrumError::internal(
+                "test capacity waiter received an unknown source",
+            ));
+        }
+        let observed_generation = observed
+            .observed()
+            .iter()
+            .map(|entry| entry.epoch())
+            .min()
+            .expect("capacity wait conditions are non-empty");
+        let capacity_epoch = self.capacity_epoch.load(Ordering::Acquire);
+        let mut signal = self.capacity_signal.subscribe();
+        self.capacity_wait_registrations
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(Some(ExecutorPrefillCapacityWaitRegistration::new(
+            async move {
+                loop {
+                    let release_epoch = *signal.borrow_and_update();
+                    let current_generation = release_epoch
+                        .checked_add(capacity_epoch)
+                        .and_then(|generation| generation.checked_add(1))
+                        .ok_or_else(|| {
+                            FerrumError::internal("test capacity generation overflowed")
+                        })?;
+                    if current_generation > observed_generation {
+                        return Ok(ExecutorAdmissionEpochs::new(
+                            std::num::NonZeroU64::new(43).unwrap(),
+                            release_epoch,
+                            capacity_epoch,
+                        ));
+                    }
+                    signal.changed().await.map_err(|_| {
+                        FerrumError::internal("test capacity signal closed while waiting")
+                    })?;
+                }
+            },
+        )))
     }
 
     fn try_admit_prefill(
@@ -196,6 +290,8 @@ impl ModelExecutor for ExecutorManagedMaintenanceTestExecutor {
         if self.capacity_epoch.load(Ordering::Acquire) == 0
             && !(self.maintenance_behavior == TestMaintenanceBehavior::WaitForRelease
                 && self.release_epoch.load(Ordering::Acquire) > 0)
+            && !(self.maintenance_behavior == TestMaintenanceBehavior::RetryAdmission
+                && self.maintenance_calls.load(Ordering::Acquire) > 0)
         {
             self.call_order
                 .lock()
@@ -205,6 +301,7 @@ impl ModelExecutor for ExecutorManagedMaintenanceTestExecutor {
                 ExecutorPrefillMaintenanceDeferral::new(
                     input.request_id.clone(),
                     self.epochs(),
+                    self.wait_condition(),
                     ExecutorPrefillMaintenanceStage::LogicalCapacity,
                     vec![ExecutorPrefillMaintenanceBlocker::Capacity {
                         domain_id: Some(1),
@@ -265,6 +362,7 @@ impl ModelExecutor for ExecutorManagedMaintenanceTestExecutor {
             TestMaintenanceBehavior::WaitForRelease => {
                 Ok(ExecutorPrefillMaintenanceOutcome::WaitForRelease {
                     current: self.epochs(),
+                    wait_condition: self.wait_condition(),
                     pressure: ferrum_interfaces::vnext::DeviceCapacityPressure::new(
                         ferrum_interfaces::vnext::DeviceCapacityPressureScope::PlanBudget,
                         "device.test-capacity-pressure".to_owned(),
@@ -277,8 +375,8 @@ impl ModelExecutor for ExecutorManagedMaintenanceTestExecutor {
                     .unwrap(),
                 })
             }
-            TestMaintenanceBehavior::StaleEpoch => {
-                Ok(ExecutorPrefillMaintenanceOutcome::RetryWithoutGrowth {
+            TestMaintenanceBehavior::RetryAdmission => {
+                Ok(ExecutorPrefillMaintenanceOutcome::RetryAdmission {
                     current: self.epochs(),
                 })
             }
@@ -1922,6 +2020,64 @@ fn test_continuous_engine_with_config(config: EngineConfig) -> ContinuousBatchEn
 }
 
 #[tokio::test]
+async fn idle_background_loop_parks_and_new_work_resumes_it() {
+    let engine = Arc::new(test_continuous_engine());
+    let mut first = policy_request();
+    first.sampling_params.max_tokens = 1;
+    tokio::time::timeout(Duration::from_secs(2), engine.infer(first))
+        .await
+        .expect("first request must complete")
+        .unwrap();
+
+    let parked_iteration = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let before = engine.inner.iteration_count.load(Ordering::Acquire);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let after = engine.inner.iteration_count.load(Ordering::Acquire);
+            if before == after {
+                break after;
+            }
+        }
+    })
+    .await
+    .expect("background loop must reach its idle wait");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        engine.inner.iteration_count.load(Ordering::Acquire),
+        parked_iteration,
+        "an idle engine must not poll for work"
+    );
+
+    let mut second = policy_request();
+    second.sampling_params.max_tokens = 1;
+    tokio::time::timeout(Duration::from_secs(2), engine.infer(second))
+        .await
+        .expect("new work must wake the parked background loop")
+        .unwrap();
+    assert!(engine.inner.iteration_count.load(Ordering::Acquire) > parked_iteration);
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_wakes_an_idle_background_loop() {
+    let engine = test_continuous_engine();
+    let background = engine.start_loop();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while engine.inner.iteration_count.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background loop must enter one idle iteration");
+
+    engine.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), background)
+        .await
+        .expect("shutdown must wake the idle loop")
+        .expect("background loop must not panic");
+}
+
+#[tokio::test]
 async fn executor_managed_product_path_requires_typed_admission_before_prefill() {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
@@ -2079,20 +2235,28 @@ async fn executor_managed_capacity_pressure_waits_without_spinning_then_retries_
     let inference = tokio::spawn(async move { infer_engine.infer(request).await });
 
     tokio::time::timeout(Duration::from_secs(1), async {
-        while executor.maintenance_calls.load(Ordering::Acquire) == 0 {
+        while executor.maintenance_calls.load(Ordering::Acquire) == 0
+            || executor.capacity_wait_registrations.load(Ordering::Acquire) == 0
+        {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("typed capacity maintenance must run");
+    let parked_iteration = engine.inner.iteration_count.load(Ordering::Acquire);
     tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        engine.inner.iteration_count.load(Ordering::Acquire),
+        parked_iteration,
+        "a registered capacity wait must park the background loop"
+    );
     assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 1);
     assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 1);
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 0);
     assert_eq!(scheduler.waiting_count(), 1);
     assert_eq!(scheduler.trace_snapshot().dynamic_admission_failed, 0);
 
-    executor.release_epoch.store(1, Ordering::Release);
+    executor.publish_release();
     let response = tokio::time::timeout(Duration::from_secs(2), inference)
         .await
         .expect("release epoch must wake the waiting request")
@@ -2114,11 +2278,48 @@ async fn executor_managed_capacity_pressure_waits_without_spinning_then_retries_
 }
 
 #[tokio::test]
+async fn executor_managed_retry_admission_does_not_require_a_published_epoch() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let kv_cache: Arc<dyn KvCacheManager + Send + Sync> = Arc::new(MockKvCacheManager::new(128));
+    let executor = Arc::new(ExecutorManagedMaintenanceTestExecutor::with_behavior(
+        128,
+        TestMaintenanceBehavior::RetryAdmission,
+    ));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let engine = ContinuousBatchEngine::new(
+        config,
+        Arc::clone(&scheduler),
+        tokenizer,
+        sampler,
+        kv_cache,
+        executor.clone(),
+        tensor_factory,
+    );
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 1;
+
+    let response = tokio::time::timeout(Duration::from_secs(2), engine.infer(request))
+        .await
+        .expect("physical recheck must force a bounded admission retry")
+        .unwrap();
+
+    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 2);
+    assert_eq!(executor.maintenance_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(scheduler.waiting_count(), 0);
+    assert_eq!(scheduler.trace_snapshot().dynamic_admission_failed, 0);
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn executor_managed_invalid_maintenance_fails_waiting_request_without_retry_loop() {
-    for behavior in [
-        TestMaintenanceBehavior::StaleEpoch,
-        TestMaintenanceBehavior::Fail,
-    ] {
+    for behavior in [TestMaintenanceBehavior::Fail] {
         let mut config = EngineConfig::default();
         config.kv_cache.max_blocks = 128;
         let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));

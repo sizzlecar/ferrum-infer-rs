@@ -16,12 +16,14 @@ use ferrum_interfaces::{
     model_executor::{
         ExecutionResourceOwnership, ExecutorAdmissionEpochs, ExecutorPrefillAdmission,
         ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
-        ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome,
-        GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy, TokenSelectionMask,
+        ExecutorPrefillCapacityWaitRegistration, ExecutorPrefillMaintenanceDeferral,
+        ExecutorPrefillMaintenanceOutcome, GreedyRepetitionPenalty, KvSlotRequest,
+        LogitsReturnPolicy, TokenSelectionMask,
     },
     vnext::{
-        AdmissionDeferred, AdmissionRejected, DeferredAction, DeviceCapacityPressureScope,
-        EventEmissionPermit, ExecutionEvent, ExecutionEventCapturePolicy, ExecutionEventDetail,
+        AdmissionDeferred, AdmissionRejected, CapacityAvailabilityEpoch, DeferredAction,
+        DeviceCapacityPressureScope, EventEmissionPermit, ExecutionEvent,
+        ExecutionEventCapturePolicy, ExecutionEventDetail,
         ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink, ExecutionEventSinkError,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateHandle, RecurrentStateManager,
@@ -33,7 +35,9 @@ use ferrum_scheduler::implementations::{
     ContinuousBatchScheduler, ExecutorAdmissionProbeOutcome, ExecutorAdmissionQueueObservation,
     RequestPhase,
 };
-use ferrum_scheduler::vnext::{AdmissionDeferral, AdmissionProbeOutcome, AdmissionWakeEpochs};
+use ferrum_scheduler::vnext::{
+    AdmissionDeferral, AdmissionProbeOutcome, AdmissionWakeEpochs, AdmissionWakeSnapshot,
+};
 use ferrum_types::{
     DataType, Device, EngineConfig, EngineStatus, FerrumError, FerrumProfileEvent, FinishReason,
     InferenceRequest, InferenceResponse, Priority, ProfileEntrypoint, ProfileError,
@@ -2246,6 +2250,12 @@ impl PendingBatchPrefill {
     }
 }
 
+enum EngineIterationOutcome {
+    Progressed,
+    Idle,
+    CapacityBlocked(ExecutorPrefillCapacityWaitRegistration),
+}
+
 struct EngineInner {
     config: EngineConfig,
     scheduler: Arc<ContinuousBatchScheduler>,
@@ -2277,6 +2287,7 @@ struct EngineInner {
     scheduler_trace_none_streak: AtomicU64,
     resource_lifecycle: Mutex<ResourceLifecycleLedger>,
     resource_trace_event_counter: AtomicU64,
+    dynamic_admission_availability: Mutex<Vec<CapacityAvailabilityEpoch>>,
     // stats
     iteration_count: AtomicU64,
     total_prefill_tokens: AtomicU64,
@@ -3708,6 +3719,7 @@ impl ContinuousBatchEngine {
                 scheduler_trace_none_streak: AtomicU64::new(0),
                 resource_lifecycle: Mutex::new(ResourceLifecycleLedger::default()),
                 resource_trace_event_counter: AtomicU64::new(0),
+                dynamic_admission_availability: Mutex::new(Vec::with_capacity(16)),
                 total_prefill_tokens: AtomicU64::new(0),
                 total_decode_tokens: AtomicU64::new(0),
                 total_preemptions: AtomicU64::new(0),
@@ -3767,14 +3779,18 @@ impl ContinuousBatchEngine {
                 } else {
                     None
                 };
-                {
+                let outcome = {
                     let lock_wait_start = Instant::now();
                     let _guard = inner.iteration_lock.lock().await;
                     inner.record_iteration_lock_wait(lock_wait_start.elapsed());
-                    if let Err(e) = inner.run_iteration().await {
-                        warn!("Iteration error: {}", e);
+                    match inner.run_iteration().await {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            warn!("Iteration error: {}", error);
+                            EngineIterationOutcome::Progressed
+                        }
                     }
-                }
+                };
                 if prof {
                     let n = GAP_PROF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if n.is_multiple_of(8) {
@@ -3784,7 +3800,26 @@ impl ContinuousBatchEngine {
                     }
                 }
                 last_iter_end = Some(std::time::Instant::now());
-                tokio::task::yield_now().await;
+                match outcome {
+                    EngineIterationOutcome::Progressed => tokio::task::yield_now().await,
+                    EngineIterationOutcome::Idle => {
+                        tokio::select! {
+                            _ = inner.shutdown_notify.notified() => {}
+                            _ = inner.work_notify.notified() => {}
+                        }
+                    }
+                    EngineIterationOutcome::CapacityBlocked(registration) => {
+                        tokio::select! {
+                            _ = inner.shutdown_notify.notified() => {}
+                            _ = inner.work_notify.notified() => {}
+                            result = registration.wait_for_change() => {
+                                if let Err(error) = result {
+                                    warn!("Executor capacity wait error: {}", error);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             info!("Background iteration loop stopped");
         })
@@ -4029,7 +4064,8 @@ impl InferenceEngine for ContinuousBatchEngine {
     async fn shutdown(&self) -> Result<()> {
         info!("Shutting down continuous batch engine");
         self.inner.is_running.store(false, Ordering::SeqCst);
-        self.inner.shutdown_notify.notify_waiters();
+        self.inner.shutdown_notify.notify_one();
+        self.inner.work_notify.notify_one();
         Ok(())
     }
 

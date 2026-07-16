@@ -9,8 +9,10 @@ use ferrum_types::{ModelInfo, RequestId, Result, TokenId};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
+    future::Future,
     hash::{Hash, Hasher},
     num::NonZeroU64,
+    pin::Pin,
     sync::Arc,
 };
 
@@ -555,6 +557,35 @@ impl ExecutorAdmissionEpochs {
     }
 }
 
+type ExecutorPrefillCapacityWaitFuture =
+    Pin<Box<dyn Future<Output = Result<ExecutorAdmissionEpochs>> + Send + 'static>>;
+
+/// Type-erased, single-use registration for one executor-owned capacity wait.
+///
+/// Registration is created synchronously so the executor can subscribe before
+/// the engine releases its iteration lock. Awaiting it never grants resources;
+/// it only returns fresh epochs that permit another authoritative admission
+/// probe.
+#[must_use = "capacity wait registrations must be awaited or explicitly dropped"]
+pub struct ExecutorPrefillCapacityWaitRegistration {
+    future: ExecutorPrefillCapacityWaitFuture,
+}
+
+impl ExecutorPrefillCapacityWaitRegistration {
+    pub fn new<F>(future: F) -> Self
+    where
+        F: Future<Output = Result<ExecutorAdmissionEpochs>> + Send + 'static,
+    {
+        Self {
+            future: Box::pin(future),
+        }
+    }
+
+    pub async fn wait_for_change(self) -> Result<ExecutorAdmissionEpochs> {
+        self.future.await
+    }
+}
+
 /// Stage that must advance before an executor-owned prefill can be admitted.
 ///
 /// This is scheduler evidence, not allocator authority. The executor retains
@@ -581,6 +612,8 @@ pub enum ExecutorPrefillMaintenanceBlocker {
     },
     Backing {
         pool_id: String,
+        domain_id: u32,
+        lifetime: crate::vnext::AllocationLifetime,
         reason: crate::vnext::DynamicBackingDeferralReason,
         requested_bytes: u64,
         free_bytes: u64,
@@ -597,6 +630,7 @@ pub enum ExecutorPrefillMaintenanceBlocker {
 pub struct ExecutorPrefillMaintenanceDeferral {
     request_id: RequestId,
     observed: ExecutorAdmissionEpochs,
+    wait_condition: crate::vnext::CapacityWaitCondition,
     stage: ExecutorPrefillMaintenanceStage,
     blockers: Vec<ExecutorPrefillMaintenanceBlocker>,
 }
@@ -605,6 +639,7 @@ impl ExecutorPrefillMaintenanceDeferral {
     pub fn new(
         request_id: RequestId,
         observed: ExecutorAdmissionEpochs,
+        wait_condition: crate::vnext::CapacityWaitCondition,
         stage: ExecutorPrefillMaintenanceStage,
         blockers: Vec<ExecutorPrefillMaintenanceBlocker>,
     ) -> Result<Self> {
@@ -613,9 +648,15 @@ impl ExecutorPrefillMaintenanceDeferral {
                 "executor prefill maintenance deferral requires at least one blocker",
             ));
         }
+        if wait_condition.coordinator_id().get() != observed.coordinator_id.get() {
+            return Err(ferrum_types::FerrumError::request_validation(
+                "executor prefill maintenance wait condition belongs to a different coordinator",
+            ));
+        }
         Ok(Self {
             request_id,
             observed,
+            wait_condition,
             stage,
             blockers,
         })
@@ -645,6 +686,7 @@ impl ExecutorPrefillMaintenanceDeferral {
         Self::new(
             request_id.clone(),
             ExecutorAdmissionEpochs::from_capacity(deferred.epochs()),
+            deferred.wait_condition().clone(),
             ExecutorPrefillMaintenanceStage::LogicalCapacity,
             blockers,
         )
@@ -659,6 +701,8 @@ impl ExecutorPrefillMaintenanceDeferral {
             .iter()
             .map(|blocker| ExecutorPrefillMaintenanceBlocker::Backing {
                 pool_id: blocker.pool_id().as_str().to_string(),
+                domain_id: blocker.domain_id().get(),
+                lifetime: deferred.lifetime(),
                 reason: blocker.reason(),
                 requested_bytes: blocker.requested_bytes(),
                 free_bytes: blocker.free_bytes(),
@@ -668,6 +712,7 @@ impl ExecutorPrefillMaintenanceDeferral {
         Self::new(
             request_id.clone(),
             ExecutorAdmissionEpochs::from_capacity(deferred.epochs()),
+            deferred.wait_condition().clone(),
             ExecutorPrefillMaintenanceStage::PhysicalBacking,
             blockers,
         )
@@ -679,6 +724,10 @@ impl ExecutorPrefillMaintenanceDeferral {
 
     pub const fn observed(&self) -> ExecutorAdmissionEpochs {
         self.observed
+    }
+
+    pub fn wait_condition(&self) -> &crate::vnext::CapacityWaitCondition {
+        &self.wait_condition
     }
 
     pub const fn stage(&self) -> ExecutorPrefillMaintenanceStage {
@@ -697,14 +746,17 @@ pub enum ExecutorPrefillMaintenanceOutcome {
     /// Cancellation won the race before the maintenance task consumed the
     /// retained deferral.
     NoLongerPending,
-    /// Another release or growth advanced the observed epochs first. The
-    /// scheduler should probe again without allocating duplicate backing.
-    RetryWithoutGrowth { current: ExecutorAdmissionEpochs },
+    /// The physical allocator changed while maintenance was installing its
+    /// wait predicate. The scheduler must clear the old backing deferral and
+    /// perform one authoritative admission probe, even if publication of the
+    /// corresponding capacity epoch is still in flight.
+    RetryAdmission { current: ExecutorAdmissionEpochs },
     /// The requested backing is valid but cannot be installed while current
     /// device claims remain live. The scheduler must wait for release evidence
     /// rather than completing the request as an error.
     WaitForRelease {
         current: ExecutorAdmissionEpochs,
+        wait_condition: crate::vnext::CapacityWaitCondition,
         pressure: crate::vnext::DeviceCapacityPressure,
     },
     /// The executor installed real backing and published the resulting
@@ -772,6 +824,32 @@ pub trait ModelExecutor: Send + Sync {
     /// Engine-managed executors return `None`; an executor declaring
     /// [`ExecutionResourceOwnership::ExecutorManaged`] must return `Some`.
     fn prefill_admission_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
+        Ok(None)
+    }
+
+    /// Writes the canonical per-source availability generations into
+    /// caller-owned storage and returns the matching global audit epochs.
+    /// Executors with typed dynamic admission override this to avoid allocating
+    /// on steady scheduler ticks.
+    fn write_prefill_admission_snapshot(
+        &self,
+        availability: &mut Vec<crate::vnext::CapacityAvailabilityEpoch>,
+    ) -> Result<Option<ExecutorAdmissionEpochs>> {
+        availability.clear();
+        self.prefill_admission_epochs()
+    }
+
+    /// Synchronously subscribes to every source named by one passive capacity
+    /// wait. The returned registration must remain alive until it is awaited or
+    /// deliberately cancelled by being dropped.
+    ///
+    /// Engine-managed executors return `None`. An executor declaring
+    /// [`ExecutionResourceOwnership::ExecutorManaged`] must return `Some` for a
+    /// wait condition issued by its own admission coordinator.
+    fn register_prefill_capacity_waiter(
+        &self,
+        _observed: &crate::vnext::CapacityWaitCondition,
+    ) -> Result<Option<ExecutorPrefillCapacityWaitRegistration>> {
         Ok(None)
     }
 

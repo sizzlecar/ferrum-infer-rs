@@ -151,6 +151,7 @@ pub enum DynamicAdmissionFaultKind {
     ForeignCoordinator,
     Poisoned,
     EpochExhausted,
+    EpochRegression,
     AuthorityExhausted,
     ArithmeticOverflow,
     AllocationFailure,
