@@ -1457,58 +1457,38 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                     {
                         info!("Resolving Qwen3.5/Qwen3.6 CUDA production executor");
                         let model_dir = std::path::Path::new(&model_path);
-                        let model_selection =
-                            ferrum_models::vnext::prepare_registered_model_from_dir(model_dir)?;
+                        let prepared =
+                            ferrum_models::vnext::prepare_registered_model_from_dir(model_dir)?
+                                .into_required()?;
                         let mut model_info = model_def
                             .to_model_info(config.engine_config.model.model_id.to_string());
                         model_info.dtype = DataType::FP16;
                         model_info.device = config.device.clone();
-                        match model_selection {
-                            ferrum_models::vnext::ProductionModelSelection::Prepared(prepared) => {
-                                let family = prepared.family();
-                                let family_fingerprint = family
-                                    .fingerprint()
-                                    .map_err(|error| FerrumError::model(error.to_string()))?;
-                                let program_fingerprint = family
-                                    .program()
-                                    .fingerprint()
-                                    .map_err(|error| FerrumError::model(error.to_string()))?;
-                                let ordinal = match &config.device {
-                                    Device::CUDA(ordinal) => *ordinal,
-                                    _ => unreachable!("Qwen3.5 CUDA branch validated its device"),
-                                };
-                                info!(
-                                    family_id = %family.family_id(),
-                                    family_fingerprint,
-                                    program_fingerprint,
-                                    "Building Qwen3.5 from the typed vNext CUDA execution plan"
-                                );
-                                let executor = ferrum_models::VNextModelExecutor::create_cuda(
-                                    ordinal,
-                                    prepared,
-                                    model_info,
-                                    &config.engine_config,
-                                )?;
-                                return Ok(Arc::new(executor));
-                            }
-                            ferrum_models::vnext::ProductionModelSelection::Unmigrated {
-                                external_metadata_id,
-                            } => {
-                                info!(
-                                    %external_metadata_id,
-                                    "Model family is not yet registered for vNext production execution"
-                                );
-                                let llm = ferrum_models::models::Qwen35BackendModel::<
-                                    ferrum_kernels::backend::cuda::CudaBackend,
-                                >::from_definition_with_native_safetensors(
-                                    &model_def, model_dir
-                                )?;
-                                return Ok(Arc::new(ferrum_models::LlmExecutor::new(
-                                    Box::new(llm),
-                                    model_info,
-                                )));
-                            }
-                        }
+                        let family = prepared.family();
+                        let family_fingerprint = family
+                            .fingerprint()
+                            .map_err(|error| FerrumError::model(error.to_string()))?;
+                        let program_fingerprint = family
+                            .program()
+                            .fingerprint()
+                            .map_err(|error| FerrumError::model(error.to_string()))?;
+                        let ordinal = match &config.device {
+                            Device::CUDA(ordinal) => *ordinal,
+                            _ => unreachable!("Qwen3.5 CUDA branch validated its device"),
+                        };
+                        info!(
+                            family_id = %family.family_id(),
+                            family_fingerprint,
+                            program_fingerprint,
+                            "Building Qwen3.5 from the typed vNext CUDA execution plan"
+                        );
+                        let executor = ferrum_models::VNextModelExecutor::create_cuda(
+                            ordinal,
+                            prepared,
+                            model_info,
+                            &config.engine_config,
+                        )?;
+                        return Ok(Arc::new(executor));
                     }
                     #[cfg(not(feature = "cuda"))]
                     {
