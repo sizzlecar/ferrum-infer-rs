@@ -29,7 +29,7 @@ use ferrum_types::{
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -115,6 +115,8 @@ pub struct ContinuousBatchRequest {
     pub capacity_deferred_from_decode: bool,
     /// Stable identity retained across waiting -> active -> waiting cycles.
     pub waiting_admission_ticket: Option<WaitingAdmissionTicket>,
+    /// Exact PlanRuntime capacity predicate suppressing blind decode retries.
+    pub execution_capacity_deferral: Option<AdmissionDeferral>,
 }
 
 impl ContinuousBatchRequest {
@@ -136,6 +138,7 @@ impl ContinuousBatchRequest {
             capacity_deferred_empty_retry_epoch: None,
             capacity_deferred_from_decode: false,
             waiting_admission_ticket: None,
+            execution_capacity_deferral: None,
         }
     }
 
@@ -208,6 +211,7 @@ pub struct ContinuousSchedulerTraceSnapshot {
     pub capacity_backpressure_admit_limit: Option<usize>,
     pub decode_capacity_backpressure_admit_limit: Option<usize>,
     pub capacity_blocked_waiting_len: usize,
+    pub execution_capacity_blocked_decode_len: usize,
     pub capacity_release_epoch: u64,
     pub capacity_mixed_recompute_epoch: u64,
     pub capacity_mixed_recompute_blocked_until_epoch: u64,
@@ -431,15 +435,66 @@ impl ContinuousBatchScheduler {
         self.waiting_queue.read().len()
     }
 
-    /// Returns an aggregate exact wait predicate only when all waiting work is
-    /// blocked on passive release evidence. Active maintenance and first-probe
+    /// Returns an aggregate exact wait predicate only when every queued item is
+    /// passively blocked. Runnable prefill/decode work and first-probe waiting
     /// work deliberately return `None` so the engine keeps driving iterations.
     pub fn passive_capacity_wait_condition(
         &self,
     ) -> Result<Option<ferrum_interfaces::vnext::CapacityWaitCondition>> {
-        self.waiting_queue
-            .read()
+        if !self.prefill_queue.read().is_empty() {
+            return Ok(None);
+        }
+
+        let mut conditions = Vec::new();
+        {
+            let decode = self.decode_queue.read();
+            for request in decode.values() {
+                let Some(deferral) = request.execution_capacity_deferral.as_ref() else {
+                    return Ok(None);
+                };
+                conditions.push(deferral.wait_condition().clone());
+            }
+        }
+        let waiting_queue = self.waiting_queue.read();
+        let waiting_count = waiting_queue.len();
+        let waiting = waiting_queue
             .passive_wait_condition()
+            .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+        drop(waiting_queue);
+        if waiting_count > 0 && waiting.is_none() {
+            return Ok(None);
+        }
+        if let Some(waiting) = waiting {
+            conditions.push(waiting);
+        }
+        if conditions.is_empty() {
+            return Ok(None);
+        }
+
+        let coordinator = conditions[0].coordinator_id();
+        let mut observed_by_source = BTreeMap::new();
+        for condition in conditions {
+            if condition.coordinator_id() != coordinator {
+                return Err(FerrumError::scheduler(
+                    "passive capacity waits belong to different coordinators",
+                ));
+            }
+            for observed in condition.observed() {
+                observed_by_source
+                    .entry(observed.source())
+                    .and_modify(|epoch: &mut u64| *epoch = (*epoch).min(observed.epoch()))
+                    .or_insert(observed.epoch());
+            }
+        }
+        let observed = observed_by_source
+            .into_iter()
+            .map(|(source, epoch)| {
+                ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(source, epoch)
+                    .map_err(|error| FerrumError::scheduler(error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ferrum_interfaces::vnext::CapacityWaitCondition::new(coordinator, observed)
+            .map(Some)
             .map_err(|error| FerrumError::scheduler(error.to_string()))
     }
 
@@ -476,6 +531,12 @@ impl ContinuousBatchScheduler {
             capacity_backpressure_admit_limit: self.capacity_backpressure_admit_limit(),
             decode_capacity_backpressure_admit_limit: self.decode_capacity_backpressure_limit(),
             capacity_blocked_waiting_len: self.capacity_blocked_waiting_len(),
+            execution_capacity_blocked_decode_len: self
+                .decode_queue
+                .read()
+                .values()
+                .filter(|request| request.execution_capacity_deferral.is_some())
+                .count(),
             capacity_release_epoch: self.capacity_release_epoch.load(Ordering::Relaxed),
             capacity_mixed_recompute_epoch: self
                 .capacity_mixed_recompute_epoch
@@ -946,6 +1007,31 @@ impl ContinuousBatchScheduler {
         );
     }
 
+    /// Preserve active PlanRuntime decode ownership while suppressing retries
+    /// until one of the exact capacity sources observed by the executor moves.
+    pub fn defer_decode_for_execution_capacity(
+        &self,
+        request_ids: &[RequestId],
+        deferral: AdmissionDeferral,
+    ) -> Result<usize> {
+        if deferral.action() != ferrum_interfaces::vnext::DeferredAction::WaitForRelease {
+            return Err(FerrumError::scheduler(
+                "active decode capacity deferral must wait for release",
+            ));
+        }
+        let mut decode = self.decode_queue.write();
+        let mut deferred = 0;
+        for request_id in request_ids {
+            if let Some(request) = decode.get_mut(request_id) {
+                request.execution_capacity_deferral = Some(deferral.clone());
+                deferred += 1;
+            }
+        }
+        self.capacity_deferred_counter
+            .fetch_add(deferred as u64, Ordering::Relaxed);
+        Ok(deferred)
+    }
+
     fn relax_backpressure_limit(limit: &AtomicUsize, max_running: usize) {
         let current = limit.load(Ordering::Relaxed);
         if current == NO_CAPACITY_BACKPRESSURE_LIMIT {
@@ -1172,6 +1258,7 @@ impl ContinuousBatchScheduler {
             req.capacity_deferred_mixed_attempt_epoch = None;
             req.capacity_deferred_empty_retry_epoch = None;
             req.capacity_deferred_from_decode = true;
+            req.execution_capacity_deferral = None;
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
             if !self.requeue_waiting_request(&mut waiting_queue, &mut request_index, req) {
                 return false;
@@ -1204,6 +1291,7 @@ impl ContinuousBatchScheduler {
             req.capacity_deferred_mixed_attempt_epoch = None;
             req.capacity_deferred_empty_retry_epoch = None;
             req.capacity_deferred_from_decode = false;
+            req.execution_capacity_deferral = None;
 
             request_index.insert(request_id.clone(), RequestPhase::Decoding);
             decode_queue.insert(request_id.clone(), req);
@@ -1589,7 +1677,8 @@ impl ContinuousBatchScheduler {
         batch_requests: &mut Vec<ScheduledRequest>,
         total_tokens: &mut usize,
         scheduled_request_ids: &mut HashSet<RequestId>,
-    ) {
+        wake: Option<AdmissionWakeSnapshot<'_>>,
+    ) -> Result<()> {
         let decode_batch_limit = if self.decode_capacity_deferred_backlog_len() > 0 {
             hint.max_batch_size
         } else {
@@ -1597,13 +1686,47 @@ impl ContinuousBatchScheduler {
                 .map(|limit| hint.max_batch_size.min(limit.max(1)))
                 .unwrap_or(hint.max_batch_size)
         };
-        let decode_queue = self.decode_queue.read();
-        for (_, req) in decode_queue.iter() {
+        let mut decode_queue = self.decode_queue.write();
+        for (_, req) in decode_queue.iter_mut() {
             if batch_requests.len() >= decode_batch_limit || *total_tokens >= hint.max_tokens {
                 break;
             }
             if scheduled_request_ids.contains(&req.inner.request.id) {
                 continue;
+            }
+            if let Some(deferral) = req.execution_capacity_deferral.as_ref() {
+                let wake = wake.ok_or_else(|| {
+                    FerrumError::scheduler(
+                        "typed decode capacity deferral reached a legacy scheduler tick",
+                    )
+                })?;
+                if deferral.observed().coordinator_id() != wake.epochs().coordinator_id()
+                    || deferral.wait_condition().coordinator_id().get()
+                        != wake.epochs().coordinator_id().get()
+                {
+                    return Err(FerrumError::scheduler(
+                        "typed decode capacity deferral belongs to another coordinator",
+                    ));
+                }
+                let observed = deferral.observed();
+                let current = wake.epochs();
+                if current.release_epoch() < observed.release_epoch()
+                    || current.capacity_epoch() < observed.capacity_epoch()
+                    || current.policy_epoch() < observed.policy_epoch()
+                {
+                    return Err(FerrumError::scheduler(
+                        "typed decode capacity audit epoch regressed",
+                    ));
+                }
+                if !deferral
+                    .wait_condition()
+                    .changed_since(wake.availability())
+                    .map_err(|error| FerrumError::scheduler(error.to_string()))?
+                    && current.policy_epoch() == observed.policy_epoch()
+                {
+                    continue;
+                }
+                req.execution_capacity_deferral = None;
             }
 
             let mut scheduled = req.inner.clone();
@@ -1613,6 +1736,7 @@ impl ContinuousBatchScheduler {
             batch_requests.push(scheduled);
             *total_tokens += 1;
         }
+        Ok(())
     }
 
     fn create_iteration_batch_with_admission(
@@ -1643,6 +1767,10 @@ impl ContinuousBatchScheduler {
             && active_count < prefill_first_target
             && !(capacity_backpressure_active && decoding_count > 0)
             && (self.prefilling_count() > 0 || self.waiting_count() > 0);
+        let execution_wake = match &waiting_admission {
+            WaitingAdmissionMode::Legacy => None,
+            WaitingAdmissionMode::Dynamic { wake, .. } => Some(*wake),
+        };
 
         // First, collect decode requests (they have priority). The opt-in
         // fill-first experiment skips decodes until the active decode cohort
@@ -1654,7 +1782,8 @@ impl ContinuousBatchScheduler {
                 &mut batch_requests,
                 &mut total_tokens,
                 &mut scheduled_request_ids,
-            );
+                execution_wake,
+            )?;
         }
         let scheduled_decode_count = batch_requests.len();
         let active_decode_prefill_chunk =
@@ -1822,7 +1951,8 @@ impl ContinuousBatchScheduler {
                 &mut batch_requests,
                 &mut total_tokens,
                 &mut scheduled_request_ids,
-            );
+                execution_wake,
+            )?;
         }
 
         // FERRUM_SCHED_NONE_PROF=1: log when next_batch is about to return SOME.
@@ -2589,6 +2719,110 @@ mod tests {
         assert_eq!(trace.dynamic_admission_probes, 3);
         assert_eq!(trace.dynamic_admission_skipped_unchanged, 1);
         assert_eq!(trace.dynamic_admission_deferred, 1);
+    }
+
+    #[tokio::test]
+    async fn active_decode_capacity_deferral_skips_unchanged_sources_without_hol_blocking() {
+        use ferrum_interfaces::vnext::{
+            CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
+            DeferredAction,
+        };
+        use std::num::NonZeroU64;
+
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let blocked = create_test_request(Priority::Normal);
+        let blocked_id = blocked.id.clone();
+        let runnable = create_test_request(Priority::Normal);
+        let runnable_id = runnable.id.clone();
+        scheduler.submit(blocked).await.unwrap();
+        scheduler.submit(runnable).await.unwrap();
+
+        let source = CapacityAvailabilitySource::ActiveSequenceSlots;
+        let availability0 = [CapacityAvailabilityEpoch::new(source, 1).unwrap()];
+        let wake0 = AdmissionWakeEpochs::new(NonZeroU64::new(29).unwrap(), 0, 0, 0);
+        let admitted = scheduler
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(2),
+                AdmissionWakeSnapshot::new(wake0, &availability0),
+                &mut |request| {
+                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                        request_id: request.id.clone(),
+                    })
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted.size(), 2);
+        scheduler.mark_prefill_complete(&blocked_id, 1);
+        scheduler.mark_prefill_complete(&runnable_id, 1);
+
+        let condition =
+            CapacityWaitCondition::from_observation(29, availability0.to_vec()).unwrap();
+        let deferral =
+            AdmissionDeferral::new(DeferredAction::WaitForRelease, wake0, condition.clone());
+        assert_eq!(
+            scheduler
+                .defer_decode_for_execution_capacity(
+                    std::slice::from_ref(&blocked_id),
+                    deferral.clone(),
+                )
+                .unwrap(),
+            1
+        );
+        let bypass = scheduler
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(2),
+                AdmissionWakeSnapshot::new(wake0, &availability0),
+                &mut |_| panic!("no waiting admission probe is allowed"),
+            )
+            .unwrap()
+            .expect("runnable decode must bypass an unchanged blocked decode");
+        assert_eq!(bypass.requests.len(), 1);
+        assert_eq!(bypass.requests[0].request.id, runnable_id);
+
+        assert_eq!(
+            scheduler
+                .defer_decode_for_execution_capacity(std::slice::from_ref(&runnable_id), deferral,)
+                .unwrap(),
+            1
+        );
+        let audit_only = AdmissionWakeEpochs::new(NonZeroU64::new(29).unwrap(), 1, 0, 0);
+        assert!(scheduler
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(2),
+                AdmissionWakeSnapshot::new(audit_only, &availability0),
+                &mut |_| panic!("unchanged exact sources must not probe"),
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            scheduler
+                .trace_snapshot()
+                .execution_capacity_blocked_decode_len,
+            2
+        );
+        assert_eq!(
+            scheduler.passive_capacity_wait_condition().unwrap(),
+            Some(condition)
+        );
+
+        let availability1 = [CapacityAvailabilityEpoch::new(source, 2).unwrap()];
+        let released = AdmissionWakeEpochs::new(NonZeroU64::new(29).unwrap(), 2, 0, 0);
+        let resumed = scheduler
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(2),
+                AdmissionWakeSnapshot::new(released, &availability1),
+                &mut |_| panic!("decode resume does not probe waiting admission"),
+            )
+            .unwrap()
+            .expect("relevant source change must resume both decodes");
+        assert_eq!(resumed.requests.len(), 2);
+        assert_eq!(
+            scheduler
+                .trace_snapshot()
+                .execution_capacity_blocked_decode_len,
+            0
+        );
     }
 
     #[tokio::test]

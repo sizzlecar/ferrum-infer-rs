@@ -1045,7 +1045,7 @@ impl EngineInner {
             let mut availability = self.dynamic_admission_availability.lock();
             let epochs = self
                 .model_executor
-                .write_prefill_admission_snapshot(&mut availability)?
+                .write_execution_capacity_snapshot(&mut availability)?
                 .ok_or_else(|| {
                     FerrumError::scheduler("plan runtime did not expose typed admission epochs")
                 })?;
@@ -1170,14 +1170,11 @@ impl EngineInner {
                         }));
                     }
                 }
-                if self.scheduler.active_count() > 0 {
-                    return Ok(EngineIterationOutcome::Progressed);
-                }
                 if plan_runtime_managed {
                     if let Some(observed) = self.scheduler.passive_capacity_wait_condition()? {
                         let registration = self
                             .model_executor
-                            .register_prefill_capacity_waiter(&observed)?
+                            .register_execution_capacity_waiter(&observed)?
                             .ok_or_else(|| {
                                 FerrumError::scheduler(
                                     "plan runtime did not register its capacity waiter",
@@ -1185,6 +1182,9 @@ impl EngineInner {
                             })?;
                         return Ok(EngineIterationOutcome::CapacityBlocked(registration));
                     }
+                }
+                if self.scheduler.active_count() > 0 {
+                    return Ok(EngineIterationOutcome::Progressed);
                 }
                 return if self.scheduler.waiting_count() == 0 {
                     Ok(EngineIterationOutcome::Idle)
