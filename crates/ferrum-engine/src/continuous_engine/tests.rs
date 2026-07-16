@@ -6,12 +6,13 @@ use ferrum_interfaces::kv_cache::{
 use ferrum_interfaces::tokenizer::{TokenizerInfo, TokenizerType};
 use ferrum_interfaces::{
     model_executor::{
-        DecodeInput, DecodeOutput, ExecutorAdmissionEpochs, ExecutorCapabilities,
-        ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
-        ExecutorPrefillAdmissionReceipt, ExecutorPrefillCapacityWaitRegistration,
-        ExecutorPrefillMaintenanceBlocker, ExecutorPrefillMaintenanceDeferral,
-        ExecutorPrefillMaintenanceOutcome, ExecutorPrefillMaintenanceStage, ExecutorStatus,
-        PlanRuntimeResourceSnapshot, PrefillInput, PrefillOutput, UnifiedBatch,
+        DecodeInput, DecodeOutput, ExecutorAdmissionEpochs, ExecutorBatchDecodeOutcome,
+        ExecutorCapabilities, ExecutorCapacityWaitRegistration, ExecutorExecutionCapacityDeferral,
+        ExecutorExecutionCapacityStage, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
+        ExecutorPrefillAdmissionReceipt, ExecutorPrefillMaintenanceBlocker,
+        ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome,
+        ExecutorPrefillMaintenanceStage, ExecutorStatus, PlanRuntimeResourceSnapshot, PrefillInput,
+        PrefillOutput, UnifiedBatch,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateManager, RecurrentStateSpec,
     RecurrentStateTensorSpec, TensorRef,
@@ -32,6 +33,8 @@ enum PlanRuntimeBatchDecodeBehavior {
     Exact,
     Short,
     WrongFirstCache,
+    Deferred,
+    DeferWideThenFailSecond,
 }
 
 struct PlanRuntimeBatchDecodeTestExecutor {
@@ -77,6 +80,15 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
 
     async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
         self.batch_decode_calls.fetch_add(1, Ordering::Relaxed);
+        if matches!(
+            self.behavior,
+            PlanRuntimeBatchDecodeBehavior::Deferred
+                | PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
+        ) {
+            return Err(FerrumError::resource_exhausted(
+                "typed test decode is waiting for capacity",
+            ));
+        }
         let mut outputs = self.inner.batch_decode(inputs).await?;
         match self.behavior {
             PlanRuntimeBatchDecodeBehavior::Exact => {}
@@ -92,8 +104,55 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
                     ));
                 }
             }
+            PlanRuntimeBatchDecodeBehavior::Deferred
+            | PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond => unreachable!(),
         }
         Ok(outputs)
+    }
+
+    async fn batch_decode_with_capacity(
+        &self,
+        inputs: &[DecodeInput],
+    ) -> Result<ExecutorBatchDecodeOutcome> {
+        if !matches!(
+            self.behavior,
+            PlanRuntimeBatchDecodeBehavior::Deferred
+                | PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
+        ) {
+            return self
+                .batch_decode(inputs)
+                .await
+                .map(ExecutorBatchDecodeOutcome::Completed);
+        }
+        self.batch_decode_calls.fetch_add(1, Ordering::Relaxed);
+        if matches!(
+            self.behavior,
+            PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
+        ) && inputs.len() == 1
+        {
+            if inputs[0].kv_cache.cache_id().ends_with("-1") {
+                return Err(FerrumError::backend(
+                    "synthetic exact-subcohort decode failure",
+                ));
+            }
+            return self
+                .inner
+                .batch_decode(inputs)
+                .await
+                .map(ExecutorBatchDecodeOutcome::Completed);
+        }
+        let source = ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots;
+        let observed = ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(source, 1)
+            .map_err(|error| FerrumError::internal(error.to_string()))?;
+        let wait_condition =
+            ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(47, vec![observed])
+                .map_err(|error| FerrumError::internal(error.to_string()))?;
+        ExecutorExecutionCapacityDeferral::new(
+            ExecutorAdmissionEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0),
+            wait_condition,
+            ExecutorExecutionCapacityStage::StepAdmission,
+        )
+        .map(ExecutorBatchDecodeOutcome::Deferred)
     }
 
     fn release_cache(&self, cache_id: &str) {
@@ -134,7 +193,7 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
         PlanRuntimeResourceSnapshot::new(1_000, 900, 700, 700, 400, 300, 200, 0, 0).map(Some)
     }
 
-    fn prefill_admission_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
+    fn execution_capacity_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
         Ok(Some(ExecutorAdmissionEpochs::new(
             std::num::NonZeroU64::new(41).unwrap(),
             0,
@@ -295,11 +354,11 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
         PlanRuntimeResourceSnapshot::new(1_000, 900, 700, 700, 400, 300, 200, 0, 0).map(Some)
     }
 
-    fn prefill_admission_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
+    fn execution_capacity_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
         Ok(Some(self.epochs()))
     }
 
-    fn write_prefill_admission_snapshot(
+    fn write_execution_capacity_snapshot(
         &self,
         availability: &mut Vec<ferrum_interfaces::vnext::CapacityAvailabilityEpoch>,
     ) -> Result<Option<ExecutorAdmissionEpochs>> {
@@ -308,10 +367,10 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
         Ok(Some(self.epochs()))
     }
 
-    fn register_prefill_capacity_waiter(
+    fn register_execution_capacity_waiter(
         &self,
         observed: &ferrum_interfaces::vnext::CapacityWaitCondition,
-    ) -> Result<Option<ExecutorPrefillCapacityWaitRegistration>> {
+    ) -> Result<Option<ExecutorCapacityWaitRegistration>> {
         if observed.coordinator_id().get() != 43 {
             return Err(FerrumError::internal(
                 "test capacity waiter received a foreign coordinator",
@@ -339,29 +398,25 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
         let mut signal = self.capacity_signal.subscribe();
         self.capacity_wait_registrations
             .fetch_add(1, Ordering::Relaxed);
-        Ok(Some(ExecutorPrefillCapacityWaitRegistration::new(
-            async move {
-                loop {
-                    let release_epoch = *signal.borrow_and_update();
-                    let current_generation = release_epoch
-                        .checked_add(capacity_epoch)
-                        .and_then(|generation| generation.checked_add(1))
-                        .ok_or_else(|| {
-                            FerrumError::internal("test capacity generation overflowed")
-                        })?;
-                    if current_generation > observed_generation {
-                        return Ok(ExecutorAdmissionEpochs::new(
-                            std::num::NonZeroU64::new(43).unwrap(),
-                            release_epoch,
-                            capacity_epoch,
-                        ));
-                    }
-                    signal.changed().await.map_err(|_| {
-                        FerrumError::internal("test capacity signal closed while waiting")
-                    })?;
+        Ok(Some(ExecutorCapacityWaitRegistration::new(async move {
+            loop {
+                let release_epoch = *signal.borrow_and_update();
+                let current_generation = release_epoch
+                    .checked_add(capacity_epoch)
+                    .and_then(|generation| generation.checked_add(1))
+                    .ok_or_else(|| FerrumError::internal("test capacity generation overflowed"))?;
+                if current_generation > observed_generation {
+                    return Ok(ExecutorAdmissionEpochs::new(
+                        std::num::NonZeroU64::new(43).unwrap(),
+                        release_epoch,
+                        capacity_epoch,
+                    ));
                 }
-            },
-        )))
+                signal.changed().await.map_err(|_| {
+                    FerrumError::internal("test capacity signal closed while waiting")
+                })?;
+            }
+        })))
     }
 
     fn try_admit_prefill(
@@ -2421,6 +2476,66 @@ async fn plan_runtime_batch_decode_process_batch_submits_one_cohort() {
 }
 
 #[tokio::test]
+async fn plan_runtime_batch_decode_capacity_deferral_splits_then_parks_exact_requests() {
+    let (engine, scheduler, executor, tokenizer) =
+        plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::Deferred);
+    let (request_ids, initial_tokens, cache_ids) =
+        install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
+    let decode_batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(2))
+        .await
+        .expect("ready decode cohort");
+
+    engine.inner.process_batch(&decode_batch).await.unwrap();
+
+    assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 3);
+    assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(scheduler.active_count(), 2);
+    assert_eq!(scheduler.waiting_count(), 0);
+    assert_eq!(
+        scheduler
+            .trace_snapshot()
+            .execution_capacity_blocked_decode_len,
+        2
+    );
+    assert!(scheduler
+        .passive_capacity_wait_condition()
+        .unwrap()
+        .is_some());
+    assert_plan_runtime_decode_cohort_unchanged(&engine, &request_ids, &initial_tokens, &cache_ids);
+}
+
+#[tokio::test]
+async fn plan_runtime_adaptive_decode_failure_only_completes_its_exact_subcohort() {
+    let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine(
+        PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond,
+    );
+    let (request_ids, initial_tokens, cache_ids) =
+        install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
+    let decode_batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(2))
+        .await
+        .expect("ready decode cohort");
+
+    engine.inner.process_batch(&decode_batch).await.unwrap();
+
+    assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 3);
+    assert_eq!(scheduler.active_count(), 1);
+    let sequences = engine.inner.sequences.read();
+    let succeeded = sequences
+        .get(&request_ids[0])
+        .expect("successful subcohort must remain active");
+    assert_eq!(succeeded.generated_tokens.first(), Some(&initial_tokens[0]));
+    assert_eq!(succeeded.generated_tokens.len(), 2);
+    assert_eq!(succeeded.model_cache_id(), Some(cache_ids[0].as_str()));
+    assert_eq!(succeeded.tokens_this_iteration, 1);
+    assert!(
+        !sequences.contains_key(&request_ids[1]),
+        "only the failed exact subcohort may be completed"
+    );
+}
+
+#[tokio::test]
 async fn plan_runtime_batch_decode_rejects_short_output_before_state_commit() {
     let (engine, scheduler, executor, tokenizer) =
         plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::Short);
@@ -2686,6 +2801,75 @@ async fn plan_runtime_capacity_pressure_waits_without_spinning_then_retries_on_r
         vec!["defer", "maintain", "admit", "prefill"]
     );
     engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn plan_runtime_capacity_wait_accepts_new_work_and_shutdown_without_reprobing_old_work() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let executor = Arc::new(PlanRuntimeMaintenanceTestExecutor::with_behavior(
+        128,
+        TestMaintenanceBehavior::WaitForRelease,
+    ));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let engine = Arc::new(
+        ContinuousBatchEngine::new_plan_runtime(
+            config,
+            scheduler,
+            tokenizer,
+            sampler,
+            executor.clone(),
+            tensor_factory,
+        )
+        .unwrap(),
+    );
+    engine.inner.bg_loop_spawned.store(true, Ordering::Release);
+    let background = engine.start_loop();
+
+    let mut first = policy_request();
+    first.sampling_params.max_tokens = 1;
+    let first_engine = Arc::clone(&engine);
+    let first_task = tokio::spawn(async move { first_engine.infer(first).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while executor.capacity_wait_registrations.load(Ordering::Acquire) < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first request must park on capacity");
+    assert_eq!(executor.admission_probes.load(Ordering::Acquire), 1);
+
+    let mut second = policy_request();
+    second.sampling_params.max_tokens = 1;
+    let second_engine = Arc::clone(&engine);
+    let second_task = tokio::spawn(async move { second_engine.infer(second).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while executor.admission_probes.load(Ordering::Acquire) < 2
+            || executor.capacity_wait_registrations.load(Ordering::Acquire) < 2
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("new work must interrupt and then rebuild the aggregate capacity wait");
+    assert_eq!(
+        executor.admission_probes.load(Ordering::Acquire),
+        2,
+        "the first unchanged request must not be probed again"
+    );
+    assert_eq!(executor.prefill_calls.load(Ordering::Acquire), 0);
+
+    engine.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), background)
+        .await
+        .expect("shutdown must interrupt the capacity waiter")
+        .expect("capacity-waiting background loop must not panic");
+    first_task.abort();
+    second_task.abort();
 }
 
 #[tokio::test]

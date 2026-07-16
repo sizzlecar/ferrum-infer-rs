@@ -14,9 +14,10 @@ use ferrum_interfaces::{
     engine::{InferenceEngine, LlmInferenceEngine},
     kv_cache::AllocationRequest,
     model_executor::{
-        ExecutionResourceAuthority, ExecutorAdmissionEpochs, ExecutorPrefillAdmission,
-        ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
-        ExecutorPrefillCapacityWaitRegistration, ExecutorPrefillMaintenanceDeferral,
+        ExecutionResourceAuthority, ExecutorAdmissionEpochs, ExecutorBatchDecodeOutcome,
+        ExecutorCapacityWaitRegistration, ExecutorExecutionCapacityDeferral,
+        ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
+        ExecutorPrefillAdmissionReceipt, ExecutorPrefillMaintenanceDeferral,
         ExecutorPrefillMaintenanceOutcome, GreedyRepetitionPenalty, KvSlotRequest,
         LogitsReturnPolicy, TokenSelectionMask,
     },
@@ -2316,7 +2317,7 @@ impl PendingBatchPrefill {
 enum EngineIterationOutcome {
     Progressed,
     Idle,
-    CapacityBlocked(ExecutorPrefillCapacityWaitRegistration),
+    CapacityBlocked(ExecutorCapacityWaitRegistration),
 }
 
 enum EngineResourceComposition {

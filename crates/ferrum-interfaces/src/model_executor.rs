@@ -732,7 +732,7 @@ impl ExecutorAdmissionEpochs {
     }
 }
 
-type ExecutorPrefillCapacityWaitFuture =
+type ExecutorCapacityWaitFuture =
     Pin<Box<dyn Future<Output = Result<ExecutorAdmissionEpochs>> + Send + 'static>>;
 
 /// Type-erased, single-use registration for one plan-runtime capacity wait.
@@ -742,11 +742,11 @@ type ExecutorPrefillCapacityWaitFuture =
 /// it only returns fresh epochs that permit another authoritative admission
 /// probe.
 #[must_use = "capacity wait registrations must be awaited or explicitly dropped"]
-pub struct ExecutorPrefillCapacityWaitRegistration {
-    future: ExecutorPrefillCapacityWaitFuture,
+pub struct ExecutorCapacityWaitRegistration {
+    future: ExecutorCapacityWaitFuture,
 }
 
-impl ExecutorPrefillCapacityWaitRegistration {
+impl ExecutorCapacityWaitRegistration {
     pub fn new<F>(future: F) -> Self
     where
         F: Future<Output = Result<ExecutorAdmissionEpochs>> + Send + 'static,
@@ -759,6 +759,85 @@ impl ExecutorPrefillCapacityWaitRegistration {
     pub async fn wait_for_change(self) -> Result<ExecutorAdmissionEpochs> {
         self.future.await
     }
+}
+
+/// Pre-submit runtime stage that could not acquire its exact dynamic capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorExecutionCapacityStage {
+    SequenceExtension,
+    StepAdmission,
+    SubmissionWave,
+}
+
+/// Scheduler-visible proof that an execution attempt was not submitted and
+/// must not be retried until one of its exact capacity sources changes.
+///
+/// This value owns no resource authority. The executor retains the committed
+/// request/sequence authority and has already retired any unsubmitted step or
+/// submission-wave authority before returning it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExecutorExecutionCapacityDeferral {
+    observed: ExecutorAdmissionEpochs,
+    wait_condition: crate::vnext::CapacityWaitCondition,
+    stage: ExecutorExecutionCapacityStage,
+}
+
+impl ExecutorExecutionCapacityDeferral {
+    pub fn new(
+        observed: ExecutorAdmissionEpochs,
+        wait_condition: crate::vnext::CapacityWaitCondition,
+        stage: ExecutorExecutionCapacityStage,
+    ) -> Result<Self> {
+        if wait_condition.coordinator_id().get() != observed.coordinator_id.get() {
+            return Err(ferrum_types::FerrumError::request_validation(
+                "executor execution deferral belongs to a different capacity coordinator",
+            ));
+        }
+        Ok(Self {
+            observed,
+            wait_condition,
+            stage,
+        })
+    }
+
+    pub fn from_admission(
+        deferred: &crate::vnext::AdmissionDeferred,
+        stage: ExecutorExecutionCapacityStage,
+    ) -> Result<Self> {
+        if deferred.action() != crate::vnext::DeferredAction::WaitForRelease {
+            return Err(ferrum_types::FerrumError::internal(
+                "execution capacity deferral must be reduced to WaitForRelease before export",
+            ));
+        }
+        Self::new(
+            ExecutorAdmissionEpochs::from_capacity(deferred.epochs()),
+            deferred.wait_condition().clone(),
+            stage,
+        )
+    }
+
+    pub const fn observed(&self) -> ExecutorAdmissionEpochs {
+        self.observed
+    }
+
+    pub fn wait_condition(&self) -> &crate::vnext::CapacityWaitCondition {
+        &self.wait_condition
+    }
+
+    pub const fn stage(&self) -> ExecutorExecutionCapacityStage {
+        self.stage
+    }
+}
+
+/// Capacity-aware batch decode result.
+///
+/// `Deferred` is only legal before provider encode or device submission. All
+/// possibly-submitted failures remain ordinary errors and retain their typed
+/// fence/recovery authority inside the executor.
+pub enum ExecutorBatchDecodeOutcome {
+    Completed(Vec<DecodeOutput>),
+    Deferred(ExecutorExecutionCapacityDeferral),
 }
 
 /// Stage that must advance before a plan-runtime prefill can be admitted.
@@ -1006,7 +1085,7 @@ pub trait ModelExecutor: Send + Sync {
     /// Current plan-local capacity evidence for scheduler wake suppression.
     /// Legacy-engine executors return `None`; an executor declaring
     /// [`ExecutionResourceAuthority::PlanRuntime`] must return `Some`.
-    fn prefill_admission_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
+    fn execution_capacity_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
         Ok(None)
     }
 
@@ -1014,12 +1093,12 @@ pub trait ModelExecutor: Send + Sync {
     /// caller-owned storage and returns the matching global audit epochs.
     /// Executors with typed dynamic admission override this to avoid allocating
     /// on steady scheduler ticks.
-    fn write_prefill_admission_snapshot(
+    fn write_execution_capacity_snapshot(
         &self,
         availability: &mut Vec<crate::vnext::CapacityAvailabilityEpoch>,
     ) -> Result<Option<ExecutorAdmissionEpochs>> {
         availability.clear();
-        self.prefill_admission_epochs()
+        self.execution_capacity_epochs()
     }
 
     /// Synchronously subscribes to every source named by one passive capacity
@@ -1029,10 +1108,10 @@ pub trait ModelExecutor: Send + Sync {
     /// Legacy-engine executors return `None`. An executor declaring
     /// [`ExecutionResourceAuthority::PlanRuntime`] must return `Some` for a
     /// wait condition issued by its own admission coordinator.
-    fn register_prefill_capacity_waiter(
+    fn register_execution_capacity_waiter(
         &self,
         _observed: &crate::vnext::CapacityWaitCondition,
-    ) -> Result<Option<ExecutorPrefillCapacityWaitRegistration>> {
+    ) -> Result<Option<ExecutorCapacityWaitRegistration>> {
         Ok(None)
     }
 
@@ -1141,6 +1220,20 @@ pub trait ModelExecutor: Send + Sync {
             outputs.push(self.decode(input).await?);
         }
         Ok(outputs)
+    }
+
+    /// Batch decode with an explicit pre-submit capacity deferral edge.
+    ///
+    /// Legacy executors inherit the successful/error-only behavior. A runtime
+    /// with typed resource authority overrides this method so temporary
+    /// capacity pressure is never flattened into a stringly resource error.
+    async fn batch_decode_with_capacity(
+        &self,
+        inputs: &[DecodeInput],
+    ) -> Result<ExecutorBatchDecodeOutcome> {
+        self.batch_decode(inputs)
+            .await
+            .map(ExecutorBatchDecodeOutcome::Completed)
     }
 
     /// Unified mixed-batch forward: process a [`UnifiedBatch`] containing

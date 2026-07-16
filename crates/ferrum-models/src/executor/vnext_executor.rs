@@ -16,11 +16,11 @@ use std::time::Instant;
 use ferrum_interfaces::kv_cache::{BlockTable, CacheHandleStats};
 use ferrum_interfaces::model_executor::{
     AttentionType, DecodeInput, DecodeOutput, ExecutionResourceAuthority, ExecutorAdmissionEpochs,
-    ExecutorCapabilities, ExecutorMemoryUsage, ExecutorPrefillAdmission,
-    ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
-    ExecutorPrefillCapacityWaitRegistration, ExecutorPrefillMaintenanceDeferral,
-    ExecutorPrefillMaintenanceOutcome, ExecutorState, ExecutorStatus, MemoryRequirements,
-    PlanRuntimeResourceSnapshot, PrefillInput, PrefillOutput,
+    ExecutorBatchDecodeOutcome, ExecutorCapabilities, ExecutorCapacityWaitRegistration,
+    ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityStage, ExecutorMemoryUsage,
+    ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
+    ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome, ExecutorState,
+    ExecutorStatus, MemoryRequirements, PlanRuntimeResourceSnapshot, PrefillInput, PrefillOutput,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -950,6 +950,11 @@ enum DispatchOutcome<R: DeviceRuntime> {
         message: String,
         completion: CompletionHandle<R>,
     },
+}
+
+enum VNextExecutionCapacityDecision<T> {
+    Ready(T),
+    Deferred(ExecutorExecutionCapacityDeferral),
 }
 
 enum VNextSequenceAdmissionDecision<R: DeviceRuntime> {
@@ -1899,30 +1904,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
-    fn current_prefill_admission_epochs(&self) -> Result<ExecutorAdmissionEpochs> {
+    fn current_execution_capacity_epochs(&self) -> Result<ExecutorAdmissionEpochs> {
         self.plan_resources
             .dynamic_pool_status()
             .map(|status| ExecutorAdmissionEpochs::from_capacity(status.epochs()))
             .map_err(|error| FerrumError::backend(error.to_string()))
-    }
-
-    fn maintain_admission_growth(
-        &self,
-        scope: &str,
-        deferred: &AdmissionDeferred,
-        attempts: &mut u32,
-    ) -> Result<bool> {
-        if deferred.action() != DeferredAction::AwaitBackingGrowth {
-            return Ok(false);
-        }
-        if *attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
-            return Err(Self::deferred(scope, deferred));
-        }
-        *attempts += 1;
-        self.plan_resources
-            .maintain_for_admission_deferred(deferred)
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
-        Ok(true)
     }
 
     fn deferred(scope: &str, deferred: &AdmissionDeferred) -> FerrumError {
@@ -2047,11 +2033,39 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .map_err(|error| FerrumError::backend(format!("vNext execution journal: {error}")))
     }
 
-    fn extend_sequence(
+    fn execution_maintenance_decision(
+        stage: ExecutorExecutionCapacityStage,
+        outcome: DynamicDeferredMaintenanceOutcome,
+    ) -> Result<Option<ExecutorExecutionCapacityDeferral>> {
+        match outcome {
+            DynamicDeferredMaintenanceOutcome::RetryAdmission { .. }
+            | DynamicDeferredMaintenanceOutcome::Maintained(_) => Ok(None),
+            DynamicDeferredMaintenanceOutcome::WaitForRelease {
+                current_epochs,
+                wait_condition,
+                ..
+            } => ExecutorExecutionCapacityDeferral::new(
+                ExecutorAdmissionEpochs::from_capacity(current_epochs),
+                wait_condition,
+                stage,
+            )
+            .map(Some),
+        }
+    }
+
+    fn execution_capacity_error(deferral: &ExecutorExecutionCapacityDeferral) -> FerrumError {
+        FerrumError::resource_exhausted(format!(
+            "vNext {:?} is waiting for an exact capacity source change: {:?}",
+            deferral.stage(),
+            deferral.wait_condition().observed()
+        ))
+    }
+
+    fn extend_sequence_with_capacity(
         &self,
         sequence: &VNextSequence<R>,
         target: ResourceWorkShape,
-    ) -> Result<()> {
+    ) -> Result<VNextExecutionCapacityDecision<()>> {
         let mut backing_attempts = 0;
         let mut rechecks = 0;
         loop {
@@ -2071,7 +2085,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .map_err(|error| FerrumError::backend(error.to_string()))?
             {
                 SequenceResourceExtensionDecision::Current(_)
-                | SequenceResourceExtensionDecision::Extended(_) => return Ok(()),
+                | SequenceResourceExtensionDecision::Extended(_) => {
+                    return Ok(VNextExecutionCapacityDecision::Ready(()))
+                }
                 SequenceResourceExtensionDecision::RetryRequired(_) => {
                     if rechecks >= MAX_EXTENSION_RECHECKS {
                         return Err(FerrumError::resource_exhausted(
@@ -2085,14 +2101,30 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.metrics
                         .extension_deferrals
                         .fetch_add(1, Ordering::Relaxed);
-                    if self.maintain_admission_growth(
-                        "sequence extension",
-                        &deferred,
-                        &mut backing_attempts,
-                    )? {
-                        continue;
+                    if deferred.action() == DeferredAction::WaitForRelease {
+                        return ExecutorExecutionCapacityDeferral::from_admission(
+                            &deferred,
+                            ExecutorExecutionCapacityStage::SequenceExtension,
+                        )
+                        .map(VNextExecutionCapacityDecision::Deferred);
                     }
-                    return Err(Self::deferred("sequence extension", &deferred));
+                    if deferred.action() != DeferredAction::AwaitBackingGrowth {
+                        return Err(Self::deferred("sequence extension", &deferred));
+                    }
+                    if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
+                        return Err(Self::deferred("sequence extension", &deferred));
+                    }
+                    backing_attempts += 1;
+                    let outcome = self
+                        .plan_resources
+                        .maintain_for_admission_deferred(&deferred)
+                        .map_err(|error| FerrumError::backend(error.to_string()))?;
+                    if let Some(deferred) = Self::execution_maintenance_decision(
+                        ExecutorExecutionCapacityStage::SequenceExtension,
+                        outcome,
+                    )? {
+                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
+                    }
                 }
                 SequenceResourceExtensionDecision::BackingDeferred(deferred) => {
                     self.metrics
@@ -2105,15 +2137,34 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         ));
                     }
                     backing_attempts += 1;
-                    deferred
+                    let outcome = deferred
                         .maintain()
                         .map_err(|error| FerrumError::backend(error.to_string()))?;
+                    if let Some(deferred) = Self::execution_maintenance_decision(
+                        ExecutorExecutionCapacityStage::SequenceExtension,
+                        outcome,
+                    )? {
+                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
+                    }
                 }
                 SequenceResourceExtensionDecision::PermanentRejected(rejected) => {
                     return Err(FerrumError::request_validation(format!(
                         "vNext sequence extension exceeds the configured fit ceiling: {rejected:?}"
                     )))
                 }
+            }
+        }
+    }
+
+    fn extend_sequence(
+        &self,
+        sequence: &VNextSequence<R>,
+        target: ResourceWorkShape,
+    ) -> Result<()> {
+        match self.extend_sequence_with_capacity(sequence, target)? {
+            VNextExecutionCapacityDecision::Ready(()) => Ok(()),
+            VNextExecutionCapacityDecision::Deferred(deferred) => {
+                Err(Self::execution_capacity_error(&deferred))
             }
         }
     }
@@ -2157,20 +2208,51 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         batch: &ExecutionBatchParticipants<R>,
         spans: &[TokenSpanWork],
     ) -> Result<Arc<StepResourceLease<R>>> {
+        match self.begin_step_for_spans_with_capacity(batch, spans)? {
+            VNextExecutionCapacityDecision::Ready(step) => Ok(step),
+            VNextExecutionCapacityDecision::Deferred(deferred) => {
+                Err(Self::execution_capacity_error(&deferred))
+            }
+        }
+    }
+
+    fn begin_step_for_spans_with_capacity(
+        &self,
+        batch: &ExecutionBatchParticipants<R>,
+        spans: &[TokenSpanWork],
+    ) -> Result<VNextExecutionCapacityDecision<Arc<StepResourceLease<R>>>> {
         let mut backing_attempts = 0;
         loop {
             match self.try_begin_step_for_spans(batch, spans)? {
-                StepResourceAdmissionDecision::Admitted(step) => return Ok(step),
+                StepResourceAdmissionDecision::Admitted(step) => {
+                    return Ok(VNextExecutionCapacityDecision::Ready(step))
+                }
                 StepResourceAdmissionDecision::Deferred(deferred) => {
                     self.metrics.step_deferrals.fetch_add(1, Ordering::Relaxed);
-                    if self.maintain_admission_growth(
-                        "step admission",
-                        &deferred,
-                        &mut backing_attempts,
-                    )? {
-                        continue;
+                    if deferred.action() == DeferredAction::WaitForRelease {
+                        return ExecutorExecutionCapacityDeferral::from_admission(
+                            &deferred,
+                            ExecutorExecutionCapacityStage::StepAdmission,
+                        )
+                        .map(VNextExecutionCapacityDecision::Deferred);
                     }
-                    return Err(Self::deferred("step admission", &deferred));
+                    if deferred.action() != DeferredAction::AwaitBackingGrowth {
+                        return Err(Self::deferred("step admission", &deferred));
+                    }
+                    if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
+                        return Err(Self::deferred("step admission", &deferred));
+                    }
+                    backing_attempts += 1;
+                    let outcome = self
+                        .plan_resources
+                        .maintain_for_admission_deferred(&deferred)
+                        .map_err(|error| FerrumError::backend(error.to_string()))?;
+                    if let Some(deferred) = Self::execution_maintenance_decision(
+                        ExecutorExecutionCapacityStage::StepAdmission,
+                        outcome,
+                    )? {
+                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
+                    }
                 }
                 StepResourceAdmissionDecision::BackingDeferred(deferred) => {
                     self.metrics
@@ -2183,9 +2265,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         ));
                     }
                     backing_attempts += 1;
-                    deferred
+                    let outcome = deferred
                         .maintain()
                         .map_err(|error| FerrumError::backend(error.to_string()))?;
+                    if let Some(deferred) = Self::execution_maintenance_decision(
+                        ExecutorExecutionCapacityStage::StepAdmission,
+                        outcome,
+                    )? {
+                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
+                    }
                 }
                 StepResourceAdmissionDecision::PermanentRejected(rejected) => {
                     return Err(FerrumError::backend(format!(
@@ -2242,20 +2330,51 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         step: &Arc<StepResourceLease<R>>,
         spans: &[TokenSpanWork],
     ) -> Result<PreparedStepSubmissionWave<R>> {
+        match self.prepare_wave_for_spans_with_capacity(step, spans)? {
+            VNextExecutionCapacityDecision::Ready(wave) => Ok(wave),
+            VNextExecutionCapacityDecision::Deferred(deferred) => {
+                Err(Self::execution_capacity_error(&deferred))
+            }
+        }
+    }
+
+    fn prepare_wave_for_spans_with_capacity(
+        &self,
+        step: &Arc<StepResourceLease<R>>,
+        spans: &[TokenSpanWork],
+    ) -> Result<VNextExecutionCapacityDecision<PreparedStepSubmissionWave<R>>> {
         let mut backing_attempts = 0;
         loop {
             match self.try_prepare_wave_for_spans(step, spans)? {
-                StepSubmissionWaveAdmissionDecision::Prepared(wave) => return Ok(wave),
+                StepSubmissionWaveAdmissionDecision::Prepared(wave) => {
+                    return Ok(VNextExecutionCapacityDecision::Ready(wave))
+                }
                 StepSubmissionWaveAdmissionDecision::Deferred(deferred) => {
                     self.metrics.wave_deferrals.fetch_add(1, Ordering::Relaxed);
-                    if self.maintain_admission_growth(
-                        "submission wave",
-                        &deferred,
-                        &mut backing_attempts,
-                    )? {
-                        continue;
+                    if deferred.action() == DeferredAction::WaitForRelease {
+                        return ExecutorExecutionCapacityDeferral::from_admission(
+                            &deferred,
+                            ExecutorExecutionCapacityStage::SubmissionWave,
+                        )
+                        .map(VNextExecutionCapacityDecision::Deferred);
                     }
-                    return Err(Self::deferred("submission wave", &deferred));
+                    if deferred.action() != DeferredAction::AwaitBackingGrowth {
+                        return Err(Self::deferred("submission wave", &deferred));
+                    }
+                    if backing_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
+                        return Err(Self::deferred("submission wave", &deferred));
+                    }
+                    backing_attempts += 1;
+                    let outcome = self
+                        .plan_resources
+                        .maintain_for_admission_deferred(&deferred)
+                        .map_err(|error| FerrumError::backend(error.to_string()))?;
+                    if let Some(deferred) = Self::execution_maintenance_decision(
+                        ExecutorExecutionCapacityStage::SubmissionWave,
+                        outcome,
+                    )? {
+                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
+                    }
                 }
                 StepSubmissionWaveAdmissionDecision::BackingDeferred(deferred) => {
                     self.metrics
@@ -2268,9 +2387,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         ));
                     }
                     backing_attempts += 1;
-                    deferred
+                    let outcome = deferred
                         .maintain()
                         .map_err(|error| FerrumError::backend(error.to_string()))?;
+                    if let Some(deferred) = Self::execution_maintenance_decision(
+                        ExecutorExecutionCapacityStage::SubmissionWave,
+                        outcome,
+                    )? {
+                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
+                    }
                 }
                 StepSubmissionWaveAdmissionDecision::PermanentRejected(rejected) => {
                     return Err(FerrumError::backend(format!(
@@ -2483,7 +2608,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         sequences: &[Arc<VNextSequence<R>>],
         token_batches: &[Vec<u32>],
         spans: &[TokenSpanWork],
-    ) -> Result<Vec<Vec<f32>>> {
+    ) -> Result<VNextExecutionCapacityDecision<Vec<Vec<f32>>>> {
         if sequences.is_empty()
             || sequences.len() != token_batches.len()
             || sequences.len() != spans.len()
@@ -2498,10 +2623,23 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "vNext decode batch differs from its canonical participant set",
             ));
         }
-        let step = self.begin_step_for_spans(batch, spans)?;
-        let wave = match self.prepare_wave_for_spans(&step, spans) {
-            Ok(wave) => wave,
-            Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
+        let step = match self.begin_step_for_spans_with_capacity(batch, spans)? {
+            VNextExecutionCapacityDecision::Ready(step) => step,
+            VNextExecutionCapacityDecision::Deferred(deferred) => {
+                return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
+            }
+        };
+        let wave = match self.prepare_wave_for_spans_with_capacity(&step, spans)? {
+            VNextExecutionCapacityDecision::Ready(wave) => wave,
+            VNextExecutionCapacityDecision::Deferred(deferred) => {
+                step.try_abort().map_err(|failure| {
+                    FerrumError::backend(format!(
+                        "vNext capacity-deferred unsubmitted step abort failed: {}",
+                        failure.error()
+                    ))
+                })?;
+                return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
+            }
         };
         let participants = sequences
             .iter()
@@ -2515,6 +2653,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .collect::<Vec<_>>();
         self.execute_prepared_participants(&participants, PreparedVNextPrefill { step, wave })
             .await
+            .map(VNextExecutionCapacityDecision::Ready)
     }
 
     async fn execute_prepared_step(
@@ -2790,10 +2929,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
-    async fn execute_decode_batch(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
+    async fn execute_decode_batch(
+        &self,
+        inputs: &[DecodeInput],
+    ) -> Result<ExecutorBatchDecodeOutcome> {
         let started = Instant::now();
         if inputs.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ExecutorBatchDecodeOutcome::Completed(Vec::new()));
         }
 
         let mut candidates = Vec::with_capacity(inputs.len());
@@ -2898,13 +3040,19 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
             let extension = ResourceWorkShape::single(extension_span)
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
-            if let Err(error) = self.extend_sequence(&candidate.sequence, extension) {
-                if DecodeFailureDisposition::from_error(&error)
-                    == DecodeFailureDisposition::AbortSequence
-                {
-                    self.abort_decode_candidates(std::slice::from_ref(candidate));
+            match self.extend_sequence_with_capacity(&candidate.sequence, extension) {
+                Ok(VNextExecutionCapacityDecision::Ready(())) => {}
+                Ok(VNextExecutionCapacityDecision::Deferred(deferred)) => {
+                    return Ok(ExecutorBatchDecodeOutcome::Deferred(deferred));
                 }
-                return Err(error);
+                Err(error) => {
+                    if DecodeFailureDisposition::from_error(&error)
+                        == DecodeFailureDisposition::AbortSequence
+                    {
+                        self.abort_decode_candidates(std::slice::from_ref(candidate));
+                    }
+                    return Err(error);
+                }
             }
             let span = TokenSpanWork::from_token_ids(&tokens, previous_len..tokens.len())
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
@@ -2921,7 +3069,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .execute_batch_step(&batch, &sequences, &token_batches, &spans)
             .await
         {
-            Ok(logits) => logits,
+            Ok(VNextExecutionCapacityDecision::Ready(logits)) => logits,
+            Ok(VNextExecutionCapacityDecision::Deferred(deferred)) => {
+                return Ok(ExecutorBatchDecodeOutcome::Deferred(deferred));
+            }
             Err(error) => {
                 if DecodeFailureDisposition::from_error(&error)
                     == DecodeFailureDisposition::AbortSequence
@@ -2974,7 +3125,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             elapsed_us.saturating_mul(participant_count),
             Ordering::Relaxed,
         );
-        ordered_outputs
+        let outputs = ordered_outputs
             .into_iter()
             .map(|output| {
                 output.ok_or_else(|| {
@@ -2983,7 +3134,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     )
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ExecutorBatchDecodeOutcome::Completed(outputs))
     }
 
     fn metrics_snapshot(&self) -> serde_json::Value {
@@ -3135,14 +3287,14 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         *self.event_sink.write() = Some(sink);
     }
 
-    fn prefill_admission_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
+    fn execution_capacity_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
         self.plan_resources
             .dynamic_pool_status()
             .map(|status| Some(ExecutorAdmissionEpochs::from_capacity(status.epochs())))
             .map_err(|error| FerrumError::backend(error.to_string()))
     }
 
-    fn write_prefill_admission_snapshot(
+    fn write_execution_capacity_snapshot(
         &self,
         availability: &mut Vec<ferrum_interfaces::vnext::CapacityAvailabilityEpoch>,
     ) -> Result<Option<ExecutorAdmissionEpochs>> {
@@ -3152,23 +3304,21 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
             .map_err(|error| FerrumError::backend(error.to_string()))
     }
 
-    fn register_prefill_capacity_waiter(
+    fn register_execution_capacity_waiter(
         &self,
         observed: &CapacityWaitCondition,
-    ) -> Result<Option<ExecutorPrefillCapacityWaitRegistration>> {
+    ) -> Result<Option<ExecutorCapacityWaitRegistration>> {
         let registration = self
             .plan_resources
             .register_capacity_waiter(observed)
             .map_err(|error| FerrumError::backend(error.to_string()))?;
-        Ok(Some(ExecutorPrefillCapacityWaitRegistration::new(
-            async move {
-                registration
-                    .wait_for_change()
-                    .await
-                    .map(ExecutorAdmissionEpochs::from_capacity)
-                    .map_err(|error| FerrumError::backend(error.to_string()))
-            },
-        )))
+        Ok(Some(ExecutorCapacityWaitRegistration::new(async move {
+            registration
+                .wait_for_change()
+                .await
+                .map(ExecutorAdmissionEpochs::from_capacity)
+                .map_err(|error| FerrumError::backend(error.to_string()))
+        })))
     }
 
     fn try_admit_prefill(
@@ -3331,7 +3481,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                         FerrumError::internal("vNext prefill maintenance byte count overflow")
                     })?;
                 Ok(ExecutorPrefillMaintenanceOutcome::Maintained {
-                    current: self.current_prefill_admission_epochs()?,
+                    current: self.current_execution_capacity_epochs()?,
                     pools_grown: receipt.growths().len(),
                     allocated_bytes,
                 })
@@ -3494,6 +3644,18 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     async fn batch_decode(&self, inputs: &[DecodeInput]) -> Result<Vec<DecodeOutput>> {
+        match self.execute_decode_batch(inputs).await? {
+            ExecutorBatchDecodeOutcome::Completed(outputs) => Ok(outputs),
+            ExecutorBatchDecodeOutcome::Deferred(deferred) => {
+                Err(Self::execution_capacity_error(&deferred))
+            }
+        }
+    }
+
+    async fn batch_decode_with_capacity(
+        &self,
+        inputs: &[DecodeInput],
+    ) -> Result<ExecutorBatchDecodeOutcome> {
         self.execute_decode_batch(inputs).await
     }
 

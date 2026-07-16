@@ -1,5 +1,14 @@
 use super::*;
 
+#[derive(Debug)]
+pub(in crate::continuous_engine) enum PlanRuntimeDecodeBatchOutcome {
+    Completed,
+    Deferred {
+        request_ids: Vec<RequestId>,
+        deferral: ExecutorExecutionCapacityDeferral,
+    },
+}
+
 impl EngineInner {
     // ── batch decode ──────────────────────────────────────────────────
 
@@ -9,7 +18,7 @@ impl EngineInner {
     pub(in crate::continuous_engine) async fn run_plan_runtime_batch_decode(
         &self,
         request_ids: &[RequestId],
-    ) -> Result<()> {
+    ) -> Result<PlanRuntimeDecodeBatchOutcome> {
         let mut rids = Vec::with_capacity(request_ids.len());
         let mut inputs = Vec::with_capacity(request_ids.len());
         {
@@ -36,7 +45,7 @@ impl EngineInner {
             }
         }
         if inputs.is_empty() {
-            return Ok(());
+            return Ok(PlanRuntimeDecodeBatchOutcome::Completed);
         }
 
         let input_cache_ids = inputs
@@ -52,10 +61,21 @@ impl EngineInner {
             "engine_plan_runtime_batch_decode_workspace",
             "engine_plan_runtime_batch_decode_workspace_release",
         );
-        let outputs = match self.model_executor.batch_decode(&inputs).await {
-            Ok(outputs) => {
+        let outputs = match self
+            .model_executor
+            .batch_decode_with_capacity(&inputs)
+            .await
+        {
+            Ok(ExecutorBatchDecodeOutcome::Completed(outputs)) => {
                 workspace_lease.release();
                 outputs
+            }
+            Ok(ExecutorBatchDecodeOutcome::Deferred(deferral)) => {
+                workspace_lease.release();
+                return Ok(PlanRuntimeDecodeBatchOutcome::Deferred {
+                    request_ids: rids,
+                    deferral,
+                });
             }
             Err(error) => {
                 drop(workspace_lease);
@@ -141,6 +161,87 @@ impl EngineInner {
             }
             if let Some(reason) = stop_reason {
                 self.complete_request(rid, reason).await?;
+            }
+        }
+        Ok(PlanRuntimeDecodeBatchOutcome::Completed)
+    }
+
+    pub(in crate::continuous_engine) async fn run_plan_runtime_batch_decode_adaptive(
+        &self,
+        request_ids: &[RequestId],
+    ) -> Result<()> {
+        let mut stack = vec![self.decode_ready_request_ids(request_ids)];
+        while let Some(chunk) = stack.pop() {
+            let chunk = self.decode_ready_request_ids(&chunk);
+            if chunk.is_empty() {
+                continue;
+            }
+            let outcome = match self.run_plan_runtime_batch_decode(&chunk).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    warn!(
+                        "Plan-runtime adaptive decode failed for {} exact request(s): {}",
+                        chunk.len(),
+                        error
+                    );
+                    self.write_scheduler_trace_event(serde_json::json!({
+                        "event": "engine_plan_runtime_decode_subcohort_failure",
+                        "request_ids": chunk,
+                        "error": error.to_string(),
+                        "scheduler": self.scheduler.trace_snapshot(),
+                    }));
+                    for request_id in &chunk {
+                        self.complete_request(request_id, FinishReason::Error)
+                            .await?;
+                    }
+                    continue;
+                }
+            };
+            match outcome {
+                PlanRuntimeDecodeBatchOutcome::Completed => {}
+                PlanRuntimeDecodeBatchOutcome::Deferred {
+                    request_ids,
+                    deferral: _,
+                } if request_ids.len() > 1 => {
+                    self.scheduler
+                        .record_decode_capacity_pressure(request_ids.len(), None);
+                    let mid = request_ids.len() / 2;
+                    stack.push(request_ids[mid..].to_vec());
+                    stack.push(request_ids[..mid].to_vec());
+                }
+                PlanRuntimeDecodeBatchOutcome::Deferred {
+                    request_ids,
+                    deferral,
+                } => {
+                    let observed = deferral.observed();
+                    let scheduler_deferral = AdmissionDeferral::new(
+                        DeferredAction::WaitForRelease,
+                        AdmissionWakeEpochs::new(
+                            observed.coordinator_id,
+                            observed.release_epoch,
+                            observed.capacity_epoch,
+                            0,
+                        ),
+                        deferral.wait_condition().clone(),
+                    );
+                    let deferred = self
+                        .scheduler
+                        .defer_decode_for_execution_capacity(&request_ids, scheduler_deferral)?;
+                    if deferred != request_ids.len() {
+                        return Err(FerrumError::scheduler(format!(
+                            "PlanRuntime decode deferral retained {deferred} of {} scheduler entries",
+                            request_ids.len()
+                        )));
+                    }
+                    self.write_scheduler_trace_event(serde_json::json!({
+                        "event": "scheduler_execution_capacity_defer",
+                        "request_ids": request_ids,
+                        "stage": deferral.stage(),
+                        "observed": observed,
+                        "wait_condition": deferral.wait_condition(),
+                        "scheduler": self.scheduler.trace_snapshot(),
+                    }));
+                }
             }
         }
         Ok(())

@@ -128,17 +128,16 @@ impl EngineInner {
 
         let decode_ids = self.decode_ready_request_ids(&decode_ids);
         if !decode_ids.is_empty() {
-            if let Err(error) = self.run_plan_runtime_batch_decode(&decode_ids).await {
+            if let Err(error) = self
+                .run_plan_runtime_batch_decode_adaptive(&decode_ids)
+                .await
+            {
                 warn!(
-                    "Plan-runtime batch decode failed for {} request(s): {}",
+                    "Plan-runtime adaptive decode control failed for {} request(s): {}",
                     decode_ids.len(),
                     error
                 );
-                if !is_resource_exhausted_error(&error) {
-                    for rid in &decode_ids {
-                        self.complete_request(rid, FinishReason::Error).await?;
-                    }
-                }
+                return Err(error);
             }
         }
         Ok(())
