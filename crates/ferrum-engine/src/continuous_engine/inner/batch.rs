@@ -1319,8 +1319,11 @@ impl EngineInner {
         let release_ordinal = completion.release_transition_ordinal();
         let resumable_ordinal = completion.resumable_transition_ordinal();
         let closed_ordinal = completion.closed_transition_ordinal();
+        let closed_reason = completion.closed_reason();
         let moved = completion.victim_requeued();
         let progress_owner_resumable = completion.progress_owner_resumable();
+        let completion_disposition =
+            closed_reason.map_or("progress_owner_resumable", |reason| reason.as_str());
         self.write_scheduler_trace_event(serde_json::json!({
             "event": "scheduler_pressure_release_fence_completed",
             "episode_id": transaction.episode_id().get(),
@@ -1330,8 +1333,11 @@ impl EngineInner {
             "release_transition_ordinal": release_ordinal.get(),
             "resumable_transition_ordinal": resumable_ordinal.map(|ordinal| ordinal.get()),
             "closed_transition_ordinal": closed_ordinal.map(|ordinal| ordinal.get()),
+            "closed_reason": closed_reason.map(|reason| reason.as_str()),
+            "completion_disposition": completion_disposition,
             "release_authority": release_authority,
             "exact_source_advanced": true,
+            "transaction_wait_condition_advanced": true,
             "progress_owner_resumable": progress_owner_resumable,
             "moved": moved,
             "scheduler": self.scheduler.trace_snapshot(),
@@ -1364,10 +1370,22 @@ impl EngineInner {
                     serde_json::json!(closed_ordinal.map(|ordinal| ordinal.get())),
                 ),
                 (
+                    "closed_reason".to_string(),
+                    serde_json::json!(closed_reason.map(|reason| reason.as_str())),
+                ),
+                (
+                    "completion_disposition".to_string(),
+                    serde_json::json!(completion_disposition),
+                ),
+                (
                     "physical_release_completed".to_string(),
                     serde_json::json!(true),
                 ),
                 ("exact_source_advanced".to_string(), serde_json::json!(true)),
+                (
+                    "transaction_wait_condition_advanced".to_string(),
+                    serde_json::json!(true),
+                ),
                 (
                     "release_authority".to_string(),
                     serde_json::json!(release_authority),

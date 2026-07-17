@@ -577,13 +577,11 @@ def validate_pressure_fence_completed(row: dict[str, Any], label: str) -> dict[s
     episode_id = shape.get("episode_id")
     released = shape.get("release_transition_ordinal")
     resumable = shape.get("resumable_transition_ordinal")
+    closed = shape.get("closed_transition_ordinal")
+    closed_reason = shape.get("closed_reason")
+    disposition = shape.get("completion_disposition")
     require(isinstance(episode_id, int) and episode_id > 0, f"{label}: episode id is invalid")
-    require(
-        isinstance(released, int)
-        and isinstance(resumable, int)
-        and 0 < released < resumable,
-        f"{label}: release/resumable ordinal order is invalid",
-    )
+    require(isinstance(released, int) and released > 0, f"{label}: release ordinal is invalid")
     require(
         shape.get("physical_release_completed") is True,
         f"{label}: completed fence has no physical release evidence",
@@ -593,10 +591,34 @@ def validate_pressure_fence_completed(row: dict[str, Any], label: str) -> dict[s
         f"{label}: completed fence did not advance its exact failed source",
     )
     require(
-        shape.get("progress_owner_resumable") is True
-        and shape.get("closed_transition_ordinal") is None,
-        f"{label}: canonical progress owner was not made resumable",
+        shape.get("transaction_wait_condition_advanced") is True,
+        f"{label}: completed fence did not identify the advanced transaction predicate",
     )
+    progress_owner_resumable = shape.get("progress_owner_resumable")
+    if progress_owner_resumable is True:
+        require(
+            isinstance(resumable, int) and released < resumable,
+            f"{label}: release/resumable ordinal order is invalid",
+        )
+        require(
+            closed is None
+            and closed_reason is None
+            and disposition == "progress_owner_resumable",
+            f"{label}: resumable completion carries a closed disposition",
+        )
+        completion_ordinal = resumable
+    else:
+        require(progress_owner_resumable is False, f"{label}: resumable state is not typed")
+        require(
+            resumable is None and isinstance(closed, int) and released < closed,
+            f"{label}: release/closed ordinal order is invalid",
+        )
+        require(
+            closed_reason in {"owner_terminal", "source_retargeted"}
+            and disposition == closed_reason,
+            f"{label}: closed completion reason is invalid",
+        )
+        completion_ordinal = closed
     release_authority = shape.get("release_authority")
     require(
         release_authority in {"retained_prefill", "active_sequence"},
@@ -621,6 +643,10 @@ def validate_pressure_fence_completed(row: dict[str, Any], label: str) -> dict[s
         "progress_owner_id": progress_owner_id,
         "release_transition_ordinal": released,
         "resumable_transition_ordinal": resumable,
+        "closed_transition_ordinal": closed,
+        "closed_reason": closed_reason,
+        "completion_disposition": disposition,
+        "completion_transition_ordinal": completion_ordinal,
         "release_authority": release_authority,
     }
 
@@ -778,7 +804,7 @@ def validate_decode_trace(
             == armed["planned_transition_ordinal"]
             < armed["armed_transition_ordinal"]
             < completed["release_transition_ordinal"]
-            < completed["resumable_transition_ordinal"],
+            < completed["completion_transition_ordinal"],
             f"pressure episode {episode_id} violated release-fence ordinal order",
         )
         matching_holds = [
@@ -789,10 +815,11 @@ def validate_decode_trace(
             and common.request_identity_matches(hold["progress_owner_id"], progress_owner_id)
             and hold["progress_baseline"] == progress_baseline
         ]
-        require(
-            matching_holds,
-            f"pressure victim {victim_request_id} was not held for owner {progress_owner_id}",
-        )
+        if completed["completion_disposition"] == "progress_owner_resumable":
+            require(
+                matching_holds,
+                f"pressure victim {victim_request_id} was not held for owner {progress_owner_id}",
+            )
         matching_releases = [
             release
             for release in releases
@@ -804,7 +831,7 @@ def validate_decode_trace(
         handoff_releases = [
             release
             for release in matching_releases
-            if release["decision"] in {"owner_advanced", "source_retargeted"}
+            if release["decision"] in {"owner_advanced", "owner_terminal", "source_retargeted"}
         ]
         require(
             handoff_releases,
@@ -820,19 +847,21 @@ def validate_decode_trace(
         )
         require(
             all(
-                release["transition_ordinal"] > completed["resumable_transition_ordinal"]
+                release["transition_ordinal"]
+                >= completed["completion_transition_ordinal"]
                 for release in matching_releases
             ),
-            f"pressure episode {episode_id} released a hold before becoming resumable",
+            f"pressure episode {episode_id} released a hold before fence completion",
         )
-        require(
-            any(
-                release["waiting_ticket"] == hold["waiting_ticket"]
-                for release in matching_releases
-                for hold in matching_holds
-            ),
-            f"pressure hold for {victim_request_id} changed waiting identity",
-        )
+        if matching_holds:
+            require(
+                any(
+                    release["waiting_ticket"] == hold["waiting_ticket"]
+                    for release in matching_releases
+                    for hold in matching_holds
+                ),
+                f"pressure hold for {victim_request_id} changed waiting identity",
+            )
 
     for hold in holds:
         require(
@@ -1744,9 +1773,12 @@ def self_test() -> int:
                 "resumable_transition_ordinal": 6,
                 "physical_release_completed": True,
                 "exact_source_advanced": True,
+                "transaction_wait_condition_advanced": True,
                 "release_authority": "active_sequence",
                 "progress_owner_resumable": True,
                 "closed_transition_ordinal": None,
+                "closed_reason": None,
+                "completion_disposition": "progress_owner_resumable",
                 "victim_requeued": True,
             },
             "attributes": {
@@ -1820,6 +1852,25 @@ def self_test() -> int:
     require(
         summary["pressure_victim_request_ids"] == ["C"],
         "self-test lost pressure-victim identity",
+    )
+
+    retargeted_completion = json.loads(json.dumps(rows[7]))
+    retargeted_completion["shape"].update(
+        {
+            "resumable_transition_ordinal": None,
+            "progress_owner_resumable": False,
+            "closed_transition_ordinal": 6,
+            "closed_reason": "source_retargeted",
+            "completion_disposition": "source_retargeted",
+        }
+    )
+    retargeted = validate_pressure_fence_completed(
+        retargeted_completion, "retargeted fence self-test"
+    )
+    require(
+        retargeted["completion_transition_ordinal"] == 6
+        and retargeted["completion_disposition"] == "source_retargeted",
+        "self-test lost source-retargeted fence completion",
     )
 
     unchanged_resume = json.loads(json.dumps(rows))
