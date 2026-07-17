@@ -586,6 +586,8 @@ impl EngineInner {
                 progress_baseline,
                 progress_current,
                 reason,
+                previous_wait_condition,
+                current_wait_condition,
                 ticket,
             } => self.write_executor_scheduler_profile_event(
                 &request_id,
@@ -615,6 +617,14 @@ impl EngineInner {
                     (
                         "progress_current".to_string(),
                         serde_json::json!(progress_current.get()),
+                    ),
+                    (
+                        "previous_wait_condition".to_string(),
+                        serde_json::json!(previous_wait_condition),
+                    ),
+                    (
+                        "current_wait_condition".to_string(),
+                        serde_json::json!(current_wait_condition),
                     ),
                     ("admission_eligible".to_string(), serde_json::json!(true)),
                     ("probe_performed".to_string(), serde_json::json!(false)),
