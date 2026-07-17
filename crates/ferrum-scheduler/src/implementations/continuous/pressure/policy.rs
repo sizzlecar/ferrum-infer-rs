@@ -102,13 +102,13 @@ impl PressureSelectionPolicy for FairPressureSelectionPolicy {
             .get(owner_id)
             .filter(|participant| {
                 participant.advances_wait_source
-                    && matches!(
-                        participant.work_kind,
-                        LogicalWorkKind::Decode | LogicalWorkKind::Recompute
-                    )
+                    && participant.work_kind == LogicalWorkKind::Decode
                     && matches!(participant.state, ParticipantState::Blocked { .. })
             })
             .map(|participant| {
+                // Decode -> recompute strictly reduces resident state. A
+                // recompute -> recompute transition discards partial replay
+                // without logical progress and can only create a restart loop.
                 PressureYieldSelection::SelfRecompute(participant.request_id.clone())
             })
     }

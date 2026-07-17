@@ -201,7 +201,6 @@ pub enum PressureTransitionKind {
     ReleaseFenceCompleted,
     FrontierResumable,
     FrontierRetargeted,
-    FrontierProgressed,
     FrontierTerminal,
     Closed,
 }
@@ -446,7 +445,6 @@ impl PressureInvariantViolation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PressureHoldReleaseReason {
-    OwnerAdvanced,
     OwnerTerminal,
     RoleTransferred,
     SourceRetargeted,
@@ -455,7 +453,6 @@ pub enum PressureHoldReleaseReason {
 impl PressureHoldReleaseReason {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::OwnerAdvanced => "owner_advanced",
             Self::OwnerTerminal => "owner_terminal",
             Self::RoleTransferred => "role_transferred",
             Self::SourceRetargeted => "source_retargeted",
@@ -1022,37 +1019,21 @@ impl PressureCoordinator {
         &mut self,
         request_id: &RequestId,
         progress: LogicalWorkGeneration,
-    ) -> Result<Option<PressureTransitionOrdinal>, PressureCoordinatorError> {
+    ) -> Result<(), PressureCoordinatorError> {
         let Some(episode_id) = self.request_index.get(request_id).copied() else {
-            return Ok(None);
+            return Ok(());
         };
-        let should_close = {
-            let Some(episode) = self.episodes.get_mut(&episode_id) else {
-                return Ok(None);
-            };
-            if let Some(participant) = episode.participants.get_mut(request_id) {
-                participant.progress = participant.progress.max(progress);
-            }
-            episode.progress_owner.as_ref() == Some(request_id)
-                && progress > episode.owner_progress_baseline
-                && episode.state == PressureEpisodeState::Resumable
+        let Some(episode) = self.episodes.get_mut(&episode_id) else {
+            return Ok(());
         };
-        if !should_close {
-            return Ok(None);
+        if let Some(participant) = episode.participants.get_mut(request_id) {
+            participant.progress = participant.progress.max(progress);
         }
-        let ordinal = self.record_transition(
-            episode_id,
-            PressureTransitionKind::FrontierProgressed,
-            Some(request_id.clone()),
-            None,
-            PressureEpisodeState::Resumable,
-        )?;
-        self.close_episode(
-            episode_id,
-            Some(PressureHoldReleaseReason::OwnerAdvanced),
-            None,
-        )?;
-        Ok(Some(ordinal))
+        // Logical token progress consumes resident capacity; it does not prove
+        // that a yielded peer can be re-admitted. Keep the peer hold until the
+        // owner reaches a terminal release (or an exact source retarget closes
+        // the episode). This is the typed equivalent of active-first scheduling.
+        Ok(())
     }
 
     pub(crate) fn record_terminal(
@@ -1844,6 +1825,37 @@ mod tests {
     }
 
     #[test]
+    fn retained_recompute_never_self_recomputes_without_logical_progress() {
+        let request_id = RequestId::new();
+        let wait = condition(73);
+        let mut coordinator = PressureCoordinator::default();
+
+        let decision = coordinator
+            .plan_failure(
+                std::slice::from_ref(&request_id),
+                &wait,
+                &[candidate(
+                    &request_id,
+                    LogicalWorkKind::Recompute,
+                    33,
+                    true,
+                    None,
+                )],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            decision,
+            PressureDecision::Deferred { count: 1, .. }
+        ));
+        assert_eq!(coordinator.stats().pending_release_fences, 0);
+        assert!(coordinator
+            .journal()
+            .iter()
+            .all(|transition| transition.kind() != PressureTransitionKind::YieldPlanned));
+    }
+
+    #[test]
     fn cuda_da9_cross_phase_terminal_state_plans_a_yield_before_park() {
         let mut coordinator = PressureCoordinator::default();
         let decode = RequestId::new();
@@ -1889,7 +1901,7 @@ mod tests {
     }
 
     #[test]
-    fn release_fence_precedes_resumable_and_owner_progress_releases_victim() {
+    fn release_fence_precedes_resumable_and_owner_terminal_releases_victim() {
         let mut coordinator = PressureCoordinator::default();
         let owner = RequestId::new();
         let victim = RequestId::new();
@@ -1949,8 +1961,15 @@ mod tests {
             .unwrap();
         assert!(matches!(
             coordinator.hold_status(&victim),
+            PressureHoldStatus::Held { .. }
+        ));
+        assert_eq!(coordinator.stats().active_episodes, 1);
+
+        coordinator.record_terminal(&owner).unwrap();
+        assert!(matches!(
+            coordinator.hold_status(&victim),
             PressureHoldStatus::Released {
-                reason: PressureHoldReleaseReason::OwnerAdvanced,
+                reason: PressureHoldReleaseReason::OwnerTerminal,
                 ..
             }
         ));
@@ -2172,7 +2191,7 @@ mod tests {
     }
 
     #[test]
-    fn resumable_owner_retargets_disjoint_exact_source_without_false_invariant() {
+    fn resumable_owner_retargets_then_defers_recompute_without_restart() {
         let mut coordinator = PressureCoordinator::default();
         let owner = RequestId::new();
         let victim = RequestId::new();
@@ -2243,14 +2262,12 @@ mod tests {
             )
             .unwrap()
         {
-            PressureDecision::YieldPlanned(transaction) => {
-                assert_eq!(transaction.kind(), PressureYieldKind::SelfRecompute);
-                assert_eq!(transaction.victim_request_id(), &owner);
-                assert_eq!(transaction.progress_owner_id(), &owner);
-                transaction.episode_id()
-            }
+            PressureDecision::Deferred {
+                episode_id,
+                count: 1,
+            } => episode_id,
             other => {
-                panic!("retarget must resolve through a new exact-source episode, got {other:?}")
+                panic!("retargeted recompute must park without restarting, got {other:?}")
             }
         };
         assert_ne!(new_episode, old_episode);
