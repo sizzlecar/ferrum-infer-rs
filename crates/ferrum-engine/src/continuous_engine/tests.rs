@@ -2941,6 +2941,12 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
         Some(&serde_json::json!(true))
     );
     assert_eq!(
+        fence_completed
+            .shape
+            .get("transaction_wait_condition_advanced"),
+        Some(&serde_json::json!(true))
+    );
+    assert_eq!(
         fence_completed.shape.get("release_authority"),
         Some(&serde_json::json!("active_sequence"))
     );
@@ -2951,6 +2957,14 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
     assert_eq!(
         fence_completed.shape.get("closed_transition_ordinal"),
         Some(&serde_json::Value::Null)
+    );
+    assert_eq!(
+        fence_completed.shape.get("closed_reason"),
+        Some(&serde_json::Value::Null)
+    );
+    assert_eq!(
+        fence_completed.shape.get("completion_disposition"),
+        Some(&serde_json::json!("progress_owner_resumable"))
     );
     assert!(fence_completed
         .attributes

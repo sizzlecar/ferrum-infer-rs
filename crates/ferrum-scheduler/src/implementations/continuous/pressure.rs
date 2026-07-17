@@ -321,6 +321,15 @@ pub struct PressureYieldTransaction {
     wait_condition: CapacityWaitCondition,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PressureReleaseFenceDisposition {
+    Resumable(PressureTransitionOrdinal),
+    Closed {
+        ordinal: PressureTransitionOrdinal,
+        reason: PressureHoldReleaseReason,
+    },
+}
+
 impl PressureYieldTransaction {
     pub const fn episode_id(&self) -> PressureEpisodeId {
         self.episode_id
@@ -818,12 +827,9 @@ impl PressureCoordinator {
     pub(crate) fn complete_release_fence(
         &mut self,
         transaction: &PressureYieldTransaction,
+        progress_owner_wait_condition: Option<&CapacityWaitCondition>,
     ) -> Result<
-        (
-            PressureTransitionOrdinal,
-            Option<PressureTransitionOrdinal>,
-            Option<PressureTransitionOrdinal>,
-        ),
+        (PressureTransitionOrdinal, PressureReleaseFenceDisposition),
         PressureCoordinatorError,
     > {
         self.validate_transaction(transaction, PressureEpisodeState::AwaitReleaseFence)?;
@@ -839,6 +845,9 @@ impl PressureCoordinator {
             .get(&transaction.episode_id)
             .and_then(|episode| episode.participants.get(&transaction.progress_owner_id))
             .is_none_or(|owner| owner.state == ParticipantState::Terminal);
+        let retargeted_wait_condition = progress_owner_wait_condition
+            .filter(|current| !same_source_topology(transaction.wait_condition(), current))
+            .cloned();
         {
             let episode = self
                 .episodes
@@ -852,8 +861,12 @@ impl PressureCoordinator {
             }
             if !owner_terminal {
                 episode.state = PressureEpisodeState::Resumable;
-                if let Some(owner) = episode.participants.get_mut(&transaction.progress_owner_id) {
-                    owner.state = ParticipantState::ProgressOwner;
+                if retargeted_wait_condition.is_none() {
+                    if let Some(owner) =
+                        episode.participants.get_mut(&transaction.progress_owner_id)
+                    {
+                        owner.state = ParticipantState::ProgressOwner;
+                    }
                 }
             }
         }
@@ -864,7 +877,35 @@ impl PressureCoordinator {
                 true,
                 None,
             )?;
-            return Ok((release_ordinal, None, Some(closed_ordinal)));
+            return Ok((
+                release_ordinal,
+                PressureReleaseFenceDisposition::Closed {
+                    ordinal: closed_ordinal,
+                    reason: PressureHoldReleaseReason::OwnerTerminal,
+                },
+            ));
+        }
+        if let Some(current_wait_condition) = retargeted_wait_condition {
+            self.record_transition(
+                transaction.episode_id,
+                PressureTransitionKind::FrontierRetargeted,
+                Some(transaction.progress_owner_id.clone()),
+                Some(transaction.victim_request_id.clone()),
+                PressureEpisodeState::Resumable,
+            )?;
+            let closed_ordinal = self.close_episode(
+                transaction.episode_id,
+                PressureHoldReleaseReason::SourceRetargeted,
+                true,
+                Some((transaction.wait_condition.clone(), current_wait_condition)),
+            )?;
+            return Ok((
+                release_ordinal,
+                PressureReleaseFenceDisposition::Closed {
+                    ordinal: closed_ordinal,
+                    reason: PressureHoldReleaseReason::SourceRetargeted,
+                },
+            ));
         }
         let resume_ordinal = self.record_transition(
             transaction.episode_id,
@@ -873,7 +914,10 @@ impl PressureCoordinator {
             Some(transaction.victim_request_id.clone()),
             PressureEpisodeState::Resumable,
         )?;
-        Ok((release_ordinal, Some(resume_ordinal), None))
+        Ok((
+            release_ordinal,
+            PressureReleaseFenceDisposition::Resumable(resume_ordinal),
+        ))
     }
 
     pub(crate) fn abort_yield(
@@ -1114,29 +1158,38 @@ impl PressureCoordinator {
     }
 
     pub(crate) fn has_pending_release_for(&self, condition: &CapacityWaitCondition) -> bool {
-        condition.observed().iter().any(|source| {
-            self.source_index
-                .get(&(condition.coordinator_id(), source.source()))
-                .and_then(|episode_id| self.episodes.get(episode_id))
-                .is_some_and(|episode| {
-                    matches!(
-                        episode.state,
-                        PressureEpisodeState::YieldPlanned
-                            | PressureEpisodeState::AwaitReleaseFence
-                    )
-                })
-        })
+        condition
+            .observed()
+            .iter()
+            .filter(|source| is_request_release_source(source.source()))
+            .any(|source| {
+                self.source_index
+                    .get(&(condition.coordinator_id(), source.source()))
+                    .and_then(|episode_id| self.episodes.get(episode_id))
+                    .is_some_and(|episode| {
+                        matches!(
+                            episode.state,
+                            PressureEpisodeState::YieldPlanned
+                                | PressureEpisodeState::AwaitReleaseFence
+                        )
+                    })
+            })
     }
 
     pub(crate) fn all_blocked_without_release_for(
         &self,
         condition: &CapacityWaitCondition,
     ) -> bool {
-        let Some(episode_id) = condition.observed().iter().find_map(|source| {
-            self.source_index
-                .get(&(condition.coordinator_id(), source.source()))
-                .copied()
-        }) else {
+        let Some(episode_id) = condition
+            .observed()
+            .iter()
+            .filter(|source| is_request_release_source(source.source()))
+            .find_map(|source| {
+                self.source_index
+                    .get(&(condition.coordinator_id(), source.source()))
+                    .copied()
+            })
+        else {
             return false;
         };
         let Some(episode) = self.episodes.get(&episode_id) else {
@@ -1222,6 +1275,7 @@ impl PressureCoordinator {
         let mut existing = condition
             .observed()
             .iter()
+            .filter(|observed| is_request_release_source(observed.source()))
             .filter_map(|observed| {
                 self.source_index
                     .get(&(condition.coordinator_id(), observed.source()))
@@ -1239,7 +1293,11 @@ impl PressureCoordinator {
             return Err(PressureCoordinatorError::OverlappingPendingEpisodes);
         }
         if let Some(id) = existing.first().copied() {
-            for source in condition.observed() {
+            for source in condition
+                .observed()
+                .iter()
+                .filter(|source| is_request_release_source(source.source()))
+            {
                 self.source_index
                     .insert((condition.coordinator_id(), source.source()), id);
             }
@@ -1252,7 +1310,11 @@ impl PressureCoordinator {
             .checked_add(1)
             .ok_or(PressureCoordinatorError::EpisodeIdentityExhausted)?;
         let episode = PressureEpisode::new(condition);
-        for source in condition.observed() {
+        for source in condition
+            .observed()
+            .iter()
+            .filter(|source| is_request_release_source(source.source()))
+        {
             self.source_index
                 .insert((condition.coordinator_id(), source.source()), id);
         }
@@ -1383,13 +1445,28 @@ impl PressureCoordinator {
     }
 }
 
+/// Sources whose availability can be advanced by yielding one live request.
+///
+/// Device-budget generations remain part of the exact retry predicate, but a
+/// request yield only returns logical pool extents; it does not shrink the
+/// plan-owned backing pool or release process-wide device claims. Treating a
+/// shared device-budget source as episode causality can therefore pair a
+/// victim with an owner whose blocked domain the victim cannot advance.
+fn is_request_release_source(source: CapacityAvailabilitySource) -> bool {
+    matches!(
+        source,
+        CapacityAvailabilitySource::Domain(_) | CapacityAvailabilitySource::ActiveSequenceSlots
+    )
+}
+
 fn waits_overlap(left: &CapacityWaitCondition, right: &CapacityWaitCondition) -> bool {
     left.coordinator_id() == right.coordinator_id()
         && left.observed().iter().any(|left_source| {
-            right
-                .observed()
-                .iter()
-                .any(|right_source| left_source.source() == right_source.source())
+            is_request_release_source(left_source.source())
+                && right.observed().iter().any(|right_source| {
+                    is_request_release_source(right_source.source())
+                        && left_source.source() == right_source.source()
+                })
         })
 }
 
@@ -1512,6 +1589,44 @@ mod tests {
             episode
         );
         assert_eq!(coordinator.stats().active_episodes, 1);
+    }
+
+    #[test]
+    fn shared_device_budget_does_not_join_disjoint_release_domains() {
+        let wait_for = |domain: u32| {
+            CapacityWaitCondition::from_observation(
+                41,
+                vec![
+                    CapacityAvailabilityEpoch::new(
+                        CapacityAvailabilitySource::Domain(CapacityDomainId::new(domain).unwrap()),
+                        1,
+                    )
+                    .unwrap(),
+                    CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::PlanDeviceBudget, 7)
+                        .unwrap(),
+                ],
+            )
+            .unwrap()
+        };
+        let domain_two = wait_for(2);
+        let domain_four = wait_for(4);
+        let mut coordinator = PressureCoordinator::default();
+
+        assert!(!waits_overlap(&domain_two, &domain_four));
+        let first = coordinator
+            .find_or_open_episode_for(&domain_two, &[])
+            .unwrap();
+        let second = coordinator
+            .find_or_open_episode_for(&domain_four, &[])
+            .unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(coordinator.stats().active_episodes, 2);
+        assert_eq!(coordinator.source_index.len(), 2);
+        assert!(coordinator
+            .source_index
+            .keys()
+            .all(|(_, source)| is_request_release_source(*source)));
     }
 
     #[test]
@@ -1730,10 +1845,12 @@ mod tests {
             coordinator.hold_status(&victim),
             PressureHoldStatus::Held { .. }
         ));
-        let (released, resumable, closed) =
-            coordinator.complete_release_fence(&transaction).unwrap();
-        let resumable = resumable.expect("live owner must become resumable");
-        assert!(closed.is_none());
+        let (released, disposition) = coordinator
+            .complete_release_fence(&transaction, None)
+            .unwrap();
+        let PressureReleaseFenceDisposition::Resumable(resumable) = disposition else {
+            panic!("live owner must become resumable");
+        };
         assert!(transaction.planned_ordinal() < armed);
         assert!(armed < released);
         assert!(released < resumable);
@@ -1759,6 +1876,106 @@ mod tests {
             .map(|event| event.ordinal().get())
             .collect::<Vec<_>>();
         assert!(ordinals.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn release_fence_closes_episode_when_owner_wait_source_retargets() {
+        let wait_for = |domain: u32, domain_epoch: u64| {
+            CapacityWaitCondition::from_observation(
+                41,
+                vec![
+                    CapacityAvailabilityEpoch::new(
+                        CapacityAvailabilitySource::Domain(CapacityDomainId::new(domain).unwrap()),
+                        domain_epoch,
+                    )
+                    .unwrap(),
+                    CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::PlanDeviceBudget, 1)
+                        .unwrap(),
+                ],
+            )
+            .unwrap()
+        };
+        let mut coordinator = PressureCoordinator::default();
+        let owner = RequestId::new();
+        let victim = RequestId::new();
+        let original_wait = wait_for(4, 136);
+        let retargeted_wait = wait_for(2, 178);
+
+        coordinator
+            .plan_failure(
+                std::slice::from_ref(&owner),
+                &original_wait,
+                &[
+                    candidate(&owner, LogicalWorkKind::Recompute, 33, true, None),
+                    candidate(&victim, LogicalWorkKind::Decode, 81, true, None),
+                ],
+            )
+            .unwrap();
+        let transaction = match coordinator
+            .plan_failure(
+                std::slice::from_ref(&victim),
+                &original_wait,
+                &[
+                    candidate(
+                        &owner,
+                        LogicalWorkKind::Recompute,
+                        33,
+                        true,
+                        Some(original_wait.clone()),
+                    ),
+                    candidate(&victim, LogicalWorkKind::Decode, 81, true, None),
+                ],
+            )
+            .unwrap()
+        {
+            PressureDecision::YieldPlanned(transaction) => transaction,
+            other => panic!("expected yield, got {other:?}"),
+        };
+
+        let armed = coordinator.arm_release_fence(&transaction).unwrap();
+        let (released, disposition) = coordinator
+            .complete_release_fence(&transaction, Some(&retargeted_wait))
+            .unwrap();
+        let PressureReleaseFenceDisposition::Closed {
+            ordinal: closed,
+            reason,
+        } = disposition
+        else {
+            panic!("retargeted owner must close the old episode");
+        };
+
+        assert_eq!(reason, PressureHoldReleaseReason::SourceRetargeted);
+        assert!(armed < released);
+        assert!(released < closed);
+        assert_eq!(coordinator.stats().active_episodes, 0);
+        assert!(matches!(
+            coordinator.hold_status(&victim),
+            PressureHoldStatus::Released {
+                reason: PressureHoldReleaseReason::SourceRetargeted,
+                previous_wait_condition: Some(ref previous),
+                current_wait_condition: Some(ref current),
+                ..
+            } if previous == &original_wait && current == &retargeted_wait
+        ));
+        let episode_events = coordinator
+            .journal()
+            .into_iter()
+            .filter(|event| event.episode_id() == transaction.episode_id())
+            .collect::<Vec<_>>();
+        let completed = episode_events
+            .iter()
+            .find(|event| event.kind() == PressureTransitionKind::ReleaseFenceCompleted)
+            .unwrap();
+        let retargeted = episode_events
+            .iter()
+            .find(|event| event.kind() == PressureTransitionKind::FrontierRetargeted)
+            .unwrap();
+        let closed = episode_events
+            .iter()
+            .find(|event| event.kind() == PressureTransitionKind::Closed)
+            .unwrap();
+        assert!(completed.ordinal() < retargeted.ordinal());
+        assert!(retargeted.ordinal() < closed.ordinal());
     }
 
     #[test]
@@ -1803,10 +2020,17 @@ mod tests {
 
         assert_eq!(coordinator.stats().active_episodes, 1);
         assert_eq!(coordinator.stats().pending_release_fences, 1);
-        let (released, resumable, closed) =
-            coordinator.complete_release_fence(&transaction).unwrap();
-        let closed = closed.expect("terminal owner must close the episode");
-        assert!(resumable.is_none());
+        let (released, disposition) = coordinator
+            .complete_release_fence(&transaction, None)
+            .unwrap();
+        let PressureReleaseFenceDisposition::Closed {
+            ordinal: closed,
+            reason,
+        } = disposition
+        else {
+            panic!("terminal owner must close the episode");
+        };
+        assert_eq!(reason, PressureHoldReleaseReason::OwnerTerminal);
         assert!(released < closed);
         assert_eq!(coordinator.stats().active_episodes, 0);
         assert!(matches!(
@@ -1919,7 +2143,9 @@ mod tests {
         assert_eq!(transaction.victim_request_id(), &victim);
         let old_episode = transaction.episode_id();
         coordinator.arm_release_fence(&transaction).unwrap();
-        coordinator.complete_release_fence(&transaction).unwrap();
+        coordinator
+            .complete_release_fence(&transaction, None)
+            .unwrap();
 
         let new_episode = match coordinator
             .plan_failure(
@@ -2014,7 +2240,9 @@ mod tests {
             other => panic!("expected yield, got {other:?}"),
         };
         coordinator.arm_release_fence(&transaction).unwrap();
-        coordinator.complete_release_fence(&transaction).unwrap();
+        coordinator
+            .complete_release_fence(&transaction, None)
+            .unwrap();
 
         let decision = coordinator
             .plan_failure(
