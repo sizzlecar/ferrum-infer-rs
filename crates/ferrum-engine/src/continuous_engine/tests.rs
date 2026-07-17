@@ -91,7 +91,7 @@ enum PlanRuntimeBatchDecodeBehavior {
     Exact,
     Short,
     WrongFirstCache,
-    Deferred,
+    DeferUntilPeerCacheRelease,
     DeferWideThenFailSecond,
 }
 
@@ -100,6 +100,7 @@ struct PlanRuntimeBatchDecodeTestExecutor {
     behavior: PlanRuntimeBatchDecodeBehavior,
     decode_calls: AtomicU64,
     batch_decode_calls: AtomicU64,
+    released_cache_count: AtomicU64,
 }
 
 impl PlanRuntimeBatchDecodeTestExecutor {
@@ -109,6 +110,7 @@ impl PlanRuntimeBatchDecodeTestExecutor {
             behavior,
             decode_calls: AtomicU64::new(0),
             batch_decode_calls: AtomicU64::new(0),
+            released_cache_count: AtomicU64::new(0),
         }
     }
 }
@@ -294,7 +296,7 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
         self.batch_decode_calls.fetch_add(1, Ordering::Relaxed);
         if matches!(
             self.behavior,
-            PlanRuntimeBatchDecodeBehavior::Deferred
+            PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
                 | PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
         ) {
             return Err(FerrumError::resource_exhausted(
@@ -316,7 +318,7 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
                     ));
                 }
             }
-            PlanRuntimeBatchDecodeBehavior::Deferred
+            PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
             | PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond => unreachable!(),
         }
         Ok(outputs)
@@ -328,7 +330,7 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
     ) -> Result<ExecutorBatchDecodeOutcome> {
         if !matches!(
             self.behavior,
-            PlanRuntimeBatchDecodeBehavior::Deferred
+            PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
                 | PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
         ) {
             return self
@@ -337,6 +339,17 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
                 .map(ExecutorBatchDecodeOutcome::Completed);
         }
         self.batch_decode_calls.fetch_add(1, Ordering::Relaxed);
+        if matches!(
+            self.behavior,
+            PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
+        ) && self.released_cache_count.load(Ordering::Acquire) > 0
+        {
+            return self
+                .inner
+                .batch_decode(inputs)
+                .await
+                .map(ExecutorBatchDecodeOutcome::Completed);
+        }
         if matches!(
             self.behavior,
             PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
@@ -368,6 +381,7 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
     }
 
     fn release_cache(&self, cache_id: &str) {
+        self.released_cache_count.fetch_add(1, Ordering::Release);
         self.inner.release_cache(cache_id);
     }
 
@@ -2614,6 +2628,9 @@ async fn install_plan_runtime_decode_cohort(
         let mut request = policy_request();
         request.prompt = prompt.to_string();
         request.sampling_params.max_tokens = 4;
+        request
+            .metadata
+            .insert(PROMPT_TOKENS_METADATA_KEY.to_string(), serde_json::json!(1));
         scheduler.submit(request.clone()).await.unwrap();
         requests.push(request);
     }
@@ -2702,37 +2719,112 @@ async fn plan_runtime_batch_decode_process_batch_submits_one_cohort() {
 }
 
 #[tokio::test]
-async fn plan_runtime_batch_decode_capacity_deferral_splits_then_parks_exact_requests() {
+async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progress_victim() {
     let trace_path = resource_trace_temp_path("plan-runtime-decode-capacity");
     let _ = std::fs::remove_file(&trace_path);
     let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine_with_trace(
-        PlanRuntimeBatchDecodeBehavior::Deferred,
+        PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease,
         Some(trace_path.clone()),
     );
-    let (request_ids, initial_tokens, cache_ids) =
+    let (request_ids, initial_tokens, _) =
         install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
+    let initial_tokens_by_request = request_ids
+        .iter()
+        .cloned()
+        .zip(initial_tokens.iter().copied())
+        .collect::<HashMap<_, _>>();
     let decode_batch = scheduler
         .next_batch(ferrum_interfaces::BatchHint::simple(2))
         .await
         .expect("ready decode cohort");
+    assert_eq!(decode_batch.requests.len(), 2);
+    let victim_id = decode_batch.requests[0].request.id.clone();
+    let progress_owner_id = decode_batch.requests[1].request.id.clone();
+    let victim_initial_token = initial_tokens_by_request[&victim_id];
+    engine
+        .inner
+        .sequences
+        .write()
+        .get_mut(&progress_owner_id)
+        .expect("progress owner sequence")
+        .sampling_params
+        .max_tokens = 2;
 
     engine.inner.process_batch(&decode_batch).await.unwrap();
 
-    assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 3);
+    assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 4);
     assert_eq!(executor.decode_calls.load(Ordering::Relaxed), 0);
-    assert_eq!(scheduler.active_count(), 2);
-    assert_eq!(scheduler.waiting_count(), 0);
+    assert_eq!(executor.released_cache_count.load(Ordering::Relaxed), 2);
+    assert_eq!(scheduler.active_count(), 0);
+    assert_eq!(scheduler.waiting_count(), 1);
     assert_eq!(
         scheduler
             .trace_snapshot()
             .execution_capacity_blocked_decode_len,
-        2
+        0
     );
     assert!(scheduler
         .passive_capacity_wait_condition()
         .unwrap()
-        .is_some());
-    assert_plan_runtime_decode_cohort_unchanged(&engine, &request_ids, &initial_tokens, &cache_ids);
+        .is_none());
+
+    let sequences = engine.inner.sequences.read();
+    let victim = sequences
+        .get(&victim_id)
+        .expect("capacity victim remains queued for logical recompute");
+    assert_eq!(victim.generated_tokens, vec![victim_initial_token]);
+    assert!(victim.model_cache_id().is_none());
+    assert!(!victim.prefill_complete);
+    assert_eq!(victim.phase, RequestPhase::Waiting);
+    assert_eq!(victim.preemption_count, 1);
+    assert!(
+        !sequences.contains_key(&progress_owner_id),
+        "progress owner must reach its release point and complete"
+    );
+    drop(sequences);
+
+    let scheduler_trace = scheduler.trace_snapshot();
+    assert_eq!(scheduler_trace.cancelled_total, 0);
+    assert_eq!(scheduler_trace.completed_total, 1);
+    assert_eq!(scheduler_trace.decode_queue_len, 0);
+    assert_eq!(scheduler_trace.waiting_queue_len, 1);
+
+    for expected_offset in [0, 1] {
+        let recompute_batch = scheduler
+            .next_batch(ferrum_interfaces::BatchHint::simple(1))
+            .await
+            .expect("released capacity must schedule the victim recompute");
+        assert_eq!(recompute_batch.requests.len(), 1);
+        assert_eq!(recompute_batch.requests[0].request.id, victim_id);
+        assert_eq!(
+            recompute_batch.requests[0].tokens_processed,
+            expected_offset
+        );
+        assert_eq!(recompute_batch.requests[0].tokens_to_process, Some(1));
+        engine.inner.process_batch(&recompute_batch).await.unwrap();
+    }
+
+    let sequences = engine.inner.sequences.read();
+    let resumed = sequences
+        .get(&victim_id)
+        .expect("recomputed victim must resume decode ownership");
+    assert_eq!(
+        resumed.generated_tokens.first(),
+        Some(&victim_initial_token)
+    );
+    assert_eq!(resumed.generated_tokens.len(), 2);
+    assert!(resumed.model_cache_id().is_some());
+    assert!(resumed.prefill_complete);
+    assert_eq!(resumed.phase, RequestPhase::Decoding);
+    assert_eq!(resumed.preemption_count, 1);
+    drop(sequences);
+    let resumed_trace = scheduler.trace_snapshot();
+    assert_eq!(resumed_trace.cancelled_total, 0);
+    assert_eq!(resumed_trace.completed_total, 1);
+    assert_eq!(resumed_trace.waiting_queue_len, 0);
+    assert_eq!(resumed_trace.prefill_queue_len, 0);
+    assert_eq!(resumed_trace.decode_queue_len, 1);
+    assert_eq!(resumed_trace.execution_capacity_blocked_decode_len, 0);
 
     let deferred_events = read_engine_profile_events(&trace_path)
         .into_iter()
@@ -2753,7 +2845,16 @@ async fn plan_runtime_batch_decode_capacity_deferral_splits_then_parks_exact_req
                 event.shape.get("decision") == Some(&serde_json::json!("wait_for_release"))
             })
             .count(),
-        2
+        1
+    );
+    assert_eq!(
+        deferred_events
+            .iter()
+            .filter(|event| {
+                event.shape.get("decision") == Some(&serde_json::json!("recompute_progress_victim"))
+            })
+            .count(),
+        1
     );
     for event in &deferred_events {
         assert_eq!(

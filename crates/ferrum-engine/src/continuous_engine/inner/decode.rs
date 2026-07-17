@@ -229,28 +229,65 @@ impl EngineInner {
                         ),
                         deferral.wait_condition().clone(),
                     );
-                    let deferred = self
+                    match self
                         .scheduler
-                        .defer_decode_for_execution_capacity(&request_ids, scheduler_deferral)?;
-                    if deferred != request_ids.len() {
-                        return Err(FerrumError::scheduler(format!(
-                            "PlanRuntime decode deferral retained {deferred} of {} scheduler entries",
-                            request_ids.len()
-                        )));
+                        .defer_decode_for_execution_capacity(&request_ids, scheduler_deferral)?
+                    {
+                        DecodeExecutionCapacityAction::Deferred { count } => {
+                            if count != request_ids.len() {
+                                return Err(FerrumError::scheduler(format!(
+                                    "PlanRuntime decode deferral retained {count} of {} scheduler entries",
+                                    request_ids.len()
+                                )));
+                            }
+                            self.trace_executor_decode_capacity_decision(
+                                &request_ids,
+                                &deferral,
+                                "wait_for_release",
+                            );
+                            self.write_scheduler_trace_event(serde_json::json!({
+                                "event": "scheduler_execution_capacity_defer",
+                                "request_ids": request_ids,
+                                "stage": deferral.stage(),
+                                "observed": observed,
+                                "wait_condition": deferral.wait_condition(),
+                                "scheduler": self.scheduler.trace_snapshot(),
+                            }));
+                        }
+                        DecodeExecutionCapacityAction::RecomputeVictim {
+                            request_id: victim_id,
+                        } => {
+                            self.trace_executor_decode_capacity_decision(
+                                &request_ids,
+                                &deferral,
+                                "recompute_progress_victim",
+                            );
+                            if !self
+                                .defer_decode_for_capacity_recompute(
+                                    &victim_id,
+                                    request_ids.len().max(1),
+                                    None,
+                                )
+                                .await
+                            {
+                                return Err(FerrumError::scheduler(format!(
+                                    "PlanRuntime decode progress victim {victim_id} could not move to recompute"
+                                )));
+                            }
+                            self.total_preemptions.fetch_add(1, Ordering::Relaxed);
+                            counter!("ferrum.engine.preemptions_total").increment(1);
+                            self.write_scheduler_trace_event(serde_json::json!({
+                                "event": "scheduler_execution_capacity_progress_recompute",
+                                "request_ids": &request_ids,
+                                "victim_request_id": victim_id,
+                                "stage": deferral.stage(),
+                                "observed": observed,
+                                "wait_condition": deferral.wait_condition(),
+                                "scheduler": self.scheduler.trace_snapshot(),
+                            }));
+                            stack.push(request_ids);
+                        }
                     }
-                    self.trace_executor_decode_capacity_decision(
-                        &request_ids,
-                        &deferral,
-                        "wait_for_release",
-                    );
-                    self.write_scheduler_trace_event(serde_json::json!({
-                        "event": "scheduler_execution_capacity_defer",
-                        "request_ids": request_ids,
-                        "stage": deferral.stage(),
-                        "observed": observed,
-                        "wait_condition": deferral.wait_condition(),
-                        "scheduler": self.scheduler.trace_snapshot(),
-                    }));
                 }
             }
         }

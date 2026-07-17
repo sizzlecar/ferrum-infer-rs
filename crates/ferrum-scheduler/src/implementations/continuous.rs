@@ -21,7 +21,9 @@ use crate::{
 use async_trait::async_trait;
 use ferrum_interfaces::model_executor::ExecutorPrefillAdmissionReceipt;
 use ferrum_interfaces::scheduler::SchedulerMetrics;
-use ferrum_interfaces::vnext::{AdmissionRejected, CapacityAvailabilityEpoch};
+use ferrum_interfaces::vnext::{
+    AdmissionRejected, CapacityAvailabilityEpoch, CapacityWaitCondition,
+};
 use ferrum_types::{
     BatchId, FerrumError, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState,
     Result, SchedulerConfig, PROMPT_TOKENS_METADATA_KEY,
@@ -80,6 +82,18 @@ pub enum RequestPhase {
     Cancelled,
     /// Typed admission failed before prefill submission.
     AdmissionFailed,
+}
+
+/// Scheduler-owned response to a pre-submit decode capacity deferral.
+///
+/// A decode may wait while another decode remains runnable. If applying the
+/// deferral would instead leave every active decode waiting on a shared exact
+/// source, one already-blocked holder must release its physical state for
+/// recompute so a peer can remain the progress owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeExecutionCapacityAction {
+    Deferred { count: usize },
+    RecomputeVictim { request_id: RequestId },
 }
 
 /// Extended scheduled request with continuous batching metadata
@@ -1116,19 +1130,77 @@ impl ContinuousBatchScheduler {
         Ok(true)
     }
 
+    fn execution_capacity_waits_overlap(
+        left: &CapacityWaitCondition,
+        right: &CapacityWaitCondition,
+    ) -> bool {
+        left.coordinator_id() == right.coordinator_id()
+            && left.observed().iter().any(|left_source| {
+                right
+                    .observed()
+                    .iter()
+                    .any(|right_source| left_source.source() == right_source.source())
+            })
+    }
+
     /// Preserve active PlanRuntime decode ownership while suppressing retries
     /// until one of the exact capacity sources observed by the executor moves.
+    ///
+    /// The decision is made while holding the decode queue lock. This prevents
+    /// every resource holder from being parked on a source that only one of
+    /// those holders can advance by completing or releasing its state.
     pub fn defer_decode_for_execution_capacity(
         &self,
         request_ids: &[RequestId],
         deferral: AdmissionDeferral,
-    ) -> Result<usize> {
+    ) -> Result<DecodeExecutionCapacityAction> {
         if deferral.action() != ferrum_interfaces::vnext::DeferredAction::WaitForRelease {
             return Err(FerrumError::scheduler(
                 "active decode capacity deferral must wait for release",
             ));
         }
         let mut decode = self.decode_queue.write();
+        let requested = request_ids
+            .iter()
+            .filter(|request_id| decode.contains_key(*request_id))
+            .cloned()
+            .collect::<HashSet<_>>();
+        if requested.is_empty() {
+            return Ok(DecodeExecutionCapacityAction::Deferred { count: 0 });
+        }
+
+        let runnable_peer_remains = decode.iter().any(|(request_id, request)| {
+            !requested.contains(request_id) && request.execution_capacity_deferral.is_none()
+        });
+        if !runnable_peer_remains {
+            let victim = decode
+                .iter()
+                .filter(|(request_id, request)| {
+                    !requested.contains(*request_id)
+                        && request
+                            .execution_capacity_deferral
+                            .as_ref()
+                            .is_some_and(|blocked| {
+                                Self::execution_capacity_waits_overlap(
+                                    blocked.wait_condition(),
+                                    deferral.wait_condition(),
+                                )
+                            })
+                })
+                .min_by(|(left_id, left), (right_id, right)| {
+                    left.inner
+                        .request
+                        .priority
+                        .cmp(&right.inner.request.priority)
+                        .then_with(|| left.decode_tokens.cmp(&right.decode_tokens))
+                        .then_with(|| left_id.0.cmp(&right_id.0))
+                })
+                .map(|(request_id, _)| request_id.clone());
+            if let Some(request_id) = victim {
+                return Ok(DecodeExecutionCapacityAction::RecomputeVictim { request_id });
+            }
+        }
+
         let mut deferred = 0;
         for request_id in request_ids {
             if let Some(request) = decode.get_mut(request_id) {
@@ -1138,7 +1210,7 @@ impl ContinuousBatchScheduler {
         }
         self.capacity_deferred_counter
             .fetch_add(deferred as u64, Ordering::Relaxed);
-        Ok(deferred)
+        Ok(DecodeExecutionCapacityAction::Deferred { count: deferred })
     }
 
     fn relax_backpressure_limit(limit: &AtomicUsize, max_running: usize) {
@@ -2951,7 +3023,7 @@ mod tests {
                     deferral.clone(),
                 )
                 .unwrap(),
-            1
+            DecodeExecutionCapacityAction::Deferred { count: 1 }
         );
         let mut observations = Vec::new();
         let bypass = scheduler
@@ -2978,11 +3050,13 @@ mod tests {
             scheduler
                 .defer_decode_for_execution_capacity(std::slice::from_ref(&runnable_id), deferral,)
                 .unwrap(),
-            1
+            DecodeExecutionCapacityAction::RecomputeVictim {
+                request_id: blocked_id.clone(),
+            }
         );
         let audit_only = AdmissionWakeEpochs::new(NonZeroU64::new(29).unwrap(), 1, 0, 0);
         observations.clear();
-        assert!(scheduler
+        let still_runnable = scheduler
             .next_batch_with_dynamic_admission_observed(
                 BatchHint::simple(2),
                 AdmissionWakeSnapshot::new(audit_only, &availability0),
@@ -2990,7 +3064,9 @@ mod tests {
                 &mut |observation| observations.push(observation),
             )
             .unwrap()
-            .is_none());
+            .expect("the selected progress owner must remain runnable");
+        assert_eq!(still_runnable.requests.len(), 1);
+        assert_eq!(still_runnable.requests[0].request.id, runnable_id);
         assert_eq!(
             observations
                 .iter()
@@ -2999,18 +3075,15 @@ mod tests {
                     ExecutorAdmissionQueueObservation::DecodeSkippedUnchanged { .. }
                 ))
                 .count(),
-            2
+            1
         );
         assert_eq!(
             scheduler
                 .trace_snapshot()
                 .execution_capacity_blocked_decode_len,
-            2
+            1
         );
-        assert_eq!(
-            scheduler.passive_capacity_wait_condition().unwrap(),
-            Some(condition)
-        );
+        assert_eq!(scheduler.passive_capacity_wait_condition().unwrap(), None);
 
         let availability1 = [CapacityAvailabilityEpoch::new(source, 2).unwrap()];
         let released = AdmissionWakeEpochs::new(NonZeroU64::new(29).unwrap(), 2, 0, 0);
@@ -3023,7 +3096,7 @@ mod tests {
                 &mut |observation| observations.push(observation),
             )
             .unwrap()
-            .expect("relevant source change must resume both decodes");
+            .expect("relevant source change must resume the blocked decode");
         assert_eq!(resumed.requests.len(), 2);
         let resumed_ids = observations
             .iter()
@@ -3038,13 +3111,77 @@ mod tests {
                 _ => None,
             })
             .collect::<HashSet<_>>();
-        assert_eq!(resumed_ids, HashSet::from([blocked_id, runnable_id]));
+        assert_eq!(resumed_ids, HashSet::from([blocked_id]));
         assert_eq!(
             scheduler
                 .trace_snapshot()
                 .execution_capacity_blocked_decode_len,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn lone_active_decode_capacity_deferral_waits_for_its_exact_source() {
+        use ferrum_interfaces::vnext::{
+            CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
+            DeferredAction,
+        };
+        use std::num::NonZeroU64;
+
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let request = create_test_request(Priority::Normal);
+        let request_id = request.id.clone();
+        scheduler.submit(request).await.unwrap();
+
+        let source = CapacityAvailabilitySource::ActiveSequenceSlots;
+        let availability0 = [CapacityAvailabilityEpoch::new(source, 3).unwrap()];
+        let wake0 = AdmissionWakeEpochs::new(NonZeroU64::new(37).unwrap(), 0, 0, 0);
+        scheduler
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(1),
+                AdmissionWakeSnapshot::new(wake0, &availability0),
+                &mut |request| {
+                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                        request_id: request.id.clone(),
+                    })
+                },
+            )
+            .unwrap()
+            .expect("request must enter prefill before decode");
+        scheduler.mark_prefill_complete(&request_id, 1);
+
+        let condition =
+            CapacityWaitCondition::from_observation(37, availability0.to_vec()).unwrap();
+        let deferral =
+            AdmissionDeferral::new(DeferredAction::WaitForRelease, wake0, condition.clone());
+        assert_eq!(
+            scheduler
+                .defer_decode_for_execution_capacity(std::slice::from_ref(&request_id), deferral,)
+                .unwrap(),
+            DecodeExecutionCapacityAction::Deferred { count: 1 }
+        );
+        assert_eq!(
+            scheduler.passive_capacity_wait_condition().unwrap(),
+            Some(condition)
+        );
+
+        let mut observations = Vec::new();
+        assert!(scheduler
+            .next_batch_with_dynamic_admission_observed(
+                BatchHint::simple(1),
+                AdmissionWakeSnapshot::new(wake0, &availability0),
+                &mut |_| panic!("unchanged decode wait must not probe admission"),
+                &mut |observation| observations.push(observation),
+            )
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            observations.as_slice(),
+            [ExecutorAdmissionQueueObservation::DecodeSkippedUnchanged {
+                request_id: observed_id,
+                ..
+            }] if observed_id == &request_id
+        ));
     }
 
     #[tokio::test]
