@@ -33,7 +33,9 @@ use crate::{
 use async_trait::async_trait;
 use ferrum_interfaces::model_executor::ExecutorPrefillAdmissionReceipt;
 use ferrum_interfaces::scheduler::SchedulerMetrics;
-use ferrum_interfaces::vnext::{AdmissionRejected, CapacityAvailabilityEpoch};
+use ferrum_interfaces::vnext::{
+    AdmissionRejected, CapacityAvailabilityEpoch, CapacityWaitCondition,
+};
 use ferrum_types::{
     BatchId, FerrumError, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState,
     Result, SchedulerConfig, PROMPT_TOKENS_METADATA_KEY,
@@ -277,6 +279,8 @@ pub enum ExecutorAdmissionQueueObservation {
         progress_baseline: LogicalWorkGeneration,
         progress_current: LogicalWorkGeneration,
         reason: PressureHoldReleaseReason,
+        previous_wait_condition: Option<CapacityWaitCondition>,
+        current_wait_condition: Option<CapacityWaitCondition>,
         ticket: u64,
     },
     SkippedUnchanged {
@@ -1003,6 +1007,8 @@ impl ContinuousBatchScheduler {
                             progress_current,
                             reason,
                             ordinal,
+                            previous_wait_condition,
+                            current_wait_condition,
                         } => {
                             {
                                 let mut coordinator = self.pressure_coordinator.lock();
@@ -1019,6 +1025,8 @@ impl ContinuousBatchScheduler {
                                     progress_baseline,
                                     progress_current,
                                     reason,
+                                    previous_wait_condition,
+                                    current_wait_condition,
                                     ticket: ticket.get(),
                                 });
                             }

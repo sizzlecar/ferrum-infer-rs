@@ -207,6 +207,42 @@ def compare_wait_sources(
     require(changed == expect_changed, f"{label}: exact wait source change evidence is inconsistent")
 
 
+def validate_source_retarget(
+    previous: Any, current: Any, *, label: str
+) -> tuple[dict[str, int], dict[str, int]]:
+    require(isinstance(previous, dict), f"{label}: previous wait condition is missing")
+    require(isinstance(current, dict), f"{label}: current wait condition is missing")
+    previous_coordinator = previous.get("coordinator_id")
+    current_coordinator = current.get("coordinator_id")
+    require(
+        isinstance(previous_coordinator, int) and previous_coordinator > 0,
+        f"{label}: previous coordinator id is invalid",
+    )
+    require(
+        isinstance(current_coordinator, int) and current_coordinator > 0,
+        f"{label}: current coordinator id is invalid",
+    )
+    previous_sources = wait_source_epochs(
+        previous.get("observed"), f"{label} previous condition"
+    )
+    current_sources = wait_source_epochs(
+        current.get("observed"), f"{label} current condition"
+    )
+    require(
+        previous_coordinator != current_coordinator
+        or previous_sources.keys() != current_sources.keys(),
+        f"{label}: source-retarget release preserved the old exact topology",
+    )
+    require(
+        all(
+            current_sources[source] >= previous_sources[source]
+            for source in previous_sources.keys() & current_sources.keys()
+        ),
+        f"{label}: shared source generation regressed during retarget",
+    )
+    return previous_sources, current_sources
+
+
 def event_request_ids(row: dict[str, Any], label: str) -> list[str]:
     attributes = row.get("attributes")
     require(isinstance(attributes, dict), f"{label}: trace attributes are missing")
@@ -423,7 +459,13 @@ def validate_pressure_hold_release(row: dict[str, Any], label: str) -> dict[str,
     )
     decision = shape.get("decision")
     require(
-        decision in {"owner_advanced", "owner_terminal", "role_transferred"},
+        decision
+        in {
+            "owner_advanced",
+            "owner_terminal",
+            "role_transferred",
+            "source_retargeted",
+        },
         f"{label}: release reason is invalid",
     )
     progress_baseline = shape.get("progress_baseline")
@@ -440,6 +482,19 @@ def validate_pressure_hold_release(row: dict[str, Any], label: str) -> dict[str,
         require(
             progress_current > progress_baseline,
             f"{label}: owner-advanced release has no committed progress",
+        )
+    previous_wait_condition = shape.get("previous_wait_condition")
+    current_wait_condition = shape.get("current_wait_condition")
+    if decision == "source_retargeted":
+        validate_source_retarget(
+            previous_wait_condition,
+            current_wait_condition,
+            label=label,
+        )
+    else:
+        require(
+            previous_wait_condition is None and current_wait_condition is None,
+            f"{label}: non-retarget release carries source-retarget evidence",
         )
     require(
         shape.get("admission_eligible") is True,
@@ -472,6 +527,8 @@ def validate_pressure_hold_release(row: dict[str, Any], label: str) -> dict[str,
         "waiting_ticket": ticket,
         "episode_id": episode_id,
         "transition_ordinal": transition_ordinal,
+        "previous_wait_condition": previous_wait_condition,
+        "current_wait_condition": current_wait_condition,
     }
 
 
@@ -744,18 +801,22 @@ def validate_decode_trace(
             and common.request_identity_matches(release["progress_owner_id"], progress_owner_id)
             and release["progress_baseline"] == progress_baseline
         ]
-        require(
-            any(release["decision"] == "owner_advanced" for release in matching_releases),
-            f"pressure hold for {victim_request_id} was not released by committed owner progress",
-        )
-        first_progress_release = min(
-            release["ts_unix_nanos"]
+        handoff_releases = [
+            release
             for release in matching_releases
-            if release["decision"] == "owner_advanced"
+            if release["decision"] in {"owner_advanced", "source_retargeted"}
+        ]
+        require(
+            handoff_releases,
+            f"pressure hold for {victim_request_id} has no proven progress or source retarget",
+        )
+        first_handoff_release = min(
+            release["ts_unix_nanos"]
+            for release in handoff_releases
         )
         require(
-            all(hold["ts_unix_nanos"] < first_progress_release for hold in matching_holds),
-            f"pressure victim {victim_request_id} remained held after owner progress",
+            all(hold["ts_unix_nanos"] < first_handoff_release for hold in matching_holds),
+            f"pressure victim {victim_request_id} remained held after handoff completion",
         )
         require(
             all(
@@ -824,10 +885,10 @@ def validate_decode_trace(
         victim_request_id = pressure_yield["victim_request_id"]
         progress_owner_id = pressure_yield["progress_owner_id"]
         progress_baseline = pressure_yield["progress_baseline"]
-        progress_releases = [
+        handoff_releases = [
             release
             for release in releases
-            if release["decision"] == "owner_advanced"
+            if release["decision"] in {"owner_advanced", "source_retargeted"}
             and release["episode_id"] == pressure_yield["episode_id"]
             and common.request_identity_matches(
                 release["victim_request_id"], victim_request_id
@@ -838,19 +899,19 @@ def validate_decode_trace(
             and release["progress_baseline"] == progress_baseline
         ]
         require(
-            progress_releases,
-            f"decode progress owner {progress_owner_id} never advanced its logical generation",
+            handoff_releases,
+            f"decode progress owner {progress_owner_id} neither advanced nor retargeted its exact source",
         )
-        progress_released_at = min(
-            release["ts_unix_nanos"] for release in progress_releases
+        handoff_released_at = min(
+            release["ts_unix_nanos"] for release in handoff_releases
         )
         require(
             any(
                 common.request_identity_matches(row.get("request_id"), victim_request_id)
-                and common.event_wall_ns(row) > progress_released_at
+                and common.event_wall_ns(row) > handoff_released_at
                 for row in admitted_rows
             ),
-            f"pressure victim {victim_request_id} was not re-admitted after owner progress",
+            f"pressure victim {victim_request_id} was not re-admitted after handoff completion",
         )
     for request_id in deferred_request_ids:
         require(
@@ -1815,6 +1876,37 @@ def self_test() -> int:
     try:
         validate_decode_trace(premature_readmission, started_wall_ns=90, finished_wall_ns=160)
         raise AssertionError("victim re-admitted before owner progress")
+    except common.CapacityGateError:
+        pass
+    source_retarget = json.loads(json.dumps(rows[9]))
+    source_retarget["shape"].update(
+        {
+            "decision": "source_retargeted",
+            "progress_current": 53,
+            "previous_wait_condition": {
+                "coordinator_id": 7,
+                "observed": [
+                    {"source": {"domain": 4}, "epoch": 109},
+                    {"source": "plan_device_budget", "epoch": 1},
+                ],
+            },
+            "current_wait_condition": {
+                "coordinator_id": 7,
+                "observed": [
+                    {"source": {"domain": 2}, "epoch": 216},
+                    {"source": "plan_device_budget", "epoch": 1},
+                ],
+            },
+        }
+    )
+    validate_pressure_hold_release(source_retarget, "valid source retarget")
+    unchanged_retarget = json.loads(json.dumps(source_retarget))
+    unchanged_retarget["shape"]["current_wait_condition"] = json.loads(
+        json.dumps(unchanged_retarget["shape"]["previous_wait_condition"])
+    )
+    try:
+        validate_pressure_hold_release(unchanged_retarget, "unchanged source retarget")
+        raise AssertionError("unchanged exact topology unexpectedly released a pressure hold")
     except common.CapacityGateError:
         pass
     print("FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY SELFTEST PASS")

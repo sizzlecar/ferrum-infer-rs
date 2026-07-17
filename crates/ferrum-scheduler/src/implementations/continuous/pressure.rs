@@ -200,6 +200,7 @@ pub enum PressureTransitionKind {
     ReleaseFenceArmed,
     ReleaseFenceCompleted,
     FrontierResumable,
+    FrontierRetargeted,
     FrontierProgressed,
     FrontierTerminal,
     Closed,
@@ -291,7 +292,7 @@ struct PressureEpisode {
     yielded_request: Option<RequestId>,
     owner_progress_baseline: LogicalWorkGeneration,
     handoff_generation: u64,
-    last_yield_observed: Option<BTreeMap<CapacityAvailabilitySource, u64>>,
+    last_yield_condition: Option<CapacityWaitCondition>,
 }
 
 impl PressureEpisode {
@@ -304,7 +305,7 @@ impl PressureEpisode {
             yielded_request: None,
             owner_progress_baseline: LogicalWorkGeneration::ZERO,
             handoff_generation: 0,
-            last_yield_observed: None,
+            last_yield_condition: None,
         }
     }
 }
@@ -390,6 +391,7 @@ pub enum PressureHoldReleaseReason {
     OwnerAdvanced,
     OwnerTerminal,
     RoleTransferred,
+    SourceRetargeted,
 }
 
 impl PressureHoldReleaseReason {
@@ -398,6 +400,7 @@ impl PressureHoldReleaseReason {
             Self::OwnerAdvanced => "owner_advanced",
             Self::OwnerTerminal => "owner_terminal",
             Self::RoleTransferred => "role_transferred",
+            Self::SourceRetargeted => "source_retargeted",
         }
     }
 }
@@ -418,6 +421,8 @@ pub(crate) enum PressureHoldStatus {
         progress_current: LogicalWorkGeneration,
         reason: PressureHoldReleaseReason,
         ordinal: PressureTransitionOrdinal,
+        previous_wait_condition: Option<CapacityWaitCondition>,
+        current_wait_condition: Option<CapacityWaitCondition>,
     },
 }
 
@@ -429,6 +434,8 @@ struct ReleasedHold {
     progress_current: LogicalWorkGeneration,
     reason: PressureHoldReleaseReason,
     ordinal: PressureTransitionOrdinal,
+    previous_wait_condition: Option<CapacityWaitCondition>,
+    current_wait_condition: Option<CapacityWaitCondition>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -573,6 +580,7 @@ impl PressureCoordinator {
             .candidate_scans
             .saturating_add(u64::try_from(candidates.len()).unwrap_or(u64::MAX));
 
+        self.retarget_resumable_owner(request_ids, condition)?;
         let episode_id = self.find_or_open_episode_for(condition, request_ids)?;
         let current_observed = observed_map(condition);
         let previous_state = self
@@ -592,12 +600,14 @@ impl PressureCoordinator {
         }
 
         if previous_state == PressureEpisodeState::Resumable {
-            let last_yield_observed = self
+            let last_yield_condition = self
                 .episodes
                 .get(&episode_id)
-                .and_then(|episode| episode.last_yield_observed.as_ref());
-            if last_yield_observed.is_some_and(|prior| !observed_advanced(prior, &current_observed))
-            {
+                .and_then(|episode| episode.last_yield_condition.as_ref());
+            if last_yield_condition.is_some_and(|prior| {
+                same_source_topology(prior, condition)
+                    && !observed_advanced(&observed_map(prior), &current_observed)
+            }) {
                 let blocked_frontiers = candidates
                     .iter()
                     .filter(|candidate| {
@@ -760,7 +770,7 @@ impl PressureCoordinator {
             episode.progress_owner = Some(owner_id.clone());
             episode.yielded_request = Some(victim_id.clone());
             episode.owner_progress_baseline = progress_baseline;
-            episode.last_yield_observed = Some(episode.observed.clone());
+            episode.last_yield_condition = Some(condition.clone());
             if let Some(owner) = episode.participants.get_mut(&owner_id) {
                 owner.state = ParticipantState::PendingResume;
             }
@@ -852,6 +862,7 @@ impl PressureCoordinator {
                 transaction.episode_id,
                 PressureHoldReleaseReason::OwnerTerminal,
                 true,
+                None,
             )?;
             return Ok((release_ordinal, None, Some(closed_ordinal)));
         }
@@ -909,6 +920,7 @@ impl PressureCoordinator {
             transaction.episode_id,
             PressureHoldReleaseReason::OwnerTerminal,
             false,
+            None,
         )?;
         Ok((aborted, closed, participants))
     }
@@ -942,7 +954,12 @@ impl PressureCoordinator {
             None,
             PressureEpisodeState::Resumable,
         )?;
-        self.close_episode(episode_id, PressureHoldReleaseReason::OwnerAdvanced, true)?;
+        self.close_episode(
+            episode_id,
+            PressureHoldReleaseReason::OwnerAdvanced,
+            true,
+            None,
+        )?;
         Ok(Some(ordinal))
     }
 
@@ -987,7 +1004,12 @@ impl PressureCoordinator {
             return Ok(Some(ordinal));
         }
         if is_owner {
-            self.close_episode(episode_id, PressureHoldReleaseReason::OwnerTerminal, true)?;
+            self.close_episode(
+                episode_id,
+                PressureHoldReleaseReason::OwnerTerminal,
+                true,
+                None,
+            )?;
         } else {
             let episode_drained = if let Some(episode) = self.episodes.get_mut(&episode_id) {
                 episode.participants.remove(request_id);
@@ -997,7 +1019,12 @@ impl PressureCoordinator {
                 false
             };
             if episode_drained {
-                self.close_episode(episode_id, PressureHoldReleaseReason::OwnerTerminal, true)?;
+                self.close_episode(
+                    episode_id,
+                    PressureHoldReleaseReason::OwnerTerminal,
+                    true,
+                    None,
+                )?;
             }
         }
         Ok(Some(ordinal))
@@ -1012,6 +1039,8 @@ impl PressureCoordinator {
                 progress_current: released.progress_current,
                 reason: released.reason,
                 ordinal: released.ordinal,
+                previous_wait_condition: released.previous_wait_condition.clone(),
+                current_wait_condition: released.current_wait_condition.clone(),
             };
         }
         let Some(episode_id) = self.request_index.get(request_id).copied() else {
@@ -1059,6 +1088,8 @@ impl PressureCoordinator {
                     .rev()
                     .find(|event| event.episode_id == episode_id)
                     .map_or(PressureTransitionOrdinal(0), |event| event.ordinal),
+                previous_wait_condition: None,
+                current_wait_condition: None,
             };
         }
         PressureHoldStatus::None
@@ -1132,6 +1163,55 @@ impl PressureCoordinator {
                 episode.state,
                 PressureEpisodeState::YieldPlanned | PressureEpisodeState::AwaitReleaseFence
             )
+    }
+
+    fn retarget_resumable_owner(
+        &mut self,
+        request_ids: &[RequestId],
+        current_condition: &CapacityWaitCondition,
+    ) -> Result<(), PressureCoordinatorError> {
+        let mut linked_episodes = request_ids
+            .iter()
+            .filter_map(|request_id| self.request_index.get(request_id).copied())
+            .collect::<Vec<_>>();
+        linked_episodes.sort_unstable();
+        linked_episodes.dedup();
+        let [episode_id] = linked_episodes.as_slice() else {
+            return Ok(());
+        };
+        let Some((owner_id, yielded_id, previous_condition)) =
+            self.episodes.get(episode_id).and_then(|episode| {
+                let owner_id = episode.progress_owner.as_ref()?;
+                let previous_condition = episode.last_yield_condition.as_ref()?;
+                (episode.state == PressureEpisodeState::Resumable
+                    && request_ids.iter().any(|request_id| request_id == owner_id)
+                    && !same_source_topology(previous_condition, current_condition))
+                .then(|| {
+                    (
+                        owner_id.clone(),
+                        episode.yielded_request.clone(),
+                        previous_condition.clone(),
+                    )
+                })
+            })
+        else {
+            return Ok(());
+        };
+
+        self.record_transition(
+            *episode_id,
+            PressureTransitionKind::FrontierRetargeted,
+            Some(owner_id),
+            yielded_id,
+            PressureEpisodeState::Resumable,
+        )?;
+        self.close_episode(
+            *episode_id,
+            PressureHoldReleaseReason::SourceRetargeted,
+            true,
+            Some((previous_condition, current_condition.clone())),
+        )?;
+        Ok(())
     }
 
     fn find_or_open_episode_for(
@@ -1218,6 +1298,7 @@ impl PressureCoordinator {
         episode_id: PressureEpisodeId,
         reason: PressureHoldReleaseReason,
         publish_yielded_holds: bool,
+        retargeted_wait_conditions: Option<(CapacityWaitCondition, CapacityWaitCondition)>,
     ) -> Result<PressureTransitionOrdinal, PressureCoordinatorError> {
         let Some(mut episode) = self.episodes.remove(&episode_id) else {
             return Err(PressureCoordinatorError::UnknownEpisode(episode_id));
@@ -1257,6 +1338,12 @@ impl PressureCoordinator {
                         progress_current,
                         reason,
                         ordinal: close_ordinal,
+                        previous_wait_condition: retargeted_wait_conditions
+                            .as_ref()
+                            .map(|(previous, _)| previous.clone()),
+                        current_wait_condition: retargeted_wait_conditions
+                            .as_ref()
+                            .map(|(_, current)| current.clone()),
                     },
                 );
             }
@@ -1312,6 +1399,16 @@ fn observed_map(condition: &CapacityWaitCondition) -> BTreeMap<CapacityAvailabil
         .iter()
         .map(|entry| (entry.source(), entry.epoch()))
         .collect()
+}
+
+fn same_source_topology(left: &CapacityWaitCondition, right: &CapacityWaitCondition) -> bool {
+    left.coordinator_id() == right.coordinator_id()
+        && left.observed().len() == right.observed().len()
+        && left
+            .observed()
+            .iter()
+            .zip(right.observed())
+            .all(|(left, right)| left.source() == right.source())
 }
 
 fn observed_advanced(
@@ -1763,6 +1860,115 @@ mod tests {
             coordinator.hold_status(&victim),
             PressureHoldStatus::None
         ));
+    }
+
+    #[test]
+    fn resumable_owner_retargets_disjoint_exact_source_without_false_invariant() {
+        let mut coordinator = PressureCoordinator::default();
+        let owner = RequestId::new();
+        let victim = RequestId::new();
+        let wait_for = |domain: u32, domain_epoch: u64| {
+            CapacityWaitCondition::from_observation(
+                41,
+                vec![
+                    CapacityAvailabilityEpoch::new(
+                        CapacityAvailabilitySource::Domain(CapacityDomainId::new(domain).unwrap()),
+                        domain_epoch,
+                    )
+                    .unwrap(),
+                    CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::PlanDeviceBudget, 1)
+                        .unwrap(),
+                ],
+            )
+            .unwrap()
+        };
+        let decode_wait = wait_for(4, 109);
+        let recompute_wait = wait_for(2, 216);
+
+        coordinator
+            .plan_failure(
+                std::slice::from_ref(&owner),
+                &decode_wait,
+                &[
+                    candidate(&owner, LogicalWorkKind::Recompute, 33, true, None),
+                    candidate(&victim, LogicalWorkKind::Decode, 81, true, None),
+                ],
+            )
+            .unwrap();
+        let transaction = match coordinator
+            .plan_failure(
+                std::slice::from_ref(&victim),
+                &decode_wait,
+                &[
+                    candidate(
+                        &owner,
+                        LogicalWorkKind::Recompute,
+                        33,
+                        true,
+                        Some(decode_wait.clone()),
+                    ),
+                    candidate(&victim, LogicalWorkKind::Decode, 81, true, None),
+                ],
+            )
+            .unwrap()
+        {
+            PressureDecision::YieldPlanned(transaction) => transaction,
+            other => panic!("expected yield, got {other:?}"),
+        };
+        assert_eq!(transaction.progress_owner_id(), &owner);
+        assert_eq!(transaction.victim_request_id(), &victim);
+        let old_episode = transaction.episode_id();
+        coordinator.arm_release_fence(&transaction).unwrap();
+        coordinator.complete_release_fence(&transaction).unwrap();
+
+        let new_episode = match coordinator
+            .plan_failure(
+                std::slice::from_ref(&owner),
+                &recompute_wait,
+                &[
+                    candidate(&owner, LogicalWorkKind::Recompute, 33, true, None),
+                    candidate(&victim, LogicalWorkKind::Waiting, 81, false, None),
+                ],
+            )
+            .unwrap()
+        {
+            PressureDecision::Deferred { episode_id, .. } => episode_id,
+            other => panic!("retarget must defer on a new exact-source episode, got {other:?}"),
+        };
+        assert_ne!(new_episode, old_episode);
+        assert_eq!(coordinator.stats().active_episodes, 1);
+        assert!(matches!(
+            coordinator.hold_status(&victim),
+            PressureHoldStatus::Released {
+                reason: PressureHoldReleaseReason::SourceRetargeted,
+                previous_wait_condition: Some(ref previous),
+                current_wait_condition: Some(ref current),
+                ..
+            } if previous == &decode_wait && current == &recompute_wait
+        ));
+
+        let journal = coordinator.journal();
+        let retarget = journal
+            .iter()
+            .find(|event| {
+                event.episode_id() == old_episode
+                    && event.kind() == PressureTransitionKind::FrontierRetargeted
+            })
+            .unwrap();
+        let old_closed = journal
+            .iter()
+            .find(|event| {
+                event.episode_id() == old_episode && event.kind() == PressureTransitionKind::Closed
+            })
+            .unwrap();
+        let new_opened = journal
+            .iter()
+            .find(|event| {
+                event.episode_id() == new_episode && event.kind() == PressureTransitionKind::Opened
+            })
+            .unwrap();
+        assert!(retarget.ordinal() < old_closed.ordinal());
+        assert!(old_closed.ordinal() < new_opened.ordinal());
     }
 
     #[test]
