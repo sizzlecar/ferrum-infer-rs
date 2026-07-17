@@ -588,13 +588,19 @@ python3 scripts/release/run_gate.py vnext-s1-cuda-decode-capacity \
   --s1-artifact <raw-out> --out <external-out>
 ```
 
-collector 必须在一个有界 A/B/C 压力序列中观察 wide decode cohort split、exact-source park 和
-typed recompute victim。victim 释放物理状态时创建 `DecodeProgressLease`，记录 owner 的逻辑
-decode generation baseline；baseline 未变化时 victim admission probe/submit 增量均为 `0`，且不能
-阻塞后到的 eligible work。owner 提交至少一次逻辑 decode progress 后，lease 必须在 owner 终态之前
-具备解除条件，随后由正常动态容量 probe 决定 victim 立即重入或继续 `WaitForRelease`。不得用 token
-阈值、时间、模型、GPU、显存档位代替该 generation 合同。A/B/C 最终各有且仅有一个 `[DONE]` 和
-usage，所有 scheduler/resource ownership 清零。精确 PASS 行为：
+collector 必须在一个有界 A/B/C 压力序列中观察 wide work cohort split、exact-source park、typed
+yield/recompute transaction 和 fence-delayed release。每个 pressure boundary 必须由 scheduler-owned
+transition ordinal 证明：至少一个 logical work frontier 获得可执行 claim，或存在一个尚未完成的
+`YieldPlanned/AwaitReleaseFence`；禁止出现 overlapping exact source 上
+`all live frontiers blocked + no pending release`。unchanged source 的 allocator/admission probe 增量
+为 `0`，无压力路径不得创建 pressure episode、改变 batch membership 或增加 host allocation。
+
+`DecodeProgressLease` baseline/release trace 可以保留为迁移期诊断，但不能再作为该 lane 的充分
+PASS 条件。正式 validator 必须消费统一 logical frontier、pressure episode、resource transaction 和
+ordered transition journal；不能依赖 wall-clock event 顺序，也不得用 token 阈值、时间、模型、GPU、
+显存档位代替 capacity/cost contract。A/B/C 最终各有且仅有一个 `[DONE]` 和 usage，任一角色连续
+30 秒无 token progress 时 REJECT，所有 scheduler/resource ownership 和 pending fence 清零。精确
+PASS 行为：
 
 ```text
 FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY PASS: <out_dir>
@@ -602,6 +608,13 @@ FERRUM GATE vnext-s1-cuda-decode-capacity PASS: <out_dir>
 ```
 
 该补充 lane 是 correctness-only 证据，不执行性能 sweep，也不单独证明 G01B、S1、性能或发布完成。
+
+`da9c1ee8363c686e71420fd5df8042c496e69757` 的 1x RTX 4090/Qwen3.5-4B collection 是
+`cross_phase_capacity_progress_deadlock` REJECT：lease 在 generation `49 -> 50` 后解除，但最终
+snapshot 为 `active=2`、`blocked prefill=1`、`blocked decode=1`，共同等待 domain `4` generation
+`73`；A/B/C content 为 `81/33/16`，仅 C 有 `[DONE]`，B progress timeout `30.010s`。该 artifact
+否定 phase-local lease 方案并强制上述 unified frontier/pressure transaction 重构；不得原样重跑或
+通过提高 timeout 改写结果。
 
 ## 12. 分支、提交和停止规则
 
