@@ -52,6 +52,7 @@ LANES = (
     "vnext-g01a",
     "vnext-s1-cuda",
     "vnext-s1-cuda-capacity",
+    "vnext-s1-cuda-decode-capacity",
     "unit",
     "metal",
     "cuda-smoke",
@@ -924,6 +925,24 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-s1-cuda-capacity",
+        )
+    if lane == "vnext-s1-cuda-decode-capacity":
+        if args.s1_artifact is None:
+            raise GateError("vnext-s1-cuda-decode-capacity requires --s1-artifact")
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_s1_cuda_decode_capacity.py",
+                "validate",
+                str(args.s1_artifact.resolve()),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-s1-cuda-decode-capacity",
         )
     if lane in SOURCE_LANES:
         source_lane = SOURCE_LANES[lane]
