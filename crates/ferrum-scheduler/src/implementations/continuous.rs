@@ -175,6 +175,18 @@ pub enum ExecutorAdmissionQueueObservation {
         deferral: AdmissionDeferral,
         current: AdmissionWakeEpochs,
     },
+    DecodeSkippedUnchanged {
+        request_id: RequestId,
+        deferral: AdmissionDeferral,
+        current: AdmissionWakeEpochs,
+    },
+    DecodeResumed {
+        request_id: RequestId,
+        deferral: AdmissionDeferral,
+        current: AdmissionWakeEpochs,
+        exact_source_changed: bool,
+        policy_epoch_changed: bool,
+    },
 }
 
 type ExecutorAdmissionQueueEvent = AdmissionQueueEvent<
@@ -191,6 +203,25 @@ enum WaitingAdmissionMode<'a> {
         probe: &'a mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
         observer: Option<&'a mut dyn FnMut(ExecutorAdmissionQueueObservation)>,
     },
+}
+
+impl<'a> WaitingAdmissionMode<'a> {
+    fn wake(&self) -> Option<AdmissionWakeSnapshot<'a>> {
+        match self {
+            Self::Legacy => None,
+            Self::Dynamic { wake, .. } => Some(*wake),
+        }
+    }
+
+    fn observe(&mut self, observation: ExecutorAdmissionQueueObservation) {
+        if let Self::Dynamic {
+            observer: Some(observer),
+            ..
+        } = self
+        {
+            observer(observation);
+        }
+    }
 }
 
 /// Read-only scheduler counters for explicit engine diagnostics.
@@ -720,11 +751,20 @@ impl ContinuousBatchScheduler {
 
     fn admit_waiting_dynamically(
         &self,
-        wake: AdmissionWakeSnapshot<'_>,
         maximum_admissions: usize,
-        probe: &mut dyn FnMut(&InferenceRequest) -> ExecutorAdmissionProbeOutcome,
-        mut observer: Option<&mut dyn FnMut(ExecutorAdmissionQueueObservation)>,
+        waiting_admission: &mut WaitingAdmissionMode<'_>,
     ) -> Result<AdmissionTickReceipt> {
+        let WaitingAdmissionMode::Dynamic {
+            wake,
+            probe,
+            observer,
+        } = waiting_admission
+        else {
+            return Err(FerrumError::scheduler(
+                "dynamic admission requires a typed wake/probe mode",
+            ));
+        };
+        let wake = *wake;
         self.dynamic_admission_ticks.fetch_add(1, Ordering::Relaxed);
         let mut waiting = self.waiting_queue.write();
         let maximum_probes = waiting.len();
@@ -1677,8 +1717,9 @@ impl ContinuousBatchScheduler {
         batch_requests: &mut Vec<ScheduledRequest>,
         total_tokens: &mut usize,
         scheduled_request_ids: &mut HashSet<RequestId>,
-        wake: Option<AdmissionWakeSnapshot<'_>>,
+        waiting_admission: &mut WaitingAdmissionMode<'_>,
     ) -> Result<()> {
+        let wake = waiting_admission.wake();
         let decode_batch_limit = if self.decode_capacity_deferred_backlog_len() > 0 {
             hint.max_batch_size
         } else {
@@ -1718,14 +1759,28 @@ impl ContinuousBatchScheduler {
                         "typed decode capacity audit epoch regressed",
                     ));
                 }
-                if !deferral
+                let exact_source_changed = deferral
                     .wait_condition()
                     .changed_since(wake.availability())
-                    .map_err(|error| FerrumError::scheduler(error.to_string()))?
-                    && current.policy_epoch() == observed.policy_epoch()
-                {
+                    .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+                let policy_epoch_changed = current.policy_epoch() != observed.policy_epoch();
+                if !exact_source_changed && !policy_epoch_changed {
+                    waiting_admission.observe(
+                        ExecutorAdmissionQueueObservation::DecodeSkippedUnchanged {
+                            request_id: req.inner.request.id.clone(),
+                            deferral: deferral.clone(),
+                            current,
+                        },
+                    );
                     continue;
                 }
+                waiting_admission.observe(ExecutorAdmissionQueueObservation::DecodeResumed {
+                    request_id: req.inner.request.id.clone(),
+                    deferral: deferral.clone(),
+                    current,
+                    exact_source_changed,
+                    policy_epoch_changed,
+                });
                 req.execution_capacity_deferral = None;
             }
 
@@ -1742,7 +1797,7 @@ impl ContinuousBatchScheduler {
     fn create_iteration_batch_with_admission(
         &self,
         hint: BatchHint,
-        waiting_admission: WaitingAdmissionMode<'_>,
+        mut waiting_admission: WaitingAdmissionMode<'_>,
     ) -> Result<Option<BatchPlan>> {
         let iteration = self.current_iteration.fetch_add(1, Ordering::Relaxed);
         self.metrics_tracker.record_iteration();
@@ -1767,11 +1822,6 @@ impl ContinuousBatchScheduler {
             && active_count < prefill_first_target
             && !(capacity_backpressure_active && decoding_count > 0)
             && (self.prefilling_count() > 0 || self.waiting_count() > 0);
-        let execution_wake = match &waiting_admission {
-            WaitingAdmissionMode::Legacy => None,
-            WaitingAdmissionMode::Dynamic { wake, .. } => Some(*wake),
-        };
-
         // First, collect decode requests (they have priority). The opt-in
         // fill-first experiment skips decodes until the active decode cohort
         // reaches the requested target, reducing early mixed prefill+decode
@@ -1782,7 +1832,7 @@ impl ContinuousBatchScheduler {
                 &mut batch_requests,
                 &mut total_tokens,
                 &mut scheduled_request_ids,
-                execution_wake,
+                &mut waiting_admission,
             )?;
         }
         let scheduled_decode_count = batch_requests.len();
@@ -1870,57 +1920,50 @@ impl ContinuousBatchScheduler {
             .capacity_backpressure_admit_limit()
             .map(|limit| available_slots.min(limit))
             .unwrap_or(available_slots);
-        match waiting_admission {
-            WaitingAdmissionMode::Legacy => {
-                self.legacy_waiting_admission_ticks
-                    .fetch_add(1, Ordering::Relaxed);
-                let waiting_queue = self.waiting_queue.read();
-                let active_count_for_capacity_wait = self.active_count();
-                let mut requests_to_admit = Vec::new();
-                let mut release_blocked_capacity_deferred_admissions = 0usize;
-                for req in waiting_queue.iter() {
-                    if requests_to_admit.len() >= available_slots {
-                        break;
-                    }
-                    let budgeted_capacity_deferred =
-                        Self::should_budget_capacity_deferred_mixed_recompute(
-                            req,
-                            active_decode_prefill_chunk,
-                        );
-                    let release_ready =
-                        req.capacity_deferred_until_release_epoch <= capacity_release_epoch;
-                    let empty_scheduler_retry = active_count_for_capacity_wait == 0
-                        && !release_ready
-                        && req.capacity_deferred_empty_retry_epoch != Some(capacity_release_epoch);
-                    if release_ready && !budgeted_capacity_deferred {
-                        requests_to_admit.push((req.inner.request.id.clone(), None));
-                    } else if empty_scheduler_retry && !budgeted_capacity_deferred {
-                        requests_to_admit
-                            .push((req.inner.request.id.clone(), Some(capacity_release_epoch)));
-                    } else if req.capacity_deferred_mixed_attempt_epoch
-                        == Some(capacity_mixed_recompute_epoch)
-                    {
-                        continue;
-                    } else if allow_capacity_deferred_mixed_recompute
-                        && release_blocked_capacity_deferred_admissions
-                            < capacity_deferred_mixed_recompute_slots_remaining.unwrap_or(0)
-                    {
-                        requests_to_admit.push((req.inner.request.id.clone(), None));
-                        release_blocked_capacity_deferred_admissions += 1;
-                    }
+        if matches!(&waiting_admission, WaitingAdmissionMode::Legacy) {
+            self.legacy_waiting_admission_ticks
+                .fetch_add(1, Ordering::Relaxed);
+            let waiting_queue = self.waiting_queue.read();
+            let active_count_for_capacity_wait = self.active_count();
+            let mut requests_to_admit = Vec::new();
+            let mut release_blocked_capacity_deferred_admissions = 0usize;
+            for req in waiting_queue.iter() {
+                if requests_to_admit.len() >= available_slots {
+                    break;
                 }
-                drop(waiting_queue);
-                for (req_id, empty_retry_epoch) in requests_to_admit {
-                    self.promote_to_prefill_with_empty_retry(&req_id, empty_retry_epoch);
+                let budgeted_capacity_deferred =
+                    Self::should_budget_capacity_deferred_mixed_recompute(
+                        req,
+                        active_decode_prefill_chunk,
+                    );
+                let release_ready =
+                    req.capacity_deferred_until_release_epoch <= capacity_release_epoch;
+                let empty_scheduler_retry = active_count_for_capacity_wait == 0
+                    && !release_ready
+                    && req.capacity_deferred_empty_retry_epoch != Some(capacity_release_epoch);
+                if release_ready && !budgeted_capacity_deferred {
+                    requests_to_admit.push((req.inner.request.id.clone(), None));
+                } else if empty_scheduler_retry && !budgeted_capacity_deferred {
+                    requests_to_admit
+                        .push((req.inner.request.id.clone(), Some(capacity_release_epoch)));
+                } else if req.capacity_deferred_mixed_attempt_epoch
+                    == Some(capacity_mixed_recompute_epoch)
+                {
+                    continue;
+                } else if allow_capacity_deferred_mixed_recompute
+                    && release_blocked_capacity_deferred_admissions
+                        < capacity_deferred_mixed_recompute_slots_remaining.unwrap_or(0)
+                {
+                    requests_to_admit.push((req.inner.request.id.clone(), None));
+                    release_blocked_capacity_deferred_admissions += 1;
                 }
             }
-            WaitingAdmissionMode::Dynamic {
-                wake,
-                probe,
-                observer,
-            } => {
-                self.admit_waiting_dynamically(wake, available_slots, probe, observer)?;
+            drop(waiting_queue);
+            for (req_id, empty_retry_epoch) in requests_to_admit {
+                self.promote_to_prefill_with_empty_retry(&req_id, empty_retry_epoch);
             }
+        } else {
+            self.admit_waiting_dynamically(available_slots, &mut waiting_admission)?;
         }
 
         // vLLM's scheduler spends the remaining per-step token budget on
@@ -1951,7 +1994,7 @@ impl ContinuousBatchScheduler {
                 &mut batch_requests,
                 &mut total_tokens,
                 &mut scheduled_request_ids,
-                execution_wake,
+                &mut waiting_admission,
             )?;
         }
 
@@ -2769,16 +2812,25 @@ mod tests {
                 .unwrap(),
             1
         );
+        let mut observations = Vec::new();
         let bypass = scheduler
-            .next_batch_with_dynamic_admission(
+            .next_batch_with_dynamic_admission_observed(
                 BatchHint::simple(2),
                 AdmissionWakeSnapshot::new(wake0, &availability0),
                 &mut |_| panic!("no waiting admission probe is allowed"),
+                &mut |observation| observations.push(observation),
             )
             .unwrap()
             .expect("runnable decode must bypass an unchanged blocked decode");
         assert_eq!(bypass.requests.len(), 1);
         assert_eq!(bypass.requests[0].request.id, runnable_id);
+        assert!(matches!(
+            observations.as_slice(),
+            [ExecutorAdmissionQueueObservation::DecodeSkippedUnchanged {
+                request_id,
+                ..
+            }] if request_id == &blocked_id
+        ));
 
         assert_eq!(
             scheduler
@@ -2787,14 +2839,26 @@ mod tests {
             1
         );
         let audit_only = AdmissionWakeEpochs::new(NonZeroU64::new(29).unwrap(), 1, 0, 0);
+        observations.clear();
         assert!(scheduler
-            .next_batch_with_dynamic_admission(
+            .next_batch_with_dynamic_admission_observed(
                 BatchHint::simple(2),
                 AdmissionWakeSnapshot::new(audit_only, &availability0),
                 &mut |_| panic!("unchanged exact sources must not probe"),
+                &mut |observation| observations.push(observation),
             )
             .unwrap()
             .is_none());
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| matches!(
+                    observation,
+                    ExecutorAdmissionQueueObservation::DecodeSkippedUnchanged { .. }
+                ))
+                .count(),
+            2
+        );
         assert_eq!(
             scheduler
                 .trace_snapshot()
@@ -2808,15 +2872,30 @@ mod tests {
 
         let availability1 = [CapacityAvailabilityEpoch::new(source, 2).unwrap()];
         let released = AdmissionWakeEpochs::new(NonZeroU64::new(29).unwrap(), 2, 0, 0);
+        observations.clear();
         let resumed = scheduler
-            .next_batch_with_dynamic_admission(
+            .next_batch_with_dynamic_admission_observed(
                 BatchHint::simple(2),
                 AdmissionWakeSnapshot::new(released, &availability1),
                 &mut |_| panic!("decode resume does not probe waiting admission"),
+                &mut |observation| observations.push(observation),
             )
             .unwrap()
             .expect("relevant source change must resume both decodes");
         assert_eq!(resumed.requests.len(), 2);
+        let resumed_ids = observations
+            .iter()
+            .filter_map(|observation| match observation {
+                ExecutorAdmissionQueueObservation::DecodeResumed {
+                    request_id,
+                    exact_source_changed: true,
+                    policy_epoch_changed: false,
+                    ..
+                } => Some(request_id.clone()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(resumed_ids, HashSet::from([blocked_id, runnable_id]));
         assert_eq!(
             scheduler
                 .trace_snapshot()

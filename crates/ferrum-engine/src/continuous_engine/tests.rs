@@ -2358,8 +2358,22 @@ fn plan_runtime_batch_decode_test_engine(
     Arc<PlanRuntimeBatchDecodeTestExecutor>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
+    plan_runtime_batch_decode_test_engine_with_trace(behavior, None)
+}
+
+fn plan_runtime_batch_decode_test_engine_with_trace(
+    behavior: PlanRuntimeBatchDecodeBehavior,
+    trace_path: Option<PathBuf>,
+) -> (
+    ContinuousBatchEngine,
+    Arc<ContinuousBatchScheduler>,
+    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<dyn Tokenizer + Send + Sync>,
+) {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
+    config.runtime.scheduler_trace_jsonl = trace_path;
+    config.runtime.profile_entrypoint = Some(ProfileEntrypoint::Synthetic);
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
@@ -2477,8 +2491,12 @@ async fn plan_runtime_batch_decode_process_batch_submits_one_cohort() {
 
 #[tokio::test]
 async fn plan_runtime_batch_decode_capacity_deferral_splits_then_parks_exact_requests() {
-    let (engine, scheduler, executor, tokenizer) =
-        plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::Deferred);
+    let trace_path = resource_trace_temp_path("plan-runtime-decode-capacity");
+    let _ = std::fs::remove_file(&trace_path);
+    let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine_with_trace(
+        PlanRuntimeBatchDecodeBehavior::Deferred,
+        Some(trace_path.clone()),
+    );
     let (request_ids, initial_tokens, cache_ids) =
         install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
     let decode_batch = scheduler
@@ -2503,6 +2521,41 @@ async fn plan_runtime_batch_decode_capacity_deferral_splits_then_parks_exact_req
         .unwrap()
         .is_some());
     assert_plan_runtime_decode_cohort_unchanged(&engine, &request_ids, &initial_tokens, &cache_ids);
+
+    let deferred_events = read_engine_profile_events(&trace_path)
+        .into_iter()
+        .filter(|event| event.phase == "vnext.decode_capacity_deferred")
+        .collect::<Vec<_>>();
+    assert_eq!(deferred_events.len(), 3);
+    assert_eq!(
+        deferred_events
+            .iter()
+            .filter(|event| event.shape.get("decision") == Some(&serde_json::json!("split_cohort")))
+            .count(),
+        1
+    );
+    assert_eq!(
+        deferred_events
+            .iter()
+            .filter(|event| {
+                event.shape.get("decision") == Some(&serde_json::json!("wait_for_release"))
+            })
+            .count(),
+        2
+    );
+    for event in &deferred_events {
+        assert_eq!(
+            event.shape.get("decode_submit_observed"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            event.shape.get("execution_stage"),
+            Some(&serde_json::json!("step_admission"))
+        );
+        assert!(event.attributes.contains_key("request_ids"));
+        assert!(event.attributes.contains_key("capacity_evidence"));
+    }
+    let _ = std::fs::remove_file(trace_path);
 }
 
 #[tokio::test]

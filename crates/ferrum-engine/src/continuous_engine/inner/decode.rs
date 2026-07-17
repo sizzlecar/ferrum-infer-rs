@@ -201,8 +201,13 @@ impl EngineInner {
                 PlanRuntimeDecodeBatchOutcome::Completed => {}
                 PlanRuntimeDecodeBatchOutcome::Deferred {
                     request_ids,
-                    deferral: _,
+                    deferral,
                 } if request_ids.len() > 1 => {
+                    self.trace_executor_decode_capacity_decision(
+                        &request_ids,
+                        &deferral,
+                        "split_cohort",
+                    );
                     self.scheduler
                         .record_decode_capacity_pressure(request_ids.len(), None);
                     let mid = request_ids.len() / 2;
@@ -233,6 +238,11 @@ impl EngineInner {
                             request_ids.len()
                         )));
                     }
+                    self.trace_executor_decode_capacity_decision(
+                        &request_ids,
+                        &deferral,
+                        "wait_for_release",
+                    );
                     self.write_scheduler_trace_event(serde_json::json!({
                         "event": "scheduler_execution_capacity_defer",
                         "request_ids": request_ids,
