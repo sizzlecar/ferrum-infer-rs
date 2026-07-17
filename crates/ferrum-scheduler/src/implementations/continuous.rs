@@ -3974,19 +3974,34 @@ mod tests {
             .unwrap();
 
         observations.clear();
+        let callback_order = std::cell::RefCell::new(Vec::new());
         let admitted = scheduler
             .next_batch_with_dynamic_admission_observed(
                 BatchHint::simple(2),
                 AdmissionWakeSnapshot::new(wake2, &availability2),
                 &mut |request| {
+                    callback_order.borrow_mut().push("admission_probe");
                     AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
                         request_id: request.id.clone(),
                     })
                 },
-                &mut |observation| observations.push(observation),
+                &mut |observation| {
+                    if matches!(
+                        observation,
+                        ExecutorAdmissionQueueObservation::PressureHoldReleased { .. }
+                    ) {
+                        callback_order.borrow_mut().push("pressure_hold_released");
+                    }
+                    observations.push(observation);
+                },
             )
             .unwrap()
             .expect("owner terminal release must admit the yielded frontier");
+        assert_eq!(
+            callback_order.into_inner(),
+            vec!["pressure_hold_released", "admission_probe"],
+            "the trace capture boundary must observe causal hold release before re-admission"
+        );
         assert_eq!(admitted.requests.len(), 1);
         assert_eq!(admitted.requests[0].request.id, runnable_id);
         assert!(observations.iter().any(|observation| matches!(

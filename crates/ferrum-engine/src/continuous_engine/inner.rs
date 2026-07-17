@@ -135,6 +135,11 @@ struct ExecutorPrefillAdmissionTrace {
     evidence: ExecutorPrefillAdmissionTraceEvidence,
 }
 
+enum ExecutorSchedulerTraceRecord {
+    PrefillAdmission(ExecutorPrefillAdmissionTrace),
+    AdmissionQueueObservation(ExecutorAdmissionQueueObservation),
+}
+
 fn scheduler_trace_monotonic_nanos() -> u64 {
     static ORIGIN: OnceLock<Instant> = OnceLock::new();
     ORIGIN
@@ -1408,24 +1413,33 @@ impl EngineInner {
             );
             let wake = AdmissionWakeSnapshot::new(wake_epochs, &availability);
             let capture_trace = self.scheduler_trace_jsonl.is_some();
-            let mut admission_traces = capture_trace.then(Vec::new);
-            let mut admission_queue_observations = capture_trace.then(Vec::new);
+            // The scheduler invokes queue-observation and admission-probe
+            // callbacks in causal order. Keep one buffer so trace emission
+            // cannot reorder a released pressure hold behind its admission.
+            let scheduler_trace_records = capture_trace
+                .then(|| std::cell::RefCell::new(Vec::<ExecutorSchedulerTraceRecord>::new()));
             let mut probe = |request: &InferenceRequest| {
                 let result = self.probe_executor_prefill_admission(request, capture_trace);
                 if let Some(maintenance) = result.maintenance {
                     prefill_maintenance.push(maintenance);
                 }
-                if let (Some(traces), Some(trace)) = (&mut admission_traces, result.trace) {
-                    traces.push(trace);
+                if let (Some(records), Some(trace)) = (&scheduler_trace_records, result.trace) {
+                    records
+                        .borrow_mut()
+                        .push(ExecutorSchedulerTraceRecord::PrefillAdmission(trace));
                 }
                 result.outcome
             };
-            let scheduled = if let Some(observations) = &mut admission_queue_observations {
+            let scheduled = if let Some(records) = &scheduler_trace_records {
                 self.scheduler.next_batch_with_dynamic_admission_observed(
                     hint,
                     wake,
                     &mut probe,
-                    &mut |observation| observations.push(observation),
+                    &mut |observation| {
+                        records.borrow_mut().push(
+                            ExecutorSchedulerTraceRecord::AdmissionQueueObservation(observation),
+                        )
+                    },
                 )
             } else {
                 self.scheduler
@@ -1433,14 +1447,16 @@ impl EngineInner {
             };
             drop(availability);
             drop(probe);
-            if let Some(traces) = admission_traces {
-                for trace in traces {
-                    self.trace_executor_prefill_admission(trace);
-                }
-            }
-            if let Some(observations) = admission_queue_observations {
-                for observation in observations {
-                    self.trace_executor_admission_queue_observation(observation);
+            if let Some(records) = scheduler_trace_records {
+                for record in records.into_inner() {
+                    match record {
+                        ExecutorSchedulerTraceRecord::PrefillAdmission(trace) => {
+                            self.trace_executor_prefill_admission(trace);
+                        }
+                        ExecutorSchedulerTraceRecord::AdmissionQueueObservation(observation) => {
+                            self.trace_executor_admission_queue_observation(observation);
+                        }
+                    }
                 }
             }
             if scheduled.is_err() {
