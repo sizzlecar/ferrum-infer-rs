@@ -238,9 +238,13 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
     require(len(request_ids) == width, f"{label}: attempted width/request count mismatch")
     attributes = row.get("attributes", {})
     victim_request_id = attributes.get("victim_request_id")
+    progress_owner_id = attributes.get("progress_owner_id")
+    progress_baseline = attributes.get("progress_baseline")
     if decision == "split_cohort":
         require(width >= 2, f"{label}: split cohort is not wide")
         require(victim_request_id is None, f"{label}: split cohort named a victim")
+        require(progress_owner_id is None, f"{label}: split cohort named a progress owner")
+        require(progress_baseline is None, f"{label}: split cohort named a progress baseline")
     elif decision == "recompute_progress_victim":
         require(width == 1, f"{label}: progress recompute cohort is not exact")
         require(
@@ -251,9 +255,20 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
             victim_request_id not in request_ids,
             f"{label}: progress owner cannot be its own recompute victim",
         )
+        require(
+            isinstance(progress_owner_id, str)
+            and common.request_identity_matches(progress_owner_id, request_ids[0]),
+            f"{label}: typed progress owner does not match the decode cohort",
+        )
+        require(
+            isinstance(progress_baseline, int) and progress_baseline >= 0,
+            f"{label}: logical progress baseline is invalid",
+        )
     else:
         require(width == 1, f"{label}: a non-exact cohort was parked")
         require(victim_request_id is None, f"{label}: parked decode named a victim")
+        require(progress_owner_id is None, f"{label}: parked decode named a progress owner")
+        require(progress_baseline is None, f"{label}: parked decode named a progress baseline")
 
     evidence = attributes.get("capacity_evidence")
     require(isinstance(evidence, dict), f"{label}: capacity evidence is missing")
@@ -272,6 +287,8 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
         "stage": stage,
         "request_ids": request_ids,
         "victim_request_id": victim_request_id,
+        "progress_owner_id": progress_owner_id,
+        "progress_baseline": progress_baseline,
         "observed": observed,
         "wait_condition": wait_condition,
     }
@@ -336,7 +353,7 @@ def validate_decode_queue_transition(
     }
 
 
-def validate_progress_reservation_hold(row: dict[str, Any], label: str) -> dict[str, Any]:
+def validate_progress_lease_hold(row: dict[str, Any], label: str) -> dict[str, Any]:
     require(row.get("status") == "ok" and row.get("error") is None, f"{label}: event failed")
     request_id = row.get("request_id")
     shape = row.get("shape")
@@ -349,17 +366,89 @@ def validate_progress_reservation_hold(row: dict[str, Any], label: str) -> dict[
     )
     require(
         not common.request_identity_matches(request_id, progress_owner_id),
-        f"{label}: victim cannot own its own progress reservation",
+        f"{label}: victim cannot own its own progress lease",
     )
-    require(shape.get("decision") == "held_for_decode_progress", f"{label}: decision is invalid")
+    require(shape.get("decision") == "held_for_owner_progress", f"{label}: decision is invalid")
     require(shape.get("prefill_submit_observed") is False, f"{label}: held victim reached submit")
     require(shape.get("probe_performed") is False, f"{label}: held victim reached admission probe")
+    progress_baseline = shape.get("progress_baseline")
+    progress_current = shape.get("progress_current")
+    require(
+        isinstance(progress_baseline, int) and progress_baseline >= 0,
+        f"{label}: progress baseline is invalid",
+    )
+    require(
+        isinstance(progress_current, int) and progress_current == progress_baseline,
+        f"{label}: held lease did not preserve its exact progress baseline",
+    )
     ticket = shape.get("waiting_ticket")
     require(isinstance(ticket, int) and ticket > 0, f"{label}: waiting ticket is invalid")
     return {
         "ts_unix_nanos": common.event_wall_ns(row),
         "victim_request_id": request_id,
         "progress_owner_id": progress_owner_id,
+        "progress_baseline": progress_baseline,
+        "progress_current": progress_current,
+        "waiting_ticket": ticket,
+    }
+
+
+def validate_progress_lease_release(row: dict[str, Any], label: str) -> dict[str, Any]:
+    require(row.get("status") == "ok" and row.get("error") is None, f"{label}: event failed")
+    request_id = row.get("request_id")
+    shape = row.get("shape")
+    require(isinstance(request_id, str) and request_id, f"{label}: victim identity is missing")
+    require(isinstance(shape, dict), f"{label}: shape is missing")
+    progress_owner_id = shape.get("progress_owner_id")
+    require(
+        isinstance(progress_owner_id, str) and progress_owner_id,
+        f"{label}: progress owner identity is missing",
+    )
+    require(
+        not common.request_identity_matches(request_id, progress_owner_id),
+        f"{label}: victim cannot own its own progress lease",
+    )
+    decision = shape.get("decision")
+    require(
+        decision in {"owner_advanced", "owner_no_longer_decoding"},
+        f"{label}: release reason is invalid",
+    )
+    progress_baseline = shape.get("progress_baseline")
+    progress_current = shape.get("progress_current")
+    require(
+        isinstance(progress_baseline, int) and progress_baseline >= 0,
+        f"{label}: progress baseline is invalid",
+    )
+    require(
+        isinstance(progress_current, int) and progress_current >= progress_baseline,
+        f"{label}: logical progress generation regressed",
+    )
+    if decision == "owner_advanced":
+        require(
+            progress_current > progress_baseline,
+            f"{label}: owner-advanced release has no committed progress",
+        )
+    require(
+        shape.get("admission_eligible") is True,
+        f"{label}: released victim did not regain dynamic admission eligibility",
+    )
+    require(
+        shape.get("probe_performed") is False,
+        f"{label}: lease release was incorrectly coupled to an admission probe",
+    )
+    require(
+        shape.get("prefill_submit_observed") is False,
+        f"{label}: release observation happened after prefill submit",
+    )
+    ticket = shape.get("waiting_ticket")
+    require(isinstance(ticket, int) and ticket > 0, f"{label}: waiting ticket is invalid")
+    return {
+        "ts_unix_nanos": common.event_wall_ns(row),
+        "victim_request_id": request_id,
+        "progress_owner_id": progress_owner_id,
+        "progress_baseline": progress_baseline,
+        "progress_current": progress_current,
+        "decision": decision,
         "waiting_ticket": ticket,
     }
 
@@ -395,15 +484,28 @@ def validate_decode_trace(
     hold_rows = [
         row
         for row in window
-        if row.get("phase") == "vnext.prefill_admission_progress_reserved"
+        if row.get("phase") == "vnext.prefill_admission_progress_lease_held"
     ]
     require(
         len(hold_rows) <= MAX_DECODE_CAPACITY_EVENTS,
-        "decode progress reservation observations exceeded the bounded event ceiling",
+        "decode progress lease holds exceeded the bounded event ceiling",
     )
     holds = [
-        validate_progress_reservation_hold(row, f"progress reservation hold {index}")
+        validate_progress_lease_hold(row, f"progress lease hold {index}")
         for index, row in enumerate(hold_rows)
+    ]
+    release_rows = [
+        row
+        for row in window
+        if row.get("phase") == "vnext.prefill_admission_progress_lease_released"
+    ]
+    require(
+        len(release_rows) <= MAX_DECODE_CAPACITY_EVENTS,
+        "decode progress lease releases exceeded the bounded event ceiling",
+    )
+    releases = [
+        validate_progress_lease_release(row, f"progress lease release {index}")
+        for index, row in enumerate(release_rows)
     ]
 
     skip_rows = [row for row in window if row.get("phase") == "vnext.decode_capacity_skipped_unchanged"]
@@ -443,7 +545,8 @@ def validate_decode_trace(
         )
     for recompute in recomputes:
         victim_request_id = recompute["victim_request_id"]
-        progress_owner_id = recompute["request_ids"][0]
+        progress_owner_id = recompute["progress_owner_id"]
+        progress_baseline = recompute["progress_baseline"]
         require(
             any(
                 park["ts_unix_nanos"] < recompute["ts_unix_nanos"]
@@ -454,8 +557,10 @@ def validate_decode_trace(
             ),
             f"decode progress victim {victim_request_id} was not previously parked",
         )
-        require(
-            any(
+        matching_holds = [
+            hold
+            for hold in holds
+            if (
                 hold["ts_unix_nanos"] > recompute["ts_unix_nanos"]
                 and common.request_identity_matches(
                     hold["victim_request_id"], victim_request_id
@@ -463,9 +568,45 @@ def validate_decode_trace(
                 and common.request_identity_matches(
                     hold["progress_owner_id"], progress_owner_id
                 )
-                for hold in holds
-            ),
+                and hold["progress_baseline"] == progress_baseline
+            )
+        ]
+        require(
+            matching_holds,
             f"decode progress victim {victim_request_id} was not held for owner {progress_owner_id}",
+        )
+        matching_releases = [
+            release
+            for release in releases
+            if release["ts_unix_nanos"] > recompute["ts_unix_nanos"]
+            and common.request_identity_matches(
+                release["victim_request_id"], victim_request_id
+            )
+            and common.request_identity_matches(
+                release["progress_owner_id"], progress_owner_id
+            )
+            and release["progress_baseline"] == progress_baseline
+        ]
+        require(
+            any(release["decision"] == "owner_advanced" for release in matching_releases),
+            f"decode progress lease for {victim_request_id} was not released by committed owner progress",
+        )
+        first_progress_release = min(
+            release["ts_unix_nanos"]
+            for release in matching_releases
+            if release["decision"] == "owner_advanced"
+        )
+        require(
+            all(hold["ts_unix_nanos"] < first_progress_release for hold in matching_holds),
+            f"decode progress victim {victim_request_id} remained held after owner progress",
+        )
+        require(
+            any(
+                release["waiting_ticket"] == hold["waiting_ticket"]
+                for release in matching_releases
+                for hold in matching_holds
+            ),
+            f"decode progress lease for {victim_request_id} changed waiting identity",
         )
 
     for hold in holds:
@@ -476,11 +617,28 @@ def validate_decode_trace(
                     recompute["victim_request_id"], hold["victim_request_id"]
                 )
                 and common.request_identity_matches(
-                    recompute["request_ids"][0], hold["progress_owner_id"]
+                    recompute["progress_owner_id"], hold["progress_owner_id"]
                 )
+                and recompute["progress_baseline"] == hold["progress_baseline"]
                 for recompute in recomputes
             ),
-            f"progress reservation hold for {hold['victim_request_id']} has no typed recompute decision",
+            f"progress lease hold for {hold['victim_request_id']} has no typed recompute decision",
+        )
+
+    for release in releases:
+        require(
+            any(
+                recompute["ts_unix_nanos"] < release["ts_unix_nanos"]
+                and common.request_identity_matches(
+                    recompute["victim_request_id"], release["victim_request_id"]
+                )
+                and common.request_identity_matches(
+                    recompute["progress_owner_id"], release["progress_owner_id"]
+                )
+                and recompute["progress_baseline"] == release["progress_baseline"]
+                for recompute in recomputes
+            ),
+            f"progress lease release for {release['victim_request_id']} has no typed recompute decision",
         )
 
     deferred_request_ids = sorted(
@@ -508,22 +666,35 @@ def validate_decode_trace(
     ]
     for recompute in recomputes:
         victim_request_id = recompute["victim_request_id"]
-        progress_owner_id = recompute["request_ids"][0]
-        owner_completions = [
-            common.event_wall_ns(row)
-            for row in completed_rows
-            if common.request_identity_matches(row.get("request_id"), progress_owner_id)
-            and common.event_wall_ns(row) > recompute["ts_unix_nanos"]
+        progress_owner_id = recompute["progress_owner_id"]
+        progress_baseline = recompute["progress_baseline"]
+        progress_releases = [
+            release
+            for release in releases
+            if release["decision"] == "owner_advanced"
+            and release["ts_unix_nanos"] > recompute["ts_unix_nanos"]
+            and common.request_identity_matches(
+                release["victim_request_id"], victim_request_id
+            )
+            and common.request_identity_matches(
+                release["progress_owner_id"], progress_owner_id
+            )
+            and release["progress_baseline"] == progress_baseline
         ]
-        require(owner_completions, f"decode progress owner {progress_owner_id} did not complete")
-        owner_completed_at = min(owner_completions)
+        require(
+            progress_releases,
+            f"decode progress owner {progress_owner_id} never advanced its logical generation",
+        )
+        progress_released_at = min(
+            release["ts_unix_nanos"] for release in progress_releases
+        )
         require(
             any(
                 common.request_identity_matches(row.get("request_id"), victim_request_id)
-                and common.event_wall_ns(row) > owner_completed_at
+                and common.event_wall_ns(row) > progress_released_at
                 for row in admitted_rows
             ),
-            f"decode progress victim {victim_request_id} was not re-admitted after owner completion",
+            f"decode progress victim {victim_request_id} was not re-admitted after owner progress",
         )
     for request_id in deferred_request_ids:
         require(
@@ -535,7 +706,8 @@ def validate_decode_trace(
         "split_events": len(splits),
         "park_events": len(parks),
         "recompute_events": len(recomputes),
-        "progress_reservation_hold_events": len(holds),
+        "progress_lease_hold_events": len(holds),
+        "progress_lease_release_events": len(releases),
         "skip_events": len(skips),
         "resume_events": len(resumes),
         "stages": sorted({event["stage"] for event in deferrals}),
@@ -544,7 +716,7 @@ def validate_decode_trace(
         "recompute_victim_request_ids": sorted(
             {event["victim_request_id"] for event in recomputes}
         ),
-        "progress_reservation_pairs": [
+        "progress_lease_pairs": [
             list(pair)
             for pair in sorted(
                 {
@@ -1239,6 +1411,7 @@ def self_test() -> int:
         request_ids: list[str],
         *,
         victim_request_id: str | None = None,
+        progress_baseline: int | None = None,
     ) -> dict[str, Any]:
         attributes = {
             "request_ids": request_ids,
@@ -1247,6 +1420,8 @@ def self_test() -> int:
         }
         if victim_request_id is not None:
             attributes["victim_request_id"] = victim_request_id
+            attributes["progress_owner_id"] = request_ids[0]
+            attributes["progress_baseline"] = progress_baseline
         return {
             "ts_unix_nanos": ts,
             "phase": "vnext.decode_capacity_deferred",
@@ -1314,30 +1489,50 @@ def self_test() -> int:
             "recompute_progress_victim",
             ["C"],
             victim_request_id="A",
+            progress_baseline=53,
         ),
         {
             "ts_unix_nanos": 145,
-            "phase": "vnext.prefill_admission_progress_reserved",
+            "phase": "vnext.prefill_admission_progress_lease_held",
             "status": "ok",
             "error": None,
             "request_id": "A",
             "shape": {
-                "decision": "held_for_decode_progress",
+                "decision": "held_for_owner_progress",
                 "waiting_ticket": 1,
                 "progress_owner_id": "C",
+                "progress_baseline": 53,
+                "progress_current": 53,
                 "prefill_submit_observed": False,
                 "probe_performed": False,
             },
         },
-        {"ts_unix_nanos": 150, "phase": "vnext.request_completed", "request_id": "C"},
+        {
+            "ts_unix_nanos": 150,
+            "phase": "vnext.prefill_admission_progress_lease_released",
+            "status": "ok",
+            "error": None,
+            "request_id": "A",
+            "shape": {
+                "decision": "owner_advanced",
+                "waiting_ticket": 1,
+                "progress_owner_id": "C",
+                "progress_baseline": 53,
+                "progress_current": 54,
+                "admission_eligible": True,
+                "probe_performed": False,
+                "prefill_submit_observed": False,
+            },
+        },
         {
             "ts_unix_nanos": 151,
             "phase": "vnext.prefill_admission",
             "request_id": "A",
             "shape": {"decision": "admitted"},
         },
-        {"ts_unix_nanos": 152, "phase": "vnext.request_completed", "request_id": "A"},
-        {"ts_unix_nanos": 153, "phase": "vnext.request_completed", "request_id": "B"},
+        {"ts_unix_nanos": 152, "phase": "vnext.request_completed", "request_id": "C"},
+        {"ts_unix_nanos": 153, "phase": "vnext.request_completed", "request_id": "A"},
+        {"ts_unix_nanos": 154, "phase": "vnext.request_completed", "request_id": "B"},
     ]
     summary = validate_decode_trace(rows, started_wall_ns=90, finished_wall_ns=160)
     require(summary["split_events"] == 1, "self-test lost split evidence")
@@ -1345,8 +1540,12 @@ def self_test() -> int:
     require(summary["resume_events"] == 1, "self-test lost resume evidence")
     require(summary["recompute_events"] == 1, "self-test lost recompute evidence")
     require(
-        summary["progress_reservation_hold_events"] == 1,
-        "self-test lost progress reservation hold evidence",
+        summary["progress_lease_hold_events"] == 1,
+        "self-test lost progress lease hold evidence",
+    )
+    require(
+        summary["progress_lease_release_events"] == 1,
+        "self-test lost progress lease release evidence",
     )
     require(
         summary["recompute_victim_request_ids"] == ["A"],
@@ -1376,7 +1575,37 @@ def self_test() -> int:
     del missing_hold[6]
     try:
         validate_decode_trace(missing_hold, started_wall_ns=90, finished_wall_ns=160)
-        raise AssertionError("progress recompute without a reservation hold unexpectedly passed")
+        raise AssertionError("progress recompute without a lease hold unexpectedly passed")
+    except common.CapacityGateError:
+        pass
+    missing_release = json.loads(json.dumps(rows))
+    del missing_release[7]
+    try:
+        validate_decode_trace(missing_release, started_wall_ns=90, finished_wall_ns=160)
+        raise AssertionError("progress lease without a release unexpectedly passed")
+    except common.CapacityGateError:
+        pass
+    unchanged_progress = json.loads(json.dumps(rows))
+    unchanged_progress[7]["shape"]["progress_current"] = 53
+    try:
+        validate_decode_trace(unchanged_progress, started_wall_ns=90, finished_wall_ns=160)
+        raise AssertionError("unchanged owner progress unexpectedly released a lease")
+    except common.CapacityGateError:
+        pass
+    stale_hold = json.loads(json.dumps(rows))
+    stale_hold_event = json.loads(json.dumps(stale_hold[6]))
+    stale_hold_event["ts_unix_nanos"] = 151
+    stale_hold.append(stale_hold_event)
+    try:
+        validate_decode_trace(stale_hold, started_wall_ns=90, finished_wall_ns=160)
+        raise AssertionError("victim remained held after owner progress")
+    except common.CapacityGateError:
+        pass
+    premature_readmission = json.loads(json.dumps(rows))
+    premature_readmission[8]["ts_unix_nanos"] = 149
+    try:
+        validate_decode_trace(premature_readmission, started_wall_ns=90, finished_wall_ns=160)
+        raise AssertionError("victim re-admitted before owner progress")
     except common.CapacityGateError:
         pass
     print("FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY SELFTEST PASS")

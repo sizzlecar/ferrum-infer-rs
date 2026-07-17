@@ -578,6 +578,31 @@ FERRUM GATE vnext-s1-cuda-capacity PASS: <out_dir>
 
 该 lane 只证明当前 SHA 的 Qwen3.5-4B CUDA 容量压力纵切，不单独证明 G01B、S1、性能或发布完成。
 
+decode execution-capacity 使用独立的补充 lane，证明 active decode 在 Step/Invocation 动态容量
+耗尽时不会热循环、互相等待或依赖某个请求先终态：
+
+```text
+python3 scripts/release/runtime_vnext_s1_cuda_decode_capacity.py collect \
+  --binary target/release/ferrum --model <qwen35-4b-model-dir> --out <raw-out>
+python3 scripts/release/run_gate.py vnext-s1-cuda-decode-capacity \
+  --s1-artifact <raw-out> --out <external-out>
+```
+
+collector 必须在一个有界 A/B/C 压力序列中观察 wide decode cohort split、exact-source park 和
+typed recompute victim。victim 释放物理状态时创建 `DecodeProgressLease`，记录 owner 的逻辑
+decode generation baseline；baseline 未变化时 victim admission probe/submit 增量均为 `0`，且不能
+阻塞后到的 eligible work。owner 提交至少一次逻辑 decode progress 后，lease 必须在 owner 终态之前
+具备解除条件，随后由正常动态容量 probe 决定 victim 立即重入或继续 `WaitForRelease`。不得用 token
+阈值、时间、模型、GPU、显存档位代替该 generation 合同。A/B/C 最终各有且仅有一个 `[DONE]` 和
+usage，所有 scheduler/resource ownership 清零。精确 PASS 行为：
+
+```text
+FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY PASS: <out_dir>
+FERRUM GATE vnext-s1-cuda-decode-capacity PASS: <out_dir>
+```
+
+该补充 lane 是 correctness-only 证据，不执行性能 sweep，也不单独证明 G01B、S1、性能或发布完成。
+
 ## 12. 分支、提交和停止规则
 
 - 每个子 Goal 使用小而可审阅的提交；核心 contract、kernel 优化、release gate 大改不得混在

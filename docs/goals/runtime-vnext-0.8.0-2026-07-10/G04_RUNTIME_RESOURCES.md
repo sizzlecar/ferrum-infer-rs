@@ -94,6 +94,13 @@ typed fairness policy 的默认 `max_relevant_bypass_events=8`，只统计该请
 decode。Ferrum 借鉴 vLLM 的 active-first、capacity defer 和 fence-delayed
 release，但不接受裸 `None`、1ms polling、队头 allocation failure `break` 或默认清空 KV 重算。
 
+active decode 为解除互等而让渡物理状态时，scheduler 可以创建 `DecodeProgressLease`。它是一次
+admission eligibility 握手，不是 capacity reservation，也不增加或占用任何资源 vector：lease 只
+携带 victim、progress owner、owner 的逻辑 decode generation baseline 和共享单调进度 capability。
+owner 仍在 decode 且 generation 未越过 baseline 时 victim 不得 probe；generation 前进、owner 离开
+decode、完成或取消时 lease 解除，之后仍由正常 typed capacity probe 决定 admit/defer。该握手不得
+存活到 owner 终态作为默认策略，也不得以时间、固定 token quantum、模型或设备分支控制。
+
 ## Transaction 与 Lease 状态机
 
 ```text

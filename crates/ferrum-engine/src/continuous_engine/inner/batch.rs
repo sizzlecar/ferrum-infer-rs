@@ -1049,15 +1049,15 @@ impl EngineInner {
         .await
     }
 
-    pub(super) async fn defer_decode_for_capacity_recompute_reserved(
+    pub(super) async fn defer_decode_for_capacity_recompute_leased(
         &self,
-        reservation: &DecodeProgressReservation,
+        lease: &DecodeProgressLease,
         attempted_decode_width: usize,
         observed_free_blocks: Option<usize>,
     ) -> bool {
         self.defer_decode_for_capacity_recompute_inner(
-            reservation.victim_request_id(),
-            Some(reservation),
+            lease.victim_request_id(),
+            Some(lease),
             attempted_decode_width,
             observed_free_blocks,
         )
@@ -1067,7 +1067,7 @@ impl EngineInner {
     async fn defer_decode_for_capacity_recompute_inner(
         &self,
         request_id: &RequestId,
-        progress_reservation: Option<&DecodeProgressReservation>,
+        progress_lease: Option<&DecodeProgressLease>,
         attempted_decode_width: usize,
         observed_free_blocks: Option<usize>,
     ) -> bool {
@@ -1089,13 +1089,12 @@ impl EngineInner {
         self.release_sequence_physical_resources(request_id, physical_resources)
             .await;
 
-        let moved = if let Some(reservation) = progress_reservation {
-            self.scheduler
-                .defer_decode_to_waiting_with_progress_reservation(
-                    reservation,
-                    attempted_decode_width,
-                    observed_free_blocks,
-                )
+        let moved = if let Some(lease) = progress_lease {
+            self.scheduler.defer_decode_to_waiting_with_progress_lease(
+                lease,
+                attempted_decode_width,
+                observed_free_blocks,
+            )
         } else {
             self.scheduler
                 .defer_decode_to_waiting_for_capacity_with_pressure(
