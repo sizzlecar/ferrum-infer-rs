@@ -1048,15 +1048,32 @@ impl EngineInner {
         .await
     }
 
-    pub(super) fn execution_capacity_release_snapshot(&self) -> ExecutionCapacityReleaseSnapshot {
-        let releasable_request_ids = self
+    pub(in crate::continuous_engine) fn execution_capacity_release_snapshot(
+        &self,
+    ) -> Result<ExecutionCapacityReleaseSnapshot> {
+        let authorities = self
             .sequences
             .read()
             .iter()
-            .filter(|(_, sequence)| sequence.can_release_execution_capacity())
-            .map(|(request_id, _)| request_id.clone())
+            .filter_map(|(request_id, sequence)| {
+                sequence
+                    .model_cache_id()
+                    .map(|cache_id| (request_id.clone(), cache_id.to_string()))
+            })
             .collect::<Vec<_>>();
-        ExecutionCapacityReleaseSnapshot::new(releasable_request_ids)
+        let mut capabilities = Vec::with_capacity(authorities.len());
+        for (request_id, cache_id) in authorities {
+            let preemption =
+                ExecutorExecutionCapacityPreemption::new(request_id.clone(), cache_id)?;
+            let mut sources = Vec::new();
+            if self
+                .model_executor
+                .write_execution_capacity_release_sources(&preemption, &mut sources)?
+            {
+                capabilities.push((request_id, sources));
+            }
+        }
+        Ok(ExecutionCapacityReleaseSnapshot::new(capabilities))
     }
 
     fn reconcile_capacity_yield_error(
@@ -1095,7 +1112,7 @@ impl EngineInner {
         }
     }
 
-    pub(super) async fn execute_capacity_yield(
+    pub(in crate::continuous_engine) async fn execute_capacity_yield(
         &self,
         transaction: &PressureYieldTransaction,
         attempted_width: usize,
@@ -1135,6 +1152,7 @@ impl EngineInner {
             "event": "scheduler_pressure_release_fence_armed",
             "episode_id": transaction.episode_id().get(),
             "handoff_generation": transaction.handoff_generation(),
+            "yield_kind": transaction.kind().as_str(),
             "victim_request_id": transaction.victim_request_id(),
             "progress_owner_id": transaction.progress_owner_id(),
             "planned_ordinal": transaction.planned_ordinal().get(),
@@ -1156,6 +1174,10 @@ impl EngineInner {
                 (
                     "handoff_generation".to_string(),
                     serde_json::json!(transaction.handoff_generation()),
+                ),
+                (
+                    "yield_kind".to_string(),
+                    serde_json::json!(transaction.kind().as_str()),
                 ),
                 (
                     "planned_transition_ordinal".to_string(),
@@ -1322,12 +1344,12 @@ impl EngineInner {
         let closed_reason = completion.closed_reason();
         let moved = completion.victim_requeued();
         let progress_owner_resumable = completion.progress_owner_resumable();
-        let completion_disposition =
-            closed_reason.map_or("progress_owner_resumable", |reason| reason.as_str());
+        let completion_disposition = completion.disposition().as_str();
         self.write_scheduler_trace_event(serde_json::json!({
             "event": "scheduler_pressure_release_fence_completed",
             "episode_id": transaction.episode_id().get(),
             "handoff_generation": transaction.handoff_generation(),
+            "yield_kind": transaction.kind().as_str(),
             "victim_request_id": transaction.victim_request_id(),
             "progress_owner_id": transaction.progress_owner_id(),
             "release_transition_ordinal": release_ordinal.get(),
@@ -1356,6 +1378,10 @@ impl EngineInner {
                 (
                     "handoff_generation".to_string(),
                     serde_json::json!(transaction.handoff_generation()),
+                ),
+                (
+                    "yield_kind".to_string(),
+                    serde_json::json!(transaction.kind().as_str()),
                 ),
                 (
                     "release_transition_ordinal".to_string(),

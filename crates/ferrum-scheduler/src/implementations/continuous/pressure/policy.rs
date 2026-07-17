@@ -1,6 +1,6 @@
 use super::{
     LogicalWorkKind, ParticipantState, PressureEpisode, PressureEpisodeState,
-    PressureTransitionOrdinal,
+    PressureTransitionOrdinal, PressureYieldSelection,
 };
 use ferrum_types::RequestId;
 use std::collections::HashSet;
@@ -13,12 +13,12 @@ pub(super) trait PressureSelectionPolicy: fmt::Debug + Send + Sync {
         requested: &HashSet<RequestId>,
     ) -> Option<RequestId>;
 
-    fn select_yield_victim(
+    fn select_yield(
         &self,
         episode: &PressureEpisode,
         requested: &HashSet<RequestId>,
         owner_id: &RequestId,
-    ) -> Option<RequestId>;
+    ) -> Option<PressureYieldSelection>;
 }
 
 /// Keeps the oldest blocked frontier moving while minimizing avoidable
@@ -68,18 +68,18 @@ impl PressureSelectionPolicy for FairPressureSelectionPolicy {
             .map(|participant| participant.request_id.clone())
     }
 
-    fn select_yield_victim(
+    fn select_yield(
         &self,
         episode: &PressureEpisode,
         requested: &HashSet<RequestId>,
         owner_id: &RequestId,
-    ) -> Option<RequestId> {
-        episode
+    ) -> Option<PressureYieldSelection> {
+        let peer = episode
             .participants
             .values()
             .filter(|participant| {
                 participant.request_id != *owner_id
-                    && participant.releasable
+                    && participant.advances_wait_source
                     && !matches!(participant.state, ParticipantState::Yielded)
             })
             .min_by(|left, right| {
@@ -92,6 +92,24 @@ impl PressureSelectionPolicy for FairPressureSelectionPolicy {
                     .then_with(|| left.progress.cmp(&right.progress))
                     .then_with(|| left.request_id.0.cmp(&right.request_id.0))
             })
-            .map(|participant| participant.request_id.clone())
+            .map(|participant| participant.request_id.clone());
+        if let Some(peer) = peer {
+            return Some(PressureYieldSelection::PeerHandoff(peer));
+        }
+
+        episode
+            .participants
+            .get(owner_id)
+            .filter(|participant| {
+                participant.advances_wait_source
+                    && matches!(
+                        participant.work_kind,
+                        LogicalWorkKind::Decode | LogicalWorkKind::Recompute
+                    )
+                    && matches!(participant.state, ParticipantState::Blocked { .. })
+            })
+            .map(|participant| {
+                PressureYieldSelection::SelfRecompute(participant.request_id.clone())
+            })
     }
 }

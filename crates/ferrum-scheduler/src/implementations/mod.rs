@@ -7,11 +7,11 @@ pub mod priority;
 // Re-export implementations
 pub use continuous::{
     ContinuousBatchConfig, ContinuousBatchRequest, ContinuousBatchScheduler,
-    ExecutionCapacityAction, ExecutionCapacityReleaseSnapshot, ExecutorAdmissionProbeOutcome,
-    ExecutorAdmissionQueueObservation, LogicalWorkGeneration, PressureEpisodeId,
-    PressureEpisodeState, PressureHoldReleaseReason, PressureInvariantViolation,
+    ExecutionCapacityAction, ExecutionCapacityReleaseSnapshot, ExecutionCapacityYieldDisposition,
+    ExecutorAdmissionProbeOutcome, ExecutorAdmissionQueueObservation, LogicalWorkGeneration,
+    PressureEpisodeId, PressureEpisodeState, PressureHoldReleaseReason, PressureInvariantViolation,
     PressureInvariantViolationClass, PressureTransition, PressureTransitionKind,
-    PressureTransitionOrdinal, PressureYieldTransaction, RequestPhase,
+    PressureTransitionOrdinal, PressureYieldKind, PressureYieldTransaction, RequestPhase,
 };
 pub use fifo::FifoScheduler;
 pub use priority::PriorityScheduler;

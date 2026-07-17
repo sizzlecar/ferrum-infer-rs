@@ -18,7 +18,7 @@ use pressure::{
 pub use pressure::{
     LogicalWorkGeneration, PressureEpisodeId, PressureEpisodeState, PressureHoldReleaseReason,
     PressureInvariantViolation, PressureInvariantViolationClass, PressureTransition,
-    PressureTransitionKind, PressureTransitionOrdinal, PressureYieldTransaction,
+    PressureTransitionKind, PressureTransitionOrdinal, PressureYieldKind, PressureYieldTransaction,
 };
 
 use crate::vnext::{
@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use ferrum_interfaces::model_executor::ExecutorPrefillAdmissionReceipt;
 use ferrum_interfaces::scheduler::SchedulerMetrics;
 use ferrum_interfaces::vnext::{
-    AdmissionRejected, CapacityAvailabilityEpoch, CapacityWaitCondition,
+    AdmissionRejected, CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
 };
 use ferrum_types::{
     BatchId, FerrumError, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState,
@@ -114,19 +114,40 @@ pub enum ExecutionCapacityAction {
     },
 }
 
+/// Typed terminal disposition of one physical execution-capacity yield.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionCapacityYieldDisposition {
+    ProgressOwnerResumable,
+    SelfRecomputeQueued,
+    OwnerTerminal,
+    SourceRetargeted,
+}
+
+impl ExecutionCapacityYieldDisposition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProgressOwnerResumable => "progress_owner_resumable",
+            Self::SelfRecomputeQueued => "self_recompute_queued",
+            Self::OwnerTerminal => "owner_terminal",
+            Self::SourceRetargeted => "source_retargeted",
+        }
+    }
+}
+
 /// Terminal result of one physical execution-capacity yield transaction.
 ///
-/// A completed release can either make the selected progress owner runnable or
-/// close the episode because that owner became terminal or changed its exact
-/// wait source while the fence was in flight. The engine must only resubmit the
-/// owner in the former case.
+/// A completed release can make a peer progress owner runnable, queue the same
+/// logical frontier for recompute, or close because the owner became terminal
+/// or changed its exact wait source. The engine only resubmits a peer owner for
+/// `ProgressOwnerResumable`; self recompute progresses through normal waiting
+/// admission after the release fence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionCapacityYieldCompletion {
     victim_requeued: bool,
     release_transition_ordinal: PressureTransitionOrdinal,
     resumable_transition_ordinal: Option<PressureTransitionOrdinal>,
     closed_transition_ordinal: Option<PressureTransitionOrdinal>,
-    closed_reason: Option<PressureHoldReleaseReason>,
+    disposition: ExecutionCapacityYieldDisposition,
 }
 
 impl ExecutionCapacityYieldCompletion {
@@ -135,7 +156,10 @@ impl ExecutionCapacityYieldCompletion {
     }
 
     pub const fn progress_owner_resumable(&self) -> bool {
-        self.resumable_transition_ordinal.is_some()
+        matches!(
+            self.disposition,
+            ExecutionCapacityYieldDisposition::ProgressOwnerResumable
+        )
     }
 
     pub const fn release_transition_ordinal(&self) -> PressureTransitionOrdinal {
@@ -151,7 +175,20 @@ impl ExecutionCapacityYieldCompletion {
     }
 
     pub const fn closed_reason(&self) -> Option<PressureHoldReleaseReason> {
-        self.closed_reason
+        match self.disposition {
+            ExecutionCapacityYieldDisposition::OwnerTerminal => {
+                Some(PressureHoldReleaseReason::OwnerTerminal)
+            }
+            ExecutionCapacityYieldDisposition::SourceRetargeted => {
+                Some(PressureHoldReleaseReason::SourceRetargeted)
+            }
+            ExecutionCapacityYieldDisposition::ProgressOwnerResumable
+            | ExecutionCapacityYieldDisposition::SelfRecomputeQueued => None,
+        }
+    }
+
+    pub const fn disposition(&self) -> ExecutionCapacityYieldDisposition {
+        self.disposition
     }
 }
 
@@ -163,18 +200,34 @@ impl ExecutionCapacityYieldCompletion {
 /// being mistaken for proof that a request can actually release capacity.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecutionCapacityReleaseSnapshot {
-    releasable_request_ids: HashSet<RequestId>,
+    release_sources_by_request: HashMap<RequestId, Vec<CapacityAvailabilitySource>>,
 }
 
 impl ExecutionCapacityReleaseSnapshot {
-    pub fn new(releasable_request_ids: impl IntoIterator<Item = RequestId>) -> Self {
+    pub fn new(
+        capabilities: impl IntoIterator<Item = (RequestId, Vec<CapacityAvailabilitySource>)>,
+    ) -> Self {
+        let mut release_sources_by_request = HashMap::new();
+        for (request_id, mut sources) in capabilities {
+            sources.sort_unstable();
+            sources.dedup();
+            if !sources.is_empty() {
+                release_sources_by_request.insert(request_id, sources);
+            }
+        }
         Self {
-            releasable_request_ids: releasable_request_ids.into_iter().collect(),
+            release_sources_by_request,
         }
     }
 
-    fn can_release(&self, request_id: &RequestId) -> bool {
-        self.releasable_request_ids.contains(request_id)
+    fn can_advance(&self, request_id: &RequestId, condition: &CapacityWaitCondition) -> bool {
+        let Some(release_sources) = self.release_sources_by_request.get(request_id) else {
+            return false;
+        };
+        condition
+            .observed()
+            .iter()
+            .any(|observed| release_sources.binary_search(&observed.source()).is_ok())
     }
 }
 
@@ -1390,7 +1443,8 @@ impl ContinuousBatchScheduler {
             return Ok(ExecutionCapacityAction::Deferred { count: 0 });
         }
 
-        let candidates = self.execution_capacity_candidates(release_snapshot);
+        let candidates =
+            self.execution_capacity_candidates(release_snapshot, deferral.wait_condition());
         let decision = {
             let mut coordinator = self.pressure_coordinator.lock();
             let decision = coordinator
@@ -1433,6 +1487,7 @@ impl ContinuousBatchScheduler {
     fn execution_capacity_candidates(
         &self,
         release_snapshot: &ExecutionCapacityReleaseSnapshot,
+        condition: &CapacityWaitCondition,
     ) -> Vec<PressureCandidate> {
         let mut candidates = Vec::new();
         {
@@ -1444,7 +1499,8 @@ impl ContinuousBatchScheduler {
                     priority: request.inner.request.priority,
                     progress: request.logical_work_frontier.progress_generation(),
                     recompute_cost: request.logical_work_frontier.recompute_cost(),
-                    releasable: release_snapshot.can_release(&request.inner.request.id),
+                    advances_wait_source: release_snapshot
+                        .can_advance(&request.inner.request.id, condition),
                     blocked_on: request
                         .execution_capacity_deferral
                         .as_ref()
@@ -1461,7 +1517,8 @@ impl ContinuousBatchScheduler {
                     priority: request.inner.request.priority,
                     progress: request.logical_work_frontier.progress_generation(),
                     recompute_cost: request.logical_work_frontier.recompute_cost(),
-                    releasable: release_snapshot.can_release(&request.inner.request.id),
+                    advances_wait_source: release_snapshot
+                        .can_advance(&request.inner.request.id, condition),
                     blocked_on: request
                         .execution_capacity_deferral
                         .as_ref()
@@ -1478,7 +1535,7 @@ impl ContinuousBatchScheduler {
                     priority: request.inner.request.priority,
                     progress: request.logical_work_frontier.progress_generation(),
                     recompute_cost: request.logical_work_frontier.recompute_cost(),
-                    releasable: false,
+                    advances_wait_source: false,
                     blocked_on: request
                         .execution_capacity_deferral
                         .as_ref()
@@ -1767,10 +1824,15 @@ impl ContinuousBatchScheduler {
 
         let (release_ordinal, disposition) = {
             let mut coordinator = self.pressure_coordinator.lock();
+            if !requeued && transaction.kind() == PressureYieldKind::SelfRecompute {
+                let _ = coordinator
+                    .record_terminal(request_id)
+                    .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+            }
             let completion = coordinator
                 .complete_release_fence(transaction, progress_owner_wait_condition.as_ref())
                 .map_err(|error| FerrumError::scheduler(error.to_string()))?;
-            if !requeued {
+            if !requeued && transaction.kind() == PressureYieldKind::PeerHandoff {
                 let _ = coordinator
                     .record_terminal(request_id)
                     .map_err(|error| FerrumError::scheduler(error.to_string()))?;
@@ -1779,11 +1841,35 @@ impl ContinuousBatchScheduler {
                 .store(coordinator.has_records(), Ordering::Release);
             completion
         };
-        let (resumable_transition_ordinal, closed_transition_ordinal, closed_reason) =
+        let (resumable_transition_ordinal, closed_transition_ordinal, disposition) =
             match disposition {
-                PressureReleaseFenceDisposition::Resumable(ordinal) => (Some(ordinal), None, None),
+                PressureReleaseFenceDisposition::Resumable(ordinal) => (
+                    Some(ordinal),
+                    None,
+                    ExecutionCapacityYieldDisposition::ProgressOwnerResumable,
+                ),
+                PressureReleaseFenceDisposition::SelfRecomputeQueued(ordinal) => (
+                    None,
+                    Some(ordinal),
+                    ExecutionCapacityYieldDisposition::SelfRecomputeQueued,
+                ),
                 PressureReleaseFenceDisposition::Closed { ordinal, reason } => {
-                    (None, Some(ordinal), Some(reason))
+                    let disposition = match reason {
+                        PressureHoldReleaseReason::OwnerTerminal => {
+                            ExecutionCapacityYieldDisposition::OwnerTerminal
+                        }
+                        PressureHoldReleaseReason::SourceRetargeted => {
+                            ExecutionCapacityYieldDisposition::SourceRetargeted
+                        }
+                        PressureHoldReleaseReason::OwnerAdvanced
+                        | PressureHoldReleaseReason::RoleTransferred => {
+                            return Err(FerrumError::scheduler(format!(
+                                "release fence closed with non-terminal hold reason {}",
+                                reason.as_str()
+                            )));
+                        }
+                    };
+                    (None, Some(ordinal), disposition)
                 }
             };
         Ok(ExecutionCapacityYieldCompletion {
@@ -1791,7 +1877,7 @@ impl ContinuousBatchScheduler {
             release_transition_ordinal: release_ordinal,
             resumable_transition_ordinal,
             closed_transition_ordinal,
-            closed_reason,
+            disposition,
         })
     }
 
@@ -3383,8 +3469,18 @@ mod tests {
 
     fn execution_capacity_release_snapshot<'a>(
         request_ids: impl IntoIterator<Item = &'a RequestId>,
+        condition: &CapacityWaitCondition,
     ) -> ExecutionCapacityReleaseSnapshot {
-        ExecutionCapacityReleaseSnapshot::new(request_ids.into_iter().cloned())
+        let sources = condition
+            .observed()
+            .iter()
+            .map(|observed| observed.source())
+            .collect::<Vec<_>>();
+        ExecutionCapacityReleaseSnapshot::new(
+            request_ids
+                .into_iter()
+                .map(|request_id| (request_id.clone(), sources.clone())),
+        )
     }
 
     #[tokio::test]
@@ -3620,7 +3716,7 @@ mod tests {
                 .defer_decode_for_execution_capacity(
                     std::slice::from_ref(&blocked_id),
                     deferral.clone(),
-                    &execution_capacity_release_snapshot([&blocked_id, &runnable_id]),
+                    &execution_capacity_release_snapshot([&blocked_id, &runnable_id], &condition,),
                 )
                 .unwrap(),
             ExecutionCapacityAction::Deferred { count: 1 }
@@ -3650,7 +3746,7 @@ mod tests {
             .defer_decode_for_execution_capacity(
                 std::slice::from_ref(&runnable_id),
                 deferral.clone(),
-                &execution_capacity_release_snapshot([&blocked_id]),
+                &ExecutionCapacityReleaseSnapshot::default(),
             )
             .unwrap();
         assert!(matches!(
@@ -3664,7 +3760,7 @@ mod tests {
             .defer_decode_for_execution_capacity(
                 std::slice::from_ref(&runnable_id),
                 deferral,
-                &execution_capacity_release_snapshot([&blocked_id, &runnable_id]),
+                &execution_capacity_release_snapshot([&blocked_id, &runnable_id], &condition),
             )
             .unwrap();
         let ExecutionCapacityAction::YieldPlanned { transaction } = action else {
@@ -3774,6 +3870,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disjoint_release_footprints_self_recompute_without_stranded_episode() {
+        use ferrum_interfaces::vnext::{
+            CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityDomainId,
+            CapacityWaitCondition, DeferredAction,
+        };
+        use std::num::NonZeroU64;
+
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let first = create_test_request(Priority::Normal);
+        let first_id = first.id.clone();
+        let second = create_test_request(Priority::Normal);
+        let second_id = second.id.clone();
+        scheduler.submit(first).await.unwrap();
+        scheduler.submit(second).await.unwrap();
+
+        let domain_two = CapacityAvailabilitySource::Domain(CapacityDomainId::new(2).unwrap());
+        let domain_four = CapacityAvailabilitySource::Domain(CapacityDomainId::new(4).unwrap());
+        let plan_budget = CapacityAvailabilitySource::PlanDeviceBudget;
+        let availability = [
+            CapacityAvailabilityEpoch::new(domain_two, 176).unwrap(),
+            CapacityAvailabilityEpoch::new(domain_four, 136).unwrap(),
+            CapacityAvailabilityEpoch::new(plan_budget, 1).unwrap(),
+        ];
+        let wake = AdmissionWakeEpochs::new(NonZeroU64::new(41).unwrap(), 0, 0, 0);
+        scheduler
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(2),
+                AdmissionWakeSnapshot::new(wake, &availability),
+                &mut |request| {
+                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                        request_id: request.id.clone(),
+                    })
+                },
+            )
+            .unwrap()
+            .unwrap();
+        scheduler.mark_prefill_complete(&first_id, 1);
+        scheduler.mark_prefill_complete(&second_id, 1);
+
+        let wait_for = |source, epoch| {
+            CapacityWaitCondition::from_observation(
+                41,
+                vec![
+                    CapacityAvailabilityEpoch::new(source, epoch).unwrap(),
+                    CapacityAvailabilityEpoch::new(plan_budget, 1).unwrap(),
+                ],
+            )
+            .unwrap()
+        };
+        let first_wait = wait_for(domain_four, 136);
+        let second_wait = wait_for(domain_two, 176);
+        let release_snapshot = ExecutionCapacityReleaseSnapshot::new([
+            (first_id.clone(), vec![domain_four]),
+            (second_id.clone(), vec![domain_two]),
+        ]);
+
+        let first_action = scheduler
+            .defer_decode_for_execution_capacity(
+                std::slice::from_ref(&first_id),
+                AdmissionDeferral::new(DeferredAction::WaitForRelease, wake, first_wait),
+                &release_snapshot,
+            )
+            .unwrap();
+        let ExecutionCapacityAction::YieldPlanned {
+            transaction: first_transaction,
+        } = first_action
+        else {
+            panic!("a disjoint runnable footprint must not suppress exact-source self recompute");
+        };
+        assert_eq!(first_transaction.kind(), PressureYieldKind::SelfRecompute);
+        assert_eq!(first_transaction.victim_request_id(), &first_id);
+        assert_eq!(
+            scheduler.trace_snapshot().pressure_pending_release_fences,
+            1
+        );
+        scheduler
+            .arm_execution_capacity_yield(&first_transaction)
+            .unwrap();
+        assert!(scheduler
+            .complete_execution_capacity_yield(&first_transaction, 1, None)
+            .unwrap()
+            .victim_requeued());
+
+        let second_action = scheduler
+            .defer_decode_for_execution_capacity(
+                std::slice::from_ref(&second_id),
+                AdmissionDeferral::new(DeferredAction::WaitForRelease, wake, second_wait),
+                &release_snapshot,
+            )
+            .unwrap();
+        let ExecutionCapacityAction::YieldPlanned {
+            transaction: second_transaction,
+        } = second_action
+        else {
+            panic!("the remaining exact-source owner must self recompute");
+        };
+        assert_eq!(second_transaction.kind(), PressureYieldKind::SelfRecompute);
+        assert_eq!(second_transaction.victim_request_id(), &second_id);
+        scheduler
+            .arm_execution_capacity_yield(&second_transaction)
+            .unwrap();
+        assert!(scheduler
+            .complete_execution_capacity_yield(&second_transaction, 1, None)
+            .unwrap()
+            .victim_requeued());
+
+        let snapshot = scheduler.trace_snapshot();
+        assert_eq!(snapshot.pressure_active_episodes, 0);
+        assert_eq!(snapshot.pressure_pending_release_fences, 0);
+        assert_eq!(snapshot.waiting_queue_len, 2);
+        assert_eq!(snapshot.execution_capacity_blocked_decode_len, 0);
+    }
+
+    #[tokio::test]
     async fn release_fence_rechecks_retargeted_owner_condition_before_resume() {
         use ferrum_interfaces::vnext::{
             CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityDomainId,
@@ -3845,7 +4055,7 @@ mod tests {
                 .defer_decode_for_execution_capacity(
                     std::slice::from_ref(&owner_id),
                     original_deferral.clone(),
-                    &execution_capacity_release_snapshot([&owner_id, &victim_id]),
+                    &execution_capacity_release_snapshot([&owner_id, &victim_id], &original_wait,),
                 )
                 .unwrap(),
             ExecutionCapacityAction::Deferred { count: 1 }
@@ -3854,7 +4064,7 @@ mod tests {
             .defer_decode_for_execution_capacity(
                 std::slice::from_ref(&victim_id),
                 original_deferral,
-                &execution_capacity_release_snapshot([&owner_id, &victim_id]),
+                &execution_capacity_release_snapshot([&owner_id, &victim_id], &original_wait),
             )
             .unwrap();
         let ExecutionCapacityAction::YieldPlanned { transaction } = action else {
@@ -3876,7 +4086,10 @@ mod tests {
                 .defer_decode_for_execution_capacity(
                     std::slice::from_ref(&owner_id),
                     retargeted_deferral,
-                    &execution_capacity_release_snapshot([&owner_id, &victim_id]),
+                    &execution_capacity_release_snapshot(
+                        [&owner_id, &victim_id],
+                        &retargeted_wait,
+                    ),
                 )
                 .unwrap(),
             ExecutionCapacityAction::Deferred { count: 1 }
@@ -3940,13 +4153,14 @@ mod tests {
         scheduler.mark_prefill_complete(&victim_id, 1);
         scheduler.mark_prefill_complete(&owner_id, 1);
         let condition = CapacityWaitCondition::from_observation(41, availability.to_vec()).unwrap();
-        let deferral = AdmissionDeferral::new(DeferredAction::WaitForRelease, wake, condition);
+        let deferral =
+            AdmissionDeferral::new(DeferredAction::WaitForRelease, wake, condition.clone());
         assert_eq!(
             scheduler
                 .defer_decode_for_execution_capacity(
                     std::slice::from_ref(&victim_id),
                     deferral.clone(),
-                    &execution_capacity_release_snapshot([&victim_id, &owner_id]),
+                    &execution_capacity_release_snapshot([&victim_id, &owner_id], &condition,),
                 )
                 .unwrap(),
             ExecutionCapacityAction::Deferred { count: 1 }
@@ -3955,7 +4169,7 @@ mod tests {
             .defer_decode_for_execution_capacity(
                 std::slice::from_ref(&owner_id),
                 deferral,
-                &execution_capacity_release_snapshot([&victim_id, &owner_id]),
+                &execution_capacity_release_snapshot([&victim_id, &owner_id], &condition),
             )
             .unwrap();
         let ExecutionCapacityAction::YieldPlanned { transaction } = action else {
@@ -4005,7 +4219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lone_active_decode_capacity_deferral_waits_for_its_exact_source() {
+    async fn lone_active_decode_capacity_deferral_self_recomputes_to_release_its_source() {
         use ferrum_interfaces::vnext::{
             CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
             DeferredAction,
@@ -4038,38 +4252,40 @@ mod tests {
             CapacityWaitCondition::from_observation(37, availability0.to_vec()).unwrap();
         let deferral =
             AdmissionDeferral::new(DeferredAction::WaitForRelease, wake0, condition.clone());
-        assert_eq!(
-            scheduler
-                .defer_decode_for_execution_capacity(
-                    std::slice::from_ref(&request_id),
-                    deferral,
-                    &execution_capacity_release_snapshot([&request_id]),
-                )
-                .unwrap(),
-            ExecutionCapacityAction::Deferred { count: 1 }
-        );
-        assert_eq!(
-            scheduler.passive_capacity_wait_condition().unwrap(),
-            Some(condition)
-        );
-
-        let mut observations = Vec::new();
-        assert!(scheduler
-            .next_batch_with_dynamic_admission_observed(
-                BatchHint::simple(1),
-                AdmissionWakeSnapshot::new(wake0, &availability0),
-                &mut |_| panic!("unchanged decode wait must not probe admission"),
-                &mut |observation| observations.push(observation),
+        let action = scheduler
+            .defer_decode_for_execution_capacity(
+                std::slice::from_ref(&request_id),
+                deferral,
+                &execution_capacity_release_snapshot([&request_id], &condition),
             )
-            .unwrap()
-            .is_none());
-        assert!(matches!(
-            observations.as_slice(),
-            [ExecutorAdmissionQueueObservation::DecodeSkippedUnchanged {
-                request_id: observed_id,
-                ..
-            }] if observed_id == &request_id
-        ));
+            .unwrap();
+        let ExecutionCapacityAction::YieldPlanned { transaction } = action else {
+            panic!("a lone releasable decode must plan a typed self recompute");
+        };
+        assert_eq!(transaction.kind(), PressureYieldKind::SelfRecompute);
+        assert_eq!(transaction.victim_request_id(), &request_id);
+        assert_eq!(transaction.progress_owner_id(), &request_id);
+
+        scheduler
+            .arm_execution_capacity_yield(&transaction)
+            .unwrap();
+        let completion = scheduler
+            .complete_execution_capacity_yield(&transaction, 1, None)
+            .unwrap();
+        assert!(completion.victim_requeued());
+        assert!(!completion.progress_owner_resumable());
+        assert_eq!(
+            completion.disposition(),
+            ExecutionCapacityYieldDisposition::SelfRecomputeQueued
+        );
+        assert!(completion.closed_transition_ordinal().is_some());
+        assert_eq!(completion.closed_reason(), None);
+
+        let snapshot = scheduler.trace_snapshot();
+        assert_eq!(snapshot.decode_queue_len, 0);
+        assert_eq!(snapshot.waiting_queue_len, 1);
+        assert_eq!(snapshot.pressure_active_episodes, 0);
+        assert_eq!(snapshot.pressure_pending_release_fences, 0);
     }
 
     #[tokio::test]
@@ -4117,7 +4333,7 @@ mod tests {
                 .defer_prefill_for_execution_capacity(
                     &request_id,
                     deferral,
-                    &execution_capacity_release_snapshot([&request_id]),
+                    &execution_capacity_release_snapshot([&request_id], &condition),
                 )
                 .unwrap(),
             ExecutionCapacityAction::Deferred { count: 1 }

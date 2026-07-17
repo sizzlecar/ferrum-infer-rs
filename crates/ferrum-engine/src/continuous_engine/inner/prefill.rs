@@ -421,7 +421,7 @@ impl EngineInner {
                     ),
                     deferral.wait_condition().clone(),
                 );
-                let release_snapshot = self.execution_capacity_release_snapshot();
+                let release_snapshot = self.execution_capacity_release_snapshot()?;
                 match self.scheduler.defer_prefill_for_execution_capacity(
                     request_id,
                     scheduler_deferral,
@@ -441,6 +441,7 @@ impl EngineInner {
                             "request_id": request_id,
                             "episode_id": transaction.episode_id().get(),
                             "handoff_generation": transaction.handoff_generation(),
+                            "yield_kind": transaction.kind().as_str(),
                             "planned_transition_ordinal": transaction.planned_ordinal().get(),
                             "victim_request_id": transaction.victim_request_id(),
                             "progress_owner_id": transaction.progress_owner_id(),
