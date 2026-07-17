@@ -17,12 +17,13 @@ import runtime_vnext_s1_cuda_capacity as common
 PASS_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY PASS"
 COLLECT_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY COLLECTED"
 FAIL_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY FAIL"
-CALIBRATION_TOKEN_BUDGET = 1
+CALIBRATION_TOKEN_BUDGET = 3
 TARGET_TOKEN_BUDGET = 1024
 MAX_NUM_SEQS = 3
 MAX_MODEL_LEN = 512
 PREFILL_FIRST_UNTIL_ACTIVE = 3
-STREAM_MAX_TOKENS = 128
+CALIBRATION_MAX_TOKENS = {"A": 128, "B": 1, "C": 16}
+TARGET_MAX_TOKENS = {"A": 128, "B": 128, "C": 16}
 MAX_DECODE_CAPACITY_EVENTS = 2048
 ALLOWED_EXECUTION_STAGES = {
     "sequence_extension",
@@ -35,7 +36,8 @@ SERVER_POLICY = {
     "prefill_first_until_active": PREFILL_FIRST_UNTIL_ACTIVE,
     "calibration_max_num_batched_tokens": CALIBRATION_TOKEN_BUDGET,
     "target_max_num_batched_tokens": TARGET_TOKEN_BUDGET,
-    "stream_max_tokens": STREAM_MAX_TOKENS,
+    "calibration_max_tokens": CALIBRATION_MAX_TOKENS,
+    "target_max_tokens": TARGET_MAX_TOKENS,
 }
 STOP_POLICY = {
     "no_progress_timeout_seconds": common.MAX_PRESSURE_NO_PROGRESS_SECONDS,
@@ -281,22 +283,30 @@ def start_stream_group(
     *,
     out_dir: Path,
     prefix: str,
+    max_tokens_by_slot: dict[str, int],
     timeout: float,
 ) -> dict[str, common.StreamTask]:
+    require(
+        set(max_tokens_by_slot) == {"A", "B", "C"},
+        "stream token policy must contain A/B/C",
+    )
     tasks = {
         slot: common.StreamTask(
             port=server.port,
             model=server.model_id,
             role=f"{prefix}-{slot}",
             workload_slot=slot,
-            max_tokens=STREAM_MAX_TOKENS,
+            max_tokens=max_tokens_by_slot[slot],
             out_dir=out_dir,
             timeout=timeout,
         )
         for slot in ("A", "B", "C")
     }
-    for task in tasks.values():
-        task.start()
+    tasks["A"].start()
+    tasks["A"].wait_first(timeout)
+    require(tasks["A"].is_alive(), f"{prefix}-A completed before B/C started")
+    tasks["B"].start()
+    tasks["C"].start()
     return tasks
 
 
@@ -460,6 +470,7 @@ def collect(args: argparse.Namespace) -> int:
             calibration,
             out_dir=out / "calibration" / "clients",
             prefix="calibration",
+            max_tokens_by_slot=CALIBRATION_MAX_TOKENS,
             timeout=args.request_timeout,
         )
         calibration_clients, calibration_monitor = wait_stream_group(
@@ -494,6 +505,7 @@ def collect(args: argparse.Namespace) -> int:
             target,
             out_dir=out / "target" / "clients",
             prefix="target",
+            max_tokens_by_slot=TARGET_MAX_TOKENS,
             timeout=args.request_timeout,
         )
         target_clients, target_monitor = wait_stream_group(
@@ -575,10 +587,15 @@ def validate_stream_group(
     root: Path,
     phase: str,
     results: dict[str, Any],
+    max_tokens_by_slot: dict[str, int],
 ) -> tuple[int, int, dict[str, float]]:
     require(isinstance(results, dict) and set(results) == {"A", "B", "C"}, f"{phase}: invalid client set")
     for role, result in results.items():
         require(isinstance(result, dict), f"{phase}-{role}: result is invalid")
+        require(
+            result.get("max_tokens") == max_tokens_by_slot[role],
+            f"{phase}-{role}: max_tokens differs from the canonical workload",
+        )
         common.validate_stream(result, f"{phase}-{role}")
     started = min(result["started_wall_ns"] for result in results.values())
     finished = max(result["finished_wall_ns"] for result in results.values())
@@ -657,10 +674,10 @@ def validate(root: Path, out: Path) -> int:
     )
 
     calibration_started, calibration_finished, calibration_silence = validate_stream_group(
-        root, "calibration", calibration.get("clients")
+        root, "calibration", calibration.get("clients"), CALIBRATION_MAX_TOKENS
     )
     target_started, target_finished, target_silence = validate_stream_group(
-        root, "target", target.get("clients")
+        root, "target", target.get("clients"), TARGET_MAX_TOKENS
     )
     for slot in ("A", "B", "C"):
         common.validate_replayed_workload(
@@ -760,6 +777,16 @@ def validate(root: Path, out: Path) -> int:
 
 
 def self_test() -> int:
+    require(
+        CALIBRATION_TOKEN_BUDGET >= MAX_NUM_SEQS,
+        "calibration token budget must be a valid product configuration",
+    )
+    require(
+        CALIBRATION_MAX_TOKENS["A"] == TARGET_MAX_TOKENS["A"]
+        and CALIBRATION_MAX_TOKENS["B"] < TARGET_MAX_TOKENS["B"]
+        and CALIBRATION_MAX_TOKENS["C"] == TARGET_MAX_TOKENS["C"],
+        "calibration must replace only B long-decode demand with a short request",
+    )
     wait_condition = {
         "coordinator_id": 7,
         "observed": [{"source": {"domain": 5}, "epoch": 3}],
