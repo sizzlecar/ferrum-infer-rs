@@ -225,7 +225,10 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
     shape = row.get("shape")
     require(isinstance(shape, dict), f"{label}: shape is missing")
     decision = shape.get("decision")
-    require(decision in {"split_cohort", "wait_for_release"}, f"{label}: decision is invalid")
+    require(
+        decision in {"split_cohort", "wait_for_release", "recompute_progress_victim"},
+        f"{label}: decision is invalid",
+    )
     width = shape.get("attempted_decode_width")
     require(isinstance(width, int) and width > 0, f"{label}: attempted width is invalid")
     stage = shape.get("execution_stage")
@@ -233,12 +236,26 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
     require(shape.get("decode_submit_observed") is False, f"{label}: decode submit preceded defer")
     request_ids = event_request_ids(row, label)
     require(len(request_ids) == width, f"{label}: attempted width/request count mismatch")
+    attributes = row.get("attributes", {})
+    victim_request_id = attributes.get("victim_request_id")
     if decision == "split_cohort":
         require(width >= 2, f"{label}: split cohort is not wide")
+        require(victim_request_id is None, f"{label}: split cohort named a victim")
+    elif decision == "recompute_progress_victim":
+        require(width == 1, f"{label}: progress recompute cohort is not exact")
+        require(
+            isinstance(victim_request_id, str) and victim_request_id,
+            f"{label}: progress recompute victim is missing",
+        )
+        require(
+            victim_request_id not in request_ids,
+            f"{label}: progress owner cannot be its own recompute victim",
+        )
     else:
         require(width == 1, f"{label}: a non-exact cohort was parked")
+        require(victim_request_id is None, f"{label}: parked decode named a victim")
 
-    evidence = row.get("attributes", {}).get("capacity_evidence")
+    evidence = attributes.get("capacity_evidence")
     require(isinstance(evidence, dict), f"{label}: capacity evidence is missing")
     observed = common.validate_admission_epochs(evidence.get("observed"), label)
     wait_condition = common.validate_capacity_wait_condition(
@@ -246,7 +263,7 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
         coordinator_id=observed["coordinator_id"],
         label=label,
     )
-    scheduler_snapshot = row.get("attributes", {}).get("scheduler_snapshot")
+    scheduler_snapshot = attributes.get("scheduler_snapshot")
     require(isinstance(scheduler_snapshot, dict), f"{label}: scheduler snapshot is missing")
     return {
         "ts_unix_nanos": common.event_wall_ns(row),
@@ -254,6 +271,7 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
         "width": width,
         "stage": stage,
         "request_ids": request_ids,
+        "victim_request_id": victim_request_id,
         "observed": observed,
         "wait_condition": wait_condition,
     }
@@ -340,7 +358,11 @@ def validate_decode_trace(
     ]
     splits = [event for event in deferrals if event["decision"] == "split_cohort"]
     parks = [event for event in deferrals if event["decision"] == "wait_for_release"]
+    recomputes = [
+        event for event in deferrals if event["decision"] == "recompute_progress_victim"
+    ]
     require(splits, "target never adaptively split a capacity-blocked decode cohort")
+    require(recomputes, "target never selected a typed decode progress victim")
 
     skip_rows = [row for row in window if row.get("phase") == "vnext.decode_capacity_skipped_unchanged"]
     resume_rows = [row for row in window if row.get("phase") == "vnext.decode_capacity_resumed"]
@@ -358,17 +380,51 @@ def validate_decode_trace(
     ]
     for park in parks:
         request_id = park["request_ids"][0]
-        matching = [
+        matching_resume = [
             resume
             for resume in resumes
             if resume["ts_unix_nanos"] > park["ts_unix_nanos"]
             and common.request_identity_matches(resume["request_id"], request_id)
             and resume["exact_source_changed"]
         ]
-        require(matching, f"parked decode {request_id} did not resume after its exact source changed")
+        matching_recompute = [
+            recompute
+            for recompute in recomputes
+            if recompute["ts_unix_nanos"] > park["ts_unix_nanos"]
+            and common.request_identity_matches(
+                recompute["victim_request_id"], request_id
+            )
+        ]
+        require(
+            matching_resume or matching_recompute,
+            f"parked decode {request_id} neither resumed after an exact-source change nor became a progress victim",
+        )
+    for recompute in recomputes:
+        victim_request_id = recompute["victim_request_id"]
+        require(
+            any(
+                park["ts_unix_nanos"] < recompute["ts_unix_nanos"]
+                and common.request_identity_matches(
+                    park["request_ids"][0], victim_request_id
+                )
+                for park in parks
+            ),
+            f"decode progress victim {victim_request_id} was not previously parked",
+        )
 
     deferred_request_ids = sorted(
-        {request_id for event in deferrals for request_id in event["request_ids"]}
+        {
+            request_id
+            for event in deferrals
+            for request_id in [
+                *event["request_ids"],
+                *(
+                    [event["victim_request_id"]]
+                    if event["victim_request_id"] is not None
+                    else []
+                ),
+            ]
+        }
     )
     completed_rows = [
         row for row in rows if str(row.get("phase", "")).endswith("request_completed")
@@ -382,11 +438,15 @@ def validate_decode_trace(
         "deferral_events": len(deferrals),
         "split_events": len(splits),
         "park_events": len(parks),
+        "recompute_events": len(recomputes),
         "skip_events": len(skips),
         "resume_events": len(resumes),
         "stages": sorted({event["stage"] for event in deferrals}),
         "max_attempted_decode_width": max(event["width"] for event in deferrals),
         "deferred_request_ids": deferred_request_ids,
+        "recompute_victim_request_ids": sorted(
+            {event["victim_request_id"] for event in recomputes}
+        ),
     }
 
 
@@ -1067,7 +1127,20 @@ def self_test() -> int:
         "wait_condition": wait_condition,
     }
 
-    def deferral(ts: int, decision: str, request_ids: list[str]) -> dict[str, Any]:
+    def deferral(
+        ts: int,
+        decision: str,
+        request_ids: list[str],
+        *,
+        victim_request_id: str | None = None,
+    ) -> dict[str, Any]:
+        attributes = {
+            "request_ids": request_ids,
+            "capacity_evidence": capacity_evidence,
+            "scheduler_snapshot": {},
+        }
+        if victim_request_id is not None:
+            attributes["victim_request_id"] = victim_request_id
         return {
             "ts_unix_nanos": ts,
             "phase": "vnext.decode_capacity_deferred",
@@ -1079,11 +1152,7 @@ def self_test() -> int:
                 "execution_stage": "step_admission",
                 "decode_submit_observed": False,
             },
-            "attributes": {
-                "request_ids": request_ids,
-                "capacity_evidence": capacity_evidence,
-                "scheduler_snapshot": {},
-            },
+            "attributes": attributes,
         }
 
     rows = [
@@ -1133,30 +1202,49 @@ def self_test() -> int:
                 }
             },
         },
+        deferral(135, "wait_for_release", ["A"]),
+        deferral(
+            140,
+            "recompute_progress_victim",
+            ["C"],
+            victim_request_id="A",
+        ),
         *[
             {
-                "ts_unix_nanos": 140 + index,
+                "ts_unix_nanos": 150 + index,
                 "phase": "vnext.request_completed",
                 "request_id": request_id,
             }
             for index, request_id in enumerate(("A", "B", "C"))
         ],
     ]
-    summary = validate_decode_trace(rows, started_wall_ns=90, finished_wall_ns=150)
+    summary = validate_decode_trace(rows, started_wall_ns=90, finished_wall_ns=160)
     require(summary["split_events"] == 1, "self-test lost split evidence")
-    require(summary["park_events"] == 1, "self-test lost park evidence")
+    require(summary["park_events"] == 2, "self-test lost park evidence")
     require(summary["resume_events"] == 1, "self-test lost resume evidence")
+    require(summary["recompute_events"] == 1, "self-test lost recompute evidence")
+    require(
+        summary["recompute_victim_request_ids"] == ["A"],
+        "self-test lost progress-victim identity",
+    )
 
     unchanged_resume = json.loads(json.dumps(rows))
     unchanged_resume[3]["attributes"]["deferral_evidence"]["current_wait_sources"][0]["epoch"] = 3
     try:
-        validate_decode_trace(unchanged_resume, started_wall_ns=90, finished_wall_ns=150)
+        validate_decode_trace(unchanged_resume, started_wall_ns=90, finished_wall_ns=160)
         raise AssertionError("unchanged exact source unexpectedly resumed")
     except common.CapacityGateError:
         pass
     try:
-        validate_decode_trace(rows[1:], started_wall_ns=90, finished_wall_ns=150)
+        validate_decode_trace(rows[1:], started_wall_ns=90, finished_wall_ns=160)
         raise AssertionError("trace without adaptive split unexpectedly passed")
+    except common.CapacityGateError:
+        pass
+    missing_victim = json.loads(json.dumps(rows))
+    del missing_victim[5]["attributes"]["victim_request_id"]
+    try:
+        validate_decode_trace(missing_victim, started_wall_ns=90, finished_wall_ns=160)
+        raise AssertionError("progress recompute without a victim unexpectedly passed")
     except common.CapacityGateError:
         pass
     print("FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY SELFTEST PASS")

@@ -740,11 +740,32 @@ impl EngineInner {
         request_ids: &[RequestId],
         deferral: &ExecutorExecutionCapacityDeferral,
         decision: &'static str,
+        victim_request_id: Option<&RequestId>,
     ) {
         let Some(request_id) = request_ids.first() else {
             return;
         };
         let observed = deferral.observed();
+        let mut attributes = BTreeMap::from([
+            ("request_ids".to_string(), serde_json::json!(request_ids)),
+            (
+                "capacity_evidence".to_string(),
+                serde_json::json!({
+                    "observed": {
+                        "coordinator_id": observed.coordinator_id,
+                        "release_epoch": observed.release_epoch,
+                        "capacity_epoch": observed.capacity_epoch,
+                    },
+                    "wait_condition": deferral.wait_condition(),
+                }),
+            ),
+        ]);
+        if let Some(victim_request_id) = victim_request_id {
+            attributes.insert(
+                "victim_request_id".to_string(),
+                serde_json::json!(victim_request_id),
+            );
+        }
         self.write_executor_scheduler_profile_event(
             request_id,
             "vnext.decode_capacity_deferred",
@@ -766,20 +787,7 @@ impl EngineInner {
                     serde_json::json!(false),
                 ),
             ]),
-            BTreeMap::from([
-                ("request_ids".to_string(), serde_json::json!(request_ids)),
-                (
-                    "capacity_evidence".to_string(),
-                    serde_json::json!({
-                        "observed": {
-                            "coordinator_id": observed.coordinator_id,
-                            "release_epoch": observed.release_epoch,
-                            "capacity_epoch": observed.capacity_epoch,
-                        },
-                        "wait_condition": deferral.wait_condition(),
-                    }),
-                ),
-            ]),
+            attributes,
             None,
         );
     }
