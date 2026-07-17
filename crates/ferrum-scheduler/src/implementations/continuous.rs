@@ -21,7 +21,7 @@ use crate::{
 use async_trait::async_trait;
 use ferrum_interfaces::model_executor::ExecutorPrefillAdmissionReceipt;
 use ferrum_interfaces::scheduler::SchedulerMetrics;
-use ferrum_interfaces::vnext::AdmissionRejected;
+use ferrum_interfaces::vnext::{AdmissionRejected, CapacityAvailabilityEpoch};
 use ferrum_types::{
     BatchId, FerrumError, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState,
     Result, SchedulerConfig, PROMPT_TOKENS_METADATA_KEY,
@@ -179,11 +179,13 @@ pub enum ExecutorAdmissionQueueObservation {
         request_id: RequestId,
         deferral: AdmissionDeferral,
         current: AdmissionWakeEpochs,
+        current_wait_sources: Vec<CapacityAvailabilityEpoch>,
     },
     DecodeResumed {
         request_id: RequestId,
         deferral: AdmissionDeferral,
         current: AdmissionWakeEpochs,
+        current_wait_sources: Vec<CapacityAvailabilityEpoch>,
         exact_source_changed: bool,
         policy_epoch_changed: bool,
     },
@@ -221,6 +223,16 @@ impl<'a> WaitingAdmissionMode<'a> {
         {
             observer(observation);
         }
+    }
+
+    fn observes(&self) -> bool {
+        matches!(
+            self,
+            Self::Dynamic {
+                observer: Some(_),
+                ..
+            }
+        )
     }
 }
 
@@ -1764,23 +1776,43 @@ impl ContinuousBatchScheduler {
                     .changed_since(wake.availability())
                     .map_err(|error| FerrumError::scheduler(error.to_string()))?;
                 let policy_epoch_changed = current.policy_epoch() != observed.policy_epoch();
+                let current_wait_sources = waiting_admission.observes().then(|| {
+                    deferral
+                        .wait_condition()
+                        .observed()
+                        .iter()
+                        .map(|observed| {
+                            let index = wake
+                                .availability()
+                                .binary_search_by_key(&observed.source(), |entry| entry.source())
+                                .expect("validated wait source remains available");
+                            wake.availability()[index]
+                        })
+                        .collect()
+                });
                 if !exact_source_changed && !policy_epoch_changed {
-                    waiting_admission.observe(
-                        ExecutorAdmissionQueueObservation::DecodeSkippedUnchanged {
-                            request_id: req.inner.request.id.clone(),
-                            deferral: deferral.clone(),
-                            current,
-                        },
-                    );
+                    if let Some(current_wait_sources) = current_wait_sources {
+                        waiting_admission.observe(
+                            ExecutorAdmissionQueueObservation::DecodeSkippedUnchanged {
+                                request_id: req.inner.request.id.clone(),
+                                deferral: deferral.clone(),
+                                current,
+                                current_wait_sources,
+                            },
+                        );
+                    }
                     continue;
                 }
-                waiting_admission.observe(ExecutorAdmissionQueueObservation::DecodeResumed {
-                    request_id: req.inner.request.id.clone(),
-                    deferral: deferral.clone(),
-                    current,
-                    exact_source_changed,
-                    policy_epoch_changed,
-                });
+                if let Some(current_wait_sources) = current_wait_sources {
+                    waiting_admission.observe(ExecutorAdmissionQueueObservation::DecodeResumed {
+                        request_id: req.inner.request.id.clone(),
+                        deferral: deferral.clone(),
+                        current,
+                        current_wait_sources,
+                        exact_source_changed,
+                        policy_epoch_changed,
+                    });
+                }
                 req.execution_capacity_deferral = None;
             }
 
@@ -2828,8 +2860,9 @@ mod tests {
             observations.as_slice(),
             [ExecutorAdmissionQueueObservation::DecodeSkippedUnchanged {
                 request_id,
+                current_wait_sources,
                 ..
-            }] if request_id == &blocked_id
+            }] if request_id == &blocked_id && current_wait_sources == &availability0
         ));
 
         assert_eq!(
@@ -2888,10 +2921,11 @@ mod tests {
             .filter_map(|observation| match observation {
                 ExecutorAdmissionQueueObservation::DecodeResumed {
                     request_id,
+                    current_wait_sources,
                     exact_source_changed: true,
                     policy_epoch_changed: false,
                     ..
-                } => Some(request_id.clone()),
+                } if current_wait_sources == &availability1 => Some(request_id.clone()),
                 _ => None,
             })
             .collect::<HashSet<_>>();
