@@ -403,10 +403,23 @@ impl EngineInner {
             "plan_runtime_prefill_workspace",
             "plan_runtime_prefill_workspace_release",
         );
-        let output = match self.model_executor.prefill_with_capacity(&input).await? {
-            ExecutorPrefillOutcome::Completed(output) => {
+        let (output, completed_chunk, capacity_probe_count) = match self
+            .model_executor
+            .prefill_with_capacity(&input)
+            .await?
+        {
+            ExecutorPrefillOutcome::Completed(completion) => {
                 workspace_lease.release();
-                output
+                let (output, executor_planned_chunk, completed_chunk, capacity_probe_count) =
+                    completion.into_parts();
+                if executor_planned_chunk != chunk {
+                    self.model_executor
+                        .release_cache(&output.kv_cache.cache_id());
+                    return Err(FerrumError::internal(format!(
+                        "PlanRuntime executor completed a different planned prefill frontier for {request_id}"
+                    )));
+                }
+                (output, completed_chunk, capacity_probe_count)
             }
             ExecutorPrefillOutcome::Deferred(deferral) => {
                 drop(workspace_lease);
@@ -422,6 +435,25 @@ impl EngineInner {
                     deferral.wait_condition().clone(),
                 );
                 let release_snapshot = self.execution_capacity_release_snapshot()?;
+                if chunk.tokens_to_process() == 1
+                    && !release_snapshot
+                        .has_external_releaser(request_id, deferral.wait_condition())
+                {
+                    self.write_scheduler_trace_event(serde_json::json!({
+                        "event": "scheduler_prefill_execution_capacity_impossible",
+                        "request_id": request_id,
+                        "tokens_processed": chunk.tokens_processed(),
+                        "tokens_to_process": chunk.tokens_to_process(),
+                        "stage": deferral.stage(),
+                        "wait_condition": deferral.wait_condition(),
+                        "shortfalls": deferral.shortfalls(),
+                        "reason": "minimum_frontier_has_no_external_releaser",
+                        "scheduler": self.scheduler.trace_snapshot(),
+                    }));
+                    return Err(FerrumError::resource_exhausted(format!(
+                        "PlanRuntime prefill for {request_id} has no runnable one-token frontier and no external capacity releaser"
+                    )));
+                }
                 match self.scheduler.defer_prefill_for_execution_capacity(
                     request_id,
                     scheduler_deferral,
@@ -469,6 +501,19 @@ impl EngineInner {
                 return Ok(());
             }
         };
+        let planned_chunk = chunk;
+        let chunk = completed_chunk;
+        if chunk != planned_chunk {
+            self.write_scheduler_trace_event(serde_json::json!({
+                "event": "scheduler_prefill_execution_frontier_narrowed",
+                "request_id": request_id,
+                "tokens_processed": chunk.tokens_processed(),
+                "planned_tokens": planned_chunk.tokens_to_process(),
+                "completed_tokens": chunk.tokens_to_process(),
+                "capacity_probe_count": capacity_probe_count,
+                "scheduler": self.scheduler.trace_snapshot(),
+            }));
+        }
         let cache_id = output.kv_cache.cache_id();
         if !chunk.is_final() {
             let model_cache_update = {
@@ -480,11 +525,15 @@ impl EngineInner {
                 seq.commit_plan_runtime_prefill_chunk_resources(output.kv_cache, chunk.end(), false)
             };
             self.apply_model_cache_ref_update(request_id, model_cache_update);
-            if self.scheduler.mark_prefill_chunk_processed(
-                request_id,
-                input_tokens.len(),
-                chunk.tokens_to_process(),
-            ) {
+            if self
+                .scheduler
+                .mark_prefill_chunk_processed_with_capacity_feedback(
+                    request_id,
+                    input_tokens.len(),
+                    planned_chunk.tokens_to_process(),
+                    chunk.tokens_to_process(),
+                )?
+            {
                 return Err(FerrumError::scheduler(format!(
                     "non-final PlanRuntime prefill chunk promoted {request_id} to decode"
                 )));
@@ -528,11 +577,15 @@ impl EngineInner {
         };
 
         self.apply_model_cache_ref_update(request_id, model_cache_update);
-        if !self.scheduler.mark_prefill_chunk_processed(
-            request_id,
-            input_tokens.len(),
-            chunk.tokens_to_process(),
-        ) {
+        if !self
+            .scheduler
+            .mark_prefill_chunk_processed_with_capacity_feedback(
+                request_id,
+                input_tokens.len(),
+                planned_chunk.tokens_to_process(),
+                chunk.tokens_to_process(),
+            )?
+        {
             self.model_executor.release_cache(&cache_id);
             return Err(FerrumError::scheduler(format!(
                 "final PlanRuntime prefill chunk did not promote {request_id} to decode"

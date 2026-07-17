@@ -11,10 +11,11 @@ use ferrum_interfaces::{
         ExecutorExecutionCapacityPreemption, ExecutorExecutionCapacityPreemptionAuthority,
         ExecutorExecutionCapacityPreemptionReceipt, ExecutorExecutionCapacityStage,
         ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
-        ExecutorPrefillAdmissionReceipt, ExecutorPrefillMaintenanceBlocker,
-        ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome,
-        ExecutorPrefillMaintenanceStage, ExecutorPrefillOutcome, ExecutorStatus,
-        PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput, PrefillOutput, UnifiedBatch,
+        ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion,
+        ExecutorPrefillMaintenanceBlocker, ExecutorPrefillMaintenanceDeferral,
+        ExecutorPrefillMaintenanceOutcome, ExecutorPrefillMaintenanceStage, ExecutorPrefillOutcome,
+        ExecutorStatus, PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput, PrefillOutput,
+        UnifiedBatch,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateManager, RecurrentStateSpec,
     RecurrentStateTensorSpec, TensorRef,
@@ -36,6 +37,7 @@ struct PlanRuntimeChunkedPrefillTestExecutor {
     attempted_chunks: std::sync::Mutex<Vec<PrefillChunk>>,
     completed_chunks: AtomicU64,
     defer_next_prefill: AtomicBool,
+    narrow_next_prefill: AtomicBool,
     release_epoch: AtomicU64,
     capacity_wait_registrations: AtomicU64,
     capacity_signal: tokio::sync::watch::Sender<u64>,
@@ -52,10 +54,17 @@ impl PlanRuntimeChunkedPrefillTestExecutor {
             attempted_chunks: std::sync::Mutex::new(Vec::new()),
             completed_chunks: AtomicU64::new(0),
             defer_next_prefill: AtomicBool::new(defer_first_prefill),
+            narrow_next_prefill: AtomicBool::new(false),
             release_epoch: AtomicU64::new(0),
             capacity_wait_registrations: AtomicU64::new(0),
             capacity_signal,
         }
+    }
+
+    fn new_with_partial_first_prefill() -> Self {
+        let executor = Self::new(false);
+        executor.narrow_next_prefill.store(true, Ordering::Release);
+        executor
     }
 
     fn epochs(&self) -> ExecutorAdmissionEpochs {
@@ -243,16 +252,34 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
             .map(ExecutorPrefillOutcome::Deferred);
         }
 
-        let output = self.inner.prefill(input).await?;
+        let completed_chunk = if self.narrow_next_prefill.swap(false, Ordering::AcqRel) {
+            PrefillChunk::new(
+                chunk.tokens_processed(),
+                chunk.tokens_to_process().div_ceil(2),
+                chunk.total_prompt_tokens(),
+            )?
+        } else {
+            chunk
+        };
+        let mut completed_input = input.clone();
+        completed_input.chunk = Some(completed_chunk);
+        let output = self.inner.prefill(&completed_input).await?;
         self.completed_chunks.fetch_add(1, Ordering::Relaxed);
-        if chunk.is_final() {
+        if completed_chunk.is_final() {
             assert!(self
                 .retained
                 .lock()
                 .expect("chunked prefill retained mutex poisoned")
                 .remove(request_id));
         }
-        Ok(ExecutorPrefillOutcome::Completed(output))
+        Ok(ExecutorPrefillOutcome::Completed(
+            ExecutorPrefillCompletion::new(
+                output,
+                chunk,
+                completed_chunk,
+                u32::from(completed_chunk != chunk),
+            )?,
+        ))
     }
 
     async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
@@ -3567,6 +3594,107 @@ async fn plan_runtime_chunked_prefill_retries_exact_chunk_and_samples_only_final
         .lock()
         .expect("chunked prefill retained mutex poisoned")
         .is_empty());
+    assert_eq!(
+        scheduler
+            .trace_snapshot()
+            .execution_capacity_blocked_prefill_len,
+        0
+    );
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn plan_runtime_partial_prefill_completion_commits_only_the_executor_prefix() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    config.scheduler.max_running_requests = 1;
+    config.scheduler.prefill_step_chunk = Some(4);
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let executor =
+        Arc::new(PlanRuntimeChunkedPrefillTestExecutor::new_with_partial_first_prefill());
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let engine = ContinuousBatchEngine::new_plan_runtime(
+        config,
+        Arc::clone(&scheduler),
+        tokenizer,
+        sampler,
+        executor.clone(),
+        tensor_factory,
+    )
+    .unwrap();
+    let mut request = policy_request();
+    request.prompt = "one two three four".to_string();
+    request.sampling_params.max_tokens = 1;
+
+    let response = engine.infer(request).await.unwrap();
+
+    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(response.tokens.len(), 1, "only the final prefix may sample");
+    assert_eq!(executor.completed_chunks.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        *executor
+            .attempted_chunks
+            .lock()
+            .expect("chunked prefill attempt mutex poisoned"),
+        vec![
+            PrefillChunk::new(0, 4, 5).unwrap(),
+            PrefillChunk::new(2, 2, 5).unwrap(),
+            PrefillChunk::new(4, 1, 5).unwrap(),
+        ]
+    );
+    assert!(executor
+        .retained
+        .lock()
+        .expect("chunked prefill retained mutex poisoned")
+        .is_empty());
+    assert_eq!(
+        scheduler
+            .trace_snapshot()
+            .execution_capacity_blocked_prefill_len,
+        0
+    );
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn plan_runtime_one_token_prefill_without_external_releaser_fails_closed() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    config.scheduler.max_running_requests = 1;
+    config.scheduler.prefill_step_chunk = Some(1);
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let executor = Arc::new(PlanRuntimeChunkedPrefillTestExecutor::new(true));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let engine = ContinuousBatchEngine::new_plan_runtime(
+        config,
+        Arc::clone(&scheduler),
+        tokenizer,
+        sampler,
+        executor.clone(),
+        tensor_factory,
+    )
+    .unwrap();
+    let mut request = policy_request();
+    request.prompt = "one two three four".to_string();
+    request.sampling_params.max_tokens = 1;
+
+    let response = tokio::time::timeout(Duration::from_secs(2), engine.infer(request))
+        .await
+        .expect("minimum prefill frontier must not wait on itself")
+        .unwrap();
+
+    assert_eq!(response.finish_reason, FinishReason::Error);
+    assert_eq!(
+        executor.capacity_wait_registrations.load(Ordering::Relaxed),
+        0,
+        "self-only capacity failure must not register a passive waiter"
+    );
     assert_eq!(
         scheduler
             .trace_snapshot()

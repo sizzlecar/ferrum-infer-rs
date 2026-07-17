@@ -20,7 +20,7 @@ use ferrum_interfaces::model_executor::{
     ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityPreemption,
     ExecutorExecutionCapacityPreemptionAuthority, ExecutorExecutionCapacityPreemptionReceipt,
     ExecutorExecutionCapacityStage, ExecutorMemoryUsage, ExecutorPrefillAdmission,
-    ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
+    ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion,
     ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome, ExecutorPrefillOutcome,
     ExecutorState, ExecutorStatus, MemoryRequirements, PlanRuntimeResourceSnapshot, PrefillChunk,
     PrefillInput, PrefillOutput,
@@ -160,6 +160,7 @@ struct VNextIoBinding {
 #[derive(Default)]
 struct VNextExecutorMetrics {
     prefill_operations: AtomicU64,
+    prefill_frontier_narrowings: AtomicU64,
     decode_operations: AtomicU64,
     submitted_waves: AtomicU64,
     completed_waves: AtomicU64,
@@ -2034,6 +2035,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     fn execution_maintenance_decision(
         stage: ExecutorExecutionCapacityStage,
         outcome: DynamicDeferredMaintenanceOutcome,
+        source: Option<&AdmissionDeferred>,
     ) -> Result<Option<ExecutorExecutionCapacityDeferral>> {
         match outcome {
             DynamicDeferredMaintenanceOutcome::RetryAdmission { .. }
@@ -2042,11 +2044,19 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 current_epochs,
                 wait_condition,
                 ..
-            } => ExecutorExecutionCapacityDeferral::new(
-                ExecutorAdmissionEpochs::from_capacity(current_epochs),
-                wait_condition,
-                stage,
-            )
+            } => match source {
+                Some(source) => ExecutorExecutionCapacityDeferral::from_maintenance(
+                    source,
+                    ExecutorAdmissionEpochs::from_capacity(current_epochs),
+                    wait_condition,
+                    stage,
+                ),
+                None => ExecutorExecutionCapacityDeferral::new(
+                    ExecutorAdmissionEpochs::from_capacity(current_epochs),
+                    wait_condition,
+                    stage,
+                ),
+            }
             .map(Some),
         }
     }
@@ -2079,7 +2089,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .map_err(|error| FerrumError::backend(error.to_string()))?;
             match sequence
                 .session
-                .try_extend_backing(request)
+                .try_ensure_backing_covers(request)
                 .map_err(|error| FerrumError::backend(error.to_string()))?
             {
                 SequenceResourceExtensionDecision::Current(_)
@@ -2120,6 +2130,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if let Some(deferred) = Self::execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::SequenceExtension,
                         outcome,
+                        Some(&deferred),
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -2141,6 +2152,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if let Some(deferred) = Self::execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::SequenceExtension,
                         outcome,
+                        None,
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -2248,6 +2260,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if let Some(deferred) = Self::execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::StepAdmission,
                         outcome,
+                        Some(&deferred),
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -2269,6 +2282,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if let Some(deferred) = Self::execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::StepAdmission,
                         outcome,
+                        None,
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -2370,6 +2384,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if let Some(deferred) = Self::execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::SubmissionWave,
                         outcome,
+                        Some(&deferred),
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -2391,6 +2406,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if let Some(deferred) = Self::execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::SubmissionWave,
                         outcome,
+                        None,
                     )? {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                     }
@@ -3164,14 +3180,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 self.maximum_model_tokens
             )));
         }
-        let chunk = match input.chunk {
+        let planned_chunk = match input.chunk {
             Some(chunk) => chunk,
             None => PrefillChunk::new(0, tokens.len(), tokens.len())?,
         };
-        if chunk.total_prompt_tokens() != tokens.len() {
+        if planned_chunk.total_prompt_tokens() != tokens.len() {
             return Err(FerrumError::request_validation(format!(
                 "vNext prefill chunk declares {} prompt tokens for input length {}",
-                chunk.total_prompt_tokens(),
+                planned_chunk.total_prompt_tokens(),
                 tokens.len()
             )));
         }
@@ -3189,10 +3205,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             )));
         }
         let processed = sequence.prefill_tokens_processed.load(Ordering::Acquire);
-        if processed != chunk.tokens_processed() {
+        if processed != planned_chunk.tokens_processed() {
             return Err(FerrumError::request_validation(format!(
                 "vNext prefill chunk for `{request_id}` starts at {}, expected {processed}",
-                chunk.tokens_processed()
+                planned_chunk.tokens_processed()
             )));
         }
         if slot.cancelled.load(Ordering::Acquire) {
@@ -3201,35 +3217,76 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             )));
         }
 
-        let extension_tokens = &tokens[..chunk.end()];
-        let extension_span =
-            TokenSpanWork::from_token_ids(extension_tokens, 0..extension_tokens.len())
-                .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let extension = ResourceWorkShape::single(extension_span)
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
-        match self.extend_sequence_with_capacity(&sequence, extension)? {
-            VNextExecutionCapacityDecision::Ready(()) => {}
-            VNextExecutionCapacityDecision::Deferred(deferred) => {
-                execution.restore_ready()?;
-                return Ok(ExecutorPrefillOutcome::Deferred(deferred));
-            }
-        }
-
-        let span = TokenSpanWork::from_token_ids_with_fit(&tokens, chunk.range(), maximum_tokens)
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
         let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&sequence.session)])
             .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let sequences = [Arc::clone(&sequence)];
-        let token_batches = [tokens];
-        let spans = [span];
-        let mut logits = match self
-            .execute_batch_step(&batch, &sequences, &token_batches, &spans)
-            .await?
-        {
-            VNextExecutionCapacityDecision::Ready(logits) => logits,
-            VNextExecutionCapacityDecision::Deferred(deferred) => {
-                execution.restore_ready()?;
-                return Ok(ExecutorPrefillOutcome::Deferred(deferred));
+        let mut completed_chunk = planned_chunk;
+        let mut capacity_probe_count = 0_u32;
+        let mut logits = loop {
+            let extension_tokens = &tokens[..completed_chunk.end()];
+            let extension_span =
+                TokenSpanWork::from_token_ids(extension_tokens, 0..extension_tokens.len())
+                    .map_err(|error| FerrumError::backend(error.to_string()))?;
+            let extension = ResourceWorkShape::single(extension_span)
+                .map_err(|error| FerrumError::backend(error.to_string()))?;
+            if let VNextExecutionCapacityDecision::Deferred(deferred) =
+                self.extend_sequence_with_capacity(&sequence, extension)?
+            {
+                let Some(next_tokens) =
+                    deferred.narrower_prefill_tokens(completed_chunk.tokens_to_process())
+                else {
+                    execution.restore_ready()?;
+                    return Ok(ExecutorPrefillOutcome::Deferred(deferred));
+                };
+                capacity_probe_count = capacity_probe_count.checked_add(1).ok_or_else(|| {
+                    FerrumError::internal("vNext prefill capacity probe count overflow")
+                })?;
+                self.metrics
+                    .prefill_frontier_narrowings
+                    .fetch_add(1, Ordering::Relaxed);
+                completed_chunk = PrefillChunk::new(
+                    completed_chunk.tokens_processed(),
+                    next_tokens,
+                    completed_chunk.total_prompt_tokens(),
+                )?;
+                continue;
+            }
+
+            let span = TokenSpanWork::from_token_ids_with_fit(
+                &tokens,
+                completed_chunk.range(),
+                maximum_tokens,
+            )
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
+            match self
+                .execute_batch_step(
+                    &batch,
+                    std::slice::from_ref(&sequence),
+                    std::slice::from_ref(&tokens),
+                    std::slice::from_ref(&span),
+                )
+                .await?
+            {
+                VNextExecutionCapacityDecision::Ready(logits) => break logits,
+                VNextExecutionCapacityDecision::Deferred(deferred) => {
+                    let Some(next_tokens) =
+                        deferred.narrower_prefill_tokens(completed_chunk.tokens_to_process())
+                    else {
+                        execution.restore_ready()?;
+                        return Ok(ExecutorPrefillOutcome::Deferred(deferred));
+                    };
+                    capacity_probe_count =
+                        capacity_probe_count.checked_add(1).ok_or_else(|| {
+                            FerrumError::internal("vNext prefill capacity probe count overflow")
+                        })?;
+                    self.metrics
+                        .prefill_frontier_narrowings
+                        .fetch_add(1, Ordering::Relaxed);
+                    completed_chunk = PrefillChunk::new(
+                        completed_chunk.tokens_processed(),
+                        next_tokens,
+                        completed_chunk.total_prompt_tokens(),
+                    )?;
+                }
             }
         };
         let logits = logits.pop().ok_or_else(|| {
@@ -3238,9 +3295,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let logits = self.prefill_tensor(logits)?;
         sequence
             .prefill_tokens_processed
-            .store(chunk.end(), Ordering::Release);
-        let cache = self.cache_handle(&sequence, chunk.end());
-        if chunk.is_final() {
+            .store(completed_chunk.end(), Ordering::Release);
+        let cache = self.cache_handle(&sequence, completed_chunk.end());
+        if completed_chunk.is_final() {
             self.sequences.lock().activate(&slot, &sequence)?;
             execution.disarm();
         } else {
@@ -3253,9 +3310,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             started.elapsed().as_micros().min(u64::MAX as u128) as u64,
             Ordering::Relaxed,
         );
-        Ok(ExecutorPrefillOutcome::Completed(PrefillOutput::new(
-            logits, cache,
-        )))
+        Ok(ExecutorPrefillOutcome::Completed(
+            ExecutorPrefillCompletion::new(
+                PrefillOutput::new(logits, cache),
+                planned_chunk,
+                completed_chunk,
+                capacity_probe_count,
+            )?,
+        ))
     }
 
     fn metrics_snapshot(&self) -> serde_json::Value {
@@ -3331,6 +3393,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             "static_bytes": self.static_bytes,
             "counters": {
                 "prefill_operations": self.metrics.prefill_operations.load(Ordering::Relaxed),
+                "prefill_frontier_narrowings": self.metrics.prefill_frontier_narrowings.load(Ordering::Relaxed),
                 "decode_operations": self.metrics.decode_operations.load(Ordering::Relaxed),
                 "submitted_waves": self.metrics.submitted_waves.load(Ordering::Relaxed),
                 "completed_waves": self.metrics.completed_waves.load(Ordering::Relaxed),
@@ -3643,7 +3706,10 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
         match self.execute_prefill_with_capacity(input).await? {
-            ExecutorPrefillOutcome::Completed(output) => Ok(output),
+            ExecutorPrefillOutcome::Completed(completion) => {
+                let (output, _, _, _) = completion.into_parts();
+                Ok(output)
+            }
             ExecutorPrefillOutcome::Deferred(deferred) => {
                 Err(Self::execution_capacity_error(&deferred))
             }

@@ -951,6 +951,7 @@ pub struct ExecutorExecutionCapacityDeferral {
     observed: ExecutorAdmissionEpochs,
     wait_condition: crate::vnext::CapacityWaitCondition,
     stage: ExecutorExecutionCapacityStage,
+    shortfalls: Vec<crate::vnext::CapacityShortfall>,
 }
 
 impl ExecutorExecutionCapacityDeferral {
@@ -968,6 +969,7 @@ impl ExecutorExecutionCapacityDeferral {
             observed,
             wait_condition,
             stage,
+            shortfalls: Vec::new(),
         })
     }
 
@@ -980,11 +982,29 @@ impl ExecutorExecutionCapacityDeferral {
                 "execution capacity deferral must be reduced to WaitForRelease before export",
             ));
         }
-        Self::new(
+        let mut result = Self::new(
             ExecutorAdmissionEpochs::from_capacity(deferred.epochs()),
             deferred.wait_condition().clone(),
             stage,
-        )
+        )?;
+        result.shortfalls = deferred.blockers().to_vec();
+        Ok(result)
+    }
+
+    pub fn from_maintenance(
+        source: &crate::vnext::AdmissionDeferred,
+        observed: ExecutorAdmissionEpochs,
+        wait_condition: crate::vnext::CapacityWaitCondition,
+        stage: ExecutorExecutionCapacityStage,
+    ) -> Result<Self> {
+        if source.action() != crate::vnext::DeferredAction::AwaitBackingGrowth {
+            return Err(ferrum_types::FerrumError::internal(
+                "execution maintenance source must await backing growth",
+            ));
+        }
+        let mut result = Self::new(observed, wait_condition, stage)?;
+        result.shortfalls = source.blockers().to_vec();
+        Ok(result)
     }
 
     pub const fn observed(&self) -> ExecutorAdmissionEpochs {
@@ -998,6 +1018,76 @@ impl ExecutorExecutionCapacityDeferral {
     pub const fn stage(&self) -> ExecutorExecutionCapacityStage {
         self.stage
     }
+
+    pub fn shortfalls(&self) -> &[crate::vnext::CapacityShortfall] {
+        &self.shortfalls
+    }
+
+    /// Return a strictly smaller, capacity-informed prefill width.
+    ///
+    /// This is a cold pressure-path hint, not allocator authority. The caller
+    /// must probe the returned prefix through normal typed admission before any
+    /// provider encode or device submission. A bounded reduction prevents a
+    /// large frontier from producing an unbounded sequence of near-identical
+    /// probes when the shortfall is small.
+    pub fn narrower_prefill_tokens(&self, attempted_tokens: usize) -> Option<usize> {
+        if attempted_tokens <= 1 {
+            return None;
+        }
+        let maximum_next = attempted_tokens
+            .saturating_sub(attempted_tokens.div_ceil(4))
+            .max(1);
+        let proportional = self
+            .shortfalls
+            .iter()
+            .filter_map(|shortfall| {
+                let requested = shortfall.requested().get();
+                let available = shortfall.available().get();
+                (requested > available).then(|| {
+                    let scaled = (attempted_tokens as u128).saturating_mul(available as u128)
+                        / requested as u128;
+                    usize::try_from(scaled)
+                        .unwrap_or(usize::MAX)
+                        .clamp(1, attempted_tokens - 1)
+                })
+            })
+            .min();
+        Some(
+            proportional
+                .unwrap_or_else(|| attempted_tokens.div_ceil(2))
+                .min(maximum_next)
+                .max(1),
+        )
+    }
+}
+
+#[cfg(test)]
+mod execution_capacity_deferral_tests {
+    use super::{
+        ExecutorAdmissionEpochs, ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityStage,
+    };
+    use crate::vnext::{
+        CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
+    };
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn prefill_narrowing_is_strict_bounded_and_stops_at_one_token() {
+        let observed =
+            CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::ActiveSequenceSlots, 7)
+                .unwrap();
+        let condition = CapacityWaitCondition::from_observation(19, vec![observed]).unwrap();
+        let deferred = ExecutorExecutionCapacityDeferral::new(
+            ExecutorAdmissionEpochs::new(NonZeroU64::new(19).unwrap(), 3, 5),
+            condition,
+            ExecutorExecutionCapacityStage::StepAdmission,
+        )
+        .unwrap();
+
+        assert_eq!(deferred.narrower_prefill_tokens(342), Some(171));
+        assert_eq!(deferred.narrower_prefill_tokens(2), Some(1));
+        assert_eq!(deferred.narrower_prefill_tokens(1), None);
+    }
 }
 
 /// Capacity-aware batch decode result.
@@ -1010,13 +1100,79 @@ pub enum ExecutorBatchDecodeOutcome {
     Deferred(ExecutorExecutionCapacityDeferral),
 }
 
-/// Capacity-aware result for one exact prefill chunk.
+/// Capacity-aware result for one planned prefill frontier.
 ///
 /// `Deferred` is only legal before provider encode or device submission. The
-/// executor retains request/sequence authority so the scheduler can park the
-/// same chunk until one of the exact capacity sources changes.
+/// executor may complete a strict prefix after typed capacity probes; the
+/// scheduler commits only that prefix and learns the narrower execution ceiling.
+pub struct ExecutorPrefillCompletion {
+    output: PrefillOutput,
+    planned_chunk: PrefillChunk,
+    completed_chunk: PrefillChunk,
+    capacity_probe_count: u32,
+}
+
+impl ExecutorPrefillCompletion {
+    pub fn new(
+        output: PrefillOutput,
+        planned_chunk: PrefillChunk,
+        completed_chunk: PrefillChunk,
+        capacity_probe_count: u32,
+    ) -> Result<Self> {
+        if completed_chunk.tokens_processed() != planned_chunk.tokens_processed()
+            || completed_chunk.total_prompt_tokens() != planned_chunk.total_prompt_tokens()
+            || completed_chunk.tokens_to_process() > planned_chunk.tokens_to_process()
+        {
+            return Err(ferrum_types::FerrumError::internal(
+                "completed prefill chunk is not a non-empty prefix of its planned chunk",
+            ));
+        }
+        if completed_chunk != planned_chunk && capacity_probe_count == 0 {
+            return Err(ferrum_types::FerrumError::internal(
+                "partial prefill completion requires a failed capacity probe",
+            ));
+        }
+        Ok(Self {
+            output,
+            planned_chunk,
+            completed_chunk,
+            capacity_probe_count,
+        })
+    }
+
+    pub fn exact(output: PrefillOutput, chunk: PrefillChunk) -> Self {
+        Self {
+            output,
+            planned_chunk: chunk,
+            completed_chunk: chunk,
+            capacity_probe_count: 0,
+        }
+    }
+
+    pub const fn planned_chunk(&self) -> PrefillChunk {
+        self.planned_chunk
+    }
+
+    pub const fn completed_chunk(&self) -> PrefillChunk {
+        self.completed_chunk
+    }
+
+    pub const fn capacity_probe_count(&self) -> u32 {
+        self.capacity_probe_count
+    }
+
+    pub fn into_parts(self) -> (PrefillOutput, PrefillChunk, PrefillChunk, u32) {
+        (
+            self.output,
+            self.planned_chunk,
+            self.completed_chunk,
+            self.capacity_probe_count,
+        )
+    }
+}
+
 pub enum ExecutorPrefillOutcome {
-    Completed(PrefillOutput),
+    Completed(ExecutorPrefillCompletion),
     Deferred(ExecutorExecutionCapacityDeferral),
 }
 
@@ -1399,9 +1555,14 @@ pub trait ModelExecutor: Send + Sync {
     /// Execute one exact prefill chunk with an explicit pre-submit capacity
     /// deferral edge. Legacy executors inherit full-prefill behavior.
     async fn prefill_with_capacity(&self, input: &PrefillInput) -> Result<ExecutorPrefillOutcome> {
-        self.prefill(input)
-            .await
-            .map(ExecutorPrefillOutcome::Completed)
+        let output = self.prefill(input).await?;
+        let chunk = match input.chunk {
+            Some(chunk) => chunk,
+            None => PrefillChunk::new(0, input.sequence_length(), input.sequence_length())?,
+        };
+        Ok(ExecutorPrefillOutcome::Completed(
+            ExecutorPrefillCompletion::exact(output, chunk),
+        ))
     }
 
     /// Batch prefill: process multiple prompts' prefill in ONE forward pass.
