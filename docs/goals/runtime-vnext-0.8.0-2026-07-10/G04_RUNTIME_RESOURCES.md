@@ -108,12 +108,18 @@ frontier 和同轮 preemption 的原则，但不复制 Python object graph、裸
 运行时字典拼装或无 fence 的立即复用。
 
 权威 allocator 返回 temporary capacity failure 后才创建 cold-path `PressureEpisode`，并按 canonical
-exact capacity source 建立索引。episode 的状态至少覆盖
-`Open -> YieldPlanned -> AwaitReleaseFence -> Resumable -> Closed`。一次 scheduler transaction 在提交
-batch 前必须满足二选一：至少一个 frontier 获得可执行 claim，或已经产生一个 typed yield/release
-transaction，且被让渡资源在 fence terminal 前不能复用；禁止把所有 frontier 先标成 passive wait 再
-期待另一个 phase 推进 source。unchanged exact source 不重新调用 allocator，也不产生逐 tick event
-洪泛，只更新预分配 episode counter 和有界 first/last sample。
+exact capacity source 建立索引。episode 必须分别保存 immutable `progress_owner`、held participant set 和
+last transaction victim，禁止用一个可变 victim/owner 字段同时表达三者。状态至少覆盖
+`Open -> YieldPlanned -> AwaitReleaseFence -> Resumable -> Closed`；当 stable owner 在仍有 held peer 时
+释放自身资源进入 recompute，还必须经过
+`OwnerAdmissionPending --typed admission receipt--> Resumable`。token progress、wait-source topology 变化和
+另一个 participant 的排队顺序都不能转移 owner，也不能解除 held peer；owner 只有在 terminal release 后
+才释放 peer。若 recompute owner 无法取得执行 claim，必须返回 typed invariant/blocker，不能把 held peer
+晋升为新 owner 或静默轮转。一次 scheduler transaction 在提交 batch 前必须满足二选一：至少一个
+frontier 获得可执行 claim，或已经产生一个 typed yield/release transaction，且被让渡资源在 fence
+terminal 前不能复用；禁止把所有 frontier 先标成 passive wait 再期待另一个 phase 推进 source。
+unchanged exact source 不重新调用 allocator，也不产生逐 tick event 洪泛，只更新预分配 episode counter
+和有界 first/last sample。
 
 机制与策略必须分离。资源机制只负责 exact claim、rollback、fence-delayed release 和 transition
 ordering；调度策略基于 priority、相关 bypass age、resident/recompute cost、剩余 logical work、可形成的
