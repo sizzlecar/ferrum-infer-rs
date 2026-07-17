@@ -1073,7 +1073,7 @@ fn full_plan_budget_returns_typed_wait_and_reuses_backing_after_availability_cha
         AllocationLifetime::Request,
         'a',
         1,
-        128,
+        64,
         TestDemand::Fixed,
     );
     let runtime = new_runtime(&catalog, 64);
@@ -1148,6 +1148,36 @@ fn full_plan_budget_returns_typed_wait_and_reuses_backing_after_availability_cha
             .unwrap(),
         RequestResourceAdmissionDecision::Admitted(_)
     ));
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+}
+
+#[test]
+fn theoretical_pool_ceiling_remains_terminal_after_device_budget_accepts_growth() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'b',
+        1,
+        64,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 128);
+    let harness = harness(Arc::clone(&runtime), catalog, 128, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.initialize_pool(&harness.pool_ids[0]).unwrap();
+    let allocations_before = runtime.allocate_calls();
+
+    let error = maintenance
+        .grow_pool(&harness.pool_ids[0], 64)
+        .expect_err("theoretical pool ceiling must remain fail-closed");
+    assert!(error
+        .to_string()
+        .contains("dynamic pool growth exceeds its core-derived resident maximum"));
+    let status = maintenance.status().unwrap();
+    assert_eq!(status.budget_claimed_bytes(), 64);
+    assert_eq!(status.process_claimed_bytes(), 64);
+    assert_eq!(status.pools()[0].resident_bytes(), 64);
+    assert_eq!(status.pools()[0].pending_growth_bytes(), 0);
     assert_eq!(runtime.allocate_calls(), allocations_before);
 }
 

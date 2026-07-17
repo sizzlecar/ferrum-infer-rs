@@ -1421,16 +1421,6 @@ where
                 if state.poisoned {
                     return Err(invalid_resource("dynamic backing pool is fail-closed"));
                 }
-                let next_residency = state
-                    .resident_bytes
-                    .checked_add(state.pending_growth_bytes)
-                    .and_then(|bytes| bytes.checked_add(chunk_bytes))
-                    .ok_or_else(|| invalid_resource("dynamic pool resident bytes overflow u64"))?;
-                if next_residency > pool.domain.pool.provisioning().maximum_resident_bytes() {
-                    return Err(invalid_resource(
-                        "dynamic pool growth exceeds its core-derived resident maximum",
-                    ));
-                }
                 let ordinal = state.next_chunk_ordinal;
                 let generation = state.next_chunk_generation;
                 let next_ordinal = ordinal
@@ -1499,6 +1489,33 @@ where
             }
             Err(error) => return Err(error),
         };
+        // Device-budget saturation is recoverable pressure even when the same
+        // growth also crosses a pool's device-derived resident ceiling. Only a
+        // growth that the authoritative device budget accepted can prove that
+        // the remaining pool ceiling is a terminal theoretical-plan violation.
+        for growth in &planned {
+            let state = growth
+                .pool
+                .state
+                .lock()
+                .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))?;
+            let next_residency = state
+                .resident_bytes
+                .checked_add(state.pending_growth_bytes)
+                .ok_or_else(|| invalid_resource("dynamic pool resident bytes overflow u64"))?;
+            if next_residency
+                > growth
+                    .pool
+                    .domain
+                    .pool
+                    .provisioning()
+                    .maximum_resident_bytes()
+            {
+                return Err(invalid_resource(
+                    "dynamic pool growth exceeds its core-derived resident maximum",
+                ));
+            }
+        }
         let grants = reservation.commit_split(
             &planned
                 .iter()
