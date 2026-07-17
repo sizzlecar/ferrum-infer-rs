@@ -37,6 +37,7 @@ SERVER_POLICY = {
     "calibration_max_num_batched_tokens": CALIBRATION_TOKEN_BUDGET,
     "target_max_num_batched_tokens": TARGET_TOKEN_BUDGET,
     "calibration_max_tokens": CALIBRATION_MAX_TOKENS,
+    "target_prewarm_max_tokens": CALIBRATION_MAX_TOKENS,
     "target_max_tokens": TARGET_MAX_TOKENS,
 }
 STOP_POLICY = {
@@ -440,6 +441,9 @@ def collect(args: argparse.Namespace) -> int:
         "schema_version": 1,
         "artifact_type": "runtime_vnext_s1_cuda_decode_capacity_collection",
         "status": "reject",
+        "source_git_sha": provenance["git_sha"],
+        "binary_sha256": provenance["binary_sha256"],
+        "model_path": str(model),
         "server_policy": SERVER_POLICY,
         "stop_policy": STOP_POLICY,
         "error": None,
@@ -452,6 +456,7 @@ def collect(args: argparse.Namespace) -> int:
             out_dir=out / "run",
             timeout=args.request_timeout,
         )
+        collection["run"] = run_summary
         calibration = server_session(
             repo=repo,
             binary=binary,
@@ -487,6 +492,14 @@ def collect(args: argparse.Namespace) -> int:
             calibration_executor, "decode calibration"
         )
         exact_budget = calibration_pool["budget_claimed_bytes"]
+        collection["calibration"] = {
+            "clients": calibration_clients,
+            "monitor": calibration_monitor,
+            "pool_snapshot": calibration_pool,
+            "health_final": "calibration/health.final.json",
+            "trace": "calibration/scheduler-trace.jsonl",
+        }
+        collection["exact_budget_bytes"] = exact_budget
         calibration.stop()
 
         target = server_session(
@@ -500,6 +513,37 @@ def collect(args: argparse.Namespace) -> int:
             startup_timeout=args.startup_timeout,
         )
         sessions.append(target)
+        prewarm_trace_baseline = (
+            target.trace_path.stat().st_size if target.trace_path.is_file() else 0
+        )
+        tasks = start_stream_group(
+            target,
+            out_dir=out / "target-prewarm" / "clients",
+            prefix="target-prewarm",
+            max_tokens_by_slot=CALIBRATION_MAX_TOKENS,
+            timeout=args.request_timeout,
+        )
+        prewarm_clients, prewarm_monitor = wait_stream_group(
+            tasks,
+            trace_path=target.trace_path,
+            trace_baseline_bytes=prewarm_trace_baseline,
+            timeout=args.request_timeout,
+        )
+        tasks = {}
+        prewarm_health = target.health("health.prewarm.json")
+        prewarm_executor = common.find_executor_snapshot(prewarm_health)
+        require(prewarm_executor is not None, "target prewarm health has no vNext executor")
+        prewarm_pool = common.quiescent_pool_snapshot(
+            prewarm_executor, "decode target prewarm"
+        )
+        collection["target_prewarm"] = {
+            "clients": prewarm_clients,
+            "monitor": prewarm_monitor,
+            "pool_snapshot": prewarm_pool,
+            "health_final": "target/health.prewarm.json",
+            "trace": "target/scheduler-trace.jsonl",
+        }
+        common.require_replayed_pool_snapshot(calibration_pool, prewarm_pool, exact_budget)
         target_trace_baseline = target.trace_path.stat().st_size if target.trace_path.is_file() else 0
         tasks = start_stream_group(
             target,
@@ -517,41 +561,29 @@ def collect(args: argparse.Namespace) -> int:
         tasks = {}
         target_started = min(result["started_wall_ns"] for result in target_clients.values())
         target_finished = max(result["finished_wall_ns"] for result in target_clients.values())
+        target_health = target.health("health.final.json")
+        target_executor = common.find_executor_snapshot(target_health)
+        require(target_executor is not None, "target health has no vNext executor")
+        target_pool = common.quiescent_pool_snapshot(target_executor, "decode target")
+        target.stop()
+        collection["target"] = {
+            "clients": target_clients,
+            "monitor": target_monitor,
+            "pool_snapshot": target_pool,
+            "health_final": "target/health.final.json",
+            "trace": "target/scheduler-trace.jsonl",
+        }
+        common.require_replayed_pool_snapshot(calibration_pool, target_pool, exact_budget)
         decode_summary = validate_decode_trace(
             common.read_trace(target.trace_path),
             started_wall_ns=target_started,
             finished_wall_ns=target_finished,
         )
-        target_health = target.health("health.final.json")
-        target_executor = common.find_executor_snapshot(target_health)
-        require(target_executor is not None, "target health has no vNext executor")
-        target_pool = common.quiescent_pool_snapshot(target_executor, "decode target")
-        common.require_replayed_pool_snapshot(calibration_pool, target_pool, exact_budget)
-        target.stop()
+        collection["target"]["decode_summary"] = decode_summary
 
         collection.update(
             {
                 "status": "collected",
-                "source_git_sha": provenance["git_sha"],
-                "binary_sha256": provenance["binary_sha256"],
-                "model_path": str(model),
-                "run": run_summary,
-                "calibration": {
-                    "clients": calibration_clients,
-                    "monitor": calibration_monitor,
-                    "pool_snapshot": calibration_pool,
-                    "health_final": "calibration/health.final.json",
-                    "trace": "calibration/scheduler-trace.jsonl",
-                },
-                "exact_budget_bytes": exact_budget,
-                "target": {
-                    "clients": target_clients,
-                    "monitor": target_monitor,
-                    "pool_snapshot": target_pool,
-                    "decode_summary": decode_summary,
-                    "health_final": "target/health.final.json",
-                    "trace": "target/scheduler-trace.jsonl",
-                },
                 "finished_wall_ns": time.time_ns(),
                 "error": None,
             }
@@ -644,19 +676,35 @@ def validate(root: Path, out: Path) -> int:
     require("Qwen3.5-4B" in str(collection.get("model_path")), "artifact model is not Qwen3.5-4B")
 
     calibration = collection.get("calibration")
+    target_prewarm = collection.get("target_prewarm")
     target = collection.get("target")
-    require(isinstance(calibration, dict) and isinstance(target, dict), "scenario summaries are missing")
+    require(
+        isinstance(calibration, dict)
+        and isinstance(target_prewarm, dict)
+        and isinstance(target, dict),
+        "scenario summaries are missing",
+    )
     calibration_health = common.read_json(root / str(calibration.get("health_final")))
+    prewarm_health = common.read_json(root / str(target_prewarm.get("health_final")))
     target_health = common.read_json(root / str(target.get("health_final")))
     calibration_executor = common.find_executor_snapshot(calibration_health)
+    prewarm_executor = common.find_executor_snapshot(prewarm_health)
     target_executor = common.find_executor_snapshot(target_health)
-    require(calibration_executor is not None and target_executor is not None, "raw executor snapshots are missing")
+    require(
+        calibration_executor is not None
+        and prewarm_executor is not None
+        and target_executor is not None,
+        "raw executor snapshots are missing",
+    )
     for identity in ("model_id", "family_fingerprint", "program_fingerprint", "plan_hash"):
         require(
-            calibration_executor.get(identity) == target_executor.get(identity),
-            f"calibration/target changed {identity}",
+            calibration_executor.get(identity)
+            == prewarm_executor.get(identity)
+            == target_executor.get(identity),
+            f"calibration/prewarm/target changed {identity}",
         )
     calibration_pool = common.quiescent_pool_snapshot(calibration_executor, "raw decode calibration")
+    prewarm_pool = common.quiescent_pool_snapshot(prewarm_executor, "raw decode target prewarm")
     target_pool = common.quiescent_pool_snapshot(target_executor, "raw decode target")
     exact_budget = collection.get("exact_budget_bytes")
     require(
@@ -664,7 +712,12 @@ def validate(root: Path, out: Path) -> int:
         "exact budget does not match calibrated installed backing",
     )
     require(calibration.get("pool_snapshot") == calibration_pool, "calibration summary differs from raw health")
+    require(
+        target_prewarm.get("pool_snapshot") == prewarm_pool,
+        "target prewarm summary differs from raw health",
+    )
     require(target.get("pool_snapshot") == target_pool, "target summary differs from raw health")
+    common.require_replayed_pool_snapshot(calibration_pool, prewarm_pool, exact_budget)
     common.require_replayed_pool_snapshot(calibration_pool, target_pool, exact_budget)
     policy = target_executor.get("runtime_memory_policy")
     require(isinstance(policy, dict), "target runtime memory policy is missing")
@@ -676,6 +729,9 @@ def validate(root: Path, out: Path) -> int:
     calibration_started, calibration_finished, calibration_silence = validate_stream_group(
         root, "calibration", calibration.get("clients"), CALIBRATION_MAX_TOKENS
     )
+    prewarm_started, prewarm_finished, prewarm_silence = validate_stream_group(
+        root, "target-prewarm", target_prewarm.get("clients"), CALIBRATION_MAX_TOKENS
+    )
     target_started, target_finished, target_silence = validate_stream_group(
         root, "target", target.get("clients"), TARGET_MAX_TOKENS
     )
@@ -684,6 +740,7 @@ def validate(root: Path, out: Path) -> int:
             slot,
             {
                 "calibration": calibration["clients"][slot],
+                "target-prewarm": target_prewarm["clients"][slot],
                 "target": target["clients"][slot],
             },
         )
@@ -697,11 +754,21 @@ def validate(root: Path, out: Path) -> int:
         ),
         "single-token calibration unexpectedly hit decode capacity pressure",
     )
+    target_rows = common.read_trace(root / str(target.get("trace")))
+    require(
+        not any(
+            row.get("phase") == "vnext.decode_capacity_deferred"
+            and isinstance(row.get("ts_unix_nanos"), int)
+            and prewarm_started <= row["ts_unix_nanos"] <= prewarm_finished
+            for row in target_rows
+        ),
+        "target prewarm unexpectedly hit decode capacity pressure",
+    )
     target_trace_path = root / str(target.get("trace"))
     target_trace_bytes = target_trace_path.stat().st_size
     require(target_trace_bytes <= STOP_POLICY["max_trace_bytes"], "target trace exceeds its byte ceiling")
     decode_summary = validate_decode_trace(
-        common.read_trace(target_trace_path),
+        target_rows,
         started_wall_ns=target_started,
         finished_wall_ns=target_finished,
     )
@@ -762,9 +829,11 @@ def validate(root: Path, out: Path) -> int:
         "decode_summary": decode_summary,
         "target_trace_bytes": target_trace_bytes,
         "calibration_window_ns": [calibration_started, calibration_finished],
+        "target_prewarm_window_ns": [prewarm_started, prewarm_finished],
         "target_window_ns": [target_started, target_finished],
         "max_silence_seconds": {
             "calibration": calibration_silence,
+            "target_prewarm": prewarm_silence,
             "target": target_silence,
         },
         "does_not_prove": ["S1", "G04", "performance", "release"],
@@ -786,6 +855,10 @@ def self_test() -> int:
         and CALIBRATION_MAX_TOKENS["B"] < TARGET_MAX_TOKENS["B"]
         and CALIBRATION_MAX_TOKENS["C"] == TARGET_MAX_TOKENS["C"],
         "calibration must replace only B long-decode demand with a short request",
+    )
+    require(
+        SERVER_POLICY["target_prewarm_max_tokens"] == CALIBRATION_MAX_TOKENS,
+        "target prewarm must replay the exact calibrated pool envelope",
     )
     wait_condition = {
         "coordinator_id": 7,
