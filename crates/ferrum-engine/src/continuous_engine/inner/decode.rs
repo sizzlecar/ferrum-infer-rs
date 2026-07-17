@@ -207,6 +207,7 @@ impl EngineInner {
                         &request_ids,
                         &deferral,
                         "split_cohort",
+                        None,
                     );
                     self.scheduler
                         .record_decode_capacity_pressure(request_ids.len(), None);
@@ -244,6 +245,7 @@ impl EngineInner {
                                 &request_ids,
                                 &deferral,
                                 "wait_for_release",
+                                None,
                             );
                             self.write_scheduler_trace_event(serde_json::json!({
                                 "event": "scheduler_execution_capacity_defer",
@@ -261,6 +263,7 @@ impl EngineInner {
                                 &request_ids,
                                 &deferral,
                                 "recompute_progress_victim",
+                                Some(&victim_id),
                             );
                             if !self
                                 .defer_decode_for_capacity_recompute(

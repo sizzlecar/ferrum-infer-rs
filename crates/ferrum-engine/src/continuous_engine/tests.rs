@@ -2856,6 +2856,16 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
             .count(),
         1
     );
+    let recompute_event = deferred_events
+        .iter()
+        .find(|event| {
+            event.shape.get("decision") == Some(&serde_json::json!("recompute_progress_victim"))
+        })
+        .expect("progress-victim decision must be traced");
+    assert_eq!(
+        recompute_event.attributes.get("victim_request_id"),
+        Some(&serde_json::json!(victim_id))
+    );
     for event in &deferred_events {
         assert_eq!(
             event.shape.get("decode_submit_observed"),
@@ -2867,6 +2877,9 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
         );
         assert!(event.attributes.contains_key("request_ids"));
         assert!(event.attributes.contains_key("capacity_evidence"));
+        if event.shape.get("decision") != Some(&serde_json::json!("recompute_progress_victim")) {
+            assert!(!event.attributes.contains_key("victim_request_id"));
+        }
     }
     let _ = std::fs::remove_file(trace_path);
 }
