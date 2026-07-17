@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -24,6 +25,15 @@ MAX_MODEL_LEN = 512
 PREFILL_FIRST_UNTIL_ACTIVE = 3
 CALIBRATION_MAX_TOKENS = {"A": 128, "B": 1, "C": 16}
 TARGET_MAX_TOKENS = {"A": 128, "B": 128, "C": 16}
+REBALANCE_PRIME_MAX_TOKENS = CALIBRATION_MAX_TOKENS
+REBALANCE_PROBE_MAX_TOKENS = 1
+REBALANCE_PROBE_WORD_COUNT = 256
+REBALANCE_PROBE_WORKLOAD_SLOT = "rebalance-probe"
+REBALANCE_PROBE_PROMPT = (
+    "Cross-pool capacity probe. Read every word before answering."
+    + " token" * REBALANCE_PROBE_WORD_COUNT
+    + " Answer with one word."
+)
 MAX_DECODE_CAPACITY_EVENTS = 2048
 ALLOWED_EXECUTION_STAGES = {
     "sequence_extension",
@@ -40,6 +50,12 @@ SERVER_POLICY = {
     "calibration_max_tokens": CALIBRATION_MAX_TOKENS,
     "target_sizing_max_tokens": CALIBRATION_MAX_TOKENS,
     "target_budget_derivation": "target_sizing_global_residency",
+    "target_rebalance_prime_max_tokens": REBALANCE_PRIME_MAX_TOKENS,
+    "target_rebalance_probe_max_tokens": REBALANCE_PROBE_MAX_TOKENS,
+    "target_rebalance_probe_prompt_sha256": hashlib.sha256(
+        REBALANCE_PROBE_PROMPT.encode("utf-8")
+    ).hexdigest(),
+    "target_rebalance_probe_word_count": REBALANCE_PROBE_WORD_COUNT,
     "target_max_tokens": TARGET_MAX_TOKENS,
 }
 STOP_POLICY = {
@@ -1461,6 +1477,66 @@ def collect(args: argparse.Namespace) -> int:
             startup_timeout=args.startup_timeout,
         )
         sessions.append(target)
+
+        prime_trace_baseline = target.trace_path.stat().st_size if target.trace_path.is_file() else 0
+        tasks = start_stream_group(
+            target,
+            out_dir=out / "target-rebalance-prime" / "clients",
+            prefix="target-rebalance-prime",
+            max_tokens_by_slot=REBALANCE_PRIME_MAX_TOKENS,
+            timeout=args.request_timeout,
+        )
+        prime_clients, prime_monitor = wait_stream_group(
+            tasks,
+            trace_path=target.trace_path,
+            trace_baseline_bytes=prime_trace_baseline,
+            timeout=args.request_timeout,
+        )
+        tasks = {}
+        prime_health = target.health("health.rebalance-prime.json")
+        prime_executor = common.find_executor_snapshot(prime_health)
+        require(prime_executor is not None, "rebalance prime health has no vNext executor")
+        prime_pool = common.quiescent_pool_snapshot(
+            prime_executor, "decode target rebalance prime"
+        )
+        require(
+            prime_pool["budget_claimed_bytes"] == exact_budget
+            and prime_pool["resident_bytes"] == target_budget_envelope["resident_bytes"],
+            "rebalance prime did not saturate the exact dynamic residency budget",
+        )
+
+        probe_task = common.StreamTask(
+            port=target.port,
+            model=target.model_id,
+            role="target-rebalance-probe",
+            workload_slot=REBALANCE_PROBE_WORKLOAD_SLOT,
+            max_tokens=REBALANCE_PROBE_MAX_TOKENS,
+            out_dir=out / "target-rebalance-probe" / "clients",
+            timeout=args.request_timeout,
+            prompt=REBALANCE_PROBE_PROMPT,
+        )
+        tasks = {REBALANCE_PROBE_WORKLOAD_SLOT: probe_task}
+        probe_deadline = time.monotonic() + args.request_timeout
+        probe_task.start()
+        probe_task.wait_first(
+            min(args.request_timeout, STOP_POLICY["no_progress_timeout_seconds"])
+        )
+        probe_client = probe_task.join(max(0.0, probe_deadline - time.monotonic()))
+        common.validate_stream(probe_client, "target-rebalance-probe")
+        tasks = {}
+        probe_health = target.health("health.rebalance-probe.json")
+        probe_executor = common.find_executor_snapshot(probe_health)
+        require(probe_executor is not None, "rebalance probe health has no vNext executor")
+        probe_pool = common.quiescent_pool_snapshot(
+            probe_executor, "decode target rebalance probe"
+        )
+        target_rows = common.read_trace(target.trace_path)
+        probe_rebalance_summary = validate_rebalance_trace(
+            target_rows,
+            started_wall_ns=probe_client["started_wall_ns"],
+            finished_wall_ns=probe_client["finished_wall_ns"],
+        )
+
         target_trace_baseline = target.trace_path.stat().st_size if target.trace_path.is_file() else 0
         tasks = start_stream_group(
             target,
@@ -1484,6 +1560,18 @@ def collect(args: argparse.Namespace) -> int:
         target_pool = common.quiescent_pool_snapshot(target_executor, "decode target")
         target.stop()
         collection["target"] = {
+            "rebalance_prime": {
+                "clients": prime_clients,
+                "monitor": prime_monitor,
+                "pool_snapshot": prime_pool,
+                "health": "target/health.rebalance-prime.json",
+            },
+            "rebalance_probe": {
+                "client": probe_client,
+                "pool_snapshot": probe_pool,
+                "health": "target/health.rebalance-probe.json",
+                "rebalance_summary": probe_rebalance_summary,
+            },
             "clients": target_clients,
             "monitor": target_monitor,
             "pool_snapshot": target_pool,
@@ -1499,13 +1587,7 @@ def collect(args: argparse.Namespace) -> int:
             started_wall_ns=target_started,
             finished_wall_ns=target_finished,
         )
-        rebalance_summary = validate_rebalance_trace(
-            target_rows,
-            started_wall_ns=target_started,
-            finished_wall_ns=target_finished,
-        )
         collection["target"]["decode_summary"] = decode_summary
-        collection["target"]["rebalance_summary"] = rebalance_summary
 
         collection.update(
             {
@@ -1577,6 +1659,46 @@ def validate_stream_group(
     return started, finished, silences
 
 
+def validate_rebalance_probe(root: Path, result: dict[str, Any]) -> tuple[int, int, float]:
+    require(isinstance(result, dict), "target-rebalance-probe: result is invalid")
+    require(
+        result.get("role") == "target-rebalance-probe"
+        and result.get("workload_slot") == REBALANCE_PROBE_WORKLOAD_SLOT
+        and result.get("max_tokens") == REBALANCE_PROBE_MAX_TOKENS,
+        "target-rebalance-probe: workload identity changed",
+    )
+    require(
+        result.get("prompt_sha256")
+        == hashlib.sha256(REBALANCE_PROBE_PROMPT.encode("utf-8")).hexdigest(),
+        "target-rebalance-probe: prompt changed",
+    )
+    prompt_tokens = result.get("prompt_tokens")
+    require(
+        isinstance(prompt_tokens, int)
+        and REBALANCE_PROBE_MAX_TOKENS < prompt_tokens < MAX_MODEL_LEN,
+        "target-rebalance-probe: tokenized prompt is outside the product model limit",
+    )
+    common.validate_stream(result, "target-rebalance-probe")
+    started = result["started_wall_ns"]
+    finished = result["finished_wall_ns"]
+    events = (
+        root
+        / "target-rebalance-probe"
+        / "clients"
+        / "target-rebalance-probe.events.jsonl"
+    )
+    silence = common.max_stream_silence_seconds(
+        result,
+        common.read_stream_content_times(events),
+        monitored_from_wall_ns=started,
+    )
+    require(
+        silence < STOP_POLICY["no_progress_timeout_seconds"],
+        f"target-rebalance-probe: token progress stalled for {silence:.3f}s",
+    )
+    return started, finished, silence
+
+
 def validate(root: Path, out: Path) -> int:
     root = root.resolve()
     out = out.resolve()
@@ -1610,28 +1732,48 @@ def validate(root: Path, out: Path) -> int:
         and isinstance(target, dict),
         "scenario summaries are missing",
     )
+    rebalance_prime = target.get("rebalance_prime")
+    rebalance_probe = target.get("rebalance_probe")
+    require(
+        isinstance(rebalance_prime, dict) and isinstance(rebalance_probe, dict),
+        "target rebalance phases are missing",
+    )
     calibration_health = common.read_json(root / str(calibration.get("health_final")))
     sizing_health = common.read_json(root / str(target_sizing.get("health_final")))
     target_health = common.read_json(root / str(target.get("health_final")))
+    prime_health = common.read_json(root / str(rebalance_prime.get("health")))
+    probe_health = common.read_json(root / str(rebalance_probe.get("health")))
     calibration_executor = common.find_executor_snapshot(calibration_health)
     sizing_executor = common.find_executor_snapshot(sizing_health)
     target_executor = common.find_executor_snapshot(target_health)
+    prime_executor = common.find_executor_snapshot(prime_health)
+    probe_executor = common.find_executor_snapshot(probe_health)
     require(
         calibration_executor is not None
         and sizing_executor is not None
-        and target_executor is not None,
+        and target_executor is not None
+        and prime_executor is not None
+        and probe_executor is not None,
         "raw executor snapshots are missing",
     )
     for identity in ("model_id", "family_fingerprint", "program_fingerprint", "plan_hash"):
         require(
             calibration_executor.get(identity)
             == sizing_executor.get(identity)
+            == prime_executor.get(identity)
+            == probe_executor.get(identity)
             == target_executor.get(identity),
             f"calibration/sizing/target changed {identity}",
         )
     calibration_pool = common.quiescent_pool_snapshot(calibration_executor, "raw decode calibration")
     sizing_pool = common.quiescent_pool_snapshot(sizing_executor, "raw decode target sizing")
     target_pool = common.quiescent_pool_snapshot(target_executor, "raw decode target")
+    prime_pool = common.quiescent_pool_snapshot(
+        prime_executor, "raw decode target rebalance prime"
+    )
+    probe_pool = common.quiescent_pool_snapshot(
+        probe_executor, "raw decode target rebalance probe"
+    )
     calibration_budget = collection.get("calibration_budget_bytes")
     exact_budget = collection.get("exact_budget_bytes")
     require(
@@ -1645,6 +1787,14 @@ def validate(root: Path, out: Path) -> int:
         "target sizing summary differs from raw health",
     )
     require(target.get("pool_snapshot") == target_pool, "target summary differs from raw health")
+    require(
+        rebalance_prime.get("pool_snapshot") == prime_pool,
+        "rebalance prime summary differs from raw health",
+    )
+    require(
+        rebalance_probe.get("pool_snapshot") == probe_pool,
+        "rebalance probe summary differs from raw health",
+    )
     target_budget_envelope = derive_target_budget_envelope(calibration_pool, sizing_pool)
     require(
         collection.get("target_budget_envelope") == target_budget_envelope,
@@ -1657,6 +1807,17 @@ def validate(root: Path, out: Path) -> int:
     )
     require_target_pool_within_budget_contract(
         target_pool, target_budget_envelope, exact_budget
+    )
+    require_target_pool_within_budget_contract(
+        prime_pool, target_budget_envelope, exact_budget
+    )
+    require_target_pool_within_budget_contract(
+        probe_pool, target_budget_envelope, exact_budget
+    )
+    require(
+        prime_pool["budget_claimed_bytes"] == exact_budget
+        and prime_pool["resident_bytes"] == target_budget_envelope["resident_bytes"],
+        "rebalance prime did not saturate the exact dynamic residency budget",
     )
     sizing_policy = sizing_executor.get("runtime_memory_policy")
     require(isinstance(sizing_policy, dict), "target sizing runtime memory policy is missing")
@@ -1678,6 +1839,15 @@ def validate(root: Path, out: Path) -> int:
     sizing_started, sizing_finished, sizing_silence = validate_stream_group(
         root, "target-sizing", target_sizing.get("clients"), CALIBRATION_MAX_TOKENS
     )
+    prime_started, prime_finished, prime_silence = validate_stream_group(
+        root,
+        "target-rebalance-prime",
+        rebalance_prime.get("clients"),
+        REBALANCE_PRIME_MAX_TOKENS,
+    )
+    probe_started, probe_finished, probe_silence = validate_rebalance_probe(
+        root, rebalance_probe.get("client")
+    )
     target_started, target_finished, target_silence = validate_stream_group(
         root, "target", target.get("clients"), TARGET_MAX_TOKENS
     )
@@ -1687,6 +1857,7 @@ def validate(root: Path, out: Path) -> int:
             {
                 "calibration": calibration["clients"][slot],
                 "target-sizing": target_sizing["clients"][slot],
+                "target-rebalance-prime": rebalance_prime["clients"][slot],
                 "target": target["clients"][slot],
             },
         )
@@ -1714,6 +1885,24 @@ def validate(root: Path, out: Path) -> int:
     target_trace_path = root / str(target.get("trace"))
     target_trace_bytes = target_trace_path.stat().st_size
     require(target_trace_bytes <= STOP_POLICY["max_trace_bytes"], "target trace exceeds its byte ceiling")
+    require(
+        rebalance_probe["client"]["prompt_tokens"]
+        > max(result["prompt_tokens"] for result in target["clients"].values()),
+        "rebalance probe did not increase request-shaped token demand",
+    )
+    for phase, started, finished in (
+        ("target-rebalance-prime", prime_started, prime_finished),
+        ("target-rebalance-probe", probe_started, probe_finished),
+    ):
+        require(
+            not any(
+                row.get("phase") == "vnext.decode_capacity_deferred"
+                and isinstance(row.get("ts_unix_nanos"), int)
+                and started <= row["ts_unix_nanos"] <= finished
+                for row in target_rows
+            ),
+            f"{phase} unexpectedly hit decode capacity pressure",
+        )
     decode_summary = validate_decode_trace(
         target_rows,
         started_wall_ns=target_started,
@@ -1722,11 +1911,11 @@ def validate(root: Path, out: Path) -> int:
     require(target.get("decode_summary") == decode_summary, "decode summary differs from raw trace")
     rebalance_summary = validate_rebalance_trace(
         target_rows,
-        started_wall_ns=target_started,
-        finished_wall_ns=target_finished,
+        started_wall_ns=probe_started,
+        finished_wall_ns=probe_finished,
     )
     require(
-        target.get("rebalance_summary") == rebalance_summary,
+        rebalance_probe.get("rebalance_summary") == rebalance_summary,
         "rebalance summary differs from raw trace",
     )
 
@@ -1787,10 +1976,14 @@ def validate(root: Path, out: Path) -> int:
         "target_trace_bytes": target_trace_bytes,
         "calibration_window_ns": [calibration_started, calibration_finished],
         "target_sizing_window_ns": [sizing_started, sizing_finished],
+        "target_rebalance_prime_window_ns": [prime_started, prime_finished],
+        "target_rebalance_probe_window_ns": [probe_started, probe_finished],
         "target_window_ns": [target_started, target_finished],
         "max_silence_seconds": {
             "calibration": calibration_silence,
             "target_sizing": sizing_silence,
+            "target_rebalance_prime": prime_silence,
+            "target_rebalance_probe": probe_silence,
             "target": target_silence,
         },
         "does_not_prove": ["S1", "G04", "performance", "release"],
@@ -1816,6 +2009,13 @@ def self_test() -> int:
     require(
         SERVER_POLICY["target_sizing_max_tokens"] == CALIBRATION_MAX_TOKENS,
         "target sizing must replay the narrow calibration workload",
+    )
+    require(
+        SERVER_POLICY["target_rebalance_prime_max_tokens"] == CALIBRATION_MAX_TOKENS
+        and SERVER_POLICY["target_rebalance_probe_max_tokens"] == 1
+        and SERVER_POLICY["target_rebalance_probe_prompt_sha256"]
+        == hashlib.sha256(REBALANCE_PROBE_PROMPT.encode("utf-8")).hexdigest(),
+        "rebalance phases are not pinned to the canonical product workload",
     )
 
     storage_profile = {"allocator": "linear_arena", "view": "contiguous"}
@@ -2185,9 +2385,9 @@ def self_test() -> int:
             {"ts_unix_nanos": 164, "phase": "vnext.request_completed", "request_id": "D"},
         ]
     )
-    rows.append(
+    rebalance_rows = [
         {
-            "ts_unix_nanos": 165,
+            "ts_unix_nanos": 85,
             "phase": "vnext.prefill_backing_maintenance",
             "status": "ok",
             "error": None,
@@ -2208,17 +2408,17 @@ def self_test() -> int:
                 }
             },
         }
-    )
+    ]
     summary = validate_decode_trace(rows, started_wall_ns=90, finished_wall_ns=170)
     rebalance_summary = validate_rebalance_trace(
-        rows, started_wall_ns=90, finished_wall_ns=170
+        rebalance_rows, started_wall_ns=80, finished_wall_ns=89
     )
     require(
         rebalance_summary["rebalance_events"] == 1
         and rebalance_summary["reclaimed_bytes"] == 64,
         "self-test lost typed cross-pool rebalance evidence",
     )
-    missing_rebalance = json.loads(json.dumps(rows))
+    missing_rebalance = json.loads(json.dumps(rebalance_rows))
     missing_rebalance[-1]["attributes"]["maintenance_evidence"].update(
         {
             "pools_reclaimed": 0,
@@ -2228,16 +2428,16 @@ def self_test() -> int:
     )
     try:
         validate_rebalance_trace(
-            missing_rebalance, started_wall_ns=90, finished_wall_ns=170
+            missing_rebalance, started_wall_ns=80, finished_wall_ns=89
         )
         raise AssertionError("trace without cross-pool reclaim unexpectedly passed")
     except common.CapacityGateError:
         pass
-    invalid_rebalance = json.loads(json.dumps(rows))
+    invalid_rebalance = json.loads(json.dumps(rebalance_rows))
     invalid_rebalance[-1]["attributes"]["maintenance_evidence"]["chunks_reclaimed"] = 0
     try:
         validate_rebalance_trace(
-            invalid_rebalance, started_wall_ns=90, finished_wall_ns=170
+            invalid_rebalance, started_wall_ns=80, finished_wall_ns=89
         )
         raise AssertionError("inconsistent cross-pool reclaim unexpectedly passed")
     except common.CapacityGateError:

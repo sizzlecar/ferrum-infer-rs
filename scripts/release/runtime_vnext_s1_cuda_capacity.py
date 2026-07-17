@@ -526,11 +526,14 @@ def stream_request(
     out_dir: Path,
     first_content: threading.Event,
     timeout: float,
+    prompt: str | None = None,
     on_content: Callable[[int], None] | None = None,
 ) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     started_wall_ns = time.time_ns()
-    prompt = capacity_prompt(workload_slot)
+    if prompt is None:
+        prompt = capacity_prompt(workload_slot)
+    require(bool(prompt.strip()), f"{role}: prompt must not be empty")
     result: dict[str, Any] = {
         "role": role,
         "workload_slot": workload_slot,
@@ -660,6 +663,7 @@ class StreamTask:
         max_tokens: int,
         out_dir: Path,
         timeout: float,
+        prompt: str | None = None,
     ) -> None:
         self.first_content = threading.Event()
         self.result: dict[str, Any] | None = None
@@ -676,6 +680,7 @@ class StreamTask:
                 "out_dir": out_dir,
                 "first_content": self.first_content,
                 "timeout": timeout,
+                "prompt": prompt,
                 "on_content": self._record_content,
             },
             daemon=True,
