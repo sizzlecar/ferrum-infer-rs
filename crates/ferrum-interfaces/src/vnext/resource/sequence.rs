@@ -991,6 +991,57 @@ where
         self.terminalize(SequenceSessionTerminalDisposition::Aborted)
     }
 
+    /// Atomically abort an idle session without publishing an intermediate
+    /// cancellation state.
+    ///
+    /// Capacity preemption uses this transition after a provider reports a
+    /// pre-submit deferral. If a frame or participant flight is still live,
+    /// the operation fails without changing the session phase so its caller
+    /// can reconcile the scheduling transaction without a half-cancelled
+    /// sequence.
+    pub fn try_abort_if_quiescent(&self) -> Result<SequenceSessionTerminalReceipt, VNextError> {
+        let mut state = self
+            .slot
+            .state
+            .lock()
+            .map_err(|_| invalid_resource("sequence session state mutex is poisoned"))?;
+        let active = match &*state {
+            SequenceSessionSlotState::Active(active)
+                if active.epoch == self.epoch && active.fingerprint == self.fingerprint =>
+            {
+                active
+            }
+            SequenceSessionSlotState::Active(_) => {
+                return Err(invalid_resource("stale sequence session authority"));
+            }
+            SequenceSessionSlotState::Terminal(_) => {
+                return Err(invalid_resource("sequence session is already terminal"));
+            }
+            SequenceSessionSlotState::Dormant { .. } => {
+                return Err(invalid_resource("sequence session is not active"));
+            }
+            SequenceSessionSlotState::FailClosed => {
+                return Err(invalid_resource("sequence session is fail-closed"));
+            }
+        };
+        if active.phase == SequenceSessionPhase::Poisoned
+            || active.active_frame.is_some()
+            || !active.participant_flights.is_empty()
+        {
+            return Err(invalid_resource(
+                "quiescent sequence abort requires an open or cancel-requested phase, no active frame, and no participant flight",
+            ));
+        }
+        let receipt = SequenceSessionTerminalReceipt {
+            epoch: active.epoch,
+            fingerprint: active.fingerprint.clone(),
+            disposition: SequenceSessionTerminalDisposition::Aborted,
+            retired_frames: active.retired_frames,
+        };
+        *state = SequenceSessionSlotState::Terminal(receipt.clone());
+        Ok(receipt)
+    }
+
     fn terminalize(
         &self,
         disposition: SequenceSessionTerminalDisposition,

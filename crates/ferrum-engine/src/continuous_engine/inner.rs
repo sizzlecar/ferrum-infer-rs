@@ -534,7 +534,8 @@ impl EngineInner {
             })
         };
         match observation {
-            ExecutorAdmissionQueueObservation::ProgressLeaseHeld {
+            ExecutorAdmissionQueueObservation::PressureHoldActive {
+                episode_id,
                 request_id,
                 progress_owner_id,
                 progress_baseline,
@@ -542,7 +543,7 @@ impl EngineInner {
                 ticket,
             } => self.write_executor_scheduler_profile_event(
                 &request_id,
-                "vnext.prefill_admission_progress_lease_held",
+                "vnext.execution_capacity_pressure_hold_active",
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
@@ -550,6 +551,10 @@ impl EngineInner {
                     (
                         "decision".to_string(),
                         serde_json::json!("held_for_owner_progress"),
+                    ),
+                    (
+                        "episode_id".to_string(),
+                        serde_json::json!(episode_id.get()),
                     ),
                     ("waiting_ticket".to_string(), serde_json::json!(ticket)),
                     (
@@ -573,7 +578,9 @@ impl EngineInner {
                 BTreeMap::new(),
                 None,
             ),
-            ExecutorAdmissionQueueObservation::ProgressLeaseReleased {
+            ExecutorAdmissionQueueObservation::PressureHoldReleased {
+                episode_id,
+                transition_ordinal,
                 request_id,
                 progress_owner_id,
                 progress_baseline,
@@ -582,12 +589,20 @@ impl EngineInner {
                 ticket,
             } => self.write_executor_scheduler_profile_event(
                 &request_id,
-                "vnext.prefill_admission_progress_lease_released",
+                "vnext.execution_capacity_pressure_hold_released",
                 ProfileEventKind::Instant,
                 ProfileStatus::Ok,
                 None,
                 BTreeMap::from([
                     ("decision".to_string(), serde_json::json!(reason.as_str())),
+                    (
+                        "episode_id".to_string(),
+                        serde_json::json!(episode_id.get()),
+                    ),
+                    (
+                        "transition_ordinal".to_string(),
+                        serde_json::json!(transition_ordinal.get()),
+                    ),
                     ("waiting_ticket".to_string(), serde_json::json!(ticket)),
                     (
                         "progress_owner_id".to_string(),
@@ -817,7 +832,7 @@ impl EngineInner {
         request_ids: &[RequestId],
         deferral: &ExecutorExecutionCapacityDeferral,
         decision: &'static str,
-        progress_lease: Option<&DecodeProgressLease>,
+        pressure_yield: Option<&PressureYieldTransaction>,
     ) {
         let Some(request_id) = request_ids.first() else {
             return;
@@ -837,18 +852,26 @@ impl EngineInner {
                 }),
             ),
         ]);
-        if let Some(lease) = progress_lease {
+        if let Some(transaction) = pressure_yield {
+            attributes.insert(
+                "episode_id".to_string(),
+                serde_json::json!(transaction.episode_id().get()),
+            );
+            attributes.insert(
+                "planned_transition_ordinal".to_string(),
+                serde_json::json!(transaction.planned_ordinal().get()),
+            );
             attributes.insert(
                 "victim_request_id".to_string(),
-                serde_json::json!(lease.victim_request_id()),
+                serde_json::json!(transaction.victim_request_id()),
             );
             attributes.insert(
                 "progress_owner_id".to_string(),
-                serde_json::json!(lease.progress_owner_id()),
+                serde_json::json!(transaction.progress_owner_id()),
             );
             attributes.insert(
                 "progress_baseline".to_string(),
-                serde_json::json!(lease.progress_baseline().get()),
+                serde_json::json!(transaction.progress_baseline().get()),
             );
         }
         self.write_executor_scheduler_profile_event(

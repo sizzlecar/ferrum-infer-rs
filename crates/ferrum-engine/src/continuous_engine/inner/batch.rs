@@ -1042,32 +1042,365 @@ impl EngineInner {
     ) -> bool {
         self.defer_decode_for_capacity_recompute_inner(
             request_id,
-            None,
             attempted_decode_width,
             observed_free_blocks,
         )
         .await
     }
 
-    pub(super) async fn defer_decode_for_capacity_recompute_leased(
+    pub(super) fn execution_capacity_release_snapshot(&self) -> ExecutionCapacityReleaseSnapshot {
+        let releasable_request_ids = self
+            .sequences
+            .read()
+            .iter()
+            .filter(|(_, sequence)| sequence.can_release_execution_capacity())
+            .map(|(request_id, _)| request_id.clone())
+            .collect::<Vec<_>>();
+        ExecutionCapacityReleaseSnapshot::new(releasable_request_ids)
+    }
+
+    fn reconcile_capacity_yield_error(
         &self,
-        lease: &DecodeProgressLease,
-        attempted_decode_width: usize,
+        transaction: &PressureYieldTransaction,
+        victim_released: bool,
+        attempted_width: usize,
         observed_free_blocks: Option<usize>,
-    ) -> bool {
-        self.defer_decode_for_capacity_recompute_inner(
-            lease.victim_request_id(),
-            Some(lease),
-            attempted_decode_width,
+        error: FerrumError,
+    ) -> FerrumError {
+        match self.scheduler.abort_execution_capacity_yield(
+            transaction,
+            victim_released,
+            attempted_width,
             observed_free_blocks,
+        ) {
+            Ok((victim_requeued, aborted_ordinal, closed_ordinal)) => {
+                self.write_scheduler_trace_event(serde_json::json!({
+                    "event": "scheduler_pressure_yield_aborted",
+                    "episode_id": transaction.episode_id().get(),
+                    "handoff_generation": transaction.handoff_generation(),
+                    "victim_request_id": transaction.victim_request_id(),
+                    "progress_owner_id": transaction.progress_owner_id(),
+                    "victim_released": victim_released,
+                    "victim_requeued": victim_requeued,
+                    "aborted_transition_ordinal": aborted_ordinal.get(),
+                    "closed_transition_ordinal": closed_ordinal.get(),
+                    "error": error.to_string(),
+                    "scheduler": self.scheduler.trace_snapshot(),
+                }));
+                error
+            }
+            Err(reconcile_error) => FerrumError::internal(format!(
+                "execution-capacity yield failed ({error}) and reconciliation failed ({reconcile_error})"
+            )),
+        }
+    }
+
+    pub(super) async fn execute_capacity_yield(
+        &self,
+        transaction: &PressureYieldTransaction,
+        attempted_width: usize,
+        observed_free_blocks: Option<usize>,
+    ) -> Result<bool> {
+        let cache_id = self
+            .sequences
+            .read()
+            .get(transaction.victim_request_id())
+            .and_then(SequenceState::model_cache_id)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                self.reconcile_capacity_yield_error(
+                    transaction,
+                    false,
+                    attempted_width,
+                    observed_free_blocks,
+                    FerrumError::internal(format!(
+                        "execution-capacity yield victim {} does not own a model-runtime cache authority",
+                        transaction.victim_request_id()
+                    )),
+                )
+            })?;
+        let armed_ordinal = self
+            .scheduler
+            .arm_execution_capacity_yield(transaction)
+            .map_err(|error| {
+                self.reconcile_capacity_yield_error(
+                    transaction,
+                    false,
+                    attempted_width,
+                    observed_free_blocks,
+                    error,
+                )
+            })?;
+        self.write_scheduler_trace_event(serde_json::json!({
+            "event": "scheduler_pressure_release_fence_armed",
+            "episode_id": transaction.episode_id().get(),
+            "handoff_generation": transaction.handoff_generation(),
+            "victim_request_id": transaction.victim_request_id(),
+            "progress_owner_id": transaction.progress_owner_id(),
+            "planned_ordinal": transaction.planned_ordinal().get(),
+            "transition_ordinal": armed_ordinal.get(),
+            "wait_condition": transaction.wait_condition(),
+            "scheduler": self.scheduler.trace_snapshot(),
+        }));
+        self.write_executor_scheduler_profile_event(
+            transaction.victim_request_id(),
+            "vnext.execution_capacity_pressure_release_fence_armed",
+            ProfileEventKind::Instant,
+            ProfileStatus::Ok,
+            None,
+            BTreeMap::from([
+                (
+                    "episode_id".to_string(),
+                    serde_json::json!(transaction.episode_id().get()),
+                ),
+                (
+                    "handoff_generation".to_string(),
+                    serde_json::json!(transaction.handoff_generation()),
+                ),
+                (
+                    "planned_transition_ordinal".to_string(),
+                    serde_json::json!(transaction.planned_ordinal().get()),
+                ),
+                (
+                    "transition_ordinal".to_string(),
+                    serde_json::json!(armed_ordinal.get()),
+                ),
+                (
+                    "physical_release_completed".to_string(),
+                    serde_json::json!(false),
+                ),
+            ]),
+            BTreeMap::from([
+                (
+                    "progress_owner_id".to_string(),
+                    serde_json::json!(transaction.progress_owner_id()),
+                ),
+                (
+                    "wait_condition".to_string(),
+                    serde_json::json!(transaction.wait_condition()),
+                ),
+            ]),
+            None,
+        );
+
+        let preemption = ExecutorExecutionCapacityPreemption::new(
+            transaction.victim_request_id().clone(),
+            cache_id.clone(),
         )
-        .await
+        .map_err(|error| {
+            self.reconcile_capacity_yield_error(
+                transaction,
+                false,
+                attempted_width,
+                observed_free_blocks,
+                error,
+            )
+        })?;
+        let release_receipt = match self
+            .model_executor
+            .preempt_execution_capacity(preemption)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return Err(self.reconcile_capacity_yield_error(
+                    transaction,
+                    false,
+                    attempted_width,
+                    observed_free_blocks,
+                    error,
+                ));
+            }
+        };
+        if release_receipt.request_id() != transaction.victim_request_id()
+            || release_receipt.cache_id() != cache_id
+        {
+            return Err(self.reconcile_capacity_yield_error(
+                transaction,
+                true,
+                attempted_width,
+                observed_free_blocks,
+                FerrumError::internal(format!(
+                    "execution-capacity release receipt identity mismatch for victim {}",
+                    transaction.victim_request_id()
+                )),
+            ));
+        }
+        let release_authority = release_receipt.authority();
+
+        let mut physical_resources = {
+            let mut sequences = self.sequences.write();
+            sequences
+                .get_mut(transaction.victim_request_id())
+                .map(|sequence| {
+                    let resources = sequence.take_physical_resources_for_recompute();
+                    sequence.preemption_count += 1;
+                    resources
+                })
+                .unwrap_or_default()
+        };
+        let taken_cache_id = physical_resources.model_cache_id.take();
+        if taken_cache_id.as_deref() != Some(cache_id.as_str()) {
+            return Err(self.reconcile_capacity_yield_error(
+                transaction,
+                true,
+                attempted_width,
+                observed_free_blocks,
+                FerrumError::internal(format!(
+                    "execution-capacity yield victim {} lost or replaced its model cache authority after release fence arm",
+                    transaction.victim_request_id()
+                )),
+            ));
+        }
+        if !physical_resources.is_empty() {
+            self.release_sequence_physical_resources(
+                transaction.victim_request_id(),
+                physical_resources,
+            )
+            .await;
+        }
+
+        let mut availability = Vec::new();
+        let capacity_snapshot = self
+            .model_executor
+            .write_execution_capacity_snapshot(&mut availability)
+            .map_err(|error| {
+                self.reconcile_capacity_yield_error(
+                    transaction,
+                    true,
+                    attempted_width,
+                    observed_free_blocks,
+                    error,
+                )
+            })?;
+        if capacity_snapshot.is_none()
+            || !transaction
+                .wait_condition()
+                .changed_since(&availability)
+                .map_err(|error| {
+                    self.reconcile_capacity_yield_error(
+                        transaction,
+                        true,
+                        attempted_width,
+                        observed_free_blocks,
+                        FerrumError::internal(error.to_string()),
+                    )
+                })?
+        {
+            return Err(self.reconcile_capacity_yield_error(
+                transaction,
+                true,
+                attempted_width,
+                observed_free_blocks,
+                FerrumError::internal(format!(
+                    "execution-capacity release for victim {} did not advance the failed exact source",
+                    transaction.victim_request_id()
+                )),
+            ));
+        }
+
+        let completion = self
+            .scheduler
+            .complete_execution_capacity_yield(transaction, attempted_width, observed_free_blocks)
+            .map_err(|error| {
+                self.reconcile_capacity_yield_error(
+                    transaction,
+                    true,
+                    attempted_width,
+                    observed_free_blocks,
+                    error,
+                )
+            })?;
+        let release_ordinal = completion.release_transition_ordinal();
+        let resumable_ordinal = completion.resumable_transition_ordinal();
+        let closed_ordinal = completion.closed_transition_ordinal();
+        let moved = completion.victim_requeued();
+        let progress_owner_resumable = completion.progress_owner_resumable();
+        self.write_scheduler_trace_event(serde_json::json!({
+            "event": "scheduler_pressure_release_fence_completed",
+            "episode_id": transaction.episode_id().get(),
+            "handoff_generation": transaction.handoff_generation(),
+            "victim_request_id": transaction.victim_request_id(),
+            "progress_owner_id": transaction.progress_owner_id(),
+            "release_transition_ordinal": release_ordinal.get(),
+            "resumable_transition_ordinal": resumable_ordinal.map(|ordinal| ordinal.get()),
+            "closed_transition_ordinal": closed_ordinal.map(|ordinal| ordinal.get()),
+            "release_authority": release_authority,
+            "exact_source_advanced": true,
+            "progress_owner_resumable": progress_owner_resumable,
+            "moved": moved,
+            "scheduler": self.scheduler.trace_snapshot(),
+        }));
+        self.write_executor_scheduler_profile_event(
+            transaction.victim_request_id(),
+            "vnext.execution_capacity_pressure_release_fence_completed",
+            ProfileEventKind::Instant,
+            ProfileStatus::Ok,
+            None,
+            BTreeMap::from([
+                (
+                    "episode_id".to_string(),
+                    serde_json::json!(transaction.episode_id().get()),
+                ),
+                (
+                    "handoff_generation".to_string(),
+                    serde_json::json!(transaction.handoff_generation()),
+                ),
+                (
+                    "release_transition_ordinal".to_string(),
+                    serde_json::json!(release_ordinal.get()),
+                ),
+                (
+                    "resumable_transition_ordinal".to_string(),
+                    serde_json::json!(resumable_ordinal.map(|ordinal| ordinal.get())),
+                ),
+                (
+                    "closed_transition_ordinal".to_string(),
+                    serde_json::json!(closed_ordinal.map(|ordinal| ordinal.get())),
+                ),
+                (
+                    "physical_release_completed".to_string(),
+                    serde_json::json!(true),
+                ),
+                ("exact_source_advanced".to_string(), serde_json::json!(true)),
+                (
+                    "release_authority".to_string(),
+                    serde_json::json!(release_authority),
+                ),
+                (
+                    "progress_owner_resumable".to_string(),
+                    serde_json::json!(progress_owner_resumable),
+                ),
+                ("victim_requeued".to_string(), serde_json::json!(moved)),
+            ]),
+            BTreeMap::from([
+                (
+                    "progress_owner_id".to_string(),
+                    serde_json::json!(transaction.progress_owner_id()),
+                ),
+                (
+                    "current_capacity_availability".to_string(),
+                    serde_json::json!(availability),
+                ),
+            ]),
+            None,
+        );
+        if moved {
+            self.total_preemptions.fetch_add(1, Ordering::Relaxed);
+            counter!("ferrum.engine.preemptions_total").increment(1);
+            self.trace_scheduler_defer(
+                transaction.victim_request_id(),
+                "engine_scheduler_execution_capacity_yield",
+                "execution capacity yielded for phase-independent recompute",
+            );
+            self.work_notify.notify_waiters();
+        }
+        Ok(progress_owner_resumable)
     }
 
     async fn defer_decode_for_capacity_recompute_inner(
         &self,
         request_id: &RequestId,
-        progress_lease: Option<&DecodeProgressLease>,
         attempted_decode_width: usize,
         observed_free_blocks: Option<usize>,
     ) -> bool {
@@ -1089,20 +1422,13 @@ impl EngineInner {
         self.release_sequence_physical_resources(request_id, physical_resources)
             .await;
 
-        let moved = if let Some(lease) = progress_lease {
-            self.scheduler.defer_decode_to_waiting_with_progress_lease(
-                lease,
+        let moved = self
+            .scheduler
+            .defer_decode_to_waiting_for_capacity_with_pressure(
+                request_id,
                 attempted_decode_width,
                 observed_free_blocks,
-            )
-        } else {
-            self.scheduler
-                .defer_decode_to_waiting_for_capacity_with_pressure(
-                    request_id,
-                    attempted_decode_width,
-                    observed_free_blocks,
-                )
-        };
+            );
         if moved {
             info!(
                 "Capacity-deferred decode request {} for KV recompute after failed width {}",

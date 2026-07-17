@@ -1527,6 +1527,39 @@ fn lifecycle_gate_linearizes_maintenance_before_close() {
 }
 
 #[test]
+fn quiescent_sequence_abort_is_one_terminal_transition() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        'f',
+        1,
+        64,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 128);
+    let harness = harness(runtime, catalog, 128, false);
+    let _initialization = harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let sequence = admitted_sequence(&harness.root, "quiescent-atomic-abort");
+    let session = sequence.open_session().unwrap();
+
+    let terminal = session.try_abort_if_quiescent().unwrap();
+
+    assert_eq!(
+        terminal.disposition(),
+        SequenceSessionTerminalDisposition::Aborted
+    );
+    assert!(session.request_cancel().is_err());
+    drop(terminal);
+    drop(session);
+    drop(sequence);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
 fn sequence_session_source_permanently_rejects_legacy_activation() {
     let catalog = pool_catalog(
         linear_profile(),

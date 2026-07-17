@@ -9,6 +9,18 @@
 //! - Memory-aware scheduling based on KV cache usage
 //! - Preemption support for long-running requests
 
+mod pressure;
+
+use pressure::{
+    LogicalWorkFrontier, PressureCandidate, PressureCoordinator, PressureDecision,
+    PressureHoldStatus,
+};
+pub use pressure::{
+    LogicalWorkGeneration, PressureEpisodeId, PressureEpisodeState, PressureHoldReleaseReason,
+    PressureInvariantViolation, PressureInvariantViolationClass, PressureTransition,
+    PressureTransitionKind, PressureTransitionOrdinal, PressureYieldTransaction,
+};
+
 use crate::vnext::{
     AdmissionDeferral, AdmissionProbeOutcome, AdmissionQueueEligibility, AdmissionQueueEvent,
     AdmissionTickReceipt, AdmissionWakeEpochs, AdmissionWakeSnapshot, DynamicAdmissionQueue,
@@ -21,9 +33,7 @@ use crate::{
 use async_trait::async_trait;
 use ferrum_interfaces::model_executor::ExecutorPrefillAdmissionReceipt;
 use ferrum_interfaces::scheduler::SchedulerMetrics;
-use ferrum_interfaces::vnext::{
-    AdmissionRejected, CapacityAvailabilityEpoch, CapacityWaitCondition,
-};
+use ferrum_interfaces::vnext::{AdmissionRejected, CapacityAvailabilityEpoch};
 use ferrum_types::{
     BatchId, FerrumError, InferenceRequest, InferenceResponse, Priority, RequestId, RequestState,
     Result, SchedulerConfig, PROMPT_TOKENS_METADATA_KEY,
@@ -33,7 +43,7 @@ use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::Instant,
@@ -84,153 +94,80 @@ pub enum RequestPhase {
     AdmissionFailed,
 }
 
-/// Scheduler-owned response to a pre-submit decode capacity deferral.
+/// Scheduler-owned response to an authoritative execution-capacity failure.
 ///
-/// A decode may wait while another decode remains runnable. If applying the
-/// deferral would instead leave every active decode waiting on a shared exact
-/// source, one already-blocked holder must release its physical state for
-/// recompute so a peer can remain the progress owner.
+/// Prefill and decode use the same decision. `YieldPlanned` is not a logical
+/// release: the engine must arm and complete the physical release fence before
+/// the selected frontier becomes resumable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DecodeExecutionCapacityAction {
-    Deferred { count: usize },
-    RecomputeVictim { lease: DecodeProgressLease },
+pub enum ExecutionCapacityAction {
+    Deferred {
+        count: usize,
+    },
+    YieldPlanned {
+        transaction: PressureYieldTransaction,
+    },
+    InvariantViolation {
+        violation: PressureInvariantViolation,
+    },
 }
 
-/// Monotonic logical decode progress for one request.
+/// Terminal result of one physical execution-capacity yield transaction.
 ///
-/// This generation follows committed output rather than physical KV state, so
-/// it survives decode -> recompute -> prefill transitions.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(transparent)]
-pub struct DecodeProgressGeneration(u64);
+/// A completed release can either make the selected progress owner runnable or
+/// close the episode because that owner became terminal while the fence was in
+/// flight. The engine must only resubmit the owner in the former case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionCapacityYieldCompletion {
+    victim_requeued: bool,
+    progress_owner_resumable: bool,
+    release_transition_ordinal: PressureTransitionOrdinal,
+    resumable_transition_ordinal: Option<PressureTransitionOrdinal>,
+    closed_transition_ordinal: Option<PressureTransitionOrdinal>,
+}
 
-impl DecodeProgressGeneration {
-    const ZERO: Self = Self(0);
-
-    fn from_generated_tokens(tokens: usize) -> Self {
-        Self(u64::try_from(tokens).unwrap_or(u64::MAX))
+impl ExecutionCapacityYieldCompletion {
+    pub const fn victim_requeued(&self) -> bool {
+        self.victim_requeued
     }
 
-    pub const fn get(self) -> u64 {
-        self.0
+    pub const fn progress_owner_resumable(&self) -> bool {
+        self.progress_owner_resumable
+    }
+
+    pub const fn release_transition_ordinal(&self) -> PressureTransitionOrdinal {
+        self.release_transition_ordinal
+    }
+
+    pub const fn resumable_transition_ordinal(&self) -> Option<PressureTransitionOrdinal> {
+        self.resumable_transition_ordinal
+    }
+
+    pub const fn closed_transition_ordinal(&self) -> Option<PressureTransitionOrdinal> {
+        self.closed_transition_ordinal
     }
 }
 
-#[derive(Debug, Clone)]
-struct DecodeProgressClock(Arc<AtomicU64>);
-
-impl DecodeProgressClock {
-    fn new() -> Self {
-        Self(Arc::new(AtomicU64::new(
-            DecodeProgressGeneration::ZERO.get(),
-        )))
-    }
-
-    fn current(&self) -> DecodeProgressGeneration {
-        DecodeProgressGeneration(self.0.load(Ordering::Acquire))
-    }
-
-    fn advance_to(&self, generation: DecodeProgressGeneration) {
-        let current = self.0.load(Ordering::Relaxed);
-        debug_assert!(
-            generation.get() >= current,
-            "logical decode progress cannot regress"
-        );
-        if generation.get() > current {
-            self.0.store(generation.get(), Ordering::Release);
-        }
-    }
-}
-
-/// Why a decode progress lease stopped holding its recompute victim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecodeProgressLeaseReleaseReason {
-    OwnerAdvanced,
-    OwnerNoLongerDecoding,
-}
-
-impl DecodeProgressLeaseReleaseReason {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::OwnerAdvanced => "owner_advanced",
-            Self::OwnerNoLongerDecoding => "owner_no_longer_decoding",
-        }
-    }
-}
-
-/// Physical capacity ceded by a recompute victim to one decode progress owner.
+/// Engine-owned physical release capabilities observed at the instant an
+/// authoritative execution-capacity failure is routed to the scheduler.
 ///
-/// The lease is planned while the decode queue is locked, then installed
-/// only after the engine has released the victim's physical state and moved it
-/// back to waiting. It prevents immediate re-admission until the owner commits
-/// logical decode progress, without monopolizing the released capacity until
-/// the owner's terminal state.
-#[derive(Debug, Clone)]
-pub struct DecodeProgressLease {
-    victim_request_id: RequestId,
-    progress_owner_id: RequestId,
-    progress_baseline: DecodeProgressGeneration,
-    progress_clock: DecodeProgressClock,
+/// Building this snapshot is a pressure-only operation. It keeps physical
+/// ownership out of the scheduler while preventing a logical queue phase from
+/// being mistaken for proof that a request can actually release capacity.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecutionCapacityReleaseSnapshot {
+    releasable_request_ids: HashSet<RequestId>,
 }
 
-impl PartialEq for DecodeProgressLease {
-    fn eq(&self, other: &Self) -> bool {
-        self.victim_request_id == other.victim_request_id
-            && self.progress_owner_id == other.progress_owner_id
-            && self.progress_baseline == other.progress_baseline
-            && Arc::ptr_eq(&self.progress_clock.0, &other.progress_clock.0)
-    }
-}
-
-impl Eq for DecodeProgressLease {}
-
-impl DecodeProgressLease {
-    fn new(
-        victim_request_id: RequestId,
-        progress_owner_id: RequestId,
-        progress_clock: DecodeProgressClock,
-    ) -> Self {
-        let progress_baseline = progress_clock.current();
+impl ExecutionCapacityReleaseSnapshot {
+    pub fn new(releasable_request_ids: impl IntoIterator<Item = RequestId>) -> Self {
         Self {
-            victim_request_id,
-            progress_owner_id,
-            progress_baseline,
-            progress_clock,
+            releasable_request_ids: releasable_request_ids.into_iter().collect(),
         }
     }
 
-    pub fn victim_request_id(&self) -> &RequestId {
-        &self.victim_request_id
-    }
-
-    pub fn progress_owner_id(&self) -> &RequestId {
-        &self.progress_owner_id
-    }
-
-    pub const fn progress_baseline(&self) -> DecodeProgressGeneration {
-        self.progress_baseline
-    }
-
-    pub fn progress_current(&self) -> DecodeProgressGeneration {
-        self.progress_clock.current()
-    }
-
-    fn is_held(&self, owner_phase: Option<RequestPhase>) -> bool {
-        owner_phase == Some(RequestPhase::Decoding)
-            && self.progress_current() <= self.progress_baseline
-    }
-
-    fn release_reason(
-        &self,
-        owner_phase: Option<RequestPhase>,
-    ) -> Option<DecodeProgressLeaseReleaseReason> {
-        if self.is_held(owner_phase) {
-            None
-        } else if owner_phase == Some(RequestPhase::Decoding) {
-            Some(DecodeProgressLeaseReleaseReason::OwnerAdvanced)
-        } else {
-            Some(DecodeProgressLeaseReleaseReason::OwnerNoLongerDecoding)
-        }
+    fn can_release(&self, request_id: &RequestId) -> bool {
+        self.releasable_request_ids.contains(request_id)
     }
 }
 
@@ -245,8 +182,8 @@ pub struct ContinuousBatchRequest {
     pub prefill_tokens: usize,
     /// Number of decode tokens generated
     pub decode_tokens: usize,
-    /// Logical output progress shared with any active decode progress lease.
-    decode_progress_clock: DecodeProgressClock,
+    /// Phase-independent logical progress and resident-work state.
+    logical_work_frontier: LogicalWorkFrontier,
     /// KV cache blocks allocated
     pub kv_blocks: Vec<ferrum_types::BlockId>,
     /// Whether prefill is chunked
@@ -271,10 +208,6 @@ pub struct ContinuousBatchRequest {
     pub waiting_admission_ticket: Option<WaitingAdmissionTicket>,
     /// Exact PlanRuntime capacity predicate suppressing blind execution retries.
     pub execution_capacity_deferral: Option<AdmissionDeferral>,
-    /// Typed ownership relation for capacity released by this recompute
-    /// request. Kept private so queue state cannot name an owner without the
-    /// matching victim identity produced by the scheduler decision.
-    decode_progress_lease: Option<DecodeProgressLease>,
 }
 
 impl ContinuousBatchRequest {
@@ -285,7 +218,7 @@ impl ContinuousBatchRequest {
             phase: RequestPhase::Waiting,
             prefill_tokens: 0,
             decode_tokens: 0,
-            decode_progress_clock: DecodeProgressClock::new(),
+            logical_work_frontier: LogicalWorkFrontier::default(),
             kv_blocks: Vec::new(),
             chunked_prefill: false,
             prefill_chunk_offset: 0,
@@ -298,7 +231,6 @@ impl ContinuousBatchRequest {
             capacity_deferred_from_decode: false,
             waiting_admission_ticket: None,
             execution_capacity_deferral: None,
-            decode_progress_lease: None,
         }
     }
 
@@ -329,19 +261,22 @@ pub type ExecutorAdmissionProbeOutcome =
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutorAdmissionQueueObservation {
-    ProgressLeaseHeld {
+    PressureHoldActive {
+        episode_id: PressureEpisodeId,
         request_id: RequestId,
         progress_owner_id: RequestId,
-        progress_baseline: DecodeProgressGeneration,
-        progress_current: DecodeProgressGeneration,
+        progress_baseline: LogicalWorkGeneration,
+        progress_current: LogicalWorkGeneration,
         ticket: u64,
     },
-    ProgressLeaseReleased {
+    PressureHoldReleased {
+        episode_id: PressureEpisodeId,
+        transition_ordinal: PressureTransitionOrdinal,
         request_id: RequestId,
         progress_owner_id: RequestId,
-        progress_baseline: DecodeProgressGeneration,
-        progress_current: DecodeProgressGeneration,
-        reason: DecodeProgressLeaseReleaseReason,
+        progress_baseline: LogicalWorkGeneration,
+        progress_current: LogicalWorkGeneration,
+        reason: PressureHoldReleaseReason,
         ticket: u64,
     },
     SkippedUnchanged {
@@ -463,6 +398,12 @@ pub struct ContinuousSchedulerTraceSnapshot {
     pub dynamic_admission_deferred: u64,
     pub dynamic_backing_growth_requested: u64,
     pub dynamic_admission_failed: u64,
+    pub pressure_episodes_created: u64,
+    pub pressure_active_episodes: usize,
+    pub pressure_pending_release_fences: usize,
+    pub pressure_candidate_scans: u64,
+    pub pressure_last_transition_ordinal: u64,
+    pub pressure_dropped_journal_entries: u64,
 }
 
 /// Continuous batching scheduler
@@ -519,6 +460,11 @@ pub struct ContinuousBatchScheduler {
     dynamic_admission_deferred: AtomicU64,
     dynamic_backing_growth_requested: AtomicU64,
     dynamic_admission_failed: AtomicU64,
+
+    /// Cold-path, phase-independent execution-capacity coordinator.
+    pressure_coordinator: Mutex<PressureCoordinator>,
+    /// A read-only hot-path guard. False avoids taking the coordinator lock.
+    pressure_active: AtomicBool,
 
     /// Start time
     start_time: Instant,
@@ -657,6 +603,8 @@ impl ContinuousBatchScheduler {
             dynamic_admission_deferred: AtomicU64::new(0),
             dynamic_backing_growth_requested: AtomicU64::new(0),
             dynamic_admission_failed: AtomicU64::new(0),
+            pressure_coordinator: Mutex::new(PressureCoordinator::default()),
+            pressure_active: AtomicBool::new(false),
             start_time: Instant::now(),
             metrics_tracker: Arc::new(ContinuousBatchMetrics::new()),
             cb_config,
@@ -700,20 +648,22 @@ impl ContinuousBatchScheduler {
             }
         }
         let waiting_queue = self.waiting_queue.read();
-        let request_index = self.request_index.read();
-        let progress_lease_is_held = |request: &ContinuousBatchRequest| {
-            request.decode_progress_lease.as_ref().is_some_and(|lease| {
-                lease.is_held(request_index.get(lease.progress_owner_id()).copied())
-            })
+        let pressure_hold_is_active = |request: &ContinuousBatchRequest| {
+            self.pressure_active.load(Ordering::Acquire)
+                && matches!(
+                    self.pressure_coordinator
+                        .lock()
+                        .hold_status(&request.inner.request.id),
+                    PressureHoldStatus::Held { .. }
+                )
         };
         let waiting_count = waiting_queue
             .iter()
-            .filter(|request| !progress_lease_is_held(request))
+            .filter(|request| !pressure_hold_is_active(request))
             .count();
         let waiting = waiting_queue
-            .passive_wait_condition_for(|request| !progress_lease_is_held(request))
+            .passive_wait_condition_for(|request| !pressure_hold_is_active(request))
             .map_err(|error| FerrumError::scheduler(error.to_string()))?;
-        drop(request_index);
         drop(waiting_queue);
         if waiting_count > 0 && waiting.is_none() {
             return Ok(None);
@@ -747,9 +697,18 @@ impl ContinuousBatchScheduler {
                     .map_err(|error| FerrumError::scheduler(error.to_string()))
             })
             .collect::<Result<Vec<_>>>()?;
-        ferrum_interfaces::vnext::CapacityWaitCondition::new(coordinator, observed)
-            .map(Some)
-            .map_err(|error| FerrumError::scheduler(error.to_string()))
+        let condition = ferrum_interfaces::vnext::CapacityWaitCondition::new(coordinator, observed)
+            .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+        let pressure = self.pressure_coordinator.lock();
+        if pressure.has_pending_release_for(&condition) {
+            return Ok(None);
+        }
+        if pressure.all_blocked_without_release_for(&condition) {
+            return Err(FerrumError::scheduler(
+                "capacity pressure contract reached all blocked frontiers without a pending release",
+            ));
+        }
+        Ok(Some(condition))
     }
 
     /// Get number of decoding requests
@@ -768,6 +727,7 @@ impl ContinuousBatchScheduler {
         let prefill_queue_len = self.prefill_queue.read().len();
         let decode_queue_len = self.decode_queue.read().len();
         let preempted_queue_len = self.preempted_requests.read().len();
+        let pressure = self.pressure_coordinator.lock().stats();
 
         ContinuousSchedulerTraceSnapshot {
             current_iteration: self.current_iteration.load(Ordering::Relaxed),
@@ -831,12 +791,23 @@ impl ContinuousBatchScheduler {
                 .dynamic_backing_growth_requested
                 .load(Ordering::Relaxed),
             dynamic_admission_failed: self.dynamic_admission_failed.load(Ordering::Relaxed),
+            pressure_episodes_created: pressure.episodes_created,
+            pressure_active_episodes: pressure.active_episodes,
+            pressure_pending_release_fences: pressure.pending_release_fences,
+            pressure_candidate_scans: pressure.candidate_scans,
+            pressure_last_transition_ordinal: pressure.last_transition_ordinal,
+            pressure_dropped_journal_entries: pressure.dropped_journal_entries,
         }
     }
 
     /// Return the scheduler phase for trace-only plan classification.
     pub fn trace_phase(&self, request_id: &RequestId) -> Option<RequestPhase> {
         self.request_index.read().get(request_id).copied()
+    }
+
+    /// Bounded, ordinal scheduler journal used by replay and release artifacts.
+    pub fn pressure_transition_journal(&self) -> Vec<PressureTransition> {
+        self.pressure_coordinator.lock().journal()
     }
 
     fn requeue_waiting_request(
@@ -903,7 +874,8 @@ impl ContinuousBatchScheduler {
             if let Some(epoch) = empty_retry_epoch {
                 req.capacity_deferred_empty_retry_epoch = Some(epoch);
             }
-            req.decode_progress_lease = None;
+            req.logical_work_frontier
+                .begin_prefill(req.capacity_deferred_from_decode);
             req.phase = RequestPhase::Prefilling;
             req.inner.state = RequestState::Running;
             let started_at = chrono::Utc::now();
@@ -919,6 +891,7 @@ impl ContinuousBatchScheduler {
 
             request_index.insert(request_id.clone(), RequestPhase::Prefilling);
             prefill_queue.push_back(req);
+            self.consume_pressure_hold(request_id);
 
             debug!("Promoted request {} to prefill queue", request_id);
             true
@@ -943,7 +916,9 @@ impl ContinuousBatchScheduler {
             );
             return;
         }
-        request.decode_progress_lease = None;
+        request
+            .logical_work_frontier
+            .begin_prefill(request.capacity_deferred_from_decode);
         request.phase = RequestPhase::Prefilling;
         request.inner.state = RequestState::Running;
         let started_at = chrono::Utc::now();
@@ -960,11 +935,14 @@ impl ContinuousBatchScheduler {
             .write()
             .insert(request_id.clone(), RequestPhase::Prefilling);
         self.prefill_queue.write().push_back(request);
+        self.consume_pressure_hold(&request_id);
         debug!("Typed admission promoted request {} to prefill", request_id);
     }
 
     fn fail_typed_admission(&self, mut request: ContinuousBatchRequest, error: FerrumError) {
         let request_id = request.inner.request.id.clone();
+        request.logical_work_frontier.finish();
+        self.record_pressure_frontier_terminal(&request_id);
         request.phase = RequestPhase::AdmissionFailed;
         request.inner.state = RequestState::Failed;
         self.request_index
@@ -999,7 +977,6 @@ impl ContinuousBatchScheduler {
         self.dynamic_admission_ticks.fetch_add(1, Ordering::Relaxed);
         let mut waiting = self.waiting_queue.write();
         let maximum_probes = waiting.len();
-        let request_index = self.request_index.read();
         let mut events = self.dynamic_admission_events.lock();
         let observer = std::cell::RefCell::new(observer);
         let receipt = waiting
@@ -1009,45 +986,69 @@ impl ContinuousBatchScheduler {
                 maximum_admissions,
                 &mut events,
                 |request, ticket| {
-                    let Some(lease) = request.decode_progress_lease.as_ref() else {
+                    let request_id = &request.inner.request.id;
+                    if !self.pressure_active.load(Ordering::Acquire) {
                         return AdmissionQueueEligibility::Eligible;
+                    }
+                    let hold_status = {
+                        let coordinator = self.pressure_coordinator.lock();
+                        coordinator.hold_status(request_id)
                     };
-                    let owner_phase = request_index.get(lease.progress_owner_id()).copied();
-                    if lease.is_held(owner_phase) {
-                        return AdmissionQueueEligibility::Held;
-                    }
-                    let lease = request
-                        .decode_progress_lease
-                        .take()
-                        .expect("fulfilled progress lease remains attached until eligibility");
-                    let reason = lease
-                        .release_reason(owner_phase)
-                        .expect("eligible progress lease must have a release reason");
-                    if let Some(observer) = observer.borrow_mut().as_deref_mut() {
-                        observer(ExecutorAdmissionQueueObservation::ProgressLeaseReleased {
-                            request_id: request.inner.request.id.clone(),
-                            progress_owner_id: lease.progress_owner_id().clone(),
-                            progress_baseline: lease.progress_baseline(),
-                            progress_current: lease.progress_current(),
+                    match hold_status {
+                        PressureHoldStatus::Held { .. } => AdmissionQueueEligibility::Held,
+                        PressureHoldStatus::Released {
+                            episode_id,
+                            progress_owner_id,
+                            progress_baseline,
+                            progress_current,
                             reason,
-                            ticket: ticket.get(),
-                        });
+                            ordinal,
+                        } => {
+                            {
+                                let mut coordinator = self.pressure_coordinator.lock();
+                                coordinator.consume_released_hold(request_id);
+                                self.pressure_active
+                                    .store(coordinator.has_records(), Ordering::Release);
+                            }
+                            if let Some(observer) = observer.borrow_mut().as_deref_mut() {
+                                observer(ExecutorAdmissionQueueObservation::PressureHoldReleased {
+                                    episode_id,
+                                    transition_ordinal: ordinal,
+                                    request_id: request_id.clone(),
+                                    progress_owner_id,
+                                    progress_baseline,
+                                    progress_current,
+                                    reason,
+                                    ticket: ticket.get(),
+                                });
+                            }
+                            AdmissionQueueEligibility::Eligible
+                        }
+                        PressureHoldStatus::None => AdmissionQueueEligibility::Eligible,
                     }
-                    AdmissionQueueEligibility::Eligible
                 },
                 |request, ticket| {
-                    let lease = request
-                        .decode_progress_lease
-                        .as_ref()
-                        .expect("held recompute admission has a progress lease");
-                    if let Some(observer) = observer.borrow_mut().as_deref_mut() {
-                        observer(ExecutorAdmissionQueueObservation::ProgressLeaseHeld {
-                            request_id: request.inner.request.id.clone(),
-                            progress_owner_id: lease.progress_owner_id().clone(),
-                            progress_baseline: lease.progress_baseline(),
-                            progress_current: lease.progress_current(),
-                            ticket: ticket.get(),
-                        });
+                    if let PressureHoldStatus::Held {
+                        episode_id,
+                        progress_owner_id,
+                        progress_baseline,
+                        progress_current,
+                        ..
+                    } = self
+                        .pressure_coordinator
+                        .lock()
+                        .hold_status(&request.inner.request.id)
+                    {
+                        if let Some(observer) = observer.borrow_mut().as_deref_mut() {
+                            observer(ExecutorAdmissionQueueObservation::PressureHoldActive {
+                                episode_id,
+                                request_id: request.inner.request.id.clone(),
+                                progress_owner_id,
+                                progress_baseline,
+                                progress_current,
+                                ticket: ticket.get(),
+                            });
+                        }
                     }
                 },
                 |request, ticket, deferral| {
@@ -1063,7 +1064,6 @@ impl ContinuousBatchScheduler {
                 |request| probe(&request.inner.request),
             )
             .map_err(|error| FerrumError::scheduler(error.to_string()))?;
-        drop(request_index);
         drop(waiting);
 
         self.dynamic_admission_probes
@@ -1323,138 +1323,188 @@ impl ContinuousBatchScheduler {
         );
     }
 
-    /// Preserve active PlanRuntime prefill ownership and progress while
-    /// suppressing retries until an exact observed capacity source moves.
+    /// Route an active prefill failure through the phase-independent pressure
+    /// coordinator.
     pub fn defer_prefill_for_execution_capacity(
         &self,
         request_id: &RequestId,
         deferral: AdmissionDeferral,
-    ) -> Result<bool> {
-        if deferral.action() != ferrum_interfaces::vnext::DeferredAction::WaitForRelease {
-            return Err(FerrumError::scheduler(
-                "active prefill capacity deferral must wait for release",
-            ));
-        }
-        let mut prefill = self.prefill_queue.write();
-        let Some(request) = prefill
-            .iter_mut()
-            .find(|request| request.inner.request.id == *request_id)
-        else {
-            return Ok(false);
-        };
-        request.execution_capacity_deferral = Some(deferral);
-        self.capacity_deferred_counter
-            .fetch_add(1, Ordering::Relaxed);
-        Ok(true)
+        release_snapshot: &ExecutionCapacityReleaseSnapshot,
+    ) -> Result<ExecutionCapacityAction> {
+        self.plan_execution_capacity_pressure(
+            std::slice::from_ref(request_id),
+            deferral,
+            release_snapshot,
+        )
     }
 
-    fn execution_capacity_waits_overlap(
-        left: &CapacityWaitCondition,
-        right: &CapacityWaitCondition,
-    ) -> bool {
-        left.coordinator_id() == right.coordinator_id()
-            && left.observed().iter().any(|left_source| {
-                right
-                    .observed()
-                    .iter()
-                    .any(|right_source| left_source.source() == right_source.source())
-            })
-    }
-
-    /// Preserve active PlanRuntime decode ownership while suppressing retries
-    /// until one of the exact capacity sources observed by the executor moves.
-    ///
-    /// The decision is made while holding the decode queue lock. This prevents
-    /// every resource holder from being parked on a source that only one of
-    /// those holders can advance by completing or releasing its state.
+    /// Route active decode failures through the same logical work frontier as
+    /// prefill/recompute failures.
     pub fn defer_decode_for_execution_capacity(
         &self,
         request_ids: &[RequestId],
         deferral: AdmissionDeferral,
-    ) -> Result<DecodeExecutionCapacityAction> {
+        release_snapshot: &ExecutionCapacityReleaseSnapshot,
+    ) -> Result<ExecutionCapacityAction> {
+        self.plan_execution_capacity_pressure(request_ids, deferral, release_snapshot)
+    }
+
+    fn plan_execution_capacity_pressure(
+        &self,
+        request_ids: &[RequestId],
+        deferral: AdmissionDeferral,
+        release_snapshot: &ExecutionCapacityReleaseSnapshot,
+    ) -> Result<ExecutionCapacityAction> {
         if deferral.action() != ferrum_interfaces::vnext::DeferredAction::WaitForRelease {
             return Err(FerrumError::scheduler(
-                "active decode capacity deferral must wait for release",
+                "active execution-capacity deferral must wait for release",
             ));
         }
-        let mut decode = self.decode_queue.write();
-        let requested = request_ids
-            .iter()
-            .filter(|request_id| decode.contains_key(*request_id))
-            .cloned()
-            .collect::<HashSet<_>>();
-        if requested.is_empty() {
-            return Ok(DecodeExecutionCapacityAction::Deferred { count: 0 });
+        let active_ids = {
+            let request_index = self.request_index.read();
+            request_ids
+                .iter()
+                .filter(|request_id| {
+                    matches!(
+                        request_index.get(*request_id),
+                        Some(RequestPhase::Prefilling | RequestPhase::Decoding)
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        if active_ids.is_empty() {
+            return Ok(ExecutionCapacityAction::Deferred { count: 0 });
         }
 
-        let runnable_peer_remains = decode.iter().any(|(request_id, request)| {
-            !requested.contains(request_id) && request.execution_capacity_deferral.is_none()
-        });
-        if !runnable_peer_remains {
-            let victim = decode
-                .iter()
-                .filter(|(request_id, request)| {
-                    !requested.contains(*request_id)
-                        && request
-                            .execution_capacity_deferral
-                            .as_ref()
-                            .is_some_and(|blocked| {
-                                Self::execution_capacity_waits_overlap(
-                                    blocked.wait_condition(),
-                                    deferral.wait_condition(),
-                                )
-                            })
-                })
-                .min_by(|(left_id, left), (right_id, right)| {
-                    left.inner
-                        .request
-                        .priority
-                        .cmp(&right.inner.request.priority)
-                        .then_with(|| {
-                            left.decode_progress_clock
-                                .current()
-                                .cmp(&right.decode_progress_clock.current())
-                        })
-                        .then_with(|| left_id.0.cmp(&right_id.0))
-                })
-                .map(|(request_id, _)| request_id.clone());
-            if let Some(victim_request_id) = victim {
-                let progress_owners = request_ids
-                    .iter()
-                    .filter(|request_id| requested.contains(*request_id))
-                    .collect::<Vec<_>>();
-                if progress_owners.len() != 1 {
+        let candidates = self.execution_capacity_candidates(release_snapshot);
+        let decision = {
+            let mut coordinator = self.pressure_coordinator.lock();
+            let decision = coordinator
+                .plan_failure(&active_ids, deferral.wait_condition(), &candidates)
+                .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+            self.pressure_active
+                .store(coordinator.has_records(), Ordering::Release);
+            decision
+        };
+
+        match decision {
+            PressureDecision::Deferred { count, .. } => {
+                let installed =
+                    self.install_execution_capacity_deferral(&active_ids, &deferral, None);
+                self.capacity_deferred_counter
+                    .fetch_add(installed as u64, Ordering::Relaxed);
+                if installed != count {
                     return Err(FerrumError::scheduler(format!(
-                        "decode progress lease requires one split progress owner, found {}",
-                        progress_owners.len()
+                        "execution-capacity deferral retained {installed} of {count} active frontiers"
                     )));
                 }
-                let progress_owner_id = (*progress_owners[0]).clone();
-                let progress_clock = decode
-                    .get(&progress_owner_id)
-                    .expect("requested progress owner remains in the decode queue")
-                    .decode_progress_clock
-                    .clone();
-                return Ok(DecodeExecutionCapacityAction::RecomputeVictim {
-                    lease: DecodeProgressLease::new(
-                        victim_request_id,
-                        progress_owner_id,
-                        progress_clock,
-                    ),
-                });
+                Ok(ExecutionCapacityAction::Deferred { count: installed })
+            }
+            PressureDecision::YieldPlanned(transaction) => {
+                let installed = self.install_execution_capacity_deferral(
+                    &active_ids,
+                    &deferral,
+                    Some(transaction.victim_request_id()),
+                );
+                self.capacity_deferred_counter
+                    .fetch_add(installed as u64, Ordering::Relaxed);
+                Ok(ExecutionCapacityAction::YieldPlanned { transaction })
+            }
+            PressureDecision::InvariantViolation(violation) => {
+                Ok(ExecutionCapacityAction::InvariantViolation { violation })
             }
         }
+    }
 
-        let mut deferred = 0;
-        for request_id in request_ids {
-            if let Some(request) = decode.get_mut(request_id) {
-                request.execution_capacity_deferral = Some(deferral.clone());
-                deferred += 1;
+    fn execution_capacity_candidates(
+        &self,
+        release_snapshot: &ExecutionCapacityReleaseSnapshot,
+    ) -> Vec<PressureCandidate> {
+        let mut candidates = Vec::new();
+        {
+            let prefill = self.prefill_queue.read();
+            candidates.extend(prefill.iter().map(|request| {
+                PressureCandidate {
+                    request_id: request.inner.request.id.clone(),
+                    work_kind: request.logical_work_frontier.work_kind(),
+                    priority: request.inner.request.priority,
+                    progress: request.logical_work_frontier.progress_generation(),
+                    recompute_cost: request.logical_work_frontier.recompute_cost(),
+                    releasable: release_snapshot.can_release(&request.inner.request.id),
+                    blocked_on: request
+                        .execution_capacity_deferral
+                        .as_ref()
+                        .map(|deferral| deferral.wait_condition().clone()),
+                }
+            }));
+        }
+        {
+            let decode = self.decode_queue.read();
+            candidates.extend(decode.values().map(|request| {
+                PressureCandidate {
+                    request_id: request.inner.request.id.clone(),
+                    work_kind: request.logical_work_frontier.work_kind(),
+                    priority: request.inner.request.priority,
+                    progress: request.logical_work_frontier.progress_generation(),
+                    recompute_cost: request.logical_work_frontier.recompute_cost(),
+                    releasable: release_snapshot.can_release(&request.inner.request.id),
+                    blocked_on: request
+                        .execution_capacity_deferral
+                        .as_ref()
+                        .map(|deferral| deferral.wait_condition().clone()),
+                }
+            }));
+        }
+        if self.pressure_active.load(Ordering::Acquire) {
+            let waiting = self.waiting_queue.read();
+            candidates.extend(waiting.iter().map(|request| {
+                PressureCandidate {
+                    request_id: request.inner.request.id.clone(),
+                    work_kind: request.logical_work_frontier.work_kind(),
+                    priority: request.inner.request.priority,
+                    progress: request.logical_work_frontier.progress_generation(),
+                    recompute_cost: request.logical_work_frontier.recompute_cost(),
+                    releasable: false,
+                    blocked_on: request
+                        .execution_capacity_deferral
+                        .as_ref()
+                        .map(|deferral| deferral.wait_condition().clone()),
+                }
+            }));
+        }
+        candidates
+    }
+
+    fn install_execution_capacity_deferral(
+        &self,
+        request_ids: &[RequestId],
+        deferral: &AdmissionDeferral,
+        yielding: Option<&RequestId>,
+    ) -> usize {
+        let requested = request_ids.iter().collect::<HashSet<_>>();
+        let mut installed = 0usize;
+        {
+            let mut prefill = self.prefill_queue.write();
+            for request in prefill.iter_mut() {
+                let request_id = &request.inner.request.id;
+                if requested.contains(request_id) && yielding != Some(request_id) {
+                    request.execution_capacity_deferral = Some(deferral.clone());
+                    installed += 1;
+                }
             }
         }
-        self.capacity_deferred_counter
-            .fetch_add(deferred as u64, Ordering::Relaxed);
-        Ok(DecodeExecutionCapacityAction::Deferred { count: deferred })
+        {
+            let mut decode = self.decode_queue.write();
+            for request in decode.values_mut() {
+                let request_id = &request.inner.request.id;
+                if requested.contains(request_id) && yielding != Some(request_id) {
+                    request.execution_capacity_deferral = Some(deferral.clone());
+                    installed += 1;
+                }
+            }
+        }
+        installed
     }
 
     fn relax_backpressure_limit(limit: &AtomicUsize, max_running: usize) {
@@ -1619,6 +1669,7 @@ impl ContinuousBatchScheduler {
             req.kv_blocks.clear();
             req.chunked_prefill = false;
             req.prefill_chunk_offset = 0;
+            req.logical_work_frontier.yield_for_recompute();
             req.capacity_deferred_until_release_epoch = self
                 .capacity_release_epoch
                 .load(Ordering::Relaxed)
@@ -1667,22 +1718,148 @@ impl ContinuousBatchScheduler {
             request_id,
             attempted_decode_width,
             observed_free_blocks,
-            None,
         )
     }
 
-    pub fn defer_decode_to_waiting_with_progress_lease(
+    /// Mark the planned yield as owning the physical release obligation.
+    pub fn arm_execution_capacity_yield(
         &self,
-        lease: &DecodeProgressLease,
+        transaction: &PressureYieldTransaction,
+    ) -> Result<PressureTransitionOrdinal> {
+        let ordinal = self
+            .pressure_coordinator
+            .lock()
+            .arm_release_fence(transaction)
+            .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+        self.pressure_active.store(true, Ordering::Release);
+        Ok(ordinal)
+    }
+
+    /// Complete a phase-independent yield after the engine has released all
+    /// physical resources and its release fence reached terminal state.
+    pub fn complete_execution_capacity_yield(
+        &self,
+        transaction: &PressureYieldTransaction,
+        attempted_decode_width: usize,
+        observed_free_blocks: Option<usize>,
+    ) -> Result<ExecutionCapacityYieldCompletion> {
+        let request_id = transaction.victim_request_id();
+        let requeued = self.requeue_execution_capacity_victim(
+            request_id,
+            attempted_decode_width,
+            observed_free_blocks,
+        );
+
+        let (release_ordinal, resumable_ordinal, closed_ordinal) = {
+            let mut coordinator = self.pressure_coordinator.lock();
+            let ordinals = coordinator
+                .complete_release_fence(transaction)
+                .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+            if !requeued {
+                let _ = coordinator
+                    .record_terminal(request_id)
+                    .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+            }
+            self.pressure_active
+                .store(coordinator.has_records(), Ordering::Release);
+            ordinals
+        };
+        Ok(ExecutionCapacityYieldCompletion {
+            victim_requeued: requeued,
+            progress_owner_resumable: resumable_ordinal.is_some(),
+            release_transition_ordinal: release_ordinal,
+            resumable_transition_ordinal: resumable_ordinal,
+            closed_transition_ordinal: closed_ordinal,
+        })
+    }
+
+    /// Resolve every planned-yield error path so a failed physical release
+    /// cannot leave the scheduler claiming a pending fence forever.
+    pub fn abort_execution_capacity_yield(
+        &self,
+        transaction: &PressureYieldTransaction,
+        victim_released: bool,
+        attempted_decode_width: usize,
+        observed_free_blocks: Option<usize>,
+    ) -> Result<(bool, PressureTransitionOrdinal, PressureTransitionOrdinal)> {
+        let (aborted_ordinal, closed_ordinal, participants) = {
+            let mut coordinator = self.pressure_coordinator.lock();
+            let (aborted, closed, participants) = coordinator
+                .abort_yield(transaction)
+                .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+            self.pressure_active
+                .store(coordinator.has_records(), Ordering::Release);
+            (aborted, closed, participants)
+        };
+        let participants = participants.into_iter().collect::<HashSet<_>>();
+        for request in self.prefill_queue.write().iter_mut() {
+            if participants.contains(&request.inner.request.id) {
+                request.execution_capacity_deferral = None;
+            }
+        }
+        for request in self.decode_queue.write().values_mut() {
+            if participants.contains(&request.inner.request.id) {
+                request.execution_capacity_deferral = None;
+            }
+        }
+        let requeued = victim_released
+            && self.requeue_execution_capacity_victim(
+                transaction.victim_request_id(),
+                attempted_decode_width,
+                observed_free_blocks,
+            );
+        Ok((requeued, aborted_ordinal, closed_ordinal))
+    }
+
+    fn requeue_execution_capacity_victim(
+        &self,
+        request_id: &RequestId,
         attempted_decode_width: usize,
         observed_free_blocks: Option<usize>,
     ) -> bool {
-        self.defer_decode_to_waiting_for_capacity_inner(
-            lease.victim_request_id(),
-            attempted_decode_width,
-            observed_free_blocks,
-            Some(lease),
-        )
+        let request = {
+            let mut prefill = self.prefill_queue.write();
+            prefill
+                .iter()
+                .position(|request| request.inner.request.id == *request_id)
+                .and_then(|position| prefill.remove(position))
+        }
+        .or_else(|| self.decode_queue.write().remove(request_id));
+
+        let mut requeued = false;
+        if let Some(mut request) = request {
+            request.phase = RequestPhase::Waiting;
+            request.inner.state = RequestState::Waiting;
+            request.inner.started_at = None;
+            request.prefill_tokens = 0;
+            request.decode_tokens = 0;
+            request.kv_blocks.clear();
+            request.chunked_prefill = false;
+            request.prefill_chunk_offset = 0;
+            request.capacity_deferred_until_release_epoch = self
+                .capacity_release_epoch
+                .load(Ordering::Relaxed)
+                .saturating_add(1);
+            request.capacity_deferred_mixed_attempt_epoch = None;
+            request.capacity_deferred_empty_retry_epoch = None;
+            request.capacity_deferred_from_decode = true;
+            request.execution_capacity_deferral = None;
+            request.logical_work_frontier.yield_for_recompute();
+            request.last_iteration = self.current_iteration.load(Ordering::Relaxed);
+
+            let mut waiting = self.waiting_queue.write();
+            let mut request_index = self.request_index.write();
+            requeued = self.requeue_waiting_request(&mut waiting, &mut request_index, request);
+            if requeued {
+                self.record_capacity_defer_feedback(attempted_decode_width.max(1));
+                self.record_decode_capacity_pressure(
+                    attempted_decode_width.max(1),
+                    observed_free_blocks,
+                );
+            }
+        }
+
+        requeued
     }
 
     fn defer_decode_to_waiting_for_capacity_inner(
@@ -1690,7 +1867,6 @@ impl ContinuousBatchScheduler {
         request_id: &RequestId,
         attempted_decode_width: usize,
         observed_free_blocks: Option<usize>,
-        progress_lease: Option<&DecodeProgressLease>,
     ) -> bool {
         let mut decode_queue = self.decode_queue.write();
         let mut waiting_queue = self.waiting_queue.write();
@@ -1713,7 +1889,7 @@ impl ContinuousBatchScheduler {
             req.capacity_deferred_empty_retry_epoch = None;
             req.capacity_deferred_from_decode = true;
             req.execution_capacity_deferral = None;
-            req.decode_progress_lease = progress_lease.cloned();
+            req.logical_work_frontier.yield_for_recompute();
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
             if !self.requeue_waiting_request(&mut waiting_queue, &mut request_index, req) {
                 return false;
@@ -1723,11 +1899,7 @@ impl ContinuousBatchScheduler {
                 attempted_decode_width.max(1),
                 observed_free_blocks,
             );
-            debug!(
-                "Deferred decode request {} back to waiting with progress lease owner {:?}",
-                request_id,
-                progress_lease.map(DecodeProgressLease::progress_owner_id)
-            );
+            debug!("Deferred decode request {} back to waiting", request_id);
             true
         } else {
             false
@@ -1751,7 +1923,7 @@ impl ContinuousBatchScheduler {
             req.capacity_deferred_empty_retry_epoch = None;
             req.capacity_deferred_from_decode = false;
             req.execution_capacity_deferral = None;
-            req.decode_progress_lease = None;
+            req.logical_work_frontier.begin_decode();
 
             request_index.insert(request_id.clone(), RequestPhase::Decoding);
             decode_queue.insert(request_id.clone(), req);
@@ -2106,6 +2278,8 @@ impl ContinuousBatchScheduler {
                 let mut scheduled = req.inner.clone();
                 scheduled.tokens_processed = req.prefill_chunk_offset;
                 scheduled.tokens_to_process = Some(prefill_chunk_tokens);
+                req.logical_work_frontier
+                    .mark_scheduled(prefill_chunk_tokens);
                 scheduled_request_ids.insert(scheduled.request.id.clone());
                 batch_requests.push(scheduled);
                 *total_tokens += prefill_chunk_tokens;
@@ -2277,6 +2451,7 @@ impl ContinuousBatchScheduler {
             let mut scheduled = req.inner.clone();
             scheduled.tokens_processed = req.total_tokens();
             scheduled.tokens_to_process = Some(1);
+            req.logical_work_frontier.mark_scheduled(1);
             scheduled_request_ids.insert(scheduled.request.id.clone());
             batch_requests.push(scheduled);
             *total_tokens += 1;
@@ -2416,16 +2591,20 @@ impl ContinuousBatchScheduler {
                 .fetch_add(1, Ordering::Relaxed);
             let active_count_for_capacity_wait = self.active_count();
             let waiting_queue = self.waiting_queue.read();
-            let request_index = self.request_index.read();
             let mut requests_to_admit = Vec::new();
             let mut release_blocked_capacity_deferred_admissions = 0usize;
             for req in waiting_queue.iter() {
                 if requests_to_admit.len() >= available_slots {
                     break;
                 }
-                if req.decode_progress_lease.as_ref().is_some_and(|lease| {
-                    lease.is_held(request_index.get(lease.progress_owner_id()).copied())
-                }) {
+                if self.pressure_active.load(Ordering::Acquire)
+                    && matches!(
+                        self.pressure_coordinator
+                            .lock()
+                            .hold_status(&req.inner.request.id),
+                        PressureHoldStatus::Held { .. }
+                    )
+                {
                     continue;
                 }
                 let budgeted_capacity_deferred =
@@ -2455,7 +2634,6 @@ impl ContinuousBatchScheduler {
                     release_blocked_capacity_deferred_admissions += 1;
                 }
             }
-            drop(request_index);
             drop(waiting_queue);
             for (req_id, empty_retry_epoch) in requests_to_admit {
                 self.promote_to_prefill_with_empty_retry(&req_id, empty_retry_epoch);
@@ -2576,14 +2754,18 @@ impl ContinuousBatchScheduler {
     pub fn mark_prefill_complete(&self, request_id: &RequestId, tokens: usize) {
         let mut prefill_queue = self.prefill_queue.write();
         let mut found = false;
+        let mut progress = None;
         if let Some(pos) = prefill_queue
             .iter()
             .position(|r| r.inner.request.id == *request_id)
         {
             let req = &mut prefill_queue[pos];
+            let delta = tokens.saturating_sub(req.prefill_chunk_offset);
             req.prefill_tokens = tokens;
             req.prefill_chunk_offset = tokens;
             req.chunked_prefill = false;
+            req.logical_work_frontier.commit_prefill(tokens, delta);
+            progress = Some(req.logical_work_frontier.progress_generation());
             found = true;
         }
         drop(prefill_queue);
@@ -2591,6 +2773,9 @@ impl ContinuousBatchScheduler {
         // Promote to decode
         self.promote_to_decode(request_id);
         if found {
+            if let Some(progress) = progress {
+                self.record_pressure_frontier_progress(request_id, progress);
+            }
             self.record_resource_progress();
         }
     }
@@ -2613,6 +2798,7 @@ impl ContinuousBatchScheduler {
         let mut prefill_queue = self.prefill_queue.write();
         let mut fully_done = false;
         let mut made_progress = false;
+        let mut progress = None;
         if let Some(pos) = prefill_queue
             .iter()
             .position(|r| r.inner.request.id == *request_id)
@@ -2620,21 +2806,31 @@ impl ContinuousBatchScheduler {
             let req = &mut prefill_queue[pos];
             req.prefill_tokens = total_prompt_tokens;
             req.chunked_prefill = true;
+            let previous_offset = req.prefill_chunk_offset;
             req.prefill_chunk_offset = req
                 .prefill_chunk_offset
                 .saturating_add(chunk_tokens)
                 .min(total_prompt_tokens);
-            if chunk_tokens > 0 {
+            let committed_tokens = req.prefill_chunk_offset.saturating_sub(previous_offset);
+            req.logical_work_frontier
+                .commit_prefill(req.prefill_chunk_offset, committed_tokens);
+            progress = Some(req.logical_work_frontier.progress_generation());
+            if committed_tokens > 0 {
                 req.capacity_deferred_mixed_attempt_epoch = None;
                 req.capacity_deferred_empty_retry_epoch = None;
             }
             fully_done = req.prefill_chunk_offset >= total_prompt_tokens;
-            made_progress = chunk_tokens > 0;
+            made_progress = committed_tokens > 0;
         }
         drop(prefill_queue);
 
         if fully_done {
             self.promote_to_decode(request_id);
+        }
+        if made_progress {
+            if let Some(progress) = progress {
+                self.record_pressure_frontier_progress(request_id, progress);
+            }
         }
         if made_progress && fully_done {
             self.record_resource_progress();
@@ -2645,16 +2841,65 @@ impl ContinuousBatchScheduler {
     /// Update decode progress for a request
     pub fn update_decode_progress(&self, request_id: &RequestId, tokens_generated: usize) {
         let mut decode_queue = self.decode_queue.write();
+        let mut progress = None;
         if let Some(req) = decode_queue.get_mut(request_id) {
             req.decode_tokens = tokens_generated;
-            req.decode_progress_clock
-                .advance_to(DecodeProgressGeneration::from_generated_tokens(
-                    tokens_generated,
-                ));
+            req.logical_work_frontier.commit_decode(tokens_generated);
+            progress = Some(req.logical_work_frontier.progress_generation());
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
+        }
+        drop(decode_queue);
+        if let Some(progress) = progress {
+            self.record_pressure_frontier_progress(request_id, progress);
         }
         // Decode progress consumes KV capacity; only actual prefill progress or
         // completion should relax capacity backpressure.
+    }
+
+    fn record_pressure_frontier_progress(
+        &self,
+        request_id: &RequestId,
+        progress: LogicalWorkGeneration,
+    ) {
+        if !self.pressure_active.load(Ordering::Acquire) {
+            return;
+        }
+        let mut coordinator = self.pressure_coordinator.lock();
+        if let Err(error) = coordinator.record_progress(request_id, progress) {
+            warn!(
+                request_id = %request_id,
+                error = %error,
+                "Pressure coordinator rejected logical frontier progress"
+            );
+        }
+        self.pressure_active
+            .store(coordinator.has_records(), Ordering::Release);
+    }
+
+    fn record_pressure_frontier_terminal(&self, request_id: &RequestId) {
+        if !self.pressure_active.load(Ordering::Acquire) {
+            return;
+        }
+        let mut coordinator = self.pressure_coordinator.lock();
+        if let Err(error) = coordinator.record_terminal(request_id) {
+            warn!(
+                request_id = %request_id,
+                error = %error,
+                "Pressure coordinator rejected logical frontier terminal state"
+            );
+        }
+        self.pressure_active
+            .store(coordinator.has_records(), Ordering::Release);
+    }
+
+    fn consume_pressure_hold(&self, request_id: &RequestId) {
+        if !self.pressure_active.load(Ordering::Acquire) {
+            return;
+        }
+        let mut coordinator = self.pressure_coordinator.lock();
+        coordinator.consume_released_hold(request_id);
+        self.pressure_active
+            .store(coordinator.has_records(), Ordering::Release);
     }
 }
 
@@ -2737,6 +2982,7 @@ impl Scheduler for ContinuousBatchScheduler {
 
             // Remove from index
             self.request_index.write().remove(&request_id);
+            self.record_pressure_frontier_terminal(&request_id);
             self.record_capacity_release_progress();
 
             Ok(())
@@ -2749,6 +2995,7 @@ impl Scheduler for ContinuousBatchScheduler {
             {
                 prefill_queue.remove(pos);
                 self.request_index.write().remove(&request_id);
+                self.record_pressure_frontier_terminal(&request_id);
                 match response.finish_reason {
                     ferrum_types::FinishReason::EOS
                     | ferrum_types::FinishReason::Stop
@@ -2798,6 +3045,7 @@ impl Scheduler for ContinuousBatchScheduler {
             if let Some(pos) = waiting_position {
                 waiting_queue.remove(pos);
                 self.request_index.write().remove(&request_id);
+                self.record_pressure_frontier_terminal(&request_id);
                 self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
                 info!("Request {} cancelled from waiting queue", request_id);
                 return Ok(true);
@@ -2813,6 +3061,7 @@ impl Scheduler for ContinuousBatchScheduler {
             {
                 prefill_queue.remove(pos);
                 self.request_index.write().remove(&request_id);
+                self.record_pressure_frontier_terminal(&request_id);
                 self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
                 self.record_capacity_release_progress();
                 warn!("Request {} cancelled during prefill", request_id);
@@ -2825,6 +3074,7 @@ impl Scheduler for ContinuousBatchScheduler {
             let mut decode_queue = self.decode_queue.write();
             if decode_queue.remove(&request_id).is_some() {
                 self.request_index.write().remove(&request_id);
+                self.record_pressure_frontier_terminal(&request_id);
                 self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
                 self.record_capacity_release_progress();
                 warn!("Request {} cancelled during decode", request_id);
@@ -3078,6 +3328,12 @@ mod tests {
             .insert(request_id, RequestPhase::Waiting);
     }
 
+    fn execution_capacity_release_snapshot<'a>(
+        request_ids: impl IntoIterator<Item = &'a RequestId>,
+    ) -> ExecutionCapacityReleaseSnapshot {
+        ExecutionCapacityReleaseSnapshot::new(request_ids.into_iter().cloned())
+    }
+
     #[tokio::test]
     async fn test_scheduler_creation() {
         let config = SchedulerConfig::default();
@@ -3268,7 +3524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_decode_capacity_deferral_skips_unchanged_sources_without_hol_blocking() {
+    async fn cross_phase_pressure_yield_resumes_oldest_blocked_frontier_after_fence() {
         use ferrum_interfaces::vnext::{
             CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
             DeferredAction,
@@ -3311,9 +3567,10 @@ mod tests {
                 .defer_decode_for_execution_capacity(
                     std::slice::from_ref(&blocked_id),
                     deferral.clone(),
+                    &execution_capacity_release_snapshot([&blocked_id, &runnable_id]),
                 )
                 .unwrap(),
-            DecodeExecutionCapacityAction::Deferred { count: 1 }
+            ExecutionCapacityAction::Deferred { count: 1 }
         );
         let mut observations = Vec::new();
         let bypass = scheduler
@@ -3336,44 +3593,62 @@ mod tests {
             }] if request_id == &blocked_id && current_wait_sources == &availability0
         ));
 
-        let action = scheduler
-            .defer_decode_for_execution_capacity(std::slice::from_ref(&runnable_id), deferral)
-            .unwrap();
-        let DecodeExecutionCapacityAction::RecomputeVictim { lease } = action else {
-            panic!("the last runnable decode must receive a progress lease");
-        };
-        assert_eq!(lease.victim_request_id(), &blocked_id);
-        assert_eq!(lease.progress_owner_id(), &runnable_id);
-        let audit_only = AdmissionWakeEpochs::new(NonZeroU64::new(29).unwrap(), 1, 0, 0);
-        observations.clear();
-        let still_runnable = scheduler
-            .next_batch_with_dynamic_admission_observed(
-                BatchHint::simple(2),
-                AdmissionWakeSnapshot::new(audit_only, &availability0),
-                &mut |_| panic!("unchanged exact sources must not probe"),
-                &mut |observation| observations.push(observation),
+        let unavailable_action = scheduler
+            .defer_decode_for_execution_capacity(
+                std::slice::from_ref(&runnable_id),
+                deferral.clone(),
+                &execution_capacity_release_snapshot([&blocked_id]),
             )
-            .unwrap()
-            .expect("the selected progress owner must remain runnable");
-        assert_eq!(still_runnable.requests.len(), 1);
-        assert_eq!(still_runnable.requests[0].request.id, runnable_id);
-        assert_eq!(
-            observations
-                .iter()
-                .filter(|observation| matches!(
-                    observation,
-                    ExecutorAdmissionQueueObservation::DecodeSkippedUnchanged { .. }
-                ))
-                .count(),
-            1
-        );
+            .unwrap();
+        assert!(matches!(
+            unavailable_action,
+            ExecutionCapacityAction::InvariantViolation {
+                violation
+            } if violation.class() == PressureInvariantViolationClass::NoReleasableFrontier
+        ));
+
+        let action = scheduler
+            .defer_decode_for_execution_capacity(
+                std::slice::from_ref(&runnable_id),
+                deferral,
+                &execution_capacity_release_snapshot([&blocked_id, &runnable_id]),
+            )
+            .unwrap();
+        let ExecutionCapacityAction::YieldPlanned { transaction } = action else {
+            panic!("the last runnable frontier must produce a pressure yield");
+        };
+        assert_eq!(transaction.victim_request_id(), &runnable_id);
+        assert_eq!(transaction.progress_owner_id(), &blocked_id);
+        let armed = scheduler
+            .arm_execution_capacity_yield(&transaction)
+            .unwrap();
+        let completion = scheduler
+            .complete_execution_capacity_yield(&transaction, 1, Some(0))
+            .unwrap();
+        let released = completion.release_transition_ordinal();
+        let resumable = completion
+            .resumable_transition_ordinal()
+            .expect("live progress owner must become resumable");
+        assert!(completion.victim_requeued());
+        assert!(completion.progress_owner_resumable());
+        assert!(completion.closed_transition_ordinal().is_none());
+        assert!(transaction.planned_ordinal() < armed);
+        assert!(armed < released);
+        assert!(released < resumable);
         assert_eq!(
             scheduler
                 .trace_snapshot()
                 .execution_capacity_blocked_decode_len,
             1
         );
-        assert_eq!(scheduler.passive_capacity_wait_condition().unwrap(), None);
+        assert_eq!(
+            scheduler.trace_phase(&runnable_id),
+            Some(RequestPhase::Waiting)
+        );
+        assert!(scheduler
+            .passive_capacity_wait_condition()
+            .unwrap()
+            .is_some());
 
         let availability1 = [CapacityAvailabilityEpoch::new(source, 2).unwrap()];
         let released = AdmissionWakeEpochs::new(NonZeroU64::new(29).unwrap(), 2, 0, 0);
@@ -3386,8 +3661,9 @@ mod tests {
                 &mut |observation| observations.push(observation),
             )
             .unwrap()
-            .expect("relevant source change must resume the blocked decode");
-        assert_eq!(resumed.requests.len(), 2);
+            .expect("relevant source change must resume the selected progress owner");
+        assert_eq!(resumed.requests.len(), 1);
+        assert_eq!(resumed.requests[0].request.id, blocked_id);
         let resumed_ids = observations
             .iter()
             .filter_map(|observation| match observation {
@@ -3401,17 +3677,51 @@ mod tests {
                 _ => None,
             })
             .collect::<HashSet<_>>();
-        assert_eq!(resumed_ids, HashSet::from([blocked_id]));
+        assert_eq!(resumed_ids, HashSet::from([blocked_id.clone()]));
         assert_eq!(
             scheduler
                 .trace_snapshot()
                 .execution_capacity_blocked_decode_len,
             0
         );
+
+        scheduler.update_decode_progress(&blocked_id, 1);
+        observations.clear();
+        let admitted = scheduler
+            .next_batch_with_dynamic_admission_observed(
+                BatchHint::simple(2),
+                AdmissionWakeSnapshot::new(released, &availability1),
+                &mut |request| {
+                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                        request_id: request.id.clone(),
+                    })
+                },
+                &mut |observation| observations.push(observation),
+            )
+            .unwrap()
+            .expect("owner progress must release and admit the yielded frontier");
+        assert!(admitted
+            .requests
+            .iter()
+            .any(|request| request.request.id == runnable_id));
+        assert!(observations.iter().any(|observation| matches!(
+            observation,
+            ExecutorAdmissionQueueObservation::PressureHoldReleased {
+                request_id,
+                progress_owner_id,
+                reason: PressureHoldReleaseReason::OwnerAdvanced,
+                ..
+            } if request_id == &runnable_id && progress_owner_id == &blocked_id
+        )));
+        let journal = scheduler.pressure_transition_journal();
+        assert!(journal
+            .windows(2)
+            .all(|pair| pair[0].ordinal() < pair[1].ordinal()));
+        assert_eq!(scheduler.trace_snapshot().pressure_active_episodes, 0);
     }
 
     #[tokio::test]
-    async fn decode_progress_lease_holds_without_hol_and_releases_after_owner_advances() {
+    async fn pressure_yield_releases_after_phase_independent_owner_terminal() {
         use ferrum_interfaces::vnext::{
             CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
             DeferredAction,
@@ -3445,8 +3755,6 @@ mod tests {
             .unwrap();
         scheduler.mark_prefill_complete(&victim_id, 1);
         scheduler.mark_prefill_complete(&owner_id, 1);
-        scheduler.update_decode_progress(&owner_id, 53);
-
         let condition = CapacityWaitCondition::from_observation(41, availability.to_vec()).unwrap();
         let deferral = AdmissionDeferral::new(DeferredAction::WaitForRelease, wake, condition);
         assert_eq!(
@@ -3454,199 +3762,35 @@ mod tests {
                 .defer_decode_for_execution_capacity(
                     std::slice::from_ref(&victim_id),
                     deferral.clone(),
+                    &execution_capacity_release_snapshot([&victim_id, &owner_id]),
                 )
                 .unwrap(),
-            DecodeExecutionCapacityAction::Deferred { count: 1 }
+            ExecutionCapacityAction::Deferred { count: 1 }
         );
         let action = scheduler
-            .defer_decode_for_execution_capacity(std::slice::from_ref(&owner_id), deferral)
+            .defer_decode_for_execution_capacity(
+                std::slice::from_ref(&owner_id),
+                deferral,
+                &execution_capacity_release_snapshot([&victim_id, &owner_id]),
+            )
             .unwrap();
-        let DecodeExecutionCapacityAction::RecomputeVictim { lease } = action else {
-            panic!("capacity release must lease progress to the runnable owner");
+        let ExecutionCapacityAction::YieldPlanned { transaction } = action else {
+            panic!("capacity pressure must plan a typed yield");
         };
-        assert_eq!(lease.victim_request_id(), &victim_id);
-        assert_eq!(lease.progress_owner_id(), &owner_id);
-        assert_eq!(lease.progress_baseline().get(), 53);
-        assert!(scheduler.defer_decode_to_waiting_with_progress_lease(&lease, 1, Some(0),));
-        assert_eq!(
-            scheduler
-                .defer_decode_for_execution_capacity(
-                    std::slice::from_ref(&owner_id),
-                    AdmissionDeferral::new(
-                        DeferredAction::WaitForRelease,
-                        wake,
-                        CapacityWaitCondition::from_observation(41, availability.to_vec()).unwrap(),
-                    ),
-                )
-                .unwrap(),
-            DecodeExecutionCapacityAction::Deferred { count: 1 }
-        );
-        assert!(
-            scheduler
-                .passive_capacity_wait_condition()
-                .unwrap()
-                .is_some(),
-            "held victim must not hide the owner's exact passive wait"
-        );
-
-        let bypass = create_test_request(Priority::Normal);
-        let bypass_id = bypass.id.clone();
-        scheduler.submit(bypass).await.unwrap();
-        let mut observations = Vec::new();
-        let mut probes = Vec::new();
-        let released_availability = [CapacityAvailabilityEpoch::new(source, 2).unwrap()];
-        let released_wake = AdmissionWakeEpochs::new(NonZeroU64::new(41).unwrap(), 1, 0, 0);
-        let batch = scheduler
-            .next_batch_with_dynamic_admission_observed(
-                BatchHint::simple(4),
-                AdmissionWakeSnapshot::new(released_wake, &released_availability),
-                &mut |request| {
-                    probes.push(request.id.clone());
-                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
-                        request_id: request.id.clone(),
-                    })
-                },
-                &mut |observation| observations.push(observation),
-            )
-            .unwrap()
-            .expect("the owner and later eligible request must continue");
-        assert_eq!(probes, vec![bypass_id.clone()]);
-        assert!(batch
-            .requests
-            .iter()
-            .any(|request| request.request.id == owner_id));
-        assert!(batch
-            .requests
-            .iter()
-            .any(|request| request.request.id == bypass_id));
-        assert!(observations.iter().any(|observation| matches!(
-            observation,
-            ExecutorAdmissionQueueObservation::ProgressLeaseHeld {
-                request_id,
-                progress_owner_id,
-                progress_baseline,
-                progress_current,
-                ..
-            } if request_id == &victim_id
-                && progress_owner_id == &owner_id
-                && progress_baseline.get() == 53
-                && progress_current.get() == 53
-        )));
-
-        scheduler.update_decode_progress(&owner_id, 54);
-
-        probes.clear();
-        observations.clear();
-        let full_batch = scheduler
-            .next_batch_with_dynamic_admission_observed(
-                BatchHint::simple(4),
-                AdmissionWakeSnapshot::new(released_wake, &released_availability),
-                &mut |_| panic!("a full active set must not run an admission probe"),
-                &mut |observation| observations.push(observation),
-            )
-            .unwrap()
-            .expect("active work must continue after the lease releases");
-        assert_eq!(full_batch.requests.len(), 2);
-        assert_eq!(
-            scheduler.trace_phase(&owner_id),
-            Some(RequestPhase::Decoding)
-        );
-        assert!(observations.iter().any(|observation| matches!(
-            observation,
-            ExecutorAdmissionQueueObservation::ProgressLeaseReleased {
-                request_id,
-                progress_owner_id,
-                progress_baseline,
-                progress_current,
-                reason: DecodeProgressLeaseReleaseReason::OwnerAdvanced,
-                ..
-            } if request_id == &victim_id
-                && progress_owner_id == &owner_id
-                && progress_baseline.get() == 53
-                && progress_current.get() == 54
-        )));
-        assert!(scheduler
-            .waiting_queue
-            .read()
-            .iter()
-            .find(|request| request.inner.request.id == victim_id)
-            .is_some_and(|request| request.decode_progress_lease.is_none()));
-
-        assert!(scheduler.cancel(bypass_id.clone()).await.unwrap());
-        probes.clear();
-        observations.clear();
-        let released = scheduler
-            .next_batch_with_dynamic_admission_observed(
-                BatchHint::simple(4),
-                AdmissionWakeSnapshot::new(released_wake, &released_availability),
-                &mut |request| {
-                    probes.push(request.id.clone());
-                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
-                        request_id: request.id.clone(),
-                    })
-                },
-                &mut |observation| observations.push(observation),
-            )
-            .unwrap()
-            .expect("a later free slot must admit the released victim");
-        assert_eq!(probes, vec![victim_id.clone()]);
-        assert!(released
-            .requests
-            .iter()
-            .any(|request| request.request.id == victim_id));
-        assert!(!observations.iter().any(|observation| matches!(
-            observation,
-            ExecutorAdmissionQueueObservation::ProgressLeaseReleased { .. }
-        )));
-    }
-
-    #[tokio::test]
-    async fn decode_progress_lease_releases_after_owner_cancel() {
-        use ferrum_interfaces::vnext::{CapacityAvailabilityEpoch, CapacityAvailabilitySource};
-        use std::num::NonZeroU64;
-
-        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
-        let victim = create_test_request(Priority::Normal);
-        let victim_id = victim.id.clone();
-        let owner = create_test_request(Priority::Normal);
-        let owner_id = owner.id.clone();
-        scheduler.submit(victim).await.unwrap();
-        scheduler.submit(owner).await.unwrap();
-
-        let availability =
-            [
-                CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::ActiveSequenceSlots, 1)
-                    .unwrap(),
-            ];
-        let wake = AdmissionWakeEpochs::new(NonZeroU64::new(43).unwrap(), 0, 0, 0);
+        assert_eq!(transaction.progress_owner_id(), &victim_id);
+        assert_eq!(transaction.victim_request_id(), &owner_id);
         scheduler
-            .next_batch_with_dynamic_admission(
-                BatchHint::simple(2),
-                AdmissionWakeSnapshot::new(wake, &availability),
-                &mut |request| {
-                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
-                        request_id: request.id.clone(),
-                    })
-                },
-            )
-            .unwrap()
+            .arm_execution_capacity_yield(&transaction)
             .unwrap();
-        scheduler.mark_prefill_complete(&victim_id, 1);
-        scheduler.mark_prefill_complete(&owner_id, 1);
-        let owner_clock = scheduler
-            .decode_queue
-            .read()
-            .get(&owner_id)
+        assert!(scheduler
+            .complete_execution_capacity_yield(&transaction, 1, None)
             .unwrap()
-            .decode_progress_clock
-            .clone();
-        let lease = DecodeProgressLease::new(victim_id.clone(), owner_id.clone(), owner_clock);
-        assert!(scheduler.defer_decode_to_waiting_with_progress_lease(&lease, 1, None,));
-        assert!(scheduler.cancel(owner_id.clone()).await.unwrap());
+            .victim_requeued());
+        assert!(scheduler.cancel(victim_id.clone()).await.unwrap());
 
         let mut probes = Vec::new();
         let mut observations = Vec::new();
-        let batch = scheduler
+        let released = scheduler
             .next_batch_with_dynamic_admission_observed(
                 BatchHint::simple(1),
                 AdmissionWakeSnapshot::new(wake, &availability),
@@ -3659,17 +3803,20 @@ mod tests {
                 &mut |observation| observations.push(observation),
             )
             .unwrap()
-            .expect("owner cancellation must release the victim admission");
-        assert_eq!(probes, vec![victim_id.clone()]);
-        assert_eq!(batch.requests[0].request.id, victim_id);
+            .expect("owner terminal state must release the yielded frontier");
+        assert_eq!(probes, vec![owner_id.clone()]);
+        assert!(released
+            .requests
+            .iter()
+            .any(|request| request.request.id == owner_id));
         assert!(observations.iter().any(|observation| matches!(
             observation,
-            ExecutorAdmissionQueueObservation::ProgressLeaseReleased {
+            ExecutorAdmissionQueueObservation::PressureHoldReleased {
                 request_id,
                 progress_owner_id,
-                reason: DecodeProgressLeaseReleaseReason::OwnerNoLongerDecoding,
+                reason: PressureHoldReleaseReason::OwnerTerminal,
                 ..
-            } if request_id == &victim_id && progress_owner_id == &owner_id
+            } if request_id == &owner_id && progress_owner_id == &victim_id
         )));
     }
 
@@ -3709,9 +3856,13 @@ mod tests {
             AdmissionDeferral::new(DeferredAction::WaitForRelease, wake0, condition.clone());
         assert_eq!(
             scheduler
-                .defer_decode_for_execution_capacity(std::slice::from_ref(&request_id), deferral,)
+                .defer_decode_for_execution_capacity(
+                    std::slice::from_ref(&request_id),
+                    deferral,
+                    &execution_capacity_release_snapshot([&request_id]),
+                )
                 .unwrap(),
-            DecodeExecutionCapacityAction::Deferred { count: 1 }
+            ExecutionCapacityAction::Deferred { count: 1 }
         );
         assert_eq!(
             scheduler.passive_capacity_wait_condition().unwrap(),
@@ -3777,9 +3928,16 @@ mod tests {
             CapacityWaitCondition::from_observation(31, availability0.to_vec()).unwrap();
         let deferral =
             AdmissionDeferral::new(DeferredAction::WaitForRelease, wake0, condition.clone());
-        assert!(scheduler
-            .defer_prefill_for_execution_capacity(&request_id, deferral)
-            .unwrap());
+        assert_eq!(
+            scheduler
+                .defer_prefill_for_execution_capacity(
+                    &request_id,
+                    deferral,
+                    &execution_capacity_release_snapshot([&request_id]),
+                )
+                .unwrap(),
+            ExecutionCapacityAction::Deferred { count: 1 }
+        );
 
         let mut observations = Vec::new();
         assert!(scheduler

@@ -8,7 +8,9 @@ use ferrum_interfaces::{
     model_executor::{
         DecodeInput, DecodeOutput, ExecutorAdmissionEpochs, ExecutorBatchDecodeOutcome,
         ExecutorCapabilities, ExecutorCapacityWaitRegistration, ExecutorExecutionCapacityDeferral,
-        ExecutorExecutionCapacityStage, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
+        ExecutorExecutionCapacityPreemption, ExecutorExecutionCapacityPreemptionAuthority,
+        ExecutorExecutionCapacityPreemptionReceipt, ExecutorExecutionCapacityStage,
+        ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
         ExecutorPrefillAdmissionReceipt, ExecutorPrefillMaintenanceBlocker,
         ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome,
         ExecutorPrefillMaintenanceStage, ExecutorPrefillOutcome, ExecutorStatus,
@@ -93,6 +95,7 @@ enum PlanRuntimeBatchDecodeBehavior {
     WrongFirstCache,
     DeferUntilPeerCacheRelease,
     DeferWideThenFailSecond,
+    DeferThenPreemptionFails,
 }
 
 struct PlanRuntimeBatchDecodeTestExecutor {
@@ -283,6 +286,50 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
         PlanRuntimeResourceSnapshot::new(1_000, 900, 700, 700, 400, 300, 200, 0, 0).map(Some)
     }
 
+    fn execution_capacity_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
+        Ok(Some(ExecutorAdmissionEpochs::new(
+            std::num::NonZeroU64::new(47).unwrap(),
+            self.released_cache_count.load(Ordering::Acquire),
+            0,
+        )))
+    }
+
+    fn write_execution_capacity_snapshot(
+        &self,
+        availability: &mut Vec<ferrum_interfaces::vnext::CapacityAvailabilityEpoch>,
+    ) -> Result<Option<ExecutorAdmissionEpochs>> {
+        availability.clear();
+        availability.push(
+            ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(
+                ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots,
+                self.released_cache_count.load(Ordering::Acquire) + 1,
+            )
+            .map_err(|error| FerrumError::internal(error.to_string()))?,
+        );
+        self.execution_capacity_epochs()
+    }
+
+    async fn preempt_execution_capacity(
+        &self,
+        preemption: ExecutorExecutionCapacityPreemption,
+    ) -> Result<ExecutorExecutionCapacityPreemptionReceipt> {
+        if matches!(
+            self.behavior,
+            PlanRuntimeBatchDecodeBehavior::DeferThenPreemptionFails
+        ) {
+            return Err(FerrumError::internal(
+                "synthetic request-scoped preemption failure",
+            ));
+        }
+        self.released_cache_count.fetch_add(1, Ordering::Release);
+        self.inner.release_cache(preemption.cache_id());
+        Ok(ExecutorExecutionCapacityPreemptionReceipt::new(
+            preemption.request_id().clone(),
+            preemption.cache_id().to_string(),
+            ExecutorExecutionCapacityPreemptionAuthority::ActiveSequence,
+        ))
+    }
+
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
         self.inner.prefill(input).await
     }
@@ -298,6 +345,7 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
             self.behavior,
             PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
                 | PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
+                | PlanRuntimeBatchDecodeBehavior::DeferThenPreemptionFails
         ) {
             return Err(FerrumError::resource_exhausted(
                 "typed test decode is waiting for capacity",
@@ -319,7 +367,8 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
                 }
             }
             PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
-            | PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond => unreachable!(),
+            | PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
+            | PlanRuntimeBatchDecodeBehavior::DeferThenPreemptionFails => unreachable!(),
         }
         Ok(outputs)
     }
@@ -332,6 +381,7 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
             self.behavior,
             PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
                 | PlanRuntimeBatchDecodeBehavior::DeferWideThenFailSecond
+                | PlanRuntimeBatchDecodeBehavior::DeferThenPreemptionFails
         ) {
             return self
                 .batch_decode(inputs)
@@ -2738,8 +2788,8 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
         .await
         .expect("ready decode cohort");
     assert_eq!(decode_batch.requests.len(), 2);
-    let victim_id = decode_batch.requests[0].request.id.clone();
-    let progress_owner_id = decode_batch.requests[1].request.id.clone();
+    let progress_owner_id = decode_batch.requests[0].request.id.clone();
+    let victim_id = decode_batch.requests[1].request.id.clone();
     let victim_initial_token = initial_tokens_by_request[&victim_id];
     engine
         .inner
@@ -2788,6 +2838,36 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
     assert_eq!(scheduler_trace.completed_total, 1);
     assert_eq!(scheduler_trace.decode_queue_len, 0);
     assert_eq!(scheduler_trace.waiting_queue_len, 1);
+    let pressure_journal = scheduler.pressure_transition_journal();
+    assert!(pressure_journal
+        .windows(2)
+        .all(|pair| pair[0].ordinal() < pair[1].ordinal()));
+    let pressure_kinds = pressure_journal
+        .iter()
+        .map(|transition| transition.kind())
+        .collect::<Vec<_>>();
+    let position = |kind| {
+        pressure_kinds
+            .iter()
+            .position(|candidate| *candidate == kind)
+            .expect("engine pressure transition must be journaled")
+    };
+    assert!(
+        position(PressureTransitionKind::YieldPlanned)
+            < position(PressureTransitionKind::ReleaseFenceArmed)
+    );
+    assert!(
+        position(PressureTransitionKind::ReleaseFenceArmed)
+            < position(PressureTransitionKind::ReleaseFenceCompleted)
+    );
+    assert!(
+        position(PressureTransitionKind::ReleaseFenceCompleted)
+            < position(PressureTransitionKind::FrontierResumable)
+    );
+    assert!(
+        position(PressureTransitionKind::FrontierResumable)
+            < position(PressureTransitionKind::FrontierProgressed)
+    );
 
     for expected_offset in [0, 1] {
         let recompute_batch = scheduler
@@ -2826,8 +2906,58 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
     assert_eq!(resumed_trace.decode_queue_len, 1);
     assert_eq!(resumed_trace.execution_capacity_blocked_decode_len, 0);
 
-    let deferred_events = read_engine_profile_events(&trace_path)
-        .into_iter()
+    let profile_events = read_engine_profile_events(&trace_path);
+    let fence_armed = profile_events
+        .iter()
+        .find(|event| event.phase == "vnext.execution_capacity_pressure_release_fence_armed")
+        .expect("physical release fence must be armed in the profile");
+    let fence_completed = profile_events
+        .iter()
+        .find(|event| event.phase == "vnext.execution_capacity_pressure_release_fence_completed")
+        .expect("physical release fence must complete in the profile");
+    let profile_ordinal = |event: &FerrumProfileEvent, field: &str| {
+        event.shape[field]
+            .as_u64()
+            .unwrap_or_else(|| panic!("pressure profile field {field} must be an ordinal"))
+    };
+    assert!(
+        profile_ordinal(fence_armed, "planned_transition_ordinal")
+            < profile_ordinal(fence_armed, "transition_ordinal")
+    );
+    assert!(
+        profile_ordinal(fence_armed, "transition_ordinal")
+            < profile_ordinal(fence_completed, "release_transition_ordinal")
+    );
+    assert!(
+        profile_ordinal(fence_completed, "release_transition_ordinal")
+            < profile_ordinal(fence_completed, "resumable_transition_ordinal")
+    );
+    assert_eq!(
+        fence_completed.shape.get("physical_release_completed"),
+        Some(&serde_json::json!(true))
+    );
+    assert_eq!(
+        fence_completed.shape.get("exact_source_advanced"),
+        Some(&serde_json::json!(true))
+    );
+    assert_eq!(
+        fence_completed.shape.get("release_authority"),
+        Some(&serde_json::json!("active_sequence"))
+    );
+    assert_eq!(
+        fence_completed.shape.get("progress_owner_resumable"),
+        Some(&serde_json::json!(true))
+    );
+    assert_eq!(
+        fence_completed.shape.get("closed_transition_ordinal"),
+        Some(&serde_json::Value::Null)
+    );
+    assert!(fence_completed
+        .attributes
+        .contains_key("current_capacity_availability"));
+
+    let deferred_events = profile_events
+        .iter()
         .filter(|event| event.phase == "vnext.decode_capacity_deferred")
         .collect::<Vec<_>>();
     assert_eq!(deferred_events.len(), 3);
@@ -2851,7 +2981,7 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
         deferred_events
             .iter()
             .filter(|event| {
-                event.shape.get("decision") == Some(&serde_json::json!("recompute_progress_victim"))
+                event.shape.get("decision") == Some(&serde_json::json!("pressure_yield_planned"))
             })
             .count(),
         1
@@ -2859,7 +2989,7 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
     let recompute_event = deferred_events
         .iter()
         .find(|event| {
-            event.shape.get("decision") == Some(&serde_json::json!("recompute_progress_victim"))
+            event.shape.get("decision") == Some(&serde_json::json!("pressure_yield_planned"))
         })
         .expect("progress-victim decision must be traced");
     assert_eq!(
@@ -2872,7 +3002,7 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
     );
     assert_eq!(
         recompute_event.attributes.get("progress_baseline"),
-        Some(&serde_json::json!(0))
+        Some(&serde_json::json!(1))
     );
     for event in &deferred_events {
         assert_eq!(
@@ -2885,11 +3015,59 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
         );
         assert!(event.attributes.contains_key("request_ids"));
         assert!(event.attributes.contains_key("capacity_evidence"));
-        if event.shape.get("decision") != Some(&serde_json::json!("recompute_progress_victim")) {
+        if event.shape.get("decision") != Some(&serde_json::json!("pressure_yield_planned")) {
             assert!(!event.attributes.contains_key("victim_request_id"));
         }
     }
     let _ = std::fs::remove_file(trace_path);
+}
+
+#[tokio::test]
+async fn plan_runtime_capacity_yield_preemption_failure_aborts_pending_transaction() {
+    let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine(
+        PlanRuntimeBatchDecodeBehavior::DeferThenPreemptionFails,
+    );
+    let _ = install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
+    let decode_batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(2))
+        .await
+        .expect("ready decode cohort");
+
+    let error = engine
+        .inner
+        .process_batch(&decode_batch)
+        .await
+        .expect_err("typed preemption failure must fail the batch");
+
+    assert!(error
+        .to_string()
+        .contains("synthetic request-scoped preemption failure"));
+    assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 0);
+    let trace = scheduler.trace_snapshot();
+    assert_eq!(trace.pressure_active_episodes, 0);
+    assert_eq!(trace.pressure_pending_release_fences, 0);
+    let kinds = scheduler
+        .pressure_transition_journal()
+        .into_iter()
+        .map(|transition| transition.kind())
+        .collect::<Vec<_>>();
+    let position = |kind| {
+        kinds
+            .iter()
+            .position(|candidate| *candidate == kind)
+            .expect("yield reconciliation transition must be journaled")
+    };
+    assert!(
+        position(PressureTransitionKind::YieldPlanned)
+            < position(PressureTransitionKind::ReleaseFenceArmed)
+    );
+    assert!(
+        position(PressureTransitionKind::ReleaseFenceArmed)
+            < position(PressureTransitionKind::YieldAborted)
+    );
+    assert!(
+        position(PressureTransitionKind::YieldAborted) < position(PressureTransitionKind::Closed)
+    );
 }
 
 #[tokio::test]
