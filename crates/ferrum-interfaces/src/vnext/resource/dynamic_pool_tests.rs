@@ -1017,7 +1017,23 @@ fn logical_fit_deferral_grows_unclaimed_backing_capacity() {
         .maintenance_controller
         .initialize_pool(&harness.pool_ids[0])
         .unwrap();
-    let request = admitted_request(&harness.root, "logical-fit-growth");
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    let request = match binding
+        .try_admit_request(
+            RequestResourceAdmissionRequest::new(
+                work_with_ceiling(1, 4),
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            RunId::new("run/logical-fit-growth").unwrap(),
+            RequestIdentity::new("request/logical-fit-growth").unwrap(),
+        )
+        .unwrap()
+    {
+        RequestResourceAdmissionDecision::Admitted(request) => request,
+        _ => panic!("test request must be admitted from resident backing"),
+    };
     let admission = SequenceResourceAdmissionRequest::new(
         chunked_work(4, 0..1),
         AdmissionFitPolicy::FullInputMustFit,
@@ -1133,6 +1149,248 @@ fn full_plan_budget_returns_typed_wait_and_reuses_backing_after_availability_cha
         RequestResourceAdmissionDecision::Admitted(_)
     ));
     assert_eq!(runtime.allocate_calls(), allocations_before);
+}
+
+#[test]
+fn plan_budget_pressure_rebalances_idle_chunks_across_pools() {
+    let donor_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        '2',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let target_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        '3',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let donor_pool_id = donor_catalog.pool_id.clone();
+    let target_pool_id = target_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[donor_catalog, target_catalog]);
+    let runtime = new_runtime(&catalog, 192);
+    let harness = harness(Arc::clone(&runtime), catalog, 192, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.initialize_pool(&donor_pool_id).unwrap();
+    let donor_growth = maintenance.grow_pool(&donor_pool_id, 64).unwrap();
+    maintenance.initialize_pool(&target_pool_id).unwrap();
+    let target_pool = Arc::clone(&harness.root.dynamic_pools.pools[&target_pool_id]);
+    let held_target = claim_size(&harness.root.dynamic_pools, &target_pool, 64);
+    let request = evaluated_request(&target_pool, 64);
+    let BackingPrepareDecision::Deferred(deferred) = harness
+        .root
+        .dynamic_pools
+        .prepare_claim(std::slice::from_ref(&request))
+        .unwrap()
+    else {
+        panic!("occupied target backing must defer under the exact plan budget")
+    };
+    let device_epochs_before = harness
+        .root
+        .dynamic_pools
+        .budget
+        .availability_snapshot()
+        .unwrap();
+
+    let DynamicDeferredMaintenanceOutcome::Maintained(growth) =
+        maintenance.maintain_for_live_deferred(&deferred).unwrap()
+    else {
+        panic!("idle donor residency must be rebalanced into the blocked target pool")
+    };
+    assert_eq!(growth.growths().len(), 1);
+    assert_eq!(growth.growths()[0].pool_id(), &target_pool_id);
+    assert_eq!(growth.growths()[0].chunk_bytes(), 64);
+    let rebalance = growth
+        .rebalance()
+        .expect("cross-pool maintenance must expose its reclaim receipt");
+    assert_eq!(rebalance.reclaimed_chunks(), 1);
+    assert_eq!(rebalance.reclaimed_bytes(), 64);
+    assert_eq!(rebalance.pools().len(), 1);
+    assert_eq!(rebalance.pools()[0].pool_id(), &donor_pool_id);
+    assert_eq!(
+        rebalance.pools()[0].chunks(),
+        std::slice::from_ref(donor_growth.chunk())
+    );
+    assert_eq!(rebalance.pools()[0].published_capacity_bytes(), 64);
+    assert!(rebalance.plan_device_capacity_epoch() > device_epochs_before.plan_epoch());
+    assert!(rebalance.process_device_capacity_epoch() > device_epochs_before.process_epoch());
+
+    let status = maintenance.status().unwrap();
+    let donor = status
+        .pools()
+        .iter()
+        .find(|pool| pool.pool_id() == &donor_pool_id)
+        .unwrap();
+    let target = status
+        .pools()
+        .iter()
+        .find(|pool| pool.pool_id() == &target_pool_id)
+        .unwrap();
+    assert_eq!(donor.resident_bytes(), 64);
+    assert_eq!(donor.resident_chunks(), 1);
+    assert_eq!(target.resident_bytes(), 128);
+    assert_eq!(target.resident_chunks(), 2);
+    assert_eq!(status.budget_claimed_bytes(), 192);
+    assert_eq!(status.process_claimed_bytes(), 192);
+    assert_eq!(runtime.allocate_calls(), 4);
+
+    drop(held_target);
+    let BackingPrepareDecision::Prepared(prepared) = harness
+        .root
+        .dynamic_pools
+        .prepare_claim(std::slice::from_ref(&request))
+        .unwrap()
+    else {
+        panic!("rebalanced target pool must satisfy the original claim")
+    };
+    drop(prepared.commit());
+}
+
+#[test]
+fn live_idle_donor_boundary_waits_then_rebalances_after_exact_release() {
+    let donor_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        '4',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let target_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        '5',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let donor_pool_id = donor_catalog.pool_id.clone();
+    let target_pool_id = target_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[donor_catalog, target_catalog]);
+    let runtime = new_runtime(&catalog, 192);
+    let harness = harness(runtime, catalog, 192, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.initialize_pool(&donor_pool_id).unwrap();
+    maintenance.grow_pool(&donor_pool_id, 64).unwrap();
+    maintenance.initialize_pool(&target_pool_id).unwrap();
+    let donor_pool = Arc::clone(&harness.root.dynamic_pools.pools[&donor_pool_id]);
+    let target_pool = Arc::clone(&harness.root.dynamic_pools.pools[&target_pool_id]);
+    let donor_minimum = claim_size(&harness.root.dynamic_pools, &donor_pool, 64);
+    let donor_excess = claim_size(&harness.root.dynamic_pools, &donor_pool, 64);
+    let held_target = claim_size(&harness.root.dynamic_pools, &target_pool, 64);
+    let request = evaluated_request(&target_pool, 64);
+    let BackingPrepareDecision::Deferred(deferred) = harness
+        .root
+        .dynamic_pools
+        .prepare_claim(std::slice::from_ref(&request))
+        .unwrap()
+    else {
+        panic!("full target pool must defer")
+    };
+
+    assert!(matches!(
+        maintenance.maintain_for_live_deferred(&deferred).unwrap(),
+        DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
+    ));
+    let blocked = maintenance.status().unwrap();
+    assert_eq!(blocked.budget_claimed_bytes(), 192);
+    assert_eq!(
+        blocked
+            .pools()
+            .iter()
+            .find(|pool| pool.pool_id() == &donor_pool_id)
+            .unwrap()
+            .resident_chunks(),
+        2
+    );
+
+    drop(donor_excess);
+    let DynamicDeferredMaintenanceOutcome::Maintained(growth) =
+        maintenance.maintain_for_live_deferred(&deferred).unwrap()
+    else {
+        panic!("the exact donor release must make one whole chunk reclaimable")
+    };
+    assert_eq!(growth.rebalance().unwrap().reclaimed_chunks(), 1);
+    assert_eq!(growth.rebalance().unwrap().reclaimed_bytes(), 64);
+    assert_eq!(maintenance.status().unwrap().budget_claimed_bytes(), 192);
+
+    drop(donor_minimum);
+    drop(held_target);
+}
+
+#[test]
+fn insufficient_idle_reclaim_keeps_all_residency_and_returns_typed_wait() {
+    let donor_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        '6',
+        1,
+        96,
+        TestDemand::Fixed,
+    );
+    let target_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        '7',
+        1,
+        128,
+        TestDemand::Fixed,
+    );
+    let donor_pool_id = donor_catalog.pool_id.clone();
+    let target_pool_id = target_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[donor_catalog, target_catalog]);
+    let runtime = new_runtime(&catalog, 160);
+    let harness = harness(runtime, catalog, 160, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.initialize_pool(&donor_pool_id).unwrap();
+    maintenance.grow_pool(&donor_pool_id, 32).unwrap();
+    maintenance.initialize_pool(&target_pool_id).unwrap();
+    let target_pool = Arc::clone(&harness.root.dynamic_pools.pools[&target_pool_id]);
+    let held_target = claim_size(&harness.root.dynamic_pools, &target_pool, 64);
+    let request = evaluated_request(&target_pool, 64);
+    let BackingPrepareDecision::Deferred(deferred) = harness
+        .root
+        .dynamic_pools
+        .prepare_claim(std::slice::from_ref(&request))
+        .unwrap()
+    else {
+        panic!("full target pool must defer")
+    };
+    let before = maintenance.status().unwrap();
+    let device_epochs_before = harness
+        .root
+        .dynamic_pools
+        .budget
+        .availability_snapshot()
+        .unwrap();
+
+    let DynamicDeferredMaintenanceOutcome::WaitForRelease { pressure, .. } =
+        maintenance.maintain_for_live_deferred(&deferred).unwrap()
+    else {
+        panic!("a partial donor chunk must not be reclaimed without satisfying the deficit")
+    };
+    assert_eq!(pressure.requested_bytes(), 64);
+    assert_eq!(pressure.available_bytes(), 0);
+    let after = maintenance.status().unwrap();
+    assert_eq!(after.pools(), before.pools());
+    assert_eq!(after.budget_claimed_bytes(), before.budget_claimed_bytes());
+    assert_eq!(
+        after.process_claimed_bytes(),
+        before.process_claimed_bytes()
+    );
+    let device_epochs_after = harness
+        .root
+        .dynamic_pools
+        .budget
+        .availability_snapshot()
+        .unwrap();
+    assert_eq!(device_epochs_after, device_epochs_before);
+
+    drop(held_target);
 }
 
 #[test]

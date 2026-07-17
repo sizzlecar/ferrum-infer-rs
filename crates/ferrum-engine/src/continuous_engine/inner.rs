@@ -975,11 +975,17 @@ impl EngineInner {
                 current,
                 pools_grown,
                 allocated_bytes,
+                pools_reclaimed,
+                chunks_reclaimed,
+                reclaimed_bytes,
             } => {
                 validate_current(*current)?;
                 if current.capacity_epoch <= observed.capacity_epoch
                     || *pools_grown == 0
                     || *allocated_bytes == 0
+                    || (*pools_reclaimed == 0 && (*chunks_reclaimed != 0 || *reclaimed_bytes != 0))
+                    || (*pools_reclaimed != 0
+                        && (*chunks_reclaimed < *pools_reclaimed || *reclaimed_bytes == 0))
                 {
                     return Err(FerrumError::internal(format!(
                         "executor maintenance for {} reported growth without installed capacity",

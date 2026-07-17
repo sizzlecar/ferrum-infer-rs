@@ -1199,6 +1199,9 @@ pub enum ExecutorPrefillMaintenanceOutcome {
         current: ExecutorAdmissionEpochs,
         pools_grown: usize,
         allocated_bytes: u64,
+        pools_reclaimed: usize,
+        chunks_reclaimed: usize,
+        reclaimed_bytes: u64,
     },
 }
 

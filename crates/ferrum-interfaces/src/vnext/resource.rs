@@ -51,6 +51,8 @@ use backing_extent::{backing_segment_range, FreeExtentIndex};
 pub use backing_extent::{BackingChunkIdentity, BackingSegment};
 mod dynamic_pool;
 pub use dynamic_pool::*;
+mod dynamic_pool_maintenance;
+pub use dynamic_pool_maintenance::*;
 mod static_lease;
 pub use static_lease::*;
 mod work;
