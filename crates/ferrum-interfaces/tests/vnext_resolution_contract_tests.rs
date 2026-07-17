@@ -6,6 +6,21 @@ fn bytes_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+#[test]
+fn runtime_policy_roundtrip_preserves_sequence_fit_policy() {
+    let policy = policy(4096);
+    assert_eq!(
+        policy.admission().sequence_fit_policy,
+        AdmissionFitPolicy::ImmediateOnly
+    );
+    let wire = serde_json::to_value(&policy).unwrap();
+    assert_eq!(wire["admission"]["sequence_fit_policy"], "immediate_only");
+    assert_eq!(
+        serde_json::from_value::<ResolvedRuntimePolicy>(wire).unwrap(),
+        policy
+    );
+}
+
 fn resolution_test_error(field: &str, reason: &str) -> VNextError {
     VNextError::InvalidResolvedModelPlan {
         field: field.to_owned(),

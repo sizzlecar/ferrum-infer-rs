@@ -667,6 +667,17 @@ fn work(tokens: usize) -> ResourceWorkShape {
     ResourceWorkShape::single(token_span(tokens)).unwrap()
 }
 
+fn work_with_ceiling(tokens: usize, maximum_tokens: usize) -> ResourceWorkShape {
+    let token_ids = (0..tokens)
+        .map(|token| u32::try_from(token).unwrap())
+        .collect::<Vec<_>>();
+    ResourceWorkShape::single(
+        TokenSpanWork::from_token_ids_with_fit(&token_ids, 0..token_ids.len(), maximum_tokens)
+            .unwrap(),
+    )
+    .unwrap()
+}
+
 fn token_span(tokens: usize) -> TokenSpanWork {
     let token_ids = (0..tokens)
         .map(|token| u32::try_from(token).unwrap())
@@ -713,9 +724,34 @@ fn admitted_sequence(
     root: &Arc<PlanRuntimeResources<TestRuntime>>,
     suffix: &str,
 ) -> Arc<AdmittedSequenceResources<TestRuntime>> {
-    let request = admitted_request(root, suffix);
+    admitted_sequence_with_ceiling(root, suffix, 1)
+}
+
+fn admitted_sequence_with_ceiling(
+    root: &Arc<PlanRuntimeResources<TestRuntime>>,
+    suffix: &str,
+    maximum_tokens: usize,
+) -> Arc<AdmittedSequenceResources<TestRuntime>> {
+    let work = work_with_ceiling(1, maximum_tokens);
+    let binding = root.trusted_runtime_binding().unwrap();
+    let request = match binding
+        .try_admit_request(
+            RequestResourceAdmissionRequest::new(
+                work.clone(),
+                AdmissionFitPolicy::FullInputMustFit,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            RunId::new(format!("run/{suffix}")).unwrap(),
+            RequestIdentity::new(format!("request/{suffix}")).unwrap(),
+        )
+        .unwrap()
+    {
+        RequestResourceAdmissionDecision::Admitted(request) => request,
+        _ => panic!("test request must be admitted from resident backing"),
+    };
     let admission = SequenceResourceAdmissionRequest::new(
-        work(1),
+        work,
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
@@ -2259,7 +2295,7 @@ fn sequence_backing_extension_publishes_atomically_between_frames() {
         .maintenance_controller
         .grow_pool(&harness.pool_ids[0], 256)
         .unwrap();
-    let sequence = admitted_sequence(&harness.root, "sequence-backing-extension");
+    let sequence = admitted_sequence_with_ceiling(&harness.root, "sequence-backing-extension", 2);
     let initial = sequence.backing_snapshot().unwrap();
     let session = sequence.open_session().unwrap();
     let active_before = TrustedActiveSequenceBinding::from_session(&session).unwrap();
@@ -2354,6 +2390,16 @@ fn sequence_backing_extension_publishes_atomically_between_frames() {
     assert_eq!(view.segment_bindings().len(), 2);
 
     second_step.try_retire_normal().unwrap();
+    let over_ceiling = match session.try_extend_backing(
+        SequenceResourceExtensionRequest::new(work(3), AdmissionPressureAction::WaitForRelease)
+            .unwrap(),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("sequence extension above the request ceiling must fail"),
+    };
+    assert!(over_ceiling
+        .to_string()
+        .contains("parent request token ceiling"));
     session.try_complete().unwrap();
     drop(active_after);
     drop(active_before);
@@ -2397,8 +2443,8 @@ fn sequence_backing_extension_waits_for_released_capacity_then_retries() {
         .maintenance_controller
         .grow_pool(&harness.pool_ids[0], 128)
         .unwrap();
-    let first = admitted_sequence(&harness.root, "extension-wait-first");
-    let second = admitted_sequence(&harness.root, "extension-wait-second");
+    let first = admitted_sequence_with_ceiling(&harness.root, "extension-wait-first", 2);
+    let second = admitted_sequence_with_ceiling(&harness.root, "extension-wait-second", 2);
     let session = first.open_session().unwrap();
 
     let deferred = match session
@@ -2472,8 +2518,8 @@ fn sequence_extension_deferral_retains_exact_session_and_rejects_stale_generatio
         .maintenance_controller
         .grow_pool(&harness.pool_ids[0], 128)
         .unwrap();
-    let first = admitted_sequence(&harness.root, "extension-owner-first");
-    let second = admitted_sequence(&harness.root, "extension-owner-second");
+    let first = admitted_sequence_with_ceiling(&harness.root, "extension-owner-first", 2);
+    let second = admitted_sequence_with_ceiling(&harness.root, "extension-owner-second", 2);
     let session = first.open_session().unwrap();
     let target = work(2);
 

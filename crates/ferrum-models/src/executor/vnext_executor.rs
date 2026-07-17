@@ -123,6 +123,7 @@ impl VNextExecutorConfig {
             AdmissionPolicy {
                 maximum_queue_depth,
                 maximum_scheduled_tokens,
+                sequence_fit_policy: AdmissionFitPolicy::ImmediateOnly,
                 allow_defer: true,
                 cancellation_check_interval_steps: DEFAULT_CANCELLATION_CHECK_INTERVAL_STEPS,
             },
@@ -1864,7 +1865,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
         let admission = SequenceResourceAdmissionRequest::new(
             work,
-            AdmissionFitPolicy::FullInputMustFit,
+            self.policy.admission().sequence_fit_policy,
             AdmissionPressureAction::WaitForRelease,
         )
         .map_err(|error| FerrumError::backend(error.to_string()))?;

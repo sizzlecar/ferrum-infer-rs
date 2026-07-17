@@ -469,6 +469,7 @@ pub(crate) fn policy() -> ResolvedRuntimePolicy {
         AdmissionPolicy {
             maximum_queue_depth: 8,
             maximum_scheduled_tokens: 4096,
+            sequence_fit_policy: AdmissionFitPolicy::ImmediateOnly,
             allow_defer: true,
             cancellation_check_interval_steps: 1,
         },
