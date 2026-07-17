@@ -725,7 +725,18 @@ class ServerSession:
         out_dir: Path,
         runtime_budget: int | None,
         startup_timeout: float,
+        max_model_len: int = 512,
+        max_num_seqs: int = 4,
+        max_num_batched_tokens: int = 1024,
+        prefill_first_until_active: int = 4,
     ) -> None:
+        require(max_model_len > 0, "server max model length must be positive")
+        require(max_num_seqs > 0, "server max sequence count must be positive")
+        require(max_num_batched_tokens > 0, "server token budget must be positive")
+        require(
+            0 < prefill_first_until_active <= max_num_seqs,
+            "server prefill-first target must be within the sequence ceiling",
+        )
         self.repo = repo
         self.port = port
         self.out_dir = out_dir
@@ -745,13 +756,13 @@ class ServerSession:
             "--port",
             str(port),
             "--max-model-len",
-            "512",
+            str(max_model_len),
             "--max-num-seqs",
-            "4",
+            str(max_num_seqs),
             "--max-num-batched-tokens",
-            "1024",
+            str(max_num_batched_tokens),
             "--scheduler-prefill-first-until-active",
-            "4",
+            str(prefill_first_until_active),
             "--profile-detail",
             "basic",
             "--profile-sample-rate",

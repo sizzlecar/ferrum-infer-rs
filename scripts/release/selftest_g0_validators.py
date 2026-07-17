@@ -33,6 +33,9 @@ RUNTIME_VNEXT_HISTORICAL_REPLAY = REPO_ROOT / "scripts/release/runtime_vnext_his
 RUNTIME_VNEXT_HISTORICAL_CAPTURE = REPO_ROOT / "scripts/release/runtime_vnext_historical_capture.py"
 RUNTIME_VNEXT_G01A_CHECKPOINT = REPO_ROOT / "scripts/release/runtime_vnext_g01a_checkpoint.py"
 RUNTIME_VNEXT_S1_CUDA_CAPACITY = REPO_ROOT / "scripts/release/runtime_vnext_s1_cuda_capacity.py"
+RUNTIME_VNEXT_S1_CUDA_DECODE_CAPACITY = (
+    REPO_ROOT / "scripts/release/runtime_vnext_s1_cuda_decode_capacity.py"
+)
 BOUNDED_COMMAND = REPO_ROOT / "scripts/release/bounded_command.py"
 RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
 PRODUCT_BACKEND_SENTINEL_GATE = REPO_ROOT / "scripts/release/product_backend_sentinel_gate.py"
@@ -425,6 +428,17 @@ def test_runtime_vnext_s1_cuda_capacity_selftest() -> None:
     )
 
 
+def test_runtime_vnext_s1_cuda_decode_capacity_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_S1_CUDA_DECODE_CAPACITY), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
 def test_bounded_command_selftest() -> None:
     ok = run([sys.executable, str(BOUNDED_COMMAND), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -617,6 +631,7 @@ def main() -> int:
     test_runtime_vnext_historical_capture_selftest()
     test_runtime_vnext_g01a_checkpoint_selftest()
     test_runtime_vnext_s1_cuda_capacity_selftest()
+    test_runtime_vnext_s1_cuda_decode_capacity_selftest()
     test_bounded_command_selftest()
     test_run_gate_selftest()
     test_run_scenarios_selftest()
