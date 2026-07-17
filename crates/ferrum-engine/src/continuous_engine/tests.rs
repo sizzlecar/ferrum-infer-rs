@@ -2955,6 +2955,9 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
     assert!(fence_completed
         .attributes
         .contains_key("current_capacity_availability"));
+    assert!(profile_events.iter().any(|event| {
+        event.phase == "engine_model_cache_ref_release" && event.request_id == victim_id.to_string()
+    }));
 
     let deferred_events = profile_events
         .iter()

@@ -1252,6 +1252,11 @@ impl EngineInner {
                 )),
             ));
         }
+        // The executor's typed preemption receipt proves that this exact cache
+        // authority was released. Record the engine-side ownership transition
+        // without issuing a second name-based release that could target a
+        // recomputed generation using the same product request identity.
+        self.trace_model_cache_ref_release(transaction.victim_request_id());
         if !physical_resources.is_empty() {
             self.release_sequence_physical_resources(
                 transaction.victim_request_id(),

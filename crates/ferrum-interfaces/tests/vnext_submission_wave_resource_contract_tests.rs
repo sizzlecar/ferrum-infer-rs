@@ -250,3 +250,38 @@ fn submission_wave_backing_deferral_retains_step_until_exact_retry() {
     drop(registry);
     resource_support::close_plan_runtime(root);
 }
+
+#[test]
+fn capacity_deferred_unsubmitted_step_rolls_back_without_poisoning_its_session() {
+    let (plan, registry) = sequential_scratch_plan();
+    let (driver, _trace) = resource_support::configured_driver(&plan, &[], &[]);
+    let root = resource_support::plan_runtime(&plan, driver, "submission-wave-step-rollback");
+    let sequence = resource_support::admit_logical_sequence(
+        &root,
+        "run.submission-wave-step-rollback",
+        "request.submission-wave-step-rollback",
+    );
+    let session = sequence.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+
+    let step = begin_step(&batch);
+    let first_step_id = step.batch_step_id();
+    let receipt = step.try_rollback_unsubmitted().unwrap();
+    assert_eq!(receipt.batch_step_id(), first_step_id);
+    assert_eq!(receipt.participants().len(), 1);
+    assert_eq!(
+        receipt.participants()[0].disposition(),
+        StepParticipantRetirementDisposition::RolledBackUnsubmitted
+    );
+
+    let retry = begin_step(&batch);
+    assert_ne!(retry.batch_step_id(), first_step_id);
+    retry.try_retire_normal().unwrap();
+
+    drop(batch);
+    session.try_complete().unwrap();
+    drop(session);
+    drop(sequence);
+    drop(registry);
+    resource_support::close_plan_runtime(root);
+}

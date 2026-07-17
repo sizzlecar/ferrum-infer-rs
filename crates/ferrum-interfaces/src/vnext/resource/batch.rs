@@ -764,9 +764,16 @@ pub(super) fn poison_session_frame(hold: &SessionFrameHold) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StepFrameFinalization {
+    Commit,
+    Abort,
+    RollbackUnsubmitted,
+}
+
 pub(super) fn finalize_session_frames(
     holds: &mut [&mut SessionFrameHold],
-    abort: bool,
+    finalization: StepFrameFinalization,
 ) -> Result<Vec<StepParticipantRetirementDisposition>, VNextError> {
     let slots = holds
         .iter()
@@ -796,19 +803,27 @@ pub(super) fn finalize_session_frames(
                     batch_step_id: hold.batch_step_id,
                 })
             || !active.participant_flights.is_empty()
-            || (!abort && active.phase == SequenceSessionPhase::Poisoned)
-            || (!abort && active.retired_frames == u64::MAX)
+            || (finalization == StepFrameFinalization::Commit
+                && active.phase == SequenceSessionPhase::Poisoned)
+            || (finalization == StepFrameFinalization::Commit && active.retired_frames == u64::MAX)
+            || (finalization == StepFrameFinalization::RollbackUnsubmitted
+                && active.phase != SequenceSessionPhase::Open)
         {
             return Err(invalid_resource(
                 "step finalization differs from its exact session frame or has live participant work",
             ));
         }
-        dispositions.push(if abort {
-            StepParticipantRetirementDisposition::Aborted
-        } else if active.phase == SequenceSessionPhase::CancelRequested {
-            StepParticipantRetirementDisposition::DiscardedCancelled
-        } else {
-            StepParticipantRetirementDisposition::Committed
+        dispositions.push(match finalization {
+            StepFrameFinalization::Abort => StepParticipantRetirementDisposition::Aborted,
+            StepFrameFinalization::RollbackUnsubmitted => {
+                StepParticipantRetirementDisposition::RolledBackUnsubmitted
+            }
+            StepFrameFinalization::Commit
+                if active.phase == SequenceSessionPhase::CancelRequested =>
+            {
+                StepParticipantRetirementDisposition::DiscardedCancelled
+            }
+            StepFrameFinalization::Commit => StepParticipantRetirementDisposition::Committed,
         });
     }
     for state in &mut states {
@@ -816,10 +831,10 @@ pub(super) fn finalize_session_frames(
             unreachable!("all step participant sessions were validated");
         };
         active.active_frame = None;
-        if abort {
-            active.phase = SequenceSessionPhase::Poisoned;
-        } else {
-            active.retired_frames += 1;
+        match finalization {
+            StepFrameFinalization::Abort => active.phase = SequenceSessionPhase::Poisoned,
+            StepFrameFinalization::Commit => active.retired_frames += 1,
+            StepFrameFinalization::RollbackUnsubmitted => {}
         }
     }
     drop(states);
@@ -856,6 +871,19 @@ pub(super) struct InvocationRegistry {
 }
 
 impl InvocationRegistry {
+    pub(super) fn ensure_pristine_for_step_rollback(&self) -> Result<(), VNextError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_resource("invocation registry is poisoned"))?;
+        if state.poisoned || !state.entries.is_empty() {
+            return Err(invalid_resource(
+                "unsubmitted step rollback requires a pristine invocation registry",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn enter(
         self: &Arc<Self>,
         keys: Vec<ParticipantNodeKey>,
@@ -1103,6 +1131,7 @@ where
 pub enum StepParticipantRetirementDisposition {
     Committed,
     DiscardedCancelled,
+    RolledBackUnsubmitted,
     Aborted,
 }
 
