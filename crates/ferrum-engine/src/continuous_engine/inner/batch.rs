@@ -1340,6 +1340,8 @@ impl EngineInner {
             })?;
         let release_ordinal = completion.release_transition_ordinal();
         let resumable_ordinal = completion.resumable_transition_ordinal();
+        let owner_admission_pending_ordinal =
+            completion.owner_admission_pending_transition_ordinal();
         let closed_ordinal = completion.closed_transition_ordinal();
         let closed_reason = completion.closed_reason();
         let moved = completion.victim_requeued();
@@ -1354,6 +1356,7 @@ impl EngineInner {
             "progress_owner_id": transaction.progress_owner_id(),
             "release_transition_ordinal": release_ordinal.get(),
             "resumable_transition_ordinal": resumable_ordinal.map(|ordinal| ordinal.get()),
+            "owner_admission_pending_transition_ordinal": owner_admission_pending_ordinal.map(|ordinal| ordinal.get()),
             "closed_transition_ordinal": closed_ordinal.map(|ordinal| ordinal.get()),
             "closed_reason": closed_reason.map(|reason| reason.as_str()),
             "completion_disposition": completion_disposition,
@@ -1390,6 +1393,10 @@ impl EngineInner {
                 (
                     "resumable_transition_ordinal".to_string(),
                     serde_json::json!(resumable_ordinal.map(|ordinal| ordinal.get())),
+                ),
+                (
+                    "owner_admission_pending_transition_ordinal".to_string(),
+                    serde_json::json!(owner_admission_pending_ordinal.map(|ordinal| ordinal.get())),
                 ),
                 (
                     "closed_transition_ordinal".to_string(),

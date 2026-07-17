@@ -208,42 +208,6 @@ def compare_wait_sources(
     require(changed == expect_changed, f"{label}: exact wait source change evidence is inconsistent")
 
 
-def validate_source_retarget(
-    previous: Any, current: Any, *, label: str
-) -> tuple[dict[str, int], dict[str, int]]:
-    require(isinstance(previous, dict), f"{label}: previous wait condition is missing")
-    require(isinstance(current, dict), f"{label}: current wait condition is missing")
-    previous_coordinator = previous.get("coordinator_id")
-    current_coordinator = current.get("coordinator_id")
-    require(
-        isinstance(previous_coordinator, int) and previous_coordinator > 0,
-        f"{label}: previous coordinator id is invalid",
-    )
-    require(
-        isinstance(current_coordinator, int) and current_coordinator > 0,
-        f"{label}: current coordinator id is invalid",
-    )
-    previous_sources = wait_source_epochs(
-        previous.get("observed"), f"{label} previous condition"
-    )
-    current_sources = wait_source_epochs(
-        current.get("observed"), f"{label} current condition"
-    )
-    require(
-        previous_coordinator != current_coordinator
-        or previous_sources.keys() != current_sources.keys(),
-        f"{label}: source-retarget release preserved the old exact topology",
-    )
-    require(
-        all(
-            current_sources[source] >= previous_sources[source]
-            for source in previous_sources.keys() & current_sources.keys()
-        ),
-        f"{label}: shared source generation regressed during retarget",
-    )
-    return previous_sources, current_sources
-
-
 def event_request_ids(row: dict[str, Any], label: str) -> list[str]:
     attributes = row.get("attributes")
     require(isinstance(attributes, dict), f"{label}: trace attributes are missing")
@@ -432,8 +396,8 @@ def validate_pressure_hold(row: dict[str, Any], label: str) -> dict[str, Any]:
         f"{label}: progress baseline is invalid",
     )
     require(
-        isinstance(progress_current, int) and progress_current == progress_baseline,
-        f"{label}: pressure hold did not preserve its exact progress baseline",
+        isinstance(progress_current, int) and progress_current >= progress_baseline,
+        f"{label}: pressure owner logical progress regressed while its peer was held",
     )
     episode_id = shape.get("episode_id")
     require(isinstance(episode_id, int) and episode_id > 0, f"{label}: episode id is invalid")
@@ -467,12 +431,7 @@ def validate_pressure_hold_release(row: dict[str, Any], label: str) -> dict[str,
     )
     decision = shape.get("decision")
     require(
-        decision
-        in {
-            "owner_terminal",
-            "role_transferred",
-            "source_retargeted",
-        },
+        decision == "owner_terminal",
         f"{label}: release reason is invalid",
     )
     progress_baseline = shape.get("progress_baseline")
@@ -487,17 +446,10 @@ def validate_pressure_hold_release(row: dict[str, Any], label: str) -> dict[str,
     )
     previous_wait_condition = shape.get("previous_wait_condition")
     current_wait_condition = shape.get("current_wait_condition")
-    if decision == "source_retargeted":
-        validate_source_retarget(
-            previous_wait_condition,
-            current_wait_condition,
-            label=label,
-        )
-    else:
-        require(
-            previous_wait_condition is None and current_wait_condition is None,
-            f"{label}: non-retarget release carries source-retarget evidence",
-        )
+    require(
+        previous_wait_condition is None and current_wait_condition is None,
+        f"{label}: terminal release carries obsolete source-retarget evidence",
+    )
     require(
         shape.get("admission_eligible") is True,
         f"{label}: released victim did not regain dynamic admission eligibility",
@@ -584,6 +536,9 @@ def validate_pressure_fence_completed(row: dict[str, Any], label: str) -> dict[s
     episode_id = shape.get("episode_id")
     released = shape.get("release_transition_ordinal")
     resumable = shape.get("resumable_transition_ordinal")
+    owner_admission_pending = shape.get(
+        "owner_admission_pending_transition_ordinal"
+    )
     closed = shape.get("closed_transition_ordinal")
     closed_reason = shape.get("closed_reason")
     disposition = shape.get("completion_disposition")
@@ -605,22 +560,37 @@ def validate_pressure_fence_completed(row: dict[str, Any], label: str) -> dict[s
     progress_owner_resumable = shape.get("progress_owner_resumable")
     if yield_kind == "self_recompute":
         require(progress_owner_resumable is False, f"{label}: self recompute resumed stale work")
-        require(
-            resumable is None and isinstance(closed, int) and released < closed,
-            f"{label}: self-recompute release/closed ordinal order is invalid",
-        )
-        require(
-            closed_reason is None and disposition == "self_recompute_queued",
-            f"{label}: self-recompute completion disposition is invalid",
-        )
-        completion_ordinal = closed
+        if disposition == "progress_owner_admission_pending":
+            require(
+                resumable is None
+                and closed is None
+                and closed_reason is None
+                and isinstance(owner_admission_pending, int)
+                and released < owner_admission_pending,
+                f"{label}: owner-admission-pending ordinal order is invalid",
+            )
+            completion_ordinal = owner_admission_pending
+        else:
+            require(
+                resumable is None
+                and owner_admission_pending is None
+                and isinstance(closed, int)
+                and released < closed,
+                f"{label}: standalone self-recompute release/closed ordinal order is invalid",
+            )
+            require(
+                closed_reason is None and disposition == "self_recompute_queued",
+                f"{label}: self-recompute completion disposition is invalid",
+            )
+            completion_ordinal = closed
     elif progress_owner_resumable is True:
         require(
             isinstance(resumable, int) and released < resumable,
             f"{label}: release/resumable ordinal order is invalid",
         )
         require(
-            closed is None
+            owner_admission_pending is None
+            and closed is None
             and closed_reason is None
             and disposition == "progress_owner_resumable",
             f"{label}: resumable completion carries a closed disposition",
@@ -629,12 +599,14 @@ def validate_pressure_fence_completed(row: dict[str, Any], label: str) -> dict[s
     else:
         require(progress_owner_resumable is False, f"{label}: resumable state is not typed")
         require(
-            resumable is None and isinstance(closed, int) and released < closed,
+            resumable is None
+            and owner_admission_pending is None
+            and isinstance(closed, int)
+            and released < closed,
             f"{label}: release/closed ordinal order is invalid",
         )
         require(
-            closed_reason in {"owner_terminal", "source_retargeted"}
-            and disposition == closed_reason,
+            closed_reason == "owner_terminal" and disposition == "owner_terminal",
             f"{label}: closed completion reason is invalid",
         )
         completion_ordinal = closed
@@ -666,6 +638,7 @@ def validate_pressure_fence_completed(row: dict[str, Any], label: str) -> dict[s
         "yield_kind": yield_kind,
         "release_transition_ordinal": released,
         "resumable_transition_ordinal": resumable,
+        "owner_admission_pending_transition_ordinal": owner_admission_pending,
         "closed_transition_ordinal": closed,
         "closed_reason": closed_reason,
         "completion_disposition": disposition,
@@ -795,6 +768,39 @@ def validate_decode_trace(
         if row.get("phase") == "vnext.prefill_admission"
         and row.get("shape", {}).get("decision") == "admitted"
     ]
+    progress_owner_by_episode: dict[int, str] = {}
+    for pressure_yield in yields:
+        episode_id = pressure_yield["episode_id"]
+        progress_owner_id = pressure_yield["progress_owner_id"]
+        prior_owner = progress_owner_by_episode.setdefault(
+            episode_id, progress_owner_id
+        )
+        require(
+            common.request_identity_matches(prior_owner, progress_owner_id),
+            f"pressure episode {episode_id} transferred its stable progress owner",
+        )
+    for hold in holds:
+        require(
+            hold["episode_id"] in progress_owner_by_episode,
+            f"pressure episode {hold['episode_id']} hold has no planned yield",
+        )
+        require(
+            common.request_identity_matches(
+                progress_owner_by_episode[hold["episode_id"]],
+                hold["progress_owner_id"],
+            ),
+            f"pressure episode {hold['episode_id']} hold has a foreign progress owner",
+        )
+        require(
+            not any(
+                pressure_yield["episode_id"] == hold["episode_id"]
+                and common.request_identity_matches(
+                    pressure_yield["progress_owner_id"], hold["victim_request_id"]
+                )
+                for pressure_yield in yields
+            ),
+            f"pressure episode {hold['episode_id']} promoted a held victim to owner",
+        )
     for pressure_yield in yields:
         episode_id = pressure_yield["episode_id"]
         victim_request_id = pressure_yield["victim_request_id"]
@@ -853,13 +859,34 @@ def validate_decode_trace(
         ]
         if yield_kind == "self_recompute":
             require(
-                completed["completion_disposition"] == "self_recompute_queued",
-                f"self-recompute episode {episode_id} did not queue reconstruction",
+                completed["completion_disposition"]
+                in {
+                    "self_recompute_queued",
+                    "progress_owner_admission_pending",
+                },
+                f"self-recompute episode {episode_id} has an invalid reconstruction state",
             )
             require(
                 not matching_holds,
                 f"self-recompute episode {episode_id} incorrectly published a peer hold",
             )
+            if (
+                completed["completion_disposition"]
+                == "progress_owner_admission_pending"
+            ):
+                require(
+                    any(
+                        hold["episode_id"] == episode_id
+                        and common.request_identity_matches(
+                            hold["progress_owner_id"], progress_owner_id
+                        )
+                        and not common.request_identity_matches(
+                            hold["victim_request_id"], progress_owner_id
+                        )
+                        for hold in holds
+                    ),
+                    f"pressure owner {progress_owner_id} entered admission-pending without a held peer",
+                )
         elif completed["completion_disposition"] == "progress_owner_resumable":
             require(
                 matching_holds,
@@ -876,7 +903,7 @@ def validate_decode_trace(
         handoff_releases = [
             release
             for release in matching_releases
-            if release["decision"] in {"owner_terminal", "source_retargeted"}
+            if release["decision"] == "owner_terminal"
         ]
         if yield_kind == "self_recompute":
             require(
@@ -886,7 +913,7 @@ def validate_decode_trace(
             continue
         require(
             handoff_releases,
-            f"pressure hold for {victim_request_id} has no owner terminal or source retarget",
+            f"pressure hold for {victim_request_id} has no owner-terminal release",
         )
         first_handoff_release = min(
             release["ts_unix_nanos"]
@@ -997,7 +1024,7 @@ def validate_decode_trace(
         handoff_releases = [
             release
             for release in releases
-            if release["decision"] in {"owner_terminal", "source_retargeted"}
+            if release["decision"] == "owner_terminal"
             and release["episode_id"] == pressure_yield["episode_id"]
             and common.request_identity_matches(
                 release["victim_request_id"], victim_request_id
@@ -1009,7 +1036,7 @@ def validate_decode_trace(
         ]
         require(
             handoff_releases,
-            f"decode progress owner {progress_owner_id} neither terminated nor retargeted its exact source",
+            f"decode progress owner {progress_owner_id} did not terminate before releasing its peer",
         )
         handoff_released_at = min(
             release["ts_unix_nanos"] for release in handoff_releases
@@ -1856,6 +1883,7 @@ def self_test() -> int:
                 "episode_id": 1,
                 "release_transition_ordinal": 5,
                 "resumable_transition_ordinal": 6,
+                "owner_admission_pending_transition_ordinal": None,
                 "yield_kind": "peer_handoff",
                 "physical_release_completed": True,
                 "exact_source_advanced": True,
@@ -1891,6 +1919,67 @@ def self_test() -> int:
                 "probe_performed": False,
             },
         },
+        deferral(
+            146,
+            "pressure_yield_planned",
+            ["A"],
+            victim_request_id="A",
+            progress_owner_id="A",
+            progress_baseline=54,
+            episode_id=1,
+            planned_transition_ordinal=7,
+            yield_kind="self_recompute",
+        ),
+        {
+            "ts_unix_nanos": 147,
+            "phase": "vnext.execution_capacity_pressure_release_fence_armed",
+            "status": "ok",
+            "error": None,
+            "request_id": "A",
+            "shape": {
+                "episode_id": 1,
+                "planned_transition_ordinal": 7,
+                "transition_ordinal": 8,
+                "yield_kind": "self_recompute",
+                "physical_release_completed": False,
+            },
+            "attributes": {"progress_owner_id": "A"},
+        },
+        {
+            "ts_unix_nanos": 148,
+            "phase": "vnext.execution_capacity_pressure_release_fence_completed",
+            "status": "ok",
+            "error": None,
+            "request_id": "A",
+            "shape": {
+                "episode_id": 1,
+                "release_transition_ordinal": 9,
+                "resumable_transition_ordinal": None,
+                "owner_admission_pending_transition_ordinal": 10,
+                "closed_transition_ordinal": None,
+                "closed_reason": None,
+                "yield_kind": "self_recompute",
+                "physical_release_completed": True,
+                "exact_source_advanced": True,
+                "transaction_wait_condition_advanced": True,
+                "release_authority": "active_sequence",
+                "progress_owner_resumable": False,
+                "completion_disposition": "progress_owner_admission_pending",
+                "victim_requeued": True,
+            },
+            "attributes": {
+                "progress_owner_id": "A",
+                "current_capacity_availability": [
+                    {"source": {"domain": 5}, "epoch": 5}
+                ],
+            },
+        },
+        {
+            "ts_unix_nanos": 149,
+            "phase": "vnext.prefill_admission",
+            "request_id": "A",
+            "shape": {"decision": "admitted"},
+        },
         {"ts_unix_nanos": 150, "phase": "vnext.request_completed", "request_id": "A"},
         {
             "ts_unix_nanos": 151,
@@ -1901,7 +1990,7 @@ def self_test() -> int:
             "shape": {
                 "decision": "owner_terminal",
                 "episode_id": 1,
-                "transition_ordinal": 8,
+                "transition_ordinal": 12,
                 "waiting_ticket": 1,
                 "progress_owner_id": "A",
                 "progress_baseline": 53,
@@ -1930,7 +2019,7 @@ def self_test() -> int:
                 progress_owner_id="D",
                 progress_baseline=21,
                 episode_id=2,
-                planned_transition_ordinal=9,
+                planned_transition_ordinal=13,
                 yield_kind="self_recompute",
             ),
             {
@@ -1941,8 +2030,8 @@ def self_test() -> int:
                 "request_id": "D",
                 "shape": {
                     "episode_id": 2,
-                    "planned_transition_ordinal": 9,
-                    "transition_ordinal": 10,
+                    "planned_transition_ordinal": 13,
+                    "transition_ordinal": 14,
                     "yield_kind": "self_recompute",
                     "physical_release_completed": False,
                 },
@@ -1956,9 +2045,10 @@ def self_test() -> int:
                 "request_id": "D",
                 "shape": {
                     "episode_id": 2,
-                    "release_transition_ordinal": 11,
+                    "release_transition_ordinal": 15,
                     "resumable_transition_ordinal": None,
-                    "closed_transition_ordinal": 12,
+                    "owner_admission_pending_transition_ordinal": None,
+                    "closed_transition_ordinal": 16,
                     "closed_reason": None,
                     "yield_kind": "self_recompute",
                     "physical_release_completed": True,
@@ -1989,14 +2079,14 @@ def self_test() -> int:
     require(summary["split_events"] == 1, "self-test lost split evidence")
     require(summary["park_events"] == 2, "self-test lost park evidence")
     require(summary["resume_events"] == 1, "self-test lost resume evidence")
-    require(summary["pressure_yield_events"] == 2, "self-test lost pressure-yield evidence")
+    require(summary["pressure_yield_events"] == 3, "self-test lost pressure-yield evidence")
     require(
         summary["pressure_yield_kinds"] == ["peer_handoff", "self_recompute"],
         "self-test lost typed yield strategies",
     )
     require(
-        summary["pressure_fence_armed_events"] == 2
-        and summary["pressure_fence_completed_events"] == 2,
+        summary["pressure_fence_armed_events"] == 3
+        and summary["pressure_fence_completed_events"] == 3,
         "self-test lost release-fence evidence",
     )
     require(
@@ -2005,7 +2095,7 @@ def self_test() -> int:
         "self-test lost pressure-hold evidence",
     )
     require(
-        summary["pressure_victim_request_ids"] == ["C", "D"],
+        summary["pressure_victim_request_ids"] == ["A", "C", "D"],
         "self-test lost pressure-victim identity",
     )
 
@@ -2019,14 +2109,13 @@ def self_test() -> int:
             "completion_disposition": "source_retargeted",
         }
     )
-    retargeted = validate_pressure_fence_completed(
-        retargeted_completion, "retargeted fence self-test"
-    )
-    require(
-        retargeted["completion_transition_ordinal"] == 6
-        and retargeted["completion_disposition"] == "source_retargeted",
-        "self-test lost source-retargeted fence completion",
-    )
+    try:
+        validate_pressure_fence_completed(
+            retargeted_completion, "obsolete retargeted fence self-test"
+        )
+        raise AssertionError("source-retargeted completion unexpectedly passed")
+    except common.CapacityGateError:
+        pass
 
     unchanged_resume = json.loads(json.dumps(rows))
     unchanged_resume[3]["attributes"]["deferral_evidence"]["current_wait_sources"][0]["epoch"] = 3
@@ -2055,14 +2144,14 @@ def self_test() -> int:
     except common.CapacityGateError:
         pass
     missing_release = json.loads(json.dumps(rows))
-    del missing_release[10]
+    del missing_release[14]
     try:
         validate_decode_trace(missing_release, started_wall_ns=90, finished_wall_ns=170)
         raise AssertionError("pressure hold without a release unexpectedly passed")
     except common.CapacityGateError:
         pass
     missing_owner_terminal = json.loads(json.dumps(rows))
-    del missing_owner_terminal[9]
+    del missing_owner_terminal[13]
     try:
         validate_decode_trace(
             missing_owner_terminal, started_wall_ns=90, finished_wall_ns=170
@@ -2080,43 +2169,40 @@ def self_test() -> int:
     except common.CapacityGateError:
         pass
     premature_readmission = json.loads(json.dumps(rows))
-    premature_readmission[11]["ts_unix_nanos"] = 149
+    premature_readmission[15]["ts_unix_nanos"] = 149
     try:
         validate_decode_trace(premature_readmission, started_wall_ns=90, finished_wall_ns=170)
         raise AssertionError("victim re-admitted before owner terminal")
     except common.CapacityGateError:
         pass
-    source_retarget = json.loads(json.dumps(rows[10]))
-    source_retarget["shape"].update(
+    rotated_owner = json.loads(json.dumps(rows))
+    rotated_owner[9]["shape"]["attempted_decode_width"] = 1
+    rotated_owner[9]["attributes"].update(
         {
-            "decision": "source_retargeted",
-            "progress_current": 53,
-            "previous_wait_condition": {
-                "coordinator_id": 7,
-                "observed": [
-                    {"source": {"domain": 4}, "epoch": 109},
-                    {"source": "plan_device_budget", "epoch": 1},
-                ],
-            },
-            "current_wait_condition": {
-                "coordinator_id": 7,
-                "observed": [
-                    {"source": {"domain": 2}, "epoch": 216},
-                    {"source": "plan_device_budget", "epoch": 1},
-                ],
-            },
+            "request_ids": ["C"],
+            "victim_request_id": "C",
+            "progress_owner_id": "C",
         }
     )
-    validate_pressure_hold_release(source_retarget, "valid source retarget")
-    unchanged_retarget = json.loads(json.dumps(source_retarget))
-    unchanged_retarget["shape"]["current_wait_condition"] = json.loads(
-        json.dumps(unchanged_retarget["shape"]["previous_wait_condition"])
-    )
+    rotated_owner[10]["request_id"] = "C"
+    rotated_owner[10]["attributes"]["progress_owner_id"] = "C"
+    rotated_owner[11]["request_id"] = "C"
+    rotated_owner[11]["attributes"]["progress_owner_id"] = "C"
     try:
-        validate_pressure_hold_release(unchanged_retarget, "unchanged source retarget")
-        raise AssertionError("unchanged exact topology unexpectedly released a pressure hold")
+        validate_decode_trace(rotated_owner, started_wall_ns=90, finished_wall_ns=170)
+        raise AssertionError("held victim unexpectedly became the pressure owner")
     except common.CapacityGateError:
         pass
+    for obsolete_reason in ["role_transferred", "source_retargeted"]:
+        obsolete_release = json.loads(json.dumps(rows[14]))
+        obsolete_release["shape"]["decision"] = obsolete_reason
+        try:
+            validate_pressure_hold_release(
+                obsolete_release, f"obsolete {obsolete_reason} hold release"
+            )
+            raise AssertionError(f"{obsolete_reason} hold release unexpectedly passed")
+        except common.CapacityGateError:
+            pass
     print("FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY SELFTEST PASS")
     return 0
 

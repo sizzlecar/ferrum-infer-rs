@@ -118,18 +118,18 @@ pub enum ExecutionCapacityAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionCapacityYieldDisposition {
     ProgressOwnerResumable,
+    ProgressOwnerAdmissionPending,
     SelfRecomputeQueued,
     OwnerTerminal,
-    SourceRetargeted,
 }
 
 impl ExecutionCapacityYieldDisposition {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ProgressOwnerResumable => "progress_owner_resumable",
+            Self::ProgressOwnerAdmissionPending => "progress_owner_admission_pending",
             Self::SelfRecomputeQueued => "self_recompute_queued",
             Self::OwnerTerminal => "owner_terminal",
-            Self::SourceRetargeted => "source_retargeted",
         }
     }
 }
@@ -137,8 +137,8 @@ impl ExecutionCapacityYieldDisposition {
 /// Terminal result of one physical execution-capacity yield transaction.
 ///
 /// A completed release can make a peer progress owner runnable, queue the same
-/// logical frontier for recompute, or close because the owner became terminal
-/// or changed its exact wait source. The engine only resubmits a peer owner for
+/// logical frontier for recompute, or close because the owner became terminal.
+/// The engine only resubmits a peer owner for
 /// `ProgressOwnerResumable`; self recompute progresses through normal waiting
 /// admission after the release fence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +146,7 @@ pub struct ExecutionCapacityYieldCompletion {
     victim_requeued: bool,
     release_transition_ordinal: PressureTransitionOrdinal,
     resumable_transition_ordinal: Option<PressureTransitionOrdinal>,
+    owner_admission_pending_transition_ordinal: Option<PressureTransitionOrdinal>,
     closed_transition_ordinal: Option<PressureTransitionOrdinal>,
     disposition: ExecutionCapacityYieldDisposition,
 }
@@ -170,6 +171,12 @@ impl ExecutionCapacityYieldCompletion {
         self.resumable_transition_ordinal
     }
 
+    pub const fn owner_admission_pending_transition_ordinal(
+        &self,
+    ) -> Option<PressureTransitionOrdinal> {
+        self.owner_admission_pending_transition_ordinal
+    }
+
     pub const fn closed_transition_ordinal(&self) -> Option<PressureTransitionOrdinal> {
         self.closed_transition_ordinal
     }
@@ -179,10 +186,8 @@ impl ExecutionCapacityYieldCompletion {
             ExecutionCapacityYieldDisposition::OwnerTerminal => {
                 Some(PressureHoldReleaseReason::OwnerTerminal)
             }
-            ExecutionCapacityYieldDisposition::SourceRetargeted => {
-                Some(PressureHoldReleaseReason::SourceRetargeted)
-            }
             ExecutionCapacityYieldDisposition::ProgressOwnerResumable
+            | ExecutionCapacityYieldDisposition::ProgressOwnerAdmissionPending
             | ExecutionCapacityYieldDisposition::SelfRecomputeQueued => None,
         }
     }
@@ -1058,6 +1063,9 @@ impl ContinuousBatchScheduler {
                     };
                     match hold_status {
                         PressureHoldStatus::Held { .. } => AdmissionQueueEligibility::Held,
+                        PressureHoldStatus::OwnerAdmissionEligible { .. } => {
+                            AdmissionQueueEligibility::Eligible
+                        }
                         PressureHoldStatus::Released {
                             episode_id,
                             progress_owner_id,
@@ -1070,7 +1078,14 @@ impl ContinuousBatchScheduler {
                         } => {
                             {
                                 let mut coordinator = self.pressure_coordinator.lock();
-                                coordinator.consume_released_hold(request_id);
+                                if let Err(error) = coordinator.consume_released_hold(request_id) {
+                                    warn!(
+                                        request_id = %request_id,
+                                        error = %error,
+                                        "Pressure coordinator rejected terminal hold release"
+                                    );
+                                    return AdmissionQueueEligibility::Held;
+                                }
                                 self.pressure_active
                                     .store(coordinator.has_records(), Ordering::Release);
                             }
@@ -1841,40 +1856,44 @@ impl ContinuousBatchScheduler {
                 .store(coordinator.has_records(), Ordering::Release);
             completion
         };
-        let (resumable_transition_ordinal, closed_transition_ordinal, disposition) =
-            match disposition {
-                PressureReleaseFenceDisposition::Resumable(ordinal) => (
-                    Some(ordinal),
-                    None,
-                    ExecutionCapacityYieldDisposition::ProgressOwnerResumable,
-                ),
-                PressureReleaseFenceDisposition::SelfRecomputeQueued(ordinal) => (
-                    None,
-                    Some(ordinal),
-                    ExecutionCapacityYieldDisposition::SelfRecomputeQueued,
-                ),
-                PressureReleaseFenceDisposition::Closed { ordinal, reason } => {
-                    let disposition = match reason {
-                        PressureHoldReleaseReason::OwnerTerminal => {
-                            ExecutionCapacityYieldDisposition::OwnerTerminal
-                        }
-                        PressureHoldReleaseReason::SourceRetargeted => {
-                            ExecutionCapacityYieldDisposition::SourceRetargeted
-                        }
-                        PressureHoldReleaseReason::RoleTransferred => {
-                            return Err(FerrumError::scheduler(format!(
-                                "release fence closed with non-terminal hold reason {}",
-                                reason.as_str()
-                            )));
-                        }
-                    };
-                    (None, Some(ordinal), disposition)
-                }
-            };
+        let (
+            resumable_transition_ordinal,
+            owner_admission_pending_transition_ordinal,
+            closed_transition_ordinal,
+            disposition,
+        ) = match disposition {
+            PressureReleaseFenceDisposition::Resumable(ordinal) => (
+                Some(ordinal),
+                None,
+                None,
+                ExecutionCapacityYieldDisposition::ProgressOwnerResumable,
+            ),
+            PressureReleaseFenceDisposition::OwnerAdmissionPending(ordinal) => (
+                None,
+                Some(ordinal),
+                None,
+                ExecutionCapacityYieldDisposition::ProgressOwnerAdmissionPending,
+            ),
+            PressureReleaseFenceDisposition::SelfRecomputeQueued(ordinal) => (
+                None,
+                None,
+                Some(ordinal),
+                ExecutionCapacityYieldDisposition::SelfRecomputeQueued,
+            ),
+            PressureReleaseFenceDisposition::Closed { ordinal, reason } => {
+                let disposition = match reason {
+                    PressureHoldReleaseReason::OwnerTerminal => {
+                        ExecutionCapacityYieldDisposition::OwnerTerminal
+                    }
+                };
+                (None, None, Some(ordinal), disposition)
+            }
+        };
         Ok(ExecutionCapacityYieldCompletion {
             victim_requeued: requeued,
             release_transition_ordinal: release_ordinal,
             resumable_transition_ordinal,
+            owner_admission_pending_transition_ordinal,
             closed_transition_ordinal,
             disposition,
         })
@@ -3035,7 +3054,13 @@ impl ContinuousBatchScheduler {
             return;
         }
         let mut coordinator = self.pressure_coordinator.lock();
-        coordinator.consume_released_hold(request_id);
+        if let Err(error) = coordinator.consume_released_hold(request_id) {
+            warn!(
+                request_id = %request_id,
+                error = %error,
+                "Pressure coordinator rejected admitted owner transition"
+            );
+        }
         self.pressure_active
             .store(coordinator.has_records(), Ordering::Release);
     }
@@ -3855,6 +3880,83 @@ mod tests {
         )));
         assert_eq!(scheduler.trace_snapshot().pressure_active_episodes, 1);
 
+        let availability2 = [CapacityAvailabilityEpoch::new(source, 3).unwrap()];
+        let wake2 = AdmissionWakeEpochs::new(NonZeroU64::new(29).unwrap(), 3, 0, 0);
+        let owner_pressure =
+            CapacityWaitCondition::from_observation(29, availability2.to_vec()).unwrap();
+        let owner_deferral = AdmissionDeferral::new(
+            DeferredAction::WaitForRelease,
+            wake2,
+            owner_pressure.clone(),
+        );
+        let owner_action = scheduler
+            .defer_decode_for_execution_capacity(
+                std::slice::from_ref(&blocked_id),
+                owner_deferral,
+                &execution_capacity_release_snapshot([&blocked_id], &owner_pressure),
+            )
+            .unwrap();
+        let ExecutionCapacityAction::YieldPlanned {
+            transaction: owner_transaction,
+        } = owner_action
+        else {
+            panic!("the stable progress owner must self recompute under renewed pressure");
+        };
+        assert_eq!(owner_transaction.kind(), PressureYieldKind::SelfRecompute);
+        assert_eq!(owner_transaction.progress_owner_id(), &blocked_id);
+        assert_eq!(owner_transaction.victim_request_id(), &blocked_id);
+        scheduler
+            .arm_execution_capacity_yield(&owner_transaction)
+            .unwrap();
+        let owner_completion = scheduler
+            .complete_execution_capacity_yield(&owner_transaction, 1, Some(0))
+            .unwrap();
+        assert_eq!(
+            owner_completion.disposition(),
+            ExecutionCapacityYieldDisposition::ProgressOwnerAdmissionPending
+        );
+        assert!(owner_completion
+            .owner_admission_pending_transition_ordinal()
+            .is_some());
+        assert!(owner_completion.closed_transition_ordinal().is_none());
+        assert_eq!(scheduler.trace_snapshot().waiting_queue_len, 2);
+
+        let mut owner_recompute_probes = Vec::new();
+        let owner_recompute = scheduler
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(2),
+                AdmissionWakeSnapshot::new(wake2, &availability2),
+                &mut |request| {
+                    owner_recompute_probes.push(request.id.clone());
+                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                        request_id: request.id.clone(),
+                    })
+                },
+            )
+            .unwrap()
+            .expect("the stable owner must be the only admission-eligible recompute");
+        assert_eq!(owner_recompute_probes, vec![blocked_id.clone()]);
+        assert_eq!(owner_recompute.requests.len(), 1);
+        assert_eq!(owner_recompute.requests[0].request.id, blocked_id);
+        assert!(matches!(
+            scheduler
+                .pressure_coordinator
+                .lock()
+                .hold_status(&runnable_id),
+            PressureHoldStatus::Held { .. }
+        ));
+        let journal = scheduler.pressure_transition_journal();
+        let admission_pending = journal
+            .iter()
+            .find(|event| event.kind() == PressureTransitionKind::OwnerAdmissionPending)
+            .expect("owner self recompute must publish admission-pending state");
+        let owner_admitted = journal
+            .iter()
+            .find(|event| event.kind() == PressureTransitionKind::OwnerAdmitted)
+            .expect("typed admission receipt must commit owner admission");
+        assert!(admission_pending.ordinal() < owner_admitted.ordinal());
+        scheduler.mark_prefill_complete(&blocked_id, 1);
+
         let response = InferenceResponse {
             request_id: blocked_id.clone(),
             text: String::new(),
@@ -3875,7 +3977,7 @@ mod tests {
         let admitted = scheduler
             .next_batch_with_dynamic_admission_observed(
                 BatchHint::simple(2),
-                AdmissionWakeSnapshot::new(released, &availability1),
+                AdmissionWakeSnapshot::new(wake2, &availability2),
                 &mut |request| {
                     AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
                         request_id: request.id.clone(),
@@ -4018,7 +4120,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_fence_rechecks_retargeted_owner_condition_before_resume() {
+    async fn release_fence_preserves_stable_owner_across_retargeted_condition() {
         use ferrum_interfaces::vnext::{
             CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityDomainId,
             CapacityWaitCondition, DeferredAction,
@@ -4133,21 +4235,16 @@ mod tests {
             .complete_execution_capacity_yield(&transaction, 1, Some(0))
             .unwrap();
         assert!(completion.victim_requeued());
-        assert!(!completion.progress_owner_resumable());
-        assert!(completion.resumable_transition_ordinal().is_none());
-        assert!(completion.closed_transition_ordinal().is_some());
-        assert_eq!(
-            completion.closed_reason(),
-            Some(PressureHoldReleaseReason::SourceRetargeted)
-        );
+        assert!(completion.progress_owner_resumable());
+        assert!(completion.resumable_transition_ordinal().is_some());
+        assert!(completion.closed_transition_ordinal().is_none());
+        assert_eq!(completion.closed_reason(), None);
         assert!(matches!(
-            scheduler.pressure_coordinator.lock().hold_status(&victim_id),
-            PressureHoldStatus::Released {
-                reason: PressureHoldReleaseReason::SourceRetargeted,
-                previous_wait_condition: Some(ref previous),
-                current_wait_condition: Some(ref current),
-                ..
-            } if previous == &original_wait && current == &retargeted_wait
+            scheduler
+                .pressure_coordinator
+                .lock()
+                .hold_status(&victim_id),
+            PressureHoldStatus::Held { .. }
         ));
     }
 

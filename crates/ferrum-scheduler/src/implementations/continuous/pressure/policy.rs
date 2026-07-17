@@ -1,6 +1,6 @@
 use super::{
-    LogicalWorkKind, ParticipantState, PressureEpisode, PressureEpisodeState,
-    PressureTransitionOrdinal, PressureYieldSelection,
+    LogicalWorkKind, ParticipantState, PressureEpisode, PressureTransitionOrdinal,
+    PressureYieldSelection,
 };
 use ferrum_types::RequestId;
 use std::collections::HashSet;
@@ -32,23 +32,27 @@ impl PressureSelectionPolicy for FairPressureSelectionPolicy {
         episode: &PressureEpisode,
         requested: &HashSet<RequestId>,
     ) -> Option<RequestId> {
-        let prior_yielded = episode
-            .yielded_request
+        let stable_owner = episode
+            .progress_owner
             .as_ref()
             .and_then(|request_id| episode.participants.get(request_id))
             .filter(|participant| participant.work_kind != LogicalWorkKind::Terminal);
-        if episode.state == PressureEpisodeState::Resumable {
-            if let Some(participant) = prior_yielded {
-                return Some(participant.request_id.clone());
-            }
+        if let Some(participant) = stable_owner {
+            return Some(participant.request_id.clone());
         }
 
         episode
             .participants
             .values()
             .filter(|participant| {
-                matches!(participant.state, ParticipantState::Blocked { .. })
-                    || requested.contains(&participant.request_id)
+                !matches!(
+                    participant.state,
+                    ParticipantState::Held
+                        | ParticipantState::YieldPlanned
+                        | ParticipantState::OwnerAdmissionPending
+                        | ParticipantState::Terminal
+                ) && (matches!(participant.state, ParticipantState::Blocked { .. })
+                    || requested.contains(&participant.request_id))
             })
             .min_by(|left, right| {
                 let left_ordinal = match left.state {
@@ -80,7 +84,13 @@ impl PressureSelectionPolicy for FairPressureSelectionPolicy {
             .filter(|participant| {
                 participant.request_id != *owner_id
                     && participant.advances_wait_source
-                    && !matches!(participant.state, ParticipantState::Yielded)
+                    && !matches!(
+                        participant.state,
+                        ParticipantState::Held
+                            | ParticipantState::YieldPlanned
+                            | ParticipantState::OwnerAdmissionPending
+                            | ParticipantState::Terminal
+                    )
             })
             .min_by(|left, right| {
                 let left_requested = requested.contains(&left.request_id);

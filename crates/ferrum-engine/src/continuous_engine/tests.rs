@@ -2831,6 +2831,152 @@ async fn plan_runtime_lone_decode_self_recompute_releases_exact_cache_before_req
     }));
 }
 
+#[tokio::test]
+async fn plan_runtime_pressure_keeps_owner_identity_across_two_physical_releases() {
+    let trace_path = resource_trace_temp_path("plan-runtime-stable-pressure-owner");
+    let _ = std::fs::remove_file(&trace_path);
+    let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine_with_trace(
+        PlanRuntimeBatchDecodeBehavior::Exact,
+        Some(trace_path.clone()),
+    );
+    let (request_ids, initial_tokens, _) =
+        install_plan_runtime_decode_cohort(&engine, &scheduler, tokenizer).await;
+    let source = ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots;
+    let first_availability =
+        ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(source, 1).unwrap();
+    let first_condition = ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(
+        47,
+        vec![first_availability],
+    )
+    .unwrap();
+    let first_deferral = AdmissionDeferral::new(
+        DeferredAction::WaitForRelease,
+        AdmissionWakeEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0, 0),
+        first_condition,
+    );
+
+    let first_action = scheduler
+        .defer_decode_for_execution_capacity(
+            &request_ids,
+            first_deferral,
+            &engine.inner.execution_capacity_release_snapshot().unwrap(),
+        )
+        .unwrap();
+    let ExecutionCapacityAction::YieldPlanned {
+        transaction: first_transaction,
+    } = first_action
+    else {
+        panic!("two decode frontiers must select one peer handoff");
+    };
+    assert_eq!(first_transaction.kind(), PressureYieldKind::PeerHandoff);
+    let progress_owner_id = first_transaction.progress_owner_id().clone();
+    let held_peer_id = first_transaction.victim_request_id().clone();
+    assert_ne!(progress_owner_id, held_peer_id);
+
+    assert!(engine
+        .inner
+        .execute_capacity_yield(&first_transaction, 2, None)
+        .await
+        .unwrap());
+    assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 1);
+    scheduler.update_decode_progress(&progress_owner_id, 1);
+
+    let second_availability =
+        ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(source, 2).unwrap();
+    let second_condition = ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(
+        47,
+        vec![second_availability],
+    )
+    .unwrap();
+    let second_deferral = AdmissionDeferral::new(
+        DeferredAction::WaitForRelease,
+        AdmissionWakeEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 1, 0, 0),
+        second_condition,
+    );
+    let second_action = scheduler
+        .defer_decode_for_execution_capacity(
+            std::slice::from_ref(&progress_owner_id),
+            second_deferral,
+            &engine.inner.execution_capacity_release_snapshot().unwrap(),
+        )
+        .unwrap();
+    let ExecutionCapacityAction::YieldPlanned {
+        transaction: second_transaction,
+    } = second_action
+    else {
+        panic!("the stable progress owner must self recompute under renewed pressure");
+    };
+    assert_eq!(second_transaction.kind(), PressureYieldKind::SelfRecompute);
+    assert_eq!(second_transaction.progress_owner_id(), &progress_owner_id);
+    assert_eq!(second_transaction.victim_request_id(), &progress_owner_id);
+
+    assert!(!engine
+        .inner
+        .execute_capacity_yield(&second_transaction, 1, None)
+        .await
+        .unwrap());
+    assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 2);
+    let snapshot = scheduler.trace_snapshot();
+    assert_eq!(snapshot.active_len, 0);
+    assert_eq!(snapshot.waiting_queue_len, 2);
+    assert_eq!(snapshot.pressure_active_episodes, 1);
+    assert_eq!(snapshot.pressure_pending_release_fences, 0);
+
+    let initial_tokens_by_request = request_ids
+        .iter()
+        .cloned()
+        .zip(initial_tokens.iter().copied())
+        .collect::<HashMap<_, _>>();
+    let sequences = engine.inner.sequences.read();
+    for request_id in [&progress_owner_id, &held_peer_id] {
+        let sequence = sequences
+            .get(request_id)
+            .expect("both pressure participants remain queued for recompute");
+        assert_eq!(
+            sequence.generated_tokens,
+            vec![initial_tokens_by_request[request_id]]
+        );
+        assert_eq!(sequence.phase, RequestPhase::Waiting);
+        assert!(sequence.model_cache_id().is_none());
+        assert_eq!(sequence.preemption_count, 1);
+    }
+    drop(sequences);
+
+    let profile_events = read_engine_profile_events(&trace_path);
+    let completions = profile_events
+        .iter()
+        .filter(|event| event.phase == "vnext.execution_capacity_pressure_release_fence_completed")
+        .collect::<Vec<_>>();
+    assert_eq!(completions.len(), 2);
+    assert_eq!(
+        completions[0].shape.get("completion_disposition"),
+        Some(&serde_json::json!("progress_owner_resumable"))
+    );
+    assert_eq!(
+        completions[1].shape.get("completion_disposition"),
+        Some(&serde_json::json!("progress_owner_admission_pending"))
+    );
+    assert!(
+        completions[1].shape["owner_admission_pending_transition_ordinal"]
+            .as_u64()
+            .is_some()
+    );
+    assert_eq!(
+        completions[1].shape.get("resumable_transition_ordinal"),
+        Some(&serde_json::Value::Null)
+    );
+    assert_eq!(
+        completions[1].shape.get("closed_transition_ordinal"),
+        Some(&serde_json::Value::Null)
+    );
+    assert_eq!(
+        completions[1].attributes.get("progress_owner_id"),
+        Some(&serde_json::json!(progress_owner_id))
+    );
+    assert_eq!(completions[1].request_id, progress_owner_id.to_string());
+    let _ = std::fs::remove_file(trace_path);
+}
+
 fn assert_plan_runtime_decode_cohort_unchanged(
     engine: &ContinuousBatchEngine,
     request_ids: &[RequestId],
