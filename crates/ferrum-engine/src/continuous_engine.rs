@@ -33,7 +33,7 @@ use ferrum_interfaces::{
 use ferrum_kv::cache::prefix::PrefixCache;
 use ferrum_sampler::json_mode::JsonModeProcessor;
 use ferrum_scheduler::implementations::{
-    ContinuousBatchScheduler, DecodeExecutionCapacityAction, DecodeProgressReservation,
+    ContinuousBatchScheduler, DecodeExecutionCapacityAction, DecodeProgressLease,
     ExecutorAdmissionProbeOutcome, ExecutorAdmissionQueueObservation, RequestPhase,
 };
 use ferrum_scheduler::vnext::{

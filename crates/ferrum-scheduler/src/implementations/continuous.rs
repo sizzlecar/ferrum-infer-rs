@@ -92,33 +92,145 @@ pub enum RequestPhase {
 /// recompute so a peer can remain the progress owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeExecutionCapacityAction {
-    Deferred {
-        count: usize,
-    },
-    RecomputeVictim {
-        reservation: DecodeProgressReservation,
-    },
+    Deferred { count: usize },
+    RecomputeVictim { lease: DecodeProgressLease },
+}
+
+/// Monotonic logical decode progress for one request.
+///
+/// This generation follows committed output rather than physical KV state, so
+/// it survives decode -> recompute -> prefill transitions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct DecodeProgressGeneration(u64);
+
+impl DecodeProgressGeneration {
+    const ZERO: Self = Self(0);
+
+    fn from_generated_tokens(tokens: usize) -> Self {
+        Self(u64::try_from(tokens).unwrap_or(u64::MAX))
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DecodeProgressClock(Arc<AtomicU64>);
+
+impl DecodeProgressClock {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(
+            DecodeProgressGeneration::ZERO.get(),
+        )))
+    }
+
+    fn current(&self) -> DecodeProgressGeneration {
+        DecodeProgressGeneration(self.0.load(Ordering::Acquire))
+    }
+
+    fn advance_to(&self, generation: DecodeProgressGeneration) {
+        let current = self.0.load(Ordering::Relaxed);
+        debug_assert!(
+            generation.get() >= current,
+            "logical decode progress cannot regress"
+        );
+        if generation.get() > current {
+            self.0.store(generation.get(), Ordering::Release);
+        }
+    }
+}
+
+/// Why a decode progress lease stopped holding its recompute victim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeProgressLeaseReleaseReason {
+    OwnerAdvanced,
+    OwnerNoLongerDecoding,
+}
+
+impl DecodeProgressLeaseReleaseReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnerAdvanced => "owner_advanced",
+            Self::OwnerNoLongerDecoding => "owner_no_longer_decoding",
+        }
+    }
 }
 
 /// Physical capacity ceded by a recompute victim to one decode progress owner.
 ///
-/// The reservation is planned while the decode queue is locked, then installed
+/// The lease is planned while the decode queue is locked, then installed
 /// only after the engine has released the victim's physical state and moved it
-/// back to waiting. It prevents immediate re-admission from reclaiming the same
-/// capacity before the selected owner reaches a terminal state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecodeProgressReservation {
+/// back to waiting. It prevents immediate re-admission until the owner commits
+/// logical decode progress, without monopolizing the released capacity until
+/// the owner's terminal state.
+#[derive(Debug, Clone)]
+pub struct DecodeProgressLease {
     victim_request_id: RequestId,
     progress_owner_id: RequestId,
+    progress_baseline: DecodeProgressGeneration,
+    progress_clock: DecodeProgressClock,
 }
 
-impl DecodeProgressReservation {
+impl PartialEq for DecodeProgressLease {
+    fn eq(&self, other: &Self) -> bool {
+        self.victim_request_id == other.victim_request_id
+            && self.progress_owner_id == other.progress_owner_id
+            && self.progress_baseline == other.progress_baseline
+            && Arc::ptr_eq(&self.progress_clock.0, &other.progress_clock.0)
+    }
+}
+
+impl Eq for DecodeProgressLease {}
+
+impl DecodeProgressLease {
+    fn new(
+        victim_request_id: RequestId,
+        progress_owner_id: RequestId,
+        progress_clock: DecodeProgressClock,
+    ) -> Self {
+        let progress_baseline = progress_clock.current();
+        Self {
+            victim_request_id,
+            progress_owner_id,
+            progress_baseline,
+            progress_clock,
+        }
+    }
+
     pub fn victim_request_id(&self) -> &RequestId {
         &self.victim_request_id
     }
 
     pub fn progress_owner_id(&self) -> &RequestId {
         &self.progress_owner_id
+    }
+
+    pub const fn progress_baseline(&self) -> DecodeProgressGeneration {
+        self.progress_baseline
+    }
+
+    pub fn progress_current(&self) -> DecodeProgressGeneration {
+        self.progress_clock.current()
+    }
+
+    fn is_held(&self, owner_phase: Option<RequestPhase>) -> bool {
+        owner_phase == Some(RequestPhase::Decoding)
+            && self.progress_current() <= self.progress_baseline
+    }
+
+    fn release_reason(
+        &self,
+        owner_phase: Option<RequestPhase>,
+    ) -> Option<DecodeProgressLeaseReleaseReason> {
+        if self.is_held(owner_phase) {
+            None
+        } else if owner_phase == Some(RequestPhase::Decoding) {
+            Some(DecodeProgressLeaseReleaseReason::OwnerAdvanced)
+        } else {
+            Some(DecodeProgressLeaseReleaseReason::OwnerNoLongerDecoding)
+        }
     }
 }
 
@@ -133,6 +245,8 @@ pub struct ContinuousBatchRequest {
     pub prefill_tokens: usize,
     /// Number of decode tokens generated
     pub decode_tokens: usize,
+    /// Logical output progress shared with any active decode progress lease.
+    decode_progress_clock: DecodeProgressClock,
     /// KV cache blocks allocated
     pub kv_blocks: Vec<ferrum_types::BlockId>,
     /// Whether prefill is chunked
@@ -160,7 +274,7 @@ pub struct ContinuousBatchRequest {
     /// Typed ownership relation for capacity released by this recompute
     /// request. Kept private so queue state cannot name an owner without the
     /// matching victim identity produced by the scheduler decision.
-    decode_progress_reservation: Option<DecodeProgressReservation>,
+    decode_progress_lease: Option<DecodeProgressLease>,
 }
 
 impl ContinuousBatchRequest {
@@ -171,6 +285,7 @@ impl ContinuousBatchRequest {
             phase: RequestPhase::Waiting,
             prefill_tokens: 0,
             decode_tokens: 0,
+            decode_progress_clock: DecodeProgressClock::new(),
             kv_blocks: Vec::new(),
             chunked_prefill: false,
             prefill_chunk_offset: 0,
@@ -183,7 +298,7 @@ impl ContinuousBatchRequest {
             capacity_deferred_from_decode: false,
             waiting_admission_ticket: None,
             execution_capacity_deferral: None,
-            decode_progress_reservation: None,
+            decode_progress_lease: None,
         }
     }
 
@@ -214,9 +329,19 @@ pub type ExecutorAdmissionProbeOutcome =
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutorAdmissionQueueObservation {
-    ProgressReservationHeld {
+    ProgressLeaseHeld {
         request_id: RequestId,
         progress_owner_id: RequestId,
+        progress_baseline: DecodeProgressGeneration,
+        progress_current: DecodeProgressGeneration,
+        ticket: u64,
+    },
+    ProgressLeaseReleased {
+        request_id: RequestId,
+        progress_owner_id: RequestId,
+        progress_baseline: DecodeProgressGeneration,
+        progress_current: DecodeProgressGeneration,
+        reason: DecodeProgressLeaseReleaseReason,
         ticket: u64,
     },
     SkippedUnchanged {
@@ -576,23 +701,17 @@ impl ContinuousBatchScheduler {
         }
         let waiting_queue = self.waiting_queue.read();
         let request_index = self.request_index.read();
-        let reservation_is_active = |request: &ContinuousBatchRequest| {
-            request
-                .decode_progress_reservation
-                .as_ref()
-                .is_some_and(|reservation| {
-                    matches!(
-                        request_index.get(reservation.progress_owner_id()),
-                        Some(RequestPhase::Prefilling | RequestPhase::Decoding)
-                    )
-                })
+        let progress_lease_is_held = |request: &ContinuousBatchRequest| {
+            request.decode_progress_lease.as_ref().is_some_and(|lease| {
+                lease.is_held(request_index.get(lease.progress_owner_id()).copied())
+            })
         };
         let waiting_count = waiting_queue
             .iter()
-            .filter(|request| !reservation_is_active(request))
+            .filter(|request| !progress_lease_is_held(request))
             .count();
         let waiting = waiting_queue
-            .passive_wait_condition_for(|request| !reservation_is_active(request))
+            .passive_wait_condition_for(|request| !progress_lease_is_held(request))
             .map_err(|error| FerrumError::scheduler(error.to_string()))?;
         drop(request_index);
         drop(waiting_queue);
@@ -784,7 +903,7 @@ impl ContinuousBatchScheduler {
             if let Some(epoch) = empty_retry_epoch {
                 req.capacity_deferred_empty_retry_epoch = Some(epoch);
             }
-            req.decode_progress_reservation = None;
+            req.decode_progress_lease = None;
             req.phase = RequestPhase::Prefilling;
             req.inner.state = RequestState::Running;
             let started_at = chrono::Utc::now();
@@ -824,7 +943,7 @@ impl ContinuousBatchScheduler {
             );
             return;
         }
-        request.decode_progress_reservation = None;
+        request.decode_progress_lease = None;
         request.phase = RequestPhase::Prefilling;
         request.inner.state = RequestState::Running;
         let started_at = chrono::Utc::now();
@@ -889,30 +1008,44 @@ impl ContinuousBatchScheduler {
                 maximum_probes,
                 maximum_admissions,
                 &mut events,
-                |request, _| {
-                    let Some(reservation) = request.decode_progress_reservation.as_ref() else {
+                |request, ticket| {
+                    let Some(lease) = request.decode_progress_lease.as_ref() else {
                         return AdmissionQueueEligibility::Eligible;
                     };
-                    if matches!(
-                        request_index.get(reservation.progress_owner_id()),
-                        Some(RequestPhase::Prefilling | RequestPhase::Decoding)
-                    ) {
-                        AdmissionQueueEligibility::Held
-                    } else {
-                        AdmissionQueueEligibility::Eligible
+                    let owner_phase = request_index.get(lease.progress_owner_id()).copied();
+                    if lease.is_held(owner_phase) {
+                        return AdmissionQueueEligibility::Held;
                     }
+                    let lease = request
+                        .decode_progress_lease
+                        .take()
+                        .expect("fulfilled progress lease remains attached until eligibility");
+                    let reason = lease
+                        .release_reason(owner_phase)
+                        .expect("eligible progress lease must have a release reason");
+                    if let Some(observer) = observer.borrow_mut().as_deref_mut() {
+                        observer(ExecutorAdmissionQueueObservation::ProgressLeaseReleased {
+                            request_id: request.inner.request.id.clone(),
+                            progress_owner_id: lease.progress_owner_id().clone(),
+                            progress_baseline: lease.progress_baseline(),
+                            progress_current: lease.progress_current(),
+                            reason,
+                            ticket: ticket.get(),
+                        });
+                    }
+                    AdmissionQueueEligibility::Eligible
                 },
                 |request, ticket| {
-                    let progress_owner_id = request
-                        .decode_progress_reservation
+                    let lease = request
+                        .decode_progress_lease
                         .as_ref()
-                        .expect("held recompute admission has a progress reservation")
-                        .progress_owner_id()
-                        .clone();
+                        .expect("held recompute admission has a progress lease");
                     if let Some(observer) = observer.borrow_mut().as_deref_mut() {
-                        observer(ExecutorAdmissionQueueObservation::ProgressReservationHeld {
+                        observer(ExecutorAdmissionQueueObservation::ProgressLeaseHeld {
                             request_id: request.inner.request.id.clone(),
-                            progress_owner_id,
+                            progress_owner_id: lease.progress_owner_id().clone(),
+                            progress_baseline: lease.progress_baseline(),
+                            progress_current: lease.progress_current(),
                             ticket: ticket.get(),
                         });
                     }
@@ -1277,7 +1410,11 @@ impl ContinuousBatchScheduler {
                         .request
                         .priority
                         .cmp(&right.inner.request.priority)
-                        .then_with(|| left.decode_tokens.cmp(&right.decode_tokens))
+                        .then_with(|| {
+                            left.decode_progress_clock
+                                .current()
+                                .cmp(&right.decode_progress_clock.current())
+                        })
                         .then_with(|| left_id.0.cmp(&right_id.0))
                 })
                 .map(|(request_id, _)| request_id.clone());
@@ -1288,15 +1425,22 @@ impl ContinuousBatchScheduler {
                     .collect::<Vec<_>>();
                 if progress_owners.len() != 1 {
                     return Err(FerrumError::scheduler(format!(
-                        "decode progress reservation requires one split progress owner, found {}",
+                        "decode progress lease requires one split progress owner, found {}",
                         progress_owners.len()
                     )));
                 }
+                let progress_owner_id = (*progress_owners[0]).clone();
+                let progress_clock = decode
+                    .get(&progress_owner_id)
+                    .expect("requested progress owner remains in the decode queue")
+                    .decode_progress_clock
+                    .clone();
                 return Ok(DecodeExecutionCapacityAction::RecomputeVictim {
-                    reservation: DecodeProgressReservation {
+                    lease: DecodeProgressLease::new(
                         victim_request_id,
-                        progress_owner_id: (*progress_owners[0]).clone(),
-                    },
+                        progress_owner_id,
+                        progress_clock,
+                    ),
                 });
             }
         }
@@ -1527,17 +1671,17 @@ impl ContinuousBatchScheduler {
         )
     }
 
-    pub fn defer_decode_to_waiting_with_progress_reservation(
+    pub fn defer_decode_to_waiting_with_progress_lease(
         &self,
-        reservation: &DecodeProgressReservation,
+        lease: &DecodeProgressLease,
         attempted_decode_width: usize,
         observed_free_blocks: Option<usize>,
     ) -> bool {
         self.defer_decode_to_waiting_for_capacity_inner(
-            reservation.victim_request_id(),
+            lease.victim_request_id(),
             attempted_decode_width,
             observed_free_blocks,
-            Some(reservation),
+            Some(lease),
         )
     }
 
@@ -1546,7 +1690,7 @@ impl ContinuousBatchScheduler {
         request_id: &RequestId,
         attempted_decode_width: usize,
         observed_free_blocks: Option<usize>,
-        progress_reservation: Option<&DecodeProgressReservation>,
+        progress_lease: Option<&DecodeProgressLease>,
     ) -> bool {
         let mut decode_queue = self.decode_queue.write();
         let mut waiting_queue = self.waiting_queue.write();
@@ -1569,7 +1713,7 @@ impl ContinuousBatchScheduler {
             req.capacity_deferred_empty_retry_epoch = None;
             req.capacity_deferred_from_decode = true;
             req.execution_capacity_deferral = None;
-            req.decode_progress_reservation = progress_reservation.cloned();
+            req.decode_progress_lease = progress_lease.cloned();
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
             if !self.requeue_waiting_request(&mut waiting_queue, &mut request_index, req) {
                 return false;
@@ -1580,9 +1724,9 @@ impl ContinuousBatchScheduler {
                 observed_free_blocks,
             );
             debug!(
-                "Deferred decode request {} back to waiting with progress owner {:?}",
+                "Deferred decode request {} back to waiting with progress lease owner {:?}",
                 request_id,
-                progress_reservation.map(DecodeProgressReservation::progress_owner_id)
+                progress_lease.map(DecodeProgressLease::progress_owner_id)
             );
             true
         } else {
@@ -1607,7 +1751,7 @@ impl ContinuousBatchScheduler {
             req.capacity_deferred_empty_retry_epoch = None;
             req.capacity_deferred_from_decode = false;
             req.execution_capacity_deferral = None;
-            req.decode_progress_reservation = None;
+            req.decode_progress_lease = None;
 
             request_index.insert(request_id.clone(), RequestPhase::Decoding);
             decode_queue.insert(request_id.clone(), req);
@@ -2270,25 +2414,18 @@ impl ContinuousBatchScheduler {
         if matches!(&waiting_admission, WaitingAdmissionMode::Legacy) {
             self.legacy_waiting_admission_ticks
                 .fetch_add(1, Ordering::Relaxed);
+            let active_count_for_capacity_wait = self.active_count();
             let waiting_queue = self.waiting_queue.read();
             let request_index = self.request_index.read();
-            let active_count_for_capacity_wait = self.active_count();
             let mut requests_to_admit = Vec::new();
             let mut release_blocked_capacity_deferred_admissions = 0usize;
             for req in waiting_queue.iter() {
                 if requests_to_admit.len() >= available_slots {
                     break;
                 }
-                if req
-                    .decode_progress_reservation
-                    .as_ref()
-                    .is_some_and(|reservation| {
-                        matches!(
-                            request_index.get(reservation.progress_owner_id()),
-                            Some(RequestPhase::Prefilling | RequestPhase::Decoding)
-                        )
-                    })
-                {
+                if req.decode_progress_lease.as_ref().is_some_and(|lease| {
+                    lease.is_held(request_index.get(lease.progress_owner_id()).copied())
+                }) {
                     continue;
                 }
                 let budgeted_capacity_deferred =
@@ -2510,6 +2647,10 @@ impl ContinuousBatchScheduler {
         let mut decode_queue = self.decode_queue.write();
         if let Some(req) = decode_queue.get_mut(request_id) {
             req.decode_tokens = tokens_generated;
+            req.decode_progress_clock
+                .advance_to(DecodeProgressGeneration::from_generated_tokens(
+                    tokens_generated,
+                ));
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
         }
         // Decode progress consumes KV capacity; only actual prefill progress or
@@ -3198,11 +3339,11 @@ mod tests {
         let action = scheduler
             .defer_decode_for_execution_capacity(std::slice::from_ref(&runnable_id), deferral)
             .unwrap();
-        let DecodeExecutionCapacityAction::RecomputeVictim { reservation } = action else {
-            panic!("the last runnable decode must receive a progress reservation");
+        let DecodeExecutionCapacityAction::RecomputeVictim { lease } = action else {
+            panic!("the last runnable decode must receive a progress lease");
         };
-        assert_eq!(reservation.victim_request_id(), &blocked_id);
-        assert_eq!(reservation.progress_owner_id(), &runnable_id);
+        assert_eq!(lease.victim_request_id(), &blocked_id);
+        assert_eq!(lease.progress_owner_id(), &runnable_id);
         let audit_only = AdmissionWakeEpochs::new(NonZeroU64::new(29).unwrap(), 1, 0, 0);
         observations.clear();
         let still_runnable = scheduler
@@ -3270,14 +3411,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decode_progress_reservation_holds_victim_without_global_hol_until_owner_terminal() {
+    async fn decode_progress_lease_holds_without_hol_and_releases_after_owner_advances() {
         use ferrum_interfaces::vnext::{
             CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
             DeferredAction,
         };
         use std::num::NonZeroU64;
 
-        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let mut config = SchedulerConfig::default();
+        config.max_running_requests = 2;
+        let scheduler = ContinuousBatchScheduler::new(config);
         let victim = create_test_request(Priority::Normal);
         let victim_id = victim.id.clone();
         let owner = create_test_request(Priority::Normal);
@@ -3302,6 +3445,7 @@ mod tests {
             .unwrap();
         scheduler.mark_prefill_complete(&victim_id, 1);
         scheduler.mark_prefill_complete(&owner_id, 1);
+        scheduler.update_decode_progress(&owner_id, 53);
 
         let condition = CapacityWaitCondition::from_observation(41, availability.to_vec()).unwrap();
         let deferral = AdmissionDeferral::new(DeferredAction::WaitForRelease, wake, condition);
@@ -3317,16 +3461,13 @@ mod tests {
         let action = scheduler
             .defer_decode_for_execution_capacity(std::slice::from_ref(&owner_id), deferral)
             .unwrap();
-        let DecodeExecutionCapacityAction::RecomputeVictim { reservation } = action else {
-            panic!("capacity release must reserve progress for the runnable owner");
+        let DecodeExecutionCapacityAction::RecomputeVictim { lease } = action else {
+            panic!("capacity release must lease progress to the runnable owner");
         };
-        assert_eq!(reservation.victim_request_id(), &victim_id);
-        assert_eq!(reservation.progress_owner_id(), &owner_id);
-        assert!(scheduler.defer_decode_to_waiting_with_progress_reservation(
-            &reservation,
-            1,
-            Some(0),
-        ));
+        assert_eq!(lease.victim_request_id(), &victim_id);
+        assert_eq!(lease.progress_owner_id(), &owner_id);
+        assert_eq!(lease.progress_baseline().get(), 53);
+        assert!(scheduler.defer_decode_to_waiting_with_progress_lease(&lease, 1, Some(0),));
         assert_eq!(
             scheduler
                 .defer_decode_for_execution_capacity(
@@ -3380,29 +3521,62 @@ mod tests {
             .any(|request| request.request.id == bypass_id));
         assert!(observations.iter().any(|observation| matches!(
             observation,
-            ExecutorAdmissionQueueObservation::ProgressReservationHeld {
+            ExecutorAdmissionQueueObservation::ProgressLeaseHeld {
                 request_id,
                 progress_owner_id,
+                progress_baseline,
+                progress_current,
                 ..
-            } if request_id == &victim_id && progress_owner_id == &owner_id
+            } if request_id == &victim_id
+                && progress_owner_id == &owner_id
+                && progress_baseline.get() == 53
+                && progress_current.get() == 53
         )));
 
-        let response = InferenceResponse {
-            request_id: owner_id.clone(),
-            text: String::new(),
-            tokens: Vec::new(),
-            finish_reason: ferrum_types::FinishReason::Length,
-            usage: ferrum_types::TokenUsage::new(0, 0),
-            latency_ms: 0,
-            created_at: chrono::Utc::now(),
-            metadata: Default::default(),
-            api_response: None,
-        };
-        scheduler.complete(owner_id, &response).await.unwrap();
+        scheduler.update_decode_progress(&owner_id, 54);
 
         probes.clear();
+        observations.clear();
+        let full_batch = scheduler
+            .next_batch_with_dynamic_admission_observed(
+                BatchHint::simple(4),
+                AdmissionWakeSnapshot::new(released_wake, &released_availability),
+                &mut |_| panic!("a full active set must not run an admission probe"),
+                &mut |observation| observations.push(observation),
+            )
+            .unwrap()
+            .expect("active work must continue after the lease releases");
+        assert_eq!(full_batch.requests.len(), 2);
+        assert_eq!(
+            scheduler.trace_phase(&owner_id),
+            Some(RequestPhase::Decoding)
+        );
+        assert!(observations.iter().any(|observation| matches!(
+            observation,
+            ExecutorAdmissionQueueObservation::ProgressLeaseReleased {
+                request_id,
+                progress_owner_id,
+                progress_baseline,
+                progress_current,
+                reason: DecodeProgressLeaseReleaseReason::OwnerAdvanced,
+                ..
+            } if request_id == &victim_id
+                && progress_owner_id == &owner_id
+                && progress_baseline.get() == 53
+                && progress_current.get() == 54
+        )));
+        assert!(scheduler
+            .waiting_queue
+            .read()
+            .iter()
+            .find(|request| request.inner.request.id == victim_id)
+            .is_some_and(|request| request.decode_progress_lease.is_none()));
+
+        assert!(scheduler.cancel(bypass_id.clone()).await.unwrap());
+        probes.clear();
+        observations.clear();
         let released = scheduler
-            .next_batch_with_dynamic_admission(
+            .next_batch_with_dynamic_admission_observed(
                 BatchHint::simple(4),
                 AdmissionWakeSnapshot::new(released_wake, &released_availability),
                 &mut |request| {
@@ -3411,18 +3585,23 @@ mod tests {
                         request_id: request.id.clone(),
                     })
                 },
+                &mut |observation| observations.push(observation),
             )
             .unwrap()
-            .expect("terminal owner must release the recompute victim");
+            .expect("a later free slot must admit the released victim");
         assert_eq!(probes, vec![victim_id.clone()]);
         assert!(released
             .requests
             .iter()
             .any(|request| request.request.id == victim_id));
+        assert!(!observations.iter().any(|observation| matches!(
+            observation,
+            ExecutorAdmissionQueueObservation::ProgressLeaseReleased { .. }
+        )));
     }
 
     #[tokio::test]
-    async fn decode_progress_reservation_releases_after_owner_cancel() {
+    async fn decode_progress_lease_releases_after_owner_cancel() {
         use ferrum_interfaces::vnext::{CapacityAvailabilityEpoch, CapacityAvailabilitySource};
         use std::num::NonZeroU64;
 
@@ -3454,16 +3633,21 @@ mod tests {
             .unwrap();
         scheduler.mark_prefill_complete(&victim_id, 1);
         scheduler.mark_prefill_complete(&owner_id, 1);
-        let reservation = DecodeProgressReservation {
-            victim_request_id: victim_id.clone(),
-            progress_owner_id: owner_id.clone(),
-        };
-        assert!(scheduler.defer_decode_to_waiting_with_progress_reservation(&reservation, 1, None,));
-        assert!(scheduler.cancel(owner_id).await.unwrap());
+        let owner_clock = scheduler
+            .decode_queue
+            .read()
+            .get(&owner_id)
+            .unwrap()
+            .decode_progress_clock
+            .clone();
+        let lease = DecodeProgressLease::new(victim_id.clone(), owner_id.clone(), owner_clock);
+        assert!(scheduler.defer_decode_to_waiting_with_progress_lease(&lease, 1, None,));
+        assert!(scheduler.cancel(owner_id.clone()).await.unwrap());
 
         let mut probes = Vec::new();
+        let mut observations = Vec::new();
         let batch = scheduler
-            .next_batch_with_dynamic_admission(
+            .next_batch_with_dynamic_admission_observed(
                 BatchHint::simple(1),
                 AdmissionWakeSnapshot::new(wake, &availability),
                 &mut |request| {
@@ -3472,11 +3656,21 @@ mod tests {
                         request_id: request.id.clone(),
                     })
                 },
+                &mut |observation| observations.push(observation),
             )
             .unwrap()
             .expect("owner cancellation must release the victim admission");
         assert_eq!(probes, vec![victim_id.clone()]);
         assert_eq!(batch.requests[0].request.id, victim_id);
+        assert!(observations.iter().any(|observation| matches!(
+            observation,
+            ExecutorAdmissionQueueObservation::ProgressLeaseReleased {
+                request_id,
+                progress_owner_id,
+                reason: DecodeProgressLeaseReleaseReason::OwnerNoLongerDecoding,
+                ..
+            } if request_id == &victim_id && progress_owner_id == &owner_id
+        )));
     }
 
     #[tokio::test]

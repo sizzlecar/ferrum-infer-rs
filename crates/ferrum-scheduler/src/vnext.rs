@@ -708,13 +708,15 @@ impl<T> DynamicAdmissionQueue<T> {
     /// Admission scan with a scheduler-owned eligibility barrier evaluated
     /// before the resource probe. Held entries stay queued and do not become a
     /// fairness barrier; the scan continues so they cannot create global HOL.
+    /// The eligibility callback may consume a fulfilled scheduler barrier even
+    /// when this tick has no resource-probe budget.
     pub fn schedule_into_observed_with_eligibility<A, R, E>(
         &mut self,
         wake: AdmissionWakeSnapshot<'_>,
         maximum_probes: usize,
         maximum_admissions: usize,
         events: &mut Vec<AdmissionQueueEvent<T, A, R, E>>,
-        mut eligibility: impl FnMut(&T, WaitingAdmissionTicket) -> AdmissionQueueEligibility,
+        mut eligibility: impl FnMut(&mut T, WaitingAdmissionTicket) -> AdmissionQueueEligibility,
         mut observe_held: impl FnMut(&T, WaitingAdmissionTicket),
         mut observe_skipped_unchanged: impl FnMut(&T, WaitingAdmissionTicket, &AdmissionDeferral),
         mut probe: impl FnMut(&mut T) -> AdmissionProbeOutcome<A, R, E>,
@@ -746,7 +748,7 @@ impl<T> DynamicAdmissionQueue<T> {
                 .waiting
                 .pop_front()
                 .expect("initial waiting length remains exact during one queue scan");
-            if eligibility(&entry.request, entry.ticket) == AdmissionQueueEligibility::Held {
+            if eligibility(&mut entry.request, entry.ticket) == AdmissionQueueEligibility::Held {
                 receipt.held += 1;
                 observe_held(&entry.request, entry.ticket);
                 entry.fairness_opportunity = false;

@@ -256,18 +256,19 @@ impl EngineInner {
                                 "scheduler": self.scheduler.trace_snapshot(),
                             }));
                         }
-                        DecodeExecutionCapacityAction::RecomputeVictim { reservation } => {
-                            let victim_id = reservation.victim_request_id().clone();
-                            let progress_owner_id = reservation.progress_owner_id().clone();
+                        DecodeExecutionCapacityAction::RecomputeVictim { lease } => {
+                            let victim_id = lease.victim_request_id().clone();
+                            let progress_owner_id = lease.progress_owner_id().clone();
+                            let progress_baseline = lease.progress_baseline().get();
                             self.trace_executor_decode_capacity_decision(
                                 &request_ids,
                                 &deferral,
                                 "recompute_progress_victim",
-                                Some(&victim_id),
+                                Some(&lease),
                             );
                             if !self
-                                .defer_decode_for_capacity_recompute_reserved(
-                                    &reservation,
+                                .defer_decode_for_capacity_recompute_leased(
+                                    &lease,
                                     request_ids.len().max(1),
                                     None,
                                 )
@@ -284,6 +285,7 @@ impl EngineInner {
                                 "request_ids": &request_ids,
                                 "victim_request_id": victim_id,
                                 "progress_owner_id": progress_owner_id,
+                                "progress_baseline": progress_baseline,
                                 "stage": deferral.stage(),
                                 "observed": observed,
                                 "wait_condition": deferral.wait_condition(),

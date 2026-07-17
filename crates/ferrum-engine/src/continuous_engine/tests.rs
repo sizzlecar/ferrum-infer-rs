@@ -2866,6 +2866,14 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
         recompute_event.attributes.get("victim_request_id"),
         Some(&serde_json::json!(victim_id))
     );
+    assert_eq!(
+        recompute_event.attributes.get("progress_owner_id"),
+        Some(&serde_json::json!(progress_owner_id))
+    );
+    assert_eq!(
+        recompute_event.attributes.get("progress_baseline"),
+        Some(&serde_json::json!(0))
+    );
     for event in &deferred_events {
         assert_eq!(
             event.shape.get("decode_submit_observed"),
