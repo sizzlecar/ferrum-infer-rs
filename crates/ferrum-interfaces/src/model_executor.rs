@@ -12,6 +12,7 @@ use std::{
     future::Future,
     hash::{Hash, Hasher},
     num::NonZeroU64,
+    ops::Range,
     pin::Pin,
     sync::Arc,
 };
@@ -161,6 +162,11 @@ pub struct PrefillInput {
     /// Maximum sequence extent this request may reach, including the prompt.
     /// Executors use this for fit validation without allocating future pages.
     pub maximum_sequence_tokens: Option<usize>,
+    /// Exact scheduler-owned prompt chunk for this invocation.
+    ///
+    /// The input tensor still contains the full prompt so token identity and
+    /// global offsets remain stable. Plan runtimes execute only this range.
+    pub chunk: Option<PrefillChunk>,
     /// Input token IDs [batch_size, sequence_length]
     pub input_ids: TensorRef,
     /// Attention mask [batch_size, sequence_length] (optional)
@@ -181,6 +187,7 @@ impl PrefillInput {
         Self {
             request_id: None,
             maximum_sequence_tokens: None,
+            chunk: None,
             input_ids,
             attention_mask: None,
             position_ids: None,
@@ -198,6 +205,12 @@ impl PrefillInput {
     ) -> Self {
         self.request_id = Some(request_id);
         self.maximum_sequence_tokens = Some(maximum_sequence_tokens);
+        self
+    }
+
+    /// Attach the exact scheduler-published prompt chunk.
+    pub fn with_chunk(mut self, chunk: PrefillChunk) -> Self {
+        self.chunk = Some(chunk);
         self
     }
 
@@ -243,6 +256,87 @@ impl PrefillInput {
         } else {
             1
         }
+    }
+}
+
+/// Exact, validated prompt progress assigned to one prefill invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PrefillChunk {
+    tokens_processed: usize,
+    tokens_to_process: usize,
+    total_prompt_tokens: usize,
+}
+
+#[cfg(test)]
+mod prefill_chunk_tests {
+    use super::PrefillChunk;
+
+    #[test]
+    fn validates_exact_progress_and_finality() {
+        let first = PrefillChunk::new(0, 3, 8).unwrap();
+        assert_eq!(first.range(), 0..3);
+        assert_eq!(first.end(), 3);
+        assert!(!first.is_final());
+
+        let final_chunk = PrefillChunk::new(3, 5, 8).unwrap();
+        assert_eq!(final_chunk.range(), 3..8);
+        assert!(final_chunk.is_final());
+    }
+
+    #[test]
+    fn rejects_empty_out_of_bounds_and_overflowing_progress() {
+        assert!(PrefillChunk::new(0, 0, 8).is_err());
+        assert!(PrefillChunk::new(0, 1, 0).is_err());
+        assert!(PrefillChunk::new(7, 2, 8).is_err());
+        assert!(PrefillChunk::new(usize::MAX, 1, usize::MAX).is_err());
+    }
+}
+
+impl PrefillChunk {
+    pub fn new(
+        tokens_processed: usize,
+        tokens_to_process: usize,
+        total_prompt_tokens: usize,
+    ) -> Result<Self> {
+        let end = tokens_processed
+            .checked_add(tokens_to_process)
+            .ok_or_else(|| {
+                ferrum_types::FerrumError::request_validation("prefill chunk overflows")
+            })?;
+        if tokens_to_process == 0 || total_prompt_tokens == 0 || end > total_prompt_tokens {
+            return Err(ferrum_types::FerrumError::request_validation(
+                "prefill chunk must be non-empty and within the full prompt",
+            ));
+        }
+        Ok(Self {
+            tokens_processed,
+            tokens_to_process,
+            total_prompt_tokens,
+        })
+    }
+
+    pub const fn tokens_processed(self) -> usize {
+        self.tokens_processed
+    }
+
+    pub const fn tokens_to_process(self) -> usize {
+        self.tokens_to_process
+    }
+
+    pub const fn total_prompt_tokens(self) -> usize {
+        self.total_prompt_tokens
+    }
+
+    pub fn range(self) -> Range<usize> {
+        self.tokens_processed..self.tokens_processed + self.tokens_to_process
+    }
+
+    pub const fn end(self) -> usize {
+        self.tokens_processed + self.tokens_to_process
+    }
+
+    pub const fn is_final(self) -> bool {
+        self.end() == self.total_prompt_tokens
     }
 }
 
@@ -698,8 +792,8 @@ impl<'a> ExecutorPrefillAdmission<'a> {
     }
 }
 
-/// Scheduler-visible proof that an executor retained the request, sequence,
-/// step, and prepared submission-wave authority required by one exact prefill.
+/// Scheduler-visible proof that an executor retained request and sequence
+/// authority for future scheduler-owned prefill chunks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutorPrefillAdmissionReceipt {
     pub request_id: RequestId,
@@ -837,6 +931,16 @@ impl ExecutorExecutionCapacityDeferral {
 /// fence/recovery authority inside the executor.
 pub enum ExecutorBatchDecodeOutcome {
     Completed(Vec<DecodeOutput>),
+    Deferred(ExecutorExecutionCapacityDeferral),
+}
+
+/// Capacity-aware result for one exact prefill chunk.
+///
+/// `Deferred` is only legal before provider encode or device submission. The
+/// executor retains request/sequence authority so the scheduler can park the
+/// same chunk until one of the exact capacity sources changes.
+pub enum ExecutorPrefillOutcome {
+    Completed(PrefillOutput),
     Deferred(ExecutorExecutionCapacityDeferral),
 }
 
@@ -1180,6 +1284,14 @@ pub trait ModelExecutor: Send + Sync {
 
     /// Execute prefill phase (process initial prompt)
     async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput>;
+
+    /// Execute one exact prefill chunk with an explicit pre-submit capacity
+    /// deferral edge. Legacy executors inherit full-prefill behavior.
+    async fn prefill_with_capacity(&self, input: &PrefillInput) -> Result<ExecutorPrefillOutcome> {
+        self.prefill(input)
+            .await
+            .map(ExecutorPrefillOutcome::Completed)
+    }
 
     /// Batch prefill: process multiple prompts' prefill in ONE forward pass.
     ///

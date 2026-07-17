@@ -114,7 +114,17 @@ impl EngineInner {
         let (prefill_ids, decode_ids) = self.classify_published_batch_sequences(batch)?;
 
         for rid in &prefill_ids {
-            if let Err(error) = self.run_plan_runtime_prefill(rid).await {
+            let scheduled = batch
+                .requests
+                .iter()
+                .find(|scheduled| scheduled.request.id == *rid)
+                .ok_or_else(|| {
+                    FerrumError::internal(format!(
+                        "PlanRuntime batch {:?} lost scheduled request {rid}",
+                        batch.batch_id
+                    ))
+                })?;
+            if let Err(error) = self.run_plan_runtime_prefill(scheduled).await {
                 warn!("Plan-runtime prefill failed for {}: {}", rid, error);
                 if is_resource_exhausted_error(&error) {
                     warn!(

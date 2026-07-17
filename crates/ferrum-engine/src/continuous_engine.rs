@@ -1271,14 +1271,21 @@ impl SequenceState {
         model_cache_update
     }
 
-    fn commit_plan_runtime_prefill_resources(
+    fn commit_plan_runtime_prefill_chunk_resources(
         &mut self,
         kv_cache: Arc<dyn KvCacheHandle>,
+        prefill_tokens_processed: usize,
+        is_final_chunk: bool,
     ) -> ModelCacheRefUpdate {
         let model_cache_update = self.install_runtime_managed_model_kv(kv_cache);
         self.recurrent_state = None;
-        self.prefill_complete = true;
-        self.phase = RequestPhase::Decoding;
+        self.prefill_tokens_processed = prefill_tokens_processed;
+        self.prefill_complete = is_final_chunk;
+        self.phase = if is_final_chunk {
+            RequestPhase::Decoding
+        } else {
+            RequestPhase::Prefilling
+        };
         model_cache_update
     }
 
