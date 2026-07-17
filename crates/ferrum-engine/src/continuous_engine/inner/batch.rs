@@ -1040,6 +1040,37 @@ impl EngineInner {
         attempted_decode_width: usize,
         observed_free_blocks: Option<usize>,
     ) -> bool {
+        self.defer_decode_for_capacity_recompute_inner(
+            request_id,
+            None,
+            attempted_decode_width,
+            observed_free_blocks,
+        )
+        .await
+    }
+
+    pub(super) async fn defer_decode_for_capacity_recompute_reserved(
+        &self,
+        reservation: &DecodeProgressReservation,
+        attempted_decode_width: usize,
+        observed_free_blocks: Option<usize>,
+    ) -> bool {
+        self.defer_decode_for_capacity_recompute_inner(
+            reservation.victim_request_id(),
+            Some(reservation),
+            attempted_decode_width,
+            observed_free_blocks,
+        )
+        .await
+    }
+
+    async fn defer_decode_for_capacity_recompute_inner(
+        &self,
+        request_id: &RequestId,
+        progress_reservation: Option<&DecodeProgressReservation>,
+        attempted_decode_width: usize,
+        observed_free_blocks: Option<usize>,
+    ) -> bool {
         let (found, physical_resources) = {
             let mut sequences = self.sequences.write();
             if let Some(seq) = sequences.get_mut(request_id) {
@@ -1058,13 +1089,21 @@ impl EngineInner {
         self.release_sequence_physical_resources(request_id, physical_resources)
             .await;
 
-        let moved = self
-            .scheduler
-            .defer_decode_to_waiting_for_capacity_with_pressure(
-                request_id,
-                attempted_decode_width,
-                observed_free_blocks,
-            );
+        let moved = if let Some(reservation) = progress_reservation {
+            self.scheduler
+                .defer_decode_to_waiting_with_progress_reservation(
+                    reservation,
+                    attempted_decode_width,
+                    observed_free_blocks,
+                )
+        } else {
+            self.scheduler
+                .defer_decode_to_waiting_for_capacity_with_pressure(
+                    request_id,
+                    attempted_decode_width,
+                    observed_free_blocks,
+                )
+        };
         if moved {
             info!(
                 "Capacity-deferred decode request {} for KV recompute after failed width {}",

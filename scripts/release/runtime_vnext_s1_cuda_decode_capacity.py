@@ -336,6 +336,34 @@ def validate_decode_queue_transition(
     }
 
 
+def validate_progress_reservation_hold(row: dict[str, Any], label: str) -> dict[str, Any]:
+    require(row.get("status") == "ok" and row.get("error") is None, f"{label}: event failed")
+    request_id = row.get("request_id")
+    shape = row.get("shape")
+    require(isinstance(request_id, str) and request_id, f"{label}: victim identity is missing")
+    require(isinstance(shape, dict), f"{label}: shape is missing")
+    progress_owner_id = shape.get("progress_owner_id")
+    require(
+        isinstance(progress_owner_id, str) and progress_owner_id,
+        f"{label}: progress owner identity is missing",
+    )
+    require(
+        not common.request_identity_matches(request_id, progress_owner_id),
+        f"{label}: victim cannot own its own progress reservation",
+    )
+    require(shape.get("decision") == "held_for_decode_progress", f"{label}: decision is invalid")
+    require(shape.get("prefill_submit_observed") is False, f"{label}: held victim reached submit")
+    require(shape.get("probe_performed") is False, f"{label}: held victim reached admission probe")
+    ticket = shape.get("waiting_ticket")
+    require(isinstance(ticket, int) and ticket > 0, f"{label}: waiting ticket is invalid")
+    return {
+        "ts_unix_nanos": common.event_wall_ns(row),
+        "victim_request_id": request_id,
+        "progress_owner_id": progress_owner_id,
+        "waiting_ticket": ticket,
+    }
+
+
 def validate_decode_trace(
     rows: list[dict[str, Any]], *, started_wall_ns: int, finished_wall_ns: int
 ) -> dict[str, Any]:
@@ -363,6 +391,20 @@ def validate_decode_trace(
     ]
     require(splits, "target never adaptively split a capacity-blocked decode cohort")
     require(recomputes, "target never selected a typed decode progress victim")
+
+    hold_rows = [
+        row
+        for row in window
+        if row.get("phase") == "vnext.prefill_admission_progress_reserved"
+    ]
+    require(
+        len(hold_rows) <= MAX_DECODE_CAPACITY_EVENTS,
+        "decode progress reservation observations exceeded the bounded event ceiling",
+    )
+    holds = [
+        validate_progress_reservation_hold(row, f"progress reservation hold {index}")
+        for index, row in enumerate(hold_rows)
+    ]
 
     skip_rows = [row for row in window if row.get("phase") == "vnext.decode_capacity_skipped_unchanged"]
     resume_rows = [row for row in window if row.get("phase") == "vnext.decode_capacity_resumed"]
@@ -401,6 +443,7 @@ def validate_decode_trace(
         )
     for recompute in recomputes:
         victim_request_id = recompute["victim_request_id"]
+        progress_owner_id = recompute["request_ids"][0]
         require(
             any(
                 park["ts_unix_nanos"] < recompute["ts_unix_nanos"]
@@ -410,6 +453,34 @@ def validate_decode_trace(
                 for park in parks
             ),
             f"decode progress victim {victim_request_id} was not previously parked",
+        )
+        require(
+            any(
+                hold["ts_unix_nanos"] > recompute["ts_unix_nanos"]
+                and common.request_identity_matches(
+                    hold["victim_request_id"], victim_request_id
+                )
+                and common.request_identity_matches(
+                    hold["progress_owner_id"], progress_owner_id
+                )
+                for hold in holds
+            ),
+            f"decode progress victim {victim_request_id} was not held for owner {progress_owner_id}",
+        )
+
+    for hold in holds:
+        require(
+            any(
+                recompute["ts_unix_nanos"] < hold["ts_unix_nanos"]
+                and common.request_identity_matches(
+                    recompute["victim_request_id"], hold["victim_request_id"]
+                )
+                and common.request_identity_matches(
+                    recompute["request_ids"][0], hold["progress_owner_id"]
+                )
+                for recompute in recomputes
+            ),
+            f"progress reservation hold for {hold['victim_request_id']} has no typed recompute decision",
         )
 
     deferred_request_ids = sorted(
@@ -429,6 +500,31 @@ def validate_decode_trace(
     completed_rows = [
         row for row in rows if str(row.get("phase", "")).endswith("request_completed")
     ]
+    admitted_rows = [
+        row
+        for row in rows
+        if row.get("phase") == "vnext.prefill_admission"
+        and row.get("shape", {}).get("decision") == "admitted"
+    ]
+    for recompute in recomputes:
+        victim_request_id = recompute["victim_request_id"]
+        progress_owner_id = recompute["request_ids"][0]
+        owner_completions = [
+            common.event_wall_ns(row)
+            for row in completed_rows
+            if common.request_identity_matches(row.get("request_id"), progress_owner_id)
+            and common.event_wall_ns(row) > recompute["ts_unix_nanos"]
+        ]
+        require(owner_completions, f"decode progress owner {progress_owner_id} did not complete")
+        owner_completed_at = min(owner_completions)
+        require(
+            any(
+                common.request_identity_matches(row.get("request_id"), victim_request_id)
+                and common.event_wall_ns(row) > owner_completed_at
+                for row in admitted_rows
+            ),
+            f"decode progress victim {victim_request_id} was not re-admitted after owner completion",
+        )
     for request_id in deferred_request_ids:
         require(
             any(common.request_identity_matches(row.get("request_id"), request_id) for row in completed_rows),
@@ -439,6 +535,7 @@ def validate_decode_trace(
         "split_events": len(splits),
         "park_events": len(parks),
         "recompute_events": len(recomputes),
+        "progress_reservation_hold_events": len(holds),
         "skip_events": len(skips),
         "resume_events": len(resumes),
         "stages": sorted({event["stage"] for event in deferrals}),
@@ -447,6 +544,15 @@ def validate_decode_trace(
         "recompute_victim_request_ids": sorted(
             {event["victim_request_id"] for event in recomputes}
         ),
+        "progress_reservation_pairs": [
+            list(pair)
+            for pair in sorted(
+                {
+                    (hold["victim_request_id"], hold["progress_owner_id"])
+                    for hold in holds
+                }
+            )
+        ],
     }
 
 
@@ -1209,20 +1315,39 @@ def self_test() -> int:
             ["C"],
             victim_request_id="A",
         ),
-        *[
-            {
-                "ts_unix_nanos": 150 + index,
-                "phase": "vnext.request_completed",
-                "request_id": request_id,
-            }
-            for index, request_id in enumerate(("A", "B", "C"))
-        ],
+        {
+            "ts_unix_nanos": 145,
+            "phase": "vnext.prefill_admission_progress_reserved",
+            "status": "ok",
+            "error": None,
+            "request_id": "A",
+            "shape": {
+                "decision": "held_for_decode_progress",
+                "waiting_ticket": 1,
+                "progress_owner_id": "C",
+                "prefill_submit_observed": False,
+                "probe_performed": False,
+            },
+        },
+        {"ts_unix_nanos": 150, "phase": "vnext.request_completed", "request_id": "C"},
+        {
+            "ts_unix_nanos": 151,
+            "phase": "vnext.prefill_admission",
+            "request_id": "A",
+            "shape": {"decision": "admitted"},
+        },
+        {"ts_unix_nanos": 152, "phase": "vnext.request_completed", "request_id": "A"},
+        {"ts_unix_nanos": 153, "phase": "vnext.request_completed", "request_id": "B"},
     ]
     summary = validate_decode_trace(rows, started_wall_ns=90, finished_wall_ns=160)
     require(summary["split_events"] == 1, "self-test lost split evidence")
     require(summary["park_events"] == 2, "self-test lost park evidence")
     require(summary["resume_events"] == 1, "self-test lost resume evidence")
     require(summary["recompute_events"] == 1, "self-test lost recompute evidence")
+    require(
+        summary["progress_reservation_hold_events"] == 1,
+        "self-test lost progress reservation hold evidence",
+    )
     require(
         summary["recompute_victim_request_ids"] == ["A"],
         "self-test lost progress-victim identity",
@@ -1245,6 +1370,13 @@ def self_test() -> int:
     try:
         validate_decode_trace(missing_victim, started_wall_ns=90, finished_wall_ns=160)
         raise AssertionError("progress recompute without a victim unexpectedly passed")
+    except common.CapacityGateError:
+        pass
+    missing_hold = json.loads(json.dumps(rows))
+    del missing_hold[6]
+    try:
+        validate_decode_trace(missing_hold, started_wall_ns=90, finished_wall_ns=160)
+        raise AssertionError("progress recompute without a reservation hold unexpectedly passed")
     except common.CapacityGateError:
         pass
     print("FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY SELFTEST PASS")

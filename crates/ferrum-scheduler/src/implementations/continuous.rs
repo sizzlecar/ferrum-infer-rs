@@ -10,9 +10,9 @@
 //! - Preemption support for long-running requests
 
 use crate::vnext::{
-    AdmissionDeferral, AdmissionProbeOutcome, AdmissionQueueEvent, AdmissionTickReceipt,
-    AdmissionWakeEpochs, AdmissionWakeSnapshot, DynamicAdmissionQueue, DynamicAdmissionQueuePolicy,
-    WaitingAdmissionTicket,
+    AdmissionDeferral, AdmissionProbeOutcome, AdmissionQueueEligibility, AdmissionQueueEvent,
+    AdmissionTickReceipt, AdmissionWakeEpochs, AdmissionWakeSnapshot, DynamicAdmissionQueue,
+    DynamicAdmissionQueuePolicy, WaitingAdmissionTicket,
 };
 use crate::{
     BatchHint, BatchPlan, BatchResourceRequirements, PreemptionResult, PreemptionState,
@@ -92,8 +92,34 @@ pub enum RequestPhase {
 /// recompute so a peer can remain the progress owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeExecutionCapacityAction {
-    Deferred { count: usize },
-    RecomputeVictim { request_id: RequestId },
+    Deferred {
+        count: usize,
+    },
+    RecomputeVictim {
+        reservation: DecodeProgressReservation,
+    },
+}
+
+/// Physical capacity ceded by a recompute victim to one decode progress owner.
+///
+/// The reservation is planned while the decode queue is locked, then installed
+/// only after the engine has released the victim's physical state and moved it
+/// back to waiting. It prevents immediate re-admission from reclaiming the same
+/// capacity before the selected owner reaches a terminal state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeProgressReservation {
+    victim_request_id: RequestId,
+    progress_owner_id: RequestId,
+}
+
+impl DecodeProgressReservation {
+    pub fn victim_request_id(&self) -> &RequestId {
+        &self.victim_request_id
+    }
+
+    pub fn progress_owner_id(&self) -> &RequestId {
+        &self.progress_owner_id
+    }
 }
 
 /// Extended scheduled request with continuous batching metadata
@@ -131,6 +157,10 @@ pub struct ContinuousBatchRequest {
     pub waiting_admission_ticket: Option<WaitingAdmissionTicket>,
     /// Exact PlanRuntime capacity predicate suppressing blind execution retries.
     pub execution_capacity_deferral: Option<AdmissionDeferral>,
+    /// Typed ownership relation for capacity released by this recompute
+    /// request. Kept private so queue state cannot name an owner without the
+    /// matching victim identity produced by the scheduler decision.
+    decode_progress_reservation: Option<DecodeProgressReservation>,
 }
 
 impl ContinuousBatchRequest {
@@ -153,6 +183,7 @@ impl ContinuousBatchRequest {
             capacity_deferred_from_decode: false,
             waiting_admission_ticket: None,
             execution_capacity_deferral: None,
+            decode_progress_reservation: None,
         }
     }
 
@@ -183,6 +214,11 @@ pub type ExecutorAdmissionProbeOutcome =
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutorAdmissionQueueObservation {
+    ProgressReservationHeld {
+        request_id: RequestId,
+        progress_owner_id: RequestId,
+        ticket: u64,
+    },
     SkippedUnchanged {
         request_id: RequestId,
         ticket: u64,
@@ -539,10 +575,26 @@ impl ContinuousBatchScheduler {
             }
         }
         let waiting_queue = self.waiting_queue.read();
-        let waiting_count = waiting_queue.len();
+        let request_index = self.request_index.read();
+        let reservation_is_active = |request: &ContinuousBatchRequest| {
+            request
+                .decode_progress_reservation
+                .as_ref()
+                .is_some_and(|reservation| {
+                    matches!(
+                        request_index.get(reservation.progress_owner_id()),
+                        Some(RequestPhase::Prefilling | RequestPhase::Decoding)
+                    )
+                })
+        };
+        let waiting_count = waiting_queue
+            .iter()
+            .filter(|request| !reservation_is_active(request))
+            .count();
         let waiting = waiting_queue
-            .passive_wait_condition()
+            .passive_wait_condition_for(|request| !reservation_is_active(request))
             .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+        drop(request_index);
         drop(waiting_queue);
         if waiting_count > 0 && waiting.is_none() {
             return Ok(None);
@@ -732,6 +784,7 @@ impl ContinuousBatchScheduler {
             if let Some(epoch) = empty_retry_epoch {
                 req.capacity_deferred_empty_retry_epoch = Some(epoch);
             }
+            req.decode_progress_reservation = None;
             req.phase = RequestPhase::Prefilling;
             req.inner.state = RequestState::Running;
             let started_at = chrono::Utc::now();
@@ -771,6 +824,7 @@ impl ContinuousBatchScheduler {
             );
             return;
         }
+        request.decode_progress_reservation = None;
         request.phase = RequestPhase::Prefilling;
         request.inner.state = RequestState::Running;
         let started_at = chrono::Utc::now();
@@ -826,15 +880,45 @@ impl ContinuousBatchScheduler {
         self.dynamic_admission_ticks.fetch_add(1, Ordering::Relaxed);
         let mut waiting = self.waiting_queue.write();
         let maximum_probes = waiting.len();
+        let request_index = self.request_index.read();
         let mut events = self.dynamic_admission_events.lock();
+        let observer = std::cell::RefCell::new(observer);
         let receipt = waiting
-            .schedule_into_observed(
+            .schedule_into_observed_with_eligibility(
                 wake,
                 maximum_probes,
                 maximum_admissions,
                 &mut events,
+                |request, _| {
+                    let Some(reservation) = request.decode_progress_reservation.as_ref() else {
+                        return AdmissionQueueEligibility::Eligible;
+                    };
+                    if matches!(
+                        request_index.get(reservation.progress_owner_id()),
+                        Some(RequestPhase::Prefilling | RequestPhase::Decoding)
+                    ) {
+                        AdmissionQueueEligibility::Held
+                    } else {
+                        AdmissionQueueEligibility::Eligible
+                    }
+                },
+                |request, ticket| {
+                    let progress_owner_id = request
+                        .decode_progress_reservation
+                        .as_ref()
+                        .expect("held recompute admission has a progress reservation")
+                        .progress_owner_id()
+                        .clone();
+                    if let Some(observer) = observer.borrow_mut().as_deref_mut() {
+                        observer(ExecutorAdmissionQueueObservation::ProgressReservationHeld {
+                            request_id: request.inner.request.id.clone(),
+                            progress_owner_id,
+                            ticket: ticket.get(),
+                        });
+                    }
+                },
                 |request, ticket, deferral| {
-                    if let Some(observer) = observer.as_deref_mut() {
+                    if let Some(observer) = observer.borrow_mut().as_deref_mut() {
                         observer(ExecutorAdmissionQueueObservation::SkippedUnchanged {
                             request_id: request.inner.request.id.clone(),
                             ticket: ticket.get(),
@@ -846,6 +930,7 @@ impl ContinuousBatchScheduler {
                 |request| probe(&request.inner.request),
             )
             .map_err(|error| FerrumError::scheduler(error.to_string()))?;
+        drop(request_index);
         drop(waiting);
 
         self.dynamic_admission_probes
@@ -1196,8 +1281,23 @@ impl ContinuousBatchScheduler {
                         .then_with(|| left_id.0.cmp(&right_id.0))
                 })
                 .map(|(request_id, _)| request_id.clone());
-            if let Some(request_id) = victim {
-                return Ok(DecodeExecutionCapacityAction::RecomputeVictim { request_id });
+            if let Some(victim_request_id) = victim {
+                let progress_owners = request_ids
+                    .iter()
+                    .filter(|request_id| requested.contains(*request_id))
+                    .collect::<Vec<_>>();
+                if progress_owners.len() != 1 {
+                    return Err(FerrumError::scheduler(format!(
+                        "decode progress reservation requires one split progress owner, found {}",
+                        progress_owners.len()
+                    )));
+                }
+                return Ok(DecodeExecutionCapacityAction::RecomputeVictim {
+                    reservation: DecodeProgressReservation {
+                        victim_request_id,
+                        progress_owner_id: (*progress_owners[0]).clone(),
+                    },
+                });
             }
         }
 
@@ -1419,6 +1519,35 @@ impl ContinuousBatchScheduler {
         attempted_decode_width: usize,
         observed_free_blocks: Option<usize>,
     ) -> bool {
+        self.defer_decode_to_waiting_for_capacity_inner(
+            request_id,
+            attempted_decode_width,
+            observed_free_blocks,
+            None,
+        )
+    }
+
+    pub fn defer_decode_to_waiting_with_progress_reservation(
+        &self,
+        reservation: &DecodeProgressReservation,
+        attempted_decode_width: usize,
+        observed_free_blocks: Option<usize>,
+    ) -> bool {
+        self.defer_decode_to_waiting_for_capacity_inner(
+            reservation.victim_request_id(),
+            attempted_decode_width,
+            observed_free_blocks,
+            Some(reservation),
+        )
+    }
+
+    fn defer_decode_to_waiting_for_capacity_inner(
+        &self,
+        request_id: &RequestId,
+        attempted_decode_width: usize,
+        observed_free_blocks: Option<usize>,
+        progress_reservation: Option<&DecodeProgressReservation>,
+    ) -> bool {
         let mut decode_queue = self.decode_queue.write();
         let mut waiting_queue = self.waiting_queue.write();
         let mut request_index = self.request_index.write();
@@ -1440,6 +1569,7 @@ impl ContinuousBatchScheduler {
             req.capacity_deferred_empty_retry_epoch = None;
             req.capacity_deferred_from_decode = true;
             req.execution_capacity_deferral = None;
+            req.decode_progress_reservation = progress_reservation.cloned();
             req.last_iteration = self.current_iteration.load(Ordering::Relaxed);
             if !self.requeue_waiting_request(&mut waiting_queue, &mut request_index, req) {
                 return false;
@@ -1449,7 +1579,11 @@ impl ContinuousBatchScheduler {
                 attempted_decode_width.max(1),
                 observed_free_blocks,
             );
-            debug!("Deferred decode request {} back to waiting", request_id);
+            debug!(
+                "Deferred decode request {} back to waiting with progress owner {:?}",
+                request_id,
+                progress_reservation.map(DecodeProgressReservation::progress_owner_id)
+            );
             true
         } else {
             false
@@ -1473,6 +1607,7 @@ impl ContinuousBatchScheduler {
             req.capacity_deferred_empty_retry_epoch = None;
             req.capacity_deferred_from_decode = false;
             req.execution_capacity_deferral = None;
+            req.decode_progress_reservation = None;
 
             request_index.insert(request_id.clone(), RequestPhase::Decoding);
             decode_queue.insert(request_id.clone(), req);
@@ -2136,12 +2271,25 @@ impl ContinuousBatchScheduler {
             self.legacy_waiting_admission_ticks
                 .fetch_add(1, Ordering::Relaxed);
             let waiting_queue = self.waiting_queue.read();
+            let request_index = self.request_index.read();
             let active_count_for_capacity_wait = self.active_count();
             let mut requests_to_admit = Vec::new();
             let mut release_blocked_capacity_deferred_admissions = 0usize;
             for req in waiting_queue.iter() {
                 if requests_to_admit.len() >= available_slots {
                     break;
+                }
+                if req
+                    .decode_progress_reservation
+                    .as_ref()
+                    .is_some_and(|reservation| {
+                        matches!(
+                            request_index.get(reservation.progress_owner_id()),
+                            Some(RequestPhase::Prefilling | RequestPhase::Decoding)
+                        )
+                    })
+                {
+                    continue;
                 }
                 let budgeted_capacity_deferred =
                     Self::should_budget_capacity_deferred_mixed_recompute(
@@ -2170,6 +2318,7 @@ impl ContinuousBatchScheduler {
                     release_blocked_capacity_deferred_admissions += 1;
                 }
             }
+            drop(request_index);
             drop(waiting_queue);
             for (req_id, empty_retry_epoch) in requests_to_admit {
                 self.promote_to_prefill_with_empty_retry(&req_id, empty_retry_epoch);
@@ -3046,14 +3195,14 @@ mod tests {
             }] if request_id == &blocked_id && current_wait_sources == &availability0
         ));
 
-        assert_eq!(
-            scheduler
-                .defer_decode_for_execution_capacity(std::slice::from_ref(&runnable_id), deferral,)
-                .unwrap(),
-            DecodeExecutionCapacityAction::RecomputeVictim {
-                request_id: blocked_id.clone(),
-            }
-        );
+        let action = scheduler
+            .defer_decode_for_execution_capacity(std::slice::from_ref(&runnable_id), deferral)
+            .unwrap();
+        let DecodeExecutionCapacityAction::RecomputeVictim { reservation } = action else {
+            panic!("the last runnable decode must receive a progress reservation");
+        };
+        assert_eq!(reservation.victim_request_id(), &blocked_id);
+        assert_eq!(reservation.progress_owner_id(), &runnable_id);
         let audit_only = AdmissionWakeEpochs::new(NonZeroU64::new(29).unwrap(), 1, 0, 0);
         observations.clear();
         let still_runnable = scheduler
@@ -3118,6 +3267,216 @@ mod tests {
                 .execution_capacity_blocked_decode_len,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn decode_progress_reservation_holds_victim_without_global_hol_until_owner_terminal() {
+        use ferrum_interfaces::vnext::{
+            CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
+            DeferredAction,
+        };
+        use std::num::NonZeroU64;
+
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let victim = create_test_request(Priority::Normal);
+        let victim_id = victim.id.clone();
+        let owner = create_test_request(Priority::Normal);
+        let owner_id = owner.id.clone();
+        scheduler.submit(victim).await.unwrap();
+        scheduler.submit(owner).await.unwrap();
+
+        let source = CapacityAvailabilitySource::ActiveSequenceSlots;
+        let availability = [CapacityAvailabilityEpoch::new(source, 1).unwrap()];
+        let wake = AdmissionWakeEpochs::new(NonZeroU64::new(41).unwrap(), 0, 0, 0);
+        scheduler
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(4),
+                AdmissionWakeSnapshot::new(wake, &availability),
+                &mut |request| {
+                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                        request_id: request.id.clone(),
+                    })
+                },
+            )
+            .unwrap()
+            .unwrap();
+        scheduler.mark_prefill_complete(&victim_id, 1);
+        scheduler.mark_prefill_complete(&owner_id, 1);
+
+        let condition = CapacityWaitCondition::from_observation(41, availability.to_vec()).unwrap();
+        let deferral = AdmissionDeferral::new(DeferredAction::WaitForRelease, wake, condition);
+        assert_eq!(
+            scheduler
+                .defer_decode_for_execution_capacity(
+                    std::slice::from_ref(&victim_id),
+                    deferral.clone(),
+                )
+                .unwrap(),
+            DecodeExecutionCapacityAction::Deferred { count: 1 }
+        );
+        let action = scheduler
+            .defer_decode_for_execution_capacity(std::slice::from_ref(&owner_id), deferral)
+            .unwrap();
+        let DecodeExecutionCapacityAction::RecomputeVictim { reservation } = action else {
+            panic!("capacity release must reserve progress for the runnable owner");
+        };
+        assert_eq!(reservation.victim_request_id(), &victim_id);
+        assert_eq!(reservation.progress_owner_id(), &owner_id);
+        assert!(scheduler.defer_decode_to_waiting_with_progress_reservation(
+            &reservation,
+            1,
+            Some(0),
+        ));
+        assert_eq!(
+            scheduler
+                .defer_decode_for_execution_capacity(
+                    std::slice::from_ref(&owner_id),
+                    AdmissionDeferral::new(
+                        DeferredAction::WaitForRelease,
+                        wake,
+                        CapacityWaitCondition::from_observation(41, availability.to_vec()).unwrap(),
+                    ),
+                )
+                .unwrap(),
+            DecodeExecutionCapacityAction::Deferred { count: 1 }
+        );
+        assert!(
+            scheduler
+                .passive_capacity_wait_condition()
+                .unwrap()
+                .is_some(),
+            "held victim must not hide the owner's exact passive wait"
+        );
+
+        let bypass = create_test_request(Priority::Normal);
+        let bypass_id = bypass.id.clone();
+        scheduler.submit(bypass).await.unwrap();
+        let mut observations = Vec::new();
+        let mut probes = Vec::new();
+        let released_availability = [CapacityAvailabilityEpoch::new(source, 2).unwrap()];
+        let released_wake = AdmissionWakeEpochs::new(NonZeroU64::new(41).unwrap(), 1, 0, 0);
+        let batch = scheduler
+            .next_batch_with_dynamic_admission_observed(
+                BatchHint::simple(4),
+                AdmissionWakeSnapshot::new(released_wake, &released_availability),
+                &mut |request| {
+                    probes.push(request.id.clone());
+                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                        request_id: request.id.clone(),
+                    })
+                },
+                &mut |observation| observations.push(observation),
+            )
+            .unwrap()
+            .expect("the owner and later eligible request must continue");
+        assert_eq!(probes, vec![bypass_id.clone()]);
+        assert!(batch
+            .requests
+            .iter()
+            .any(|request| request.request.id == owner_id));
+        assert!(batch
+            .requests
+            .iter()
+            .any(|request| request.request.id == bypass_id));
+        assert!(observations.iter().any(|observation| matches!(
+            observation,
+            ExecutorAdmissionQueueObservation::ProgressReservationHeld {
+                request_id,
+                progress_owner_id,
+                ..
+            } if request_id == &victim_id && progress_owner_id == &owner_id
+        )));
+
+        let response = InferenceResponse {
+            request_id: owner_id.clone(),
+            text: String::new(),
+            tokens: Vec::new(),
+            finish_reason: ferrum_types::FinishReason::Length,
+            usage: ferrum_types::TokenUsage::new(0, 0),
+            latency_ms: 0,
+            created_at: chrono::Utc::now(),
+            metadata: Default::default(),
+            api_response: None,
+        };
+        scheduler.complete(owner_id, &response).await.unwrap();
+
+        probes.clear();
+        let released = scheduler
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(4),
+                AdmissionWakeSnapshot::new(released_wake, &released_availability),
+                &mut |request| {
+                    probes.push(request.id.clone());
+                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                        request_id: request.id.clone(),
+                    })
+                },
+            )
+            .unwrap()
+            .expect("terminal owner must release the recompute victim");
+        assert_eq!(probes, vec![victim_id.clone()]);
+        assert!(released
+            .requests
+            .iter()
+            .any(|request| request.request.id == victim_id));
+    }
+
+    #[tokio::test]
+    async fn decode_progress_reservation_releases_after_owner_cancel() {
+        use ferrum_interfaces::vnext::{CapacityAvailabilityEpoch, CapacityAvailabilitySource};
+        use std::num::NonZeroU64;
+
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let victim = create_test_request(Priority::Normal);
+        let victim_id = victim.id.clone();
+        let owner = create_test_request(Priority::Normal);
+        let owner_id = owner.id.clone();
+        scheduler.submit(victim).await.unwrap();
+        scheduler.submit(owner).await.unwrap();
+
+        let availability =
+            [
+                CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::ActiveSequenceSlots, 1)
+                    .unwrap(),
+            ];
+        let wake = AdmissionWakeEpochs::new(NonZeroU64::new(43).unwrap(), 0, 0, 0);
+        scheduler
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(2),
+                AdmissionWakeSnapshot::new(wake, &availability),
+                &mut |request| {
+                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                        request_id: request.id.clone(),
+                    })
+                },
+            )
+            .unwrap()
+            .unwrap();
+        scheduler.mark_prefill_complete(&victim_id, 1);
+        scheduler.mark_prefill_complete(&owner_id, 1);
+        let reservation = DecodeProgressReservation {
+            victim_request_id: victim_id.clone(),
+            progress_owner_id: owner_id.clone(),
+        };
+        assert!(scheduler.defer_decode_to_waiting_with_progress_reservation(&reservation, 1, None,));
+        assert!(scheduler.cancel(owner_id).await.unwrap());
+
+        let mut probes = Vec::new();
+        let batch = scheduler
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(1),
+                AdmissionWakeSnapshot::new(wake, &availability),
+                &mut |request| {
+                    probes.push(request.id.clone());
+                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                        request_id: request.id.clone(),
+                    })
+                },
+            )
+            .unwrap()
+            .expect("owner cancellation must release the victim admission");
+        assert_eq!(probes, vec![victim_id.clone()]);
+        assert_eq!(batch.requests[0].request.id, victim_id);
     }
 
     #[tokio::test]
