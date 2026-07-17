@@ -11,8 +11,8 @@ use super::{
     BufferDescriptor, BufferUsage, CanonicalRational, CapabilityId, CompletionHandle,
     CompletionReaper, ContractVersion, DefinitelyNotSubmittedRetryAuthority,
     DefinitelyNotSubmittedWaveRetryAuthority, DeviceCommandBatch, DeviceId, DeviceRuntime,
-    DynamicResourceDemand, ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts,
-    ExecutionLane, ExecutionLaneId, HostTransferLayout, IdentifiedFailure,
+    DynamicResourceDemand, DynamicResourceShape, ExecutablePlanView, ExecutionIdentityEnvelope,
+    ExecutionIdentityParts, ExecutionLane, ExecutionLaneId, HostTransferLayout, IdentifiedFailure,
     IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
     LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId,
     NodeInvocationId, NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
@@ -2400,6 +2400,14 @@ enum OperationBufferSource<'a, B> {
     Backing(LogicalBackingBufferView<'a, B>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationBufferCoverage {
+    Exact,
+    /// The operation sees an exact prefix while sequence authority retains the
+    /// wider backing needed by a previously admitted execution frontier.
+    BackingPrefix,
+}
+
 #[derive(Clone, Copy)]
 enum OperationRegionSource<'a, B> {
     Contiguous {
@@ -2579,6 +2587,7 @@ fn validate_dynamic_binding_layout(
     storage_kind: OperationBufferStorageKind,
     logical_size_bytes: u64,
     mut binding_lengths: impl ExactSizeIterator<Item = u64>,
+    coverage: OperationBufferCoverage,
 ) -> Result<(), VNextError> {
     let binding_count = binding_lengths.len();
     if storage_kind == OperationBufferStorageKind::StaticContiguous {
@@ -2601,17 +2610,39 @@ fn validate_dynamic_binding_layout(
             .checked_add(length_bytes)
             .ok_or_else(|| invalid_operation("backing segment coverage overflows u64"))
     })?;
-    if covered != logical_size_bytes {
+    if covered < logical_size_bytes
+        || (coverage == OperationBufferCoverage::Exact && covered != logical_size_bytes)
+    {
         return Err(invalid_operation(
-            "dynamic backing segments do not exactly cover the logical resource",
+            "dynamic backing segments do not cover the operation's exact logical view",
         ));
     }
     Ok(())
 }
 
+fn sequence_execution_shape(
+    committed: DynamicResourceShape,
+    source_end_tokens: u64,
+) -> Result<DynamicResourceShape, VNextError> {
+    if committed.sequences() != 1
+        || source_end_tokens == 0
+        || source_end_tokens > committed.tokens()
+    {
+        return Err(invalid_operation(
+            "sequence operation frontier is empty or exceeds committed backing",
+        ));
+    }
+    Ok(DynamicResourceShape::from_validated(
+        1,
+        source_end_tokens,
+        committed.pages(),
+    ))
+}
+
 pub struct OperationBufferView<'a, B> {
     descriptor: super::BufferDescriptor,
     source: OperationBufferSource<'a, B>,
+    coverage: OperationBufferCoverage,
 }
 
 impl<'a, B> OperationBufferView<'a, B> {
@@ -2675,6 +2706,7 @@ impl<'a, B> OperationBufferView<'a, B> {
                     bindings
                         .iter()
                         .map(|binding| binding.segment().length_bytes()),
+                    self.coverage,
                 )?;
                 let source = match storage_kind {
                     OperationBufferStorageKind::DynamicContiguous => {
@@ -2848,12 +2880,61 @@ mod operation_buffer_region_tests {
             OperationBufferStorageKind::DynamicContiguous,
             20,
             bindings.iter().map(|(_, length_bytes)| *length_bytes),
+            OperationBufferCoverage::Exact,
         )
         .unwrap_err();
 
         assert!(error
             .to_string()
             .contains("contiguous dynamic storage requires one physical segment binding"));
+    }
+
+    #[test]
+    fn operation_prefix_view_retains_wider_backing_coverage() {
+        validate_dynamic_binding_layout(
+            OperationBufferStorageKind::DynamicPaged,
+            64,
+            [64_u64, 64].into_iter(),
+            OperationBufferCoverage::BackingPrefix,
+        )
+        .unwrap();
+        validate_dynamic_binding_layout(
+            OperationBufferStorageKind::DynamicContiguous,
+            64,
+            [128_u64].into_iter(),
+            OperationBufferCoverage::BackingPrefix,
+        )
+        .unwrap();
+
+        assert!(validate_dynamic_binding_layout(
+            OperationBufferStorageKind::DynamicPaged,
+            64,
+            [64_u64, 64].into_iter(),
+            OperationBufferCoverage::Exact,
+        )
+        .is_err());
+        assert!(validate_dynamic_binding_layout(
+            OperationBufferStorageKind::DynamicPaged,
+            128,
+            [64_u64].into_iter(),
+            OperationBufferCoverage::BackingPrefix,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn sequence_execution_shape_uses_the_executed_source_frontier() {
+        let committed = DynamicResourceShape::from_validated(1, 8, 3);
+        let projected = sequence_execution_shape(committed, 4).unwrap();
+
+        assert_eq!(projected.sequences(), 1);
+        assert_eq!(projected.tokens(), 4);
+        assert_eq!(projected.pages(), 3);
+        assert!(sequence_execution_shape(committed, 0).is_err());
+        assert!(sequence_execution_shape(committed, 9).is_err());
+        assert!(
+            sequence_execution_shape(DynamicResourceShape::from_validated(2, 8, 3), 4).is_err()
+        );
     }
 
     #[test]
@@ -3620,6 +3701,7 @@ impl<'a, B> OperationInvocation<'a, B> {
                 views.push(OperationBufferView {
                     descriptor: leased.committed_descriptor().clone(),
                     source: OperationBufferSource::Static(leased),
+                    coverage: OperationBufferCoverage::Exact,
                 });
             } else if let Some(descriptor) = dynamic_descriptors.get(resource_id) {
                 let backing = resources.backing_view(resource_id).or_else(|_| {
@@ -3632,8 +3714,20 @@ impl<'a, B> OperationInvocation<'a, B> {
                     AllocationLifetime::Step => descriptor.evaluate_request_bytes_for_shape(
                         resources.step_resources().work_shape().immediate_shape(),
                     )?,
-                    AllocationLifetime::Sequence => descriptor
-                        .evaluate_request_bytes_for_shape(participant_backing.committed_shape())?,
+                    AllocationLifetime::Sequence => {
+                        let participant_token_range = resources
+                            .work_shape()?
+                            .participant_token_ranges()
+                            .get(participant_index)
+                            .ok_or_else(|| {
+                                invalid_operation("operation participant token range is missing")
+                            })?;
+                        let execution_shape = sequence_execution_shape(
+                            participant_backing.committed_shape(),
+                            participant_token_range.source_token_range().end,
+                        )?;
+                        descriptor.evaluate_request_bytes_for_shape(execution_shape)?
+                    }
                     AllocationLifetime::Request => descriptor
                         .evaluate_fit_request_bytes(participant.request_resources().work_shape())?,
                     AllocationLifetime::Plan => {
@@ -3656,15 +3750,23 @@ impl<'a, B> OperationInvocation<'a, B> {
                         "logical backing extent differs from plan descriptor `{resource_id}`"
                     )));
                 }
+                let coverage = if descriptor.lifetime() == AllocationLifetime::Sequence
+                    && backing.size_bytes() > expected_bytes
+                {
+                    OperationBufferCoverage::BackingPrefix
+                } else {
+                    OperationBufferCoverage::Exact
+                };
                 views.push(OperationBufferView {
                     descriptor: super::BufferDescriptor {
                         resource_id: resource_id.clone(),
-                        size_bytes: backing.size_bytes(),
+                        size_bytes: expected_bytes,
                         alignment_bytes: backing.alignment_bytes(),
                         usage: backing.usage(),
                         element_type: backing.element_type(),
                     },
                     source: OperationBufferSource::Backing(backing),
+                    coverage,
                 });
             } else {
                 return Err(invalid_operation(format!(
