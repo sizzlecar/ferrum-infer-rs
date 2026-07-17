@@ -324,6 +324,17 @@ impl CausalAttentionShape {
         align_up(logical, VNEXT_KV_PAGE_BYTES)
     }
 
+    fn physical_state_bytes_for_source_frontier(
+        self,
+        source_end_tokens: u64,
+        full_input_tokens: u64,
+    ) -> Result<u64, String> {
+        if source_end_tokens == 0 || source_end_tokens > full_input_tokens {
+            return Err("causal attention source frontier exceeds its full input".to_owned());
+        }
+        self.physical_state_bytes(source_end_tokens)
+    }
+
     fn maximum_pages(self) -> Result<u64, String> {
         Ok(self.physical_state_bytes(self.maximum_context_tokens)? / VNEXT_KV_PAGE_BYTES)
     }
@@ -556,7 +567,10 @@ fn encode_attention(
         let pages = paged_state_regions(
             participant,
             state,
-            shape.physical_state_bytes(token_range.full_input_tokens())?,
+            shape.physical_state_bytes_for_source_frontier(
+                source.end,
+                token_range.full_input_tokens(),
+            )?,
         )?;
         let page_count = u64::try_from(pages.len())
             .map_err(|_| "causal attention page count exceeds u64".to_owned())?;
@@ -1265,6 +1279,24 @@ mod tests {
             shape.fixed_scratch_bytes().unwrap() + 17 * shape.scratch_bytes_per_token().unwrap()
         );
         assert_eq!(shape.maximum_pages().unwrap(), 128);
+    }
+
+    #[test]
+    fn chunked_prefill_state_tracks_the_source_frontier() {
+        let shape = CausalAttentionShape::from_attributes(&attributes(true)).unwrap();
+        let chunk_state = shape.physical_state_bytes(3).unwrap();
+        let full_prompt_state = shape.physical_state_bytes(128).unwrap();
+
+        assert_ne!(chunk_state, full_prompt_state);
+        assert_eq!(
+            shape
+                .physical_state_bytes_for_source_frontier(3, 128)
+                .unwrap(),
+            chunk_state
+        );
+        assert!(shape
+            .physical_state_bytes_for_source_frontier(129, 128)
+            .is_err());
     }
 
     #[test]
