@@ -572,6 +572,7 @@ impl EngineInner {
                 request_id,
                 deferral,
                 current,
+                current_wait_sources,
             } => self.write_executor_scheduler_profile_event(
                 &request_id,
                 "vnext.decode_capacity_skipped_unchanged",
@@ -596,6 +597,7 @@ impl EngineInner {
                         "observed": epochs(deferral.observed()),
                         "current": epochs(current),
                         "wait_condition": deferral.wait_condition(),
+                        "current_wait_sources": current_wait_sources,
                     }),
                 )]),
                 None,
@@ -604,6 +606,7 @@ impl EngineInner {
                 request_id,
                 deferral,
                 current,
+                current_wait_sources,
                 exact_source_changed,
                 policy_epoch_changed,
             } => self.write_executor_scheduler_profile_event(
@@ -642,6 +645,7 @@ impl EngineInner {
                         "observed": epochs(deferral.observed()),
                         "current": epochs(current),
                         "wait_condition": deferral.wait_condition(),
+                        "current_wait_sources": current_wait_sources,
                     }),
                 )]),
                 None,
