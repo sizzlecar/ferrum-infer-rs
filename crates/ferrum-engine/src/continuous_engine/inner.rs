@@ -525,12 +525,6 @@ impl EngineInner {
         &self,
         observation: ExecutorAdmissionQueueObservation,
     ) {
-        let ExecutorAdmissionQueueObservation::SkippedUnchanged {
-            request_id,
-            ticket,
-            deferral,
-            current,
-        } = observation;
         let epochs = |value: AdmissionWakeEpochs| {
             serde_json::json!({
                 "coordinator_id": value.coordinator_id().get(),
@@ -539,32 +533,167 @@ impl EngineInner {
                 "policy_epoch": value.policy_epoch(),
             })
         };
+        match observation {
+            ExecutorAdmissionQueueObservation::SkippedUnchanged {
+                request_id,
+                ticket,
+                deferral,
+                current,
+            } => self.write_executor_scheduler_profile_event(
+                &request_id,
+                "vnext.prefill_admission_skipped_unchanged",
+                ProfileEventKind::Instant,
+                ProfileStatus::Ok,
+                None,
+                BTreeMap::from([
+                    (
+                        "decision".to_string(),
+                        serde_json::json!("skipped_unchanged"),
+                    ),
+                    ("waiting_ticket".to_string(), serde_json::json!(ticket)),
+                    (
+                        "prefill_submit_observed".to_string(),
+                        serde_json::json!(false),
+                    ),
+                    ("probe_performed".to_string(), serde_json::json!(false)),
+                ]),
+                BTreeMap::from([(
+                    "deferral_evidence".to_string(),
+                    serde_json::json!({
+                        "action": deferral.action(),
+                        "observed": epochs(deferral.observed()),
+                        "current": epochs(current),
+                        "wait_condition": deferral.wait_condition(),
+                    }),
+                )]),
+                None,
+            ),
+            ExecutorAdmissionQueueObservation::DecodeSkippedUnchanged {
+                request_id,
+                deferral,
+                current,
+            } => self.write_executor_scheduler_profile_event(
+                &request_id,
+                "vnext.decode_capacity_skipped_unchanged",
+                ProfileEventKind::Instant,
+                ProfileStatus::Ok,
+                None,
+                BTreeMap::from([
+                    (
+                        "decision".to_string(),
+                        serde_json::json!("skipped_unchanged"),
+                    ),
+                    (
+                        "decode_submit_observed".to_string(),
+                        serde_json::json!(false),
+                    ),
+                    ("probe_performed".to_string(), serde_json::json!(false)),
+                ]),
+                BTreeMap::from([(
+                    "deferral_evidence".to_string(),
+                    serde_json::json!({
+                        "action": deferral.action(),
+                        "observed": epochs(deferral.observed()),
+                        "current": epochs(current),
+                        "wait_condition": deferral.wait_condition(),
+                    }),
+                )]),
+                None,
+            ),
+            ExecutorAdmissionQueueObservation::DecodeResumed {
+                request_id,
+                deferral,
+                current,
+                exact_source_changed,
+                policy_epoch_changed,
+            } => self.write_executor_scheduler_profile_event(
+                &request_id,
+                "vnext.decode_capacity_resumed",
+                ProfileEventKind::Instant,
+                ProfileStatus::Ok,
+                None,
+                BTreeMap::from([
+                    (
+                        "decision".to_string(),
+                        serde_json::json!(if exact_source_changed {
+                            "exact_source_changed"
+                        } else {
+                            "policy_epoch_changed"
+                        }),
+                    ),
+                    (
+                        "exact_source_changed".to_string(),
+                        serde_json::json!(exact_source_changed),
+                    ),
+                    (
+                        "policy_epoch_changed".to_string(),
+                        serde_json::json!(policy_epoch_changed),
+                    ),
+                    (
+                        "decode_submit_observed".to_string(),
+                        serde_json::json!(false),
+                    ),
+                    ("probe_performed".to_string(), serde_json::json!(false)),
+                ]),
+                BTreeMap::from([(
+                    "deferral_evidence".to_string(),
+                    serde_json::json!({
+                        "action": deferral.action(),
+                        "observed": epochs(deferral.observed()),
+                        "current": epochs(current),
+                        "wait_condition": deferral.wait_condition(),
+                    }),
+                )]),
+                None,
+            ),
+        }
+    }
+
+    fn trace_executor_decode_capacity_decision(
+        &self,
+        request_ids: &[RequestId],
+        deferral: &ExecutorExecutionCapacityDeferral,
+        decision: &'static str,
+    ) {
+        let Some(request_id) = request_ids.first() else {
+            return;
+        };
+        let observed = deferral.observed();
         self.write_executor_scheduler_profile_event(
-            &request_id,
-            "vnext.prefill_admission_skipped_unchanged",
+            request_id,
+            "vnext.decode_capacity_deferred",
             ProfileEventKind::Instant,
             ProfileStatus::Ok,
             None,
             BTreeMap::from([
+                ("decision".to_string(), serde_json::json!(decision)),
                 (
-                    "decision".to_string(),
-                    serde_json::json!("skipped_unchanged"),
+                    "attempted_decode_width".to_string(),
+                    serde_json::json!(request_ids.len()),
                 ),
-                ("waiting_ticket".to_string(), serde_json::json!(ticket)),
                 (
-                    "prefill_submit_observed".to_string(),
+                    "execution_stage".to_string(),
+                    serde_json::json!(deferral.stage()),
+                ),
+                (
+                    "decode_submit_observed".to_string(),
                     serde_json::json!(false),
                 ),
-                ("probe_performed".to_string(), serde_json::json!(false)),
             ]),
-            BTreeMap::from([(
-                "deferral_evidence".to_string(),
-                serde_json::json!({
-                    "action": deferral.action(),
-                    "observed": epochs(deferral.observed()),
-                    "current": epochs(current),
-                }),
-            )]),
+            BTreeMap::from([
+                ("request_ids".to_string(), serde_json::json!(request_ids)),
+                (
+                    "capacity_evidence".to_string(),
+                    serde_json::json!({
+                        "observed": {
+                            "coordinator_id": observed.coordinator_id,
+                            "release_epoch": observed.release_epoch,
+                            "capacity_epoch": observed.capacity_epoch,
+                        },
+                        "wait_condition": deferral.wait_condition(),
+                    }),
+                ),
+            ]),
             None,
         );
     }
