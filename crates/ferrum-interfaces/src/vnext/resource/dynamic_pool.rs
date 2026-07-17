@@ -1,20 +1,17 @@
 use super::{
     backing_segment_range, invalid_resource, validate_runtime_descriptor_for_admission,
-    AdmissionDeferred, AllocationLifetime, AllocationSeal, Arc, AtomicU64, BTreeMap,
-    BackingChunkIdentity, BackingSegment, BufferDescriptor, BufferRequest, BufferUsage,
-    CapacityAvailabilityEpoch, CapacityDomainId, CapacityEpochs, CapacityUnits,
-    CapacityWaitCondition, DeviceAllocationPermit, DeviceCapacityAvailabilitySnapshot,
-    DeviceCapacityBudget, DeviceCapacityGrant, DeviceCapacityReservation, DeviceRuntime,
-    DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicResourceDescriptor,
-    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView, ElementType,
-    FreeExtentIndex, InvocationLivenessMode, LogicalAdmissionCoordinator, Mutex, Ordering,
-    PlanNode, ResourceId, ResourceReservation, ResourceRetentionPolicy,
+    AllocationLifetime, AllocationSeal, Arc, AtomicU64, BTreeMap, BackingChunkIdentity,
+    BackingSegment, BufferDescriptor, BufferRequest, BufferUsage, CapacityAvailabilityEpoch,
+    CapacityDomainId, CapacityEpochs, CapacityUnits, CapacityWaitCondition, DeviceAllocationPermit,
+    DeviceCapacityAvailabilitySnapshot, DeviceCapacityBudget, DeviceCapacityGrant,
+    DeviceCapacityReservation, DeviceRuntime, DynamicBackingPoolId, DynamicBackingPoolSpec,
+    DynamicResourceDescriptor, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView,
+    ElementType, FreeExtentIndex, InvocationLivenessMode, LogicalAdmissionCoordinator, Mutex,
+    Ordering, PlanNode, ResourceId, ResourceReservation, ResourceRetentionPolicy,
     ResourceTransactionIdentity, RunId, Serialize, StaticProvisioningBinding, StepResourceSlotKind,
     TransactionId, VNextError,
 };
-use crate::vnext::{
-    CapacityShortfallKind, CapacityWaitSnapshot, DeferredAction, DeviceCapacityPressure,
-};
+use crate::vnext::DeviceCapacityPressure;
 use sha2::{Digest, Sha256};
 
 static NEXT_DYNAMIC_POOL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -131,8 +128,8 @@ impl DynamicPoolDomainSpec {
 pub(super) struct ResidentChunkBacking<B> {
     // Buffer must drop before its physical capacity grant is returned.
     pub(super) buffer: B,
-    _grant: DeviceCapacityGrant,
-    identity: BackingChunkIdentity,
+    pub(super) _grant: DeviceCapacityGrant,
+    pub(super) identity: BackingChunkIdentity,
     pub(super) descriptor: BufferDescriptor,
 }
 
@@ -190,7 +187,7 @@ where
     instance_id: u64,
     pub(super) domain: DynamicPoolDomainSpec,
     logical_admission: LogicalAdmissionCoordinator,
-    maintenance: Mutex<()>,
+    pub(super) maintenance: Mutex<()>,
     next_extent_generation: AtomicU64,
     pub(super) state: Mutex<DynamicBackingPoolState<R::Buffer>>,
 }
@@ -319,20 +316,20 @@ pub struct DynamicPoolGrowthReceipt {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DynamicPoolStatus {
-    pool_id: DynamicBackingPoolId,
-    domain_id: CapacityDomainId,
-    storage_profile: DynamicStorageProfile,
-    resident_bytes: u64,
-    pending_growth_bytes: u64,
-    free_bytes: u64,
-    largest_contiguous_bytes: u64,
-    resident_chunks: usize,
-    live_segments: u64,
-    quarantined_chunks: usize,
-    quarantined_bytes: u64,
-    descriptor_mismatch_chunks: usize,
-    publication_rejected_chunks: usize,
-    poisoned: bool,
+    pub(super) pool_id: DynamicBackingPoolId,
+    pub(super) domain_id: CapacityDomainId,
+    pub(super) storage_profile: DynamicStorageProfile,
+    pub(super) resident_bytes: u64,
+    pub(super) pending_growth_bytes: u64,
+    pub(super) free_bytes: u64,
+    pub(super) largest_contiguous_bytes: u64,
+    pub(super) resident_chunks: usize,
+    pub(super) live_segments: u64,
+    pub(super) quarantined_chunks: usize,
+    pub(super) quarantined_bytes: u64,
+    pub(super) descriptor_mismatch_chunks: usize,
+    pub(super) publication_rejected_chunks: usize,
+    pub(super) poisoned: bool,
 }
 
 impl DynamicPoolStatus {
@@ -394,528 +391,71 @@ impl DynamicPoolStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DynamicPoolMaintenanceStatus {
-    epochs: CapacityEpochs,
-    device_capacity_bytes: u64,
-    effective_device_usable_ceiling_bytes: u64,
-    process_claimed_bytes: u64,
-    budget_device_wide_usable_ceiling_bytes: u64,
-    budget_claimed_bytes: u64,
-    pools: Vec<DynamicPoolStatus>,
-}
-
-impl DynamicPoolMaintenanceStatus {
-    pub const fn epochs(&self) -> CapacityEpochs {
-        self.epochs
-    }
-
-    pub const fn device_capacity_bytes(&self) -> u64 {
-        self.device_capacity_bytes
-    }
-
-    pub const fn effective_device_usable_ceiling_bytes(&self) -> u64 {
-        self.effective_device_usable_ceiling_bytes
-    }
-
-    pub const fn process_claimed_bytes(&self) -> u64 {
-        self.process_claimed_bytes
-    }
-
-    pub const fn budget_device_wide_usable_ceiling_bytes(&self) -> u64 {
-        self.budget_device_wide_usable_ceiling_bytes
-    }
-
-    pub const fn budget_claimed_bytes(&self) -> u64 {
-        self.budget_claimed_bytes
-    }
-
-    pub fn pools(&self) -> &[DynamicPoolStatus] {
-        &self.pools
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub enum DynamicDeferredMaintenanceOutcome {
-    RetryAdmission {
-        current_epochs: CapacityEpochs,
-    },
-    WaitForRelease {
-        current_epochs: CapacityEpochs,
-        wait_condition: CapacityWaitCondition,
-        pressure: DeviceCapacityPressure,
-    },
-    Maintained(DynamicPoolGrowthBatchReceipt),
-}
-
-struct DynamicDeviceCapacityBlocked {
-    pressure: DeviceCapacityPressure,
-    availability: DeviceCapacityAvailabilitySnapshot,
-    planned_domains: Vec<CapacityDomainId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DynamicPoolQuarantineRelease {
+pub struct DynamicPoolIdleReclaim {
     pool_id: DynamicBackingPoolId,
-    released_chunks: usize,
-    released_bytes: u64,
+    chunks: Vec<BackingChunkIdentity>,
+    reclaimed_bytes: u64,
+    published_capacity_bytes: u64,
 }
 
-impl DynamicPoolQuarantineRelease {
+impl DynamicPoolIdleReclaim {
     pub fn pool_id(&self) -> &DynamicBackingPoolId {
         &self.pool_id
     }
 
-    pub const fn released_chunks(&self) -> usize {
-        self.released_chunks
+    pub fn chunks(&self) -> &[BackingChunkIdentity] {
+        &self.chunks
     }
 
-    pub const fn released_bytes(&self) -> u64 {
-        self.released_bytes
+    pub const fn reclaimed_bytes(&self) -> u64 {
+        self.reclaimed_bytes
+    }
+
+    pub const fn published_capacity_bytes(&self) -> u64 {
+        self.published_capacity_bytes
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DynamicPoolQuarantineReleaseReceipt {
-    pools: Vec<DynamicPoolQuarantineRelease>,
-    released_chunks: usize,
-    released_bytes: u64,
+pub struct DynamicPoolRebalanceReceipt {
+    pools: Vec<DynamicPoolIdleReclaim>,
+    reclaimed_chunks: usize,
+    reclaimed_bytes: u64,
+    logical_capacity_epoch: u64,
+    plan_device_capacity_epoch: u64,
+    process_device_capacity_epoch: u64,
 }
 
-impl DynamicPoolQuarantineReleaseReceipt {
-    pub fn pools(&self) -> &[DynamicPoolQuarantineRelease] {
+impl DynamicPoolRebalanceReceipt {
+    pub fn pools(&self) -> &[DynamicPoolIdleReclaim] {
         &self.pools
     }
 
-    pub const fn released_chunks(&self) -> usize {
-        self.released_chunks
+    pub const fn reclaimed_chunks(&self) -> usize {
+        self.reclaimed_chunks
     }
 
-    pub const fn released_bytes(&self) -> u64 {
-        self.released_bytes
+    pub const fn reclaimed_bytes(&self) -> u64 {
+        self.reclaimed_bytes
+    }
+
+    pub const fn logical_capacity_epoch(&self) -> u64 {
+        self.logical_capacity_epoch
+    }
+
+    pub const fn plan_device_capacity_epoch(&self) -> u64 {
+        self.plan_device_capacity_epoch
+    }
+
+    pub const fn process_device_capacity_epoch(&self) -> u64 {
+        self.process_device_capacity_epoch
     }
 }
 
-/// Plan-owner capability for changing physical dynamic-pool residency. It is
-/// created once during provisioning, is intentionally not `Clone`, and cannot
-/// be derived from any request, sequence, step, invocation, or static lease.
-///
-/// ```compile_fail
-/// use ferrum_interfaces::vnext::{AdmittedRequestResources, DeviceRuntime};
-/// fn request_cannot_mint<R: DeviceRuntime>(request: &AdmittedRequestResources<R>) {
-///     let _ = request.dynamic_pool_maintenance_controller();
-/// }
-/// ```
-///
-/// ```compile_fail
-/// use ferrum_interfaces::vnext::{DeviceRuntime, StaticProvisioningLease};
-/// fn lease_cannot_mint<R: DeviceRuntime>(lease: &StaticProvisioningLease<R>) {
-///     let _ = lease.dynamic_pool_maintenance_controller();
-/// }
-/// ```
-#[must_use = "dynamic pool maintenance controller must be retained by the plan owner"]
-pub struct DynamicPoolMaintenanceController<R>
-where
-    R: DeviceRuntime,
-{
-    pools: Arc<DynamicPoolSet<R>>,
-}
-
-impl<R> DynamicPoolMaintenanceController<R>
-where
-    R: DeviceRuntime,
-{
-    pub(super) fn new(pools: Arc<DynamicPoolSet<R>>) -> Self {
-        Self { pools }
-    }
-
-    pub fn pool_ids(&self) -> impl ExactSizeIterator<Item = &DynamicBackingPoolId> {
-        self.pools.pools.keys()
-    }
-
-    /// Returns one exact domain-to-pool and physical-capacity snapshot. The
-    /// process-wide usable ceiling is the conservative minimum across all live
-    /// plan budgets; plan claims remain separately visible.
-    pub fn status(&self) -> Result<DynamicPoolMaintenanceStatus, VNextError> {
-        let mut pools = Vec::with_capacity(self.pools.pools.len());
-        for pool in self.pools.pools.values() {
-            let state = pool
-                .state
-                .lock()
-                .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))?;
-            let live_segments = state.chunks.values().try_fold(0_u64, |total, chunk| {
-                total
-                    .checked_add(chunk.live_segments)
-                    .ok_or_else(|| invalid_resource("dynamic live segment count overflows u64"))
-            })?;
-            let quarantined_bytes = state.quarantined.iter().try_fold(0_u64, |total, chunk| {
-                total
-                    .checked_add(chunk.backing._grant.bytes())
-                    .ok_or_else(|| invalid_resource("dynamic quarantine bytes overflow u64"))
-            })?;
-            pools.push(DynamicPoolStatus {
-                pool_id: pool.domain.pool_id().clone(),
-                domain_id: pool.domain.domain_id,
-                storage_profile: pool.domain.pool.compatibility().profile(),
-                resident_bytes: state.resident_bytes,
-                pending_growth_bytes: state.pending_growth_bytes,
-                free_bytes: state.allocator.free_bytes,
-                largest_contiguous_bytes: state.allocator.largest_contiguous_bytes(),
-                resident_chunks: state.chunks.len(),
-                live_segments,
-                quarantined_chunks: state.quarantined.len(),
-                quarantined_bytes,
-                descriptor_mismatch_chunks: state
-                    .quarantined
-                    .iter()
-                    .filter(|chunk| {
-                        chunk.reason == DynamicChunkQuarantineReason::DescriptorMismatch
-                    })
-                    .count(),
-                publication_rejected_chunks: state
-                    .quarantined
-                    .iter()
-                    .filter(|chunk| {
-                        chunk.reason == DynamicChunkQuarantineReason::PublicationRejected
-                    })
-                    .count(),
-                poisoned: state.poisoned,
-            });
-        }
-        let account = &self.pools.budget.account;
-        let state = account
-            .state
-            .lock()
-            .map_err(|_| invalid_resource("device capacity account is poisoned"))?;
-        let effective_device_usable_ceiling_bytes = state
-            .budgets
-            .values()
-            .map(|budget| budget.device_wide_usable_ceiling_bytes)
-            .min()
-            .ok_or_else(|| invalid_resource("device capacity account has no live budget"))?;
-        let budget_claimed_bytes = state
-            .budgets
-            .get(&self.pools.budget.budget_id)
-            .ok_or_else(|| invalid_resource("dynamic pool plan budget is stale"))?
-            .claimed_bytes;
-        Ok(DynamicPoolMaintenanceStatus {
-            epochs: self.pools.logical_admission.epochs()?,
-            device_capacity_bytes: account.device_capacity_bytes,
-            effective_device_usable_ceiling_bytes,
-            process_claimed_bytes: state.claimed_bytes,
-            budget_device_wide_usable_ceiling_bytes: self
-                .pools
-                .budget
-                .device_wide_usable_ceiling_bytes,
-            budget_claimed_bytes,
-            pools,
-        })
-    }
-
-    /// Makes the core-derived runnable minimum resident. A second call is a
-    /// no-op and returns `None`; it never creates a duplicate initial chunk.
-    pub fn initialize_pool(
-        &self,
-        pool_id: &DynamicBackingPoolId,
-    ) -> Result<Option<DynamicPoolGrowthReceipt>, VNextError> {
-        let mut receipt = self
-            .pools
-            .maintain_pools(vec![DynamicPoolGrowthIntent::Minimum(pool_id.clone())])?;
-        Ok(receipt.growths.pop())
-    }
-
-    /// Initializes several pools in one canonical all-or-nothing publication.
-    pub fn initialize_pools(
-        &self,
-        pool_ids: &[DynamicBackingPoolId],
-    ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
-        self.pools.maintain_pools(
-            pool_ids
-                .iter()
-                .cloned()
-                .map(DynamicPoolGrowthIntent::Minimum)
-                .collect(),
-        )
-    }
-
-    /// Adds one explicitly-sized resident chunk. The physical allocation is
-    /// globally reserved before the runtime is called and published only after
-    /// allocation, descriptor validation, and installation all succeed.
-    pub fn grow_pool(
-        &self,
-        pool_id: &DynamicBackingPoolId,
-        requested_bytes: u64,
-    ) -> Result<DynamicPoolGrowthReceipt, VNextError> {
-        let request = DynamicPoolGrowthRequest::new(pool_id.clone(), requested_bytes)?;
-        let mut receipt = self.grow_pools(vec![request])?;
-        receipt
-            .growths
-            .pop()
-            .ok_or_else(|| invalid_resource("single-pool growth produced no receipt"))
-    }
-
-    /// Grows distinct pools under one global reservation and one capacity
-    /// epoch publication. Input order is ignored; duplicate pools are rejected.
-    pub fn grow_pools(
-        &self,
-        requests: Vec<DynamicPoolGrowthRequest>,
-    ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
-        self.pools.maintain_pools(
-            requests
-                .into_iter()
-                .map(DynamicPoolGrowthIntent::Additional)
-                .collect(),
-        )
-    }
-
-    fn wait_snapshot_for_pool_ids<'a>(
-        &self,
-        pool_ids: impl IntoIterator<Item = &'a DynamicBackingPoolId>,
-    ) -> Result<CapacityWaitSnapshot, VNextError> {
-        self.pools.logical_admission.wait_snapshot_for_domains(
-            pool_ids
-                .into_iter()
-                .map(|pool_id| {
-                    self.pools
-                        .pools
-                        .get(pool_id)
-                        .map(|pool| pool.domain.domain_id)
-                        .ok_or_else(|| {
-                            invalid_resource("dynamic maintenance references an unknown pool")
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        )
-    }
-
-    fn capacity_wait_outcome(
-        &self,
-        logical_snapshot: CapacityWaitSnapshot,
-        blocked: DynamicDeviceCapacityBlocked,
-    ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
-        let logical_snapshot = logical_snapshot.narrow_to_domains(blocked.planned_domains)?;
-        let mut observed = logical_snapshot.wait_condition().observed().to_vec();
-        observed.push(blocked.availability.epoch_for_pressure(&blocked.pressure));
-        let wait_condition = CapacityWaitCondition::new(
-            logical_snapshot.wait_condition().coordinator_id(),
-            observed,
-        )?;
-        Ok(DynamicDeferredMaintenanceOutcome::WaitForRelease {
-            current_epochs: logical_snapshot.epochs(),
-            wait_condition,
-            pressure: blocked.pressure,
-        })
-    }
-
-    /// Revalidates a physical deferral while its exact typed owner remains
-    /// live. Unrelated capacity epochs may advance between admission and this
-    /// bounded maintenance attempt, so growth is recomputed from current pool
-    /// state instead of trusting the stale byte snapshot.
-    pub(super) fn maintain_for_live_deferred(
-        &self,
-        deferred: &DynamicBackingDeferred,
-    ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
-        let coordinator_id = self.pools.logical_admission.id();
-        if coordinator_id != deferred.epochs().coordinator_id()
-            || coordinator_id != deferred.wait_condition().coordinator_id()
-        {
-            return Err(invalid_resource(
-                "dynamic backing deferral belongs to another admission coordinator",
-            ));
-        }
-        if deferred.blockers().is_empty() {
-            return Err(invalid_resource(
-                "dynamic backing deferral contains no blocking pool",
-            ));
-        }
-        let logical_snapshot = self.wait_snapshot_for_pool_ids(
-            deferred
-                .blockers()
-                .iter()
-                .map(DynamicBackingBlocker::pool_id),
-        )?;
-        let mut capacity_blocked = None;
-        let growth = self.pools.maintain_pools_observed(
-            deferred
-                .blockers()
-                .iter()
-                .cloned()
-                .map(DynamicPoolGrowthIntent::RevalidatedDeferral)
-                .collect(),
-            &mut capacity_blocked,
-        );
-        match growth {
-            Ok(receipt) if receipt.growths().is_empty() => {
-                let current_epochs = self.pools.logical_admission.epochs()?;
-                if current_epochs == deferred.epochs() {
-                    return Err(invalid_resource(
-                        "dynamic backing maintenance made no progress on an unchanged deferral",
-                    ));
-                }
-                Ok(DynamicDeferredMaintenanceOutcome::RetryAdmission { current_epochs })
-            }
-            Ok(receipt) => Ok(DynamicDeferredMaintenanceOutcome::Maintained(receipt)),
-            Err(VNextError::DeviceCapacityUnavailable(_)) => self.capacity_wait_outcome(
-                logical_snapshot,
-                capacity_blocked.expect("typed capacity failure retains its exact observation"),
-            ),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Materializes fit capacity that logical admission identified as
-    /// growable but that immediate backing preparation does not yet claim.
-    pub fn maintain_for_admission_deferred(
-        &self,
-        deferred: &AdmissionDeferred,
-    ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
-        let coordinator_id = self.pools.logical_admission.id();
-        if coordinator_id != deferred.epochs().coordinator_id()
-            || coordinator_id != deferred.wait_condition().coordinator_id()
-        {
-            return Err(invalid_resource(
-                "logical admission deferral belongs to another coordinator",
-            ));
-        }
-        if deferred.action() != DeferredAction::AwaitBackingGrowth {
-            return Err(invalid_resource(
-                "logical admission deferral does not request backing growth",
-            ));
-        }
-        let pools_by_domain = self
-            .pools
-            .pools
-            .values()
-            .map(|pool| (pool.domain.domain_id, pool.domain.pool_id().clone()))
-            .collect::<BTreeMap<_, _>>();
-        let current = self.pools.logical_admission.snapshot()?;
-        let mut requested_by_pool = BTreeMap::<DynamicBackingPoolId, u64>::new();
-        for blocker in deferred
-            .blockers()
-            .iter()
-            .filter(|blocker| blocker.kind() == CapacityShortfallKind::BackingGrowthRequired)
-        {
-            let domain = blocker.domain().ok_or_else(|| {
-                invalid_resource("backing-growth blocker contains no capacity domain")
-            })?;
-            let pool_id = pools_by_domain.get(&domain).ok_or_else(|| {
-                invalid_resource("backing-growth blocker references a non-pool domain")
-            })?;
-            let current_total = current
-                .domains()
-                .iter()
-                .find(|snapshot| snapshot.domain() == domain)
-                .ok_or_else(|| {
-                    invalid_resource("backing-growth blocker references an unknown domain")
-                })?
-                .total()
-                .get();
-            let missing = blocker.requested().get().saturating_sub(current_total);
-            if missing == 0 {
-                continue;
-            }
-            requested_by_pool
-                .entry(pool_id.clone())
-                .and_modify(|bytes| *bytes = (*bytes).max(missing))
-                .or_insert(missing);
-        }
-        if requested_by_pool.is_empty() {
-            return Ok(DynamicDeferredMaintenanceOutcome::RetryAdmission {
-                current_epochs: self.pools.logical_admission.epochs()?,
-            });
-        }
-        let requests = requested_by_pool
-            .into_iter()
-            .map(|(pool_id, bytes)| DynamicPoolGrowthRequest::new(pool_id, bytes))
-            .collect::<Result<Vec<_>, _>>()?;
-        let logical_snapshot =
-            self.wait_snapshot_for_pool_ids(requests.iter().map(|request| request.pool_id()))?;
-        let mut capacity_blocked = None;
-        let growth = self.pools.maintain_pools_observed(
-            requests
-                .into_iter()
-                .map(DynamicPoolGrowthIntent::Additional)
-                .collect(),
-            &mut capacity_blocked,
-        );
-        match growth {
-            Ok(receipt) => Ok(DynamicDeferredMaintenanceOutcome::Maintained(receipt)),
-            Err(VNextError::DeviceCapacityUnavailable(_)) => self.capacity_wait_outcome(
-                logical_snapshot,
-                capacity_blocked.expect("typed capacity failure retains its exact observation"),
-            ),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Explicitly releases only unclaimable quarantined chunks. Resident
-    /// chunks and logical totals are unchanged; the returned grants are
-    /// dropped after all pool locks have been released.
-    pub fn release_quarantined_chunks(
-        &self,
-    ) -> Result<DynamicPoolQuarantineReleaseReceipt, VNextError> {
-        let pools = self.pools.pools.values().cloned().collect::<Vec<_>>();
-        let _maintenance = pools
-            .iter()
-            .map(|pool| {
-                pool.maintenance
-                    .lock()
-                    .map_err(|_| invalid_resource("dynamic pool maintenance authority is poisoned"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut states = pools
-            .iter()
-            .map(|pool| {
-                pool.state
-                    .lock()
-                    .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let pool_totals = states
-            .iter()
-            .map(|state| {
-                let bytes = state.quarantined.iter().try_fold(0_u64, |total, chunk| {
-                    total
-                        .checked_add(chunk.backing._grant.bytes())
-                        .ok_or_else(|| invalid_resource("released quarantine bytes overflow u64"))
-                })?;
-                Ok((state.quarantined.len(), bytes))
-            })
-            .collect::<Result<Vec<_>, VNextError>>()?;
-        let released_chunks = pool_totals.iter().try_fold(0_usize, |total, (count, _)| {
-            total
-                .checked_add(*count)
-                .ok_or_else(|| invalid_resource("released quarantine count overflows usize"))
-        })?;
-        let released_bytes = pool_totals.iter().try_fold(0_u64, |total, (_, bytes)| {
-            total
-                .checked_add(*bytes)
-                .ok_or_else(|| invalid_resource("released quarantine bytes overflow u64"))
-        })?;
-        let mut released = Vec::with_capacity(pools.len());
-        let mut receipts = Vec::new();
-        for ((pool, state), (pool_chunks, pool_bytes)) in
-            pools.iter().zip(states.iter_mut()).zip(pool_totals)
-        {
-            if pool_chunks == 0 {
-                continue;
-            }
-            let chunks = std::mem::take(&mut state.quarantined);
-            debug_assert_eq!(chunks.len(), pool_chunks);
-            receipts.push(DynamicPoolQuarantineRelease {
-                pool_id: pool.domain.pool_id().clone(),
-                released_chunks: pool_chunks,
-                released_bytes: pool_bytes,
-            });
-            released.push(chunks);
-        }
-        drop(states);
-        drop(released);
-        Ok(DynamicPoolQuarantineReleaseReceipt {
-            pools: receipts,
-            released_chunks,
-            released_bytes,
-        })
-    }
+pub(super) struct DynamicDeviceCapacityBlocked {
+    pub(super) pressure: DeviceCapacityPressure,
+    pub(super) availability: DeviceCapacityAvailabilitySnapshot,
+    pub(super) planned_domains: Vec<CapacityDomainId>,
 }
 
 impl DynamicPoolGrowthReceipt {
@@ -970,8 +510,10 @@ impl DynamicPoolGrowthRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DynamicPoolGrowthBatchReceipt {
-    growths: Vec<DynamicPoolGrowthReceipt>,
+    pub(super) growths: Vec<DynamicPoolGrowthReceipt>,
     capacity_epoch: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) rebalance: Option<DynamicPoolRebalanceReceipt>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1070,16 +612,21 @@ impl DynamicPoolGrowthBatchReceipt {
     pub const fn capacity_epoch(&self) -> u64 {
         self.capacity_epoch
     }
+
+    pub const fn rebalance(&self) -> Option<&DynamicPoolRebalanceReceipt> {
+        self.rebalance.as_ref()
+    }
 }
 
-enum DynamicPoolGrowthIntent {
+#[derive(Clone)]
+pub(super) enum DynamicPoolGrowthIntent {
     Additional(DynamicPoolGrowthRequest),
     Minimum(DynamicBackingPoolId),
     RevalidatedDeferral(DynamicBackingBlocker),
 }
 
 impl DynamicPoolGrowthIntent {
-    fn pool_id(&self) -> &DynamicBackingPoolId {
+    pub(super) fn pool_id(&self) -> &DynamicBackingPoolId {
         match self {
             Self::Additional(request) => request.pool_id(),
             Self::Minimum(pool_id) => pool_id,
@@ -1100,6 +647,13 @@ where
 
 struct AllocatedDynamicGrowth<B> {
     backing: Arc<ResidentChunkBacking<B>>,
+}
+
+#[derive(Clone)]
+struct IdleChunkReclaimCandidate {
+    pool_index: usize,
+    chunk: BackingChunkIdentity,
+    chunk_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -1491,7 +1045,272 @@ where
         Ok(epochs)
     }
 
-    fn maintain_pools(
+    /// Rebalances only whole, unreferenced chunks from non-target pools. The
+    /// batch is selected before mutation, logical totals publish atomically,
+    /// and physical grants are returned only after every pool lock is dropped.
+    pub(super) fn reclaim_idle_chunks_for_pressure(
+        &self,
+        pressure: &DeviceCapacityPressure,
+        excluded_domains: &[CapacityDomainId],
+    ) -> Result<Option<DynamicPoolRebalanceReceipt>, VNextError> {
+        if pressure.device_id() != self.runtime.descriptor().id.to_string() {
+            return Err(invalid_resource(
+                "dynamic pool rebalance received pressure for another device",
+            ));
+        }
+        let deficit = pressure
+            .requested_bytes()
+            .checked_sub(pressure.available_bytes())
+            .ok_or_else(|| invalid_resource("dynamic pool pressure has no reclaimable deficit"))?;
+        if deficit == 0 {
+            return Err(invalid_resource(
+                "dynamic pool pressure has an empty reclaimable deficit",
+            ));
+        }
+
+        let excluded_domains = excluded_domains
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let pools = self.pools.values().cloned().collect::<Vec<_>>();
+        let maintenance = pools
+            .iter()
+            .map(|pool| {
+                pool.maintenance
+                    .lock()
+                    .map_err(|_| invalid_resource("dynamic pool maintenance authority is poisoned"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut states = pools
+            .iter()
+            .map(|pool| {
+                pool.state
+                    .lock()
+                    .map_err(|_| invalid_resource("dynamic backing pool is poisoned"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let logical = self.logical_admission.snapshot()?;
+        let used_by_domain = logical
+            .domains()
+            .iter()
+            .map(|domain| (domain.domain(), domain.used().get()))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut candidates = Vec::new();
+        let mut reclaimable_by_pool = vec![0_u64; pools.len()];
+        for (pool_index, (pool, state)) in pools.iter().zip(states.iter()).enumerate() {
+            if state.poisoned {
+                return Err(invalid_resource("dynamic backing pool is fail-closed"));
+            }
+            if excluded_domains.contains(&pool.domain.domain_id) || state.pending_growth_bytes != 0
+            {
+                continue;
+            }
+            let used = used_by_domain
+                .get(&pool.domain.domain_id)
+                .copied()
+                .ok_or_else(|| invalid_resource("dynamic pool domain is absent from admission"))?;
+            let resident_floor = pool
+                .domain
+                .pool
+                .provisioning()
+                .minimum_resident_bytes()
+                .max(used);
+            let reclaimable = state.resident_bytes.saturating_sub(resident_floor);
+            reclaimable_by_pool[pool_index] = reclaimable;
+            if reclaimable == 0 {
+                continue;
+            }
+            for (&ordinal, chunk) in &state.chunks {
+                let chunk_bytes = chunk.backing._grant.bytes();
+                let full_extent = state.allocator.by_offset.get(&(ordinal, 0));
+                if chunk.live_segments != 0
+                    || Arc::strong_count(&chunk.backing) != 1
+                    || chunk_bytes > reclaimable
+                    || chunk.backing.descriptor.size_bytes != chunk_bytes
+                    || full_extent.is_none_or(|extent| {
+                        extent.chunk_generation != chunk.backing.identity.generation()
+                            || extent.length_bytes != chunk_bytes
+                    })
+                {
+                    continue;
+                }
+                candidates.push(IdleChunkReclaimCandidate {
+                    pool_index,
+                    chunk: chunk.backing.identity.clone(),
+                    chunk_bytes,
+                });
+            }
+        }
+
+        let mut selected = Vec::<IdleChunkReclaimCandidate>::new();
+        let mut selected_by_pool = vec![0_u64; pools.len()];
+        let mut reclaimed_bytes = 0_u64;
+        let best_single = candidates
+            .iter()
+            .filter(|candidate| candidate.chunk_bytes >= deficit)
+            .min_by(|left, right| {
+                left.chunk_bytes
+                    .cmp(&right.chunk_bytes)
+                    .then_with(|| left.pool_index.cmp(&right.pool_index))
+                    .then_with(|| right.chunk.ordinal().cmp(&left.chunk.ordinal()))
+            })
+            .cloned();
+        if let Some(candidate) = best_single {
+            selected_by_pool[candidate.pool_index] = candidate.chunk_bytes;
+            reclaimed_bytes = candidate.chunk_bytes;
+            selected.push(candidate);
+        } else {
+            candidates.sort_by(|left, right| {
+                right
+                    .chunk_bytes
+                    .cmp(&left.chunk_bytes)
+                    .then_with(|| left.pool_index.cmp(&right.pool_index))
+                    .then_with(|| right.chunk.ordinal().cmp(&left.chunk.ordinal()))
+            });
+            for candidate in candidates {
+                let next_pool_total = selected_by_pool[candidate.pool_index]
+                    .checked_add(candidate.chunk_bytes)
+                    .ok_or_else(|| invalid_resource("dynamic reclaim bytes overflow u64"))?;
+                if next_pool_total > reclaimable_by_pool[candidate.pool_index] {
+                    continue;
+                }
+                selected_by_pool[candidate.pool_index] = next_pool_total;
+                reclaimed_bytes = reclaimed_bytes
+                    .checked_add(candidate.chunk_bytes)
+                    .ok_or_else(|| invalid_resource("dynamic reclaim bytes overflow u64"))?;
+                selected.push(candidate);
+                if reclaimed_bytes >= deficit {
+                    break;
+                }
+            }
+        }
+        if reclaimed_bytes < deficit {
+            return Ok(None);
+        }
+        selected.sort_by(|left, right| {
+            left.pool_index
+                .cmp(&right.pool_index)
+                .then_with(|| left.chunk.ordinal().cmp(&right.chunk.ordinal()))
+        });
+
+        for candidate in &selected {
+            let state = &states[candidate.pool_index];
+            let chunk = state
+                .chunks
+                .get(&candidate.chunk.ordinal())
+                .ok_or_else(|| invalid_resource("selected dynamic reclaim chunk disappeared"))?;
+            let extent = state
+                .allocator
+                .by_offset
+                .get(&(candidate.chunk.ordinal(), 0))
+                .ok_or_else(|| invalid_resource("selected dynamic reclaim extent disappeared"))?;
+            if chunk.live_segments != 0
+                || Arc::strong_count(&chunk.backing) != 1
+                || chunk.backing.identity != candidate.chunk
+                || extent.chunk_generation != candidate.chunk.generation()
+                || extent.length_bytes != candidate.chunk_bytes
+            {
+                return Err(invalid_resource(
+                    "selected dynamic reclaim chunk changed before publication",
+                ));
+            }
+        }
+
+        let published_totals = states
+            .iter()
+            .zip(&selected_by_pool)
+            .map(|(state, &selected_bytes)| {
+                state
+                    .resident_bytes
+                    .checked_sub(selected_bytes)
+                    .ok_or_else(|| invalid_resource("dynamic reclaim resident bytes underflow"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut removed = Vec::with_capacity(selected.len());
+        for candidate in &selected {
+            let state = &mut states[candidate.pool_index];
+            let extent = state
+                .allocator
+                .remove_extent(candidate.chunk.ordinal(), 0)
+                .expect("validated idle chunk retains its exact full extent");
+            debug_assert_eq!(extent.chunk_generation, candidate.chunk.generation());
+            debug_assert_eq!(extent.length_bytes, candidate.chunk_bytes);
+            let chunk = state
+                .chunks
+                .remove(&candidate.chunk.ordinal())
+                .expect("validated idle chunk remains resident");
+            removed.push((candidate.clone(), chunk));
+        }
+        let updates = selected_by_pool
+            .iter()
+            .enumerate()
+            .filter(|(_, selected_bytes)| **selected_bytes != 0)
+            .map(|(pool_index, _)| {
+                (
+                    pools[pool_index].domain.domain_id,
+                    CapacityUnits::new(published_totals[pool_index]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let epochs = match self.logical_admission.set_domain_totals(&updates) {
+            Ok(epochs) => epochs,
+            Err(error) => {
+                for (candidate, chunk) in removed.drain(..).rev() {
+                    let state = &mut states[candidate.pool_index];
+                    state
+                        .allocator
+                        .insert_extent(
+                            candidate.chunk.ordinal(),
+                            candidate.chunk.generation(),
+                            0,
+                            candidate.chunk_bytes,
+                        )
+                        .expect("unpublished idle chunk extent can be restored");
+                    assert!(state
+                        .chunks
+                        .insert(candidate.chunk.ordinal(), chunk)
+                        .is_none());
+                }
+                return Err(error);
+            }
+        };
+        for (state, &published_total) in states.iter_mut().zip(&published_totals) {
+            state.resident_bytes = published_total;
+        }
+
+        let mut pool_receipts = Vec::new();
+        for (pool_index, &pool_reclaimed_bytes) in selected_by_pool.iter().enumerate() {
+            if pool_reclaimed_bytes == 0 {
+                continue;
+            }
+            pool_receipts.push(DynamicPoolIdleReclaim {
+                pool_id: pools[pool_index].domain.pool_id().clone(),
+                chunks: selected
+                    .iter()
+                    .filter(|candidate| candidate.pool_index == pool_index)
+                    .map(|candidate| candidate.chunk.clone())
+                    .collect(),
+                reclaimed_bytes: pool_reclaimed_bytes,
+                published_capacity_bytes: published_totals[pool_index],
+            });
+        }
+        let reclaimed_chunks = selected.len();
+        drop(states);
+        drop(maintenance);
+        drop(removed);
+        let availability = self.budget.availability_snapshot()?;
+        Ok(Some(DynamicPoolRebalanceReceipt {
+            pools: pool_receipts,
+            reclaimed_chunks,
+            reclaimed_bytes,
+            logical_capacity_epoch: epochs.capacity_epoch(),
+            plan_device_capacity_epoch: availability.plan_epoch(),
+            process_device_capacity_epoch: availability.process_epoch(),
+        }))
+    }
+
+    pub(super) fn maintain_pools(
         &self,
         intents: Vec<DynamicPoolGrowthIntent>,
     ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
@@ -1499,7 +1318,7 @@ where
         self.maintain_pools_observed(intents, &mut ignored_capacity_block)
     }
 
-    fn maintain_pools_observed(
+    pub(super) fn maintain_pools_observed(
         &self,
         mut intents: Vec<DynamicPoolGrowthIntent>,
         capacity_blocked: &mut Option<DynamicDeviceCapacityBlocked>,
@@ -1655,6 +1474,7 @@ where
             return Ok(DynamicPoolGrowthBatchReceipt {
                 growths: Vec::new(),
                 capacity_epoch: self.logical_admission.epochs()?.capacity_epoch(),
+                rebalance: None,
             });
         }
 
@@ -1869,6 +1689,7 @@ where
                 )
                 .collect(),
             capacity_epoch: epochs.capacity_epoch(),
+            rebalance: None,
         })
     }
 

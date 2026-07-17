@@ -788,6 +788,9 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
                     current: self.epochs(),
                     pools_grown: 1,
                     allocated_bytes: 4096,
+                    pools_reclaimed: 0,
+                    chunks_reclaimed: 0,
+                    reclaimed_bytes: 0,
                 })
             }
             TestMaintenanceBehavior::WaitForRelease => {
