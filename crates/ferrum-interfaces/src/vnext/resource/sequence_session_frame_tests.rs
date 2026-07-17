@@ -51,7 +51,8 @@ fn active_candidate(next_frame: u64, fingerprint: &str) -> SequenceFrameCandidat
 
 fn retire(holds: &mut [SessionFrameHold]) -> Vec<StepParticipantRetirementDisposition> {
     let mut references = holds.iter_mut().collect::<Vec<_>>();
-    finalize_session_frames(&mut references, false).expect("test frame retires")
+    finalize_session_frames(&mut references, StepFrameFinalization::Commit)
+        .expect("test frame retires")
 }
 
 fn flight_candidate(
@@ -181,7 +182,7 @@ fn explicit_frame_abort_clears_the_hold_but_keeps_the_session_fail_closed() {
     let mut holds = acquire_session_frames(std::slice::from_ref(&candidate), step(1)).unwrap();
     let mut references = holds.iter_mut().collect::<Vec<_>>();
     assert_eq!(
-        finalize_session_frames(&mut references, true).unwrap(),
+        finalize_session_frames(&mut references, StepFrameFinalization::Abort).unwrap(),
         vec![StepParticipantRetirementDisposition::Aborted]
     );
     drop(references);
@@ -196,6 +197,38 @@ fn explicit_frame_abort_clears_the_hold_but_keeps_the_session_fail_closed() {
     assert_eq!(active.next_frame, Some(frame(2)));
     drop(state);
     assert!(acquire_session_frames(std::slice::from_ref(&candidate), step(2)).is_err());
+}
+
+#[test]
+fn unsubmitted_frame_rollback_keeps_the_session_open_for_retry() {
+    let candidate = active_candidate(1, "session-capacity-retry");
+    let mut first = acquire_session_frames(std::slice::from_ref(&candidate), step(1)).unwrap();
+    let mut references = first.iter_mut().collect::<Vec<_>>();
+    assert_eq!(
+        finalize_session_frames(&mut references, StepFrameFinalization::RollbackUnsubmitted,)
+            .unwrap(),
+        vec![StepParticipantRetirementDisposition::RolledBackUnsubmitted]
+    );
+    drop(references);
+    drop(first);
+
+    {
+        let state = candidate.slot.state.lock().unwrap();
+        let SequenceSessionSlotState::Active(active) = &*state else {
+            unreachable!();
+        };
+        assert_eq!(active.phase, SequenceSessionPhase::Open);
+        assert_eq!(active.active_frame, None);
+        assert_eq!(active.retired_frames, 0);
+        assert_eq!(active.next_frame, Some(frame(2)));
+    }
+
+    let mut retry = acquire_session_frames(std::slice::from_ref(&candidate), step(2)).unwrap();
+    assert_eq!(retry[0].frame_id, frame(2));
+    assert_eq!(
+        retire(&mut retry),
+        vec![StepParticipantRetirementDisposition::Committed]
+    );
 }
 
 #[test]

@@ -22,8 +22,9 @@ use super::{
     RequestIdentity, ResourceId, RunId, SequenceAuthorityId, SequenceBackingSnapshot,
     SequenceExecutionAuthoritySource, SequenceRecoveryRegistry, SequenceSessionEpoch,
     SequenceSessionFingerprint, Serialize, Sha256, StaticProvisioningLease,
-    StepAdmissionBackingDeferral, StepFinalizationFailure, StepParticipantFrameAssignment,
-    StepParticipantRetirement, StepParticipantRetirementDisposition, StepResourceAdmissionDecision,
+    StepAdmissionBackingDeferral, StepFinalizationFailure, StepFrameFinalization,
+    StepParticipantFrameAssignment, StepParticipantRetirement,
+    StepParticipantRetirementDisposition, StepResourceAdmissionDecision,
     StepResourceAdmissionRequest, StepResourceLease, StepRetirementReceipt, StreamState,
     TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError, SEQUENCE_DISPATCH_POISONED_BIT,
 };
@@ -163,16 +164,25 @@ where
     pub fn try_retire_normal(
         self: Arc<Self>,
     ) -> Result<StepRetirementReceipt, StepFinalizationFailure<R>> {
-        Self::try_finalize(self, false)
+        Self::try_finalize(self, StepFrameFinalization::Commit)
     }
 
     pub fn try_abort(self: Arc<Self>) -> Result<StepRetirementReceipt, StepFinalizationFailure<R>> {
-        Self::try_finalize(self, true)
+        Self::try_finalize(self, StepFrameFinalization::Abort)
+    }
+
+    /// Releases a capacity-deferred step before any invocation was prepared or
+    /// submitted. Unlike `try_abort`, this leaves every participant session open
+    /// so the scheduler can retry after the exact capacity source advances.
+    pub fn try_rollback_unsubmitted(
+        self: Arc<Self>,
+    ) -> Result<StepRetirementReceipt, StepFinalizationFailure<R>> {
+        Self::try_finalize(self, StepFrameFinalization::RollbackUnsubmitted)
     }
 
     fn try_finalize(
         step: Arc<Self>,
-        abort: bool,
+        finalization: StepFrameFinalization,
     ) -> Result<StepRetirementReceipt, StepFinalizationFailure<R>> {
         let mut step = match Arc::try_unwrap(step) {
             Ok(step) => step,
@@ -185,7 +195,15 @@ where
                 });
             }
         };
-        let dispositions = match step.finalize_participants(abort) {
+        if finalization == StepFrameFinalization::RollbackUnsubmitted {
+            if let Err(error) = step.invocation_registry.ensure_pristine_for_step_rollback() {
+                return Err(StepFinalizationFailure {
+                    step: Arc::new(step),
+                    error,
+                });
+            }
+        }
+        let dispositions = match step.finalize_participants(finalization) {
             Ok(dispositions) => dispositions,
             Err(error) => {
                 return Err(StepFinalizationFailure {
@@ -215,7 +233,7 @@ where
 
     fn finalize_participants(
         &mut self,
-        abort: bool,
+        finalization: StepFrameFinalization,
     ) -> Result<Vec<StepParticipantRetirementDisposition>, VNextError> {
         if self.finalized {
             return Err(invalid_resource("step resources are already finalized"));
@@ -225,7 +243,7 @@ where
             .iter_mut()
             .map(|participant| &mut participant.frame)
             .collect::<Vec<_>>();
-        let dispositions = finalize_session_frames(&mut holds, abort)?;
+        let dispositions = finalize_session_frames(&mut holds, finalization)?;
         self.finalized = true;
         Ok(dispositions)
     }

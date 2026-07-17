@@ -2594,9 +2594,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let wave = match self.prepare_wave_for_spans_with_capacity(&step, spans)? {
             VNextExecutionCapacityDecision::Ready(wave) => wave,
             VNextExecutionCapacityDecision::Deferred(deferred) => {
-                step.try_abort().map_err(|failure| {
+                step.try_rollback_unsubmitted().map_err(|failure| {
                     FerrumError::backend(format!(
-                        "vNext capacity-deferred unsubmitted step abort failed: {}",
+                        "vNext capacity-deferred unsubmitted step rollback failed: {}",
                         failure.error()
                     ))
                 })?;
