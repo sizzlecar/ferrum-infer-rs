@@ -37,7 +37,8 @@ SERVER_POLICY = {
     "calibration_max_num_batched_tokens": CALIBRATION_TOKEN_BUDGET,
     "target_max_num_batched_tokens": TARGET_TOKEN_BUDGET,
     "calibration_max_tokens": CALIBRATION_MAX_TOKENS,
-    "target_prewarm_max_tokens": CALIBRATION_MAX_TOKENS,
+    "target_sizing_max_tokens": CALIBRATION_MAX_TOKENS,
+    "target_budget_derivation": "per_pool_maximum",
     "target_max_tokens": TARGET_MAX_TOKENS,
 }
 STOP_POLICY = {
@@ -55,6 +56,116 @@ class DecodeCapacityGateError(common.CapacityGateError):
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise DecodeCapacityGateError(message)
+
+
+def derive_target_budget_envelope(
+    calibration: dict[str, Any], target_sizing: dict[str, Any]
+) -> dict[str, Any]:
+    require(
+        target_sizing.get("static_bytes") == calibration.get("static_bytes"),
+        "target sizing static bytes differ from calibration",
+    )
+    calibration_pools = calibration.get("pool_resident_bytes")
+    sizing_pools = target_sizing.get("pool_resident_bytes")
+    calibration_envelopes = calibration.get("pool_envelopes")
+    sizing_envelopes = target_sizing.get("pool_envelopes")
+    require(
+        isinstance(calibration_pools, dict)
+        and isinstance(sizing_pools, dict)
+        and calibration_pools.keys() == sizing_pools.keys(),
+        "target sizing pool identities differ from calibration",
+    )
+    require(
+        isinstance(calibration_envelopes, dict)
+        and isinstance(sizing_envelopes, dict)
+        and calibration_envelopes.keys() == sizing_envelopes.keys(),
+        "target sizing pool envelopes differ from calibration",
+    )
+
+    pool_resident_bytes: dict[str, int] = {}
+    pool_sources: dict[str, str] = {}
+    pool_storage_profiles: dict[str, Any] = {}
+    for pool_id in sorted(calibration_pools):
+        calibration_bytes = calibration_pools[pool_id]
+        sizing_bytes = sizing_pools[pool_id]
+        require(
+            isinstance(calibration_bytes, int)
+            and calibration_bytes >= 0
+            and isinstance(sizing_bytes, int)
+            and sizing_bytes >= 0,
+            f"invalid sizing residency for {pool_id}",
+        )
+        calibration_profile = calibration_envelopes[pool_id].get("storage_profile")
+        sizing_profile = sizing_envelopes[pool_id].get("storage_profile")
+        require(
+            calibration_profile == sizing_profile,
+            f"target sizing storage profile differs for {pool_id}",
+        )
+        pool_resident_bytes[pool_id] = max(calibration_bytes, sizing_bytes)
+        if calibration_bytes > sizing_bytes:
+            pool_sources[pool_id] = "calibration"
+        elif sizing_bytes > calibration_bytes:
+            pool_sources[pool_id] = "target_sizing"
+        else:
+            pool_sources[pool_id] = "equal"
+        pool_storage_profiles[pool_id] = calibration_profile
+
+    static_bytes = calibration.get("static_bytes")
+    require(isinstance(static_bytes, int) and static_bytes > 0, "invalid sizing static bytes")
+    resident_bytes = sum(pool_resident_bytes.values())
+    exact_budget = static_bytes + resident_bytes
+    require(
+        exact_budget >= calibration.get("budget_claimed_bytes", 0)
+        and exact_budget >= target_sizing.get("budget_claimed_bytes", 0),
+        "derived target budget is smaller than a sizing receipt",
+    )
+    return {
+        "static_bytes": static_bytes,
+        "resident_bytes": resident_bytes,
+        "budget_claimed_bytes": exact_budget,
+        "pool_resident_bytes": pool_resident_bytes,
+        "pool_sources": pool_sources,
+        "pool_storage_profiles": pool_storage_profiles,
+    }
+
+
+def require_target_pool_within_envelope(
+    target: dict[str, Any], envelope: dict[str, Any], exact_budget: int
+) -> None:
+    require(
+        target.get("static_bytes") == envelope.get("static_bytes"),
+        "target static bytes differ from its sizing envelope",
+    )
+    target_pools = target.get("pool_resident_bytes")
+    target_envelopes = target.get("pool_envelopes")
+    limits = envelope.get("pool_resident_bytes")
+    profiles = envelope.get("pool_storage_profiles")
+    require(
+        isinstance(target_pools, dict)
+        and isinstance(limits, dict)
+        and target_pools.keys() == limits.keys(),
+        "target pool identities differ from its sizing envelope",
+    )
+    require(
+        isinstance(target_envelopes, dict)
+        and isinstance(profiles, dict)
+        and target_envelopes.keys() == target_pools.keys()
+        and profiles.keys() == target_pools.keys(),
+        "target sizing profiles are missing",
+    )
+    for pool_id, resident_bytes in target_pools.items():
+        require(
+            isinstance(resident_bytes, int) and 0 <= resident_bytes <= limits[pool_id],
+            f"target pool {pool_id} exceeded its sizing envelope",
+        )
+        require(
+            target_envelopes[pool_id].get("storage_profile") == profiles[pool_id],
+            f"target pool {pool_id} changed storage profile",
+        )
+    require(
+        target.get("budget_claimed_bytes", exact_budget + 1) <= exact_budget,
+        "target installed backing exceeded the derived exact budget",
+    )
 
 
 def source_key(source: Any) -> str:
@@ -403,7 +514,7 @@ def collect(args: argparse.Namespace) -> int:
     require(not out.exists(), f"collection output already exists: {out}")
     require(binary.is_file(), f"missing binary: {binary}")
     require(model.is_dir(), f"missing model directory: {model}")
-    require(args.port < 65535, "base port leaves no target-server port")
+    require(args.port < 65534, "base port leaves no sizing/target-server ports")
     require(
         0 < args.request_timeout <= STOP_POLICY["joint_stream_timeout_seconds"],
         "request timeout exceeds the bounded stop policy",
@@ -491,7 +602,7 @@ def collect(args: argparse.Namespace) -> int:
         calibration_pool = common.quiescent_pool_snapshot(
             calibration_executor, "decode calibration"
         )
-        exact_budget = calibration_pool["budget_claimed_bytes"]
+        calibration_budget = calibration_pool["budget_claimed_bytes"]
         collection["calibration"] = {
             "clients": calibration_clients,
             "monitor": calibration_monitor,
@@ -499,51 +610,71 @@ def collect(args: argparse.Namespace) -> int:
             "health_final": "calibration/health.final.json",
             "trace": "calibration/scheduler-trace.jsonl",
         }
-        collection["exact_budget_bytes"] = exact_budget
+        collection["calibration_budget_bytes"] = calibration_budget
         calibration.stop()
+
+        target_sizing = server_session(
+            repo=repo,
+            binary=binary,
+            model=model,
+            port=args.port + 1,
+            out_dir=out / "target-sizing",
+            runtime_budget=calibration_budget,
+            max_num_batched_tokens=TARGET_TOKEN_BUDGET,
+            startup_timeout=args.startup_timeout,
+        )
+        sessions.append(target_sizing)
+        sizing_trace_baseline = (
+            target_sizing.trace_path.stat().st_size
+            if target_sizing.trace_path.is_file()
+            else 0
+        )
+        tasks = start_stream_group(
+            target_sizing,
+            out_dir=out / "target-sizing" / "clients",
+            prefix="target-sizing",
+            max_tokens_by_slot=CALIBRATION_MAX_TOKENS,
+            timeout=args.request_timeout,
+        )
+        sizing_clients, sizing_monitor = wait_stream_group(
+            tasks,
+            trace_path=target_sizing.trace_path,
+            trace_baseline_bytes=sizing_trace_baseline,
+            timeout=args.request_timeout,
+        )
+        tasks = {}
+        sizing_health = target_sizing.health("health.final.json")
+        sizing_executor = common.find_executor_snapshot(sizing_health)
+        require(sizing_executor is not None, "target sizing health has no vNext executor")
+        sizing_pool = common.quiescent_pool_snapshot(
+            sizing_executor, "decode target sizing"
+        )
+        collection["target_sizing"] = {
+            "clients": sizing_clients,
+            "monitor": sizing_monitor,
+            "pool_snapshot": sizing_pool,
+            "health_final": "target-sizing/health.final.json",
+            "trace": "target-sizing/scheduler-trace.jsonl",
+        }
+        target_budget_envelope = derive_target_budget_envelope(
+            calibration_pool, sizing_pool
+        )
+        exact_budget = target_budget_envelope["budget_claimed_bytes"]
+        collection["target_budget_envelope"] = target_budget_envelope
+        collection["exact_budget_bytes"] = exact_budget
+        target_sizing.stop()
 
         target = server_session(
             repo=repo,
             binary=binary,
             model=model,
-            port=args.port + 1,
+            port=args.port + 2,
             out_dir=out / "target",
             runtime_budget=exact_budget,
             max_num_batched_tokens=TARGET_TOKEN_BUDGET,
             startup_timeout=args.startup_timeout,
         )
         sessions.append(target)
-        prewarm_trace_baseline = (
-            target.trace_path.stat().st_size if target.trace_path.is_file() else 0
-        )
-        tasks = start_stream_group(
-            target,
-            out_dir=out / "target-prewarm" / "clients",
-            prefix="target-prewarm",
-            max_tokens_by_slot=CALIBRATION_MAX_TOKENS,
-            timeout=args.request_timeout,
-        )
-        prewarm_clients, prewarm_monitor = wait_stream_group(
-            tasks,
-            trace_path=target.trace_path,
-            trace_baseline_bytes=prewarm_trace_baseline,
-            timeout=args.request_timeout,
-        )
-        tasks = {}
-        prewarm_health = target.health("health.prewarm.json")
-        prewarm_executor = common.find_executor_snapshot(prewarm_health)
-        require(prewarm_executor is not None, "target prewarm health has no vNext executor")
-        prewarm_pool = common.quiescent_pool_snapshot(
-            prewarm_executor, "decode target prewarm"
-        )
-        collection["target_prewarm"] = {
-            "clients": prewarm_clients,
-            "monitor": prewarm_monitor,
-            "pool_snapshot": prewarm_pool,
-            "health_final": "target/health.prewarm.json",
-            "trace": "target/scheduler-trace.jsonl",
-        }
-        common.require_replayed_pool_snapshot(calibration_pool, prewarm_pool, exact_budget)
         target_trace_baseline = target.trace_path.stat().st_size if target.trace_path.is_file() else 0
         tasks = start_stream_group(
             target,
@@ -573,7 +704,9 @@ def collect(args: argparse.Namespace) -> int:
             "health_final": "target/health.final.json",
             "trace": "target/scheduler-trace.jsonl",
         }
-        common.require_replayed_pool_snapshot(calibration_pool, target_pool, exact_budget)
+        require_target_pool_within_envelope(
+            target_pool, target_budget_envelope, exact_budget
+        )
         decode_summary = validate_decode_trace(
             common.read_trace(target.trace_path),
             started_wall_ns=target_started,
@@ -676,49 +809,69 @@ def validate(root: Path, out: Path) -> int:
     require("Qwen3.5-4B" in str(collection.get("model_path")), "artifact model is not Qwen3.5-4B")
 
     calibration = collection.get("calibration")
-    target_prewarm = collection.get("target_prewarm")
+    target_sizing = collection.get("target_sizing")
     target = collection.get("target")
     require(
         isinstance(calibration, dict)
-        and isinstance(target_prewarm, dict)
+        and isinstance(target_sizing, dict)
         and isinstance(target, dict),
         "scenario summaries are missing",
     )
     calibration_health = common.read_json(root / str(calibration.get("health_final")))
-    prewarm_health = common.read_json(root / str(target_prewarm.get("health_final")))
+    sizing_health = common.read_json(root / str(target_sizing.get("health_final")))
     target_health = common.read_json(root / str(target.get("health_final")))
     calibration_executor = common.find_executor_snapshot(calibration_health)
-    prewarm_executor = common.find_executor_snapshot(prewarm_health)
+    sizing_executor = common.find_executor_snapshot(sizing_health)
     target_executor = common.find_executor_snapshot(target_health)
     require(
         calibration_executor is not None
-        and prewarm_executor is not None
+        and sizing_executor is not None
         and target_executor is not None,
         "raw executor snapshots are missing",
     )
     for identity in ("model_id", "family_fingerprint", "program_fingerprint", "plan_hash"):
         require(
             calibration_executor.get(identity)
-            == prewarm_executor.get(identity)
+            == sizing_executor.get(identity)
             == target_executor.get(identity),
-            f"calibration/prewarm/target changed {identity}",
+            f"calibration/sizing/target changed {identity}",
         )
     calibration_pool = common.quiescent_pool_snapshot(calibration_executor, "raw decode calibration")
-    prewarm_pool = common.quiescent_pool_snapshot(prewarm_executor, "raw decode target prewarm")
+    sizing_pool = common.quiescent_pool_snapshot(sizing_executor, "raw decode target sizing")
     target_pool = common.quiescent_pool_snapshot(target_executor, "raw decode target")
+    calibration_budget = collection.get("calibration_budget_bytes")
     exact_budget = collection.get("exact_budget_bytes")
     require(
-        isinstance(exact_budget, int) and exact_budget == calibration_pool["budget_claimed_bytes"],
-        "exact budget does not match calibrated installed backing",
+        isinstance(calibration_budget, int)
+        and calibration_budget == calibration_pool["budget_claimed_bytes"],
+        "calibration budget does not match its installed backing",
     )
     require(calibration.get("pool_snapshot") == calibration_pool, "calibration summary differs from raw health")
     require(
-        target_prewarm.get("pool_snapshot") == prewarm_pool,
-        "target prewarm summary differs from raw health",
+        target_sizing.get("pool_snapshot") == sizing_pool,
+        "target sizing summary differs from raw health",
     )
     require(target.get("pool_snapshot") == target_pool, "target summary differs from raw health")
-    common.require_replayed_pool_snapshot(calibration_pool, prewarm_pool, exact_budget)
-    common.require_replayed_pool_snapshot(calibration_pool, target_pool, exact_budget)
+    target_budget_envelope = derive_target_budget_envelope(calibration_pool, sizing_pool)
+    require(
+        collection.get("target_budget_envelope") == target_budget_envelope,
+        "target budget envelope differs from raw sizing receipts",
+    )
+    require(
+        isinstance(exact_budget, int)
+        and exact_budget == target_budget_envelope["budget_claimed_bytes"],
+        "exact budget does not match the target-compatible sizing envelope",
+    )
+    require_target_pool_within_envelope(
+        target_pool, target_budget_envelope, exact_budget
+    )
+    sizing_policy = sizing_executor.get("runtime_memory_policy")
+    require(isinstance(sizing_policy, dict), "target sizing runtime memory policy is missing")
+    require(
+        sizing_policy.get("capacity_bytes", 0) - sizing_policy.get("reserve_bytes", 0)
+        == calibration_budget,
+        "target sizing runtime did not use the narrow calibration budget",
+    )
     policy = target_executor.get("runtime_memory_policy")
     require(isinstance(policy, dict), "target runtime memory policy is missing")
     require(
@@ -729,8 +882,8 @@ def validate(root: Path, out: Path) -> int:
     calibration_started, calibration_finished, calibration_silence = validate_stream_group(
         root, "calibration", calibration.get("clients"), CALIBRATION_MAX_TOKENS
     )
-    prewarm_started, prewarm_finished, prewarm_silence = validate_stream_group(
-        root, "target-prewarm", target_prewarm.get("clients"), CALIBRATION_MAX_TOKENS
+    sizing_started, sizing_finished, sizing_silence = validate_stream_group(
+        root, "target-sizing", target_sizing.get("clients"), CALIBRATION_MAX_TOKENS
     )
     target_started, target_finished, target_silence = validate_stream_group(
         root, "target", target.get("clients"), TARGET_MAX_TOKENS
@@ -740,7 +893,7 @@ def validate(root: Path, out: Path) -> int:
             slot,
             {
                 "calibration": calibration["clients"][slot],
-                "target-prewarm": target_prewarm["clients"][slot],
+                "target-sizing": target_sizing["clients"][slot],
                 "target": target["clients"][slot],
             },
         )
@@ -754,16 +907,17 @@ def validate(root: Path, out: Path) -> int:
         ),
         "single-token calibration unexpectedly hit decode capacity pressure",
     )
-    target_rows = common.read_trace(root / str(target.get("trace")))
+    sizing_rows = common.read_trace(root / str(target_sizing.get("trace")))
     require(
         not any(
             row.get("phase") == "vnext.decode_capacity_deferred"
             and isinstance(row.get("ts_unix_nanos"), int)
-            and prewarm_started <= row["ts_unix_nanos"] <= prewarm_finished
-            for row in target_rows
+            and sizing_started <= row["ts_unix_nanos"] <= sizing_finished
+            for row in sizing_rows
         ),
-        "target prewarm unexpectedly hit decode capacity pressure",
+        "target sizing unexpectedly hit decode capacity pressure",
     )
+    target_rows = common.read_trace(root / str(target.get("trace")))
     target_trace_path = root / str(target.get("trace"))
     target_trace_bytes = target_trace_path.stat().st_size
     require(target_trace_bytes <= STOP_POLICY["max_trace_bytes"], "target trace exceeds its byte ceiling")
@@ -829,11 +983,11 @@ def validate(root: Path, out: Path) -> int:
         "decode_summary": decode_summary,
         "target_trace_bytes": target_trace_bytes,
         "calibration_window_ns": [calibration_started, calibration_finished],
-        "target_prewarm_window_ns": [prewarm_started, prewarm_finished],
+        "target_sizing_window_ns": [sizing_started, sizing_finished],
         "target_window_ns": [target_started, target_finished],
         "max_silence_seconds": {
             "calibration": calibration_silence,
-            "target_prewarm": prewarm_silence,
+            "target_sizing": sizing_silence,
             "target": target_silence,
         },
         "does_not_prove": ["S1", "G04", "performance", "release"],
@@ -857,9 +1011,53 @@ def self_test() -> int:
         "calibration must replace only B long-decode demand with a short request",
     )
     require(
-        SERVER_POLICY["target_prewarm_max_tokens"] == CALIBRATION_MAX_TOKENS,
-        "target prewarm must replay the exact calibrated pool envelope",
+        SERVER_POLICY["target_sizing_max_tokens"] == CALIBRATION_MAX_TOKENS,
+        "target sizing must replay the narrow calibration workload",
     )
+
+    storage_profile = {"allocator": "linear_arena", "view": "contiguous"}
+
+    def pool_snapshot(pools: dict[str, int]) -> dict[str, Any]:
+        resident_bytes = sum(pools.values())
+        return {
+            "static_bytes": 100,
+            "resident_bytes": resident_bytes,
+            "budget_claimed_bytes": 100 + resident_bytes,
+            "pool_resident_bytes": pools,
+            "pool_envelopes": {
+                pool_id: {
+                    "resident_bytes": value,
+                    "resident_chunks": 1,
+                    "largest_contiguous_bytes": value,
+                    "storage_profile": storage_profile,
+                }
+                for pool_id, value in pools.items()
+            },
+        }
+
+    calibration_pool = pool_snapshot({"sequence": 30, "workspace": 4})
+    sizing_pool = pool_snapshot({"sequence": 20, "workspace": 7})
+    target_envelope = derive_target_budget_envelope(calibration_pool, sizing_pool)
+    require(
+        target_envelope["budget_claimed_bytes"] == 137,
+        "self-test lost target-compatible budget derivation",
+    )
+    require(
+        target_envelope["pool_sources"]
+        == {"sequence": "calibration", "workspace": "target_sizing"},
+        "self-test lost per-pool sizing provenance",
+    )
+    require_target_pool_within_envelope(
+        pool_snapshot({"sequence": 30, "workspace": 7}), target_envelope, 137
+    )
+    try:
+        require_target_pool_within_envelope(
+            pool_snapshot({"sequence": 31, "workspace": 7}), target_envelope, 137
+        )
+        raise AssertionError("oversized target pool unexpectedly fit its sizing envelope")
+    except common.CapacityGateError:
+        pass
+
     wait_condition = {
         "coordinator_id": 7,
         "observed": [{"source": {"domain": 5}, "epoch": 3}],
