@@ -256,9 +256,9 @@ impl EngineInner {
                                 "scheduler": self.scheduler.trace_snapshot(),
                             }));
                         }
-                        DecodeExecutionCapacityAction::RecomputeVictim {
-                            request_id: victim_id,
-                        } => {
+                        DecodeExecutionCapacityAction::RecomputeVictim { reservation } => {
+                            let victim_id = reservation.victim_request_id().clone();
+                            let progress_owner_id = reservation.progress_owner_id().clone();
                             self.trace_executor_decode_capacity_decision(
                                 &request_ids,
                                 &deferral,
@@ -266,8 +266,8 @@ impl EngineInner {
                                 Some(&victim_id),
                             );
                             if !self
-                                .defer_decode_for_capacity_recompute(
-                                    &victim_id,
+                                .defer_decode_for_capacity_recompute_reserved(
+                                    &reservation,
                                     request_ids.len().max(1),
                                     None,
                                 )
@@ -283,6 +283,7 @@ impl EngineInner {
                                 "event": "scheduler_execution_capacity_progress_recompute",
                                 "request_ids": &request_ids,
                                 "victim_request_id": victim_id,
+                                "progress_owner_id": progress_owner_id,
                                 "stage": deferral.stage(),
                                 "observed": observed,
                                 "wait_condition": deferral.wait_condition(),

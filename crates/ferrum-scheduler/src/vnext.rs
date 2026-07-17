@@ -205,6 +205,19 @@ pub enum AdmissionProbeOutcome<A, R, E> {
     Faulted(E),
 }
 
+/// Scheduler-owned eligibility for one waiting admission scan.
+///
+/// `Held` is distinct from a capacity deferral: the request must not consult
+/// the resource authority yet because another active request temporarily owns
+/// the progress made possible by its released physical state. Held entries are
+/// rotated without consuming probe or fairness budget, so later eligible work
+/// can still be admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionQueueEligibility {
+    Eligible,
+    Held,
+}
+
 /// Ownership changes emitted by one bounded scheduling tick.
 pub enum AdmissionQueueEvent<T, A, R, E> {
     Admitted {
@@ -244,6 +257,7 @@ pub enum AdmissionQueueEvent<T, A, R, E> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdmissionTickReceipt {
     probed: usize,
+    held: usize,
     skipped_unchanged: usize,
     admitted: usize,
     deferred: usize,
@@ -258,6 +272,10 @@ pub struct AdmissionTickReceipt {
 impl AdmissionTickReceipt {
     pub const fn probed(self) -> usize {
         self.probed
+    }
+
+    pub const fn held(self) -> usize {
+        self.held
     }
 
     pub const fn skipped_unchanged(self) -> usize {
@@ -406,13 +424,26 @@ impl<T> DynamicAdmissionQueue<T> {
     pub fn passive_wait_condition(
         &self,
     ) -> Result<Option<CapacityWaitCondition>, DynamicAdmissionQueueError> {
-        if self.waiting.is_empty() {
-            return Ok(None);
-        }
+        self.passive_wait_condition_for(|_| true)
+    }
 
+    /// Aggregate passive capacity waits for entries currently eligible to
+    /// consult the resource authority. Scheduler-owned held entries are
+    /// intentionally excluded: their progress dependency is represented by
+    /// the active owner, and treating their missing deferral as runnable would
+    /// force the engine to poll instead of waiting on that owner's exact source.
+    pub fn passive_wait_condition_for(
+        &self,
+        mut include: impl FnMut(&T) -> bool,
+    ) -> Result<Option<CapacityWaitCondition>, DynamicAdmissionQueueError> {
+        let mut included = 0usize;
         let mut coordinator_id: Option<LogicalAdmissionCoordinatorId> = None;
         let mut observed_by_source = BTreeMap::new();
         for entry in &self.waiting {
+            if !include(&entry.request) {
+                continue;
+            }
+            included += 1;
             let Some(deferral) = entry.deferral.as_ref() else {
                 return Ok(None);
             };
@@ -438,6 +469,9 @@ impl<T> DynamicAdmissionQueue<T> {
                     .or_insert(observed.epoch());
             }
         }
+        if included == 0 {
+            return Ok(None);
+        }
 
         let observed = observed_by_source
             .into_iter()
@@ -448,7 +482,7 @@ impl<T> DynamicAdmissionQueue<T> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         CapacityWaitCondition::new(
-            coordinator_id.expect("non-empty passive queue has one coordinator"),
+            coordinator_id.expect("non-empty included passive queue has one coordinator"),
             observed,
         )
         .map(Some)
@@ -659,6 +693,32 @@ impl<T> DynamicAdmissionQueue<T> {
         mut observe_skipped_unchanged: impl FnMut(&T, WaitingAdmissionTicket, &AdmissionDeferral),
         mut probe: impl FnMut(&mut T) -> AdmissionProbeOutcome<A, R, E>,
     ) -> Result<AdmissionTickReceipt, DynamicAdmissionQueueError> {
+        self.schedule_into_observed_with_eligibility(
+            wake,
+            maximum_probes,
+            maximum_admissions,
+            events,
+            |_, _| AdmissionQueueEligibility::Eligible,
+            |_, _| {},
+            &mut observe_skipped_unchanged,
+            &mut probe,
+        )
+    }
+
+    /// Admission scan with a scheduler-owned eligibility barrier evaluated
+    /// before the resource probe. Held entries stay queued and do not become a
+    /// fairness barrier; the scan continues so they cannot create global HOL.
+    pub fn schedule_into_observed_with_eligibility<A, R, E>(
+        &mut self,
+        wake: AdmissionWakeSnapshot<'_>,
+        maximum_probes: usize,
+        maximum_admissions: usize,
+        events: &mut Vec<AdmissionQueueEvent<T, A, R, E>>,
+        mut eligibility: impl FnMut(&T, WaitingAdmissionTicket) -> AdmissionQueueEligibility,
+        mut observe_held: impl FnMut(&T, WaitingAdmissionTicket),
+        mut observe_skipped_unchanged: impl FnMut(&T, WaitingAdmissionTicket, &AdmissionDeferral),
+        mut probe: impl FnMut(&mut T) -> AdmissionProbeOutcome<A, R, E>,
+    ) -> Result<AdmissionTickReceipt, DynamicAdmissionQueueError> {
         events.clear();
         let wake_epochs = wake.epochs();
         self.validate_wake(wake_epochs)?;
@@ -667,6 +727,7 @@ impl<T> DynamicAdmissionQueue<T> {
         let initial_len = self.waiting.len();
         let mut receipt = AdmissionTickReceipt {
             probed: 0,
+            held: 0,
             skipped_unchanged: 0,
             admitted: 0,
             deferred: 0,
@@ -685,6 +746,13 @@ impl<T> DynamicAdmissionQueue<T> {
                 .waiting
                 .pop_front()
                 .expect("initial waiting length remains exact during one queue scan");
+            if eligibility(&entry.request, entry.ticket) == AdmissionQueueEligibility::Held {
+                receipt.held += 1;
+                observe_held(&entry.request, entry.ticket);
+                entry.fairness_opportunity = false;
+                self.waiting.push_back(entry);
+                continue;
+            }
             let first_probe = entry.deferral.is_none();
             entry.fairness_opportunity = false;
             let aged = entry.relevant_bypass_events >= self.policy.max_relevant_bypass_events;
@@ -1549,6 +1617,66 @@ mod tests {
 
         assert_eq!(receipt.permanent_rejected(), 1);
         assert_eq!(receipt.faulted(), 1);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn held_entry_uses_no_probe_and_does_not_block_later_eligible_work() {
+        let mut queue = DynamicAdmissionQueue::new(DynamicAdmissionQueuePolicy::default());
+        let held_ticket = queue.enqueue(1_u64).unwrap();
+        let eligible_ticket = queue.enqueue(2_u64).unwrap();
+        let mut events = Vec::new();
+        let mut held = Vec::new();
+        let mut probed = Vec::new();
+
+        let receipt = queue
+            .schedule_into_observed_with_eligibility(
+                wake(0, 0, 0).snapshot(),
+                2,
+                1,
+                &mut events,
+                |request, _| {
+                    if *request == 1 {
+                        AdmissionQueueEligibility::Held
+                    } else {
+                        AdmissionQueueEligibility::Eligible
+                    }
+                },
+                |request, ticket| held.push((*request, ticket)),
+                |_, _, _| unreachable!("neither fresh request has a deferral"),
+                |request| {
+                    probed.push(*request);
+                    AdmissionProbeOutcome::<(), (), ()>::Admitted(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(receipt.held(), 1);
+        assert_eq!(receipt.probed(), 1);
+        assert_eq!(receipt.admitted(), 1);
+        assert_eq!(held, vec![(1, held_ticket)]);
+        assert_eq!(probed, vec![2]);
+        assert!(matches!(
+            events.as_slice(),
+            [AdmissionQueueEvent::Admitted { ticket, request: 2, .. }]
+                if *ticket == eligible_ticket
+        ));
+        assert_eq!(queue.iter().copied().collect::<Vec<_>>(), vec![1]);
+
+        let released = queue
+            .schedule_into_observed_with_eligibility(
+                wake(0, 0, 0).snapshot(),
+                1,
+                1,
+                &mut events,
+                |_, _| AdmissionQueueEligibility::Eligible,
+                |_, _| unreachable!("released entry must not remain held"),
+                |_, _, _| unreachable!("held entry has no capacity deferral"),
+                |_| AdmissionProbeOutcome::<(), (), ()>::Admitted(()),
+            )
+            .unwrap();
+        assert_eq!(released.held(), 0);
+        assert_eq!(released.admitted(), 1);
         assert!(queue.is_empty());
     }
 

@@ -534,6 +534,35 @@ impl EngineInner {
             })
         };
         match observation {
+            ExecutorAdmissionQueueObservation::ProgressReservationHeld {
+                request_id,
+                progress_owner_id,
+                ticket,
+            } => self.write_executor_scheduler_profile_event(
+                &request_id,
+                "vnext.prefill_admission_progress_reserved",
+                ProfileEventKind::Instant,
+                ProfileStatus::Ok,
+                None,
+                BTreeMap::from([
+                    (
+                        "decision".to_string(),
+                        serde_json::json!("held_for_decode_progress"),
+                    ),
+                    ("waiting_ticket".to_string(), serde_json::json!(ticket)),
+                    (
+                        "progress_owner_id".to_string(),
+                        serde_json::json!(progress_owner_id.0),
+                    ),
+                    (
+                        "prefill_submit_observed".to_string(),
+                        serde_json::json!(false),
+                    ),
+                    ("probe_performed".to_string(), serde_json::json!(false)),
+                ]),
+                BTreeMap::new(),
+                None,
+            ),
             ExecutorAdmissionQueueObservation::SkippedUnchanged {
                 request_id,
                 ticket,
