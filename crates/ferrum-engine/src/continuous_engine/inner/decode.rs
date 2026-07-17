@@ -230,11 +230,13 @@ impl EngineInner {
                         ),
                         deferral.wait_condition().clone(),
                     );
-                    match self
-                        .scheduler
-                        .defer_decode_for_execution_capacity(&request_ids, scheduler_deferral)?
-                    {
-                        DecodeExecutionCapacityAction::Deferred { count } => {
+                    let release_snapshot = self.execution_capacity_release_snapshot();
+                    match self.scheduler.defer_decode_for_execution_capacity(
+                        &request_ids,
+                        scheduler_deferral,
+                        &release_snapshot,
+                    )? {
+                        ExecutionCapacityAction::Deferred { count } => {
                             if count != request_ids.len() {
                                 return Err(FerrumError::scheduler(format!(
                                     "PlanRuntime decode deferral retained {count} of {} scheduler entries",
@@ -256,33 +258,29 @@ impl EngineInner {
                                 "scheduler": self.scheduler.trace_snapshot(),
                             }));
                         }
-                        DecodeExecutionCapacityAction::RecomputeVictim { lease } => {
-                            let victim_id = lease.victim_request_id().clone();
-                            let progress_owner_id = lease.progress_owner_id().clone();
-                            let progress_baseline = lease.progress_baseline().get();
+                        ExecutionCapacityAction::YieldPlanned { transaction } => {
+                            let victim_id = transaction.victim_request_id().clone();
+                            let progress_owner_id = transaction.progress_owner_id().clone();
+                            let progress_baseline = transaction.progress_baseline().get();
                             self.trace_executor_decode_capacity_decision(
                                 &request_ids,
                                 &deferral,
-                                "recompute_progress_victim",
-                                Some(&lease),
+                                "pressure_yield_planned",
+                                Some(&transaction),
                             );
-                            if !self
-                                .defer_decode_for_capacity_recompute_leased(
-                                    &lease,
+                            let progress_owner_resumable = self
+                                .execute_capacity_yield(
+                                    &transaction,
                                     request_ids.len().max(1),
                                     None,
                                 )
-                                .await
-                            {
-                                return Err(FerrumError::scheduler(format!(
-                                    "PlanRuntime decode progress victim {victim_id} could not move to recompute"
-                                )));
-                            }
-                            self.total_preemptions.fetch_add(1, Ordering::Relaxed);
-                            counter!("ferrum.engine.preemptions_total").increment(1);
+                                .await?;
                             self.write_scheduler_trace_event(serde_json::json!({
-                                "event": "scheduler_execution_capacity_progress_recompute",
+                                "event": "scheduler_execution_capacity_yield_planned",
                                 "request_ids": &request_ids,
+                                "episode_id": transaction.episode_id().get(),
+                                "handoff_generation": transaction.handoff_generation(),
+                                "planned_transition_ordinal": transaction.planned_ordinal().get(),
                                 "victim_request_id": victim_id,
                                 "progress_owner_id": progress_owner_id,
                                 "progress_baseline": progress_baseline,
@@ -291,7 +289,19 @@ impl EngineInner {
                                 "wait_condition": deferral.wait_condition(),
                                 "scheduler": self.scheduler.trace_snapshot(),
                             }));
-                            stack.push(request_ids);
+                            // The yielded request no longer owns runnable physical
+                            // resources. Resume the frontier named by the completed
+                            // release transaction instead of retrying the victim.
+                            if progress_owner_resumable {
+                                stack.push(vec![progress_owner_id]);
+                            }
+                        }
+                        ExecutionCapacityAction::InvariantViolation { violation } => {
+                            return Err(FerrumError::internal(format!(
+                                "execution-capacity pressure episode {} violated {:?}",
+                                violation.episode_id().get(),
+                                violation.class()
+                            )));
                         }
                     }
                 }

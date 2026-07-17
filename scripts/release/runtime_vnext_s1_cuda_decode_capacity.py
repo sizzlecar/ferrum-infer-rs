@@ -226,7 +226,7 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
     require(isinstance(shape, dict), f"{label}: shape is missing")
     decision = shape.get("decision")
     require(
-        decision in {"split_cohort", "wait_for_release", "recompute_progress_victim"},
+        decision in {"split_cohort", "wait_for_release", "pressure_yield_planned"},
         f"{label}: decision is invalid",
     )
     width = shape.get("attempted_decode_width")
@@ -240,29 +240,37 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
     victim_request_id = attributes.get("victim_request_id")
     progress_owner_id = attributes.get("progress_owner_id")
     progress_baseline = attributes.get("progress_baseline")
+    episode_id = attributes.get("episode_id")
+    planned_transition_ordinal = attributes.get("planned_transition_ordinal")
     if decision == "split_cohort":
         require(width >= 2, f"{label}: split cohort is not wide")
         require(victim_request_id is None, f"{label}: split cohort named a victim")
         require(progress_owner_id is None, f"{label}: split cohort named a progress owner")
         require(progress_baseline is None, f"{label}: split cohort named a progress baseline")
-    elif decision == "recompute_progress_victim":
-        require(width == 1, f"{label}: progress recompute cohort is not exact")
+    elif decision == "pressure_yield_planned":
+        require(width == 1, f"{label}: pressure-yield cohort is not exact")
         require(
             isinstance(victim_request_id, str) and victim_request_id,
-            f"{label}: progress recompute victim is missing",
+            f"{label}: pressure-yield victim is missing",
         )
         require(
-            victim_request_id not in request_ids,
-            f"{label}: progress owner cannot be its own recompute victim",
+            common.request_identity_matches(victim_request_id, request_ids[0]),
+            f"{label}: pressure-yield victim does not match the failing cohort",
         )
         require(
             isinstance(progress_owner_id, str)
-            and common.request_identity_matches(progress_owner_id, request_ids[0]),
-            f"{label}: typed progress owner does not match the decode cohort",
+            and not common.request_identity_matches(progress_owner_id, victim_request_id),
+            f"{label}: pressure victim cannot own the released progress role",
         )
         require(
             isinstance(progress_baseline, int) and progress_baseline >= 0,
             f"{label}: logical progress baseline is invalid",
+        )
+        require(isinstance(episode_id, int) and episode_id > 0, f"{label}: episode id is invalid")
+        require(
+            isinstance(planned_transition_ordinal, int)
+            and planned_transition_ordinal > 0,
+            f"{label}: planned transition ordinal is invalid",
         )
     else:
         require(width == 1, f"{label}: a non-exact cohort was parked")
@@ -289,6 +297,8 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
         "victim_request_id": victim_request_id,
         "progress_owner_id": progress_owner_id,
         "progress_baseline": progress_baseline,
+        "episode_id": episode_id,
+        "planned_transition_ordinal": planned_transition_ordinal,
         "observed": observed,
         "wait_condition": wait_condition,
     }
@@ -353,7 +363,7 @@ def validate_decode_queue_transition(
     }
 
 
-def validate_progress_lease_hold(row: dict[str, Any], label: str) -> dict[str, Any]:
+def validate_pressure_hold(row: dict[str, Any], label: str) -> dict[str, Any]:
     require(row.get("status") == "ok" and row.get("error") is None, f"{label}: event failed")
     request_id = row.get("request_id")
     shape = row.get("shape")
@@ -366,7 +376,7 @@ def validate_progress_lease_hold(row: dict[str, Any], label: str) -> dict[str, A
     )
     require(
         not common.request_identity_matches(request_id, progress_owner_id),
-        f"{label}: victim cannot own its own progress lease",
+        f"{label}: pressure victim cannot own the progress role",
     )
     require(shape.get("decision") == "held_for_owner_progress", f"{label}: decision is invalid")
     require(shape.get("prefill_submit_observed") is False, f"{label}: held victim reached submit")
@@ -379,8 +389,10 @@ def validate_progress_lease_hold(row: dict[str, Any], label: str) -> dict[str, A
     )
     require(
         isinstance(progress_current, int) and progress_current == progress_baseline,
-        f"{label}: held lease did not preserve its exact progress baseline",
+        f"{label}: pressure hold did not preserve its exact progress baseline",
     )
+    episode_id = shape.get("episode_id")
+    require(isinstance(episode_id, int) and episode_id > 0, f"{label}: episode id is invalid")
     ticket = shape.get("waiting_ticket")
     require(isinstance(ticket, int) and ticket > 0, f"{label}: waiting ticket is invalid")
     return {
@@ -390,10 +402,11 @@ def validate_progress_lease_hold(row: dict[str, Any], label: str) -> dict[str, A
         "progress_baseline": progress_baseline,
         "progress_current": progress_current,
         "waiting_ticket": ticket,
+        "episode_id": episode_id,
     }
 
 
-def validate_progress_lease_release(row: dict[str, Any], label: str) -> dict[str, Any]:
+def validate_pressure_hold_release(row: dict[str, Any], label: str) -> dict[str, Any]:
     require(row.get("status") == "ok" and row.get("error") is None, f"{label}: event failed")
     request_id = row.get("request_id")
     shape = row.get("shape")
@@ -406,11 +419,11 @@ def validate_progress_lease_release(row: dict[str, Any], label: str) -> dict[str
     )
     require(
         not common.request_identity_matches(request_id, progress_owner_id),
-        f"{label}: victim cannot own its own progress lease",
+        f"{label}: pressure victim cannot own the progress role",
     )
     decision = shape.get("decision")
     require(
-        decision in {"owner_advanced", "owner_no_longer_decoding"},
+        decision in {"owner_advanced", "owner_terminal", "role_transferred"},
         f"{label}: release reason is invalid",
     )
     progress_baseline = shape.get("progress_baseline")
@@ -434,7 +447,7 @@ def validate_progress_lease_release(row: dict[str, Any], label: str) -> dict[str
     )
     require(
         shape.get("probe_performed") is False,
-        f"{label}: lease release was incorrectly coupled to an admission probe",
+        f"{label}: pressure-hold release was incorrectly coupled to an admission probe",
     )
     require(
         shape.get("prefill_submit_observed") is False,
@@ -442,6 +455,13 @@ def validate_progress_lease_release(row: dict[str, Any], label: str) -> dict[str
     )
     ticket = shape.get("waiting_ticket")
     require(isinstance(ticket, int) and ticket > 0, f"{label}: waiting ticket is invalid")
+    episode_id = shape.get("episode_id")
+    transition_ordinal = shape.get("transition_ordinal")
+    require(isinstance(episode_id, int) and episode_id > 0, f"{label}: episode id is invalid")
+    require(
+        isinstance(transition_ordinal, int) and transition_ordinal > 0,
+        f"{label}: release transition ordinal is invalid",
+    )
     return {
         "ts_unix_nanos": common.event_wall_ns(row),
         "victim_request_id": request_id,
@@ -450,6 +470,101 @@ def validate_progress_lease_release(row: dict[str, Any], label: str) -> dict[str
         "progress_current": progress_current,
         "decision": decision,
         "waiting_ticket": ticket,
+        "episode_id": episode_id,
+        "transition_ordinal": transition_ordinal,
+    }
+
+
+def validate_pressure_fence_armed(row: dict[str, Any], label: str) -> dict[str, Any]:
+    require(row.get("status") == "ok" and row.get("error") is None, f"{label}: event failed")
+    request_id = row.get("request_id")
+    shape = row.get("shape")
+    attributes = row.get("attributes")
+    require(isinstance(request_id, str) and request_id, f"{label}: victim identity is missing")
+    require(isinstance(shape, dict) and isinstance(attributes, dict), f"{label}: payload is missing")
+    episode_id = shape.get("episode_id")
+    planned = shape.get("planned_transition_ordinal")
+    armed = shape.get("transition_ordinal")
+    require(isinstance(episode_id, int) and episode_id > 0, f"{label}: episode id is invalid")
+    require(
+        isinstance(planned, int) and isinstance(armed, int) and 0 < planned < armed,
+        f"{label}: planned/armed ordinal order is invalid",
+    )
+    require(
+        shape.get("physical_release_completed") is False,
+        f"{label}: armed fence already claims physical release",
+    )
+    progress_owner_id = attributes.get("progress_owner_id")
+    require(
+        isinstance(progress_owner_id, str)
+        and not common.request_identity_matches(progress_owner_id, request_id),
+        f"{label}: progress owner identity is invalid",
+    )
+    return {
+        "ts_unix_nanos": common.event_wall_ns(row),
+        "episode_id": episode_id,
+        "victim_request_id": request_id,
+        "progress_owner_id": progress_owner_id,
+        "planned_transition_ordinal": planned,
+        "armed_transition_ordinal": armed,
+    }
+
+
+def validate_pressure_fence_completed(row: dict[str, Any], label: str) -> dict[str, Any]:
+    require(row.get("status") == "ok" and row.get("error") is None, f"{label}: event failed")
+    request_id = row.get("request_id")
+    shape = row.get("shape")
+    attributes = row.get("attributes")
+    require(isinstance(request_id, str) and request_id, f"{label}: victim identity is missing")
+    require(isinstance(shape, dict) and isinstance(attributes, dict), f"{label}: payload is missing")
+    episode_id = shape.get("episode_id")
+    released = shape.get("release_transition_ordinal")
+    resumable = shape.get("resumable_transition_ordinal")
+    require(isinstance(episode_id, int) and episode_id > 0, f"{label}: episode id is invalid")
+    require(
+        isinstance(released, int)
+        and isinstance(resumable, int)
+        and 0 < released < resumable,
+        f"{label}: release/resumable ordinal order is invalid",
+    )
+    require(
+        shape.get("physical_release_completed") is True,
+        f"{label}: completed fence has no physical release evidence",
+    )
+    require(
+        shape.get("exact_source_advanced") is True,
+        f"{label}: completed fence did not advance its exact failed source",
+    )
+    require(
+        shape.get("progress_owner_resumable") is True
+        and shape.get("closed_transition_ordinal") is None,
+        f"{label}: canonical progress owner was not made resumable",
+    )
+    release_authority = shape.get("release_authority")
+    require(
+        release_authority in {"retained_prefill", "active_sequence"},
+        f"{label}: completed fence has no typed release authority",
+    )
+    current_availability = attributes.get("current_capacity_availability")
+    require(
+        isinstance(current_availability, list) and current_availability,
+        f"{label}: completed fence has no current capacity snapshot",
+    )
+    require(shape.get("victim_requeued") is True, f"{label}: victim was not requeued")
+    progress_owner_id = attributes.get("progress_owner_id")
+    require(
+        isinstance(progress_owner_id, str)
+        and not common.request_identity_matches(progress_owner_id, request_id),
+        f"{label}: progress owner identity is invalid",
+    )
+    return {
+        "ts_unix_nanos": common.event_wall_ns(row),
+        "episode_id": episode_id,
+        "victim_request_id": request_id,
+        "progress_owner_id": progress_owner_id,
+        "release_transition_ordinal": released,
+        "resumable_transition_ordinal": resumable,
+        "release_authority": release_authority,
     }
 
 
@@ -475,37 +590,59 @@ def validate_decode_trace(
     ]
     splits = [event for event in deferrals if event["decision"] == "split_cohort"]
     parks = [event for event in deferrals if event["decision"] == "wait_for_release"]
-    recomputes = [
-        event for event in deferrals if event["decision"] == "recompute_progress_victim"
+    yields = [
+        event for event in deferrals if event["decision"] == "pressure_yield_planned"
     ]
     require(splits, "target never adaptively split a capacity-blocked decode cohort")
-    require(recomputes, "target never selected a typed decode progress victim")
+    require(yields, "target never planned a typed execution-capacity yield")
 
     hold_rows = [
         row
         for row in window
-        if row.get("phase") == "vnext.prefill_admission_progress_lease_held"
+        if row.get("phase") == "vnext.execution_capacity_pressure_hold_active"
     ]
     require(
         len(hold_rows) <= MAX_DECODE_CAPACITY_EVENTS,
-        "decode progress lease holds exceeded the bounded event ceiling",
+        "execution-capacity pressure holds exceeded the bounded event ceiling",
     )
     holds = [
-        validate_progress_lease_hold(row, f"progress lease hold {index}")
+        validate_pressure_hold(row, f"pressure hold {index}")
         for index, row in enumerate(hold_rows)
     ]
     release_rows = [
         row
         for row in window
-        if row.get("phase") == "vnext.prefill_admission_progress_lease_released"
+        if row.get("phase") == "vnext.execution_capacity_pressure_hold_released"
     ]
     require(
         len(release_rows) <= MAX_DECODE_CAPACITY_EVENTS,
-        "decode progress lease releases exceeded the bounded event ceiling",
+        "execution-capacity pressure-hold releases exceeded the bounded event ceiling",
     )
     releases = [
-        validate_progress_lease_release(row, f"progress lease release {index}")
+        validate_pressure_hold_release(row, f"pressure hold release {index}")
         for index, row in enumerate(release_rows)
+    ]
+    armed_rows = [
+        row
+        for row in window
+        if row.get("phase") == "vnext.execution_capacity_pressure_release_fence_armed"
+    ]
+    completed_fence_rows = [
+        row
+        for row in window
+        if row.get("phase") == "vnext.execution_capacity_pressure_release_fence_completed"
+    ]
+    require(
+        len(armed_rows) + len(completed_fence_rows) <= 2 * MAX_DECODE_CAPACITY_EVENTS,
+        "execution-capacity release fences exceeded the bounded event ceiling",
+    )
+    armed_fences = [
+        validate_pressure_fence_armed(row, f"pressure fence armed {index}")
+        for index, row in enumerate(armed_rows)
+    ]
+    completed_fences = [
+        validate_pressure_fence_completed(row, f"pressure fence completed {index}")
+        for index, row in enumerate(completed_fence_rows)
     ]
 
     skip_rows = [row for row in window if row.get("phase") == "vnext.decode_capacity_skipped_unchanged"]
@@ -531,65 +668,85 @@ def validate_decode_trace(
             and common.request_identity_matches(resume["request_id"], request_id)
             and resume["exact_source_changed"]
         ]
-        matching_recompute = [
-            recompute
-            for recompute in recomputes
-            if recompute["ts_unix_nanos"] > park["ts_unix_nanos"]
+        matching_yield = [
+            pressure_yield
+            for pressure_yield in yields
+            if pressure_yield["ts_unix_nanos"] > park["ts_unix_nanos"]
             and common.request_identity_matches(
-                recompute["victim_request_id"], request_id
+                pressure_yield["progress_owner_id"], request_id
             )
         ]
         require(
-            matching_resume or matching_recompute,
-            f"parked decode {request_id} neither resumed after an exact-source change nor became a progress victim",
+            matching_resume or matching_yield,
+            f"parked decode {request_id} neither resumed after an exact-source change nor received a released progress role",
         )
-    for recompute in recomputes:
-        victim_request_id = recompute["victim_request_id"]
-        progress_owner_id = recompute["progress_owner_id"]
-        progress_baseline = recompute["progress_baseline"]
+    for pressure_yield in yields:
+        episode_id = pressure_yield["episode_id"]
+        victim_request_id = pressure_yield["victim_request_id"]
+        progress_owner_id = pressure_yield["progress_owner_id"]
+        progress_baseline = pressure_yield["progress_baseline"]
         require(
             any(
-                park["ts_unix_nanos"] < recompute["ts_unix_nanos"]
+                park["ts_unix_nanos"] < pressure_yield["ts_unix_nanos"]
                 and common.request_identity_matches(
-                    park["request_ids"][0], victim_request_id
+                    park["request_ids"][0], progress_owner_id
                 )
                 for park in parks
             ),
-            f"decode progress victim {victim_request_id} was not previously parked",
+            f"pressure progress owner {progress_owner_id} was not previously parked",
+        )
+        matching_armed = [
+            fence
+            for fence in armed_fences
+            if fence["episode_id"] == episode_id
+            and common.request_identity_matches(fence["victim_request_id"], victim_request_id)
+            and common.request_identity_matches(fence["progress_owner_id"], progress_owner_id)
+        ]
+        matching_completed = [
+            fence
+            for fence in completed_fences
+            if fence["episode_id"] == episode_id
+            and common.request_identity_matches(fence["victim_request_id"], victim_request_id)
+            and common.request_identity_matches(fence["progress_owner_id"], progress_owner_id)
+        ]
+        require(len(matching_armed) == 1, f"pressure episode {episode_id} has no unique armed fence")
+        require(
+            len(matching_completed) == 1,
+            f"pressure episode {episode_id} has no unique completed fence",
+        )
+        armed = matching_armed[0]
+        completed = matching_completed[0]
+        require(
+            pressure_yield["planned_transition_ordinal"]
+            == armed["planned_transition_ordinal"]
+            < armed["armed_transition_ordinal"]
+            < completed["release_transition_ordinal"]
+            < completed["resumable_transition_ordinal"],
+            f"pressure episode {episode_id} violated release-fence ordinal order",
         )
         matching_holds = [
             hold
             for hold in holds
-            if (
-                hold["ts_unix_nanos"] > recompute["ts_unix_nanos"]
-                and common.request_identity_matches(
-                    hold["victim_request_id"], victim_request_id
-                )
-                and common.request_identity_matches(
-                    hold["progress_owner_id"], progress_owner_id
-                )
-                and hold["progress_baseline"] == progress_baseline
-            )
+            if hold["episode_id"] == episode_id
+            and common.request_identity_matches(hold["victim_request_id"], victim_request_id)
+            and common.request_identity_matches(hold["progress_owner_id"], progress_owner_id)
+            and hold["progress_baseline"] == progress_baseline
         ]
         require(
             matching_holds,
-            f"decode progress victim {victim_request_id} was not held for owner {progress_owner_id}",
+            f"pressure victim {victim_request_id} was not held for owner {progress_owner_id}",
         )
         matching_releases = [
             release
             for release in releases
-            if release["ts_unix_nanos"] > recompute["ts_unix_nanos"]
-            and common.request_identity_matches(
-                release["victim_request_id"], victim_request_id
-            )
-            and common.request_identity_matches(
-                release["progress_owner_id"], progress_owner_id
-            )
+            if release["episode_id"] == episode_id
+            and common.request_identity_matches(release["victim_request_id"], victim_request_id)
+            and common.request_identity_matches(release["progress_owner_id"], progress_owner_id)
             and release["progress_baseline"] == progress_baseline
         ]
         require(
             any(release["decision"] == "owner_advanced" for release in matching_releases),
-            f"decode progress lease for {victim_request_id} was not released by committed owner progress",
+            f"pressure hold for {victim_request_id} was not released by committed owner progress",
         )
         first_progress_release = min(
             release["ts_unix_nanos"]
@@ -598,7 +755,14 @@ def validate_decode_trace(
         )
         require(
             all(hold["ts_unix_nanos"] < first_progress_release for hold in matching_holds),
-            f"decode progress victim {victim_request_id} remained held after owner progress",
+            f"pressure victim {victim_request_id} remained held after owner progress",
+        )
+        require(
+            all(
+                release["transition_ordinal"] > completed["resumable_transition_ordinal"]
+                for release in matching_releases
+            ),
+            f"pressure episode {episode_id} released a hold before becoming resumable",
         )
         require(
             any(
@@ -606,39 +770,31 @@ def validate_decode_trace(
                 for release in matching_releases
                 for hold in matching_holds
             ),
-            f"decode progress lease for {victim_request_id} changed waiting identity",
+            f"pressure hold for {victim_request_id} changed waiting identity",
         )
 
     for hold in holds:
         require(
             any(
-                recompute["ts_unix_nanos"] < hold["ts_unix_nanos"]
+                pressure_yield["episode_id"] == hold["episode_id"]
                 and common.request_identity_matches(
-                    recompute["victim_request_id"], hold["victim_request_id"]
+                    pressure_yield["victim_request_id"], hold["victim_request_id"]
                 )
-                and common.request_identity_matches(
-                    recompute["progress_owner_id"], hold["progress_owner_id"]
-                )
-                and recompute["progress_baseline"] == hold["progress_baseline"]
-                for recompute in recomputes
+                for pressure_yield in yields
             ),
-            f"progress lease hold for {hold['victim_request_id']} has no typed recompute decision",
+            f"pressure hold for {hold['victim_request_id']} has no typed yield decision",
         )
 
     for release in releases:
         require(
             any(
-                recompute["ts_unix_nanos"] < release["ts_unix_nanos"]
+                pressure_yield["episode_id"] == release["episode_id"]
                 and common.request_identity_matches(
-                    recompute["victim_request_id"], release["victim_request_id"]
+                    pressure_yield["victim_request_id"], release["victim_request_id"]
                 )
-                and common.request_identity_matches(
-                    recompute["progress_owner_id"], release["progress_owner_id"]
-                )
-                and recompute["progress_baseline"] == release["progress_baseline"]
-                for recompute in recomputes
+                for pressure_yield in yields
             ),
-            f"progress lease release for {release['victim_request_id']} has no typed recompute decision",
+            f"pressure-hold release for {release['victim_request_id']} has no typed yield decision",
         )
 
     deferred_request_ids = sorted(
@@ -664,15 +820,15 @@ def validate_decode_trace(
         if row.get("phase") == "vnext.prefill_admission"
         and row.get("shape", {}).get("decision") == "admitted"
     ]
-    for recompute in recomputes:
-        victim_request_id = recompute["victim_request_id"]
-        progress_owner_id = recompute["progress_owner_id"]
-        progress_baseline = recompute["progress_baseline"]
+    for pressure_yield in yields:
+        victim_request_id = pressure_yield["victim_request_id"]
+        progress_owner_id = pressure_yield["progress_owner_id"]
+        progress_baseline = pressure_yield["progress_baseline"]
         progress_releases = [
             release
             for release in releases
             if release["decision"] == "owner_advanced"
-            and release["ts_unix_nanos"] > recompute["ts_unix_nanos"]
+            and release["episode_id"] == pressure_yield["episode_id"]
             and common.request_identity_matches(
                 release["victim_request_id"], victim_request_id
             )
@@ -694,7 +850,7 @@ def validate_decode_trace(
                 and common.event_wall_ns(row) > progress_released_at
                 for row in admitted_rows
             ),
-            f"decode progress victim {victim_request_id} was not re-admitted after owner progress",
+            f"pressure victim {victim_request_id} was not re-admitted after owner progress",
         )
     for request_id in deferred_request_ids:
         require(
@@ -705,18 +861,20 @@ def validate_decode_trace(
         "deferral_events": len(deferrals),
         "split_events": len(splits),
         "park_events": len(parks),
-        "recompute_events": len(recomputes),
-        "progress_lease_hold_events": len(holds),
-        "progress_lease_release_events": len(releases),
+        "pressure_yield_events": len(yields),
+        "pressure_fence_armed_events": len(armed_fences),
+        "pressure_fence_completed_events": len(completed_fences),
+        "pressure_hold_events": len(holds),
+        "pressure_hold_release_events": len(releases),
         "skip_events": len(skips),
         "resume_events": len(resumes),
         "stages": sorted({event["stage"] for event in deferrals}),
         "max_attempted_decode_width": max(event["width"] for event in deferrals),
         "deferred_request_ids": deferred_request_ids,
-        "recompute_victim_request_ids": sorted(
-            {event["victim_request_id"] for event in recomputes}
+        "pressure_victim_request_ids": sorted(
+            {event["victim_request_id"] for event in yields}
         ),
-        "progress_lease_pairs": [
+        "pressure_episode_pairs": [
             list(pair)
             for pair in sorted(
                 {
@@ -1411,7 +1569,10 @@ def self_test() -> int:
         request_ids: list[str],
         *,
         victim_request_id: str | None = None,
+        progress_owner_id: str | None = None,
         progress_baseline: int | None = None,
+        episode_id: int | None = None,
+        planned_transition_ordinal: int | None = None,
     ) -> dict[str, Any]:
         attributes = {
             "request_ids": request_ids,
@@ -1420,8 +1581,10 @@ def self_test() -> int:
         }
         if victim_request_id is not None:
             attributes["victim_request_id"] = victim_request_id
-            attributes["progress_owner_id"] = request_ids[0]
+            attributes["progress_owner_id"] = progress_owner_id
             attributes["progress_baseline"] = progress_baseline
+            attributes["episode_id"] = episode_id
+            attributes["planned_transition_ordinal"] = planned_transition_ordinal
         return {
             "ts_unix_nanos": ts,
             "phase": "vnext.decode_capacity_deferred",
@@ -1486,21 +1649,63 @@ def self_test() -> int:
         deferral(135, "wait_for_release", ["A"]),
         deferral(
             140,
-            "recompute_progress_victim",
+            "pressure_yield_planned",
             ["C"],
-            victim_request_id="A",
+            victim_request_id="C",
+            progress_owner_id="A",
             progress_baseline=53,
+            episode_id=1,
+            planned_transition_ordinal=3,
         ),
         {
-            "ts_unix_nanos": 145,
-            "phase": "vnext.prefill_admission_progress_lease_held",
+            "ts_unix_nanos": 141,
+            "phase": "vnext.execution_capacity_pressure_release_fence_armed",
             "status": "ok",
             "error": None,
-            "request_id": "A",
+            "request_id": "C",
+            "shape": {
+                "episode_id": 1,
+                "planned_transition_ordinal": 3,
+                "transition_ordinal": 4,
+                "physical_release_completed": False,
+            },
+            "attributes": {"progress_owner_id": "A"},
+        },
+        {
+            "ts_unix_nanos": 142,
+            "phase": "vnext.execution_capacity_pressure_release_fence_completed",
+            "status": "ok",
+            "error": None,
+            "request_id": "C",
+            "shape": {
+                "episode_id": 1,
+                "release_transition_ordinal": 5,
+                "resumable_transition_ordinal": 6,
+                "physical_release_completed": True,
+                "exact_source_advanced": True,
+                "release_authority": "active_sequence",
+                "progress_owner_resumable": True,
+                "closed_transition_ordinal": None,
+                "victim_requeued": True,
+            },
+            "attributes": {
+                "progress_owner_id": "A",
+                "current_capacity_availability": [
+                    {"source": {"domain": 5}, "epoch": 4}
+                ],
+            },
+        },
+        {
+            "ts_unix_nanos": 145,
+            "phase": "vnext.execution_capacity_pressure_hold_active",
+            "status": "ok",
+            "error": None,
+            "request_id": "C",
             "shape": {
                 "decision": "held_for_owner_progress",
+                "episode_id": 1,
                 "waiting_ticket": 1,
-                "progress_owner_id": "C",
+                "progress_owner_id": "A",
                 "progress_baseline": 53,
                 "progress_current": 53,
                 "prefill_submit_observed": False,
@@ -1509,14 +1714,16 @@ def self_test() -> int:
         },
         {
             "ts_unix_nanos": 150,
-            "phase": "vnext.prefill_admission_progress_lease_released",
+            "phase": "vnext.execution_capacity_pressure_hold_released",
             "status": "ok",
             "error": None,
-            "request_id": "A",
+            "request_id": "C",
             "shape": {
                 "decision": "owner_advanced",
+                "episode_id": 1,
+                "transition_ordinal": 8,
                 "waiting_ticket": 1,
-                "progress_owner_id": "C",
+                "progress_owner_id": "A",
                 "progress_baseline": 53,
                 "progress_current": 54,
                 "admission_eligible": True,
@@ -1527,7 +1734,7 @@ def self_test() -> int:
         {
             "ts_unix_nanos": 151,
             "phase": "vnext.prefill_admission",
-            "request_id": "A",
+            "request_id": "C",
             "shape": {"decision": "admitted"},
         },
         {"ts_unix_nanos": 152, "phase": "vnext.request_completed", "request_id": "C"},
@@ -1538,18 +1745,20 @@ def self_test() -> int:
     require(summary["split_events"] == 1, "self-test lost split evidence")
     require(summary["park_events"] == 2, "self-test lost park evidence")
     require(summary["resume_events"] == 1, "self-test lost resume evidence")
-    require(summary["recompute_events"] == 1, "self-test lost recompute evidence")
+    require(summary["pressure_yield_events"] == 1, "self-test lost pressure-yield evidence")
     require(
-        summary["progress_lease_hold_events"] == 1,
-        "self-test lost progress lease hold evidence",
+        summary["pressure_fence_armed_events"] == 1
+        and summary["pressure_fence_completed_events"] == 1,
+        "self-test lost release-fence evidence",
     )
     require(
-        summary["progress_lease_release_events"] == 1,
-        "self-test lost progress lease release evidence",
+        summary["pressure_hold_events"] == 1
+        and summary["pressure_hold_release_events"] == 1,
+        "self-test lost pressure-hold evidence",
     )
     require(
-        summary["recompute_victim_request_ids"] == ["A"],
-        "self-test lost progress-victim identity",
+        summary["pressure_victim_request_ids"] == ["C"],
+        "self-test lost pressure-victim identity",
     )
 
     unchanged_resume = json.loads(json.dumps(rows))
@@ -1568,32 +1777,32 @@ def self_test() -> int:
     del missing_victim[5]["attributes"]["victim_request_id"]
     try:
         validate_decode_trace(missing_victim, started_wall_ns=90, finished_wall_ns=160)
-        raise AssertionError("progress recompute without a victim unexpectedly passed")
+        raise AssertionError("pressure yield without a victim unexpectedly passed")
     except common.CapacityGateError:
         pass
     missing_hold = json.loads(json.dumps(rows))
-    del missing_hold[6]
+    del missing_hold[8]
     try:
         validate_decode_trace(missing_hold, started_wall_ns=90, finished_wall_ns=160)
-        raise AssertionError("progress recompute without a lease hold unexpectedly passed")
+        raise AssertionError("pressure yield without a hold unexpectedly passed")
     except common.CapacityGateError:
         pass
     missing_release = json.loads(json.dumps(rows))
-    del missing_release[7]
+    del missing_release[9]
     try:
         validate_decode_trace(missing_release, started_wall_ns=90, finished_wall_ns=160)
-        raise AssertionError("progress lease without a release unexpectedly passed")
+        raise AssertionError("pressure hold without a release unexpectedly passed")
     except common.CapacityGateError:
         pass
     unchanged_progress = json.loads(json.dumps(rows))
-    unchanged_progress[7]["shape"]["progress_current"] = 53
+    unchanged_progress[9]["shape"]["progress_current"] = 53
     try:
         validate_decode_trace(unchanged_progress, started_wall_ns=90, finished_wall_ns=160)
-        raise AssertionError("unchanged owner progress unexpectedly released a lease")
+        raise AssertionError("unchanged owner progress unexpectedly released a pressure hold")
     except common.CapacityGateError:
         pass
     stale_hold = json.loads(json.dumps(rows))
-    stale_hold_event = json.loads(json.dumps(stale_hold[6]))
+    stale_hold_event = json.loads(json.dumps(stale_hold[8]))
     stale_hold_event["ts_unix_nanos"] = 151
     stale_hold.append(stale_hold_event)
     try:
@@ -1602,7 +1811,7 @@ def self_test() -> int:
     except common.CapacityGateError:
         pass
     premature_readmission = json.loads(json.dumps(rows))
-    premature_readmission[8]["ts_unix_nanos"] = 149
+    premature_readmission[10]["ts_unix_nanos"] = 149
     try:
         validate_decode_trace(premature_readmission, started_wall_ns=90, finished_wall_ns=160)
         raise AssertionError("victim re-admitted before owner progress")

@@ -16,10 +16,10 @@ use ferrum_interfaces::{
     model_executor::{
         ExecutionResourceAuthority, ExecutorAdmissionEpochs, ExecutorBatchDecodeOutcome,
         ExecutorCapacityWaitRegistration, ExecutorExecutionCapacityDeferral,
-        ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
-        ExecutorPrefillAdmissionReceipt, ExecutorPrefillMaintenanceDeferral,
-        ExecutorPrefillMaintenanceOutcome, GreedyRepetitionPenalty, KvSlotRequest,
-        LogitsReturnPolicy, TokenSelectionMask,
+        ExecutorExecutionCapacityPreemption, ExecutorPrefillAdmission,
+        ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
+        ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome,
+        GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy, TokenSelectionMask,
     },
     vnext::{
         AdmissionDeferred, AdmissionRejected, CapacityAvailabilityEpoch, DeferredAction,
@@ -32,9 +32,12 @@ use ferrum_interfaces::{
 };
 use ferrum_kv::cache::prefix::PrefixCache;
 use ferrum_sampler::json_mode::JsonModeProcessor;
+#[cfg(test)]
+use ferrum_scheduler::implementations::PressureTransitionKind;
 use ferrum_scheduler::implementations::{
-    ContinuousBatchScheduler, DecodeExecutionCapacityAction, DecodeProgressLease,
-    ExecutorAdmissionProbeOutcome, ExecutorAdmissionQueueObservation, RequestPhase,
+    ContinuousBatchScheduler, ExecutionCapacityAction, ExecutionCapacityReleaseSnapshot,
+    ExecutorAdmissionProbeOutcome, ExecutorAdmissionQueueObservation, PressureYieldTransaction,
+    RequestPhase,
 };
 use ferrum_scheduler::vnext::{
     AdmissionDeferral, AdmissionProbeOutcome, AdmissionWakeEpochs, AdmissionWakeSnapshot,
@@ -969,6 +972,10 @@ struct ModelCacheRefUpdate {
 }
 
 impl SequenceState {
+    fn can_release_execution_capacity(&self) -> bool {
+        self.model_kv.is_some()
+    }
+
     pub fn new(request: InferenceRequest, input_tokens: Vec<TokenId>) -> Self {
         Self::new_with_tokenizer(request, input_tokens, None)
     }

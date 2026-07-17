@@ -5,7 +5,7 @@
 
 use crate::{KvCacheHandle, RecurrentStateHandle, RecurrentStateSpec, TensorRef};
 use async_trait::async_trait;
-use ferrum_types::{ModelInfo, RequestId, Result, TokenId};
+use ferrum_types::{FerrumError, ModelInfo, RequestId, Result, TokenId};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap},
@@ -587,6 +587,82 @@ impl DecodeOutput {
 pub enum ExecutionResourceAuthority {
     LegacyEngine,
     PlanRuntime,
+}
+
+/// Request-scoped authority selected for a capacity-pressure preemption.
+///
+/// The cache identity prevents the engine from releasing a newer sequence
+/// incarnation after a stale scheduler decision. Implementations must retire
+/// retained prefill and active decode authority through the same operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorExecutionCapacityPreemption {
+    request_id: RequestId,
+    cache_id: String,
+}
+
+impl ExecutorExecutionCapacityPreemption {
+    pub fn new(request_id: RequestId, cache_id: String) -> Result<Self> {
+        if cache_id.is_empty() {
+            return Err(FerrumError::request_validation(
+                "execution-capacity preemption requires a cache identity",
+            ));
+        }
+        Ok(Self {
+            request_id,
+            cache_id,
+        })
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn cache_id(&self) -> &str {
+        &self.cache_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorExecutionCapacityPreemptionAuthority {
+    RetainedPrefill,
+    ActiveSequence,
+}
+
+/// Proof that the executor retired one exact request authority to a terminal
+/// state. Source-generation advancement remains independently verified by the
+/// engine before the scheduler may resume another frontier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorExecutionCapacityPreemptionReceipt {
+    request_id: RequestId,
+    cache_id: String,
+    authority: ExecutorExecutionCapacityPreemptionAuthority,
+}
+
+impl ExecutorExecutionCapacityPreemptionReceipt {
+    pub fn new(
+        request_id: RequestId,
+        cache_id: String,
+        authority: ExecutorExecutionCapacityPreemptionAuthority,
+    ) -> Self {
+        Self {
+            request_id,
+            cache_id,
+            authority,
+        }
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn cache_id(&self) -> &str {
+        &self.cache_id
+    }
+
+    pub const fn authority(&self) -> ExecutorExecutionCapacityPreemptionAuthority {
+        self.authority
+    }
 }
 
 /// Point-in-time memory evidence emitted by the shared plan runtime.
@@ -1236,6 +1312,21 @@ pub trait ModelExecutor: Send + Sync {
     /// Returns true only when a retained authority was found and released.
     fn cancel_prefill_admission(&self, _request_id: &RequestId) -> bool {
         false
+    }
+
+    /// Retire one exact request-scoped runtime authority for recompute.
+    ///
+    /// Success is a terminal release fence: all provider/device work that can
+    /// access the authority is quiescent and the request can be admitted as a
+    /// new sequence incarnation. Implementations must fail closed on identity
+    /// mismatch or an in-flight authority they cannot terminalize.
+    async fn preempt_execution_capacity(
+        &self,
+        _preemption: ExecutorExecutionCapacityPreemption,
+    ) -> Result<ExecutorExecutionCapacityPreemptionReceipt> {
+        Err(FerrumError::unsupported(
+            "request-scoped execution-capacity preemption is not implemented",
+        ))
     }
 
     /// Consume one retained logical/physical backing deferral after the

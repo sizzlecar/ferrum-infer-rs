@@ -17,8 +17,10 @@ use ferrum_interfaces::kv_cache::{BlockTable, CacheHandleStats};
 use ferrum_interfaces::model_executor::{
     AttentionType, DecodeInput, DecodeOutput, ExecutionResourceAuthority, ExecutorAdmissionEpochs,
     ExecutorBatchDecodeOutcome, ExecutorCapabilities, ExecutorCapacityWaitRegistration,
-    ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityStage, ExecutorMemoryUsage,
-    ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
+    ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityPreemption,
+    ExecutorExecutionCapacityPreemptionAuthority, ExecutorExecutionCapacityPreemptionReceipt,
+    ExecutorExecutionCapacityStage, ExecutorMemoryUsage, ExecutorPrefillAdmission,
+    ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
     ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome, ExecutorPrefillOutcome,
     ExecutorState, ExecutorStatus, MemoryRequirements, PlanRuntimeResourceSnapshot, PrefillChunk,
     PrefillInput, PrefillOutput,
@@ -717,6 +719,20 @@ struct VNextDecodeCandidate<R: DeviceRuntime> {
 }
 
 impl<R: DeviceRuntime> VNextSequence<R> {
+    fn preempt_for_recompute(&self) -> Result<()> {
+        if !self.active.load(Ordering::Acquire) {
+            return Err(FerrumError::already_exists(format!(
+                "vNext request `{}` is already terminal",
+                self.request_id
+            )));
+        }
+        self.session
+            .try_abort_if_quiescent()
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
+        self.active.store(false, Ordering::Release);
+        Ok(())
+    }
+
     fn complete(&self) {
         if !self.active.swap(false, Ordering::AcqRel) {
             return;
@@ -1229,6 +1245,70 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
         self.prefills.remove(request_id);
         prior.abort();
         true
+    }
+
+    fn preempt_execution_capacity(
+        &mut self,
+        preemption: &ExecutorExecutionCapacityPreemption,
+    ) -> Result<ExecutorExecutionCapacityPreemptionAuthority> {
+        let request_id = preemption.request_id();
+        if let Some(slot) = self.prefills.get(request_id).cloned() {
+            let mut state = slot.state.lock();
+            let sequence = match &*state {
+                VNextPrefillSlotState::Ready(sequence) => Arc::clone(sequence),
+                VNextPrefillSlotState::Executing(_) => {
+                    return Err(FerrumError::internal(format!(
+                        "vNext request `{request_id}` cannot preempt an executing prefill"
+                    )));
+                }
+                _ => {
+                    return Err(FerrumError::request_validation(format!(
+                        "vNext request `{request_id}` has no releasable retained prefill authority"
+                    )));
+                }
+            };
+            if sequence.cache_id != preemption.cache_id() {
+                return Err(FerrumError::request_validation(format!(
+                    "vNext request `{request_id}` preemption cache mismatch: expected {}, found {}",
+                    preemption.cache_id(),
+                    sequence.cache_id
+                )));
+            }
+            sequence.preempt_for_recompute()?;
+            *state = VNextPrefillSlotState::Terminal;
+            slot.cancelled.store(true, Ordering::Release);
+            drop(state);
+            self.prefills.remove(request_id);
+            return Ok(ExecutorExecutionCapacityPreemptionAuthority::RetainedPrefill);
+        }
+
+        let sequence = self
+            .active
+            .get(preemption.cache_id())
+            .cloned()
+            .ok_or_else(|| {
+                let detail = self
+                    .active
+                    .values()
+                    .find(|sequence| sequence.request_id == *request_id)
+                    .map_or_else(
+                        || "no active sequence".to_string(),
+                        |sequence| format!("active cache is {}", sequence.cache_id),
+                    );
+                FerrumError::request_validation(format!(
+                    "vNext request `{request_id}` preemption did not match an authority: {detail}"
+                ))
+            })?;
+        if sequence.request_id != *request_id {
+            return Err(FerrumError::request_validation(format!(
+                "vNext cache `{}` belongs to request {}, not {request_id}",
+                preemption.cache_id(),
+                sequence.request_id
+            )));
+        }
+        sequence.preempt_for_recompute()?;
+        self.active.remove(preemption.cache_id());
+        Ok(ExecutorExecutionCapacityPreemptionAuthority::ActiveSequence)
     }
 
     fn finish_prefill_execution(
@@ -3376,6 +3456,21 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
     fn cancel_prefill_admission(&self, request_id: &RequestId) -> bool {
         self.sequences.lock().cancel_prefill(request_id)
+    }
+
+    async fn preempt_execution_capacity(
+        &self,
+        preemption: ExecutorExecutionCapacityPreemption,
+    ) -> Result<ExecutorExecutionCapacityPreemptionReceipt> {
+        let authority = self
+            .sequences
+            .lock()
+            .preempt_execution_capacity(&preemption)?;
+        Ok(ExecutorExecutionCapacityPreemptionReceipt::new(
+            preemption.request_id().clone(),
+            preemption.cache_id().to_string(),
+            authority,
+        ))
     }
 
     fn maintain_prefill_backing(

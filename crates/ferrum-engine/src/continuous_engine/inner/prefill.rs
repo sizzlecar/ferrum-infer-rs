@@ -421,13 +421,39 @@ impl EngineInner {
                     ),
                     deferral.wait_condition().clone(),
                 );
-                if !self
-                    .scheduler
-                    .defer_prefill_for_execution_capacity(request_id, scheduler_deferral)?
-                {
-                    return Err(FerrumError::scheduler(format!(
-                        "PlanRuntime prefill deferral lost scheduler entry {request_id}"
-                    )));
+                let release_snapshot = self.execution_capacity_release_snapshot();
+                match self.scheduler.defer_prefill_for_execution_capacity(
+                    request_id,
+                    scheduler_deferral,
+                    &release_snapshot,
+                )? {
+                    ExecutionCapacityAction::Deferred { count: 1 } => {}
+                    ExecutionCapacityAction::Deferred { count } => {
+                        return Err(FerrumError::scheduler(format!(
+                            "PlanRuntime prefill deferral retained {count} scheduler entries for {request_id}"
+                        )));
+                    }
+                    ExecutionCapacityAction::YieldPlanned { transaction } => {
+                        let _progress_owner_resumable =
+                            self.execute_capacity_yield(&transaction, 1, None).await?;
+                        self.write_scheduler_trace_event(serde_json::json!({
+                            "event": "scheduler_prefill_execution_capacity_yield_planned",
+                            "request_id": request_id,
+                            "episode_id": transaction.episode_id().get(),
+                            "handoff_generation": transaction.handoff_generation(),
+                            "planned_transition_ordinal": transaction.planned_ordinal().get(),
+                            "victim_request_id": transaction.victim_request_id(),
+                            "progress_owner_id": transaction.progress_owner_id(),
+                            "scheduler": self.scheduler.trace_snapshot(),
+                        }));
+                    }
+                    ExecutionCapacityAction::InvariantViolation { violation } => {
+                        return Err(FerrumError::internal(format!(
+                            "prefill execution-capacity pressure episode {} violated {:?}",
+                            violation.episode_id().get(),
+                            violation.class()
+                        )));
+                    }
                 }
                 self.write_scheduler_trace_event(serde_json::json!({
                     "event": "scheduler_prefill_execution_capacity_defer",
