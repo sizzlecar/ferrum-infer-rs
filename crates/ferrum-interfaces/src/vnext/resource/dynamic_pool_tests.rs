@@ -2644,7 +2644,7 @@ fn sequence_backing_extension_publishes_atomically_between_frames() {
             .unwrap(),
     );
     match session
-        .try_extend_backing(
+        .try_ensure_backing_covers(
             SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
                 .unwrap(),
         )
@@ -2658,7 +2658,7 @@ fn sequence_backing_extension_publishes_atomically_between_frames() {
     first_step.try_retire_normal().unwrap();
 
     let extended = match session
-        .try_extend_backing(
+        .try_ensure_backing_covers(
             SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
                 .unwrap(),
         )
@@ -2711,7 +2711,19 @@ fn sequence_backing_extension_publishes_atomically_between_frames() {
     assert_eq!(view.segment_bindings().len(), 2);
 
     second_step.try_retire_normal().unwrap();
-    let over_ceiling = match session.try_extend_backing(
+    let covered_prefix = match session
+        .try_ensure_backing_covers(
+            SequenceResourceExtensionRequest::new(work(1), AdmissionPressureAction::WaitForRelease)
+                .unwrap(),
+        )
+        .unwrap()
+    {
+        SequenceResourceExtensionDecision::Current(snapshot) => snapshot,
+        _ => panic!("a committed backing frontier must cover a narrower execution prefix"),
+    };
+    assert!(Arc::ptr_eq(&covered_prefix, &extended));
+
+    let over_ceiling = match session.try_ensure_backing_covers(
         SequenceResourceExtensionRequest::new(work(3), AdmissionPressureAction::WaitForRelease)
             .unwrap(),
     ) {
@@ -2729,6 +2741,7 @@ fn sequence_backing_extension_publishes_atomically_between_frames() {
     drop(sequence);
     drop(first_captured);
     drop(initial);
+    drop(covered_prefix);
     drop(extended);
     let released = harness
         .root
@@ -2769,7 +2782,7 @@ fn sequence_backing_extension_waits_for_released_capacity_then_retries() {
     let session = first.open_session().unwrap();
 
     let deferred = match session
-        .try_extend_backing(
+        .try_ensure_backing_covers(
             SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
                 .unwrap(),
         )
@@ -2787,7 +2800,7 @@ fn sequence_backing_extension_waits_for_released_capacity_then_retries() {
     drop(deferred);
 
     let extended = match session
-        .try_extend_backing(
+        .try_ensure_backing_covers(
             SequenceResourceExtensionRequest::new(work(2), AdmissionPressureAction::WaitForRelease)
                 .unwrap(),
         )
@@ -2845,7 +2858,7 @@ fn sequence_extension_deferral_retains_exact_session_and_rejects_stale_generatio
     let target = work(2);
 
     let deferred = match session
-        .try_extend_backing(
+        .try_ensure_backing_covers(
             SequenceResourceExtensionRequest::new(
                 target.clone(),
                 AdmissionPressureAction::WaitForRelease,
@@ -2869,7 +2882,7 @@ fn sequence_extension_deferral_retains_exact_session_and_rejects_stale_generatio
         .upgrade()
         .expect("the deferred authority retains its exact session");
     let extended = match retained_session
-        .try_extend_backing(
+        .try_ensure_backing_covers(
             SequenceResourceExtensionRequest::new(target, AdmissionPressureAction::WaitForRelease)
                 .unwrap(),
         )

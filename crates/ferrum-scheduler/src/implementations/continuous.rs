@@ -234,6 +234,16 @@ impl ExecutionCapacityReleaseSnapshot {
             .iter()
             .any(|observed| release_sources.binary_search(&observed.source()).is_ok())
     }
+
+    pub fn has_external_releaser(
+        &self,
+        blocked_request_id: &RequestId,
+        condition: &CapacityWaitCondition,
+    ) -> bool {
+        self.release_sources_by_request.keys().any(|request_id| {
+            request_id != blocked_request_id && self.can_advance(request_id, condition)
+        })
+    }
 }
 
 /// Extended scheduled request with continuous batching metadata
@@ -255,6 +265,9 @@ pub struct ContinuousBatchRequest {
     pub chunked_prefill: bool,
     /// Current chunk offset for chunked prefill
     pub prefill_chunk_offset: usize,
+    /// Request-local upper bound learned from definitely-not-submitted
+    /// execution-capacity probes.
+    pub prefill_execution_chunk_ceiling: Option<usize>,
     /// Last iteration this request was processed
     pub last_iteration: u64,
     /// Time spent in prefill (ms)
@@ -287,6 +300,7 @@ impl ContinuousBatchRequest {
             kv_blocks: Vec::new(),
             chunked_prefill: false,
             prefill_chunk_offset: 0,
+            prefill_execution_chunk_ceiling: None,
             last_iteration: 0,
             prefill_time_ms: 0,
             decode_time_ms: 0,
@@ -1754,6 +1768,7 @@ impl ContinuousBatchScheduler {
             req.kv_blocks.clear();
             req.chunked_prefill = false;
             req.prefill_chunk_offset = 0;
+            req.prefill_execution_chunk_ceiling = None;
             req.logical_work_frontier.yield_for_recompute();
             req.capacity_deferred_until_release_epoch = self
                 .capacity_release_epoch
@@ -1993,6 +2008,7 @@ impl ContinuousBatchScheduler {
             request.kv_blocks.clear();
             request.chunked_prefill = false;
             request.prefill_chunk_offset = 0;
+            request.prefill_execution_chunk_ceiling = None;
             request.capacity_deferred_until_release_epoch = self
                 .capacity_release_epoch
                 .load(Ordering::Relaxed)
@@ -2038,6 +2054,7 @@ impl ContinuousBatchScheduler {
             req.kv_blocks.clear();
             req.chunked_prefill = false;
             req.prefill_chunk_offset = 0;
+            req.prefill_execution_chunk_ceiling = None;
             req.capacity_deferred_until_release_epoch = self
                 .capacity_release_epoch
                 .load(Ordering::Relaxed)
@@ -2213,6 +2230,13 @@ impl ContinuousBatchScheduler {
         chunk.min(remaining).max(1)
     }
 
+    fn apply_prefill_execution_chunk_ceiling(req: &ContinuousBatchRequest, tokens: usize) -> usize {
+        req.prefill_execution_chunk_ceiling
+            .map(|ceiling| tokens.min(ceiling))
+            .unwrap_or(tokens)
+            .max(1)
+    }
+
     fn prefill_budget_tokens(
         &self,
         req: &ContinuousBatchRequest,
@@ -2229,24 +2253,27 @@ impl ContinuousBatchScheduler {
             let chunk = self
                 .effective_active_decode_prefill_chunk(Some(chunk), prefill_step_chunk)
                 .unwrap_or(chunk.max(1));
-            return self
+            let tokens = self
                 .chunked_prefill_budget_tokens(req, chunk)
                 .min(step_tokens_remaining)
                 .max(1);
+            return Self::apply_prefill_execution_chunk_ceiling(req, tokens);
         }
 
         let remaining = self.remaining_prefill_tokens(req);
         if let Some(chunk) = prefill_step_chunk {
-            return self
+            let tokens = self
                 .chunked_prefill_budget_tokens(req, chunk)
                 .min(step_tokens_remaining)
                 .max(1);
+            return Self::apply_prefill_execution_chunk_ceiling(req, tokens);
         }
-        if self.cb_config.enable_chunked_prefill {
+        let tokens = if self.cb_config.enable_chunked_prefill {
             remaining.min(step_tokens_remaining).max(1)
         } else {
             remaining.max(1)
-        }
+        };
+        Self::apply_prefill_execution_chunk_ceiling(req, tokens)
     }
 
     fn active_decode_prefill_budget_tokens(
@@ -2952,6 +2979,38 @@ impl ContinuousBatchScheduler {
         total_prompt_tokens: usize,
         chunk_tokens: usize,
     ) -> bool {
+        self.mark_prefill_chunk_processed_inner(request_id, total_prompt_tokens, chunk_tokens, None)
+    }
+
+    /// Commit an executor-selected prefix of the scheduler's maximum prefill
+    /// frontier and retain the observed fit as a request-local scheduling cap.
+    pub fn mark_prefill_chunk_processed_with_capacity_feedback(
+        &self,
+        request_id: &RequestId,
+        total_prompt_tokens: usize,
+        planned_chunk_tokens: usize,
+        completed_chunk_tokens: usize,
+    ) -> Result<bool> {
+        if completed_chunk_tokens == 0 || completed_chunk_tokens > planned_chunk_tokens {
+            return Err(FerrumError::scheduler(
+                "completed prefill prefix must be non-empty and no wider than its planned frontier",
+            ));
+        }
+        Ok(self.mark_prefill_chunk_processed_inner(
+            request_id,
+            total_prompt_tokens,
+            completed_chunk_tokens,
+            Some((planned_chunk_tokens, completed_chunk_tokens)),
+        ))
+    }
+
+    fn mark_prefill_chunk_processed_inner(
+        &self,
+        request_id: &RequestId,
+        total_prompt_tokens: usize,
+        chunk_tokens: usize,
+        execution_frontier_feedback: Option<(usize, usize)>,
+    ) -> bool {
         let mut prefill_queue = self.prefill_queue.write();
         let mut fully_done = false;
         let mut made_progress = false;
@@ -2971,6 +3030,17 @@ impl ContinuousBatchScheduler {
             let committed_tokens = req.prefill_chunk_offset.saturating_sub(previous_offset);
             req.logical_work_frontier
                 .commit_prefill(req.prefill_chunk_offset, committed_tokens);
+            if let Some((planned, completed)) = execution_frontier_feedback {
+                if completed < planned {
+                    req.prefill_execution_chunk_ceiling = Some(
+                        req.prefill_execution_chunk_ceiling
+                            .map(|current| current.min(completed))
+                            .unwrap_or(completed),
+                    );
+                } else if let Some(current) = req.prefill_execution_chunk_ceiling {
+                    req.prefill_execution_chunk_ceiling = Some(current.saturating_mul(2));
+                }
+            }
             progress = Some(req.logical_work_frontier.progress_generation());
             if committed_tokens > 0 {
                 req.capacity_deferred_mixed_attempt_epoch = None;
@@ -4543,6 +4613,64 @@ mod tests {
                 .execution_capacity_blocked_prefill_len,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn partial_prefill_completion_limits_the_next_scheduled_frontier() {
+        use ferrum_interfaces::vnext::{CapacityAvailabilityEpoch, CapacityAvailabilitySource};
+        use std::num::NonZeroU64;
+
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 1,
+            prefill_step_chunk: Some(4),
+            ..SchedulerConfig::default()
+        });
+        let request = create_test_request_with_prompt_tokens(Priority::Normal, 8);
+        let request_id = request.id.clone();
+        scheduler.submit(request).await.unwrap();
+        let availability =
+            [
+                CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::ActiveSequenceSlots, 1)
+                    .unwrap(),
+            ];
+        let wake = AdmissionWakeSnapshot::new(
+            AdmissionWakeEpochs::new(NonZeroU64::new(31).unwrap(), 0, 0, 0),
+            &availability,
+        );
+
+        let first = scheduler
+            .next_batch_with_dynamic_admission(BatchHint::simple(1), wake, &mut |request| {
+                AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                    request_id: request.id.clone(),
+                })
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.requests[0].tokens_to_process, Some(4));
+        assert!(!scheduler
+            .mark_prefill_chunk_processed_with_capacity_feedback(&request_id, 8, 4, 2)
+            .unwrap());
+
+        let second = scheduler
+            .next_batch_with_dynamic_admission(BatchHint::simple(1), wake, &mut |_| {
+                panic!("active prefill must not re-enter admission")
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.requests[0].tokens_processed, 2);
+        assert_eq!(second.requests[0].tokens_to_process, Some(2));
+        assert!(!scheduler
+            .mark_prefill_chunk_processed_with_capacity_feedback(&request_id, 8, 2, 2)
+            .unwrap());
+
+        let third = scheduler
+            .next_batch_with_dynamic_admission(BatchHint::simple(1), wake, &mut |_| {
+                panic!("active prefill must not re-enter admission")
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(third.requests[0].tokens_processed, 4);
+        assert_eq!(third.requests[0].tokens_to_process, Some(4));
     }
 
     #[tokio::test]

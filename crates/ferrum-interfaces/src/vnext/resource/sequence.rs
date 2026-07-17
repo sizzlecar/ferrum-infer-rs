@@ -780,11 +780,13 @@ where
             .register_admission_waiter(deferred)
     }
 
-    /// Advances the sequence-owned committed backing frontier without making
-    /// an in-flight frame observe a different physical generation. Expensive
-    /// preparation happens outside the session/backing locks; publication is
-    /// one short slot -> backing critical section.
-    pub fn try_extend_backing(
+    /// Ensures that the sequence-owned committed backing frontier covers the
+    /// requested work without making an in-flight frame observe a different
+    /// physical generation. A frontier already wider than the requested work
+    /// is returned unchanged. Expensive preparation happens outside the
+    /// session/backing locks; publication is one short slot -> backing critical
+    /// section.
+    pub fn try_ensure_backing_covers(
         self: &Arc<Self>,
         request: SequenceResourceExtensionRequest,
     ) -> Result<SequenceResourceExtensionDecision<R>, VNextError> {
@@ -834,16 +836,22 @@ where
             };
             let backing = self.resources.lock_backing_state()?;
             let current = Arc::clone(&backing.current);
-            if target.sequences() != 1
-                || target.tokens() < current.committed_tokens()
+            if target.sequences() != 1 {
+                return Err(invalid_resource(
+                    "sequence backing coverage target must contain exactly one sequence",
+                ));
+            }
+            if current.committed_tokens() >= target.tokens()
+                && current.committed_pages() >= target.pages()
+            {
+                return Ok(SequenceResourceExtensionDecision::Current(current));
+            }
+            if target.tokens() < current.committed_tokens()
                 || target.pages() < current.committed_pages()
             {
                 return Err(invalid_resource(
-                    "sequence backing extension target regresses committed work",
+                    "sequence backing coverage target is incomparable with committed work",
                 ));
-            }
-            if target == current.committed_shape() {
-                return Ok(SequenceResourceExtensionDecision::Current(current));
             }
             if active.active_frame.is_some() || !active.participant_flights.is_empty() {
                 return Ok(SequenceResourceExtensionDecision::RetryRequired(current));
