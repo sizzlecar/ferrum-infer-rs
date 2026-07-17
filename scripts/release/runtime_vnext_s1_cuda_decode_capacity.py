@@ -39,7 +39,7 @@ SERVER_POLICY = {
     "target_max_num_batched_tokens": TARGET_TOKEN_BUDGET,
     "calibration_max_tokens": CALIBRATION_MAX_TOKENS,
     "target_sizing_max_tokens": CALIBRATION_MAX_TOKENS,
-    "target_budget_derivation": "per_pool_maximum",
+    "target_budget_derivation": "target_sizing_global_residency",
     "target_max_tokens": TARGET_MAX_TOKENS,
 }
 STOP_POLICY = {
@@ -83,8 +83,7 @@ def derive_target_budget_envelope(
         "target sizing pool envelopes differ from calibration",
     )
 
-    pool_resident_bytes: dict[str, int] = {}
-    pool_sources: dict[str, str] = {}
+    sizing_pool_resident_bytes: dict[str, int] = {}
     pool_storage_profiles: dict[str, Any] = {}
     for pool_id in sorted(calibration_pools):
         calibration_bytes = calibration_pools[pool_id]
@@ -102,35 +101,39 @@ def derive_target_budget_envelope(
             calibration_profile == sizing_profile,
             f"target sizing storage profile differs for {pool_id}",
         )
-        pool_resident_bytes[pool_id] = max(calibration_bytes, sizing_bytes)
-        if calibration_bytes > sizing_bytes:
-            pool_sources[pool_id] = "calibration"
-        elif sizing_bytes > calibration_bytes:
-            pool_sources[pool_id] = "target_sizing"
-        else:
-            pool_sources[pool_id] = "equal"
+        sizing_pool_resident_bytes[pool_id] = sizing_bytes
         pool_storage_profiles[pool_id] = calibration_profile
 
-    static_bytes = calibration.get("static_bytes")
+    static_bytes = target_sizing.get("static_bytes")
     require(isinstance(static_bytes, int) and static_bytes > 0, "invalid sizing static bytes")
-    resident_bytes = sum(pool_resident_bytes.values())
-    exact_budget = static_bytes + resident_bytes
+    resident_bytes = target_sizing.get("resident_bytes")
     require(
-        exact_budget >= calibration.get("budget_claimed_bytes", 0)
-        and exact_budget >= target_sizing.get("budget_claimed_bytes", 0),
-        "derived target budget is smaller than a sizing receipt",
+        isinstance(resident_bytes, int)
+        and resident_bytes == sum(sizing_pool_resident_bytes.values()),
+        "target sizing resident total differs from its pool receipts",
+    )
+    exact_budget = static_bytes + resident_bytes
+    calibration_budget = calibration.get("budget_claimed_bytes")
+    require(
+        target_sizing.get("budget_claimed_bytes") == exact_budget,
+        "target sizing budget differs from installed backing",
+    )
+    require(
+        isinstance(calibration_budget, int) and calibration_budget >= exact_budget,
+        "calibration budget is smaller than target sizing backing",
     )
     return {
         "static_bytes": static_bytes,
         "resident_bytes": resident_bytes,
         "budget_claimed_bytes": exact_budget,
-        "pool_resident_bytes": pool_resident_bytes,
-        "pool_sources": pool_sources,
+        "sizing_pool_resident_bytes": sizing_pool_resident_bytes,
         "pool_storage_profiles": pool_storage_profiles,
+        "calibration_budget_claimed_bytes": calibration_budget,
+        "bootstrap_headroom_bytes": calibration_budget - exact_budget,
     }
 
 
-def require_target_pool_within_envelope(
+def require_target_pool_within_budget_contract(
     target: dict[str, Any], envelope: dict[str, Any], exact_budget: int
 ) -> None:
     require(
@@ -139,12 +142,12 @@ def require_target_pool_within_envelope(
     )
     target_pools = target.get("pool_resident_bytes")
     target_envelopes = target.get("pool_envelopes")
-    limits = envelope.get("pool_resident_bytes")
+    sizing_pools = envelope.get("sizing_pool_resident_bytes")
     profiles = envelope.get("pool_storage_profiles")
     require(
         isinstance(target_pools, dict)
-        and isinstance(limits, dict)
-        and target_pools.keys() == limits.keys(),
+        and isinstance(sizing_pools, dict)
+        and target_pools.keys() == sizing_pools.keys(),
         "target pool identities differ from its sizing envelope",
     )
     require(
@@ -156,15 +159,27 @@ def require_target_pool_within_envelope(
     )
     for pool_id, resident_bytes in target_pools.items():
         require(
-            isinstance(resident_bytes, int) and 0 <= resident_bytes <= limits[pool_id],
-            f"target pool {pool_id} exceeded its sizing envelope",
+            isinstance(resident_bytes, int) and resident_bytes >= 0,
+            f"target pool {pool_id} has invalid residency",
         )
         require(
             target_envelopes[pool_id].get("storage_profile") == profiles[pool_id],
             f"target pool {pool_id} changed storage profile",
         )
+    target_resident_bytes = target.get("resident_bytes")
     require(
-        target.get("budget_claimed_bytes", exact_budget + 1) <= exact_budget,
+        isinstance(target_resident_bytes, int)
+        and target_resident_bytes == sum(target_pools.values()),
+        "target resident total differs from its pool receipts",
+    )
+    require(
+        target_resident_bytes <= envelope.get("resident_bytes", -1),
+        "target installed dynamic backing exceeded the global sizing envelope",
+    )
+    require(
+        target.get("budget_claimed_bytes")
+        == target.get("static_bytes", exact_budget + 1) + target_resident_bytes
+        and target.get("budget_claimed_bytes", exact_budget + 1) <= exact_budget,
         "target installed backing exceeded the derived exact budget",
     )
 
@@ -1084,6 +1099,83 @@ def validate_decode_trace(
     }
 
 
+def validate_rebalance_trace(
+    rows: list[dict[str, Any]], *, started_wall_ns: int, finished_wall_ns: int
+) -> dict[str, Any]:
+    require(started_wall_ns > 0 and finished_wall_ns >= started_wall_ns, "invalid rebalance window")
+    maintenance_rows = [
+        row
+        for row in rows
+        if row.get("phase") == "vnext.prefill_backing_maintenance"
+        and isinstance(row.get("ts_unix_nanos"), int)
+        and started_wall_ns <= row["ts_unix_nanos"] <= finished_wall_ns
+    ]
+    require(maintenance_rows, "target produced no typed prefill backing maintenance")
+    rebalances: list[dict[str, int]] = []
+    for index, row in enumerate(maintenance_rows):
+        require(
+            row.get("status") == "ok" and row.get("error") is None,
+            f"prefill maintenance {index}: event failed",
+        )
+        attributes = row.get("attributes")
+        require(isinstance(attributes, dict), f"prefill maintenance {index}: attributes are missing")
+        evidence = attributes.get("maintenance_evidence")
+        require(isinstance(evidence, dict), f"prefill maintenance {index}: evidence is missing")
+        if evidence.get("outcome") != "maintained":
+            continue
+        pools_grown = evidence.get("pools_grown")
+        allocated_bytes = evidence.get("allocated_bytes")
+        pools_reclaimed = evidence.get("pools_reclaimed")
+        chunks_reclaimed = evidence.get("chunks_reclaimed")
+        reclaimed_bytes = evidence.get("reclaimed_bytes")
+        require(
+            isinstance(pools_grown, int)
+            and pools_grown > 0
+            and isinstance(allocated_bytes, int)
+            and allocated_bytes > 0,
+            f"prefill maintenance {index}: maintained growth is invalid",
+        )
+        require(
+            isinstance(pools_reclaimed, int)
+            and pools_reclaimed >= 0
+            and isinstance(chunks_reclaimed, int)
+            and chunks_reclaimed >= 0
+            and isinstance(reclaimed_bytes, int)
+            and reclaimed_bytes >= 0,
+            f"prefill maintenance {index}: rebalance receipt is missing",
+        )
+        require(
+            (pools_reclaimed == 0 and chunks_reclaimed == 0 and reclaimed_bytes == 0)
+            or (
+                pools_reclaimed > 0
+                and chunks_reclaimed >= pools_reclaimed
+                and reclaimed_bytes > 0
+            ),
+            f"prefill maintenance {index}: rebalance receipt is inconsistent",
+        )
+        if pools_reclaimed > 0:
+            rebalances.append(
+                {
+                    "pools_grown": pools_grown,
+                    "allocated_bytes": allocated_bytes,
+                    "pools_reclaimed": pools_reclaimed,
+                    "chunks_reclaimed": chunks_reclaimed,
+                    "reclaimed_bytes": reclaimed_bytes,
+                }
+            )
+    require(rebalances, "target produced no typed cross-pool rebalance")
+    return {
+        "maintenance_events": len(maintenance_rows),
+        "rebalance_events": len(rebalances),
+        "pools_reclaimed": sum(event["pools_reclaimed"] for event in rebalances),
+        "chunks_reclaimed": sum(event["chunks_reclaimed"] for event in rebalances),
+        "reclaimed_bytes": sum(event["reclaimed_bytes"] for event in rebalances),
+        "allocated_bytes_after_rebalance": sum(
+            event["allocated_bytes"] for event in rebalances
+        ),
+    }
+
+
 def start_stream_group(
     server: common.ServerSession,
     *,
@@ -1398,15 +1490,22 @@ def collect(args: argparse.Namespace) -> int:
             "health_final": "target/health.final.json",
             "trace": "target/scheduler-trace.jsonl",
         }
-        require_target_pool_within_envelope(
+        require_target_pool_within_budget_contract(
             target_pool, target_budget_envelope, exact_budget
         )
+        target_rows = common.read_trace(target.trace_path)
         decode_summary = validate_decode_trace(
-            common.read_trace(target.trace_path),
+            target_rows,
+            started_wall_ns=target_started,
+            finished_wall_ns=target_finished,
+        )
+        rebalance_summary = validate_rebalance_trace(
+            target_rows,
             started_wall_ns=target_started,
             finished_wall_ns=target_finished,
         )
         collection["target"]["decode_summary"] = decode_summary
+        collection["target"]["rebalance_summary"] = rebalance_summary
 
         collection.update(
             {
@@ -1556,7 +1655,7 @@ def validate(root: Path, out: Path) -> int:
         and exact_budget == target_budget_envelope["budget_claimed_bytes"],
         "exact budget does not match the target-compatible sizing envelope",
     )
-    require_target_pool_within_envelope(
+    require_target_pool_within_budget_contract(
         target_pool, target_budget_envelope, exact_budget
     )
     sizing_policy = sizing_executor.get("runtime_memory_policy")
@@ -1621,6 +1720,15 @@ def validate(root: Path, out: Path) -> int:
         finished_wall_ns=target_finished,
     )
     require(target.get("decode_summary") == decode_summary, "decode summary differs from raw trace")
+    rebalance_summary = validate_rebalance_trace(
+        target_rows,
+        started_wall_ns=target_started,
+        finished_wall_ns=target_finished,
+    )
+    require(
+        target.get("rebalance_summary") == rebalance_summary,
+        "rebalance summary differs from raw trace",
+    )
 
     counters = target_executor.get("counters")
     require(isinstance(counters, dict), "target executor counters are missing")
@@ -1675,6 +1783,7 @@ def validate(root: Path, out: Path) -> int:
         "server_policy": SERVER_POLICY,
         "stop_policy": STOP_POLICY,
         "decode_summary": decode_summary,
+        "rebalance_summary": rebalance_summary,
         "target_trace_bytes": target_trace_bytes,
         "calibration_window_ns": [calibration_started, calibration_finished],
         "target_sizing_window_ns": [sizing_started, sizing_finished],
@@ -1733,22 +1842,23 @@ def self_test() -> int:
     sizing_pool = pool_snapshot({"sequence": 20, "workspace": 7})
     target_envelope = derive_target_budget_envelope(calibration_pool, sizing_pool)
     require(
-        target_envelope["budget_claimed_bytes"] == 137,
-        "self-test lost target-compatible budget derivation",
+        target_envelope["budget_claimed_bytes"] == 127,
+        "self-test lost global target-sizing budget derivation",
     )
     require(
-        target_envelope["pool_sources"]
-        == {"sequence": "calibration", "workspace": "target_sizing"},
-        "self-test lost per-pool sizing provenance",
+        target_envelope["sizing_pool_resident_bytes"]
+        == {"sequence": 20, "workspace": 7}
+        and target_envelope["bootstrap_headroom_bytes"] == 7,
+        "self-test lost target-sizing provenance",
     )
-    require_target_pool_within_envelope(
-        pool_snapshot({"sequence": 30, "workspace": 7}), target_envelope, 137
+    require_target_pool_within_budget_contract(
+        pool_snapshot({"sequence": 25, "workspace": 2}), target_envelope, 127
     )
     try:
-        require_target_pool_within_envelope(
-            pool_snapshot({"sequence": 31, "workspace": 7}), target_envelope, 137
+        require_target_pool_within_budget_contract(
+            pool_snapshot({"sequence": 26, "workspace": 2}), target_envelope, 127
         )
-        raise AssertionError("oversized target pool unexpectedly fit its sizing envelope")
+        raise AssertionError("oversized global target residency unexpectedly fit its sizing envelope")
     except common.CapacityGateError:
         pass
 
@@ -2075,7 +2185,63 @@ def self_test() -> int:
             {"ts_unix_nanos": 164, "phase": "vnext.request_completed", "request_id": "D"},
         ]
     )
+    rows.append(
+        {
+            "ts_unix_nanos": 165,
+            "phase": "vnext.prefill_backing_maintenance",
+            "status": "ok",
+            "error": None,
+            "shape": {"outcome": "maintained"},
+            "attributes": {
+                "maintenance_evidence": {
+                    "outcome": "maintained",
+                    "current": {
+                        "coordinator_id": 7,
+                        "release_epoch": 15,
+                        "capacity_epoch": 17,
+                    },
+                    "pools_grown": 1,
+                    "allocated_bytes": 32,
+                    "pools_reclaimed": 1,
+                    "chunks_reclaimed": 1,
+                    "reclaimed_bytes": 64,
+                }
+            },
+        }
+    )
     summary = validate_decode_trace(rows, started_wall_ns=90, finished_wall_ns=170)
+    rebalance_summary = validate_rebalance_trace(
+        rows, started_wall_ns=90, finished_wall_ns=170
+    )
+    require(
+        rebalance_summary["rebalance_events"] == 1
+        and rebalance_summary["reclaimed_bytes"] == 64,
+        "self-test lost typed cross-pool rebalance evidence",
+    )
+    missing_rebalance = json.loads(json.dumps(rows))
+    missing_rebalance[-1]["attributes"]["maintenance_evidence"].update(
+        {
+            "pools_reclaimed": 0,
+            "chunks_reclaimed": 0,
+            "reclaimed_bytes": 0,
+        }
+    )
+    try:
+        validate_rebalance_trace(
+            missing_rebalance, started_wall_ns=90, finished_wall_ns=170
+        )
+        raise AssertionError("trace without cross-pool reclaim unexpectedly passed")
+    except common.CapacityGateError:
+        pass
+    invalid_rebalance = json.loads(json.dumps(rows))
+    invalid_rebalance[-1]["attributes"]["maintenance_evidence"]["chunks_reclaimed"] = 0
+    try:
+        validate_rebalance_trace(
+            invalid_rebalance, started_wall_ns=90, finished_wall_ns=170
+        )
+        raise AssertionError("inconsistent cross-pool reclaim unexpectedly passed")
+    except common.CapacityGateError:
+        pass
     require(summary["split_events"] == 1, "self-test lost split evidence")
     require(summary["park_events"] == 2, "self-test lost park evidence")
     require(summary["resume_events"] == 1, "self-test lost resume evidence")
