@@ -343,6 +343,11 @@ where
             fit_policy,
             pressure_action,
         } = request;
+        if work_shape.fit_tokens() > self.work_shape.fit_tokens() {
+            return Err(invalid_resource(
+                "sequence token ceiling exceeds its parent request ceiling",
+            ));
+        }
         let immediate_shape = work_shape.immediate_shape();
         let fit_shape = match fit_policy {
             AdmissionFitPolicy::ImmediateOnly => immediate_shape,
@@ -769,6 +774,11 @@ where
             .read_lifecycle("extend sequence backing")?;
         let target_fingerprint = request.target_work.fingerprint().to_owned();
         let target = request.target_work.fit_shape();
+        if target.tokens() > self.resources.request.work_shape().fit_tokens() {
+            return Err(invalid_resource(
+                "sequence backing extension exceeds its parent request token ceiling",
+            ));
+        }
 
         let expected = {
             let slot = self

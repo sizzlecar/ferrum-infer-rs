@@ -1176,6 +1176,7 @@ pub(crate) fn policy_with_tokens(
         serde_json::from_value(json!({
             "maximum_queue_depth": 8,
             "maximum_scheduled_tokens": maximum_scheduled_tokens,
+            "sequence_fit_policy": "immediate_only",
             "allow_defer": true,
             "cancellation_check_interval_steps": 1
         }))

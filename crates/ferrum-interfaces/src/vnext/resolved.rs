@@ -8,11 +8,11 @@ use std::io::{self, Write};
 
 use super::model::PreparedModelFamilyWire;
 use super::{
-    CapabilityCatalog, ContractVersion, DeviceDescriptor, DynamicStorageProfile,
-    ExecutablePlanView, ExecutionPlan, ModelFamilyRegistry, PlanNodeResolution,
-    PreparedModelFamily, ProviderId, RuntimePolicy, SpecialTokenRole, TokenizerDescriptor,
-    UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, UnvalidatedPreparedModelFamily,
-    VNextError,
+    AdmissionFitPolicy, CapabilityCatalog, ContractVersion, DeviceDescriptor,
+    DynamicStorageProfile, ExecutablePlanView, ExecutionPlan, ModelFamilyRegistry,
+    PlanNodeResolution, PreparedModelFamily, ProviderId, RuntimePolicy, SpecialTokenRole,
+    TokenizerDescriptor, UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire,
+    UnvalidatedPreparedModelFamily, VNextError,
 };
 
 /// Maximum raw byte length accepted for one resolution source artifact.
@@ -654,6 +654,7 @@ pub struct RuntimeMemoryPolicy {
 pub struct AdmissionPolicy {
     pub maximum_queue_depth: u32,
     pub maximum_scheduled_tokens: u64,
+    pub sequence_fit_policy: AdmissionFitPolicy,
     pub allow_defer: bool,
     pub cancellation_check_interval_steps: u32,
 }
