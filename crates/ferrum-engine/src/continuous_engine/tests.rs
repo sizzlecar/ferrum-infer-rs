@@ -11,8 +11,8 @@ use ferrum_interfaces::{
         ExecutorExecutionCapacityStage, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
         ExecutorPrefillAdmissionReceipt, ExecutorPrefillMaintenanceBlocker,
         ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome,
-        ExecutorPrefillMaintenanceStage, ExecutorStatus, PlanRuntimeResourceSnapshot, PrefillInput,
-        PrefillOutput, UnifiedBatch,
+        ExecutorPrefillMaintenanceStage, ExecutorPrefillOutcome, ExecutorStatus,
+        PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput, PrefillOutput, UnifiedBatch,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateManager, RecurrentStateSpec,
     RecurrentStateTensorSpec, TensorRef,
@@ -26,6 +26,64 @@ struct PlanRuntimeAdmissionTestExecutor {
     retained: std::sync::Mutex<HashSet<RequestId>>,
     admission_probes: AtomicU64,
     prefill_calls: AtomicU64,
+}
+
+struct PlanRuntimeChunkedPrefillTestExecutor {
+    inner: MockModelExecutor,
+    retained: std::sync::Mutex<HashSet<RequestId>>,
+    attempted_chunks: std::sync::Mutex<Vec<PrefillChunk>>,
+    completed_chunks: AtomicU64,
+    defer_next_prefill: AtomicBool,
+    release_epoch: AtomicU64,
+    capacity_wait_registrations: AtomicU64,
+    capacity_signal: tokio::sync::watch::Sender<u64>,
+}
+
+impl PlanRuntimeChunkedPrefillTestExecutor {
+    const COORDINATOR_ID: u64 = 61;
+
+    fn new(defer_first_prefill: bool) -> Self {
+        let (capacity_signal, _) = tokio::sync::watch::channel(0);
+        Self {
+            inner: MockModelExecutor::instant(128),
+            retained: std::sync::Mutex::new(HashSet::new()),
+            attempted_chunks: std::sync::Mutex::new(Vec::new()),
+            completed_chunks: AtomicU64::new(0),
+            defer_next_prefill: AtomicBool::new(defer_first_prefill),
+            release_epoch: AtomicU64::new(0),
+            capacity_wait_registrations: AtomicU64::new(0),
+            capacity_signal,
+        }
+    }
+
+    fn epochs(&self) -> ExecutorAdmissionEpochs {
+        ExecutorAdmissionEpochs::new(
+            std::num::NonZeroU64::new(Self::COORDINATOR_ID).unwrap(),
+            self.release_epoch.load(Ordering::Acquire),
+            0,
+        )
+    }
+
+    fn availability(&self) -> ferrum_interfaces::vnext::CapacityAvailabilityEpoch {
+        ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(
+            ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots,
+            self.release_epoch.load(Ordering::Acquire) + 1,
+        )
+        .unwrap()
+    }
+
+    fn wait_condition(&self) -> ferrum_interfaces::vnext::CapacityWaitCondition {
+        ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(
+            Self::COORDINATOR_ID,
+            vec![self.availability()],
+        )
+        .unwrap()
+    }
+
+    fn publish_release(&self) {
+        let epoch = self.release_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.capacity_signal.send_replace(epoch);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -52,6 +110,160 @@ impl PlanRuntimeBatchDecodeTestExecutor {
             decode_calls: AtomicU64::new(0),
             batch_decode_calls: AtomicU64::new(0),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
+    fn info(&self) -> &ferrum_types::ModelInfo {
+        self.inner.info()
+    }
+
+    fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
+        ExecutionResourceAuthority::PlanRuntime
+    }
+
+    fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
+        PlanRuntimeResourceSnapshot::new(1_000, 900, 700, 700, 400, 300, 200, 0, 0).map(Some)
+    }
+
+    fn execution_capacity_epochs(&self) -> Result<Option<ExecutorAdmissionEpochs>> {
+        Ok(Some(self.epochs()))
+    }
+
+    fn write_execution_capacity_snapshot(
+        &self,
+        availability: &mut Vec<ferrum_interfaces::vnext::CapacityAvailabilityEpoch>,
+    ) -> Result<Option<ExecutorAdmissionEpochs>> {
+        availability.clear();
+        availability.push(self.availability());
+        Ok(Some(self.epochs()))
+    }
+
+    fn register_execution_capacity_waiter(
+        &self,
+        observed: &ferrum_interfaces::vnext::CapacityWaitCondition,
+    ) -> Result<Option<ExecutorCapacityWaitRegistration>> {
+        if observed.coordinator_id().get() != Self::COORDINATOR_ID {
+            return Err(FerrumError::internal(
+                "chunked prefill test received a foreign coordinator",
+            ));
+        }
+        let observed_epoch = observed
+            .observed()
+            .first()
+            .ok_or_else(|| FerrumError::internal("chunked prefill wait has no source"))?
+            .epoch();
+        let mut signal = self.capacity_signal.subscribe();
+        self.capacity_wait_registrations
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(Some(ExecutorCapacityWaitRegistration::new(async move {
+            loop {
+                let release_epoch = *signal.borrow_and_update();
+                if release_epoch + 1 > observed_epoch {
+                    return Ok(ExecutorAdmissionEpochs::new(
+                        std::num::NonZeroU64::new(Self::COORDINATOR_ID).unwrap(),
+                        release_epoch,
+                        0,
+                    ));
+                }
+                signal.changed().await.map_err(|_| {
+                    FerrumError::internal("chunked prefill capacity signal closed while waiting")
+                })?;
+            }
+        })))
+    }
+
+    fn try_admit_prefill(
+        &self,
+        input: ExecutorPrefillAdmission<'_>,
+    ) -> Result<ExecutorPrefillAdmissionDecision> {
+        let inserted = self
+            .retained
+            .lock()
+            .expect("chunked prefill retained mutex poisoned")
+            .insert(input.request_id.clone());
+        if !inserted {
+            return Err(FerrumError::already_exists(
+                "duplicate chunked prefill test admission",
+            ));
+        }
+        Ok(ExecutorPrefillAdmissionDecision::Admitted(
+            ExecutorPrefillAdmissionReceipt {
+                request_id: input.request_id.clone(),
+            },
+        ))
+    }
+
+    fn cancel_prefill_admission(&self, request_id: &RequestId) -> bool {
+        self.retained
+            .lock()
+            .expect("chunked prefill retained mutex poisoned")
+            .remove(request_id)
+    }
+
+    async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
+        self.inner.prefill(input).await
+    }
+
+    async fn prefill_with_capacity(&self, input: &PrefillInput) -> Result<ExecutorPrefillOutcome> {
+        let request_id = input
+            .request_id
+            .as_ref()
+            .ok_or_else(|| FerrumError::request_validation("missing request id"))?;
+        let chunk = input
+            .chunk
+            .ok_or_else(|| FerrumError::request_validation("missing typed prefill chunk"))?;
+        if !self
+            .retained
+            .lock()
+            .expect("chunked prefill retained mutex poisoned")
+            .contains(request_id)
+        {
+            return Err(FerrumError::internal(
+                "chunked prefill submit has no retained admission",
+            ));
+        }
+        self.attempted_chunks
+            .lock()
+            .expect("chunked prefill attempt mutex poisoned")
+            .push(chunk);
+
+        if self.defer_next_prefill.swap(false, Ordering::AcqRel) {
+            return ExecutorExecutionCapacityDeferral::new(
+                self.epochs(),
+                self.wait_condition(),
+                ExecutorExecutionCapacityStage::StepAdmission,
+            )
+            .map(ExecutorPrefillOutcome::Deferred);
+        }
+
+        let output = self.inner.prefill(input).await?;
+        self.completed_chunks.fetch_add(1, Ordering::Relaxed);
+        if chunk.is_final() {
+            assert!(self
+                .retained
+                .lock()
+                .expect("chunked prefill retained mutex poisoned")
+                .remove(request_id));
+        }
+        Ok(ExecutorPrefillOutcome::Completed(output))
+    }
+
+    async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+        self.inner.decode(input).await
+    }
+
+    fn release_cache(&self, cache_id: &str) {
+        self.inner.release_cache(cache_id);
+    }
+
+    fn capabilities(&self) -> ExecutorCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn status(&self) -> ExecutorStatus {
+        self.inner.status()
     }
 }
 
@@ -2692,6 +2904,103 @@ async fn plan_runtime_product_path_requires_typed_admission_before_prefill() {
     let trace = scheduler.trace_snapshot();
     assert_eq!(trace.legacy_waiting_admission_ticks, 0);
     assert!(trace.dynamic_admission_ticks >= 1);
+}
+
+#[tokio::test]
+async fn plan_runtime_chunked_prefill_retries_exact_chunk_and_samples_only_final_chunk() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    config.scheduler.max_running_requests = 1;
+    config.scheduler.prefill_step_chunk = Some(2);
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let executor = Arc::new(PlanRuntimeChunkedPrefillTestExecutor::new(true));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(MockTensorFactory);
+    let engine = Arc::new(
+        ContinuousBatchEngine::new_plan_runtime(
+            config,
+            Arc::clone(&scheduler),
+            tokenizer,
+            sampler,
+            executor.clone(),
+            tensor_factory,
+        )
+        .unwrap(),
+    );
+    let mut request = policy_request();
+    request.prompt = "one two three four".to_string();
+    request.sampling_params.max_tokens = 1;
+    let request_id = request.id.clone();
+    let infer_engine = Arc::clone(&engine);
+    let inference = tokio::spawn(async move { infer_engine.infer(request).await });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while executor.capacity_wait_registrations.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first prefill chunk must park on exact execution capacity");
+
+    assert_eq!(
+        *executor
+            .attempted_chunks
+            .lock()
+            .expect("chunked prefill attempt mutex poisoned"),
+        vec![PrefillChunk::new(0, 2, 5).unwrap()]
+    );
+    {
+        let sequences = engine.inner.sequences.read();
+        let sequence = sequences
+            .get(&request_id)
+            .expect("deferred prefill retains engine sequence state");
+        assert_eq!(sequence.prefill_tokens_processed, 0);
+        assert!(sequence.generated_tokens.is_empty());
+    }
+    assert_eq!(scheduler.prefilling_count(), 1);
+    assert_eq!(
+        scheduler
+            .trace_snapshot()
+            .execution_capacity_blocked_prefill_len,
+        1
+    );
+
+    executor.publish_release();
+    let response = tokio::time::timeout(Duration::from_secs(2), inference)
+        .await
+        .expect("capacity release must resume the exact prefill chunk")
+        .expect("chunked prefill inference task must not panic")
+        .unwrap();
+
+    assert_eq!(response.finish_reason, FinishReason::Length);
+    assert_eq!(response.tokens.len(), 1, "only the final chunk may sample");
+    assert_eq!(executor.completed_chunks.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        *executor
+            .attempted_chunks
+            .lock()
+            .expect("chunked prefill attempt mutex poisoned"),
+        vec![
+            PrefillChunk::new(0, 2, 5).unwrap(),
+            PrefillChunk::new(0, 2, 5).unwrap(),
+            PrefillChunk::new(2, 2, 5).unwrap(),
+            PrefillChunk::new(4, 1, 5).unwrap(),
+        ]
+    );
+    assert!(executor
+        .retained
+        .lock()
+        .expect("chunked prefill retained mutex poisoned")
+        .is_empty());
+    assert_eq!(
+        scheduler
+            .trace_snapshot()
+            .execution_capacity_blocked_prefill_len,
+        0
+    );
+    engine.shutdown().await.unwrap();
 }
 
 #[tokio::test]
