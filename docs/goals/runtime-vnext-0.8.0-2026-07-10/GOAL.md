@@ -595,6 +595,14 @@ transition ordinal 证明：至少一个 logical work frontier 获得可执行 c
 `all live frontiers blocked + no pending release`。unchanged source 的 allocator/admission probe 增量
 为 `0`，无压力路径不得创建 pressure episode、改变 batch membership 或增加 host allocation。
 
+同一 target server 还必须把 plan-owner 跨池回收与上述 decode 压力分成两个因果窗口。先复放
+target-sizing workload，直到 quiescent pool snapshot 恰好占满校准后的全局动态预算；再发送一个
+仍处于 `max_model_len` 内、但 token demand 高于 A/B/C 的真实 stream 请求，只接受带非零
+`pools_reclaimed`、`chunks_reclaimed` 和 `reclaimed_bytes` 的 typed maintenance receipt。随后才运行
+A/B/C decode-pressure 序列。validator 必须分别从 rebalance-probe 和 decode 窗口重算两类证据，
+禁止用任意历史 maintenance 事件补足 decode 结果，也禁止硬编码 pool hash、domain id、GPU 名称或
+显存档位来制造回收。
+
 `DecodeProgressLease` baseline/release trace 可以保留为迁移期诊断，但不能再作为该 lane 的充分
 PASS 条件。正式 validator 必须消费统一 logical frontier、pressure episode、resource transaction 和
 ordered transition journal；不能依赖 wall-clock event 顺序，也不得用 token 阈值、时间、模型、GPU、
