@@ -249,7 +249,7 @@ pub(crate) struct PressureCandidate {
     pub(crate) priority: Priority,
     pub(crate) progress: LogicalWorkGeneration,
     pub(crate) recompute_cost: usize,
-    pub(crate) releasable: bool,
+    pub(crate) advances_wait_source: bool,
     pub(crate) blocked_on: Option<CapacityWaitCondition>,
 }
 
@@ -279,7 +279,7 @@ struct PressureParticipant {
     priority: Priority,
     progress: LogicalWorkGeneration,
     recompute_cost: usize,
-    releasable: bool,
+    advances_wait_source: bool,
     state: ParticipantState,
 }
 
@@ -314,6 +314,7 @@ impl PressureEpisode {
 pub struct PressureYieldTransaction {
     episode_id: PressureEpisodeId,
     handoff_generation: u64,
+    kind: PressureYieldKind,
     victim_request_id: RequestId,
     progress_owner_id: RequestId,
     progress_baseline: LogicalWorkGeneration,
@@ -321,9 +322,53 @@ pub struct PressureYieldTransaction {
     wait_condition: CapacityWaitCondition,
 }
 
+/// Strategy selected at an authoritative execution-capacity boundary.
+///
+/// A peer handoff frees one frontier so another can make logical progress. A
+/// self recompute is the bounded fallback when the only frontier proven to
+/// advance the waited source is also the blocked owner; it releases that
+/// physical state and queues the same logical frontier for reconstruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PressureYieldKind {
+    PeerHandoff,
+    SelfRecompute,
+}
+
+impl PressureYieldKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PeerHandoff => "peer_handoff",
+            Self::SelfRecompute => "self_recompute",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PressureYieldSelection {
+    PeerHandoff(RequestId),
+    SelfRecompute(RequestId),
+}
+
+impl PressureYieldSelection {
+    fn kind(&self) -> PressureYieldKind {
+        match self {
+            Self::PeerHandoff(_) => PressureYieldKind::PeerHandoff,
+            Self::SelfRecompute(_) => PressureYieldKind::SelfRecompute,
+        }
+    }
+
+    fn into_victim(self) -> RequestId {
+        match self {
+            Self::PeerHandoff(request_id) | Self::SelfRecompute(request_id) => request_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PressureReleaseFenceDisposition {
     Resumable(PressureTransitionOrdinal),
+    SelfRecomputeQueued(PressureTransitionOrdinal),
     Closed {
         ordinal: PressureTransitionOrdinal,
         reason: PressureHoldReleaseReason,
@@ -337,6 +382,10 @@ impl PressureYieldTransaction {
 
     pub const fn handoff_generation(&self) -> u64 {
         self.handoff_generation
+    }
+
+    pub const fn kind(&self) -> PressureYieldKind {
+        self.kind
     }
 
     pub fn victim_request_id(&self) -> &RequestId {
@@ -658,14 +707,14 @@ impl PressureCoordinator {
                         priority: candidate.priority,
                         progress: candidate.progress,
                         recompute_cost: candidate.recompute_cost,
-                        releasable: candidate.releasable,
+                        advances_wait_source: candidate.advances_wait_source,
                         state: ParticipantState::Runnable,
                     });
                 participant.work_kind = candidate.work_kind;
                 participant.priority = candidate.priority;
                 participant.progress = candidate.progress;
                 participant.recompute_cost = candidate.recompute_cost;
-                participant.releasable = candidate.releasable;
+                participant.advances_wait_source = candidate.advances_wait_source;
                 self.request_index
                     .insert(candidate.request_id.clone(), episode_id);
                 if requested.contains(&candidate.request_id)
@@ -700,17 +749,14 @@ impl PressureCoordinator {
             }
         }
 
-        let runnable_peer = self
-            .episodes
-            .get(&episode_id)
-            .expect("opened pressure episode remains registered")
-            .participants
-            .values()
-            .any(|participant| {
-                !requested.contains(&participant.request_id)
-                    && participant.releasable
-                    && matches!(participant.state, ParticipantState::Runnable)
-            });
+        // A runnable peer may suppress self recompute only when the executor's
+        // release footprint proves that terminating it advances this exact
+        // wait source. Generic cache ownership is not causal evidence.
+        let runnable_peer = candidates.iter().any(|candidate| {
+            !requested.contains(&candidate.request_id)
+                && candidate.advances_wait_source
+                && candidate.blocked_on.is_none()
+        });
         if runnable_peer {
             return Ok(PressureDecision::Deferred {
                 episode_id,
@@ -728,11 +774,11 @@ impl PressureCoordinator {
                 count: requested.len(),
             });
         };
-        let victim_id = self.episodes.get(&episode_id).and_then(|episode| {
+        let selection = self.episodes.get(&episode_id).and_then(|episode| {
             self.selection_policy
-                .select_yield_victim(episode, &requested, &owner_id)
+                .select_yield(episode, &requested, &owner_id)
         });
-        let Some(victim_id) = victim_id else {
+        let Some(selection) = selection else {
             let blocked_frontiers = self
                 .episodes
                 .get(&episode_id)
@@ -763,6 +809,8 @@ impl PressureCoordinator {
                 count: requested.len(),
             });
         };
+        let yield_kind = selection.kind();
+        let victim_id = selection.into_victim();
 
         let (progress_baseline, handoff_generation) = {
             let episode = self
@@ -798,6 +846,7 @@ impl PressureCoordinator {
         Ok(PressureDecision::YieldPlanned(PressureYieldTransaction {
             episode_id,
             handoff_generation,
+            kind: yield_kind,
             victim_request_id: victim_id,
             progress_owner_id: owner_id,
             progress_baseline,
@@ -857,9 +906,9 @@ impl PressureCoordinator {
                 if victim.state != ParticipantState::Terminal {
                     victim.state = ParticipantState::Yielded;
                 }
-                victim.releasable = false;
+                victim.advances_wait_source = false;
             }
-            if !owner_terminal {
+            if !owner_terminal && transaction.kind == PressureYieldKind::PeerHandoff {
                 episode.state = PressureEpisodeState::Resumable;
                 if retargeted_wait_condition.is_none() {
                     if let Some(owner) =
@@ -873,8 +922,7 @@ impl PressureCoordinator {
         if owner_terminal {
             let closed_ordinal = self.close_episode(
                 transaction.episode_id,
-                PressureHoldReleaseReason::OwnerTerminal,
-                true,
+                Some(PressureHoldReleaseReason::OwnerTerminal),
                 None,
             )?;
             return Ok((
@@ -883,6 +931,13 @@ impl PressureCoordinator {
                     ordinal: closed_ordinal,
                     reason: PressureHoldReleaseReason::OwnerTerminal,
                 },
+            ));
+        }
+        if transaction.kind == PressureYieldKind::SelfRecompute {
+            let closed_ordinal = self.close_episode(transaction.episode_id, None, None)?;
+            return Ok((
+                release_ordinal,
+                PressureReleaseFenceDisposition::SelfRecomputeQueued(closed_ordinal),
             ));
         }
         if let Some(current_wait_condition) = retargeted_wait_condition {
@@ -895,8 +950,7 @@ impl PressureCoordinator {
             )?;
             let closed_ordinal = self.close_episode(
                 transaction.episode_id,
-                PressureHoldReleaseReason::SourceRetargeted,
-                true,
+                Some(PressureHoldReleaseReason::SourceRetargeted),
                 Some((transaction.wait_condition.clone(), current_wait_condition)),
             )?;
             return Ok((
@@ -960,12 +1014,7 @@ impl PressureCoordinator {
             Some(transaction.progress_owner_id.clone()),
             state,
         )?;
-        let closed = self.close_episode(
-            transaction.episode_id,
-            PressureHoldReleaseReason::OwnerTerminal,
-            false,
-            None,
-        )?;
+        let closed = self.close_episode(transaction.episode_id, None, None)?;
         Ok((aborted, closed, participants))
     }
 
@@ -1000,8 +1049,7 @@ impl PressureCoordinator {
         )?;
         self.close_episode(
             episode_id,
-            PressureHoldReleaseReason::OwnerAdvanced,
-            true,
+            Some(PressureHoldReleaseReason::OwnerAdvanced),
             None,
         )?;
         Ok(Some(ordinal))
@@ -1042,7 +1090,7 @@ impl PressureCoordinator {
                 .and_then(|episode| episode.participants.get_mut(request_id))
             {
                 participant.work_kind = LogicalWorkKind::Terminal;
-                participant.releasable = false;
+                participant.advances_wait_source = false;
                 participant.state = ParticipantState::Terminal;
             }
             return Ok(Some(ordinal));
@@ -1050,8 +1098,7 @@ impl PressureCoordinator {
         if is_owner {
             self.close_episode(
                 episode_id,
-                PressureHoldReleaseReason::OwnerTerminal,
-                true,
+                Some(PressureHoldReleaseReason::OwnerTerminal),
                 None,
             )?;
         } else {
@@ -1065,8 +1112,7 @@ impl PressureCoordinator {
             if episode_drained {
                 self.close_episode(
                     episode_id,
-                    PressureHoldReleaseReason::OwnerTerminal,
-                    true,
+                    Some(PressureHoldReleaseReason::OwnerTerminal),
                     None,
                 )?;
             }
@@ -1260,8 +1306,7 @@ impl PressureCoordinator {
         )?;
         self.close_episode(
             *episode_id,
-            PressureHoldReleaseReason::SourceRetargeted,
-            true,
+            Some(PressureHoldReleaseReason::SourceRetargeted),
             Some((previous_condition, current_condition.clone())),
         )?;
         Ok(())
@@ -1358,8 +1403,7 @@ impl PressureCoordinator {
     fn close_episode(
         &mut self,
         episode_id: PressureEpisodeId,
-        reason: PressureHoldReleaseReason,
-        publish_yielded_holds: bool,
+        released_hold_reason: Option<PressureHoldReleaseReason>,
         retargeted_wait_conditions: Option<(CapacityWaitCondition, CapacityWaitCondition)>,
     ) -> Result<PressureTransitionOrdinal, PressureCoordinatorError> {
         let Some(mut episode) = self.episodes.remove(&episode_id) else {
@@ -1382,12 +1426,12 @@ impl PressureCoordinator {
         )?;
         for participant in episode.participants.values() {
             self.request_index.remove(&participant.request_id);
-            if publish_yielded_holds
-                && matches!(
+            if let Some(reason) = released_hold_reason.filter(|_| {
+                matches!(
                     participant.state,
                     ParticipantState::Yielded | ParticipantState::YieldPlanned
                 )
-            {
+            }) {
                 self.released_holds.insert(
                     participant.request_id.clone(),
                     ReleasedHold {
@@ -1520,7 +1564,7 @@ mod tests {
         request_id: &RequestId,
         work_kind: LogicalWorkKind,
         progress: u64,
-        releasable: bool,
+        advances_wait_source: bool,
         blocked_on: Option<CapacityWaitCondition>,
     ) -> PressureCandidate {
         PressureCandidate {
@@ -1529,7 +1573,7 @@ mod tests {
             priority: Priority::Normal,
             progress: LogicalWorkGeneration(progress),
             recompute_cost: usize::try_from(progress).unwrap(),
-            releasable,
+            advances_wait_source,
             blocked_on,
         }
     }
@@ -1745,7 +1789,7 @@ mod tests {
                     &request_id,
                     LogicalWorkKind::Decode,
                     3,
-                    true,
+                    false,
                     None,
                 )],
             )
@@ -1755,6 +1799,47 @@ mod tests {
         coordinator.record_terminal(&request_id).unwrap();
 
         assert_eq!(coordinator.stats().active_episodes, 0);
+        assert!(!coordinator.has_records());
+    }
+
+    #[test]
+    fn single_releasable_frontier_self_recomputes_after_its_release_fence() {
+        let request_id = RequestId::new();
+        let wait = condition(73);
+        let mut coordinator = PressureCoordinator::default();
+
+        let PressureDecision::YieldPlanned(transaction) = coordinator
+            .plan_failure(
+                std::slice::from_ref(&request_id),
+                &wait,
+                &[candidate(
+                    &request_id,
+                    LogicalWorkKind::Decode,
+                    33,
+                    true,
+                    None,
+                )],
+            )
+            .unwrap()
+        else {
+            panic!("a self-blocked releasable frontier must plan recompute");
+        };
+        assert_eq!(transaction.kind(), PressureYieldKind::SelfRecompute);
+        assert_eq!(transaction.victim_request_id(), &request_id);
+        assert_eq!(transaction.progress_owner_id(), &request_id);
+
+        let armed = coordinator.arm_release_fence(&transaction).unwrap();
+        let (released, disposition) = coordinator
+            .complete_release_fence(&transaction, None)
+            .unwrap();
+        let PressureReleaseFenceDisposition::SelfRecomputeQueued(closed) = disposition else {
+            panic!("self release must queue recompute instead of resuming stale decode");
+        };
+        assert!(transaction.planned_ordinal() < armed);
+        assert!(armed < released);
+        assert!(released < closed);
+        assert_eq!(coordinator.stats().active_episodes, 0);
+        assert_eq!(coordinator.stats().pending_release_fences, 0);
         assert!(!coordinator.has_records());
     }
 
@@ -2158,8 +2243,15 @@ mod tests {
             )
             .unwrap()
         {
-            PressureDecision::Deferred { episode_id, .. } => episode_id,
-            other => panic!("retarget must defer on a new exact-source episode, got {other:?}"),
+            PressureDecision::YieldPlanned(transaction) => {
+                assert_eq!(transaction.kind(), PressureYieldKind::SelfRecompute);
+                assert_eq!(transaction.victim_request_id(), &owner);
+                assert_eq!(transaction.progress_owner_id(), &owner);
+                transaction.episode_id()
+            }
+            other => {
+                panic!("retarget must resolve through a new exact-source episode, got {other:?}")
+            }
         };
         assert_ne!(new_episode, old_episode);
         assert_eq!(coordinator.stats().active_episodes, 1);

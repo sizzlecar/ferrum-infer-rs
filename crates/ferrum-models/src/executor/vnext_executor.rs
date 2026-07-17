@@ -1247,6 +1247,42 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
         true
     }
 
+    fn write_execution_capacity_release_sources(
+        &self,
+        preemption: &ExecutorExecutionCapacityPreemption,
+        sources: &mut Vec<CapacityAvailabilitySource>,
+    ) -> Result<bool> {
+        sources.clear();
+        let retained = self.prefills.get(preemption.request_id()).and_then(|slot| {
+            let state = slot.state.lock();
+            match &*state {
+                VNextPrefillSlotState::Ready(sequence)
+                    if sequence.cache_id == preemption.cache_id() =>
+                {
+                    Some(Arc::clone(sequence))
+                }
+                _ => None,
+            }
+        });
+        let sequence = retained.or_else(|| {
+            self.active
+                .get(preemption.cache_id())
+                .filter(|sequence| sequence.request_id == *preemption.request_id())
+                .cloned()
+        });
+        let Some(sequence) = sequence else {
+            return Ok(false);
+        };
+        if !sequence.active.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        sequence
+            .session
+            .write_release_capacity_sources(sources)
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
+        Ok(true)
+    }
+
     fn preempt_execution_capacity(
         &mut self,
         preemption: &ExecutorExecutionCapacityPreemption,
@@ -3456,6 +3492,16 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
     fn cancel_prefill_admission(&self, request_id: &RequestId) -> bool {
         self.sequences.lock().cancel_prefill(request_id)
+    }
+
+    fn write_execution_capacity_release_sources(
+        &self,
+        preemption: &ExecutorExecutionCapacityPreemption,
+        sources: &mut Vec<CapacityAvailabilitySource>,
+    ) -> Result<bool> {
+        self.sequences
+            .lock()
+            .write_execution_capacity_release_sources(preemption, sources)
     }
 
     async fn preempt_execution_capacity(

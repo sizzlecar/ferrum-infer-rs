@@ -309,6 +309,16 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
         self.execution_capacity_epochs()
     }
 
+    fn write_execution_capacity_release_sources(
+        &self,
+        _preemption: &ExecutorExecutionCapacityPreemption,
+        sources: &mut Vec<ferrum_interfaces::vnext::CapacityAvailabilitySource>,
+    ) -> Result<bool> {
+        sources.clear();
+        sources.push(ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots);
+        Ok(true)
+    }
+
     async fn preempt_execution_capacity(
         &self,
         preemption: ExecutorExecutionCapacityPreemption,
@@ -2673,10 +2683,19 @@ async fn install_plan_runtime_decode_cohort(
     scheduler: &ContinuousBatchScheduler,
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
 ) -> (Vec<RequestId>, Vec<TokenId>, Vec<String>) {
+    install_plan_runtime_decode_frontiers(engine, scheduler, tokenizer, &["test", "ok"]).await
+}
+
+async fn install_plan_runtime_decode_frontiers(
+    engine: &ContinuousBatchEngine,
+    scheduler: &ContinuousBatchScheduler,
+    tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+    prompts: &[&str],
+) -> (Vec<RequestId>, Vec<TokenId>, Vec<String>) {
     let mut requests = Vec::new();
-    for prompt in ["test", "ok"] {
+    for prompt in prompts {
         let mut request = policy_request();
-        request.prompt = prompt.to_string();
+        request.prompt = (*prompt).to_string();
         request.sampling_params.max_tokens = 4;
         request
             .metadata
@@ -2685,7 +2704,7 @@ async fn install_plan_runtime_decode_cohort(
         requests.push(request);
     }
     let initial_batch = scheduler
-        .next_batch(ferrum_interfaces::BatchHint::simple(2))
+        .next_batch(ferrum_interfaces::BatchHint::simple(prompts.len().max(1)))
         .await
         .expect("decode cohort should first be scheduled as prefill");
     assert_eq!(initial_batch.requests.len(), requests.len());
@@ -2722,6 +2741,94 @@ async fn install_plan_runtime_decode_cohort(
         cache_ids.push(cache_id);
     }
     (request_ids, initial_tokens, cache_ids)
+}
+
+#[tokio::test]
+async fn plan_runtime_lone_decode_self_recompute_releases_exact_cache_before_requeue() {
+    let trace_path = resource_trace_temp_path("plan-runtime-self-recompute");
+    let _ = std::fs::remove_file(&trace_path);
+    let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine_with_trace(
+        PlanRuntimeBatchDecodeBehavior::Exact,
+        Some(trace_path.clone()),
+    );
+    let (request_ids, initial_tokens, _cache_ids) =
+        install_plan_runtime_decode_frontiers(&engine, &scheduler, tokenizer, &["test"]).await;
+    let request_id = request_ids[0].clone();
+    let source = ferrum_interfaces::vnext::CapacityAvailabilitySource::ActiveSequenceSlots;
+    let availability =
+        [ferrum_interfaces::vnext::CapacityAvailabilityEpoch::new(source, 1).unwrap()];
+    let condition = ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(
+        47,
+        availability.to_vec(),
+    )
+    .unwrap();
+    let wake = AdmissionWakeEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0, 0);
+    let deferral = AdmissionDeferral::new(DeferredAction::WaitForRelease, wake, condition);
+    let release_snapshot = engine.inner.execution_capacity_release_snapshot().unwrap();
+
+    let action = scheduler
+        .defer_decode_for_execution_capacity(
+            std::slice::from_ref(&request_id),
+            deferral,
+            &release_snapshot,
+        )
+        .unwrap();
+    let ExecutionCapacityAction::YieldPlanned { transaction } = action else {
+        panic!("lone decode pressure must plan a typed self recompute");
+    };
+    assert_eq!(transaction.kind(), PressureYieldKind::SelfRecompute);
+    assert_eq!(transaction.victim_request_id(), &request_id);
+    assert_eq!(transaction.progress_owner_id(), &request_id);
+
+    let progress_owner_resumable = engine
+        .inner
+        .execute_capacity_yield(&transaction, 1, None)
+        .await
+        .unwrap();
+    assert!(!progress_owner_resumable);
+    assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 1);
+    let snapshot = scheduler.trace_snapshot();
+    assert_eq!(snapshot.active_len, 0);
+    assert_eq!(snapshot.waiting_queue_len, 1);
+    assert_eq!(snapshot.pressure_active_episodes, 0);
+    assert_eq!(snapshot.pressure_pending_release_fences, 0);
+
+    let sequences = engine.inner.sequences.read();
+    let sequence = sequences.get(&request_id).expect("self-recompute sequence");
+    assert_eq!(sequence.generated_tokens, vec![initial_tokens[0]]);
+    assert_eq!(sequence.phase, RequestPhase::Waiting);
+    assert!(sequence.model_cache_id().is_none());
+    assert_eq!(sequence.preemption_count, 1);
+    drop(sequences);
+
+    let profile_events = read_engine_profile_events(&trace_path);
+    let completed = profile_events
+        .iter()
+        .find(|event| event.phase == "vnext.execution_capacity_pressure_release_fence_completed")
+        .expect("self-recompute fence completion must be profiled");
+    assert_eq!(
+        completed.shape.get("yield_kind"),
+        Some(&serde_json::json!("self_recompute"))
+    );
+    assert_eq!(
+        completed.shape.get("completion_disposition"),
+        Some(&serde_json::json!("self_recompute_queued"))
+    );
+    assert_eq!(
+        completed.shape.get("progress_owner_resumable"),
+        Some(&serde_json::json!(false))
+    );
+    assert_eq!(
+        completed.shape.get("resumable_transition_ordinal"),
+        Some(&serde_json::Value::Null)
+    );
+    assert!(completed.shape["closed_transition_ordinal"]
+        .as_u64()
+        .is_some());
+    assert!(!profile_events.iter().any(|event| {
+        event.phase == "vnext.execution_capacity_pressure_hold_active"
+            && event.request_id == request_id.to_string()
+    }));
 }
 
 fn assert_plan_runtime_decode_cohort_unchanged(

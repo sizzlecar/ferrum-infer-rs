@@ -14,6 +14,7 @@ use super::{
     TrustedPlanRuntimeBinding, TrustedPlanRuntimeEvidence, VNextError, Weak,
     SEQUENCE_DISPATCH_POISONED_BIT,
 };
+use crate::vnext::CapacityAvailabilitySource;
 
 pub(super) const fn sequence_slot_active(epoch: u64) -> u64 {
     (epoch << 2) | 1
@@ -716,6 +717,27 @@ where
 {
     pub fn resources(&self) -> &Arc<AdmittedSequenceResources<R>> {
         &self.resources
+    }
+
+    /// Projects the exact scheduler-visible sources advanced by terminally
+    /// releasing this sequence authority.
+    pub fn write_release_capacity_sources(
+        &self,
+        sources: &mut Vec<CapacityAvailabilitySource>,
+    ) -> Result<(), VNextError> {
+        self.ensure_open_identity()?;
+        let backing = self.resources.backing_snapshot()?;
+        sources.clear();
+        sources.push(CapacityAvailabilitySource::ActiveSequenceSlots);
+        sources.extend(
+            backing
+                .backing_slices()
+                .iter()
+                .map(|slice| CapacityAvailabilitySource::Domain(slice.domain_id())),
+        );
+        sources.sort_unstable();
+        sources.dedup();
+        Ok(())
     }
 
     pub const fn epoch(&self) -> SequenceSessionEpoch {

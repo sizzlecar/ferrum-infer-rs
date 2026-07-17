@@ -1314,6 +1314,23 @@ pub trait ModelExecutor: Send + Sync {
         false
     }
 
+    /// Writes the exact availability sources advanced when this request
+    /// authority is preempted for recompute.
+    ///
+    /// `true` proves that `preemption` still identifies a live, quiescently
+    /// releasable authority and that `sources` is its complete release
+    /// footprint. Callers must treat `false` as not releasable; a generic
+    /// "owns some cache" observation is not evidence that another request can
+    /// advance the source on which the current frontier is blocked.
+    fn write_execution_capacity_release_sources(
+        &self,
+        _preemption: &ExecutorExecutionCapacityPreemption,
+        sources: &mut Vec<crate::vnext::CapacityAvailabilitySource>,
+    ) -> Result<bool> {
+        sources.clear();
+        Ok(false)
+    }
+
     /// Retire one exact request-scoped runtime authority for recompute.
     ///
     /// Success is a terminal release fence: all provider/device work that can

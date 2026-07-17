@@ -872,6 +872,10 @@ impl EngineInner {
                 serde_json::json!(transaction.planned_ordinal().get()),
             );
             attributes.insert(
+                "yield_kind".to_string(),
+                serde_json::json!(transaction.kind().as_str()),
+            );
+            attributes.insert(
                 "victim_request_id".to_string(),
                 serde_json::json!(transaction.victim_request_id()),
             );

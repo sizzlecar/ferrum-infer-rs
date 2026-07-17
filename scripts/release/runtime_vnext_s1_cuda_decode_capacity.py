@@ -30,6 +30,7 @@ ALLOWED_EXECUTION_STAGES = {
     "step_admission",
     "submission_wave",
 }
+ALLOWED_PRESSURE_YIELD_KINDS = {"peer_handoff", "self_recompute"}
 SERVER_POLICY = {
     "max_model_len": MAX_MODEL_LEN,
     "max_num_seqs": MAX_NUM_SEQS,
@@ -278,11 +279,13 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
     progress_baseline = attributes.get("progress_baseline")
     episode_id = attributes.get("episode_id")
     planned_transition_ordinal = attributes.get("planned_transition_ordinal")
+    yield_kind = attributes.get("yield_kind")
     if decision == "split_cohort":
         require(width >= 2, f"{label}: split cohort is not wide")
         require(victim_request_id is None, f"{label}: split cohort named a victim")
         require(progress_owner_id is None, f"{label}: split cohort named a progress owner")
         require(progress_baseline is None, f"{label}: split cohort named a progress baseline")
+        require(yield_kind is None, f"{label}: split cohort named a yield kind")
     elif decision == "pressure_yield_planned":
         require(width == 1, f"{label}: pressure-yield cohort is not exact")
         require(
@@ -293,10 +296,13 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
             common.request_identity_matches(victim_request_id, request_ids[0]),
             f"{label}: pressure-yield victim does not match the failing cohort",
         )
+        require(yield_kind in ALLOWED_PRESSURE_YIELD_KINDS, f"{label}: yield kind is invalid")
+        require(isinstance(progress_owner_id, str), f"{label}: progress owner is missing")
+        same_frontier = common.request_identity_matches(progress_owner_id, victim_request_id)
         require(
-            isinstance(progress_owner_id, str)
-            and not common.request_identity_matches(progress_owner_id, victim_request_id),
-            f"{label}: pressure victim cannot own the released progress role",
+            (yield_kind == "self_recompute" and same_frontier)
+            or (yield_kind == "peer_handoff" and not same_frontier),
+            f"{label}: yield kind does not match its frontier identities",
         )
         require(
             isinstance(progress_baseline, int) and progress_baseline >= 0,
@@ -313,6 +319,7 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
         require(victim_request_id is None, f"{label}: parked decode named a victim")
         require(progress_owner_id is None, f"{label}: parked decode named a progress owner")
         require(progress_baseline is None, f"{label}: parked decode named a progress baseline")
+        require(yield_kind is None, f"{label}: parked decode named a yield kind")
 
     evidence = attributes.get("capacity_evidence")
     require(isinstance(evidence, dict), f"{label}: capacity evidence is missing")
@@ -335,6 +342,7 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
         "progress_baseline": progress_baseline,
         "episode_id": episode_id,
         "planned_transition_ordinal": planned_transition_ordinal,
+        "yield_kind": yield_kind,
         "observed": observed,
         "wait_condition": wait_condition,
     }
@@ -542,6 +550,7 @@ def validate_pressure_fence_armed(row: dict[str, Any], label: str) -> dict[str, 
     episode_id = shape.get("episode_id")
     planned = shape.get("planned_transition_ordinal")
     armed = shape.get("transition_ordinal")
+    yield_kind = shape.get("yield_kind")
     require(isinstance(episode_id, int) and episode_id > 0, f"{label}: episode id is invalid")
     require(
         isinstance(planned, int) and isinstance(armed, int) and 0 < planned < armed,
@@ -552,16 +561,20 @@ def validate_pressure_fence_armed(row: dict[str, Any], label: str) -> dict[str, 
         f"{label}: armed fence already claims physical release",
     )
     progress_owner_id = attributes.get("progress_owner_id")
+    require(yield_kind in ALLOWED_PRESSURE_YIELD_KINDS, f"{label}: yield kind is invalid")
+    require(isinstance(progress_owner_id, str), f"{label}: progress owner identity is missing")
+    same_frontier = common.request_identity_matches(progress_owner_id, request_id)
     require(
-        isinstance(progress_owner_id, str)
-        and not common.request_identity_matches(progress_owner_id, request_id),
-        f"{label}: progress owner identity is invalid",
+        (yield_kind == "self_recompute" and same_frontier)
+        or (yield_kind == "peer_handoff" and not same_frontier),
+        f"{label}: yield kind does not match its frontier identities",
     )
     return {
         "ts_unix_nanos": common.event_wall_ns(row),
         "episode_id": episode_id,
         "victim_request_id": request_id,
         "progress_owner_id": progress_owner_id,
+        "yield_kind": yield_kind,
         "planned_transition_ordinal": planned,
         "armed_transition_ordinal": armed,
     }
@@ -580,6 +593,7 @@ def validate_pressure_fence_completed(row: dict[str, Any], label: str) -> dict[s
     closed = shape.get("closed_transition_ordinal")
     closed_reason = shape.get("closed_reason")
     disposition = shape.get("completion_disposition")
+    yield_kind = shape.get("yield_kind")
     require(isinstance(episode_id, int) and episode_id > 0, f"{label}: episode id is invalid")
     require(isinstance(released, int) and released > 0, f"{label}: release ordinal is invalid")
     require(
@@ -595,7 +609,18 @@ def validate_pressure_fence_completed(row: dict[str, Any], label: str) -> dict[s
         f"{label}: completed fence did not identify the advanced transaction predicate",
     )
     progress_owner_resumable = shape.get("progress_owner_resumable")
-    if progress_owner_resumable is True:
+    if yield_kind == "self_recompute":
+        require(progress_owner_resumable is False, f"{label}: self recompute resumed stale work")
+        require(
+            resumable is None and isinstance(closed, int) and released < closed,
+            f"{label}: self-recompute release/closed ordinal order is invalid",
+        )
+        require(
+            closed_reason is None and disposition == "self_recompute_queued",
+            f"{label}: self-recompute completion disposition is invalid",
+        )
+        completion_ordinal = closed
+    elif progress_owner_resumable is True:
         require(
             isinstance(resumable, int) and released < resumable,
             f"{label}: release/resumable ordinal order is invalid",
@@ -631,16 +656,20 @@ def validate_pressure_fence_completed(row: dict[str, Any], label: str) -> dict[s
     )
     require(shape.get("victim_requeued") is True, f"{label}: victim was not requeued")
     progress_owner_id = attributes.get("progress_owner_id")
+    require(yield_kind in ALLOWED_PRESSURE_YIELD_KINDS, f"{label}: yield kind is invalid")
+    require(isinstance(progress_owner_id, str), f"{label}: progress owner identity is missing")
+    same_frontier = common.request_identity_matches(progress_owner_id, request_id)
     require(
-        isinstance(progress_owner_id, str)
-        and not common.request_identity_matches(progress_owner_id, request_id),
-        f"{label}: progress owner identity is invalid",
+        (yield_kind == "self_recompute" and same_frontier)
+        or (yield_kind == "peer_handoff" and not same_frontier),
+        f"{label}: yield kind does not match its frontier identities",
     )
     return {
         "ts_unix_nanos": common.event_wall_ns(row),
         "episode_id": episode_id,
         "victim_request_id": request_id,
         "progress_owner_id": progress_owner_id,
+        "yield_kind": yield_kind,
         "release_transition_ordinal": released,
         "resumable_transition_ordinal": resumable,
         "closed_transition_ordinal": closed,
@@ -768,22 +797,25 @@ def validate_decode_trace(
         victim_request_id = pressure_yield["victim_request_id"]
         progress_owner_id = pressure_yield["progress_owner_id"]
         progress_baseline = pressure_yield["progress_baseline"]
-        require(
-            any(
-                park["ts_unix_nanos"] < pressure_yield["ts_unix_nanos"]
-                and common.request_identity_matches(
-                    park["request_ids"][0], progress_owner_id
-                )
-                for park in parks
-            ),
-            f"pressure progress owner {progress_owner_id} was not previously parked",
-        )
+        yield_kind = pressure_yield["yield_kind"]
+        if yield_kind == "peer_handoff":
+            require(
+                any(
+                    park["ts_unix_nanos"] < pressure_yield["ts_unix_nanos"]
+                    and common.request_identity_matches(
+                        park["request_ids"][0], progress_owner_id
+                    )
+                    for park in parks
+                ),
+                f"pressure progress owner {progress_owner_id} was not previously parked",
+            )
         matching_armed = [
             fence
             for fence in armed_fences
             if fence["episode_id"] == episode_id
             and common.request_identity_matches(fence["victim_request_id"], victim_request_id)
             and common.request_identity_matches(fence["progress_owner_id"], progress_owner_id)
+            and fence["yield_kind"] == yield_kind
         ]
         matching_completed = [
             fence
@@ -791,6 +823,7 @@ def validate_decode_trace(
             if fence["episode_id"] == episode_id
             and common.request_identity_matches(fence["victim_request_id"], victim_request_id)
             and common.request_identity_matches(fence["progress_owner_id"], progress_owner_id)
+            and fence["yield_kind"] == yield_kind
         ]
         require(len(matching_armed) == 1, f"pressure episode {episode_id} has no unique armed fence")
         require(
@@ -815,7 +848,16 @@ def validate_decode_trace(
             and common.request_identity_matches(hold["progress_owner_id"], progress_owner_id)
             and hold["progress_baseline"] == progress_baseline
         ]
-        if completed["completion_disposition"] == "progress_owner_resumable":
+        if yield_kind == "self_recompute":
+            require(
+                completed["completion_disposition"] == "self_recompute_queued",
+                f"self-recompute episode {episode_id} did not queue reconstruction",
+            )
+            require(
+                not matching_holds,
+                f"self-recompute episode {episode_id} incorrectly published a peer hold",
+            )
+        elif completed["completion_disposition"] == "progress_owner_resumable":
             require(
                 matching_holds,
                 f"pressure victim {victim_request_id} was not held for owner {progress_owner_id}",
@@ -833,6 +875,12 @@ def validate_decode_trace(
             for release in matching_releases
             if release["decision"] in {"owner_advanced", "owner_terminal", "source_retargeted"}
         ]
+        if yield_kind == "self_recompute":
+            require(
+                not matching_releases,
+                f"self-recompute episode {episode_id} incorrectly released a peer hold",
+            )
+            continue
         require(
             handoff_releases,
             f"pressure hold for {victim_request_id} has no proven progress or source retarget",
@@ -914,6 +962,22 @@ def validate_decode_trace(
         victim_request_id = pressure_yield["victim_request_id"]
         progress_owner_id = pressure_yield["progress_owner_id"]
         progress_baseline = pressure_yield["progress_baseline"]
+        if pressure_yield["yield_kind"] == "self_recompute":
+            completed = next(
+                fence
+                for fence in completed_fences
+                if fence["episode_id"] == pressure_yield["episode_id"]
+                and fence["yield_kind"] == "self_recompute"
+            )
+            require(
+                any(
+                    common.request_identity_matches(row.get("request_id"), victim_request_id)
+                    and common.event_wall_ns(row) > completed["ts_unix_nanos"]
+                    for row in admitted_rows
+                ),
+                f"self-recompute frontier {victim_request_id} was not re-admitted after its fence",
+            )
+            continue
         handoff_releases = [
             release
             for release in releases
@@ -952,6 +1016,7 @@ def validate_decode_trace(
         "split_events": len(splits),
         "park_events": len(parks),
         "pressure_yield_events": len(yields),
+        "pressure_yield_kinds": sorted({event["yield_kind"] for event in yields}),
         "pressure_fence_armed_events": len(armed_fences),
         "pressure_fence_completed_events": len(completed_fences),
         "pressure_hold_events": len(holds),
@@ -1663,6 +1728,7 @@ def self_test() -> int:
         progress_baseline: int | None = None,
         episode_id: int | None = None,
         planned_transition_ordinal: int | None = None,
+        yield_kind: str | None = None,
     ) -> dict[str, Any]:
         attributes = {
             "request_ids": request_ids,
@@ -1675,6 +1741,7 @@ def self_test() -> int:
             attributes["progress_baseline"] = progress_baseline
             attributes["episode_id"] = episode_id
             attributes["planned_transition_ordinal"] = planned_transition_ordinal
+            attributes["yield_kind"] = yield_kind
         return {
             "ts_unix_nanos": ts,
             "phase": "vnext.decode_capacity_deferred",
@@ -1746,6 +1813,7 @@ def self_test() -> int:
             progress_baseline=53,
             episode_id=1,
             planned_transition_ordinal=3,
+            yield_kind="peer_handoff",
         ),
         {
             "ts_unix_nanos": 141,
@@ -1757,6 +1825,7 @@ def self_test() -> int:
                 "episode_id": 1,
                 "planned_transition_ordinal": 3,
                 "transition_ordinal": 4,
+                "yield_kind": "peer_handoff",
                 "physical_release_completed": False,
             },
             "attributes": {"progress_owner_id": "A"},
@@ -1771,6 +1840,7 @@ def self_test() -> int:
                 "episode_id": 1,
                 "release_transition_ordinal": 5,
                 "resumable_transition_ordinal": 6,
+                "yield_kind": "peer_handoff",
                 "physical_release_completed": True,
                 "exact_source_advanced": True,
                 "transaction_wait_condition_advanced": True,
@@ -1834,14 +1904,83 @@ def self_test() -> int:
         {"ts_unix_nanos": 153, "phase": "vnext.request_completed", "request_id": "A"},
         {"ts_unix_nanos": 154, "phase": "vnext.request_completed", "request_id": "B"},
     ]
-    summary = validate_decode_trace(rows, started_wall_ns=90, finished_wall_ns=160)
+    rows.extend(
+        [
+            deferral(
+                160,
+                "pressure_yield_planned",
+                ["D"],
+                victim_request_id="D",
+                progress_owner_id="D",
+                progress_baseline=21,
+                episode_id=2,
+                planned_transition_ordinal=9,
+                yield_kind="self_recompute",
+            ),
+            {
+                "ts_unix_nanos": 161,
+                "phase": "vnext.execution_capacity_pressure_release_fence_armed",
+                "status": "ok",
+                "error": None,
+                "request_id": "D",
+                "shape": {
+                    "episode_id": 2,
+                    "planned_transition_ordinal": 9,
+                    "transition_ordinal": 10,
+                    "yield_kind": "self_recompute",
+                    "physical_release_completed": False,
+                },
+                "attributes": {"progress_owner_id": "D"},
+            },
+            {
+                "ts_unix_nanos": 162,
+                "phase": "vnext.execution_capacity_pressure_release_fence_completed",
+                "status": "ok",
+                "error": None,
+                "request_id": "D",
+                "shape": {
+                    "episode_id": 2,
+                    "release_transition_ordinal": 11,
+                    "resumable_transition_ordinal": None,
+                    "closed_transition_ordinal": 12,
+                    "closed_reason": None,
+                    "yield_kind": "self_recompute",
+                    "physical_release_completed": True,
+                    "exact_source_advanced": True,
+                    "transaction_wait_condition_advanced": True,
+                    "release_authority": "active_sequence",
+                    "progress_owner_resumable": False,
+                    "completion_disposition": "self_recompute_queued",
+                    "victim_requeued": True,
+                },
+                "attributes": {
+                    "progress_owner_id": "D",
+                    "current_capacity_availability": [
+                        {"source": {"domain": 5}, "epoch": 4}
+                    ],
+                },
+            },
+            {
+                "ts_unix_nanos": 163,
+                "phase": "vnext.prefill_admission",
+                "request_id": "D",
+                "shape": {"decision": "admitted"},
+            },
+            {"ts_unix_nanos": 164, "phase": "vnext.request_completed", "request_id": "D"},
+        ]
+    )
+    summary = validate_decode_trace(rows, started_wall_ns=90, finished_wall_ns=170)
     require(summary["split_events"] == 1, "self-test lost split evidence")
     require(summary["park_events"] == 2, "self-test lost park evidence")
     require(summary["resume_events"] == 1, "self-test lost resume evidence")
-    require(summary["pressure_yield_events"] == 1, "self-test lost pressure-yield evidence")
+    require(summary["pressure_yield_events"] == 2, "self-test lost pressure-yield evidence")
     require(
-        summary["pressure_fence_armed_events"] == 1
-        and summary["pressure_fence_completed_events"] == 1,
+        summary["pressure_yield_kinds"] == ["peer_handoff", "self_recompute"],
+        "self-test lost typed yield strategies",
+    )
+    require(
+        summary["pressure_fence_armed_events"] == 2
+        and summary["pressure_fence_completed_events"] == 2,
         "self-test lost release-fence evidence",
     )
     require(
@@ -1850,7 +1989,7 @@ def self_test() -> int:
         "self-test lost pressure-hold evidence",
     )
     require(
-        summary["pressure_victim_request_ids"] == ["C"],
+        summary["pressure_victim_request_ids"] == ["C", "D"],
         "self-test lost pressure-victim identity",
     )
 
@@ -1876,40 +2015,40 @@ def self_test() -> int:
     unchanged_resume = json.loads(json.dumps(rows))
     unchanged_resume[3]["attributes"]["deferral_evidence"]["current_wait_sources"][0]["epoch"] = 3
     try:
-        validate_decode_trace(unchanged_resume, started_wall_ns=90, finished_wall_ns=160)
+        validate_decode_trace(unchanged_resume, started_wall_ns=90, finished_wall_ns=170)
         raise AssertionError("unchanged exact source unexpectedly resumed")
     except common.CapacityGateError:
         pass
     try:
-        validate_decode_trace(rows[1:], started_wall_ns=90, finished_wall_ns=160)
+        validate_decode_trace(rows[1:], started_wall_ns=90, finished_wall_ns=170)
         raise AssertionError("trace without adaptive split unexpectedly passed")
     except common.CapacityGateError:
         pass
     missing_victim = json.loads(json.dumps(rows))
     del missing_victim[5]["attributes"]["victim_request_id"]
     try:
-        validate_decode_trace(missing_victim, started_wall_ns=90, finished_wall_ns=160)
+        validate_decode_trace(missing_victim, started_wall_ns=90, finished_wall_ns=170)
         raise AssertionError("pressure yield without a victim unexpectedly passed")
     except common.CapacityGateError:
         pass
     missing_hold = json.loads(json.dumps(rows))
     del missing_hold[8]
     try:
-        validate_decode_trace(missing_hold, started_wall_ns=90, finished_wall_ns=160)
+        validate_decode_trace(missing_hold, started_wall_ns=90, finished_wall_ns=170)
         raise AssertionError("pressure yield without a hold unexpectedly passed")
     except common.CapacityGateError:
         pass
     missing_release = json.loads(json.dumps(rows))
     del missing_release[9]
     try:
-        validate_decode_trace(missing_release, started_wall_ns=90, finished_wall_ns=160)
+        validate_decode_trace(missing_release, started_wall_ns=90, finished_wall_ns=170)
         raise AssertionError("pressure hold without a release unexpectedly passed")
     except common.CapacityGateError:
         pass
     unchanged_progress = json.loads(json.dumps(rows))
     unchanged_progress[9]["shape"]["progress_current"] = 53
     try:
-        validate_decode_trace(unchanged_progress, started_wall_ns=90, finished_wall_ns=160)
+        validate_decode_trace(unchanged_progress, started_wall_ns=90, finished_wall_ns=170)
         raise AssertionError("unchanged owner progress unexpectedly released a pressure hold")
     except common.CapacityGateError:
         pass
@@ -1918,14 +2057,14 @@ def self_test() -> int:
     stale_hold_event["ts_unix_nanos"] = 151
     stale_hold.append(stale_hold_event)
     try:
-        validate_decode_trace(stale_hold, started_wall_ns=90, finished_wall_ns=160)
+        validate_decode_trace(stale_hold, started_wall_ns=90, finished_wall_ns=170)
         raise AssertionError("victim remained held after owner progress")
     except common.CapacityGateError:
         pass
     premature_readmission = json.loads(json.dumps(rows))
     premature_readmission[10]["ts_unix_nanos"] = 149
     try:
-        validate_decode_trace(premature_readmission, started_wall_ns=90, finished_wall_ns=160)
+        validate_decode_trace(premature_readmission, started_wall_ns=90, finished_wall_ns=170)
         raise AssertionError("victim re-admitted before owner progress")
     except common.CapacityGateError:
         pass
