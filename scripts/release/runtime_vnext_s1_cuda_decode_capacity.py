@@ -469,7 +469,6 @@ def validate_pressure_hold_release(row: dict[str, Any], label: str) -> dict[str,
     require(
         decision
         in {
-            "owner_advanced",
             "owner_terminal",
             "role_transferred",
             "source_retargeted",
@@ -486,11 +485,6 @@ def validate_pressure_hold_release(row: dict[str, Any], label: str) -> dict[str,
         isinstance(progress_current, int) and progress_current >= progress_baseline,
         f"{label}: logical progress generation regressed",
     )
-    if decision == "owner_advanced":
-        require(
-            progress_current > progress_baseline,
-            f"{label}: owner-advanced release has no committed progress",
-        )
     previous_wait_condition = shape.get("previous_wait_condition")
     current_wait_condition = shape.get("current_wait_condition")
     if decision == "source_retargeted":
@@ -792,6 +786,15 @@ def validate_decode_trace(
             matching_resume or matching_yield,
             f"parked decode {request_id} neither resumed after an exact-source change nor received a released progress role",
         )
+    completed_rows = [
+        row for row in rows if str(row.get("phase", "")).endswith("request_completed")
+    ]
+    admitted_rows = [
+        row
+        for row in rows
+        if row.get("phase") == "vnext.prefill_admission"
+        and row.get("shape", {}).get("decision") == "admitted"
+    ]
     for pressure_yield in yields:
         episode_id = pressure_yield["episode_id"]
         victim_request_id = pressure_yield["victim_request_id"]
@@ -873,7 +876,7 @@ def validate_decode_trace(
         handoff_releases = [
             release
             for release in matching_releases
-            if release["decision"] in {"owner_advanced", "owner_terminal", "source_retargeted"}
+            if release["decision"] in {"owner_terminal", "source_retargeted"}
         ]
         if yield_kind == "self_recompute":
             require(
@@ -883,7 +886,7 @@ def validate_decode_trace(
             continue
         require(
             handoff_releases,
-            f"pressure hold for {victim_request_id} has no proven progress or source retarget",
+            f"pressure hold for {victim_request_id} has no owner terminal or source retarget",
         )
         first_handoff_release = min(
             release["ts_unix_nanos"]
@@ -893,6 +896,28 @@ def validate_decode_trace(
             all(hold["ts_unix_nanos"] < first_handoff_release for hold in matching_holds),
             f"pressure victim {victim_request_id} remained held after handoff completion",
         )
+        require(
+            not any(
+                common.request_identity_matches(row.get("request_id"), victim_request_id)
+                and completed["ts_unix_nanos"]
+                < common.event_wall_ns(row)
+                < first_handoff_release
+                for row in admitted_rows
+            ),
+            f"pressure victim {victim_request_id} was re-admitted before its owner released capacity",
+        )
+        for release in handoff_releases:
+            if release["decision"] == "owner_terminal":
+                require(
+                    any(
+                        common.request_identity_matches(
+                            row.get("request_id"), progress_owner_id
+                        )
+                        and common.event_wall_ns(row) <= release["ts_unix_nanos"]
+                        for row in completed_rows
+                    ),
+                    f"pressure owner {progress_owner_id} did not terminate before victim release",
+                )
         require(
             all(
                 release["transition_ordinal"]
@@ -949,15 +974,6 @@ def validate_decode_trace(
             ]
         }
     )
-    completed_rows = [
-        row for row in rows if str(row.get("phase", "")).endswith("request_completed")
-    ]
-    admitted_rows = [
-        row
-        for row in rows
-        if row.get("phase") == "vnext.prefill_admission"
-        and row.get("shape", {}).get("decision") == "admitted"
-    ]
     for pressure_yield in yields:
         victim_request_id = pressure_yield["victim_request_id"]
         progress_owner_id = pressure_yield["progress_owner_id"]
@@ -981,7 +997,7 @@ def validate_decode_trace(
         handoff_releases = [
             release
             for release in releases
-            if release["decision"] in {"owner_advanced", "source_retargeted"}
+            if release["decision"] in {"owner_terminal", "source_retargeted"}
             and release["episode_id"] == pressure_yield["episode_id"]
             and common.request_identity_matches(
                 release["victim_request_id"], victim_request_id
@@ -993,7 +1009,7 @@ def validate_decode_trace(
         ]
         require(
             handoff_releases,
-            f"decode progress owner {progress_owner_id} neither advanced nor retargeted its exact source",
+            f"decode progress owner {progress_owner_id} neither terminated nor retargeted its exact source",
         )
         handoff_released_at = min(
             release["ts_unix_nanos"] for release in handoff_releases
@@ -1875,33 +1891,33 @@ def self_test() -> int:
                 "probe_performed": False,
             },
         },
+        {"ts_unix_nanos": 150, "phase": "vnext.request_completed", "request_id": "A"},
         {
-            "ts_unix_nanos": 150,
+            "ts_unix_nanos": 151,
             "phase": "vnext.execution_capacity_pressure_hold_released",
             "status": "ok",
             "error": None,
             "request_id": "C",
             "shape": {
-                "decision": "owner_advanced",
+                "decision": "owner_terminal",
                 "episode_id": 1,
                 "transition_ordinal": 8,
                 "waiting_ticket": 1,
                 "progress_owner_id": "A",
                 "progress_baseline": 53,
-                "progress_current": 54,
+                "progress_current": 53,
                 "admission_eligible": True,
                 "probe_performed": False,
                 "prefill_submit_observed": False,
             },
         },
         {
-            "ts_unix_nanos": 151,
+            "ts_unix_nanos": 152,
             "phase": "vnext.prefill_admission",
             "request_id": "C",
             "shape": {"decision": "admitted"},
         },
-        {"ts_unix_nanos": 152, "phase": "vnext.request_completed", "request_id": "C"},
-        {"ts_unix_nanos": 153, "phase": "vnext.request_completed", "request_id": "A"},
+        {"ts_unix_nanos": 153, "phase": "vnext.request_completed", "request_id": "C"},
         {"ts_unix_nanos": 154, "phase": "vnext.request_completed", "request_id": "B"},
     ]
     rows.extend(
@@ -2039,36 +2055,38 @@ def self_test() -> int:
     except common.CapacityGateError:
         pass
     missing_release = json.loads(json.dumps(rows))
-    del missing_release[9]
+    del missing_release[10]
     try:
         validate_decode_trace(missing_release, started_wall_ns=90, finished_wall_ns=170)
         raise AssertionError("pressure hold without a release unexpectedly passed")
     except common.CapacityGateError:
         pass
-    unchanged_progress = json.loads(json.dumps(rows))
-    unchanged_progress[9]["shape"]["progress_current"] = 53
+    missing_owner_terminal = json.loads(json.dumps(rows))
+    del missing_owner_terminal[9]
     try:
-        validate_decode_trace(unchanged_progress, started_wall_ns=90, finished_wall_ns=170)
-        raise AssertionError("unchanged owner progress unexpectedly released a pressure hold")
+        validate_decode_trace(
+            missing_owner_terminal, started_wall_ns=90, finished_wall_ns=170
+        )
+        raise AssertionError("live owner unexpectedly released a pressure hold")
     except common.CapacityGateError:
         pass
     stale_hold = json.loads(json.dumps(rows))
     stale_hold_event = json.loads(json.dumps(stale_hold[8]))
-    stale_hold_event["ts_unix_nanos"] = 151
+    stale_hold_event["ts_unix_nanos"] = 152
     stale_hold.append(stale_hold_event)
     try:
         validate_decode_trace(stale_hold, started_wall_ns=90, finished_wall_ns=170)
-        raise AssertionError("victim remained held after owner progress")
+        raise AssertionError("victim remained held after owner terminal")
     except common.CapacityGateError:
         pass
     premature_readmission = json.loads(json.dumps(rows))
-    premature_readmission[10]["ts_unix_nanos"] = 149
+    premature_readmission[11]["ts_unix_nanos"] = 149
     try:
         validate_decode_trace(premature_readmission, started_wall_ns=90, finished_wall_ns=170)
-        raise AssertionError("victim re-admitted before owner progress")
+        raise AssertionError("victim re-admitted before owner terminal")
     except common.CapacityGateError:
         pass
-    source_retarget = json.loads(json.dumps(rows[9]))
+    source_retarget = json.loads(json.dumps(rows[10]))
     source_retarget["shape"].update(
         {
             "decision": "source_retargeted",

@@ -1861,8 +1861,7 @@ impl ContinuousBatchScheduler {
                         PressureHoldReleaseReason::SourceRetargeted => {
                             ExecutionCapacityYieldDisposition::SourceRetargeted
                         }
-                        PressureHoldReleaseReason::OwnerAdvanced
-                        | PressureHoldReleaseReason::RoleTransferred => {
+                        PressureHoldReleaseReason::RoleTransferred => {
                             return Err(FerrumError::scheduler(format!(
                                 "release fence closed with non-terminal hold reason {}",
                                 reason.as_str()
@@ -3673,7 +3672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_phase_pressure_yield_resumes_oldest_blocked_frontier_after_fence() {
+    async fn cross_phase_pressure_yield_holds_victim_until_owner_terminal() {
         use ferrum_interfaces::vnext::{
             CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
             DeferredAction,
@@ -3836,6 +3835,43 @@ mod tests {
 
         scheduler.update_decode_progress(&blocked_id, 1);
         observations.clear();
+        let owner_only = scheduler
+            .next_batch_with_dynamic_admission_observed(
+                BatchHint::simple(2),
+                AdmissionWakeSnapshot::new(released, &availability1),
+                &mut |_| panic!("owner token progress must not probe a held victim"),
+                &mut |observation| observations.push(observation),
+            )
+            .unwrap()
+            .expect("progress owner must continue while the victim remains held");
+        assert_eq!(owner_only.requests.len(), 1);
+        assert_eq!(owner_only.requests[0].request.id, blocked_id);
+        assert!(!observations.iter().any(|observation| matches!(
+            observation,
+            ExecutorAdmissionQueueObservation::PressureHoldReleased {
+                request_id,
+                ..
+            } if request_id == &runnable_id
+        )));
+        assert_eq!(scheduler.trace_snapshot().pressure_active_episodes, 1);
+
+        let response = InferenceResponse {
+            request_id: blocked_id.clone(),
+            text: String::new(),
+            tokens: Vec::new(),
+            finish_reason: ferrum_types::FinishReason::Length,
+            usage: ferrum_types::TokenUsage::new(0, 0),
+            latency_ms: 0,
+            created_at: chrono::Utc::now(),
+            metadata: Default::default(),
+            api_response: None,
+        };
+        scheduler
+            .complete(blocked_id.clone(), &response)
+            .await
+            .unwrap();
+
+        observations.clear();
         let admitted = scheduler
             .next_batch_with_dynamic_admission_observed(
                 BatchHint::simple(2),
@@ -3848,17 +3884,15 @@ mod tests {
                 &mut |observation| observations.push(observation),
             )
             .unwrap()
-            .expect("owner progress must release and admit the yielded frontier");
-        assert!(admitted
-            .requests
-            .iter()
-            .any(|request| request.request.id == runnable_id));
+            .expect("owner terminal release must admit the yielded frontier");
+        assert_eq!(admitted.requests.len(), 1);
+        assert_eq!(admitted.requests[0].request.id, runnable_id);
         assert!(observations.iter().any(|observation| matches!(
             observation,
             ExecutorAdmissionQueueObservation::PressureHoldReleased {
                 request_id,
                 progress_owner_id,
-                reason: PressureHoldReleaseReason::OwnerAdvanced,
+                reason: PressureHoldReleaseReason::OwnerTerminal,
                 ..
             } if request_id == &runnable_id && progress_owner_id == &blocked_id
         )));

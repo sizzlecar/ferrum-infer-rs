@@ -2973,7 +2973,7 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
     );
     assert!(
         position(PressureTransitionKind::FrontierResumable)
-            < position(PressureTransitionKind::FrontierProgressed)
+            < position(PressureTransitionKind::FrontierTerminal)
     );
 
     for expected_offset in [0, 1] {
