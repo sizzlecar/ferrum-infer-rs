@@ -202,6 +202,10 @@ struct VNextWaveTimingMetrics {
     token_upload_prepare: AtomicDurationMetrics,
     wave_identity_bind: AtomicDurationMetrics,
     provider_encode_submit: AtomicDurationMetrics,
+    contract_validate_reserve: AtomicDurationMetrics,
+    backing_input_encode: AtomicDurationMetrics,
+    provider_node_encode: AtomicDurationMetrics,
+    lane_reserve_submit_arm: AtomicDurationMetrics,
     completion_round_trip: AtomicDurationMetrics,
     host_postprocess: AtomicDurationMetrics,
     submitted_wave_total: AtomicDurationMetrics,
@@ -219,6 +223,12 @@ impl VNextWaveTimingMetrics {
                 "token_upload_prepare": self.token_upload_prepare.snapshot(),
                 "wave_identity_bind": self.wave_identity_bind.snapshot(),
                 "provider_encode_submit": self.provider_encode_submit.snapshot(),
+                "provider_encode_submit_breakdown": {
+                    "contract_validate_reserve": self.contract_validate_reserve.snapshot(),
+                    "backing_input_encode": self.backing_input_encode.snapshot(),
+                    "provider_node_encode": self.provider_node_encode.snapshot(),
+                    "lane_reserve_submit_arm": self.lane_reserve_submit_arm.snapshot(),
+                },
             },
             "completion_round_trip": self.completion_round_trip.snapshot(),
             "host_postprocess": self.host_postprocess.snapshot(),
@@ -226,11 +236,32 @@ impl VNextWaveTimingMetrics {
             "limitations": [
                 "resource_prepare_attempt includes capacity-deferred attempts and is outside submitted_wave_total",
                 "host_encode_submit breakdown is collected only while a typed profile sink is attached",
-                "provider_encode_submit includes completion reservation, provider command encoding, and lane submission",
+                "provider_encode_submit breakdown covers contract validation and completion reservation, backing/input encoding, provider node encoding, and lane reserve/submit/arm",
                 "completion_round_trip includes async queue wait, device fence wait, and readback",
                 "these host intervals are not kernel or device-busy time"
             ],
         })
+    }
+}
+
+impl SubmissionWaveDispatchTimingSink for VNextWaveTimingMetrics {
+    const ENABLED: bool = true;
+
+    fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration) {
+        match stage {
+            SubmissionWaveDispatchStage::ContractValidateAndReserve => {
+                self.contract_validate_reserve.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::BackingAndInputEncode => {
+                self.backing_input_encode.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::ProviderNodeEncode => {
+                self.provider_node_encode.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::LaneReserveSubmitAndArm => {
+                self.lane_reserve_submit_arm.record(elapsed)
+            }
+        }
     }
 }
 
@@ -2619,17 +2650,32 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .wave_timing
                     .provider_encode_submit
                     .start_if(timing_enabled);
-                OperationDispatch::encode_and_submit_wave_with_inputs(
-                    self.providers.providers(),
-                    &self.resolved_plan,
-                    &identity,
-                    active_bindings(),
-                    self.device_timing_mode(),
-                    &uploads,
-                    wave,
-                    &self.lane,
-                    &self.reaper,
-                )
+                if timing_enabled {
+                    OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
+                        self.providers.providers(),
+                        &self.resolved_plan,
+                        &identity,
+                        active_bindings(),
+                        self.device_timing_mode(),
+                        &uploads,
+                        &self.metrics.wave_timing,
+                        wave,
+                        &self.lane,
+                        &self.reaper,
+                    )
+                } else {
+                    OperationDispatch::encode_and_submit_wave_with_inputs(
+                        self.providers.providers(),
+                        &self.resolved_plan,
+                        &identity,
+                        active_bindings(),
+                        self.device_timing_mode(),
+                        &uploads,
+                        wave,
+                        &self.lane,
+                        &self.reaper,
+                    )
+                }
             };
             match submission {
                 Ok(completion) => {
@@ -4080,6 +4126,11 @@ mod tests {
         );
         assert_eq!(
             snapshot["host_encode_submit_breakdown"]["wave_identity_bind"]["samples"],
+            0
+        );
+        assert_eq!(
+            snapshot["host_encode_submit_breakdown"]["provider_encode_submit_breakdown"]
+                ["provider_node_encode"]["samples"],
             0
         );
         assert!(snapshot["limitations"]
