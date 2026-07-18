@@ -200,7 +200,7 @@ fn explicit_frame_abort_clears_the_hold_but_keeps_the_session_fail_closed() {
 }
 
 #[test]
-fn unsubmitted_frame_rollback_keeps_the_session_open_for_retry() {
+fn unsubmitted_frame_rollback_restores_the_unexecuted_frame_for_retry() {
     let candidate = active_candidate(1, "session-capacity-retry");
     let mut first = acquire_session_frames(std::slice::from_ref(&candidate), step(1)).unwrap();
     let mut references = first.iter_mut().collect::<Vec<_>>();
@@ -220,14 +220,47 @@ fn unsubmitted_frame_rollback_keeps_the_session_open_for_retry() {
         assert_eq!(active.phase, SequenceSessionPhase::Open);
         assert_eq!(active.active_frame, None);
         assert_eq!(active.retired_frames, 0);
-        assert_eq!(active.next_frame, Some(frame(2)));
+        assert_eq!(active.next_frame, Some(frame(1)));
     }
 
     let mut retry = acquire_session_frames(std::slice::from_ref(&candidate), step(2)).unwrap();
-    assert_eq!(retry[0].frame_id, frame(2));
+    assert_eq!(retry[0].frame_id, frame(1));
     assert_eq!(
         retire(&mut retry),
         vec![StepParticipantRetirementDisposition::Committed]
+    );
+}
+
+#[test]
+fn batch_unsubmitted_rollback_restores_each_participants_local_frame() {
+    let candidates = vec![
+        active_candidate(7, "session-retry-7"),
+        active_candidate(2, "session-retry-2"),
+        active_candidate(19, "session-retry-19"),
+    ];
+    let expected = vec![frame(7), frame(2), frame(19)];
+    let mut first = acquire_session_frames(&candidates, step(41)).unwrap();
+    assert_eq!(
+        first.iter().map(|hold| hold.frame_id).collect::<Vec<_>>(),
+        expected
+    );
+    let mut references = first.iter_mut().collect::<Vec<_>>();
+    assert_eq!(
+        finalize_session_frames(&mut references, StepFrameFinalization::RollbackUnsubmitted)
+            .unwrap(),
+        vec![StepParticipantRetirementDisposition::RolledBackUnsubmitted; 3]
+    );
+    drop(references);
+    drop(first);
+
+    let mut retry = acquire_session_frames(&candidates, step(42)).unwrap();
+    assert_eq!(
+        retry.iter().map(|hold| hold.frame_id).collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        retire(&mut retry),
+        vec![StepParticipantRetirementDisposition::Committed; 3]
     );
 }
 

@@ -541,6 +541,13 @@ where
     pub(super) session: Arc<SequenceSession<R>>,
 }
 
+fn execution_frame_successor(frame_id: ExecutionFrameId) -> Option<ExecutionFrameId> {
+    frame_id
+        .get()
+        .checked_add(1)
+        .and_then(|next| ExecutionFrameId::try_from(next).ok())
+}
+
 pub(super) fn acquire_session_frames(
     candidates: &[SequenceFrameCandidate],
     batch_step_id: BatchStepId,
@@ -601,10 +608,7 @@ pub(super) fn acquire_session_frames(
             .next_frame
             .take()
             .expect("validated session has a next execution frame");
-        active.next_frame = frame_id
-            .get()
-            .checked_add(1)
-            .and_then(|next| ExecutionFrameId::try_from(next).ok());
+        active.next_frame = execution_frame_successor(frame_id);
         active.active_frame = Some(ActiveSequenceFrame {
             frame_id,
             batch_step_id,
@@ -706,10 +710,7 @@ where
             .next_frame
             .take()
             .expect("validated session has a next execution frame");
-        active.next_frame = frame_id
-            .get()
-            .checked_add(1)
-            .and_then(|next| ExecutionFrameId::try_from(next).ok());
+        active.next_frame = execution_frame_successor(frame_id);
         active.active_frame = Some(ActiveSequenceFrame {
             frame_id,
             batch_step_id,
@@ -802,6 +803,7 @@ pub(super) fn finalize_session_frames(
                     frame_id: hold.frame_id,
                     batch_step_id: hold.batch_step_id,
                 })
+            || active.next_frame != execution_frame_successor(hold.frame_id)
             || !active.participant_flights.is_empty()
             || (finalization == StepFrameFinalization::Commit
                 && active.phase == SequenceSessionPhase::Poisoned)
@@ -826,7 +828,8 @@ pub(super) fn finalize_session_frames(
             StepFrameFinalization::Commit => StepParticipantRetirementDisposition::Committed,
         });
     }
-    for state in &mut states {
+    for (hold, state) in holds.iter().zip(&mut states) {
+        let hold = &**hold;
         let SequenceSessionSlotState::Active(active) = &mut **state else {
             unreachable!("all step participant sessions were validated");
         };
@@ -834,7 +837,7 @@ pub(super) fn finalize_session_frames(
         match finalization {
             StepFrameFinalization::Abort => active.phase = SequenceSessionPhase::Poisoned,
             StepFrameFinalization::Commit => active.retired_frames += 1,
-            StepFrameFinalization::RollbackUnsubmitted => {}
+            StepFrameFinalization::RollbackUnsubmitted => active.next_frame = Some(hold.frame_id),
         }
     }
     drop(states);
