@@ -19,7 +19,7 @@ use super::{
     IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
     LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId,
     NodeInvocationId, NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
-    PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
+    PlanNode, PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
     ProviderWorkspaceRequirement, QuantizationFormatId, ResourceId, SemanticValue,
     SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint, SpanId,
     StepParticipantFrameAssignment, StepResourceLease, TrustedActiveSequenceBinding,
@@ -3594,6 +3594,198 @@ impl<'a, R: DeviceRuntime> OperationInvocationResources<'a, R> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedOperationResourceSource {
+    PlanStatic { slot_index: usize },
+    Dynamic { descriptor_index: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedOperationResource {
+    resource_id: ResourceId,
+    source: PreparedOperationResourceSource,
+}
+
+/// Immutable per-node recipe compiled while the runtime registry is bound to
+/// an exact plan. Static catalog, operation, provider, and resource-shape
+/// proofs terminate here; dispatch retains only live authority and buffer
+/// validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedOperationDispatchBinding {
+    node_index: usize,
+    resources: Vec<PreparedOperationResource>,
+    binding_component_views: Vec<Vec<usize>>,
+    scratch_view: Option<usize>,
+    persistent_view: Option<usize>,
+}
+
+impl PreparedOperationDispatchBinding {
+    fn prepare(
+        resolved: &dyn ExecutablePlanView,
+        provider: &OperationProviderDescriptor,
+        node_id: &NodeId,
+    ) -> Result<Self, VNextError> {
+        let plan = resolved.execution_plan();
+        let (node_index, node) = plan
+            .payload()
+            .nodes()
+            .iter()
+            .enumerate()
+            .find(|(_, node)| node.id() == node_id)
+            .ok_or_else(|| invalid_operation(format!("plan has no node `{node_id}`")))?;
+        let operation = resolved.capabilities().operation(node.operation_id())?;
+        let registered = resolved
+            .capabilities()
+            .providers_for(node.operation_id())?
+            .iter()
+            .find(|candidate| candidate.provider_id() == provider.provider_id())
+            .ok_or_else(|| invalid_operation("operation provider is absent from the catalog"))?;
+        if registered != provider
+            || provider.provider_id() != node.selection().selected_provider()
+            || provider.operation_id() != node.operation_id()
+            || provider.operation_fingerprint() != node.operation_fingerprint()
+            || provider.provider_implementation_fingerprint()
+                != node.provider_implementation_fingerprint()
+            || provider.device_id() != plan.payload().device_id()
+            || !provider.version().satisfies(node.operation_version())
+        {
+            return Err(invalid_operation(
+                "operation provider is not the exact catalog entry selected by the plan",
+            ));
+        }
+        operation.validate_attributes(node.attributes())?;
+        operation.validate_resolved_bindings(node.values())?;
+
+        let provider_resources = node.provider_resources();
+        if provider_resources.provider_id() != provider.provider_id()
+            || provider_resources.estimator_id() != provider.resource_estimator_id()
+            || provider_resources.estimator_version() != provider.resource_estimator_version()
+            || provider_resources.estimator_implementation_fingerprint()
+                != provider.resource_estimator_implementation_fingerprint()
+            || provider_resources.value_alignment_bytes()
+                < operation.resources.minimum_value_alignment_bytes
+            || provider_resources.value_alignment_bytes()
+                % operation.resources.minimum_value_alignment_bytes
+                != 0
+            || !operation
+                .resources
+                .scratch
+                .accepts(provider_resources.scratch().is_some())
+            || !operation
+                .resources
+                .persistent
+                .accepts(provider_resources.persistent().is_some())
+        {
+            return Err(invalid_operation(
+                "plan provider resource estimate is not bound to the selected provider and operation contract",
+            ));
+        }
+        let scratch_resource = select_workspace_resource(
+            provider_resources.scratch(),
+            node.scratch_resource(),
+            "scratch",
+        )?;
+        let persistent_resource = select_workspace_resource(
+            provider_resources.persistent(),
+            node.persistent_resource(),
+            "persistent",
+        )?;
+
+        let memory = plan.payload().memory();
+        let mut required_resources = node
+            .values()
+            .iter()
+            .flat_map(|binding| binding.storage().components())
+            .map(|component| component.resource_id().clone())
+            .collect::<BTreeSet<_>>();
+        required_resources.extend(scratch_resource.iter().map(|resource| (*resource).clone()));
+        required_resources.extend(
+            persistent_resource
+                .iter()
+                .map(|resource| (*resource).clone()),
+        );
+        let resources = required_resources
+            .into_iter()
+            .map(|resource_id| {
+                let static_index = memory
+                    .static_allocations()
+                    .binary_search_by(|allocation| allocation.resource_id().cmp(&resource_id));
+                let dynamic_index = memory
+                    .dynamic_descriptors()
+                    .binary_search_by(|descriptor| descriptor.base_resource_id().cmp(&resource_id));
+                let source = match (static_index, dynamic_index) {
+                    (Ok(slot_index), Err(_)) => {
+                        PreparedOperationResourceSource::PlanStatic { slot_index }
+                    }
+                    (Err(_), Ok(descriptor_index)) => {
+                        PreparedOperationResourceSource::Dynamic { descriptor_index }
+                    }
+                    (Ok(_), Ok(_)) => {
+                        return Err(invalid_operation(format!(
+                            "plan resource `{resource_id}` is both static and dynamic"
+                        )))
+                    }
+                    (Err(_), Err(_)) => {
+                        return Err(invalid_operation(format!(
+                            "plan has no static allocation or dynamic descriptor for `{resource_id}`"
+                        )));
+                    }
+                };
+                Ok(PreparedOperationResource {
+                    resource_id,
+                    source,
+                })
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        let view_index_for = |resource_id: &ResourceId, kind: &str| {
+            resources
+                .binary_search_by(|resource| resource.resource_id.cmp(resource_id))
+                .map_err(|_| invalid_operation(format!("{kind} resource view is missing")))
+        };
+        let binding_component_views = node
+            .values()
+            .iter()
+            .map(|binding| {
+                binding
+                    .storage()
+                    .components()
+                    .iter()
+                    .map(|component| view_index_for(component.resource_id(), "value binding"))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let scratch_view = scratch_resource
+            .map(|resource| view_index_for(resource, "scratch"))
+            .transpose()?;
+        let persistent_view = persistent_resource
+            .map(|resource| view_index_for(resource, "persistent"))
+            .transpose()?;
+        Ok(Self {
+            node_index,
+            resources,
+            binding_component_views,
+            scratch_view,
+            persistent_view,
+        })
+    }
+
+    fn node<'plan>(
+        &self,
+        resolved: &'plan dyn ExecutablePlanView,
+        node_id: &NodeId,
+    ) -> Result<&'plan PlanNode, VNextError> {
+        resolved
+            .execution_plan()
+            .payload()
+            .nodes()
+            .get(self.node_index)
+            .filter(|node| node.id() == node_id)
+            .ok_or_else(|| {
+                invalid_operation("prepared operation binding differs from its plan node")
+            })
+    }
+}
+
 /// One participant projection inside a plan-selected physical batch. It has
 /// no public constructor and does not own submission authority.
 pub struct OperationInvocation<'a, B> {
@@ -3602,7 +3794,7 @@ pub struct OperationInvocation<'a, B> {
     node_id: &'a NodeId,
     provider_id: &'a ProviderId,
     views: Vec<OperationBufferView<'a, B>>,
-    bindings: Vec<ResolvedValueBinding>,
+    bindings: &'a [ResolvedValueBinding],
     attributes: &'a BTreeMap<AttributeId, SemanticValue>,
     work: &'a NodeWorkContract,
     scratch_view: Option<usize>,
@@ -3613,10 +3805,12 @@ pub struct OperationInvocation<'a, B> {
 
 impl<'a, B> OperationInvocation<'a, B> {
     #[allow(clippy::too_many_arguments)]
-    fn from_resolved<R>(
+    fn from_prepared<R>(
         runtime: &R,
         resolved: &'a dyn ExecutablePlanView,
-        provider: &'a OperationProviderDescriptor,
+        prepared: &PreparedOperationDispatchBinding,
+        node: &'a PlanNode,
+        operation: &'a OperationDescriptor,
         identity: &'a ExecutionIdentityEnvelope,
         node_id: &'a NodeId,
         resources: OperationInvocationResources<'a, R>,
@@ -3627,13 +3821,6 @@ impl<'a, B> OperationInvocation<'a, B> {
         R: DeviceRuntime<Buffer = B>,
     {
         let plan = resolved.execution_plan();
-        let node = plan
-            .payload()
-            .nodes()
-            .iter()
-            .find(|node| node.id() == node_id)
-            .ok_or_else(|| invalid_operation(format!("plan has no node `{node_id}`")))?;
-        let operation = resolved.capabilities().operation(node.operation_id())?;
         let parts = identity.parts();
         let participant = resources.participant(participant_index)?;
         let participant_backing = resources.participant_backing_snapshot(participant_index)?;
@@ -3711,198 +3898,115 @@ impl<'a, B> OperationInvocation<'a, B> {
                 "operation invocation does not close over the runtime device, selected plan, node, provider, request, and lease transaction",
             ));
         }
-        let registered = resolved
-            .capabilities()
-            .providers_for(node.operation_id())?
-            .iter()
-            .find(|candidate| candidate.provider_id() == provider.provider_id())
-            .ok_or_else(|| invalid_operation("operation provider is absent from the catalog"))?;
-        if registered != provider
-            || provider.provider_id() != node.selection().selected_provider()
-            || provider.operation_id() != node.operation_id()
-            || provider.operation_fingerprint() != node.operation_fingerprint()
-            || provider.provider_implementation_fingerprint()
-                != node.provider_implementation_fingerprint()
-            || provider.device_id() != plan.payload().device_id()
-            || !provider.version().satisfies(node.operation_version())
-        {
-            return Err(invalid_operation(
-                "operation provider is not the exact catalog entry selected by the plan",
-            ));
-        }
-        operation.validate_attributes(node.attributes())?;
-        operation.validate_resolved_bindings(node.values())?;
-
         let provider_resources = node.provider_resources();
-        if provider_resources.provider_id() != provider.provider_id()
-            || provider_resources.estimator_id() != provider.resource_estimator_id()
-            || provider_resources.estimator_version() != provider.resource_estimator_version()
-            || provider_resources.estimator_implementation_fingerprint()
-                != provider.resource_estimator_implementation_fingerprint()
-            || provider_resources.value_alignment_bytes()
-                < operation.resources.minimum_value_alignment_bytes
-            || provider_resources.value_alignment_bytes()
-                % operation.resources.minimum_value_alignment_bytes
-                != 0
-            || !operation
-                .resources
-                .scratch
-                .accepts(provider_resources.scratch().is_some())
-            || !operation
-                .resources
-                .persistent
-                .accepts(provider_resources.persistent().is_some())
-        {
-            return Err(invalid_operation(
-                "plan provider resource estimate is not bound to the selected provider and operation contract",
-            ));
-        }
-        let scratch_resource = select_workspace_resource(
-            provider_resources.scratch(),
-            node.scratch_resource(),
-            "scratch",
-        )?;
-        let persistent_resource = select_workspace_resource(
-            provider_resources.persistent(),
-            node.persistent_resource(),
-            "persistent",
-        )?;
-
-        let allocations = plan
-            .payload()
-            .memory()
-            .static_allocations()
-            .iter()
-            .map(|allocation| (allocation.resource_id(), allocation))
-            .collect::<BTreeMap<_, _>>();
-        let dynamic_descriptors = memory
-            .dynamic_descriptors()
-            .iter()
-            .map(|descriptor| (descriptor.base_resource_id(), descriptor))
-            .collect::<BTreeMap<_, _>>();
-        let bindings = node.values().to_vec();
-        operation.validate_resolved_bindings(&bindings)?;
-
-        let mut required_resources = bindings
-            .iter()
-            .flat_map(|binding| binding.storage().components())
-            .map(|component| component.resource_id().clone())
-            .collect::<BTreeSet<_>>();
-        required_resources.extend(scratch_resource.iter().map(|resource| (*resource).clone()));
-        required_resources.extend(
-            persistent_resource
-                .iter()
-                .map(|resource| (*resource).clone()),
-        );
-        let lease_entries = static_lease
-            .map(|lease| {
-                lease
-                    .plan_static_entries()
-                    .map(|entry| (entry.resource_id(), entry))
-                    .collect::<BTreeMap<_, _>>()
-            })
-            .unwrap_or_default();
-        let mut views = Vec::with_capacity(required_resources.len());
-        for resource_id in &required_resources {
-            if let Some(allocation) = allocations.get(resource_id) {
-                let lease = static_lease.ok_or_else(|| {
-                    invalid_operation(format!(
-                        "plan-static resource `{resource_id}` lacks static provisioning"
-                    ))
-                })?;
-                let entry = lease_entries.get(resource_id).ok_or_else(|| {
-                    invalid_operation(format!(
-                        "static lease does not own plan resource `{resource_id}`"
-                    ))
-                })?;
-                if entry.size_bytes() != allocation.size_bytes()
-                    || entry.alignment_bytes() != allocation.alignment_bytes()
-                    || entry.usage() != allocation.usage()
-                    || entry.element_type() != allocation.element_type()
-                {
-                    return Err(invalid_operation(format!(
-                        "static lease metadata differs from plan allocation `{resource_id}`"
-                    )));
+        let mut views = Vec::with_capacity(prepared.resources.len());
+        for resource in &prepared.resources {
+            let resource_id = &resource.resource_id;
+            match resource.source {
+                PreparedOperationResourceSource::PlanStatic { slot_index } => {
+                    let allocation = memory
+                        .static_allocations()
+                        .get(slot_index)
+                        .filter(|allocation| allocation.resource_id() == resource_id)
+                        .ok_or_else(|| {
+                            invalid_operation(
+                                "prepared static resource index differs from the memory plan",
+                            )
+                        })?;
+                    let lease = static_lease.ok_or_else(|| {
+                        invalid_operation(format!(
+                            "plan-static resource `{resource_id}` lacks static provisioning"
+                        ))
+                    })?;
+                    let leased = lease.plan_static_view(slot_index, allocation)?;
+                    views.push(OperationBufferView {
+                        descriptor: leased.committed_descriptor().clone(),
+                        source: OperationBufferSource::Static(leased),
+                        coverage: OperationBufferCoverage::Exact,
+                    });
                 }
-                let leased = lease.view(resource_id, entry.generation())?;
-                views.push(OperationBufferView {
-                    descriptor: leased.committed_descriptor().clone(),
-                    source: OperationBufferSource::Static(leased),
-                    coverage: OperationBufferCoverage::Exact,
-                });
-            } else if let Some(descriptor) = dynamic_descriptors.get(resource_id) {
-                let backing = resources.backing_view(resource_id).or_else(|_| {
-                    resources.participant_backing_view(participant_index, resource_id)
-                })?;
-                let expected_bytes = match descriptor.lifetime() {
-                    AllocationLifetime::Invocation => descriptor.evaluate_request_bytes_for_shape(
-                        resources.work_shape()?.immediate_shape(),
-                    )?,
-                    AllocationLifetime::Step => descriptor.evaluate_request_bytes_for_shape(
-                        resources.step_resources().work_shape().immediate_shape(),
-                    )?,
-                    AllocationLifetime::Sequence => {
-                        let participant_token_range = resources
-                            .work_shape()?
-                            .participant_token_ranges()
-                            .get(participant_index)
-                            .ok_or_else(|| {
-                                invalid_operation("operation participant token range is missing")
-                            })?;
-                        let execution_shape = sequence_execution_shape(
-                            participant_backing.committed_shape(),
-                            participant_token_range.source_token_range().end,
-                        )?;
-                        descriptor.evaluate_request_bytes_for_shape(execution_shape)?
-                    }
-                    AllocationLifetime::Request => descriptor
-                        .evaluate_fit_request_bytes(participant.request_resources().work_shape())?,
-                    AllocationLifetime::Plan => {
+                PreparedOperationResourceSource::Dynamic { descriptor_index } => {
+                    let descriptor = memory
+                        .dynamic_descriptors()
+                        .get(descriptor_index)
+                        .filter(|descriptor| descriptor.base_resource_id() == resource_id)
+                        .ok_or_else(|| {
+                            invalid_operation(
+                                "prepared dynamic resource index differs from the memory plan",
+                            )
+                        })?;
+                    let backing = resources.backing_view(resource_id).or_else(|_| {
+                        resources.participant_backing_view(participant_index, resource_id)
+                    })?;
+                    let expected_bytes = match descriptor.lifetime() {
+                        AllocationLifetime::Invocation => descriptor
+                            .evaluate_request_bytes_for_shape(
+                                resources.work_shape()?.immediate_shape(),
+                            )?,
+                        AllocationLifetime::Step => descriptor.evaluate_request_bytes_for_shape(
+                            resources.step_resources().work_shape().immediate_shape(),
+                        )?,
+                        AllocationLifetime::Sequence => {
+                            let participant_token_range = resources
+                                .work_shape()?
+                                .participant_token_ranges()
+                                .get(participant_index)
+                                .ok_or_else(|| {
+                                    invalid_operation(
+                                        "operation participant token range is missing",
+                                    )
+                                })?;
+                            let execution_shape = sequence_execution_shape(
+                                participant_backing.committed_shape(),
+                                participant_token_range.source_token_range().end,
+                            )?;
+                            descriptor.evaluate_request_bytes_for_shape(execution_shape)?
+                        }
+                        AllocationLifetime::Request => descriptor.evaluate_fit_request_bytes(
+                            participant.request_resources().work_shape(),
+                        )?,
+                        AllocationLifetime::Plan => {
+                            return Err(invalid_operation(format!(
+                                "plan-lifetime resource `{resource_id}` cannot use dynamic backing"
+                            )))
+                        }
+                    };
+                    let size_matches = match descriptor.lifetime() {
+                        AllocationLifetime::Sequence => backing.size_bytes() >= expected_bytes,
+                        _ => backing.size_bytes() == expected_bytes,
+                    };
+                    if !size_matches
+                        || backing.alignment_bytes() != descriptor.alignment_bytes()
+                        || backing.usage() != descriptor.usage()
+                        || backing.element_type() != descriptor.element_type()
+                        || backing.storage_profile() != descriptor.storage().profile()
+                    {
                         return Err(invalid_operation(format!(
-                            "plan-lifetime resource `{resource_id}` cannot use dynamic backing"
-                        )))
+                            "logical backing extent differs from plan descriptor `{resource_id}`"
+                        )));
                     }
-                };
-                let size_matches = match descriptor.lifetime() {
-                    AllocationLifetime::Sequence => backing.size_bytes() >= expected_bytes,
-                    _ => backing.size_bytes() == expected_bytes,
-                };
-                if !size_matches
-                    || backing.alignment_bytes() != descriptor.alignment_bytes()
-                    || backing.usage() != descriptor.usage()
-                    || backing.element_type() != descriptor.element_type()
-                    || backing.storage_profile() != descriptor.storage().profile()
-                {
-                    return Err(invalid_operation(format!(
-                        "logical backing extent differs from plan descriptor `{resource_id}`"
-                    )));
+                    let coverage = if descriptor.lifetime() == AllocationLifetime::Sequence
+                        && backing.size_bytes() > expected_bytes
+                    {
+                        OperationBufferCoverage::BackingPrefix
+                    } else {
+                        OperationBufferCoverage::Exact
+                    };
+                    views.push(OperationBufferView {
+                        descriptor: super::BufferDescriptor {
+                            resource_id: resource_id.clone(),
+                            size_bytes: expected_bytes,
+                            alignment_bytes: backing.alignment_bytes(),
+                            usage: backing.usage(),
+                            element_type: backing.element_type(),
+                        },
+                        source: OperationBufferSource::Backing(backing),
+                        coverage,
+                    });
                 }
-                let coverage = if descriptor.lifetime() == AllocationLifetime::Sequence
-                    && backing.size_bytes() > expected_bytes
-                {
-                    OperationBufferCoverage::BackingPrefix
-                } else {
-                    OperationBufferCoverage::Exact
-                };
-                views.push(OperationBufferView {
-                    descriptor: super::BufferDescriptor {
-                        resource_id: resource_id.clone(),
-                        size_bytes: expected_bytes,
-                        alignment_bytes: backing.alignment_bytes(),
-                        usage: backing.usage(),
-                        element_type: backing.element_type(),
-                    },
-                    source: OperationBufferSource::Backing(backing),
-                    coverage,
-                });
-            } else {
-                return Err(invalid_operation(format!(
-                    "plan has no static allocation or dynamic descriptor for `{resource_id}`"
-                )));
             }
         }
 
-        let mut descriptors = BTreeMap::new();
         for view in &views {
             match &view.source {
                 OperationBufferSource::Static(static_view) => {
@@ -3955,37 +4059,65 @@ impl<'a, B> OperationInvocation<'a, B> {
                     view.resource_id()
                 )));
             }
-            if descriptors
-                .insert(view.resource_id().clone(), view.descriptor.clone())
-                .is_some()
-            {
-                return Err(invalid_operation(format!(
-                    "operation resource `{}` is duplicated",
-                    view.resource_id()
-                )));
-            }
         }
-        for binding in &bindings {
-            for component in binding.storage().components() {
-                let descriptor = descriptors.get(component.resource_id()).ok_or_else(|| {
+        if node.values().len() != prepared.binding_component_views.len() {
+            return Err(invalid_operation(
+                "prepared value-binding recipe differs from its plan node",
+            ));
+        }
+        for (binding, component_views) in
+            node.values().iter().zip(&prepared.binding_component_views)
+        {
+            if binding.storage().components().len() != component_views.len() {
+                return Err(invalid_operation(
+                    "prepared component recipe differs from its value binding",
+                ));
+            }
+            for (component, view_index) in
+                binding.storage().components().iter().zip(component_views)
+            {
+                let view = views.get(*view_index).ok_or_else(|| {
                     invalid_operation("value binding lacks a committed resource view")
                 })?;
+                if view.resource_id() != component.resource_id() {
+                    return Err(invalid_operation(
+                        "prepared value-binding view differs from its resource",
+                    ));
+                }
+                let dynamic_demand = match prepared
+                    .resources
+                    .get(*view_index)
+                    .map(|resource| resource.source)
+                {
+                    Some(PreparedOperationResourceSource::PlanStatic { .. }) => None,
+                    Some(PreparedOperationResourceSource::Dynamic { descriptor_index }) => Some(
+                        memory
+                            .dynamic_descriptors()
+                            .get(descriptor_index)
+                            .filter(|descriptor| {
+                                descriptor.base_resource_id() == component.resource_id()
+                            })
+                            .ok_or_else(|| {
+                                invalid_operation(
+                                    "prepared component descriptor differs from the memory plan",
+                                )
+                            })?
+                            .demand(),
+                    ),
+                    None => {
+                        return Err(invalid_operation(
+                            "prepared component view index is out of range",
+                        ))
+                    }
+                };
                 let coverage = validate_value_binding_physical_coverage(
                     node.work(),
                     binding,
                     component,
-                    descriptor,
-                    dynamic_descriptors
-                        .get(component.resource_id())
-                        .map(|descriptor| descriptor.demand()),
+                    view.descriptor(),
+                    dynamic_demand,
                     provider_resources.value_alignment_bytes(),
                 )?;
-                let view = views
-                    .iter()
-                    .find(|view| view.resource_id() == component.resource_id())
-                    .ok_or_else(|| {
-                        invalid_operation("value binding lacks a physical region translator")
-                    })?;
                 if coverage == ValueBindingPhysicalCoverage::CanonicalComponent {
                     let translated =
                         view.translate(component.offset_bytes(), component.length_bytes())?;
@@ -4003,22 +4135,16 @@ impl<'a, B> OperationInvocation<'a, B> {
                 }
             }
         }
-        let scratch_view = scratch_resource
-            .map(|resource| view_index(&views, resource, "scratch"))
-            .transpose()?;
-        let persistent_view = persistent_resource
-            .map(|resource| view_index(&views, resource, "persistent"))
-            .transpose()?;
         validate_workspace(
             &views,
-            scratch_view,
+            prepared.scratch_view,
             BufferUsage::Scratch,
             provider_resources.scratch(),
             "scratch",
         )?;
         validate_workspace(
             &views,
-            persistent_view,
+            prepared.persistent_view,
             BufferUsage::Persistent,
             provider_resources.persistent(),
             "persistent",
@@ -4027,13 +4153,13 @@ impl<'a, B> OperationInvocation<'a, B> {
             identity,
             operation,
             node_id,
-            provider_id: provider.provider_id(),
+            provider_id: node.selection().selected_provider(),
             views,
-            bindings,
+            bindings: node.values(),
             attributes: node.attributes(),
             work: node.work(),
-            scratch_view,
-            persistent_view,
+            scratch_view: prepared.scratch_view,
+            persistent_view: prepared.persistent_view,
             work_shape: resources.work_shape()?,
             claimed_backing_fingerprint: resources.backing_fingerprint(),
         })
@@ -4060,7 +4186,7 @@ impl<'a, B> OperationInvocation<'a, B> {
     }
 
     pub fn bindings(&self) -> &[ResolvedValueBinding] {
-        &self.bindings
+        self.bindings
     }
 
     pub fn attributes(&self) -> &BTreeMap<AttributeId, SemanticValue> {
@@ -4101,7 +4227,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
     fn from_resolved<R>(
         runtime: &R,
         resolved: &'a dyn ExecutablePlanView,
-        provider: &'a OperationProviderDescriptor,
+        prepared: &PreparedOperationDispatchBinding,
         batch_identity: &'a BatchOperationIdentity,
         resources: &'a InvocationResourceLease<R>,
         active_bindings: &'a [TrustedActiveSequenceBinding],
@@ -4115,7 +4241,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         Self::from_resources(
             runtime,
             resolved,
-            provider,
+            prepared,
             batch_identity,
             node_identity,
             OperationInvocationResources::Invocation(resources),
@@ -4127,7 +4253,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
     fn from_wave_node<'binding, R, I>(
         runtime: &R,
         resolved: &'a dyn ExecutablePlanView,
-        provider: &'a OperationProviderDescriptor,
+        prepared: &PreparedOperationDispatchBinding,
         batch_identity: &'a BatchOperationIdentity,
         node_identity: &'a BatchOperationNodeIdentity,
         wave: &'a PreparedStepSubmissionWave<R>,
@@ -4141,7 +4267,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         Self::from_resources(
             runtime,
             resolved,
-            provider,
+            prepared,
             batch_identity,
             node_identity,
             OperationInvocationResources::Wave { wave, node_index },
@@ -4153,7 +4279,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
     fn from_resources<'binding, R, I>(
         runtime: &R,
         resolved: &'a dyn ExecutablePlanView,
-        provider: &'a OperationProviderDescriptor,
+        prepared: &PreparedOperationDispatchBinding,
         batch_identity: &'a BatchOperationIdentity,
         node_identity: &'a BatchOperationNodeIdentity,
         resources: OperationInvocationResources<'a, R>,
@@ -4184,16 +4310,20 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
                 "batched operation identity differs from its exact invocation resources",
             ));
         }
+        let node = prepared.node(resolved, node_identity.node_id())?;
+        let operation = resolved.capabilities().operation(node.operation_id())?;
         let participants = node_identity
             .participants()
             .iter()
             .zip(active_bindings)
             .enumerate()
             .map(|(index, (participant, active_binding))| {
-                OperationInvocation::from_resolved(
+                OperationInvocation::from_prepared(
                     runtime,
                     resolved,
-                    provider,
+                    prepared,
+                    node,
+                    operation,
                     participant.identity(),
                     node_identity.node_id(),
                     resources,
@@ -4261,17 +4391,6 @@ fn select_workspace_resource<'a>(
             requirement.scope()
         ))
     })
-}
-
-fn view_index<B>(
-    views: &[OperationBufferView<'_, B>],
-    resource_id: &ResourceId,
-    kind: &str,
-) -> Result<usize, VNextError> {
-    views
-        .iter()
-        .position(|view| view.resource_id() == resource_id)
-        .ok_or_else(|| invalid_operation(format!("{kind} resource view is missing")))
 }
 
 fn validate_workspace<B>(
@@ -5028,7 +5147,7 @@ impl OperationDispatch {
         let invocation = BatchedOperationInvocation::from_resolved(
             runtime,
             resolved,
-            provider.provider().descriptor(),
+            provider.dispatch(),
             batch_identity,
             completion.invocation(),
             active_bindings,
@@ -5317,7 +5436,7 @@ impl OperationDispatch {
             let invocation = BatchedOperationInvocation::from_wave_node(
                 runtime,
                 resolved,
-                provider.provider().descriptor(),
+                provider.dispatch(),
                 batch_identity,
                 node_identity,
                 completion.wave(),
@@ -5962,11 +6081,14 @@ where
     ) -> Result<BoundOperationProvider<'registry, R>, VNextError> {
         let provider = self.selected_provider(resolved, node_id)?;
         let plan = resolved.execution_plan();
+        let dispatch =
+            PreparedOperationDispatchBinding::prepare(resolved, provider.descriptor(), node_id)?;
         Ok(BoundOperationProvider {
             provider: BoundOperationProviderSource::Borrowed(provider.as_ref()),
             plan_id: plan.payload().plan_id().clone(),
             plan_hash: plan.plan_hash().clone(),
             node_id: node_id.clone(),
+            dispatch,
         })
     }
 
@@ -5987,11 +6109,17 @@ where
             .map(|node| {
                 let provider = self.selected_provider(resolved, node.id())?;
                 let plan = resolved.execution_plan();
+                let dispatch = PreparedOperationDispatchBinding::prepare(
+                    resolved,
+                    provider.descriptor(),
+                    node.id(),
+                )?;
                 Ok(BoundOperationProvider {
                     provider: BoundOperationProviderSource::Owned(Arc::clone(provider)),
                     plan_id: plan.payload().plan_id().clone(),
                     plan_hash: plan.plan_hash().clone(),
                     node_id: node.id().clone(),
+                    dispatch,
                 })
             })
             .collect::<Result<Vec<BoundOperationProvider<'static, R>>, _>>()?;
@@ -6098,6 +6226,7 @@ where
     plan_id: PlanId,
     plan_hash: PlanHash,
     node_id: NodeId,
+    dispatch: PreparedOperationDispatchBinding,
 }
 
 impl<R> BoundOperationProvider<'_, R>
@@ -6122,7 +6251,12 @@ where
                 "bound operation provider belongs to a different plan or node",
             ));
         }
+        self.dispatch.node(resolved, node_id)?;
         Ok(())
+    }
+
+    fn dispatch(&self) -> &PreparedOperationDispatchBinding {
+        &self.dispatch
     }
 
     pub fn descriptor(&self) -> &OperationProviderDescriptor {
