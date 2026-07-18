@@ -98,11 +98,9 @@ extern "C" __global__ void vnext_causal_prepare_f16(
     const __half* __restrict__ query_norm_weight,
     const __half* __restrict__ key_norm_weight,
     __half* __restrict__ query,
+    const int* __restrict__ control,
     const unsigned long long* __restrict__ page_pointers,
-    const int page_count,
     const int page_elements,
-    const int position_start,
-    const int tokens,
     const int query_heads,
     const int kv_heads,
     const int head_dim,
@@ -113,6 +111,9 @@ extern "C" __global__ void vnext_causal_prepare_f16(
     const float epsilon,
     const float rope_theta,
     const int rope_interleaved) {
+  const int page_count = control[0];
+  const int position_start = control[1];
+  const int tokens = control[2];
   const int token = blockIdx.x;
   const int combined_head = blockIdx.y;
   const int lane = threadIdx.x;
@@ -215,17 +216,18 @@ extern "C" __global__ void vnext_causal_prepare_f16(
 extern "C" __global__ void vnext_causal_attention_f16(
     const __half* __restrict__ query,
     const __half* __restrict__ query_raw,
+    const int* __restrict__ control,
     const unsigned long long* __restrict__ page_pointers,
     __half* __restrict__ output,
-    const int page_count,
     const int page_elements,
-    const int position_start,
-    const int tokens,
     const int query_heads,
     const int kv_heads,
     const int head_dim,
     const int query_projection_stride,
     const int output_gate) {
+  const int page_count = control[0];
+  const int position_start = control[1];
+  const int tokens = control[2];
   const int token = blockIdx.x;
   const int query_head = blockIdx.y;
   const int lane = threadIdx.x;

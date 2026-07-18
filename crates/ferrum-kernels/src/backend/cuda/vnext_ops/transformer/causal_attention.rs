@@ -38,6 +38,8 @@ const RESIDUAL_ADD_FUNCTION: &str = "residual_add_f16";
 const RESIDUAL_ADD_INPLACE_FUNCTION: &str = "residual_add_inplace_f16";
 const SCRATCH_ALIGNMENT: u64 = 16;
 const POINTER_BYTES: u64 = std::mem::size_of::<u64>() as u64;
+const BINDING_CONTROL_WORDS: usize = 4;
+const BINDING_CONTROL_BYTES: u64 = (BINDING_CONTROL_WORDS * std::mem::size_of::<i32>()) as u64;
 const WARP_THREADS: u32 = 32;
 const MAXIMUM_HEAD_DIM: u64 = 256;
 
@@ -198,8 +200,8 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
             CausalAttentionShape::from_attributes(request.attributes()).map_err(invalid_plan)?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::affine(
-                shape.fixed_scratch_bytes().map_err(invalid_plan)?,
                 0,
+                shape.binding_slot_bytes().map_err(invalid_plan)?,
                 shape.scratch_bytes_per_token().map_err(invalid_plan)?,
             )?,
             SCRATCH_ALIGNMENT,
@@ -220,18 +222,16 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_attention(&self.functions, invocation)
-            .map(EncodedDeviceOperation::compute)
-            .map_err(|message| {
-                OperationFailure::new(
-                    identity,
-                    ProfilePhase::Forward,
-                    "cuda.causal_paged_attention.encode",
-                    message.chars().take(2048).collect::<String>(),
-                    false,
-                )
-                .expect("core-issued CUDA causal attention identity must be valid")
-            })
+        encode_attention(&self.functions, invocation).map_err(|message| {
+            OperationFailure::new(
+                identity,
+                ProfilePhase::Forward,
+                "cuda.causal_paged_attention.encode",
+                message.chars().take(2048).collect::<String>(),
+                false,
+            )
+            .expect("core-issued CUDA causal attention identity must be valid")
+        })
     }
 }
 
@@ -342,8 +342,10 @@ impl CausalAttentionShape {
         Ok(self.physical_state_bytes(self.maximum_context_tokens)? / VNEXT_KV_PAGE_BYTES)
     }
 
-    fn fixed_scratch_bytes(self) -> Result<u64, String> {
-        aligned_bytes(self.maximum_pages()?, POINTER_BYTES)
+    fn binding_slot_bytes(self) -> Result<u64, String> {
+        BINDING_CONTROL_BYTES
+            .checked_add(aligned_bytes(self.maximum_pages()?, POINTER_BYTES)?)
+            .ok_or_else(|| "causal attention binding slot size overflows".to_owned())
     }
 
     fn scratch_bytes_per_token(self) -> Result<u64, String> {
@@ -404,6 +406,7 @@ struct CudaCausalAttentionShape {
 #[derive(Debug, Clone, Copy)]
 struct ScratchLayout {
     required_bytes: u64,
+    binding_slot_bytes: u64,
     normalized: u64,
     query_raw: u64,
     key_raw: u64,
@@ -414,11 +417,20 @@ struct ScratchLayout {
 }
 
 impl ScratchLayout {
-    fn new(shape: CausalAttentionShape, total_tokens: u64) -> Result<Self, String> {
-        if total_tokens == 0 {
-            return Err("causal attention scratch cannot be sized for zero tokens".to_owned());
+    fn new(
+        shape: CausalAttentionShape,
+        total_tokens: u64,
+        participant_count: usize,
+    ) -> Result<Self, String> {
+        if total_tokens == 0 || participant_count == 0 {
+            return Err("causal attention scratch cannot be sized for empty work".to_owned());
         }
-        let mut offset = shape.fixed_scratch_bytes()?;
+        let participant_count = u64::try_from(participant_count)
+            .map_err(|_| "causal attention participant count exceeds u64".to_owned())?;
+        let binding_slot_bytes = shape.binding_slot_bytes()?;
+        let mut offset = binding_slot_bytes
+            .checked_mul(participant_count)
+            .ok_or_else(|| "causal attention binding scratch size overflows".to_owned())?;
         let normalized = reserve_tokens(&mut offset, shape.hidden_size, total_tokens)?;
         let query_raw = reserve_tokens(&mut offset, shape.query_projection_features, total_tokens)?;
         let key_raw = reserve_tokens(&mut offset, shape.kv_features, total_tokens)?;
@@ -426,8 +438,9 @@ impl ScratchLayout {
         let query = reserve_tokens(&mut offset, shape.query_features, total_tokens)?;
         let context = reserve_tokens(&mut offset, shape.query_features, total_tokens)?;
         let projected = reserve_tokens(&mut offset, shape.hidden_size, total_tokens)?;
-        let expected = shape
-            .fixed_scratch_bytes()?
+        let expected = binding_slot_bytes
+            .checked_mul(participant_count)
+            .ok_or_else(|| "causal attention binding scratch size overflows".to_owned())?
             .checked_add(
                 shape
                     .scratch_bytes_per_token()?
@@ -440,6 +453,7 @@ impl ScratchLayout {
         }
         Ok(Self {
             required_bytes: offset,
+            binding_slot_bytes,
             normalized,
             query_raw,
             key_raw,
@@ -448,6 +462,16 @@ impl ScratchLayout {
             context,
             projected,
         })
+    }
+
+    fn binding_offset(self, participant: usize) -> Result<u64, String> {
+        self.binding_slot_bytes
+            .checked_mul(
+                u64::try_from(participant)
+                    .map_err(|_| "causal attention participant index exceeds u64".to_owned())?,
+            )
+            .filter(|offset| *offset < self.normalized)
+            .ok_or_else(|| "causal attention binding offset exceeds scratch".to_owned())
     }
 }
 
@@ -467,18 +491,23 @@ struct SharedRegions {
 struct CausalAttentionLaunch {
     input_region: usize,
     output_region: usize,
-    first_page_region: usize,
-    page_count: usize,
-    host_page_table: usize,
+    binding_offset: u64,
     tokens: u64,
     tokens_i32: i32,
-    position_start: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CausalAttentionBinding {
+    first_page_region: usize,
+    page_count: usize,
+    host_binding: usize,
+    binding_offset: u64,
 }
 
 fn encode_attention(
     functions: &CausalAttentionFunctions,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-) -> Result<CudaDeviceCommand, String> {
+) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, String> {
     if invocation.participants().is_empty()
         || invocation.operation().id.as_str() != CAUSAL_PAGED_ATTENTION_OPERATION_ID
     {
@@ -495,7 +524,7 @@ fn encode_attention(
     }
 
     let total_tokens = invocation.work_shape().immediate_tokens();
-    let layout = ScratchLayout::new(shape, total_tokens)?;
+    let layout = ScratchLayout::new(shape, total_tokens, invocation.participants().len())?;
     let cuda = shape.cuda_shape()?;
     let token_ranges = invocation.participant_token_ranges();
     if token_ranges.len() != invocation.participants().len() {
@@ -510,18 +539,18 @@ fn encode_attention(
         ElementType::F16,
     )?;
 
-    let mut regions = Vec::new();
+    let mut compute_regions = Vec::new();
     let shared = SharedRegions {
-        input_norm: push_shared_weight(&mut regions, &invocation, 1)?,
-        query_weight: push_shared_weight(&mut regions, &invocation, 2)?,
-        key_weight: push_shared_weight(&mut regions, &invocation, 3)?,
-        value_weight: push_shared_weight(&mut regions, &invocation, 4)?,
-        output_weight: push_shared_weight(&mut regions, &invocation, 5)?,
-        query_norm: push_shared_weight(&mut regions, &invocation, 6)?,
-        key_norm: push_shared_weight(&mut regions, &invocation, 7)?,
+        input_norm: push_shared_weight(&mut compute_regions, &invocation, 1)?,
+        query_weight: push_shared_weight(&mut compute_regions, &invocation, 2)?,
+        key_weight: push_shared_weight(&mut compute_regions, &invocation, 3)?,
+        value_weight: push_shared_weight(&mut compute_regions, &invocation, 4)?,
+        output_weight: push_shared_weight(&mut compute_regions, &invocation, 5)?,
+        query_norm: push_shared_weight(&mut compute_regions, &invocation, 6)?,
+        key_norm: push_shared_weight(&mut compute_regions, &invocation, 7)?,
         scratch: {
-            let index = regions.len();
-            regions.push(super::shared_scratch_region(
+            let index = compute_regions.len();
+            compute_regions.push(super::shared_scratch_region(
                 &invocation,
                 layout.required_bytes,
             )?);
@@ -529,9 +558,16 @@ fn encode_attention(
         },
     };
 
+    let mut binding_regions = vec![compute_regions[shared.scratch].clone()];
     let mut host_storage = Vec::with_capacity(invocation.participants().len());
     let mut launches = Vec::with_capacity(invocation.participants().len());
-    for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
+    let mut bindings = Vec::with_capacity(invocation.participants().len());
+    for (participant_index, (participant, token_range)) in invocation
+        .participants()
+        .iter()
+        .zip(token_ranges)
+        .enumerate()
+    {
         let tokens = token_range.immediate_tokens();
         let source = token_range.source_token_range();
         let packed = token_range.immediate_token_range();
@@ -540,8 +576,8 @@ fn encode_attention(
         {
             return Err("causal attention token range exceeds its admitted context".to_owned());
         }
-        let input_region = regions.len();
-        regions.push(contiguous_token_region(
+        let input_region = compute_regions.len();
+        compute_regions.push(contiguous_token_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
             ElementType::F16,
@@ -552,8 +588,8 @@ fn encode_attention(
             },
             tokens,
         )?);
-        let output_region = regions.len();
-        regions.push(contiguous_token_region(
+        let output_region = compute_regions.len();
+        compute_regions.push(contiguous_token_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
             ElementType::F16,
@@ -565,7 +601,7 @@ fn encode_attention(
             tokens,
         )?);
 
-        let first_page_region = regions.len();
+        let first_page_region = binding_regions.len();
         let state = binding(participant.bindings(), ResolvedValueRole::Input, 8)?;
         let pages = paged_state_regions(
             participant,
@@ -580,46 +616,116 @@ fn encode_attention(
         if page_count > shape.maximum_pages()? {
             return Err("causal attention page table exceeds its admitted maximum".to_owned());
         }
-        let host_page_table = host_storage.len();
-        host_storage.push(page_pointer_table(&pages));
+        let tokens_i32 = checked_i32(tokens, "causal attention participant token count")?;
+        let position_start = checked_i32(source.start, "causal attention source position")?;
+        let page_count_i32 = checked_i32(page_count, "causal attention page count")?;
+        let host_binding = host_storage.len();
+        host_storage.push(binding_payload(
+            page_count_i32,
+            position_start,
+            tokens_i32,
+            &pages,
+        ));
         let page_count = pages.len();
-        regions.extend(pages);
+        binding_regions.extend(pages);
+        let binding_offset = layout.binding_offset(participant_index)?;
+        bindings.push(CausalAttentionBinding {
+            first_page_region,
+            page_count,
+            host_binding,
+            binding_offset,
+        });
         launches.push(CausalAttentionLaunch {
             input_region,
             output_region,
-            first_page_region,
-            page_count,
-            host_page_table,
+            binding_offset,
             tokens,
-            tokens_i32: checked_i32(tokens, "causal attention participant token count")?,
-            position_start: checked_i32(source.start, "causal attention source position")?,
+            tokens_i32,
         });
     }
 
-    let functions = functions.clone();
-    CudaDeviceCommand::operation_with_host_storage_and_blas(
-        "vnext_causal_paged_attention",
-        regions,
+    let binding_command = CudaDeviceCommand::operation_with_host_storage_and_blas(
+        "vnext_causal_paged_attention_bindings",
+        binding_regions,
         host_storage,
-        move |stream, blas, regions, host_storage| {
+        move |stream, _blas, regions, host_storage| {
+            enqueue_bindings(stream, layout, &bindings, regions, host_storage)
+        },
+    )
+    .map_err(|error| error.to_string())?;
+
+    let functions = functions.clone();
+    let compute_command = CudaDeviceCommand::operation_with_blas(
+        "vnext_causal_paged_attention_compute",
+        compute_regions,
+        move |stream, blas, regions| {
             for launch in &launches {
                 enqueue_attention(
-                    stream,
-                    blas,
-                    &functions,
-                    shape,
-                    cuda,
-                    layout,
-                    shared,
-                    *launch,
-                    regions,
-                    host_storage,
+                    stream, blas, &functions, shape, cuda, layout, shared, *launch, regions,
                 )?;
             }
             Ok(())
         },
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+
+    Ok(EncodedDeviceOperation::compute(compute_command).with_dynamic_binding(binding_command))
+}
+
+fn enqueue_bindings(
+    stream: &CudaStream,
+    layout: ScratchLayout,
+    bindings: &[CausalAttentionBinding],
+    regions: &[CudaBufferRegion],
+    host_storage: &[Box<[u8]>],
+) -> Result<(), CudaDeviceRuntimeError> {
+    let scratch = &regions[0];
+    if scratch.length_bytes() < layout.required_bytes {
+        return Err(CudaDeviceRuntimeError::contract(
+            "causal attention scratch is smaller than its admitted estimate",
+        ));
+    }
+    for binding in bindings {
+        let page_region_end = binding
+            .first_page_region
+            .checked_add(binding.page_count)
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("causal attention page region range overflows")
+            })?;
+        if regions
+            .get(binding.first_page_region..page_region_end)
+            .is_none_or(|pages| {
+                pages.iter().any(|page| {
+                    page.length_bytes() != VNEXT_KV_PAGE_BYTES
+                        || page.element_type() != ElementType::F16
+                })
+            })
+        {
+            return Err(CudaDeviceRuntimeError::contract(
+                "causal attention page regions changed after encoding",
+            ));
+        }
+        let payload = host_storage.get(binding.host_binding).ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("causal attention binding payload is missing")
+        })?;
+        if payload.len() as u64 > layout.binding_slot_bytes {
+            return Err(CudaDeviceRuntimeError::contract(
+                "causal attention binding payload exceeds its admitted slot",
+            ));
+        }
+        let destination = scratch_pointer(scratch.device_ptr(), binding.binding_offset)?;
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(
+                destination,
+                payload.as_ref(),
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|error| {
+            CudaDeviceRuntimeError::driver("causal attention binding upload", error)
+        })?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -633,7 +739,6 @@ fn enqueue_attention(
     shared: SharedRegions,
     launch: CausalAttentionLaunch,
     regions: &[CudaBufferRegion],
-    host_storage: &[Box<[u8]>],
 ) -> Result<(), CudaDeviceRuntimeError> {
     let scratch = &regions[shared.scratch];
     if scratch.length_bytes() < layout.required_bytes {
@@ -641,36 +746,11 @@ fn enqueue_attention(
             "causal attention scratch is smaller than its admitted estimate",
         ));
     }
-    let page_region_end = launch
-        .first_page_region
-        .checked_add(launch.page_count)
-        .ok_or_else(|| {
-            CudaDeviceRuntimeError::contract("causal attention page region range overflows")
-        })?;
-    if regions
-        .get(launch.first_page_region..page_region_end)
-        .is_none_or(|pages| {
-            pages.iter().any(|page| {
-                page.length_bytes() != VNEXT_KV_PAGE_BYTES
-                    || page.element_type() != ElementType::F16
-            })
-        })
-    {
-        return Err(CudaDeviceRuntimeError::contract(
-            "causal attention page regions changed after encoding",
-        ));
-    }
-
     let scratch_base = scratch.device_ptr();
-    let page_table = scratch_base;
-    unsafe {
-        cudarc::driver::result::memcpy_htod_async(
-            page_table,
-            host_storage[launch.host_page_table].as_ref(),
-            stream.cu_stream(),
-        )
-    }
-    .map_err(|error| CudaDeviceRuntimeError::driver("causal page-table upload", error))?;
+    let control = scratch_pointer(scratch_base, launch.binding_offset)?;
+    let page_table = control.checked_add(BINDING_CONTROL_BYTES).ok_or_else(|| {
+        CudaDeviceRuntimeError::contract("causal attention page-table pointer overflows")
+    })?;
 
     let input = regions[launch.input_region].device_ptr();
     let output = regions[launch.output_region].device_ptr();
@@ -732,6 +812,7 @@ fn enqueue_attention(
         regions[shared.query_norm].device_ptr(),
         regions[shared.key_norm].device_ptr(),
         query,
+        control,
         page_table,
         launch,
         cuda,
@@ -741,6 +822,7 @@ fn enqueue_attention(
         &functions.attention,
         query,
         query_raw,
+        control,
         page_table,
         context,
         launch,
@@ -781,11 +863,11 @@ fn launch_prepare(
     query_norm: u64,
     key_norm: u64,
     query: u64,
+    control: u64,
     page_table: u64,
     launch: CausalAttentionLaunch,
     shape: CudaCausalAttentionShape,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    let page_count = checked_i32_runtime(launch.page_count as u64, "causal page count")?;
     let page_elements = checked_i32_runtime(
         VNEXT_KV_PAGE_BYTES / ElementType::F16.size_bytes(),
         "causal page elements",
@@ -801,16 +883,13 @@ fn launch_prepare(
         .ok_or_else(|| CudaDeviceRuntimeError::contract("causal prepare head count overflows"))?;
     let mut builder = stream.launch_builder(function);
     let pointers = [
-        query_raw, key_raw, value_raw, query_norm, key_norm, query, page_table,
+        query_raw, key_raw, value_raw, query_norm, key_norm, query, control, page_table,
     ];
     for pointer in &pointers {
         builder.arg(pointer);
     }
     let dimensions = [
-        page_count,
         page_elements,
-        launch.position_start,
-        launch.tokens_i32,
         shape.query_heads,
         shape.key_value_heads,
         shape.head_dim,
@@ -848,26 +927,23 @@ fn launch_attention(
     function: &CudaFunction,
     query: u64,
     query_raw: u64,
+    control: u64,
     page_table: u64,
     output: u64,
     launch: CausalAttentionLaunch,
     shape: CudaCausalAttentionShape,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    let page_count = checked_i32_runtime(launch.page_count as u64, "causal page count")?;
     let page_elements = checked_i32_runtime(
         VNEXT_KV_PAGE_BYTES / ElementType::F16.size_bytes(),
         "causal page elements",
     )?;
     let mut builder = stream.launch_builder(function);
-    let pointers = [query, query_raw, page_table, output];
+    let pointers = [query, query_raw, control, page_table, output];
     for pointer in &pointers {
         builder.arg(pointer);
     }
     let dimensions = [
-        page_count,
         page_elements,
-        launch.position_start,
-        launch.tokens_i32,
         shape.query_heads,
         shape.key_value_heads,
         shape.head_dim,
@@ -1027,12 +1103,22 @@ fn paged_state_regions(
     Ok(pages)
 }
 
-fn page_pointer_table(pages: &[CudaBufferRegion]) -> Box<[u8]> {
-    pages
-        .iter()
-        .flat_map(|page| page.device_ptr().to_ne_bytes())
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
+fn binding_payload(
+    page_count: i32,
+    position_start: i32,
+    active_tokens: i32,
+    pages: &[CudaBufferRegion],
+) -> Box<[u8]> {
+    let mut payload = Vec::with_capacity(
+        BINDING_CONTROL_BYTES as usize + pages.len() * std::mem::size_of::<u64>(),
+    );
+    for value in [page_count, position_start, active_tokens, 0] {
+        payload.extend_from_slice(&value.to_ne_bytes());
+    }
+    for page in pages {
+        payload.extend_from_slice(&page.device_ptr().to_ne_bytes());
+    }
+    payload.into_boxed_slice()
 }
 
 fn validate_signature(
@@ -1276,10 +1362,15 @@ mod tests {
     #[test]
     fn scratch_estimator_and_layout_are_identical() {
         let shape = CausalAttentionShape::from_attributes(&attributes(true)).unwrap();
-        let layout = ScratchLayout::new(shape, 17).unwrap();
+        let layout = ScratchLayout::new(shape, 17, 3).unwrap();
         assert_eq!(
             layout.required_bytes,
-            shape.fixed_scratch_bytes().unwrap() + 17 * shape.scratch_bytes_per_token().unwrap()
+            3 * shape.binding_slot_bytes().unwrap() + 17 * shape.scratch_bytes_per_token().unwrap()
+        );
+        assert_eq!(layout.binding_offset(0).unwrap(), 0);
+        assert_eq!(
+            layout.binding_offset(2).unwrap(),
+            2 * shape.binding_slot_bytes().unwrap()
         );
         assert_eq!(shape.maximum_pages().unwrap(), 128);
     }
