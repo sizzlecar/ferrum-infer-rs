@@ -6,7 +6,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
-    ExternalModelMetadataId, PreparedModelFamily, WeightComponentSource,
+    ExternalModelMetadataId, ModelFamilyRegistration, ModelFamilyRegistry, PreparedModelFamily,
+    TypedFamilyRegistration, WeightComponentSource,
 };
 use ferrum_types::{DataType, Device, ModelId, ModelInfo, ModelType};
 use serde_json::Value;
@@ -14,12 +15,14 @@ use serde_json::Value;
 pub mod qwen35;
 
 type PrepareModel = fn(&Path) -> ferrum_types::Result<PreparedProductionModel>;
+type CreateFamilyRegistration = fn() -> ferrum_types::Result<Box<dyn ModelFamilyRegistration>>;
 
 struct ModelLoaderRegistration {
     external_metadata_id: &'static str,
     execution_kind: ProductionExecutionKind,
     allows_legacy_reference: bool,
     prepare: PrepareModel,
+    create_family_registration: CreateFamilyRegistration,
 }
 
 const MODEL_LOADERS: &[ModelLoaderRegistration] = &[ModelLoaderRegistration {
@@ -27,7 +30,40 @@ const MODEL_LOADERS: &[ModelLoaderRegistration] = &[ModelLoaderRegistration {
     execution_kind: ProductionExecutionKind::CausalLanguage,
     allows_legacy_reference: true,
     prepare: qwen35::prepare_from_model_dir,
+    create_family_registration: qwen35_family_registration,
 }];
+
+fn qwen35_family_registration() -> ferrum_types::Result<Box<dyn ModelFamilyRegistration>> {
+    let provider = qwen35::Qwen35FamilyProvider::new()
+        .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
+    Ok(Box::new(TypedFamilyRegistration::new(provider)))
+}
+
+/// Complete typed family registry for production vNext registrations.
+/// It is derived from `MODEL_LOADERS`, so family preparation and resolved-plan
+/// revalidation cannot drift into separate model-name switch statements.
+pub struct ProductionModelFamilyRegistry {
+    registrations: Vec<Box<dyn ModelFamilyRegistration>>,
+}
+
+impl ProductionModelFamilyRegistry {
+    pub fn new() -> ferrum_types::Result<Self> {
+        let registrations = MODEL_LOADERS
+            .iter()
+            .map(|registration| (registration.create_family_registration)())
+            .collect::<ferrum_types::Result<Vec<_>>>()?;
+        Ok(Self { registrations })
+    }
+}
+
+impl ModelFamilyRegistry for ProductionModelFamilyRegistry {
+    fn registrations(&self) -> Vec<&dyn ModelFamilyRegistration> {
+        self.registrations
+            .iter()
+            .map(|registration| registration.as_ref())
+            .collect()
+    }
+}
 
 struct LegacyModelRegistration {
     external_metadata_id: &'static str,
@@ -522,6 +558,17 @@ mod tests {
                 registration.external_metadata_id
             );
         }
+    }
+
+    #[test]
+    fn production_family_registry_is_derived_from_loader_rows() {
+        let registry = ProductionModelFamilyRegistry::new().unwrap();
+        assert_eq!(registry.registrations().len(), MODEL_LOADERS.len());
+        let metadata = ExternalModelMetadataId::new(qwen35::EXTERNAL_METADATA_ID).unwrap();
+        let registration = (&registry as &dyn ModelFamilyRegistry)
+            .resolve_external(&metadata)
+            .unwrap();
+        assert_eq!(registration.family_id().as_str(), qwen35::FAMILY_ID);
     }
 
     #[test]

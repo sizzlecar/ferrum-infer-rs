@@ -1423,7 +1423,7 @@ impl<R: DeviceRuntime> Drop for VNextPrefillExecutionGuard<'_, R> {
 /// registry. CUDA and Metal factories differ only in composition creation.
 pub struct VNextModelExecutor<R: DeviceRuntime> {
     info: ModelInfo,
-    executable: ExecutablePlan,
+    resolved_plan: ResolvedModelPlan,
     runtime: Arc<R>,
     providers: BoundOperationProviderSet<R>,
     policy: ResolvedRuntimePolicy,
@@ -1449,7 +1449,7 @@ impl<R: DeviceRuntime> fmt::Debug for VNextModelExecutor<R> {
             .field("model_id", &self.info.model_id)
             .field(
                 "plan_id",
-                self.executable.execution_plan().payload().plan_id(),
+                self.resolved_plan.execution_plan().payload().plan_id(),
             )
             .field("device", &self.runtime.descriptor().id)
             .field("maximum_model_tokens", &self.maximum_model_tokens)
@@ -1459,14 +1459,23 @@ impl<R: DeviceRuntime> fmt::Debug for VNextModelExecutor<R> {
 }
 
 impl<R: DeviceRuntime> VNextModelExecutor<R> {
-    pub fn from_runtime_composition(
+    pub fn from_runtime_composition<F>(
         prepared: PreparedProductionModel,
         info: ModelInfo,
         engine_config: &EngineConfig,
         runtime: Arc<R>,
         registry: OperationRuntimeRegistry<R>,
         catalog: CapabilityCatalog,
-    ) -> Result<Self> {
+        resolve_plan: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(
+            &PreparedProductionModel,
+            &ResolvedRuntimePolicy,
+            &CapabilityCatalog,
+            &ProgramPlanCompilation,
+        ) -> Result<ResolvedModelPlan>,
+    {
         let attention_head_dimension = prepared.descriptor().attention_head_dimension();
         let config =
             VNextExecutorConfig::from_engine_config(engine_config, &info, runtime.as_ref())?;
@@ -1508,11 +1517,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             &compile_options,
         )
         .map_err(|error| FerrumError::model(format!("vNext plan compile: {error}")))?;
-        let (executable, _, _) = compilation.into_parts();
+        let resolved_plan =
+            resolve_plan(&prepared, &config.runtime_policy, &catalog, &compilation)?;
+        if resolved_plan.execution_plan() != compilation.executable().execution_plan() {
+            return Err(FerrumError::internal(
+                "product composition returned a different execution plan than the compiler",
+            ));
+        }
         let providers = registry
-            .bind_plan(&executable)
+            .bind_plan(&resolved_plan)
             .map_err(|error| FerrumError::model(format!("vNext provider binding: {error}")))?;
-        let io = Self::resolve_io(&executable, &input_id, &output_id, info.vocab_size)?;
+        let io = Self::resolve_io(&resolved_plan, &input_id, &output_id, info.vocab_size)?;
         let family_fingerprint = family
             .fingerprint()
             .map_err(|error| FerrumError::model(error.to_string()))?;
@@ -1520,7 +1535,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .program()
             .fingerprint()
             .map_err(|error| FerrumError::model(error.to_string()))?;
-        let static_bytes = executable
+        let static_bytes = resolved_plan
             .execution_plan()
             .payload()
             .memory()
@@ -1529,7 +1544,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .map_err(|error| FerrumError::internal(error.to_string()))?;
         let provision_request = RequestIdentity::new(format!("request.vnext.provision.{run_id}"))
             .map_err(|error| FerrumError::internal(error.to_string()))?;
-        let provisioned = executable
+        let provisioned = resolved_plan
             .execution_plan()
             .provision_static(Arc::clone(&runtime), provision_request)
             .map_err(|error| FerrumError::device(format!("vNext static provision: {error}")))?;
@@ -1577,7 +1592,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 };
                 let initialized = match committed.initialize_static(
                     family,
-                    executable.execution_plan(),
+                    resolved_plan.execution_plan(),
                     prepared.weights(),
                     config.static_initialization,
                 ) {
@@ -1609,7 +1624,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
         Ok(Self {
             info,
-            executable,
+            resolved_plan,
             runtime,
             providers,
             policy: config.runtime_policy,
@@ -1630,7 +1645,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     }
 
     fn resolve_io(
-        executable: &ExecutablePlan,
+        executable: &impl ExecutablePlanView,
         input_id: &ProgramValueId,
         output_id: &ProgramValueId,
         expected_vocab: usize,
@@ -2027,7 +2042,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         let active = TrustedActiveSequenceBinding::from_session(session)
             .map_err(|error| FerrumError::backend(error.to_string()))?;
-        VNextExecutionJournal::open(sink, self.executable.execution_plan(), active)
+        VNextExecutionJournal::open(sink, self.resolved_plan.execution_plan(), active)
             .map(Some)
             .map_err(|error| FerrumError::backend(format!("vNext execution journal: {error}")))
     }
@@ -2310,7 +2325,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         spans: &[TokenSpanWork],
     ) -> Result<StepSubmissionWaveAdmissionDecision<R>> {
         let requests = self
-            .executable
+            .resolved_plan
             .execution_plan()
             .payload()
             .nodes()
@@ -2506,7 +2521,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let mut retries = 0;
         loop {
             let identity = match OperationDispatch::bind_submission_wave_identity(
-                &self.executable,
+                &self.resolved_plan,
                 &active_bindings,
                 &wave,
                 &self.lane,
@@ -2516,7 +2531,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             };
             match OperationDispatch::encode_and_submit_wave_with_inputs(
                 self.providers.providers(),
-                &self.executable,
+                &self.resolved_plan,
                 &identity,
                 &active_bindings,
                 &uploads,
@@ -3377,8 +3392,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             "model_id": self.info.model_id.to_string(),
             "family_fingerprint": self.family_fingerprint,
             "program_fingerprint": self.program_fingerprint,
-            "plan_id": self.executable.execution_plan().payload().plan_id().to_string(),
-            "plan_hash": self.executable.execution_plan().plan_hash().to_string(),
+            "resolved_plan_fingerprint": self.resolved_plan.fingerprint(),
+            "plan_id": self.resolved_plan.execution_plan().payload().plan_id().to_string(),
+            "plan_hash": self.resolved_plan.execution_plan().plan_hash().to_string(),
             "policy_id": self.policy.policy_id(),
             "policy_fingerprint": self.policy.fingerprint_str(),
             "device_id": self.runtime.descriptor().id.to_string(),
@@ -3424,6 +3440,10 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
     fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
         ExecutionResourceAuthority::PlanRuntime
+    }
+
+    fn resolved_model_plan(&self) -> Option<&ResolvedModelPlan> {
+        Some(&self.resolved_plan)
     }
 
     fn plan_runtime_resource_snapshot(&self) -> Result<Option<PlanRuntimeResourceSnapshot>> {
@@ -3939,24 +3959,5 @@ mod tests {
             DecodeFailureDisposition::from_error(&error),
             DecodeFailureDisposition::AbortSequence
         );
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl VNextModelExecutor<ferrum_kernels::backend::cuda::vnext_runtime::CudaDeviceRuntime> {
-    pub fn create_cuda(
-        ordinal: usize,
-        prepared: PreparedProductionModel,
-        info: ModelInfo,
-        engine_config: &EngineConfig,
-    ) -> Result<Self> {
-        use ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition;
-
-        let device_id = DeviceId::new(format!("device.cuda.{ordinal}"))
-            .map_err(|error| FerrumError::device(error.to_string()))?;
-        let composition = CudaVNextComposition::create(ordinal, device_id)
-            .map_err(|error| FerrumError::device(format!("create vNext CUDA runtime: {error}")))?;
-        let (runtime, registry, catalog) = composition.into_parts();
-        Self::from_runtime_composition(prepared, info, engine_config, runtime, registry, catalog)
     }
 }

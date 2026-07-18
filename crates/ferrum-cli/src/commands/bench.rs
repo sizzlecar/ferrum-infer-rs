@@ -176,6 +176,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let mut engine_config = ferrum_types::EngineConfig::default();
     engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
     engine_config.model.source = Some(original_source);
+    engine_config.sampling.default_params = bench_sampling_params(cmd.max_tokens);
     engine_config.backend.device = device;
     engine_config.backend.backend_options.insert(
         "model_path".to_string(),
@@ -401,18 +402,7 @@ fn make_request(model_id: &str, prompt: &str, max_tokens: u32) -> InferenceReque
         id: RequestId(Uuid::new_v4()),
         model_id: ferrum_types::ModelId(model_id.to_string()),
         prompt: prompt.to_string(),
-        sampling_params: SamplingParams {
-            max_tokens: max_tokens as usize,
-            temperature: 0.0, // greedy — matches PLAYBOOK § 0.5 L3 determinism contract
-            top_p: 1.0,
-            repetition_penalty: 1.0,
-            stop_sequences: vec![
-                "<|im_end|>".to_string(),
-                "</s>".to_string(),
-                "<|endoftext|>".to_string(),
-            ],
-            ..Default::default()
-        },
+        sampling_params: bench_sampling_params(max_tokens),
         stream: true,
         priority: Priority::Normal,
         client_id: None,
@@ -420,6 +410,21 @@ fn make_request(model_id: &str, prompt: &str, max_tokens: u32) -> InferenceReque
         created_at: Utc::now(),
         api_request: None,
         metadata: HashMap::new(),
+    }
+}
+
+fn bench_sampling_params(max_tokens: u32) -> SamplingParams {
+    SamplingParams {
+        max_tokens: max_tokens as usize,
+        temperature: 0.0, // greedy — matches PLAYBOOK § 0.5 L3 determinism contract
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        stop_sequences: vec![
+            "<|im_end|>".to_string(),
+            "</s>".to_string(),
+            "<|endoftext|>".to_string(),
+        ],
+        ..Default::default()
     }
 }
 
