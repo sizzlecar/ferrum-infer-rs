@@ -5,6 +5,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::{
     classify_device_error, AdmittedSequenceResources, AllocationLifetime,
@@ -4355,6 +4356,101 @@ where
 pub type SubmissionWaveDispatchError<R> =
     OperationDispatchError<R, DefinitelyNotSubmittedWaveRetryAuthority<R>>;
 
+/// Typed host boundaries inside one prepared wave dispatch. These intervals
+/// are host wall time and must not be combined with backend device timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmissionWaveDispatchStage {
+    ContractValidateAndReserve,
+    BackingAndInputEncode,
+    ProviderNodeEncode,
+    LaneReserveSubmitAndArm,
+}
+
+/// Diagnostic-only timing sink for the prepared-wave dispatch hot path.
+///
+/// The sink receives only a stage and completed host duration; it receives no
+/// command, resource, or correctness authority. `ENABLED = false` is the
+/// compile-time off path: no clock is read and `record` is never called.
+/// Enabled implementations run on the submission thread and must not block,
+/// allocate, or panic.
+pub trait SubmissionWaveDispatchTimingSink: Send + Sync {
+    const ENABLED: bool;
+
+    fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration);
+}
+
+struct DisabledSubmissionWaveDispatchTimingSink;
+
+impl SubmissionWaveDispatchTimingSink for DisabledSubmissionWaveDispatchTimingSink {
+    const ENABLED: bool = false;
+
+    fn record(&self, _stage: SubmissionWaveDispatchStage, _elapsed: Duration) {
+        unreachable!("disabled submission timing cannot record")
+    }
+}
+
+struct SubmissionWaveDispatchStageTimer<'sink, S>
+where
+    S: SubmissionWaveDispatchTimingSink,
+{
+    sink: &'sink S,
+    stage: SubmissionWaveDispatchStage,
+    started: Option<Instant>,
+}
+
+impl<'sink, S> SubmissionWaveDispatchStageTimer<'sink, S>
+where
+    S: SubmissionWaveDispatchTimingSink,
+{
+    #[inline(always)]
+    fn start(sink: &'sink S, stage: SubmissionWaveDispatchStage) -> Self {
+        Self {
+            sink,
+            stage,
+            started: S::ENABLED.then(Instant::now),
+        }
+    }
+}
+
+impl<S> Drop for SubmissionWaveDispatchStageTimer<'_, S>
+where
+    S: SubmissionWaveDispatchTimingSink,
+{
+    fn drop(&mut self) {
+        if let Some(started) = self.started.take() {
+            if !std::thread::panicking() {
+                self.sink.record(self.stage, started.elapsed());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod submission_wave_dispatch_timing_tests {
+    use super::*;
+
+    struct DisabledPanicSink;
+
+    impl SubmissionWaveDispatchTimingSink for DisabledPanicSink {
+        const ENABLED: bool = false;
+
+        fn record(&self, _stage: SubmissionWaveDispatchStage, _elapsed: Duration) {
+            panic!("disabled timing sink was called");
+        }
+    }
+
+    #[test]
+    fn disabled_submission_timing_does_not_record() {
+        let timer = SubmissionWaveDispatchStageTimer::start(
+            &DisabledPanicSink,
+            SubmissionWaveDispatchStage::ProviderNodeEncode,
+        );
+        drop(timer);
+
+        assert!(!DisabledPanicSink::ENABLED);
+    }
+}
+
 impl<R, Retry> fmt::Debug for OperationDispatchError<R, Retry>
 where
     R: DeviceRuntime,
@@ -5048,7 +5144,7 @@ impl OperationDispatch {
         active_bindings: I,
         timing_mode: DeviceTimingMode,
         input_uploads: &[SubmissionWaveInputUpload],
-        mut wave: PreparedStepSubmissionWave<R>,
+        wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
         reaper: &Arc<CompletionReaper<R>>,
     ) -> Result<CompletionHandle<R>, SubmissionWaveDispatchError<R>>
@@ -5056,6 +5152,77 @@ impl OperationDispatch {
         R: DeviceRuntime,
         I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
+        Self::encode_and_submit_wave_with_inputs_timed(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            &DisabledSubmissionWaveDispatchTimingSink,
+            wave,
+            lane,
+            reaper,
+        )
+    }
+
+    /// Dispatches one prepared wave while attributing host time to exact typed
+    /// ownership boundaries. The diagnostic sink receives no access to the
+    /// command, submission, completion, or failure value.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_and_submit_wave_with_inputs_and_timing<'binding, R, I, S>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        timing_sink: &S,
+        wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<CompletionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+    {
+        Self::encode_and_submit_wave_with_inputs_timed(
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            timing_mode,
+            input_uploads,
+            timing_sink,
+            wave,
+            lane,
+            reaper,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_and_submit_wave_with_inputs_timed<'binding, R, I, S>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        timing_mode: DeviceTimingMode,
+        input_uploads: &[SubmissionWaveInputUpload],
+        timing_sink: &S,
+        mut wave: PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+        reaper: &Arc<CompletionReaper<R>>,
+    ) -> Result<CompletionHandle<R>, SubmissionWaveDispatchError<R>>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+        S: SubmissionWaveDispatchTimingSink,
+    {
+        let contract_stage = SubmissionWaveDispatchStageTimer::start(
+            timing_sink,
+            SubmissionWaveDispatchStage::ContractValidateAndReserve,
+        );
         let identity_participant_count = batch_identity.participants().len();
         let active_participant_count = active_bindings.len();
         let expected_identity_participant_count =
@@ -5111,6 +5278,12 @@ impl OperationDispatch {
                 "wave encode runtime differs from its execution lane snapshot",
             )));
         }
+        drop(contract_stage);
+
+        let backing_stage = SubmissionWaveDispatchStageTimer::start(
+            timing_sink,
+            SubmissionWaveDispatchStage::BackingAndInputEncode,
+        );
         let mut commands = DeviceCommandBatch::with_capacity_and_timing(
             providers.len().saturating_add(input_uploads.len()),
             timing_mode,
@@ -5131,6 +5304,12 @@ impl OperationDispatch {
             input_uploads,
             &mut commands,
         )?;
+        drop(backing_stage);
+
+        let provider_stage = SubmissionWaveDispatchStageTimer::start(
+            timing_sink,
+            SubmissionWaveDispatchStage::ProviderNodeEncode,
+        );
         let pre_provider_command_count = commands.len();
         for (node_index, (provider, node_identity)) in
             providers.iter().zip(batch_identity.nodes()).enumerate()
@@ -5170,11 +5349,17 @@ impl OperationDispatch {
                 "wave encode did not produce one command per immutable plan node",
             )));
         }
+        drop(provider_stage);
+
+        let lane_stage = SubmissionWaveDispatchStageTimer::start(
+            timing_sink,
+            SubmissionWaveDispatchStage::LaneReserveSubmitAndArm,
+        );
         let mut lane_reservation = lane
             .reserve_enqueue()
             .map_err(SubmissionWaveDispatchError::Contract)?;
         completion.mark_submission_started();
-        match lane_reservation.submit(commands) {
+        let outcome = match lane_reservation.submit(commands) {
             LaneSubmitOutcome::DefinitelyNotSubmitted(error) => {
                 drop(lane_reservation);
                 let retry = completion
@@ -5215,7 +5400,9 @@ impl OperationDispatch {
                 }
                 Ok(completion)
             }
-        }
+        };
+        drop(lane_stage);
+        outcome
     }
 }
 

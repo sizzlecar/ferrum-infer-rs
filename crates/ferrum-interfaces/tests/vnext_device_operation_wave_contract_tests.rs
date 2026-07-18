@@ -2,6 +2,19 @@ mod vnext_device_operation_contract;
 
 use vnext_device_operation_contract::*;
 
+#[derive(Default)]
+struct RecordingSubmissionTimingSink {
+    stages: Mutex<Vec<SubmissionWaveDispatchStage>>,
+}
+
+impl SubmissionWaveDispatchTimingSink for RecordingSubmissionTimingSink {
+    const ENABLED: bool = true;
+
+    fn record(&self, stage: SubmissionWaveDispatchStage, _elapsed: Duration) {
+        self.stages.lock().unwrap().push(stage);
+    }
+}
+
 fn prepare_wave(
     _plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
     plan: &ExecutionPlan,
@@ -364,13 +377,15 @@ fn typed_input_upload_precedes_the_plan_in_one_submission() {
         vec![0; 16],
     )
     .unwrap();
-    let handle = OperationDispatch::encode_and_submit_wave_with_inputs(
+    let timing = RecordingSubmissionTimingSink::default();
+    let handle = OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
         &providers,
         &fixture.resolved,
         &batch_identity,
         active_bindings.iter(),
         DeviceTimingMode::Off,
         &[upload],
+        &timing,
         wave,
         &lane,
         &reaper,
@@ -383,6 +398,15 @@ fn typed_input_upload_precedes_the_plan_in_one_submission() {
             .unwrap()
             .submitted_command_counts,
         vec![3]
+    );
+    assert_eq!(
+        *timing.stages.lock().unwrap(),
+        vec![
+            SubmissionWaveDispatchStage::ContractValidateAndReserve,
+            SubmissionWaveDispatchStage::BackingAndInputEncode,
+            SubmissionWaveDispatchStage::ProviderNodeEncode,
+            SubmissionWaveDispatchStage::LaneReserveSubmitAndArm,
+        ]
     );
     assert!(matches!(
         handle.wait().unwrap(),
