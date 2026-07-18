@@ -27,7 +27,9 @@ MAX_PRESSURE_NO_PROGRESS_SECONDS = 30.0
 MAX_PRESSURE_UNCHANGED_SKIPS = 512
 MAX_PRESSURE_TRACE_BYTES = 16 * 1024 * 1024
 MAX_PRESSURE_JOINT_STREAM_SECONDS = 300.0
+CAPACITY_SCENARIO_VERSION = 2
 SERVER_MAX_MODEL_LEN = 256
+SEQUENCE_FIT_POLICY = "full-input-must-fit"
 PRESSURE_B_WORD_COUNT = 192
 PRESSURE_MAX_TOKENS = {"A": 224, "B": 32, "C": 16}
 PRESSURE_B_PROMPT = (
@@ -36,7 +38,9 @@ PRESSURE_B_PROMPT = (
     + " Emit deterministic short words until the output limit."
 )
 PRESSURE_WORKLOAD_POLICY = {
+    "scenario_version": CAPACITY_SCENARIO_VERSION,
     "max_model_len": SERVER_MAX_MODEL_LEN,
+    "sequence_fit_policy": SEQUENCE_FIT_POLICY,
     "max_tokens_by_slot": PRESSURE_MAX_TOKENS,
     "b_prompt_sha256": hashlib.sha256(PRESSURE_B_PROMPT.encode("utf-8")).hexdigest(),
     "b_prompt_word_count": PRESSURE_B_WORD_COUNT,
@@ -274,6 +278,102 @@ def quiescent_pool_snapshot(executor: dict[str, Any], label: str) -> dict[str, A
     }
 
 
+def require_full_input_fit_policy(executor: dict[str, Any], label: str) -> None:
+    admission = executor.get("runtime_admission_policy")
+    require(isinstance(admission, dict), f"{label}: runtime admission policy is missing")
+    require(
+        admission.get("sequence_fit_policy") == "full_input_must_fit",
+        f"{label}: sequence fit policy is not FullInputMustFit",
+    )
+
+
+def fixed_block_pool_snapshot(
+    executor: dict[str, Any], label: str, *, require_live: bool
+) -> dict[str, Any]:
+    dynamic_pools = executor.get("dynamic_pools")
+    require(isinstance(dynamic_pools, dict), f"{label}: dynamic pools are missing")
+    pools = dynamic_pools.get("pools")
+    require(isinstance(pools, list), f"{label}: dynamic pool list is missing")
+    candidates = []
+    for pool in pools:
+        if not isinstance(pool, dict):
+            continue
+        profile = pool.get("storage_profile")
+        if not isinstance(profile, dict):
+            continue
+        allocator = profile.get("allocator")
+        view = profile.get("view")
+        if (
+            isinstance(allocator, dict)
+            and isinstance(allocator.get("fixed_block_arena"), dict)
+            and isinstance(view, dict)
+            and isinstance(view.get("paged_regions"), dict)
+        ):
+            candidates.append(pool)
+    require(len(candidates) == 1, f"{label}: expected one paged fixed-block pool")
+    pool = candidates[0]
+    pool_id = pool.get("pool_id")
+    domain_id = pool.get("domain_id")
+    resident_bytes = pool.get("resident_bytes")
+    free_bytes = pool.get("free_bytes")
+    largest_contiguous_bytes = pool.get("largest_contiguous_bytes")
+    live_segments = pool.get("live_segments")
+    resident_chunks = pool.get("resident_chunks")
+    block_bytes = pool["storage_profile"]["allocator"]["fixed_block_arena"].get(
+        "block_bytes"
+    )
+    view_block_bytes = pool["storage_profile"]["view"]["paged_regions"].get(
+        "block_bytes"
+    )
+    require(isinstance(pool_id, str) and pool_id, f"{label}: paged pool id is missing")
+    require(isinstance(domain_id, int) and domain_id > 0, f"{label}: paged domain id is invalid")
+    require(
+        isinstance(block_bytes, int)
+        and block_bytes > 0
+        and block_bytes == view_block_bytes,
+        f"{label}: paged block geometry is inconsistent",
+    )
+    require(
+        isinstance(resident_bytes, int)
+        and resident_bytes > 0
+        and resident_bytes % block_bytes == 0,
+        f"{label}: paged residency is invalid",
+    )
+    require(
+        isinstance(free_bytes, int) and 0 <= free_bytes <= resident_bytes,
+        f"{label}: paged free capacity is invalid",
+    )
+    require(
+        isinstance(largest_contiguous_bytes, int)
+        and 0 <= largest_contiguous_bytes <= free_bytes,
+        f"{label}: paged contiguous capacity is invalid",
+    )
+    require(
+        isinstance(live_segments, int) and live_segments >= 0,
+        f"{label}: paged live segment count is invalid",
+    )
+    require(
+        isinstance(resident_chunks, int) and resident_chunks > 0,
+        f"{label}: paged resident chunk count is invalid",
+    )
+    if require_live:
+        require(live_segments > 0, f"{label}: A owns no live paged KV segment")
+        require(
+            free_bytes < resident_bytes,
+            f"{label}: A did not consume paged KV capacity",
+        )
+    return {
+        "pool_id": pool_id,
+        "domain_id": domain_id,
+        "resident_bytes": resident_bytes,
+        "free_bytes": free_bytes,
+        "largest_contiguous_bytes": largest_contiguous_bytes,
+        "live_segments": live_segments,
+        "resident_chunks": resident_chunks,
+        "block_bytes": block_bytes,
+    }
+
+
 def require_replayed_pool_snapshot(
     calibration: dict[str, Any], replay: dict[str, Any], exact_budget: int
 ) -> None:
@@ -470,6 +570,8 @@ def collect_run_smoke(
         "Respond with only the city name: What is the capital of France?",
         "--max-tokens",
         "16",
+        "--sequence-fit-policy",
+        SEQUENCE_FIT_POLICY,
         "--temperature",
         "0",
         "--seed",
@@ -782,6 +884,8 @@ class ServerSession:
             str(max_num_seqs),
             "--max-num-batched-tokens",
             str(max_num_batched_tokens),
+            "--sequence-fit-policy",
+            SEQUENCE_FIT_POLICY,
             "--scheduler-prefill-first-until-active",
             str(prefill_first_until_active),
             "--profile-detail",
@@ -861,6 +965,108 @@ class ServerSession:
         self.proc = None
 
 
+def wait_for_active_fixed_block_pool(
+    server: ServerSession,
+    task: StreamTask,
+    *,
+    artifact_name: str,
+    timeout: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    deadline = time.monotonic() + timeout
+    last_error = "active executor snapshot was not observed"
+    while time.monotonic() < deadline:
+        require(task.is_alive(), "pressure A completed before live KV evidence was captured")
+        try:
+            health = http_json(server.port, "/health")
+            executor = find_executor_snapshot(health)
+            require(executor is not None, "pressure A health has no vNext executor snapshot")
+            require_full_input_fit_policy(executor, "pressure A")
+            require(
+                executor.get("active_sequences", 0) >= 1,
+                "pressure A is not an active vNext sequence",
+            )
+            require(
+                health.get("engine", {}).get("active_requests", 0) >= 1,
+                "pressure A is not an active product request",
+            )
+            pool = fixed_block_pool_snapshot(executor, "pressure A", require_live=True)
+            write_json(server.out_dir / artifact_name, health)
+            return health, pool
+        except CapacityGateError as error:
+            last_error = str(error)
+        time.sleep(0.02)
+    raise CapacityGateError(f"timed out waiting for live pressure A KV state: {last_error}")
+
+
+def validate_b_wait_health(
+    health: dict[str, Any], expected_pool: dict[str, Any], label: str
+) -> dict[str, Any]:
+    executor = find_executor_snapshot(health)
+    require(executor is not None, f"{label}: vNext executor snapshot is missing")
+    require_full_input_fit_policy(executor, label)
+    pool = fixed_block_pool_snapshot(executor, label, require_live=True)
+    require(
+        pool["pool_id"] == expected_pool["pool_id"]
+        and pool["domain_id"] == expected_pool["domain_id"],
+        f"{label}: live paged KV identity changed while B waited",
+    )
+    require(
+        executor.get("active_sequences") == 1,
+        f"{label}: expected exactly one active holder sequence",
+    )
+    require(
+        executor.get("staged_prefill_requests", 0)
+        + executor.get("staged_prefill_sequences", 0)
+        >= 1,
+        f"{label}: B has no staged prefill authority",
+    )
+    require(
+        executor.get("pending_prefill_maintenance") == 0,
+        f"{label}: B is still inside backing maintenance",
+    )
+    engine = health.get("engine")
+    require(isinstance(engine, dict), f"{label}: engine status is missing")
+    require(
+        engine.get("active_requests") == 1,
+        f"{label}: expected only A to be active",
+    )
+    require(
+        isinstance(engine.get("queued_requests"), int)
+        and engine["queued_requests"] >= 1,
+        f"{label}: B is not retained in the product queue",
+    )
+    return pool
+
+
+def wait_for_b_wait_health(
+    server: ServerSession,
+    a: StreamTask,
+    b: StreamTask,
+    expected_pool: dict[str, Any],
+    *,
+    artifact_name: str,
+    timeout: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    deadline = time.monotonic() + timeout
+    last_error = "B wait health was not observed"
+    while time.monotonic() < deadline:
+        require(a.is_alive(), "pressure A completed before B wait evidence was captured")
+        require(b.is_alive(), "pressure B completed before B wait evidence was captured")
+        require(
+            b.live_content_chunks() == 0,
+            "pressure B produced content before its typed capacity wait was captured",
+        )
+        try:
+            health = http_json(server.port, "/health")
+            pool = validate_b_wait_health(health, expected_pool, "pressure B wait")
+            write_json(server.out_dir / artifact_name, health)
+            return health, pool
+        except CapacityGateError as error:
+            last_error = str(error)
+        time.sleep(0.02)
+    raise CapacityGateError(f"timed out waiting for retained B pressure: {last_error}")
+
+
 def require_stream_success(result: dict[str, Any], label: str) -> None:
     require(result.get("error") is None, f"{label}: {result.get('error')}")
     require(result.get("http_status") == 200, f"{label}: HTTP status is not 200")
@@ -924,11 +1130,11 @@ def wait_for_typed_wait_for_release(
     trace_path: Path,
     baseline_rows: int,
     started_wall_ns: int,
+    capacity_pool: dict[str, Any],
     timeout: float,
 ) -> tuple[str, dict[str, Any]]:
     deadline = time.monotonic() + timeout
     request_id: str | None = None
-    first_deferral: dict[str, Any] | None = None
     while time.monotonic() < deadline:
         rows = read_trace(trace_path)
         pressure_rows = rows[baseline_rows:]
@@ -943,7 +1149,6 @@ def wait_for_typed_wait_for_release(
             ):
                 if request_id is None:
                     request_id = row["request_id"]
-                    first_deferral = row
                 require(
                     request_identity_matches(row.get("request_id"), request_id),
                     "multiple requests produced pressure while identifying B",
@@ -970,9 +1175,16 @@ def wait_for_typed_wait_for_release(
                 for row in request_rows
             )
             if completed_wait:
-                typed_wait_for_release_transitions(request_rows, request_id)
-                require(first_deferral is not None, "B wait has no initial deferral")
-                return request_id, first_deferral
+                transitions = typed_wait_for_release_transitions(
+                    request_rows, request_id
+                )
+                matching = [
+                    transition
+                    for transition in transitions
+                    if transition_targets_capacity_pool(transition, capacity_pool)
+                ]
+                if matching:
+                    return request_id, matching[0]["row"]
             admitted = any(
                 row.get("phase") == "vnext.prefill_admission"
                 and row.get("shape", {}).get("decision") == "admitted"
@@ -993,11 +1205,13 @@ def wait_for_typed_wait_for_release(
                     if row.get("phase") == "vnext.prefill_backing_maintenance"
                 ]
                 raise CapacityGateError(
-                    "B was admitted before typed WaitForRelease; "
+                    "B was admitted before a typed paged-KV WaitForRelease; "
                     f"maintenance={maintenance}"
                 )
         time.sleep(0.02)
-    raise CapacityGateError("B did not enter typed WaitForRelease before timeout")
+    raise CapacityGateError(
+        "B did not enter typed paged-KV WaitForRelease before timeout"
+    )
 
 
 def wait_for_pressure_streams(
@@ -1119,6 +1333,7 @@ def collect(args: argparse.Namespace) -> int:
     out.mkdir(parents=True)
     provenance = {
         "schema_version": 1,
+        "capacity_scenario_version": CAPACITY_SCENARIO_VERSION,
         "command_line": sys.argv,
         "git_sha": command_output(["git", "rev-parse", "HEAD"], repo),
         "dirty_status": command_output(["git", "status", "--short"], repo),
@@ -1146,8 +1361,8 @@ def collect(args: argparse.Namespace) -> int:
     sessions: list[ServerSession] = []
     pressure_tasks: dict[str, StreamTask] = {}
     collection: dict[str, Any] = {
-        "schema_version": 1,
-        "artifact_type": "runtime_vnext_s1_cuda_capacity_pressure_collection",
+        "schema_version": CAPACITY_SCENARIO_VERSION,
+        "artifact_type": "runtime_vnext_s1_cuda_capacity_pressure_collection_v2",
         "status": "reject",
         "provenance": "provenance.json",
         "pressure_stop_policy": pressure_stop_policy,
@@ -1178,6 +1393,7 @@ def collect(args: argparse.Namespace) -> int:
         calibration_health = calibration.health("health.final.json")
         executor = find_executor_snapshot(calibration_health)
         require(executor is not None, "calibration health has no vNext executor snapshot")
+        require_full_input_fit_policy(executor, "calibration")
         calibration_pool_snapshot = quiescent_pool_snapshot(executor, "calibration")
         static_bytes = calibration_pool_snapshot["static_bytes"]
         resident_bytes = calibration_pool_snapshot["resident_bytes"]
@@ -1200,6 +1416,7 @@ def collect(args: argparse.Namespace) -> int:
         warmup_health = target.health("health.warmup.json")
         warmup_executor = find_executor_snapshot(warmup_health)
         require(warmup_executor is not None, "warmup health has no vNext executor snapshot")
+        require_full_input_fit_policy(warmup_executor, "warmup replay")
         warmup_pool_snapshot = quiescent_pool_snapshot(warmup_executor, "warmup replay")
         require_replayed_pool_snapshot(
             calibration_pool_snapshot, warmup_pool_snapshot, exact_budget
@@ -1234,6 +1451,17 @@ def collect(args: argparse.Namespace) -> int:
                 label="pressure A first content",
             )
         )
+        _, pressure_a_pool_snapshot = wait_for_active_fixed_block_pool(
+            target,
+            a,
+            artifact_name="health.pressure-a.json",
+            timeout=bounded_remaining_timeout(
+                deadline_monotonic=pressure_deadline,
+                requested_timeout=args.deferral_timeout,
+                now_monotonic=time.monotonic(),
+                label="pressure A live KV snapshot",
+            ),
+        )
         baseline_rows = len(read_trace(target.trace_path))
         b = StreamTask(
             port=target.port,
@@ -1251,11 +1479,25 @@ def collect(args: argparse.Namespace) -> int:
             target.trace_path,
             baseline_rows,
             b_started,
+            pressure_a_pool_snapshot,
             bounded_remaining_timeout(
                 deadline_monotonic=pressure_deadline,
                 requested_timeout=args.deferral_timeout,
                 now_monotonic=time.monotonic(),
                 label="pressure B deferral",
+            ),
+        )
+        _, pressure_b_wait_pool_snapshot = wait_for_b_wait_health(
+            target,
+            a,
+            b,
+            pressure_a_pool_snapshot,
+            artifact_name="health.b-wait.json",
+            timeout=bounded_remaining_timeout(
+                deadline_monotonic=pressure_deadline,
+                requested_timeout=args.deferral_timeout,
+                now_monotonic=time.monotonic(),
+                label="pressure B retained wait snapshot",
             ),
         )
         c = StreamTask(
@@ -1336,6 +1578,9 @@ def collect(args: argparse.Namespace) -> int:
             "pressure lifecycle exceeded the joint bounded timeout",
         )
         final_health = target.health("health.final.json")
+        final_executor = find_executor_snapshot(final_health)
+        require(final_executor is not None, "final health has no vNext executor snapshot")
+        require_full_input_fit_policy(final_executor, "final target")
         target.stop()
         collection.update(
             {
@@ -1362,8 +1607,12 @@ def collect(args: argparse.Namespace) -> int:
                     },
                     "b_request_id": b_request_id,
                     "b_deferral": b_deferral,
+                    "pressure_a_pool_snapshot": pressure_a_pool_snapshot,
+                    "pressure_b_wait_pool_snapshot": pressure_b_wait_pool_snapshot,
                     "pressure_stop_observed": pressure_stop_observed,
                     "health_warmup": "target/health.warmup.json",
+                    "health_pressure_a": "target/health.pressure-a.json",
+                    "health_b_wait": "target/health.b-wait.json",
                     "health_final": "target/health.final.json",
                     "trace": "target/scheduler-trace.jsonl",
                 },
@@ -1523,6 +1772,155 @@ def validate_device_capacity_pressure(value: Any, label: str) -> dict[str, Any]:
     return value
 
 
+def validate_prefill_admission_shape(
+    row: dict[str, Any], label: str
+) -> dict[str, int]:
+    shape = row.get("shape")
+    require(isinstance(shape, dict), f"{label}: admission shape is missing")
+    input_token_count = shape.get("input_token_count")
+    maximum_sequence_tokens = shape.get("maximum_sequence_tokens")
+    require(
+        isinstance(input_token_count, int)
+        and not isinstance(input_token_count, bool)
+        and input_token_count > 0,
+        f"{label}: typed input token count is missing",
+    )
+    require(
+        isinstance(maximum_sequence_tokens, int)
+        and not isinstance(maximum_sequence_tokens, bool)
+        and input_token_count <= maximum_sequence_tokens <= SERVER_MAX_MODEL_LEN,
+        f"{label}: typed maximum sequence horizon is invalid",
+    )
+    return {
+        "input_token_count": input_token_count,
+        "maximum_sequence_tokens": maximum_sequence_tokens,
+    }
+
+
+def validate_admission_blockers(value: Any, label: str) -> list[dict[str, Any]]:
+    require(isinstance(value, list) and value, f"{label}: admission blockers are missing")
+    blockers = []
+    for index, blocker in enumerate(value):
+        require(isinstance(blocker, dict), f"{label}: blocker {index} is invalid")
+        domain_id = blocker.get("domain_id", blocker.get("domain"))
+        require(
+            domain_id is None or (isinstance(domain_id, int) and domain_id > 0),
+            f"{label}: blocker {index} has an invalid domain",
+        )
+        blockers.append(blocker)
+    return blockers
+
+
+def validate_maintenance_rebalance_evidence(
+    evidence: Any, label: str
+) -> dict[str, Any]:
+    require(isinstance(evidence, dict), f"{label}: maintenance evidence is missing")
+    require(evidence.get("outcome") == "maintained", f"{label}: outcome is not maintained")
+    pools_reclaimed = evidence.get("pools_reclaimed")
+    chunks_reclaimed = evidence.get("chunks_reclaimed")
+    reclaimed_bytes = evidence.get("reclaimed_bytes")
+    require(
+        all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in (pools_reclaimed, chunks_reclaimed, reclaimed_bytes)
+        ),
+        f"{label}: aggregate reclaim counters are invalid",
+    )
+    rebalance = evidence.get("rebalance")
+    if pools_reclaimed == 0:
+        require(
+            chunks_reclaimed == 0 and reclaimed_bytes == 0 and rebalance is None,
+            f"{label}: empty reclaim counters do not match the exact receipt",
+        )
+        return {
+            "pools_reclaimed": 0,
+            "chunks_reclaimed": 0,
+            "reclaimed_bytes": 0,
+            "pool_ids": [],
+            "chunk_identities": [],
+        }
+    require(isinstance(rebalance, dict), f"{label}: exact rebalance receipt is missing")
+    pools = rebalance.get("pools")
+    require(
+        isinstance(pools, list) and len(pools) == pools_reclaimed,
+        f"{label}: exact pool receipts do not match the aggregate count",
+    )
+    require(
+        rebalance.get("reclaimed_chunks") == chunks_reclaimed
+        and rebalance.get("reclaimed_bytes") == reclaimed_bytes,
+        f"{label}: exact rebalance aggregates do not reconcile",
+    )
+    for key in (
+        "logical_capacity_epoch",
+        "plan_device_capacity_epoch",
+        "process_device_capacity_epoch",
+    ):
+        require(
+            isinstance(rebalance.get(key), int)
+            and not isinstance(rebalance.get(key), bool)
+            and rebalance[key] > 0,
+            f"{label}: exact rebalance {key} is invalid",
+        )
+    pool_ids: list[str] = []
+    chunk_identities: list[tuple[str, int, int]] = []
+    detailed_bytes = 0
+    for pool_index, pool in enumerate(pools):
+        require(isinstance(pool, dict), f"{label}: pool receipt {pool_index} is invalid")
+        pool_id = pool.get("pool_id")
+        pool_bytes = pool.get("reclaimed_bytes")
+        published_bytes = pool.get("published_capacity_bytes")
+        chunks = pool.get("chunks")
+        require(
+            isinstance(pool_id, str) and pool_id and pool_id not in pool_ids,
+            f"{label}: pool receipt {pool_index} has an invalid identity",
+        )
+        require(
+            isinstance(pool_bytes, int) and pool_bytes > 0,
+            f"{label}: pool receipt {pool_index} has no reclaimed bytes",
+        )
+        require(
+            isinstance(published_bytes, int) and published_bytes >= 0,
+            f"{label}: pool receipt {pool_index} has invalid published capacity",
+        )
+        require(
+            isinstance(chunks, list) and chunks,
+            f"{label}: pool receipt {pool_index} has no chunk identities",
+        )
+        pool_ids.append(pool_id)
+        detailed_bytes += pool_bytes
+        for chunk_index, chunk in enumerate(chunks):
+            require(
+                isinstance(chunk, dict),
+                f"{label}: chunk receipt {pool_index}/{chunk_index} is invalid",
+            )
+            identity = (
+                chunk.get("pool_id"),
+                chunk.get("ordinal"),
+                chunk.get("generation"),
+            )
+            require(
+                identity[0] == pool_id
+                and isinstance(identity[1], int)
+                and identity[1] > 0
+                and isinstance(identity[2], int)
+                and identity[2] > 0
+                and identity not in chunk_identities,
+                f"{label}: chunk receipt {pool_index}/{chunk_index} has an invalid identity",
+            )
+            chunk_identities.append(identity)
+    require(
+        len(chunk_identities) == chunks_reclaimed and detailed_bytes == reclaimed_bytes,
+        f"{label}: detailed reclaim receipt does not reconcile",
+    )
+    return {
+        "pools_reclaimed": pools_reclaimed,
+        "chunks_reclaimed": chunks_reclaimed,
+        "reclaimed_bytes": reclaimed_bytes,
+        "pool_ids": pool_ids,
+        "chunk_identities": [list(identity) for identity in chunk_identities],
+    }
+
+
 def typed_wait_for_release_transitions(
     rows: list[dict[str, Any]], request_id: str
 ) -> list[dict[str, Any]]:
@@ -1534,6 +1932,7 @@ def typed_wait_for_release_transitions(
         if not isinstance(shape, dict):
             continue
         if phase == "vnext.prefill_admission":
+            validate_prefill_admission_shape(row, "B prefill admission")
             decision = shape.get("decision")
             if decision == "maintenance_deferred":
                 require(
@@ -1567,14 +1966,14 @@ def typed_wait_for_release_transitions(
                     coordinator_id=observed["coordinator_id"],
                     label="B maintenance deferral",
                 )
-                require(
-                    isinstance(evidence.get("blockers"), list) and evidence["blockers"],
-                    "B maintenance deferral has no blockers",
+                blockers = validate_admission_blockers(
+                    evidence.get("blockers"), "B maintenance deferral"
                 )
                 pending_maintenance = {
                     "row": row,
                     "observed": observed,
                     "wall_ns": event_wall_ns(row),
+                    "blockers": blockers,
                 }
             elif decision == "deferred":
                 require(
@@ -1611,12 +2010,17 @@ def typed_wait_for_release_transitions(
                     coordinator_id=epochs["coordinator_id"],
                     label="B direct deferral",
                 )
+                blockers = validate_admission_blockers(
+                    evidence.get("blockers"), "B direct deferral"
+                )
                 transitions.append(
                     {
                         "source": "direct_admission",
+                        "row": row,
                         "wall_ns": event_wall_ns(row),
                         "epochs": epochs,
                         "wait_condition": wait_condition,
+                        "blockers": blockers,
                     }
                 )
             elif decision in {"admitted", "permanent_rejected", "faulted"}:
@@ -1635,6 +2039,15 @@ def typed_wait_for_release_transitions(
                 "B backing maintenance did not follow its typed deferral",
             )
             outcome = shape.get("outcome")
+            if outcome == "maintained":
+                require(
+                    row.get("status") == "ok" and row.get("error") is None,
+                    "B maintained backing event is not successful",
+                )
+                validate_maintenance_rebalance_evidence(
+                    row.get("attributes", {}).get("maintenance_evidence"),
+                    "B maintained backing",
+                )
             if outcome == "wait_for_release":
                 require(
                     row.get("status") == "ok" and row.get("error") is None,
@@ -1685,9 +2098,11 @@ def typed_wait_for_release_transitions(
                 transitions.append(
                     {
                         "source": "backing_maintenance",
+                        "row": row,
                         "wall_ns": maintenance_ns,
                         "epochs": current,
                         "wait_condition": wait_condition,
+                        "blockers": pending_maintenance["blockers"],
                     }
                 )
             pending_maintenance = None
@@ -1697,6 +2112,201 @@ def typed_wait_for_release_transitions(
     )
     require(transitions, "B never entered typed WaitForRelease admission")
     return transitions
+
+
+def transition_targets_capacity_pool(
+    transition: dict[str, Any], pool: dict[str, Any]
+) -> bool:
+    domain_id = pool.get("domain_id")
+    pool_id = pool.get("pool_id")
+    require(
+        isinstance(domain_id, int) and domain_id > 0,
+        "target paged capacity domain is invalid",
+    )
+    require(
+        isinstance(pool_id, str) and pool_id,
+        "target paged capacity pool is invalid",
+    )
+    wait_condition = transition.get("wait_condition")
+    observed = wait_condition.get("observed") if isinstance(wait_condition, dict) else None
+    observes_domain = isinstance(observed, list) and any(
+        isinstance(entry, dict)
+        and entry.get("source") == {"domain": domain_id}
+        for entry in observed
+    )
+    blockers = transition.get("blockers")
+    if not isinstance(blockers, list):
+        return False
+    for blocker in blockers:
+        if not isinstance(blocker, dict):
+            continue
+        observed_domain = blocker.get("domain_id", blocker.get("domain"))
+        if observed_domain != domain_id:
+            continue
+        source = blocker.get("source")
+        kind = blocker.get("kind")
+        if source == "backing":
+            require(
+                blocker.get("pool_id") == pool_id,
+                "paged backing blocker names a different pool",
+            )
+            require(
+                blocker.get("lifetime") == "sequence",
+                "paged backing blocker is not sequence-scoped",
+            )
+            reason = blocker.get("reason")
+            requested = blocker.get("requested_bytes")
+            free = blocker.get("free_bytes")
+            largest = blocker.get("largest_contiguous_bytes")
+            require(
+                reason in {"growth_required", "fragmented"}
+                and all(
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                    for value in (requested, free, largest)
+                )
+                and requested > 0
+                and largest <= free,
+                "paged backing blocker has invalid capacity evidence",
+            )
+            if reason == "growth_required":
+                require(
+                    requested > free,
+                    "paged growth blocker does not exceed free bytes",
+                )
+            else:
+                require(
+                    requested <= free and requested > largest,
+                    "paged fragmentation blocker does not exceed contiguous bytes",
+                )
+            require(observes_domain, "paged backing wait omits its domain epoch")
+            return True
+        if source not in {None, "capacity"}:
+            continue
+        if kind not in {"fit_availability", "backing_growth_required"}:
+            continue
+        requested = blocker.get("requested")
+        available = blocker.get("available")
+        require(
+            isinstance(requested, int)
+            and not isinstance(requested, bool)
+            and requested > 0
+            and isinstance(available, int)
+            and not isinstance(available, bool)
+            and available >= 0
+            and requested > available,
+            "paged logical blocker does not prove a capacity shortfall",
+        )
+        require(observes_domain, "paged logical wait omits its domain epoch")
+        return True
+    return False
+
+
+def validate_client_admission_trace(
+    rows: list[dict[str, Any]],
+    result: dict[str, Any],
+    label: str,
+    *,
+    request_id: str | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    prompt_tokens = result.get("prompt_tokens")
+    max_tokens = result.get("max_tokens")
+    started_wall_ns = result.get("started_wall_ns")
+    first_content_wall_ns = result.get("first_content_wall_ns")
+    require(
+        isinstance(prompt_tokens, int)
+        and prompt_tokens > 0
+        and isinstance(max_tokens, int)
+        and max_tokens > 0,
+        f"{label}: client token shape is invalid",
+    )
+    require(
+        isinstance(started_wall_ns, int)
+        and isinstance(first_content_wall_ns, int)
+        and started_wall_ns <= first_content_wall_ns,
+        f"{label}: client trace window is invalid",
+    )
+    expected_maximum = prompt_tokens + max_tokens - 1
+    candidates = []
+    for row in rows:
+        if row.get("phase") != "vnext.prefill_admission":
+            continue
+        wall_ns = event_wall_ns(row)
+        if not (started_wall_ns <= wall_ns <= first_content_wall_ns):
+            continue
+        if request_id is not None and not request_identity_matches(
+            row.get("request_id"), request_id
+        ):
+            continue
+        shape = validate_prefill_admission_shape(row, label)
+        if (
+            shape["input_token_count"] == prompt_tokens
+            and shape["maximum_sequence_tokens"] == expected_maximum
+        ):
+            candidates.append(row)
+    require(candidates, f"{label}: no admission trace matches the client token shape")
+    request_ids = {row.get("request_id") for row in candidates}
+    require(
+        len(request_ids) == 1 and all(isinstance(value, str) and value for value in request_ids),
+        f"{label}: admission trace has ambiguous request identity",
+    )
+    traced_request_id = next(iter(request_ids))
+    require(
+        request_id is None or request_identity_matches(traced_request_id, request_id),
+        f"{label}: admission trace request identity changed",
+    )
+    traced_rows = [
+        row
+        for row in rows
+        if row.get("phase") == "vnext.prefill_admission"
+        and row.get("request_id") == traced_request_id
+    ]
+    require(traced_rows, f"{label}: traced request has no admission rows")
+    for row in traced_rows:
+        shape = validate_prefill_admission_shape(row, label)
+        require(
+            shape["input_token_count"] == prompt_tokens
+            and shape["maximum_sequence_tokens"] == expected_maximum,
+            f"{label}: typed token shape drifted across admission retries",
+        )
+    require(
+        any(row.get("shape", {}).get("decision") == "admitted" for row in traced_rows),
+        f"{label}: request was never admitted",
+    )
+    return traced_request_id, traced_rows
+
+
+def require_command_option(path: Path, option: str, expected: str) -> None:
+    command = read_json(path).get("argv")
+    require(isinstance(command, list), f"{path}: command argv is missing")
+    positions = [index for index, value in enumerate(command) if value == option]
+    require(len(positions) == 1, f"{path}: expected exactly one {option}")
+    index = positions[0]
+    require(index + 1 < len(command), f"{path}: {option} has no value")
+    require(command[index + 1] == expected, f"{path}: {option} has the wrong value")
+
+
+def request_trace_rows(
+    rows: list[dict[str, Any]], request_id: str
+) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in rows
+        if request_identity_matches(row.get("request_id"), request_id)
+    ]
+
+
+def first_phase_ns(
+    rows: list[dict[str, Any]], phase_suffix: str, label: str
+) -> int:
+    matches = [
+        event_wall_ns(row)
+        for row in rows
+        if str(row.get("phase", "")).endswith(phase_suffix)
+    ]
+    require(matches, f"{label}: missing {phase_suffix} trace event")
+    return min(matches)
 
 
 def validate_stream(result: dict[str, Any], label: str) -> None:
@@ -1759,6 +2369,14 @@ def validate(root: Path, out: Path) -> int:
     out.mkdir(parents=True, exist_ok=True)
     collection = read_json(root / "collection.json")
     provenance = read_json(root / "provenance.json")
+    require(
+        collection.get("schema_version") == CAPACITY_SCENARIO_VERSION
+        and collection.get("artifact_type")
+        == "runtime_vnext_s1_cuda_capacity_pressure_collection_v2"
+        and provenance.get("capacity_scenario_version")
+        == CAPACITY_SCENARIO_VERSION,
+        "collection is not the canonical capacity scenario v2",
+    )
     require(collection.get("status") == "collected", f"collection is not usable: {collection.get('error')}")
     pressure_stop_policy = collection.get("pressure_stop_policy")
     require(
@@ -1780,6 +2398,16 @@ def validate(root: Path, out: Path) -> int:
         "artifact is not from exactly one RTX 4090",
     )
     require("Qwen3.5-4B" in str(collection.get("model_path")), "artifact model is not Qwen3.5-4B")
+    require_command_option(
+        root / "run" / "command.json", "--sequence-fit-policy", SEQUENCE_FIT_POLICY
+    )
+    for command_path in (
+        root / "calibration" / "server.command.json",
+        root / "target" / "server.command.json",
+    ):
+        require_command_option(
+            command_path, "--sequence-fit-policy", SEQUENCE_FIT_POLICY
+        )
 
     calibration = collection.get("calibration")
     target = collection.get("target")
@@ -1792,12 +2420,20 @@ def validate(root: Path, out: Path) -> int:
     require(calibration.get("resident_bytes", 0) > 0, "calibrated backing is empty")
     calibration_health = read_json(root / "calibration" / "health.final.json")
     warmup_health = read_json(root / "target" / "health.warmup.json")
+    pressure_a_health = read_json(root / str(target.get("health_pressure_a")))
+    pressure_b_wait_health = read_json(root / str(target.get("health_b_wait")))
     calibration_executor = find_executor_snapshot(calibration_health)
     warmup_executor = find_executor_snapshot(warmup_health)
+    pressure_a_executor = find_executor_snapshot(pressure_a_health)
     require(
-        calibration_executor is not None and warmup_executor is not None,
-        "raw calibration/warmup executor snapshots are missing",
+        calibration_executor is not None
+        and warmup_executor is not None
+        and pressure_a_executor is not None,
+        "raw calibration/warmup/pressure executor snapshots are missing",
     )
+    require_full_input_fit_policy(calibration_executor, "raw calibration")
+    require_full_input_fit_policy(warmup_executor, "raw warmup replay")
+    require_full_input_fit_policy(pressure_a_executor, "raw pressure A")
     calibration_pool_snapshot = quiescent_pool_snapshot(
         calibration_executor, "raw calibration"
     )
@@ -1815,6 +2451,26 @@ def validate(root: Path, out: Path) -> int:
     )
     require_replayed_pool_snapshot(
         calibration_pool_snapshot, warmup_pool_snapshot, exact_budget
+    )
+    pressure_a_pool_snapshot = fixed_block_pool_snapshot(
+        pressure_a_executor, "raw pressure A", require_live=True
+    )
+    require(
+        target.get("pressure_a_pool_snapshot") == pressure_a_pool_snapshot,
+        "collection pressure A pool summary differs from raw health",
+    )
+    require(
+        pressure_a_executor.get("active_sequences", 0) >= 1
+        and pressure_a_health.get("engine", {}).get("active_requests", 0) >= 1,
+        "raw pressure A snapshot is not active",
+    )
+    pressure_b_wait_pool_snapshot = validate_b_wait_health(
+        pressure_b_wait_health, pressure_a_pool_snapshot, "raw pressure B wait"
+    )
+    require(
+        target.get("pressure_b_wait_pool_snapshot")
+        == pressure_b_wait_pool_snapshot,
+        "collection pressure B wait pool summary differs from raw health",
     )
     for label, result in calibration.get("clients", {}).items():
         validate_stream(result, f"calibration-{label}")
@@ -1888,11 +2544,60 @@ def validate(root: Path, out: Path) -> int:
         b["prompt_tokens"] + b["max_tokens"] <= SERVER_MAX_MODEL_LEN,
         "pressure B exceeds the typed server model-length ceiling",
     )
+    maximum_horizons = {
+        role: result["prompt_tokens"] + result["max_tokens"] - 1
+        for role, result in pressure.items()
+    }
+    require(
+        maximum_horizons["B"] >= 248
+        and maximum_horizons["A"] > maximum_horizons["C"]
+        and maximum_horizons["B"] > maximum_horizons["C"],
+        "capacity workload does not create a near-ceiling A/B versus small-C shape",
+    )
     b_request_id = target.get("b_request_id")
     require(isinstance(b_request_id, str) and b_request_id, "B request identity is missing")
     target_trace_path = root / str(target.get("trace"))
     rows = read_trace(target_trace_path)
     require(rows, "target scheduler trace is empty")
+    a_request_id, a_admission_rows = validate_client_admission_trace(
+        rows, a, "pressure A admission"
+    )
+    traced_b_request_id, b_admission_rows = validate_client_admission_trace(
+        rows, b, "pressure B admission", request_id=b_request_id
+    )
+    c_request_id, c_admission_rows = validate_client_admission_trace(
+        rows, c, "pressure C admission"
+    )
+    require(
+        len({a_request_id, traced_b_request_id, c_request_id}) == 3,
+        "pressure A/B/C admission identities are not distinct",
+    )
+    b_shapes = [
+        validate_prefill_admission_shape(row, "pressure B admission")
+        for row in b_admission_rows
+    ]
+    require(
+        all(
+            shape["input_token_count"] == b["prompt_tokens"]
+            and shape["maximum_sequence_tokens"]
+            == b["prompt_tokens"] + b["max_tokens"] - 1
+            for shape in b_shapes
+        ),
+        "pressure B typed horizon differs from tokenizer usage",
+    )
+    exact_rebalances = []
+    for index, row in enumerate(rows):
+        if (
+            row.get("phase") == "vnext.prefill_backing_maintenance"
+            and row.get("shape", {}).get("outcome") == "maintained"
+        ):
+            summary = validate_maintenance_rebalance_evidence(
+                row.get("attributes", {}).get("maintenance_evidence"),
+                f"target maintained backing {index}",
+            )
+            if summary["pools_reclaimed"] > 0:
+                exact_rebalances.append(summary)
+    require(exact_rebalances, "target trace exercised no exact cross-pool rebalance receipt")
     target_trace_bytes = target_trace_path.stat().st_size
     pressure_trace_bytes = trace_bytes_at_or_after(
         target_trace_path, a["started_wall_ns"]
@@ -1910,13 +2615,24 @@ def validate(root: Path, out: Path) -> int:
         <= pressure_stop_policy["max_pressure_trace_bytes"],
         "observed pressure trace bytes are invalid",
     )
-    b_rows = [
-        row
-        for row in rows
-        if request_identity_matches(row.get("request_id"), b_request_id)
-    ]
+    a_rows = request_trace_rows(rows, a_request_id)
+    b_rows = request_trace_rows(rows, b_request_id)
+    c_rows = request_trace_rows(rows, c_request_id)
     wait_transitions = typed_wait_for_release_transitions(b_rows, b_request_id)
-    defer_ns = min(transition["wall_ns"] for transition in wait_transitions)
+    paged_wait_transitions = [
+        transition
+        for transition in wait_transitions
+        if transition_targets_capacity_pool(transition, pressure_a_pool_snapshot)
+    ]
+    require(
+        paged_wait_transitions,
+        "B WaitForRelease was not caused by the live paged-KV capacity domain",
+    )
+    require(
+        target.get("b_deferral") == paged_wait_transitions[0]["row"],
+        "collector did not stop on the first typed paged-KV wait",
+    )
+    defer_ns = min(transition["wall_ns"] for transition in paged_wait_transitions)
     skipped = [
         row
         for row in b_rows
@@ -1951,9 +2667,30 @@ def validate(root: Path, out: Path) -> int:
         min(event_wall_ns(row) for row in submitted) >= admitted_ns,
         "B submitted work before typed admission",
     )
+    a_admitted_ns = min(
+        event_wall_ns(row)
+        for row in a_admission_rows
+        if row.get("shape", {}).get("decision") == "admitted"
+    )
+    c_admitted_ns = min(
+        event_wall_ns(row)
+        for row in c_admission_rows
+        if row.get("shape", {}).get("decision") == "admitted"
+    )
+    c_completed_ns = first_phase_ns(c_rows, "request_completed", "pressure C")
+    a_completed_ns = first_phase_ns(a_rows, "request_completed", "pressure A")
+    b_submitted_ns = first_phase_ns(b_rows, "operation_submitted", "pressure B")
+    b_completed_ns = first_phase_ns(b_rows, "request_completed", "pressure B")
     require(
-        any(str(row.get("phase", "")).endswith("request_completed") for row in b_rows),
-        "B has no vNext request completion",
+        a_admitted_ns
+        < defer_ns
+        < c_admitted_ns
+        < c_completed_ns
+        < a_completed_ns
+        < admitted_ns
+        < b_submitted_ns
+        < b_completed_ns,
+        "typed capacity lifecycle is not A-admit/B-wait/C-bypass/A-release/B-resume",
     )
 
     require(a["started_wall_ns"] < b["started_wall_ns"] < c["started_wall_ns"], "client arrival order is not A/B/C")
@@ -1991,6 +2728,7 @@ def validate(root: Path, out: Path) -> int:
     final_health = read_json(root / str(target.get("health_final")))
     final_executor = find_executor_snapshot(final_health)
     require(final_executor is not None, "final health has no vNext executor snapshot")
+    require_full_input_fit_policy(final_executor, "raw final target")
     final_pools = final_executor.get("dynamic_pools", {})
     final_epochs = final_pools.get("epochs", {})
     require(
@@ -2037,8 +2775,8 @@ def validate(root: Path, out: Path) -> int:
 
     pass_line = f"{PASS_PREFIX}: {out}"
     manifest = {
-        "schema_version": 1,
-        "artifact_type": "runtime_vnext_s1_cuda_capacity_pressure_validation",
+        "schema_version": CAPACITY_SCENARIO_VERSION,
+        "artifact_type": "runtime_vnext_s1_cuda_capacity_pressure_validation_v2",
         "status": "pass",
         "source_git_sha": source_git_sha,
         "binary_sha256": collection["binary_sha256"],
@@ -2048,8 +2786,33 @@ def validate(root: Path, out: Path) -> int:
         "exact_budget_bytes": exact_budget,
         "b_request_id": b_request_id,
         "b_wait_for_release_events": len(wait_transitions),
+        "b_paged_wait_for_release_events": len(paged_wait_transitions),
         "b_wait_for_release_sources": sorted(
             {transition["source"] for transition in wait_transitions}
+        ),
+        "pressure_request_ids": {
+            "A": a_request_id,
+            "B": traced_b_request_id,
+            "C": c_request_id,
+        },
+        "pressure_a_paged_pool": pressure_a_pool_snapshot,
+        "pressure_b_wait_paged_pool": pressure_b_wait_pool_snapshot,
+        "maximum_sequence_tokens_by_role": maximum_horizons,
+        "capacity_lifecycle_wall_ns": {
+            "a_admitted": a_admitted_ns,
+            "b_paged_deferred": defer_ns,
+            "c_admitted": c_admitted_ns,
+            "c_completed": c_completed_ns,
+            "a_completed": a_completed_ns,
+            "b_admitted": admitted_ns,
+            "b_submitted": b_submitted_ns,
+            "b_completed": b_completed_ns,
+        },
+        "b_typed_input_tokens": b["prompt_tokens"],
+        "b_typed_maximum_sequence_tokens": b["prompt_tokens"] + b["max_tokens"] - 1,
+        "exact_rebalance_events": len(exact_rebalances),
+        "exact_reclaimed_chunks": sum(
+            summary["chunks_reclaimed"] for summary in exact_rebalances
         ),
         "b_unchanged_epoch_skips": len(skipped),
         "target_trace_bytes": target_trace_bytes,
@@ -2134,6 +2897,65 @@ def self_test() -> int:
         raise AssertionError("per-pool replay drift unexpectedly passed")
     except CapacityGateError:
         pass
+    paged_pool_id = "dynamic-pool/sha256/" + "b" * 64
+    b_wait_health = {
+        "engine": {"active_requests": 1, "queued_requests": 1},
+        "cache": {
+            "prefix_cache": {
+                "schema": "ferrum.runtime-vnext.executor-trace.v1",
+                "runtime_admission_policy": {
+                    "sequence_fit_policy": "full_input_must_fit"
+                },
+                "active_sequences": 1,
+                "staged_prefill_requests": 1,
+                "staged_prefill_sequences": 0,
+                "pending_prefill_maintenance": 0,
+                "dynamic_pools": {
+                    "pools": [
+                        {
+                            "pool_id": paged_pool_id,
+                            "domain_id": 5,
+                            "resident_bytes": 1024,
+                            "free_bytes": 512,
+                            "largest_contiguous_bytes": 512,
+                            "live_segments": 1,
+                            "resident_chunks": 1,
+                            "storage_profile": {
+                                "allocator": {
+                                    "fixed_block_arena": {"block_bytes": 64}
+                                },
+                                "view": {"paged_regions": {"block_bytes": 64}},
+                            },
+                        }
+                    ]
+                },
+            }
+        },
+    }
+    expected_paged_pool = {
+        "pool_id": paged_pool_id,
+        "domain_id": 5,
+        "resident_bytes": 1024,
+        "free_bytes": 512,
+        "largest_contiguous_bytes": 512,
+        "live_segments": 1,
+        "resident_chunks": 1,
+        "block_bytes": 64,
+    }
+    require(
+        validate_b_wait_health(
+            b_wait_health, expected_paged_pool, "self-test B wait"
+        )
+        == expected_paged_pool,
+        "B wait health did not preserve the paged pool identity",
+    )
+    no_queued_b = json.loads(json.dumps(b_wait_health))
+    no_queued_b["engine"]["queued_requests"] = 0
+    try:
+        validate_b_wait_health(no_queued_b, expected_paged_pool, "self-test B wait")
+        raise AssertionError("B wait health without a queued request unexpectedly passed")
+    except CapacityGateError:
+        pass
     prompt_hashes = {
         slot: hashlib.sha256(capacity_prompt(slot).encode("utf-8")).hexdigest()
         for slot in ("A", "B", "C")
@@ -2208,6 +3030,8 @@ def self_test() -> int:
         "phase": "vnext.prefill_admission",
         "shape": {
             "decision": "deferred",
+            "input_token_count": 32,
+            "maximum_sequence_tokens": 255,
             "execution_authority_retained": False,
             "maintenance_required": False,
             "prefill_submit_observed": False,
@@ -2219,14 +3043,36 @@ def self_test() -> int:
                 "release_epoch": 11,
                 "capacity_epoch": 13,
                 "wait_condition": wait_condition,
+                "blockers": [
+                    {
+                        "domain": 5,
+                        "kind": "fit_availability",
+                        "requested": 255,
+                        "available": 32,
+                    }
+                ],
             }
         },
     }
     direct_transitions = typed_wait_for_release_transitions([direct_wait], "B")
+    paged_pool = {
+        "pool_id": "dynamic-pool/sha256/" + "b" * 64,
+        "domain_id": 5,
+        "resident_bytes": 1024,
+        "free_bytes": 512,
+        "largest_contiguous_bytes": 512,
+        "live_segments": 1,
+        "resident_chunks": 1,
+        "block_bytes": 64,
+    }
     require(
         len(direct_transitions) == 1
         and direct_transitions[0]["source"] == "direct_admission",
         "direct WaitForRelease transition was not recognized",
+    )
+    require(
+        transition_targets_capacity_pool(direct_transitions[0], paged_pool),
+        "direct paged capacity transition was not recognized",
     )
 
     maintenance_deferred = {
@@ -2235,6 +3081,8 @@ def self_test() -> int:
         "phase": "vnext.prefill_admission",
         "shape": {
             "decision": "maintenance_deferred",
+            "input_token_count": 32,
+            "maximum_sequence_tokens": 255,
             "execution_authority_retained": False,
             "maintenance_required": True,
             "prefill_submit_observed": False,
@@ -2252,7 +3100,18 @@ def self_test() -> int:
                     "observed": [{"source": {"domain": 5}, "epoch": 3}],
                 },
                 "stage": "physical_backing",
-                "blockers": [{"source": "backing"}],
+                "blockers": [
+                    {
+                        "source": "backing",
+                        "pool_id": paged_pool["pool_id"],
+                        "domain_id": paged_pool["domain_id"],
+                        "lifetime": "sequence",
+                        "reason": "growth_required",
+                        "requested_bytes": 8,
+                        "free_bytes": 0,
+                        "largest_contiguous_bytes": 0,
+                    }
+                ],
             }
         },
     }
@@ -2324,10 +3183,10 @@ def self_test() -> int:
             + "\n"
         )
         waited_request, waited_deferral = wait_for_typed_wait_for_release(
-            wait_trace, 0, 1, 0.1
+            wait_trace, 0, 1, paged_pool, 0.1
         )
         require(
-            waited_request == "B" and waited_deferral == maintenance_deferred,
+            waited_request == "B" and waited_deferral == maintenance_wait,
             "collector did not wait for the completed typed capacity transition",
         )
 
@@ -2339,7 +3198,29 @@ def self_test() -> int:
                 "maintenance_evidence": {
                     "outcome": "maintained",
                     "pools_reclaimed": 1,
+                    "chunks_reclaimed": 1,
                     "reclaimed_bytes": 64,
+                    "rebalance": {
+                        "pools": [
+                            {
+                                "pool_id": "dynamic-pool/sha256/" + "a" * 64,
+                                "chunks": [
+                                    {
+                                        "pool_id": "dynamic-pool/sha256/" + "a" * 64,
+                                        "ordinal": 1,
+                                        "generation": 2,
+                                    }
+                                ],
+                                "reclaimed_bytes": 64,
+                                "published_capacity_bytes": 128,
+                            }
+                        ],
+                        "reclaimed_chunks": 1,
+                        "reclaimed_bytes": 64,
+                        "logical_capacity_epoch": 15,
+                        "plan_device_capacity_epoch": 16,
+                        "process_device_capacity_epoch": 17,
+                    },
                 }
             },
             "request_id": "B",
@@ -2347,7 +3228,11 @@ def self_test() -> int:
         admitted = {
             "ts_unix_nanos": 30,
             "phase": "vnext.prefill_admission",
-            "shape": {"decision": "admitted"},
+            "shape": {
+                "decision": "admitted",
+                "input_token_count": 32,
+                "maximum_sequence_tokens": 255,
+            },
             "request_id": "B",
         }
         admitted_trace = Path(temp) / "admitted-trace.jsonl"
@@ -2359,8 +3244,10 @@ def self_test() -> int:
             + "\n"
         )
         expect_gate_error(
-            lambda: wait_for_typed_wait_for_release(admitted_trace, 0, 1, 0.1),
-            "admitted before typed WaitForRelease",
+            lambda: wait_for_typed_wait_for_release(
+                admitted_trace, 0, 1, paged_pool, 0.1
+            ),
+            "admitted before a typed paged-KV WaitForRelease",
         )
 
         trace = Path(temp) / "trace.jsonl"
