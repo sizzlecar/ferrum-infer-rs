@@ -1,9 +1,9 @@
 use super::{
     expected_lease_transition, invalid_resource, AdmissionFitPolicy, AdmissionPressureAction, Arc,
     BTreeSet, BufferDescriptor, CoreOwnedAllocation, DeviceRuntime, DynamicResourceShape,
-    ResourceId, ResourceLeaseAction, ResourceLeaseEntry, ResourceLeaseState, ResourceOwnedBuffer,
-    ResourceReservation, ResourceReservationBatch, ResourceTransactionIdentity, ResourceWorkShape,
-    StaticProvisioningBinding, VNextError,
+    ResourceAllocation, ResourceId, ResourceLeaseAction, ResourceLeaseEntry, ResourceLeaseState,
+    ResourceOwnedBuffer, ResourceReservation, ResourceReservationBatch,
+    ResourceTransactionIdentity, ResourceWorkShape, StaticProvisioningBinding, VNextError,
 };
 
 pub(super) struct OwnedLeaseSlot<B> {
@@ -193,6 +193,55 @@ where
             .buffer
             .as_ref()
             .ok_or_else(|| invalid_resource("lease resource buffer is not live"))?;
+        Ok(LeasedBufferView {
+            identity: &self.identity,
+            admission: &self.admission,
+            resource_id: &slot.entry.resource_id,
+            generation: slot.entry.generation,
+            descriptor,
+            buffer,
+        })
+    }
+
+    /// Borrows the plan-static slot selected by the immutable memory plan.
+    /// The slot index is prepared once from canonical allocation order; live
+    /// generation, descriptor, and buffer ownership are still checked here.
+    pub(crate) fn plan_static_view(
+        &self,
+        slot_index: usize,
+        allocation: &ResourceAllocation,
+    ) -> Result<LeasedBufferView<'_, R::Buffer>, VNextError> {
+        let slot = self
+            .slots
+            .get(slot_index)
+            .ok_or_else(|| invalid_resource("plan-static slot index is out of range"))?;
+        let descriptor = slot
+            .descriptor
+            .as_ref()
+            .ok_or_else(|| invalid_resource("plan-static resource is not committed"))?;
+        let buffer = slot
+            .buffer
+            .as_ref()
+            .ok_or_else(|| invalid_resource("plan-static resource buffer is not live"))?;
+        if slot.entry.resource_id() != allocation.resource_id()
+            || slot.entry.size_bytes() != allocation.size_bytes()
+            || slot.entry.alignment_bytes() != allocation.alignment_bytes()
+            || slot.entry.usage() != allocation.usage()
+            || slot.entry.element_type() != allocation.element_type()
+            || slot.entry.generation() == 0
+            || slot.entry.state() != ResourceLeaseState::Active
+            || slot.actual_resource_id.as_ref() != Some(allocation.resource_id())
+            || slot.actual_generation != Some(slot.entry.generation())
+            || descriptor.resource_id != *allocation.resource_id()
+            || descriptor.size_bytes != allocation.size_bytes()
+            || descriptor.alignment_bytes != allocation.alignment_bytes()
+            || descriptor.usage != allocation.usage()
+            || descriptor.element_type != allocation.element_type()
+        {
+            return Err(invalid_resource(
+                "plan-static slot differs from its immutable allocation",
+            ));
+        }
         Ok(LeasedBufferView {
             identity: &self.identity,
             admission: &self.admission,
