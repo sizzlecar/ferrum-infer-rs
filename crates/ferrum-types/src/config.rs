@@ -178,6 +178,11 @@ pub struct EngineModelConfig {
     pub model_id: ModelId,
     pub model_info: Option<ModelInfo>,
     pub tokenizer: TokenizerConfig,
+    /// Typed identity of the source requested by the product entrypoint.
+    /// The resolved local path remains a runtime/backend concern, while this
+    /// value preserves repository/revision provenance for product composition.
+    #[serde(default)]
+    pub source: Option<crate::ModelSource>,
 }
 
 impl Default for EngineModelConfig {
@@ -186,6 +191,7 @@ impl Default for EngineModelConfig {
             model_id: ModelId::new("default"),
             model_info: None,
             tokenizer: TokenizerConfig::default(),
+            source: None,
         }
     }
 }
