@@ -1400,6 +1400,14 @@ where
         self.dynamic_pools().prepare_claim(&requested_slices)
     }
 
+    pub(super) fn prepare_initial_sequence_backing_slices(
+        &self,
+        requested_slices: &[EvaluatedBackingRequest<'_>],
+    ) -> Result<BackingPrepareDecision<R>, VNextError> {
+        self.dynamic_pools()
+            .prepare_initial_sequence_claim(requested_slices)
+    }
+
     pub(super) fn register_backing_waiter(
         &self,
         deferred: &DynamicBackingDeferred,

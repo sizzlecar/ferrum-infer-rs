@@ -1203,7 +1203,7 @@ pub enum ExecutorPrefillMaintenanceBlocker {
     Backing {
         pool_id: String,
         domain_id: u32,
-        lifetime: crate::vnext::AllocationLifetime,
+        lifetime: crate::vnext::DynamicBackingClaimScope,
         reason: crate::vnext::DynamicBackingDeferralReason,
         requested_bytes: u64,
         free_bytes: u64,
@@ -1292,7 +1292,7 @@ impl ExecutorPrefillMaintenanceDeferral {
             .map(|blocker| ExecutorPrefillMaintenanceBlocker::Backing {
                 pool_id: blocker.pool_id().as_str().to_string(),
                 domain_id: blocker.domain_id().get(),
-                lifetime: deferred.lifetime(),
+                lifetime: deferred.scope(),
                 reason: blocker.reason(),
                 requested_bytes: blocker.requested_bytes(),
                 free_bytes: blocker.free_bytes(),

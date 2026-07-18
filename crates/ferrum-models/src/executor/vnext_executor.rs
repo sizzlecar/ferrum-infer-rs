@@ -905,17 +905,13 @@ enum VNextExecutionCapacityDecision<T> {
 
 enum VNextSequenceAdmissionDecision<R: DeviceRuntime> {
     Admitted(Arc<SequenceSession<R>>),
-    Deferred {
-        deferred: AdmissionDeferred,
-        staged_request: Option<Arc<AdmittedRequestResources<R>>>,
-    },
+    Deferred(AdmissionDeferred),
     BackingDeferred(VNextPrefillBackingDeferral<R>),
     PermanentRejected(AdmissionRejected),
 }
 
 enum VNextPrefillBackingDeferral<R: DeviceRuntime> {
-    Request(RequestBackingDeferral<R>),
-    Sequence(SequenceAdmissionBackingDeferral<R>),
+    InitialSequence(InitialSequenceBackingDeferral<R>),
     Step(StepAdmissionBackingDeferral<R>),
     SubmissionWave(StepSubmissionWaveBackingDeferral<R>),
 }
@@ -923,25 +919,15 @@ enum VNextPrefillBackingDeferral<R: DeviceRuntime> {
 impl<R: DeviceRuntime> VNextPrefillBackingDeferral<R> {
     fn evidence(&self) -> &DynamicBackingDeferred {
         match self {
-            Self::Request(deferred) => deferred.evidence(),
-            Self::Sequence(deferred) => deferred.evidence(),
+            Self::InitialSequence(deferred) => deferred.evidence(),
             Self::Step(deferred) => deferred.evidence(),
             Self::SubmissionWave(deferred) => deferred.evidence(),
         }
     }
 
-    fn parent(&self) -> Option<&Arc<AdmittedRequestResources<R>>> {
-        match self {
-            Self::Request(_) => None,
-            Self::Sequence(deferred) => Some(deferred.parent()),
-            Self::Step(_) | Self::SubmissionWave(_) => None,
-        }
-    }
-
     fn maintain(&self) -> std::result::Result<DynamicDeferredMaintenanceOutcome, VNextError> {
         match self {
-            Self::Request(deferred) => deferred.maintain(),
-            Self::Sequence(deferred) => deferred.maintain(),
+            Self::InitialSequence(deferred) => deferred.maintain(),
             Self::Step(deferred) => deferred.maintain(),
             Self::SubmissionWave(deferred) => deferred.maintain(),
         }
@@ -966,24 +952,9 @@ impl<R: DeviceRuntime> PendingPrefillMaintenance<R> {
     }
 }
 
-enum StagedVNextPrefill<R: DeviceRuntime> {
-    Request(Arc<AdmittedRequestResources<R>>),
-    Sequence(Arc<VNextSequence<R>>),
-}
-
-impl<R: DeviceRuntime> StagedVNextPrefill<R> {
-    fn abort(self) {
-        match self {
-            Self::Request(_) => {}
-            Self::Sequence(sequence) => sequence.abort(),
-        }
-    }
-}
-
 enum VNextPrefillSlotState<R: DeviceRuntime> {
     Probing,
     Deferred {
-        staged: Option<StagedVNextPrefill<R>>,
         maintenance: Option<PendingPrefillMaintenance<R>>,
         maintaining: bool,
     },
@@ -993,13 +964,9 @@ enum VNextPrefillSlotState<R: DeviceRuntime> {
 }
 
 enum VNextPrefillProbeResolution<R: DeviceRuntime> {
-    Deferred {
-        deferred: AdmissionDeferred,
-        staged: Option<StagedVNextPrefill<R>>,
-    },
+    Deferred(AdmissionDeferred),
     MaintenanceDeferred {
         pending: PendingPrefillMaintenance<R>,
-        staged: Option<StagedVNextPrefill<R>>,
     },
     Ready(Arc<VNextSequence<R>>),
     PermanentRejected(AdmissionRejected),
@@ -1008,19 +975,8 @@ enum VNextPrefillProbeResolution<R: DeviceRuntime> {
 impl<R: DeviceRuntime> VNextPrefillProbeResolution<R> {
     fn abort(self) {
         match self {
-            Self::Deferred { staged, .. } => {
-                if let Some(staged) = staged {
-                    staged.abort();
-                }
-            }
-            Self::MaintenanceDeferred {
-                pending, staged, ..
-            } => {
-                drop(pending);
-                if let Some(staged) = staged {
-                    staged.abort();
-                }
-            }
+            Self::Deferred(_) => {}
+            Self::MaintenanceDeferred { pending } => drop(pending),
             Self::Ready(sequence) => sequence.abort(),
             Self::PermanentRejected(_) => {}
         }
@@ -1030,16 +986,7 @@ impl<R: DeviceRuntime> VNextPrefillProbeResolution<R> {
 impl<R: DeviceRuntime> VNextPrefillSlotState<R> {
     fn abort(self) {
         match self {
-            Self::Deferred {
-                staged,
-                maintenance,
-                ..
-            } => {
-                drop(maintenance);
-                if let Some(staged) = staged {
-                    staged.abort();
-                }
-            }
+            Self::Deferred { maintenance, .. } => drop(maintenance),
             Self::Ready(sequence) | Self::Executing(sequence) => sequence.abort(),
             Self::Probing | Self::Terminal => {}
         }
@@ -1048,14 +995,16 @@ impl<R: DeviceRuntime> VNextPrefillSlotState<R> {
 
 struct VNextPrefillSlot<R: DeviceRuntime> {
     request_id: RequestId,
+    work_shape: ResourceWorkShape,
     cancelled: AtomicBool,
     state: Mutex<VNextPrefillSlotState<R>>,
 }
 
 impl<R: DeviceRuntime> VNextPrefillSlot<R> {
-    fn new(request_id: RequestId) -> Arc<Self> {
+    fn new(request_id: RequestId, work_shape: ResourceWorkShape) -> Arc<Self> {
         Arc::new(Self {
             request_id,
+            work_shape,
             cancelled: AtomicBool::new(false),
             state: Mutex::new(VNextPrefillSlotState::Probing),
         })
@@ -1091,7 +1040,8 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
     fn begin_prefill_probe(
         &mut self,
         request_id: &RequestId,
-    ) -> Result<(Arc<VNextPrefillSlot<R>>, Option<StagedVNextPrefill<R>>)> {
+        work_shape: &ResourceWorkShape,
+    ) -> Result<Arc<VNextPrefillSlot<R>>> {
         if self
             .active
             .values()
@@ -1102,6 +1052,11 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
             )));
         }
         if let Some(slot) = self.prefills.get(request_id).cloned() {
+            if slot.work_shape != *work_shape {
+                return Err(FerrumError::request_validation(format!(
+                    "vNext prefill retry for `{request_id}` differs from its deferred work shape"
+                )));
+            }
             if slot.cancelled.load(Ordering::Acquire) {
                 return Err(FerrumError::cancelled(format!(
                     "vNext prefill probe for `{request_id}` was cancelled"
@@ -1111,12 +1066,11 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
             let prior = std::mem::replace(&mut *state, VNextPrefillSlotState::Probing);
             match prior {
                 VNextPrefillSlotState::Deferred {
-                    staged,
                     maintenance: None,
                     maintaining: false,
                 } => {
                     drop(state);
-                    Ok((slot, staged))
+                    Ok(slot)
                 }
                 other => {
                     *state = other;
@@ -1126,9 +1080,9 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
                 }
             }
         } else {
-            let slot = VNextPrefillSlot::new(request_id.clone());
+            let slot = VNextPrefillSlot::new(request_id.clone(), work_shape.clone());
             self.prefills.insert(request_id.clone(), Arc::clone(&slot));
-            Ok((slot, None))
+            Ok(slot)
         }
     }
 
@@ -1792,17 +1746,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
 
         let (decision, terminal) = match resolution {
-            VNextPrefillProbeResolution::Deferred { deferred, staged } => {
+            VNextPrefillProbeResolution::Deferred(deferred) => {
                 *state = VNextPrefillSlotState::Deferred {
-                    staged,
                     maintenance: None,
                     maintaining: false,
                 };
                 (ExecutorPrefillAdmissionDecision::Deferred(deferred), false)
             }
-            VNextPrefillProbeResolution::MaintenanceDeferred { pending, staged } => {
+            VNextPrefillProbeResolution::MaintenanceDeferred { pending } => {
                 *state = VNextPrefillSlotState::Deferred {
-                    staged,
                     maintenance: Some(pending),
                     maintaining: false,
                 };
@@ -1843,87 +1795,58 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         maximum_tokens: usize,
         tokens: Vec<u32>,
         work: ResourceWorkShape,
-        staged: Option<StagedVNextPrefill<R>>,
     ) -> Result<VNextPrefillProbeResolution<R>> {
-        let sequence = match staged {
-            Some(StagedVNextPrefill::Sequence(sequence)) => {
-                if sequence.request_id != *request_id
-                    || sequence.maximum_tokens != maximum_tokens
-                    || *sequence.tokens.lock() != tokens
-                {
-                    sequence.abort();
-                    return Err(FerrumError::request_validation(format!(
-                        "vNext prefill retry for `{request_id}` differs from its staged sequence"
-                    )));
+        let identity = RequestIdentity::new(format!("request.product.{request_id}"))
+            .map_err(|error| FerrumError::internal(error.to_string()))?;
+        let session = match self.try_admit_sequence(identity, work)? {
+            VNextSequenceAdmissionDecision::Admitted(session) => session,
+            VNextSequenceAdmissionDecision::Deferred(deferred) => {
+                if deferred.action() == DeferredAction::AwaitBackingGrowth {
+                    return Ok(VNextPrefillProbeResolution::MaintenanceDeferred {
+                        pending: PendingPrefillMaintenance::Logical(deferred),
+                    });
                 }
-                sequence
+                return Ok(VNextPrefillProbeResolution::Deferred(deferred));
             }
-            staged => {
-                let staged_request = match staged {
-                    Some(StagedVNextPrefill::Request(request)) => Some(request),
-                    Some(StagedVNextPrefill::Sequence(_)) => unreachable!(),
-                    None => None,
-                };
-                let identity = RequestIdentity::new(format!("request.product.{request_id}"))
-                    .map_err(|error| FerrumError::internal(error.to_string()))?;
-                let session = match self.try_admit_sequence(identity, work, staged_request)? {
-                    VNextSequenceAdmissionDecision::Admitted(session) => session,
-                    VNextSequenceAdmissionDecision::Deferred {
-                        deferred,
-                        staged_request,
-                    } => {
-                        let staged = staged_request.map(StagedVNextPrefill::Request);
-                        if deferred.action() == DeferredAction::AwaitBackingGrowth {
-                            return Ok(VNextPrefillProbeResolution::MaintenanceDeferred {
-                                pending: PendingPrefillMaintenance::Logical(deferred),
-                                staged,
-                            });
-                        }
-                        return Ok(VNextPrefillProbeResolution::Deferred { deferred, staged });
-                    }
-                    VNextSequenceAdmissionDecision::BackingDeferred(deferred) => {
-                        let staged = deferred.parent().cloned().map(StagedVNextPrefill::Request);
-                        return Ok(VNextPrefillProbeResolution::MaintenanceDeferred {
-                            pending: PendingPrefillMaintenance::Backing(deferred),
-                            staged,
-                        });
-                    }
-                    VNextSequenceAdmissionDecision::PermanentRejected(rejected) => {
-                        return Ok(VNextPrefillProbeResolution::PermanentRejected(rejected));
-                    }
-                };
-                let events = match self.execution_journal(&session) {
-                    Ok(events) => events,
-                    Err(error) => {
-                        let _ = session.request_cancel();
-                        let _ = session.try_abort();
-                        return Err(error);
-                    }
-                };
-                let prompt_tokens = match u64::try_from(tokens.len()) {
-                    Ok(prompt_tokens) => prompt_tokens,
-                    Err(_) => {
-                        let _ = session.request_cancel();
-                        let _ = session.try_abort();
-                        return Err(FerrumError::request_validation(
-                            "prompt token count exceeds u64",
-                        ));
-                    }
-                };
-                Arc::new(VNextSequence {
-                    cache_id: format!("vnext-cache-{request_id}"),
-                    request_id: request_id.clone(),
-                    session,
-                    tokens: Mutex::new(tokens),
-                    maximum_tokens,
-                    active: AtomicBool::new(true),
-                    operation: AsyncMutex::new(()),
-                    events: events.map(Mutex::new),
-                    prompt_tokens,
-                    prefill_tokens_processed: AtomicUsize::new(0),
-                })
+            VNextSequenceAdmissionDecision::BackingDeferred(deferred) => {
+                return Ok(VNextPrefillProbeResolution::MaintenanceDeferred {
+                    pending: PendingPrefillMaintenance::Backing(deferred),
+                });
+            }
+            VNextSequenceAdmissionDecision::PermanentRejected(rejected) => {
+                return Ok(VNextPrefillProbeResolution::PermanentRejected(rejected));
             }
         };
+        let events = match self.execution_journal(&session) {
+            Ok(events) => events,
+            Err(error) => {
+                let _ = session.request_cancel();
+                let _ = session.try_abort();
+                return Err(error);
+            }
+        };
+        let prompt_tokens = match u64::try_from(tokens.len()) {
+            Ok(prompt_tokens) => prompt_tokens,
+            Err(_) => {
+                let _ = session.request_cancel();
+                let _ = session.try_abort();
+                return Err(FerrumError::request_validation(
+                    "prompt token count exceeds u64",
+                ));
+            }
+        };
+        let sequence = Arc::new(VNextSequence {
+            cache_id: format!("vnext-cache-{request_id}"),
+            request_id: request_id.clone(),
+            session,
+            tokens: Mutex::new(tokens),
+            maximum_tokens,
+            active: AtomicBool::new(true),
+            operation: AsyncMutex::new(()),
+            events: events.map(Mutex::new),
+            prompt_tokens,
+            prefill_tokens_processed: AtomicUsize::new(0),
+        });
 
         Ok(VNextPrefillProbeResolution::Ready(sequence))
     }
@@ -1954,86 +1877,43 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         request_id: RequestIdentity,
         work: ResourceWorkShape,
-        staged_request: Option<Arc<AdmittedRequestResources<R>>>,
     ) -> Result<VNextSequenceAdmissionDecision<R>> {
-        let request = if let Some(request) = staged_request {
-            if request.run_id() != &self.run_id
-                || request.request_id() != &request_id
-                || request.work_shape() != &work
-            {
-                return Err(FerrumError::internal(
-                    "staged vNext prefill parent does not match its retry",
-                ));
-            }
-            request
-        } else {
-            let binding = self
-                .plan_resources
-                .trusted_runtime_binding()
-                .map_err(|error| FerrumError::backend(error.to_string()))?;
-            let admission = RequestResourceAdmissionRequest::new(
-                work.clone(),
-                AdmissionFitPolicy::FullInputMustFit,
-                AdmissionPressureAction::WaitForRelease,
-            )
+        let binding = self
+            .plan_resources
+            .trusted_runtime_binding()
             .map_err(|error| FerrumError::backend(error.to_string()))?;
-            match binding
-                .try_admit_request(admission, self.run_id.clone(), request_id)
-                .map_err(|error| FerrumError::backend(error.to_string()))?
-            {
-                RequestResourceAdmissionDecision::Admitted(request) => request,
-                RequestResourceAdmissionDecision::Deferred(deferred) => {
-                    self.metrics
-                        .request_deferrals
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(VNextSequenceAdmissionDecision::Deferred {
-                        deferred,
-                        staged_request: None,
-                    });
-                }
-                RequestResourceAdmissionDecision::BackingDeferred(deferred) => {
-                    self.metrics
-                        .backing_deferrals
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(VNextSequenceAdmissionDecision::BackingDeferred(
-                        VNextPrefillBackingDeferral::Request(deferred),
-                    ));
-                }
-                RequestResourceAdmissionDecision::PermanentRejected(rejected) => {
-                    return Ok(VNextSequenceAdmissionDecision::PermanentRejected(rejected));
-                }
-            }
-        };
-
-        let admission = SequenceResourceAdmissionRequest::new(
+        let request = RequestResourceAdmissionRequest::new(
+            work.clone(),
+            AdmissionFitPolicy::FullInputMustFit,
+            AdmissionPressureAction::WaitForRelease,
+        )
+        .map_err(|error| FerrumError::backend(error.to_string()))?;
+        let sequence = SequenceResourceAdmissionRequest::new(
             work,
             self.policy.admission().sequence_fit_policy,
             AdmissionPressureAction::WaitForRelease,
         )
         .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let sequence = match request
-            .try_admit_sequence(admission)
+        let sequence = match binding
+            .try_admit_initial_sequence(request, sequence, self.run_id.clone(), request_id)
             .map_err(|error| FerrumError::backend(error.to_string()))?
         {
-            SequenceResourceAdmissionDecision::Admitted(sequence) => sequence,
-            SequenceResourceAdmissionDecision::Deferred(deferred) => {
+            InitialSequenceResourceAdmissionDecision::Admitted(sequence) => sequence,
+            InitialSequenceResourceAdmissionDecision::Deferred(deferred) => {
                 self.metrics
                     .sequence_deferrals
                     .fetch_add(1, Ordering::Relaxed);
-                return Ok(VNextSequenceAdmissionDecision::Deferred {
-                    deferred,
-                    staged_request: Some(request),
-                });
+                return Ok(VNextSequenceAdmissionDecision::Deferred(deferred));
             }
-            SequenceResourceAdmissionDecision::BackingDeferred(deferred) => {
+            InitialSequenceResourceAdmissionDecision::BackingDeferred(deferred) => {
                 self.metrics
                     .backing_deferrals
                     .fetch_add(1, Ordering::Relaxed);
                 return Ok(VNextSequenceAdmissionDecision::BackingDeferred(
-                    VNextPrefillBackingDeferral::Sequence(deferred),
+                    VNextPrefillBackingDeferral::InitialSequence(deferred),
                 ));
             }
-            SequenceResourceAdmissionDecision::PermanentRejected(rejected) => {
+            InitialSequenceResourceAdmissionDecision::PermanentRejected(rejected) => {
                 return Ok(VNextSequenceAdmissionDecision::PermanentRejected(rejected));
             }
         };
@@ -3353,32 +3233,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .ok()
             .and_then(|status| serde_json::to_value(status).ok());
         let cleanup = serde_json::to_value(self.plan_resources.deferred_cleanup_status()).ok();
-        let (
-            pending_sequences,
-            active_sequences,
-            staged_prefill_requests,
-            staged_prefill_sequences,
-            pending_prefill_maintenance,
-            executing_prefills,
-        ) = {
+        let (pending_sequences, active_sequences, pending_prefill_maintenance, executing_prefills) = {
             let sequences = self.sequences.lock();
             let mut ready = 0;
-            let mut staged_requests = 0;
-            let mut staged_sequences = 0;
             let mut maintenance = 0;
             let mut executing = 0;
             for slot in sequences.prefills.values() {
                 match &*slot.state.lock() {
                     VNextPrefillSlotState::Deferred {
-                        staged,
                         maintenance: pending,
                         maintaining,
                     } => {
-                        match staged {
-                            Some(StagedVNextPrefill::Request(_)) => staged_requests += 1,
-                            Some(StagedVNextPrefill::Sequence(_)) => staged_sequences += 1,
-                            None => {}
-                        }
                         if pending.is_some() || *maintaining {
                             maintenance += 1;
                         }
@@ -3388,14 +3253,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     VNextPrefillSlotState::Probing | VNextPrefillSlotState::Terminal => {}
                 }
             }
-            (
-                ready,
-                sequences.active.len(),
-                staged_requests,
-                staged_sequences,
-                maintenance,
-                executing,
-            )
+            (ready, sequences.active.len(), maintenance, executing)
         };
         serde_json::json!({
             "schema": "ferrum.runtime-vnext.executor-trace.v1",
@@ -3414,8 +3272,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             "runtime_admission_policy": self.policy.admission(),
             "pending_sequences": pending_sequences,
             "active_sequences": active_sequences,
-            "staged_prefill_requests": staged_prefill_requests,
-            "staged_prefill_sequences": staged_prefill_sequences,
+            "staged_prefill_requests": 0,
+            "staged_prefill_sequences": 0,
             "pending_prefill_maintenance": pending_prefill_maintenance,
             "executing_prefills": executing_prefills,
             "static_bytes": self.static_bytes,
@@ -3565,16 +3423,15 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
         let work = ResourceWorkShape::single(span.clone())
             .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let (slot, staged) = self
+        let slot = self
             .sequences
             .lock()
-            .begin_prefill_probe(input.request_id)?;
+            .begin_prefill_probe(input.request_id, &work)?;
         let resolution = match self.resolve_prefill_probe(
             input.request_id,
             input.maximum_sequence_tokens,
             tokens,
             work,
-            staged,
         ) {
             Ok(resolution) => resolution,
             Err(error) => {

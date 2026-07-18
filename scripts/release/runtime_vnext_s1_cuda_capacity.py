@@ -1015,10 +1015,9 @@ def validate_b_wait_health(
         f"{label}: expected exactly one active holder sequence",
     )
     require(
-        executor.get("staged_prefill_requests", 0)
-        + executor.get("staged_prefill_sequences", 0)
-        >= 1,
-        f"{label}: B has no staged prefill authority",
+        executor.get("staged_prefill_requests") == 0
+        and executor.get("staged_prefill_sequences") == 0,
+        f"{label}: deferred B retained partial prefill authority",
     )
     require(
         executor.get("pending_prefill_maintenance") == 0,
@@ -2151,8 +2150,8 @@ def transition_targets_capacity_pool(
                 "paged backing blocker names a different pool",
             )
             require(
-                blocker.get("lifetime") == "sequence",
-                "paged backing blocker is not sequence-scoped",
+                blocker.get("lifetime") == "initial_sequence_bundle",
+                "paged backing blocker is not an atomic initial-sequence bundle",
             )
             reason = blocker.get("reason")
             requested = blocker.get("requested_bytes")
@@ -2907,7 +2906,7 @@ def self_test() -> int:
                     "sequence_fit_policy": "full_input_must_fit"
                 },
                 "active_sequences": 1,
-                "staged_prefill_requests": 1,
+                "staged_prefill_requests": 0,
                 "staged_prefill_sequences": 0,
                 "pending_prefill_maintenance": 0,
                 "dynamic_pools": {
@@ -3105,7 +3104,7 @@ def self_test() -> int:
                         "source": "backing",
                         "pool_id": paged_pool["pool_id"],
                         "domain_id": paged_pool["domain_id"],
-                        "lifetime": "sequence",
+                        "lifetime": "initial_sequence_bundle",
                         "reason": "growth_required",
                         "requested_bytes": 8,
                         "free_bytes": 0,

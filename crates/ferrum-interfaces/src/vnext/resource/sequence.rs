@@ -1,10 +1,11 @@
 use super::{
     defer_device_cleanup, invalid_resource, AdmissionDecision, AdmissionDeferred,
     AdmissionFitPolicy, AdmissionPreflightDecision, AdmissionPressureAction, AdmissionRejected,
-    AllocationLifetime, Arc, AtomicU64, BTreeMap, BackingPrepareDecision, BatchStepId,
+    AllocationLifetime, Arc, AtomicU64, BTreeMap, BTreeSet, BackingPrepareDecision, BatchStepId,
     CapacityClaimDecision, DeferredDeviceCleanupDisposition, DeferredDeviceCleanupTask,
-    DeviceRuntime, Digest, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
-    DynamicResourceShape, ExecutionFrameId, LogicalAdmissionCoordinatorId, LogicalAdmissionLease,
+    DeviceRuntime, Digest, DynamicBackingClaimScope, DynamicBackingDeferred,
+    DynamicDeferredMaintenanceOutcome, DynamicResourceShape, ExecutionFrameId,
+    InitialSequenceAdmissionDecision, LogicalAdmissionCoordinatorId, LogicalAdmissionLease,
     LogicalBackingBufferView, LogicalBackingSliceAuthority, LogicalBackingSliceEvidence,
     LogicalCapacityLease, LogicalRequestLease, ManuallyDrop, Mutex, NonZeroU64, Ordering,
     ParticipantNodeKey, PlanBackingDeferral, PlanCapacityWaitRegistration, PreparedBackingClaim,
@@ -81,6 +82,56 @@ where
     PermanentRejected(AdmissionRejected),
 }
 
+pub enum InitialSequenceResourceAdmissionDecision<R>
+where
+    R: DeviceRuntime,
+{
+    Admitted(Arc<AdmittedSequenceResources<R>>),
+    Deferred(AdmissionDeferred),
+    BackingDeferred(InitialSequenceBackingDeferral<R>),
+    PermanentRejected(AdmissionRejected),
+}
+
+/// Non-cloneable authority for physical maintenance of an uncommitted initial
+/// request/sequence bundle. It owns no request or sequence lease.
+#[must_use = "initial sequence backing deferral owns its exact bundle attempt"]
+pub struct InitialSequenceBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    evidence: DynamicBackingDeferred,
+    plan: TrustedPlanRuntimeBinding<R>,
+}
+
+impl<R> InitialSequenceBackingDeferral<R>
+where
+    R: DeviceRuntime,
+{
+    pub fn evidence(&self) -> &DynamicBackingDeferred {
+        &self.evidence
+    }
+
+    pub fn maintain(&self) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        if self.evidence.scope() != DynamicBackingClaimScope::InitialSequenceBundle {
+            return Err(invalid_resource(
+                "initial sequence maintenance requires a bundle-scoped deferral",
+            ));
+        }
+        let _lifecycle = self
+            .plan
+            .resources
+            .read_lifecycle("maintain deferred initial sequence backing")?;
+        self.plan
+            .resources
+            .maintenance_controller
+            .maintain_for_live_deferred(&self.evidence)
+    }
+
+    pub fn register_waiter(&self) -> Result<PlanCapacityWaitRegistration<R>, VNextError> {
+        self.plan.register_backing_waiter(&self.evidence)
+    }
+}
+
 /// Non-cloneable authority for one exact request-admission backing attempt.
 /// The embedded evidence can be projected to schedulers and traces, but only
 /// this handle can invoke live revalidation.
@@ -136,7 +187,7 @@ where
         &self,
         deferred: &DynamicBackingDeferred,
     ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
-        if deferred.lifetime() != AllocationLifetime::Request {
+        if deferred.scope() != DynamicBackingClaimScope::Request {
             return Err(invalid_resource(
                 "request backing maintenance requires a request-lifetime deferral",
             ));
@@ -220,6 +271,196 @@ where
             ),
         }
     }
+
+    /// Atomically admits one request root and its first child sequence. Elastic
+    /// backing may grow before the final logical commit, but no request-only
+    /// authority is retained when the sequence cannot be admitted.
+    pub fn try_admit_initial_sequence(
+        &self,
+        request: RequestResourceAdmissionRequest,
+        sequence: SequenceResourceAdmissionRequest,
+        run_id: RunId,
+        request_id: RequestIdentity,
+    ) -> Result<InitialSequenceResourceAdmissionDecision<R>, VNextError> {
+        let _lifecycle = self
+            .resources
+            .read_lifecycle("admit an initial request/sequence bundle")?;
+        let RequestResourceAdmissionRequest {
+            work_shape: request_work_shape,
+            fit_policy: request_fit_policy,
+            pressure_action: request_pressure_action,
+        } = request;
+        let SequenceResourceAdmissionRequest {
+            work_shape: sequence_work_shape,
+            fit_policy: sequence_fit_policy,
+            pressure_action: sequence_pressure_action,
+        } = sequence;
+        if sequence_work_shape.fit_tokens() > request_work_shape.fit_tokens() {
+            return Err(invalid_resource(
+                "initial sequence token ceiling exceeds its request ceiling",
+            ));
+        }
+
+        let request_shape = request_work_shape.fit_shape();
+        let (request_demand, mut requested_slices) = self.scoped_demand(
+            AllocationLifetime::Request,
+            None,
+            request_shape,
+            request_shape,
+            request_fit_policy,
+            request_pressure_action,
+        )?;
+        let sequence_immediate_shape = sequence_work_shape.immediate_shape();
+        let sequence_fit_shape = match sequence_fit_policy {
+            AdmissionFitPolicy::ImmediateOnly => sequence_immediate_shape,
+            AdmissionFitPolicy::FullInputMustFit => sequence_work_shape.fit_shape(),
+        };
+        let (sequence_demand, mut sequence_slices) = self.scoped_demand(
+            AllocationLifetime::Sequence,
+            None,
+            sequence_immediate_shape,
+            sequence_fit_shape,
+            sequence_fit_policy,
+            sequence_pressure_action,
+        )?;
+
+        let request_resource_ids = requested_slices
+            .iter()
+            .flat_map(|request| request.projections.iter())
+            .map(|projection| projection.descriptor.base_resource_id().clone())
+            .collect::<BTreeSet<_>>();
+        let sequence_resource_ids = sequence_slices
+            .iter()
+            .flat_map(|request| request.projections.iter())
+            .map(|projection| projection.descriptor.base_resource_id().clone())
+            .collect::<BTreeSet<_>>();
+        if !request_resource_ids.is_disjoint(&sequence_resource_ids) {
+            return Err(invalid_resource(
+                "initial request and sequence backing resources are not disjoint",
+            ));
+        }
+        requested_slices.append(&mut sequence_slices);
+
+        loop {
+            match self
+                .logical_admission()
+                .preflight_initial_sequence(&request_demand, &sequence_demand)?
+            {
+                AdmissionPreflightDecision::Eligible => {}
+                AdmissionPreflightDecision::Deferred(deferred) => {
+                    return Ok(InitialSequenceResourceAdmissionDecision::Deferred(deferred));
+                }
+                AdmissionPreflightDecision::PermanentRejected(rejected) => {
+                    return Ok(InitialSequenceResourceAdmissionDecision::PermanentRejected(
+                        rejected,
+                    ));
+                }
+            }
+
+            let prepared = match self.prepare_initial_sequence_backing_slices(&requested_slices)? {
+                BackingPrepareDecision::Prepared(prepared) => prepared,
+                BackingPrepareDecision::Deferred(evidence) => {
+                    return Ok(InitialSequenceResourceAdmissionDecision::BackingDeferred(
+                        InitialSequenceBackingDeferral {
+                            evidence,
+                            plan: TrustedPlanRuntimeBinding {
+                                resources: Arc::clone(&self.resources),
+                            },
+                        },
+                    ));
+                }
+            };
+
+            match self
+                .logical_admission()
+                .try_admit_initial_sequence(&request_demand, &sequence_demand)?
+            {
+                InitialSequenceAdmissionDecision::Admitted(logical) => {
+                    let (request_logical, sequence_logical) = logical.into_parts();
+                    if !self.logical_admission().owns_request(&request_logical)
+                        || !self.logical_admission().owns(&sequence_logical)
+                        || sequence_logical.request() != request_logical.request()
+                    {
+                        return Err(invalid_resource(
+                            "initial bundle admission returned incoherent authority",
+                        ));
+                    }
+
+                    let mut request_backing = Vec::new();
+                    let mut sequence_backing = Vec::new();
+                    let mut seen_request = BTreeSet::new();
+                    let mut seen_sequence = BTreeSet::new();
+                    for authority in prepared.commit() {
+                        let resource_id = authority.resource_id().clone();
+                        if request_resource_ids.contains(&resource_id) {
+                            seen_request.insert(resource_id);
+                            request_backing.push(authority);
+                        } else if sequence_resource_ids.contains(&resource_id) {
+                            seen_sequence.insert(resource_id);
+                            sequence_backing.push(authority);
+                        } else {
+                            return Err(invalid_resource(
+                                "initial bundle prepared an unrequested backing resource",
+                            ));
+                        }
+                    }
+                    if seen_request != request_resource_ids
+                        || seen_sequence != sequence_resource_ids
+                    {
+                        return Err(invalid_resource(
+                            "initial bundle backing did not cover every requested resource",
+                        ));
+                    }
+
+                    let request = Arc::new(AdmittedRequestResources {
+                        backing_slices: request_backing,
+                        logical_lease: request_logical,
+                        plan: TrustedPlanRuntimeBinding {
+                            resources: Arc::clone(&self.resources),
+                        },
+                        work_shape: request_work_shape,
+                        run_id,
+                        request_id,
+                    });
+                    return Ok(InitialSequenceResourceAdmissionDecision::Admitted(
+                        Arc::new(AdmittedSequenceResources::new(
+                            request,
+                            sequence_logical,
+                            sequence_backing,
+                            sequence_work_shape,
+                        )?),
+                    ));
+                }
+                InitialSequenceAdmissionDecision::Deferred => {
+                    drop(prepared);
+                    match self
+                        .logical_admission()
+                        .observe_initial_sequence(&request_demand, &sequence_demand)?
+                    {
+                        AdmissionPreflightDecision::Eligible => continue,
+                        AdmissionPreflightDecision::Deferred(deferred) => {
+                            return Ok(InitialSequenceResourceAdmissionDecision::Deferred(
+                                deferred,
+                            ));
+                        }
+                        AdmissionPreflightDecision::PermanentRejected(rejected) => {
+                            return Ok(
+                                InitialSequenceResourceAdmissionDecision::PermanentRejected(
+                                    rejected,
+                                ),
+                            );
+                        }
+                    }
+                }
+                InitialSequenceAdmissionDecision::PermanentRejected(rejected) => {
+                    drop(prepared);
+                    return Ok(InitialSequenceResourceAdmissionDecision::PermanentRejected(
+                        rejected,
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// Request root authority. Request-lifetime state is physically and logically
@@ -299,7 +540,7 @@ where
         &self,
         deferred: &DynamicBackingDeferred,
     ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
-        if deferred.lifetime() != AllocationLifetime::Sequence {
+        if deferred.scope() != DynamicBackingClaimScope::Sequence {
             return Err(invalid_resource(
                 "sequence backing maintenance requires a sequence-lifetime deferral",
             ));

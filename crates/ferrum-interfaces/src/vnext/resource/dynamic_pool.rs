@@ -2,12 +2,13 @@ use super::{
     backing_segment_range, invalid_resource, validate_runtime_descriptor_for_admission,
     AllocationLifetime, AllocationSeal, Arc, AtomicU64, AtomicU8, BTreeMap, BackingChunkIdentity,
     BackingSegment, BufferDescriptor, BufferRequest, BufferUsage, CapacityAvailabilityEpoch,
-    CapacityDomainId, CapacityEpochs, CapacityUnits, CapacityWaitCondition, DeviceAllocationPermit,
-    DeviceCapacityAvailabilitySnapshot, DeviceCapacityBudget, DeviceCapacityGrant,
-    DeviceCapacityReservation, DeviceRuntime, DynamicBackingPoolId, DynamicBackingPoolSpec,
-    DynamicResourceDescriptor, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView,
-    ElementType, FreeExtentIndex, InvocationLivenessMode, LogicalAdmissionCoordinator, Mutex,
-    Ordering, PlanNode, ResourceId, ResourceReservation, ResourceRetentionPolicy,
+    CapacityDomainId, CapacityEntry, CapacityEpochs, CapacityUnits, CapacityVector,
+    CapacityWaitCondition, DeviceAllocationPermit, DeviceCapacityAvailabilitySnapshot,
+    DeviceCapacityBudget, DeviceCapacityGrant, DeviceCapacityReservation, DeviceRuntime,
+    DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicResourceDescriptor,
+    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView, ElementType,
+    FreeExtentIndex, InvocationLivenessMode, LogicalAdmissionCoordinator, Mutex, Ordering,
+    PlanNode, ResourceId, ResourceReservation, ResourceRetentionPolicy,
     ResourceTransactionIdentity, RunId, Serialize, StateInitialization, StaticProvisioningBinding,
     StepResourceSlotKind, TransactionId, VNextError,
 };
@@ -723,6 +724,59 @@ pub enum DynamicBackingDeferralReason {
     FragmentedContiguous,
 }
 
+/// Semantic ownership boundary for one atomic physical backing attempt.
+/// `InitialSequenceBundle` is the only scope allowed to combine Request and
+/// Sequence descriptors; it publishes neither lifetime unless both can commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicBackingClaimScope {
+    Plan,
+    Request,
+    Sequence,
+    Step,
+    Invocation,
+    InitialSequenceBundle,
+}
+
+impl DynamicBackingClaimScope {
+    const fn accepts(self, lifetime: AllocationLifetime) -> bool {
+        match self {
+            Self::Plan => matches!(lifetime, AllocationLifetime::Plan),
+            Self::Request => matches!(lifetime, AllocationLifetime::Request),
+            Self::Sequence => matches!(lifetime, AllocationLifetime::Sequence),
+            Self::Step => matches!(lifetime, AllocationLifetime::Step),
+            Self::Invocation => matches!(lifetime, AllocationLifetime::Invocation),
+            Self::InitialSequenceBundle => matches!(
+                lifetime,
+                AllocationLifetime::Request | AllocationLifetime::Sequence
+            ),
+        }
+    }
+
+    pub const fn lifetime(self) -> Option<AllocationLifetime> {
+        match self {
+            Self::Plan => Some(AllocationLifetime::Plan),
+            Self::Request => Some(AllocationLifetime::Request),
+            Self::Sequence => Some(AllocationLifetime::Sequence),
+            Self::Step => Some(AllocationLifetime::Step),
+            Self::Invocation => Some(AllocationLifetime::Invocation),
+            Self::InitialSequenceBundle => None,
+        }
+    }
+}
+
+impl From<AllocationLifetime> for DynamicBackingClaimScope {
+    fn from(lifetime: AllocationLifetime) -> Self {
+        match lifetime {
+            AllocationLifetime::Plan => Self::Plan,
+            AllocationLifetime::Request => Self::Request,
+            AllocationLifetime::Sequence => Self::Sequence,
+            AllocationLifetime::Step => Self::Step,
+            AllocationLifetime::Invocation => Self::Invocation,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DynamicBackingBlocker {
     pool_id: DynamicBackingPoolId,
@@ -775,7 +829,8 @@ pub struct DynamicBackingDeferred {
     blockers: Vec<DynamicBackingBlocker>,
     epochs: CapacityEpochs,
     wait_condition: CapacityWaitCondition,
-    lifetime: AllocationLifetime,
+    scope: DynamicBackingClaimScope,
+    protected_immediate: CapacityVector,
 }
 
 impl DynamicBackingDeferred {
@@ -799,8 +854,18 @@ impl DynamicBackingDeferred {
         &self.wait_condition
     }
 
-    pub const fn lifetime(&self) -> AllocationLifetime {
-        self.lifetime
+    pub const fn scope(&self) -> DynamicBackingClaimScope {
+        self.scope
+    }
+
+    pub const fn lifetime(&self) -> Option<AllocationLifetime> {
+        self.scope.lifetime()
+    }
+
+    /// Exact uncommitted physical demand that must remain simultaneously
+    /// runnable while maintenance rebalances other pools.
+    pub fn protected_immediate(&self) -> &CapacityVector {
+        &self.protected_immediate
     }
 }
 
@@ -1311,6 +1376,7 @@ where
         &self,
         pressure: &DeviceCapacityPressure,
         excluded_domains: &[CapacityDomainId],
+        protected_immediate: &CapacityVector,
     ) -> Result<Option<DynamicPoolRebalanceReceipt>, VNextError> {
         if pressure.device_id() != self.runtime.descriptor().id.to_string() {
             return Err(invalid_resource(
@@ -1354,6 +1420,11 @@ where
             .iter()
             .map(|domain| (domain.domain(), domain.used().get()))
             .collect::<BTreeMap<_, _>>();
+        let protected_by_domain = protected_immediate
+            .entries()
+            .iter()
+            .map(|entry| (entry.domain(), entry.units().get()))
+            .collect::<BTreeMap<_, _>>();
 
         let mut candidates = Vec::new();
         let mut reclaimable_by_pool = vec![0_u64; pools.len()];
@@ -1369,12 +1440,19 @@ where
                 .get(&pool.domain.domain_id)
                 .copied()
                 .ok_or_else(|| invalid_resource("dynamic pool domain is absent from admission"))?;
+            let protected = protected_by_domain
+                .get(&pool.domain.domain_id)
+                .copied()
+                .unwrap_or(0);
+            let coherent_runnable_floor = used.checked_add(protected).ok_or_else(|| {
+                invalid_resource("dynamic pool protected runnable floor overflows u64")
+            })?;
             let resident_floor = pool
                 .domain
                 .pool
                 .provisioning()
                 .minimum_resident_bytes()
-                .max(used);
+                .max(coherent_runnable_floor);
             let reclaimable = state.resident_bytes.saturating_sub(resident_floor);
             reclaimable_by_pool[pool_index] = reclaimable;
             if reclaimable == 0 {
@@ -1983,6 +2061,26 @@ where
             .and_then(|request| request.projections.first())
             .map(|projection| projection.descriptor.lifetime())
             .ok_or_else(|| invalid_resource("dynamic backing request has no projection"))?;
+        self.prepare_claim_scoped(requests, DynamicBackingClaimScope::from(lifetime))
+    }
+
+    pub(super) fn prepare_initial_sequence_claim(
+        &self,
+        requests: &[EvaluatedBackingRequest<'_>],
+    ) -> Result<BackingPrepareDecision<R>, VNextError> {
+        self.prepare_claim_scoped(requests, DynamicBackingClaimScope::InitialSequenceBundle)
+    }
+
+    fn prepare_claim_scoped(
+        &self,
+        requests: &[EvaluatedBackingRequest<'_>],
+        scope: DynamicBackingClaimScope,
+    ) -> Result<BackingPrepareDecision<R>, VNextError> {
+        if requests.is_empty() {
+            return Ok(BackingPrepareDecision::Prepared(
+                PreparedBackingClaim::empty(),
+            ));
+        }
         let mut grouped =
             BTreeMap::<DynamicBackingPoolId, Vec<&EvaluatedBackingRequest<'_>>>::new();
         for request in requests {
@@ -2007,6 +2105,19 @@ where
             })?;
             groups.push((pool, requests));
         }
+        let protected_immediate = CapacityVector::new(
+            groups
+                .iter()
+                .map(|(pool, requests)| {
+                    let bytes = requests.iter().try_fold(0_u64, |total, request| {
+                        total.checked_add(request.size_bytes).ok_or_else(|| {
+                            invalid_resource("dynamic backing protection bytes overflow u64")
+                        })
+                    })?;
+                    CapacityEntry::new(pool.domain.domain_id, CapacityUnits::new(bytes))
+                })
+                .collect::<Result<Vec<_>, VNextError>>()?,
+        )?;
         'prepare: loop {
             let mut states = groups
                 .iter()
@@ -2057,7 +2168,7 @@ where
                         })
                         || request.projections.iter().any(|projection| {
                             projection.descriptor.pool_id() != pool.domain.pool_id()
-                                || projection.descriptor.lifetime() != lifetime
+                                || !scope.accepts(projection.descriptor.lifetime())
                                 || projection.size_bytes == 0
                                 || projection.size_bytes % quantum != 0
                                 || projection.physical_offset_bytes % quantum != 0
@@ -2144,7 +2255,9 @@ where
                 .collect::<Vec<_>>();
             if !blockers.is_empty() {
                 drop(states);
-                if let Some(deferred) = self.confirm_backing_deferral(blockers, lifetime)? {
+                if let Some(deferred) =
+                    self.confirm_backing_deferral(blockers, scope, protected_immediate.clone())?
+                {
                     return Ok(BackingPrepareDecision::Deferred(deferred));
                 }
                 continue 'prepare;
@@ -2240,9 +2353,11 @@ where
                             contiguous_claim_bytes_descending: Some(claim_bytes_descending),
                         };
                         drop(states);
-                        if let Some(deferred) =
-                            self.confirm_backing_deferral(vec![blocker], lifetime)?
-                        {
+                        if let Some(deferred) = self.confirm_backing_deferral(
+                            vec![blocker],
+                            scope,
+                            protected_immediate.clone(),
+                        )? {
                             return Ok(BackingPrepareDecision::Deferred(deferred));
                         }
                         continue 'prepare;
@@ -2391,7 +2506,8 @@ where
     fn confirm_backing_deferral(
         &self,
         blockers: Vec<DynamicBackingBlocker>,
-        lifetime: AllocationLifetime,
+        scope: DynamicBackingClaimScope,
+        protected_immediate: CapacityVector,
     ) -> Result<Option<DynamicBackingDeferred>, VNextError> {
         let wait_snapshot = self
             .logical_admission
@@ -2419,7 +2535,8 @@ where
             blockers,
             epochs: wait_snapshot.epochs(),
             wait_condition: wait_snapshot.wait_condition().clone(),
-            lifetime,
+            scope,
+            protected_immediate,
         }))
     }
 
