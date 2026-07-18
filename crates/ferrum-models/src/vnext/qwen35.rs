@@ -739,7 +739,11 @@ fn load_family_config(
     let vocab_size = required_u64(text_value, "vocab_size")?;
     let max_position_embeddings = required_u64(text_value, "max_position_embeddings")?;
     let rms_norm_epsilon = hf_rms_norm_epsilon(&hf_config)?;
-    let tokenizer_config = read_json(&model_dir.join("tokenizer_config.json"))?;
+    let tokenizer_config_path = model_dir.join("tokenizer_config.json");
+    let tokenizer_config_bytes = fs::read(&tokenizer_config_path)
+        .map_err(|error| format!("read {tokenizer_config_path:?}: {error}"))?;
+    let tokenizer_config: Value = serde_json::from_slice(&tokenizer_config_bytes)
+        .map_err(|error| format!("parse {tokenizer_config_path:?}: {error}"))?;
     let template = tokenizer_config
         .get("chat_template")
         .and_then(Value::as_str)
@@ -776,7 +780,7 @@ fn load_family_config(
         max_position_embeddings,
         rms_norm_epsilon,
         template: TemplateInput {
-            sha256: format!("{:x}", Sha256::digest(template.as_bytes())),
+            sha256: format!("{:x}", Sha256::digest(&tokenizer_config_bytes)),
             template,
             source_file: "tokenizer_config.json".to_owned(),
         },

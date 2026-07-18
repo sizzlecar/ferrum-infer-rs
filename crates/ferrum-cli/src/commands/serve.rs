@@ -418,6 +418,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         None,
     )
     .await?;
+    let original_source = resolved.original_source;
     let source = resolved.source;
     let model_id = crate::source_resolver::public_model_id(&source);
     let gguf_path = (source.format == ModelFormat::GGUF).then(|| source.local_path.clone());
@@ -781,6 +782,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             let tokenizer = crate::commands::embed::load_tokenizer(&source.local_path)?;
             let mut engine_config = ferrum_types::EngineConfig::default();
             engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
+            engine_config.model.source = Some(original_source);
             engine_config.backend.device = device;
             if let Some(selection) = &gpu_selection {
                 selection.insert_backend_options(&mut engine_config.backend.backend_options);

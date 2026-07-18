@@ -29,7 +29,8 @@ use std::path::{Path, PathBuf};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
 use ferrum_server::chat_template::ModelChatTemplate;
 use ferrum_types::{
-    FerrumError, Result, RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource,
+    FerrumError, ModelSource, Result, RuntimeConfigEntry, RuntimeConfigSnapshot,
+    RuntimeConfigSource,
 };
 
 use crate::config::CliConfig;
@@ -853,6 +854,10 @@ pub enum DownloadPolicy {
 /// caller can use to decide whether to apply GPU autosize.
 pub struct Resolved {
     pub source: ResolvedModelSource,
+    /// Typed source identity retained past local cache resolution. Product
+    /// composition uses this instead of reverse-engineering a repository from
+    /// an opaque snapshot path.
+    pub original_source: ModelSource,
     /// `true` when the resolver also ran the GPU-memory autosizer for
     /// this snapshot. Caller can skip a redundant call.
     pub autosized: bool,
@@ -915,6 +920,11 @@ pub async fn resolve_model_source(
                 format: ModelFormat::GGUF,
                 from_cache,
             },
+            ModelSource::HuggingFace {
+                repo_id: repo,
+                revision: None,
+                cache_dir: Some(cache_dir.display().to_string()),
+            },
             autosize,
         ));
     }
@@ -929,6 +939,7 @@ pub async fn resolve_model_source(
                 format: ModelFormat::GGUF,
                 from_cache: false,
             },
+            ModelSource::Local(model.to_owned()),
             autosize,
         ));
     }
@@ -945,6 +956,7 @@ pub async fn resolve_model_source(
                     format,
                     from_cache: false,
                 },
+                ModelSource::Local(model.to_owned()),
                 autosize,
             ));
         }
@@ -953,7 +965,15 @@ pub async fn resolve_model_source(
     // 4. HF cache hit.
     let model_id = resolve_model_alias(model);
     if let Some(source) = find_cached_model(cache_dir, &model_id) {
-        return Ok(finalize_resolution(source, autosize));
+        return Ok(finalize_resolution(
+            source,
+            ModelSource::HuggingFace {
+                repo_id: model_id,
+                revision: None,
+                cache_dir: Some(cache_dir.display().to_string()),
+            },
+            autosize,
+        ));
     }
 
     // 5. HF download.
@@ -977,10 +997,15 @@ pub async fn resolve_model_source(
     }
     Ok(finalize_resolution(
         ResolvedModelSource {
-            original: model_id,
+            original: model_id.clone(),
             local_path: snapshot_path,
             format,
             from_cache: false,
+        },
+        ModelSource::HuggingFace {
+            repo_id: model_id,
+            revision: None,
+            cache_dir: Some(cache_dir.display().to_string()),
         },
         autosize,
     ))
@@ -1036,6 +1061,7 @@ async fn ensure_gguf_tokenizer_sidecars(
 
 fn finalize_resolution(
     source: ResolvedModelSource,
+    original_source: ModelSource,
     autosize: Option<(AutoSizeProfile, f32)>,
 ) -> Resolved {
     let autosized = if let Some((profile, gpu_util)) = autosize {
@@ -1047,7 +1073,11 @@ fn finalize_resolution(
     } else {
         false
     };
-    Resolved { source, autosized }
+    Resolved {
+        source,
+        original_source,
+        autosized,
+    }
 }
 
 #[cfg(test)]
@@ -1112,6 +1142,10 @@ mod tests {
         assert_eq!(resolved.source.local_path, dir);
         assert_eq!(resolved.source.format, ModelFormat::SafeTensors);
         assert!(!resolved.source.from_cache);
+        assert!(matches!(
+            &resolved.original_source,
+            ModelSource::Local(path) if path == dir.to_str().unwrap()
+        ));
         assert_eq!(
             public_model_id(&resolved.source),
             dir.file_name().unwrap().to_string_lossy()
@@ -1136,6 +1170,10 @@ mod tests {
 
         assert_eq!(resolved.source.local_path, gguf);
         assert_eq!(resolved.source.format, ModelFormat::GGUF);
+        assert!(matches!(
+            &resolved.original_source,
+            ModelSource::Local(path) if path == gguf.to_str().unwrap()
+        ));
         assert_eq!(
             public_model_id(&resolved.source),
             "Qwen3.5-4B-Instruct-Q4_K_M"
@@ -1166,6 +1204,11 @@ mod tests {
         assert_eq!(resolved.source.local_path, gguf);
         assert_eq!(resolved.source.format, ModelFormat::GGUF);
         assert!(resolved.source.from_cache);
+        assert!(matches!(
+            &resolved.original_source,
+            ModelSource::HuggingFace { repo_id, revision: None, cache_dir: Some(root) }
+                if repo_id == &repo && root == &cache.display().to_string()
+        ));
         assert_eq!(
             public_model_id(&resolved.source),
             Path::new(&filename).file_stem().unwrap().to_string_lossy()
