@@ -4482,6 +4482,9 @@ pub enum SubmissionWaveDispatchStage {
     ContractValidateAndReserve,
     BackingAndInputEncode,
     ProviderNodeEncode,
+    LaneReserve,
+    DeviceRuntimeSubmit,
+    CompletionArm,
     LaneReserveSubmitAndArm,
 }
 
@@ -5474,13 +5477,26 @@ impl OperationDispatch {
             timing_sink,
             SubmissionWaveDispatchStage::LaneReserveSubmitAndArm,
         );
+        let lane_reserve_stage = SubmissionWaveDispatchStageTimer::start(
+            timing_sink,
+            SubmissionWaveDispatchStage::LaneReserve,
+        );
         let mut lane_reservation = lane
             .reserve_enqueue()
             .map_err(SubmissionWaveDispatchError::Contract)?;
+        drop(lane_reserve_stage);
+
+        let device_submit_stage = SubmissionWaveDispatchStageTimer::start(
+            timing_sink,
+            SubmissionWaveDispatchStage::DeviceRuntimeSubmit,
+        );
         completion.mark_submission_started();
-        let outcome = match lane_reservation.submit(commands) {
+        let submit_outcome = lane_reservation.submit(commands);
+        drop(lane_reservation);
+        drop(device_submit_stage);
+
+        let outcome = match submit_outcome {
             LaneSubmitOutcome::DefinitelyNotSubmitted(error) => {
-                drop(lane_reservation);
                 let retry = completion
                     .definitely_not_submitted_wave()
                     .map_err(SubmissionWaveDispatchError::Contract)?;
@@ -5495,12 +5511,14 @@ impl OperationDispatch {
                 Err(SubmissionWaveDispatchError::DefinitelyNotSubmitted { failures, retry })
             }
             LaneSubmitOutcome::PossiblySubmittedPanic => {
-                drop(lane_reservation);
                 let recovery = completion.submission_indeterminate();
                 Err(SubmissionWaveDispatchError::SubmissionIndeterminate { recovery })
             }
             LaneSubmitOutcome::Submitted(fence) => {
-                drop(lane_reservation);
+                let completion_arm_stage = SubmissionWaveDispatchStageTimer::start(
+                    timing_sink,
+                    SubmissionWaveDispatchStage::CompletionArm,
+                );
                 let completion = match completion.arm(fence, timing_mode) {
                     Ok(completion) => completion,
                     Err((error, completion)) => {
@@ -5517,6 +5535,7 @@ impl OperationDispatch {
                         completion,
                     });
                 }
+                drop(completion_arm_stage);
                 Ok(completion)
             }
         };
