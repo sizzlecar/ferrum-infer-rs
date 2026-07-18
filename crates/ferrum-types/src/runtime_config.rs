@@ -232,6 +232,7 @@ fn infer_effects(key: &str) -> Vec<RuntimeConfigEffect> {
         || key.contains("BATCHED_TOKENS")
         || key.contains("PAGED_MAX_SEQS")
         || key.contains("MODEL_LEN")
+        || key.contains("FIT_POLICY")
         || key.contains("STATE_MAX_SLOTS")
         || key.contains("MEMORY")
     {
@@ -241,6 +242,7 @@ fn infer_effects(key: &str) -> Vec<RuntimeConfigEffect> {
     if key.contains("PREFIX_CACHE")
         || key.contains("MODEL_PATH")
         || key.contains("MODEL_LEN")
+        || key.contains("FIT_POLICY")
         || key.contains("RUNTIME_MEMORY_BUDGET")
         || key.contains("NATIVE")
         || key.contains("ARTIFACT")

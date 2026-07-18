@@ -2,7 +2,7 @@
 //!
 //! Handles loading and parsing of configuration files for the CLI tool.
 
-use ferrum_types::{Result, RuntimeConfigEntry, RuntimeConfigSource};
+use ferrum_types::{Result, RuntimeConfigEntry, RuntimeConfigSource, SequenceFitPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -361,6 +361,10 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub max_model_len: Option<usize>,
 
+    /// Sequence fit gate used before prefill admission.
+    #[serde(default)]
+    pub sequence_fit_policy: Option<SequenceFitPolicy>,
+
     /// Minimum MoE batch size for the batched expert path, equivalent to
     /// `FERRUM_MOE_BATCH_THRESHOLD`.
     #[serde(default)]
@@ -506,6 +510,12 @@ impl RuntimeCliConfig {
             self.fa2_native_inputs_sha256.as_deref(),
         );
         push_usize_entry(&mut entries, "FERRUM_MAX_MODEL_LEN", self.max_model_len);
+        push_string_entry(
+            &mut entries,
+            "FERRUM_SEQUENCE_FIT_POLICY",
+            self.sequence_fit_policy
+                .map(SequenceFitPolicy::as_runtime_value),
+        );
         push_usize_entry(
             &mut entries,
             "FERRUM_MOE_BATCH_THRESHOLD",
@@ -780,11 +790,12 @@ mod tests {
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
             ),
             max_model_len: Some(4096),
+            sequence_fit_policy: Some(SequenceFitPolicy::FullInputMustFit),
             moe_batch_threshold: Some(4),
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 40);
+        assert_eq!(entries.len(), 41);
         let entry = |key: &str| {
             entries
                 .iter()
@@ -885,6 +896,10 @@ mod tests {
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
         assert_eq!(entry("FERRUM_MAX_MODEL_LEN").effective_value, "4096");
+        assert_eq!(
+            entry("FERRUM_SEQUENCE_FIT_POLICY").effective_value,
+            "full-input-must-fit"
+        );
         assert_eq!(entry("FERRUM_MOE_BATCH_THRESHOLD").effective_value, "4");
     }
 

@@ -7,6 +7,42 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
+/// Product policy for proving that a sequence fits before prefill admission.
+///
+/// This is a non-reserving fit gate: it does not claim future KV blocks. The
+/// execution runtime still acquires exact live-frontier resources transactionally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SequenceFitPolicy {
+    FullInputMustFit,
+    ImmediateOnly,
+}
+
+impl SequenceFitPolicy {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::FullInputMustFit => "full-input-must-fit",
+            Self::ImmediateOnly => "immediate-only",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "full-input-must-fit" => Ok(Self::FullInputMustFit),
+            "immediate-only" => Ok(Self::ImmediateOnly),
+            _ => Err(format!(
+                "expected full-input-must-fit or immediate-only; got {raw:?}"
+            )),
+        }
+    }
+}
+
+impl Default for SequenceFitPolicy {
+    fn default() -> Self {
+        Self::ImmediateOnly
+    }
+}
+
 /// Engine runtime knobs the CLI/autosizer resolves and injects via the
 /// runtime-config snapshot. The continuous engine reads these from the typed
 /// config instead of `std::env::vars()`, so the env bridge stays at the
@@ -228,6 +264,9 @@ pub struct SchedulerConfig {
     /// Emit diagnostic scheduler None/SOME decisions.
     #[serde(default)]
     pub scheduler_none_prof: bool,
+    /// Non-reserving sequence fit gate used before prefill admission.
+    #[serde(default)]
+    pub sequence_fit_policy: SequenceFitPolicy,
 }
 
 impl Default for SchedulerConfig {
@@ -245,6 +284,7 @@ impl Default for SchedulerConfig {
             prefill_step_chunk: None,
             active_decode_prefill_chunk: None,
             scheduler_none_prof: false,
+            sequence_fit_policy: SequenceFitPolicy::default(),
         }
     }
 }
@@ -279,6 +319,10 @@ impl SchedulerConfig {
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_SCHED_NONE_PROF") {
             self.scheduler_none_prof = parse_presence_bool(value)
                 .map_err(|reason| format!("FERRUM_SCHED_NONE_PROF: {reason}"))?;
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_SEQUENCE_FIT_POLICY") {
+            self.sequence_fit_policy = SequenceFitPolicy::parse_runtime_value(value)
+                .map_err(|reason| format!("FERRUM_SEQUENCE_FIT_POLICY: {reason}"))?;
         }
         Ok(())
     }
@@ -783,6 +827,75 @@ impl Default for BatchConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduler_keeps_immediate_fit_default_until_full_input_policy_is_gated() {
+        assert_eq!(
+            SchedulerConfig::default().sequence_fit_policy,
+            SequenceFitPolicy::ImmediateOnly
+        );
+    }
+
+    #[test]
+    fn sequence_fit_policy_uses_canonical_product_values() {
+        assert_eq!(
+            serde_json::to_string(&SequenceFitPolicy::FullInputMustFit).unwrap(),
+            "\"full-input-must-fit\""
+        );
+        assert_eq!(
+            serde_json::from_str::<SequenceFitPolicy>("\"immediate-only\"").unwrap(),
+            SequenceFitPolicy::ImmediateOnly
+        );
+    }
+
+    #[test]
+    fn scheduler_deserialization_without_fit_policy_keeps_legacy_default() {
+        let mut serialized = serde_json::to_value(SchedulerConfig::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("sequence_fit_policy");
+
+        let scheduler: SchedulerConfig = serde_json::from_value(serialized).unwrap();
+
+        assert_eq!(
+            scheduler.sequence_fit_policy,
+            SequenceFitPolicy::ImmediateOnly
+        );
+    }
+
+    #[test]
+    fn engine_config_applies_typed_sequence_fit_policy() {
+        let mut config = EngineConfig::default();
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([(
+            "FERRUM_SEQUENCE_FIT_POLICY",
+            "full-input-must-fit",
+        )]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(
+            config.scheduler.sequence_fit_policy,
+            SequenceFitPolicy::FullInputMustFit
+        );
+    }
+
+    #[test]
+    fn engine_config_rejects_unknown_sequence_fit_policy() {
+        let mut config = EngineConfig::default();
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([(
+            "FERRUM_SEQUENCE_FIT_POLICY",
+            "reserve-everything",
+        )]);
+
+        let error = config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect_err("unknown fit policy must fail closed");
+
+        assert!(error.contains("FERRUM_SEQUENCE_FIT_POLICY"));
+    }
 
     #[test]
     fn engine_config_applies_recurrent_state_max_slots_runtime_key() {

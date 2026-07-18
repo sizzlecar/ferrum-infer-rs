@@ -341,6 +341,10 @@ pub struct RunCommand {
     #[arg(long, value_name = "N")]
     pub max_num_batched_tokens: Option<usize>,
 
+    /// Sequence fit gate used before prefill admission.
+    #[arg(long, value_enum)]
+    pub sequence_fit_policy: Option<crate::commands::SequenceFitPolicyArg>,
+
     /// Enable legacy Llama/Gemma batched decode CUDA graph replay.
     #[arg(long, conflicts_with = "disable_batched_graph")]
     pub batched_graph: bool,
@@ -583,7 +587,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             serde_json::Value::Bool(true),
         );
     }
-    let runtime_config = RuntimeConfigSnapshot::capture_current();
+    let runtime_config = run_base_runtime_config(&config, RuntimeConfigSnapshot::capture_current());
     if let Some(selection) = &gpu_selection {
         selection.insert_backend_options(&mut engine_config.backend.backend_options);
     }
@@ -1695,6 +1699,17 @@ fn run_effective_runtime_config(
     snapshot
 }
 
+fn run_base_runtime_config(
+    config: &CliConfig,
+    env_snapshot: RuntimeConfigSnapshot,
+) -> RuntimeConfigSnapshot {
+    crate::commands::serve::merge_runtime_config_sources(
+        config.runtime.runtime_config_entries(),
+        env_snapshot,
+        Vec::new(),
+    )
+}
+
 fn run_startup_cli_runtime_entries(
     cmd: &RunCommand,
     gpu_selection: Option<&crate::gpu_devices::GpuDeviceSelection>,
@@ -1725,6 +1740,12 @@ fn run_startup_cli_runtime_entries(
         &mut entries,
         "FERRUM_MAX_BATCHED_TOKENS",
         cmd.max_num_batched_tokens,
+    );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
+        "FERRUM_SEQUENCE_FIT_POLICY",
+        cmd.sequence_fit_policy
+            .map(crate::commands::SequenceFitPolicyArg::as_runtime_value),
     );
     crate::runtime_env::push_cli_runtime_usize(
         &mut entries,
@@ -1885,7 +1906,7 @@ pub fn apply_kv_dtype_override(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_types::RuntimeConfigSource;
+    use ferrum_types::{RuntimeConfigSource, SequenceFitPolicy};
 
     fn default_params(max_tokens: usize) -> SamplingParams {
         SamplingParams {
@@ -1921,6 +1942,7 @@ mod tests {
             max_model_len: None,
             max_num_seqs: None,
             max_num_batched_tokens: None,
+            sequence_fit_policy: None,
             batched_graph: false,
             disable_batched_graph: false,
             unified_graph: false,
@@ -2140,6 +2162,7 @@ mod tests {
         cmd.max_model_len = Some(8192);
         cmd.max_num_seqs = Some(8);
         cmd.max_num_batched_tokens = Some(1024);
+        cmd.sequence_fit_policy = Some(crate::commands::SequenceFitPolicyArg::FullInputMustFit);
         let snapshot = RuntimeConfigSnapshot::from_entries(Vec::new());
         let cli_entries = run_startup_cli_runtime_entries(&cmd, None);
         let effective = run_effective_runtime_config(&snapshot, &cli_entries);
@@ -2157,9 +2180,57 @@ mod tests {
         assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "8");
         assert_eq!(entry("FERRUM_MAX_BATCHED_TOKENS").effective_value, "1024");
         assert_eq!(
+            entry("FERRUM_SEQUENCE_FIT_POLICY").effective_value,
+            "full-input-must-fit"
+        );
+        assert_eq!(
             entry("FERRUM_MAX_MODEL_LEN").source,
             RuntimeConfigSource::Cli
         );
+    }
+
+    #[test]
+    fn run_runtime_config_precedence_is_config_then_env_then_cli() {
+        let mut config = CliConfig::default();
+        config.runtime.sequence_fit_policy = Some(SequenceFitPolicy::FullInputMustFit);
+
+        let config_only =
+            run_base_runtime_config(&config, RuntimeConfigSnapshot::from_entries(Vec::new()));
+        let config_entry = config_only
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SEQUENCE_FIT_POLICY")
+            .expect("config sequence fit policy is missing");
+        assert_eq!(config_entry.effective_value, "full-input-must-fit");
+        assert_eq!(config_entry.source, RuntimeConfigSource::ConfigFile);
+
+        let env_wins = run_base_runtime_config(
+            &config,
+            RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+                "FERRUM_SEQUENCE_FIT_POLICY",
+                "immediate-only",
+                RuntimeConfigSource::Env,
+            )]),
+        );
+        let env_entry = env_wins
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SEQUENCE_FIT_POLICY")
+            .expect("env sequence fit policy is missing");
+        assert_eq!(env_entry.effective_value, "immediate-only");
+        assert_eq!(env_entry.source, RuntimeConfigSource::Env);
+
+        let mut cmd = test_run_cmd();
+        cmd.sequence_fit_policy = Some(crate::commands::SequenceFitPolicyArg::FullInputMustFit);
+        let effective =
+            run_effective_runtime_config(&env_wins, &run_startup_cli_runtime_entries(&cmd, None));
+        let cli_entry = effective
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_SEQUENCE_FIT_POLICY")
+            .expect("CLI sequence fit policy is missing");
+        assert_eq!(cli_entry.effective_value, "full-input-must-fit");
+        assert_eq!(cli_entry.source, RuntimeConfigSource::Cli);
     }
 
     #[test]
