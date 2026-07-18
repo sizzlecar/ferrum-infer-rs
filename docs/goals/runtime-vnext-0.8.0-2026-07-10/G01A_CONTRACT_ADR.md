@@ -93,6 +93,26 @@ and `ExecutionEventSink` are peers of execution rather than backend extensions.
 `ResolvedModelPlan` is the validated, data-only product composition result; G01A does
 not connect it to a product entrypoint.
 
+### 2026-07-19 exact completion timing amendment
+
+Real CUDA S1 evidence showed that a host-only completion interval cannot distinguish
+device execution, fence wait, and readback. Timing policy remains selected through the
+typed `ExecutionEventSink`, but the exact request is copied into `DeviceCommandBatch`
+and the result is inseparable from the quiescent terminal receipt. This is a bounded
+extension of the device primitive contract, not an operation-provider or model-family
+branch.
+
+The amendment has four invariants:
+
+1. `Off` creates no backend start event, takes no host clock reading, and allocates no
+   timing side channel on the submission hot path.
+2. `Completion` records at most one backend start event per physical submission; the
+   existing terminal fence event is the end event.
+3. Device elapsed time can only be consumed with the exact terminal receipt. There is
+   no second fence query and no timing owner outside completion/reaper ownership.
+4. Device elapsed, host fence wait, and host readback use distinct clocks, may overlap,
+   and must never be summed into a fabricated total.
+
 ## Frozen Contract Rules
 
 ### Object safety and typed dispatch
@@ -105,8 +125,11 @@ not connect it to a product entrypoint.
   `Indeterminate`. Only a quiescent terminal proves buffers release-safe. Core, not the
   backend, attaches exact execution identity and the fixed `Device` failure domain. Blocking
   fence wait and lane drain are recovery/shutdown correctness tools, never normal request
-  progress. Device timing is emitted through `ExecutionEventSink` and the
-  `OperationContract::profile_phase` identity rather than expanding this stable trait.
+  progress. Device timing policy is selected through `ExecutionEventSink` and the
+  `OperationContract::profile_phase` identity. Under the exact-completion amendment,
+  `DeviceCommandBatch` carries the typed request and the terminal receipt carries the
+  optional measurement or typed unavailability reason; timing never becomes a global
+  backend switch or a second post-terminal query.
 - `OperationContract` is object-safe metadata and validation. It contains an operation
   id and schema-major-compatible version plus shape, dtype, layout, typed attribute
   schema and constraints, resource, oracle, and profile-phase requirements.
