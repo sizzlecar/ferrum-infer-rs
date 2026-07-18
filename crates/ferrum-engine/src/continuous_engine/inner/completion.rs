@@ -286,8 +286,17 @@ impl EngineInner {
             self.model_executor.cancel_prefill_admission(request_id);
         }
 
-        self.release_sequence_physical_resources(request_id, completion_resources.physical)
-            .await;
+        if finish_reason == FinishReason::Error {
+            self.release_sequence_physical_resources(request_id, completion_resources.physical)
+                .await;
+        } else {
+            self.complete_sequence_physical_resources(
+                request_id,
+                completion_resources.physical,
+                &response.usage,
+            )
+            .await?;
+        }
 
         let scheduler_complete = self.scheduler.complete(request_id.clone(), &response).await;
         if let Some(request_slot) = completion_resources.request_slot {
