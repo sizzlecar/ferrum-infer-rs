@@ -1,4 +1,4 @@
-use serde::{ser::SerializeSeq, Serialize};
+use serde::{ser::SerializeSeq, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -517,57 +517,119 @@ impl CompletionSlotId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[must_use = "physical submission evidence must be recorded"]
-pub struct SubmittedOperationReceipt {
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct SubmittedOperationReceiptData {
     slot_id: CompletionSlotId,
     batch_identity: BatchOperationIdentity,
     participants: Vec<SubmittedOperationParticipantReceipt>,
     fingerprint: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[must_use = "participant submission projections must remain linked to the physical batch"]
-pub struct SubmittedOperationParticipantReceipt {
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "physical submission evidence must be recorded"]
+pub struct SubmittedOperationReceipt {
+    data: Arc<SubmittedOperationReceiptData>,
+}
+
+impl Serialize for SubmittedOperationReceipt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.data.as_ref().serialize(serializer)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct SubmittedOperationParticipantReceiptData {
     slot_id: CompletionSlotId,
     participant_index: u32,
     identity: ExecutionIdentityEnvelope,
     batch_submission_fingerprint: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "participant submission projections must remain linked to the physical batch"]
+pub struct SubmittedOperationParticipantReceipt {
+    data: Arc<SubmittedOperationParticipantReceiptData>,
+}
+
+impl SubmittedOperationParticipantReceipt {
+    fn new(
+        slot_id: CompletionSlotId,
+        participant_index: u32,
+        identity: ExecutionIdentityEnvelope,
+        batch_submission_fingerprint: String,
+    ) -> Self {
+        Self {
+            data: Arc::new(SubmittedOperationParticipantReceiptData {
+                slot_id,
+                participant_index,
+                identity,
+                batch_submission_fingerprint,
+            }),
+        }
+    }
+}
+
+impl Serialize for SubmittedOperationParticipantReceipt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.data.as_ref().serialize(serializer)
+    }
+}
+
 impl SubmittedOperationReceipt {
-    pub const fn slot_id(&self) -> CompletionSlotId {
-        self.slot_id
+    fn new(
+        slot_id: CompletionSlotId,
+        batch_identity: BatchOperationIdentity,
+        participants: Vec<SubmittedOperationParticipantReceipt>,
+        fingerprint: String,
+    ) -> Self {
+        Self {
+            data: Arc::new(SubmittedOperationReceiptData {
+                slot_id,
+                batch_identity,
+                participants,
+                fingerprint,
+            }),
+        }
+    }
+
+    pub fn slot_id(&self) -> CompletionSlotId {
+        self.data.slot_id
     }
 
     pub fn batch_identity(&self) -> &BatchOperationIdentity {
-        &self.batch_identity
+        &self.data.batch_identity
     }
 
     pub fn participants(&self) -> &[SubmittedOperationParticipantReceipt] {
-        &self.participants
+        &self.data.participants
     }
 
     pub fn fingerprint(&self) -> &str {
-        &self.fingerprint
+        &self.data.fingerprint
     }
 }
 
 impl SubmittedOperationParticipantReceipt {
-    pub const fn slot_id(&self) -> CompletionSlotId {
-        self.slot_id
+    pub fn slot_id(&self) -> CompletionSlotId {
+        self.data.slot_id
     }
 
-    pub const fn participant_index(&self) -> u32 {
-        self.participant_index
+    pub fn participant_index(&self) -> u32 {
+        self.data.participant_index
     }
 
     pub fn identity(&self) -> &ExecutionIdentityEnvelope {
-        &self.identity
+        &self.data.identity
     }
 
     pub fn batch_submission_fingerprint(&self) -> &str {
-        &self.batch_submission_fingerprint
+        &self.data.batch_submission_fingerprint
     }
 }
 
@@ -1409,19 +1471,21 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         let participant_receipts = batch_identity
             .participants()
             .iter()
-            .map(|participant| SubmittedOperationParticipantReceipt {
-                slot_id,
-                participant_index: participant.participant_index(),
-                identity: participant.identity().clone(),
-                batch_submission_fingerprint: fingerprint.clone(),
+            .map(|participant| {
+                SubmittedOperationParticipantReceipt::new(
+                    slot_id,
+                    participant.participant_index(),
+                    participant.identity().clone(),
+                    fingerprint.clone(),
+                )
             })
             .collect();
-        let receipt = SubmittedOperationReceipt {
+        let receipt = SubmittedOperationReceipt::new(
             slot_id,
-            batch_identity: batch_identity.clone(),
-            participants: participant_receipts,
+            batch_identity.clone(),
+            participant_receipts,
             fingerprint,
-        };
+        );
         let record_receipt = receipt.clone();
         Ok(CompletionReservation {
             reaper: Arc::clone(reaper),
@@ -2735,7 +2799,7 @@ impl<R: DeviceRuntime> CompletionHandle<R> {
         self.receipt.batch_identity()
     }
 
-    pub const fn slot_id(&self) -> CompletionSlotId {
+    pub fn slot_id(&self) -> CompletionSlotId {
         self.receipt.slot_id()
     }
 
