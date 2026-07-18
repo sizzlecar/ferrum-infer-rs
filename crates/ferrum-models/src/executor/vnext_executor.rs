@@ -36,7 +36,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::vnext::PreparedProductionModel;
 
-use super::common;
+use super::{common, vnext_completion_worker::VNextCompletionWorker};
 
 const POLICY_ID: &str = "policy.ferrum.product.vnext.default";
 const POLICY_VERSION: ContractVersion = ContractVersion::new(1, 0);
@@ -1421,6 +1421,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     policy: ResolvedRuntimePolicy,
     plan_resources: Arc<PlanRuntimeResources<R>>,
     lane: Arc<ExecutionLane<R>>,
+    completion_worker: VNextCompletionWorker,
     reaper: Arc<CompletionReaper<R>>,
     io: VNextIoBinding,
     maximum_model_tokens: usize,
@@ -1612,6 +1613,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let lane = ExecutionLane::create(Arc::clone(&runtime)).map_err(|error| {
             FerrumError::device(format!("vNext execution lane creation failed: {error:?}"))
         })?;
+        let completion_worker = VNextCompletionWorker::new().map_err(|error| {
+            FerrumError::device(format!("vNext completion worker creation failed: {error}"))
+        })?;
         let reaper = CompletionReaper::new();
 
         Ok(Self {
@@ -1622,6 +1626,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             policy: config.runtime_policy,
             plan_resources,
             lane,
+            completion_worker,
             reaper,
             io,
             maximum_model_tokens: config.maximum_model_tokens,
@@ -2637,10 +2642,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 return Err(self.abort_step(step, message).await)
             }
             DispatchOutcome::SubmissionIndeterminate { message, recovery } => {
-                let recovered =
-                    tokio::task::spawn_blocking(move || recovery.recover_by_draining_lane())
-                        .await
-                        .map_err(|error| FerrumError::backend(format!("{message}: {error}")))?;
+                let reaper = Arc::clone(&self.reaper);
+                let recovered = self
+                    .completion_worker
+                    .execute(move || {
+                        let recovered = recovery.recover_by_draining_lane();
+                        drop(reaper);
+                        recovered
+                    })
+                    .await
+                    .map_err(|error| FerrumError::backend(format!("{message}: {error}")))?;
                 match recovered {
                     Ok(_) => return Err(self.abort_step(step, message).await),
                     Err(error) => {
@@ -2656,7 +2667,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 message,
                 completion,
             } => {
-                let observed = tokio::task::spawn_blocking(move || completion.wait())
+                let reaper = Arc::clone(&self.reaper);
+                let observed = self
+                    .completion_worker
+                    .execute(move || {
+                        let observed = completion.wait();
+                        drop(reaper);
+                        observed
+                    })
                     .await
                     .map_err(|error| FerrumError::backend(format!("{message}: {error}")))?;
                 match observed {
@@ -2708,13 +2726,19 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .collect::<Result<Vec<_>>>()?;
         let readbacks = CompletionReadbackBatchRequest::new(readbacks)
             .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let observation =
-            tokio::task::spawn_blocking(move || completion.wait_with_readbacks(readbacks))
-                .await
-                .map_err(|error| {
-                    FerrumError::backend(format!("vNext completion task failed: {error}"))
-                })?
-                .map_err(|error| FerrumError::backend(error.to_string()))?;
+        let reaper = Arc::clone(&self.reaper);
+        let observation = self
+            .completion_worker
+            .execute(move || {
+                let observation = completion.wait_with_readbacks(readbacks);
+                drop(reaper);
+                observation
+            })
+            .await
+            .map_err(|error| {
+                FerrumError::backend(format!("vNext completion task failed: {error}"))
+            })?
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
         let receipt = match observation {
             CompletionReadbackBatchObservation::Terminal(receipt) => receipt,
             other => {
@@ -3322,6 +3346,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "uploaded_bytes": self.metrics.uploaded_bytes.load(Ordering::Relaxed),
                 "readback_bytes": self.metrics.readback_bytes.load(Ordering::Relaxed),
             },
+            "completion_worker": self.completion_worker.metrics_snapshot(),
             "dynamic_pools": pool_status,
             "deferred_cleanup": cleanup,
             "last_failure": self.metrics.last_failure.lock().clone(),
