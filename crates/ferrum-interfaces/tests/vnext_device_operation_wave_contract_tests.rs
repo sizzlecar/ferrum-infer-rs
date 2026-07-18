@@ -70,14 +70,12 @@ fn setup_with_fixture(
 fn wave_active_bindings(
     wave: &PreparedStepSubmissionWave<TestRuntime>,
     session: &Arc<SequenceSession<TestRuntime>>,
-) -> Vec<Vec<TrustedActiveSequenceBinding>> {
+) -> Vec<TrustedActiveSequenceBinding> {
     let active = TrustedActiveSequenceBinding::from_session(session).unwrap();
-    let mut active_bindings = Vec::with_capacity(wave.node_count());
     for node in wave.nodes() {
         assert_eq!(node.participant_frames().len(), 1);
-        active_bindings.push(vec![active.clone()]);
     }
-    active_bindings
+    vec![active]
 }
 
 fn teardown(
@@ -195,7 +193,7 @@ fn unsubmitted_step_retry_keeps_the_first_physical_journal_identity() {
     let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
     let batch_identity = OperationDispatch::bind_submission_wave_identity(
         &fixture.resolved,
-        &active_bindings,
+        active_bindings.iter(),
         &wave,
         &lane,
     )
@@ -265,7 +263,7 @@ fn all_plan_nodes_encode_into_one_submission_and_one_completion() {
         .collect::<Vec<_>>();
     let batch_identity = OperationDispatch::bind_submission_wave_identity(
         &fixture.resolved,
-        &active_bindings,
+        active_bindings.iter(),
         &wave,
         &lane,
     )
@@ -292,7 +290,7 @@ fn all_plan_nodes_encode_into_one_submission_and_one_completion() {
         &providers,
         &fixture.resolved,
         &batch_identity,
-        &active_bindings,
+        active_bindings.iter(),
         wave,
         &lane,
         &reaper,
@@ -339,7 +337,7 @@ fn typed_input_upload_precedes_the_plan_in_one_submission() {
         .collect::<Vec<_>>();
     let batch_identity = OperationDispatch::bind_submission_wave_identity(
         &fixture.resolved,
-        &active_bindings,
+        active_bindings.iter(),
         &wave,
         &lane,
     )
@@ -357,7 +355,7 @@ fn typed_input_upload_precedes_the_plan_in_one_submission() {
         &providers,
         &fixture.resolved,
         &batch_identity,
-        &active_bindings,
+        active_bindings.iter(),
         &[upload],
         wave,
         &lane,
@@ -406,7 +404,7 @@ fn terminal_wave_reads_output_before_releasing_backing() {
         .collect::<Vec<_>>();
     let batch_identity = OperationDispatch::bind_submission_wave_identity(
         &executable,
-        &active_bindings,
+        active_bindings.iter(),
         &wave,
         &lane,
     )
@@ -415,7 +413,7 @@ fn terminal_wave_reads_output_before_releasing_backing() {
         &providers,
         &executable,
         &batch_identity,
-        &active_bindings,
+        active_bindings.iter(),
         wave,
         &lane,
         &reaper,
@@ -513,7 +511,7 @@ fn definitely_not_submitted_retries_the_same_whole_wave() {
     fixture.runtime_trace.lock().unwrap().submit_behavior = SubmitBehavior::DefinitelyNotSubmitted;
     let first_identity = OperationDispatch::bind_submission_wave_identity(
         &fixture.resolved,
-        &active_bindings,
+        active_bindings.iter(),
         &wave,
         &lane,
     )
@@ -522,7 +520,7 @@ fn definitely_not_submitted_retries_the_same_whole_wave() {
         &providers,
         &fixture.resolved,
         &first_identity,
-        &active_bindings,
+        active_bindings.iter(),
         wave,
         &lane,
         &reaper,
@@ -544,7 +542,7 @@ fn definitely_not_submitted_retries_the_same_whole_wave() {
     fixture.runtime_trace.lock().unwrap().submit_behavior = SubmitBehavior::Success;
     let retry_identity = OperationDispatch::bind_submission_wave_identity(
         &fixture.resolved,
-        &active_bindings,
+        active_bindings.iter(),
         &retry_wave,
         &lane,
     )
@@ -554,7 +552,7 @@ fn definitely_not_submitted_retries_the_same_whole_wave() {
         &providers,
         &fixture.resolved,
         &retry_identity,
-        &active_bindings,
+        active_bindings.iter(),
         retry_wave,
         &lane,
         &reaper,
@@ -599,7 +597,7 @@ fn zero_state_initialization_is_ordered_retried_and_not_repeated_after_success()
     fixture.runtime_trace.lock().unwrap().submit_behavior = SubmitBehavior::DefinitelyNotSubmitted;
     let first_identity = OperationDispatch::bind_submission_wave_identity(
         &fixture.resolved,
-        &active_bindings,
+        active_bindings.iter(),
         &first_wave,
         &lane,
     )
@@ -608,7 +606,7 @@ fn zero_state_initialization_is_ordered_retried_and_not_repeated_after_success()
         &providers,
         &fixture.resolved,
         &first_identity,
-        &active_bindings,
+        active_bindings.iter(),
         first_wave,
         &lane,
         &reaper,
@@ -621,7 +619,7 @@ fn zero_state_initialization_is_ordered_retried_and_not_repeated_after_success()
     let retry_wave = retry.retry().unwrap();
     let retry_identity = OperationDispatch::bind_submission_wave_identity(
         &fixture.resolved,
-        &active_bindings,
+        active_bindings.iter(),
         &retry_wave,
         &lane,
     )
@@ -630,7 +628,7 @@ fn zero_state_initialization_is_ordered_retried_and_not_repeated_after_success()
         &providers,
         &fixture.resolved,
         &retry_identity,
-        &active_bindings,
+        active_bindings.iter(),
         retry_wave,
         &lane,
         &reaper,
@@ -668,7 +666,7 @@ fn zero_state_initialization_is_ordered_retried_and_not_repeated_after_success()
     let second_active_bindings = wave_active_bindings(&second_wave, &session);
     let second_identity = OperationDispatch::bind_submission_wave_identity(
         &fixture.resolved,
-        &second_active_bindings,
+        second_active_bindings.iter(),
         &second_wave,
         &lane,
     )
@@ -677,7 +675,7 @@ fn zero_state_initialization_is_ordered_retried_and_not_repeated_after_success()
         &providers,
         &fixture.resolved,
         &second_identity,
-        &second_active_bindings,
+        second_active_bindings.iter(),
         second_wave,
         &lane,
         &reaper,

@@ -3993,12 +3993,12 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
             batch_identity,
             node_identity,
             OperationInvocationResources::Invocation(resources),
-            active_bindings,
+            active_bindings.iter(),
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn from_wave_node<R>(
+    fn from_wave_node<'binding, R, I>(
         runtime: &R,
         resolved: &'a dyn ExecutablePlanView,
         provider: &'a OperationProviderDescriptor,
@@ -4006,10 +4006,11 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         node_identity: &'a BatchOperationNodeIdentity,
         wave: &'a PreparedStepSubmissionWave<R>,
         node_index: usize,
-        active_bindings: &'a [TrustedActiveSequenceBinding],
+        active_bindings: I,
     ) -> Result<Self, VNextError>
     where
         R: DeviceRuntime<Buffer = B>,
+        I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
         Self::from_resources(
             runtime,
@@ -4023,17 +4024,18 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn from_resources<R>(
+    fn from_resources<'binding, R, I>(
         runtime: &R,
         resolved: &'a dyn ExecutablePlanView,
         provider: &'a OperationProviderDescriptor,
         batch_identity: &'a BatchOperationIdentity,
         node_identity: &'a BatchOperationNodeIdentity,
         resources: OperationInvocationResources<'a, R>,
-        active_bindings: &'a [TrustedActiveSequenceBinding],
+        active_bindings: I,
     ) -> Result<Self, VNextError>
     where
         R: DeviceRuntime<Buffer = B>,
+        I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
         let participant_count = resources.participant_count()?;
         let resource_keys = resources.participant_node_keys()?;
@@ -4473,10 +4475,10 @@ impl OperationDispatch {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn bind_node_identity<R>(
+    fn bind_node_identity<'binding, R, I>(
         resolved: &dyn ExecutablePlanView,
         participant_identities: Vec<ExecutionIdentityEnvelope>,
-        active_bindings: &[TrustedActiveSequenceBinding],
+        active_bindings: I,
         resources: OperationInvocationResources<'_, R>,
         lane: &Arc<ExecutionLane<R>>,
         node_index: u32,
@@ -4484,6 +4486,7 @@ impl OperationDispatch {
     ) -> Result<BatchOperationNodeIdentity, VNextError>
     where
         R: DeviceRuntime,
+        I: ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
         let plan = resolved.execution_plan();
         let node_id = resources.node_id()?;
@@ -4524,10 +4527,13 @@ impl OperationDispatch {
             ));
         }
         let mut participant_projections = Vec::with_capacity(participant_identities.len());
-        for (local_index, identity) in participant_identities.into_iter().enumerate() {
+        for (local_index, (identity, active)) in participant_identities
+            .into_iter()
+            .zip(active_bindings)
+            .enumerate()
+        {
             let participant = participants[local_index];
             let frame = frames[local_index];
-            let active = &active_bindings[local_index];
             let session = sessions[local_index];
             let key = &node_keys[local_index];
             let parts = identity.parts();
@@ -4606,7 +4612,7 @@ impl OperationDispatch {
         let node_identity = Self::bind_node_identity(
             resolved,
             participant_identities,
-            active_bindings,
+            active_bindings.iter(),
             resources,
             lane,
             0,
@@ -4627,21 +4633,22 @@ impl OperationDispatch {
         )
     }
 
-    fn bind_submission_wave_identity_from_envelopes<R>(
+    fn bind_submission_wave_identity_from_envelopes<'binding, R, I>(
         resolved: &dyn ExecutablePlanView,
         participant_identities: Vec<Vec<ExecutionIdentityEnvelope>>,
-        active_bindings: &[Vec<TrustedActiveSequenceBinding>],
+        active_bindings: I,
         wave: &PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
     ) -> Result<BatchOperationIdentity, VNextError>
     where
         R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
         let plan = resolved.execution_plan();
         if wave.nodes().is_empty()
             || wave.nodes().len() != plan.payload().nodes().len()
             || participant_identities.len() != wave.nodes().len()
-            || active_bindings.len() != wave.nodes().len()
+            || active_bindings.len() == 0
             || wave
                 .nodes()
                 .iter()
@@ -4654,9 +4661,8 @@ impl OperationDispatch {
         }
         let mut participant_start = 0_u32;
         let mut nodes = Vec::with_capacity(wave.nodes().len());
-        for (node_index, ((identities, bindings), _node)) in participant_identities
+        for (node_index, (identities, _node)) in participant_identities
             .into_iter()
-            .zip(active_bindings)
             .zip(wave.nodes())
             .enumerate()
         {
@@ -4667,7 +4673,7 @@ impl OperationDispatch {
             let node_identity = Self::bind_node_identity(
                 resolved,
                 identities,
-                bindings,
+                active_bindings.clone(),
                 OperationInvocationResources::Wave {
                     wave,
                     node_index: node_index as usize,
@@ -4701,27 +4707,27 @@ impl OperationDispatch {
     /// Binds one immutable-plan submission wave without accepting caller-made
     /// execution envelopes. Frame, node, provider, provisioning, span, and
     /// invocation identities are minted from core-owned plan/session evidence.
-    pub fn bind_submission_wave_identity<R>(
+    pub fn bind_submission_wave_identity<'binding, R, I>(
         resolved: &dyn ExecutablePlanView,
-        active_bindings: &[Vec<TrustedActiveSequenceBinding>],
+        active_bindings: I,
         wave: &PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
     ) -> Result<BatchOperationIdentity, VNextError>
     where
         R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
-        if active_bindings.len() != wave.nodes().len() {
+        if active_bindings.len() == 0 {
             return Err(invalid_operation(
-                "submission wave active bindings must cover every immutable plan node",
+                "submission wave requires a non-empty active participant set",
             ));
         }
         let participant_identities = wave
             .nodes()
             .iter()
-            .zip(active_bindings)
             .enumerate()
-            .map(|(node_index, (node, bindings))| {
-                if bindings.len() != node.participant_frames().len() {
+            .map(|(node_index, node)| {
+                if active_bindings.len() != node.participant_frames().len() {
                     return Err(invalid_operation(format!(
                         "submission wave node {node_index} active binding count differs from its participant frames"
                     )));
@@ -4729,7 +4735,7 @@ impl OperationDispatch {
                 node.participant_frames()
                     .iter()
                     .copied()
-                    .zip(bindings)
+                    .zip(active_bindings.clone())
                     .map(|(frame, active)| {
                         Self::trusted_submission_node_identity(
                             resolved,
@@ -4881,17 +4887,18 @@ impl OperationDispatch {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn encode_and_submit_wave<R>(
+    pub fn encode_and_submit_wave<'binding, R, I>(
         providers: &[BoundOperationProvider<'_, R>],
         resolved: &dyn ExecutablePlanView,
         batch_identity: &BatchOperationIdentity,
-        active_bindings: &[Vec<TrustedActiveSequenceBinding>],
+        active_bindings: I,
         wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
         reaper: &Arc<CompletionReaper<R>>,
     ) -> Result<CompletionHandle<R>, SubmissionWaveDispatchError<R>>
     where
         R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
         Self::encode_and_submit_wave_with_inputs(
             providers,
@@ -4906,11 +4913,11 @@ impl OperationDispatch {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn encode_and_submit_wave_with_inputs<R>(
+    pub fn encode_and_submit_wave_with_inputs<'binding, R, I>(
         providers: &[BoundOperationProvider<'_, R>],
         resolved: &dyn ExecutablePlanView,
         batch_identity: &BatchOperationIdentity,
-        active_bindings: &[Vec<TrustedActiveSequenceBinding>],
+        active_bindings: I,
         input_uploads: &[SubmissionWaveInputUpload],
         mut wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
@@ -4918,14 +4925,17 @@ impl OperationDispatch {
     ) -> Result<CompletionHandle<R>, SubmissionWaveDispatchError<R>>
     where
         R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
     {
         let identity_participant_count = batch_identity.participants().len();
-        let active_participant_count = active_bindings.iter().map(Vec::len).sum::<usize>();
+        let active_participant_count = active_bindings.len();
+        let expected_identity_participant_count =
+            active_participant_count.checked_mul(batch_identity.nodes().len());
         if providers.is_empty()
             || providers.len() != wave.nodes().len()
             || providers.len() != batch_identity.nodes().len()
-            || providers.len() != active_bindings.len()
-            || identity_participant_count != active_participant_count
+            || active_participant_count == 0
+            || expected_identity_participant_count != Some(identity_participant_count)
             || batch_identity.batch_step_id() != wave.batch_step_id()
             || batch_identity.batch_invocation_id() != wave.batch_invocation_id()
             || batch_identity.claimed_backing_fingerprint() != wave.fingerprint()
@@ -4954,6 +4964,7 @@ impl OperationDispatch {
                 || node_identity.participants().len()
                     != usize::try_from(prepared_node.participant_count())
                         .expect("prepared wave participant count fits usize")
+                || node_identity.participants().len() != active_participant_count
             {
                 return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
                     "wave provider or node identity differs from its prepared node",
@@ -4990,11 +5001,8 @@ impl OperationDispatch {
             &mut commands,
         )?;
         let pre_provider_command_count = commands.len();
-        for (node_index, ((provider, node_identity), bindings)) in providers
-            .iter()
-            .zip(batch_identity.nodes())
-            .zip(active_bindings)
-            .enumerate()
+        for (node_index, (provider, node_identity)) in
+            providers.iter().zip(batch_identity.nodes()).enumerate()
         {
             let invocation = BatchedOperationInvocation::from_wave_node(
                 runtime,
@@ -5004,7 +5012,7 @@ impl OperationDispatch {
                 node_identity,
                 completion.wave(),
                 node_index,
-                bindings,
+                active_bindings.clone(),
             )
             .map_err(SubmissionWaveDispatchError::Contract)?;
             let expected_phase = invocation.operation().profile_phase;
