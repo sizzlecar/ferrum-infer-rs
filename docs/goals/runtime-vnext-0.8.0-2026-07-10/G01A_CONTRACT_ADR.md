@@ -113,6 +113,14 @@ The amendment has four invariants:
 4. Device elapsed, host fence wait, and host readback use distinct clocks, may overlap,
    and must never be summed into a fabricated total.
 
+Completion output ownership and completion identity are deliberately separate. A
+successful readback receipt continues to own the exact raw output bytes and their
+validated SHA256. Stable single and batch readback fingerprints bind the request,
+typed disposition/failure evidence, and that already-computed output digest; they must
+not serialize or hash the raw bytes again. The corrected batch projection uses the
+`ferrum.runtime-vnext.completion-readback-batch.v2` domain so the semantic change is
+explicit rather than silently reusing the old digest domain.
+
 ## Frozen Contract Rules
 
 ### Object safety and typed dispatch
