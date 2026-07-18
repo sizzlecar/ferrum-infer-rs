@@ -121,6 +121,37 @@ not serialize or hash the raw bytes again. The corrected batch projection uses t
 `ferrum.runtime-vnext.completion-readback-batch.v2` domain so the semantic change is
 explicit rather than silently reusing the old digest domain.
 
+### 2026-07-19 immutable submission evidence amendment
+
+CUDA host-boundary attribution also found repeated ownership work before submit. A
+physical wave cloned validated batch, node, participant, execution-envelope and
+submitted-receipt values at several ownership boundaries. Those clones recursively
+copied the same immutable identity tree. Batch identity construction then serialized
+that complete tree into a temporary JSON buffer and hashed it again even though each
+node already carried a validated semantic fingerprint.
+
+Validated submission evidence is therefore a shared immutable value with these rules:
+
+1. Cloning an execution envelope, batch/node participant identity, or submitted receipt
+   shares one private `Arc`-backed payload; it does not recursively copy evidence.
+2. Sharing is process-local ownership only. Manual serialization preserves the existing
+   transparent wire shape exactly and never exposes an implementation `data` wrapper,
+   pointer, allocation identity or reference count.
+3. Node identity retains its existing full semantic digest. Batch identity v2 hashes
+   the canonical batch fields plus the ordered, already-validated node fingerprints;
+   it does not serialize the nested node/operation/participant trees a second time.
+4. Fingerprint JSON is streamed directly into SHA256. Trusted deserialization and
+   reconstruction rules remain unchanged; shared storage never becomes validation
+   authority.
+5. Hot-path evidence remains immutable after construction. Runtime counters, terminal
+   state, fences and mutable resource ownership cannot be placed in these shared
+   payloads.
+
+This amendment changes process-local ownership and the explicit batch fingerprint
+domain, not provider selection or model routing. The bounded CUDA checkpoint is
+recorded in `S1_STATUS_2026-07-17.md`; formal dispatch and event-sink overhead remain
+owned by the G01B proof plan.
+
 ## Frozen Contract Rules
 
 ### Object safety and typed dispatch
@@ -189,6 +220,10 @@ explicit rather than silently reusing the old digest domain.
   ownership, so dropping it cannot release device-visible resources. Raw commands never escape
   for submission on another runtime or lane. Provider errors are accepted only when their
   execution identity and profile phase equal the dispatch context.
+- Execution envelopes, batch/node participant identities and submitted receipts are immutable
+  evidence objects. Their process-local clones share private payload storage while their
+  serialized form remains the canonical contract form. Batch composition consumes ordered
+  validated node digests rather than recursively reserializing the node evidence tree.
 - A plan node records the selected provider identity. The execution loop neither asks
   `supports_*` questions nor branches on a concrete backend or architecture.
 - Every shape-dependent plan node records a core-derived `NodeWorkContract` in the immutable plan
