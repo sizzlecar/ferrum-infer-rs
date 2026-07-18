@@ -334,6 +334,11 @@ impl EngineBuilder {
                         "plan runtime cannot be combined with a legacy engine recurrent-state manager",
                     ));
                 }
+                if executor.resolved_model_plan().is_none() {
+                    return Err(FerrumError::config(
+                        "plan-runtime executor did not expose its authoritative ResolvedModelPlan",
+                    ));
+                }
                 (None, None)
             }
             ferrum_interfaces::model_executor::ExecutionResourceAuthority::LegacyEngine => {
@@ -925,7 +930,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_runtime_build_does_not_invoke_legacy_kv_factory() {
+    async fn plan_runtime_without_resolved_plan_rejects_before_legacy_kv_factory() {
         let calls = Arc::new(AtomicUsize::new(0));
         let registry = Arc::new(ComponentRegistry::with_defaults());
         registry.register_kv_cache_factory(
@@ -943,9 +948,12 @@ mod tests {
             .build()
             .await;
 
-        if let Err(error) = result {
-            panic!("plan-runtime build failed: {error}");
-        }
+        let error = result
+            .err()
+            .expect("plan runtime without a resolved plan must fail closed");
+        assert!(error
+            .to_string()
+            .contains("authoritative ResolvedModelPlan"));
         assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 

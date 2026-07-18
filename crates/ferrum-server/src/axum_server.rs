@@ -61,6 +61,19 @@ const INITIAL_STRUCTURED_CALL_FORBIDDEN_TOKEN_TEXTS: &[&str] =
 const FERRUM_SESSION_HEADER: &str = "x-ferrum-session";
 static PROFILE_JSONL_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// Product defaults used when an OpenAI chat request omits sampling fields.
+/// The engine composition root consumes the same typed value so its resolved
+/// startup plan cannot describe different defaults from the HTTP endpoint.
+pub fn default_chat_sampling_params() -> SamplingParams {
+    SamplingParams {
+        max_tokens: DEFAULT_COMPLETION_MAX_TOKENS as usize,
+        temperature: DEFAULT_SAMPLING_TEMPERATURE,
+        top_p: DEFAULT_SAMPLING_TOP_P,
+        repetition_penalty: DEFAULT_CHAT_REPETITION_PENALTY,
+        ..SamplingParams::default()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CachePolicy {
     prefix_cache_enabled: bool,
@@ -7154,14 +7167,12 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
 
         let request = engine.last_request();
+        let defaults = default_chat_sampling_params();
         assert_eq!(request.sampling_params.max_tokens, 3);
-        assert_eq!(
-            request.sampling_params.temperature,
-            DEFAULT_SAMPLING_TEMPERATURE
-        );
+        assert_eq!(request.sampling_params.temperature, defaults.temperature);
         assert_eq!(
             request.sampling_params.repetition_penalty,
-            DEFAULT_CHAT_REPETITION_PENALTY
+            defaults.repetition_penalty
         );
         assert_eq!(request.sampling_params.stop_sequences, vec!["<END>"]);
     }

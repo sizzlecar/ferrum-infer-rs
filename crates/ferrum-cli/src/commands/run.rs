@@ -572,6 +572,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let mut engine_config = ferrum_types::EngineConfig::default();
     engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
     engine_config.model.source = Some(original_source);
+    engine_config.sampling.default_params = build_sampling_params(&cmd);
     engine_config.backend.device = device.clone();
     engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
     engine_config.backend.backend_options.insert(

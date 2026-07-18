@@ -1143,12 +1143,34 @@ fn create_registered_vnext_executor(
                     backend = "cuda",
                     "Building registered model from a typed vNext execution plan"
                 );
-                let executor = ferrum_models::VNextModelExecutor::create_cuda(
-                    *ordinal,
+                let device_id = ferrum_interfaces::vnext::DeviceId::new(format!(
+                    "device.cuda.{ordinal}"
+                ))
+                .map_err(|error| FerrumError::device(error.to_string()))?;
+                let composition =
+                    ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition::create(
+                        *ordinal, device_id,
+                    )
+                    .map_err(|error| {
+                        FerrumError::device(format!("create vNext CUDA runtime: {error}"))
+                    })?;
+                let (runtime, operation_registry, catalog) = composition.into_parts();
+                let executor = crate::product_composition::create_vnext_executor(
+                    model_path,
+                    &config.engine_config,
                     prepared,
                     model_info,
-                    &config.engine_config,
+                    runtime,
+                    operation_registry,
+                    catalog,
                 )?;
+                info!(
+                    resolved_plan_fingerprint = executor
+                        .resolved_model_plan()
+                        .map(|plan| plan.fingerprint())
+                        .unwrap_or("missing"),
+                    "Resolved product model plan is authoritative for vNext execution"
+                );
                 Ok(Arc::new(executor))
             }
             #[cfg(not(feature = "cuda"))]

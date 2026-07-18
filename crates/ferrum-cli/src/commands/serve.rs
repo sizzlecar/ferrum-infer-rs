@@ -783,6 +783,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             let mut engine_config = ferrum_types::EngineConfig::default();
             engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
             engine_config.model.source = Some(original_source);
+            engine_config.sampling.default_params = ferrum_server::default_chat_sampling_params();
             engine_config.backend.device = device;
             if let Some(selection) = &gpu_selection {
                 selection.insert_backend_options(&mut engine_config.backend.backend_options);

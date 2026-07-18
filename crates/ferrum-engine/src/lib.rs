@@ -53,6 +53,7 @@ pub(crate) mod layer_split;
 pub mod modality_stubs;
 pub mod parallel;
 pub mod pipeline;
+mod product_composition;
 pub mod recurrent_state;
 pub mod registry;
 pub(crate) mod resource_lifecycle;

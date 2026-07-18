@@ -1389,6 +1389,14 @@ pub trait ModelExecutor: Send + Sync {
         ExecutionResourceAuthority::LegacyEngine
     }
 
+    /// Returns the immutable product plan that owns planning, provider
+    /// selection, and resource authority for a plan-runtime executor.
+    /// Legacy executors return `None`; `PlanRuntime` executors must expose the
+    /// exact plan used for provisioning and dispatch.
+    fn resolved_model_plan(&self) -> Option<&crate::vnext::ResolvedModelPlan> {
+        None
+    }
+
     /// Returns the authoritative memory breakdown for a shared plan runtime.
     /// `LegacyEngine` executors return `None`; `PlanRuntime` executors must
     /// return `Some` while they are ready.
