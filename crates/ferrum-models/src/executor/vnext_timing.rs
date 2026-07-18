@@ -16,6 +16,10 @@ impl AtomicDurationMetrics {
         }
     }
 
+    pub(super) fn start_if(&self, enabled: bool) -> Option<AtomicDurationTimer<'_>> {
+        enabled.then(|| self.start())
+    }
+
     pub(super) fn record(&self, duration: Duration) {
         let nanoseconds = duration.as_nanos().min(u64::MAX as u128) as u64;
         self.samples.fetch_add(1, Ordering::Relaxed);
@@ -67,5 +71,16 @@ mod tests {
         assert_eq!(snapshot["total_ns"], 8_000);
         assert_eq!(snapshot["average_us"], 4.0);
         assert_eq!(snapshot["max_us"], 6.0);
+    }
+
+    #[test]
+    fn disabled_duration_metrics_do_not_read_or_record_a_sample() {
+        let metrics = AtomicDurationMetrics::default();
+
+        assert!(metrics.start_if(false).is_none());
+        assert_eq!(metrics.snapshot()["samples"], 0);
+
+        drop(metrics.start_if(true));
+        assert_eq!(metrics.snapshot()["samples"], 1);
     }
 }

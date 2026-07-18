@@ -199,6 +199,9 @@ struct VNextExecutorMetrics {
 struct VNextWaveTimingMetrics {
     resource_prepare_attempt: AtomicDurationMetrics,
     host_encode_submit: AtomicDurationMetrics,
+    token_upload_prepare: AtomicDurationMetrics,
+    wave_identity_bind: AtomicDurationMetrics,
+    provider_encode_submit: AtomicDurationMetrics,
     completion_round_trip: AtomicDurationMetrics,
     host_postprocess: AtomicDurationMetrics,
     submitted_wave_total: AtomicDurationMetrics,
@@ -211,11 +214,19 @@ impl VNextWaveTimingMetrics {
             "scope": "executor_host_wall_boundaries",
             "resource_prepare_attempt": self.resource_prepare_attempt.snapshot(),
             "host_encode_submit": self.host_encode_submit.snapshot(),
+            "host_encode_submit_breakdown": {
+                "collection": "profile_attached_only",
+                "token_upload_prepare": self.token_upload_prepare.snapshot(),
+                "wave_identity_bind": self.wave_identity_bind.snapshot(),
+                "provider_encode_submit": self.provider_encode_submit.snapshot(),
+            },
             "completion_round_trip": self.completion_round_trip.snapshot(),
             "host_postprocess": self.host_postprocess.snapshot(),
             "submitted_wave_total": self.submitted_wave_total.snapshot(),
             "limitations": [
                 "resource_prepare_attempt includes capacity-deferred attempts and is outside submitted_wave_total",
+                "host_encode_submit breakdown is collected only while a typed profile sink is attached",
+                "provider_encode_submit includes completion reservation, provider command encoding, and lane submission",
                 "completion_round_trip includes async queue wait, device fence wait, and readback",
                 "these host intervals are not kernel or device-busy time"
             ],
@@ -1765,6 +1776,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
+    fn host_dispatch_timing_enabled(&self) -> bool {
+        self.device_timing_mode() != DeviceTimingMode::Off
+    }
+
     fn resolve_io(
         executable: &impl ExecutablePlanView,
         input_id: &ProgramValueId,
@@ -2508,53 +2523,67 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .iter()
                 .map(|participant| participant.sequence.active_binding.as_ref())
         };
-        let uploads = match participants
-            .iter()
-            .enumerate()
-            .map(|(participant_index, participant)| {
-                let range = participant.span.immediate_token_range();
-                let host_range = Range {
-                    start: usize::try_from(range.start).map_err(|_| {
-                        FerrumError::backend("vNext token upload start exceeds host address space")
-                    })?,
-                    end: usize::try_from(range.end).map_err(|_| {
-                        FerrumError::backend("vNext token upload end exceeds host address space")
-                    })?,
-                };
-                let host_tokens = participant.tokens.get(host_range.clone()).ok_or_else(|| {
-                    FerrumError::backend(format!(
-                        "vNext token upload range {host_range:?} exceeds host token length {}",
-                        participant.tokens.len()
-                    ))
-                })?;
-                let host_bytes = host_tokens
-                    .iter()
-                    .flat_map(|token| token.to_le_bytes())
-                    .collect::<Vec<_>>();
-                let logical_offset_bytes = range
-                    .start
-                    .checked_mul(ElementType::U32.size_bytes())
-                    .ok_or_else(|| {
-                    FerrumError::backend("vNext token upload offset overflows u64")
-                })?;
-                let source_layout =
-                    HostTransferLayout::new(ElementType::U32, participant.span.immediate_tokens())
-                        .map_err(|error| FerrumError::backend(error.to_string()))?;
-                let participant_index = u32::try_from(participant_index).map_err(|_| {
-                    FerrumError::backend("vNext token upload participant index exceeds u32")
-                })?;
-                SubmissionWaveInputUpload::new(
-                    self.io.input_node_id.clone(),
-                    participant_index,
-                    self.io.input_ordinal,
-                    logical_offset_bytes,
-                    source_layout,
-                    host_bytes,
-                )
-                .map_err(|error| FerrumError::backend(error.to_string()))
-            })
-            .collect::<Result<Vec<_>>>()
-        {
+        let timing_enabled = self.host_dispatch_timing_enabled();
+        let uploads = match {
+            let _timing = self
+                .metrics
+                .wave_timing
+                .token_upload_prepare
+                .start_if(timing_enabled);
+            participants
+                .iter()
+                .enumerate()
+                .map(|(participant_index, participant)| {
+                    let range = participant.span.immediate_token_range();
+                    let host_range = Range {
+                        start: usize::try_from(range.start).map_err(|_| {
+                            FerrumError::backend(
+                                "vNext token upload start exceeds host address space",
+                            )
+                        })?,
+                        end: usize::try_from(range.end).map_err(|_| {
+                            FerrumError::backend(
+                                "vNext token upload end exceeds host address space",
+                            )
+                        })?,
+                    };
+                    let host_tokens =
+                        participant.tokens.get(host_range.clone()).ok_or_else(|| {
+                            FerrumError::backend(format!(
+                                "vNext token upload range {host_range:?} exceeds host token length {}",
+                                participant.tokens.len()
+                            ))
+                        })?;
+                    let host_bytes = host_tokens
+                        .iter()
+                        .flat_map(|token| token.to_le_bytes())
+                        .collect::<Vec<_>>();
+                    let logical_offset_bytes = range
+                        .start
+                        .checked_mul(ElementType::U32.size_bytes())
+                        .ok_or_else(|| {
+                            FerrumError::backend("vNext token upload offset overflows u64")
+                        })?;
+                    let source_layout = HostTransferLayout::new(
+                        ElementType::U32,
+                        participant.span.immediate_tokens(),
+                    )
+                    .map_err(|error| FerrumError::backend(error.to_string()))?;
+                    let participant_index = u32::try_from(participant_index).map_err(|_| {
+                        FerrumError::backend("vNext token upload participant index exceeds u32")
+                    })?;
+                    SubmissionWaveInputUpload::new(
+                        self.io.input_node_id.clone(),
+                        participant_index,
+                        self.io.input_ordinal,
+                        logical_offset_bytes,
+                        source_layout,
+                        host_bytes,
+                    )
+                    .map_err(|error| FerrumError::backend(error.to_string()))
+                })
+                .collect::<Result<Vec<_>>>()
+        } {
             Ok(uploads) => uploads,
             Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
         };
@@ -2568,26 +2597,41 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let mut wave = wave;
         let mut retries = 0;
         loop {
-            let identity = match OperationDispatch::bind_submission_wave_identity(
-                &self.resolved_plan,
-                active_bindings(),
-                &wave,
-                &self.lane,
-            ) {
+            let identity = match {
+                let _timing = self
+                    .metrics
+                    .wave_timing
+                    .wave_identity_bind
+                    .start_if(timing_enabled);
+                OperationDispatch::bind_submission_wave_identity(
+                    &self.resolved_plan,
+                    active_bindings(),
+                    &wave,
+                    &self.lane,
+                )
+            } {
                 Ok(identity) => identity,
                 Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
             };
-            match OperationDispatch::encode_and_submit_wave_with_inputs(
-                self.providers.providers(),
-                &self.resolved_plan,
-                &identity,
-                active_bindings(),
-                self.device_timing_mode(),
-                &uploads,
-                wave,
-                &self.lane,
-                &self.reaper,
-            ) {
+            let submission = {
+                let _timing = self
+                    .metrics
+                    .wave_timing
+                    .provider_encode_submit
+                    .start_if(timing_enabled);
+                OperationDispatch::encode_and_submit_wave_with_inputs(
+                    self.providers.providers(),
+                    &self.resolved_plan,
+                    &identity,
+                    active_bindings(),
+                    self.device_timing_mode(),
+                    &uploads,
+                    wave,
+                    &self.lane,
+                    &self.reaper,
+                )
+            };
+            match submission {
                 Ok(completion) => {
                     self.metrics.submitted_waves.fetch_add(1, Ordering::Relaxed);
                     return DispatchOutcome::Submitted(completion);
@@ -4030,6 +4074,14 @@ mod tests {
         assert_eq!(snapshot["clock"], "host_monotonic");
         assert_eq!(snapshot["resource_prepare_attempt"]["samples"], 0);
         assert_eq!(snapshot["submitted_wave_total"]["samples"], 0);
+        assert_eq!(
+            snapshot["host_encode_submit_breakdown"]["collection"],
+            "profile_attached_only"
+        );
+        assert_eq!(
+            snapshot["host_encode_submit_breakdown"]["wave_identity_bind"]["samples"],
+            0
+        );
         assert!(snapshot["limitations"]
             .as_array()
             .unwrap()
