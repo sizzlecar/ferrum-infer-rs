@@ -165,7 +165,7 @@ impl CudaExecutableSegment {
         last_used: u64,
     ) -> Result<Self, CudaReplayError> {
         let capture_status = unsafe {
-            sys::cuStreamBeginCapture(
+            sys::cuStreamBeginCapture_v2(
                 stream.cu_stream(),
                 sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
             )
