@@ -388,7 +388,11 @@ not connect it to a product entrypoint.
   transitions from pre-plan to a plan-bound state using
   `TrustedExecutionTopology::from_plan`. Every execution frame starts at one and advances
   contiguously; each frame executes every trusted plan node exactly once, node invocation
-  ids are globally monotonic, and dependencies must complete in the same frame. Repeating
+  ids are globally monotonic, and dependencies must complete in the same frame. A pristine
+  Step that proves `RollbackUnsubmitted` restores each participant's unexecuted frame; its
+  retry uses a fresh `BatchStepId`/physical attempt id but the same participant-local
+  `ExecutionFrameId`. Abort, arbitrary Drop, prepared/in-flight work, or an indeterminate
+  submission cannot rewind a frame. Repeating
   a plan node in later decode frames is valid; repeating an invocation is not. Node and
   operation events require a live typed sequence session, whose active fingerprint cannot
   be substituted with a resource-journal hash. Active operation invocation and failure
@@ -408,7 +412,9 @@ not connect it to a product entrypoint.
   installs the durable fence and only then publishes the external Submitted receipt.
   `DefinitelyNotSubmitted` is the only
   transition that mints a sealed retry authority; retry requires the exact topology and work-shape
-  fingerprints and a fresh attempt id. Provider failure, arbitrary Drop, a changed shape or a
+  fingerprints and a fresh attempt id. A whole pristine Step rollback follows the same distinction:
+  it changes the physical attempt identity without creating a gap in the request journal's frame
+  identity. Provider failure, arbitrary Drop, a changed shape or a
   possibly-submitted error cannot relabel a key as retryable. Request journals contain only
   participant projections linked to that shared submission/completion fingerprint. They cannot
   construct, duplicate or count a physical command/fence. Replay requires closure over every
