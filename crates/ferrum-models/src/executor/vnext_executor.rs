@@ -270,7 +270,7 @@ enum JournaledSubmission {
 struct VNextExecutionJournal {
     emitter: ExecutionEventEmitter<'static>,
     topology: TrustedExecutionTopology,
-    active: TrustedActiveSequenceBinding,
+    active: Arc<TrustedActiveSequenceBinding>,
     capture_policy: ExecutionEventCapturePolicy,
     completed_frames: u64,
     started: Instant,
@@ -287,7 +287,7 @@ impl VNextExecutionJournal {
     fn open(
         sink: Arc<dyn ExecutionEventSink>,
         plan: &ExecutionPlan,
-        active: TrustedActiveSequenceBinding,
+        active: Arc<TrustedActiveSequenceBinding>,
     ) -> std::result::Result<Self, ExecutionEventSinkError> {
         let topology = TrustedExecutionTopology::from_plan(plan).map_err(Self::error)?;
         let root_span =
@@ -736,6 +736,7 @@ struct VNextSequence<R: DeviceRuntime> {
     cache_id: String,
     request_id: RequestId,
     session: Arc<SequenceSession<R>>,
+    active_binding: Arc<TrustedActiveSequenceBinding>,
     tokens: Mutex<Vec<u32>>,
     maximum_tokens: usize,
     active: AtomicBool,
@@ -1883,7 +1884,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 return Ok(VNextPrefillProbeResolution::PermanentRejected(rejected));
             }
         };
-        let events = match self.execution_journal(&session) {
+        let active_binding = match TrustedActiveSequenceBinding::from_session(&session) {
+            Ok(active_binding) => Arc::new(active_binding),
+            Err(error) => {
+                let _ = session.request_cancel();
+                let _ = session.try_abort();
+                return Err(FerrumError::backend(error.to_string()));
+            }
+        };
+        let events = match self.execution_journal(&active_binding) {
             Ok(events) => events,
             Err(error) => {
                 let _ = session.request_cancel();
@@ -1905,6 +1914,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             cache_id: format!("vnext-cache-{request_id}"),
             request_id: request_id.clone(),
             session,
+            active_binding,
             tokens: Mutex::new(tokens),
             maximum_tokens,
             active: AtomicBool::new(true),
@@ -1991,16 +2001,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
     fn execution_journal(
         &self,
-        session: &Arc<SequenceSession<R>>,
+        active: &Arc<TrustedActiveSequenceBinding>,
     ) -> Result<Option<VNextExecutionJournal>> {
         let Some(sink) = self.event_sink.read().clone() else {
             return Ok(None);
         };
-        let active = TrustedActiveSequenceBinding::from_session(session)
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
-        VNextExecutionJournal::open(sink, self.resolved_plan.execution_plan(), active)
-            .map(Some)
-            .map_err(|error| FerrumError::backend(format!("vNext execution journal: {error}")))
+        VNextExecutionJournal::open(
+            sink,
+            self.resolved_plan.execution_plan(),
+            Arc::clone(active),
+        )
+        .map(Some)
+        .map_err(|error| FerrumError::backend(format!("vNext execution journal: {error}")))
     }
 
     fn execution_maintenance_decision(
@@ -2401,21 +2413,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "vNext submission wave requires at least one participant".to_owned(),
             );
         }
-        let active = match participants
-            .iter()
-            .map(|participant| {
-                TrustedActiveSequenceBinding::from_session(&participant.sequence.session)
-            })
-            .collect::<std::result::Result<Vec<_>, VNextError>>()
-        {
-            Ok(active) => active,
-            Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
+        let active_bindings = || {
+            participants
+                .iter()
+                .map(|participant| participant.sequence.active_binding.as_ref())
         };
-        let active_bindings = wave
-            .nodes()
-            .iter()
-            .map(|_| active.clone())
-            .collect::<Vec<_>>();
         let uploads = match participants
             .iter()
             .enumerate()
@@ -2478,7 +2480,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         loop {
             let identity = match OperationDispatch::bind_submission_wave_identity(
                 &self.resolved_plan,
-                &active_bindings,
+                active_bindings(),
                 &wave,
                 &self.lane,
             ) {
@@ -2489,7 +2491,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 self.providers.providers(),
                 &self.resolved_plan,
                 &identity,
-                &active_bindings,
+                active_bindings(),
                 &uploads,
                 wave,
                 &self.lane,
