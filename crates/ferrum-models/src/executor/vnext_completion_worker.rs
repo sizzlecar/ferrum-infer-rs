@@ -3,12 +3,53 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use tokio::sync::{mpsc, oneshot};
+
+use super::vnext_timing::AtomicDurationMetrics;
 
 const COMPLETION_WORKER_QUEUE_CAPACITY: usize = 1;
 
 type VNextCompletionTask = Box<dyn FnOnce() + Send + 'static>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VNextCompletionTaskKind {
+    WaveReadback,
+    PostSubmitDrain,
+    IndeterminateRecovery,
+}
+
+impl VNextCompletionTaskKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::WaveReadback => "wave_readback",
+            Self::PostSubmitDrain => "post_submit_drain",
+            Self::IndeterminateRecovery => "indeterminate_recovery",
+        }
+    }
+}
+
+#[derive(Default)]
+struct VNextCompletionTaskClassMetrics {
+    scheduled_tasks: AtomicU64,
+    completed_tasks: AtomicU64,
+    reservation_wait: AtomicDurationMetrics,
+    queued_wait: AtomicDurationMetrics,
+    task_run: AtomicDurationMetrics,
+}
+
+impl VNextCompletionTaskClassMetrics {
+    fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "scheduled_tasks": self.scheduled_tasks.load(Ordering::Relaxed),
+            "completed_tasks": self.completed_tasks.load(Ordering::Relaxed),
+            "reservation_wait": self.reservation_wait.snapshot(),
+            "queued_wait": self.queued_wait.snapshot(),
+            "task_run": self.task_run.snapshot(),
+        })
+    }
+}
 
 #[derive(Default)]
 struct VNextCompletionWorkerCounters {
@@ -16,6 +57,19 @@ struct VNextCompletionWorkerCounters {
     completed_tasks: AtomicU64,
     panicked_tasks: AtomicU64,
     pending_tasks: AtomicUsize,
+    wave_readback: VNextCompletionTaskClassMetrics,
+    post_submit_drain: VNextCompletionTaskClassMetrics,
+    indeterminate_recovery: VNextCompletionTaskClassMetrics,
+}
+
+impl VNextCompletionWorkerCounters {
+    fn task_class(&self, kind: VNextCompletionTaskKind) -> &VNextCompletionTaskClassMetrics {
+        match kind {
+            VNextCompletionTaskKind::WaveReadback => &self.wave_readback,
+            VNextCompletionTaskKind::PostSubmitDrain => &self.post_submit_drain,
+            VNextCompletionTaskKind::IndeterminateRecovery => &self.indeterminate_recovery,
+        }
+    }
 }
 
 struct VNextCompletionTaskGuard {
@@ -93,7 +147,11 @@ impl VNextCompletionWorker {
         })
     }
 
-    pub(super) async fn execute<T, F>(&self, task: F) -> Result<T, VNextCompletionWorkerError>
+    pub(super) async fn execute<T, F>(
+        &self,
+        kind: VNextCompletionTaskKind,
+        task: F,
+    ) -> Result<T, VNextCompletionWorkerError>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
@@ -102,10 +160,14 @@ impl VNextCompletionWorker {
             .sender
             .as_ref()
             .ok_or(VNextCompletionWorkerError::QueueClosed)?;
+        let reservation_started = Instant::now();
         let permit = sender
             .reserve()
             .await
             .map_err(|_| VNextCompletionWorkerError::QueueClosed)?;
+        let class = self.counters.task_class(kind);
+        class.reservation_wait.record(reservation_started.elapsed());
+        class.scheduled_tasks.fetch_add(1, Ordering::Relaxed);
         self.counters
             .scheduled_tasks
             .fetch_add(1, Ordering::Relaxed);
@@ -115,11 +177,17 @@ impl VNextCompletionWorker {
         };
         let counters = Arc::clone(&self.counters);
         let (result_sender, result_receiver) = oneshot::channel();
+        let queued_at = Instant::now();
         let job = Box::new(move || {
+            let class = counters.task_class(kind);
+            class.queued_wait.record(queued_at.elapsed());
+            let task_started = Instant::now();
             let result = catch_unwind(AssertUnwindSafe(task)).map_err(|_| {
                 counters.panicked_tasks.fetch_add(1, Ordering::Relaxed);
                 VNextCompletionWorkerError::TaskPanicked
             });
+            class.task_run.record(task_started.elapsed());
+            class.completed_tasks.fetch_add(1, Ordering::Relaxed);
             counters.completed_tasks.fetch_add(1, Ordering::Relaxed);
             drop(guard);
             let _ = result_sender.send(result);
@@ -142,6 +210,11 @@ impl VNextCompletionWorker {
             "scheduled_tasks": self.counters.scheduled_tasks.load(Ordering::Relaxed),
             "completed_tasks": self.counters.completed_tasks.load(Ordering::Relaxed),
             "panicked_tasks": self.counters.panicked_tasks.load(Ordering::Relaxed),
+            "task_classes": {
+                VNextCompletionTaskKind::WaveReadback.as_str(): self.counters.wave_readback.snapshot(),
+                VNextCompletionTaskKind::PostSubmitDrain.as_str(): self.counters.post_submit_drain.snapshot(),
+                VNextCompletionTaskKind::IndeterminateRecovery.as_str(): self.counters.indeterminate_recovery.snapshot(),
+            },
         })
     }
 }
@@ -166,7 +239,7 @@ impl Drop for VNextCompletionWorker {
 
 #[cfg(test)]
 mod tests {
-    use super::VNextCompletionWorker;
+    use super::{VNextCompletionTaskKind, VNextCompletionWorker};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -179,7 +252,7 @@ mod tests {
         let cancelled_worker = Arc::clone(&worker);
         let cancelled = tokio::spawn(async move {
             cancelled_worker
-                .execute(move || {
+                .execute(VNextCompletionTaskKind::WaveReadback, move || {
                     let _ = started_sender.send(());
                     release_receiver.recv().unwrap();
                     7_u64
@@ -190,7 +263,12 @@ mod tests {
         cancelled.abort();
 
         let queued_worker = Arc::clone(&worker);
-        let queued = tokio::spawn(async move { queued_worker.execute(|| 8_u64).await.unwrap() });
+        let queued = tokio::spawn(async move {
+            queued_worker
+                .execute(VNextCompletionTaskKind::PostSubmitDrain, || 8_u64)
+                .await
+                .unwrap()
+        });
         tokio::time::timeout(Duration::from_secs(1), async {
             while worker.pending_tasks() != 2 {
                 tokio::task::yield_now().await;
@@ -203,7 +281,9 @@ mod tests {
         let (blocked_started_sender, blocked_started_receiver) = tokio::sync::oneshot::channel();
         let blocked = tokio::spawn(async move {
             let _ = blocked_started_sender.send(());
-            blocked_worker.execute(|| 9_u64).await
+            blocked_worker
+                .execute(VNextCompletionTaskKind::IndeterminateRecovery, || 9_u64)
+                .await
         });
         blocked_started_receiver.await.unwrap();
         tokio::task::yield_now().await;
@@ -230,7 +310,7 @@ mod tests {
             let maximum_active = Arc::clone(&maximum_active);
             tasks.push(tokio::spawn(async move {
                 worker
-                    .execute(move || {
+                    .execute(VNextCompletionTaskKind::WaveReadback, move || {
                         let now = active.fetch_add(1, Ordering::AcqRel) + 1;
                         maximum_active.fetch_max(now, Ordering::AcqRel);
                         std::thread::sleep(Duration::from_millis(2));
@@ -249,7 +329,9 @@ mod tests {
         assert!(names.iter().all(|name| name == &names[0]));
 
         let worker_name = worker
-            .execute(|| std::thread::current().name().unwrap().to_owned())
+            .execute(VNextCompletionTaskKind::IndeterminateRecovery, || {
+                std::thread::current().name().unwrap().to_owned()
+            })
             .await
             .unwrap();
         assert_eq!(worker_name, names[0]);
@@ -261,5 +343,33 @@ mod tests {
         assert_eq!(metrics["scheduled_tasks"], 35);
         assert_eq!(metrics["completed_tasks"], 35);
         assert_eq!(metrics["panicked_tasks"], 0);
+        assert_eq!(
+            metrics["task_classes"]["wave_readback"]["scheduled_tasks"],
+            33
+        );
+        assert_eq!(
+            metrics["task_classes"]["wave_readback"]["completed_tasks"],
+            33
+        );
+        assert_eq!(
+            metrics["task_classes"]["post_submit_drain"]["scheduled_tasks"],
+            1
+        );
+        assert_eq!(
+            metrics["task_classes"]["post_submit_drain"]["completed_tasks"],
+            1
+        );
+        assert_eq!(
+            metrics["task_classes"]["indeterminate_recovery"]["scheduled_tasks"],
+            1
+        );
+        assert_eq!(
+            metrics["task_classes"]["indeterminate_recovery"]["completed_tasks"],
+            1
+        );
+        assert_eq!(
+            metrics["task_classes"]["wave_readback"]["task_run"]["samples"],
+            33
+        );
     }
 }

@@ -14,6 +14,7 @@ pub mod stub_executor;
 pub mod tts_executor;
 mod vnext_completion_worker;
 pub mod vnext_executor;
+mod vnext_timing;
 pub mod whisper_executor;
 
 pub use bert_executor::BertModelExecutor;

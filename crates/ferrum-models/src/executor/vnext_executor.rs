@@ -36,7 +36,11 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::vnext::PreparedProductionModel;
 
-use super::{common, vnext_completion_worker::VNextCompletionWorker};
+use super::{
+    common,
+    vnext_completion_worker::{VNextCompletionTaskKind, VNextCompletionWorker},
+    vnext_timing::AtomicDurationMetrics,
+};
 
 const POLICY_ID: &str = "policy.ferrum.product.vnext.default";
 const POLICY_VERSION: ContractVersion = ContractVersion::new(1, 0);
@@ -186,7 +190,36 @@ struct VNextExecutorMetrics {
     readback_bytes: AtomicU64,
     total_prefill_us: AtomicU64,
     total_decode_us: AtomicU64,
+    wave_timing: VNextWaveTimingMetrics,
     last_failure: Mutex<Option<String>>,
+}
+
+#[derive(Default)]
+struct VNextWaveTimingMetrics {
+    resource_prepare_attempt: AtomicDurationMetrics,
+    host_encode_submit: AtomicDurationMetrics,
+    completion_round_trip: AtomicDurationMetrics,
+    host_postprocess: AtomicDurationMetrics,
+    submitted_wave_total: AtomicDurationMetrics,
+}
+
+impl VNextWaveTimingMetrics {
+    fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "clock": "host_monotonic",
+            "scope": "executor_host_wall_boundaries",
+            "resource_prepare_attempt": self.resource_prepare_attempt.snapshot(),
+            "host_encode_submit": self.host_encode_submit.snapshot(),
+            "completion_round_trip": self.completion_round_trip.snapshot(),
+            "host_postprocess": self.host_postprocess.snapshot(),
+            "submitted_wave_total": self.submitted_wave_total.snapshot(),
+            "limitations": [
+                "resource_prepare_attempt includes capacity-deferred attempts and is outside submitted_wave_total",
+                "completion_round_trip includes async queue wait, device fence wait, and readback",
+                "these host intervals are not kernel or device-busy time"
+            ],
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2544,14 +2577,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         tokens: &[u32],
         span: TokenSpanWork,
     ) -> Result<Vec<f32>> {
-        let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&sequence.session)])
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
-        let step = self.begin_step(&batch, &span)?;
-        let wave = match self.prepare_wave(&step, &span) {
-            Ok(wave) => wave,
-            Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
+        let prepared = {
+            let _timing = self.metrics.wave_timing.resource_prepare_attempt.start();
+            let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&sequence.session)])
+                .map_err(|error| FerrumError::backend(error.to_string()))?;
+            let step = self.begin_step(&batch, &span)?;
+            let wave = match self.prepare_wave(&step, &span) {
+                Ok(wave) => wave,
+                Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
+            };
+            PreparedVNextPrefill { step, wave }
         };
-        self.execute_prepared_step(sequence, tokens, span, PreparedVNextPrefill { step, wave })
+        self.execute_prepared_step(sequence, tokens, span, prepared)
             .await
     }
 
@@ -2576,23 +2613,27 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "vNext decode batch differs from its canonical participant set",
             ));
         }
-        let step = match self.begin_step_for_spans_with_capacity(batch, spans)? {
-            VNextExecutionCapacityDecision::Ready(step) => step,
-            VNextExecutionCapacityDecision::Deferred(deferred) => {
-                return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
-            }
-        };
-        let wave = match self.prepare_wave_for_spans_with_capacity(&step, spans)? {
-            VNextExecutionCapacityDecision::Ready(wave) => wave,
-            VNextExecutionCapacityDecision::Deferred(deferred) => {
-                step.try_rollback_unsubmitted().map_err(|failure| {
-                    FerrumError::backend(format!(
-                        "vNext capacity-deferred unsubmitted step rollback failed: {}",
-                        failure.error()
-                    ))
-                })?;
-                return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
-            }
+        let prepared = {
+            let _timing = self.metrics.wave_timing.resource_prepare_attempt.start();
+            let step = match self.begin_step_for_spans_with_capacity(batch, spans)? {
+                VNextExecutionCapacityDecision::Ready(step) => step,
+                VNextExecutionCapacityDecision::Deferred(deferred) => {
+                    return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
+                }
+            };
+            let wave = match self.prepare_wave_for_spans_with_capacity(&step, spans)? {
+                VNextExecutionCapacityDecision::Ready(wave) => wave,
+                VNextExecutionCapacityDecision::Deferred(deferred) => {
+                    step.try_rollback_unsubmitted().map_err(|failure| {
+                        FerrumError::backend(format!(
+                            "vNext capacity-deferred unsubmitted step rollback failed: {}",
+                            failure.error()
+                        ))
+                    })?;
+                    return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
+                }
+            };
+            PreparedVNextPrefill { step, wave }
         };
         let participants = sequences
             .iter()
@@ -2604,7 +2645,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 span,
             })
             .collect::<Vec<_>>();
-        self.execute_prepared_participants(&participants, PreparedVNextPrefill { step, wave })
+        self.execute_prepared_participants(&participants, prepared)
             .await
             .map(VNextExecutionCapacityDecision::Ready)
     }
@@ -2634,8 +2675,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         participants: &[VNextExecutionParticipant<'_, R>],
         prepared: PreparedVNextPrefill<R>,
     ) -> Result<Vec<Vec<f32>>> {
+        let _execution_timing = self.metrics.wave_timing.submitted_wave_total.start();
         let PreparedVNextPrefill { step, wave } = prepared;
-        let dispatch = self.dispatch_participant_wave(participants, wave);
+        let dispatch = {
+            let _timing = self.metrics.wave_timing.host_encode_submit.start();
+            self.dispatch_participant_wave(participants, wave)
+        };
         let completion = match dispatch {
             DispatchOutcome::Submitted(completion) => completion,
             DispatchOutcome::QuiescentFailure(message) => {
@@ -2645,7 +2690,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 let reaper = Arc::clone(&self.reaper);
                 let recovered = self
                     .completion_worker
-                    .execute(move || {
+                    .execute(VNextCompletionTaskKind::IndeterminateRecovery, move || {
                         let recovered = recovery.recover_by_draining_lane();
                         drop(reaper);
                         recovered
@@ -2670,7 +2715,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 let reaper = Arc::clone(&self.reaper);
                 let observed = self
                     .completion_worker
-                    .execute(move || {
+                    .execute(VNextCompletionTaskKind::PostSubmitDrain, move || {
                         let observed = completion.wait();
                         drop(reaper);
                         observed
@@ -2727,18 +2772,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let readbacks = CompletionReadbackBatchRequest::new(readbacks)
             .map_err(|error| FerrumError::backend(error.to_string()))?;
         let reaper = Arc::clone(&self.reaper);
-        let observation = self
-            .completion_worker
-            .execute(move || {
-                let observation = completion.wait_with_readbacks(readbacks);
-                drop(reaper);
-                observation
-            })
-            .await
-            .map_err(|error| {
-                FerrumError::backend(format!("vNext completion task failed: {error}"))
-            })?
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
+        let observation = {
+            let _timing = self.metrics.wave_timing.completion_round_trip.start();
+            self.completion_worker
+                .execute(VNextCompletionTaskKind::WaveReadback, move || {
+                    let observation = completion.wait_with_readbacks(readbacks);
+                    drop(reaper);
+                    observation
+                })
+                .await
+                .map_err(|error| {
+                    FerrumError::backend(format!("vNext completion task failed: {error}"))
+                })?
+                .map_err(|error| FerrumError::backend(error.to_string()))?
+        };
+        let _postprocess_timing = self.metrics.wave_timing.host_postprocess.start();
         let receipt = match observation {
             CompletionReadbackBatchObservation::Terminal(receipt) => receipt,
             other => {
@@ -3346,6 +3394,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "uploaded_bytes": self.metrics.uploaded_bytes.load(Ordering::Relaxed),
                 "readback_bytes": self.metrics.readback_bytes.load(Ordering::Relaxed),
             },
+            "wave_timing": self.metrics.wave_timing.snapshot(),
             "completion_worker": self.completion_worker.metrics_snapshot(),
             "dynamic_pools": pool_status,
             "deferred_cleanup": cleanup,
@@ -3873,8 +3922,22 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 mod tests {
     use super::{
         reported_allocated_bytes, resolved_sequence_fit_policy, AdmissionFitPolicy,
-        DecodeFailureDisposition, FerrumError, SequenceFitPolicy,
+        DecodeFailureDisposition, FerrumError, SequenceFitPolicy, VNextWaveTimingMetrics,
     };
+
+    #[test]
+    fn wave_timing_snapshot_exposes_honest_host_boundaries() {
+        let snapshot = VNextWaveTimingMetrics::default().snapshot();
+
+        assert_eq!(snapshot["clock"], "host_monotonic");
+        assert_eq!(snapshot["resource_prepare_attempt"]["samples"], 0);
+        assert_eq!(snapshot["submitted_wave_total"]["samples"], 0);
+        assert!(snapshot["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.as_str().unwrap().contains("not kernel")));
+    }
 
     #[test]
     fn product_sequence_fit_policy_maps_exhaustively_to_runtime_contract() {
