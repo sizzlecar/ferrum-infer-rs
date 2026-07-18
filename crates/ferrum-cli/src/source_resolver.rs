@@ -29,8 +29,8 @@ use std::path::{Path, PathBuf};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
 use ferrum_server::chat_template::ModelChatTemplate;
 use ferrum_types::{
-    FerrumError, ModelSource, Result, RuntimeConfigEntry, RuntimeConfigSnapshot,
-    RuntimeConfigSource,
+    EngineConfig, FerrumError, ModelId, ModelSource, Result, RuntimeConfigEntry,
+    RuntimeConfigSnapshot, RuntimeConfigSource,
 };
 
 use crate::config::CliConfig;
@@ -853,14 +853,40 @@ pub enum DownloadPolicy {
 /// Resolution outcome — a fully-resolved local source plus a flag the
 /// caller can use to decide whether to apply GPU autosize.
 pub struct Resolved {
-    pub source: ResolvedModelSource,
+    source: ResolvedModelSource,
     /// Typed source identity retained past local cache resolution. Product
     /// composition uses this instead of reverse-engineering a repository from
     /// an opaque snapshot path.
-    pub original_source: ModelSource,
+    original_source: ModelSource,
     /// `true` when the resolver also ran the GPU-memory autosizer for
     /// this snapshot. Caller can skip a redundant call.
+    autosized: bool,
+}
+
+/// Atomic handoff from source resolution into a product engine composition.
+/// Keeping the original source inside the base config prevents entrypoints or
+/// architecture arms from retaining only the resolved cache path.
+pub struct ProductEngineInput {
+    pub source: ResolvedModelSource,
+    pub engine_config: EngineConfig,
     pub autosized: bool,
+}
+
+impl Resolved {
+    pub fn local_path(&self) -> &Path {
+        &self.source.local_path
+    }
+
+    pub fn into_product_engine_input(self) -> ProductEngineInput {
+        let mut engine_config = EngineConfig::default();
+        engine_config.model.model_id = ModelId::new(public_model_id(&self.source));
+        engine_config.model.source = Some(self.original_source);
+        ProductEngineInput {
+            source: self.source,
+            engine_config,
+            autosized: self.autosized,
+        }
+    }
 }
 
 /// One-stop model resolution. Caller passes the user's model arg
@@ -1138,16 +1164,18 @@ mod tests {
         )
         .await
         .unwrap();
+        let product = resolved.into_product_engine_input();
 
-        assert_eq!(resolved.source.local_path, dir);
-        assert_eq!(resolved.source.format, ModelFormat::SafeTensors);
-        assert!(!resolved.source.from_cache);
+        assert_eq!(product.source.local_path, dir);
+        assert_eq!(product.source.format, ModelFormat::SafeTensors);
+        assert!(!product.source.from_cache);
+        assert!(!product.autosized);
         assert!(matches!(
-            &resolved.original_source,
+            product.engine_config.model.source.as_ref().unwrap(),
             ModelSource::Local(path) if path == dir.to_str().unwrap()
         ));
         assert_eq!(
-            public_model_id(&resolved.source),
+            product.engine_config.model.model_id.as_str(),
             dir.file_name().unwrap().to_string_lossy()
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -1167,15 +1195,16 @@ mod tests {
         )
         .await
         .unwrap();
+        let product = resolved.into_product_engine_input();
 
-        assert_eq!(resolved.source.local_path, gguf);
-        assert_eq!(resolved.source.format, ModelFormat::GGUF);
+        assert_eq!(product.source.local_path, gguf);
+        assert_eq!(product.source.format, ModelFormat::GGUF);
         assert!(matches!(
-            &resolved.original_source,
+            product.engine_config.model.source.as_ref().unwrap(),
             ModelSource::Local(path) if path == gguf.to_str().unwrap()
         ));
         assert_eq!(
-            public_model_id(&resolved.source),
+            product.engine_config.model.model_id.as_str(),
             "Qwen3.5-4B-Instruct-Q4_K_M"
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -1200,17 +1229,18 @@ mod tests {
             resolve_model_source("qwen3:4b-q4_k_m", &cache, DownloadPolicy::NoDownload, None)
                 .await
                 .unwrap();
+        let product = resolved.into_product_engine_input();
 
-        assert_eq!(resolved.source.local_path, gguf);
-        assert_eq!(resolved.source.format, ModelFormat::GGUF);
-        assert!(resolved.source.from_cache);
+        assert_eq!(product.source.local_path, gguf);
+        assert_eq!(product.source.format, ModelFormat::GGUF);
+        assert!(product.source.from_cache);
         assert!(matches!(
-            &resolved.original_source,
+            product.engine_config.model.source.as_ref().unwrap(),
             ModelSource::HuggingFace { repo_id, revision: None, cache_dir: Some(root) }
                 if repo_id == &repo && root == &cache.display().to_string()
         ));
         assert_eq!(
-            public_model_id(&resolved.source),
+            product.engine_config.model.model_id.as_str(),
             Path::new(&filename).file_stem().unwrap().to_string_lossy()
         );
         let _ = std::fs::remove_dir_all(cache);

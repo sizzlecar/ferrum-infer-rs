@@ -135,8 +135,9 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
         None,
     )
     .await?;
-    let original_source = resolved.original_source;
-    let source = resolved.source;
+    let product_input = resolved.into_product_engine_input();
+    let source = product_input.source;
+    let mut engine_config = product_input.engine_config;
     let model_id = crate::source_resolver::public_model_id(&source);
     eprintln!("{}", format!("Ferrum Benchmark - {}", model_id).bold());
     eprintln!("{}", "=".repeat(60).dimmed());
@@ -173,9 +174,6 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
         }
     }
 
-    let mut engine_config = ferrum_types::EngineConfig::default();
-    engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
-    engine_config.model.source = Some(original_source);
     engine_config.sampling.default_params = bench_sampling_params(cmd.max_tokens);
     engine_config.backend.device = device;
     engine_config.backend.backend_options.insert(

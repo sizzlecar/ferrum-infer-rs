@@ -418,8 +418,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         None,
     )
     .await?;
-    let original_source = resolved.original_source;
-    let source = resolved.source;
+    let product_input = resolved.into_product_engine_input();
+    let source = product_input.source;
+    let product_engine_config = product_input.engine_config;
     let model_id = crate::source_resolver::public_model_id(&source);
     let gguf_path = (source.format == ModelFormat::GGUF).then(|| source.local_path.clone());
     println!("{} {}", "Model:".dimmed(), model_id.cyan());
@@ -780,9 +781,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 candle_core::DType::F32,
             )?;
             let tokenizer = crate::commands::embed::load_tokenizer(&source.local_path)?;
-            let mut engine_config = ferrum_types::EngineConfig::default();
-            engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
-            engine_config.model.source = Some(original_source);
+            let mut engine_config = product_engine_config;
             engine_config.sampling.default_params = ferrum_server::default_chat_sampling_params();
             engine_config.backend.device = device;
             if let Some(selection) = &gpu_selection {
@@ -802,8 +801,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 candle_device,
                 candle_core::DType::F32,
             )?;
-            let mut engine_config = ferrum_types::EngineConfig::default();
-            engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
+            let mut engine_config = product_engine_config;
             engine_config.backend.device = device;
             if let Some(selection) = &gpu_selection {
                 selection.insert_backend_options(&mut engine_config.backend.backend_options);
@@ -852,8 +850,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 "{}",
                 "Initializing engine (continuous batching)...".dimmed()
             );
-            let mut engine_config = ferrum_types::EngineConfig::default();
-            engine_config.model.model_id = ferrum_types::ModelId::new(model_id.clone());
+            let mut engine_config = product_engine_config;
             engine_config.kv_cache.cache_type = serve_kv_cache_type_for_device(&device);
             engine_config.backend.device = device;
             engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
