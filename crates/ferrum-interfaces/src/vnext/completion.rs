@@ -13,11 +13,11 @@ use super::{
     BatchOperationIdentity, BatchParticipantAuthority, BufferUsage, CopyRegion,
     DeferredDeviceCleanupDisposition, DeferredDeviceCleanupDomainId, DeferredDeviceCleanupTask,
     DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
-    DeviceCommandBatch, DeviceDescriptor, DeviceExecutionTiming, DeviceRuntime, DeviceTerminal,
-    DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
-    DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, FenceQuery, HostTransferLayout,
-    IdentifiedFailure, InvocationResourceLease, LogicalBackingBufferView, NodeId,
-    PreparedStepSubmissionWave, ResourceId, StreamState, VNextError,
+    DeviceCommandBatch, DeviceDescriptor, DeviceExecutionTiming, DeviceRuntime,
+    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
+    DeviceTimingMode, DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, FenceQuery,
+    HostTransferLayout, IdentifiedFailure, InvocationResourceLease, LogicalBackingBufferView,
+    NodeId, PreparedStepSubmissionWave, ResourceId, StreamState, VNextError,
 };
 
 fn invalid_completion(reason: impl Into<String>) -> VNextError {
@@ -478,13 +478,16 @@ pub(crate) struct ExecutionLaneEnqueue<'a, R: DeviceRuntime> {
 }
 
 impl<R: DeviceRuntime> ExecutionLaneEnqueue<'_, R> {
-    pub(crate) fn submit(
+    fn submit_via(
         &mut self,
-        commands: super::DeviceCommandBatch<R::Command>,
+        submit: impl FnOnce(
+            &R,
+            &mut R::Stream,
+        ) -> Result<R::Fence, super::DefinitelyNotSubmitted<R::Error>>,
     ) -> LaneSubmitOutcome<R::Fence, R::Error> {
-        let submission = catch_unwind(AssertUnwindSafe(|| {
-            self.lane.runtime.submit(&mut self.state.stream, commands)
-        }));
+        let runtime = self.lane.runtime.as_ref();
+        let stream = &mut self.state.stream;
+        let submission = catch_unwind(AssertUnwindSafe(|| submit(runtime, stream)));
         match submission {
             Ok(Ok(fence)) => {
                 if let Some(next) = self.state.in_flight.checked_add(1) {
@@ -504,6 +507,24 @@ impl<R: DeviceRuntime> ExecutionLaneEnqueue<'_, R> {
                 LaneSubmitOutcome::PossiblySubmittedPanic
             }
         }
+    }
+
+    pub(crate) fn submit(
+        &mut self,
+        commands: super::DeviceCommandBatch<R::Command>,
+    ) -> LaneSubmitOutcome<R::Fence, R::Error> {
+        self.submit_via(|runtime, stream| runtime.submit(stream, commands))
+    }
+
+    pub(crate) fn submit_with_timing<S>(
+        &mut self,
+        commands: DeviceCommandBatch<R::Command>,
+        timing_sink: &S,
+    ) -> LaneSubmitOutcome<R::Fence, R::Error>
+    where
+        S: DeviceSubmissionTimingSink,
+    {
+        self.submit_via(|runtime, stream| runtime.submit_with_timing(stream, commands, timing_sink))
     }
 }
 

@@ -7,9 +7,13 @@ struct RecordingSubmissionTimingSink {
     stages: Mutex<Vec<SubmissionWaveDispatchStage>>,
 }
 
-impl SubmissionWaveDispatchTimingSink for RecordingSubmissionTimingSink {
+impl DeviceSubmissionTimingSink for RecordingSubmissionTimingSink {
     const ENABLED: bool = true;
 
+    fn record_device_submission(&self, _stage: DeviceSubmissionStage, _elapsed: Duration) {}
+}
+
+impl SubmissionWaveDispatchTimingSink for RecordingSubmissionTimingSink {
     fn record(&self, stage: SubmissionWaveDispatchStage, _elapsed: Duration) {
         self.stages.lock().unwrap().push(stage);
     }

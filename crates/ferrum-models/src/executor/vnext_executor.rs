@@ -208,6 +208,10 @@ struct VNextWaveTimingMetrics {
     lane_reserve_submit_arm: AtomicDurationMetrics,
     lane_reserve: AtomicDurationMetrics,
     device_runtime_submit: AtomicDurationMetrics,
+    device_submit_validate_prepare: AtomicDurationMetrics,
+    device_submit_begin_timing: AtomicDurationMetrics,
+    device_submit_enqueue_commands: AtomicDurationMetrics,
+    device_submit_record_fence_account: AtomicDurationMetrics,
     completion_arm: AtomicDurationMetrics,
     completion_round_trip: AtomicDurationMetrics,
     host_postprocess: AtomicDurationMetrics,
@@ -234,6 +238,12 @@ impl VNextWaveTimingMetrics {
                     "lane_reserve_submit_arm_breakdown": {
                         "lane_reserve": self.lane_reserve.snapshot(),
                         "device_runtime_submit": self.device_runtime_submit.snapshot(),
+                        "device_runtime_submit_breakdown": {
+                            "validate_and_prepare": self.device_submit_validate_prepare.snapshot(),
+                            "begin_timing": self.device_submit_begin_timing.snapshot(),
+                            "enqueue_commands": self.device_submit_enqueue_commands.snapshot(),
+                            "record_fence_and_account": self.device_submit_record_fence_account.snapshot(),
+                        },
                         "completion_arm": self.completion_arm.snapshot(),
                     },
                 },
@@ -246,6 +256,7 @@ impl VNextWaveTimingMetrics {
                 "host_encode_submit breakdown is collected only while a typed profile sink is attached",
                 "provider_encode_submit breakdown covers contract validation and completion reservation, backing/input encoding, provider node encoding, and lane reserve/submit/arm",
                 "lane_reserve_submit_arm breakdown isolates lane acquisition, DeviceRuntime::submit, and successful completion arming; failed submissions do not emit completion_arm",
+                "device_runtime_submit breakdown isolates backend validation/preparation, timing start, ordered command enqueue, and fence/accounting for runtimes that implement typed attribution",
                 "completion_round_trip includes async queue wait, device fence wait, and readback",
                 "these host intervals are not kernel or device-busy time"
             ],
@@ -253,9 +264,26 @@ impl VNextWaveTimingMetrics {
     }
 }
 
-impl SubmissionWaveDispatchTimingSink for VNextWaveTimingMetrics {
+impl DeviceSubmissionTimingSink for VNextWaveTimingMetrics {
     const ENABLED: bool = true;
 
+    fn record_device_submission(&self, stage: DeviceSubmissionStage, elapsed: Duration) {
+        match stage {
+            DeviceSubmissionStage::ValidateAndPrepare => {
+                self.device_submit_validate_prepare.record(elapsed)
+            }
+            DeviceSubmissionStage::BeginTiming => self.device_submit_begin_timing.record(elapsed),
+            DeviceSubmissionStage::EnqueueCommands => {
+                self.device_submit_enqueue_commands.record(elapsed)
+            }
+            DeviceSubmissionStage::RecordFenceAndAccount => {
+                self.device_submit_record_fence_account.record(elapsed)
+            }
+        }
+    }
+}
+
+impl SubmissionWaveDispatchTimingSink for VNextWaveTimingMetrics {
     fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration) {
         match stage {
             SubmissionWaveDispatchStage::ContractValidateAndReserve => {
@@ -4150,6 +4178,12 @@ mod tests {
         assert_eq!(
             snapshot["host_encode_submit_breakdown"]["provider_encode_submit_breakdown"]
                 ["lane_reserve_submit_arm_breakdown"]["device_runtime_submit"]["samples"],
+            0
+        );
+        assert_eq!(
+            snapshot["host_encode_submit_breakdown"]["provider_encode_submit_breakdown"]
+                ["lane_reserve_submit_arm_breakdown"]["device_runtime_submit_breakdown"]
+                ["enqueue_commands"]["samples"],
             0
         );
         assert!(snapshot["limitations"]
