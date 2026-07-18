@@ -946,14 +946,61 @@ impl HostTransferLayout {
 /// Backends may use this phase to compile reusable device executables, but
 /// they must preserve the original ordering and may only reuse `Compute`
 /// commands whose backend provider supplied an exact replay contract.
-/// Initialization and dynamic binding commands are explicit eager barriers:
-/// replaying either can reset live state or reuse stale request data.
+/// Initialization, dynamic binding, and result binding commands are explicit
+/// eager barriers: replaying them can reset live state, reuse stale request
+/// data, or write results into an earlier request's backing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceCommandPhase {
     Initialization,
     DynamicBinding,
     Compute,
+    ResultBinding,
+}
+
+/// Provider-encoded work for one logical operation.
+///
+/// Core owns the phase boundaries: request-specific inputs are written before
+/// compute, and request-specific outputs are materialized afterwards. A
+/// backend may optimize the compute command, but cannot accidentally capture
+/// either dynamic boundary into a reusable executable.
+#[must_use = "encoded device operations must be appended to a submission batch"]
+pub struct EncodedDeviceOperation<C> {
+    dynamic_bindings: Vec<C>,
+    compute: C,
+    result_bindings: Vec<C>,
+}
+
+impl<C> EncodedDeviceOperation<C> {
+    pub fn compute(command: C) -> Self {
+        Self {
+            dynamic_bindings: Vec::new(),
+            compute: command,
+            result_bindings: Vec::new(),
+        }
+    }
+
+    pub fn with_dynamic_binding(mut self, command: C) -> Self {
+        self.dynamic_bindings.push(command);
+        self
+    }
+
+    pub fn with_result_binding(mut self, command: C) -> Self {
+        self.result_bindings.push(command);
+        self
+    }
+
+    pub fn dynamic_binding_count(&self) -> usize {
+        self.dynamic_bindings.len()
+    }
+
+    pub fn result_binding_count(&self) -> usize {
+        self.result_bindings.len()
+    }
+
+    fn into_parts(self) -> (Vec<C>, C, Vec<C>) {
+        (self.dynamic_bindings, self.compute, self.result_bindings)
+    }
 }
 
 /// One command plus the core-issued semantic phase that constrains backend
@@ -1033,6 +1080,24 @@ impl<C> DeviceCommandBatch<C> {
             phase: DeviceCommandPhase::Compute,
             command,
         });
+    }
+
+    pub(crate) fn push_result_binding(&mut self, command: C) {
+        self.commands.push(DeviceCommandEntry {
+            phase: DeviceCommandPhase::ResultBinding,
+            command,
+        });
+    }
+
+    pub(crate) fn push_operation(&mut self, operation: EncodedDeviceOperation<C>) {
+        let (dynamic_bindings, compute, result_bindings) = operation.into_parts();
+        for command in dynamic_bindings {
+            self.push_dynamic_binding(command);
+        }
+        self.push_compute(compute);
+        for command in result_bindings {
+            self.push_result_binding(command);
+        }
     }
 
     pub(crate) fn push(&mut self, command: C) {
@@ -1266,6 +1331,38 @@ mod deferred_cleanup_tests {
             attempts,
             dropped,
         )
+    }
+
+    #[test]
+    fn encoded_operation_preserves_typed_dynamic_compute_and_result_boundaries() {
+        let operation = EncodedDeviceOperation::compute("compute")
+            .with_dynamic_binding("bind-a")
+            .with_dynamic_binding("bind-b")
+            .with_result_binding("writeback");
+        let mut batch = DeviceCommandBatch::with_capacity(4);
+        batch.push_operation(operation);
+
+        let entries = batch.into_entries();
+        assert_eq!(
+            entries
+                .iter()
+                .map(DeviceCommandEntry::phase)
+                .collect::<Vec<_>>(),
+            vec![
+                DeviceCommandPhase::DynamicBinding,
+                DeviceCommandPhase::DynamicBinding,
+                DeviceCommandPhase::Compute,
+                DeviceCommandPhase::ResultBinding,
+            ]
+        );
+        assert_eq!(
+            entries
+                .into_iter()
+                .map(DeviceCommandEntry::into_parts)
+                .map(|(_, command)| command)
+                .collect::<Vec<_>>(),
+            vec!["bind-a", "bind-b", "compute", "writeback"]
+        );
     }
 
     #[test]

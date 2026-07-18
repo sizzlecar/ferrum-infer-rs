@@ -258,8 +258,8 @@ impl OperationProvider<TestRuntime> for TestExecutionProvider {
     fn encode_selected(
         &self,
         _invocation: BatchedOperationInvocation<'_, TestBuffer>,
-    ) -> Result<(), OperationFailure> {
-        Ok(())
+    ) -> Result<EncodedDeviceOperation<()>, OperationFailure> {
+        Ok(EncodedDeviceOperation::compute(()))
     }
 }
 

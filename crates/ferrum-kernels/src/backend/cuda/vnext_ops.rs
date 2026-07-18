@@ -11,11 +11,12 @@ use ferrum_interfaces::vnext::{
     residual_add_contract, rms_norm_contract, token_embedding_contract, AttributeId,
     BatchedOperationInvocation, CapabilityCatalog, CapabilityId, ContractVersion, DeviceId,
     DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement,
-    DynamicStorageView, ElementType, EngineProviderDescriptor, OperationContract, OperationFailure,
-    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, OperationRuntimeRegistry,
-    ProfilePhase, ProviderId, ProviderStorageBindingRequirement, ResolvedTensorLayout,
-    ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
+    DynamicStorageView, ElementType, EncodedDeviceOperation, EngineProviderDescriptor,
+    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationResourceEstimator, OperationRuntimeRegistry, ProfilePhase, ProviderId,
+    ProviderStorageBindingRequirement, ResolvedTensorLayout, ResolvedValueBinding,
+    ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
     DENSE_SWIGLU_F16_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
@@ -290,9 +291,10 @@ impl OperationProvider<CudaDeviceRuntime> for CudaTokenEmbeddingProvider {
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-    ) -> Result<CudaDeviceCommand, OperationFailure> {
+    ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
         encode_token_embedding(&self.function, invocation)
+            .map(EncodedDeviceOperation::compute)
             .map_err(|message| provider_failure(identity, "cuda.token_embedding.encode", message))
     }
 }
@@ -346,12 +348,13 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-    ) -> Result<CudaDeviceCommand, OperationFailure> {
+    ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
         encode_last_token_dense_linear(
             self.descriptor.provider_implementation_fingerprint(),
             invocation,
         )
+        .map(EncodedDeviceOperation::compute)
         .map_err(|message| {
             provider_failure(identity, "cuda.last_token_dense_linear.encode", message)
         })
