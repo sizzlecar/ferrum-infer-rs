@@ -257,6 +257,7 @@ fn resolved_inputs(fixture: &PlanFixture) -> ResolvedModelPlanInputs {
             maximum_output_tokens: 64,
             token_ids: BTreeSet::from([3]),
             strings: vec!["stop".to_owned()],
+            collision_policy: StopTokenCollisionPolicy::require_distinct(),
         },
         structured_output: StructuredOutputPolicy::JsonObject,
     }
@@ -543,6 +544,77 @@ fn resolved_model_plan_closes_all_contract_links() {
         )
         .is_err());
     }
+}
+
+#[test]
+fn resolved_stop_alias_requires_exact_product_owned_policy() {
+    let fixture = plan_fixture(0);
+
+    let mut missing_inputs = resolved_inputs(&fixture);
+    missing_inputs.stop.token_ids = BTreeSet::from([2]);
+    let missing = resolved_evidence_for_inputs(missing_inputs);
+    let missing_context = ResolvedPlanValidationContext::new(
+        &fixture.registry,
+        &missing.source_evidence,
+        &fixture.node_resolutions,
+        fixture.catalog.device(),
+        &fixture.catalog,
+        &fixture.policy,
+    );
+    let error =
+        ResolvedModelPlan::new(missing.inputs, missing.bindings, &missing_context).unwrap_err();
+    assert!(matches!(
+        error,
+        VNextError::InvalidResolvedModelPlan { ref field, .. }
+            if field == "stop.collision_policy"
+    ));
+
+    let mut exact_inputs = resolved_inputs(&fixture);
+    exact_inputs.stop.token_ids = BTreeSet::from([2]);
+    exact_inputs.stop.collision_policy =
+        StopTokenCollisionPolicy::new(BTreeSet::from([SpecialTokenRole::Eos])).unwrap();
+    let exact = resolved_evidence_for_inputs(exact_inputs);
+    let exact_context = ResolvedPlanValidationContext::new(
+        &fixture.registry,
+        &exact.source_evidence,
+        &fixture.node_resolutions,
+        fixture.catalog.device(),
+        &fixture.catalog,
+        &fixture.policy,
+    );
+    let plan = ResolvedModelPlan::new(exact.inputs, exact.bindings, &exact_context).unwrap();
+    assert_eq!(
+        serde_json::to_value(&plan).unwrap()["parts"]["stop"]["collision_policy"]
+            ["allowed_model_roles"],
+        json!(["eos"])
+    );
+    assert_eq!(
+        ResolvedModelPlan::from_json_validated(&plan.to_json().unwrap(), &exact_context).unwrap(),
+        plan
+    );
+
+    let mut broad_inputs = resolved_inputs(&fixture);
+    broad_inputs.stop.token_ids = BTreeSet::from([2]);
+    broad_inputs.stop.collision_policy = StopTokenCollisionPolicy::new(BTreeSet::from([
+        SpecialTokenRole::Eos,
+        SpecialTokenRole::Pad,
+    ]))
+    .unwrap();
+    let broad = resolved_evidence_for_inputs(broad_inputs);
+    let broad_context = ResolvedPlanValidationContext::new(
+        &fixture.registry,
+        &broad.source_evidence,
+        &fixture.node_resolutions,
+        fixture.catalog.device(),
+        &fixture.catalog,
+        &fixture.policy,
+    );
+    let error = ResolvedModelPlan::new(broad.inputs, broad.bindings, &broad_context).unwrap_err();
+    assert!(matches!(
+        error,
+        VNextError::InvalidResolvedModelPlan { ref field, ref reason }
+            if field == "stop.collision_policy" && reason.contains("exactly match")
+    ));
 }
 
 #[test]

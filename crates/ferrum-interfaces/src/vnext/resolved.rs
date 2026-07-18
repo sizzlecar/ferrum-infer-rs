@@ -1111,10 +1111,44 @@ impl SamplingPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopTokenCollisionPolicy {
+    allowed_model_roles: BTreeSet<SpecialTokenRole>,
+}
+
+impl StopTokenCollisionPolicy {
+    pub fn new(allowed_model_roles: BTreeSet<SpecialTokenRole>) -> Result<Self, VNextError> {
+        if allowed_model_roles.contains(&SpecialTokenRole::Stop) {
+            return Err(invalid_plan(
+                "stop.collision_policy",
+                "a stop-token collision policy can only name model-owned roles",
+            ));
+        }
+        Ok(Self {
+            allowed_model_roles,
+        })
+    }
+
+    pub fn require_distinct() -> Self {
+        Self {
+            allowed_model_roles: BTreeSet::new(),
+        }
+    }
+
+    pub fn allows(&self, model_role: SpecialTokenRole) -> bool {
+        self.allowed_model_roles.contains(&model_role)
+    }
+
+    pub fn allowed_model_roles(&self) -> &BTreeSet<SpecialTokenRole> {
+        &self.allowed_model_roles
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StopPolicy {
     pub maximum_output_tokens: u32,
     pub token_ids: BTreeSet<u32>,
     pub strings: Vec<String>,
+    pub collision_policy: StopTokenCollisionPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3067,6 +3101,15 @@ impl ResolvedModelPlan {
     fn validate_token_contract(parts: &ResolvedModelPlanParts) -> Result<(), VNextError> {
         let vocabulary_size = parts.tokenizer.vocabulary_size;
         let special = &parts.prepared_family.metadata().special_tokens;
+        if special.collision_policy.allowed().iter().any(|collision| {
+            collision.first() == SpecialTokenRole::Stop
+                || collision.second() == SpecialTokenRole::Stop
+        }) {
+            return Err(invalid_plan(
+                "special_tokens.collision_policy",
+                "model metadata cannot authorize product-owned stop-token collisions",
+            ));
+        }
         let mut roles = Vec::new();
         if let Some(token_id) = special.bos_token_id {
             roles.push((SpecialTokenRole::Bos, token_id));
@@ -3098,20 +3141,45 @@ impl ResolvedModelPlan {
                 "a model or stop token id exceeds the tokenizer vocabulary",
             ));
         }
+        let mut observed_stop_collisions = BTreeSet::new();
         for (index, (role, token_id)) in roles.iter().enumerate() {
             for (other_role, other_token_id) in &roles[..index] {
-                if token_id == other_token_id
-                    && role != other_role
-                    && !special.collision_policy.allows(*role, *other_role)
-                {
-                    return Err(invalid_plan(
-                        "special_tokens.collision_policy",
-                        format!(
-                            "token id {token_id} is shared by {role:?} and {other_role:?} without an explicit policy"
-                        ),
-                    ));
+                if token_id == other_token_id && role != other_role {
+                    let (policy_field, allowed) = if *role == SpecialTokenRole::Stop
+                        || *other_role == SpecialTokenRole::Stop
+                    {
+                        let model_role = if *role == SpecialTokenRole::Stop {
+                            *other_role
+                        } else {
+                            *role
+                        };
+                        observed_stop_collisions.insert(model_role);
+                        (
+                            "stop.collision_policy",
+                            parts.stop.collision_policy.allows(model_role),
+                        )
+                    } else {
+                        (
+                            "special_tokens.collision_policy",
+                            special.collision_policy.allows(*role, *other_role),
+                        )
+                    };
+                    if !allowed {
+                        return Err(invalid_plan(
+                            policy_field,
+                            format!(
+                                "token id {token_id} is shared by {role:?} and {other_role:?} without an explicit policy"
+                            ),
+                        ));
+                    }
                 }
             }
+        }
+        if observed_stop_collisions != *parts.stop.collision_policy.allowed_model_roles() {
+            return Err(invalid_plan(
+                "stop.collision_policy",
+                "declared model-role collisions must exactly match observed stop-token aliases",
+            ));
         }
         Ok(())
     }
