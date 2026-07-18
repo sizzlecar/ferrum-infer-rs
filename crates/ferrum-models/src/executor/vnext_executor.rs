@@ -22,8 +22,8 @@ use ferrum_interfaces::model_executor::{
     ExecutorExecutionCapacityStage, ExecutorMemoryUsage, ExecutorPrefillAdmission,
     ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion,
     ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome, ExecutorPrefillOutcome,
-    ExecutorState, ExecutorStatus, MemoryRequirements, PlanRuntimeResourceSnapshot, PrefillChunk,
-    PrefillInput, PrefillOutput,
+    ExecutorSequenceCompletion, ExecutorState, ExecutorStatus, MemoryRequirements,
+    PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput, PrefillOutput,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -635,6 +635,7 @@ impl VNextExecutionJournal {
         &mut self,
         receipt: &SequenceSessionTerminalReceipt,
         input_tokens: u64,
+        output_tokens: u64,
     ) -> std::result::Result<(), ExecutionEventSinkError> {
         if self.pending_submission.is_some() {
             return Err(Self::error(
@@ -682,7 +683,7 @@ impl VNextExecutionJournal {
             parts,
             ExecutionEventDetail::Counters {
                 input: input_tokens,
-                output: self.completed_frames,
+                output: output_tokens,
             },
         )?;
         self.emitter.emit(
@@ -744,20 +745,47 @@ impl<R: DeviceRuntime> VNextSequence<R> {
         Ok(())
     }
 
-    fn complete(&self) {
+    fn complete(&self, completion: &ExecutorSequenceCompletion) -> Result<()> {
+        if completion.request_id() != &self.request_id {
+            self.abort();
+            return Err(FerrumError::request_validation(format!(
+                "vNext completion request `{}` differs from cache owner `{}`",
+                completion.request_id(),
+                self.request_id
+            )));
+        }
+        if completion.input_tokens() != self.prompt_tokens {
+            self.abort();
+            return Err(FerrumError::request_validation(format!(
+                "vNext completion input count {} differs from admitted prompt count {}",
+                completion.input_tokens(),
+                self.prompt_tokens
+            )));
+        }
         if !self.active.swap(false, Ordering::AcqRel) {
-            return;
+            return Err(FerrumError::already_exists(format!(
+                "vNext request `{}` is already terminal",
+                self.request_id
+            )));
         }
-        if let Ok(receipt) = self.session.try_complete() {
-            if let Some(events) = &self.events {
-                let _ = events
-                    .lock()
-                    .complete_sequence(&receipt, self.prompt_tokens);
-            }
-            return;
+        let receipt = self.session.try_complete().map_err(|error| {
+            let _ = self.session.request_cancel();
+            let _ = self.session.try_abort();
+            FerrumError::backend(format!("vNext sequence completion: {error}"))
+        })?;
+        if let Some(events) = &self.events {
+            events
+                .lock()
+                .complete_sequence(
+                    &receipt,
+                    completion.input_tokens(),
+                    completion.output_tokens(),
+                )
+                .map_err(|error| {
+                    FerrumError::backend(format!("vNext execution journal completion: {error}"))
+                })?;
         }
-        let _ = self.session.request_cancel();
-        let _ = self.session.try_abort();
+        Ok(())
     }
 
     fn abort(&self) {
@@ -3716,8 +3744,23 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
     fn release_cache(&self, cache_id: &str) {
         if let Some(sequence) = self.sequences.lock().active.remove(cache_id) {
-            sequence.complete();
+            sequence.abort();
         }
+    }
+
+    fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
+        let sequence = self
+            .sequences
+            .lock()
+            .active
+            .remove(completion.cache_id())
+            .ok_or_else(|| {
+                FerrumError::not_found(format!(
+                    "vNext completion cache `{}` is not active",
+                    completion.cache_id()
+                ))
+            })?;
+        sequence.complete(&completion)
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {

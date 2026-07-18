@@ -14,8 +14,8 @@ use ferrum_interfaces::{
         ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion,
         ExecutorPrefillMaintenanceBlocker, ExecutorPrefillMaintenanceDeferral,
         ExecutorPrefillMaintenanceOutcome, ExecutorPrefillMaintenanceStage, ExecutorPrefillOutcome,
-        ExecutorStatus, PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput, PrefillOutput,
-        UnifiedBatch,
+        ExecutorSequenceCompletion, ExecutorStatus, PlanRuntimeResourceSnapshot, PrefillChunk,
+        PrefillInput, PrefillOutput, UnifiedBatch,
     },
     KvCacheHandle, KvCacheManager, ModelExecutor, RecurrentStateManager, RecurrentStateSpec,
     RecurrentStateTensorSpec, TensorRef,
@@ -27,6 +27,7 @@ use std::time::Duration;
 struct PlanRuntimeAdmissionTestExecutor {
     inner: MockModelExecutor,
     retained: std::sync::Mutex<HashSet<RequestId>>,
+    completions: std::sync::Mutex<Vec<ExecutorSequenceCompletion>>,
     admission_probes: AtomicU64,
     prefill_calls: AtomicU64,
 }
@@ -486,6 +487,7 @@ impl PlanRuntimeAdmissionTestExecutor {
         Self {
             inner: MockModelExecutor::instant(vocab_size),
             retained: std::sync::Mutex::new(HashSet::new()),
+            completions: std::sync::Mutex::new(Vec::new()),
             admission_probes: AtomicU64::new(0),
             prefill_calls: AtomicU64::new(0),
         }
@@ -566,6 +568,15 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
 
     fn release_cache(&self, cache_id: &str) {
         self.inner.release_cache(cache_id);
+    }
+
+    fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
+        self.inner.release_cache(completion.cache_id());
+        self.completions
+            .lock()
+            .expect("completion receipt mutex poisoned")
+            .push(completion);
+        Ok(())
     }
 
     fn capabilities(&self) -> ExecutorCapabilities {
@@ -3510,6 +3521,21 @@ async fn plan_runtime_product_path_requires_typed_admission_before_prefill() {
     assert_eq!(response.finish_reason, FinishReason::Length);
     assert_eq!(executor.admission_probes.load(Ordering::Relaxed), 1);
     assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
+    let completions = executor
+        .completions
+        .lock()
+        .expect("completion receipt mutex poisoned");
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].request_id(), &response.request_id);
+    assert_eq!(
+        completions[0].input_tokens(),
+        response.usage.prompt_tokens as u64
+    );
+    assert_eq!(
+        completions[0].output_tokens(),
+        response.usage.completion_tokens as u64
+    );
+    drop(completions);
     assert!(executor
         .retained
         .lock()

@@ -575,6 +575,64 @@ impl DecodeOutput {
     }
 }
 
+/// Product-authoritative evidence for a successfully completed sequence.
+///
+/// Physical cache release is not completion evidence: cancellation, failure,
+/// recompute, and successful generation all release the same cache authority.
+/// The engine constructs this receipt only after it has finalized user-visible
+/// token usage, allowing plan runtimes to reconcile terminal events without
+/// inferring output counts from execution frames.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorSequenceCompletion {
+    request_id: RequestId,
+    cache_id: String,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+impl ExecutorSequenceCompletion {
+    pub fn new(
+        request_id: RequestId,
+        cache_id: String,
+        input_tokens: usize,
+        output_tokens: usize,
+    ) -> Result<Self> {
+        if cache_id.is_empty() {
+            return Err(FerrumError::request_validation(
+                "executor sequence completion requires a cache identity",
+            ));
+        }
+        let input_tokens = u64::try_from(input_tokens).map_err(|_| {
+            FerrumError::request_validation("executor completion input token count exceeds u64")
+        })?;
+        let output_tokens = u64::try_from(output_tokens).map_err(|_| {
+            FerrumError::request_validation("executor completion output token count exceeds u64")
+        })?;
+        Ok(Self {
+            request_id,
+            cache_id,
+            input_tokens,
+            output_tokens,
+        })
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn cache_id(&self) -> &str {
+        &self.cache_id
+    }
+
+    pub const fn input_tokens(&self) -> u64 {
+        self.input_tokens
+    }
+
+    pub const fn output_tokens(&self) -> u64 {
+        self.output_tokens
+    }
+}
+
 /// Declares the authoritative runtime for request-lifetime accelerator resources.
 ///
 /// This is a lifecycle boundary, not a capacity limit. `PlanRuntime` means the
@@ -1727,11 +1785,22 @@ pub trait ModelExecutor: Send + Sync {
         Ok(())
     }
 
-    /// Release KV cache and state for a completed sequence.
+    /// Complete and release one cache authority with product-authoritative
+    /// terminal token counts.
     ///
-    /// Called by the engine when a request finishes (success or error) to free
-    /// GPU memory held by the sequence's KV cache. The `cache_id` matches the
-    /// value embedded in the `KvCacheHandle` returned by prefill/decode.
+    /// Legacy executors only need physical release and inherit that behavior.
+    /// Plan runtimes with terminal journals override this method so completion
+    /// cannot be inferred from a generic release operation.
+    fn complete_cache(&self, completion: ExecutorSequenceCompletion) -> Result<()> {
+        self.release_cache(completion.cache_id());
+        Ok(())
+    }
+
+    /// Release KV cache and state without asserting successful completion.
+    ///
+    /// Called for cancellation, failure, recompute, and legacy cleanup. The
+    /// `cache_id` matches the value embedded in the `KvCacheHandle` returned by
+    /// prefill/decode. Successful product completion uses [`Self::complete_cache`].
     fn release_cache(&self, _cache_id: &str) {
         // Default no-op — executors that manage per-sequence KV caches should override.
     }

@@ -19,7 +19,8 @@ use ferrum_interfaces::{
         ExecutorExecutionCapacityPreemption, ExecutorPrefillAdmission,
         ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt,
         ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome,
-        GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy, TokenSelectionMask,
+        ExecutorSequenceCompletion, GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy,
+        TokenSelectionMask,
     },
     vnext::{
         AdmissionDeferred, AdmissionRejected, CapacityAvailabilityEpoch, DeferredAction,
@@ -3248,6 +3249,37 @@ impl EngineInner {
             self.release_recurrent_allocation(request_id, recurrent_allocation.slots)
                 .await;
         }
+    }
+
+    async fn complete_sequence_physical_resources(
+        &self,
+        request_id: &RequestId,
+        mut resources: SequencePhysicalResources,
+        usage: &TokenUsage,
+    ) -> Result<()> {
+        let completion_result = if let Some(cache_id) = resources.model_cache_id.take() {
+            let completion = ExecutorSequenceCompletion::new(
+                request_id.clone(),
+                cache_id.clone(),
+                usage.prompt_tokens,
+                usage.completion_tokens,
+            );
+            let result = match completion {
+                Ok(completion) => self.model_executor.complete_cache(completion),
+                Err(error) => {
+                    self.model_executor.release_cache(&cache_id);
+                    Err(error)
+                }
+            };
+            self.trace_model_cache_ref_release(request_id);
+            result
+        } else {
+            Ok(())
+        };
+
+        self.release_sequence_physical_resources(request_id, resources)
+            .await;
+        completion_result
     }
 
     fn trace_recurrent_allocate(
