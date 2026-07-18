@@ -31,7 +31,7 @@ pub async fn execute(cmd: PullCommand, config: CliConfig) -> Result<()> {
         Ok(resolved) => {
             println!();
             println!("{} Model ready at:", "✓".green().bold());
-            println!("  {}", resolved.source.local_path.display());
+            println!("  {}", resolved.local_path().display());
             Ok(())
         }
         Err(error) => {
