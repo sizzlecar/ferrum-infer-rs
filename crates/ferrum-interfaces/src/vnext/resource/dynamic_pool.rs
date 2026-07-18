@@ -1,6 +1,6 @@
 use super::{
     backing_segment_range, invalid_resource, validate_runtime_descriptor_for_admission,
-    AllocationLifetime, AllocationSeal, Arc, AtomicU64, BTreeMap, BackingChunkIdentity,
+    AllocationLifetime, AllocationSeal, Arc, AtomicU64, AtomicU8, BTreeMap, BackingChunkIdentity,
     BackingSegment, BufferDescriptor, BufferRequest, BufferUsage, CapacityAvailabilityEpoch,
     CapacityDomainId, CapacityEpochs, CapacityUnits, CapacityWaitCondition, DeviceAllocationPermit,
     DeviceCapacityAvailabilitySnapshot, DeviceCapacityBudget, DeviceCapacityGrant,
@@ -8,8 +8,8 @@ use super::{
     DynamicResourceDescriptor, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView,
     ElementType, FreeExtentIndex, InvocationLivenessMode, LogicalAdmissionCoordinator, Mutex,
     Ordering, PlanNode, ResourceId, ResourceReservation, ResourceRetentionPolicy,
-    ResourceTransactionIdentity, RunId, Serialize, StaticProvisioningBinding, StepResourceSlotKind,
-    TransactionId, VNextError,
+    ResourceTransactionIdentity, RunId, Serialize, StateInitialization, StaticProvisioningBinding,
+    StepResourceSlotKind, TransactionId, VNextError,
 };
 use crate::vnext::DeviceCapacityPressure;
 use sha2::{Digest, Sha256};
@@ -233,7 +233,207 @@ pub(super) struct BackingSegmentLease {
     pub(super) segment_generation: u64,
     segments: Vec<BackingSegment>,
     pub(super) size_bytes: u64,
+    initialization: Option<Arc<BackingInitializationCell>>,
     released: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackingInitializationStatus {
+    Pending,
+    Prepared,
+    InFlight,
+    Initialized,
+    Poisoned,
+}
+
+const BACKING_INITIALIZATION_PENDING: u8 = 0;
+const BACKING_INITIALIZATION_PREPARED: u8 = 1;
+const BACKING_INITIALIZATION_IN_FLIGHT: u8 = 2;
+const BACKING_INITIALIZATION_INITIALIZED: u8 = 3;
+const BACKING_INITIALIZATION_POISONED: u8 = 4;
+
+#[derive(Debug)]
+enum BackingInitializationState {
+    Pending,
+    Prepared { wave_fingerprint: String },
+    InFlight { wave_fingerprint: String },
+    Initialized,
+    Poisoned,
+}
+
+#[derive(Debug)]
+pub(super) struct BackingInitializationCell {
+    target_fingerprint: String,
+    status: AtomicU8,
+    state: Mutex<BackingInitializationState>,
+}
+
+impl BackingInitializationCell {
+    fn new(target_fingerprint: String) -> Self {
+        Self {
+            target_fingerprint,
+            status: AtomicU8::new(BACKING_INITIALIZATION_PENDING),
+            state: Mutex::new(BackingInitializationState::Pending),
+        }
+    }
+
+    pub(super) fn target_fingerprint(&self) -> &str {
+        &self.target_fingerprint
+    }
+
+    pub(super) fn status(&self) -> Result<BackingInitializationStatus, VNextError> {
+        match self.status.load(Ordering::Acquire) {
+            BACKING_INITIALIZATION_PENDING => Ok(BackingInitializationStatus::Pending),
+            BACKING_INITIALIZATION_PREPARED => Ok(BackingInitializationStatus::Prepared),
+            BACKING_INITIALIZATION_IN_FLIGHT => Ok(BackingInitializationStatus::InFlight),
+            BACKING_INITIALIZATION_INITIALIZED => Ok(BackingInitializationStatus::Initialized),
+            BACKING_INITIALIZATION_POISONED => Ok(BackingInitializationStatus::Poisoned),
+            _ => Err(invalid_resource(
+                "backing initialization status contains an invalid value",
+            )),
+        }
+    }
+
+    pub(super) fn prepare(&self, wave_fingerprint: &str) -> Result<bool, VNextError> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                *state = BackingInitializationState::Poisoned;
+                self.status
+                    .store(BACKING_INITIALIZATION_POISONED, Ordering::Release);
+                return Err(invalid_resource("backing initialization state is poisoned"));
+            }
+        };
+        match &*state {
+            BackingInitializationState::Pending => {
+                *state = BackingInitializationState::Prepared {
+                    wave_fingerprint: wave_fingerprint.to_owned(),
+                };
+                self.status
+                    .store(BACKING_INITIALIZATION_PREPARED, Ordering::Release);
+                Ok(true)
+            }
+            BackingInitializationState::Initialized => Ok(false),
+            BackingInitializationState::Prepared {
+                wave_fingerprint: current,
+            } if current == wave_fingerprint => Ok(true),
+            BackingInitializationState::Prepared { .. }
+            | BackingInitializationState::InFlight { .. } => Err(invalid_resource(
+                "backing initialization is owned by another submission wave",
+            )),
+            BackingInitializationState::Poisoned => Err(invalid_resource(
+                "backing initialization authority is fail-closed",
+            )),
+        }
+    }
+
+    pub(super) fn mark_in_flight(&self, wave_fingerprint: &str) -> Result<(), VNextError> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                *state = BackingInitializationState::Poisoned;
+                self.status
+                    .store(BACKING_INITIALIZATION_POISONED, Ordering::Release);
+                return Err(invalid_resource("backing initialization state is poisoned"));
+            }
+        };
+        match &*state {
+            BackingInitializationState::Prepared {
+                wave_fingerprint: current,
+            } if current == wave_fingerprint => {
+                *state = BackingInitializationState::InFlight {
+                    wave_fingerprint: wave_fingerprint.to_owned(),
+                };
+                self.status
+                    .store(BACKING_INITIALIZATION_IN_FLIGHT, Ordering::Release);
+                Ok(())
+            }
+            _ => {
+                *state = BackingInitializationState::Poisoned;
+                self.status
+                    .store(BACKING_INITIALIZATION_POISONED, Ordering::Release);
+                Err(invalid_resource(
+                    "backing initialization fence was installed from an invalid state",
+                ))
+            }
+        }
+    }
+
+    pub(super) fn finish(&self, wave_fingerprint: &str, succeeded: bool) -> Result<(), VNextError> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                *state = BackingInitializationState::Poisoned;
+                self.status
+                    .store(BACKING_INITIALIZATION_POISONED, Ordering::Release);
+                return Err(invalid_resource("backing initialization state is poisoned"));
+            }
+        };
+        match &*state {
+            BackingInitializationState::InFlight {
+                wave_fingerprint: current,
+            } if current == wave_fingerprint => {
+                *state = if succeeded {
+                    BackingInitializationState::Initialized
+                } else {
+                    BackingInitializationState::Poisoned
+                };
+                self.status.store(
+                    if succeeded {
+                        BACKING_INITIALIZATION_INITIALIZED
+                    } else {
+                        BACKING_INITIALIZATION_POISONED
+                    },
+                    Ordering::Release,
+                );
+                Ok(())
+            }
+            _ => {
+                *state = BackingInitializationState::Poisoned;
+                self.status
+                    .store(BACKING_INITIALIZATION_POISONED, Ordering::Release);
+                Err(invalid_resource(
+                    "backing initialization completed from an invalid state",
+                ))
+            }
+        }
+    }
+
+    pub(super) fn rollback_prepared(&self, wave_fingerprint: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*state {
+            BackingInitializationState::Prepared {
+                wave_fingerprint: current,
+            } if current == wave_fingerprint => {
+                *state = BackingInitializationState::Pending;
+                self.status
+                    .store(BACKING_INITIALIZATION_PENDING, Ordering::Release);
+            }
+            BackingInitializationState::Initialized | BackingInitializationState::Pending => {}
+            _ => {
+                *state = BackingInitializationState::Poisoned;
+                self.status
+                    .store(BACKING_INITIALIZATION_POISONED, Ordering::Release);
+            }
+        }
+    }
+
+    pub(super) fn mark_indeterminate(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = BackingInitializationState::Poisoned;
+        self.status
+            .store(BACKING_INITIALIZATION_POISONED, Ordering::Release);
+    }
 }
 
 impl Drop for BackingSegmentLease {
@@ -739,6 +939,15 @@ where
     pub(super) fn commit(mut self) -> Vec<LogicalBackingSliceAuthority> {
         let mut slices = Vec::new();
         for extent in std::mem::take(&mut self.extents) {
+            let initialization = extent
+                .projections
+                .iter()
+                .any(|projection| projection.initialization == StateInitialization::Zero)
+                .then(|| {
+                    Arc::new(BackingInitializationCell::new(
+                        backing_initialization_target_fingerprint(&extent),
+                    ))
+                });
             let owner: Arc<dyn BackingExtentOwner> = extent.pool;
             let segment_lease = Arc::new(BackingSegmentLease {
                 owner_instance_id: owner.instance_id(),
@@ -747,6 +956,7 @@ where
                 segment_generation: extent.segment_generation,
                 segments: extent.segments,
                 size_bytes: extent.size_bytes,
+                initialization,
                 released: false,
             });
             slices.extend(extent.projections.into_iter().map(|evidence| {
@@ -760,6 +970,38 @@ where
         self.committed = true;
         slices
     }
+}
+
+fn backing_initialization_target_fingerprint<R>(extent: &PreparedBackingExtent<R>) -> String
+where
+    R: DeviceRuntime,
+{
+    let mut hasher = Sha256::new();
+    hasher.update(b"ferrum.runtime-vnext.backing-initialization-target.v1\0");
+    hasher.update(extent.pool.instance_id.to_be_bytes());
+    hasher.update(extent.segment_generation.to_be_bytes());
+    hasher.update(extent.claim_identity.pool_id().as_str().as_bytes());
+    for resource_id in extent.claim_identity.resource_ids() {
+        hasher.update([0]);
+        hasher.update(resource_id.as_str().as_bytes());
+    }
+    for segment in &extent.segments {
+        hasher.update(segment.chunk_ordinal().to_be_bytes());
+        hasher.update(segment.chunk_generation().to_be_bytes());
+        hasher.update(segment.offset_bytes().to_be_bytes());
+        hasher.update(segment.length_bytes().to_be_bytes());
+    }
+    for projection in extent
+        .projections
+        .iter()
+        .filter(|projection| projection.initialization == StateInitialization::Zero)
+    {
+        hasher.update([1]);
+        hasher.update(projection.resource_id.as_str().as_bytes());
+        hasher.update(projection.physical_offset_bytes.to_be_bytes());
+        hasher.update(projection.size_bytes.to_be_bytes());
+    }
+    format!("sha256/{:x}", hasher.finalize())
 }
 
 impl<R> Drop for PreparedBackingClaim<R>
@@ -814,6 +1056,7 @@ pub struct LogicalBackingSliceEvidence {
     pub(super) usage: BufferUsage,
     pub(super) element_type: ElementType,
     pub(super) storage_profile: DynamicStorageProfile,
+    pub(super) initialization: StateInitialization,
 }
 
 impl LogicalBackingSliceEvidence {
@@ -872,6 +1115,10 @@ impl LogicalBackingSliceEvidence {
     pub const fn storage_profile(&self) -> DynamicStorageProfile {
         self.storage_profile
     }
+
+    pub const fn initialization(&self) -> StateInitialization {
+        self.initialization
+    }
 }
 
 #[must_use = "a logical backing authority owns its physical arena extents"]
@@ -902,6 +1149,18 @@ impl LogicalBackingSliceAuthority {
 
     pub const fn size_bytes(&self) -> u64 {
         self.evidence.size_bytes
+    }
+
+    pub fn initialization_status(&self) -> Result<Option<BackingInitializationStatus>, VNextError> {
+        self.segment_lease
+            .initialization
+            .as_ref()
+            .map(|cell| cell.status())
+            .transpose()
+    }
+
+    pub(super) fn initialization_cell(&self) -> Option<&Arc<BackingInitializationCell>> {
+        self.segment_lease.initialization.as_ref()
     }
 }
 
@@ -2097,6 +2356,7 @@ where
                                 usage: projection.descriptor.usage(),
                                 element_type: projection.descriptor.element_type(),
                                 storage_profile: pool.domain.pool.compatibility().profile(),
+                                initialization: projection.descriptor.initialization(),
                             })
                         })
                         .collect::<Result<Vec<_>, VNextError>>()?;
@@ -2279,6 +2539,7 @@ where
                 || authority.evidence.alignment_bytes != first.evidence.alignment_bytes
                 || authority.evidence.usage != first.evidence.usage
                 || authority.evidence.element_type != first.evidence.element_type
+                || authority.evidence.initialization != first.evidence.initialization
             {
                 return Err(invalid_resource(
                     "logical backing authorities have incompatible resource metadata",

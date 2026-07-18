@@ -3,7 +3,7 @@ use super::{
     DynamicResourceDemand, DynamicResourceDescriptor, DynamicStorageProfile, ElementType,
     InvocationLivenessMode, InvocationResourceLiveness, NodeId, PlanNode, ProgramValueId,
     ProviderId, ProviderResourcePlan, RejectedProvider, ResolvedTensorSpec, ResolvedValueStorage,
-    ResourceId, StateId, VNextError,
+    ResourceId, StateId, StateInitialization, VNextError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +351,7 @@ pub(super) struct ValueAllocationAccumulator {
     pub(super) usage: BufferUsage,
     pub(super) element_type: ElementType,
     pub(super) demand: ValueResourceDemand,
+    pub(super) initialization: StateInitialization,
     pub(super) logical_layout_fingerprints: BTreeSet<String>,
     pub(super) merge_result: Option<()>,
 }
@@ -402,9 +403,14 @@ impl ValueAllocationAccumulator {
         usage: BufferUsage,
         element_type: ElementType,
         demand: ValueResourceDemand,
+        initialization: StateInitialization,
         logical_layout_fingerprint: String,
     ) -> Option<()> {
-        if self.usage != usage || self.element_type != element_type || self.demand != demand {
+        if self.usage != usage
+            || self.element_type != element_type
+            || self.demand != demand
+            || self.initialization != initialization
+        {
             return None;
         }
         self.end_bytes = self.end_bytes.max(end_bytes);

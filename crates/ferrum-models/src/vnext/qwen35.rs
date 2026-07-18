@@ -16,9 +16,9 @@ use ferrum_interfaces::vnext::{
     PreparedModelFamily, ProgramBlock, ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec,
     ProgramValueId, ResolvedTensorLayout, SemanticValue, SpecialTokenCollision,
     SpecialTokenCollisionPolicy, SpecialTokenMetadata, SpecialTokenRole, StateCapacityDemand,
-    StateId, StateLifetime, StateSpec, TemplateMetadata, TypedFamilyRegistration, VNextError,
-    WeightComponentRole, WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId,
-    WeightLayoutId, WeightReference, WeightSchema, WeightTensorSpec,
+    StateId, StateInitialization, StateLifetime, StateSpec, TemplateMetadata,
+    TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSpec, WeightEncoding,
+    WeightFormatId, WeightId, WeightLayoutId, WeightReference, WeightSchema, WeightTensorSpec,
     CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
     RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
@@ -410,6 +410,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                         ),
                         lifetime: StateLifetime::Sequence,
                         capacity_demand: StateCapacityDemand::FixedPerScope,
+                        initialization: StateInitialization::Zero,
                     });
                     states.push(StateSpec {
                         id: state_id(format!("state.layer.{layer_index}.delta"))?,
@@ -424,6 +425,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                         ),
                         lifetime: StateLifetime::Sequence,
                         capacity_demand: StateCapacityDemand::FixedPerScope,
+                        initialization: StateInitialization::Zero,
                     });
                     (
                         GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
@@ -481,6 +483,10 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                             bytes_per_token: kv_bytes_per_token,
                             maximum_tokens: config.max_position_embeddings,
                         },
+                        // The attention provider writes each valid KV slot before
+                        // that slot can be read; clearing unused block capacity is
+                        // unnecessary work on the decode path.
+                        initialization: StateInitialization::None,
                     });
                     (
                         CAUSAL_PAGED_ATTENTION_OPERATION_ID,
@@ -1555,6 +1561,46 @@ mod tests {
         );
         assert!(!operation_ids.contains(&"operation.logits_projection"));
         assert_eq!(prepared.program().states().len(), 7);
+        assert_eq!(
+            prepared
+                .program()
+                .states()
+                .iter()
+                .filter(|state| {
+                    state.lifetime == StateLifetime::Sequence
+                        && state.capacity_demand == StateCapacityDemand::FixedPerScope
+                        && state.initialization == StateInitialization::Zero
+                })
+                .count(),
+            6
+        );
+        assert_eq!(
+            prepared
+                .program()
+                .states()
+                .iter()
+                .filter(|state| {
+                    state.lifetime == StateLifetime::Sequence
+                        && matches!(
+                            state.capacity_demand,
+                            StateCapacityDemand::TokenScaled { .. }
+                        )
+                        && state.initialization == StateInitialization::None
+                })
+                .count(),
+            1
+        );
+        assert!(prepared.program().states().iter().all(|state| {
+            state.lifetime == StateLifetime::Sequence
+                && match state.capacity_demand {
+                    StateCapacityDemand::FixedPerScope => {
+                        state.initialization == StateInitialization::Zero
+                    }
+                    StateCapacityDemand::TokenScaled { .. } => {
+                        state.initialization == StateInitialization::None
+                    }
+                }
+        }));
         assert_eq!(prepared.program().weights().len(), config.weights.len() - 4);
         assert_eq!(prepared.weight_schema().version, ContractVersion::new(1, 2));
         for component in prepared

@@ -14,8 +14,8 @@ use super::{
     ProgramValueId, ProviderCompatibilityRejectReason, ProviderCompatibilityRequest, ProviderId,
     QuantizationFormatId, ResolvedStorageComponent, ResolvedTensorLayout, ResolvedTensorSpec,
     ResolvedValueBinding, ResolvedValueRole, ResolvedValueStorage, ResourceId, SemanticValue,
-    StateCapacityDemand, StateId, StateLifetime, StrideConstraint, TensorAccess, TensorContract,
-    VNextError, WeightEncoding, WeightFormatId, WeightId,
+    StateCapacityDemand, StateId, StateInitialization, StateLifetime, StrideConstraint,
+    TensorAccess, TensorContract, VNextError, WeightEncoding, WeightFormatId, WeightId,
 };
 
 mod foundation;

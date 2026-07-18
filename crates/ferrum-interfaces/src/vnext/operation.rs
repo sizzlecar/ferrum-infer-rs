@@ -6,16 +6,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::{
-    classify_device_error, AdmittedSequenceResources, AllocationLifetime, BatchInvocationId,
-    BatchParticipantAuthority, BatchParticipantTokenRange, BatchStepId, BatchWorkShape,
-    BufferDescriptor, BufferUsage, CanonicalRational, CapabilityId, CompletionHandle,
-    CompletionReaper, ContractVersion, DefinitelyNotSubmittedRetryAuthority,
-    DefinitelyNotSubmittedWaveRetryAuthority, DeviceCommandBatch, DeviceId, DeviceRuntime,
-    DynamicResourceDemand, DynamicResourceShape, ExecutablePlanView, ExecutionIdentityEnvelope,
-    ExecutionIdentityParts, ExecutionLane, ExecutionLaneId, HostTransferLayout, IdentifiedFailure,
-    IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
-    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId,
-    NodeInvocationId, NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
+    classify_device_error, AdmittedSequenceResources, AllocationLifetime,
+    BackingInitializationEncodeError, BatchInvocationId, BatchParticipantAuthority,
+    BatchParticipantTokenRange, BatchStepId, BatchWorkShape, BufferDescriptor, BufferUsage,
+    CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper, ContractVersion,
+    DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
+    DeviceCommandBatch, DeviceId, DeviceRuntime, DynamicResourceDemand, DynamicResourceShape,
+    ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane,
+    ExecutionLaneId, HostTransferLayout, IdentifiedFailure, IndeterminateSubmissionHandle,
+    InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId,
+    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, NodeInvocationId,
+    NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
     PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
     ProviderWorkspaceRequirement, QuantizationFormatId, ResourceId, SemanticValue,
     SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint, SpanId,
@@ -4209,6 +4210,7 @@ where
 {
     Contract(VNextError),
     Provider(OperationFailure),
+    Initialization(IdentifiedFailure),
     InputUpload(IdentifiedFailure),
     DefinitelyNotSubmitted {
         failures: Vec<IdentifiedFailure>,
@@ -4235,6 +4237,10 @@ where
         match self {
             Self::Contract(error) => formatter.debug_tuple("Contract").field(error).finish(),
             Self::Provider(error) => formatter.debug_tuple("Provider").field(error).finish(),
+            Self::Initialization(error) => formatter
+                .debug_tuple("Initialization")
+                .field(error)
+                .finish(),
             Self::InputUpload(error) => formatter.debug_tuple("InputUpload").field(error).finish(),
             Self::DefinitelyNotSubmitted { failures, retry } => formatter
                 .debug_struct("DefinitelyNotSubmitted")
@@ -4269,6 +4275,12 @@ where
                 "operation provider failed with {}: {}",
                 error.code(),
                 error.message()
+            ),
+            Self::Initialization(error) => write!(
+                formatter,
+                "operation backing initialization failed with {}: {}",
+                error.failure().code(),
+                error.failure().message()
             ),
             Self::InputUpload(error) => write!(
                 formatter,
@@ -4815,11 +4827,16 @@ impl OperationDispatch {
                 "operation encode completion runtime drifted",
             )));
         }
+        let mut commands = DeviceCommandBatch::with_capacity(2);
+        completion
+            .encode_backing_initializations(runtime, &mut commands)
+            .map_err(|error| map_backing_initialization_error(runtime, batch_identity, error))?;
+        commands.push(command);
         let mut lane_reservation = lane
             .reserve_enqueue()
             .map_err(OperationDispatchError::Contract)?;
         completion.mark_submission_started();
-        match lane_reservation.submit(DeviceCommandBatch::singleton(command)) {
+        match lane_reservation.submit(commands) {
             LaneSubmitOutcome::DefinitelyNotSubmitted(error) => {
                 drop(lane_reservation);
                 let retry = completion
@@ -4956,6 +4973,14 @@ impl OperationDispatch {
         }
         let mut commands =
             DeviceCommandBatch::with_capacity(providers.len().saturating_add(input_uploads.len()));
+        let initialization_command_count = completion
+            .encode_backing_initializations(runtime, &mut commands)
+            .map_err(|error| map_backing_initialization_error(runtime, batch_identity, error))?;
+        if commands.len() != initialization_command_count {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "backing initialization command accounting differs from encoded commands",
+            )));
+        }
         encode_submission_wave_inputs(
             runtime,
             resolved,
@@ -4964,7 +4989,7 @@ impl OperationDispatch {
             input_uploads,
             &mut commands,
         )?;
-        let input_command_count = commands.len();
+        let pre_provider_command_count = commands.len();
         for (node_index, ((provider, node_identity), bindings)) in providers
             .iter()
             .zip(batch_identity.nodes())
@@ -4999,7 +5024,7 @@ impl OperationDispatch {
             };
             commands.push(command);
         }
-        if commands.len() != input_command_count.saturating_add(batch_identity.nodes().len())
+        if commands.len() != pre_provider_command_count.saturating_add(batch_identity.nodes().len())
             || !lane.current_descriptor_matches_snapshot()
         {
             return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
@@ -5050,6 +5075,44 @@ impl OperationDispatch {
                     });
                 }
                 Ok(completion)
+            }
+        }
+    }
+}
+
+fn map_backing_initialization_error<R, Retry>(
+    runtime: &R,
+    batch_identity: &BatchOperationIdentity,
+    error: BackingInitializationEncodeError<R::Error>,
+) -> OperationDispatchError<R, Retry>
+where
+    R: DeviceRuntime,
+    Retry: DispatchRetryAuthority,
+{
+    match error {
+        BackingInitializationEncodeError::Contract(error) => {
+            OperationDispatchError::Contract(error)
+        }
+        BackingInitializationEncodeError::Runtime { participant, error } => {
+            let identity = batch_identity
+                .nodes()
+                .iter()
+                .flat_map(BatchOperationNodeIdentity::participants)
+                .find(|candidate| {
+                    candidate.node_key().sequence_authority() == participant.sequence_authority()
+                        && candidate.node_key().request_authority()
+                            == participant.request_authority()
+                })
+                .map(BatchOperationParticipantIdentity::identity)
+                .cloned();
+            let Some(identity) = identity else {
+                return OperationDispatchError::Contract(invalid_operation(
+                    "backing initialization failure has no matching batch participant",
+                ));
+            };
+            match classify_device_error(runtime, identity, &error) {
+                Ok(failure) => OperationDispatchError::Initialization(failure),
+                Err(error) => OperationDispatchError::Contract(error),
             }
         }
     }

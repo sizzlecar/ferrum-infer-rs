@@ -494,6 +494,7 @@ fn state_capacity_demand_is_explicit_checked_and_wire_closed() {
             bytes_per_token: 4,
             maximum_tokens: 128,
         },
+        initialization: StateInitialization::Zero,
     };
     let restored: StateSpec =
         serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();

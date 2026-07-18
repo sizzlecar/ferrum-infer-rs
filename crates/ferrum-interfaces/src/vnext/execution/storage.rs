@@ -3,7 +3,8 @@ use super::{
     validate_active_sequence_ceiling, AllocationKind, AllocationLifetime, BTreeSet,
     BlockedTensorPadding, BufferUsage, ContractVersion, Deserialize, Deserializer,
     DynamicResourceDemand, DynamicResourceShape, DynamicStorageProfile, ElementType, NodeId,
-    ResolvedTensorLayout, ResourceId, ResourceWorkShape, Serialize, VNextError,
+    ResolvedTensorLayout, ResourceId, ResourceWorkShape, Serialize, StateInitialization,
+    VNextError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -542,6 +543,7 @@ pub struct DynamicResourceDescriptor {
     pub(super) kind: AllocationKind,
     pub(super) storage: DynamicStorageContract,
     pub(super) pool_id: DynamicBackingPoolId,
+    pub(super) initialization: StateInitialization,
     /// Protocol-only ceiling used for checked evidence. No API may iterate,
     /// reserve, allocate, or claim this many instances.
     pub(super) theoretical_maximum_instances: u32,
@@ -558,6 +560,7 @@ impl DynamicResourceDescriptor {
         lifetime: AllocationLifetime,
         kind: AllocationKind,
         storage: DynamicStorageContract,
+        initialization: StateInitialization,
         theoretical_maximum_instances: u32,
     ) -> Result<Self, VNextError> {
         validate_active_sequence_ceiling(theoretical_maximum_instances)?;
@@ -591,6 +594,15 @@ impl DynamicResourceDescriptor {
                 "dynamic resource kind, lifetime, usage, or element type is inconsistent",
             ));
         }
+        if initialization == StateInitialization::Zero
+            && (kind != AllocationKind::Value
+                || usage != BufferUsage::State
+                || lifetime != AllocationLifetime::Sequence)
+        {
+            return Err(invalid_plan(
+                "zero initialization requires semantic Sequence state backing",
+            ));
+        }
         demand.validate()?;
         let pool_id = DynamicBackingPoolId::from_compatibility(&PoolCompatibilityKey::new(
             &storage,
@@ -608,6 +620,7 @@ impl DynamicResourceDescriptor {
             kind,
             storage,
             pool_id,
+            initialization,
             theoretical_maximum_instances,
         };
         descriptor.evaluate_request_bytes_for_shape(descriptor.demand.minimum_shape())?;
@@ -708,6 +721,10 @@ impl DynamicResourceDescriptor {
     pub fn pool_id(&self) -> &DynamicBackingPoolId {
         &self.pool_id
     }
+
+    pub const fn initialization(&self) -> StateInitialization {
+        self.initialization
+    }
 }
 
 #[derive(Deserialize)]
@@ -722,6 +739,7 @@ pub(super) struct DynamicResourceDescriptorWire {
     pub(super) kind: AllocationKind,
     pub(super) storage: DynamicStorageContract,
     pub(super) pool_id: DynamicBackingPoolId,
+    pub(super) initialization: StateInitialization,
     pub(super) theoretical_maximum_instances: u32,
 }
 
@@ -740,6 +758,7 @@ impl<'de> Deserialize<'de> for DynamicResourceDescriptor {
             wire.lifetime,
             wire.kind,
             wire.storage,
+            wire.initialization,
             wire.theoretical_maximum_instances,
         )
         .map_err(serde::de::Error::custom)?;
