@@ -571,7 +571,9 @@ impl CudaStreamState {
     }
 
     fn is_quiescent(&self) -> bool {
-        !self.recording.load(Ordering::Acquire) && self.in_flight.load(Ordering::Acquire) == 0
+        !self.failed.load(Ordering::Acquire)
+            && !self.recording.load(Ordering::Acquire)
+            && self.in_flight.load(Ordering::Acquire) == 0
     }
 
     fn begin_submission(&self) -> Result<(), CudaDeviceRuntimeError> {
@@ -1110,8 +1112,6 @@ impl DeviceRuntime for CudaDeviceRuntime {
         if let Err(error) = stream.state.begin_submission() {
             return Err(DefinitelyNotSubmitted::new(error));
         }
-        drop(validate_stage);
-
         let mut segment_start = 0;
         while segment_start < commands.len() {
             let Some(segment_end) =
@@ -1127,6 +1127,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 &commands[segment_start..segment_end],
                 stream_was_quiescent,
             ) {
+                if !error.eager_fallback_safe() {
+                    stream.state.fail();
+                    self.quarantine(stream, commands);
+                    panic!(
+                        "CUDA submission became indeterminate while preparing a reusable executable: {error}"
+                    );
+                }
                 tracing::debug!(
                     error = %error,
                     command_count = segment_end - segment_start,
@@ -1135,6 +1142,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             }
             segment_start = segment_end;
         }
+        drop(validate_stage);
 
         let begin_timing_stage =
             CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::BeginTiming);

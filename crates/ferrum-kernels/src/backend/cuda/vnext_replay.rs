@@ -5,8 +5,9 @@
 //! command in a captured segment. A key binds provider semantics, launch
 //! scalars, physical regions, and retained host bytes.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use cudarc::cublas::CudaBlas;
@@ -122,21 +123,44 @@ impl CudaExecutableSegmentKey {
 pub(crate) struct CudaReplayError {
     stage: &'static str,
     detail: String,
+    eager_fallback_safe: bool,
 }
 
 impl CudaReplayError {
-    fn cuda(stage: &'static str, status: sys::CUresult) -> Self {
+    fn cuda(stage: &'static str, status: sys::CUresult, eager_fallback_safe: bool) -> Self {
         Self {
             stage,
             detail: format!("{status:?}"),
+            eager_fallback_safe,
         }
     }
 
-    fn runtime(stage: &'static str, error: CudaDeviceRuntimeError) -> Self {
+    fn runtime(
+        stage: &'static str,
+        error: CudaDeviceRuntimeError,
+        eager_fallback_safe: bool,
+    ) -> Self {
         Self {
             stage,
             detail: error.to_string(),
+            eager_fallback_safe,
         }
+    }
+
+    fn provider_panic(capture_terminated: bool) -> Self {
+        Self {
+            stage: "encode reusable executable capture",
+            detail: if capture_terminated {
+                "provider command panicked; capture was terminated".to_owned()
+            } else {
+                "provider command panicked and capture termination could not be proven".to_owned()
+            },
+            eager_fallback_safe: false,
+        }
+    }
+
+    pub(crate) const fn eager_fallback_safe(&self) -> bool {
+        self.eager_fallback_safe
     }
 }
 
@@ -174,14 +198,33 @@ impl CudaExecutableSegment {
             return Err(CudaReplayError::cuda(
                 "begin reusable executable capture",
                 capture_status,
+                true,
             ));
         }
 
-        let encoded = commands
-            .iter()
-            .try_for_each(|command| command.enqueue(stream, blas));
+        let encoded = catch_unwind(AssertUnwindSafe(|| {
+            commands
+                .iter()
+                .try_for_each(|command| command.enqueue(stream, blas))
+        }));
         let mut graph: sys::CUgraph = std::ptr::null_mut();
         let end_status = unsafe { sys::cuStreamEndCapture(stream.cu_stream(), &mut graph) };
+        let mut capture_state = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_INVALIDATED;
+        let capture_query_status =
+            unsafe { sys::cuStreamIsCapturing(stream.cu_stream(), &mut capture_state) };
+        let capture_terminated = capture_query_status == sys::CUresult::CUDA_SUCCESS
+            && capture_state == sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+        let encoded = match encoded {
+            Ok(encoded) => encoded,
+            Err(_panic) => {
+                if !graph.is_null() {
+                    unsafe {
+                        sys::cuGraphDestroy(graph);
+                    }
+                }
+                return Err(CudaReplayError::provider_panic(capture_terminated));
+            }
+        };
         if let Err(error) = encoded {
             if !graph.is_null() {
                 unsafe {
@@ -191,9 +234,10 @@ impl CudaExecutableSegment {
             return Err(CudaReplayError::runtime(
                 "encode reusable executable capture",
                 error,
+                capture_terminated,
             ));
         }
-        if end_status != sys::CUresult::CUDA_SUCCESS || graph.is_null() {
+        if end_status != sys::CUresult::CUDA_SUCCESS || graph.is_null() || !capture_terminated {
             if !graph.is_null() {
                 unsafe {
                     sys::cuGraphDestroy(graph);
@@ -202,6 +246,7 @@ impl CudaExecutableSegment {
             return Err(CudaReplayError::cuda(
                 "end reusable executable capture",
                 end_status,
+                capture_terminated,
             ));
         }
 
@@ -215,6 +260,7 @@ impl CudaExecutableSegment {
             return Err(CudaReplayError::cuda(
                 "instantiate reusable executable",
                 instantiate_status,
+                true,
             ));
         }
         let upload_status = unsafe { sys::cuGraphUpload(executable, stream.cu_stream()) };
@@ -226,6 +272,7 @@ impl CudaExecutableSegment {
             return Err(CudaReplayError::cuda(
                 "upload reusable executable",
                 upload_status,
+                false,
             ));
         }
 
@@ -243,7 +290,11 @@ impl CudaExecutableSegment {
     fn launch(&mut self, stream: &CudaStream, last_used: u64) -> Result<(), CudaReplayError> {
         let status = unsafe { sys::cuGraphLaunch(self.executable, stream.cu_stream()) };
         if status != sys::CUresult::CUDA_SUCCESS {
-            return Err(CudaReplayError::cuda("launch reusable executable", status));
+            return Err(CudaReplayError::cuda(
+                "launch reusable executable",
+                status,
+                false,
+            ));
         }
         self.last_used = last_used;
         Ok(())
@@ -273,7 +324,7 @@ unsafe impl Send for CudaExecutableSegment {}
 
 pub(crate) struct CudaExecutableCache {
     entries: HashMap<CudaExecutableSegmentKey, CudaExecutableSegment>,
-    rejected: HashSet<CudaExecutableSegmentKey>,
+    rejected: HashMap<CudaExecutableSegmentKey, u64>,
     maximum_entries: usize,
     clock: u64,
 }
@@ -286,7 +337,7 @@ impl CudaExecutableCache {
         );
         Self {
             entries: HashMap::new(),
-            rejected: HashSet::new(),
+            rejected: HashMap::new(),
             maximum_entries,
             clock: 0,
         }
@@ -313,7 +364,7 @@ impl CudaExecutableCache {
             entry.last_used = now;
             return Ok(true);
         }
-        if self.rejected.contains(&key) || !stream_is_quiescent {
+        if self.rejected.contains_key(&key) || !stream_is_quiescent {
             return Ok(false);
         }
         if self.entries.len() >= self.maximum_entries {
@@ -332,7 +383,19 @@ impl CudaExecutableCache {
                 Ok(true)
             }
             Err(error) => {
-                self.rejected.insert(key);
+                if error.eager_fallback_safe() {
+                    if self.rejected.len() >= self.maximum_entries {
+                        let oldest = self
+                            .rejected
+                            .iter()
+                            .min_by_key(|(_, last_used)| *last_used)
+                            .map(|(key, _)| *key);
+                        if let Some(oldest) = oldest {
+                            self.rejected.remove(&oldest);
+                        }
+                    }
+                    self.rejected.insert(key, now);
+                }
                 Err(error)
             }
         }
