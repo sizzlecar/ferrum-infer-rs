@@ -24,12 +24,12 @@ use super::{
     DeviceId, DeviceRuntime, DynamicBackingPoolId, DynamicBackingPoolSpec,
     DynamicResourceDescriptor, DynamicResourceShape, DynamicStorageAllocator,
     DynamicStorageProfile, DynamicStorageView, ElementType, ExecutionFrameId, ExecutionPlan,
-    FailureDomain, FailureEnvelope, InvocationLivenessMode, LogicalAdmissionCoordinator,
-    LogicalAdmissionCoordinatorId, LogicalAdmissionLease, LogicalBatchCapacityLease,
-    LogicalCapacityLease, LogicalRequestLease, NodeId, PlanHash, PlanId, PlanNode,
-    RequestAdmissionDecision, RequestAuthorityId, RequestIdentity, ResourceAllocation, ResourceId,
-    ResourceWorkShape, RunId, SequenceAuthorityId, StateInitialization, StepResourceSlotKind,
-    StreamState, TokenSpanWork, TransactionId, VNextError,
+    FailureDomain, FailureEnvelope, InitialSequenceAdmissionDecision, InvocationLivenessMode,
+    LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, LogicalAdmissionLease,
+    LogicalBatchCapacityLease, LogicalCapacityLease, LogicalRequestLease, NodeId, PlanHash, PlanId,
+    PlanNode, RequestAdmissionDecision, RequestAuthorityId, RequestIdentity, ResourceAllocation,
+    ResourceId, ResourceWorkShape, RunId, SequenceAuthorityId, StateInitialization,
+    StepResourceSlotKind, StreamState, TokenSpanWork, TransactionId, VNextError,
     MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
 };
 

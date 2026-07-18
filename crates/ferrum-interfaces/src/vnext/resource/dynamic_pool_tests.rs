@@ -1558,6 +1558,173 @@ fn insufficient_idle_reclaim_keeps_all_residency_and_returns_typed_wait() {
 }
 
 #[test]
+fn initial_bundle_waits_without_partial_request_and_allows_smaller_bypass() {
+    let request_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        '8',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let sequence_catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        '9',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let request_pool_id = request_catalog.pool_id.clone();
+    let sequence_pool_id = sequence_catalog.pool_id.clone();
+    let catalog = combine_catalogs(&[request_catalog, sequence_catalog]);
+    let runtime = new_runtime(&catalog, 320);
+    let harness = harness(runtime, catalog, 320, false);
+    let maintenance = &harness.root.maintenance_controller;
+    maintenance.initialize_pool(&request_pool_id).unwrap();
+    maintenance.grow_pool(&request_pool_id, 128).unwrap();
+    maintenance.initialize_pool(&sequence_pool_id).unwrap();
+    maintenance.grow_pool(&sequence_pool_id, 64).unwrap();
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+
+    let work_a = work_with_ceiling(1, 1);
+    let active = match binding
+        .try_admit_initial_sequence(
+            RequestResourceAdmissionRequest::new(
+                work_a.clone(),
+                AdmissionFitPolicy::FullInputMustFit,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            SequenceResourceAdmissionRequest::new(
+                work_a,
+                AdmissionFitPolicy::FullInputMustFit,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            RunId::new("run/initial-bundle-a").unwrap(),
+            RequestIdentity::new("request/initial-bundle-a").unwrap(),
+        )
+        .unwrap()
+    {
+        InitialSequenceResourceAdmissionDecision::Admitted(sequence) => sequence,
+        _ => panic!("A must occupy one request and sequence slice"),
+    };
+    let before_b = maintenance.status().unwrap();
+    let logical_before_b = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .snapshot()
+        .unwrap();
+
+    let work_b = work_with_ceiling(2, 2);
+    let deferred = match binding
+        .try_admit_initial_sequence(
+            RequestResourceAdmissionRequest::new(
+                work_b.clone(),
+                AdmissionFitPolicy::FullInputMustFit,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            SequenceResourceAdmissionRequest::new(
+                work_b,
+                AdmissionFitPolicy::FullInputMustFit,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            RunId::new("run/initial-bundle-b").unwrap(),
+            RequestIdentity::new("request/initial-bundle-b").unwrap(),
+        )
+        .unwrap()
+    {
+        InitialSequenceResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("B must wait for its larger sequence backing"),
+    };
+    assert_eq!(
+        deferred.evidence().scope(),
+        DynamicBackingClaimScope::InitialSequenceBundle
+    );
+    let request_domain = harness.root.dynamic_pools.pools[&request_pool_id]
+        .domain
+        .domain_id;
+    let sequence_domain = harness.root.dynamic_pools.pools[&sequence_pool_id]
+        .domain
+        .domain_id;
+    assert_eq!(
+        deferred
+            .evidence()
+            .protected_immediate()
+            .units_for(request_domain)
+            .unwrap()
+            .get(),
+        128
+    );
+    assert_eq!(
+        deferred
+            .evidence()
+            .protected_immediate()
+            .units_for(sequence_domain)
+            .unwrap()
+            .get(),
+        128
+    );
+    let after_b = maintenance.status().unwrap();
+    let logical_after_b = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .snapshot()
+        .unwrap();
+    assert_eq!(after_b.pools(), before_b.pools());
+    assert_eq!(logical_after_b.domains(), logical_before_b.domains());
+    assert_eq!(logical_after_b.active_requests(), 1);
+    assert_eq!(logical_after_b.active_sequences(), 1);
+    assert!(matches!(
+        deferred.maintain().unwrap(),
+        DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
+    ));
+
+    let work_c = work_with_ceiling(1, 1);
+    let bypass = match binding
+        .try_admit_initial_sequence(
+            RequestResourceAdmissionRequest::new(
+                work_c.clone(),
+                AdmissionFitPolicy::FullInputMustFit,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            SequenceResourceAdmissionRequest::new(
+                work_c,
+                AdmissionFitPolicy::FullInputMustFit,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            RunId::new("run/initial-bundle-c").unwrap(),
+            RequestIdentity::new("request/initial-bundle-c").unwrap(),
+        )
+        .unwrap()
+    {
+        InitialSequenceResourceAdmissionDecision::Admitted(sequence) => sequence,
+        _ => panic!("C must bypass B while A remains active"),
+    };
+    let with_c = harness
+        .root
+        .dynamic_pools
+        .logical_admission
+        .snapshot()
+        .unwrap();
+    assert_eq!(with_c.active_requests(), 2);
+    assert_eq!(with_c.active_sequences(), 2);
+
+    drop(deferred);
+    drop(bypass);
+    drop(active);
+    drop(binding);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
 fn plan_budget_wait_retains_staged_parent_and_reuses_released_sequence_backing() {
     let request_catalog = pool_catalog(
         linear_profile(),

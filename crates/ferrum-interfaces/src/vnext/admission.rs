@@ -164,11 +164,33 @@ impl CapacityVector {
         self.0.is_empty()
     }
 
-    fn units_for(&self, domain: CapacityDomainId) -> Option<CapacityUnits> {
+    pub(crate) fn units_for(&self, domain: CapacityDomainId) -> Option<CapacityUnits> {
         self.0
             .binary_search_by_key(&domain, |entry| entry.domain)
             .ok()
             .map(|index| self.0[index].units)
+    }
+
+    pub(crate) fn checked_sum(left: &Self, right: &Self) -> Result<Self, VNextError> {
+        let mut units_by_domain = BTreeMap::<CapacityDomainId, u64>::new();
+        for entry in left.entries().iter().chain(right.entries()) {
+            let units = units_by_domain.entry(entry.domain()).or_default();
+            *units = units.checked_add(entry.units().get()).ok_or_else(|| {
+                admission_fault(
+                    DynamicAdmissionFaultKind::ArithmeticOverflow,
+                    "combined admission demand overflows u64",
+                )
+            })?;
+        }
+        if units_by_domain.is_empty() {
+            return Ok(Self::empty());
+        }
+        Self::new(
+            units_by_domain
+                .into_iter()
+                .map(|(domain, units)| CapacityEntry::new(domain, CapacityUnits::new(units)))
+                .collect::<Result<Vec<_>, _>>()?,
+        )
     }
 }
 
@@ -244,6 +266,27 @@ impl AdmissionDemand {
 
     pub const fn pressure_action(&self) -> AdmissionPressureAction {
         self.pressure_action
+    }
+
+    fn initial_sequence_bundle(request: &Self, sequence: &Self) -> Result<Self, VNextError> {
+        if request.pressure_action != sequence.pressure_action {
+            return Err(invalid_admission(
+                "initial request and sequence require one pressure action",
+            ));
+        }
+        let fit_policy = if request.fit_policy == AdmissionFitPolicy::FullInputMustFit
+            || sequence.fit_policy == AdmissionFitPolicy::FullInputMustFit
+        {
+            AdmissionFitPolicy::FullInputMustFit
+        } else {
+            AdmissionFitPolicy::ImmediateOnly
+        };
+        Self::from_plan(
+            CapacityVector::checked_sum(&request.immediate_claim, &sequence.immediate_claim)?,
+            CapacityVector::checked_sum(&request.fit_requirement, &sequence.fit_requirement)?,
+            fit_policy,
+            request.pressure_action,
+        )
     }
 }
 
@@ -769,6 +812,26 @@ pub enum RequestAdmissionDecision {
     Admitted(LogicalRequestLease),
     Deferred(AdmissionDeferred),
     PermanentRejected(AdmissionRejected),
+}
+
+pub(crate) enum InitialSequenceAdmissionDecision {
+    Admitted(LogicalInitialSequenceAdmission),
+    Deferred,
+    PermanentRejected(AdmissionRejected),
+}
+
+/// Atomic logical authority for a request root and its first child sequence.
+/// Field order is intentional: an unconsumed bundle releases the child before
+/// the parent request.
+pub(crate) struct LogicalInitialSequenceAdmission {
+    sequence: LogicalAdmissionLease,
+    request: LogicalRequestLease,
+}
+
+impl LogicalInitialSequenceAdmission {
+    pub(crate) fn into_parts(self) -> (LogicalRequestLease, LogicalAdmissionLease) {
+        (self.request, self.sequence)
+    }
 }
 
 pub(crate) enum AdmissionPreflightDecision {
@@ -1499,6 +1562,237 @@ impl LogicalAdmissionCoordinator {
             claims: committed_claims,
             released: false,
         }))
+    }
+
+    /// Rejects an impossible initial request/sequence pair and observes the
+    /// global sequence ceiling before physical backing is prepared. Ordinary
+    /// capacity blockers deliberately remain eligible here because elastic
+    /// backing maintenance may increase their current totals before the final
+    /// atomic admission check.
+    pub(crate) fn preflight_initial_sequence(
+        &self,
+        request: &AdmissionDemand,
+        sequence: &AdmissionDemand,
+    ) -> Result<AdmissionPreflightDecision, VNextError> {
+        let demand = AdmissionDemand::initial_sequence_bundle(request, sequence)?;
+        let state = self.inner.lock_state()?;
+        if state.poisoned {
+            return Err(admission_fault(
+                DynamicAdmissionFaultKind::Poisoned,
+                "coordinator is fail-closed",
+            ));
+        }
+        let mut evaluation = evaluate_demand(&state, &demand)?;
+        if !evaluation.permanent.is_empty() {
+            return Ok(AdmissionPreflightDecision::PermanentRejected(
+                AdmissionRejected {
+                    immediate_requested: demand.immediate_claim,
+                    fit_requested: demand.fit_requirement,
+                    maximum: state.snapshot(self.id()),
+                    blockers: evaluation.permanent,
+                },
+            ));
+        }
+        if state.active_sequences < state.maximum_active_sequences {
+            return Ok(AdmissionPreflightDecision::Eligible);
+        }
+        evaluation.blockers.push(CapacityShortfall {
+            domain: None,
+            kind: CapacityShortfallKind::ActiveSequenceCeiling,
+            requested: CapacityUnits::new(1),
+            available: CapacityUnits::ZERO,
+            current_total: CapacityUnits::new(u64::from(state.maximum_active_sequences)),
+            maximum_total: CapacityUnits::new(u64::from(state.maximum_active_sequences)),
+        });
+        let wait_condition = state.wait_condition_for_blockers(self.id(), &evaluation.blockers)?;
+        let snapshot = state.snapshot(self.id());
+        Ok(AdmissionPreflightDecision::Deferred(AdmissionDeferred {
+            immediate_requested: demand.immediate_claim,
+            fit_requested: demand.fit_requirement,
+            release_epoch: snapshot.release_epoch,
+            capacity_epoch: snapshot.capacity_epoch,
+            available: snapshot,
+            blockers: evaluation.blockers,
+            action: match demand.pressure_action {
+                AdmissionPressureAction::WaitForRelease => DeferredAction::WaitForRelease,
+                AdmissionPressureAction::PreemptAndRecompute => DeferredAction::PreemptAndRecompute,
+            },
+            wait_condition,
+        }))
+    }
+
+    /// Re-observes the complete bundle after unpublished physical reservations
+    /// have been rolled back. The returned wait condition therefore cannot be
+    /// invalidated by the caller's own rollback notification.
+    pub(crate) fn observe_initial_sequence(
+        &self,
+        request: &AdmissionDemand,
+        sequence: &AdmissionDemand,
+    ) -> Result<AdmissionPreflightDecision, VNextError> {
+        let demand = AdmissionDemand::initial_sequence_bundle(request, sequence)?;
+        let state = self.inner.lock_state()?;
+        if state.poisoned {
+            return Err(admission_fault(
+                DynamicAdmissionFaultKind::Poisoned,
+                "coordinator is fail-closed",
+            ));
+        }
+        let mut evaluation = evaluate_demand(&state, &demand)?;
+        if !evaluation.permanent.is_empty() {
+            return Ok(AdmissionPreflightDecision::PermanentRejected(
+                AdmissionRejected {
+                    immediate_requested: demand.immediate_claim,
+                    fit_requested: demand.fit_requirement,
+                    maximum: state.snapshot(self.id()),
+                    blockers: evaluation.permanent,
+                },
+            ));
+        }
+        if state.active_sequences >= state.maximum_active_sequences {
+            evaluation.blockers.push(CapacityShortfall {
+                domain: None,
+                kind: CapacityShortfallKind::ActiveSequenceCeiling,
+                requested: CapacityUnits::new(1),
+                available: CapacityUnits::ZERO,
+                current_total: CapacityUnits::new(u64::from(state.maximum_active_sequences)),
+                maximum_total: CapacityUnits::new(u64::from(state.maximum_active_sequences)),
+            });
+        }
+        if evaluation.blockers.is_empty() {
+            return Ok(AdmissionPreflightDecision::Eligible);
+        }
+        let action = deferred_action(&demand, evaluation.growth_required);
+        let wait_condition = state.wait_condition_for_blockers(self.id(), &evaluation.blockers)?;
+        let snapshot = state.snapshot(self.id());
+        Ok(AdmissionPreflightDecision::Deferred(AdmissionDeferred {
+            immediate_requested: demand.immediate_claim,
+            fit_requested: demand.fit_requirement,
+            release_epoch: snapshot.release_epoch,
+            capacity_epoch: snapshot.capacity_epoch,
+            available: snapshot,
+            blockers: evaluation.blockers,
+            action,
+            wait_condition,
+        }))
+    }
+
+    /// Commits a request root and its first child sequence under one mutation
+    /// lock. No request authority or capacity claim can escape when the child
+    /// sequence is deferred or permanently rejected.
+    pub(crate) fn try_admit_initial_sequence(
+        &self,
+        request_demand: &AdmissionDemand,
+        sequence_demand: &AdmissionDemand,
+    ) -> Result<InitialSequenceAdmissionDecision, VNextError> {
+        let demand = AdmissionDemand::initial_sequence_bundle(request_demand, sequence_demand)?;
+        let mut state = self.inner.lock_mutation()?;
+        if state.poisoned {
+            return Err(admission_fault(
+                DynamicAdmissionFaultKind::Poisoned,
+                "coordinator is fail-closed",
+            ));
+        }
+
+        let mut evaluation = evaluate_demand(&state, &demand)?;
+        if !evaluation.permanent.is_empty() {
+            return Ok(InitialSequenceAdmissionDecision::PermanentRejected(
+                AdmissionRejected {
+                    immediate_requested: demand.immediate_claim,
+                    fit_requested: demand.fit_requirement,
+                    maximum: state.snapshot(self.id()),
+                    blockers: evaluation.permanent,
+                },
+            ));
+        }
+        if state.active_sequences >= state.maximum_active_sequences {
+            evaluation.blockers.push(CapacityShortfall {
+                domain: None,
+                kind: CapacityShortfallKind::ActiveSequenceCeiling,
+                requested: CapacityUnits::new(1),
+                available: CapacityUnits::ZERO,
+                current_total: CapacityUnits::new(u64::from(state.maximum_active_sequences)),
+                maximum_total: CapacityUnits::new(u64::from(state.maximum_active_sequences)),
+            });
+        }
+        if !evaluation.blockers.is_empty() {
+            return Ok(InitialSequenceAdmissionDecision::Deferred);
+        }
+
+        let request_reservation = state.preview_request_authority()?;
+        let sequence_reservation = state.preview_sequence_authority()?;
+        let mut next_usage = Vec::with_capacity(demand.immediate_claim.entries().len());
+        for entry in demand.immediate_claim.entries() {
+            let domain = state
+                .domains
+                .get(&entry.domain)
+                .expect("known bundle demand domain was preflight validated");
+            let used = domain.used.checked_add(entry.units.get()).ok_or_else(|| {
+                admission_fault(
+                    DynamicAdmissionFaultKind::ArithmeticOverflow,
+                    "initial request/sequence capacity usage overflows u64",
+                )
+            })?;
+            next_usage.push((entry.domain, used));
+        }
+        let next_active_requests = state.active_requests.checked_add(1).ok_or_else(|| {
+            admission_fault(
+                DynamicAdmissionFaultKind::AuthorityExhausted,
+                "active request count is exhausted",
+            )
+        })?;
+        let next_active_sequences = state.active_sequences.checked_add(1).ok_or_else(|| {
+            admission_fault(
+                DynamicAdmissionFaultKind::ArithmeticOverflow,
+                "active sequence count overflows u32",
+            )
+        })?;
+        state
+            .release_epoch
+            .checked_add(u64::from(next_active_requests))
+            .and_then(|epoch| epoch.checked_add(u64::from(next_active_sequences)))
+            .and_then(|epoch| epoch.checked_add(state.active_child_claims))
+            .ok_or_else(|| {
+                admission_fault(
+                    DynamicAdmissionFaultKind::EpochExhausted,
+                    "release epoch cannot represent the initial request/sequence bundle",
+                )
+            })?;
+        state.prepare_request_storage(request_reservation)?;
+        state.prepare_sequence_storage(sequence_reservation)?;
+
+        let request = state.commit_request_authority(request_reservation);
+        let sequence = state.commit_sequence_authority(sequence_reservation, request);
+        for (domain, used) in next_usage {
+            state
+                .domains
+                .get_mut(&domain)
+                .expect("validated bundle capacity domain remains registered")
+                .used = used;
+        }
+        state.active_requests = next_active_requests;
+        state.active_sequences = next_active_sequences;
+        state.live_requests[request.sparse_id as usize]
+            .as_mut()
+            .expect("new initial request remains live")
+            .active_sequences = 1;
+
+        Ok(InitialSequenceAdmissionDecision::Admitted(
+            LogicalInitialSequenceAdmission {
+                sequence: LogicalAdmissionLease {
+                    inner: Arc::clone(&self.inner),
+                    request,
+                    sequence,
+                    claims: sequence_demand.immediate_claim.clone(),
+                    released: false,
+                },
+                request: LogicalRequestLease {
+                    inner: Arc::clone(&self.inner),
+                    request,
+                    claims: request_demand.immediate_claim.clone(),
+                    released: false,
+                },
+            },
+        ))
     }
 
     pub(crate) fn try_admit_sequence_for_request(
@@ -2996,6 +3290,78 @@ mod tests {
         assert_eq!(after.active_requests(), 1);
         assert_eq!(after.active_sequences(), 0);
         drop(held);
+    }
+
+    #[test]
+    fn initial_sequence_defer_retains_no_partial_request_or_capacity() {
+        let coordinator = coordinator(2);
+        let held = match coordinator
+            .try_admit_initial_sequence(
+                &demand(&[(1, 1)], &[(1, 1)]),
+                &demand(&[(2, 3)], &[(2, 3)]),
+            )
+            .unwrap()
+        {
+            InitialSequenceAdmissionDecision::Admitted(bundle) => bundle,
+            _ => panic!("first initial bundle must be admitted"),
+        };
+        let before = coordinator.snapshot().unwrap();
+
+        assert!(matches!(
+            coordinator
+                .try_admit_initial_sequence(
+                    &demand(&[(1, 1)], &[(1, 1)]),
+                    &demand(&[(2, 2)], &[(2, 2)]),
+                )
+                .unwrap(),
+            InitialSequenceAdmissionDecision::Deferred
+        ));
+        let after = coordinator.snapshot().unwrap();
+        assert_eq!(after.active_requests(), before.active_requests());
+        assert_eq!(after.active_sequences(), before.active_sequences());
+        assert_eq!(after.domains, before.domains);
+
+        drop(held);
+        let empty = coordinator.snapshot().unwrap();
+        assert_eq!(empty.active_requests(), 0);
+        assert_eq!(empty.active_sequences(), 0);
+        assert!(empty
+            .domains()
+            .iter()
+            .all(|domain| domain.used().get() == 0));
+    }
+
+    #[test]
+    fn initial_sequence_bundle_sums_overlapping_domains_and_releases_child_first() {
+        let coordinator = coordinator(1);
+        let bundle = match coordinator
+            .try_admit_initial_sequence(
+                &demand(&[(1, 2), (2, 1)], &[(1, 2), (2, 1)]),
+                &demand(&[(1, 3), (2, 2)], &[(1, 3), (2, 2)]),
+            )
+            .unwrap()
+        {
+            InitialSequenceAdmissionDecision::Admitted(bundle) => bundle,
+            _ => panic!("overlapping initial bundle must be admitted atomically"),
+        };
+        let admitted = coordinator.snapshot().unwrap();
+        assert_eq!(admitted.active_requests(), 1);
+        assert_eq!(admitted.active_sequences(), 1);
+        assert_eq!(admitted.domains()[0].used().get(), 5);
+        assert_eq!(admitted.domains()[1].used().get(), 3);
+
+        let (request, sequence) = bundle.into_parts();
+        assert_eq!(request.request(), sequence.request());
+        drop(sequence);
+        drop(request);
+        let released = coordinator.snapshot().unwrap();
+        assert!(!released.poisoned());
+        assert_eq!(released.active_requests(), 0);
+        assert_eq!(released.active_sequences(), 0);
+        assert!(released
+            .domains()
+            .iter()
+            .all(|domain| domain.used().get() == 0));
     }
 
     #[test]
