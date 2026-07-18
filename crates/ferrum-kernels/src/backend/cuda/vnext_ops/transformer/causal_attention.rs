@@ -9,13 +9,14 @@ use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, AttributeId, BatchedOperationInvocation, CapabilityId,
     ContractVersion, DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile,
-    DynamicStorageRequirement, DynamicStorageView, ElementType, OperationBufferStorageKind,
-    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
-    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
-    OperationResourceEstimator, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
-    ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
-    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError,
-    WeightFormatId, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+    DynamicStorageRequirement, DynamicStorageView, ElementType, EncodedDeviceOperation,
+    OperationBufferStorageKind, OperationContract, OperationFailure, OperationInvocation,
+    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
+    ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceScope,
+    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    SemanticValue, VNextError, WeightFormatId, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+    CAUSAL_PAGED_ATTENTION_OPERATION_ID,
 };
 
 use super::{ensure_estimator_request, estimate, launch_gemm_f16};
@@ -217,18 +218,20 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-    ) -> Result<CudaDeviceCommand, OperationFailure> {
+    ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_attention(&self.functions, invocation).map_err(|message| {
-            OperationFailure::new(
-                identity,
-                ProfilePhase::Forward,
-                "cuda.causal_paged_attention.encode",
-                message.chars().take(2048).collect::<String>(),
-                false,
-            )
-            .expect("core-issued CUDA causal attention identity must be valid")
-        })
+        encode_attention(&self.functions, invocation)
+            .map(EncodedDeviceOperation::compute)
+            .map_err(|message| {
+                OperationFailure::new(
+                    identity,
+                    ProfilePhase::Forward,
+                    "cuda.causal_paged_attention.encode",
+                    message.chars().take(2048).collect::<String>(),
+                    false,
+                )
+                .expect("core-issued CUDA causal attention identity must be valid")
+            })
     }
 }
 

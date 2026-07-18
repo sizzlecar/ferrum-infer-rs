@@ -13,15 +13,15 @@ use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     dense_linear_contract, dense_swiglu_contract, residual_add_contract, rms_norm_contract,
     AttributeId, BatchedOperationInvocation, CapabilityId, ContractVersion, DeviceRuntime,
-    DynamicStorageRequirement, ElementType, OperationContract, OperationFailure,
-    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
-    ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    SemanticValue, VNextError, WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID,
-    DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_F16_CAPABILITY_ID, DENSE_SWIGLU_OPERATION_ID,
-    RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F16_CAPABILITY_ID,
-    RMS_NORM_OPERATION_ID,
+    DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationContract,
+    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
+    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
+    ProfilePhase, ProviderId, ProviderStorageBindingRequirement, ProviderWorkspaceRequirement,
+    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
+    ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
+    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
+    DENSE_SWIGLU_OPERATION_ID, RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_OPERATION_ID,
+    RMS_NORM_F16_CAPABILITY_ID, RMS_NORM_OPERATION_ID,
 };
 
 use super::super::vnext_runtime::{
@@ -109,13 +109,14 @@ impl OperationProvider<CudaDeviceRuntime> for CudaRmsNormProvider {
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-    ) -> Result<CudaDeviceCommand, OperationFailure> {
+    ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
         encode_rms_norm(
             self.descriptor.provider_implementation_fingerprint(),
             &self.function,
             invocation,
         )
+        .map(EncodedDeviceOperation::compute)
         .map_err(|message| provider_failure(identity, "cuda.rms_norm.encode", message))
     }
 }
@@ -160,12 +161,13 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseLinearProvider {
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-    ) -> Result<CudaDeviceCommand, OperationFailure> {
+    ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
         encode_dense_linear(
             self.descriptor.provider_implementation_fingerprint(),
             invocation,
         )
+        .map(EncodedDeviceOperation::compute)
         .map_err(|message| provider_failure(identity, "cuda.dense_linear.encode", message))
     }
 }
@@ -239,13 +241,14 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-    ) -> Result<CudaDeviceCommand, OperationFailure> {
+    ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
         encode_dense_swiglu(
             self.descriptor.provider_implementation_fingerprint(),
             &self.silu_mul,
             invocation,
         )
+        .map(EncodedDeviceOperation::compute)
         .map_err(|message| provider_failure(identity, "cuda.dense_swiglu.encode", message))
     }
 }
@@ -302,13 +305,14 @@ impl OperationProvider<CudaDeviceRuntime> for CudaResidualAddProvider {
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
-    ) -> Result<CudaDeviceCommand, OperationFailure> {
+    ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
         encode_residual_add(
             self.descriptor.provider_implementation_fingerprint(),
             &self.function,
             invocation,
         )
+        .map(EncodedDeviceOperation::compute)
         .map_err(|message| provider_failure(identity, "cuda.residual_add.encode", message))
     }
 }

@@ -447,7 +447,7 @@ impl OperationProvider<TestRuntime> for TestProvider {
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, TestBuffer>,
-    ) -> Result<TestCommand, OperationFailure> {
+    ) -> Result<EncodedDeviceOperation<TestCommand>, OperationFailure> {
         let mut trace = self.trace.lock().unwrap();
         trace.encode_calls += 1;
         trace.last_participant_count = invocation.participants().len();
@@ -470,7 +470,7 @@ impl OperationProvider<TestRuntime> for TestProvider {
             .collect();
         drop(trace);
         match *self.behavior.lock().unwrap() {
-            ProviderBehavior::Success => Ok(TestCommand::Provider),
+            ProviderBehavior::Success => Ok(EncodedDeviceOperation::compute(TestCommand::Provider)),
             ProviderBehavior::WrongIdentity => {
                 let mut parts = participant.identity().parts().clone();
                 parts.request_id = id("request.provider.wrong");

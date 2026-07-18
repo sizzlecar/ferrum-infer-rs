@@ -14,17 +14,18 @@ use super::{
     CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper, ContractVersion,
     DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
     DeviceCommandBatch, DeviceId, DeviceRuntime, DeviceSubmissionStage, DeviceSubmissionTimingSink,
-    DeviceTimingMode, DynamicResourceDemand, DynamicResourceShape, ExecutablePlanView,
-    ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane, ExecutionLaneId,
-    HostTransferLayout, IdentifiedFailure, IndeterminateSubmissionHandle, InvocationResourceLease,
-    LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId, LogicalBackingBufferView,
-    LogicalBackingSegmentBinding, NodeId, NodeInvocationId, NodeWorkContract, OperationId,
-    ParticipantNodeKey, PlanHash, PlanId, PlanNode, PreparedStepSubmissionNode,
-    PreparedStepSubmissionWave, ProgramValueId, ProviderId, ProviderWorkspaceRequirement,
-    QuantizationFormatId, ResourceId, SemanticValue, SequenceBackingSnapshot, SequenceSessionEpoch,
-    SequenceSessionFingerprint, SpanId, StepParticipantFrameAssignment, StepResourceLease,
-    TrustedActiveSequenceBinding, TrustedPlanRuntimeEvidence, UnvalidatedExecutionIdentityParts,
-    VNextError, WeightFormatId, WeightId, EXECUTION_IDENTITY_VERSION,
+    DeviceTimingMode, DynamicResourceDemand, DynamicResourceShape, EncodedDeviceOperation,
+    ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane,
+    ExecutionLaneId, HostTransferLayout, IdentifiedFailure, IndeterminateSubmissionHandle,
+    InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId,
+    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, NodeInvocationId,
+    NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId, PlanNode,
+    PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
+    ProviderWorkspaceRequirement, QuantizationFormatId, ResourceId, SemanticValue,
+    SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint, SpanId,
+    StepParticipantFrameAssignment, StepResourceLease, TrustedActiveSequenceBinding,
+    TrustedPlanRuntimeEvidence, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
+    WeightId, EXECUTION_IDENTITY_VERSION,
 };
 
 pub const MAX_OPERATION_CATALOG_ROWS: usize = 4096;
@@ -5167,8 +5168,8 @@ impl OperationDispatch {
         )
         .map_err(OperationDispatchError::Contract)?;
         let expected_phase = invocation.operation().profile_phase;
-        let command = match provider.provider().encode_selected(invocation) {
-            Ok(command) => command,
+        let operation = match provider.provider().encode_selected(invocation) {
+            Ok(operation) => operation,
             Err(failure)
                 if batch_identity.contains_identity(failure.identity())
                     && failure.phase() == expected_phase =>
@@ -5190,7 +5191,7 @@ impl OperationDispatch {
         completion
             .encode_backing_initializations(runtime, &mut commands)
             .map_err(|error| map_backing_initialization_error(runtime, batch_identity, error))?;
-        commands.push_compute(command);
+        commands.push_operation(operation);
         let timing_mode = commands.timing_mode();
         let mut lane_reservation = lane
             .reserve_enqueue()
@@ -5458,8 +5459,8 @@ impl OperationDispatch {
             )
             .map_err(SubmissionWaveDispatchError::Contract)?;
             let expected_phase = invocation.operation().profile_phase;
-            let command = match provider.provider().encode_selected(invocation) {
-                Ok(command) => command,
+            let operation = match provider.provider().encode_selected(invocation) {
+                Ok(operation) => operation,
                 Err(failure)
                     if node_identity.contains_identity(failure.identity())
                         && failure.phase() == expected_phase =>
@@ -5472,7 +5473,7 @@ impl OperationDispatch {
                     )));
                 }
             };
-            commands.push_compute(command);
+            commands.push_operation(operation);
         }
         if commands.len() != pre_provider_command_count.saturating_add(batch_identity.nodes().len())
             || !lane.current_descriptor_matches_snapshot()
@@ -5990,7 +5991,7 @@ pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
     fn encode_selected(
         &self,
         invocation: BatchedOperationInvocation<'_, R::Buffer>,
-    ) -> Result<R::Command, OperationFailure>;
+    ) -> Result<EncodedDeviceOperation<R::Command>, OperationFailure>;
 }
 
 /// Composition-root registry that owns the exact provider objects used for

@@ -994,8 +994,8 @@ impl OperationProvider<PlanningTestRuntime> for TestEstimator {
     fn encode_selected(
         &self,
         _invocation: BatchedOperationInvocation<'_, BufferDescriptor>,
-    ) -> Result<(), OperationFailure> {
-        Ok(())
+    ) -> Result<EncodedDeviceOperation<()>, OperationFailure> {
+        Ok(EncodedDeviceOperation::compute(()))
     }
 }
 
@@ -1048,8 +1048,8 @@ impl OperationProvider<PlanningTestRuntime> for SequentialScratchEstimator {
     fn encode_selected(
         &self,
         _invocation: BatchedOperationInvocation<'_, BufferDescriptor>,
-    ) -> Result<(), OperationFailure> {
-        Ok(())
+    ) -> Result<EncodedDeviceOperation<()>, OperationFailure> {
+        Ok(EncodedDeviceOperation::compute(()))
     }
 }
 
