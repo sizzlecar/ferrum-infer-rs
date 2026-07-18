@@ -24,7 +24,7 @@ use ferrum_interfaces::{
     },
     vnext::{
         AdmissionDeferred, AdmissionRejected, CapacityAvailabilityEpoch, DeferredAction,
-        DeviceCapacityPressureScope, EventEmissionPermit, ExecutionEvent,
+        DeviceCapacityPressureScope, EventBatchEmissionPermit, EventEmissionPermit, ExecutionEvent,
         ExecutionEventCapturePolicy, ExecutionEventDetail,
         ExecutionEventKind as VNextExecutionEventKind, ExecutionEventSink, ExecutionEventSinkError,
     },
@@ -3509,20 +3509,11 @@ impl VNextProfileExecutionEventSink {
     }
 }
 
-impl ExecutionEventSink for VNextProfileExecutionEventSink {
-    fn is_enabled(&self, _kind: VNextExecutionEventKind) -> bool {
-        true
-    }
-
-    fn capture_policy(&self) -> ExecutionEventCapturePolicy {
-        ExecutionEventCapturePolicy::FirstFramePerRequest
-    }
-
-    fn record(
+impl VNextProfileExecutionEventSink {
+    fn profile_event(
         &self,
         event: &ExecutionEvent,
-        _permit: EventEmissionPermit<'_>,
-    ) -> std::result::Result<(), ExecutionEventSinkError> {
+    ) -> std::result::Result<FerrumProfileEvent, ExecutionEventSinkError> {
         let identity = event.identity().parts();
         let event_name = vnext_execution_event_name(event.kind());
         let timestamp = chrono::Utc::now();
@@ -3689,16 +3680,59 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
         profile.validate().map_err(|error| {
             ExecutionEventSinkError::new(format!("invalid vNext profile event: {error}"))
         })?;
-        let mut line = serde_json::to_string(&profile).map_err(|error| {
-            ExecutionEventSinkError::new(format!("serialize vNext profile event: {error}"))
+        Ok(profile)
+    }
+
+    fn write_events(
+        &self,
+        events: &[ExecutionEvent],
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        const INITIAL_BATCH_BUFFER_LIMIT: usize = 1024 * 1024;
+        let initial_capacity = events
+            .len()
+            .checked_mul(2_048)
+            .unwrap_or(INITIAL_BATCH_BUFFER_LIMIT)
+            .min(INITIAL_BATCH_BUFFER_LIMIT);
+        let mut buffer = Vec::new();
+        buffer.try_reserve(initial_capacity).map_err(|error| {
+            ExecutionEventSinkError::new(format!("reserve vNext profile batch: {error}"))
         })?;
-        line.push('\n');
-        self.file
-            .lock()
-            .write_all(line.as_bytes())
-            .map_err(|error| {
-                ExecutionEventSinkError::new(format!("write vNext profile event: {error}"))
-            })
+        for event in events {
+            let profile = self.profile_event(event)?;
+            serde_json::to_writer(&mut buffer, &profile).map_err(|error| {
+                ExecutionEventSinkError::new(format!("serialize vNext profile event: {error}"))
+            })?;
+            buffer.push(b'\n');
+        }
+        self.file.lock().write_all(&buffer).map_err(|error| {
+            ExecutionEventSinkError::new(format!("write vNext profile event: {error}"))
+        })
+    }
+}
+
+impl ExecutionEventSink for VNextProfileExecutionEventSink {
+    fn is_enabled(&self, _kind: VNextExecutionEventKind) -> bool {
+        true
+    }
+
+    fn capture_policy(&self) -> ExecutionEventCapturePolicy {
+        ExecutionEventCapturePolicy::FirstFramePerRequest
+    }
+
+    fn record(
+        &self,
+        event: &ExecutionEvent,
+        permit: EventEmissionPermit<'_>,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        debug_assert!(std::ptr::eq(event, permit.event()));
+        self.write_events(std::slice::from_ref(event))
+    }
+
+    fn record_batch(
+        &self,
+        permit: EventBatchEmissionPermit<'_>,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        self.write_events(permit.events())
     }
 }
 

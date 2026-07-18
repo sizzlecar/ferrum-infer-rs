@@ -49,6 +49,19 @@ impl<'event> EventEmissionPermit<'event> {
     }
 }
 
+/// Capability created only after the emitter has validated an ordered event
+/// batch against one transactional cursor.
+pub struct EventBatchEmissionPermit<'events> {
+    events: &'events [ExecutionEvent],
+    _seal: event_sink_seal::Seal,
+}
+
+impl<'events> EventBatchEmissionPermit<'events> {
+    pub fn events(&self) -> &'events [ExecutionEvent] {
+        self.events
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ExecutionEventCapturePolicy {
     #[default]
@@ -84,6 +97,24 @@ pub trait ExecutionEventSink: Send + Sync {
         event: &ExecutionEvent,
         permit: EventEmissionPermit<'_>,
     ) -> Result<(), ExecutionEventSinkError>;
+
+    /// Records one cursor-ordered batch. Sinks with a buffered transport should
+    /// override this boundary; the default preserves compatibility and order.
+    fn record_batch(
+        &self,
+        permit: EventBatchEmissionPermit<'_>,
+    ) -> Result<(), ExecutionEventSinkError> {
+        for event in permit.events() {
+            self.record(
+                event,
+                EventEmissionPermit {
+                    event,
+                    _seal: event_sink_seal::Seal,
+                },
+            )?;
+        }
+        Ok(())
+    }
 }
 
 enum ExecutionEventSinkHandle<'sink> {
@@ -135,16 +166,11 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         }
     }
 
-    pub fn emit(
-        &mut self,
+    fn validate_next(
+        cursor: &mut ExecutionEventCursor,
         event: &ExecutionEvent,
         context: &TrustedExecutionEventContext<'_>,
     ) -> Result<(), ExecutionEventSinkError> {
-        if self.sink_failed {
-            return Err(ExecutionEventSinkError::new(
-                "execution event emitter is sealed after a sink failure",
-            ));
-        }
         let requires_open_sequence = matches!(
             event.kind(),
             ExecutionEventKind::FrameStarted | ExecutionEventKind::NodeStarted
@@ -169,10 +195,23 @@ impl<'sink> ExecutionEventEmitter<'sink> {
             };
             live.map_err(|error| ExecutionEventSinkError::new(error.to_string()))?;
         }
-        let mut next_cursor = self.cursor.clone();
-        next_cursor
+        cursor
             .observe_against(event, context)
-            .map_err(|error| ExecutionEventSinkError::new(error.to_string()))?;
+            .map_err(|error| ExecutionEventSinkError::new(error.to_string()))
+    }
+
+    pub fn emit(
+        &mut self,
+        event: &ExecutionEvent,
+        context: &TrustedExecutionEventContext<'_>,
+    ) -> Result<(), ExecutionEventSinkError> {
+        if self.sink_failed {
+            return Err(ExecutionEventSinkError::new(
+                "execution event emitter is sealed after a sink failure",
+            ));
+        }
+        let mut next_cursor = self.cursor.clone();
+        Self::validate_next(&mut next_cursor, event, context)?;
         if self.sink.as_sink().is_enabled(event.kind()) {
             let permit = EventEmissionPermit {
                 event,
@@ -181,6 +220,61 @@ impl<'sink> ExecutionEventEmitter<'sink> {
             if let Err(error) = self.sink.as_sink().record(event, permit) {
                 self.sink_failed = true;
                 return Err(error);
+            }
+        }
+        self.cursor = next_cursor;
+        Ok(())
+    }
+
+    pub fn emit_batch(
+        &mut self,
+        events: &[ExecutionEvent],
+        contexts: &[TrustedExecutionEventContext<'_>],
+    ) -> Result<(), ExecutionEventSinkError> {
+        if self.sink_failed {
+            return Err(ExecutionEventSinkError::new(
+                "execution event emitter is sealed after a sink failure",
+            ));
+        }
+        if events.len() != contexts.len() {
+            return Err(ExecutionEventSinkError::new(
+                "execution event batch context count differs from event count",
+            ));
+        }
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let mut next_cursor = self.cursor.clone();
+        for (event, context) in events.iter().zip(contexts) {
+            Self::validate_next(&mut next_cursor, event, context)?;
+        }
+
+        let all_enabled = events
+            .iter()
+            .all(|event| self.sink.as_sink().is_enabled(event.kind()));
+        if all_enabled {
+            let permit = EventBatchEmissionPermit {
+                events,
+                _seal: event_sink_seal::Seal,
+            };
+            if let Err(error) = self.sink.as_sink().record_batch(permit) {
+                self.sink_failed = true;
+                return Err(error);
+            }
+        } else {
+            for event in events
+                .iter()
+                .filter(|event| self.sink.as_sink().is_enabled(event.kind()))
+            {
+                let permit = EventEmissionPermit {
+                    event,
+                    _seal: event_sink_seal::Seal,
+                };
+                if let Err(error) = self.sink.as_sink().record(event, permit) {
+                    self.sink_failed = true;
+                    return Err(error);
+                }
             }
         }
         self.cursor = next_cursor;

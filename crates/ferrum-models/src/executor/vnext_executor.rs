@@ -281,13 +281,6 @@ impl VNextExecutionJournal {
             journal.base_parts(1, journal.root_span.clone(), None),
             ExecutionEventDetail::None,
         )?;
-        journal.emitter.emit(
-            &accepted,
-            &TrustedExecutionEventContext::pre_plan(
-                journal.active.run_id(),
-                journal.active.request_id(),
-            ),
-        )?;
         let plan_span = SpanId::new(format!("{}/plan", journal.root_span)).map_err(Self::error)?;
         let planned_parts =
             journal.bind_plan(journal.base_parts(2, plan_span, Some(journal.root_span.clone())));
@@ -297,14 +290,19 @@ impl VNextExecutionJournal {
             planned_parts,
             ExecutionEventDetail::None,
         )?;
-        journal.emitter.emit(
-            &planned,
-            &TrustedExecutionEventContext::bound(
+        let events = [accepted, planned];
+        let contexts = [
+            TrustedExecutionEventContext::pre_plan(
+                journal.active.run_id(),
+                journal.active.request_id(),
+            ),
+            TrustedExecutionEventContext::bound(
                 journal.active.run_id(),
                 journal.active.request_id(),
                 &journal.topology,
             ),
-        )?;
+        ];
+        journal.emitter.emit_batch(&events, &contexts)?;
         Ok(journal)
     }
 
@@ -503,36 +501,31 @@ impl VNextExecutionJournal {
         };
         let first_identity = submission.participants()[first_index].identity();
         let frame_started = self.frame_event(first_identity, ExecutionEventKind::FrameStarted)?;
-        self.emitter.emit(
-            &frame_started,
-            &TrustedExecutionEventContext::active(
-                self.active.run_id(),
-                self.active.request_id(),
-                &self.topology,
-                &self.active,
-            ),
-        )?;
         let node_started = self.node_event(first_identity, ExecutionEventKind::NodeStarted)?;
-        self.emitter.emit(
-            &node_started,
-            &TrustedExecutionEventContext::active(
+        let operation_submitted = self.operation_event(first_identity)?;
+        let events = [frame_started, node_started, operation_submitted];
+        let contexts = [
+            TrustedExecutionEventContext::active(
                 self.active.run_id(),
                 self.active.request_id(),
                 &self.topology,
                 &self.active,
             ),
-        )?;
-        let operation_submitted = self.operation_event(first_identity)?;
-        self.emitter.emit(
-            &operation_submitted,
-            &TrustedExecutionEventContext::operation_submitted(
+            TrustedExecutionEventContext::active(
+                self.active.run_id(),
+                self.active.request_id(),
+                &self.topology,
+                &self.active,
+            ),
+            TrustedExecutionEventContext::operation_submitted(
                 self.active.run_id(),
                 self.active.request_id(),
                 &self.topology,
                 &self.active,
                 submission,
             ),
-        )?;
+        ];
+        self.emitter.emit_batch(&events, &contexts)?;
         self.pending_submission = Some(JournaledSubmission::Captured {
             receipt: submission.clone(),
             selected,
@@ -569,6 +562,13 @@ impl VNextExecutionJournal {
                 "completion differs from the journaled physical submission",
             ));
         }
+        enum CompletionEventEvidence {
+            Active,
+            Submitted,
+            Retired(usize),
+        }
+        let mut events = Vec::with_capacity(selected.len().saturating_mul(3));
+        let mut evidence = Vec::with_capacity(selected.len().saturating_mul(3));
         for (position, participant_index) in selected.iter().copied().enumerate() {
             let participant = completion
                 .participants()
@@ -576,39 +576,16 @@ impl VNextExecutionJournal {
                 .ok_or_else(|| Self::error("completion participant index is missing"))?;
             let identity = participant.submission().identity();
             let retired = self.node_event(identity, ExecutionEventKind::NodeRetired)?;
-            self.emitter.emit(
-                &retired,
-                &TrustedExecutionEventContext::node_retired(
-                    self.active.run_id(),
-                    self.active.request_id(),
-                    &self.topology,
-                    &self.active,
-                    participant,
-                ),
-            )?;
+            events.push(retired);
+            evidence.push(CompletionEventEvidence::Retired(participant_index));
             if let Some(next_index) = selected.get(position + 1).copied() {
                 let next_identity = submission.participants()[next_index].identity();
                 let started = self.node_event(next_identity, ExecutionEventKind::NodeStarted)?;
-                self.emitter.emit(
-                    &started,
-                    &TrustedExecutionEventContext::active(
-                        self.active.run_id(),
-                        self.active.request_id(),
-                        &self.topology,
-                        &self.active,
-                    ),
-                )?;
+                events.push(started);
+                evidence.push(CompletionEventEvidence::Active);
                 let submitted = self.operation_event(next_identity)?;
-                self.emitter.emit(
-                    &submitted,
-                    &TrustedExecutionEventContext::operation_submitted(
-                        self.active.run_id(),
-                        self.active.request_id(),
-                        &self.topology,
-                        &self.active,
-                        &submission,
-                    ),
-                )?;
+                events.push(submitted);
+                evidence.push(CompletionEventEvidence::Submitted);
             }
         }
         let last_index = *selected
@@ -618,15 +595,38 @@ impl VNextExecutionJournal {
             submission.participants()[last_index].identity(),
             ExecutionEventKind::FrameCompleted,
         )?;
-        self.emitter.emit(
-            &frame_completed,
-            &TrustedExecutionEventContext::active(
-                self.active.run_id(),
-                self.active.request_id(),
-                &self.topology,
-                &self.active,
-            ),
-        )?;
+        events.push(frame_completed);
+        evidence.push(CompletionEventEvidence::Active);
+        let contexts = evidence
+            .iter()
+            .map(|evidence| match evidence {
+                CompletionEventEvidence::Active => TrustedExecutionEventContext::active(
+                    self.active.run_id(),
+                    self.active.request_id(),
+                    &self.topology,
+                    &self.active,
+                ),
+                CompletionEventEvidence::Submitted => {
+                    TrustedExecutionEventContext::operation_submitted(
+                        self.active.run_id(),
+                        self.active.request_id(),
+                        &self.topology,
+                        &self.active,
+                        &submission,
+                    )
+                }
+                CompletionEventEvidence::Retired(participant_index) => {
+                    TrustedExecutionEventContext::node_retired(
+                        self.active.run_id(),
+                        self.active.request_id(),
+                        &self.topology,
+                        &self.active,
+                        &completion.participants()[*participant_index],
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        self.emitter.emit_batch(&events, &contexts)?;
         self.completed_frames = self.completed_frames.saturating_add(1);
         Ok(())
     }
