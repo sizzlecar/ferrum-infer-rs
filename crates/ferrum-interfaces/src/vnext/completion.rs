@@ -8,13 +8,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use super::{
-    classify_device_error, defer_device_cleanup, BatchOperationIdentity, BatchParticipantAuthority,
-    BufferUsage, CopyRegion, DeferredDeviceCleanupDisposition, DeferredDeviceCleanupDomainId,
-    DeferredDeviceCleanupTask, DefinitelyNotSubmittedRetryAuthority,
-    DefinitelyNotSubmittedWaveRetryAuthority, DeviceDescriptor, DeviceRuntime, DeviceTerminal,
-    ExecutionIdentityEnvelope, FenceQuery, HostTransferLayout, IdentifiedFailure,
-    InvocationResourceLease, LogicalBackingBufferView, NodeId, PreparedStepSubmissionWave,
-    ResourceId, StreamState, VNextError,
+    classify_device_error, defer_device_cleanup, BackingInitializationEncodeError,
+    BatchOperationIdentity, BatchParticipantAuthority, BufferUsage, CopyRegion,
+    DeferredDeviceCleanupDisposition, DeferredDeviceCleanupDomainId, DeferredDeviceCleanupTask,
+    DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
+    DeviceCommandBatch, DeviceDescriptor, DeviceRuntime, DeviceTerminal, ExecutionIdentityEnvelope,
+    FenceQuery, HostTransferLayout, IdentifiedFailure, InvocationResourceLease,
+    LogicalBackingBufferView, NodeId, PreparedStepSubmissionWave, ResourceId, StreamState,
+    VNextError,
 };
 
 fn invalid_completion(reason: impl Into<String>) -> VNextError {
@@ -889,6 +890,33 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
         }
     }
 
+    fn encode_backing_initializations(
+        &self,
+        runtime: &R,
+        commands: &mut DeviceCommandBatch<R::Command>,
+    ) -> Result<usize, BackingInitializationEncodeError<R::Error>> {
+        match self {
+            Self::Invocation(invocation) => {
+                invocation.encode_backing_initializations(runtime, commands)
+            }
+            Self::Wave(wave) => wave.encode_backing_initializations(runtime, commands),
+        }
+    }
+
+    fn mark_submission_indeterminate(&mut self) {
+        match self {
+            Self::Invocation(invocation) => invocation.mark_submission_indeterminate(),
+            Self::Wave(wave) => wave.mark_submission_indeterminate(),
+        }
+    }
+
+    fn finish_backing_initializations(&mut self, succeeded: bool) -> Result<(), VNextError> {
+        match self {
+            Self::Invocation(invocation) => invocation.finish_backing_initializations(succeeded),
+            Self::Wave(wave) => wave.finish_backing_initializations(succeeded),
+        }
+    }
+
     fn backing_view(
         &self,
         node_id: &NodeId,
@@ -1574,6 +1602,16 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             let terminal = terminal_action(&resources, &lane, &batch_identity, &disposition);
             if let Err(failure) = lane.finish_one_terminal() {
                 disposition = OperationCompletionDisposition::ContractFailedButQuiescent(failure);
+            }
+            let initialization_succeeded =
+                matches!(disposition, OperationCompletionDisposition::Succeeded);
+            let mut resources = resources;
+            if let Err(error) = resources.finish_backing_initializations(initialization_succeeded) {
+                disposition = OperationCompletionDisposition::ContractFailedButQuiescent(
+                    QuiescentCompletionContractFailure::new(format!(
+                        "backing initialization terminal transition failed: {error}"
+                    )),
+                );
             }
             drop(guard);
             self.remove_exact(slot_id, &record);
@@ -2493,6 +2531,17 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             .backing_view(node_id, participant_index, resource_id)
     }
 
+    pub(crate) fn encode_backing_initializations(
+        &self,
+        runtime: &R,
+        commands: &mut DeviceCommandBatch<R::Command>,
+    ) -> Result<usize, BackingInitializationEncodeError<R::Error>> {
+        self.resources
+            .as_ref()
+            .expect("live completion reservation owns submission resources")
+            .encode_backing_initializations(runtime, commands)
+    }
+
     pub(crate) fn mark_submission_started(&mut self) {
         self.submission_may_have_happened = true;
     }
@@ -2592,7 +2641,8 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
     }
 
     pub(crate) fn submission_indeterminate(mut self) -> IndeterminateSubmissionHandle<R> {
-        let resources = self.resources.take().expect("reservation owns resources");
+        let mut resources = self.resources.take().expect("reservation owns resources");
+        resources.mark_submission_indeterminate();
         let lane = self.lane.take().expect("reservation owns lane");
         let batch_identity = self
             .batch_identity
@@ -2638,9 +2688,10 @@ impl<R: DeviceRuntime> Drop for CompletionReservation<R> {
             return;
         }
         if self.submission_may_have_happened {
-            let Some(resources) = self.resources.take() else {
+            let Some(mut resources) = self.resources.take() else {
                 return;
             };
+            resources.mark_submission_indeterminate();
             let Some(lane) = self.lane.take() else {
                 std::mem::forget(resources);
                 return;

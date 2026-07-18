@@ -2547,6 +2547,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 Err(error @ SubmissionWaveDispatchError::DefinitelyNotSubmitted { .. })
                 | Err(error @ SubmissionWaveDispatchError::Contract(_))
                 | Err(error @ SubmissionWaveDispatchError::Provider(_))
+                | Err(error @ SubmissionWaveDispatchError::Initialization(_))
                 | Err(error @ SubmissionWaveDispatchError::InputUpload(_)) => {
                     return DispatchOutcome::QuiescentFailure(error.to_string())
                 }

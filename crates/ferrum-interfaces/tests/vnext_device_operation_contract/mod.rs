@@ -89,6 +89,8 @@ pub(crate) fn suppress_expected_panic_hook<T>(action: impl FnOnce() -> T) -> T {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TestConfig {
     pub(crate) width: u64,
+    #[serde(default)]
+    pub(crate) zero_state: bool,
 }
 
 #[derive(Default)]
@@ -196,6 +198,26 @@ impl ModelFamilyProvider for TestFamily {
     }
 
     fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
+        let mut main_inputs = vec![id("value.input"), id("value.weight")];
+        let mut tail_inputs = vec![id("value.intermediate"), id("value.weight")];
+        let states = if config.zero_state {
+            main_inputs.push(id("value.state"));
+            tail_inputs.push(id("value.state"));
+            vec![StateSpec {
+                id: id("state.device-operation"),
+                value_id: id("value.state"),
+                tensor: ProgramTensorSpec {
+                    dimensions: vec![config.width],
+                    element_type: ElementType::U8,
+                    layout: ResolvedTensorLayout::Contiguous,
+                },
+                lifetime: StateLifetime::Sequence,
+                capacity_demand: StateCapacityDemand::FixedPerScope,
+                initialization: StateInitialization::Zero,
+            }]
+        } else {
+            Vec::new()
+        };
         ModelProgram::new(
             self.family_id().clone(),
             vec![id("value.input")],
@@ -207,7 +229,7 @@ impl ModelFamilyProvider for TestFamily {
                         operation_id: id("operation.main"),
                         required_version: ContractVersion::new(1, 0),
                         work: ProgramNodeWorkSpec::Fixed,
-                        inputs: vec![id("value.input"), id("value.weight")],
+                        inputs: main_inputs,
                         outputs: vec![id("value.intermediate")],
                         attributes: BTreeMap::new(),
                     },
@@ -216,13 +238,13 @@ impl ModelFamilyProvider for TestFamily {
                         operation_id: id("operation.main"),
                         required_version: ContractVersion::new(1, 0),
                         work: ProgramNodeWorkSpec::Fixed,
-                        inputs: vec![id("value.intermediate"), id("value.weight")],
+                        inputs: tail_inputs,
                         outputs: vec![id("value.output")],
                         attributes: BTreeMap::new(),
                     },
                 ],
             }],
-            Vec::new(),
+            states,
             vec![WeightReference {
                 weight_id: id("weight.matrix"),
                 value_id: id("value.weight"),
@@ -257,9 +279,16 @@ impl ModelFamilyProvider for TestFamily {
 }
 
 pub(crate) fn tensor_contract(access: TensorAccess) -> TensorContract {
+    typed_tensor_contract(ElementType::F32, access)
+}
+
+pub(crate) fn typed_tensor_contract(
+    element_type: ElementType,
+    access: TensorAccess,
+) -> TensorContract {
     TensorContract::new(
         vec![DimensionConstraint::Exact(4)],
-        BTreeSet::from([ElementType::F32]),
+        BTreeSet::from([element_type]),
         vec![LayoutConstraint::Contiguous],
         access,
         AliasPolicy::NoAlias,
@@ -268,13 +297,21 @@ pub(crate) fn tensor_contract(access: TensorAccess) -> TensorContract {
 }
 
 pub(crate) fn operation() -> OperationDescriptor {
+    operation_with_zero_state(false)
+}
+
+pub(crate) fn operation_with_zero_state(zero_state: bool) -> OperationDescriptor {
+    let mut inputs = vec![
+        tensor_contract(TensorAccess::Read),
+        tensor_contract(TensorAccess::Read),
+    ];
+    if zero_state {
+        inputs.push(typed_tensor_contract(ElementType::U8, TensorAccess::Read));
+    }
     OperationDescriptor {
         id: id("operation.main"),
         version: ContractVersion::new(1, 0),
-        inputs: vec![
-            tensor_contract(TensorAccess::Read),
-            tensor_contract(TensorAccess::Read),
-        ],
+        inputs,
         outputs: vec![tensor_contract(TensorAccess::Write)],
         attributes: AttributeSchema::empty(),
         resources: ResourceRequirements {
@@ -292,7 +329,11 @@ pub(crate) fn operation() -> OperationDescriptor {
 }
 
 pub(crate) fn catalog() -> CapabilityCatalog {
-    let operation = operation();
+    catalog_with_zero_state(false)
+}
+
+pub(crate) fn catalog_with_zero_state(zero_state: bool) -> CapabilityCatalog {
+    let operation = operation_with_zero_state(zero_state);
     let device_id: DeviceId = id("device.device-operation.0");
     let capabilities = BTreeSet::from([id("capability.compute")]);
     let provider = OperationProviderDescriptor::new(
@@ -429,7 +470,7 @@ impl OperationProvider<TestRuntime> for TestProvider {
             .collect();
         drop(trace);
         match *self.behavior.lock().unwrap() {
-            ProviderBehavior::Success => Ok(TestCommand),
+            ProviderBehavior::Success => Ok(TestCommand::Provider),
             ProviderBehavior::WrongIdentity => {
                 let mut parts = participant.identity().parts().clone();
                 parts.request_id = id("request.provider.wrong");
@@ -478,7 +519,11 @@ pub(crate) fn policy() -> ResolvedRuntimePolicy {
 }
 
 pub(crate) fn resolved_tensor() -> ResolvedTensorSpec {
-    ResolvedTensorSpec::new(vec![4], ElementType::F32, ResolvedTensorLayout::Contiguous).unwrap()
+    resolved_tensor_for(ElementType::F32)
+}
+
+pub(crate) fn resolved_tensor_for(element_type: ElementType) -> ResolvedTensorSpec {
+    ResolvedTensorSpec::new(vec![4], element_type, ResolvedTensorLayout::Contiguous).unwrap()
 }
 
 pub(crate) fn single_binding(
@@ -558,6 +603,30 @@ pub(crate) fn node_values_for(
     ]
 }
 
+pub(crate) fn node_values_with_zero_state_for(
+    input_value: &str,
+    input_resource: &str,
+    output_value: &str,
+    output_resource: &str,
+) -> Vec<ResolvedValueBinding> {
+    let mut values = node_values_for(input_value, input_resource, output_value, output_resource);
+    values.insert(
+        2,
+        ResolvedValueBinding::new(
+            id("value.state"),
+            ResolvedValueRole::Input,
+            2,
+            resolved_tensor_for(ElementType::U8),
+            TensorAccess::Read,
+            AliasPolicy::NoAlias,
+            BufferUsage::State,
+            ResolvedValueStorage::single(id("resource.state"), 0, 4, ElementType::U8).unwrap(),
+        )
+        .unwrap(),
+    );
+    values
+}
+
 pub(crate) fn node_values() -> Vec<ResolvedValueBinding> {
     node_values_for(
         "value.input",
@@ -584,8 +653,13 @@ pub(crate) struct TestBuffer {
 #[derive(Debug, Default)]
 pub(crate) struct TestStream;
 
-#[derive(Debug)]
-pub(crate) struct TestCommand;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestCommand {
+    Provider,
+    Copy,
+    Upload,
+    Zero,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TestFence(u64);
@@ -624,6 +698,7 @@ pub(crate) struct RuntimeTrace {
     pub(crate) allocation_calls: u64,
     pub(crate) submit_calls: u64,
     pub(crate) submitted_command_counts: Vec<usize>,
+    pub(crate) submitted_commands: Vec<Vec<TestCommand>>,
     pub(crate) readback_calls: u64,
     pub(crate) readback_lengths: Vec<u64>,
     pub(crate) synchronize_calls: u64,
@@ -712,7 +787,7 @@ impl DeviceRuntime for TestRuntime {
         _destination: &Self::Buffer,
         _region: CopyRegion,
     ) -> Result<Self::Command, Self::Error> {
-        Ok(TestCommand)
+        Ok(TestCommand::Copy)
     }
 
     fn encode_upload(
@@ -722,7 +797,7 @@ impl DeviceRuntime for TestRuntime {
         _destination: &Self::Buffer,
         _destination_offset_bytes: u64,
     ) -> Result<Self::Command, Self::Error> {
-        Ok(TestCommand)
+        Ok(TestCommand::Upload)
     }
 
     fn encode_zero(
@@ -731,7 +806,7 @@ impl DeviceRuntime for TestRuntime {
         _destination_offset_bytes: u64,
         _length_bytes: u64,
     ) -> Result<Self::Command, Self::Error> {
-        Ok(TestCommand)
+        Ok(TestCommand::Zero)
     }
 
     fn submit(
@@ -740,11 +815,13 @@ impl DeviceRuntime for TestRuntime {
         commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
         assert!(!commands.is_empty(), "core must not submit an empty batch");
+        let commands = commands.into_commands();
         let command_count = commands.len();
         let (drift, behavior, fence) = {
             let mut trace = self.trace.lock().unwrap();
             trace.submit_calls += 1;
             trace.submitted_command_counts.push(command_count);
+            trace.submitted_commands.push(commands);
             trace.next_fence += 1;
             (
                 trace.drift_on_submit,
@@ -1154,13 +1231,32 @@ pub(crate) fn node_resolution(
     runtime_policy: &ResolvedRuntimePolicy,
     registry: &OperationRuntimeRegistry<TestRuntime>,
 ) -> PlanNodeResolution {
+    node_resolution_with_zero_state(family, catalog, runtime_policy, registry, false)
+}
+
+pub(crate) fn node_resolution_with_zero_state(
+    family: &PreparedModelFamily,
+    catalog: &CapabilityCatalog,
+    runtime_policy: &ResolvedRuntimePolicy,
+    registry: &OperationRuntimeRegistry<TestRuntime>,
+    zero_state: bool,
+) -> PlanNodeResolution {
     node_resolution_for(
         family,
         catalog,
         runtime_policy,
         registry,
         "node.main",
-        node_values(),
+        if zero_state {
+            node_values_with_zero_state_for(
+                "value.input",
+                "resource.input",
+                "value.intermediate",
+                "resource.intermediate",
+            )
+        } else {
+            node_values()
+        },
     )
 }
 
@@ -1170,29 +1266,63 @@ pub(crate) fn tail_node_resolution(
     runtime_policy: &ResolvedRuntimePolicy,
     registry: &OperationRuntimeRegistry<TestRuntime>,
 ) -> PlanNodeResolution {
+    tail_node_resolution_with_zero_state(family, catalog, runtime_policy, registry, false)
+}
+
+pub(crate) fn tail_node_resolution_with_zero_state(
+    family: &PreparedModelFamily,
+    catalog: &CapabilityCatalog,
+    runtime_policy: &ResolvedRuntimePolicy,
+    registry: &OperationRuntimeRegistry<TestRuntime>,
+    zero_state: bool,
+) -> PlanNodeResolution {
     node_resolution_for(
         family,
         catalog,
         runtime_policy,
         registry,
         "node.tail",
-        tail_node_values(),
+        if zero_state {
+            node_values_with_zero_state_for(
+                "value.intermediate",
+                "resource.intermediate",
+                "value.output",
+                "resource.output",
+            )
+        } else {
+            tail_node_values()
+        },
     )
 }
 
 pub(crate) fn resolved_model_plan(
     registry: &OperationRuntimeRegistry<TestRuntime>,
 ) -> (ResolvedModelPlan, ExecutionPlan) {
+    resolved_model_plan_with_zero_state(registry, false)
+}
+
+pub(crate) fn resolved_model_plan_with_zero_state(
+    registry: &OperationRuntimeRegistry<TestRuntime>,
+    zero_state: bool,
+) -> (ResolvedModelPlan, ExecutionPlan) {
     let model_registry = TestModelRegistry::new();
-    let family = model_registry
-        .registration
-        .prepare(&json!({"width": 4}))
-        .unwrap();
-    let catalog = catalog();
+    let raw_config = if zero_state {
+        json!({"width": 4, "zero_state": true})
+    } else {
+        json!({"width": 4})
+    };
+    let family = model_registry.registration.prepare(&raw_config).unwrap();
+    let catalog = catalog_with_zero_state(zero_state);
     let runtime_policy = policy();
     let resolutions = vec![
-        node_resolution(&family, &catalog, &runtime_policy, registry),
-        tail_node_resolution(&family, &catalog, &runtime_policy, registry),
+        node_resolution_with_zero_state(&family, &catalog, &runtime_policy, registry, zero_state),
+        tail_node_resolution_with_zero_state(
+            &family,
+            &catalog,
+            &runtime_policy,
+            registry,
+            zero_state,
+        ),
     ];
     let plan = ExecutionPlan::build(
         PlanBuildRequest::new(&family, &catalog, &runtime_policy, resolutions.clone()).unwrap(),
@@ -1316,10 +1446,22 @@ pub(crate) fn resolved_model_plan(
 }
 
 pub(crate) fn plan_for_registry(registry: &OperationRuntimeRegistry<TestRuntime>) -> ExecutionPlan {
+    plan_for_registry_with_zero_state(registry, false)
+}
+
+pub(crate) fn plan_for_registry_with_zero_state(
+    registry: &OperationRuntimeRegistry<TestRuntime>,
+    zero_state: bool,
+) -> ExecutionPlan {
+    let raw_config = if zero_state {
+        json!({"width": 4, "zero_state": true})
+    } else {
+        json!({"width": 4})
+    };
     let family = TypedFamilyRegistration::new(TestFamily)
-        .prepare(&json!({"width": 4}))
+        .prepare(&raw_config)
         .unwrap();
-    let catalog = catalog();
+    let catalog = catalog_with_zero_state(zero_state);
     let runtime_policy = policy();
     ExecutionPlan::build(
         PlanBuildRequest::new(
@@ -1327,8 +1469,20 @@ pub(crate) fn plan_for_registry(registry: &OperationRuntimeRegistry<TestRuntime>
             &catalog,
             &runtime_policy,
             vec![
-                node_resolution(&family, &catalog, &runtime_policy, registry),
-                tail_node_resolution(&family, &catalog, &runtime_policy, registry),
+                node_resolution_with_zero_state(
+                    &family,
+                    &catalog,
+                    &runtime_policy,
+                    registry,
+                    zero_state,
+                ),
+                tail_node_resolution_with_zero_state(
+                    &family,
+                    &catalog,
+                    &runtime_policy,
+                    registry,
+                    zero_state,
+                ),
             ],
         )
         .unwrap(),
@@ -1595,7 +1749,11 @@ pub(crate) struct Fixture {
 }
 
 pub(crate) fn fixture() -> Fixture {
-    let catalog = catalog();
+    fixture_with_zero_state(false)
+}
+
+pub(crate) fn fixture_with_zero_state(zero_state: bool) -> Fixture {
+    let catalog = catalog_with_zero_state(zero_state);
     let provider_behavior = Arc::new(Mutex::new(ProviderBehavior::Success));
     let provider_trace = Arc::new(Mutex::new(ProviderTrace::default()));
     let registry = operation_registry(
@@ -1610,13 +1768,15 @@ pub(crate) fn fixture() -> Fixture {
         )
         .unwrap();
     assert_eq!(derived_catalog, catalog);
-    let (resolved, plan) = resolved_model_plan(&registry);
+    let (resolved, plan) = resolved_model_plan_with_zero_state(&registry, zero_state);
     let impostor_registry = operation_registry(
         &catalog,
         Arc::new(Mutex::new(ProviderBehavior::WrongPhase)),
         Arc::new(Mutex::new(ProviderTrace::default())),
     );
-    let impostor_plan_hash = plan_for_registry(&impostor_registry).plan_hash().clone();
+    let impostor_plan_hash = plan_for_registry_with_zero_state(&impostor_registry, zero_state)
+        .plan_hash()
+        .clone();
     let (runtime, runtime_trace) = runtime(&catalog);
     let plan_resources = plan_runtime_resources(&plan, Arc::clone(&runtime));
     Fixture {

@@ -347,6 +347,7 @@ fn pool_catalog(
         demand,
         "state",
         false,
+        StateInitialization::None,
     )
 }
 
@@ -360,6 +361,7 @@ fn pool_catalog_with_options(
     demand: TestDemand,
     usage: &str,
     share_step_slot: bool,
+    initialization: StateInitialization,
 ) -> PoolCatalog {
     assert!(!share_step_slot || lifetime == AllocationLifetime::Step && resource_count > 1);
     let layout_fingerprint = layout_digit.to_string().repeat(64);
@@ -407,6 +409,7 @@ fn pool_catalog_with_options(
                     "logical_layout_fingerprint": layout_fingerprint
                 },
                 "pool_id": pool_id_text,
+                "initialization": initialization,
                 "theoretical_maximum_instances": 64
             }))
             .unwrap(),
@@ -484,6 +487,7 @@ fn shared_step_activation_catalog(profile: DynamicStorageProfile) -> PoolCatalog
         TestDemand::Tokens,
         "activations",
         true,
+        StateInitialization::None,
     )
 }
 
@@ -825,6 +829,123 @@ fn evaluated_descriptor_request<'a>(
             size_bytes,
         }],
     }
+}
+
+#[test]
+fn reused_extent_receives_a_fresh_pending_initialization_authority() {
+    let catalog = pool_catalog_with_options(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        64,
+        TestDemand::Fixed,
+        "state",
+        false,
+        StateInitialization::Zero,
+    );
+    let runtime = new_runtime(&catalog, 64);
+    let harness = harness(runtime, catalog, 64, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let pool = Arc::clone(&harness.root.dynamic_pools.pools[&harness.pool_ids[0]]);
+
+    let first = claim_size(&harness.root.dynamic_pools, &pool, 64);
+    let first_segment = first.evidence().segments()[0].clone();
+    let first_generation = first.evidence().segment_generation();
+    let first_cell = Arc::clone(first.initialization_cell().unwrap());
+    assert_eq!(
+        first.initialization_status().unwrap(),
+        Some(BackingInitializationStatus::Pending)
+    );
+    assert!(first_cell.prepare("wave/a").unwrap());
+    first_cell.mark_in_flight("wave/a").unwrap();
+    first_cell.finish("wave/a", true).unwrap();
+    assert_eq!(
+        first.initialization_status().unwrap(),
+        Some(BackingInitializationStatus::Initialized)
+    );
+    let retained = first.retained();
+    assert!(Arc::ptr_eq(
+        retained.initialization_cell().unwrap(),
+        &first_cell
+    ));
+    drop(first);
+    assert_eq!(
+        retained.initialization_status().unwrap(),
+        Some(BackingInitializationStatus::Initialized)
+    );
+    drop(retained);
+
+    let second = claim_size(&harness.root.dynamic_pools, &pool, 64);
+    let second_segment = &second.evidence().segments()[0];
+    assert_eq!(second_segment.chunk(), first_segment.chunk());
+    assert_eq!(second_segment.offset_bytes(), first_segment.offset_bytes());
+    assert_ne!(second.evidence().segment_generation(), first_generation);
+    assert!(!Arc::ptr_eq(
+        second.initialization_cell().unwrap(),
+        &first_cell
+    ));
+    assert_eq!(
+        second.initialization_status().unwrap(),
+        Some(BackingInitializationStatus::Pending)
+    );
+}
+
+#[test]
+fn failed_initialization_poison_is_scoped_to_one_extent_generation() {
+    let catalog = pool_catalog_with_options(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        'a',
+        1,
+        64,
+        TestDemand::Fixed,
+        "state",
+        false,
+        StateInitialization::Zero,
+    );
+    let runtime = new_runtime(&catalog, 64);
+    let harness = harness(runtime, catalog, 64, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let pool = Arc::clone(&harness.root.dynamic_pools.pools[&harness.pool_ids[0]]);
+
+    let failed = claim_size(&harness.root.dynamic_pools, &pool, 64);
+    let failed_generation = failed.evidence().segment_generation();
+    let failed_segment = failed.evidence().segments()[0].clone();
+    let failed_cell = Arc::clone(failed.initialization_cell().unwrap());
+    assert!(failed_cell.prepare("wave/failed").unwrap());
+    failed_cell.mark_in_flight("wave/failed").unwrap();
+    failed_cell.finish("wave/failed", false).unwrap();
+    assert_eq!(
+        failed.initialization_status().unwrap(),
+        Some(BackingInitializationStatus::Poisoned)
+    );
+    drop(failed);
+
+    let recovered = claim_size(&harness.root.dynamic_pools, &pool, 64);
+    let recovered_segment = &recovered.evidence().segments()[0];
+    assert_eq!(recovered_segment.chunk(), failed_segment.chunk());
+    assert_eq!(
+        recovered_segment.offset_bytes(),
+        failed_segment.offset_bytes()
+    );
+    assert_ne!(recovered.evidence().segment_generation(), failed_generation);
+    assert!(!Arc::ptr_eq(
+        recovered.initialization_cell().unwrap(),
+        &failed_cell
+    ));
+    assert_eq!(
+        recovered.initialization_status().unwrap(),
+        Some(BackingInitializationStatus::Pending)
+    );
 }
 
 #[test]
@@ -2601,13 +2722,16 @@ fn step_backing_deferral_retains_exact_participant_session_until_retry() {
 
 #[test]
 fn sequence_backing_extension_publishes_atomically_between_frames() {
-    let catalog = pool_catalog(
+    let catalog = pool_catalog_with_options(
         paged_profile(),
         AllocationLifetime::Sequence,
         'a',
         1,
         256,
         TestDemand::Tokens,
+        "state",
+        false,
+        StateInitialization::Zero,
     );
     let runtime = new_runtime(&catalog, 256);
     let harness = harness(runtime, catalog, 256, false);
@@ -2618,6 +2742,10 @@ fn sequence_backing_extension_publishes_atomically_between_frames() {
         .unwrap();
     let sequence = admitted_sequence_with_ceiling(&harness.root, "sequence-backing-extension", 2);
     let initial = sequence.backing_snapshot().unwrap();
+    let initial_cell = Arc::clone(initial.backing_slices()[0].initialization_cell().unwrap());
+    assert!(initial_cell.prepare("wave/initial").unwrap());
+    initial_cell.mark_in_flight("wave/initial").unwrap();
+    initial_cell.finish("wave/initial", true).unwrap();
     let session = sequence.open_session().unwrap();
     let active_before = TrustedActiveSequenceBinding::from_session(&session).unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
@@ -2672,6 +2800,26 @@ fn sequence_backing_extension_publishes_atomically_between_frames() {
     assert_eq!(extended.generation().get(), 2);
     assert_eq!(extended.committed_tokens(), 2);
     assert_eq!(extended.backing_slices().len(), 2);
+    assert!(Arc::ptr_eq(
+        extended.backing_slices()[0].initialization_cell().unwrap(),
+        &initial_cell
+    ));
+    assert_eq!(
+        extended.backing_slices()[0]
+            .initialization_status()
+            .unwrap(),
+        Some(BackingInitializationStatus::Initialized)
+    );
+    assert!(!Arc::ptr_eq(
+        extended.backing_slices()[1].initialization_cell().unwrap(),
+        &initial_cell
+    ));
+    assert_eq!(
+        extended.backing_slices()[1]
+            .initialization_status()
+            .unwrap(),
+        Some(BackingInitializationStatus::Pending)
+    );
     assert_eq!(
         extended
             .backing_slices()

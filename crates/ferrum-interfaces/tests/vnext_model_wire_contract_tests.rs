@@ -160,6 +160,7 @@ impl ModelFamilyProvider for TestFamily {
                 },
                 lifetime: StateLifetime::Sequence,
                 capacity_demand: StateCapacityDemand::FixedPerScope,
+                initialization: StateInitialization::Zero,
             }],
             vec![WeightReference {
                 weight_id: id("weight.tensor.model-wire-test"),

@@ -18,9 +18,9 @@ use super::{
     ProviderResourcePlan, ProviderSelection, ProviderSelectionReason, ProviderWorkspaceScope,
     QuantizationFormatId, RejectedProvider, ResolvedValueBinding, ResolvedValueRole,
     ResourceAllocation, ResourceId, RuntimePolicy, Serialize, StateCapacityDemand,
-    StateDependencyTracker, StateLifetime, TensorAccess, UnvalidatedExecutionPlan,
-    UnvalidatedExecutionPlanWire, VNextError, ValueAllocationAccumulator, ValueResourceDemand,
-    WeightFormatId, EXECUTION_PLAN_SCHEMA, MAX_EXECUTION_PLAN_WIRE_BYTES,
+    StateDependencyTracker, StateInitialization, StateLifetime, TensorAccess,
+    UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, VNextError, ValueAllocationAccumulator,
+    ValueResourceDemand, WeightFormatId, EXECUTION_PLAN_SCHEMA, MAX_EXECUTION_PLAN_WIRE_BYTES,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1438,6 +1438,12 @@ impl ExecutionPlan {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
+        let state_initializations = family
+            .program()
+            .states()
+            .iter()
+            .map(|state| (state.value_id.clone(), state.initialization))
+            .collect::<BTreeMap<_, _>>();
         let mut values = BTreeMap::<ResourceId, ValueAllocationAccumulator>::new();
         let mut static_allocations = Vec::new();
         let mut dynamic_descriptors = Vec::new();
@@ -1487,6 +1493,10 @@ impl ExecutionPlan {
                         &program_inputs,
                         &program_outputs,
                     )?;
+                    let initialization = state_initializations
+                        .get(binding.value_id())
+                        .copied()
+                        .unwrap_or(StateInitialization::None);
                     values
                         .entry(component.resource_id().clone())
                         .and_modify(|allocation| {
@@ -1498,6 +1508,7 @@ impl ExecutionPlan {
                                         binding.usage(),
                                         component.element_type(),
                                         demand,
+                                        initialization,
                                         logical_layout_fingerprint.clone(),
                                     )
                                 });
@@ -1508,6 +1519,7 @@ impl ExecutionPlan {
                             usage: binding.usage(),
                             element_type: component.element_type(),
                             demand,
+                            initialization,
                             logical_layout_fingerprints: BTreeSet::from([
                                 logical_layout_fingerprint.clone(),
                             ]),
@@ -1551,6 +1563,7 @@ impl ExecutionPlan {
                         node_id: node.id.clone(),
                     },
                     storage,
+                    StateInitialization::None,
                     maximum_active_sequences,
                 )?);
             } else if node.scratch_resource.is_some() {
@@ -1629,6 +1642,7 @@ impl ExecutionPlan {
                                 node_id: node.id.clone(),
                             },
                             storage,
+                            StateInitialization::None,
                             maximum_active_sequences,
                         )?);
                     }
@@ -1692,6 +1706,7 @@ impl ExecutionPlan {
                         })?,
                         AllocationKind::Value,
                         storage,
+                        accumulator.initialization,
                         maximum_active_sequences,
                     )?);
                 }

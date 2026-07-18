@@ -1413,6 +1413,9 @@ pub struct StateSpec {
     pub tensor: ProgramTensorSpec,
     pub lifetime: StateLifetime,
     pub capacity_demand: StateCapacityDemand,
+    /// Initial contents required when a new logical state scope acquires
+    /// physical backing. This is semantic model state, not an allocator hint.
+    pub initialization: StateInitialization,
 }
 
 #[derive(Deserialize)]
@@ -1423,6 +1426,7 @@ struct StateSpecWire {
     tensor: ProgramTensorSpec,
     lifetime: StateLifetime,
     capacity_demand: StateCapacityDemand,
+    initialization: StateInitialization,
 }
 
 impl<'de> Deserialize<'de> for StateSpec {
@@ -1441,8 +1445,21 @@ impl<'de> Deserialize<'de> for StateSpec {
             tensor: wire.tensor,
             lifetime: wire.lifetime,
             capacity_demand: wire.capacity_demand,
+            initialization: wire.initialization,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateInitialization {
+    /// Core does not initialize the backing. The first consumer must fully
+    /// define every byte before it is read.
+    None,
+    /// Core zeroes each exact Sequence backing acquisition before its first
+    /// state consumer in the same ordered submission. Request-scope zeroing is
+    /// reserved until initialization dependencies can defer sibling sequences.
+    Zero,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

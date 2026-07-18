@@ -44,7 +44,18 @@ fn setup() -> (
     ExecutionBatchParticipants<TestRuntime>,
     Arc<StepResourceLease<TestRuntime>>,
 ) {
-    let fixture = fixture();
+    setup_with_fixture(fixture())
+}
+
+fn setup_with_fixture(
+    fixture: Fixture,
+) -> (
+    Fixture,
+    Arc<AdmittedSequenceResources<TestRuntime>>,
+    Arc<SequenceSession<TestRuntime>>,
+    ExecutionBatchParticipants<TestRuntime>,
+    Arc<StepResourceLease<TestRuntime>>,
+) {
     let sequence = logical_resources(
         &fixture.plan_resources,
         "run.device-operation.wave",
@@ -567,4 +578,136 @@ fn definitely_not_submitted_retries_the_same_whole_wave() {
     drop(reaper);
     drop(lane);
     teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
+fn zero_state_initialization_is_ordered_retried_and_not_repeated_after_success() {
+    let (fixture, sequence, session, batch, first_step) =
+        setup_with_fixture(fixture_with_zero_state(true));
+    let first_wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &first_step);
+    let active_bindings = wave_active_bindings(&first_wave, &session);
+    let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+
+    fixture.runtime_trace.lock().unwrap().submit_behavior = SubmitBehavior::DefinitelyNotSubmitted;
+    let first_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        &active_bindings,
+        &first_wave,
+        &lane,
+    )
+    .unwrap();
+    let retry = match OperationDispatch::encode_and_submit_wave(
+        &providers,
+        &fixture.resolved,
+        &first_identity,
+        &active_bindings,
+        first_wave,
+        &lane,
+        &reaper,
+    ) {
+        Err(SubmissionWaveDispatchError::DefinitelyNotSubmitted { retry, .. }) => retry,
+        other => panic!("zero-state wave did not return retry authority: {other:?}"),
+    };
+
+    fixture.runtime_trace.lock().unwrap().submit_behavior = SubmitBehavior::Success;
+    let retry_wave = retry.retry().unwrap();
+    let retry_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        &active_bindings,
+        &retry_wave,
+        &lane,
+    )
+    .unwrap();
+    let first_completion = OperationDispatch::encode_and_submit_wave(
+        &providers,
+        &fixture.resolved,
+        &retry_identity,
+        &active_bindings,
+        retry_wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    assert!(matches!(
+        first_completion.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+    {
+        let trace = fixture.runtime_trace.lock().unwrap();
+        assert_eq!(
+            trace.submitted_commands,
+            vec![
+                vec![
+                    TestCommand::Zero,
+                    TestCommand::Provider,
+                    TestCommand::Provider
+                ],
+                vec![
+                    TestCommand::Zero,
+                    TestCommand::Provider,
+                    TestCommand::Provider
+                ],
+            ]
+        );
+    }
+
+    drop(first_completion);
+    drop(active_bindings);
+    first_step.try_retire_normal().unwrap();
+
+    let second_step = begin_single_participant_step(&fixture.plan_resources, &batch);
+    let second_wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &second_step);
+    let second_active_bindings = wave_active_bindings(&second_wave, &session);
+    let second_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        &second_active_bindings,
+        &second_wave,
+        &lane,
+    )
+    .unwrap();
+    let second_completion = OperationDispatch::encode_and_submit_wave(
+        &providers,
+        &fixture.resolved,
+        &second_identity,
+        &second_active_bindings,
+        second_wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    assert!(matches!(
+        second_completion.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+    assert_eq!(
+        fixture.runtime_trace.lock().unwrap().submitted_commands,
+        vec![
+            vec![
+                TestCommand::Zero,
+                TestCommand::Provider,
+                TestCommand::Provider
+            ],
+            vec![
+                TestCommand::Zero,
+                TestCommand::Provider,
+                TestCommand::Provider
+            ],
+            vec![TestCommand::Provider, TestCommand::Provider],
+        ]
+    );
+
+    drop(second_completion);
+    drop(second_active_bindings);
+    drop(providers);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, second_step);
 }

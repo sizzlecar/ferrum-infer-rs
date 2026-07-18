@@ -308,9 +308,47 @@ fn dynamic_value_descriptor(
         AllocationLifetime::Sequence,
         AllocationKind::Value,
         storage,
+        StateInitialization::None,
         1024,
     )
     .expect("valid descriptor")
+}
+
+#[test]
+fn zero_initialization_is_closed_to_sequence_state_backing() {
+    let layout = canonical_fingerprint(&"contiguous_v1", "test layout").expect("fingerprint");
+    let storage = DynamicStorageContract::new(linear_profile(), layout).expect("storage");
+    let descriptor = DynamicResourceDescriptor::new(
+        ResourceId::new("resource/zero-sequence-state").expect("resource id"),
+        DynamicResourceDemand::fixed(64).expect("demand"),
+        16,
+        BufferUsage::State,
+        ElementType::U8,
+        AllocationLifetime::Sequence,
+        AllocationKind::Value,
+        storage.clone(),
+        StateInitialization::Zero,
+        1024,
+    )
+    .expect("sequence state supports first-acquisition zeroing");
+    assert_eq!(descriptor.initialization(), StateInitialization::Zero);
+
+    let error = DynamicResourceDescriptor::new(
+        ResourceId::new("resource/zero-request-state").expect("resource id"),
+        DynamicResourceDemand::fixed(64).expect("demand"),
+        16,
+        BufferUsage::State,
+        ElementType::U8,
+        AllocationLifetime::Request,
+        AllocationKind::Value,
+        storage,
+        StateInitialization::Zero,
+        1024,
+    )
+    .expect_err("request state needs a scheduler-visible initialization dependency");
+    assert!(error
+        .to_string()
+        .contains("requires semantic Sequence state backing"));
 }
 
 fn invocation_descriptor(
@@ -330,6 +368,7 @@ fn invocation_descriptor(
             node_id: NodeId::new(node).expect("valid node id"),
         },
         storage,
+        StateInitialization::None,
         1024,
     )
     .expect("valid invocation descriptor")
@@ -350,6 +389,7 @@ fn step_descriptor(
         AllocationLifetime::Step,
         AllocationKind::Value,
         storage,
+        StateInitialization::None,
         1024,
     )
     .expect("valid step descriptor")
@@ -405,6 +445,7 @@ fn fixed_block_storage_quantizes_logical_demand_and_maxima() {
         AllocationLifetime::Sequence,
         AllocationKind::Value,
         storage,
+        StateInitialization::None,
         1024,
     )
     .expect("descriptor");
@@ -445,6 +486,7 @@ fn fixed_block_storage_uses_larger_allocator_geometry_and_rejects_overflow() {
         AllocationLifetime::Sequence,
         AllocationKind::Value,
         storage,
+        StateInitialization::None,
         1024,
     )
     .expect_err("physical quantum rounding must reject overflow");
