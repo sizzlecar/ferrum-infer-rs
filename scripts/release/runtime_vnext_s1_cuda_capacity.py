@@ -27,6 +27,20 @@ MAX_PRESSURE_NO_PROGRESS_SECONDS = 30.0
 MAX_PRESSURE_UNCHANGED_SKIPS = 512
 MAX_PRESSURE_TRACE_BYTES = 16 * 1024 * 1024
 MAX_PRESSURE_JOINT_STREAM_SECONDS = 300.0
+SERVER_MAX_MODEL_LEN = 512
+PRESSURE_B_WORD_COUNT = 256
+PRESSURE_MAX_TOKENS = {"A": 128, "B": 128, "C": 16}
+PRESSURE_B_PROMPT = (
+    "Capacity lane large request. Read every word before answering."
+    + " token" * PRESSURE_B_WORD_COUNT
+    + " Emit deterministic short words until the output limit."
+)
+PRESSURE_WORKLOAD_POLICY = {
+    "max_model_len": SERVER_MAX_MODEL_LEN,
+    "max_tokens_by_slot": PRESSURE_MAX_TOKENS,
+    "b_prompt_sha256": hashlib.sha256(PRESSURE_B_PROMPT.encode("utf-8")).hexdigest(),
+    "b_prompt_word_count": PRESSURE_B_WORD_COUNT,
+}
 PRESSURE_STOP_POLICY = {
     "no_progress_timeout_seconds": MAX_PRESSURE_NO_PROGRESS_SECONDS,
     "max_unchanged_epoch_skips": MAX_PRESSURE_UNCHANGED_SKIPS,
@@ -432,6 +446,8 @@ def request_identity_matches(observed: Any, request_id: str) -> bool:
 
 def capacity_prompt(workload_slot: str) -> str:
     require(workload_slot in {"A", "B", "C"}, "invalid capacity workload slot")
+    if workload_slot == "B":
+        return PRESSURE_B_PROMPT
     return (
         f"Capacity lane slot {workload_slot}. Emit deterministic short words until the token "
         "limit; do not explain the task."
@@ -730,7 +746,7 @@ class ServerSession:
         out_dir: Path,
         runtime_budget: int | None,
         startup_timeout: float,
-        max_model_len: int = 512,
+        max_model_len: int = SERVER_MAX_MODEL_LEN,
         max_num_seqs: int = 4,
         max_num_batched_tokens: int = 1024,
         prefill_first_until_active: int = 4,
@@ -904,16 +920,19 @@ def run_capacity_pair(
     return {"A": a_result, "C": c_result}
 
 
-def wait_for_deferral(
+def wait_for_typed_wait_for_release(
     trace_path: Path,
     baseline_rows: int,
     started_wall_ns: int,
     timeout: float,
 ) -> tuple[str, dict[str, Any]]:
     deadline = time.monotonic() + timeout
+    request_id: str | None = None
+    first_deferral: dict[str, Any] | None = None
     while time.monotonic() < deadline:
         rows = read_trace(trace_path)
-        for row in rows[baseline_rows:]:
+        pressure_rows = rows[baseline_rows:]
+        for row in pressure_rows:
             shape = row.get("shape")
             decision = shape.get("decision") if isinstance(shape, dict) else None
             if (
@@ -922,9 +941,63 @@ def wait_for_deferral(
                 and isinstance(row.get("request_id"), str)
                 and row.get("ts_unix_nanos", 0) >= started_wall_ns
             ):
-                return row["request_id"], row
+                if request_id is None:
+                    request_id = row["request_id"]
+                    first_deferral = row
+                require(
+                    request_identity_matches(row.get("request_id"), request_id),
+                    "multiple requests produced pressure while identifying B",
+                )
+        if request_id is not None:
+            request_rows = [
+                row
+                for row in pressure_rows
+                if request_identity_matches(row.get("request_id"), request_id)
+            ]
+            completed_wait = any(
+                (
+                    row.get("phase") == "vnext.prefill_admission"
+                    and row.get("shape", {}).get("decision") == "deferred"
+                    and row.get("attributes", {})
+                    .get("admission_evidence", {})
+                    .get("action")
+                    == "wait_for_release"
+                )
+                or (
+                    row.get("phase") == "vnext.prefill_backing_maintenance"
+                    and row.get("shape", {}).get("outcome") == "wait_for_release"
+                )
+                for row in request_rows
+            )
+            if completed_wait:
+                typed_wait_for_release_transitions(request_rows, request_id)
+                require(first_deferral is not None, "B wait has no initial deferral")
+                return request_id, first_deferral
+            admitted = any(
+                row.get("phase") == "vnext.prefill_admission"
+                and row.get("shape", {}).get("decision") == "admitted"
+                for row in request_rows
+            )
+            if admitted:
+                maintenance = [
+                    {
+                        "outcome": row.get("shape", {}).get("outcome"),
+                        "pools_reclaimed": row.get("attributes", {})
+                        .get("maintenance_evidence", {})
+                        .get("pools_reclaimed", 0),
+                        "reclaimed_bytes": row.get("attributes", {})
+                        .get("maintenance_evidence", {})
+                        .get("reclaimed_bytes", 0),
+                    }
+                    for row in request_rows
+                    if row.get("phase") == "vnext.prefill_backing_maintenance"
+                ]
+                raise CapacityGateError(
+                    "B was admitted before typed WaitForRelease; "
+                    f"maintenance={maintenance}"
+                )
         time.sleep(0.02)
-    raise CapacityGateError("B did not produce a typed admission deferral before timeout")
+    raise CapacityGateError("B did not enter typed WaitForRelease before timeout")
 
 
 def wait_for_pressure_streams(
@@ -1078,6 +1151,7 @@ def collect(args: argparse.Namespace) -> int:
         "status": "reject",
         "provenance": "provenance.json",
         "pressure_stop_policy": pressure_stop_policy,
+        "pressure_workload_policy": PRESSURE_WORKLOAD_POLICY,
         "error": None,
     }
     try:
@@ -1146,7 +1220,7 @@ def collect(args: argparse.Namespace) -> int:
             model=target.model_id,
             role="pressure-A",
             workload_slot="A",
-            max_tokens=128,
+            max_tokens=PRESSURE_MAX_TOKENS["A"],
             out_dir=pressure_dir,
             timeout=args.request_timeout,
         )
@@ -1166,14 +1240,14 @@ def collect(args: argparse.Namespace) -> int:
             model=target.model_id,
             role="pressure-B",
             workload_slot="B",
-            max_tokens=128,
+            max_tokens=PRESSURE_MAX_TOKENS["B"],
             out_dir=pressure_dir,
             timeout=args.request_timeout,
         )
         b_started = time.time_ns()
         b.start()
         pressure_tasks["B"] = b
-        b_request_id, b_deferral = wait_for_deferral(
+        b_request_id, b_deferral = wait_for_typed_wait_for_release(
             target.trace_path,
             baseline_rows,
             b_started,
@@ -1189,7 +1263,7 @@ def collect(args: argparse.Namespace) -> int:
             model=target.model_id,
             role="pressure-C",
             workload_slot="C",
-            max_tokens=16,
+            max_tokens=PRESSURE_MAX_TOKENS["C"],
             out_dir=pressure_dir,
             timeout=args.request_timeout,
         )
@@ -1682,6 +1756,10 @@ def validate(root: Path, out: Path) -> int:
         pressure_stop_policy == PRESSURE_STOP_POLICY,
         "collection did not use the canonical pressure stop policy",
     )
+    require(
+        collection.get("pressure_workload_policy") == PRESSURE_WORKLOAD_POLICY,
+        "collection did not use the canonical mixed-size pressure workload",
+    )
     source_git_sha = collection.get("source_git_sha")
     require(GIT_SHA_RE.fullmatch(str(source_git_sha)) is not None, "invalid source git SHA")
     require(source_git_sha == provenance.get("git_sha"), "collection/provenance git SHA mismatch")
@@ -1789,6 +1867,18 @@ def validate(root: Path, out: Path) -> int:
     )
 
     a, b, c = pressure["A"], pressure["B"], pressure["C"]
+    require(
+        b.get("prompt_sha256") == PRESSURE_WORKLOAD_POLICY["b_prompt_sha256"],
+        "pressure B did not use the canonical large-request prompt",
+    )
+    require(
+        b["prompt_tokens"] > max(a["prompt_tokens"], c["prompt_tokens"]),
+        "pressure B is not larger than the eligible A/C workloads",
+    )
+    require(
+        b["prompt_tokens"] + b["max_tokens"] <= SERVER_MAX_MODEL_LEN,
+        "pressure B exceeds the typed server model-length ceiling",
+    )
     b_request_id = target.get("b_request_id")
     require(isinstance(b_request_id, str) and b_request_id, "B request identity is missing")
     target_trace_path = root / str(target.get("trace"))
@@ -2040,6 +2130,11 @@ def self_test() -> int:
         for slot in ("A", "B", "C")
     }
     require(len(set(prompt_hashes.values())) == 3, "capacity workload prompts are not slot-specific")
+    require(
+        prompt_hashes["B"] == PRESSURE_WORKLOAD_POLICY["b_prompt_sha256"]
+        and capacity_prompt("B").count(" token") == PRESSURE_B_WORD_COUNT,
+        "large pressure workload policy drifted",
+    )
     validate_replayed_workload(
         "A",
         {
@@ -2122,6 +2217,7 @@ def self_test() -> int:
 
     maintenance_deferred = {
         "ts_unix_nanos": 20,
+        "request_id": "B",
         "phase": "vnext.prefill_admission",
         "shape": {
             "decision": "maintenance_deferred",
@@ -2148,6 +2244,7 @@ def self_test() -> int:
     }
     maintenance_wait = {
         "ts_unix_nanos": 30,
+        "request_id": "B",
         "phase": "vnext.prefill_backing_maintenance",
         "status": "ok",
         "error": None,
@@ -2207,6 +2304,51 @@ def self_test() -> int:
     )
 
     with __import__("tempfile").TemporaryDirectory() as temp:
+        wait_trace = Path(temp) / "wait-trace.jsonl"
+        wait_trace.write_text(
+            "\n".join(json.dumps(row) for row in (maintenance_deferred, maintenance_wait))
+            + "\n"
+        )
+        waited_request, waited_deferral = wait_for_typed_wait_for_release(
+            wait_trace, 0, 1, 0.1
+        )
+        require(
+            waited_request == "B" and waited_deferral == maintenance_deferred,
+            "collector did not wait for the completed typed capacity transition",
+        )
+
+        maintained = {
+            "ts_unix_nanos": 25,
+            "phase": "vnext.prefill_backing_maintenance",
+            "shape": {"outcome": "maintained"},
+            "attributes": {
+                "maintenance_evidence": {
+                    "outcome": "maintained",
+                    "pools_reclaimed": 1,
+                    "reclaimed_bytes": 64,
+                }
+            },
+            "request_id": "B",
+        }
+        admitted = {
+            "ts_unix_nanos": 30,
+            "phase": "vnext.prefill_admission",
+            "shape": {"decision": "admitted"},
+            "request_id": "B",
+        }
+        admitted_trace = Path(temp) / "admitted-trace.jsonl"
+        admitted_trace.write_text(
+            "\n".join(
+                json.dumps(row)
+                for row in (maintenance_deferred, maintained, admitted)
+            )
+            + "\n"
+        )
+        expect_gate_error(
+            lambda: wait_for_typed_wait_for_release(admitted_trace, 0, 1, 0.1),
+            "admitted before typed WaitForRelease",
+        )
+
         trace = Path(temp) / "trace.jsonl"
         trace.write_text('{"phase":"complete"}\n{"phase":')
         require(read_trace(trace) == [{"phase": "complete"}], "partial trace handling failed")
