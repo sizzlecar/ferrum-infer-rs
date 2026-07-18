@@ -1,7 +1,8 @@
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -35,6 +36,29 @@ fn invalid_operation(reason: impl Into<String>) -> VNextError {
     VNextError::InvalidExecutionPlan {
         reason: reason.into(),
     }
+}
+
+struct OperationFingerprintWriter<'a>(&'a mut Sha256);
+
+impl Write for OperationFingerprintWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn canonical_operation_fingerprint(
+    value: &impl Serialize,
+    failure_context: &'static str,
+) -> Result<String, VNextError> {
+    let mut digest = Sha256::new();
+    serde_json::to_writer(OperationFingerprintWriter(&mut digest), value)
+        .map_err(|error| invalid_operation(format!("{failure_context}: {error}")))?;
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2960,24 +2984,52 @@ mod operation_buffer_region_tests {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BatchOperationParticipantIdentity {
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct BatchOperationParticipantIdentityData {
     participant_index: u32,
     node_key: ParticipantNodeKey,
     identity: ExecutionIdentityEnvelope,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchOperationParticipantIdentity {
+    data: Arc<BatchOperationParticipantIdentityData>,
+}
+
+impl Serialize for BatchOperationParticipantIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.data.as_ref().serialize(serializer)
+    }
+}
+
 impl BatchOperationParticipantIdentity {
-    pub const fn participant_index(&self) -> u32 {
-        self.participant_index
+    fn new(
+        participant_index: u32,
+        node_key: ParticipantNodeKey,
+        identity: ExecutionIdentityEnvelope,
+    ) -> Self {
+        Self {
+            data: Arc::new(BatchOperationParticipantIdentityData {
+                participant_index,
+                node_key,
+                identity,
+            }),
+        }
+    }
+
+    pub fn participant_index(&self) -> u32 {
+        self.data.participant_index
     }
 
     pub fn node_key(&self) -> &ParticipantNodeKey {
-        &self.node_key
+        &self.data.node_key
     }
 
     pub fn identity(&self) -> &ExecutionIdentityEnvelope {
-        &self.identity
+        &self.data.identity
     }
 }
 
@@ -3009,17 +3061,17 @@ impl BatchOperationNodeIdentity {
         if participants.is_empty()
             || participants.iter().enumerate().any(|(index, participant)| {
                 participant_start.and_then(|start| start.checked_add(index as u32))
-                    != Some(participant.participant_index)
-                    || participant.node_key.node_id() != &node_id
-                    || participant.identity.parts().frame_id
-                        != Some(participant.node_key.frame_id())
-                    || participant.identity.parts().node_id.as_ref() != Some(&node_id)
-                    || participant.identity.parts().operation_id.as_ref() != Some(&operation_id)
-                    || participant.identity.parts().provider_id.as_ref() != Some(&provider_id)
+                    != Some(participant.participant_index())
+                    || participant.node_key().node_id() != &node_id
+                    || participant.identity().parts().frame_id
+                        != Some(participant.node_key().frame_id())
+                    || participant.identity().parts().node_id.as_ref() != Some(&node_id)
+                    || participant.identity().parts().operation_id.as_ref() != Some(&operation_id)
+                    || participant.identity().parts().provider_id.as_ref() != Some(&provider_id)
             })
             || participants
                 .windows(2)
-                .any(|pair| pair[0].node_key >= pair[1].node_key)
+                .any(|pair| pair[0].node_key() >= pair[1].node_key())
             || !canonical_sha256(&work_shape_fingerprint)
         {
             return Err(invalid_operation(
@@ -3036,23 +3088,18 @@ impl BatchOperationNodeIdentity {
             work_shape_fingerprint: &'a str,
             participants: &'a [BatchOperationParticipantIdentity],
         }
-        let fingerprint = format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json::to_vec(&FingerprintInput {
-                    domain: "ferrum.runtime-vnext.batch-operation-node-identity.v1",
-                    node_index,
-                    node_id: &node_id,
-                    operation_id: &operation_id,
-                    provider_id: &provider_id,
-                    work_shape_fingerprint: &work_shape_fingerprint,
-                    participants: &participants,
-                })
-                .map_err(|error| {
-                    invalid_operation(format!("batch node identity encode failed: {error}"))
-                })?
-            )
-        );
+        let fingerprint = canonical_operation_fingerprint(
+            &FingerprintInput {
+                domain: "ferrum.runtime-vnext.batch-operation-node-identity.v1",
+                node_index,
+                node_id: &node_id,
+                operation_id: &operation_id,
+                provider_id: &provider_id,
+                work_shape_fingerprint: &work_shape_fingerprint,
+                participants: &participants,
+            },
+            "batch node identity encode failed",
+        )?;
         Ok(Self {
             node_index,
             node_id,
@@ -3101,8 +3148,8 @@ impl BatchOperationNodeIdentity {
 
 /// One physical command-batch attempt identity. It may contain one operation
 /// or the entire immutable-plan wave, but it always maps to one submit/fence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BatchOperationIdentity {
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct BatchOperationIdentityData {
     batch_step_id: BatchStepId,
     batch_invocation_id: BatchInvocationId,
     plan_id: PlanId,
@@ -3114,6 +3161,35 @@ pub struct BatchOperationIdentity {
     nodes: Vec<BatchOperationNodeIdentity>,
     participants: Vec<BatchOperationParticipantIdentity>,
     fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchOperationIdentity {
+    data: Arc<BatchOperationIdentityData>,
+}
+
+impl Serialize for BatchOperationIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.data.as_ref().serialize(serializer)
+    }
+}
+
+struct BatchOperationNodeFingerprints<'a>(&'a [BatchOperationNodeIdentity]);
+
+impl Serialize for BatchOperationNodeFingerprints<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for node in self.0 {
+            sequence.serialize_element(node.fingerprint())?;
+        }
+        sequence.end()
+    }
 }
 
 impl BatchOperationIdentity {
@@ -3133,11 +3209,11 @@ impl BatchOperationIdentity {
             || nodes.iter().enumerate().any(|(index, node)| {
                 node.node_index as usize != index
                     || node.participants.iter().any(|participant| {
-                        participant.identity.parts().plan_id.as_ref() != Some(&plan_id)
-                            || participant.identity.parts().plan_hash.as_ref() != Some(&plan_hash)
-                            || participant.identity.parts().device_id.as_ref() != Some(&device_id)
+                        participant.identity().parts().plan_id.as_ref() != Some(&plan_id)
+                            || participant.identity().parts().plan_hash.as_ref() != Some(&plan_hash)
+                            || participant.identity().parts().device_id.as_ref() != Some(&device_id)
                             || participant
-                                .identity
+                                .identity()
                                 .parts()
                                 .runtime_implementation_fingerprint
                                 .as_deref()
@@ -3164,7 +3240,7 @@ impl BatchOperationIdentity {
         if participants
             .iter()
             .enumerate()
-            .any(|(index, participant)| participant.participant_index as usize != index)
+            .any(|(index, participant)| participant.participant_index() as usize != index)
         {
             return Err(invalid_operation(
                 "physical batch participant indices are not globally contiguous",
@@ -3181,95 +3257,144 @@ impl BatchOperationIdentity {
             runtime_implementation_fingerprint: &'a str,
             lane_id: ExecutionLaneId,
             claimed_backing_fingerprint: &'a str,
-            nodes: &'a [BatchOperationNodeIdentity],
+            node_fingerprints: BatchOperationNodeFingerprints<'a>,
         }
-        let fingerprint = format!(
-            "{:x}",
-            Sha256::digest(
-                serde_json::to_vec(&FingerprintInput {
-                    domain: "ferrum.runtime-vnext.physical-command-batch-identity.v1",
-                    batch_step_id,
-                    batch_invocation_id,
-                    plan_id: &plan_id,
-                    plan_hash: &plan_hash,
-                    device_id: &device_id,
-                    runtime_implementation_fingerprint: &runtime_implementation_fingerprint,
-                    lane_id,
-                    claimed_backing_fingerprint: &claimed_backing_fingerprint,
-                    nodes: &nodes,
-                })
-                .map_err(|error| {
-                    invalid_operation(format!("physical batch identity encode failed: {error}"))
-                })?,
-            )
-        );
+        let fingerprint = canonical_operation_fingerprint(
+            &FingerprintInput {
+                domain: "ferrum.runtime-vnext.physical-command-batch-identity.v2",
+                batch_step_id,
+                batch_invocation_id,
+                plan_id: &plan_id,
+                plan_hash: &plan_hash,
+                device_id: &device_id,
+                runtime_implementation_fingerprint: &runtime_implementation_fingerprint,
+                lane_id,
+                claimed_backing_fingerprint: &claimed_backing_fingerprint,
+                node_fingerprints: BatchOperationNodeFingerprints(&nodes),
+            },
+            "physical batch identity encode failed",
+        )?;
         Ok(Self {
-            batch_step_id,
-            batch_invocation_id,
-            plan_id,
-            plan_hash,
-            device_id,
-            runtime_implementation_fingerprint,
-            lane_id,
-            claimed_backing_fingerprint,
-            nodes,
-            participants,
-            fingerprint,
+            data: Arc::new(BatchOperationIdentityData {
+                batch_step_id,
+                batch_invocation_id,
+                plan_id,
+                plan_hash,
+                device_id,
+                runtime_implementation_fingerprint,
+                lane_id,
+                claimed_backing_fingerprint,
+                nodes,
+                participants,
+                fingerprint,
+            }),
         })
     }
 
-    pub const fn batch_step_id(&self) -> BatchStepId {
-        self.batch_step_id
+    pub fn batch_step_id(&self) -> BatchStepId {
+        self.data.batch_step_id
     }
 
-    pub const fn batch_invocation_id(&self) -> BatchInvocationId {
-        self.batch_invocation_id
+    pub fn batch_invocation_id(&self) -> BatchInvocationId {
+        self.data.batch_invocation_id
     }
 
     pub fn plan_id(&self) -> &PlanId {
-        &self.plan_id
+        &self.data.plan_id
     }
 
     pub fn plan_hash(&self) -> &PlanHash {
-        &self.plan_hash
+        &self.data.plan_hash
     }
 
     pub fn device_id(&self) -> &DeviceId {
-        &self.device_id
+        &self.data.device_id
     }
 
     pub fn runtime_implementation_fingerprint(&self) -> &str {
-        &self.runtime_implementation_fingerprint
+        &self.data.runtime_implementation_fingerprint
     }
 
-    pub const fn lane_id(&self) -> ExecutionLaneId {
-        self.lane_id
+    pub fn lane_id(&self) -> ExecutionLaneId {
+        self.data.lane_id
     }
 
     pub fn claimed_backing_fingerprint(&self) -> &str {
-        &self.claimed_backing_fingerprint
+        &self.data.claimed_backing_fingerprint
     }
 
     pub fn nodes(&self) -> &[BatchOperationNodeIdentity] {
-        &self.nodes
+        &self.data.nodes
     }
 
     pub fn single_node(&self) -> Option<&BatchOperationNodeIdentity> {
-        (self.nodes.len() == 1).then(|| &self.nodes[0])
+        (self.data.nodes.len() == 1).then(|| &self.data.nodes[0])
     }
 
     pub fn participants(&self) -> &[BatchOperationParticipantIdentity] {
-        &self.participants
+        &self.data.participants
     }
 
     pub fn fingerprint(&self) -> &str {
-        &self.fingerprint
+        &self.data.fingerprint
     }
 
     fn contains_identity(&self, identity: &ExecutionIdentityEnvelope) -> bool {
-        self.participants
+        self.data
+            .participants
             .iter()
             .any(|participant| participant.identity() == identity)
+    }
+}
+
+#[cfg(test)]
+mod batch_operation_identity_fingerprint_tests {
+    use super::*;
+
+    fn fingerprint_node(index: u32, marker: char) -> BatchOperationNodeIdentity {
+        BatchOperationNodeIdentity {
+            node_index: index,
+            node_id: NodeId::new(format!("node.{index}")).unwrap(),
+            operation_id: OperationId::new(format!("operation.{index}")).unwrap(),
+            provider_id: ProviderId::new(format!("provider.{index}")).unwrap(),
+            work_shape_fingerprint: std::iter::repeat_n(marker, 64).collect(),
+            participants: Vec::new(),
+            fingerprint: std::iter::repeat_n(marker, 64).collect(),
+        }
+    }
+
+    #[test]
+    fn streaming_fingerprint_matches_canonical_json_digest() {
+        #[derive(Serialize)]
+        struct Input<'a> {
+            domain: &'static str,
+            value: &'a str,
+        }
+
+        let input = Input {
+            domain: "ferrum.runtime-vnext.test",
+            value: "evidence",
+        };
+        let expected = format!("{:x}", Sha256::digest(serde_json::to_vec(&input).unwrap()));
+
+        assert_eq!(
+            canonical_operation_fingerprint(&input, "test fingerprint").unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn batch_fingerprint_projection_contains_only_validated_node_digests() {
+        let first = std::iter::repeat_n('a', 64).collect::<String>();
+        let second = std::iter::repeat_n('b', 64).collect::<String>();
+        let nodes = [fingerprint_node(0, 'a'), fingerprint_node(1, 'b')];
+
+        let encoded = serde_json::to_string(&BatchOperationNodeFingerprints(&nodes)).unwrap();
+
+        assert_eq!(encoded, format!("[\"{first}\",\"{second}\"]"));
+        assert!(!encoded.contains("node.0"));
+        assert!(!encoded.contains("operation.0"));
+        assert!(!encoded.contains("participants"));
     }
 }
 
@@ -4578,13 +4703,13 @@ impl OperationDispatch {
             }
             let local_index = u32::try_from(local_index)
                 .map_err(|_| invalid_operation("batch participant index exceeds u32"))?;
-            participant_projections.push(BatchOperationParticipantIdentity {
-                participant_index: participant_start.checked_add(local_index).ok_or_else(|| {
+            participant_projections.push(BatchOperationParticipantIdentity::new(
+                participant_start.checked_add(local_index).ok_or_else(|| {
                     invalid_operation("physical batch participant index overflows u32")
                 })?,
-                node_key: key.clone(),
+                key.clone(),
                 identity,
-            });
+            ));
         }
         BatchOperationNodeIdentity::from_validated(
             node_index,

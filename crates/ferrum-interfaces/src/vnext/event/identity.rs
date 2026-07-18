@@ -1,5 +1,6 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use super::{
     invalid_event, validate_sha256, ContractVersion, DeviceId, ExecutionFrameId, NodeId,
@@ -113,10 +114,18 @@ impl From<UnvalidatedExecutionIdentityParts> for ExecutionIdentityParts {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionIdentityEnvelope {
-    parts: ExecutionIdentityParts,
+    parts: Arc<ExecutionIdentityParts>,
+}
+
+impl Serialize for ExecutionIdentityEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.parts.as_ref().serialize(serializer)
+    }
 }
 
 impl ExecutionIdentityEnvelope {
@@ -234,10 +243,12 @@ impl ExecutionIdentityEnvelope {
                 "async links must be unique and distinct from span and parent",
             ));
         }
-        Ok(Self { parts })
+        Ok(Self {
+            parts: Arc::new(parts),
+        })
     }
 
     pub fn parts(&self) -> &ExecutionIdentityParts {
-        &self.parts
+        self.parts.as_ref()
     }
 }

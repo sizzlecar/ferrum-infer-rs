@@ -144,6 +144,25 @@ fn thirty_two_participant_dispatch_is_one_physical_submission() {
         &lane,
     )
     .unwrap();
+    assert_eq!(
+        std::mem::size_of::<ExecutionIdentityEnvelope>(),
+        std::mem::size_of::<Arc<()>>()
+    );
+    assert_eq!(
+        std::mem::size_of::<BatchOperationParticipantIdentity>(),
+        std::mem::size_of::<Arc<()>>()
+    );
+    assert_eq!(
+        std::mem::size_of::<BatchOperationIdentity>(),
+        std::mem::size_of::<Arc<()>>()
+    );
+    let batch_wire = serde_json::to_value(&batch_identity).unwrap();
+    assert!(batch_wire.get("batch_step_id").is_some());
+    assert!(batch_wire.get("data").is_none());
+    assert_eq!(
+        batch_wire,
+        serde_json::to_value(batch_identity.clone()).unwrap()
+    );
     assert_eq!(batch_identity.participants().len(), 32);
     assert_eq!(
         batch_identity
@@ -162,6 +181,21 @@ fn thirty_two_participant_dispatch_is_one_physical_submission() {
         &reaper,
     )
     .unwrap();
+    assert_eq!(
+        std::mem::size_of::<SubmittedOperationReceipt>(),
+        std::mem::size_of::<Arc<()>>()
+    );
+    assert_eq!(
+        std::mem::size_of::<SubmittedOperationParticipantReceipt>(),
+        std::mem::size_of::<Arc<()>>()
+    );
+    let submission_wire = serde_json::to_value(handle.receipt()).unwrap();
+    assert!(submission_wire.get("slot_id").is_some());
+    assert!(submission_wire.get("data").is_none());
+    assert_eq!(
+        submission_wire,
+        serde_json::to_value(handle.receipt().clone()).unwrap()
+    );
     assert_eq!(runtime_trace.lock().unwrap().submit_calls, 1);
     let trace = provider_trace.lock().unwrap();
     assert_eq!(trace.encode_calls, 1);
