@@ -18,14 +18,14 @@ use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, D
 use ferrum_interfaces::vnext::{
     BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceClass,
     DeviceCommandBatch, DeviceCommandEntry, DeviceCommandPhase, DeviceDescriptor,
-    DeviceErrorReport, DeviceExecutionTiming, DeviceId, DeviceRuntime, DeviceSubmissionStage,
-    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
-    DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
-    DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
-    StreamState, VNextError,
+    DeviceErrorReport, DeviceExecutionTiming, DeviceId, DeviceReusableExecutionObservation,
+    DeviceRuntime, DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal,
+    DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
+    DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink, DynamicStorageProfile,
+    ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout, StreamState, VNextError,
 };
 
-use super::vnext_replay::{CudaCommandReplayKey, CudaExecutableCache};
+use super::vnext_replay::{CudaCommandReplayKey, CudaExecutableCache, CudaExecutablePreparation};
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -1112,6 +1112,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         if let Err(error) = stream.state.begin_submission() {
             return Err(DefinitelyNotSubmitted::new(error));
         }
+        let mut replay_observation = DeviceReusableExecutionObservation::default();
         let mut segment_start = 0;
         while segment_start < commands.len() {
             let Some(segment_end) =
@@ -1120,25 +1121,45 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 segment_start += 1;
                 continue;
             };
-            if let Err(error) = stream.executable_cache.prepare(
+            if S::ENABLED {
+                replay_observation.observe_candidate_segment();
+            }
+            let preparation = stream.executable_cache.prepare(
                 &self.context,
                 &stream.stream,
                 &stream.blas,
                 &commands[segment_start..segment_end],
                 stream_was_quiescent,
-            ) {
-                if !error.eager_fallback_safe() {
-                    stream.state.fail();
-                    self.quarantine(stream, commands);
-                    panic!(
-                        "CUDA submission became indeterminate while preparing a reusable executable: {error}"
+            );
+            match preparation {
+                Ok(CudaExecutablePreparation::Captured) => {
+                    if S::ENABLED {
+                        replay_observation.observe_captured_segment();
+                    }
+                }
+                Ok(CudaExecutablePreparation::CacheHit) => {
+                    if S::ENABLED {
+                        replay_observation.observe_cache_hit_segment();
+                    }
+                }
+                Ok(CudaExecutablePreparation::Unavailable) => {}
+                Err(error) => {
+                    if !error.eager_fallback_safe() {
+                        stream.state.fail();
+                        self.quarantine(stream, commands);
+                        panic!(
+                            "CUDA submission became indeterminate while preparing a reusable executable: {error}"
+                        );
+                    }
+                    if S::ENABLED {
+                        replay_observation.observe_capture_rejection();
+                    }
+                    tracing::debug!(
+                        error = %error,
+                        command_count = segment_end - segment_start,
+                        "CUDA reusable executable capture rejected; using eager fallback"
                     );
                 }
-                tracing::debug!(
-                    error = %error,
-                    command_count = segment_end - segment_start,
-                    "CUDA reusable executable capture rejected; using eager fallback"
-                );
             }
             segment_start = segment_end;
         }
@@ -1177,6 +1198,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 });
             match replayed_end {
                 Some(Ok(segment_end)) => {
+                    if S::ENABLED {
+                        replay_observation.observe_replayed_segment(segment_end - index);
+                    }
                     index = segment_end;
                     continue;
                 }
@@ -1194,9 +1218,15 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 self.quarantine(stream, commands);
                 panic!("CUDA submission became indeterminate while enqueueing its batch: {error}");
             }
+            if S::ENABLED {
+                replay_observation.observe_eager_command();
+            }
             index += 1;
         }
         drop(enqueue_stage);
+        if S::ENABLED {
+            timing_sink.record_reusable_execution(replay_observation);
+        }
 
         let fence_stage = CudaSubmissionStageTimer::start(
             timing_sink,

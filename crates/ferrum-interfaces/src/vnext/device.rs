@@ -580,6 +580,79 @@ pub enum DeviceSubmissionStage {
     RecordFenceAndAccount,
 }
 
+/// Aggregate reusable-execution work observed inside one backend submission.
+///
+/// The observation carries no execution authority and is recorded only by an
+/// enabled diagnostic sink. Backends update one stack value while submitting;
+/// the product sink aggregates it without allocating on the hot path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionObservation {
+    candidate_segments: u64,
+    captured_segments: u64,
+    cache_hit_segments: u64,
+    capture_rejected_segments: u64,
+    replayed_segments: u64,
+    replayed_commands: u64,
+    eager_commands: u64,
+}
+
+impl DeviceReusableExecutionObservation {
+    pub fn observe_candidate_segment(&mut self) {
+        self.candidate_segments = self.candidate_segments.saturating_add(1);
+    }
+
+    pub fn observe_captured_segment(&mut self) {
+        self.captured_segments = self.captured_segments.saturating_add(1);
+    }
+
+    pub fn observe_cache_hit_segment(&mut self) {
+        self.cache_hit_segments = self.cache_hit_segments.saturating_add(1);
+    }
+
+    pub fn observe_capture_rejection(&mut self) {
+        self.capture_rejected_segments = self.capture_rejected_segments.saturating_add(1);
+    }
+
+    pub fn observe_replayed_segment(&mut self, command_count: usize) {
+        self.replayed_segments = self.replayed_segments.saturating_add(1);
+        self.replayed_commands = self
+            .replayed_commands
+            .saturating_add(u64::try_from(command_count).unwrap_or(u64::MAX));
+    }
+
+    pub fn observe_eager_command(&mut self) {
+        self.eager_commands = self.eager_commands.saturating_add(1);
+    }
+
+    pub const fn candidate_segments(self) -> u64 {
+        self.candidate_segments
+    }
+
+    pub const fn captured_segments(self) -> u64 {
+        self.captured_segments
+    }
+
+    pub const fn cache_hit_segments(self) -> u64 {
+        self.cache_hit_segments
+    }
+
+    pub const fn capture_rejected_segments(self) -> u64 {
+        self.capture_rejected_segments
+    }
+
+    pub const fn replayed_segments(self) -> u64 {
+        self.replayed_segments
+    }
+
+    pub const fn replayed_commands(self) -> u64 {
+        self.replayed_commands
+    }
+
+    pub const fn eager_commands(self) -> u64 {
+        self.eager_commands
+    }
+}
+
 /// Diagnostic-only sink for backend submission attribution.
 ///
 /// `ENABLED = false` is the compile-time off path: a backend must not read a
@@ -590,6 +663,8 @@ pub trait DeviceSubmissionTimingSink: Send + Sync {
     const ENABLED: bool;
 
     fn record_device_submission(&self, stage: DeviceSubmissionStage, elapsed: Duration);
+
+    fn record_reusable_execution(&self, _observation: DeviceReusableExecutionObservation) {}
 }
 
 pub struct DisabledDeviceSubmissionTimingSink;

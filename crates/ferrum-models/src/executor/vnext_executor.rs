@@ -212,6 +212,7 @@ struct VNextWaveTimingMetrics {
     device_submit_begin_timing: AtomicDurationMetrics,
     device_submit_enqueue_commands: AtomicDurationMetrics,
     device_submit_record_fence_account: AtomicDurationMetrics,
+    reusable_execution: VNextReusableExecutionMetrics,
     completion_arm: AtomicDurationMetrics,
     completion_round_trip: AtomicDurationMetrics,
     host_postprocess: AtomicDurationMetrics,
@@ -243,6 +244,7 @@ impl VNextWaveTimingMetrics {
                             "begin_timing": self.device_submit_begin_timing.snapshot(),
                             "enqueue_commands": self.device_submit_enqueue_commands.snapshot(),
                             "record_fence_and_account": self.device_submit_record_fence_account.snapshot(),
+                            "reusable_execution": self.reusable_execution.snapshot(),
                         },
                         "completion_arm": self.completion_arm.snapshot(),
                     },
@@ -264,6 +266,48 @@ impl VNextWaveTimingMetrics {
     }
 }
 
+#[derive(Default)]
+struct VNextReusableExecutionMetrics {
+    candidate_segments: AtomicU64,
+    captured_segments: AtomicU64,
+    cache_hit_segments: AtomicU64,
+    capture_rejected_segments: AtomicU64,
+    replayed_segments: AtomicU64,
+    replayed_commands: AtomicU64,
+    eager_commands: AtomicU64,
+}
+
+impl VNextReusableExecutionMetrics {
+    fn record(&self, observation: DeviceReusableExecutionObservation) {
+        self.candidate_segments
+            .fetch_add(observation.candidate_segments(), Ordering::Relaxed);
+        self.captured_segments
+            .fetch_add(observation.captured_segments(), Ordering::Relaxed);
+        self.cache_hit_segments
+            .fetch_add(observation.cache_hit_segments(), Ordering::Relaxed);
+        self.capture_rejected_segments
+            .fetch_add(observation.capture_rejected_segments(), Ordering::Relaxed);
+        self.replayed_segments
+            .fetch_add(observation.replayed_segments(), Ordering::Relaxed);
+        self.replayed_commands
+            .fetch_add(observation.replayed_commands(), Ordering::Relaxed);
+        self.eager_commands
+            .fetch_add(observation.eager_commands(), Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "candidate_segments": self.candidate_segments.load(Ordering::Relaxed),
+            "captured_segments": self.captured_segments.load(Ordering::Relaxed),
+            "cache_hit_segments": self.cache_hit_segments.load(Ordering::Relaxed),
+            "capture_rejected_segments": self.capture_rejected_segments.load(Ordering::Relaxed),
+            "replayed_segments": self.replayed_segments.load(Ordering::Relaxed),
+            "replayed_commands": self.replayed_commands.load(Ordering::Relaxed),
+            "eager_commands": self.eager_commands.load(Ordering::Relaxed),
+        })
+    }
+}
+
 impl DeviceSubmissionTimingSink for VNextWaveTimingMetrics {
     const ENABLED: bool = true;
 
@@ -280,6 +324,10 @@ impl DeviceSubmissionTimingSink for VNextWaveTimingMetrics {
                 self.device_submit_record_fence_account.record(elapsed)
             }
         }
+    }
+
+    fn record_reusable_execution(&self, observation: DeviceReusableExecutionObservation) {
+        self.reusable_execution.record(observation);
     }
 }
 
@@ -4184,6 +4232,12 @@ mod tests {
             snapshot["host_encode_submit_breakdown"]["provider_encode_submit_breakdown"]
                 ["lane_reserve_submit_arm_breakdown"]["device_runtime_submit_breakdown"]
                 ["enqueue_commands"]["samples"],
+            0
+        );
+        assert_eq!(
+            snapshot["host_encode_submit_breakdown"]["provider_encode_submit_breakdown"]
+                ["lane_reserve_submit_arm_breakdown"]["device_runtime_submit_breakdown"]
+                ["reusable_execution"]["replayed_commands"],
             0
         );
         assert!(snapshot["limitations"]
