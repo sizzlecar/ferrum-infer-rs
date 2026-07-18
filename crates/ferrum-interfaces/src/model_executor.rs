@@ -1358,6 +1358,9 @@ pub enum ExecutorPrefillMaintenanceOutcome {
         pools_reclaimed: usize,
         chunks_reclaimed: usize,
         reclaimed_bytes: u64,
+        /// Exact allocator-issued rebalance receipt. The aggregate counters
+        /// above remain for stable metrics and must reconcile with this value.
+        rebalance: Option<crate::vnext::DynamicPoolRebalanceReceipt>,
     },
 }
 

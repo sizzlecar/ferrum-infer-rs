@@ -582,6 +582,7 @@ enum TestMaintenanceBehavior {
     Advance,
     WaitForRelease,
     RetryAdmission,
+    IncoherentRebalance,
     Fail,
 }
 
@@ -818,6 +819,7 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
                     pools_reclaimed: 0,
                     chunks_reclaimed: 0,
                     reclaimed_bytes: 0,
+                    rebalance: None,
                 })
             }
             TestMaintenanceBehavior::WaitForRelease => {
@@ -839,6 +841,18 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
             TestMaintenanceBehavior::RetryAdmission => {
                 Ok(ExecutorPrefillMaintenanceOutcome::RetryAdmission {
                     current: self.epochs(),
+                })
+            }
+            TestMaintenanceBehavior::IncoherentRebalance => {
+                self.capacity_epoch.store(1, Ordering::Release);
+                Ok(ExecutorPrefillMaintenanceOutcome::Maintained {
+                    current: self.epochs(),
+                    pools_grown: 1,
+                    allocated_bytes: 4096,
+                    pools_reclaimed: 1,
+                    chunks_reclaimed: 1,
+                    reclaimed_bytes: 4096,
+                    rebalance: None,
                 })
             }
             TestMaintenanceBehavior::Fail => {
@@ -3785,6 +3799,25 @@ async fn plan_runtime_backing_maintenance_advances_epoch_before_prefill() {
         events[deferred_index].shape.get("prefill_submit_observed"),
         Some(&serde_json::json!(false))
     );
+    let input_token_count = events[deferred_index]
+        .shape
+        .get("input_token_count")
+        .and_then(serde_json::Value::as_u64)
+        .expect("typed prefill input token count");
+    let maximum_sequence_tokens = events[deferred_index]
+        .shape
+        .get("maximum_sequence_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .expect("typed maximum sequence horizon");
+    assert!(input_token_count > 0);
+    assert!(maximum_sequence_tokens >= input_token_count);
+    assert_eq!(
+        events[maintenance_index]
+            .attributes
+            .get("maintenance_evidence")
+            .and_then(|evidence| evidence.get("rebalance")),
+        Some(&serde_json::Value::Null)
+    );
     assert!(events[deferred_index]
         .attributes
         .get("monotonic_nanos")
@@ -3976,7 +4009,10 @@ async fn plan_runtime_retry_admission_does_not_require_a_published_epoch() {
 
 #[tokio::test]
 async fn plan_runtime_invalid_maintenance_fails_waiting_request_without_retry_loop() {
-    for behavior in [TestMaintenanceBehavior::Fail] {
+    for behavior in [
+        TestMaintenanceBehavior::Fail,
+        TestMaintenanceBehavior::IncoherentRebalance,
+    ] {
         let mut config = EngineConfig::default();
         config.kv_cache.max_blocks = 128;
         let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
