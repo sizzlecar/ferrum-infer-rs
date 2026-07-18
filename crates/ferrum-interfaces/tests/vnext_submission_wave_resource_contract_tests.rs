@@ -266,9 +266,18 @@ fn capacity_deferred_unsubmitted_step_rolls_back_without_poisoning_its_session()
 
     let step = begin_step(&batch);
     let first_step_id = step.batch_step_id();
+    let first_frame = step
+        .participant_frames()
+        .next()
+        .expect("single-participant step owns one frame")
+        .frame_id();
     let receipt = step.try_rollback_unsubmitted().unwrap();
     assert_eq!(receipt.batch_step_id(), first_step_id);
     assert_eq!(receipt.participants().len(), 1);
+    assert_eq!(
+        receipt.participants()[0].assignment().frame_id(),
+        first_frame
+    );
     assert_eq!(
         receipt.participants()[0].disposition(),
         StepParticipantRetirementDisposition::RolledBackUnsubmitted
@@ -276,6 +285,15 @@ fn capacity_deferred_unsubmitted_step_rolls_back_without_poisoning_its_session()
 
     let retry = begin_step(&batch);
     assert_ne!(retry.batch_step_id(), first_step_id);
+    assert_eq!(
+        retry
+            .participant_frames()
+            .next()
+            .expect("single-participant retry owns one frame")
+            .frame_id(),
+        first_frame,
+        "a fresh physical step attempt must reuse the request frame that never executed"
+    );
     retry.try_retire_normal().unwrap();
 
     drop(batch);

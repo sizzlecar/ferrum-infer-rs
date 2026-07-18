@@ -159,6 +159,51 @@ fn immutable_plan_nodes_prepare_one_owned_submission_wave() {
 }
 
 #[test]
+fn unsubmitted_step_retry_keeps_the_first_physical_journal_identity() {
+    let (fixture, sequence, session, batch, first_step) = setup();
+    let first_step_id = first_step.batch_step_id();
+    let first_frame = first_step
+        .participant_frames()
+        .next()
+        .expect("single-participant step owns one frame")
+        .frame_id();
+    first_step.try_rollback_unsubmitted().unwrap();
+
+    let retry = begin_single_participant_step(&fixture.plan_resources, &batch);
+    assert_ne!(retry.batch_step_id(), first_step_id);
+    assert_eq!(
+        retry
+            .participant_frames()
+            .next()
+            .expect("single-participant retry owns one frame")
+            .frame_id(),
+        first_frame
+    );
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &retry);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        &active_bindings,
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let first_operation = batch_identity.nodes()[0].participants()[0]
+        .identity()
+        .parts();
+    assert_eq!(first_operation.frame_id, Some(first_frame));
+    assert_eq!(first_operation.sequence, 5);
+    assert_eq!(first_operation.node_invocation_id.unwrap().get(), 1);
+
+    drop(batch_identity);
+    drop(lane);
+    drop(active_bindings);
+    drop(wave);
+    teardown(fixture, sequence, session, batch, retry);
+}
+
+#[test]
 fn wrong_wave_topology_rejects_before_legal_wave_can_prepare() {
     let (fixture, sequence, session, batch, step) = setup();
     let wrong = InvocationResourceAdmissionRequest::for_all_step_participants(
