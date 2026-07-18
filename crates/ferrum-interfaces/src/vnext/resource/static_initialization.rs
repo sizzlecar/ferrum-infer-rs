@@ -566,7 +566,7 @@ where
     *pending_staging_bytes = 0;
     let mut batch = DeviceCommandBatch::with_capacity(commands.len());
     for command in commands {
-        batch.push(command);
+        batch.push_initialization(command);
     }
     let submitted = catch_unwind(AssertUnwindSafe(|| {
         runtime.submit(

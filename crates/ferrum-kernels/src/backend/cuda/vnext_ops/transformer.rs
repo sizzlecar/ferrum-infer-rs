@@ -33,6 +33,7 @@ use super::{
     implementation_fingerprint, same_physical_region, DENSE_SAFETENSORS_FORMAT_ID,
     THREADS_PER_BLOCK, VALUE_ALIGNMENT_BYTES,
 };
+use crate::backend::cuda::vnext_replay::CudaCommandReplayKeyBuilder;
 
 mod attention;
 mod causal_attention;
@@ -53,6 +54,8 @@ const RMS_NORM_FUNCTION_NAME: &str = "rms_norm_f16";
 const SILU_MUL_FUNCTION_NAME: &str = "fused_silu_mul_interleaved_f16";
 const RESIDUAL_ADD_FUNCTION_NAME: &str = "residual_add_f16";
 const SWIGLU_SCRATCH_PARTS: u64 = 3;
+static CUDA_GEMM_ALPHA_F32: f32 = 1.0;
+static CUDA_GEMM_BETA_F32: f32 = 0.0;
 
 pub(super) struct CudaRmsNormProvider {
     descriptor: OperationProviderDescriptor,
@@ -108,8 +111,12 @@ impl OperationProvider<CudaDeviceRuntime> for CudaRmsNormProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<CudaDeviceCommand, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_rms_norm(&self.function, invocation)
-            .map_err(|message| provider_failure(identity, "cuda.rms_norm.encode", message))
+        encode_rms_norm(
+            self.descriptor.provider_implementation_fingerprint(),
+            &self.function,
+            invocation,
+        )
+        .map_err(|message| provider_failure(identity, "cuda.rms_norm.encode", message))
     }
 }
 
@@ -155,8 +162,11 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseLinearProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<CudaDeviceCommand, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_dense_linear(invocation)
-            .map_err(|message| provider_failure(identity, "cuda.dense_linear.encode", message))
+        encode_dense_linear(
+            self.descriptor.provider_implementation_fingerprint(),
+            invocation,
+        )
+        .map_err(|message| provider_failure(identity, "cuda.dense_linear.encode", message))
     }
 }
 
@@ -231,8 +241,12 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<CudaDeviceCommand, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_dense_swiglu(&self.silu_mul, invocation)
-            .map_err(|message| provider_failure(identity, "cuda.dense_swiglu.encode", message))
+        encode_dense_swiglu(
+            self.descriptor.provider_implementation_fingerprint(),
+            &self.silu_mul,
+            invocation,
+        )
+        .map_err(|message| provider_failure(identity, "cuda.dense_swiglu.encode", message))
     }
 }
 
@@ -290,8 +304,12 @@ impl OperationProvider<CudaDeviceRuntime> for CudaResidualAddProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<CudaDeviceCommand, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_residual_add(&self.function, invocation)
-            .map_err(|message| provider_failure(identity, "cuda.residual_add.encode", message))
+        encode_residual_add(
+            self.descriptor.provider_implementation_fingerprint(),
+            &self.function,
+            invocation,
+        )
+        .map_err(|message| provider_failure(identity, "cuda.residual_add.encode", message))
     }
 }
 
@@ -394,6 +412,7 @@ pub(super) fn estimate(
 }
 
 fn encode_rms_norm(
+    provider_fingerprint: &str,
     function: &CudaFunction,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
@@ -436,26 +455,36 @@ fn encode_rms_norm(
     let rows = checked_u32(tokens, "RMSNorm row count")?;
     let hidden_size = checked_i32(hidden_size, "RMSNorm hidden size")?;
     let function = function.clone();
-    CudaDeviceCommand::operation("vnext_rms_norm", regions, move |stream, regions| {
-        let input = regions[0].device_ptr();
-        let weight = regions[1].device_ptr();
-        let output = regions[2].device_ptr();
-        let mut builder = stream.launch_builder(&function);
-        builder.arg(&input);
-        builder.arg(&weight);
-        builder.arg(&output);
-        builder.arg(&hidden_size);
-        builder.arg(&epsilon);
-        unsafe {
-            builder.launch(LaunchConfig {
-                grid_dim: (rows, 1, 1),
-                block_dim: ((hidden_size as u32).min(1024), 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .map(|_| ())
-        .map_err(|error| CudaDeviceRuntimeError::driver("vNext RMSNorm launch", error))
-    })
+    let replay_key = CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_rms_norm")
+        .u32(rows)
+        .i32(hidden_size)
+        .f32(epsilon)
+        .finish();
+    CudaDeviceCommand::replayable_operation(
+        "vnext_rms_norm",
+        regions,
+        replay_key,
+        move |stream, regions| {
+            let input = regions[0].device_ptr();
+            let weight = regions[1].device_ptr();
+            let output = regions[2].device_ptr();
+            let mut builder = stream.launch_builder(&function);
+            builder.arg(&input);
+            builder.arg(&weight);
+            builder.arg(&output);
+            builder.arg(&hidden_size);
+            builder.arg(&epsilon);
+            unsafe {
+                builder.launch(LaunchConfig {
+                    grid_dim: (rows, 1, 1),
+                    block_dim: ((hidden_size as u32).min(1024), 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map(|_| ())
+            .map_err(|error| CudaDeviceRuntimeError::driver("vNext RMSNorm launch", error))
+        },
+    )
     .map_err(|error| error.to_string())
 }
 
@@ -469,6 +498,7 @@ struct GemmLaunch {
 }
 
 fn encode_dense_linear(
+    provider_fingerprint: &str,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
     ensure_invocation(&invocation, DENSE_LINEAR_OPERATION_ID)?;
@@ -574,11 +604,23 @@ fn encode_dense_linear(
             });
         }
     }
-    CudaDeviceCommand::operation_with_blas(
+    let mut replay_key =
+        CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_dense_linear")
+            .u64(launches.len() as u64);
+    for launch in &launches {
+        replay_key = replay_key
+            .u64(launch.input_region as u64)
+            .u64(launch.output_region as u64)
+            .i32(launch.rows)
+            .i32(launch.out_features)
+            .i32(launch.in_features);
+    }
+    CudaDeviceCommand::replayable_operation_with_blas(
         "vnext_dense_linear",
         regions,
+        replay_key.finish(),
         move |_stream, blas, regions| {
-            for launch in launches {
+            for launch in &launches {
                 launch_gemm_f16(
                     blas,
                     regions[launch.input_region].device_ptr(),
@@ -597,6 +639,7 @@ fn encode_dense_linear(
 }
 
 fn encode_dense_swiglu(
+    provider_fingerprint: &str,
     silu_mul: &CudaFunction,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
@@ -668,9 +711,17 @@ fn encode_dense_swiglu(
     let hidden_size = checked_i32(hidden_size, "dense SwiGLU hidden size")?;
     let intermediate_size = checked_i32(intermediate_size, "dense SwiGLU intermediate size")?;
     let silu_mul = silu_mul.clone();
-    CudaDeviceCommand::operation_with_blas(
+    let replay_key = CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_dense_swiglu")
+        .i32(tokens)
+        .i32(hidden_size)
+        .i32(intermediate_size)
+        .u64(gate_up_bytes)
+        .u64(required_scratch_bytes)
+        .finish();
+    CudaDeviceCommand::replayable_operation_with_blas(
         "vnext_dense_swiglu",
         regions,
+        replay_key,
         move |stream, blas, regions| {
             let input = regions[0].device_ptr();
             let gate_up_weight = regions[1].device_ptr();
@@ -725,6 +776,7 @@ fn encode_dense_swiglu(
 }
 
 fn encode_residual_add(
+    provider_fingerprint: &str,
     function: &CudaFunction,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
@@ -779,25 +831,34 @@ fn encode_residual_add(
         "residual add launch grid",
     )?;
     let function = function.clone();
-    CudaDeviceCommand::operation("vnext_residual_add", regions, move |stream, regions| {
-        let left = regions[0].device_ptr();
-        let right = regions[1].device_ptr();
-        let output = regions[2].device_ptr();
-        let mut builder = stream.launch_builder(&function);
-        builder.arg(&left);
-        builder.arg(&right);
-        builder.arg(&output);
-        builder.arg(&elements);
-        unsafe {
-            builder.launch(LaunchConfig {
-                grid_dim: (grid_x, 1, 1),
-                block_dim: (THREADS_PER_BLOCK, 1, 1),
-                shared_mem_bytes: 0,
-            })
-        }
-        .map(|_| ())
-        .map_err(|error| CudaDeviceRuntimeError::driver("vNext residual add launch", error))
-    })
+    let replay_key = CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_residual_add")
+        .i32(elements)
+        .u32(grid_x)
+        .finish();
+    CudaDeviceCommand::replayable_operation(
+        "vnext_residual_add",
+        regions,
+        replay_key,
+        move |stream, regions| {
+            let left = regions[0].device_ptr();
+            let right = regions[1].device_ptr();
+            let output = regions[2].device_ptr();
+            let mut builder = stream.launch_builder(&function);
+            builder.arg(&left);
+            builder.arg(&right);
+            builder.arg(&output);
+            builder.arg(&elements);
+            unsafe {
+                builder.launch(LaunchConfig {
+                    grid_dim: (grid_x, 1, 1),
+                    block_dim: (THREADS_PER_BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map(|_| ())
+            .map_err(|error| CudaDeviceRuntimeError::driver("vNext residual add launch", error))
+        },
+    )
     .map_err(|error| error.to_string())
 }
 
@@ -811,8 +872,6 @@ pub(super) fn launch_gemm_f16(
     in_features: i32,
     operation: &'static str,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    let alpha = 1.0_f32;
-    let beta = 0.0_f32;
     unsafe {
         gemm_ex(
             *blas.handle(),
@@ -821,14 +880,14 @@ pub(super) fn launch_gemm_f16(
             out_features,
             rows,
             in_features,
-            &alpha as *const f32 as *const c_void,
+            &CUDA_GEMM_ALPHA_F32 as *const f32 as *const c_void,
             weight as *const c_void,
             cudaDataType_t::CUDA_R_16F,
             in_features,
             input as *const c_void,
             cudaDataType_t::CUDA_R_16F,
             in_features,
-            &beta as *const f32 as *const c_void,
+            &CUDA_GEMM_BETA_F32 as *const f32 as *const c_void,
             output as *mut c_void,
             cudaDataType_t::CUDA_R_16F,
             out_features,

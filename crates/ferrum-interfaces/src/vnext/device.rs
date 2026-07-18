@@ -866,6 +866,42 @@ impl HostTransferLayout {
     }
 }
 
+/// Semantic phase of one command inside a core-owned submission batch.
+///
+/// Backends may use this phase to compile reusable device executables, but
+/// they must preserve the original ordering and may only reuse `Compute`
+/// commands whose backend provider supplied an exact replay contract.
+/// Initialization and dynamic binding commands are explicit eager barriers:
+/// replaying either can reset live state or reuse stale request data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceCommandPhase {
+    Initialization,
+    DynamicBinding,
+    Compute,
+}
+
+/// One command plus the core-issued semantic phase that constrains backend
+/// execution optimizations.
+pub struct DeviceCommandEntry<C> {
+    phase: DeviceCommandPhase,
+    command: C,
+}
+
+impl<C> DeviceCommandEntry<C> {
+    pub const fn phase(&self) -> DeviceCommandPhase {
+        self.phase
+    }
+
+    pub const fn command(&self) -> &C {
+        &self.command
+    }
+
+    pub fn into_parts(self) -> (DeviceCommandPhase, C) {
+        (self.phase, self.command)
+    }
+}
+
 /// Core-owned physical submission unit.
 ///
 /// Operation providers produce individual commands, while the execution
@@ -874,14 +910,17 @@ impl HostTransferLayout {
 /// silently split one admitted lane segment into unrelated submissions.
 #[must_use = "encoded device command batches must be submitted"]
 pub struct DeviceCommandBatch<C> {
-    commands: Vec<C>,
+    commands: Vec<DeviceCommandEntry<C>>,
     timing_mode: DeviceTimingMode,
 }
 
 impl<C> DeviceCommandBatch<C> {
     pub(crate) fn singleton(command: C) -> Self {
         Self {
-            commands: vec![command],
+            commands: vec![DeviceCommandEntry {
+                phase: DeviceCommandPhase::Compute,
+                command,
+            }],
             timing_mode: DeviceTimingMode::Off,
         }
     }
@@ -900,8 +939,29 @@ impl<C> DeviceCommandBatch<C> {
         }
     }
 
+    pub(crate) fn push_initialization(&mut self, command: C) {
+        self.commands.push(DeviceCommandEntry {
+            phase: DeviceCommandPhase::Initialization,
+            command,
+        });
+    }
+
+    pub(crate) fn push_dynamic_binding(&mut self, command: C) {
+        self.commands.push(DeviceCommandEntry {
+            phase: DeviceCommandPhase::DynamicBinding,
+            command,
+        });
+    }
+
+    pub(crate) fn push_compute(&mut self, command: C) {
+        self.commands.push(DeviceCommandEntry {
+            phase: DeviceCommandPhase::Compute,
+            command,
+        });
+    }
+
     pub(crate) fn push(&mut self, command: C) {
-        self.commands.push(command);
+        self.push_compute(command);
     }
 
     pub fn len(&self) -> usize {
@@ -917,6 +977,13 @@ impl<C> DeviceCommandBatch<C> {
     }
 
     pub fn into_commands(self) -> Vec<C> {
+        self.commands
+            .into_iter()
+            .map(|entry| entry.command)
+            .collect()
+    }
+
+    pub fn into_entries(self) -> Vec<DeviceCommandEntry<C>> {
         self.commands
     }
 }

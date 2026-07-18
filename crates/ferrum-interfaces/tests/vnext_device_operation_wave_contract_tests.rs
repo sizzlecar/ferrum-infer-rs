@@ -404,6 +404,18 @@ fn typed_input_upload_precedes_the_plan_in_one_submission() {
         vec![3]
     );
     assert_eq!(
+        fixture
+            .runtime_trace
+            .lock()
+            .unwrap()
+            .submitted_command_phases,
+        vec![vec![
+            DeviceCommandPhase::DynamicBinding,
+            DeviceCommandPhase::Compute,
+            DeviceCommandPhase::Compute,
+        ]]
+    );
+    assert_eq!(
         *timing.stages.lock().unwrap(),
         vec![
             SubmissionWaveDispatchStage::ContractValidateAndReserve,
@@ -706,6 +718,21 @@ fn zero_state_initialization_is_ordered_retried_and_not_repeated_after_success()
     {
         let trace = fixture.runtime_trace.lock().unwrap();
         assert_eq!(
+            trace.submitted_command_phases,
+            vec![
+                vec![
+                    DeviceCommandPhase::Initialization,
+                    DeviceCommandPhase::Compute,
+                    DeviceCommandPhase::Compute,
+                ],
+                vec![
+                    DeviceCommandPhase::Initialization,
+                    DeviceCommandPhase::Compute,
+                    DeviceCommandPhase::Compute,
+                ],
+            ]
+        );
+        assert_eq!(
             trace.submitted_commands,
             vec![
                 vec![
@@ -765,6 +792,26 @@ fn zero_state_initialization_is_ordered_retried_and_not_repeated_after_success()
                 TestCommand::Provider
             ],
             vec![TestCommand::Provider, TestCommand::Provider],
+        ]
+    );
+    assert_eq!(
+        fixture
+            .runtime_trace
+            .lock()
+            .unwrap()
+            .submitted_command_phases,
+        vec![
+            vec![
+                DeviceCommandPhase::Initialization,
+                DeviceCommandPhase::Compute,
+                DeviceCommandPhase::Compute,
+            ],
+            vec![
+                DeviceCommandPhase::Initialization,
+                DeviceCommandPhase::Compute,
+                DeviceCommandPhase::Compute,
+            ],
+            vec![DeviceCommandPhase::Compute, DeviceCommandPhase::Compute],
         ]
     );
 
