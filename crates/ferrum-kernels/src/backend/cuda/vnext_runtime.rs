@@ -11,19 +11,58 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use cudarc::cublas::{result::CublasError, CudaBlas};
 use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DriverError};
 use ferrum_interfaces::vnext::{
     BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceClass,
     DeviceCommandBatch, DeviceDescriptor, DeviceErrorReport, DeviceExecutionTiming, DeviceId,
-    DeviceRuntime, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
-    DeviceTimingMode, DeviceTimingUnavailableReason, DynamicStorageProfile, ElementType,
-    FenceIndeterminate, FenceQuery, HostTransferLayout, StreamState, VNextError,
+    DeviceRuntime, DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal,
+    DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
+    DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink, DynamicStorageProfile,
+    ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout, StreamState, VNextError,
 };
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+struct CudaSubmissionStageTimer<'sink, S>
+where
+    S: DeviceSubmissionTimingSink,
+{
+    sink: &'sink S,
+    stage: DeviceSubmissionStage,
+    started: Option<Instant>,
+}
+
+impl<'sink, S> CudaSubmissionStageTimer<'sink, S>
+where
+    S: DeviceSubmissionTimingSink,
+{
+    #[inline(always)]
+    fn start(sink: &'sink S, stage: DeviceSubmissionStage) -> Self {
+        Self {
+            sink,
+            stage,
+            started: S::ENABLED.then(Instant::now),
+        }
+    }
+}
+
+impl<S> Drop for CudaSubmissionStageTimer<'_, S>
+where
+    S: DeviceSubmissionTimingSink,
+{
+    fn drop(&mut self) {
+        if let Some(started) = self.started.take() {
+            if !std::thread::panicking() {
+                self.sink
+                    .record_device_submission(self.stage, started.elapsed());
+            }
+        }
+    }
+}
 
 /// Typed construction input supplied by the CUDA composition root.
 ///
@@ -849,6 +888,20 @@ impl DeviceRuntime for CudaDeviceRuntime {
         stream: &mut Self::Stream,
         commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
+        self.submit_with_timing(stream, commands, &DisabledDeviceSubmissionTimingSink)
+    }
+
+    fn submit_with_timing<S>(
+        &self,
+        stream: &mut Self::Stream,
+        commands: DeviceCommandBatch<Self::Command>,
+        timing_sink: &S,
+    ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>>
+    where
+        S: DeviceSubmissionTimingSink,
+    {
+        let validate_stage =
+            CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::ValidateAndPrepare);
         if let Err(error) = self.validate_stream(stream) {
             return Err(DefinitelyNotSubmitted::new(error));
         }
@@ -878,6 +931,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
         if let Err(error) = stream.state.begin_submission() {
             return Err(DefinitelyNotSubmitted::new(error));
         }
+        drop(validate_stage);
+
+        let begin_timing_stage =
+            CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::BeginTiming);
         let timing = match timing_mode {
             DeviceTimingMode::Off => CudaFenceTiming::NotRequested,
             DeviceTimingMode::Completion => {
@@ -890,6 +947,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 }
             }
         };
+        drop(begin_timing_stage);
+
+        let enqueue_stage =
+            CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::EnqueueCommands);
         for index in 0..commands.len() {
             if let Err(error) = commands[index].enqueue(&stream.stream, &stream.blas) {
                 stream.state.fail();
@@ -897,6 +958,12 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 panic!("CUDA submission became indeterminate while enqueueing its batch: {error}");
             }
         }
+        drop(enqueue_stage);
+
+        let fence_stage = CudaSubmissionStageTimer::start(
+            timing_sink,
+            DeviceSubmissionStage::RecordFenceAndAccount,
+        );
         let fence_flags = match timing_mode {
             DeviceTimingMode::Off => None,
             DeviceTimingMode::Completion => {
@@ -916,7 +983,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             self.quarantine(stream, commands);
             panic!("CUDA submission became indeterminate while accounting its fence: {error}");
         }
-        Ok(CudaDeviceFence {
+        let fence = CudaDeviceFence {
             event,
             timing,
             stream_state: Arc::clone(&stream.state),
@@ -924,7 +991,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
             _stream: Arc::clone(&stream.stream),
             _blas: Arc::clone(&stream.blas),
             _commands: commands,
-        })
+        };
+        drop(fence_stage);
+        Ok(fence)
     }
 
     fn query_fence(&self, fence: &Self::Fence) -> FenceQuery<Self::Error> {

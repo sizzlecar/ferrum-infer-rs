@@ -13,18 +13,18 @@ use super::{
     BatchParticipantTokenRange, BatchStepId, BatchWorkShape, BufferDescriptor, BufferUsage,
     CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper, ContractVersion,
     DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
-    DeviceCommandBatch, DeviceId, DeviceRuntime, DeviceTimingMode, DynamicResourceDemand,
-    DynamicResourceShape, ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts,
-    ExecutionLane, ExecutionLaneId, HostTransferLayout, IdentifiedFailure,
-    IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
-    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId,
-    NodeInvocationId, NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
-    PlanNode, PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
-    ProviderWorkspaceRequirement, QuantizationFormatId, ResourceId, SemanticValue,
-    SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint, SpanId,
-    StepParticipantFrameAssignment, StepResourceLease, TrustedActiveSequenceBinding,
-    TrustedPlanRuntimeEvidence, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
-    WeightId, EXECUTION_IDENTITY_VERSION,
+    DeviceCommandBatch, DeviceId, DeviceRuntime, DeviceSubmissionStage, DeviceSubmissionTimingSink,
+    DeviceTimingMode, DynamicResourceDemand, DynamicResourceShape, ExecutablePlanView,
+    ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane, ExecutionLaneId,
+    HostTransferLayout, IdentifiedFailure, IndeterminateSubmissionHandle, InvocationResourceLease,
+    LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId, LogicalBackingBufferView,
+    LogicalBackingSegmentBinding, NodeId, NodeInvocationId, NodeWorkContract, OperationId,
+    ParticipantNodeKey, PlanHash, PlanId, PlanNode, PreparedStepSubmissionNode,
+    PreparedStepSubmissionWave, ProgramValueId, ProviderId, ProviderWorkspaceRequirement,
+    QuantizationFormatId, ResourceId, SemanticValue, SequenceBackingSnapshot, SequenceSessionEpoch,
+    SequenceSessionFingerprint, SpanId, StepParticipantFrameAssignment, StepResourceLease,
+    TrustedActiveSequenceBinding, TrustedPlanRuntimeEvidence, UnvalidatedExecutionIdentityParts,
+    VNextError, WeightFormatId, WeightId, EXECUTION_IDENTITY_VERSION,
 };
 
 pub const MAX_OPERATION_CATALOG_ROWS: usize = 4096;
@@ -4495,17 +4495,21 @@ pub enum SubmissionWaveDispatchStage {
 /// compile-time off path: no clock is read and `record` is never called.
 /// Enabled implementations run on the submission thread and must not block,
 /// allocate, or panic.
-pub trait SubmissionWaveDispatchTimingSink: Send + Sync {
-    const ENABLED: bool;
-
+pub trait SubmissionWaveDispatchTimingSink: DeviceSubmissionTimingSink {
     fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration);
 }
 
 struct DisabledSubmissionWaveDispatchTimingSink;
 
-impl SubmissionWaveDispatchTimingSink for DisabledSubmissionWaveDispatchTimingSink {
+impl DeviceSubmissionTimingSink for DisabledSubmissionWaveDispatchTimingSink {
     const ENABLED: bool = false;
 
+    fn record_device_submission(&self, _stage: DeviceSubmissionStage, _elapsed: Duration) {
+        unreachable!("disabled device submission timing cannot record")
+    }
+}
+
+impl SubmissionWaveDispatchTimingSink for DisabledSubmissionWaveDispatchTimingSink {
     fn record(&self, _stage: SubmissionWaveDispatchStage, _elapsed: Duration) {
         unreachable!("disabled submission timing cannot record")
     }
@@ -4553,9 +4557,15 @@ mod submission_wave_dispatch_timing_tests {
 
     struct DisabledPanicSink;
 
-    impl SubmissionWaveDispatchTimingSink for DisabledPanicSink {
+    impl DeviceSubmissionTimingSink for DisabledPanicSink {
         const ENABLED: bool = false;
 
+        fn record_device_submission(&self, _stage: DeviceSubmissionStage, _elapsed: Duration) {
+            panic!("disabled device timing sink was called");
+        }
+    }
+
+    impl SubmissionWaveDispatchTimingSink for DisabledPanicSink {
         fn record(&self, _stage: SubmissionWaveDispatchStage, _elapsed: Duration) {
             panic!("disabled timing sink was called");
         }
@@ -5491,7 +5501,7 @@ impl OperationDispatch {
             SubmissionWaveDispatchStage::DeviceRuntimeSubmit,
         );
         completion.mark_submission_started();
-        let submit_outcome = lane_reservation.submit(commands);
+        let submit_outcome = lane_reservation.submit_with_timing(commands, timing_sink);
         drop(lane_reservation);
         drop(device_submit_stage);
 

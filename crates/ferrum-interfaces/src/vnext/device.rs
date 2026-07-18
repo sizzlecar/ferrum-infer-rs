@@ -5,6 +5,7 @@ use std::num::NonZeroU64;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use super::{
     CapabilityId, DeviceAllocationPermit, DeviceId, DynamicStorageProfile, ElementType,
@@ -569,6 +570,38 @@ pub enum DeviceTimingMode {
     Completion,
 }
 
+/// Typed host boundaries inside one backend submission. These intervals use
+/// the host monotonic clock and must not be combined with device-event time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceSubmissionStage {
+    ValidateAndPrepare,
+    BeginTiming,
+    EnqueueCommands,
+    RecordFenceAndAccount,
+}
+
+/// Diagnostic-only sink for backend submission attribution.
+///
+/// `ENABLED = false` is the compile-time off path: a backend must not read a
+/// clock or call `record_device_submission` in that specialization. Enabled
+/// implementations run on the submission thread and must not block, allocate,
+/// or panic.
+pub trait DeviceSubmissionTimingSink: Send + Sync {
+    const ENABLED: bool;
+
+    fn record_device_submission(&self, stage: DeviceSubmissionStage, elapsed: Duration);
+}
+
+pub struct DisabledDeviceSubmissionTimingSink;
+
+impl DeviceSubmissionTimingSink for DisabledDeviceSubmissionTimingSink {
+    const ENABLED: bool = false;
+
+    fn record_device_submission(&self, _stage: DeviceSubmissionStage, _elapsed: Duration) {
+        unreachable!("disabled device submission timing cannot record")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceTimingUnavailableReason {
@@ -950,6 +983,23 @@ pub trait DeviceRuntime: Send + Sync + 'static {
         stream: &mut Self::Stream,
         commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>>;
+
+    /// Profile-attached submission entrypoint. Backends override this only
+    /// when they can expose typed internal boundaries without changing
+    /// submission ownership or error semantics.
+    fn submit_with_timing<S>(
+        &self,
+        stream: &mut Self::Stream,
+        commands: DeviceCommandBatch<Self::Command>,
+        timing_sink: &S,
+    ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>>
+    where
+        Self: Sized,
+        S: DeviceSubmissionTimingSink,
+    {
+        let _ = timing_sink;
+        self.submit(stream, commands)
+    }
 
     /// Observes a fence without blocking. `Indeterminate` is not terminal and
     /// therefore cannot release command-owned resources.
