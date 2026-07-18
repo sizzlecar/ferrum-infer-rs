@@ -3716,8 +3716,9 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                     .ok_or_else(|| {
                         FerrumError::internal("vNext prefill maintenance byte count overflow")
                     })?;
+                let rebalance = receipt.rebalance().cloned();
                 let (pools_reclaimed, chunks_reclaimed, reclaimed_bytes) =
-                    receipt.rebalance().map_or((0, 0, 0), |rebalance| {
+                    rebalance.as_ref().map_or((0, 0, 0), |rebalance| {
                         (
                             rebalance.pools().len(),
                             rebalance.reclaimed_chunks(),
@@ -3731,6 +3732,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                     pools_reclaimed,
                     chunks_reclaimed,
                     reclaimed_bytes,
+                    rebalance,
                 })
             }
         }

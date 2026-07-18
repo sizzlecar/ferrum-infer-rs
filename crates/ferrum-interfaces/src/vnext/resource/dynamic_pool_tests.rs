@@ -1367,6 +1367,19 @@ fn plan_budget_pressure_rebalances_idle_chunks_across_pools() {
         std::slice::from_ref(donor_growth.chunk())
     );
     assert_eq!(rebalance.pools()[0].published_capacity_bytes(), 64);
+    let serialized_rebalance = serde_json::to_value(rebalance).unwrap();
+    assert_eq!(
+        serialized_rebalance["pools"][0]["pool_id"],
+        json!(donor_pool_id.as_str())
+    );
+    assert_eq!(
+        serialized_rebalance["pools"][0]["chunks"][0]["ordinal"],
+        json!(donor_growth.chunk().ordinal())
+    );
+    assert_eq!(
+        serialized_rebalance["pools"][0]["chunks"][0]["generation"],
+        json!(donor_growth.chunk().generation())
+    );
     assert!(rebalance.plan_device_capacity_epoch() > device_epochs_before.plan_epoch());
     assert!(rebalance.process_device_capacity_epoch() > device_epochs_before.process_epoch());
 

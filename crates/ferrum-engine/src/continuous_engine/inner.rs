@@ -132,6 +132,8 @@ enum ExecutorPrefillAdmissionTraceEvidence {
 
 struct ExecutorPrefillAdmissionTrace {
     request_id: RequestId,
+    input_token_count: Option<usize>,
+    maximum_sequence_tokens: Option<usize>,
     evidence: ExecutorPrefillAdmissionTraceEvidence,
 }
 
@@ -227,11 +229,21 @@ impl EngineInner {
             return ExecutorPrefillProbeResult {
                 trace: capture_trace.then(|| ExecutorPrefillAdmissionTrace {
                     request_id: request.id.clone(),
+                    input_token_count: None,
+                    maximum_sequence_tokens: None,
                     evidence: ExecutorPrefillAdmissionTraceEvidence::Faulted(error.to_string()),
                 }),
                 outcome: AdmissionProbeOutcome::Faulted(error),
                 maintenance: None,
             };
+        };
+        let capture_admission_trace = |evidence| {
+            capture_trace.then(|| ExecutorPrefillAdmissionTrace {
+                request_id: request.id.clone(),
+                input_token_count: Some(input_tokens.len()),
+                maximum_sequence_tokens: Some(maximum_sequence_tokens),
+                evidence,
+            })
         };
         match self
             .model_executor
@@ -241,10 +253,9 @@ impl EngineInner {
                 maximum_sequence_tokens,
             )) {
             Ok(ExecutorPrefillAdmissionDecision::Admitted(receipt)) => ExecutorPrefillProbeResult {
-                trace: capture_trace.then(|| ExecutorPrefillAdmissionTrace {
-                    request_id: request.id.clone(),
-                    evidence: ExecutorPrefillAdmissionTraceEvidence::Admitted(receipt.clone()),
-                }),
+                trace: capture_admission_trace(ExecutorPrefillAdmissionTraceEvidence::Admitted(
+                    receipt.clone(),
+                )),
                 outcome: AdmissionProbeOutcome::Admitted(receipt),
                 maintenance: None,
             },
@@ -256,12 +267,9 @@ impl EngineInner {
                         request.id
                     ));
                     return ExecutorPrefillProbeResult {
-                        trace: capture_trace.then(|| ExecutorPrefillAdmissionTrace {
-                            request_id: request.id.clone(),
-                            evidence: ExecutorPrefillAdmissionTraceEvidence::Faulted(
-                                error.to_string(),
-                            ),
-                        }),
+                        trace: capture_admission_trace(
+                            ExecutorPrefillAdmissionTraceEvidence::Faulted(error.to_string()),
+                        ),
                         outcome: AdmissionProbeOutcome::Faulted(error),
                         maintenance: None,
                     };
@@ -270,10 +278,9 @@ impl EngineInner {
                     &deferred, 0,
                 ));
                 ExecutorPrefillProbeResult {
-                    trace: capture_trace.then(|| ExecutorPrefillAdmissionTrace {
-                        request_id: request.id.clone(),
-                        evidence: ExecutorPrefillAdmissionTraceEvidence::Deferred(deferred),
-                    }),
+                    trace: capture_admission_trace(
+                        ExecutorPrefillAdmissionTraceEvidence::Deferred(deferred),
+                    ),
                     outcome,
                     maintenance: None,
                 }
@@ -287,12 +294,9 @@ impl EngineInner {
                         request.id
                     ));
                     return ExecutorPrefillProbeResult {
-                        trace: capture_trace.then(|| ExecutorPrefillAdmissionTrace {
-                            request_id: request.id.clone(),
-                            evidence: ExecutorPrefillAdmissionTraceEvidence::Faulted(
-                                error.to_string(),
-                            ),
-                        }),
+                        trace: capture_admission_trace(
+                            ExecutorPrefillAdmissionTraceEvidence::Faulted(error.to_string()),
+                        ),
                         outcome: AdmissionProbeOutcome::Faulted(error),
                         maintenance: None,
                     };
@@ -309,33 +313,28 @@ impl EngineInner {
                     deferred.wait_condition().clone(),
                 ));
                 ExecutorPrefillProbeResult {
-                    trace: capture_trace.then(|| ExecutorPrefillAdmissionTrace {
-                        request_id: request.id.clone(),
-                        evidence: ExecutorPrefillAdmissionTraceEvidence::MaintenanceDeferred(
+                    trace: capture_admission_trace(
+                        ExecutorPrefillAdmissionTraceEvidence::MaintenanceDeferred(
                             deferred.clone(),
                         ),
-                    }),
+                    ),
                     outcome,
                     maintenance: Some(deferred),
                 }
             }
             Ok(ExecutorPrefillAdmissionDecision::PermanentRejected(rejected)) => {
                 ExecutorPrefillProbeResult {
-                    trace: capture_trace.then(|| ExecutorPrefillAdmissionTrace {
-                        request_id: request.id.clone(),
-                        evidence: ExecutorPrefillAdmissionTraceEvidence::PermanentRejected(
-                            rejected.clone(),
-                        ),
-                    }),
+                    trace: capture_admission_trace(
+                        ExecutorPrefillAdmissionTraceEvidence::PermanentRejected(rejected.clone()),
+                    ),
                     outcome: AdmissionProbeOutcome::PermanentRejected(rejected),
                     maintenance: None,
                 }
             }
             Err(error) => ExecutorPrefillProbeResult {
-                trace: capture_trace.then(|| ExecutorPrefillAdmissionTrace {
-                    request_id: request.id.clone(),
-                    evidence: ExecutorPrefillAdmissionTraceEvidence::Faulted(error.to_string()),
-                }),
+                trace: capture_admission_trace(ExecutorPrefillAdmissionTraceEvidence::Faulted(
+                    error.to_string(),
+                )),
                 outcome: AdmissionProbeOutcome::Faulted(error),
                 maintenance: None,
             },
@@ -507,6 +506,14 @@ impl EngineInner {
                 (
                     "blocker_count".to_string(),
                     serde_json::json!(blocker_count),
+                ),
+                (
+                    "input_token_count".to_string(),
+                    serde_json::json!(trace.input_token_count),
+                ),
+                (
+                    "maximum_sequence_tokens".to_string(),
+                    serde_json::json!(trace.maximum_sequence_tokens),
                 ),
                 (
                     "execution_authority_retained".to_string(),
@@ -983,14 +990,38 @@ impl EngineInner {
                 pools_reclaimed,
                 chunks_reclaimed,
                 reclaimed_bytes,
+                rebalance,
             } => {
                 validate_current(*current)?;
+                let rebalance_matches = match rebalance {
+                    None => {
+                        *pools_reclaimed == 0 && *chunks_reclaimed == 0 && *reclaimed_bytes == 0
+                    }
+                    Some(rebalance) => {
+                        let detailed_chunks =
+                            rebalance.pools().iter().try_fold(0_usize, |total, pool| {
+                                total.checked_add(pool.chunks().len())
+                            });
+                        let detailed_bytes =
+                            rebalance.pools().iter().try_fold(0_u64, |total, pool| {
+                                total.checked_add(pool.reclaimed_bytes())
+                            });
+                        !rebalance.pools().is_empty()
+                            && rebalance
+                                .pools()
+                                .iter()
+                                .all(|pool| !pool.chunks().is_empty() && pool.reclaimed_bytes() > 0)
+                            && rebalance.pools().len() == *pools_reclaimed
+                            && rebalance.reclaimed_chunks() == *chunks_reclaimed
+                            && rebalance.reclaimed_bytes() == *reclaimed_bytes
+                            && detailed_chunks == Some(*chunks_reclaimed)
+                            && detailed_bytes == Some(*reclaimed_bytes)
+                    }
+                };
                 if current.capacity_epoch <= observed.capacity_epoch
                     || *pools_grown == 0
                     || *allocated_bytes == 0
-                    || (*pools_reclaimed == 0 && (*chunks_reclaimed != 0 || *reclaimed_bytes != 0))
-                    || (*pools_reclaimed != 0
-                        && (*chunks_reclaimed < *pools_reclaimed || *reclaimed_bytes == 0))
+                    || !rebalance_matches
                 {
                     return Err(FerrumError::internal(format!(
                         "executor maintenance for {} reported growth without installed capacity",
