@@ -10,7 +10,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import runtime_vnext_s1_cuda_capacity as common
 
@@ -64,6 +64,20 @@ STOP_POLICY = {
     "max_trace_bytes": common.MAX_PRESSURE_TRACE_BYTES,
     "max_decode_capacity_events": MAX_DECODE_CAPACITY_EVENTS,
 }
+STABLE_EXECUTOR_IDENTITY_FIELDS = (
+    "model_id",
+    "family_fingerprint",
+    "program_fingerprint",
+    "runtime_fingerprint",
+    "policy_id",
+    "device_id",
+)
+EXECUTION_PLAN_IDENTITY_FIELDS = (
+    "plan_id",
+    "plan_hash",
+    "policy_fingerprint",
+    "runtime_memory_policy",
+)
 
 
 class DecodeCapacityGateError(common.CapacityGateError):
@@ -73,6 +87,130 @@ class DecodeCapacityGateError(common.CapacityGateError):
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise DecodeCapacityGateError(message)
+
+
+def require_executor_identity_shape(executor: dict[str, Any], label: str) -> None:
+    require(
+        common.GIT_SHA_RE.fullmatch(str(executor.get("model_id"))) is not None,
+        f"{label}: invalid model id",
+    )
+    for field in (
+        "family_fingerprint",
+        "program_fingerprint",
+        "runtime_fingerprint",
+        "plan_hash",
+        "policy_fingerprint",
+    ):
+        require(
+            common.SHA256_RE.fullmatch(str(executor.get(field))) is not None,
+            f"{label}: invalid {field}",
+        )
+    plan_hash = executor["plan_hash"]
+    require(
+        executor.get("plan_id") == f"plan/sha256/{plan_hash}",
+        f"{label}: plan id does not identify plan hash",
+    )
+    require(
+        executor.get("policy_id") == "policy.ferrum.product.vnext.default",
+        f"{label}: non-canonical product policy id",
+    )
+    require(executor.get("device_id") == "device.cuda.0", f"{label}: non-CUDA-0 device id")
+    require(
+        isinstance(executor.get("runtime_memory_policy"), dict),
+        f"{label}: runtime memory policy is missing",
+    )
+
+
+def require_same_fields(
+    snapshots: list[tuple[str, dict[str, Any]]],
+    fields: tuple[str, ...],
+    label: str,
+) -> None:
+    require(bool(snapshots), f"{label}: no executor snapshots")
+    reference_name, reference = snapshots[0]
+    for snapshot_name, snapshot in snapshots[1:]:
+        for field in fields:
+            require(
+                snapshot.get(field) == reference.get(field),
+                f"{label}: {snapshot_name} changed {field} from {reference_name}",
+            )
+
+
+def validate_executor_identity_contract(
+    phase_snapshots: dict[str, list[tuple[str, dict[str, Any]]]],
+) -> None:
+    all_snapshots: list[tuple[str, dict[str, Any]]] = []
+    for phase, snapshots in phase_snapshots.items():
+        require(bool(snapshots), f"{phase}: no executor snapshots")
+        for snapshot_name, snapshot in snapshots:
+            require_executor_identity_shape(snapshot, snapshot_name)
+            all_snapshots.append((snapshot_name, snapshot))
+        require_same_fields(
+            snapshots,
+            STABLE_EXECUTOR_IDENTITY_FIELDS + EXECUTION_PLAN_IDENTITY_FIELDS,
+            f"{phase} process identity",
+        )
+    require_same_fields(
+        all_snapshots,
+        STABLE_EXECUTOR_IDENTITY_FIELDS,
+        "cross-process executor identity",
+    )
+
+
+def argv_option(argv: list[str], flag: str, label: str) -> str | None:
+    positions = [index for index, value in enumerate(argv) if value == flag]
+    require(len(positions) <= 1, f"{label}: duplicate {flag}")
+    if not positions:
+        return None
+    position = positions[0]
+    require(position + 1 < len(argv), f"{label}: {flag} has no value")
+    return argv[position + 1]
+
+
+def validate_canonical_server_argv(
+    argv: list[str],
+    *,
+    label: str,
+    token_budget: int,
+    runtime_budget: int | None,
+) -> None:
+    require(
+        len(argv) >= 3 and argv[1] == "serve",
+        f"{label}: command is not the ferrum serve product entrypoint",
+    )
+    expected_options = {
+        "--backend": "cuda",
+        "--max-model-len": str(MAX_MODEL_LEN),
+        "--max-num-seqs": str(MAX_NUM_SEQS),
+        "--max-num-batched-tokens": str(token_budget),
+        "--scheduler-prefill-first-until-active": str(PREFILL_FIRST_UNTIL_ACTIVE),
+    }
+    for flag, expected in expected_options.items():
+        require(
+            argv_option(argv, flag, label) == expected,
+            f"{label}: {flag} differs from canonical value {expected}",
+        )
+    observed_runtime_budget = argv_option(argv, "--runtime-memory-budget-bytes", label)
+    if runtime_budget is None:
+        require(
+            observed_runtime_budget is None,
+            f"{label}: calibration unexpectedly overrides runtime memory budget",
+        )
+    else:
+        require(
+            observed_runtime_budget == str(runtime_budget),
+            f"{label}: runtime memory budget differs from derived value",
+        )
+
+
+def read_server_argv(root: Path, phase: str) -> list[str]:
+    command = common.read_json(root / phase / "server.command.json")
+    argv = command.get("argv")
+    require(
+        isinstance(argv, list) and all(isinstance(value, str) for value in argv),
+        f"{phase}: server command argv is invalid",
+    )
+    return argv
 
 
 def derive_target_budget_envelope(
@@ -1115,6 +1253,68 @@ def validate_decode_trace(
     }
 
 
+def validate_decode_counter_provenance(
+    rows: list[dict[str, Any]],
+    *,
+    started_wall_ns: int,
+    finished_wall_ns: int,
+    counters: dict[str, Any],
+) -> dict[str, Any]:
+    counter_by_stage = {
+        "sequence_extension": "extension_deferrals",
+        "step_admission": "step_deferrals",
+        "submission_wave": "wave_deferrals",
+    }
+    for counter in (*counter_by_stage.values(), "backing_deferrals"):
+        require(
+            isinstance(counters.get(counter), int) and counters[counter] >= 0,
+            f"target counter {counter} is invalid",
+        )
+    raw_deferrals = [
+        row
+        for row in rows
+        if row.get("phase") == "vnext.decode_capacity_deferred"
+        and isinstance(row.get("ts_unix_nanos"), int)
+        and started_wall_ns <= row["ts_unix_nanos"] <= finished_wall_ns
+    ]
+    deferrals = [
+        validate_decode_deferral(row, f"counter provenance deferral {index}")
+        for index, row in enumerate(raw_deferrals)
+    ]
+    direct_by_stage = {stage: 0 for stage in counter_by_stage}
+    backing_events = 0
+    for event in deferrals:
+        sources = {
+            entry["source"]
+            for entry in event["wait_condition"]["observed"]
+            if isinstance(entry.get("source"), str)
+        }
+        if sources & {"plan_device_budget", "process_device_capacity"}:
+            backing_events += 1
+        else:
+            direct_by_stage[event["stage"]] += 1
+    for stage, event_count in direct_by_stage.items():
+        if event_count == 0:
+            continue
+        counter = counter_by_stage[stage]
+        require(
+            counters[counter] > 0,
+            f"target counter {counter} did not record direct {stage} deferral evidence",
+        )
+    require(
+        backing_events == 0 or counters["backing_deferrals"] >= backing_events,
+        "target backing_deferrals did not cover device-backing trace evidence",
+    )
+    return {
+        "direct_trace_events_by_stage": direct_by_stage,
+        "device_backing_trace_events": backing_events,
+        "counters": {
+            counter: counters[counter]
+            for counter in (*counter_by_stage.values(), "backing_deferrals")
+        },
+    }
+
+
 def validate_rebalance_trace(
     rows: list[dict[str, Any]], *, started_wall_ns: int, finished_wall_ns: int
 ) -> dict[str, Any]:
@@ -1738,33 +1938,55 @@ def validate(root: Path, out: Path) -> int:
         isinstance(rebalance_prime, dict) and isinstance(rebalance_probe, dict),
         "target rebalance phases are missing",
     )
+    calibration_start_health = common.read_json(root / "calibration/health.start.json")
+    sizing_start_health = common.read_json(root / "target-sizing/health.start.json")
+    target_start_health = common.read_json(root / "target/health.start.json")
     calibration_health = common.read_json(root / str(calibration.get("health_final")))
     sizing_health = common.read_json(root / str(target_sizing.get("health_final")))
     target_health = common.read_json(root / str(target.get("health_final")))
     prime_health = common.read_json(root / str(rebalance_prime.get("health")))
     probe_health = common.read_json(root / str(rebalance_probe.get("health")))
+    calibration_start_executor = common.find_executor_snapshot(calibration_start_health)
+    sizing_start_executor = common.find_executor_snapshot(sizing_start_health)
+    target_start_executor = common.find_executor_snapshot(target_start_health)
     calibration_executor = common.find_executor_snapshot(calibration_health)
     sizing_executor = common.find_executor_snapshot(sizing_health)
     target_executor = common.find_executor_snapshot(target_health)
     prime_executor = common.find_executor_snapshot(prime_health)
     probe_executor = common.find_executor_snapshot(probe_health)
     require(
-        calibration_executor is not None
+        calibration_start_executor is not None
+        and sizing_start_executor is not None
+        and target_start_executor is not None
+        and calibration_executor is not None
         and sizing_executor is not None
         and target_executor is not None
         and prime_executor is not None
         and probe_executor is not None,
         "raw executor snapshots are missing",
     )
-    for identity in ("model_id", "family_fingerprint", "program_fingerprint", "plan_hash"):
-        require(
-            calibration_executor.get(identity)
-            == sizing_executor.get(identity)
-            == prime_executor.get(identity)
-            == probe_executor.get(identity)
-            == target_executor.get(identity),
-            f"calibration/sizing/target changed {identity}",
-        )
+    validate_executor_identity_contract(
+        {
+            "calibration": [
+                ("calibration start", calibration_start_executor),
+                ("calibration final", calibration_executor),
+            ],
+            "target sizing": [
+                ("target sizing start", sizing_start_executor),
+                ("target sizing final", sizing_executor),
+            ],
+            "target": [
+                ("target start", target_start_executor),
+                ("target rebalance prime", prime_executor),
+                ("target rebalance probe", probe_executor),
+                ("target final", target_executor),
+            ],
+        }
+    )
+    require(
+        calibration_executor.get("model_id") in str(collection.get("model_path")),
+        "executor model id is absent from immutable model path",
+    )
     calibration_pool = common.quiescent_pool_snapshot(calibration_executor, "raw decode calibration")
     sizing_pool = common.quiescent_pool_snapshot(sizing_executor, "raw decode target sizing")
     target_pool = common.quiescent_pool_snapshot(target_executor, "raw decode target")
@@ -1804,6 +2026,24 @@ def validate(root: Path, out: Path) -> int:
         isinstance(exact_budget, int)
         and exact_budget == target_budget_envelope["budget_claimed_bytes"],
         "exact budget does not match the target-compatible sizing envelope",
+    )
+    validate_canonical_server_argv(
+        read_server_argv(root, "calibration"),
+        label="calibration",
+        token_budget=CALIBRATION_TOKEN_BUDGET,
+        runtime_budget=None,
+    )
+    validate_canonical_server_argv(
+        read_server_argv(root, "target-sizing"),
+        label="target sizing",
+        token_budget=TARGET_TOKEN_BUDGET,
+        runtime_budget=calibration_budget,
+    )
+    validate_canonical_server_argv(
+        read_server_argv(root, "target"),
+        label="target",
+        token_budget=TARGET_TOKEN_BUDGET,
+        runtime_budget=exact_budget,
     )
     require_target_pool_within_budget_contract(
         target_pool, target_budget_envelope, exact_budget
@@ -1921,14 +2161,12 @@ def validate(root: Path, out: Path) -> int:
 
     counters = target_executor.get("counters")
     require(isinstance(counters, dict), "target executor counters are missing")
-    counter_by_stage = {
-        "sequence_extension": "extension_deferrals",
-        "step_admission": "step_deferrals",
-        "submission_wave": "wave_deferrals",
-    }
-    for stage in decode_summary["stages"]:
-        counter = counter_by_stage[stage]
-        require(counters.get(counter, 0) > 0, f"target counter {counter} did not record its trace stage")
+    counter_provenance = validate_decode_counter_provenance(
+        target_rows,
+        started_wall_ns=target_started,
+        finished_wall_ns=target_finished,
+        counters=counters,
+    )
     require(target_executor.get("active_sequences") == 0, "target still has active sequences")
     require(target_executor.get("pending_sequences") == 0, "target still has pending sequences")
     require(target_executor.get("pending_prefill_maintenance") == 0, "target still has prefill maintenance")
@@ -1979,6 +2217,7 @@ def validate(root: Path, out: Path) -> int:
         "target_rebalance_prime_window_ns": [prime_started, prime_finished],
         "target_rebalance_probe_window_ns": [probe_started, probe_finished],
         "target_window_ns": [target_started, target_finished],
+        "decode_counter_provenance": counter_provenance,
         "max_silence_seconds": {
             "calibration": calibration_silence,
             "target_sizing": sizing_silence,
@@ -2016,6 +2255,105 @@ def self_test() -> int:
         and SERVER_POLICY["target_rebalance_probe_prompt_sha256"]
         == hashlib.sha256(REBALANCE_PROBE_PROMPT.encode("utf-8")).hexdigest(),
         "rebalance phases are not pinned to the canonical product workload",
+    )
+
+    def expect_reject(action: Callable[[], None], label: str) -> None:
+        try:
+            action()
+            raise AssertionError(f"self-test unexpectedly accepted {label}")
+        except DecodeCapacityGateError:
+            pass
+
+    def executor_fixture(
+        plan_digit: str, policy_digit: str, reserve_bytes: int
+    ) -> dict[str, Any]:
+        plan_hash = plan_digit * 64
+        return {
+            "model_id": "1" * 40,
+            "family_fingerprint": "2" * 64,
+            "program_fingerprint": "3" * 64,
+            "runtime_fingerprint": "4" * 64,
+            "policy_id": "policy.ferrum.product.vnext.default",
+            "device_id": "device.cuda.0",
+            "plan_id": f"plan/sha256/{plan_hash}",
+            "plan_hash": plan_hash,
+            "policy_fingerprint": policy_digit * 64,
+            "runtime_memory_policy": {
+                "capacity_bytes": 1000,
+                "reserve_bytes": reserve_bytes,
+                "maximum_active_sequences": MAX_NUM_SEQS,
+            },
+        }
+
+    calibration_executor = executor_fixture("a", "5", 100)
+    sizing_executor = executor_fixture("b", "6", 200)
+    target_executor = executor_fixture("c", "7", 300)
+    validate_executor_identity_contract(
+        {
+            "calibration": [
+                ("calibration start", calibration_executor),
+                ("calibration final", dict(calibration_executor)),
+            ],
+            "target sizing": [
+                ("target sizing start", sizing_executor),
+                ("target sizing final", dict(sizing_executor)),
+            ],
+            "target": [
+                ("target start", target_executor),
+                ("target final", dict(target_executor)),
+            ],
+        }
+    )
+    drifted_target = dict(target_executor)
+    drifted_target["plan_hash"] = "d" * 64
+    drifted_target["plan_id"] = f"plan/sha256/{drifted_target['plan_hash']}"
+    expect_reject(
+        lambda: validate_executor_identity_contract(
+            {
+                "target": [
+                    ("target start", target_executor),
+                    ("target final", drifted_target),
+                ]
+            }
+        ),
+        "within-process plan drift",
+    )
+    malformed_plan = dict(target_executor)
+    malformed_plan["plan_id"] = "plan/sha256/not-the-plan-hash"
+    expect_reject(
+        lambda: require_executor_identity_shape(malformed_plan, "malformed plan"),
+        "plan id/hash mismatch",
+    )
+
+    canonical_argv = [
+        "/tmp/ferrum",
+        "serve",
+        "/tmp/model",
+        "--backend",
+        "cuda",
+        "--max-model-len",
+        str(MAX_MODEL_LEN),
+        "--max-num-seqs",
+        str(MAX_NUM_SEQS),
+        "--max-num-batched-tokens",
+        str(CALIBRATION_TOKEN_BUDGET),
+        "--scheduler-prefill-first-until-active",
+        str(PREFILL_FIRST_UNTIL_ACTIVE),
+    ]
+    validate_canonical_server_argv(
+        canonical_argv,
+        label="self-test calibration",
+        token_budget=CALIBRATION_TOKEN_BUDGET,
+        runtime_budget=None,
+    )
+    expect_reject(
+        lambda: validate_canonical_server_argv(
+            canonical_argv + ["--max-num-seqs", str(MAX_NUM_SEQS)],
+            label="self-test duplicate flag",
+            token_budget=CALIBRATION_TOKEN_BUDGET,
+            runtime_budget=None,
+        ),
+        "duplicate canonical option",
     )
 
     storage_profile = {"allocator": "linear_arena", "view": "contiguous"}
@@ -2410,6 +2748,59 @@ def self_test() -> int:
         }
     ]
     summary = validate_decode_trace(rows, started_wall_ns=90, finished_wall_ns=170)
+    direct_counter_provenance = validate_decode_counter_provenance(
+        rows,
+        started_wall_ns=90,
+        finished_wall_ns=170,
+        counters={
+            "extension_deferrals": 0,
+            "step_deferrals": summary["deferral_events"],
+            "wave_deferrals": 0,
+            "backing_deferrals": 0,
+        },
+    )
+    require(
+        direct_counter_provenance["direct_trace_events_by_stage"]["step_admission"]
+        == summary["deferral_events"],
+        "self-test lost direct step-admission counter provenance",
+    )
+    backing_rows = json.loads(json.dumps(rows))
+    for row in backing_rows:
+        if row.get("phase") != "vnext.decode_capacity_deferred":
+            continue
+        row["attributes"]["capacity_evidence"]["wait_condition"]["observed"].append(
+            {"source": "plan_device_budget", "epoch": 9}
+        )
+    backing_counter_provenance = validate_decode_counter_provenance(
+        backing_rows,
+        started_wall_ns=90,
+        finished_wall_ns=170,
+        counters={
+            "extension_deferrals": 0,
+            "step_deferrals": 0,
+            "wave_deferrals": 0,
+            "backing_deferrals": summary["deferral_events"],
+        },
+    )
+    require(
+        backing_counter_provenance["device_backing_trace_events"]
+        == summary["deferral_events"],
+        "self-test lost device-backing counter provenance",
+    )
+    expect_reject(
+        lambda: validate_decode_counter_provenance(
+            backing_rows,
+            started_wall_ns=90,
+            finished_wall_ns=170,
+            counters={
+                "extension_deferrals": 0,
+                "step_deferrals": 0,
+                "wave_deferrals": 0,
+                "backing_deferrals": 0,
+            },
+        ),
+        "missing backing deferral counter provenance",
+    )
     rebalance_summary = validate_rebalance_trace(
         rebalance_rows, started_wall_ns=80, finished_wall_ns=89
     )
