@@ -566,6 +566,67 @@ fn terminal_wave_reads_output_before_releasing_backing() {
 }
 
 #[test]
+fn provider_declared_binding_compute_and_result_phases_share_one_wave() {
+    let (fixture, sequence, session, batch, step) = setup();
+    *fixture.provider_behavior.lock().unwrap() = ProviderBehavior::SplitPhases;
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let handle = OperationDispatch::encode_and_submit_wave(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Off,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+
+    let trace = fixture.runtime_trace.lock().unwrap();
+    assert_eq!(trace.submitted_command_counts, vec![6]);
+    assert_eq!(
+        trace.submitted_command_phases,
+        vec![vec![
+            DeviceCommandPhase::DynamicBinding,
+            DeviceCommandPhase::Compute,
+            DeviceCommandPhase::ResultBinding,
+            DeviceCommandPhase::DynamicBinding,
+            DeviceCommandPhase::Compute,
+            DeviceCommandPhase::ResultBinding,
+        ]]
+    );
+    drop(trace);
+    assert!(matches!(
+        handle.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+
+    drop(handle);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
 fn definitely_not_submitted_retries_the_same_whole_wave() {
     let (fixture, sequence, session, batch, step) = setup();
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);

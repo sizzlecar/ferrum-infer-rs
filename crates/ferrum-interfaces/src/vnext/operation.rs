@@ -5444,6 +5444,7 @@ impl OperationDispatch {
             SubmissionWaveDispatchStage::ProviderNodeEncode,
         );
         let pre_provider_command_count = commands.len();
+        let mut encoded_provider_command_count = 0_usize;
         for (node_index, (provider, node_identity)) in
             providers.iter().zip(batch_identity.nodes()).enumerate()
         {
@@ -5473,13 +5474,30 @@ impl OperationDispatch {
                     )));
                 }
             };
+            let operation_command_count = operation
+                .dynamic_binding_count()
+                .checked_add(1)
+                .and_then(|count| count.checked_add(operation.result_binding_count()))
+                .ok_or_else(|| {
+                    SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "provider operation command count overflows usize",
+                    ))
+                })?;
+            encoded_provider_command_count = encoded_provider_command_count
+                .checked_add(operation_command_count)
+                .ok_or_else(|| {
+                    SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "submission wave command count overflows usize",
+                    ))
+                })?;
             commands.push_operation(operation);
         }
-        if commands.len() != pre_provider_command_count.saturating_add(batch_identity.nodes().len())
+        if commands.len()
+            != pre_provider_command_count.saturating_add(encoded_provider_command_count)
             || !lane.current_descriptor_matches_snapshot()
         {
             return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                "wave encode did not produce one command per immutable plan node",
+                "wave encode command phases differ from provider-declared operation boundaries",
             )));
         }
         drop(provider_stage);

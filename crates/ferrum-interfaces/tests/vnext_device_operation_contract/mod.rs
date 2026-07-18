@@ -402,6 +402,7 @@ impl OperationContract for TestOperationContract {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderBehavior {
     Success,
+    SplitPhases,
     WrongIdentity,
     WrongPhase,
 }
@@ -471,6 +472,11 @@ impl OperationProvider<TestRuntime> for TestProvider {
         drop(trace);
         match *self.behavior.lock().unwrap() {
             ProviderBehavior::Success => Ok(EncodedDeviceOperation::compute(TestCommand::Provider)),
+            ProviderBehavior::SplitPhases => {
+                Ok(EncodedDeviceOperation::compute(TestCommand::Provider)
+                    .with_dynamic_binding(TestCommand::DynamicBinding)
+                    .with_result_binding(TestCommand::ResultBinding))
+            }
             ProviderBehavior::WrongIdentity => {
                 let mut parts = participant.identity().parts().clone();
                 parts.request_id = id("request.provider.wrong");
@@ -656,6 +662,8 @@ pub(crate) struct TestStream;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TestCommand {
     Provider,
+    DynamicBinding,
+    ResultBinding,
     Copy,
     Upload,
     Zero,
