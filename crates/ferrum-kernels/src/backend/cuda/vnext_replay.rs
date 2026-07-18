@@ -361,7 +361,7 @@ impl CudaExecutableCache {
         stream: &Arc<CudaStream>,
         blas: &Arc<CudaBlas>,
         commands: &[CudaDeviceCommand],
-        stream_is_quiescent: bool,
+        capture_allowed: bool,
     ) -> Result<CudaExecutablePreparation, CudaReplayError> {
         let Some(key) = CudaExecutableSegmentKey::from_commands(commands) else {
             return Ok(CudaExecutablePreparation::Unavailable);
@@ -371,7 +371,7 @@ impl CudaExecutableCache {
             entry.last_used = now;
             return Ok(CudaExecutablePreparation::CacheHit);
         }
-        if self.rejected.contains_key(&key) || !stream_is_quiescent {
+        if self.rejected.contains_key(&key) || !capture_allowed {
             return Ok(CudaExecutablePreparation::Unavailable);
         }
         if self.entries.len() >= self.maximum_entries {

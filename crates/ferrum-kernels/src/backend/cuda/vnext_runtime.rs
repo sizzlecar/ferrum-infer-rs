@@ -1108,7 +1108,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 error,
             )));
         }
-        let stream_was_quiescent = stream.state.is_quiescent();
+        let mut capture_allowed = stream.state.is_quiescent();
         if let Err(error) = stream.state.begin_submission() {
             return Err(DefinitelyNotSubmitted::new(error));
         }
@@ -1129,10 +1129,14 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 &stream.stream,
                 &stream.blas,
                 &commands[segment_start..segment_end],
-                stream_was_quiescent,
+                capture_allowed,
             );
             match preparation {
                 Ok(CudaExecutablePreparation::Captured) => {
+                    // Graph upload has now queued stream work. Existing cache
+                    // hits remain replayable, but another capture or eviction
+                    // must wait for a later physically quiescent submission.
+                    capture_allowed = false;
                     if S::ENABLED {
                         replay_observation.observe_captured_segment();
                     }
