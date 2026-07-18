@@ -24,6 +24,7 @@ use ferrum_interfaces::vnext::{
 };
 use sha2::{Digest, Sha256};
 
+use super::vnext_replay::CudaCommandReplayKeyBuilder;
 use super::vnext_runtime::{
     CudaBufferRegion, CudaDeviceBuffer, CudaDeviceCommand, CudaDeviceRuntime,
     CudaDeviceRuntimeConfig, CudaDeviceRuntimeError,
@@ -38,6 +39,9 @@ const LAST_TOKEN_DENSE_LINEAR_PROVIDER_ID: &str =
 const LAST_TOKEN_DENSE_LINEAR_ESTIMATOR_ID: &str =
     "resource-estimator.cuda.last_token_dense_linear.f16.cublas";
 const CUDA_ENGINE_PROVIDER_ID: &str = "provider.engine.cuda.vnext";
+const CUDA_REUSABLE_EXECUTABLE_CAPABILITY_ID: &str =
+    "capability.device.cuda.reusable_executable.v1";
+const DEFAULT_REUSABLE_EXECUTABLE_CACHE_ENTRIES: usize = 64;
 const DENSE_SAFETENSORS_FORMAT_ID: &str = "weight-format.safetensors.dense";
 const EMBEDDING_FUNCTION_NAME: &str = "vnext_embedding_lookup_f16";
 const VALUE_ALIGNMENT_BYTES: u64 = 16;
@@ -55,6 +59,7 @@ pub fn cuda_vnext_runtime_config(
         device_id,
         runtime_implementation_fingerprint: implementation_fingerprint(&[
             include_str!("vnext_runtime.rs").as_bytes(),
+            include_str!("vnext_replay.rs").as_bytes(),
             include_str!("vnext_ops.rs").as_bytes(),
             include_str!("vnext_ops/transformer.rs").as_bytes(),
             include_str!("vnext_ops/transformer/attention.rs").as_bytes(),
@@ -83,6 +88,7 @@ pub fn cuda_vnext_runtime_config(
                 },
             )?,
         ]),
+        maximum_reusable_executables_per_stream: DEFAULT_REUSABLE_EXECUTABLE_CACHE_ENTRIES,
     })
 }
 
@@ -96,6 +102,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         RESIDUAL_ADD_F16_CAPABILITY_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+        CUDA_REUSABLE_EXECUTABLE_CAPABILITY_ID,
     ]
     .into_iter()
     .map(CapabilityId::new)
@@ -341,7 +348,11 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<CudaDeviceCommand, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_last_token_dense_linear(invocation).map_err(|message| {
+        encode_last_token_dense_linear(
+            self.descriptor.provider_implementation_fingerprint(),
+            invocation,
+        )
+        .map_err(|message| {
             provider_failure(identity, "cuda.last_token_dense_linear.encode", message)
         })
     }
@@ -354,6 +365,7 @@ struct LastTokenDenseLinearLaunch {
 }
 
 fn encode_last_token_dense_linear(
+    provider_fingerprint: &str,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
     if invocation.operation().id.as_str() != LAST_TOKEN_DENSE_LINEAR_OPERATION_ID
@@ -425,12 +437,24 @@ fn encode_last_token_dense_linear(
         .map_err(|_| "last-token dense-linear hidden size exceeds i32".to_owned())?;
     let out_features = i32::try_from(out_features)
         .map_err(|_| "last-token dense-linear output width exceeds i32".to_owned())?;
-    CudaDeviceCommand::operation_with_blas(
+    let mut replay_key =
+        CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_last_token_dense_linear")
+            .i32(rows)
+            .i32(hidden_size)
+            .i32(out_features)
+            .u64(launches.len() as u64);
+    for launch in &launches {
+        replay_key = replay_key
+            .u64(launch.input_region as u64)
+            .u64(launch.output_region as u64);
+    }
+    CudaDeviceCommand::replayable_operation_with_blas(
         "vnext_last_token_dense_linear",
         regions,
+        replay_key.finish(),
         move |_stream, blas, regions| {
             let weight = regions[0].device_ptr();
-            for launch in launches {
+            for launch in &launches {
                 transformer::launch_gemm_f16(
                     blas,
                     regions[launch.input_region].device_ptr(),
@@ -550,7 +574,7 @@ fn encode_token_embedding(
 
     let function = function.clone();
     CudaDeviceCommand::operation("vnext_token_embedding", regions, move |stream, regions| {
-        for launch in launches {
+        for launch in &launches {
             let table = regions[launch.first_region].device_ptr();
             let token_ids_base = regions[launch.first_region + 1].device_ptr();
             let output_base = regions[launch.first_region + 2].device_ptr();

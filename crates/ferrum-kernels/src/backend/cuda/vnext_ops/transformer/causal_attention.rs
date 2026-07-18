@@ -599,7 +599,7 @@ fn encode_attention(
         regions,
         host_storage,
         move |stream, blas, regions, host_storage| {
-            for launch in launches {
+            for launch in &launches {
                 enqueue_attention(
                     stream,
                     blas,
@@ -608,7 +608,7 @@ fn encode_attention(
                     cuda,
                     layout,
                     shared,
-                    launch,
+                    *launch,
                     regions,
                     host_storage,
                 )?;

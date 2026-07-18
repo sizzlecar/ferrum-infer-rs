@@ -715,6 +715,7 @@ pub(crate) struct RuntimeTrace {
     pub(crate) allocation_calls: u64,
     pub(crate) submit_calls: u64,
     pub(crate) submitted_command_counts: Vec<usize>,
+    pub(crate) submitted_command_phases: Vec<Vec<DeviceCommandPhase>>,
     pub(crate) submitted_commands: Vec<Vec<TestCommand>>,
     pub(crate) readback_calls: u64,
     pub(crate) readback_lengths: Vec<u64>,
@@ -833,12 +834,19 @@ impl DeviceRuntime for TestRuntime {
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
         assert!(!commands.is_empty(), "core must not submit an empty batch");
         let timing_mode = commands.timing_mode();
-        let commands = commands.into_commands();
+        let entries = commands.into_entries();
+        let command_phases = entries.iter().map(DeviceCommandEntry::phase).collect();
+        let commands = entries
+            .into_iter()
+            .map(DeviceCommandEntry::into_parts)
+            .map(|(_, command)| command)
+            .collect::<Vec<_>>();
         let command_count = commands.len();
         let (drift, behavior, fence) = {
             let mut trace = self.trace.lock().unwrap();
             trace.submit_calls += 1;
             trace.submitted_command_counts.push(command_count);
+            trace.submitted_command_phases.push(command_phases);
             trace.submitted_commands.push(commands);
             trace.next_fence += 1;
             (

@@ -24,6 +24,7 @@ use crate::backend::cuda::vnext_ops::{
     implementation_fingerprint, DENSE_SAFETENSORS_FORMAT_ID, THREADS_PER_BLOCK,
     VALUE_ALIGNMENT_BYTES,
 };
+use crate::backend::cuda::vnext_replay::CudaCommandReplayKeyBuilder;
 use crate::backend::cuda::vnext_runtime::{
     CudaBufferRegion, CudaDeviceBuffer, CudaDeviceCommand, CudaDeviceRuntime,
     CudaDeviceRuntimeError,
@@ -201,7 +202,12 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<CudaDeviceCommand, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_attention(&self.functions, invocation).map_err(|message| {
+        encode_attention(
+            self.descriptor.provider_implementation_fingerprint(),
+            &self.functions,
+            invocation,
+        )
+        .map_err(|message| {
             OperationFailure::new(
                 identity,
                 ProfilePhase::Forward,
@@ -545,6 +551,7 @@ struct SharedRegions {
 }
 
 fn encode_attention(
+    provider_fingerprint: &str,
     functions: &AttentionFunctions,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
@@ -655,12 +662,41 @@ fn encode_attention(
     }
 
     let functions = functions.clone();
-    CudaDeviceCommand::operation_with_host_storage_and_blas(
+    let mut replay_key = CudaCommandReplayKeyBuilder::new(
+        provider_fingerprint,
+        "vnext_gated_delta_recurrent_attention",
+    )
+    .u64(shape.hidden_size)
+    .u64(shape.key_heads)
+    .u64(shape.value_heads)
+    .u64(shape.key_head_dim)
+    .u64(shape.value_head_dim)
+    .u64(shape.qkv_features)
+    .u64(shape.value_features)
+    .u64(shape.conv_kernel)
+    .u64(shape.conv_state_width)
+    .f32(shape.epsilon)
+    .u64(shape.layer_index)
+    .u64(total_tokens)
+    .u64(layout.required_bytes)
+    .u64(launches.len() as u64);
+    for launch in &launches {
+        replay_key = replay_key
+            .u64(launch.input_region as u64)
+            .u64(launch.output_region as u64)
+            .u64(launch.conv_state_region as u64)
+            .u64(launch.delta_state_region as u64)
+            .u64(launch.host_control as u64)
+            .u64(launch.tokens)
+            .i32(launch.tokens_i32);
+    }
+    CudaDeviceCommand::replayable_operation_with_host_storage_and_blas(
         "vnext_gated_delta_recurrent_attention",
         regions,
         host_storage,
+        replay_key.finish(),
         move |stream, blas, regions, host_storage| {
-            for launch in launches {
+            for launch in &launches {
                 enqueue_attention(
                     stream,
                     blas,
@@ -669,7 +705,7 @@ fn encode_attention(
                     shape,
                     layout,
                     shared,
-                    launch,
+                    *launch,
                     regions,
                     host_storage,
                 )?;

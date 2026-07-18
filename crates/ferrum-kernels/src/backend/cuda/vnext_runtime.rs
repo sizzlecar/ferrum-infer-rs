@@ -17,12 +17,15 @@ use cudarc::cublas::{result::CublasError, CudaBlas};
 use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DriverError};
 use ferrum_interfaces::vnext::{
     BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceClass,
-    DeviceCommandBatch, DeviceDescriptor, DeviceErrorReport, DeviceExecutionTiming, DeviceId,
-    DeviceRuntime, DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal,
-    DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
-    DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink, DynamicStorageProfile,
-    ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout, StreamState, VNextError,
+    DeviceCommandBatch, DeviceCommandEntry, DeviceCommandPhase, DeviceDescriptor,
+    DeviceErrorReport, DeviceExecutionTiming, DeviceId, DeviceRuntime, DeviceSubmissionStage,
+    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
+    DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
+    DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
+    StreamState, VNextError,
 };
+
+use super::vnext_replay::{CudaCommandReplayKey, CudaExecutableCache};
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -75,6 +78,7 @@ pub struct CudaDeviceRuntimeConfig {
     pub runtime_implementation_fingerprint: String,
     pub capabilities: BTreeSet<CapabilityId>,
     pub dynamic_storage_profiles: BTreeSet<DynamicStorageProfile>,
+    pub maximum_reusable_executables_per_stream: usize,
 }
 
 #[derive(Debug)]
@@ -215,7 +219,7 @@ impl CudaBufferRegion {
 }
 
 type EnqueueAction = Box<
-    dyn FnOnce(
+    dyn Fn(
             &CudaStream,
             &CudaBlas,
             &[CudaBufferRegion],
@@ -225,14 +229,19 @@ type EnqueueAction = Box<
         + 'static,
 >;
 
+pub(crate) struct CudaCommandPayload {
+    regions: Vec<CudaBufferRegion>,
+    host_storage: Vec<Box<[u8]>>,
+    enqueue: Mutex<EnqueueAction>,
+}
+
 /// Encoded CUDA work. Buffer and host-transfer storage stays alive until the
 /// returned fence reaches a terminal state.
 pub struct CudaDeviceCommand {
     runtime_instance: u64,
     operation: &'static str,
-    regions: Vec<CudaBufferRegion>,
-    host_storage: Vec<Box<[u8]>>,
-    enqueue: Option<EnqueueAction>,
+    payload: Arc<CudaCommandPayload>,
+    replay_key: Option<CudaCommandReplayKey>,
 }
 
 impl fmt::Debug for CudaDeviceCommand {
@@ -241,8 +250,9 @@ impl fmt::Debug for CudaDeviceCommand {
             .debug_struct("CudaDeviceCommand")
             .field("runtime_instance", &self.runtime_instance)
             .field("operation", &self.operation)
-            .field("region_count", &self.regions.len())
-            .field("host_storage_count", &self.host_storage.len())
+            .field("region_count", &self.payload.regions.len())
+            .field("host_storage_count", &self.payload.host_storage.len())
+            .field("replayable", &self.replay_key.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -253,50 +263,116 @@ impl CudaDeviceCommand {
     pub(crate) fn operation(
         operation: &'static str,
         regions: Vec<CudaBufferRegion>,
-        enqueue: impl FnOnce(&CudaStream, &[CudaBufferRegion]) -> Result<(), CudaDeviceRuntimeError>
+        enqueue: impl Fn(&CudaStream, &[CudaBufferRegion]) -> Result<(), CudaDeviceRuntimeError>
             + Send
             + 'static,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        let runtime_instance = common_runtime_instance(&regions)?;
-        Ok(Self {
-            runtime_instance,
+        Self::operation_inner(
             operation,
             regions,
-            host_storage: Vec::new(),
-            enqueue: Some(Box::new(move |stream, _blas, regions, _host_storage| {
-                enqueue(stream, regions)
-            })),
-        })
+            None,
+            move |stream, _blas, regions, _host_storage| enqueue(stream, regions),
+        )
+    }
+
+    pub(crate) fn replayable_operation(
+        operation: &'static str,
+        regions: Vec<CudaBufferRegion>,
+        replay_key: CudaCommandReplayKey,
+        enqueue: impl Fn(&CudaStream, &[CudaBufferRegion]) -> Result<(), CudaDeviceRuntimeError>
+            + Send
+            + 'static,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::operation_inner(
+            operation,
+            regions,
+            Some(replay_key),
+            move |stream, _blas, regions, _host_storage| enqueue(stream, regions),
+        )
     }
 
     pub(crate) fn operation_with_blas(
         operation: &'static str,
         regions: Vec<CudaBufferRegion>,
-        enqueue: impl FnOnce(
-                &CudaStream,
-                &CudaBlas,
-                &[CudaBufferRegion],
-            ) -> Result<(), CudaDeviceRuntimeError>
+        enqueue: impl Fn(&CudaStream, &CudaBlas, &[CudaBufferRegion]) -> Result<(), CudaDeviceRuntimeError>
             + Send
             + 'static,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        let runtime_instance = common_runtime_instance(&regions)?;
-        Ok(Self {
-            runtime_instance,
+        Self::operation_inner(
             operation,
             regions,
-            host_storage: Vec::new(),
-            enqueue: Some(Box::new(move |stream, blas, regions, _host_storage| {
-                enqueue(stream, blas, regions)
-            })),
-        })
+            None,
+            move |stream, blas, regions, _host_storage| enqueue(stream, blas, regions),
+        )
+    }
+
+    pub(crate) fn replayable_operation_with_blas(
+        operation: &'static str,
+        regions: Vec<CudaBufferRegion>,
+        replay_key: CudaCommandReplayKey,
+        enqueue: impl Fn(&CudaStream, &CudaBlas, &[CudaBufferRegion]) -> Result<(), CudaDeviceRuntimeError>
+            + Send
+            + 'static,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::operation_inner(
+            operation,
+            regions,
+            Some(replay_key),
+            move |stream, blas, regions, _host_storage| enqueue(stream, blas, regions),
+        )
     }
 
     pub(crate) fn operation_with_host_storage_and_blas(
         operation: &'static str,
         regions: Vec<CudaBufferRegion>,
         host_storage: Vec<Box<[u8]>>,
-        enqueue: impl FnOnce(
+        enqueue: impl Fn(
+                &CudaStream,
+                &CudaBlas,
+                &[CudaBufferRegion],
+                &[Box<[u8]>],
+            ) -> Result<(), CudaDeviceRuntimeError>
+            + Send
+            + 'static,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::operation_with_host_storage_and_blas_inner(
+            operation,
+            regions,
+            host_storage,
+            None,
+            enqueue,
+        )
+    }
+
+    pub(crate) fn replayable_operation_with_host_storage_and_blas(
+        operation: &'static str,
+        regions: Vec<CudaBufferRegion>,
+        host_storage: Vec<Box<[u8]>>,
+        replay_key: CudaCommandReplayKey,
+        enqueue: impl Fn(
+                &CudaStream,
+                &CudaBlas,
+                &[CudaBufferRegion],
+                &[Box<[u8]>],
+            ) -> Result<(), CudaDeviceRuntimeError>
+            + Send
+            + 'static,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::operation_with_host_storage_and_blas_inner(
+            operation,
+            regions,
+            host_storage,
+            Some(replay_key),
+            enqueue,
+        )
+    }
+
+    fn operation_with_host_storage_and_blas_inner(
+        operation: &'static str,
+        regions: Vec<CudaBufferRegion>,
+        host_storage: Vec<Box<[u8]>>,
+        replay_key: Option<CudaCommandReplayKey>,
+        enqueue: impl Fn(
                 &CudaStream,
                 &CudaBlas,
                 &[CudaBufferRegion],
@@ -311,12 +387,44 @@ impl CudaDeviceCommand {
                 "CUDA operation host storage contains an empty region",
             ));
         }
+        let replay_key = bind_replay_key(replay_key, operation, &regions, &host_storage);
         Ok(Self {
             runtime_instance,
             operation,
-            regions,
-            host_storage,
-            enqueue: Some(Box::new(enqueue)),
+            payload: Arc::new(CudaCommandPayload {
+                regions,
+                host_storage,
+                enqueue: Mutex::new(Box::new(enqueue)),
+            }),
+            replay_key,
+        })
+    }
+
+    fn operation_inner(
+        operation: &'static str,
+        regions: Vec<CudaBufferRegion>,
+        replay_key: Option<CudaCommandReplayKey>,
+        enqueue: impl Fn(
+                &CudaStream,
+                &CudaBlas,
+                &[CudaBufferRegion],
+                &[Box<[u8]>],
+            ) -> Result<(), CudaDeviceRuntimeError>
+            + Send
+            + 'static,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let runtime_instance = common_runtime_instance(&regions)?;
+        let host_storage = Vec::new();
+        let replay_key = bind_replay_key(replay_key, operation, &regions, &host_storage);
+        Ok(Self {
+            runtime_instance,
+            operation,
+            payload: Arc::new(CudaCommandPayload {
+                regions,
+                host_storage,
+                enqueue: Mutex::new(Box::new(enqueue)),
+            }),
+            replay_key,
         })
     }
 
@@ -327,25 +435,65 @@ impl CudaDeviceCommand {
         host_storage: Vec<Box<[u8]>>,
         enqueue: EnqueueAction,
     ) -> Self {
+        let payload = Arc::new(CudaCommandPayload {
+            regions,
+            host_storage,
+            enqueue: Mutex::new(enqueue),
+        });
         Self {
             runtime_instance,
             operation,
-            regions,
-            host_storage,
-            enqueue: Some(enqueue),
+            payload,
+            replay_key: None,
         }
     }
 
-    fn enqueue(
-        &mut self,
+    pub(crate) fn enqueue(
+        &self,
         stream: &CudaStream,
         blas: &CudaBlas,
     ) -> Result<(), CudaDeviceRuntimeError> {
-        let enqueue = self.enqueue.take().ok_or_else(|| {
-            CudaDeviceRuntimeError::contract("CUDA command was already submitted")
-        })?;
-        enqueue(stream, blas, &self.regions, &self.host_storage)
+        let enqueue = self
+            .payload
+            .enqueue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        enqueue(
+            stream,
+            blas,
+            &self.payload.regions,
+            &self.payload.host_storage,
+        )
     }
+
+    pub(crate) const fn replay_key(&self) -> Option<CudaCommandReplayKey> {
+        self.replay_key
+    }
+
+    pub(crate) fn payload(&self) -> Arc<CudaCommandPayload> {
+        Arc::clone(&self.payload)
+    }
+}
+
+fn bind_replay_key(
+    replay_key: Option<CudaCommandReplayKey>,
+    operation: &'static str,
+    regions: &[CudaBufferRegion],
+    host_storage: &[Box<[u8]>],
+) -> Option<CudaCommandReplayKey> {
+    replay_key.map(|key| {
+        key.bind_runtime_payload(
+            operation,
+            regions.iter().map(|region| {
+                (
+                    region.device_ptr,
+                    region.length_bytes,
+                    region.element_type.size_bytes(),
+                )
+            }),
+            host_storage,
+        )
+    })
 }
 
 fn common_runtime_instance(regions: &[CudaBufferRegion]) -> Result<u64, CudaDeviceRuntimeError> {
@@ -370,6 +518,7 @@ pub struct CudaDeviceStream {
     stream: Arc<CudaStream>,
     blas: Arc<CudaBlas>,
     state: Arc<CudaStreamState>,
+    executable_cache: CudaExecutableCache,
 }
 
 impl fmt::Debug for CudaDeviceStream {
@@ -380,6 +529,17 @@ impl fmt::Debug for CudaDeviceStream {
             .field("runtime_instance", &self.runtime_instance)
             .field("state", &self.state.snapshot())
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for CudaDeviceStream {
+    fn drop(&mut self) {
+        if !self.state.is_quiescent() {
+            // An indeterminate lane must retain captured pointer ownership.
+            // Normal executor shutdown reaches quiescence and destroys every
+            // graph without a device-wide synchronization.
+            self.executable_cache.leak_if_in_flight();
+        }
     }
 }
 
@@ -408,6 +568,10 @@ impl CudaStreamState {
         } else {
             StreamState::Submitted
         }
+    }
+
+    fn is_quiescent(&self) -> bool {
+        !self.recording.load(Ordering::Acquire) && self.in_flight.load(Ordering::Acquire) == 0
     }
 
     fn begin_submission(&self) -> Result<(), CudaDeviceRuntimeError> {
@@ -548,6 +712,7 @@ pub struct CudaDeviceRuntime {
     context: Arc<CudaContext>,
     allocation_stream: Arc<CudaStream>,
     quarantined: Mutex<Vec<QuarantinedSubmission>>,
+    maximum_reusable_executables_per_stream: usize,
 }
 
 impl fmt::Debug for CudaDeviceRuntime {
@@ -562,6 +727,11 @@ impl fmt::Debug for CudaDeviceRuntime {
 
 impl CudaDeviceRuntime {
     pub fn new(config: CudaDeviceRuntimeConfig) -> Result<Self, CudaDeviceRuntimeError> {
+        if config.maximum_reusable_executables_per_stream == 0 {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA reusable executable cache capacity must be positive",
+            ));
+        }
         let context = CudaContext::new(config.ordinal)
             .map_err(|error| CudaDeviceRuntimeError::driver("context creation", error))?;
         // vNext owns all cross-stream ordering through explicit commands and
@@ -603,6 +773,7 @@ impl CudaDeviceRuntime {
             context,
             allocation_stream,
             quarantined: Mutex::new(Vec::new()),
+            maximum_reusable_executables_per_stream: config.maximum_reusable_executables_per_stream,
         })
     }
 
@@ -751,6 +922,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
             stream,
             blas,
             state: Arc::new(CudaStreamState::new()),
+            executable_cache: CudaExecutableCache::new(
+                self.maximum_reusable_executables_per_stream,
+            ),
         })
     }
 
@@ -911,7 +1085,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
             ));
         }
         let timing_mode = commands.timing_mode();
-        let mut commands = commands.into_commands();
+        let (command_phases, commands): (Vec<_>, Vec<_>) = commands
+            .into_entries()
+            .into_iter()
+            .map(DeviceCommandEntry::into_parts)
+            .unzip();
         if commands
             .iter()
             .any(|command| command.runtime_instance != self.runtime_instance)
@@ -928,10 +1106,35 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 error,
             )));
         }
+        let stream_was_quiescent = stream.state.is_quiescent();
         if let Err(error) = stream.state.begin_submission() {
             return Err(DefinitelyNotSubmitted::new(error));
         }
         drop(validate_stage);
+
+        let mut segment_start = 0;
+        while segment_start < commands.len() {
+            let Some(segment_end) =
+                replayable_segment_end(&command_phases, &commands, segment_start)
+            else {
+                segment_start += 1;
+                continue;
+            };
+            if let Err(error) = stream.executable_cache.prepare(
+                &self.context,
+                &stream.stream,
+                &stream.blas,
+                &commands[segment_start..segment_end],
+                stream_was_quiescent,
+            ) {
+                tracing::debug!(
+                    error = %error,
+                    command_count = segment_end - segment_start,
+                    "CUDA reusable executable capture rejected; using eager fallback"
+                );
+            }
+            segment_start = segment_end;
+        }
 
         let begin_timing_stage =
             CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::BeginTiming);
@@ -951,12 +1154,39 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
         let enqueue_stage =
             CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::EnqueueCommands);
-        for index in 0..commands.len() {
+        let mut index = 0;
+        while index < commands.len() {
+            let replayed_end =
+                replayable_segment_end(&command_phases, &commands, index).and_then(|segment_end| {
+                    match stream
+                        .executable_cache
+                        .launch(&stream.stream, &commands[index..segment_end])
+                    {
+                        Ok(true) => Some(Ok(segment_end)),
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    }
+                });
+            match replayed_end {
+                Some(Ok(segment_end)) => {
+                    index = segment_end;
+                    continue;
+                }
+                Some(Err(error)) => {
+                    stream.state.fail();
+                    self.quarantine(stream, commands);
+                    panic!(
+                        "CUDA submission became indeterminate while launching a reusable executable: {error}"
+                    );
+                }
+                None => {}
+            }
             if let Err(error) = commands[index].enqueue(&stream.stream, &stream.blas) {
                 stream.state.fail();
                 self.quarantine(stream, commands);
                 panic!("CUDA submission became indeterminate while enqueueing its batch: {error}");
             }
+            index += 1;
         }
         drop(enqueue_stage);
 
@@ -1133,4 +1363,24 @@ impl DeviceRuntime for CudaDeviceRuntime {
         };
         DeviceErrorReport::new(code, error.to_string(), retryable)
     }
+}
+
+fn replayable_segment_end(
+    phases: &[DeviceCommandPhase],
+    commands: &[CudaDeviceCommand],
+    start: usize,
+) -> Option<usize> {
+    if phases.get(start) != Some(&DeviceCommandPhase::Compute)
+        || commands.get(start)?.replay_key().is_none()
+    {
+        return None;
+    }
+    let mut end = start + 1;
+    while end < commands.len()
+        && phases.get(end) == Some(&DeviceCommandPhase::Compute)
+        && commands[end].replay_key().is_some()
+    {
+        end += 1;
+    }
+    Some(end)
 }

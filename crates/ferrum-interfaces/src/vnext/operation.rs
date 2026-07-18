@@ -5190,7 +5190,7 @@ impl OperationDispatch {
         completion
             .encode_backing_initializations(runtime, &mut commands)
             .map_err(|error| map_backing_initialization_error(runtime, batch_identity, error))?;
-        commands.push(command);
+        commands.push_compute(command);
         let timing_mode = commands.timing_mode();
         let mut lane_reservation = lane
             .reserve_enqueue()
@@ -5472,7 +5472,7 @@ impl OperationDispatch {
                     )));
                 }
             };
-            commands.push(command);
+            commands.push_compute(command);
         }
         if commands.len() != pre_provider_command_count.saturating_add(batch_identity.nodes().len())
             || !lane.current_descriptor_matches_snapshot()
@@ -5779,7 +5779,7 @@ where
                             .map(SubmissionWaveDispatchError::InputUpload)
                             .unwrap_or_else(SubmissionWaveDispatchError::Contract)
                     })?;
-                commands.push(command);
+                commands.push_dynamic_binding(command);
                 encoded_bytes = encoded_bytes.checked_add(piece_bytes).ok_or_else(|| {
                     SubmissionWaveDispatchError::Contract(invalid_operation(
                         "submission input upload encoded byte count overflows",

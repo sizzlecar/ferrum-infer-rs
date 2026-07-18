@@ -233,7 +233,7 @@ impl PreparedBackingInitializations {
                             participant: claim.participant,
                             error,
                         })?;
-                    commands.push(command);
+                    commands.push_initialization(command);
                     command_count = command_count.checked_add(1).ok_or_else(|| {
                         BackingInitializationEncodeError::Contract(invalid_resource(
                             "backing initialization command count overflows usize",

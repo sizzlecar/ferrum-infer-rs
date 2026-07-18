@@ -74,6 +74,7 @@ pub mod rms_norm;
 pub mod rope;
 pub mod tp_decode;
 pub mod vnext_ops;
+mod vnext_replay;
 pub mod vnext_runtime;
 pub mod weight_store;
 
