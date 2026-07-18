@@ -405,6 +405,9 @@ fn typed_input_upload_precedes_the_plan_in_one_submission() {
             SubmissionWaveDispatchStage::ContractValidateAndReserve,
             SubmissionWaveDispatchStage::BackingAndInputEncode,
             SubmissionWaveDispatchStage::ProviderNodeEncode,
+            SubmissionWaveDispatchStage::LaneReserve,
+            SubmissionWaveDispatchStage::DeviceRuntimeSubmit,
+            SubmissionWaveDispatchStage::CompletionArm,
             SubmissionWaveDispatchStage::LaneReserveSubmitAndArm,
         ]
     );

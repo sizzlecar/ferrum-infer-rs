@@ -206,6 +206,9 @@ struct VNextWaveTimingMetrics {
     backing_input_encode: AtomicDurationMetrics,
     provider_node_encode: AtomicDurationMetrics,
     lane_reserve_submit_arm: AtomicDurationMetrics,
+    lane_reserve: AtomicDurationMetrics,
+    device_runtime_submit: AtomicDurationMetrics,
+    completion_arm: AtomicDurationMetrics,
     completion_round_trip: AtomicDurationMetrics,
     host_postprocess: AtomicDurationMetrics,
     submitted_wave_total: AtomicDurationMetrics,
@@ -228,6 +231,11 @@ impl VNextWaveTimingMetrics {
                     "backing_input_encode": self.backing_input_encode.snapshot(),
                     "provider_node_encode": self.provider_node_encode.snapshot(),
                     "lane_reserve_submit_arm": self.lane_reserve_submit_arm.snapshot(),
+                    "lane_reserve_submit_arm_breakdown": {
+                        "lane_reserve": self.lane_reserve.snapshot(),
+                        "device_runtime_submit": self.device_runtime_submit.snapshot(),
+                        "completion_arm": self.completion_arm.snapshot(),
+                    },
                 },
             },
             "completion_round_trip": self.completion_round_trip.snapshot(),
@@ -237,6 +245,7 @@ impl VNextWaveTimingMetrics {
                 "resource_prepare_attempt includes capacity-deferred attempts and is outside submitted_wave_total",
                 "host_encode_submit breakdown is collected only while a typed profile sink is attached",
                 "provider_encode_submit breakdown covers contract validation and completion reservation, backing/input encoding, provider node encoding, and lane reserve/submit/arm",
+                "lane_reserve_submit_arm breakdown isolates lane acquisition, DeviceRuntime::submit, and successful completion arming; failed submissions do not emit completion_arm",
                 "completion_round_trip includes async queue wait, device fence wait, and readback",
                 "these host intervals are not kernel or device-busy time"
             ],
@@ -258,6 +267,11 @@ impl SubmissionWaveDispatchTimingSink for VNextWaveTimingMetrics {
             SubmissionWaveDispatchStage::ProviderNodeEncode => {
                 self.provider_node_encode.record(elapsed)
             }
+            SubmissionWaveDispatchStage::LaneReserve => self.lane_reserve.record(elapsed),
+            SubmissionWaveDispatchStage::DeviceRuntimeSubmit => {
+                self.device_runtime_submit.record(elapsed)
+            }
+            SubmissionWaveDispatchStage::CompletionArm => self.completion_arm.record(elapsed),
             SubmissionWaveDispatchStage::LaneReserveSubmitAndArm => {
                 self.lane_reserve_submit_arm.record(elapsed)
             }
@@ -4131,6 +4145,11 @@ mod tests {
         assert_eq!(
             snapshot["host_encode_submit_breakdown"]["provider_encode_submit_breakdown"]
                 ["provider_node_encode"]["samples"],
+            0
+        );
+        assert_eq!(
+            snapshot["host_encode_submit_breakdown"]["provider_encode_submit_breakdown"]
+                ["lane_reserve_submit_arm_breakdown"]["device_runtime_submit"]["samples"],
             0
         );
         assert!(snapshot["limitations"]
