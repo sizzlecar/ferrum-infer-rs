@@ -880,10 +880,15 @@ impl DeviceRuntime for CudaDeviceRuntime {
         }
         let timing = match timing_mode {
             DeviceTimingMode::Off => CudaFenceTiming::NotRequested,
-            DeviceTimingMode::Completion => match stream.stream.record_event(None) {
-                Ok(start) => CudaFenceTiming::Events { start },
-                Err(_) => CudaFenceTiming::Unavailable,
-            },
+            DeviceTimingMode::Completion => {
+                match stream
+                    .stream
+                    .record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT))
+                {
+                    Ok(start) => CudaFenceTiming::Events { start },
+                    Err(_) => CudaFenceTiming::Unavailable,
+                }
+            }
         };
         for index in 0..commands.len() {
             if let Err(error) = commands[index].enqueue(&stream.stream, &stream.blas) {
@@ -892,7 +897,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 panic!("CUDA submission became indeterminate while enqueueing its batch: {error}");
             }
         }
-        let event = match stream.stream.record_event(None) {
+        let fence_flags = match timing_mode {
+            DeviceTimingMode::Off => None,
+            DeviceTimingMode::Completion => {
+                Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)
+            }
+        };
+        let event = match stream.stream.record_event(fence_flags) {
             Ok(event) => event,
             Err(error) => {
                 stream.state.fail();
