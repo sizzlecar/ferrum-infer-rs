@@ -191,7 +191,10 @@ exact evaluated bytes，不能只比较 minimum bytes 或在 claim 后替换 wor
 物理 scheduler step/invocation 使用 core-minted `BatchStepId`/`BatchInvocationId`；每个 participant 同时保留自己的连续
 `ExecutionFrameId` 和 active-session fingerprint。长序列 frame=7、新加入序列 frame=2 可以进入同一
 batch，Step guard 按各自 frame 获取；request journal node invocation identity 也由各 participant
-cursor 独立生成。禁止要求 participant frame/node id 相等或复制 leader identity。
+cursor 独立生成。只有无 invocation、无 flight、无 submit 的 pristine Step 才能通过
+`RollbackUnsubmitted` 恢复各 participant 尚未执行的 frame；下一次物理尝试必须使用新的
+`BatchStepId`，但复用原 participant-local `ExecutionFrameId`。abort、Drop、possibly-submitted 或
+indeterminate 路径禁止回退 frame。禁止要求 participant frame/node id 相等或复制 leader identity。
 
 Step 内的 invocation registry 必须以 canonical
 `ParticipantNodeKey = (sequence authority, request authority, ExecutionFrameId, NodeId)` 占位；
