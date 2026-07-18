@@ -6,16 +6,18 @@ use std::num::NonZeroU64;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::Instant;
 
 use super::{
     classify_device_error, defer_device_cleanup, BackingInitializationEncodeError,
     BatchOperationIdentity, BatchParticipantAuthority, BufferUsage, CopyRegion,
     DeferredDeviceCleanupDisposition, DeferredDeviceCleanupDomainId, DeferredDeviceCleanupTask,
     DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
-    DeviceCommandBatch, DeviceDescriptor, DeviceRuntime, DeviceTerminal, ExecutionIdentityEnvelope,
-    FenceQuery, HostTransferLayout, IdentifiedFailure, InvocationResourceLease,
-    LogicalBackingBufferView, NodeId, PreparedStepSubmissionWave, ResourceId, StreamState,
-    VNextError,
+    DeviceCommandBatch, DeviceDescriptor, DeviceExecutionTiming, DeviceRuntime, DeviceTerminal,
+    DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
+    DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, FenceQuery, HostTransferLayout,
+    IdentifiedFailure, InvocationResourceLease, LogicalBackingBufferView, NodeId,
+    PreparedStepSubmissionWave, ResourceId, StreamState, VNextError,
 };
 
 fn invalid_completion(reason: impl Into<String>) -> VNextError {
@@ -59,6 +61,11 @@ struct ExecutionLaneState<S> {
 enum LaneReadbackError<E> {
     Contract(VNextError),
     Device(E),
+}
+
+struct LaneReadback {
+    bytes: Vec<u8>,
+    timing: DeviceTimingMeasurement<CompletionReadbackTiming>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -215,7 +222,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
     fn wait_fence(
         &self,
         fence: &R::Fence,
-    ) -> Result<DeviceTerminal<R::Error>, super::FenceIndeterminate<R::Error>> {
+    ) -> Result<DeviceTerminalReceipt<R::Error>, super::FenceIndeterminate<R::Error>> {
         self.runtime.wait_fence(fence)
     }
 
@@ -265,7 +272,9 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
         backing: &LogicalBackingBufferView<'_, R::Buffer>,
         logical_offset_bytes: u64,
         output_layout: HostTransferLayout,
-    ) -> Result<Vec<u8>, LaneReadbackError<R::Error>> {
+        timing_mode: DeviceTimingMode,
+    ) -> Result<LaneReadback, LaneReadbackError<R::Error>> {
+        let timing_started = (timing_mode == DeviceTimingMode::Completion).then(Instant::now);
         let output_bytes = output_layout
             .byte_len()
             .map_err(LaneReadbackError::Contract)?;
@@ -314,6 +323,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             ))
         })?;
         let mut output = Vec::with_capacity(output_capacity);
+        let mut readback_calls = 0_u32;
         let mut logical_cursor = 0_u64;
         for binding in backing.segment_bindings() {
             let segment = binding.segment();
@@ -357,6 +367,11 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
                         .map_err(LaneReadbackError::Contract)?;
                 let region = CopyRegion::new(source_offset, 0, length)
                     .map_err(LaneReadbackError::Contract)?;
+                readback_calls = readback_calls.checked_add(1).ok_or_else(|| {
+                    LaneReadbackError::Contract(invalid_completion(
+                        "completion readback call count exceeds u32",
+                    ))
+                })?;
                 let piece = match self.runtime.readback(
                     &mut state.stream,
                     binding.buffer(),
@@ -388,7 +403,30 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
                 "completion readback did not cover its exact logical output",
             )));
         }
-        Ok(output)
+        let timing = match timing_started {
+            Some(started) => {
+                let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).map_err(|_| {
+                    LaneReadbackError::Contract(invalid_completion(
+                        "completion readback host duration exceeds u64 nanoseconds",
+                    ))
+                })?;
+                let bytes = u64::try_from(output.len()).map_err(|_| {
+                    LaneReadbackError::Contract(invalid_completion(
+                        "completion readback output length exceeds u64",
+                    ))
+                })?;
+                DeviceTimingMeasurement::Measured(CompletionReadbackTiming::new(
+                    elapsed_ns,
+                    readback_calls,
+                    bytes,
+                ))
+            }
+            None => DeviceTimingMeasurement::NotRequested,
+        };
+        Ok(LaneReadback {
+            bytes: output,
+            timing,
+        })
     }
 
     fn drain(&self, retires_submitted_fence: bool) -> bool {
@@ -589,11 +627,85 @@ impl QuiescentCompletionContractFailure {
     }
 }
 
+/// Fence timing for one exact operation completion. Device execution and host
+/// wait use different clocks and may overlap; consumers must not add them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CompletionFenceTiming {
+    timing_mode: DeviceTimingMode,
+    device_execution: DeviceTimingMeasurement<DeviceExecutionTiming>,
+    blocking_wait_host_ns: DeviceTimingMeasurement<u64>,
+}
+
+impl CompletionFenceTiming {
+    fn new(
+        timing_mode: DeviceTimingMode,
+        device_execution: DeviceTimingMeasurement<DeviceExecutionTiming>,
+        blocking_wait_host_ns: DeviceTimingMeasurement<u64>,
+    ) -> Self {
+        let device_execution = match (timing_mode, device_execution) {
+            (DeviceTimingMode::Off, _) => DeviceTimingMeasurement::NotRequested,
+            (DeviceTimingMode::Completion, DeviceTimingMeasurement::NotRequested) => {
+                DeviceTimingMeasurement::Unavailable(
+                    DeviceTimingUnavailableReason::BackendUnsupported,
+                )
+            }
+            (DeviceTimingMode::Completion, measurement) => measurement,
+        };
+        Self {
+            timing_mode,
+            device_execution,
+            blocking_wait_host_ns,
+        }
+    }
+
+    pub const fn device_execution(self) -> DeviceTimingMeasurement<DeviceExecutionTiming> {
+        self.device_execution
+    }
+
+    pub const fn blocking_wait_host_ns(self) -> DeviceTimingMeasurement<u64> {
+        self.blocking_wait_host_ns
+    }
+
+    pub const fn timing_mode(self) -> DeviceTimingMode {
+        self.timing_mode
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CompletionReadbackTiming {
+    host_elapsed_ns: u64,
+    calls: u32,
+    bytes: u64,
+}
+
+impl CompletionReadbackTiming {
+    const fn new(host_elapsed_ns: u64, calls: u32, bytes: u64) -> Self {
+        Self {
+            host_elapsed_ns,
+            calls,
+            bytes,
+        }
+    }
+
+    pub const fn host_elapsed_ns(self) -> u64 {
+        self.host_elapsed_ns
+    }
+
+    pub const fn calls(self) -> u32 {
+        self.calls
+    }
+
+    pub const fn bytes(self) -> u64 {
+        self.bytes
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[must_use = "a terminal completion receipt releases one exact invocation"]
 pub struct OperationCompletionReceipt {
     submission: SubmittedOperationReceipt,
     disposition: OperationCompletionDisposition,
+    fence_timing: CompletionFenceTiming,
     participants: Vec<OperationParticipantCompletionReceipt>,
     fingerprint: String,
 }
@@ -602,6 +714,7 @@ impl OperationCompletionReceipt {
     fn new(
         submission: SubmittedOperationReceipt,
         disposition: OperationCompletionDisposition,
+        fence_timing: CompletionFenceTiming,
     ) -> Result<Self, VNextError> {
         let participant_dispositions = match &disposition {
             OperationCompletionDisposition::Succeeded => submission
@@ -663,6 +776,7 @@ impl OperationCompletionReceipt {
         Ok(Self {
             submission,
             disposition,
+            fence_timing,
             participants,
             fingerprint,
         })
@@ -674,6 +788,10 @@ impl OperationCompletionReceipt {
 
     pub fn disposition(&self) -> &OperationCompletionDisposition {
         &self.disposition
+    }
+
+    pub const fn fence_timing(&self) -> CompletionFenceTiming {
+        self.fence_timing
     }
 
     pub fn participants(&self) -> &[OperationParticipantCompletionReceipt] {
@@ -1002,6 +1120,7 @@ enum CompletionRecord<R: DeviceRuntime> {
         fence: R::Fence,
         batch_identity: BatchOperationIdentity,
         receipt: SubmittedOperationReceipt,
+        timing_mode: DeviceTimingMode,
         recovery_state: CompletionRecoveryState,
     },
     SubmissionIndeterminate {
@@ -1346,14 +1465,14 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         &self,
         slot_id: CompletionSlotId,
     ) -> Result<CompletionObservation, VNextError> {
-        Self::map_plain_observation(self.observe_bound_with(slot_id, false, |_, _, _, _| ())?)
+        Self::map_plain_observation(self.observe_bound_with(slot_id, false, |_, _, _, _, _| ())?)
     }
 
     pub(crate) fn wait_bound(
         &self,
         slot_id: CompletionSlotId,
     ) -> Result<CompletionObservation, VNextError> {
-        Self::map_plain_observation(self.observe_bound_with(slot_id, true, |_, _, _, _| ())?)
+        Self::map_plain_observation(self.observe_bound_with(slot_id, true, |_, _, _, _, _| ())?)
     }
 
     pub(crate) fn wait_bound_with_readback(
@@ -1364,8 +1483,15 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         let observation = self.observe_bound_with(
             slot_id,
             true,
-            |resources, lane, batch_identity, disposition| {
-                attempt_completion_readback(resources, lane, batch_identity, disposition, request)
+            |resources, lane, batch_identity, disposition, timing_mode| {
+                attempt_completion_readback(
+                    resources,
+                    lane,
+                    batch_identity,
+                    disposition,
+                    timing_mode,
+                    request,
+                )
             },
         )?;
         Ok(match observation {
@@ -1400,8 +1526,15 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
         let observation = self.observe_bound_with(
             slot_id,
             true,
-            |resources, lane, batch_identity, disposition| {
-                attempt_completion_readbacks(resources, lane, batch_identity, disposition, request)
+            |resources, lane, batch_identity, disposition, timing_mode| {
+                attempt_completion_readbacks(
+                    resources,
+                    lane,
+                    batch_identity,
+                    disposition,
+                    timing_mode,
+                    request,
+                )
             },
         )?;
         Ok(match observation {
@@ -1486,6 +1619,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             &Arc<ExecutionLane<R>>,
             &BatchOperationIdentity,
             &OperationCompletionDisposition,
+            DeviceTimingMode,
         ) -> T,
     {
         let record = self.lookup(slot_id)?;
@@ -1511,37 +1645,70 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                 lane,
                 fence,
                 batch_identity,
+                timing_mode,
                 ..
-            } if blocking => match catch_unwind(AssertUnwindSafe(|| lane.wait_fence(fence))) {
-                Ok(Ok(terminal)) => catch_unwind(AssertUnwindSafe(|| {
-                    terminal_observation(lane, batch_identity, terminal)
-                }))
-                .unwrap_or(FenceObservation::ObservationPanicked),
-                Ok(Err(indeterminate)) => catch_unwind(AssertUnwindSafe(|| {
-                    classify_batch_device_error(
-                        lane.runtime(),
-                        batch_identity,
-                        indeterminate.error(),
-                    )
-                }))
-                .map_or(
-                    FenceObservation::ObservationPanicked,
-                    |classified| match classified {
-                        Ok(failure) => FenceObservation::Indeterminate(failure),
-                        Err(error) => FenceObservation::ContractIndeterminate(error),
-                    },
-                ),
-                Err(_) => FenceObservation::ObservationPanicked,
-            },
+            } if blocking => {
+                let wait_started =
+                    (*timing_mode == DeviceTimingMode::Completion).then(Instant::now);
+                match catch_unwind(AssertUnwindSafe(|| lane.wait_fence(fence))) {
+                    Ok(Ok(terminal)) => {
+                        let wait_timing = match wait_started {
+                            Some(started) => u64::try_from(started.elapsed().as_nanos()).map_or(
+                                DeviceTimingMeasurement::Unavailable(
+                                    DeviceTimingUnavailableReason::DurationOverflow,
+                                ),
+                                DeviceTimingMeasurement::Measured,
+                            ),
+                            None => DeviceTimingMeasurement::NotRequested,
+                        };
+                        catch_unwind(AssertUnwindSafe(|| {
+                            terminal_observation(
+                                lane,
+                                batch_identity,
+                                terminal,
+                                *timing_mode,
+                                wait_timing,
+                            )
+                        }))
+                        .unwrap_or(FenceObservation::ObservationPanicked)
+                    }
+                    Ok(Err(indeterminate)) => catch_unwind(AssertUnwindSafe(|| {
+                        classify_batch_device_error(
+                            lane.runtime(),
+                            batch_identity,
+                            indeterminate.error(),
+                        )
+                    }))
+                    .map_or(
+                        FenceObservation::ObservationPanicked,
+                        |classified| match classified {
+                            Ok(failure) => FenceObservation::Indeterminate(failure),
+                            Err(error) => FenceObservation::ContractIndeterminate(error),
+                        },
+                    ),
+                    Err(_) => FenceObservation::ObservationPanicked,
+                }
+            }
             CompletionRecord::InFlight {
                 lane,
                 fence,
                 batch_identity,
+                timing_mode,
                 ..
             } => match catch_unwind(AssertUnwindSafe(|| lane.query_fence(fence))) {
                 Ok(FenceQuery::Pending) => FenceObservation::Pending,
                 Ok(FenceQuery::Terminal(terminal)) => catch_unwind(AssertUnwindSafe(|| {
-                    terminal_observation(lane, batch_identity, terminal)
+                    terminal_observation(
+                        lane,
+                        batch_identity,
+                        terminal,
+                        *timing_mode,
+                        if *timing_mode == DeviceTimingMode::Completion {
+                            DeviceTimingMeasurement::Measured(0)
+                        } else {
+                            DeviceTimingMeasurement::NotRequested
+                        },
+                    )
                 }))
                 .unwrap_or(FenceObservation::ObservationPanicked),
                 Ok(FenceQuery::Indeterminate(error)) => catch_unwind(AssertUnwindSafe(|| {
@@ -1587,19 +1754,26 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                 }
             }
         }
-        if let FenceObservation::Terminal(mut disposition) = observation {
+        if let FenceObservation::Terminal(mut disposition, fence_timing) = observation {
             let old = std::mem::replace(&mut *guard, CompletionRecord::Reaped);
             let CompletionRecord::InFlight {
                 resources,
                 lane,
                 batch_identity,
                 receipt,
+                timing_mode,
                 ..
             } = old
             else {
                 unreachable!("terminal observation came from an in-flight record")
             };
-            let terminal = terminal_action(&resources, &lane, &batch_identity, &disposition);
+            let terminal = terminal_action(
+                &resources,
+                &lane,
+                &batch_identity,
+                &disposition,
+                timing_mode,
+            );
             if let Err(failure) = lane.finish_one_terminal() {
                 disposition = OperationCompletionDisposition::ContractFailedButQuiescent(failure);
             }
@@ -1615,12 +1789,12 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             }
             drop(guard);
             self.remove_exact(slot_id, &record);
-            return OperationCompletionReceipt::new(receipt, disposition).map(|completion| {
-                BoundCompletionObservation::Terminal {
+            return OperationCompletionReceipt::new(receipt, disposition, fence_timing).map(
+                |completion| BoundCompletionObservation::Terminal {
                     completion,
                     terminal,
-                }
-            });
+                },
+            );
         }
         Ok(match observation {
             FenceObservation::Pending => BoundCompletionObservation::Pending,
@@ -1637,7 +1811,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             FenceObservation::Quarantined(receipt) => {
                 BoundCompletionObservation::Quarantined(receipt)
             }
-            FenceObservation::Terminal(_) => {
+            FenceObservation::Terminal(_, _) => {
                 unreachable!("terminal observation returned through the reaping branch")
             }
         })
@@ -1770,7 +1944,7 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
 
 enum FenceObservation {
     Pending,
-    Terminal(OperationCompletionDisposition),
+    Terminal(OperationCompletionDisposition, CompletionFenceTiming),
     Indeterminate(Vec<IdentifiedFailure>),
     ContractIndeterminate(VNextError),
     SubmissionIndeterminate,
@@ -1781,8 +1955,12 @@ enum FenceObservation {
 fn terminal_observation<R: DeviceRuntime>(
     lane: &ExecutionLane<R>,
     batch_identity: &BatchOperationIdentity,
-    terminal: DeviceTerminal<R::Error>,
+    terminal: DeviceTerminalReceipt<R::Error>,
+    timing_mode: DeviceTimingMode,
+    blocking_wait_host_ns: DeviceTimingMeasurement<u64>,
 ) -> FenceObservation {
+    let (terminal, device_execution) = terminal.into_parts();
+    let timing = CompletionFenceTiming::new(timing_mode, device_execution, blocking_wait_host_ns);
     let descriptor_is_stable = catch_unwind(AssertUnwindSafe(|| {
         lane.current_descriptor_matches_snapshot()
     }))
@@ -1794,19 +1972,23 @@ fn terminal_observation<R: DeviceRuntime>(
                     "completion runtime descriptor differs from its execution lane snapshot",
                 ),
             ),
+            timing,
         );
     }
-    FenceObservation::Terminal(match terminal {
-        DeviceTerminal::Succeeded => OperationCompletionDisposition::Succeeded,
-        DeviceTerminal::FailedButQuiescent(error) => {
-            match classify_batch_device_error(lane.runtime(), batch_identity, &error) {
-                Ok(failures) => OperationCompletionDisposition::FailedButQuiescent(failures),
-                Err(error) => OperationCompletionDisposition::ContractFailedButQuiescent(
-                    QuiescentCompletionContractFailure::new(error.to_string()),
-                ),
+    FenceObservation::Terminal(
+        match terminal {
+            DeviceTerminal::Succeeded => OperationCompletionDisposition::Succeeded,
+            DeviceTerminal::FailedButQuiescent(error) => {
+                match classify_batch_device_error(lane.runtime(), batch_identity, &error) {
+                    Ok(failures) => OperationCompletionDisposition::FailedButQuiescent(failures),
+                    Err(error) => OperationCompletionDisposition::ContractFailedButQuiescent(
+                        QuiescentCompletionContractFailure::new(error.to_string()),
+                    ),
+                }
             }
-        }
-    })
+        },
+        timing,
+    )
 }
 
 fn classify_batch_device_error<R: DeviceRuntime>(
@@ -2090,16 +2272,19 @@ pub struct CompletionReadbackOutput {
     request: CompletionReadbackRequest,
     bytes: Vec<u8>,
     sha256: String,
+    #[serde(skip)]
+    timing: DeviceTimingMeasurement<CompletionReadbackTiming>,
 }
 
 impl CompletionReadbackOutput {
-    fn new(request: CompletionReadbackRequest, bytes: Vec<u8>) -> Result<Self, VNextError> {
-        request.output_layout.validate_bytes(bytes.len())?;
-        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    fn new(request: CompletionReadbackRequest, readback: LaneReadback) -> Result<Self, VNextError> {
+        request.output_layout.validate_bytes(readback.bytes.len())?;
+        let sha256 = format!("{:x}", Sha256::digest(&readback.bytes));
         Ok(Self {
             request,
-            bytes,
+            bytes: readback.bytes,
             sha256,
+            timing: readback.timing,
         })
     }
 
@@ -2113,6 +2298,10 @@ impl CompletionReadbackOutput {
 
     pub fn sha256(&self) -> &str {
         &self.sha256
+    }
+
+    pub const fn timing(&self) -> DeviceTimingMeasurement<CompletionReadbackTiming> {
+        self.timing
     }
 
     pub fn into_bytes(self) -> Vec<u8> {
@@ -2140,6 +2329,7 @@ pub enum CompletionReadbackDisposition {
 pub struct CompletionReadbackReceipt {
     completion: OperationCompletionReceipt,
     disposition: CompletionReadbackDisposition,
+    readback_timing: Option<DeviceTimingMeasurement<CompletionReadbackTiming>>,
     fingerprint: String,
 }
 
@@ -2148,6 +2338,9 @@ impl CompletionReadbackReceipt {
         completion: OperationCompletionReceipt,
         disposition: CompletionReadbackDisposition,
     ) -> Self {
+        let readback_timing = (completion.fence_timing().timing_mode()
+            == DeviceTimingMode::Completion)
+            .then(|| readback_timing_for_disposition(&disposition));
         #[derive(Serialize)]
         struct FingerprintInput<'a> {
             domain: &'static str,
@@ -2180,6 +2373,7 @@ impl CompletionReadbackReceipt {
         Self {
             completion,
             disposition,
+            readback_timing,
             fingerprint,
         }
     }
@@ -2192,6 +2386,12 @@ impl CompletionReadbackReceipt {
         &self.disposition
     }
 
+    pub const fn readback_timing(
+        &self,
+    ) -> Option<DeviceTimingMeasurement<CompletionReadbackTiming>> {
+        self.readback_timing
+    }
+
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
@@ -2202,6 +2402,7 @@ impl CompletionReadbackReceipt {
 pub struct CompletionReadbackBatchReceipt {
     completion: OperationCompletionReceipt,
     dispositions: Vec<CompletionReadbackDisposition>,
+    readback_timings: Option<Vec<DeviceTimingMeasurement<CompletionReadbackTiming>>>,
     fingerprint: String,
 }
 
@@ -2210,6 +2411,13 @@ impl CompletionReadbackBatchReceipt {
         completion: OperationCompletionReceipt,
         dispositions: Vec<CompletionReadbackDisposition>,
     ) -> Self {
+        let readback_timings =
+            (completion.fence_timing().timing_mode() == DeviceTimingMode::Completion).then(|| {
+                dispositions
+                    .iter()
+                    .map(readback_timing_for_disposition)
+                    .collect()
+            });
         #[derive(Serialize)]
         struct FingerprintInput<'a> {
             domain: &'static str,
@@ -2224,6 +2432,7 @@ impl CompletionReadbackBatchReceipt {
         Self {
             completion,
             dispositions,
+            readback_timings,
             fingerprint,
         }
     }
@@ -2236,8 +2445,25 @@ impl CompletionReadbackBatchReceipt {
         &self.dispositions
     }
 
+    pub fn readback_timings(&self) -> Option<&[DeviceTimingMeasurement<CompletionReadbackTiming>]> {
+        self.readback_timings.as_deref()
+    }
+
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
+    }
+}
+
+fn readback_timing_for_disposition(
+    disposition: &CompletionReadbackDisposition,
+) -> DeviceTimingMeasurement<CompletionReadbackTiming> {
+    match disposition {
+        CompletionReadbackDisposition::Succeeded(output) => output.timing(),
+        CompletionReadbackDisposition::NotAttempted(_)
+        | CompletionReadbackDisposition::FailedButQuiescent { .. }
+        | CompletionReadbackDisposition::ContractFailedButQuiescent { .. } => {
+            DeviceTimingMeasurement::NotRequested
+        }
     }
 }
 
@@ -2246,6 +2472,7 @@ fn attempt_completion_readback<R: DeviceRuntime>(
     lane: &Arc<ExecutionLane<R>>,
     batch_identity: &BatchOperationIdentity,
     completion_disposition: &OperationCompletionDisposition,
+    timing_mode: DeviceTimingMode,
     request: CompletionReadbackRequest,
 ) -> CompletionReadbackDisposition {
     if !matches!(
@@ -2272,10 +2499,11 @@ fn attempt_completion_readback<R: DeviceRuntime>(
             &backing,
             request.logical_offset_bytes(),
             request.output_layout(),
+            timing_mode,
         )
     }));
     match readback {
-        Ok(Ok(bytes)) => match CompletionReadbackOutput::new(request.clone(), bytes) {
+        Ok(Ok(readback)) => match CompletionReadbackOutput::new(request.clone(), readback) {
             Ok(output) => CompletionReadbackDisposition::Succeeded(output),
             Err(error) => CompletionReadbackDisposition::ContractFailedButQuiescent {
                 request,
@@ -2316,6 +2544,7 @@ fn attempt_completion_readbacks<R: DeviceRuntime>(
     lane: &Arc<ExecutionLane<R>>,
     batch_identity: &BatchOperationIdentity,
     completion_disposition: &OperationCompletionDisposition,
+    timing_mode: DeviceTimingMode,
     request: CompletionReadbackBatchRequest,
 ) -> Vec<CompletionReadbackDisposition> {
     request
@@ -2327,6 +2556,7 @@ fn attempt_completion_readbacks<R: DeviceRuntime>(
                 lane,
                 batch_identity,
                 completion_disposition,
+                timing_mode,
                 request,
             )
         })
@@ -2587,6 +2817,7 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
     pub(crate) fn arm(
         mut self,
         fence: R::Fence,
+        timing_mode: DeviceTimingMode,
     ) -> Result<CompletionHandle<R>, (VNextError, CompletionHandle<R>)> {
         let resources = self.resources.take().expect("reservation owns resources");
         let lane = self.lane.take().expect("reservation owns lane");
@@ -2615,6 +2846,7 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
             fence,
             batch_identity,
             receipt: record_receipt,
+            timing_mode,
             recovery_state: CompletionRecoveryState::Unobserved,
         };
         let transition = match &mut *record {

@@ -662,7 +662,24 @@ pub(crate) enum TestCommand {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct TestFence(u64);
+pub(crate) struct TestFence(u64, DeviceTimingMode);
+
+impl TestFence {
+    fn terminal_receipt(
+        &self,
+        terminal: DeviceTerminal<TestRuntimeError>,
+    ) -> DeviceTerminalReceipt<TestRuntimeError> {
+        match self.1 {
+            DeviceTimingMode::Off => DeviceTerminalReceipt::unprofiled(terminal),
+            DeviceTimingMode::Completion => DeviceTerminalReceipt::profiled(
+                terminal,
+                DeviceTimingMeasurement::Measured(DeviceExecutionTiming::device_event_elapsed(
+                    1_000_000,
+                )),
+            ),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct TestRuntimeError(pub(crate) &'static str);
@@ -815,6 +832,7 @@ impl DeviceRuntime for TestRuntime {
         commands: DeviceCommandBatch<Self::Command>,
     ) -> Result<Self::Fence, DefinitelyNotSubmitted<Self::Error>> {
         assert!(!commands.is_empty(), "core must not submit an empty batch");
+        let timing_mode = commands.timing_mode();
         let commands = commands.into_commands();
         let command_count = commands.len();
         let (drift, behavior, fence) = {
@@ -826,7 +844,7 @@ impl DeviceRuntime for TestRuntime {
             (
                 trace.drift_on_submit,
                 trace.submit_behavior,
-                TestFence(trace.next_fence),
+                TestFence(trace.next_fence, timing_mode),
             )
         };
         match behavior {
@@ -855,10 +873,12 @@ impl DeviceRuntime for TestRuntime {
         drop(trace);
         match behavior {
             FenceBehavior::Pending => FenceQuery::Pending,
-            FenceBehavior::Succeeded => FenceQuery::Terminal(DeviceTerminal::Succeeded),
-            FenceBehavior::FailedButQuiescent => FenceQuery::Terminal(
+            FenceBehavior::Succeeded => {
+                FenceQuery::Terminal(fence.terminal_receipt(DeviceTerminal::Succeeded))
+            }
+            FenceBehavior::FailedButQuiescent => FenceQuery::Terminal(fence.terminal_receipt(
                 DeviceTerminal::FailedButQuiescent(TestRuntimeError("terminal-failure")),
-            ),
+            )),
             FenceBehavior::Indeterminate => {
                 FenceQuery::Indeterminate(TestRuntimeError("fence-indeterminate"))
             }
@@ -869,7 +889,7 @@ impl DeviceRuntime for TestRuntime {
     fn wait_fence(
         &self,
         fence: &Self::Fence,
-    ) -> Result<DeviceTerminal<Self::Error>, FenceIndeterminate<Self::Error>> {
+    ) -> Result<DeviceTerminalReceipt<Self::Error>, FenceIndeterminate<Self::Error>> {
         assert!(fence.0 > 0);
         let (behavior, block) = {
             let mut trace = self.trace.lock().unwrap();
@@ -886,9 +906,9 @@ impl DeviceRuntime for TestRuntime {
             release.wait();
         }
         match behavior {
-            FenceBehavior::Succeeded => Ok(DeviceTerminal::Succeeded),
-            FenceBehavior::FailedButQuiescent => Ok(DeviceTerminal::FailedButQuiescent(
-                TestRuntimeError("terminal-failure"),
+            FenceBehavior::Succeeded => Ok(fence.terminal_receipt(DeviceTerminal::Succeeded)),
+            FenceBehavior::FailedButQuiescent => Ok(fence.terminal_receipt(
+                DeviceTerminal::FailedButQuiescent(TestRuntimeError("terminal-failure")),
             )),
             FenceBehavior::Pending | FenceBehavior::Indeterminate => Err(FenceIndeterminate::new(
                 TestRuntimeError("fence-indeterminate"),

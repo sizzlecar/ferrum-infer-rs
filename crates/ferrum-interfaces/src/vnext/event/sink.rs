@@ -88,6 +88,10 @@ impl ExecutionEventCapturePolicy {
 pub trait ExecutionEventSink: Send + Sync {
     fn is_enabled(&self, kind: ExecutionEventKind) -> bool;
 
+    fn device_timing_mode(&self) -> super::super::DeviceTimingMode {
+        super::super::DeviceTimingMode::Off
+    }
+
     fn capture_policy(&self) -> ExecutionEventCapturePolicy {
         ExecutionEventCapturePolicy::AllFrames
     }

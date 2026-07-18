@@ -16,9 +16,10 @@ use cudarc::cublas::{result::CublasError, CudaBlas};
 use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DriverError};
 use ferrum_interfaces::vnext::{
     BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceClass,
-    DeviceCommandBatch, DeviceDescriptor, DeviceErrorReport, DeviceId, DeviceRuntime,
-    DeviceTerminal, DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery,
-    HostTransferLayout, StreamState, VNextError,
+    DeviceCommandBatch, DeviceDescriptor, DeviceErrorReport, DeviceExecutionTiming, DeviceId,
+    DeviceRuntime, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
+    DeviceTimingMode, DeviceTimingUnavailableReason, DynamicStorageProfile, ElementType,
+    FenceIndeterminate, FenceQuery, HostTransferLayout, StreamState, VNextError,
 };
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -419,11 +420,18 @@ impl CudaStreamState {
 
 pub struct CudaDeviceFence {
     event: CudaEvent,
+    timing: CudaFenceTiming,
     stream_state: Arc<CudaStreamState>,
     terminal_accounted: AtomicBool,
     _stream: Arc<CudaStream>,
     _blas: Arc<CudaBlas>,
     _commands: Vec<CudaDeviceCommand>,
+}
+
+enum CudaFenceTiming {
+    NotRequested,
+    Events { start: CudaEvent },
+    Unavailable,
 }
 
 impl fmt::Debug for CudaDeviceFence {
@@ -439,6 +447,49 @@ impl CudaDeviceFence {
     fn mark_terminal(&self) {
         if !self.terminal_accounted.swap(true, Ordering::AcqRel) {
             self.stream_state.finish_one();
+        }
+    }
+
+    fn execution_timing(&self) -> DeviceTimingMeasurement<DeviceExecutionTiming> {
+        let start = match &self.timing {
+            CudaFenceTiming::Events { start } => start,
+            _ => {
+                return match &self.timing {
+                    CudaFenceTiming::NotRequested => DeviceTimingMeasurement::NotRequested,
+                    CudaFenceTiming::Unavailable => DeviceTimingMeasurement::Unavailable(
+                        DeviceTimingUnavailableReason::BackendMeasurementFailed,
+                    ),
+                    CudaFenceTiming::Events { .. } => unreachable!(),
+                };
+            }
+        };
+        let elapsed_ms = match unsafe {
+            cudarc::driver::result::event::elapsed(start.cu_event(), self.event.cu_event())
+        } {
+            Ok(elapsed_ms) if elapsed_ms.is_finite() && elapsed_ms >= 0.0 => elapsed_ms,
+            Ok(_) | Err(_) => {
+                return DeviceTimingMeasurement::Unavailable(
+                    DeviceTimingUnavailableReason::BackendMeasurementFailed,
+                );
+            }
+        };
+        let elapsed_ns = f64::from(elapsed_ms) * 1_000_000.0;
+        if elapsed_ns > u64::MAX as f64 {
+            return DeviceTimingMeasurement::Unavailable(
+                DeviceTimingUnavailableReason::DurationOverflow,
+            );
+        }
+        DeviceTimingMeasurement::Measured(DeviceExecutionTiming::device_event_elapsed(
+            elapsed_ns.round() as u64,
+        ))
+    }
+
+    fn terminal_receipt<E>(&self, terminal: DeviceTerminal<E>) -> DeviceTerminalReceipt<E> {
+        match &self.timing {
+            CudaFenceTiming::NotRequested => DeviceTerminalReceipt::unprofiled(terminal),
+            CudaFenceTiming::Events { .. } | CudaFenceTiming::Unavailable => {
+                DeviceTerminalReceipt::profiled(terminal, self.execution_timing())
+            }
         }
     }
 }
@@ -806,6 +857,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 CudaDeviceRuntimeError::contract("CUDA command batch is empty"),
             ));
         }
+        let timing_mode = commands.timing_mode();
         let mut commands = commands.into_commands();
         if commands
             .iter()
@@ -826,6 +878,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
         if let Err(error) = stream.state.begin_submission() {
             return Err(DefinitelyNotSubmitted::new(error));
         }
+        let timing = match timing_mode {
+            DeviceTimingMode::Off => CudaFenceTiming::NotRequested,
+            DeviceTimingMode::Completion => match stream.stream.record_event(None) {
+                Ok(start) => CudaFenceTiming::Events { start },
+                Err(_) => CudaFenceTiming::Unavailable,
+            },
+        };
         for index in 0..commands.len() {
             if let Err(error) = commands[index].enqueue(&stream.stream, &stream.blas) {
                 stream.state.fail();
@@ -848,6 +907,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         }
         Ok(CudaDeviceFence {
             event,
+            timing,
             stream_state: Arc::clone(&stream.state),
             terminal_accounted: AtomicBool::new(false),
             _stream: Arc::clone(&stream.stream),
@@ -867,7 +927,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         match unsafe { cudarc::driver::result::event::query(fence.event.cu_event()) } {
             Ok(()) => {
                 fence.mark_terminal();
-                FenceQuery::Terminal(DeviceTerminal::Succeeded)
+                FenceQuery::Terminal(fence.terminal_receipt(DeviceTerminal::Succeeded))
             }
             Err(error) if error.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => {
                 FenceQuery::Pending
@@ -882,11 +942,11 @@ impl DeviceRuntime for CudaDeviceRuntime {
     fn wait_fence(
         &self,
         fence: &Self::Fence,
-    ) -> Result<DeviceTerminal<Self::Error>, FenceIndeterminate<Self::Error>> {
+    ) -> Result<DeviceTerminalReceipt<Self::Error>, FenceIndeterminate<Self::Error>> {
         match fence.event.synchronize() {
             Ok(()) => {
                 fence.mark_terminal();
-                Ok(DeviceTerminal::Succeeded)
+                Ok(fence.terminal_receipt(DeviceTerminal::Succeeded))
             }
             Err(error) => {
                 fence.stream_state.fail();

@@ -291,6 +291,7 @@ fn all_plan_nodes_encode_into_one_submission_and_one_completion() {
         &fixture.resolved,
         &batch_identity,
         active_bindings.iter(),
+        DeviceTimingMode::Off,
         wave,
         &lane,
         &reaper,
@@ -306,10 +307,22 @@ fn all_plan_nodes_encode_into_one_submission_and_one_completion() {
     assert_eq!(handle.receipt().participants().len(), 2);
     assert_eq!(lane.in_flight_count(), 1);
     assert_eq!(reaper.retained_count(), 1);
-    assert!(matches!(
-        handle.poll().unwrap(),
-        CompletionObservation::Terminal(_)
-    ));
+    let completion = match handle.poll().unwrap() {
+        CompletionObservation::Terminal(completion) => completion,
+        other => panic!("wave did not terminate: {other:?}"),
+    };
+    assert_eq!(
+        completion.fence_timing().timing_mode(),
+        DeviceTimingMode::Off
+    );
+    assert_eq!(
+        completion.fence_timing().device_execution(),
+        DeviceTimingMeasurement::NotRequested
+    );
+    assert_eq!(
+        completion.fence_timing().blocking_wait_host_ns(),
+        DeviceTimingMeasurement::NotRequested
+    );
     assert_eq!(lane.in_flight_count(), 0);
     assert_eq!(reaper.retained_count(), 0);
 
@@ -356,6 +369,7 @@ fn typed_input_upload_precedes_the_plan_in_one_submission() {
         &fixture.resolved,
         &batch_identity,
         active_bindings.iter(),
+        DeviceTimingMode::Off,
         &[upload],
         wave,
         &lane,
@@ -414,6 +428,7 @@ fn terminal_wave_reads_output_before_releasing_backing() {
         &executable,
         &batch_identity,
         active_bindings.iter(),
+        DeviceTimingMode::Completion,
         wave,
         &lane,
         &reaper,
@@ -465,6 +480,21 @@ fn terminal_wave_reads_output_before_releasing_backing() {
     assert!(matches!(
         receipt.completion().disposition(),
         OperationCompletionDisposition::Succeeded
+    ));
+    let fence_timing = receipt.completion().fence_timing();
+    assert_eq!(fence_timing.timing_mode(), DeviceTimingMode::Completion);
+    assert!(matches!(
+        fence_timing.device_execution(),
+        DeviceTimingMeasurement::Measured(timing) if timing.elapsed_ns() == 1_000_000
+    ));
+    assert!(matches!(
+        fence_timing.blocking_wait_host_ns(),
+        DeviceTimingMeasurement::Measured(_)
+    ));
+    assert!(matches!(
+        receipt.readback_timing(),
+        Some(DeviceTimingMeasurement::Measured(timing))
+            if timing.calls() == 1 && timing.bytes() == 16
     ));
     let output = match receipt.disposition() {
         CompletionReadbackDisposition::Succeeded(output) => output,
@@ -521,6 +551,7 @@ fn definitely_not_submitted_retries_the_same_whole_wave() {
         &fixture.resolved,
         &first_identity,
         active_bindings.iter(),
+        DeviceTimingMode::Off,
         wave,
         &lane,
         &reaper,
@@ -553,6 +584,7 @@ fn definitely_not_submitted_retries_the_same_whole_wave() {
         &fixture.resolved,
         &retry_identity,
         active_bindings.iter(),
+        DeviceTimingMode::Off,
         retry_wave,
         &lane,
         &reaper,
@@ -607,6 +639,7 @@ fn zero_state_initialization_is_ordered_retried_and_not_repeated_after_success()
         &fixture.resolved,
         &first_identity,
         active_bindings.iter(),
+        DeviceTimingMode::Off,
         first_wave,
         &lane,
         &reaper,
@@ -629,6 +662,7 @@ fn zero_state_initialization_is_ordered_retried_and_not_repeated_after_success()
         &fixture.resolved,
         &retry_identity,
         active_bindings.iter(),
+        DeviceTimingMode::Off,
         retry_wave,
         &lane,
         &reaper,
@@ -676,6 +710,7 @@ fn zero_state_initialization_is_ordered_retried_and_not_repeated_after_success()
         &fixture.resolved,
         &second_identity,
         second_active_bindings.iter(),
+        DeviceTimingMode::Off,
         second_wave,
         &lane,
         &reaper,

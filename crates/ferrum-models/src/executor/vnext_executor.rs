@@ -9,9 +9,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ferrum_interfaces::kv_cache::{BlockTable, CacheHandleStats};
 use ferrum_interfaces::model_executor::{
@@ -191,6 +191,7 @@ struct VNextExecutorMetrics {
     total_prefill_us: AtomicU64,
     total_decode_us: AtomicU64,
     wave_timing: VNextWaveTimingMetrics,
+    device_timing: VNextDeviceTimingMetrics,
     last_failure: Mutex<Option<String>>,
 }
 
@@ -217,6 +218,86 @@ impl VNextWaveTimingMetrics {
                 "resource_prepare_attempt includes capacity-deferred attempts and is outside submitted_wave_total",
                 "completion_round_trip includes async queue wait, device fence wait, and readback",
                 "these host intervals are not kernel or device-busy time"
+            ],
+        })
+    }
+}
+
+#[derive(Default)]
+struct VNextDeviceTimingMetrics {
+    device_execution: AtomicDurationMetrics,
+    fence_wait_host: AtomicDurationMetrics,
+    readback_host: AtomicDurationMetrics,
+    readback_calls: AtomicU64,
+    readback_bytes: AtomicU64,
+    device_unavailable: AtomicU64,
+    fence_wait_unavailable: AtomicU64,
+    readback_unavailable: AtomicU64,
+}
+
+impl VNextDeviceTimingMetrics {
+    fn record(&self, receipt: &CompletionReadbackBatchReceipt) {
+        let fence = receipt.completion().fence_timing();
+        match fence.device_execution() {
+            DeviceTimingMeasurement::Measured(timing) => self
+                .device_execution
+                .record(Duration::from_nanos(timing.elapsed_ns())),
+            DeviceTimingMeasurement::Unavailable(_) => {
+                self.device_unavailable.fetch_add(1, Ordering::Relaxed);
+            }
+            DeviceTimingMeasurement::NotRequested => {}
+        }
+        match fence.blocking_wait_host_ns() {
+            DeviceTimingMeasurement::Measured(nanoseconds) => self
+                .fence_wait_host
+                .record(Duration::from_nanos(nanoseconds)),
+            DeviceTimingMeasurement::Unavailable(_) => {
+                self.fence_wait_unavailable.fetch_add(1, Ordering::Relaxed);
+            }
+            DeviceTimingMeasurement::NotRequested => {}
+        }
+        if let Some(readbacks) = receipt.readback_timings() {
+            for readback in readbacks {
+                match readback {
+                    DeviceTimingMeasurement::Measured(timing) => {
+                        self.readback_host
+                            .record(Duration::from_nanos(timing.host_elapsed_ns()));
+                        self.readback_calls
+                            .fetch_add(u64::from(timing.calls()), Ordering::Relaxed);
+                        self.readback_bytes
+                            .fetch_add(timing.bytes(), Ordering::Relaxed);
+                    }
+                    DeviceTimingMeasurement::Unavailable(_) => {
+                        self.readback_unavailable.fetch_add(1, Ordering::Relaxed);
+                    }
+                    DeviceTimingMeasurement::NotRequested => {}
+                }
+            }
+        }
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "scope": "exact_submission_completion",
+            "device_execution": self.device_execution.snapshot(),
+            "fence_wait_host": self.fence_wait_host.snapshot(),
+            "readback_host": self.readback_host.snapshot(),
+            "readback_calls": self.readback_calls.load(Ordering::Relaxed),
+            "readback_bytes": self.readback_bytes.load(Ordering::Relaxed),
+            "unavailable": {
+                "device_execution": self.device_unavailable.load(Ordering::Relaxed),
+                "fence_wait_host": self.fence_wait_unavailable.load(Ordering::Relaxed),
+                "readback_host": self.readback_unavailable.load(Ordering::Relaxed),
+            },
+            "clocks": {
+                "device_execution": "backend_device_event_elapsed",
+                "fence_wait_host": "host_monotonic",
+                "readback_host": "host_monotonic",
+            },
+            "limitations": [
+                "device execution and fence host wait may overlap and must not be added",
+                "readback host time includes backend synchronization, host allocation, and transfer",
+                "device event elapsed has no cross-clock anchor and is diagnostic-only"
             ],
         })
     }
@@ -1466,6 +1547,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     static_bytes: u64,
     sequences: Mutex<VNextSequenceRegistry<R>>,
     event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
+    device_timing_mode: AtomicU8,
     metrics: VNextExecutorMetrics,
 }
 
@@ -1671,8 +1753,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             static_bytes,
             sequences: Mutex::new(VNextSequenceRegistry::default()),
             event_sink: RwLock::new(None),
+            device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
             metrics: VNextExecutorMetrics::default(),
         })
+    }
+
+    fn device_timing_mode(&self) -> DeviceTimingMode {
+        match self.device_timing_mode.load(Ordering::Acquire) {
+            value if value == DeviceTimingMode::Completion as u8 => DeviceTimingMode::Completion,
+            _ => DeviceTimingMode::Off,
+        }
     }
 
     fn resolve_io(
@@ -2492,6 +2582,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 &self.resolved_plan,
                 &identity,
                 active_bindings(),
+                self.device_timing_mode(),
                 &uploads,
                 wave,
                 &self.lane,
@@ -2799,6 +2890,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 ));
             }
         };
+        self.metrics.device_timing.record(&receipt);
         for participant in participants {
             if let Some(events) = &participant.sequence.events {
                 if let Err(error) = events.lock().completed(receipt.completion()) {
@@ -3397,6 +3489,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "readback_bytes": self.metrics.readback_bytes.load(Ordering::Relaxed),
             },
             "wave_timing": self.metrics.wave_timing.snapshot(),
+            "device_timing": self.metrics.device_timing.snapshot(),
             "completion_worker": self.completion_worker.metrics_snapshot(),
             "dynamic_pools": pool_status,
             "deferred_cleanup": cleanup,
@@ -3461,6 +3554,8 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     }
 
     fn attach_execution_event_sink(&self, sink: Arc<dyn ExecutionEventSink>) {
+        self.device_timing_mode
+            .store(sink.device_timing_mode() as u8, Ordering::Release);
         *self.event_sink.write() = Some(sink);
     }
 
@@ -3924,7 +4019,8 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 mod tests {
     use super::{
         reported_allocated_bytes, resolved_sequence_fit_policy, AdmissionFitPolicy,
-        DecodeFailureDisposition, FerrumError, SequenceFitPolicy, VNextWaveTimingMetrics,
+        DecodeFailureDisposition, FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics,
+        VNextWaveTimingMetrics,
     };
 
     #[test]
@@ -3939,6 +4035,24 @@ mod tests {
             .unwrap()
             .iter()
             .any(|entry| entry.as_str().unwrap().contains("not kernel")));
+    }
+
+    #[test]
+    fn device_timing_snapshot_distinguishes_device_and_host_clocks() {
+        let snapshot = VNextDeviceTimingMetrics::default().snapshot();
+
+        assert_eq!(snapshot["device_execution"]["samples"], 0);
+        assert_eq!(snapshot["fence_wait_host"]["samples"], 0);
+        assert_eq!(snapshot["readback_host"]["samples"], 0);
+        assert_eq!(
+            snapshot["clocks"]["device_execution"],
+            "backend_device_event_elapsed"
+        );
+        assert!(snapshot["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.as_str().unwrap().contains("must not be added")));
     }
 
     #[test]

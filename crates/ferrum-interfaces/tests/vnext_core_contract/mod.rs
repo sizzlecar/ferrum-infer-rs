@@ -873,14 +873,14 @@ impl DeviceRuntime for PlanningTestRuntime {
     }
 
     fn query_fence(&self, _fence: &Self::Fence) -> FenceQuery<Self::Error> {
-        FenceQuery::Terminal(DeviceTerminal::Succeeded)
+        FenceQuery::Terminal(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
     }
 
     fn wait_fence(
         &self,
         _fence: &Self::Fence,
-    ) -> Result<DeviceTerminal<Self::Error>, FenceIndeterminate<Self::Error>> {
-        Ok(DeviceTerminal::Succeeded)
+    ) -> Result<DeviceTerminalReceipt<Self::Error>, FenceIndeterminate<Self::Error>> {
+        Ok(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
     }
 
     fn synchronize(&self, _stream: &mut Self::Stream) -> Result<(), Self::Error> {

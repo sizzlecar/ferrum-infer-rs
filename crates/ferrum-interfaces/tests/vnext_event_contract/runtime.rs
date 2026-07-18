@@ -163,14 +163,16 @@ impl DeviceRuntime for TestRuntime {
 
     fn query_fence(&self, fence: &Self::Fence) -> FenceQuery<Self::Error> {
         match fence {
-            TestFence::Succeeded => FenceQuery::Terminal(DeviceTerminal::Succeeded),
-            TestFence::Failed => {
-                FenceQuery::Terminal(DeviceTerminal::FailedButQuiescent(TestRuntimeError))
+            TestFence::Succeeded => {
+                FenceQuery::Terminal(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
             }
+            TestFence::Failed => FenceQuery::Terminal(DeviceTerminalReceipt::unprofiled(
+                DeviceTerminal::FailedButQuiescent(TestRuntimeError),
+            )),
             TestFence::Indeterminate => FenceQuery::Indeterminate(TestRuntimeError),
             TestFence::ContractFailed => {
                 self.stream_failed.store(true, Ordering::SeqCst);
-                FenceQuery::Terminal(DeviceTerminal::Succeeded)
+                FenceQuery::Terminal(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
             }
         }
     }
@@ -178,14 +180,18 @@ impl DeviceRuntime for TestRuntime {
     fn wait_fence(
         &self,
         fence: &Self::Fence,
-    ) -> Result<DeviceTerminal<Self::Error>, FenceIndeterminate<Self::Error>> {
+    ) -> Result<DeviceTerminalReceipt<Self::Error>, FenceIndeterminate<Self::Error>> {
         match fence {
-            TestFence::Succeeded => Ok(DeviceTerminal::Succeeded),
-            TestFence::Failed => Ok(DeviceTerminal::FailedButQuiescent(TestRuntimeError)),
+            TestFence::Succeeded => {
+                Ok(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
+            }
+            TestFence::Failed => Ok(DeviceTerminalReceipt::unprofiled(
+                DeviceTerminal::FailedButQuiescent(TestRuntimeError),
+            )),
             TestFence::Indeterminate => Err(FenceIndeterminate::new(TestRuntimeError)),
             TestFence::ContractFailed => {
                 self.stream_failed.store(true, Ordering::SeqCst);
-                Ok(DeviceTerminal::Succeeded)
+                Ok(DeviceTerminalReceipt::unprofiled(DeviceTerminal::Succeeded))
             }
         }
     }
