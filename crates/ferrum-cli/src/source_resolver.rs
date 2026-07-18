@@ -3,14 +3,16 @@
 //! Centralises the lookup chain that `run` / `serve` / `bench` were
 //! reinventing each in their own copy:
 //!
-//!   1. **GGUF file path** — if the user passed an existing `*.gguf` file,
+//!   1. **Curated GGUF alias** — resolve an explicit quantized alias to one
+//!      repository and filename.
+//!   2. **GGUF file path** — if the user passed an existing `*.gguf` file,
 //!      build a [`ResolvedModelSource`] directly without HF lookup.
-//!   2. **Local model dir** — if the path is an existing directory with
+//!   3. **Local model dir** — if the path is an existing directory with
 //!      `config.json` + weights, treat it as a direct source.
-//!   3. **HF cache hit** — `~/.cache/huggingface/hub/models--<owner>--<repo>/snapshots/<rev>`.
-//!   4. **HF download** — fall back to [`HfDownloader`] (`run` / `serve`
+//!   4. **HF cache hit** — `~/.cache/huggingface/hub/models--<owner>--<repo>/snapshots/<rev>`.
+//!   5. **HF download** — fall back to [`HfDownloader`] (`run` / `serve`
 //!      only; `bench` callers may opt out).
-//!   5. **GPU-memory autosizing** — for GPU backends, run the chat
+//!   6. **GPU-memory autosizing** — for GPU backends, run the chat
 //!      autosizer once on the resolved snapshot so `FERRUM_KV_MAX_BLOCKS`
 //!      etc. are populated before the engine starts.
 //!
@@ -30,7 +32,16 @@ use ferrum_types::{
     FerrumError, Result, RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource,
 };
 
+use crate::config::CliConfig;
 use crate::gpu_mem_autosize::{apply_auto_size_with_profile, AutoSizeProfile};
+
+/// Resolve the single Hugging Face cache root used by product entrypoints.
+pub fn hf_cache_dir(config: &CliConfig) -> PathBuf {
+    if let Ok(hf_home) = std::env::var("HF_HOME") {
+        return PathBuf::from(hf_home);
+    }
+    PathBuf::from(shellexpand::tilde(&config.models.download.hf_cache_dir).as_ref())
+}
 
 /// Detect the on-disk format of a model directory or file.
 pub fn detect_format(path: &Path) -> ModelFormat {
@@ -59,6 +70,228 @@ pub fn looks_like_gguf_path(model: &str) -> bool {
         .map(|e| e.eq_ignore_ascii_case("gguf"))
         .unwrap_or(false)
         && p.is_file()
+}
+
+/// Stable product-facing model id derived from one resolved source.
+///
+/// Repository models retain their canonical repository id. Direct local
+/// directories use the directory name, while GGUF files use the file stem.
+/// `run` and `serve` must use this helper rather than inventing entrypoint-
+/// specific ids for the same local source.
+pub fn public_model_id(source: &ResolvedModelSource) -> String {
+    match source.format {
+        ModelFormat::GGUF => source
+            .local_path
+            .file_stem()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| source.original.clone()),
+        _ if source.local_path == Path::new(&source.original) => source
+            .local_path
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| source.original.clone()),
+        _ => source.original.clone(),
+    }
+}
+
+/// Resolve an ergonomic model alias to its canonical Hugging Face model id.
+pub fn resolve_model_alias(name: &str) -> String {
+    match name.to_lowercase().as_str() {
+        "tinyllama" | "tiny" => "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string(),
+        "qwen2.5:0.5b" | "qwen:0.5b" => "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
+        "qwen2.5:1.5b" | "qwen:1.5b" => "Qwen/Qwen2.5-1.5B-Instruct".to_string(),
+        "qwen2.5:3b" | "qwen:3b" => "Qwen/Qwen2.5-3B-Instruct".to_string(),
+        "qwen2.5:7b" | "qwen:7b" => "Qwen/Qwen2.5-7B-Instruct".to_string(),
+        "qwen3:0.6b" => "Qwen/Qwen3-0.6B".to_string(),
+        "qwen3:1.7b" => "Qwen/Qwen3-1.7B".to_string(),
+        "qwen3:4b" => "Qwen/Qwen3-4B".to_string(),
+        "qwen3:14b" => "Qwen/Qwen3-14B".to_string(),
+        "qwen3:32b" => "Qwen/Qwen3-32B".to_string(),
+        "qwen3-coder:30b" | "qwen3-coder:30b-a3b" => {
+            "Qwen/Qwen3-Coder-30B-A3B-Instruct".to_string()
+        }
+        "qwen3-coder:30b-gptq" => "jart25/Qwen3-Coder-30B-A3B-Instruct-Int4-gptq".to_string(),
+        "qwen3:14b-gptq" => "JunHowie/Qwen3-14B-GPTQ-Int4".to_string(),
+        "qwen3:32b-gptq" => "JunHowie/Qwen3-32B-GPTQ-Int4".to_string(),
+        "deepseek-r1:8b" | "r1:8b" => "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B".to_string(),
+        "deepseek-r1:14b" | "r1:14b" => "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B".to_string(),
+        "deepseek-r1:32b" | "r1:32b" => "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B".to_string(),
+        "deepseek-r1:32b-gptq" => "OPEA/DeepSeek-R1-Distill-Qwen-32B-int4-gptq-sym-inc".to_string(),
+        "qwen2.5-coder:32b" => "Qwen/Qwen2.5-Coder-32B-Instruct".to_string(),
+        "qwen2.5-coder:32b-gptq" => "Qwen/Qwen2.5-Coder-32B-Instruct-GPTQ-Int4".to_string(),
+        "qwen2.5-coder:14b" => "Qwen/Qwen2.5-Coder-14B-Instruct".to_string(),
+        "gemma3:1b" => "unsloth/gemma-3-1b-it".to_string(),
+        "gemma3:4b" => "unsloth/gemma-3-4b-it".to_string(),
+        "gemma3:27b" => "unsloth/gemma-3-27b-it".to_string(),
+        "gemma3:27b-gptq" => "circulus/gemma-3-27b-it-gptq".to_string(),
+        "mistral-small:24b" | "mistral-small:3.2" => {
+            "mistralai/Mistral-Small-3.2-24B-Instruct-2506".to_string()
+        }
+        "devstral:24b" | "devstral:2" => "mistralai/Devstral-Small-2-24B-Instruct-2512".to_string(),
+        "magistral:24b" => "mistralai/Magistral-Small-2509".to_string(),
+        "qwen2.5:3b-gptq" | "qwen2.5-3b-instruct-gptq-int4" => {
+            "Qwen/Qwen2.5-3B-Instruct-GPTQ-Int4".to_string()
+        }
+        "llama3.2:1b" => "meta-llama/Llama-3.2-1B-Instruct".to_string(),
+        "llama3.2:3b" => "meta-llama/Llama-3.2-3B-Instruct".to_string(),
+        "whisper-tiny" | "whisper:tiny" => "openai/whisper-tiny".to_string(),
+        "whisper-base" | "whisper:base" => "openai/whisper-base".to_string(),
+        "whisper-small" | "whisper:small" => "openai/whisper-small".to_string(),
+        "whisper-medium" | "whisper:medium" => "openai/whisper-medium".to_string(),
+        "whisper-large-v3" | "whisper:large-v3" => "openai/whisper-large-v3".to_string(),
+        "whisper-turbo" | "whisper:turbo" | "whisper-large-v3-turbo" => {
+            "openai/whisper-large-v3-turbo".to_string()
+        }
+        "qwen3-tts" | "tts" | "tts:0.6b" => "Qwen/Qwen3-TTS-12Hz-0.6B-Base".to_string(),
+        "tts:1.7b" | "qwen3-tts:1.7b" => "Qwen/Qwen3-TTS-12Hz-1.7B-Base".to_string(),
+        _ => name.to_string(),
+    }
+}
+
+struct GgufAliasEntry {
+    aliases: &'static [&'static str],
+    repo: &'static str,
+    filename: &'static str,
+    tokenizer_repo: Option<&'static str>,
+}
+
+const GGUF_ALIASES: &[GgufAliasEntry] = &[
+    GgufAliasEntry {
+        aliases: &["qwen3:8b-q4_k_m"],
+        repo: "Qwen/Qwen3-8B-GGUF",
+        filename: "Qwen3-8B-Q4_K_M.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["qwen3:4b-q4_k_m"],
+        repo: "Qwen/Qwen3-4B-GGUF",
+        filename: "Qwen3-4B-Q4_K_M.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        // Keep the unqualified `qwen3:1.7b` alias on safetensors. Quantized
+        // aliases must name their format so every product entrypoint resolves
+        // the same source.
+        aliases: &["qwen3:1.7b-gguf", "qwen3:1.7b-q8_0"],
+        repo: "Qwen/Qwen3-1.7B-GGUF",
+        filename: "Qwen3-1.7B-Q8_0.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["qwen3:0.6b-gguf", "qwen3:0.6b-q8_0"],
+        repo: "Qwen/Qwen3-0.6B-GGUF",
+        filename: "Qwen3-0.6B-Q8_0.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["qwen3-moe:30b-a3b-q4_k_m", "qwen3:30b-a3b-q4_k_m"],
+        repo: "Qwen/Qwen3-30B-A3B-GGUF",
+        filename: "Qwen3-30B-A3B-Q4_K_M.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["gemma3:1b-q4_k_m"],
+        repo: "unsloth/gemma-3-1b-it-GGUF",
+        filename: "gemma-3-1b-it-Q4_K_M.gguf",
+        tokenizer_repo: Some("unsloth/gemma-3-1b-it"),
+    },
+    GgufAliasEntry {
+        aliases: &["gemma3:27b-q4_k_m"],
+        repo: "unsloth/gemma-3-27b-it-GGUF",
+        filename: "gemma-3-27b-it-Q4_K_M.gguf",
+        tokenizer_repo: Some("unsloth/gemma-3-27b-it"),
+    },
+    GgufAliasEntry {
+        aliases: &["qwen3:14b-q4_k_m"],
+        repo: "Qwen/Qwen3-14B-GGUF",
+        filename: "Qwen3-14B-Q4_K_M.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["qwen3:32b-q4_k_m"],
+        repo: "Qwen/Qwen3-32B-GGUF",
+        filename: "Qwen3-32B-Q4_K_M.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["qwen3-coder:30b-q4_k_m", "qwen3-coder:30b-a3b-q4_k_m"],
+        repo: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+        filename: "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["deepseek-r1:8b-q4_k_m", "r1:8b-q4_k_m"],
+        repo: "unsloth/DeepSeek-R1-0528-Qwen3-8B-GGUF",
+        filename: "DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["deepseek-r1:32b-q4_k_m", "r1:32b-q4_k_m"],
+        repo: "unsloth/DeepSeek-R1-Distill-Qwen-32B-GGUF",
+        filename: "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf",
+        tokenizer_repo: None,
+    },
+    GgufAliasEntry {
+        aliases: &["qwen2.5-coder:32b-q4_k_m"],
+        repo: "bartowski/Qwen2.5-Coder-32B-Instruct-GGUF",
+        filename: "Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf",
+        tokenizer_repo: Some("Qwen/Qwen2.5-Coder-32B-Instruct"),
+    },
+    GgufAliasEntry {
+        aliases: &["mistral-small:24b-q4_k_m"],
+        repo: "bartowski/mistralai_Mistral-Small-3.2-24B-Instruct-2506-GGUF",
+        filename: "mistralai_Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf",
+        tokenizer_repo: Some("unsloth/Mistral-Small-3.2-24B-Instruct-2506"),
+    },
+    GgufAliasEntry {
+        aliases: &["devstral:24b-q4_k_m"],
+        repo: "bartowski/mistralai_Devstral-Small-2-24B-Instruct-2512-GGUF",
+        filename: "mistralai_Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf",
+        tokenizer_repo: Some("mistralai/Devstral-Small-2-24B-Instruct-2512"),
+    },
+    GgufAliasEntry {
+        aliases: &["magistral:24b-q4_k_m"],
+        repo: "bartowski/mistralai_Magistral-Small-2509-GGUF",
+        filename: "mistralai_Magistral-Small-2509-Q4_K_M.gguf",
+        tokenizer_repo: Some("unsloth/Magistral-Small-2509"),
+    },
+    GgufAliasEntry {
+        aliases: &["llama3.1:8b-q4_k_m"],
+        repo: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+        filename: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        tokenizer_repo: Some("unsloth/Meta-Llama-3.1-8B-Instruct"),
+    },
+    GgufAliasEntry {
+        aliases: &["llama3.2:3b-q4_k_m"],
+        repo: "bartowski/Llama-3.2-3B-Instruct-GGUF",
+        filename: "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+        tokenizer_repo: Some("unsloth/Llama-3.2-3B-Instruct"),
+    },
+    GgufAliasEntry {
+        aliases: &["llama3.2:1b-q4_k_m"],
+        repo: "bartowski/Llama-3.2-1B-Instruct-GGUF",
+        filename: "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+        tokenizer_repo: Some("unsloth/Llama-3.2-1B-Instruct"),
+    },
+];
+
+/// Resolve a GGUF alias to its repository and exact quantized filename.
+pub fn resolve_gguf_alias(name: &str) -> Option<(String, String)> {
+    let name = name.to_lowercase();
+    GGUF_ALIASES
+        .iter()
+        .find(|entry| entry.aliases.contains(&name.as_str()))
+        .map(|entry| (entry.repo.to_string(), entry.filename.to_string()))
+}
+
+/// Resolve the tokenizer sidecar repository for a GGUF repository.
+pub fn tokenizer_sibling_repo(gguf_repo: &str) -> Option<String> {
+    if let Some(entry) = GGUF_ALIASES.iter().find(|entry| entry.repo == gguf_repo) {
+        if let Some(repo) = entry.tokenizer_repo {
+            return Some(repo.to_string());
+        }
+    }
+    gguf_repo.strip_suffix("-GGUF").map(str::to_string)
 }
 
 /// Chat-profile runtime defaults for `ferrum run`. Sniffs the arch
@@ -580,6 +813,31 @@ pub fn find_cached_model(cache_dir: &Path, model_id: &str) -> Option<ResolvedMod
     None
 }
 
+/// Locate one exact GGUF artifact in the Hugging Face cache.
+pub fn find_cached_gguf(cache_dir: &Path, repo: &str, filename: &str) -> Option<PathBuf> {
+    let repo_dir = cache_dir
+        .join("hub")
+        .join(format!("models--{}", repo.replace('/', "--")));
+    let snapshots_dir = repo_dir.join("snapshots");
+
+    let ref_main = repo_dir.join("refs").join("main");
+    if let Ok(revision) = std::fs::read_to_string(&ref_main) {
+        let revision = revision.trim();
+        if !revision.is_empty() {
+            let candidate = snapshots_dir.join(revision).join(filename);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    std::fs::read_dir(&snapshots_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path().join(filename))
+        .find(|candidate| candidate.is_file())
+}
+
 /// Should the resolver attempt to download from HF if the model isn't
 /// found locally? `run` / `serve` say yes; `bench` defaults to no
 /// (caller handles per-bench-flow download policy).
@@ -605,10 +863,11 @@ pub struct Resolved {
 /// download policy + autosize profile. Returns a resolved source.
 ///
 /// Resolution order:
-///   1. `*.gguf` file → direct GGUF source.
-///   2. Existing local directory with valid weights → direct source.
-///   3. HF cache hit → cached source.
-///   4. (if `AutoDownload`) HF download → cached source.
+///   1. Explicit GGUF alias -> exact cached/downloaded GGUF file.
+///   2. `*.gguf` file -> direct GGUF source.
+///   3. Existing local directory with valid weights -> direct source.
+///   4. HF cache hit -> cached source.
+///   5. (if `AutoDownload`) HF download -> cached source.
 ///
 /// On GPU backends the chat-profile autosizer fires once on the resolved
 /// snapshot before returning, populating `FERRUM_KV_MAX_BLOCKS` etc.
@@ -620,68 +879,84 @@ pub async fn resolve_model_source(
     download: DownloadPolicy,
     autosize: Option<(AutoSizeProfile, f32)>,
 ) -> Result<Resolved> {
-    // 1. GGUF file path.
+    // 1. Curated GGUF alias. Resolve this before the general HF alias table:
+    // a GGUF alias names one exact file, not a safetensors repository.
+    if let Some((repo, filename)) = resolve_gguf_alias(model) {
+        let token = (download == DownloadPolicy::AutoDownload)
+            .then(|| {
+                std::env::var("HF_TOKEN")
+                    .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
+                    .ok()
+            })
+            .flatten();
+        let (local_path, from_cache) = match find_cached_gguf(cache_dir, &repo, &filename) {
+            Some(path) => (path, true),
+            None if download == DownloadPolicy::AutoDownload => {
+                let downloader =
+                    ferrum_models::HfDownloader::new(cache_dir.to_path_buf(), token.clone())?;
+                (
+                    downloader.download_gguf(&repo, None, &filename).await?,
+                    false,
+                )
+            }
+            None => {
+                return Err(FerrumError::model(format!(
+                    "GGUF alias '{model}' is not cached and DownloadPolicy::NoDownload is set"
+                )))
+            }
+        };
+        if download == DownloadPolicy::AutoDownload {
+            ensure_gguf_tokenizer_sidecars(cache_dir, token, &repo, &local_path).await?;
+        }
+        return Ok(finalize_resolution(
+            ResolvedModelSource {
+                original: model.to_string(),
+                local_path,
+                format: ModelFormat::GGUF,
+                from_cache,
+            },
+            autosize,
+        ));
+    }
+
+    // 2. GGUF file path.
     if looks_like_gguf_path(model) {
         let local_path = PathBuf::from(model);
-        let mut autosized = false;
-        if let Some((profile, gpu_util)) = autosize {
-            apply_auto_size_with_profile(&local_path, gpu_util, profile);
-            autosized = true;
-            if profile == AutoSizeProfile::Chat {
-                apply_chat_profile_env(&local_path);
-            }
-        }
-        return Ok(Resolved {
-            source: ResolvedModelSource {
+        return Ok(finalize_resolution(
+            ResolvedModelSource {
                 original: model.to_string(),
                 local_path,
                 format: ModelFormat::GGUF,
                 from_cache: false,
             },
-            autosized,
-        });
+            autosize,
+        ));
     }
 
-    // 2. Local directory.
+    // 3. Local directory.
     let direct = PathBuf::from(model);
     if direct.is_dir() {
         let format = detect_format(&direct);
         if format != ModelFormat::Unknown {
-            let mut autosized = false;
-            if let Some((profile, gpu_util)) = autosize {
-                apply_auto_size_with_profile(&direct, gpu_util, profile);
-                autosized = true;
-                if profile == AutoSizeProfile::Chat {
-                    apply_chat_profile_env(&direct);
-                }
-            }
-            return Ok(Resolved {
-                source: ResolvedModelSource {
+            return Ok(finalize_resolution(
+                ResolvedModelSource {
                     original: model.to_string(),
                     local_path: direct,
                     format,
                     from_cache: false,
                 },
-                autosized,
-            });
+                autosize,
+            ));
         }
     }
 
-    // 3. HF cache hit.
-    let model_id = super::commands::run::resolve_model_alias(model);
+    // 4. HF cache hit.
+    let model_id = resolve_model_alias(model);
     if let Some(source) = find_cached_model(cache_dir, &model_id) {
-        let mut autosized = false;
-        if let Some((profile, gpu_util)) = autosize {
-            apply_auto_size_with_profile(&source.local_path, gpu_util, profile);
-            autosized = true;
-            if profile == AutoSizeProfile::Chat {
-                apply_chat_profile_env(&source.local_path);
-            }
-        }
-        return Ok(Resolved { source, autosized });
+        return Ok(finalize_resolution(source, autosize));
     }
 
-    // 4. HF download.
+    // 5. HF download.
     if download != DownloadPolicy::AutoDownload {
         return Err(FerrumError::model(format!(
             "model '{}' not found locally and DownloadPolicy::NoDownload set",
@@ -700,23 +975,79 @@ pub async fn resolve_model_source(
             "downloaded model has unknown format (no safetensors / pytorch_model.bin)",
         ));
     }
-    let mut autosized = false;
-    if let Some((profile, gpu_util)) = autosize {
-        apply_auto_size_with_profile(&snapshot_path, gpu_util, profile);
-        autosized = true;
-        if profile == AutoSizeProfile::Chat {
-            apply_chat_profile_env(&snapshot_path);
-        }
-    }
-    Ok(Resolved {
-        source: ResolvedModelSource {
+    Ok(finalize_resolution(
+        ResolvedModelSource {
             original: model_id,
             local_path: snapshot_path,
             format,
             from_cache: false,
         },
-        autosized,
-    })
+        autosize,
+    ))
+}
+
+async fn ensure_gguf_tokenizer_sidecars(
+    cache_dir: &Path,
+    token: Option<String>,
+    gguf_repo: &str,
+    gguf_path: &Path,
+) -> Result<()> {
+    const SIDECAR_FILES: [&str; 6] = [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "chat_template.json",
+        "chat_template.jinja",
+        "generation_config.json",
+    ];
+
+    let snapshot_dir = gguf_path
+        .parent()
+        .ok_or_else(|| FerrumError::model("resolved GGUF path has no snapshot directory"))?;
+    if snapshot_dir.join("tokenizer.json").is_file() {
+        return Ok(());
+    }
+    let sibling = tokenizer_sibling_repo(gguf_repo).ok_or_else(|| {
+        FerrumError::model(format!(
+            "GGUF repository '{gguf_repo}' has no tokenizer sidecar source"
+        ))
+    })?;
+    let downloader = ferrum_models::HfDownloader::new(cache_dir.to_path_buf(), token)?;
+    let sibling_dir = downloader
+        .download_sidecar_files(&sibling, None, &SIDECAR_FILES)
+        .await?;
+    for filename in SIDECAR_FILES {
+        let source = sibling_dir.join(filename);
+        if source.is_file() {
+            std::fs::copy(&source, snapshot_dir.join(filename)).map_err(|error| {
+                FerrumError::model(format!(
+                    "copy GGUF tokenizer sidecar {filename} from {sibling}: {error}"
+                ))
+            })?;
+        }
+    }
+    if !snapshot_dir.join("tokenizer.json").is_file() {
+        return Err(FerrumError::model(format!(
+            "GGUF tokenizer source '{sibling}' did not provide tokenizer.json"
+        )));
+    }
+    Ok(())
+}
+
+fn finalize_resolution(
+    source: ResolvedModelSource,
+    autosize: Option<(AutoSizeProfile, f32)>,
+) -> Resolved {
+    let autosized = if let Some((profile, gpu_util)) = autosize {
+        apply_auto_size_with_profile(&source.local_path, gpu_util, profile);
+        if profile == AutoSizeProfile::Chat {
+            apply_chat_profile_env(&source.local_path);
+        }
+        true
+    } else {
+        false
+    };
+    Resolved { source, autosized }
 }
 
 #[cfg(test)]
@@ -743,6 +1074,103 @@ mod tests {
             .iter()
             .find(|entry| entry.key == key)
             .map(|entry| entry.effective_value.clone())
+    }
+
+    #[test]
+    fn hf_and_gguf_aliases_are_disjoint() {
+        for entry in GGUF_ALIASES {
+            for alias in entry.aliases {
+                assert_eq!(
+                    resolve_model_alias(alias),
+                    *alias,
+                    "alias '{alias}' resolves to both an HF repository and a GGUF file"
+                );
+            }
+        }
+        assert_eq!(resolve_model_alias("qwen3:1.7b"), "Qwen/Qwen3-1.7B");
+        assert!(resolve_gguf_alias("qwen3:1.7b").is_none());
+        assert!(resolve_gguf_alias("qwen3:1.7b-gguf").is_some());
+    }
+
+    #[tokio::test]
+    async fn resolves_local_model_directory_with_stable_product_id() {
+        let dir = temp_model_dir(
+            "local-product-id",
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5"}"#,
+        );
+        std::fs::write(dir.join("model.safetensors"), []).unwrap();
+
+        let resolved = resolve_model_source(
+            dir.to_str().unwrap(),
+            &dir.join("unused-cache"),
+            DownloadPolicy::NoDownload,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.source.local_path, dir);
+        assert_eq!(resolved.source.format, ModelFormat::SafeTensors);
+        assert!(!resolved.source.from_cache);
+        assert_eq!(
+            public_model_id(&resolved.source),
+            dir.file_name().unwrap().to_string_lossy()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn resolves_direct_gguf_with_file_stem_product_id() {
+        let dir = temp_model_dir("direct-gguf", r#"{}"#);
+        let gguf = dir.join("Qwen3.5-4B-Instruct-Q4_K_M.gguf");
+        std::fs::write(&gguf, []).unwrap();
+
+        let resolved = resolve_model_source(
+            gguf.to_str().unwrap(),
+            &dir.join("unused-cache"),
+            DownloadPolicy::NoDownload,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.source.local_path, gguf);
+        assert_eq!(resolved.source.format, ModelFormat::GGUF);
+        assert_eq!(
+            public_model_id(&resolved.source),
+            "Qwen3.5-4B-Instruct-Q4_K_M"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn resolves_cached_gguf_alias_without_entrypoint_short_circuit() {
+        let cache = temp_model_dir("cached-gguf-alias", r#"{}"#);
+        let (repo, filename) = resolve_gguf_alias("qwen3:4b-q4_k_m").unwrap();
+        let repo_dir = cache
+            .join("hub")
+            .join(format!("models--{}", repo.replace('/', "--")));
+        let revision = "fixture-revision";
+        let snapshot = repo_dir.join("snapshots").join(revision);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::create_dir_all(repo_dir.join("refs")).unwrap();
+        std::fs::write(repo_dir.join("refs/main"), revision).unwrap();
+        let gguf = snapshot.join(&filename);
+        std::fs::write(&gguf, []).unwrap();
+
+        let resolved =
+            resolve_model_source("qwen3:4b-q4_k_m", &cache, DownloadPolicy::NoDownload, None)
+                .await
+                .unwrap();
+
+        assert_eq!(resolved.source.local_path, gguf);
+        assert_eq!(resolved.source.format, ModelFormat::GGUF);
+        assert!(resolved.source.from_cache);
+        assert_eq!(
+            public_model_id(&resolved.source),
+            Path::new(&filename).file_stem().unwrap().to_string_lossy()
+        );
+        let _ = std::fs::remove_dir_all(cache);
     }
 
     #[test]

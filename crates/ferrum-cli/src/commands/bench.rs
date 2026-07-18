@@ -127,42 +127,16 @@ fn measured_request_count(cmd: &BenchCommand) -> Result<u32> {
 
 pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     validate_command(&cmd)?;
-    // GGUF alias short-circuit (kept here because aliases like
-    // `qwen3:8b-q4_k_m` map to a sibling .gguf file in the cache,
-    // which `source_resolver` doesn't yet resolve directly).
-    let cache_dir = super::run::get_hf_cache_dir(&config);
-    let (model_id, source) =
-        if let Some((repo, filename)) = super::run::resolve_gguf_alias(&cmd.model) {
-            let gguf_path =
-                super::run::find_cached_gguf(&cache_dir, &repo, &filename).ok_or_else(|| {
-                    eprintln!(
-                        "GGUF alias '{}' not in cache. Run: ferrum pull {}",
-                        cmd.model, cmd.model
-                    );
-                    ferrum_types::FerrumError::model("GGUF model not found")
-                })?;
-            let id = gguf_path
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| cmd.model.clone());
-            let src = ferrum_models::source::ResolvedModelSource {
-                original: cmd.model.clone(),
-                local_path: gguf_path,
-                format: ferrum_models::source::ModelFormat::GGUF,
-                from_cache: true,
-            };
-            (id, src)
-        } else {
-            let resolved = crate::source_resolver::resolve_model_source(
-                &cmd.model,
-                &cache_dir,
-                crate::source_resolver::DownloadPolicy::AutoDownload,
-                None,
-            )
-            .await?;
-            let id = resolved.source.original.clone();
-            (id, resolved.source)
-        };
+    let cache_dir = crate::source_resolver::hf_cache_dir(&config);
+    let resolved = crate::source_resolver::resolve_model_source(
+        &cmd.model,
+        &cache_dir,
+        crate::source_resolver::DownloadPolicy::AutoDownload,
+        None,
+    )
+    .await?;
+    let source = resolved.source;
+    let model_id = crate::source_resolver::public_model_id(&source);
     eprintln!("{}", format!("Ferrum Benchmark - {}", model_id).bold());
     eprintln!("{}", "=".repeat(60).dimmed());
 

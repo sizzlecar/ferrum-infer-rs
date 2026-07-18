@@ -3,9 +3,7 @@
 use crate::config::CliConfig;
 use clap::Args;
 use colored::*;
-use ferrum_models::HfDownloader;
 use ferrum_types::Result;
-use std::path::PathBuf;
 
 #[derive(Args)]
 pub struct PullCommand {
@@ -14,154 +12,33 @@ pub struct PullCommand {
 }
 
 pub async fn execute(cmd: PullCommand, config: CliConfig) -> Result<()> {
-    // GGUF alias path — pulls just the requested quantization plus the
-    // sidecar tokenizer.json so `serve` / `bench` can pick it up. Doing
-    // this BEFORE `resolve_model_alias` keeps GGUF aliases like
-    // `qwen3:8b-q4_k_m` from accidentally falling through to the
-    // safetensors HF repo (`Qwen/Qwen3-8B-Q4_K_M`, which doesn't exist).
-    if let Some((repo, filename)) = super::run::resolve_gguf_alias(&cmd.model) {
-        println!(
-            "{} {} (file: {})",
-            "Pulling GGUF".cyan().bold(),
-            repo,
-            filename
-        );
-        let cache_dir = get_hf_cache_dir(&config);
-        println!("{}", format!("Cache: {}", cache_dir.display()).dimmed());
-        let token = std::env::var("HF_TOKEN")
-            .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
-            .ok();
-        let downloader = HfDownloader::new(cache_dir.clone(), token.clone())?;
-        let gguf_path = match downloader.download_gguf(&repo, None, &filename).await {
-            Ok(path) => path,
-            Err(e) => {
-                eprintln!();
-                eprintln!("{} Failed to pull GGUF: {}", "✗".red().bold(), e);
-                return Err(e);
-            }
-        };
-
-        // Some GGUF repos (e.g. Qwen/Qwen3-*-GGUF) don't host
-        // tokenizer.json. Pull the small sidecar files from the
-        // safetensors sibling repo (`<repo>` minus `-GGUF`) — never its
-        // weights — and drop them next to the gguf file so serve /
-        // bench's auto_discover_tokenizer_path picks them up.
-        const SIDECAR_FILES: [&str; 6] = [
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "special_tokens_map.json",
-            "chat_template.json",
-            "chat_template.jinja",
-            "generation_config.json",
-        ];
-        let snapshot_dir = gguf_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| cache_dir.clone());
-        if !snapshot_dir.join("tokenizer.json").is_file() {
-            if let Some(sibling) = super::run::tokenizer_sibling_repo(&repo) {
-                println!();
-                println!(
-                    "{} tokenizer.json missing in GGUF repo — fetching from {}",
-                    "→".cyan(),
-                    sibling.dimmed()
-                );
-                let dl2 = HfDownloader::new(cache_dir.clone(), token.clone())?;
-                match dl2
-                    .download_sidecar_files(&sibling, None, &SIDECAR_FILES)
-                    .await
-                {
-                    Ok(sibling_dir) => {
-                        // Copy the sidecars into the GGUF snapshot dir so
-                        // they live next to the gguf file.
-                        for tok_file in SIDECAR_FILES {
-                            let src = sibling_dir.join(tok_file);
-                            if src.is_file() {
-                                let dst = snapshot_dir.join(tok_file);
-                                if let Err(e) = std::fs::copy(&src, &dst) {
-                                    eprintln!(
-                                        "{} could not copy {}: {}",
-                                        "⚠".yellow(),
-                                        tok_file,
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        println!(
-                            "{} tokenizer placed at {}",
-                            "✓".green(),
-                            snapshot_dir.display().to_string().dimmed()
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "{} sibling tokenizer pull failed: {} — \
-                             you'll need to provide tokenizer.json manually",
-                            "⚠".yellow().bold(),
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
-        println!();
-        println!("{} Model ready at:", "✓".green().bold());
-        println!("  {}", gguf_path.display());
-        println!();
-        println!("{}", "Run with:".dimmed());
-        println!("  ferrum serve {}", cmd.model.cyan());
-        println!("  ferrum bench {} --concurrency 8", cmd.model.cyan());
-        return Ok(());
-    }
-
-    let model_id = resolve_model_alias(&cmd.model);
-
-    println!("{} {}", "Pulling".cyan().bold(), model_id);
-
-    // Get cache directory
-    let cache_dir = get_hf_cache_dir(&config);
+    let cache_dir = crate::source_resolver::hf_cache_dir(&config);
+    println!(
+        "{} {}",
+        "Pulling".cyan().bold(),
+        crate::source_resolver::resolve_model_alias(&cmd.model)
+    );
     println!("{}", format!("Cache: {}", cache_dir.display()).dimmed());
 
-    // Get HF token
-    let token = std::env::var("HF_TOKEN")
-        .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
-        .ok();
-
-    // Create downloader with proxy support
-    let downloader = HfDownloader::new(cache_dir, token)?;
-
-    // Download
-    match downloader.download(&model_id, None).await {
-        Ok(path) => {
+    match crate::source_resolver::resolve_model_source(
+        &cmd.model,
+        &cache_dir,
+        crate::source_resolver::DownloadPolicy::AutoDownload,
+        None,
+    )
+    .await
+    {
+        Ok(resolved) => {
             println!();
             println!("{} Model ready at:", "✓".green().bold());
-            println!("  {}", path.display());
+            println!("  {}", resolved.source.local_path.display());
             Ok(())
         }
-        Err(e) => {
+        Err(error) => {
             eprintln!();
-            eprintln!("{} Failed to pull model: {}", "✗".red().bold(), e);
-            eprintln!();
-            eprintln!("Tips:");
-            eprintln!("  • Check your internet connection");
-            eprintln!("  • Set proxy: HTTPS_PROXY=socks5h://host:port");
-            eprintln!("  • For private models, set HF_TOKEN environment variable");
-            Err(e)
+            eprintln!("{} Failed to pull model: {}", "✗".red().bold(), error);
+            eprintln!("Set HF_TOKEN for private models and verify network/proxy settings.");
+            Err(error)
         }
     }
-}
-
-fn resolve_model_alias(name: &str) -> String {
-    // Single source of truth — see run.rs.
-    super::run::resolve_model_alias(name)
-}
-
-fn get_hf_cache_dir(config: &CliConfig) -> PathBuf {
-    if let Ok(hf_home) = std::env::var("HF_HOME") {
-        return PathBuf::from(hf_home);
-    }
-    let configured = shellexpand::tilde(&config.models.download.hf_cache_dir).to_string();
-    PathBuf::from(configured)
 }
