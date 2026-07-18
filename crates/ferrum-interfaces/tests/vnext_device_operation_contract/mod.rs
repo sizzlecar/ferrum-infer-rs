@@ -1393,6 +1393,7 @@ pub(crate) fn resolved_model_plan_with_zero_state(
             maximum_output_tokens: 32,
             token_ids: BTreeSet::from([3]),
             strings: vec!["stop".to_owned()],
+            collision_policy: StopTokenCollisionPolicy::require_distinct(),
         },
         structured_output: StructuredOutputPolicy::JsonObject,
     };

@@ -14,8 +14,9 @@ use ferrum_interfaces::vnext::{
     ResolutionDecisionBinding, ResolutionDecisionSource, ResolutionField, ResolutionFingerprint,
     ResolutionReasonId, ResolutionSourceEvidence, ResolutionSourceProvenance, ResolvedModelPlan,
     ResolvedModelPlanInputs, ResolvedModelSource, ResolvedPlanValidationContext,
-    ResolvedRuntimePolicy, SamplingPolicy, StopPolicy, StructuredOutputPolicy, TokenizerDescriptor,
-    TokenizerId, TriStatePolicy, JSON_RESOLUTION_SOURCE_PARSER,
+    ResolvedRuntimePolicy, SamplingPolicy, SpecialTokenRole, StopPolicy, StopTokenCollisionPolicy,
+    StructuredOutputPolicy, TokenizerDescriptor, TokenizerId, TriStatePolicy,
+    JSON_RESOLUTION_SOURCE_PARSER,
 };
 use ferrum_models::vnext::{PreparedProductionModel, ProductionModelFamilyRegistry};
 use ferrum_models::VNextModelExecutor;
@@ -275,15 +276,23 @@ fn generation_defaults(
     let mut strings = params.stop_sequences.clone();
     strings.sort();
     strings.dedup();
+    let token_ids = prepared
+        .family()
+        .metadata()
+        .special_tokens
+        .eos_token_ids
+        .clone();
+    let collision_policy = if token_ids.is_empty() {
+        StopTokenCollisionPolicy::require_distinct()
+    } else {
+        StopTokenCollisionPolicy::new(BTreeSet::from([SpecialTokenRole::Eos]))
+            .map_err(|error| FerrumError::config(error.to_string()))?
+    };
     let stop = StopPolicy {
         maximum_output_tokens,
-        token_ids: prepared
-            .family()
-            .metadata()
-            .special_tokens
-            .eos_token_ids
-            .clone(),
+        token_ids,
         strings,
+        collision_policy,
     };
     let structured_output = match &params.response_format {
         ResponseFormat::Text => StructuredOutputPolicy::Disabled,
