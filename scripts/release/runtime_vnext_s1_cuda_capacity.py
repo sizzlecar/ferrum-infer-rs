@@ -27,9 +27,9 @@ MAX_PRESSURE_NO_PROGRESS_SECONDS = 30.0
 MAX_PRESSURE_UNCHANGED_SKIPS = 512
 MAX_PRESSURE_TRACE_BYTES = 16 * 1024 * 1024
 MAX_PRESSURE_JOINT_STREAM_SECONDS = 300.0
-SERVER_MAX_MODEL_LEN = 512
-PRESSURE_B_WORD_COUNT = 256
-PRESSURE_MAX_TOKENS = {"A": 128, "B": 128, "C": 16}
+SERVER_MAX_MODEL_LEN = 256
+PRESSURE_B_WORD_COUNT = 192
+PRESSURE_MAX_TOKENS = {"A": 224, "B": 32, "C": 16}
 PRESSURE_B_PROMPT = (
     "Capacity lane large request. Read every word before answering."
     + " token" * PRESSURE_B_WORD_COUNT
@@ -893,7 +893,7 @@ def run_capacity_pair(
         model=server.model_id,
         role=f"{prefix}-A",
         workload_slot="A",
-        max_tokens=128,
+        max_tokens=PRESSURE_MAX_TOKENS["A"],
         out_dir=out_dir,
         timeout=timeout,
     )
@@ -904,7 +904,7 @@ def run_capacity_pair(
         model=server.model_id,
         role=f"{prefix}-C",
         workload_slot="C",
-        max_tokens=16,
+        max_tokens=PRESSURE_MAX_TOKENS["C"],
         out_dir=out_dir,
         timeout=timeout,
     )
@@ -1714,6 +1714,7 @@ def validate_stream(result: dict[str, Any], label: str) -> None:
 def validate_replayed_workload(
     workload_slot: str, labeled_results: dict[str, dict[str, Any]]
 ) -> None:
+    expected_max_tokens = PRESSURE_MAX_TOKENS[workload_slot]
     prompt_hashes: set[str] = set()
     prompt_token_counts: set[int] = set()
     for label, result in labeled_results.items():
@@ -1731,6 +1732,14 @@ def validate_replayed_workload(
         require(
             isinstance(prompt_tokens, int) and prompt_tokens > 0,
             f"{label}: prompt token count is missing",
+        )
+        require(
+            result.get("max_tokens") == expected_max_tokens,
+            f"{label}: max_tokens does not match workload slot {workload_slot}",
+        )
+        require(
+            prompt_tokens + expected_max_tokens <= SERVER_MAX_MODEL_LEN,
+            f"{label}: workload slot {workload_slot} exceeds the typed model-length ceiling",
         )
         prompt_token_counts.add(prompt_tokens)
     require(
@@ -2142,16 +2151,19 @@ def self_test() -> int:
                 "workload_slot": "A",
                 "prompt_sha256": prompt_hashes["A"],
                 "prompt_tokens": 32,
+                "max_tokens": PRESSURE_MAX_TOKENS["A"],
             },
             "warmup": {
                 "workload_slot": "A",
                 "prompt_sha256": prompt_hashes["A"],
                 "prompt_tokens": 32,
+                "max_tokens": PRESSURE_MAX_TOKENS["A"],
             },
             "pressure": {
                 "workload_slot": "A",
                 "prompt_sha256": prompt_hashes["A"],
                 "prompt_tokens": 32,
+                "max_tokens": PRESSURE_MAX_TOKENS["A"],
             },
         },
     )
@@ -2163,11 +2175,13 @@ def self_test() -> int:
                     "workload_slot": "A",
                     "prompt_sha256": prompt_hashes["A"],
                     "prompt_tokens": 32,
+                    "max_tokens": PRESSURE_MAX_TOKENS["A"],
                 },
                 "warmup": {
                     "workload_slot": "A",
                     "prompt_sha256": prompt_hashes["B"],
                     "prompt_tokens": 32,
+                    "max_tokens": PRESSURE_MAX_TOKENS["A"],
                 },
             },
         )
