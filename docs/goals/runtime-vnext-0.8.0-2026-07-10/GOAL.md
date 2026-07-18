@@ -536,6 +536,11 @@ CUDA contract 稳定后开始，但不得把三个 Metal lane 全部拖到发布
 S1 CUDA 基础纵切的 production evidence 通过统一 gate 固化：
 
 ```text
+python3 scripts/release/runtime_vnext_s1_cuda_basic_collector.py collect \
+  --repo <clean-source-root> \
+  --model <qwen35-4b-hf-snapshot> \
+  --out <qwen35-4b-cuda-raw-artifact>
+
 python3 scripts/release/run_gate.py vnext-s1-cuda \
   --s1-artifact <qwen35-4b-cuda-raw-artifact> \
   --out <external-out>
@@ -545,6 +550,12 @@ child validator 必须从原始 `run`、`serve`、stream、`bench-serve`、sched
 样本重新计算结果，不能信任手工摘要。要求 basic trace 每请求只捕获一个完整 execution frame、operation
 identity 完整、terminal token 与 usage 对账、trace `<=1 MiB/request`，并在同一 RTX 4090 上满足均值和
 中位数开销均 `<=2%`、两组样本 CV 均 `<=5%`。精确 PASS 行为：
+
+collector 固定 workload、seed、repeat 和 slot order，不暴露性能口径参数；每个 slot 必须保存 bench
+前、bench 中至少 `3` 个样本和 bench 后的同一 GPU UUID/P-state/graphics-SM-memory clocks/power/
+temperature/utilization/memory 以及 host CPU ticks/load/memory/swap。telemetry 只观测、不得设置 clocks、
+power limit 或产品隐藏环境变量。首四 slot 的 `overhead.first-half.json` 只保存当时的真实诊断状态，允许
+PASS 或 REJECT；正式 validator 必须重算它，禁止要求、伪造或复用历史 noisy REJECT。
 
 ```text
 FERRUM RUNTIME VNEXT S1 CUDA BASIC SLICE PASS: <out_dir>

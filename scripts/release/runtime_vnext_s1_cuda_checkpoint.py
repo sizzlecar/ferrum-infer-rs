@@ -10,9 +10,11 @@ import math
 import re
 import shlex
 import statistics
+import subprocess
 import sys
 import tempfile
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +74,24 @@ PROFILE_EXPECTED_EVENTS_PER_REQUEST = 399
 PROFILE_MAX_BYTES_PER_REQUEST = 1024 * 1024
 PROFILE_MAX_OVERHEAD = 0.02
 PROFILE_MAX_CV = 0.05
+COLLECTION_SCHEMA_VERSION = 2
+COLLECTOR_RELATIVE_PATH = "scripts/release/runtime_vnext_s1_cuda_basic_collector.py"
+FIRST_HALF_PROFILE_SLOTS = PROFILE_SLOT_ORDER[:4]
+GPU_QUERY_FIELDS = (
+    "index",
+    "uuid",
+    "pstate",
+    "clocks.current.graphics",
+    "clocks.current.sm",
+    "clocks.current.memory",
+    "power.draw",
+    "power.limit",
+    "temperature.gpu",
+    "utilization.gpu",
+    "utilization.memory",
+    "memory.used",
+    "memory.total",
+)
 
 
 class ValidationError(RuntimeError):
@@ -112,12 +132,69 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def parse_timestamp(path: Path) -> datetime:
+    value = read_text(path).strip()
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValidationError(f"invalid timestamp {path}: {value!r}") from error
+    require(parsed.tzinfo is not None, f"timestamp has no timezone: {path}")
+    return parsed.astimezone(timezone.utc)
+
+
+def parse_json_timestamp(value: Any, label: str) -> datetime:
+    require(isinstance(value, str) and value, f"{label} timestamp is missing")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValidationError(f"{label} timestamp is invalid: {value!r}") from error
+    require(parsed.tzinfo is not None, f"{label} timestamp has no timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def require_finite_number(
+    value: Any,
+    label: str,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    require(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value)),
+        f"{label} is not a finite number",
+    )
+    normalized = float(value)
+    if minimum is not None:
+        require(normalized >= minimum, f"{label} is below {minimum}")
+    if maximum is not None:
+        require(normalized <= maximum, f"{label} exceeds {maximum}")
+    return normalized
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def git_blob_sha256(source_sha: str, relative_path: str) -> str:
+    repository = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        ["git", "show", f"{source_sha}:{relative_path}"],
+        cwd=repository,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    require(
+        result.returncode == 0,
+        f"cannot resolve collector at source SHA {source_sha}: {result.stderr.decode(errors='replace').strip()}",
+    )
+    return hashlib.sha256(result.stdout).hexdigest()
 
 
 def require_zero_exit(path: Path) -> None:
@@ -336,6 +413,68 @@ def validate_serve(root: Path) -> dict[str, Any]:
     return summary
 
 
+def validate_collection_manifest(root: Path, source_sha: str) -> dict[str, Any] | None:
+    path = root / "collection.json"
+    if not path.exists():
+        return None
+    collection = read_json(path)
+    require(
+        collection.get("schema_version") == COLLECTION_SCHEMA_VERSION,
+        "S1 collection schema version mismatch",
+    )
+    require(
+        collection.get("artifact_type") == "runtime_vnext_s1_cuda_basic_raw_collection",
+        "S1 collection artifact type mismatch",
+    )
+    require(collection.get("source_git_sha") == source_sha, "collection source SHA mismatch")
+    collector = collection.get("collector")
+    require(isinstance(collector, dict), "collection collector identity is missing")
+    require(collector.get("path") == COLLECTOR_RELATIVE_PATH, "collection used a non-canonical collector")
+    require(
+        isinstance(collector.get("sha256"), str)
+        and SHA256_RE.fullmatch(collector["sha256"]) is not None,
+        "collection collector SHA256 is invalid",
+    )
+    require(
+        collector["sha256"] == git_blob_sha256(source_sha, COLLECTOR_RELATIVE_PATH),
+        "collection collector SHA256 differs from the clean source commit",
+    )
+    model_path = collection.get("model_snapshot_path")
+    require(
+        isinstance(model_path, str)
+        and "models--Qwen--Qwen3.5-4B/snapshots/" in model_path,
+        "collection model snapshot is not Qwen3.5-4B",
+    )
+    protocol = collection.get("protocol")
+    expected_protocol = {
+        "slot_order": list(PROFILE_SLOT_ORDER),
+        "comparison": "ABBA-BAAB",
+        "concurrency": 1,
+        "random_input_len": 128,
+        "random_output_len": 64,
+        "prompts_per_repeat": PROFILE_REQUESTS_PER_REPEAT,
+        "warmup_requests": PROFILE_WARMUP_REQUESTS,
+        "repeats_per_slot": PROFILE_REPEAT_COUNT,
+        "seed": 9271,
+        "require_ci": True,
+        "fail_on_error": True,
+    }
+    require(isinstance(protocol, dict), "collection protocol is missing")
+    for field, expected in expected_protocol.items():
+        require(protocol.get(field) == expected, f"collection protocol {field} drifted")
+    interval = protocol.get("telemetry_interval_ms")
+    require(
+        isinstance(interval, int) and not isinstance(interval, bool) and 250 <= interval <= 1000,
+        "collection telemetry interval is outside 250..1000 ms",
+    )
+    runtime_env = read_json(root / "runtime-env.json")
+    require(
+        runtime_env.get("hidden_ferrum_environment_overrides") == [],
+        "collection used hidden Ferrum environment overrides",
+    )
+    return collection
+
+
 def validate(root: Path, expected_git_sha: str | None) -> dict[str, Any]:
     root = root.resolve()
     require(root.is_dir(), f"artifact directory does not exist: {root}")
@@ -348,6 +487,7 @@ def validate(root: Path, expected_git_sha: str | None) -> dict[str, Any]:
     binary_line = read_text(root / "binary.sha256").strip().split()
     require(binary_line and SHA256_RE.fullmatch(binary_line[0]) is not None, "invalid binary SHA256")
     require("RTX 4090" in read_text(root / "hardware.csv"), "artifact is not from RTX 4090")
+    collection = validate_collection_manifest(root, source_sha)
     validate_forbidden_logs(root)
     summary = {
         "schema_version": 1,
@@ -356,6 +496,9 @@ def validate(root: Path, expected_git_sha: str | None) -> dict[str, Any]:
         "source_git_sha": source_sha,
         "binary_sha256": binary_line[0],
         "hardware": read_text(root / "hardware.csv").strip(),
+        "collection_schema_version": (
+            collection["schema_version"] if collection is not None else 1
+        ),
         "run": validate_run(root),
         "serve": validate_serve(root),
     }
@@ -501,6 +644,172 @@ def validate_profile_report(directory: Path, slot: str, mode: str) -> dict[str, 
         )
         throughput.append(float(value))
     return {"model_path": model_path, "report": report, "throughput": throughput}
+
+
+def validate_telemetry_sample(
+    row: dict[str, Any],
+    *,
+    slot: str,
+    mode: str,
+    phase: str,
+    label: str,
+) -> tuple[datetime, int, str, int]:
+    require(row.get("schema_version") == 1, f"{label}: telemetry schema mismatch")
+    require(row.get("slot") == slot, f"{label}: telemetry slot mismatch")
+    require(row.get("mode") == mode, f"{label}: telemetry mode mismatch")
+    require(row.get("phase") == phase, f"{label}: telemetry phase mismatch")
+    sampled_at = parse_json_timestamp(row.get("sampled_at"), label)
+    wall_time_ns = row.get("wall_time_ns")
+    monotonic_ns = row.get("monotonic_ns")
+    require(
+        isinstance(wall_time_ns, int) and not isinstance(wall_time_ns, bool) and wall_time_ns > 0,
+        f"{label}: wall clock receipt is invalid",
+    )
+    require(
+        isinstance(monotonic_ns, int) and not isinstance(monotonic_ns, bool) and monotonic_ns > 0,
+        f"{label}: monotonic receipt is invalid",
+    )
+    gpu = row.get("gpu")
+    require(isinstance(gpu, dict), f"{label}: GPU telemetry is missing")
+    require(gpu.get("index") == 0, f"{label}: telemetry did not use GPU index 0")
+    uuid = gpu.get("uuid")
+    require(isinstance(uuid, str) and uuid.startswith("GPU-"), f"{label}: GPU UUID is invalid")
+    require(
+        isinstance(gpu.get("pstate"), str)
+        and re.fullmatch(r"P(?:[0-9]|1[0-5])", gpu["pstate"]) is not None,
+        f"{label}: GPU P-state is invalid",
+    )
+    for field in ("graphics_clock_mhz", "sm_clock_mhz", "memory_clock_mhz"):
+        require_finite_number(gpu.get(field), f"{label}.{field}", minimum=1)
+    require_finite_number(gpu.get("power_draw_w"), f"{label}.power_draw_w", minimum=0)
+    require_finite_number(gpu.get("power_limit_w"), f"{label}.power_limit_w", minimum=1)
+    require_finite_number(gpu.get("temperature_c"), f"{label}.temperature_c", minimum=0, maximum=125)
+    for field in ("gpu_utilization_percent", "memory_utilization_percent"):
+        require_finite_number(gpu.get(field), f"{label}.{field}", minimum=0, maximum=100)
+    require_finite_number(gpu.get("memory_used_mib"), f"{label}.memory_used_mib", minimum=0)
+    memory_total = require_finite_number(
+        gpu.get("memory_total_mib"), f"{label}.memory_total_mib", minimum=20_000
+    )
+    host = row.get("host")
+    require(isinstance(host, dict), f"{label}: host telemetry is missing")
+    for field in ("load_1", "load_5", "load_15"):
+        require_finite_number(host.get(field), f"{label}.{field}", minimum=0)
+    require(
+        isinstance(host.get("cpu_count"), int)
+        and not isinstance(host["cpu_count"], bool)
+        and host["cpu_count"] > 0,
+        f"{label}: CPU count is invalid",
+    )
+    cpu_ticks = host.get("cpu_ticks")
+    require(isinstance(cpu_ticks, dict), f"{label}: CPU tick evidence is missing")
+    for field in ("user", "nice", "system", "idle", "iowait"):
+        require(
+            isinstance(cpu_ticks.get(field), int)
+            and not isinstance(cpu_ticks[field], bool)
+            and cpu_ticks[field] >= 0,
+            f"{label}: CPU tick {field} is invalid",
+        )
+    require_finite_number(
+        host.get("mem_available_bytes"), f"{label}.mem_available_bytes", minimum=1
+    )
+    require_finite_number(host.get("swap_used_bytes"), f"{label}.swap_used_bytes", minimum=0)
+    return sampled_at, monotonic_ns, uuid, int(memory_total)
+
+
+def validate_slot_telemetry(directory: Path, slot: str, mode: str) -> dict[str, Any]:
+    label = f"profile-overhead/{slot}"
+    require_zero_exit(directory / "telemetry.exit")
+    command = read_json(directory / "telemetry.command.json")
+    require(command.get("schema_version") == 1, f"{label}: telemetry command schema mismatch")
+    require(command.get("collector_path") == COLLECTOR_RELATIVE_PATH, f"{label}: non-canonical telemetry collector")
+    require(
+        isinstance(command.get("collector_sha256"), str)
+        and SHA256_RE.fullmatch(command["collector_sha256"]) is not None,
+        f"{label}: telemetry collector SHA256 is invalid",
+    )
+    require(command.get("gpu_query_fields") == list(GPU_QUERY_FIELDS), f"{label}: GPU query drifted")
+    require(
+        command.get("host_sources") == ["/proc/loadavg", "/proc/stat", "/proc/meminfo"],
+        f"{label}: host telemetry sources drifted",
+    )
+    require(command.get("mutates_gpu_state") is False, f"{label}: telemetry mutates GPU state")
+    interval = command.get("interval_ms")
+    require(
+        isinstance(interval, int) and not isinstance(interval, bool) and 250 <= interval <= 1000,
+        f"{label}: telemetry interval is outside 250..1000 ms",
+    )
+    before = read_json(directory / "telemetry.before.json")
+    during = read_jsonl(directory / "telemetry.samples.jsonl")
+    after = read_json(directory / "telemetry.after.json")
+    require(len(during) >= 3, f"{label}: fewer than three during telemetry samples")
+    normalized = [
+        validate_telemetry_sample(
+            before,
+            slot=slot,
+            mode=mode,
+            phase="before",
+            label=f"{label}.telemetry.before",
+        )
+    ]
+    normalized.extend(
+        validate_telemetry_sample(
+            row,
+            slot=slot,
+            mode=mode,
+            phase="during",
+            label=f"{label}.telemetry.during[{index}]",
+        )
+        for index, row in enumerate(during)
+    )
+    normalized.append(
+        validate_telemetry_sample(
+            after,
+            slot=slot,
+            mode=mode,
+            phase="after",
+            label=f"{label}.telemetry.after",
+        )
+    )
+    bench_started = parse_timestamp(directory / "bench.started")
+    bench_finished = parse_timestamp(directory / "bench.finished")
+    require(bench_started < bench_finished, f"{label}: benchmark timestamps are inverted")
+    require(normalized[0][0] <= bench_started, f"{label}: before sample does not precede benchmark")
+    require(normalized[-1][0] >= bench_finished, f"{label}: after sample does not follow benchmark")
+    require(
+        all(bench_started <= row[0] <= bench_finished for row in normalized[1:-1]),
+        f"{label}: during telemetry does not stay inside benchmark window",
+    )
+    monotonic_values = [row[1] for row in normalized]
+    require(
+        all(left < right for left, right in zip(monotonic_values, monotonic_values[1:])),
+        f"{label}: telemetry monotonic timestamps are not strictly increasing",
+    )
+    uuids = {row[2] for row in normalized}
+    memory_totals = {row[3] for row in normalized}
+    require(len(uuids) == 1, f"{label}: GPU UUID drifted within the slot")
+    require(len(memory_totals) == 1, f"{label}: GPU total memory drifted within the slot")
+    expected_summary = {
+        "schema_version": 1,
+        "slot": slot,
+        "mode": mode,
+        "gpu_uuid": next(iter(uuids)),
+        "during_sample_count": len(during),
+        "before_sampled_at": before["sampled_at"],
+        "after_sampled_at": after["sampled_at"],
+    }
+    require(
+        read_json(directory / "telemetry.summary.json") == expected_summary,
+        f"{label}: telemetry summary differs from raw samples",
+    )
+    return {
+        "collector_sha256": command["collector_sha256"],
+        "gpu_uuid": next(iter(uuids)),
+        "memory_total_mib": next(iter(memory_totals)),
+        "during_sample_count": len(during),
+        "interval_ms": interval,
+        "before_sampled_at": before["sampled_at"],
+        "after_sampled_at": after["sampled_at"],
+    }
 
 
 def validate_product_commands(root: Path) -> dict[str, Any]:
@@ -668,18 +977,65 @@ def scalar_stats(values: list[float]) -> dict[str, Any]:
     }
 
 
+def derive_first_half_receipt(reports: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    off = scalar_stats(
+        [
+            value
+            for slot in ("off1", "off2")
+            for value in reports[slot]["throughput"]
+        ]
+    )
+    basic = scalar_stats(
+        [
+            value
+            for slot in ("basic1", "basic2")
+            for value in reports[slot]["throughput"]
+        ]
+    )
+    mean_overhead = (off["mean"] - basic["mean"]) / off["mean"]
+    median_overhead = (off["median"] - basic["median"]) / off["median"]
+    return {
+        "schema_version": 1,
+        "artifact_type": "runtime_vnext_s1_profile_overhead_first_half",
+        "slot_order": list(FIRST_HALF_PROFILE_SLOTS),
+        "off": off,
+        "basic": basic,
+        "mean_overhead": mean_overhead,
+        "median_overhead": median_overhead,
+        "max_overhead": PROFILE_MAX_OVERHEAD,
+        "max_cv": PROFILE_MAX_CV,
+        "status": (
+            "pass"
+            if off["cv"] <= PROFILE_MAX_CV
+            and basic["cv"] <= PROFILE_MAX_CV
+            and mean_overhead <= PROFILE_MAX_OVERHEAD
+            and median_overhead <= PROFILE_MAX_OVERHEAD
+            else "reject"
+        ),
+    }
+
+
 def validate_profile_overhead(root: Path) -> dict[str, Any]:
     performance = root / "profile-overhead"
+    collection_path = root / "collection.json"
+    canonical_collection = collection_path.is_file()
+    require(
+        canonical_collection,
+        "bounded overhead evidence requires the checked-in schema-2 S1 collector",
+    )
     require(
         read_text(performance / "slot-order").split() == list(PROFILE_SLOT_ORDER),
         "profile overhead slot order is not ABBA-BAAB",
     )
     reports: dict[str, dict[str, Any]] = {}
     traces: dict[str, dict[str, Any]] = {}
+    telemetry: dict[str, dict[str, Any]] = {}
     for slot in PROFILE_SLOT_ORDER:
         mode = "basic" if slot in BASIC_PROFILE_SLOTS else "off"
         result = validate_profile_report(performance / slot, slot, mode)
         reports[slot] = result
+        if canonical_collection:
+            telemetry[slot] = validate_slot_telemetry(performance / slot, slot, mode)
         if mode == "basic":
             traces[slot] = validate_bounded_profile_trace(
                 performance / slot,
@@ -688,6 +1044,27 @@ def validate_profile_overhead(root: Path) -> dict[str, Any]:
             )
     model_paths = {result["model_path"] for result in reports.values()}
     require(len(model_paths) == 1, "profile slots use different model snapshots")
+    if canonical_collection:
+        collection = read_json(collection_path)
+        expected_collector_sha = (collection.get("collector") or {}).get("sha256")
+        require(
+            {row["collector_sha256"] for row in telemetry.values()}
+            == {expected_collector_sha},
+            "slot telemetry collector SHA differs from collection provenance",
+        )
+        require(
+            len({row["gpu_uuid"] for row in telemetry.values()}) == 1,
+            "profile slots used different GPU UUIDs",
+        )
+        require(
+            len({row["memory_total_mib"] for row in telemetry.values()}) == 1,
+            "profile slots observed different GPU memory totals",
+        )
+        require(
+            read_json(performance / "overhead.first-half.json")
+            == derive_first_half_receipt(reports),
+            "first-half ABBA receipt differs from raw reports",
+        )
 
     off = scalar_stats(
         [value for slot in OFF_PROFILE_SLOTS for value in reports[slot]["throughput"]]
@@ -706,16 +1083,6 @@ def validate_profile_overhead(root: Path) -> dict[str, Any]:
     require(
         median_overhead <= PROFILE_MAX_OVERHEAD,
         f"basic median overhead {median_overhead:.6f} exceeds 0.02",
-    )
-    require(read_json(performance / "overhead.json").get("status") == "pass", "overhead summary rejects")
-    require(
-        read_json(performance / "trace-boundedness.json").get("status") == "pass",
-        "trace boundedness summary rejects",
-    )
-    initial = read_json(performance / "overhead.abba.reject.json")
-    require(
-        initial.get("status") == "reject" and initial.get("noise_pass") is False,
-        "initial noisy ABBA rejection was not preserved",
     )
     return {
         "status": "pass",
@@ -741,6 +1108,10 @@ def validate_profile_overhead(root: Path) -> dict[str, Any]:
         "completed_requests": {"off": 48, "basic": 48},
         "failed_requests": {"off": 0, "basic": 0},
         "bounded_traces": traces,
+        "slot_telemetry": telemetry,
+        "first_half": (
+            derive_first_half_receipt(reports) if canonical_collection else None
+        ),
     }
 
 
@@ -829,6 +1200,7 @@ def write_basic_slice_evidence(
             "profile_mean_overhead_lte_2pct": True,
             "profile_median_overhead_lte_2pct": True,
             "profile_cv_lte_5pct": True,
+            "slot_gpu_host_telemetry_complete": True,
         },
         "metrics": {
             "mean_overhead_fraction": performance["mean_overhead"],
@@ -841,6 +1213,18 @@ def write_basic_slice_evidence(
             "max_trace_bytes_per_request": max(
                 trace["bytes_per_request"]
                 for trace in performance["bounded_traces"].values()
+            ),
+            "minimum_telemetry_samples_per_slot": min(
+                row["during_sample_count"]
+                for row in performance["slot_telemetry"].values()
+            ),
+            "gpu_uuid": next(
+                iter(
+                    {
+                        row["gpu_uuid"]
+                        for row in performance["slot_telemetry"].values()
+                    }
+                )
             ),
         },
         "unlocks": ["G01B"],
@@ -969,6 +1353,106 @@ def create_selftest_fixture(root: Path) -> None:
     )
 
 
+def telemetry_fixture_row(
+    slot: str,
+    mode: str,
+    phase: str,
+    sampled_at: str,
+    monotonic_ns: int,
+    *,
+    uuid: str = "GPU-selftest",
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "slot": slot,
+        "mode": mode,
+        "phase": phase,
+        "sampled_at": sampled_at,
+        "wall_time_ns": monotonic_ns + 1_000_000_000,
+        "monotonic_ns": monotonic_ns,
+        "gpu": {
+            "index": 0,
+            "uuid": uuid,
+            "pstate": "P2",
+            "graphics_clock_mhz": 2500,
+            "sm_clock_mhz": 2500,
+            "memory_clock_mhz": 10501,
+            "power_draw_w": 240.0,
+            "power_limit_w": 450.0,
+            "temperature_c": 60,
+            "gpu_utilization_percent": 95,
+            "memory_utilization_percent": 40,
+            "memory_used_mib": 8000,
+            "memory_total_mib": 24564,
+        },
+        "host": {
+            "load_1": 1.0,
+            "load_5": 1.0,
+            "load_15": 1.0,
+            "cpu_count": 32,
+            "cpu_ticks": {
+                "user": monotonic_ns,
+                "nice": 0,
+                "system": monotonic_ns,
+                "idle": monotonic_ns,
+                "iowait": 0,
+            },
+            "mem_available_bytes": 32 * 1024**3,
+            "swap_used_bytes": 0,
+        },
+    }
+
+
+def create_telemetry_selftest_fixture(directory: Path) -> None:
+    directory.mkdir()
+    before = telemetry_fixture_row(
+        "off1", "off", "before", "2026-07-18T00:00:00Z", 1
+    )
+    during = [
+        telemetry_fixture_row(
+            "off1",
+            "off",
+            "during",
+            f"2026-07-18T00:00:0{second}Z",
+            second,
+        )
+        for second in (2, 3, 4)
+    ]
+    after = telemetry_fixture_row(
+        "off1", "off", "after", "2026-07-18T00:00:06Z", 6
+    )
+    write_json(
+        directory / "telemetry.command.json",
+        {
+            "schema_version": 1,
+            "collector_path": COLLECTOR_RELATIVE_PATH,
+            "collector_sha256": "c" * 64,
+            "interval_ms": 500,
+            "gpu_query_fields": list(GPU_QUERY_FIELDS),
+            "host_sources": ["/proc/loadavg", "/proc/stat", "/proc/meminfo"],
+            "mutates_gpu_state": False,
+        },
+    )
+    write_json(directory / "telemetry.before.json", before)
+    write_jsonl(directory / "telemetry.samples.jsonl", during)
+    write_json(directory / "telemetry.after.json", after)
+    write_json(
+        directory / "telemetry.summary.json",
+        {
+            "schema_version": 1,
+            "slot": "off1",
+            "mode": "off",
+            "gpu_uuid": "GPU-selftest",
+            "during_sample_count": 3,
+            "before_sampled_at": before["sampled_at"],
+            "after_sampled_at": after["sampled_at"],
+        },
+    )
+    (directory / "telemetry.exit").write_text("0")
+    (directory / "bench.started").write_text("2026-07-18T00:00:01Z\n")
+    (directory / "bench.finished").write_text("2026-07-18T00:00:05Z\n")
+
+
 def self_test() -> int:
     with tempfile.TemporaryDirectory(prefix="runtime-vnext-s1-") as temp:
         root = Path(temp)
@@ -984,6 +1468,29 @@ def self_test() -> int:
             require("provider_id" in str(error), "self-test rejected mutation for wrong reason")
         else:
             raise ValidationError("self-test missing-provider mutation unexpectedly passed")
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-s1-telemetry-") as temp:
+        directory = Path(temp) / "off1"
+        create_telemetry_selftest_fixture(directory)
+        validate_slot_telemetry(directory, "off1", "off")
+        after = read_json(directory / "telemetry.after.json")
+        after["gpu"]["uuid"] = "GPU-drifted"
+        write_json(directory / "telemetry.after.json", after)
+        try:
+            validate_slot_telemetry(directory, "off1", "off")
+        except ValidationError as error:
+            require("UUID drifted" in str(error), "telemetry mutation failed for wrong reason")
+        else:
+            raise ValidationError("telemetry UUID drift unexpectedly passed")
+    synthetic_reports = {
+        "off1": {"throughput": [100.0, 100.5, 99.5]},
+        "basic1": {"throughput": [99.0, 99.5, 98.5]},
+        "basic2": {"throughput": [99.2, 99.7, 98.7]},
+        "off2": {"throughput": [100.2, 100.7, 99.7]},
+    }
+    require(
+        derive_first_half_receipt(synthetic_reports)["status"] == "pass",
+        "a stable first-half ABBA receipt must not be forced to REJECT",
+    )
     print("FERRUM RUNTIME VNEXT S1 CUDA TRACE CHECKPOINT SELFTEST PASS")
     return 0
 
