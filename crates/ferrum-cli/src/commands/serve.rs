@@ -407,49 +407,22 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // Print banner
     print_banner();
 
-    // GGUF short-circuit: if the user passed a `.gguf` file path directly OR
-    // an alias resolving to a GGUF (e.g. `qwen3:8b-q4_k_m`), look up the
-    // file in the HF cache (or accept the path) and skip
-    // `ConfigManager::load_from_path` (which expects an HF safetensors
-    // directory). The engine's LlmExecutorFactory +
-    // HuggingFaceTokenizerFactory both detect `.gguf` and route to
-    // GgufLoader + sibling-tokenizer auto-discovery.
-    let cache_dir_for_gguf = get_hf_cache_dir(&config);
-    let gguf_path: Option<PathBuf> = if super::run::looks_like_gguf_path(&model_name) {
-        Some(PathBuf::from(&model_name))
-    } else if let Some((repo, filename)) = super::run::resolve_gguf_alias(&model_name) {
-        match super::run::find_cached_gguf(&cache_dir_for_gguf, &repo, &filename) {
-            Some(p) => Some(p),
-            None => {
-                eprintln!(
-                    "{} GGUF alias '{}' not in cache. Run: ferrum pull {}",
-                    "Error:".red().bold(),
-                    model_name,
-                    model_name
-                );
-                return Err(ferrum_types::FerrumError::model("GGUF model not found"));
-            }
-        }
-    } else {
-        None
-    };
-
-    // Local safetensors directory passthrough: if `--model` is a path to
-    // a directory containing `config.json` (the canonical HF safetensors
-    // layout), use it directly without going through the HF cache lookup.
-    // Lets bench scripts / tooling point at any locally-staged model
-    // (e.g. `--local-dir` pulls or symlinked snapshots) without having
-    // to mimic the `models--owner--repo/snapshots/<sha>/` cache layout.
-    let local_dir_path: Option<PathBuf> = if gguf_path.is_none() {
-        let p = PathBuf::from(&model_name);
-        if p.is_dir() && p.join("config.json").is_file() {
-            Some(p)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // `run` and `serve` share one source decision. This covers exact GGUF
+    // aliases/files, local model directories, HF cache hits, and resumable HF
+    // download without an entrypoint-specific fallback chain.
+    let cache_dir = crate::source_resolver::hf_cache_dir(&config);
+    let resolved = crate::source_resolver::resolve_model_source(
+        &model_name,
+        &cache_dir,
+        crate::source_resolver::DownloadPolicy::AutoDownload,
+        None,
+    )
+    .await?;
+    let source = resolved.source;
+    let model_id = crate::source_resolver::public_model_id(&source);
+    let gguf_path = (source.format == ModelFormat::GGUF).then(|| source.local_path.clone());
+    println!("{} {}", "Model:".dimmed(), model_id.cyan());
+    println!("{} {}", "Path:".dimmed(), source.local_path.display());
 
     let config_runtime_entries = config.runtime.runtime_config_entries();
     let configured_runtime_preset = runtime_preset
@@ -474,22 +447,6 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         RuntimeConfigSnapshot::from_entries(non_env_runtime_entries).entries;
     let mut materialized_runtime_keys =
         crate::runtime_env::materialize_runtime_env_defaults(&non_env_runtime_entries);
-
-    let model_id = if let Some(p) = gguf_path.as_ref() {
-        // Use the GGUF stem as the OpenAI model id — the user sees this
-        // back in /v1/models responses + chat completion `model` field.
-        p.file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| model_name.clone())
-    } else if let Some(p) = local_dir_path.as_ref() {
-        // Local safetensors dir → use the dir name as the public id.
-        p.file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| model_name.clone())
-    } else {
-        resolve_model_alias(&model_name)
-    };
-    println!("{} {}", "Model:".dimmed(), model_id.cyan());
 
     let lora_specs = parse_lora_specs(&lora)?;
     let startup_lora_adapters = if lora_specs.is_empty() {
@@ -521,43 +478,6 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         config.runtime.kv_dtype.as_deref(),
     );
 
-    let source: ferrum_models::source::ResolvedModelSource = if let Some(p) = gguf_path.clone() {
-        println!("{} {}", "Path:".dimmed(), p.display());
-        ferrum_models::source::ResolvedModelSource {
-            original: model_name.clone(),
-            local_path: p,
-            format: ModelFormat::Unknown, // GGUF — handled by engine
-            from_cache: true,
-        }
-    } else if let Some(p) = local_dir_path.clone() {
-        // Local safetensors directory passed via --model.
-        println!("{} {}", "Path:".dimmed(), p.display());
-        ferrum_models::source::ResolvedModelSource {
-            original: model_name.clone(),
-            local_path: p,
-            format: ModelFormat::SafeTensors,
-            from_cache: false,
-        }
-    } else {
-        // Find cached model
-        let cache_dir = get_hf_cache_dir(&config);
-        match crate::source_resolver::find_cached_model(&cache_dir, &model_id) {
-            Some(source) => {
-                println!("{} {}", "Path:".dimmed(), source.local_path.display());
-                source
-            }
-            None => {
-                eprintln!(
-                    "{} Model '{}' not found. Run: ferrum pull {}",
-                    "Error:".red().bold(),
-                    model_id,
-                    model_name
-                );
-                return Err(ferrum_types::FerrumError::model("Model not found"));
-            }
-        }
-    };
-
     let engine_model_path = source.local_path.to_string_lossy().to_string();
 
     // Speculative decoding draft model: resolve the draft path and pass it
@@ -570,9 +490,9 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
                 "Speculative decoding is not yet wired through the GGUF path",
             ));
         }
-        let draft_id = resolve_model_alias(draft_name);
+        let draft_id = crate::source_resolver::resolve_model_alias(draft_name);
         println!("{} {}", "Draft model:".dimmed(), draft_id.cyan());
-        let cache_dir = get_hf_cache_dir(&config);
+        let cache_dir = crate::source_resolver::hf_cache_dir(&config);
         let draft_source = crate::source_resolver::find_cached_model(&cache_dir, &draft_id)
             .ok_or_else(|| {
                 eprintln!(
@@ -1200,20 +1120,6 @@ fn print_banner() {
         format!("Version {}", env!("CARGO_PKG_VERSION")).dimmed()
     );
     println!();
-}
-
-fn resolve_model_alias(name: &str) -> String {
-    // Single source of truth — see run.rs. serve/pull previously carried
-    // stale local copies, so new aliases worked in `run` but not `serve`.
-    super::run::resolve_model_alias(name)
-}
-
-fn get_hf_cache_dir(config: &CliConfig) -> PathBuf {
-    if let Ok(hf_home) = std::env::var("HF_HOME") {
-        return PathBuf::from(hf_home);
-    }
-    let configured = shellexpand::tilde(&config.models.download.hf_cache_dir).to_string();
-    PathBuf::from(configured)
 }
 
 fn parse_lora_specs(values: &[String]) -> Result<Vec<ferrum_models::StartupLoraSpec>> {
