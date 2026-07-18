@@ -11,12 +11,12 @@ use super::{
     BatchParticipantTokenRange, BatchStepId, BatchWorkShape, BufferDescriptor, BufferUsage,
     CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper, ContractVersion,
     DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
-    DeviceCommandBatch, DeviceId, DeviceRuntime, DynamicResourceDemand, DynamicResourceShape,
-    ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane,
-    ExecutionLaneId, HostTransferLayout, IdentifiedFailure, IndeterminateSubmissionHandle,
-    InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId,
-    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, NodeInvocationId,
-    NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
+    DeviceCommandBatch, DeviceId, DeviceRuntime, DeviceTimingMode, DynamicResourceDemand,
+    DynamicResourceShape, ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts,
+    ExecutionLane, ExecutionLaneId, HostTransferLayout, IdentifiedFailure,
+    IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
+    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId,
+    NodeInvocationId, NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
     PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
     ProviderWorkspaceRequirement, QuantizationFormatId, ResourceId, SemanticValue,
     SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint, SpanId,
@@ -4838,6 +4838,7 @@ impl OperationDispatch {
             .encode_backing_initializations(runtime, &mut commands)
             .map_err(|error| map_backing_initialization_error(runtime, batch_identity, error))?;
         commands.push(command);
+        let timing_mode = commands.timing_mode();
         let mut lane_reservation = lane
             .reserve_enqueue()
             .map_err(OperationDispatchError::Contract)?;
@@ -4865,7 +4866,7 @@ impl OperationDispatch {
             }
             LaneSubmitOutcome::Submitted(fence) => {
                 drop(lane_reservation);
-                let completion = match completion.arm(fence) {
+                let completion = match completion.arm(fence, timing_mode) {
                     Ok(completion) => completion,
                     Err((error, completion)) => {
                         return Err(OperationDispatchError::PostSubmitContract {
@@ -4892,6 +4893,7 @@ impl OperationDispatch {
         resolved: &dyn ExecutablePlanView,
         batch_identity: &BatchOperationIdentity,
         active_bindings: I,
+        timing_mode: DeviceTimingMode,
         wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
         reaper: &Arc<CompletionReaper<R>>,
@@ -4905,6 +4907,7 @@ impl OperationDispatch {
             resolved,
             batch_identity,
             active_bindings,
+            timing_mode,
             &[],
             wave,
             lane,
@@ -4918,6 +4921,7 @@ impl OperationDispatch {
         resolved: &dyn ExecutablePlanView,
         batch_identity: &BatchOperationIdentity,
         active_bindings: I,
+        timing_mode: DeviceTimingMode,
         input_uploads: &[SubmissionWaveInputUpload],
         mut wave: PreparedStepSubmissionWave<R>,
         lane: &Arc<ExecutionLane<R>>,
@@ -4982,8 +4986,10 @@ impl OperationDispatch {
                 "wave encode runtime differs from its execution lane snapshot",
             )));
         }
-        let mut commands =
-            DeviceCommandBatch::with_capacity(providers.len().saturating_add(input_uploads.len()));
+        let mut commands = DeviceCommandBatch::with_capacity_and_timing(
+            providers.len().saturating_add(input_uploads.len()),
+            timing_mode,
+        );
         let initialization_command_count = completion
             .encode_backing_initializations(runtime, &mut commands)
             .map_err(|error| map_backing_initialization_error(runtime, batch_identity, error))?;
@@ -5066,7 +5072,7 @@ impl OperationDispatch {
             }
             LaneSubmitOutcome::Submitted(fence) => {
                 drop(lane_reservation);
-                let completion = match completion.arm(fence) {
+                let completion = match completion.arm(fence, timing_mode) {
                     Ok(completion) => completion,
                     Err((error, completion)) => {
                         return Err(SubmissionWaveDispatchError::PostSubmitContract {

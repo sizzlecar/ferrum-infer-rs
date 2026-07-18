@@ -604,14 +604,12 @@ where
     };
     let waited = catch_unwind(AssertUnwindSafe(|| runtime.wait_fence(&fence)));
     match waited {
-        Ok(Ok(DeviceTerminal::Succeeded)) => Ok(()),
-        Ok(Ok(DeviceTerminal::FailedButQuiescent(error))) => {
-            Err(InitializationStepFailure::Quiescent(device_failure(
-                runtime,
-                &error,
-                "static_fence_failed",
-            )))
-        }
+        Ok(Ok(receipt)) => match receipt.into_parts().0 {
+            DeviceTerminal::Succeeded => Ok(()),
+            DeviceTerminal::FailedButQuiescent(error) => Err(InitializationStepFailure::Quiescent(
+                device_failure(runtime, &error, "static_fence_failed"),
+            )),
+        },
         Ok(Err(indeterminate)) => Err(InitializationStepFailure::Indeterminate {
             failure: device_failure(runtime, indeterminate.error(), "static_fence_indeterminate"),
             recovery: StaticInitializationRecovery {

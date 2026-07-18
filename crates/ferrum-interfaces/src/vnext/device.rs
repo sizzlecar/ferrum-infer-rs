@@ -556,6 +556,118 @@ pub enum StreamState {
     Failed,
 }
 
+/// Backend timing is enabled monotonically before product requests start.
+/// `Off` must not allocate backend events or add host clock reads to the hot
+/// path; `Completion` measures only the existing submission terminal and
+/// readback boundaries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceTimingMode {
+    #[default]
+    Off,
+    Completion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceTimingUnavailableReason {
+    BackendUnsupported,
+    BackendMeasurementFailed,
+    DurationOverflow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "detail")]
+pub enum DeviceTimingMeasurement<T> {
+    NotRequested,
+    Measured(T),
+    Unavailable(DeviceTimingUnavailableReason),
+}
+
+impl<T> DeviceTimingMeasurement<T> {
+    pub const fn measured(&self) -> Option<&T> {
+        match self {
+            Self::Measured(measured) => Some(measured),
+            Self::NotRequested | Self::Unavailable(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceTimingClock {
+    DeviceEventElapsed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceExecutionTiming {
+    elapsed_ns: u64,
+    clock: DeviceTimingClock,
+}
+
+impl DeviceExecutionTiming {
+    pub const fn device_event_elapsed(elapsed_ns: u64) -> Self {
+        Self {
+            elapsed_ns,
+            clock: DeviceTimingClock::DeviceEventElapsed,
+        }
+    }
+
+    pub const fn elapsed_ns(self) -> u64 {
+        self.elapsed_ns
+    }
+
+    pub const fn clock(self) -> DeviceTimingClock {
+        self.clock
+    }
+}
+
+/// A terminal and its optional backend clock evidence are inseparable. This
+/// prevents timing from being queried before the exact fence proves quiescence.
+#[derive(Debug, Serialize)]
+#[must_use = "a device terminal receipt owns exact fence timing evidence"]
+pub struct DeviceTerminalReceipt<E> {
+    terminal: DeviceTerminal<E>,
+    execution_timing: DeviceTimingMeasurement<DeviceExecutionTiming>,
+}
+
+impl<E> DeviceTerminalReceipt<E> {
+    pub fn unprofiled(terminal: DeviceTerminal<E>) -> Self {
+        Self {
+            terminal,
+            execution_timing: DeviceTimingMeasurement::NotRequested,
+        }
+    }
+
+    pub fn profiled(
+        terminal: DeviceTerminal<E>,
+        execution_timing: DeviceTimingMeasurement<DeviceExecutionTiming>,
+    ) -> Self {
+        Self {
+            terminal,
+            execution_timing,
+        }
+    }
+
+    pub const fn terminal(&self) -> &DeviceTerminal<E> {
+        &self.terminal
+    }
+
+    pub const fn execution_timing(&self) -> &DeviceTimingMeasurement<DeviceExecutionTiming> {
+        &self.execution_timing
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        DeviceTerminal<E>,
+        DeviceTimingMeasurement<DeviceExecutionTiming>,
+    ) {
+        (self.terminal, self.execution_timing)
+    }
+}
+
 /// A submit failure that guarantees no device-visible work was enqueued.
 ///
 /// This wrapper is deliberately distinct from an arbitrary runtime error:
@@ -604,7 +716,7 @@ impl<E> DeviceTerminal<E> {
 #[must_use = "a fence query must preserve pending or indeterminate ownership"]
 pub enum FenceQuery<E> {
     Pending,
-    Terminal(DeviceTerminal<E>),
+    Terminal(DeviceTerminalReceipt<E>),
     Indeterminate(E),
 }
 
@@ -730,18 +842,28 @@ impl HostTransferLayout {
 #[must_use = "encoded device command batches must be submitted"]
 pub struct DeviceCommandBatch<C> {
     commands: Vec<C>,
+    timing_mode: DeviceTimingMode,
 }
 
 impl<C> DeviceCommandBatch<C> {
     pub(crate) fn singleton(command: C) -> Self {
         Self {
             commands: vec![command],
+            timing_mode: DeviceTimingMode::Off,
         }
     }
 
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             commands: Vec::with_capacity(capacity),
+            timing_mode: DeviceTimingMode::Off,
+        }
+    }
+
+    pub(crate) fn with_capacity_and_timing(capacity: usize, timing_mode: DeviceTimingMode) -> Self {
+        Self {
+            commands: Vec::with_capacity(capacity),
+            timing_mode,
         }
     }
 
@@ -755,6 +877,10 @@ impl<C> DeviceCommandBatch<C> {
 
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()
+    }
+
+    pub const fn timing_mode(&self) -> DeviceTimingMode {
+        self.timing_mode
     }
 
     pub fn into_commands(self) -> Vec<C> {
@@ -834,7 +960,7 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     fn wait_fence(
         &self,
         fence: &Self::Fence,
-    ) -> Result<DeviceTerminal<Self::Error>, FenceIndeterminate<Self::Error>>;
+    ) -> Result<DeviceTerminalReceipt<Self::Error>, FenceIndeterminate<Self::Error>>;
 
     fn synchronize(&self, stream: &mut Self::Stream) -> Result<(), Self::Error>;
 

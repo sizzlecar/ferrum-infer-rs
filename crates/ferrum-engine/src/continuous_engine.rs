@@ -3715,6 +3715,10 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
         true
     }
 
+    fn device_timing_mode(&self) -> ferrum_interfaces::vnext::DeviceTimingMode {
+        ferrum_interfaces::vnext::DeviceTimingMode::Completion
+    }
+
     fn capture_policy(&self) -> ExecutionEventCapturePolicy {
         ExecutionEventCapturePolicy::FirstFramePerRequest
     }
