@@ -20,6 +20,41 @@ impl ExecutionEventSink for RecordingSink {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct BatchRecordingSink {
+    pub(crate) kinds: Mutex<Vec<ExecutionEventKind>>,
+    pub(crate) record_calls: Mutex<usize>,
+    pub(crate) batch_calls: Mutex<usize>,
+}
+
+impl ExecutionEventSink for BatchRecordingSink {
+    fn is_enabled(&self, _kind: ExecutionEventKind) -> bool {
+        true
+    }
+
+    fn record(
+        &self,
+        event: &ExecutionEvent,
+        _permit: EventEmissionPermit<'_>,
+    ) -> Result<(), ExecutionEventSinkError> {
+        *self.record_calls.lock().unwrap() += 1;
+        self.kinds.lock().unwrap().push(event.kind());
+        Ok(())
+    }
+
+    fn record_batch(
+        &self,
+        permit: EventBatchEmissionPermit<'_>,
+    ) -> Result<(), ExecutionEventSinkError> {
+        *self.batch_calls.lock().unwrap() += 1;
+        self.kinds
+            .lock()
+            .unwrap()
+            .extend(permit.events().iter().map(ExecutionEvent::kind));
+        Ok(())
+    }
+}
+
 pub(crate) struct FailingSink;
 
 impl ExecutionEventSink for FailingSink {
@@ -33,6 +68,35 @@ impl ExecutionEventSink for FailingSink {
         _permit: EventEmissionPermit<'_>,
     ) -> Result<(), ExecutionEventSinkError> {
         Err(ExecutionEventSinkError::new("injected sink failure"))
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct DisabledRecordingSink {
+    pub(crate) record_calls: Mutex<usize>,
+    pub(crate) batch_calls: Mutex<usize>,
+}
+
+impl ExecutionEventSink for DisabledRecordingSink {
+    fn is_enabled(&self, _kind: ExecutionEventKind) -> bool {
+        false
+    }
+
+    fn record(
+        &self,
+        _event: &ExecutionEvent,
+        _permit: EventEmissionPermit<'_>,
+    ) -> Result<(), ExecutionEventSinkError> {
+        *self.record_calls.lock().unwrap() += 1;
+        Ok(())
+    }
+
+    fn record_batch(
+        &self,
+        _permit: EventBatchEmissionPermit<'_>,
+    ) -> Result<(), ExecutionEventSinkError> {
+        *self.batch_calls.lock().unwrap() += 1;
+        Ok(())
     }
 }
 

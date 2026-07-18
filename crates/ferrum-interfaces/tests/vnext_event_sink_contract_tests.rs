@@ -4,7 +4,7 @@ use vnext_event_contract::*;
 
 #[test]
 fn vnext_event_sink_contract() {
-    const EXPECTED_CASES: usize = 16;
+    const EXPECTED_CASES: usize = 27;
     let mut passed = 0_usize;
     let runtime_catalog = catalog();
     let operation_registry = make_operation_registry(&runtime_catalog);
@@ -82,6 +82,105 @@ fn vnext_event_sink_contract() {
     check(
         &mut passed,
         shared_sink.kinds.lock().unwrap().as_slice() == [ExecutionEventKind::RequestAccepted],
+    );
+    let default_batch_sink = RecordingSink::default();
+    let mut default_batch_emitter = ExecutionEventEmitter::new(
+        &default_batch_sink,
+        active.run_id().clone(),
+        active.request_id().clone(),
+    );
+    let default_batch_contexts = [
+        TrustedExecutionEventContext::pre_plan(active.run_id(), active.request_id()),
+        TrustedExecutionEventContext::bound(active.run_id(), active.request_id(), &topology),
+    ];
+    default_batch_emitter
+        .emit_batch(&journal[..2], &default_batch_contexts)
+        .unwrap();
+    check(
+        &mut passed,
+        default_batch_sink.kinds.lock().unwrap().as_slice()
+            == [
+                ExecutionEventKind::RequestAccepted,
+                ExecutionEventKind::PlanBuilt,
+            ],
+    );
+    check(
+        &mut passed,
+        default_batch_emitter.cursor().last_sequence() == 2,
+    );
+    let batch_sink = BatchRecordingSink::default();
+    let mut batch_emitter = ExecutionEventEmitter::new(
+        &batch_sink,
+        active.run_id().clone(),
+        active.request_id().clone(),
+    );
+    let invalid_contexts = [
+        TrustedExecutionEventContext::pre_plan(active.run_id(), active.request_id()),
+        TrustedExecutionEventContext::pre_plan(active.run_id(), active.request_id()),
+    ];
+    check(
+        &mut passed,
+        batch_emitter
+            .emit_batch(&journal[..2], &invalid_contexts)
+            .is_err(),
+    );
+    check(
+        &mut passed,
+        *batch_sink.batch_calls.lock().unwrap() == 0
+            && batch_emitter.cursor().last_sequence() == 0
+            && !batch_emitter.sink_failed(),
+    );
+    let contexts = [
+        TrustedExecutionEventContext::pre_plan(active.run_id(), active.request_id()),
+        TrustedExecutionEventContext::bound(active.run_id(), active.request_id(), &topology),
+    ];
+    batch_emitter.emit_batch(&journal[..2], &contexts).unwrap();
+    check(
+        &mut passed,
+        *batch_sink.batch_calls.lock().unwrap() == 1
+            && *batch_sink.record_calls.lock().unwrap() == 0,
+    );
+    check(
+        &mut passed,
+        batch_sink.kinds.lock().unwrap().as_slice()
+            == [
+                ExecutionEventKind::RequestAccepted,
+                ExecutionEventKind::PlanBuilt,
+            ],
+    );
+    check(&mut passed, batch_emitter.cursor().last_sequence() == 2);
+    let mut failed_batch_emitter = ExecutionEventEmitter::new(
+        &FailingSink,
+        active.run_id().clone(),
+        active.request_id().clone(),
+    );
+    check(
+        &mut passed,
+        failed_batch_emitter
+            .emit_batch(&journal[..2], &contexts)
+            .is_err(),
+    );
+    check(
+        &mut passed,
+        failed_batch_emitter.cursor().last_sequence() == 0 && failed_batch_emitter.sink_failed(),
+    );
+    let disabled_sink = DisabledRecordingSink::default();
+    let mut disabled_emitter = ExecutionEventEmitter::new(
+        &disabled_sink,
+        active.run_id().clone(),
+        active.request_id().clone(),
+    );
+    disabled_emitter
+        .emit_batch(&journal[..2], &contexts)
+        .unwrap();
+    check(
+        &mut passed,
+        *disabled_sink.record_calls.lock().unwrap() == 0
+            && *disabled_sink.batch_calls.lock().unwrap() == 0,
+    );
+    check(
+        &mut passed,
+        disabled_emitter.cursor().last_sequence() == 2 && !disabled_emitter.sink_failed(),
     );
     let mut failed_emitter = ExecutionEventEmitter::new(
         &FailingSink,
