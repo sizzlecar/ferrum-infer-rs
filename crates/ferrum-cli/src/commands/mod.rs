@@ -1,5 +1,22 @@
 //! CLI Commands - Ollama-style interface
 
+use clap::ValueEnum;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SequenceFitPolicyArg {
+    FullInputMustFit,
+    ImmediateOnly,
+}
+
+impl SequenceFitPolicyArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::FullInputMustFit => "full-input-must-fit",
+            Self::ImmediateOnly => "immediate-only",
+        }
+    }
+}
+
 pub mod bench;
 pub mod bench_serve;
 pub mod embed;

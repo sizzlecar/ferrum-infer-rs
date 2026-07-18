@@ -29,6 +29,7 @@ use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
 use ferrum_types::{
     Device, EngineConfig, FerrumError, ModelInfo, RequestId, Result, SchedulingPolicy,
+    SequenceFitPolicy,
 };
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
@@ -47,6 +48,13 @@ const MAX_BACKING_MAINTENANCE_ATTEMPTS: u32 = 2;
 const MAX_EXTENSION_RECHECKS: u32 = 2;
 
 type VNextDriver<R> = RuntimeResourceDriver<R>;
+
+const fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFitPolicy {
+    match policy {
+        SequenceFitPolicy::FullInputMustFit => AdmissionFitPolicy::FullInputMustFit,
+        SequenceFitPolicy::ImmediateOnly => AdmissionFitPolicy::ImmediateOnly,
+    }
+}
 
 /// Typed product policy resolved before plan compilation. None of these
 /// values are inferred from a model name, GPU name, or hidden environment
@@ -125,7 +133,9 @@ impl VNextExecutorConfig {
             AdmissionPolicy {
                 maximum_queue_depth,
                 maximum_scheduled_tokens,
-                sequence_fit_policy: AdmissionFitPolicy::ImmediateOnly,
+                sequence_fit_policy: resolved_sequence_fit_policy(
+                    engine.scheduler.sequence_fit_policy,
+                ),
                 allow_defer: true,
                 cancellation_check_interval_steps: DEFAULT_CANCELLATION_CHECK_INTERVAL_STEPS,
             },
@@ -3401,6 +3411,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             "runtime_fingerprint": self.runtime.descriptor().runtime_implementation_fingerprint,
             "maximum_model_tokens": self.maximum_model_tokens,
             "runtime_memory_policy": self.policy.memory(),
+            "runtime_admission_policy": self.policy.admission(),
             "pending_sequences": pending_sequences,
             "active_sequences": active_sequences,
             "staged_prefill_requests": staged_prefill_requests,
@@ -3933,7 +3944,22 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{reported_allocated_bytes, DecodeFailureDisposition, FerrumError};
+    use super::{
+        reported_allocated_bytes, resolved_sequence_fit_policy, AdmissionFitPolicy,
+        DecodeFailureDisposition, FerrumError, SequenceFitPolicy,
+    };
+
+    #[test]
+    fn product_sequence_fit_policy_maps_exhaustively_to_runtime_contract() {
+        assert_eq!(
+            resolved_sequence_fit_policy(SequenceFitPolicy::ImmediateOnly),
+            AdmissionFitPolicy::ImmediateOnly
+        );
+        assert_eq!(
+            resolved_sequence_fit_policy(SequenceFitPolicy::FullInputMustFit),
+            AdmissionFitPolicy::FullInputMustFit
+        );
+    }
 
     #[test]
     fn allocated_memory_does_not_count_static_claim_twice() {
