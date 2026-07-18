@@ -32,6 +32,12 @@ RUNTIME_VNEXT_HISTORICAL_CORPUS = REPO_ROOT / "scripts/release/runtime_vnext_his
 RUNTIME_VNEXT_HISTORICAL_REPLAY = REPO_ROOT / "scripts/release/runtime_vnext_historical_replay.py"
 RUNTIME_VNEXT_HISTORICAL_CAPTURE = REPO_ROOT / "scripts/release/runtime_vnext_historical_capture.py"
 RUNTIME_VNEXT_G01A_CHECKPOINT = REPO_ROOT / "scripts/release/runtime_vnext_g01a_checkpoint.py"
+RUNTIME_VNEXT_S1_CUDA_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_s1_cuda_checkpoint.py"
+)
+RUNTIME_VNEXT_S1_CUDA_BASIC_COLLECTOR = (
+    REPO_ROOT / "scripts/release/runtime_vnext_s1_cuda_basic_collector.py"
+)
 RUNTIME_VNEXT_S1_CUDA_CAPACITY = REPO_ROOT / "scripts/release/runtime_vnext_s1_cuda_capacity.py"
 RUNTIME_VNEXT_S1_CUDA_DECODE_CAPACITY = (
     REPO_ROOT / "scripts/release/runtime_vnext_s1_cuda_decode_capacity.py"
@@ -428,6 +434,26 @@ def test_runtime_vnext_s1_cuda_capacity_selftest() -> None:
     )
 
 
+def test_runtime_vnext_s1_cuda_checkpoint_selftest() -> None:
+    ok = run([sys.executable, str(RUNTIME_VNEXT_S1_CUDA_CHECKPOINT), "--self-test"])
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT S1 CUDA TRACE CHECKPOINT SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_s1_cuda_basic_collector_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_S1_CUDA_BASIC_COLLECTOR), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT S1 CUDA BASIC COLLECTOR SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
 def test_runtime_vnext_s1_cuda_decode_capacity_selftest() -> None:
     ok = run(
         [sys.executable, str(RUNTIME_VNEXT_S1_CUDA_DECODE_CAPACITY), "--self-test"]
@@ -630,6 +656,8 @@ def main() -> int:
     test_runtime_vnext_historical_replay_selftest()
     test_runtime_vnext_historical_capture_selftest()
     test_runtime_vnext_g01a_checkpoint_selftest()
+    test_runtime_vnext_s1_cuda_checkpoint_selftest()
+    test_runtime_vnext_s1_cuda_basic_collector_selftest()
     test_runtime_vnext_s1_cuda_capacity_selftest()
     test_runtime_vnext_s1_cuda_decode_capacity_selftest()
     test_bounded_command_selftest()
