@@ -329,6 +329,13 @@ pub(crate) struct CudaExecutableCache {
     clock: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CudaExecutablePreparation {
+    Unavailable,
+    CacheHit,
+    Captured,
+}
+
 impl CudaExecutableCache {
     pub(crate) fn new(maximum_entries: usize) -> Self {
         assert!(
@@ -355,17 +362,17 @@ impl CudaExecutableCache {
         blas: &Arc<CudaBlas>,
         commands: &[CudaDeviceCommand],
         stream_is_quiescent: bool,
-    ) -> Result<bool, CudaReplayError> {
+    ) -> Result<CudaExecutablePreparation, CudaReplayError> {
         let Some(key) = CudaExecutableSegmentKey::from_commands(commands) else {
-            return Ok(false);
+            return Ok(CudaExecutablePreparation::Unavailable);
         };
         let now = self.tick();
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.last_used = now;
-            return Ok(true);
+            return Ok(CudaExecutablePreparation::CacheHit);
         }
         if self.rejected.contains_key(&key) || !stream_is_quiescent {
-            return Ok(false);
+            return Ok(CudaExecutablePreparation::Unavailable);
         }
         if self.entries.len() >= self.maximum_entries {
             let oldest = self
@@ -380,7 +387,7 @@ impl CudaExecutableCache {
         match CudaExecutableSegment::capture(context, stream, blas, commands, now) {
             Ok(entry) => {
                 self.entries.insert(key, entry);
-                Ok(true)
+                Ok(CudaExecutablePreparation::Captured)
             }
             Err(error) => {
                 if error.eager_fallback_safe() {
