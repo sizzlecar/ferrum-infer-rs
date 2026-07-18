@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{ser::SerializeSeq, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -2324,6 +2324,80 @@ pub enum CompletionReadbackDisposition {
     },
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "detail")]
+enum CompletionReadbackDispositionFingerprint<'a> {
+    Succeeded {
+        request: &'a CompletionReadbackRequest,
+        output_sha256: &'a str,
+    },
+    NotAttempted {
+        request: &'a CompletionReadbackRequest,
+    },
+    FailedButQuiescent {
+        request: &'a CompletionReadbackRequest,
+        failures: &'a [IdentifiedFailure],
+    },
+    ContractFailedButQuiescent {
+        request: &'a CompletionReadbackRequest,
+        failure: &'a str,
+    },
+}
+
+impl<'a> From<&'a CompletionReadbackDisposition> for CompletionReadbackDispositionFingerprint<'a> {
+    fn from(disposition: &'a CompletionReadbackDisposition) -> Self {
+        match disposition {
+            CompletionReadbackDisposition::Succeeded(output) => Self::Succeeded {
+                request: output.request(),
+                output_sha256: output.sha256(),
+            },
+            CompletionReadbackDisposition::NotAttempted(request) => Self::NotAttempted { request },
+            CompletionReadbackDisposition::FailedButQuiescent { request, failures } => {
+                Self::FailedButQuiescent { request, failures }
+            }
+            CompletionReadbackDisposition::ContractFailedButQuiescent { request, failure } => {
+                Self::ContractFailedButQuiescent {
+                    request,
+                    failure: failure.reason(),
+                }
+            }
+        }
+    }
+}
+
+struct CompletionReadbackDispositionFingerprints<'a>(&'a [CompletionReadbackDisposition]);
+
+impl Serialize for CompletionReadbackDispositionFingerprints<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for disposition in self.0 {
+            sequence
+                .serialize_element(&CompletionReadbackDispositionFingerprint::from(disposition))?;
+        }
+        sequence.end()
+    }
+}
+
+fn completion_readback_batch_fingerprint(
+    completion_fingerprint: &str,
+    dispositions: &[CompletionReadbackDisposition],
+) -> String {
+    #[derive(Serialize)]
+    struct FingerprintInput<'a> {
+        domain: &'static str,
+        completion_fingerprint: &'a str,
+        dispositions: CompletionReadbackDispositionFingerprints<'a>,
+    }
+    canonical_completion_fingerprint(&FingerprintInput {
+        domain: "ferrum.runtime-vnext.completion-readback-batch.v2",
+        completion_fingerprint,
+        dispositions: CompletionReadbackDispositionFingerprints(dispositions),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[must_use = "a terminal readback receipt couples output evidence to its exact completion"]
 pub struct CompletionReadbackReceipt {
@@ -2418,17 +2492,8 @@ impl CompletionReadbackBatchReceipt {
                     .map(readback_timing_for_disposition)
                     .collect()
             });
-        #[derive(Serialize)]
-        struct FingerprintInput<'a> {
-            domain: &'static str,
-            completion_fingerprint: &'a str,
-            dispositions: &'a [CompletionReadbackDisposition],
-        }
-        let fingerprint = canonical_completion_fingerprint(&FingerprintInput {
-            domain: "ferrum.runtime-vnext.completion-readback-batch.v1",
-            completion_fingerprint: completion.fingerprint(),
-            dispositions: &dispositions,
-        });
+        let fingerprint =
+            completion_readback_batch_fingerprint(completion.fingerprint(), &dispositions);
         Self {
             completion,
             dispositions,
@@ -2949,5 +3014,72 @@ impl<R: DeviceRuntime> Drop for CompletionReservation<R> {
         } else {
             self.remove_reserved_slot();
         }
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    use crate::vnext::ElementType;
+
+    const LARGE_READBACK_BYTES: usize = 512 * 1024;
+
+    fn request() -> CompletionReadbackRequest {
+        CompletionReadbackRequest::new(
+            NodeId::try_from("node.fingerprint-test".to_owned()).unwrap(),
+            0,
+            ResourceId::try_from("resource.fingerprint-test".to_owned()).unwrap(),
+            0,
+            HostTransferLayout::new(ElementType::U8, LARGE_READBACK_BYTES as u64).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn successful_output(fill: u8) -> CompletionReadbackOutput {
+        let bytes = vec![fill; LARGE_READBACK_BYTES];
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        CompletionReadbackOutput {
+            request: request(),
+            bytes,
+            sha256,
+            timing: DeviceTimingMeasurement::NotRequested,
+        }
+    }
+
+    #[test]
+    fn batch_fingerprint_is_bounded_by_digest_evidence_not_output_bytes() {
+        let first = vec![CompletionReadbackDisposition::Succeeded(successful_output(
+            0x5a,
+        ))];
+        let encoded = serde_json::to_vec(&CompletionReadbackDispositionFingerprints(&first))
+            .expect("fingerprint evidence serializes");
+        assert!(encoded.len() < 1024, "encoded {} bytes", encoded.len());
+        let first_sha = match &first[0] {
+            CompletionReadbackDisposition::Succeeded(output) => output.sha256(),
+            _ => unreachable!(),
+        };
+        assert!(String::from_utf8(encoded).unwrap().contains(first_sha));
+
+        let completion_fingerprint = "a".repeat(64);
+        let first_fingerprint =
+            completion_readback_batch_fingerprint(&completion_fingerprint, &first);
+        assert_eq!(
+            first_fingerprint,
+            completion_readback_batch_fingerprint(&completion_fingerprint, &first)
+        );
+
+        let second = vec![CompletionReadbackDisposition::Succeeded(successful_output(
+            0xa5,
+        ))];
+        assert_ne!(
+            first_fingerprint,
+            completion_readback_batch_fingerprint(&completion_fingerprint, &second)
+        );
+
+        let not_attempted = vec![CompletionReadbackDisposition::NotAttempted(request())];
+        assert_ne!(
+            first_fingerprint,
+            completion_readback_batch_fingerprint(&completion_fingerprint, &not_attempted)
+        );
     }
 }
