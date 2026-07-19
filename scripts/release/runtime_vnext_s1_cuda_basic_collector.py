@@ -775,6 +775,7 @@ def collect_profile_slots(
             write_text(directory / "bench.exit", f"{returncode}\n")
             write_text(directory / "bench.finished", now_iso() + "\n")
             telemetry.finish()
+            write_json(directory / "health.after-bench.json", fetch_json(port, "/health"))
             require(returncode == 0, f"profile benchmark failed with exit {returncode}: {slot}")
         finally:
             if telemetry_started:
@@ -839,6 +840,7 @@ def collect(args: argparse.Namespace) -> int:
                 "fail_on_error": True,
                 "batched_graph": args.batched_graph,
                 "telemetry_interval_ms": args.telemetry_interval_ms,
+                "profile_health_after_bench": True,
             },
         },
     )

@@ -464,6 +464,11 @@ def validate_collection_manifest(root: Path, source_sha: str) -> dict[str, Any] 
     require(isinstance(protocol, dict), "collection protocol is missing")
     for field, expected in expected_protocol.items():
         require(protocol.get(field) == expected, f"collection protocol {field} drifted")
+    profile_health_after_bench = protocol.get("profile_health_after_bench", False)
+    require(
+        isinstance(profile_health_after_bench, bool),
+        "collection profile-health capability is not boolean",
+    )
     interval = protocol.get("telemetry_interval_ms")
     require(
         isinstance(interval, int) and not isinstance(interval, bool) and 250 <= interval <= 1000,
@@ -924,6 +929,95 @@ def validate_slot_telemetry(directory: Path, slot: str, mode: str) -> dict[str, 
     }
 
 
+PROFILE_RUNTIME_HOST_TIMINGS = (
+    "submitted_wave_total",
+    "resource_prepare_attempt",
+    "host_encode_submit",
+    "completion_round_trip",
+    "host_postprocess",
+)
+PROFILE_RUNTIME_DEVICE_TIMINGS = (
+    "device_execution",
+    "fence_wait_host",
+    "readback_host",
+)
+
+
+def validate_duration_metrics(value: Any, label: str, *, required: bool) -> dict[str, Any]:
+    require(isinstance(value, dict), f"{label}: timing metrics are missing")
+    samples = value.get("samples")
+    total_ns = value.get("total_ns")
+    average_us = value.get("average_us")
+    max_us = value.get("max_us")
+    require(
+        isinstance(samples, int) and not isinstance(samples, bool) and samples >= 0,
+        f"{label}: sample count is invalid",
+    )
+    require(
+        isinstance(total_ns, int) and not isinstance(total_ns, bool) and total_ns >= 0,
+        f"{label}: total nanoseconds are invalid",
+    )
+    require(
+        isinstance(average_us, (int, float))
+        and not isinstance(average_us, bool)
+        and average_us >= 0,
+        f"{label}: average microseconds are invalid",
+    )
+    require(
+        isinstance(max_us, (int, float)) and not isinstance(max_us, bool) and max_us >= 0,
+        f"{label}: maximum microseconds are invalid",
+    )
+    if required:
+        require(samples > 0 and total_ns > 0, f"{label}: measured timing is empty")
+        require(average_us > 0 and max_us > 0, f"{label}: measured duration is zero")
+    else:
+        require(
+            samples == 0 and total_ns == 0 and average_us == 0 and max_us == 0,
+            f"{label}: disabled timing unexpectedly recorded work",
+        )
+    return {
+        "samples": samples,
+        "total_ns": total_ns,
+        "average_us": average_us,
+        "max_us": max_us,
+    }
+
+
+def validate_profile_runtime_snapshot(directory: Path, slot: str, mode: str) -> dict[str, Any]:
+    label = f"profile-overhead/{slot}.health.after-bench"
+    health = read_json(directory / "health.after-bench.json")
+    require(health.get("status") == "healthy", f"{label}: server is not healthy")
+    try:
+        runtime = health["cache"]["prefix_cache"]
+        wave_timing = runtime["wave_timing"]
+        device_timing = runtime["device_timing"]
+    except (KeyError, TypeError) as error:
+        raise ValidationError(f"{label}: vNext runtime timing snapshot is missing") from error
+    host = {
+        name: validate_duration_metrics(
+            wave_timing.get(name),
+            f"{label}.wave_timing.{name}",
+            required=True,
+        )
+        for name in PROFILE_RUNTIME_HOST_TIMINGS
+    }
+    device_required = mode == "basic"
+    device = {
+        name: validate_duration_metrics(
+            device_timing.get(name),
+            f"{label}.device_timing.{name}",
+            required=device_required,
+        )
+        for name in PROFILE_RUNTIME_DEVICE_TIMINGS
+    }
+    return {
+        "mode": mode,
+        "host": host,
+        "device": device,
+        "device_completion_timing_enabled": device_required,
+    }
+
+
 def validate_product_commands(root: Path) -> dict[str, Any]:
     run_tokens = command_tokens(root / "run" / "command")
     require("run" in run_tokens, "run command is not ferrum run")
@@ -1127,6 +1221,52 @@ def derive_first_half_receipt(reports: dict[str, dict[str, Any]]) -> dict[str, A
     }
 
 
+def validate_first_half_receipt(saved: dict[str, Any], derived: dict[str, Any]) -> None:
+    for field in (
+        "schema_version",
+        "artifact_type",
+        "slot_order",
+        "max_overhead",
+        "max_cv",
+        "status",
+    ):
+        require(saved.get(field) == derived.get(field), f"first-half ABBA receipt {field} drifted")
+    for group in ("off", "basic"):
+        saved_group = saved.get(group)
+        derived_group = derived.get(group)
+        require(
+            isinstance(saved_group, dict) and isinstance(derived_group, dict),
+            f"first-half ABBA receipt {group} statistics are missing",
+        )
+        for field in ("values", "n"):
+            require(
+                saved_group.get(field) == derived_group.get(field),
+                f"first-half ABBA receipt {group}.{field} drifted",
+            )
+        for field in ("mean", "median", "sample_stddev", "cv"):
+            saved_value = saved_group.get(field)
+            derived_value = derived_group.get(field)
+            require(
+                isinstance(saved_value, (int, float))
+                and not isinstance(saved_value, bool)
+                and isinstance(derived_value, (int, float))
+                and not isinstance(derived_value, bool)
+                and math.isclose(saved_value, derived_value, rel_tol=1e-12, abs_tol=1e-12),
+                f"first-half ABBA receipt {group}.{field} drifted",
+            )
+    for field in ("mean_overhead", "median_overhead"):
+        saved_value = saved.get(field)
+        derived_value = derived.get(field)
+        require(
+            isinstance(saved_value, (int, float))
+            and not isinstance(saved_value, bool)
+            and isinstance(derived_value, (int, float))
+            and not isinstance(derived_value, bool)
+            and math.isclose(saved_value, derived_value, rel_tol=1e-12, abs_tol=1e-12),
+            f"first-half ABBA receipt {field} drifted",
+        )
+
+
 def validate_profile_overhead(root: Path) -> dict[str, Any]:
     performance = root / "profile-overhead"
     collection_path = root / "collection.json"
@@ -1142,12 +1282,23 @@ def validate_profile_overhead(root: Path) -> dict[str, Any]:
     reports: dict[str, dict[str, Any]] = {}
     traces: dict[str, dict[str, Any]] = {}
     telemetry: dict[str, dict[str, Any]] = {}
+    runtime_profiles: dict[str, dict[str, Any]] = {}
+    collection = read_json(collection_path)
+    capture_runtime_profiles = bool(
+        (collection.get("protocol") or {}).get("profile_health_after_bench", False)
+    )
     for slot in PROFILE_SLOT_ORDER:
         mode = "basic" if slot in BASIC_PROFILE_SLOTS else "off"
         result = validate_profile_report(performance / slot, slot, mode)
         reports[slot] = result
         if canonical_collection:
             telemetry[slot] = validate_slot_telemetry(performance / slot, slot, mode)
+        if capture_runtime_profiles:
+            runtime_profiles[slot] = validate_profile_runtime_snapshot(
+                performance / slot,
+                slot,
+                mode,
+            )
         if mode == "basic":
             traces[slot] = validate_bounded_profile_trace(
                 performance / slot,
@@ -1157,7 +1308,6 @@ def validate_profile_overhead(root: Path) -> dict[str, Any]:
     model_paths = {result["model_path"] for result in reports.values()}
     require(len(model_paths) == 1, "profile slots use different model snapshots")
     if canonical_collection:
-        collection = read_json(collection_path)
         expected_collector_sha = (collection.get("collector") or {}).get("sha256")
         require(
             {row["collector_sha256"] for row in telemetry.values()}
@@ -1172,10 +1322,9 @@ def validate_profile_overhead(root: Path) -> dict[str, Any]:
             len({row["memory_total_mib"] for row in telemetry.values()}) == 1,
             "profile slots observed different GPU memory totals",
         )
-        require(
-            read_json(performance / "overhead.first-half.json")
-            == derive_first_half_receipt(reports),
-            "first-half ABBA receipt differs from raw reports",
+        validate_first_half_receipt(
+            read_json(performance / "overhead.first-half.json"),
+            derive_first_half_receipt(reports),
         )
 
     off = scalar_stats(
@@ -1221,6 +1370,7 @@ def validate_profile_overhead(root: Path) -> dict[str, Any]:
         "failed_requests": {"off": 0, "basic": 0},
         "bounded_traces": traces,
         "slot_telemetry": telemetry,
+        "slot_runtime_profiles": runtime_profiles,
         "first_half": (
             derive_first_half_receipt(reports) if canonical_collection else None
         ),
@@ -1643,6 +1793,38 @@ def create_telemetry_selftest_fixture(directory: Path) -> None:
     (directory / "bench.finished").write_text("2026-07-18T00:00:05Z\n")
 
 
+def duration_metrics_fixture(samples: int) -> dict[str, Any]:
+    return {
+        "samples": samples,
+        "total_ns": samples * 1_000,
+        "average_us": 1.0 if samples else 0.0,
+        "max_us": 1.0 if samples else 0.0,
+    }
+
+
+def create_profile_runtime_selftest_fixture(directory: Path, mode: str) -> None:
+    directory.mkdir()
+    device_samples = 8 if mode == "basic" else 0
+    write_json(
+        directory / "health.after-bench.json",
+        {
+            "status": "healthy",
+            "cache": {
+                "prefix_cache": {
+                    "wave_timing": {
+                        name: duration_metrics_fixture(8)
+                        for name in PROFILE_RUNTIME_HOST_TIMINGS
+                    },
+                    "device_timing": {
+                        name: duration_metrics_fixture(device_samples)
+                        for name in PROFILE_RUNTIME_DEVICE_TIMINGS
+                    },
+                }
+            },
+        },
+    )
+
+
 def self_test() -> int:
     with tempfile.TemporaryDirectory(prefix="runtime-vnext-s1-") as temp:
         root = Path(temp)
@@ -1693,16 +1875,52 @@ def self_test() -> int:
             require("UUID drifted" in str(error), "telemetry mutation failed for wrong reason")
         else:
             raise ValidationError("telemetry UUID drift unexpectedly passed")
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-s1-runtime-profile-") as temp:
+        root = Path(temp)
+        off = root / "off1"
+        basic = root / "basic1"
+        create_profile_runtime_selftest_fixture(off, "off")
+        create_profile_runtime_selftest_fixture(basic, "basic")
+        validate_profile_runtime_snapshot(off, "off1", "off")
+        validate_profile_runtime_snapshot(basic, "basic1", "basic")
+        health = read_json(basic / "health.after-bench.json")
+        health["cache"]["prefix_cache"]["device_timing"]["device_execution"] = (
+            duration_metrics_fixture(0)
+        )
+        write_json(basic / "health.after-bench.json", health)
+        try:
+            validate_profile_runtime_snapshot(basic, "basic1", "basic")
+        except ValidationError as error:
+            require(
+                "measured timing is empty" in str(error),
+                "runtime profile mutation failed for the wrong reason",
+            )
+        else:
+            raise ValidationError("empty basic device timing unexpectedly passed")
     synthetic_reports = {
         "off1": {"throughput": [100.0, 100.5, 99.5]},
         "basic1": {"throughput": [99.0, 99.5, 98.5]},
         "basic2": {"throughput": [99.2, 99.7, 98.7]},
         "off2": {"throughput": [100.2, 100.7, 99.7]},
     }
+    derived_receipt = derive_first_half_receipt(synthetic_reports)
     require(
-        derive_first_half_receipt(synthetic_reports)["status"] == "pass",
+        derived_receipt["status"] == "pass",
         "a stable first-half ABBA receipt must not be forced to REJECT",
     )
+    portable_receipt = json.loads(json.dumps(derived_receipt))
+    portable_receipt["off"]["sample_stddev"] += 1e-13
+    validate_first_half_receipt(portable_receipt, derived_receipt)
+    portable_receipt["off"]["sample_stddev"] += 1e-6
+    try:
+        validate_first_half_receipt(portable_receipt, derived_receipt)
+    except ValidationError as error:
+        require(
+            "off.sample_stddev drifted" in str(error),
+            "first-half float mutation failed for the wrong reason",
+        )
+    else:
+        raise ValidationError("material first-half float mutation unexpectedly passed")
     print("FERRUM RUNTIME VNEXT S1 CUDA TRACE CHECKPOINT SELFTEST PASS")
     return 0
 
