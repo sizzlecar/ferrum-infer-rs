@@ -222,6 +222,11 @@ pub enum StructuredOutputPhase {
 pub struct StructuredOutputMaskOutcome {
     pub phase: StructuredOutputPhase,
     pub accepting: bool,
+    /// Exact delimiter token authorized for the next sampling step while the
+    /// processor is waiting to activate. The engine uses this typed grant to
+    /// avoid rejecting an intentionally hidden special token during output
+    /// quality filtering.
+    pub required_delimiter_token_id: Option<u32>,
 }
 
 /// Terminal/debug snapshot that distinguishes activation failures from an
@@ -314,6 +319,7 @@ impl StructuredOutputProcessor {
             return Ok(StructuredOutputMaskOutcome {
                 phase: StructuredOutputPhase::WaitingForDelimiter,
                 accepting: false,
+                required_delimiter_token_id: required_control_token.copied(),
             });
         }
 
@@ -350,6 +356,7 @@ impl StructuredOutputProcessor {
         Ok(StructuredOutputMaskOutcome {
             phase: StructuredOutputPhase::EnforcingGrammar,
             accepting,
+            required_delimiter_token_id: None,
         })
     }
 
@@ -736,6 +743,7 @@ mod tests {
             .unwrap();
         assert_eq!(waiting.phase, StructuredOutputPhase::WaitingForDelimiter);
         assert!(!waiting.accepting);
+        assert_eq!(waiting.required_delimiter_token_id, Some(b'<' as u32));
         assert!(waiting_logits[b'<' as usize].is_finite());
         assert!(!waiting_logits[b'>' as usize].is_finite());
 
@@ -753,6 +761,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(partial.phase, StructuredOutputPhase::WaitingForDelimiter);
+        assert_eq!(partial.required_delimiter_token_id, Some(b'>' as u32));
         assert!(!partial_logits[b'<' as usize].is_finite());
         assert!(partial_logits[b'>' as usize].is_finite());
         let partial_progress = processor
