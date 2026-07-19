@@ -6738,8 +6738,9 @@ async fn process_batch_speculative_draft_tensor_error_releases_target_and_draft_
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
-        Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
+    let mut raw_tokenizer = PolicyTokenizer::new(64, &[]);
+    raw_tokenizer.special = ferrum_types::SpecialTokens::default();
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(raw_tokenizer);
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
     let kv_cache = Arc::new(MockKvCacheManager::new(128));
     let target_executor: Arc<dyn ModelExecutor + Send + Sync> =
@@ -7961,6 +7962,67 @@ fn model_decode_logits_policy_keeps_repetition_penalty_on_greedy_argmax_path() {
     assert_eq!(mask.valid_token_mask[2], 0);
     assert_eq!(penalty.penalty, 1.1);
     assert_eq!(penalty.token_ids.as_ref(), &[3, 0]);
+}
+
+#[test]
+fn request_sampling_plan_applies_presence_and_frequency_penalties() {
+    let mut request = policy_request();
+    request.sampling_params.temperature = 0.0;
+    request.sampling_params.repetition_penalty = 1.0;
+    request.sampling_params.presence_penalty = 1.5;
+    request.sampling_params.frequency_penalty = 0.5;
+    let mut state = SequenceState::new(request, vec![TokenId::new(0)]);
+    state.generated_tokens = vec![TokenId::new(1), TokenId::new(1)];
+    state.token_frequencies.insert(TokenId::new(1), 2);
+
+    assert_eq!(
+        state.sampling_plan.processor_chain.processor_names(),
+        vec!["presence_frequency_penalty"]
+    );
+
+    let mut logits = vec![0.0, 3.0, 2.0];
+    let token = state.sample_with_processors(&mut logits).unwrap();
+
+    assert_eq!(token, TokenId::new(2));
+    assert!((logits[1] - 0.5).abs() < 1e-6);
+    assert_eq!(state.token_frequencies.get(&TokenId::new(2)), Some(&1));
+}
+
+#[test]
+fn speculative_decode_requires_a_raw_greedy_sampling_contract() {
+    let raw_greedy = SequenceState::new(policy_request(), vec![TokenId::new(0)]);
+    assert!(raw_greedy.supports_raw_speculative_decode());
+
+    let mut penalized_request = policy_request();
+    penalized_request.sampling_params.presence_penalty = 0.1;
+    let penalized = SequenceState::new(penalized_request, vec![TokenId::new(0)]);
+    assert!(!penalized.supports_raw_speculative_decode());
+
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        4,
+        &[("normal", 0), ("<s>", 1), ("<unk>", 2), ("ok", 3)],
+    ));
+    let masked =
+        SequenceState::new_with_tokenizer(policy_request(), vec![TokenId::new(0)], Some(tokenizer));
+    assert!(!masked.supports_raw_speculative_decode());
+}
+
+#[test]
+fn sequence_rejects_unrepresented_sampling_modes_before_execution() {
+    let mut request = policy_request();
+    request.sampling_params.typical_p = Some(0.9);
+
+    let error = SequenceState::try_new_with_tokenizer_model_vocab_and_structured_factory(
+        request,
+        vec![TokenId::new(0)],
+        None,
+        None,
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("tfs, typical_p, and mirostat are not supported"));
 }
 
 #[test]

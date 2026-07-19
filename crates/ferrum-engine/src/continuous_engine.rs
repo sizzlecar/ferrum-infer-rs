@@ -24,6 +24,7 @@ use ferrum_interfaces::{
         ExecutorSequenceCompletion, GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy,
         TokenSelectionMask,
     },
+    sampler::SamplingConfig as TokenSamplingPlan,
     vnext::{
         AdmissionDeferred, AdmissionRejected, CapacityAvailabilityEpoch, DeferredAction,
         DeviceCapacityPressureScope, EventBatchEmissionPermit, EventEmissionPermit, ExecutionEvent,
@@ -620,7 +621,9 @@ pub struct SequenceState {
     pub generated_tokens: Vec<TokenId>,
     model_kv: Option<SequenceModelKvState>,
     recurrent_state: Option<SequenceRecurrentState>,
-    pub sampling_params: SamplingParams,
+    sampling_params: SamplingParams,
+    /// Immutable logits-processing and sampler plan prepared once per request.
+    sampling_plan: TokenSamplingPlan,
     pub phase: RequestPhase,
     pub rng: StdRng,
     pub prefill_complete: bool,
@@ -652,7 +655,7 @@ pub struct SequenceState {
     /// Tokenizer-aware hard grammar for `json_object` and strict schema.
     pub structured_output_processor: Option<StructuredOutputProcessor>,
     draft_kv: Option<SequenceDraftKvState>,
-    /// Token frequency counts for repetition penalty.
+    /// Generated-token counts shared by repetition, presence, and frequency penalties.
     pub token_frequencies: HashMap<TokenId, usize>,
     /// Single-token stop ids: model's EOS + any `stop_sequences` that encode to
     /// exactly one token. Checked against the last generated token each step
@@ -1002,7 +1005,7 @@ impl SequenceState {
             model_vocab_size,
             None,
         )
-        .expect("direct SequenceState construction must have a valid structured-output contract")
+        .expect("direct SequenceState construction requires supported sampling and structured-output contracts")
     }
 
     pub fn try_new_with_tokenizer_model_vocab_and_structured_factory(
@@ -1013,6 +1016,16 @@ impl SequenceState {
         shared_structured_factory: Option<&StructuredOutputFactory>,
     ) -> Result<Self> {
         use ferrum_types::ResponseFormat;
+        request.sampling_params.validate()?;
+        if request.sampling_params.tfs.is_some()
+            || request.sampling_params.typical_p.is_some()
+            || request.sampling_params.mirostat.is_some()
+        {
+            return Err(FerrumError::unsupported(
+                "tfs, typical_p, and mirostat are not supported by the token sampling plan",
+            ));
+        }
+        let sampling_plan = TokenSamplingPlan::from_params(&request.sampling_params);
         let rng = request
             .sampling_params
             .seed
@@ -1110,6 +1123,7 @@ impl SequenceState {
             model_kv: None,
             recurrent_state: None,
             sampling_params: request.sampling_params,
+            sampling_plan,
             phase: RequestPhase::Waiting,
             rng,
             prefill_complete: false,
@@ -1140,6 +1154,11 @@ impl SequenceState {
 
     pub fn total_tokens(&self) -> usize {
         self.input_tokens.len() + self.generated_tokens.len()
+    }
+
+    /// Original immutable sampling parameters used to prepare this request.
+    pub fn sampling_params(&self) -> &SamplingParams {
+        &self.sampling_params
     }
 
     pub fn prefill_context_tokens(&self) -> Vec<TokenId> {
@@ -1545,6 +1564,15 @@ impl SequenceState {
             && matches!(params.response_format, ResponseFormat::Text)
     }
 
+    fn supports_raw_speculative_decode(&self) -> bool {
+        self.structured_output_processor.is_none()
+            && self.sampling_plan.supports_raw_greedy_speculation()
+            && self
+                .argmax_token_mask
+                .as_ref()
+                .is_none_or(|mask| mask.valid_token_mask.iter().all(|&value| value != 0))
+    }
+
     fn model_decode_repetition_penalty(&self) -> Option<GreedyRepetitionPenalty> {
         let penalty = self.sampling_params.repetition_penalty;
         if penalty == 1.0 || self.generated_tokens.is_empty() {
@@ -1748,7 +1776,7 @@ impl SequenceState {
         logits: &mut [f32],
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
     ) -> Result<TokenId> {
-        use ferrum_interfaces::sampler::{SamplingConfig, SamplingContext};
+        use ferrum_interfaces::sampler::SamplingContext;
 
         // The grammar mask runs first. There is deliberately no invalid-token
         // fallback: a dead grammar state is a request error, not permission to
@@ -1802,8 +1830,6 @@ impl SequenceState {
             }
         }
 
-        // Build SamplingConfig from this request's params (includes temperature, top-k/p, repetition penalty)
-        let config = SamplingConfig::from_params(&self.sampling_params);
         let step = self.generated_tokens.len();
         let vocab_size = logits.len();
         let previous_streamed_text_len = self.streamed_text_len;
@@ -1816,11 +1842,14 @@ impl SequenceState {
                 &self.token_frequencies,
                 vocab_size,
             );
-            config.processor_chain.process(&mut ctx)?;
+            self.sampling_plan.processor_chain.process(&mut ctx)?;
             let mut attempts = 0usize;
             let mut rejected_tokens = Vec::new();
             loop {
-                let token = config.sampler.sample_with_context(&ctx, &mut self.rng)?;
+                let token = self
+                    .sampling_plan
+                    .sampler
+                    .sample_with_context(&ctx, &mut self.rng)?;
                 if !self.sample_candidate_decodes_to_forbidden_output(
                     tokenizer,
                     previous_streamed_text_len,
