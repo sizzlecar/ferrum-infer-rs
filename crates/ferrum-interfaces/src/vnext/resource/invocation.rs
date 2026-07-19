@@ -1,30 +1,32 @@
 use super::{
     acquire_session_frames_with_backing, begin_participant_flights_dispatch,
-    enter_sequence_dispatch, finalize_session_frames, fmt, invalid_resource,
-    issue_batch_invocation_id, issue_batch_step_id, poison_session_frame,
-    prepare_participant_flight_wave, prepare_participant_flights,
-    reset_participant_flights_after_definitely_not_submitted, sequence_dispatch_is_poisoned,
-    sequence_slot_active, sequence_slot_is_poisoned, sequence_slot_poisoned_drained,
-    sequence_slot_poisoned_undrained, session_frame_capture_candidates, session_participant_key,
-    AbandonedSequenceMetadata, AbandonedSequenceRecoveryError, ActiveInvocationWaveGuard,
-    ActiveSequenceAbortDisposition, ActiveSequenceAbortReceipt, ActiveSequenceFrame,
-    AdmissionDeferred, AdmissionFitPolicy, AdmissionPressureAction, AdmissionRejected,
-    AdmittedSequenceResources, AdmittedStepParticipant, AllocationLifetime, Arc, AtomicU64,
-    BTreeMap, BTreeSet, BackingInitializationCell, BackingPrepareDecision,
-    BatchCapacityClaimDecision, BatchInvocationId, BatchParticipantAuthority,
-    BatchParticipantTokenSpan, BatchStepId, BatchWorkShape, ClaimedBackingTransaction,
-    ClaimedSubmissionWaveBacking, DeferredDeviceCleanupDomainId, DeviceCommandBatch, DeviceRuntime,
-    Digest, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome, ExecutionBatchParticipants,
-    ExecutionLane, ExecutionLaneId, InvocationRegistry, InvocationResourceAdmissionRequest,
-    LaneBackingPrepareDecision, LogicalAdmissionCoordinatorId, LogicalBackingBufferView,
-    LogicalBackingSliceAuthority, LogicalBatchCapacityLease, NodeId, Ordering,
-    ParticipantFlightCandidate, ParticipantFlightPhase, ParticipantFlightWaveCandidate,
-    ParticipantNodeKey, PlanBackingDeferral, PlanCapacityWaitRegistration,
-    PreparedParticipantFlightHold, RequestIdentity, ResourceId, RunId, SequenceAuthorityId,
-    SequenceBackingSnapshot, SequenceExecutionAuthoritySource, SequenceRecoveryRegistry,
-    SequenceSessionEpoch, SequenceSessionFingerprint, Serialize, Sha256, StateInitialization,
-    StaticProvisioningLease, StepAdmissionBackingDeferral, StepFinalizationFailure,
-    StepFrameFinalization, StepParticipantFrameAssignment, StepParticipantRetirement,
+    begin_submission_wave_participant_flights_dispatch, enter_sequence_dispatch,
+    finalize_session_frames, fmt, invalid_resource, issue_batch_invocation_id, issue_batch_step_id,
+    poison_session_frame, prepare_participant_flights, prepare_submission_wave_participant_flights,
+    reset_participant_flights_after_definitely_not_submitted,
+    reset_submission_wave_participant_flights_after_definitely_not_submitted,
+    sequence_dispatch_is_poisoned, sequence_slot_active, sequence_slot_is_poisoned,
+    sequence_slot_poisoned_drained, sequence_slot_poisoned_undrained,
+    session_frame_capture_candidates, session_participant_key, AbandonedSequenceMetadata,
+    AbandonedSequenceRecoveryError, ActiveInvocationWaveGuard, ActiveSequenceAbortDisposition,
+    ActiveSequenceAbortReceipt, ActiveSequenceFrame, AdmissionDeferred, AdmissionFitPolicy,
+    AdmissionPressureAction, AdmissionRejected, AdmittedSequenceResources, AdmittedStepParticipant,
+    AllocationLifetime, Arc, AtomicU64, BTreeMap, BTreeSet, BackingInitializationCell,
+    BackingPrepareDecision, BatchCapacityClaimDecision, BatchInvocationId,
+    BatchParticipantAuthority, BatchParticipantTokenSpan, BatchStepId, BatchWorkShape,
+    ClaimedBackingTransaction, ClaimedSubmissionWaveBacking, DeferredDeviceCleanupDomainId,
+    DeviceCommandBatch, DeviceRuntime, Digest, DynamicBackingDeferred,
+    DynamicDeferredMaintenanceOutcome, ExecutionBatchParticipants, ExecutionLane, ExecutionLaneId,
+    InvocationRegistry, InvocationResourceAdmissionRequest, LaneBackingPrepareDecision,
+    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSliceAuthority,
+    LogicalBatchCapacityLease, NodeId, Ordering, ParticipantFlightCandidate,
+    ParticipantFlightPhase, ParticipantNodeKey, PlanBackingDeferral, PlanCapacityWaitRegistration,
+    PreparedParticipantFlightHold, PreparedSubmissionWaveParticipantFlightHold, RequestIdentity,
+    ResourceId, RunId, SequenceAuthorityId, SequenceBackingSnapshot,
+    SequenceExecutionAuthoritySource, SequenceRecoveryRegistry, SequenceSessionEpoch,
+    SequenceSessionFingerprint, Serialize, Sha256, StateInitialization, StaticProvisioningLease,
+    StepAdmissionBackingDeferral, StepFinalizationFailure, StepFrameFinalization,
+    StepParticipantFrameAssignment, StepParticipantRetirement,
     StepParticipantRetirementDisposition, StepResourceAdmissionDecision,
     StepResourceAdmissionRequest, StepResourceLease, StepRetirementReceipt, StreamState,
     TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError, SEQUENCE_DISPATCH_POISONED_BIT,
@@ -856,29 +858,33 @@ where
             ));
         }
 
+        let work_shape = Arc::clone(&requests[0].work_shape);
+        if requests
+            .iter()
+            .any(|request| request.work_shape.as_ref() != work_shape.as_ref())
+        {
+            return Err(invalid_resource(
+                "submission wave nodes must share one canonical work authority",
+            ));
+        }
+        let participant_authority =
+            Arc::new(self.prepare_participant_authority(Arc::clone(&work_shape), fit_policy)?);
         let prepared_nodes = requests
             .into_iter()
-            .map(|request| self.prepare_invocation_metadata(request))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|request| {
+                PreparedStepSubmissionNode::new(request.node_id, Arc::clone(&participant_authority))
+            })
+            .collect::<Vec<_>>();
         let node_shapes = prepared_nodes
             .iter()
             .map(|node| {
                 (
                     node.node_id.clone(),
-                    node.work_shape.immediate_shape(),
+                    node.work_shape().immediate_shape(),
                     match fit_policy {
-                        AdmissionFitPolicy::ImmediateOnly => node.work_shape.immediate_shape(),
-                        AdmissionFitPolicy::FullInputMustFit => node.work_shape.fit_shape(),
+                        AdmissionFitPolicy::ImmediateOnly => node.work_shape().immediate_shape(),
+                        AdmissionFitPolicy::FullInputMustFit => node.work_shape().fit_shape(),
                     },
-                )
-            })
-            .collect::<Vec<_>>();
-        let deferred_node_work_fingerprints = prepared_nodes
-            .iter()
-            .map(|node| {
-                (
-                    node.node_id.clone(),
-                    node.work_shape.fingerprint().to_owned(),
                 )
             })
             .collect::<Vec<_>>();
@@ -893,6 +899,15 @@ where
         {
             LaneBackingPrepareDecision::Prepared(prepared) => prepared,
             LaneBackingPrepareDecision::Deferred(deferred) => {
+                let deferred_node_work_fingerprints = prepared_nodes
+                    .iter()
+                    .map(|node| {
+                        (
+                            node.node_id.clone(),
+                            node.work_shape().fingerprint().to_owned(),
+                        )
+                    })
+                    .collect();
                 return Ok(StepSubmissionWaveAdmissionDecision::BackingDeferred(
                     StepSubmissionWaveBackingDeferral::new(
                         Arc::clone(self),
@@ -947,7 +962,7 @@ where
         };
         let node_work_shapes = prepared_nodes
             .iter()
-            .map(|node| (node.node_id.clone(), node.work_shape.clone()))
+            .map(|node| (node.node_id.clone(), Arc::clone(&work_shape)))
             .collect();
         let (backing_slices, lane_slot_lease) = prepared_backing.commit().into_parts();
         let claimed_backing = ClaimedSubmissionWaveBacking::new(
@@ -961,33 +976,23 @@ where
         let wave_fingerprint =
             submission_wave_fingerprint(self, &prepared_nodes, &claimed_backing)?;
         let batch_invocation_id = issue_batch_invocation_id()?;
-        let flight_candidates = prepared_nodes
+        let prepared_participant_flights =
+            prepare_submission_wave_participant_flights(&participant_authority.flight_candidates)?;
+        let mut topology_keys = prepared_nodes
             .iter()
-            .flat_map(|node| {
-                node.flight_candidates.iter().cloned().map(|candidate| {
-                    ParticipantFlightWaveCandidate::new(candidate, node.node_id.clone())
-                })
-            })
-            .collect();
-        let prepared_participant_flights = prepare_participant_flight_wave(flight_candidates)?;
-        let topology_keys = prepared_participant_flights
-            .iter()
-            .map(|hold| hold.key().clone())
-            .collect();
+            .flat_map(PreparedStepSubmissionNode::participant_node_keys)
+            .collect::<Vec<_>>();
+        topology_keys.sort();
         let active_wave = self.invocation_registry.enter(
             topology_keys,
             batch_invocation_id,
             &wave_fingerprint,
         )?;
-        let nodes = prepared_nodes
-            .into_iter()
-            .map(PreparedStepSubmissionNode::from_prepared)
-            .collect();
         Ok(StepSubmissionWaveAdmissionDecision::Prepared(
             PreparedStepSubmissionWave {
                 claimed_backing,
                 initializations: None,
-                nodes,
+                nodes: prepared_nodes,
                 prepared_participant_flights,
                 active_wave,
                 step: Arc::clone(self),
@@ -1103,6 +1108,30 @@ where
             fit_policy,
             pressure_action,
         } = request;
+        let PreparedParticipantAuthority {
+            participants,
+            participant_frames,
+            participant_session_identities,
+            flight_candidates,
+            work_shape,
+        } = self.prepare_participant_authority(work_shape, fit_policy)?;
+        Ok(PreparedInvocationMetadata {
+            participants,
+            participant_frames,
+            participant_session_identities,
+            flight_candidates,
+            node_id,
+            work_shape,
+            fit_policy,
+            pressure_action,
+        })
+    }
+
+    fn prepare_participant_authority(
+        &self,
+        work_shape: Arc<BatchWorkShape>,
+        fit_policy: AdmissionFitPolicy,
+    ) -> Result<PreparedParticipantAuthority<R>, VNextError> {
         let immediate_shape = work_shape.immediate_shape();
         let fit_shape = match fit_policy {
             AdmissionFitPolicy::ImmediateOnly => immediate_shape,
@@ -1188,15 +1217,12 @@ where
             .iter()
             .map(|candidate| (candidate.epoch, candidate.fingerprint.clone()))
             .collect();
-        Ok(PreparedInvocationMetadata {
+        Ok(PreparedParticipantAuthority {
             participants,
             participant_frames,
             participant_session_identities,
             flight_candidates,
-            node_id,
             work_shape,
-            fit_policy,
-            pressure_action,
         })
     }
 }
@@ -1324,9 +1350,20 @@ where
     pressure_action: AdmissionPressureAction,
 }
 
+struct PreparedParticipantAuthority<R>
+where
+    R: DeviceRuntime,
+{
+    participants: Vec<Arc<AdmittedSequenceResources<R>>>,
+    participant_frames: Vec<StepParticipantFrameAssignment>,
+    participant_session_identities: Vec<(SequenceSessionEpoch, SequenceSessionFingerprint)>,
+    flight_candidates: Vec<ParticipantFlightCandidate>,
+    work_shape: Arc<BatchWorkShape>,
+}
+
 fn submission_wave_fingerprint<R>(
     step: &StepResourceLease<R>,
-    nodes: &[PreparedInvocationMetadata<R>],
+    nodes: &[PreparedStepSubmissionNode<R>],
     claimed_backing: &ClaimedSubmissionWaveBacking,
 ) -> Result<String, VNextError>
 where
@@ -1357,8 +1394,8 @@ where
             .iter()
             .map(|node| NodeInput {
                 node_id: &node.node_id,
-                participant_frames: &node.participant_frames,
-                work_fingerprint: node.work_shape.fingerprint(),
+                participant_frames: node.participant_frames(),
+                work_fingerprint: node.work_shape().fingerprint(),
             })
             .collect(),
     })
@@ -1444,10 +1481,7 @@ pub struct PreparedStepSubmissionNode<R>
 where
     R: DeviceRuntime,
 {
-    work_shape: Arc<BatchWorkShape>,
-    participants: Vec<Arc<AdmittedSequenceResources<R>>>,
-    participant_frames: Vec<StepParticipantFrameAssignment>,
-    participant_session_identities: Vec<(SequenceSessionEpoch, SequenceSessionFingerprint)>,
+    participant_authority: Arc<PreparedParticipantAuthority<R>>,
     node_id: NodeId,
 }
 
@@ -1455,13 +1489,10 @@ impl<R> PreparedStepSubmissionNode<R>
 where
     R: DeviceRuntime,
 {
-    fn from_prepared(prepared: PreparedInvocationMetadata<R>) -> Self {
+    fn new(node_id: NodeId, participant_authority: Arc<PreparedParticipantAuthority<R>>) -> Self {
         Self {
-            work_shape: prepared.work_shape,
-            participants: prepared.participants,
-            participant_frames: prepared.participant_frames,
-            participant_session_identities: prepared.participant_session_identities,
-            node_id: prepared.node_id,
+            participant_authority,
+            node_id,
         }
     }
 
@@ -1470,42 +1501,47 @@ where
     }
 
     pub fn participant_count(&self) -> u32 {
-        u32::try_from(self.participants.len())
+        u32::try_from(self.participant_authority.participants.len())
             .expect("wave participant count was validated before admission")
     }
 
     pub fn participants(
         &self,
     ) -> impl ExactSizeIterator<Item = &Arc<AdmittedSequenceResources<R>>> {
-        self.participants.iter()
+        self.participant_authority.participants.iter()
     }
 
     pub fn participant_frames(&self) -> &[StepParticipantFrameAssignment] {
-        &self.participant_frames
+        &self.participant_authority.participant_frames
     }
 
     pub fn work_shape(&self) -> &BatchWorkShape {
-        self.work_shape.as_ref()
+        self.participant_authority.work_shape.as_ref()
     }
 
     pub fn plan_evidence(&self) -> TrustedPlanRuntimeEvidence {
-        self.participants[0].plan_evidence()
+        self.participant_authority.participants[0].plan_evidence()
     }
 
     pub(crate) fn runtime(&self) -> &Arc<R> {
-        &self.participants[0].request.plan.runtime()
+        &self.participant_authority.participants[0]
+            .request
+            .plan
+            .runtime()
     }
 
     pub(crate) fn participant_session_identities(
         &self,
     ) -> impl ExactSizeIterator<Item = (SequenceSessionEpoch, &SequenceSessionFingerprint)> {
-        self.participant_session_identities
+        self.participant_authority
+            .participant_session_identities
             .iter()
             .map(|(epoch, fingerprint)| (*epoch, fingerprint))
     }
 
     pub(crate) fn participant_node_keys(&self) -> Vec<ParticipantNodeKey> {
-        self.participant_frames
+        self.participant_authority
+            .participant_frames
             .iter()
             .map(|assignment| {
                 ParticipantNodeKey::new(
@@ -1530,7 +1566,7 @@ where
     claimed_backing: ClaimedSubmissionWaveBacking,
     initializations: Option<PreparedBackingInitializations>,
     nodes: Vec<PreparedStepSubmissionNode<R>>,
-    prepared_participant_flights: Vec<PreparedParticipantFlightHold>,
+    prepared_participant_flights: Vec<PreparedSubmissionWaveParticipantFlightHold>,
     active_wave: ActiveInvocationWaveGuard,
     step: Arc<StepResourceLease<R>>,
     execution_lane_id: ExecutionLaneId,
@@ -1574,6 +1610,13 @@ where
         self.prepared_participant_flights.len()
     }
 
+    pub fn node_participant_projection_count(&self) -> usize {
+        self.nodes
+            .iter()
+            .map(|node| node.participant_count() as usize)
+            .sum()
+    }
+
     pub fn step_resources(&self) -> &Arc<StepResourceLease<R>> {
         &self.step
     }
@@ -1583,7 +1626,7 @@ where
     }
 
     pub(crate) fn deferred_cleanup_domain(&self) -> DeferredDeviceCleanupDomainId {
-        self.nodes[0].participants[0]
+        self.nodes[0].participant_authority.participants[0]
             .request
             .plan
             .resources
@@ -1592,13 +1635,6 @@ where
 
     pub fn has_shared_step_backing(&self) -> bool {
         self.step.claimed_backing().has_shared_physical_claims()
-    }
-
-    pub(crate) fn participant_node_keys(&self) -> Vec<ParticipantNodeKey> {
-        self.prepared_participant_flights
-            .iter()
-            .map(|hold| hold.key().clone())
-            .collect()
     }
 
     pub(crate) fn backing_view(
@@ -1616,7 +1652,7 @@ where
             .iter()
             .find(|authority| authority.resource_id() == resource_id)
         {
-            return node.participants[0]
+            return node.participant_authority.participants[0]
                 .request
                 .plan
                 .dynamic_pools()
@@ -1635,7 +1671,7 @@ where
                 )?);
             }
         }
-        begin_participant_flights_dispatch(&mut self.prepared_participant_flights)
+        begin_submission_wave_participant_flights_dispatch(&mut self.prepared_participant_flights)
     }
 
     pub(crate) fn encode_backing_initializations(
@@ -1681,7 +1717,7 @@ where
         mut self,
     ) -> Result<DefinitelyNotSubmittedWaveRetryAuthority<R>, VNextError> {
         self.active_wave.mark_not_submitted()?;
-        reset_participant_flights_after_definitely_not_submitted(
+        reset_submission_wave_participant_flights_after_definitely_not_submitted(
             &mut self.prepared_participant_flights,
         )?;
         let topology_fingerprint = self.fingerprint.clone();

@@ -192,13 +192,13 @@ pub(super) struct ParticipantFlightCandidate {
 }
 
 #[derive(Clone)]
-pub(super) struct ParticipantFlightWaveCandidate {
+struct ParticipantNodeFlightCandidate {
     candidate: ParticipantFlightCandidate,
     node_id: NodeId,
 }
 
-impl ParticipantFlightWaveCandidate {
-    pub(super) fn new(candidate: ParticipantFlightCandidate, node_id: NodeId) -> Self {
+impl ParticipantNodeFlightCandidate {
+    fn new(candidate: ParticipantFlightCandidate, node_id: NodeId) -> Self {
         Self { candidate, node_id }
     }
 
@@ -222,12 +222,6 @@ pub(super) struct PreparedParticipantFlightHold {
     key: ParticipantNodeKey,
     batch_step_id: BatchStepId,
     pub(super) phase: ParticipantFlightPhase,
-}
-
-impl PreparedParticipantFlightHold {
-    pub(super) fn key(&self) -> &ParticipantNodeKey {
-        &self.key
-    }
 }
 
 impl Drop for PreparedParticipantFlightHold {
@@ -257,17 +251,17 @@ pub(super) fn prepare_participant_flights(
     candidates: &[ParticipantFlightCandidate],
     node_id: &NodeId,
 ) -> Result<Vec<PreparedParticipantFlightHold>, VNextError> {
-    prepare_participant_flight_wave(
+    prepare_participant_node_flights(
         candidates
             .iter()
             .cloned()
-            .map(|candidate| ParticipantFlightWaveCandidate::new(candidate, node_id.clone()))
+            .map(|candidate| ParticipantNodeFlightCandidate::new(candidate, node_id.clone()))
             .collect(),
     )
 }
 
-pub(super) fn prepare_participant_flight_wave(
-    candidates: Vec<ParticipantFlightWaveCandidate>,
+fn prepare_participant_node_flights(
+    candidates: Vec<ParticipantNodeFlightCandidate>,
 ) -> Result<Vec<PreparedParticipantFlightHold>, VNextError> {
     let mut candidates = candidates
         .into_iter()
@@ -340,6 +334,7 @@ pub(super) fn prepare_participant_flight_wave(
                     && active.fingerprint == candidate.fingerprint
                     && active.phase == SequenceSessionPhase::Open
                     && active.active_frame == Some(candidate.frame)
+                    && active.submission_wave_flight.is_none()
                     && !active.participant_flights.contains_key(key) => {}
             SequenceSessionSlotState::Active(active)
                 if active.epoch != candidate.epoch
@@ -402,6 +397,289 @@ pub(super) fn prepare_participant_flight_wave(
             phase: ParticipantFlightPhase::Prepared,
         })
         .collect())
+}
+
+/// One participant-local owner for a physical all-node submission wave. Node
+/// coverage remains in the immutable plan topology and invocation registry;
+/// the sequence session only tracks whether this participant has device work.
+pub(super) struct PreparedSubmissionWaveParticipantFlightHold {
+    slot: Arc<SequenceSessionSlot>,
+    pub(super) epoch: SequenceSessionEpoch,
+    pub(super) fingerprint: SequenceSessionFingerprint,
+    participant: BatchParticipantAuthority,
+    frame: ActiveSequenceFrame,
+    pub(super) phase: ParticipantFlightPhase,
+}
+
+impl PreparedSubmissionWaveParticipantFlightHold {
+    fn canonical_key(&self) -> (u32, u64, u32, u64, u64) {
+        let (sequence, sequence_generation, request, request_generation) =
+            self.participant.canonical_key();
+        (
+            sequence,
+            sequence_generation,
+            request,
+            request_generation,
+            self.frame.frame_id.get(),
+        )
+    }
+}
+
+impl Drop for PreparedSubmissionWaveParticipantFlightHold {
+    fn drop(&mut self) {
+        let mut state = match self.slot.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                *state = SequenceSessionSlotState::FailClosed;
+                return;
+            }
+        };
+        match &mut *state {
+            SequenceSessionSlotState::Active(active)
+                if active.epoch == self.epoch && active.fingerprint == self.fingerprint =>
+            {
+                if active.submission_wave_flight.take() != Some(self.phase) {
+                    active.phase = SequenceSessionPhase::Poisoned;
+                }
+            }
+            _ => *state = SequenceSessionSlotState::FailClosed,
+        }
+    }
+}
+
+pub(super) fn prepare_submission_wave_participant_flights(
+    candidates: &[ParticipantFlightCandidate],
+) -> Result<Vec<PreparedSubmissionWaveParticipantFlightHold>, VNextError> {
+    type ParticipantFrameKey = (u32, u64, u32, u64, u64);
+
+    let mut candidates = candidates
+        .iter()
+        .cloned()
+        .map(|candidate| {
+            let (sequence, sequence_generation, request, request_generation) =
+                candidate.participant.canonical_key();
+            let key = (
+                sequence,
+                sequence_generation,
+                request,
+                request_generation,
+                candidate.frame.frame_id.get(),
+            );
+            (candidate, key)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(_, key)| *key);
+    if candidates.is_empty() || candidates.windows(2).any(|pair| pair[0].1 >= pair[1].1) {
+        return Err(invalid_resource(
+            "submission wave requires canonical non-empty unique participant/frame authorities",
+        ));
+    }
+
+    let mut slot_by_participant = BTreeMap::<ParticipantFrameKey, usize>::new();
+    let mut participant_by_slot = BTreeMap::<usize, ParticipantFrameKey>::new();
+    let mut unique_slots = Vec::<Arc<SequenceSessionSlot>>::new();
+    let mut unique_slot_indices = BTreeMap::<usize, usize>::new();
+    let mut slot_indices = Vec::with_capacity(candidates.len());
+    for (candidate, participant) in &candidates {
+        let slot_identity = Arc::as_ptr(&candidate.slot) as usize;
+        if slot_by_participant
+            .get(participant)
+            .is_some_and(|known| *known != slot_identity)
+            || participant_by_slot
+                .get(&slot_identity)
+                .is_some_and(|known| known != participant)
+        {
+            return Err(invalid_resource(
+                "submission wave participant/frame authority maps to inconsistent session slots",
+            ));
+        }
+        slot_by_participant.insert(*participant, slot_identity);
+        participant_by_slot.insert(slot_identity, *participant);
+        let slot_index = match unique_slot_indices.get(&slot_identity).copied() {
+            Some(index) => index,
+            None => {
+                let index = unique_slots.len();
+                unique_slots.push(Arc::clone(&candidate.slot));
+                unique_slot_indices.insert(slot_identity, index);
+                index
+            }
+        };
+        slot_indices.push(slot_index);
+    }
+
+    let mut states = Vec::with_capacity(unique_slots.len());
+    for slot in &unique_slots {
+        states.push(
+            slot.state
+                .lock()
+                .map_err(|_| invalid_resource("sequence session state mutex is poisoned"))?,
+        );
+    }
+    for ((candidate, _), &slot_index) in candidates.iter().zip(&slot_indices) {
+        match &*states[slot_index] {
+            SequenceSessionSlotState::Active(active)
+                if active.epoch == candidate.epoch
+                    && active.fingerprint == candidate.fingerprint
+                    && active.phase == SequenceSessionPhase::Open
+                    && active.active_frame == Some(candidate.frame)
+                    && active.participant_flights.is_empty()
+                    && active.submission_wave_flight.is_none() => {}
+            SequenceSessionSlotState::Active(active)
+                if active.epoch != candidate.epoch
+                    || active.fingerprint != candidate.fingerprint =>
+            {
+                return Err(invalid_resource(
+                    "stale submission wave participant authority",
+                ));
+            }
+            SequenceSessionSlotState::Active(_) => {
+                return Err(invalid_resource(
+                    "cancelled, poisoned, duplicate, cross-frame, or node-busy participant cannot enter a submission wave",
+                ));
+            }
+            _ => {
+                return Err(invalid_resource(
+                    "inactive or terminal participant cannot enter a submission wave",
+                ));
+            }
+        }
+    }
+
+    let mut inserted_slots = Vec::<usize>::with_capacity(candidates.len());
+    for &slot_index in &slot_indices {
+        let previous = {
+            let SequenceSessionSlotState::Active(active) = &mut *states[slot_index] else {
+                unreachable!("all submission wave participants were validated");
+            };
+            active
+                .submission_wave_flight
+                .replace(ParticipantFlightPhase::Prepared)
+        };
+        if previous.is_some() {
+            for rollback_slot in inserted_slots.into_iter().rev() {
+                if let SequenceSessionSlotState::Active(rollback) = &mut *states[rollback_slot] {
+                    rollback.submission_wave_flight = None;
+                    rollback.phase = SequenceSessionPhase::Poisoned;
+                }
+            }
+            if let SequenceSessionSlotState::Active(active) = &mut *states[slot_index] {
+                active.submission_wave_flight = previous;
+                active.phase = SequenceSessionPhase::Poisoned;
+            }
+            return Err(invalid_resource(
+                "submission wave participant flights changed during atomic insertion",
+            ));
+        }
+        inserted_slots.push(slot_index);
+    }
+    drop(states);
+
+    Ok(candidates
+        .into_iter()
+        .map(
+            |(candidate, _)| PreparedSubmissionWaveParticipantFlightHold {
+                slot: candidate.slot,
+                epoch: candidate.epoch,
+                fingerprint: candidate.fingerprint,
+                participant: candidate.participant,
+                frame: candidate.frame,
+                phase: ParticipantFlightPhase::Prepared,
+            },
+        )
+        .collect())
+}
+
+pub(super) fn begin_submission_wave_participant_flights_dispatch(
+    holds: &mut [PreparedSubmissionWaveParticipantFlightHold],
+) -> Result<(), VNextError> {
+    transition_submission_wave_participant_flights(
+        holds,
+        ParticipantFlightPhase::Prepared,
+        ParticipantFlightPhase::InFlight,
+        "begin submission wave dispatch",
+    )
+}
+
+pub(super) fn reset_submission_wave_participant_flights_after_definitely_not_submitted(
+    holds: &mut [PreparedSubmissionWaveParticipantFlightHold],
+) -> Result<(), VNextError> {
+    transition_submission_wave_participant_flights(
+        holds,
+        ParticipantFlightPhase::InFlight,
+        ParticipantFlightPhase::Prepared,
+        "reset definitely-not-submitted submission wave dispatch",
+    )
+}
+
+fn transition_submission_wave_participant_flights(
+    holds: &mut [PreparedSubmissionWaveParticipantFlightHold],
+    expected: ParticipantFlightPhase,
+    next: ParticipantFlightPhase,
+    context: &'static str,
+) -> Result<(), VNextError> {
+    if holds.is_empty()
+        || holds.iter().any(|hold| hold.phase != expected)
+        || holds
+            .windows(2)
+            .any(|pair| pair[0].canonical_key() >= pair[1].canonical_key())
+    {
+        return Err(invalid_resource(format!(
+            "{context} requires canonical non-empty unique participant flights in the expected phase"
+        )));
+    }
+
+    let slots = holds
+        .iter()
+        .map(|hold| Arc::clone(&hold.slot))
+        .collect::<Vec<_>>();
+    let mut states = Vec::with_capacity(slots.len());
+    for slot in &slots {
+        states.push(
+            slot.state
+                .lock()
+                .map_err(|_| invalid_resource("sequence session state mutex is poisoned"))?,
+        );
+    }
+    for (hold, state) in holds.iter().zip(&states) {
+        match &**state {
+            SequenceSessionSlotState::Active(active)
+                if active.epoch == hold.epoch
+                    && active.fingerprint == hold.fingerprint
+                    && active.phase == SequenceSessionPhase::Open
+                    && active.active_frame == Some(hold.frame)
+                    && active.participant_flights.is_empty()
+                    && active.submission_wave_flight == Some(expected) => {}
+            SequenceSessionSlotState::Active(active)
+                if active.epoch != hold.epoch || active.fingerprint != hold.fingerprint =>
+            {
+                return Err(invalid_resource(
+                    "stale submission wave participant authority during phase transition",
+                ));
+            }
+            SequenceSessionSlotState::Active(_) => {
+                return Err(invalid_resource(format!(
+                    "cancelled, poisoned, wrong-phase, cross-frame, or node-busy participant cannot {context}"
+                )));
+            }
+            _ => {
+                return Err(invalid_resource(format!(
+                    "inactive or terminal participant cannot {context}"
+                )));
+            }
+        }
+    }
+    for state in &mut states {
+        let SequenceSessionSlotState::Active(active) = &mut **state else {
+            unreachable!("all submission wave participants were validated while locked");
+        };
+        active.submission_wave_flight = Some(next);
+    }
+    drop(states);
+    for hold in holds {
+        hold.phase = next;
+    }
+    Ok(())
 }
 
 pub(super) fn begin_participant_flights_dispatch(
@@ -474,6 +752,7 @@ fn transition_participant_flights(
                             frame_id: hold.key.frame_id(),
                             batch_step_id: hold.batch_step_id,
                         })
+                    && active.submission_wave_flight.is_none()
                     && active.participant_flights.get(&hold.key) == Some(&expected) => {}
             SequenceSessionSlotState::Active(active)
                 if active.epoch != hold.epoch || active.fingerprint != hold.fingerprint =>
@@ -808,7 +1087,7 @@ pub(super) fn finalize_session_frames(
                     batch_step_id: hold.batch_step_id,
                 })
             || active.next_frame != execution_frame_successor(hold.frame_id)
-            || !active.participant_flights.is_empty()
+            || active.has_participant_flights()
             || (finalization == StepFrameFinalization::Commit
                 && active.phase == SequenceSessionPhase::Poisoned)
             || (finalization == StepFrameFinalization::Commit && active.retired_frames == u64::MAX)
