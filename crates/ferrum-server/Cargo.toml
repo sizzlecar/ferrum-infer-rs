@@ -28,7 +28,6 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 sha2 = "0.10"
 minijinja = { version = "2.20", features = ["json", "preserve_order"] }
 minijinja-contrib = { version = "2.20", features = ["pycompat"] }
-regex-lite = "0.1"
 
 # Error handling
 anyhow = { workspace = true }

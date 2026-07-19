@@ -1628,7 +1628,6 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "pin-project",
- "regex-lite",
  "reqwest",
  "serde",
  "serde_json",

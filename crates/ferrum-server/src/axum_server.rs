@@ -2119,8 +2119,15 @@ async fn handle_chat_completions_stream(
         .as_ref()
         .and_then(|opts| opts.include_usage)
         .unwrap_or(false);
-    let buffer_json_object_stream = response_format_is_json_object(&openai_request);
-    let buffer_strict_json_schema_stream = strict_json_schema_string(&openai_request)?.is_some();
+    let output_contract = EffectiveChatOutputContract::resolve(&openai_request);
+    let buffer_json_object_stream = matches!(
+        output_contract,
+        EffectiveChatOutputContract::JsonObjectContent
+    );
+    let buffer_strict_json_schema_stream = matches!(
+        output_contract,
+        EffectiveChatOutputContract::StrictJsonSchemaContent
+    );
     let stream_api_request = match inference_request.api_request.as_ref() {
         Some(ferrum_types::ApiRequest::Chat(request)) => request.clone(),
         _ => api_chat_request(&openai_request, openai_request.tool_choice.as_ref()),
@@ -2282,19 +2289,6 @@ async fn handle_chat_completions_stream(
                             &openai_request,
                             &parsed_final.content,
                         );
-                        if let Err(e) = validate_strict_json_schema_response(
-                            &openai_request,
-                            &parsed_final.content,
-                        ) {
-                            let error_event = openai_error_sse_event(
-                                strict_stream_validation_error_message(e),
-                                "internal_server_error",
-                                Some("response_format.json_schema"),
-                            );
-                            let _ = tx.send(Ok(error_event));
-                            let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                            break;
-                        }
                         let structured_chat_response = match chunk.api_response.as_ref() {
                             Some(ferrum_types::ApiResponse::Chat(response)) => {
                                 Some(response.clone())
@@ -2307,6 +2301,48 @@ async fn handle_chat_completions_stream(
                             }
                             _ => None,
                         };
+
+                        if let Some(chat_response) = structured_chat_response.as_ref() {
+                            if let Err(e) =
+                                validate_structured_tool_response(&openai_request, chat_response)
+                            {
+                                let error_event = openai_error_sse_event(
+                                    stream_validation_error_message(e),
+                                    "internal_server_error",
+                                    Some("tool_choice"),
+                                );
+                                let _ = tx.send(Ok(error_event));
+                                let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                                break;
+                            }
+                        } else if tool_choice_required(&openai_request) {
+                            log_required_tool_choice_failure(
+                                &openai_request,
+                                &parsed_final.content,
+                                parsed_final.reasoning.as_deref(),
+                            );
+                            let error_event = openai_error_sse_event(
+                                "model output did not satisfy required tool_choice",
+                                "invalid_request_error",
+                                Some("tool_choice"),
+                            );
+                            let _ = tx.send(Ok(error_event));
+                            let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                            break;
+                        }
+                        if let Err(e) = validate_strict_json_schema_response(
+                            &openai_request,
+                            &parsed_final.content,
+                        ) {
+                            let error_event = openai_error_sse_event(
+                                stream_validation_error_message(e),
+                                "internal_server_error",
+                                Some("response_format.json_schema"),
+                            );
+                            let _ = tx.send(Ok(error_event));
+                            let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                            break;
+                        }
 
                         if let Some(chat_response) = structured_chat_response.as_ref() {
                             let mut delta = openai_chat_delta_from_api(&chat_response.message);
@@ -2333,20 +2369,6 @@ async fn handle_chat_completions_stream(
                             if tx.send(Ok(sse_event)).is_err() {
                                 break;
                             }
-                        } else if tool_choice_required(&openai_request) {
-                            log_required_tool_choice_failure(
-                                &openai_request,
-                                &parsed_final.content,
-                                parsed_final.reasoning.as_deref(),
-                            );
-                            let error_event = openai_error_sse_event(
-                                "model output did not satisfy required tool_choice",
-                                "invalid_request_error",
-                                Some("tool_choice"),
-                            );
-                            let _ = tx.send(Ok(error_event));
-                            let _ = tx.send(Ok(Event::default().data("[DONE]")));
-                            break;
                         } else if buffer_structured_api_stream
                             && parsed_final.content.trim().is_empty()
                         {
@@ -2627,6 +2649,30 @@ async fn handle_chat_completions_sync(
                 },
             };
             if let Some(chat_response) = structured_chat_response.as_ref() {
+                if let Err(error) =
+                    validate_structured_tool_response(&openai_request, chat_response)
+                {
+                    if let Err(err) = write_chat_request_profile_event(
+                        &state,
+                        &replay_request_id,
+                        &profile_request_model,
+                        false,
+                        "chat_completions_sync_tool_contract",
+                        profile_started_at,
+                        None,
+                        tokens.len(),
+                        Some(&usage),
+                        Some("error"),
+                        Some(ProfileError {
+                            kind: "tool_contract_failure".to_string(),
+                            message: format!("{error:?}"),
+                            blocking: true,
+                        }),
+                    ) {
+                        warn!("failed to write chat tool-contract profile event: {}", err);
+                    }
+                    return Err(error);
+                }
                 message = openai_chat_message_from_api(&chat_response.message);
                 if message.reasoning.is_none() {
                     message.reasoning = parsed.reasoning.clone();
@@ -2789,6 +2835,44 @@ async fn handle_chat_completions_sync(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveChatOutputContract {
+    RequiredToolCall,
+    StrictJsonSchemaContent,
+    JsonObjectContent,
+    BestEffortJsonSchemaContent,
+    Text,
+}
+
+impl EffectiveChatOutputContract {
+    fn resolve(request: &ChatCompletionsRequest) -> Self {
+        if tool_choice_required(request) {
+            return Self::RequiredToolCall;
+        }
+        let Some(format) = request.response_format.as_ref() else {
+            return Self::Text;
+        };
+        match format.format_type.as_str() {
+            "json_schema"
+                if format
+                    .json_schema
+                    .as_ref()
+                    .and_then(|schema| schema.strict)
+                    .unwrap_or(false) =>
+            {
+                Self::StrictJsonSchemaContent
+            }
+            "json_schema" => Self::BestEffortJsonSchemaContent,
+            "json_object" => Self::JsonObjectContent,
+            _ => Self::Text,
+        }
+    }
+
+    fn accepts_requested_response_format(self) -> bool {
+        !matches!(self, Self::RequiredToolCall)
+    }
+}
+
 /// Convert OpenAI chat request to internal inference request
 #[allow(dead_code)]
 fn convert_chat_request(
@@ -2821,10 +2905,15 @@ fn convert_chat_request_with_template_model(
         .as_ref()
         .or(default_tool_choice.as_ref());
     let functions = request.functions.as_deref().unwrap_or_default();
+    let output_contract = EffectiveChatOutputContract::resolve(request);
     let forced_response_format = forced_tool_choice_response_format(request);
-    let requested_response_format = requested_response_format_for_sampling(request)?;
+    let requested_response_format = output_contract
+        .accepts_requested_response_format()
+        .then(|| requested_response_format_for_sampling(request))
+        .transpose()?
+        .flatten();
     let render_messages =
-        render_messages_with_response_format_instruction(request, forced_response_format.as_ref());
+        render_messages_with_response_format_instruction(request, output_contract);
     let chat_template_options = chat_template_options_for_request(request, model_template)?;
     let prompt = if tools.is_empty() && functions.is_empty() {
         render_chat_prompt_with_model_template_options(
@@ -2993,10 +3082,9 @@ fn chat_template_options_for_request(
 
 fn render_messages_with_response_format_instruction(
     request: &ChatCompletionsRequest,
-    forced_response_format: Option<&ferrum_types::ResponseFormat>,
+    output_contract: EffectiveChatOutputContract,
 ) -> Vec<ChatMessage> {
-    let Some(instruction) = response_format_prompt_instruction(request, forced_response_format)
-    else {
+    let Some(instruction) = response_format_prompt_instruction(request, output_contract) else {
         return request.messages.clone();
     };
     let mut messages = Vec::with_capacity(request.messages.len() + 1);
@@ -3015,8 +3103,11 @@ fn render_messages_with_response_format_instruction(
 
 fn response_format_prompt_instruction(
     request: &ChatCompletionsRequest,
-    _forced_response_format: Option<&ferrum_types::ResponseFormat>,
+    output_contract: EffectiveChatOutputContract,
 ) -> Option<String> {
+    if !output_contract.accepts_requested_response_format() {
+        return None;
+    }
     if let Some(format) = request.response_format.as_ref() {
         return match format.format_type.as_str() {
             "json_object" => Some(
@@ -3104,7 +3195,7 @@ fn selected_tool_for_forced_tool_choice(request: &ChatCompletionsRequest) -> Opt
             .iter()
             .find(|tool| tool.function.name == function.name),
         ToolChoice::Mode(mode) if mode.eq_ignore_ascii_case("required") => {
-            request.tools.as_ref()?.first()
+            single_function_tool(request.tools.as_deref()?)
         }
         _ => None,
     }
@@ -3360,6 +3451,12 @@ fn normalize_structured_response_content(
     request: &ChatCompletionsRequest,
     content: &str,
 ) -> String {
+    if matches!(
+        EffectiveChatOutputContract::resolve(request),
+        EffectiveChatOutputContract::RequiredToolCall
+    ) {
+        return content.to_string();
+    }
     let Some(response_format) = request.response_format.as_ref() else {
         return content.to_string();
     };
@@ -3378,13 +3475,6 @@ fn normalize_structured_response_content(
         }
         _ => content.to_string(),
     }
-}
-
-fn response_format_is_json_object(request: &ChatCompletionsRequest) -> bool {
-    request
-        .response_format
-        .as_ref()
-        .is_some_and(|format| format.format_type == "json_object")
 }
 
 fn extract_json_object_text(text: &str) -> Option<String> {
@@ -3879,31 +3969,123 @@ fn validate_strict_json_schema_response(
     request: &ChatCompletionsRequest,
     content: &str,
 ) -> std::result::Result<(), ServerError> {
+    if !matches!(
+        EffectiveChatOutputContract::resolve(request),
+        EffectiveChatOutputContract::StrictJsonSchemaContent
+    ) {
+        return Ok(());
+    }
     let Some(schema_json) = strict_json_schema_string(request)? else {
         return Ok(());
     };
-    let _parsed_json: serde_json::Value = serde_json::from_str(content).map_err(|e| {
+    let schema: serde_json::Value = serde_json::from_str(&schema_json).map_err(|e| {
         ServerError::InternalError(format!(
-            "model output did not satisfy response_format.json_schema.strict: invalid JSON: {e}"
+            "strict json_schema could not be reconstructed after request validation: {e}"
         ))
     })?;
-    let pattern = ferrum_sampler::schema_to_regex::schema_to_regex(&schema_json).map_err(|e| {
+    validate_json_text_against_schema(&schema, content).map_err(|reason| {
         ServerError::InternalError(format!(
-            "strict json_schema translator failed after validation: {e}"
+            "model output did not satisfy response_format.json_schema.strict: {reason}"
         ))
-    })?;
-    let regex = regex_lite::Regex::new(&format!("^(?:{pattern})$")).map_err(|e| {
-        ServerError::InternalError(format!("strict json_schema validator build failed: {e}"))
-    })?;
-    if !regex.is_match(content) {
-        return Err(ServerError::InternalError(
-            "model output did not satisfy response_format.json_schema.strict".to_string(),
-        ));
+    })
+}
+
+fn validate_structured_tool_response(
+    request: &ChatCompletionsRequest,
+    response: &ferrum_types::ApiChatResponse,
+) -> std::result::Result<(), ServerError> {
+    let required = tool_choice_required(request);
+    if response.message.tool_calls.is_empty() {
+        if required {
+            return Err(ServerError::invalid_request(
+                "model output did not satisfy required tool_choice",
+                Some("tool_choice"),
+            ));
+        }
+        return Ok(());
+    }
+
+    if required {
+        if !response.message.content.trim().is_empty() {
+            return Err(ServerError::InternalError(
+                "required tool response contained assistant content".to_string(),
+            ));
+        }
+        if response.finish_reason.as_deref() != Some("tool_calls") {
+            return Err(ServerError::InternalError(
+                "required tool response did not finish with tool_calls".to_string(),
+            ));
+        }
+    }
+
+    let tools = request.tools.as_deref().unwrap_or_default();
+    for call in &response.message.tool_calls {
+        if call.tool_type != "function" {
+            return Err(ServerError::InternalError(format!(
+                "model emitted unsupported tool call type '{}'",
+                call.tool_type
+            )));
+        }
+        let Some(tool) = tools
+            .iter()
+            .find(|tool| tool.tool_type == "function" && tool.function.name == call.function.name)
+        else {
+            return Err(ServerError::InternalError(format!(
+                "model emitted undeclared tool call '{}'",
+                call.function.name
+            )));
+        };
+        if let Some(ToolChoice::Function {
+            tool_type,
+            function,
+        }) = request.tool_choice.as_ref()
+        {
+            if tool_type != "function" || function.name != call.function.name {
+                return Err(ServerError::InternalError(format!(
+                    "model emitted tool '{}' instead of selected tool '{}'",
+                    call.function.name, function.name
+                )));
+            }
+        }
+
+        let arguments: serde_json::Value =
+            serde_json::from_str(&call.function.arguments).map_err(|e| {
+                ServerError::InternalError(format!(
+                    "model emitted invalid JSON arguments for tool '{}': {e}",
+                    call.function.name
+                ))
+            })?;
+        if !arguments.is_object() {
+            return Err(ServerError::InternalError(format!(
+                "model emitted non-object arguments for tool '{}'",
+                call.function.name
+            )));
+        }
+        if let Some(schema) = tool.function.parameters.as_ref() {
+            validate_json_text_against_schema(schema, &call.function.arguments).map_err(
+                |reason| {
+                    ServerError::InternalError(format!(
+                        "model arguments for tool '{}' did not satisfy its schema: {reason}",
+                        call.function.name
+                    ))
+                },
+            )?;
+        }
     }
     Ok(())
 }
 
-fn strict_stream_validation_error_message(error: ServerError) -> String {
+fn validate_json_text_against_schema(
+    schema: &serde_json::Value,
+    content: &str,
+) -> std::result::Result<(), String> {
+    let value = serde_json::from_str::<serde_json::Value>(content)
+        .map_err(|e| format!("invalid JSON: {e}"))?;
+    ferrum_sampler::schema_validation::validate_json_schema_value(schema, &value)
+        .map_err(|e| e.to_string())
+}
+
+fn stream_validation_error_message(error: ServerError) -> String {
     match error {
         ServerError::InternalError(message)
         | ServerError::NotImplemented(message)
@@ -6561,6 +6743,113 @@ mod tests {
         );
     }
 
+    fn required_tool_with_strict_response_format_request(stream: bool) -> Value {
+        json!({
+            "model": "stub-model",
+            "messages": [{"role": "user", "content": "Use the weather tool."}],
+            "stream": stream,
+            "stream_options": stream.then_some(json!({"include_usage": true})),
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string", "const": "Paris"}},
+                        "required": ["city"],
+                        "additionalProperties": false
+                    }
+                }
+            }],
+            "tool_choice": "required",
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "content_answer",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string", "const": "IGNORED"}},
+                        "required": ["answer"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn route_chat_required_tool_takes_priority_over_strict_response_format() {
+        let response = post_json(
+            router_with_stub(r#"{"city":"Paris"}"#),
+            "/v1/chat/completions",
+            required_tool_with_strict_response_format_request(false),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(body["choices"][0]["message"]["content"], "");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "weather"
+        );
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            r#"{"city":"Paris"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn route_chat_required_tool_rejects_arguments_that_violate_const_schema() {
+        let response = post_json(
+            router_with_stub(r#"{"city":"London"}"#),
+            "/v1/chat/completions",
+            required_tool_with_strict_response_format_request(false),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "internal_server_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("did not satisfy its schema")),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_streaming_required_tool_takes_priority_over_strict_response_format() {
+        let response = post_json(
+            router_with_stub(r#"{"city":"Paris"}"#),
+            "/v1/chat/completions",
+            required_tool_with_strict_response_format_request(true),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert_eq!(body.matches("data: [DONE]").count(), 1, "body: {body}");
+        assert!(
+            body.contains(r#""finish_reason":"tool_calls""#),
+            "tool priority must finish with tool_calls: {body}"
+        );
+        assert!(
+            body.contains(r#""name":"weather""#)
+                && body.contains(r#""arguments":"{\"city\":\"Paris\"}""#),
+            "stream must carry the reconstructed tool call: {body}"
+        );
+        assert_eq!(
+            body.matches(r#""usage":{"#).count(),
+            1,
+            "stream must carry exactly one usage row: {body}"
+        );
+        assert!(
+            !body.contains("strict json_schema") && !body.contains("invalid JSON"),
+            "dormant content schema must not reject a required tool call: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn route_chat_tool_choice_required_errors_without_valid_tool_call() {
         let response = post_json(
@@ -9014,6 +9303,72 @@ mod tests {
             }
             ref other => panic!("expected forced tool json schema, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn required_tool_choice_suppresses_conflicting_response_format_instruction() {
+        let request: ChatCompletionsRequest =
+            serde_json::from_value(required_tool_with_strict_response_format_request(false))
+                .expect("request parses");
+
+        validate_chat_request(&request).expect("request validates");
+        let internal = convert_chat_request(&request).expect("convert");
+
+        assert!(
+            !internal.prompt.contains("response_format requires"),
+            "required tool output must not receive a conflicting content-schema instruction: {}",
+            internal.prompt
+        );
+        let ferrum_types::ResponseFormat::JsonSchema(schema) =
+            internal.sampling_params.response_format
+        else {
+            panic!("single required tool must use its argument schema");
+        };
+        let schema: Value = serde_json::from_str(&schema).expect("tool schema JSON");
+        assert!(schema["properties"].get("city").is_some(), "{schema}");
+        assert!(schema["properties"].get("answer").is_none(), "{schema}");
+    }
+
+    #[test]
+    fn required_multiple_tools_do_not_force_the_first_tool_schema() {
+        let request: ChatCompletionsRequest = serde_json::from_value(json!({
+            "model": "stub-model",
+            "messages": [{"role": "user", "content": "Use the appropriate tool."}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "calendar",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"date": {"type": "string"}},
+                            "required": ["date"]
+                        }
+                    }
+                }
+            ],
+            "tool_choice": "required"
+        }))
+        .expect("request parses");
+
+        validate_chat_request(&request).expect("request validates");
+        let internal = convert_chat_request(&request).expect("convert");
+        assert_eq!(
+            internal.sampling_params.response_format,
+            ferrum_types::ResponseFormat::Text,
+            "required permits either declared tool, so guided decoding cannot bind the first tool's arguments"
+        );
     }
 
     #[test]
