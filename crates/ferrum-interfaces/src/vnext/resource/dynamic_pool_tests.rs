@@ -1370,7 +1370,71 @@ fn theoretical_pool_ceiling_remains_terminal_after_device_budget_accepts_growth(
 }
 
 #[test]
-fn idle_lane_stable_cache_is_evicted_before_alternate_layout_retries() {
+fn eager_step_backing_releases_when_the_step_retires_while_lane_remains_live() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        '9',
+        1,
+        128,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(Arc::clone(&runtime), catalog, 256, false);
+    let lane = harness.root.create_execution_lane().unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 128)
+        .unwrap();
+
+    let sequence = admitted_sequence(&harness.root, "eager-step-release");
+    let session = sequence.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let request = StepResourceAdmissionRequest::new(
+        batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let step = match batch.try_begin_step(request, &lane).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("resident eager step backing must admit"),
+    };
+    assert_eq!(
+        harness
+            .root
+            .maintenance_controller
+            .status()
+            .unwrap()
+            .pools()[0]
+            .live_segments(),
+        1
+    );
+
+    step.try_retire_normal().unwrap();
+    assert_eq!(
+        harness
+            .root
+            .maintenance_controller
+            .status()
+            .unwrap()
+            .pools()[0]
+            .live_segments(),
+        0,
+        "ordinary eager backing must not become a lane-lifetime cache"
+    );
+
+    session.try_complete().unwrap();
+    drop(batch);
+    drop(session);
+    drop(sequence);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn eager_alternate_layout_reuses_released_pool_without_maintenance() {
     let catalog = pool_catalog(
         linear_profile(),
         AllocationLifetime::Step,
@@ -1400,7 +1464,7 @@ fn idle_lane_stable_cache_is_evicted_before_alternate_layout_retries() {
     .unwrap();
     let first_step = match first_batch.try_begin_step(first_request, &lane).unwrap() {
         StepResourceAdmissionDecision::Admitted(step) => step,
-        _ => panic!("resident two-token lane-stable layout must admit"),
+        _ => panic!("resident two-token eager layout must admit"),
     };
     first_step.try_retire_normal().unwrap();
     first_session.try_complete().unwrap();
@@ -1417,26 +1481,12 @@ fn idle_lane_stable_cache_is_evicted_before_alternate_layout_retries() {
         AdmissionPressureAction::WaitForRelease,
     )
     .unwrap();
-    let deferred = match second_batch
-        .try_begin_step(second_request.clone(), &lane)
-        .unwrap()
-    {
-        StepResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
-        _ => panic!("pinned alternate lane-stable layout must defer physical backing"),
-    };
-    let outcome = deferred.maintain().unwrap();
-    assert!(matches!(
-        outcome,
-        DynamicDeferredMaintenanceOutcome::RetryAdmission { .. }
-    ));
-    assert_eq!(runtime.allocate_calls(), allocations_before);
-    drop(deferred);
-
     let second_step = match second_batch.try_begin_step(second_request, &lane).unwrap() {
         StepResourceAdmissionDecision::Admitted(step) => step,
-        _ => panic!("alternate layout must reuse backing after idle cache eviction"),
+        _ => panic!("alternate eager layout must reuse backing immediately after release"),
     };
     assert_eq!(second_step.backing_slices()[0].size_bytes(), 64);
+    assert_eq!(runtime.allocate_calls(), allocations_before);
     second_step.try_retire_normal().unwrap();
     second_session.try_complete().unwrap();
     drop(second_batch);
@@ -1651,7 +1701,7 @@ fn reusable_bucket_step_admission_keeps_logical_claim_exact() {
 }
 
 #[test]
-fn busy_lane_stable_cache_returns_pool_wait_then_retries_after_release() {
+fn busy_eager_backing_returns_pool_wait_then_retries_after_release() {
     let catalog = pool_catalog(
         linear_profile(),
         AllocationLifetime::Step,
@@ -1686,7 +1736,7 @@ fn busy_lane_stable_cache_returns_pool_wait_then_retries_after_release() {
         .unwrap()
     {
         StepResourceAdmissionDecision::Admitted(step) => step,
-        _ => panic!("resident busy lane-stable layout must admit"),
+        _ => panic!("resident busy eager layout must admit"),
     };
 
     let second_sequence = admitted_sequence(&harness.root, "busy-cache-second");
@@ -1703,7 +1753,7 @@ fn busy_lane_stable_cache_returns_pool_wait_then_retries_after_release() {
         .unwrap()
     {
         StepResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
-        _ => panic!("busy alternate lane-stable layout must defer physical backing"),
+        _ => panic!("busy alternate eager layout must defer physical backing"),
     };
     let DynamicDeferredMaintenanceOutcome::WaitForRelease {
         wait_condition,
@@ -1711,7 +1761,7 @@ fn busy_lane_stable_cache_returns_pool_wait_then_retries_after_release() {
         ..
     } = deferred.maintain().unwrap()
     else {
-        panic!("busy lane-stable cache must become typed pool pressure")
+        panic!("busy eager backing must become typed pool pressure")
     };
     let pool_pressure = pressure
         .pool_resident()
@@ -1736,7 +1786,7 @@ fn busy_lane_stable_cache_returns_pool_wait_then_retries_after_release() {
     drop(deferred);
     let second_step = match second_batch.try_begin_step(second_request, &lane).unwrap() {
         StepResourceAdmissionDecision::Admitted(step) => step,
-        _ => panic!("released busy cache must admit the waiting alternate layout"),
+        _ => panic!("released eager backing must admit the waiting alternate layout"),
     };
     assert_eq!(runtime.allocate_calls(), allocations_before);
 

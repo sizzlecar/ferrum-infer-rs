@@ -1242,16 +1242,10 @@ pub(super) enum LaneBackingPrepareDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum LaneStableArenaLayoutIdentity {
-    ReusableBucket(ReusableExecutionBucketId),
-    Evaluated([u8; 32]),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct LaneStableArenaKey {
     lane_id: ExecutionLaneId,
     lifetime: AllocationLifetime,
-    layout: LaneStableArenaLayoutIdentity,
+    reusable_execution_bucket_id: ReusableExecutionBucketId,
 }
 
 struct LaneStableProjectionBinding {
@@ -1557,11 +1551,6 @@ fn lane_stable_layout_key(
     lifetime: AllocationLifetime,
     requests: &[&EvaluatedBackingRequest<'_>],
 ) -> Result<LaneStableArenaKey, VNextError> {
-    fn update_bytes(hasher: &mut Sha256, bytes: &[u8]) {
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
-    }
-
     if requests.is_empty()
         || requests
             .windows(2)
@@ -1578,57 +1567,26 @@ fn lane_stable_layout_key(
             "lane-stable arena layout is empty, non-canonical, or mixes lifetimes",
         ));
     }
-    if let Some(bucket_id) = requests[0].reusable_execution_bucket_id.as_ref() {
-        if requests
-            .iter()
-            .any(|request| request.reusable_execution_bucket_id.as_ref() != Some(bucket_id))
-        {
-            return Err(invalid_resource(
-                "lane-stable arena layout mixes reusable execution buckets",
-            ));
-        }
-        return Ok(LaneStableArenaKey {
-            lane_id,
-            lifetime,
-            layout: LaneStableArenaLayoutIdentity::ReusableBucket(bucket_id.clone()),
-        });
-    }
-    // This registry is owned by one immutable plan, so static descriptor fields
-    // are implicit. The hot key only needs the evaluated physical layout.
-    let mut hasher = Sha256::new();
-    hasher.update(b"ferrum.runtime-vnext.lane-stable-arena-layout.v3");
-    hasher.update((requests.len() as u64).to_le_bytes());
-    for request in requests {
-        update_bytes(
-            &mut hasher,
-            request.claim_identity.pool_id().as_str().as_bytes(),
-        );
-        hasher.update((request.claim_identity.resource_ids().len() as u64).to_le_bytes());
-        for resource_id in request.claim_identity.resource_ids() {
-            update_bytes(&mut hasher, resource_id.as_str().as_bytes());
-        }
-        match &request.reusable_execution_bucket_id {
-            Some(bucket_id) => {
-                hasher.update([1]);
-                update_bytes(&mut hasher, bucket_id.as_str().as_bytes());
-            }
-            None => hasher.update([0]),
-        }
-        hasher.update(request.capacity_size_bytes.to_le_bytes());
-        hasher.update((request.projections.len() as u64).to_le_bytes());
-        for projection in &request.projections {
-            update_bytes(
-                &mut hasher,
-                projection.descriptor.base_resource_id().as_str().as_bytes(),
-            );
-            hasher.update(projection.physical_offset_bytes.to_le_bytes());
-            hasher.update(projection.capacity_size_bytes.to_le_bytes());
-        }
+    let bucket_id = requests[0]
+        .reusable_execution_bucket_id
+        .as_ref()
+        .ok_or_else(|| {
+            invalid_resource(
+                "lane-stable arena requires an immutable-plan reusable execution bucket",
+            )
+        })?;
+    if requests
+        .iter()
+        .any(|request| request.reusable_execution_bucket_id.as_ref() != Some(bucket_id))
+    {
+        return Err(invalid_resource(
+            "lane-stable arena layout mixes reusable execution buckets",
+        ));
     }
     Ok(LaneStableArenaKey {
         lane_id,
         lifetime,
-        layout: LaneStableArenaLayoutIdentity::Evaluated(hasher.finalize().into()),
+        reusable_execution_bucket_id: bucket_id.clone(),
     })
 }
 
@@ -2718,7 +2676,20 @@ where
                 },
             ));
         }
-        self.reusable_capacity_shape_for_requests(requests)?;
+        let reusable_capacity_shape = self.reusable_capacity_shape_for_requests(requests)?;
+        if reusable_capacity_shape.is_none() {
+            return self.prepare_claim(requests).map(|decision| match decision {
+                BackingPrepareDecision::Prepared(prepared) => {
+                    LaneBackingPrepareDecision::Prepared(PreparedLaneBackingClaim {
+                        stable: prepared.commit(),
+                        slot_lease: None,
+                    })
+                }
+                BackingPrepareDecision::Deferred(deferred) => {
+                    LaneBackingPrepareDecision::Deferred(deferred)
+                }
+            });
+        }
         let lifetime = requests
             .first()
             .and_then(|request| request.projections.first())
