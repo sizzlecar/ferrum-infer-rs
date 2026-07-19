@@ -199,20 +199,25 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
         let shape =
             CausalAttentionShape::from_attributes(request.attributes()).map_err(invalid_plan)?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
-            ProviderWorkspaceSizeFormula::affine(
-                0,
-                shape.binding_slot_bytes().map_err(invalid_plan)?,
+            ProviderWorkspaceSizeFormula::tokens(
                 shape.scratch_bytes_per_token().map_err(invalid_plan)?,
             )?,
             SCRATCH_ALIGNMENT,
             ProviderWorkspaceScope::Invocation,
             DynamicStorageRequirement::contiguous(),
         )?;
-        Ok(estimate(
-            &self.descriptor,
-            request.input_fingerprint(),
-            Some(scratch),
-        ))
+        let binding = ProviderWorkspaceRequirement::from_formula(
+            ProviderWorkspaceSizeFormula::actual_sequences(
+                shape.binding_slot_bytes().map_err(invalid_plan)?,
+            )?,
+            SCRATCH_ALIGNMENT,
+            ProviderWorkspaceScope::Invocation,
+            DynamicStorageRequirement::contiguous(),
+        )?;
+        Ok(
+            estimate(&self.descriptor, request.input_fingerprint(), Some(scratch))
+                .with_binding(binding),
+        )
     }
 }
 
@@ -406,7 +411,6 @@ struct CudaCausalAttentionShape {
 #[derive(Debug, Clone, Copy)]
 struct ScratchLayout {
     required_bytes: u64,
-    binding_slot_bytes: u64,
     normalized: u64,
     query_raw: u64,
     key_raw: u64,
@@ -417,20 +421,11 @@ struct ScratchLayout {
 }
 
 impl ScratchLayout {
-    fn new(
-        shape: CausalAttentionShape,
-        total_tokens: u64,
-        participant_count: usize,
-    ) -> Result<Self, String> {
-        if total_tokens == 0 || participant_count == 0 {
+    fn new(shape: CausalAttentionShape, total_tokens: u64) -> Result<Self, String> {
+        if total_tokens == 0 {
             return Err("causal attention scratch cannot be sized for empty work".to_owned());
         }
-        let participant_count = u64::try_from(participant_count)
-            .map_err(|_| "causal attention participant count exceeds u64".to_owned())?;
-        let binding_slot_bytes = shape.binding_slot_bytes()?;
-        let mut offset = binding_slot_bytes
-            .checked_mul(participant_count)
-            .ok_or_else(|| "causal attention binding scratch size overflows".to_owned())?;
+        let mut offset = 0;
         let normalized = reserve_tokens(&mut offset, shape.hidden_size, total_tokens)?;
         let query_raw = reserve_tokens(&mut offset, shape.query_projection_features, total_tokens)?;
         let key_raw = reserve_tokens(&mut offset, shape.kv_features, total_tokens)?;
@@ -438,22 +433,15 @@ impl ScratchLayout {
         let query = reserve_tokens(&mut offset, shape.query_features, total_tokens)?;
         let context = reserve_tokens(&mut offset, shape.query_features, total_tokens)?;
         let projected = reserve_tokens(&mut offset, shape.hidden_size, total_tokens)?;
-        let expected = binding_slot_bytes
-            .checked_mul(participant_count)
-            .ok_or_else(|| "causal attention binding scratch size overflows".to_owned())?
-            .checked_add(
-                shape
-                    .scratch_bytes_per_token()?
-                    .checked_mul(total_tokens)
-                    .ok_or_else(|| "causal attention scratch size overflows".to_owned())?,
-            )
+        let expected = shape
+            .scratch_bytes_per_token()?
+            .checked_mul(total_tokens)
             .ok_or_else(|| "causal attention scratch size overflows".to_owned())?;
         if offset != expected {
             return Err("causal attention scratch layout differs from its estimate".to_owned());
         }
         Ok(Self {
             required_bytes: offset,
-            binding_slot_bytes,
             normalized,
             query_raw,
             key_raw,
@@ -463,15 +451,39 @@ impl ScratchLayout {
             projected,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BindingLayout {
+    required_bytes: u64,
+    slot_bytes: u64,
+}
+
+impl BindingLayout {
+    fn new(shape: CausalAttentionShape, participant_count: usize) -> Result<Self, String> {
+        if participant_count == 0 {
+            return Err("causal attention binding cannot be sized for empty work".to_owned());
+        }
+        let participant_count = u64::try_from(participant_count)
+            .map_err(|_| "causal attention participant count exceeds u64".to_owned())?;
+        let slot_bytes = shape.binding_slot_bytes()?;
+        let required_bytes = slot_bytes
+            .checked_mul(participant_count)
+            .ok_or_else(|| "causal attention binding workspace size overflows".to_owned())?;
+        Ok(Self {
+            required_bytes,
+            slot_bytes,
+        })
+    }
 
     fn binding_offset(self, participant: usize) -> Result<u64, String> {
-        self.binding_slot_bytes
+        self.slot_bytes
             .checked_mul(
                 u64::try_from(participant)
                     .map_err(|_| "causal attention participant index exceeds u64".to_owned())?,
             )
-            .filter(|offset| *offset < self.normalized)
-            .ok_or_else(|| "causal attention binding offset exceeds scratch".to_owned())
+            .filter(|offset| *offset < self.required_bytes)
+            .ok_or_else(|| "causal attention binding offset exceeds its workspace".to_owned())
     }
 }
 
@@ -485,6 +497,7 @@ struct SharedRegions {
     query_norm: usize,
     key_norm: usize,
     scratch: usize,
+    binding: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -524,7 +537,8 @@ fn encode_attention(
     }
 
     let total_tokens = invocation.work_shape().immediate_tokens();
-    let layout = ScratchLayout::new(shape, total_tokens, invocation.participants().len())?;
+    let layout = ScratchLayout::new(shape, total_tokens)?;
+    let binding_layout = BindingLayout::new(shape, invocation.participants().len())?;
     let cuda = shape.cuda_shape()?;
     let token_ranges = invocation.participant_token_ranges();
     if token_ranges.len() != invocation.participants().len() {
@@ -556,9 +570,17 @@ fn encode_attention(
             )?);
             index
         },
+        binding: {
+            let index = compute_regions.len();
+            compute_regions.push(super::shared_binding_region(
+                &invocation,
+                binding_layout.required_bytes,
+            )?);
+            index
+        },
     };
 
-    let mut binding_regions = vec![compute_regions[shared.scratch].clone()];
+    let mut binding_regions = vec![compute_regions[shared.binding].clone()];
     let mut host_storage = Vec::with_capacity(invocation.participants().len());
     let mut launches = Vec::with_capacity(invocation.participants().len());
     let mut bindings = Vec::with_capacity(invocation.participants().len());
@@ -628,7 +650,7 @@ fn encode_attention(
         ));
         let page_count = pages.len();
         binding_regions.extend(pages);
-        let binding_offset = layout.binding_offset(participant_index)?;
+        let binding_offset = binding_layout.binding_offset(participant_index)?;
         bindings.push(CausalAttentionBinding {
             first_page_region,
             page_count,
@@ -649,7 +671,7 @@ fn encode_attention(
         binding_regions,
         host_storage,
         move |stream, _blas, regions, host_storage| {
-            enqueue_bindings(stream, layout, &bindings, regions, host_storage)
+            enqueue_bindings(stream, binding_layout, &bindings, regions, host_storage)
         },
     )
     .map_err(|error| error.to_string())?;
@@ -674,15 +696,15 @@ fn encode_attention(
 
 fn enqueue_bindings(
     stream: &CudaStream,
-    layout: ScratchLayout,
+    layout: BindingLayout,
     bindings: &[CausalAttentionBinding],
     regions: &[CudaBufferRegion],
     host_storage: &[Box<[u8]>],
 ) -> Result<(), CudaDeviceRuntimeError> {
-    let scratch = &regions[0];
-    if scratch.length_bytes() < layout.required_bytes {
+    let binding_workspace = &regions[0];
+    if binding_workspace.length_bytes() < layout.required_bytes {
         return Err(CudaDeviceRuntimeError::contract(
-            "causal attention scratch is smaller than its admitted estimate",
+            "causal attention binding workspace is smaller than its admitted estimate",
         ));
     }
     for binding in bindings {
@@ -708,12 +730,12 @@ fn enqueue_bindings(
         let payload = host_storage.get(binding.host_binding).ok_or_else(|| {
             CudaDeviceRuntimeError::contract("causal attention binding payload is missing")
         })?;
-        if payload.len() as u64 > layout.binding_slot_bytes {
+        if payload.len() as u64 > layout.slot_bytes {
             return Err(CudaDeviceRuntimeError::contract(
                 "causal attention binding payload exceeds its admitted slot",
             ));
         }
-        let destination = scratch_pointer(scratch.device_ptr(), binding.binding_offset)?;
+        let destination = scratch_pointer(binding_workspace.device_ptr(), binding.binding_offset)?;
         unsafe {
             cudarc::driver::result::memcpy_htod_async(
                 destination,
@@ -747,7 +769,8 @@ fn enqueue_attention(
         ));
     }
     let scratch_base = scratch.device_ptr();
-    let control = scratch_pointer(scratch_base, launch.binding_offset)?;
+    let binding = &regions[shared.binding];
+    let control = scratch_pointer(binding.device_ptr(), launch.binding_offset)?;
     let page_table = control.checked_add(BINDING_CONTROL_BYTES).ok_or_else(|| {
         CudaDeviceRuntimeError::contract("causal attention page-table pointer overflows")
     })?;
@@ -1362,14 +1385,19 @@ mod tests {
     #[test]
     fn scratch_estimator_and_layout_are_identical() {
         let shape = CausalAttentionShape::from_attributes(&attributes(true)).unwrap();
-        let layout = ScratchLayout::new(shape, 17, 3).unwrap();
+        let layout = ScratchLayout::new(shape, 17).unwrap();
+        let bindings = BindingLayout::new(shape, 3).unwrap();
         assert_eq!(
             layout.required_bytes,
-            3 * shape.binding_slot_bytes().unwrap() + 17 * shape.scratch_bytes_per_token().unwrap()
+            17 * shape.scratch_bytes_per_token().unwrap()
         );
-        assert_eq!(layout.binding_offset(0).unwrap(), 0);
         assert_eq!(
-            layout.binding_offset(2).unwrap(),
+            bindings.required_bytes,
+            3 * shape.binding_slot_bytes().unwrap()
+        );
+        assert_eq!(bindings.binding_offset(0).unwrap(), 0);
+        assert_eq!(
+            bindings.binding_offset(2).unwrap(),
             2 * shape.binding_slot_bytes().unwrap()
         );
         assert_eq!(shape.maximum_pages().unwrap(), 128);

@@ -18,6 +18,7 @@ pub struct ProviderResourcePlan {
     pub(super) estimate_fingerprint: String,
     pub(super) value_alignment_bytes: u64,
     pub(super) scratch: Option<ProviderWorkspaceRequirement>,
+    pub(super) binding: Option<ProviderWorkspaceRequirement>,
     pub(super) persistent: Option<ProviderWorkspaceRequirement>,
 }
 
@@ -49,6 +50,7 @@ impl ProviderResourcePlan {
             estimate_fingerprint: String::new(),
             value_alignment_bytes: estimate.value_alignment_bytes(),
             scratch: estimate.scratch().cloned(),
+            binding: estimate.binding().cloned(),
             persistent: estimate.persistent().cloned(),
         };
         plan.validate_fields()?;
@@ -69,6 +71,16 @@ impl ProviderResourcePlan {
             || self.value_alignment_bytes == 0
             || !self.value_alignment_bytes.is_power_of_two()
             || self.scratch.as_ref().is_some_and(|workspace| {
+                workspace.scope != ProviderWorkspaceScope::Invocation
+                    || ProviderWorkspaceRequirement::from_formula(
+                        workspace.size_formula.clone(),
+                        workspace.alignment_bytes,
+                        workspace.scope,
+                        workspace.storage.clone(),
+                    )
+                    .is_err()
+            })
+            || self.binding.as_ref().is_some_and(|workspace| {
                 workspace.scope != ProviderWorkspaceScope::Invocation
                     || ProviderWorkspaceRequirement::from_formula(
                         workspace.size_formula.clone(),
@@ -118,6 +130,7 @@ impl ProviderResourcePlan {
                 estimator_input_fingerprint: &self.estimator_input_fingerprint,
                 value_alignment_bytes: self.value_alignment_bytes,
                 scratch: &self.scratch,
+                binding: &self.binding,
                 persistent: &self.persistent,
             },
             "fingerprint provider resource estimate",
@@ -156,6 +169,10 @@ impl ProviderResourcePlan {
         self.scratch.as_ref()
     }
 
+    pub fn binding(&self) -> Option<&ProviderWorkspaceRequirement> {
+        self.binding.as_ref()
+    }
+
     pub fn persistent(&self) -> Option<&ProviderWorkspaceRequirement> {
         self.persistent.as_ref()
     }
@@ -170,5 +187,6 @@ pub(super) struct ProviderEstimateFingerprintMaterial<'a> {
     pub(super) estimator_input_fingerprint: &'a str,
     pub(super) value_alignment_bytes: u64,
     pub(super) scratch: &'a Option<ProviderWorkspaceRequirement>,
+    pub(super) binding: &'a Option<ProviderWorkspaceRequirement>,
     pub(super) persistent: &'a Option<ProviderWorkspaceRequirement>,
 }

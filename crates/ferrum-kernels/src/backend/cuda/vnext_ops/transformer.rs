@@ -1124,6 +1124,20 @@ pub(super) fn shared_scratch_region(
     Ok(region)
 }
 
+pub(super) fn shared_binding_region(
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    required_bytes: u64,
+) -> Result<CudaBufferRegion, String> {
+    let region = contiguous_binding_region(&invocation.participants()[0], required_bytes)?;
+    for participant in &invocation.participants()[1..] {
+        let candidate = contiguous_binding_region(participant, required_bytes)?;
+        if !same_physical_region(&region, &candidate) {
+            return Err("CUDA batch binding is not one invocation-scoped region".to_owned());
+        }
+    }
+    Ok(region)
+}
+
 fn contiguous_scratch_region(
     participant: &OperationInvocation<'_, CudaDeviceBuffer>,
     required_bytes: u64,
@@ -1145,6 +1159,32 @@ fn contiguous_scratch_region(
         .ok_or_else(|| "CUDA dense SwiGLU scratch has no physical region".to_owned())?;
     if physical.next().is_some() {
         return Err("CUDA dense SwiGLU scratch is not physically contiguous".to_owned());
+    }
+    let (buffer, range) = region.buffer_and_physical_range();
+    buffer.region(range).map_err(|error| error.to_string())
+}
+
+fn contiguous_binding_region(
+    participant: &OperationInvocation<'_, CudaDeviceBuffer>,
+    required_bytes: u64,
+) -> Result<CudaBufferRegion, String> {
+    let view = participant
+        .binding_view()
+        .ok_or_else(|| "CUDA invocation has no binding workspace view".to_owned())?;
+    if view.descriptor().element_type != ElementType::U8
+        || view.descriptor().size_bytes < required_bytes
+    {
+        return Err("CUDA binding workspace differs from its estimate".to_owned());
+    }
+    let translated = view
+        .translate(0, view.descriptor().size_bytes)
+        .map_err(|error| error.to_string())?;
+    let mut physical = translated.iter();
+    let region = physical
+        .next()
+        .ok_or_else(|| "CUDA binding workspace has no physical region".to_owned())?;
+    if physical.next().is_some() {
+        return Err("CUDA binding workspace is not physically contiguous".to_owned());
     }
     let (buffer, range) = region.buffer_and_physical_range();
     buffer.region(range).map_err(|error| error.to_string())

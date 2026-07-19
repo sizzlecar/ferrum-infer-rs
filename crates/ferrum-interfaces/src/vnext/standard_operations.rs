@@ -92,6 +92,7 @@ pub fn token_embedding_contract() -> Result<StandardOperationContract, VNextErro
         resources: ResourceRequirements {
             minimum_value_alignment_bytes: 16,
             scratch: ResourcePresenceRequirement::Forbidden,
+            binding: ResourcePresenceRequirement::Forbidden,
             persistent: ResourcePresenceRequirement::Forbidden,
         },
         oracle: OracleSpec::Exact,
@@ -264,6 +265,7 @@ pub fn dense_swiglu_contract() -> Result<StandardOperationContract, VNextError> 
         resources: ResourceRequirements {
             minimum_value_alignment_bytes: 16,
             scratch: ResourcePresenceRequirement::Required,
+            binding: ResourcePresenceRequirement::Forbidden,
             persistent: ResourcePresenceRequirement::Forbidden,
         },
         oracle: f16_reference_tolerance()?,
@@ -492,7 +494,7 @@ pub fn causal_paged_attention_contract() -> Result<StandardOperationContract, VN
             positive_epsilon_attribute("epsilon")?,
             nonnegative_unsigned_attribute("layer_index")?,
         ]))?,
-        resources: attention_resources(),
+        resources: causal_attention_resources(),
         oracle: f16_reference_tolerance()?,
         provider: provider_requirement(
             CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
@@ -553,6 +555,7 @@ fn no_auxiliary_resources() -> ResourceRequirements {
     ResourceRequirements {
         minimum_value_alignment_bytes: 16,
         scratch: ResourcePresenceRequirement::Forbidden,
+        binding: ResourcePresenceRequirement::Forbidden,
         persistent: ResourcePresenceRequirement::Forbidden,
     }
 }
@@ -561,6 +564,16 @@ fn attention_resources() -> ResourceRequirements {
     ResourceRequirements {
         minimum_value_alignment_bytes: 16,
         scratch: ResourcePresenceRequirement::Required,
+        binding: ResourcePresenceRequirement::Forbidden,
+        persistent: ResourcePresenceRequirement::Forbidden,
+    }
+}
+
+fn causal_attention_resources() -> ResourceRequirements {
+    ResourceRequirements {
+        minimum_value_alignment_bytes: 16,
+        scratch: ResourcePresenceRequirement::Required,
+        binding: ResourcePresenceRequirement::Required,
         persistent: ResourcePresenceRequirement::Forbidden,
     }
 }
@@ -749,6 +762,10 @@ mod tests {
         }
         assert_eq!(linear.descriptor().inputs.len(), 13);
         assert_eq!(linear.descriptor().version, ContractVersion::new(2, 0));
+        assert_eq!(
+            linear.descriptor().resources.binding,
+            ResourcePresenceRequirement::Forbidden
+        );
         for ordinal in [7, 8, 9] {
             assert_eq!(
                 linear.descriptor().inputs[ordinal].element_types(),
@@ -765,6 +782,10 @@ mod tests {
         );
         assert_eq!(full.descriptor().inputs.len(), 9);
         assert_eq!(full.descriptor().version, ContractVersion::new(2, 0));
+        assert_eq!(
+            full.descriptor().resources.binding,
+            ResourcePresenceRequirement::Required
+        );
         assert_eq!(
             full.descriptor().inputs[8].access(),
             TensorAccess::ReadWrite

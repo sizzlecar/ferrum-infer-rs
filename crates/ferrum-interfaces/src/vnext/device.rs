@@ -478,6 +478,8 @@ pub enum BufferUsage {
     /// Provider/runtime workspace whose lifetime spans operations but is not
     /// model semantic state (for example packed metadata or persistent scratch).
     Persistent,
+    /// Request-shaped provider control data written before reusable compute.
+    Binding,
     Scratch,
     Transfer,
 }

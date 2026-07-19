@@ -216,6 +216,10 @@ impl PlanNodeResolution {
                     .accepts(provider_resources.scratch().is_some())
                 || !operation
                     .resources
+                    .binding
+                    .accepts(provider_resources.binding().is_some())
+                || !operation
+                    .resources
                     .persistent
                     .accepts(provider_resources.persistent().is_some())
             {
@@ -226,6 +230,7 @@ impl PlanNodeResolution {
             let mut workspace_storage_conflicts = BTreeSet::new();
             for (kind, workspace) in [
                 ("scratch", provider_resources.scratch()),
+                ("binding", provider_resources.binding()),
                 ("persistent", provider_resources.persistent()),
             ] {
                 if workspace.is_some_and(|workspace| !profile_available(workspace.storage())) {

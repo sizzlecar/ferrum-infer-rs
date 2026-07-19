@@ -578,6 +578,11 @@ impl DynamicResourceDescriptor {
                     && usage == BufferUsage::Scratch
                     && element_type == ElementType::U8
             }
+            AllocationKind::Binding { .. } => {
+                lifetime == AllocationLifetime::Invocation
+                    && usage == BufferUsage::Binding
+                    && element_type == ElementType::U8
+            }
             AllocationKind::Persistent { .. } => {
                 matches!(
                     lifetime,

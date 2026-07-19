@@ -35,6 +35,7 @@ fn provider_resources(provider: &str) -> ProviderResourcePlan {
         estimate_fingerprint: "3".repeat(64),
         value_alignment_bytes: 16,
         scratch: None,
+        binding: None,
         persistent: None,
     }
 }
@@ -106,6 +107,7 @@ fn node_work_contract_is_derived_from_one_symbolic_activation_axis() {
         resources: ResourceRequirements {
             minimum_value_alignment_bytes: 16,
             scratch: ResourcePresenceRequirement::Forbidden,
+            binding: ResourcePresenceRequirement::Forbidden,
             persistent: ResourcePresenceRequirement::Forbidden,
         },
         oracle: OracleSpec::Exact,
@@ -374,6 +376,29 @@ fn invocation_descriptor(
     .expect("valid invocation descriptor")
 }
 
+fn binding_descriptor(
+    resource: &str,
+    node: &str,
+    bytes: u64,
+    storage: DynamicStorageContract,
+) -> DynamicResourceDescriptor {
+    DynamicResourceDescriptor::new(
+        ResourceId::new(resource).expect("valid resource id"),
+        DynamicResourceDemand::fixed(bytes).expect("valid demand"),
+        16,
+        BufferUsage::Binding,
+        ElementType::U8,
+        AllocationLifetime::Invocation,
+        AllocationKind::Binding {
+            node_id: NodeId::new(node).expect("valid node id"),
+        },
+        storage,
+        StateInitialization::None,
+        1024,
+    )
+    .expect("valid binding descriptor")
+}
+
 fn step_descriptor(
     resource: &str,
     bytes_per_token: u64,
@@ -427,6 +452,7 @@ fn plan_node(id: &str, dependencies: &[&str], resources: &[&str]) -> PlanNode {
         exact_aliases: Vec::new(),
         state_effects: Vec::new(),
         scratch_resource: None,
+        binding_resource: None,
         persistent_resource: None,
         resources,
     }
@@ -529,6 +555,27 @@ fn per_pool_unordered_invocations_use_conservative_sum() {
 
     let pools =
         MemoryPlan::derive_dynamic_pools(&[first, second], &nodes, 1 << 20).expect("derive pools");
+    assert_eq!(
+        pools[0].invocation_liveness_mode(),
+        InvocationLivenessMode::ConservativeConcurrent
+    );
+    assert_eq!(pools[0].minimum_invocation_peak_bytes(), 192);
+}
+
+#[test]
+fn ordered_wave_bindings_remain_disjoint_for_preamble_uploads() {
+    let layout = canonical_fingerprint(&"binding_v1", "test layout").expect("fingerprint");
+    let storage = DynamicStorageContract::new(linear_profile(), layout).expect("storage");
+    let first = binding_descriptor("resource/binding-a", "node/a", 64, storage.clone());
+    let second = binding_descriptor("resource/binding-b", "node/b", 128, storage);
+    let nodes = vec![
+        plan_node("node/a", &[], &["resource/binding-a"]),
+        plan_node("node/b", &["node/a"], &["resource/binding-b"]),
+    ];
+
+    let pools =
+        MemoryPlan::derive_dynamic_pools(&[first, second], &nodes, 1 << 20).expect("derive pools");
+    assert_eq!(pools.len(), 1);
     assert_eq!(
         pools[0].invocation_liveness_mode(),
         InvocationLivenessMode::ConservativeConcurrent

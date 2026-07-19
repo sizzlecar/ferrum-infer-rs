@@ -282,6 +282,7 @@ pub struct PlanNode {
     pub(super) exact_aliases: Vec<PlanExactAlias>,
     pub(super) state_effects: Vec<PlanStateEffect>,
     pub(super) scratch_resource: Option<ResourceId>,
+    pub(super) binding_resource: Option<ResourceId>,
     pub(super) persistent_resource: Option<ResourceId>,
     pub(super) resources: Vec<ResourceId>,
 }
@@ -298,6 +299,7 @@ impl PlanNode {
             estimate_fingerprint: "3".repeat(64),
             value_alignment_bytes: 16,
             scratch: None,
+            binding: None,
             persistent: None,
         };
         let selected_provider = provider_resources.provider_id().clone();
@@ -322,6 +324,7 @@ impl PlanNode {
             exact_aliases: Vec::new(),
             state_effects: Vec::new(),
             scratch_resource: None,
+            binding_resource: None,
             persistent_resource: None,
             resources: Vec::new(),
         }
@@ -387,6 +390,10 @@ impl PlanNode {
         self.scratch_resource.as_ref()
     }
 
+    pub fn binding_resource(&self) -> Option<&ResourceId> {
+        self.binding_resource.as_ref()
+    }
+
     pub fn persistent_resource(&self) -> Option<&ResourceId> {
         self.persistent_resource.as_ref()
     }
@@ -411,5 +418,6 @@ pub enum AllocationLifetime {
 pub enum AllocationKind {
     Value,
     Scratch { node_id: NodeId },
+    Binding { node_id: NodeId },
     Persistent { node_id: NodeId },
 }
