@@ -888,21 +888,14 @@ where
                 PreparedStepSubmissionNode::new(request.node_id, Arc::clone(&participant_authority))
             })
             .collect::<Vec<_>>();
-        let node_shapes = prepared_nodes
-            .iter()
-            .map(|node| {
-                (
-                    node.node_id.clone(),
-                    node.work_shape().immediate_shape(),
-                    match fit_policy {
-                        AdmissionFitPolicy::ImmediateOnly => node.work_shape().immediate_shape(),
-                        AdmissionFitPolicy::FullInputMustFit => node.work_shape().fit_shape(),
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
+        let immediate_shape = work_shape.immediate_shape();
+        let fit_shape = match fit_policy {
+            AdmissionFitPolicy::ImmediateOnly => immediate_shape,
+            AdmissionFitPolicy::FullInputMustFit => work_shape.fit_shape(),
+        };
         let (demand, requested_slices) = plan.submission_wave_demand(
-            &node_shapes,
+            immediate_shape,
+            fit_shape,
             self.reusable_execution_bucket.as_ref(),
             fit_policy,
             pressure_action,

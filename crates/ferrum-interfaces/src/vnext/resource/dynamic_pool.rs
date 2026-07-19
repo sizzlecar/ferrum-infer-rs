@@ -130,6 +130,112 @@ impl DynamicPoolDomainSpec {
     }
 }
 
+#[derive(Debug)]
+pub(super) struct SubmissionWaveProjectionLayout {
+    pub(super) descriptor_index: usize,
+    pub(super) projection_index: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct SubmissionWaveRowLayout {
+    pub(super) projections: Vec<SubmissionWaveProjectionLayout>,
+}
+
+#[derive(Debug)]
+pub(super) struct SubmissionWaveDomainLayout {
+    pub(super) rows: Vec<SubmissionWaveRowLayout>,
+    pub(super) claim_identity: PhysicalBackingClaimIdentity,
+    pub(super) projection_count: usize,
+}
+
+fn compile_submission_wave_domain_layout(
+    domain: &DynamicPoolDomainSpec,
+    nodes: &[PlanNode],
+) -> Result<Option<SubmissionWaveDomainLayout>, VNextError> {
+    if domain.pool.invocation_liveness_mode() == InvocationLivenessMode::NoInvocationResources {
+        return Ok(None);
+    }
+
+    let canonical_projections = domain
+        .descriptors
+        .iter()
+        .enumerate()
+        .filter(|(_, descriptor)| descriptor.lifetime() == AllocationLifetime::Invocation)
+        .collect::<Vec<_>>();
+    let projection_by_resource = canonical_projections
+        .iter()
+        .enumerate()
+        .map(|(projection_index, (descriptor_index, descriptor))| {
+            (
+                descriptor.base_resource_id(),
+                (*descriptor_index, projection_index),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if canonical_projections.is_empty()
+        || projection_by_resource.len() != canonical_projections.len()
+    {
+        return Err(invalid_resource(
+            "submission wave layout requires unique invocation descriptors",
+        ));
+    }
+
+    let liveness = domain.pool.invocation_liveness();
+    let mut covered_projections = std::collections::BTreeSet::new();
+    let mut rows = Vec::with_capacity(liveness.len());
+    for node in nodes {
+        let Ok(row_index) = liveness.binary_search_by(|row| row.node_id().cmp(node.id())) else {
+            continue;
+        };
+        let row = &liveness[row_index];
+        let projections = row
+            .resource_ids()
+            .iter()
+            .map(|resource_id| {
+                let &(descriptor_index, projection_index) =
+                    projection_by_resource.get(resource_id).ok_or_else(|| {
+                        invalid_resource(
+                            "submission wave liveness references a descriptor outside its pool",
+                        )
+                    })?;
+                if !covered_projections.insert(projection_index) {
+                    return Err(invalid_resource(
+                        "submission wave liveness repeats one invocation descriptor",
+                    ));
+                }
+                Ok(SubmissionWaveProjectionLayout {
+                    descriptor_index,
+                    projection_index,
+                })
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        rows.push(SubmissionWaveRowLayout { projections });
+    }
+    if rows.len() != liveness.len()
+        || covered_projections.len() != canonical_projections.len()
+        || covered_projections
+            .iter()
+            .copied()
+            .ne(0..canonical_projections.len())
+    {
+        return Err(invalid_resource(
+            "submission wave layout does not cover immutable plan invocation resources exactly",
+        ));
+    }
+
+    Ok(Some(SubmissionWaveDomainLayout {
+        rows,
+        claim_identity: PhysicalBackingClaimIdentity::new(
+            domain.pool_id().clone(),
+            canonical_projections
+                .iter()
+                .map(|(_, descriptor)| descriptor.base_resource_id().clone())
+                .collect(),
+        )?,
+        projection_count: canonical_projections.len(),
+    }))
+}
+
 pub(super) struct ResidentChunkBacking<B> {
     // Buffer must drop before its physical capacity grant is returned.
     pub(super) buffer: B,
@@ -1136,15 +1242,27 @@ pub(super) enum LaneBackingPrepareDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum LaneStableArenaLayoutIdentity {
+    ReusableBucket(ReusableExecutionBucketId),
+    Evaluated([u8; 32]),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct LaneStableArenaKey {
     lane_id: ExecutionLaneId,
     lifetime: AllocationLifetime,
-    layout_fingerprint: [u8; 32],
+    layout: LaneStableArenaLayoutIdentity,
+}
+
+struct LaneStableProjectionBinding {
+    request_index: usize,
+    projection_index: usize,
 }
 
 struct LaneStableArenaSlot {
     slot_id: u64,
     authorities: Vec<LogicalBackingSliceAuthority>,
+    projection_bindings: Vec<LaneStableProjectionBinding>,
     availability_domains: Vec<CapacityDomainId>,
     in_use: bool,
     last_used: u64,
@@ -1198,6 +1316,67 @@ struct LaneStableArenaEvictionCandidate {
     lane: Arc<dyn LaneStableArenaLane>,
 }
 
+fn lane_stable_projection_matches(
+    authority: &LogicalBackingSliceAuthority,
+    request: &EvaluatedBackingRequest<'_>,
+    projection: &EvaluatedBackingProjection<'_>,
+) -> bool {
+    request.claim_identity == *authority.evidence.physical_claim_identity()
+        && projection.descriptor.base_resource_id() == authority.evidence.resource_id()
+        && request.capacity_size_bytes == authority.evidence.physical_size_bytes
+        && projection.physical_offset_bytes == authority.evidence.physical_offset_bytes
+        && projection.capacity_size_bytes == authority.evidence.capacity_size_bytes
+        && projection.logical_size_bytes != 0
+        && projection.logical_size_bytes <= projection.capacity_size_bytes
+}
+
+fn bind_lane_stable_slot_projections(
+    authorities: &[LogicalBackingSliceAuthority],
+    requests: &[&EvaluatedBackingRequest<'_>],
+) -> Result<Vec<LaneStableProjectionBinding>, VNextError> {
+    authorities
+        .iter()
+        .map(|authority| {
+            let request_index = requests
+                .binary_search_by(|request| {
+                    request
+                        .claim_identity
+                        .cmp(authority.evidence.physical_claim_identity())
+                })
+                .map_err(|_| {
+                    invalid_resource("lane-stable arena request lost its physical claim projection")
+                })?;
+            let request = requests[request_index];
+            let projection_index = request
+                .projections
+                .binary_search_by(|projection| {
+                    projection
+                        .descriptor
+                        .base_resource_id()
+                        .cmp(authority.evidence.resource_id())
+                })
+                .map_err(|_| {
+                    invalid_resource(
+                        "lane-stable arena request lost its logical resource projection",
+                    )
+                })?;
+            if !lane_stable_projection_matches(
+                authority,
+                request,
+                &request.projections[projection_index],
+            ) {
+                return Err(invalid_resource(
+                    "lane-stable arena request differs from its retained capacity layout",
+                ));
+            }
+            Ok(LaneStableProjectionBinding {
+                request_index,
+                projection_index,
+            })
+        })
+        .collect()
+}
+
 impl LaneStableArenaEntry {
     fn claim_idle_slot(
         &mut self,
@@ -1215,16 +1394,19 @@ impl LaneStableArenaEntry {
         let Some(slot) = self.slots.values_mut().find(|slot| !slot.in_use) else {
             return Ok(None);
         };
+        if slot.authorities.len() != slot.projection_bindings.len() {
+            return Err(invalid_resource(
+                "lane-stable arena slot lost its projection bindings",
+            ));
+        }
         let stable = slot
             .authorities
             .iter()
-            .map(|authority| {
+            .zip(&slot.projection_bindings)
+            .map(|(authority, binding)| {
                 let request = requests
-                    .iter()
+                    .get(binding.request_index)
                     .copied()
-                    .find(|request| {
-                        request.claim_identity == authority.evidence.physical_claim_identity
-                    })
                     .ok_or_else(|| {
                         invalid_resource(
                             "lane-stable arena request lost its physical claim projection",
@@ -1232,21 +1414,13 @@ impl LaneStableArenaEntry {
                     })?;
                 let projection = request
                     .projections
-                    .iter()
-                    .find(|projection| {
-                        projection.descriptor.base_resource_id() == &authority.evidence.resource_id
-                    })
+                    .get(binding.projection_index)
                     .ok_or_else(|| {
                         invalid_resource(
                             "lane-stable arena request lost its logical resource projection",
                         )
                     })?;
-                if request.capacity_size_bytes != authority.evidence.physical_size_bytes
-                    || projection.physical_offset_bytes != authority.evidence.physical_offset_bytes
-                    || projection.capacity_size_bytes != authority.evidence.capacity_size_bytes
-                    || projection.logical_size_bytes == 0
-                    || projection.logical_size_bytes > projection.capacity_size_bytes
-                {
+                if !lane_stable_projection_matches(authority, request, projection) {
                     return Err(invalid_resource(
                         "lane-stable arena request differs from its retained capacity layout",
                     ));
@@ -1404,6 +1578,21 @@ fn lane_stable_layout_key(
             "lane-stable arena layout is empty, non-canonical, or mixes lifetimes",
         ));
     }
+    if let Some(bucket_id) = requests[0].reusable_execution_bucket_id.as_ref() {
+        if requests
+            .iter()
+            .any(|request| request.reusable_execution_bucket_id.as_ref() != Some(bucket_id))
+        {
+            return Err(invalid_resource(
+                "lane-stable arena layout mixes reusable execution buckets",
+            ));
+        }
+        return Ok(LaneStableArenaKey {
+            lane_id,
+            lifetime,
+            layout: LaneStableArenaLayoutIdentity::ReusableBucket(bucket_id.clone()),
+        });
+    }
     // This registry is owned by one immutable plan, so static descriptor fields
     // are implicit. The hot key only needs the evaluated physical layout.
     let mut hasher = Sha256::new();
@@ -1439,7 +1628,7 @@ fn lane_stable_layout_key(
     Ok(LaneStableArenaKey {
         lane_id,
         lifetime,
-        layout_fingerprint: hasher.finalize().into(),
+        layout: LaneStableArenaLayoutIdentity::Evaluated(hasher.finalize().into()),
     })
 }
 
@@ -1450,6 +1639,7 @@ where
     pub(super) pools: BTreeMap<DynamicBackingPoolId, Arc<DynamicBackingPool<R>>>,
     pub(super) domains: Vec<DynamicPoolDomainSpec>,
     pub(super) nodes: Arc<[PlanNode]>,
+    pub(super) submission_wave_layouts: Vec<Option<SubmissionWaveDomainLayout>>,
     pub(super) reusable_execution: Option<ReusableExecutionMemoryPlan>,
     pub(super) logical_admission: LogicalAdmissionCoordinator,
     pub(super) budget: Arc<DeviceCapacityBudget>,
@@ -1707,6 +1897,10 @@ where
         nodes: Arc<[PlanNode]>,
         reusable_execution: Option<ReusableExecutionMemoryPlan>,
     ) -> Result<Self, VNextError> {
+        let submission_wave_layouts = domains
+            .iter()
+            .map(|domain| compile_submission_wave_domain_layout(domain, &nodes))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut pools = BTreeMap::new();
         for domain in &domains {
             let instance_id = NEXT_DYNAMIC_POOL_INSTANCE_ID
@@ -1745,6 +1939,7 @@ where
             domains,
             pools,
             nodes,
+            submission_wave_layouts,
             reusable_execution,
             lane_stable_arenas: Arc::new(Mutex::new(LaneStableArenaState::default())),
         })
@@ -2548,12 +2743,6 @@ where
         canonical_requests
             .sort_unstable_by(|left, right| left.claim_identity.cmp(&right.claim_identity));
         let key = lane_stable_layout_key(lane.id(), lifetime, &canonical_requests)?;
-        let availability_domains = requests
-            .iter()
-            .map(|request| request.domain.domain_id())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
         let lane_owner: Arc<dyn LaneStableArenaLane> =
             Arc::clone(lane) as Arc<dyn LaneStableArenaLane>;
 
@@ -2638,10 +2827,18 @@ where
                         }
                     }
                     let authorities = prepared.commit();
+                    let projection_bindings =
+                        bind_lane_stable_slot_projections(&authorities, &canonical_requests)?;
                     let stable = authorities
                         .iter()
                         .map(|authority| authority.retained_for_lane(lane.id()))
                         .collect();
+                    let availability_domains = requests
+                        .iter()
+                        .map(|request| request.domain.domain_id())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
                     let slot_id = arenas.issue_slot_id()?;
                     let entry =
                         arenas
@@ -2658,6 +2855,7 @@ where
                             LaneStableArenaSlot {
                                 slot_id,
                                 authorities,
+                                projection_bindings,
                                 availability_domains: availability_domains.clone(),
                                 in_use: true,
                                 last_used: now,

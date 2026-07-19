@@ -1328,72 +1328,58 @@ where
     /// node rows, while a conservative pool retains disjoint row ranges.
     pub(super) fn submission_wave_demand(
         &self,
-        node_shapes: &[(NodeId, DynamicResourceShape, DynamicResourceShape)],
+        immediate_shape: DynamicResourceShape,
+        fit_shape: DynamicResourceShape,
         reusable_execution_bucket: Option<&ReusableExecutionBucketSpec>,
         fit_policy: AdmissionFitPolicy,
         pressure_action: AdmissionPressureAction,
     ) -> Result<(AdmissionDemand, Vec<EvaluatedBackingRequest<'_>>), VNextError> {
-        if node_shapes.is_empty()
-            || node_shapes.len() != self.nodes().len()
-            || node_shapes
-                .iter()
-                .zip(self.nodes())
-                .any(|((node_id, _, _), node)| node_id != node.id())
-        {
-            return Err(invalid_resource(
-                "submission wave demand must cover every plan node in immutable plan order",
-            ));
-        }
-        let capacity_shape = reusable_execution_bucket
-            .map(|bucket| {
-                node_shapes.iter().try_for_each(|(_, immediate, fit)| {
-                    if bucket.capacity().covers(
-                        immediate.sequences(),
-                        immediate.tokens(),
-                        immediate.pages(),
-                    ) && bucket
-                        .capacity()
-                        .covers(fit.sequences(), fit.tokens(), fit.pages())
-                    {
-                        Ok(())
-                    } else {
-                        Err(invalid_resource(
-                            "reusable execution bucket does not cover every submission-wave node",
-                        ))
-                    }
-                })?;
-                Ok(DynamicResourceShape::from_validated(
+        let capacity_shape = match reusable_execution_bucket {
+            Some(bucket)
+                if bucket.capacity().covers(
+                    immediate_shape.sequences(),
+                    immediate_shape.tokens(),
+                    immediate_shape.pages(),
+                ) && bucket.capacity().covers(
+                    fit_shape.sequences(),
+                    fit_shape.tokens(),
+                    fit_shape.pages(),
+                ) =>
+            {
+                DynamicResourceShape::from_validated(
                     bucket.capacity().maximum_sequences(),
                     bucket.capacity().maximum_tokens(),
                     bucket.capacity().maximum_pages(),
-                ))
-            })
-            .transpose()?;
+                )
+            }
+            Some(_) => {
+                return Err(invalid_resource(
+                    "reusable execution bucket does not cover the submission-wave work shape",
+                ));
+            }
+            None => immediate_shape,
+        };
 
         let mut immediate_entries = Vec::new();
         let mut fit_entries = Vec::new();
         let mut requested_slices = Vec::new();
-        for domain in &self.dynamic_pools().domains {
-            let mode = domain.pool.invocation_liveness_mode();
-            if mode == InvocationLivenessMode::NoInvocationResources {
+        let pools = self.dynamic_pools();
+        if pools.domains.len() != pools.submission_wave_layouts.len() {
+            return Err(invalid_resource(
+                "submission wave layout count differs from immutable plan domains",
+            ));
+        }
+        for (domain, layout) in pools.domains.iter().zip(&pools.submission_wave_layouts) {
+            let Some(layout) = layout else {
                 continue;
-            }
+            };
+            let mode = domain.pool.invocation_liveness_mode();
 
-            let mut projections = Vec::new();
+            let mut projections = vec![None; layout.projection_count];
             let mut immediate_pool_bytes = 0_u64;
             let mut fit_pool_bytes = 0_u64;
             let mut capacity_pool_bytes = 0_u64;
-            let mut matched_rows = 0_usize;
-            for (node_id, immediate_shape, fit_shape) in node_shapes {
-                let Some(row) = domain
-                    .pool
-                    .invocation_liveness()
-                    .iter()
-                    .find(|row| row.node_id() == node_id)
-                else {
-                    continue;
-                };
-                matched_rows += 1;
+            for row in &layout.rows {
                 let row_base = match mode {
                     InvocationLivenessMode::TotalOrderReuse => 0,
                     InvocationLivenessMode::ConservativeConcurrent => capacity_pool_bytes,
@@ -1402,14 +1388,13 @@ where
                 let mut immediate_row_bytes = 0_u64;
                 let mut fit_row_bytes = 0_u64;
                 let mut capacity_row_bytes = 0_u64;
-                for resource_id in row.resource_ids() {
+                for projection_layout in &row.projections {
                     let descriptor = domain
                         .descriptors
-                        .iter()
-                        .find(|descriptor| descriptor.base_resource_id() == resource_id)
+                        .get(projection_layout.descriptor_index)
                         .ok_or_else(|| {
                             invalid_resource(
-                                "invocation liveness row references a descriptor outside its pool",
+                                "submission wave layout references a descriptor outside its pool",
                             )
                         })?;
                     if descriptor.lifetime() != AllocationLifetime::Invocation {
@@ -1418,11 +1403,19 @@ where
                         ));
                     }
                     let logical_size_bytes =
-                        descriptor.evaluate_request_bytes_for_shape(*immediate_shape)?;
-                    let fit_bytes = descriptor.evaluate_request_bytes_for_shape(*fit_shape)?;
-                    let capacity_size_bytes = descriptor.evaluate_request_bytes_for_shape(
-                        capacity_shape.unwrap_or(*immediate_shape),
-                    )?;
+                        descriptor.evaluate_request_bytes_for_shape(immediate_shape)?;
+                    let fit_bytes = if fit_shape == immediate_shape {
+                        logical_size_bytes
+                    } else {
+                        descriptor.evaluate_request_bytes_for_shape(fit_shape)?
+                    };
+                    let capacity_size_bytes = if capacity_shape == immediate_shape {
+                        logical_size_bytes
+                    } else if capacity_shape == fit_shape {
+                        fit_bytes
+                    } else {
+                        descriptor.evaluate_request_bytes_for_shape(capacity_shape)?
+                    };
                     let physical_offset_bytes =
                         row_base.checked_add(capacity_row_bytes).ok_or_else(|| {
                             invalid_resource("invocation wave projection offset overflows u64")
@@ -1440,12 +1433,19 @@ where
                         .ok_or_else(|| {
                             invalid_resource("invocation wave capacity row overflows u64")
                         })?;
-                    projections.push(EvaluatedBackingProjection {
-                        descriptor,
-                        physical_offset_bytes,
-                        logical_size_bytes,
-                        capacity_size_bytes,
-                    });
+                    if projections[projection_layout.projection_index]
+                        .replace(EvaluatedBackingProjection {
+                            descriptor,
+                            physical_offset_bytes,
+                            logical_size_bytes,
+                            capacity_size_bytes,
+                        })
+                        .is_some()
+                    {
+                        return Err(invalid_resource(
+                            "submission wave layout repeated a canonical projection",
+                        ));
+                    }
                 }
                 match mode {
                     InvocationLivenessMode::TotalOrderReuse => {
@@ -1472,30 +1472,21 @@ where
                     InvocationLivenessMode::NoInvocationResources => unreachable!(),
                 }
             }
-            if matched_rows != domain.pool.invocation_liveness().len()
-                || projections.is_empty()
-                || immediate_pool_bytes == 0
-            {
+            let projections = projections
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    invalid_resource("submission wave layout left a projection unevaluated")
+                })?;
+            if projections.is_empty() || immediate_pool_bytes == 0 {
                 return Err(invalid_resource(
-                    "invocation liveness rows do not map exactly onto the submission wave",
+                    "submission wave layout evaluated to empty invocation demand",
                 ));
             }
 
-            projections.sort_by(|left, right| {
-                left.descriptor
-                    .base_resource_id()
-                    .cmp(right.descriptor.base_resource_id())
-            });
-            let resource_ids = projections
-                .iter()
-                .map(|projection| projection.descriptor.base_resource_id().clone())
-                .collect::<Vec<_>>();
             requested_slices.push(EvaluatedBackingRequest {
                 domain,
-                claim_identity: PhysicalBackingClaimIdentity::new(
-                    domain.pool_id().clone(),
-                    resource_ids,
-                )?,
+                claim_identity: layout.claim_identity.clone(),
                 capacity_size_bytes: capacity_pool_bytes,
                 reusable_execution_bucket_id: reusable_execution_bucket
                     .map(|bucket| bucket.bucket_id().clone()),
