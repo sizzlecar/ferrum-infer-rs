@@ -102,7 +102,7 @@ impl PlanNodeResolution {
             .flat_map(|block| &block.nodes)
             .find(|node| node.id == node_id)
             .ok_or_else(|| invalid_plan(format!("program has no node `{node_id}`")))?;
-        let operation = catalog.operation(&program_node.operation_id)?;
+        let operation = catalog.operation_for_node(&program_node.id, &program_node.operation_id)?;
 
         let contracts = registry.contracts_for(&program_node.operation_id);
         if contracts.len() != 1 {
@@ -142,7 +142,7 @@ impl PlanNodeResolution {
             required_quantization_formats,
         )?;
         let report = catalog.provider_compatibility(compatibility_request)?;
-        report.require_compatible(&catalog.device().id)?;
+        report.require_compatible_for_node(&catalog.device().id, &program_node.id)?;
         let profile_available = |requirement: &DynamicStorageRequirement| {
             policy
                 .dynamic_storage_profile_order()
@@ -156,7 +156,7 @@ impl PlanNodeResolution {
         let mut provider_resolution_rejections = BTreeMap::new();
         for provider_id in report.compatible_provider_ids() {
             let descriptor = catalog
-                .providers_for(&program_node.operation_id)?
+                .providers_for_node(&program_node.id, &program_node.operation_id)?
                 .iter()
                 .find(|provider| provider.provider_id() == provider_id)
                 .ok_or_else(|| invalid_plan("compatible provider is absent from the catalog"))?;

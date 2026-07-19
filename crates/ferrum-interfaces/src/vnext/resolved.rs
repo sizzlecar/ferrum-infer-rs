@@ -2947,7 +2947,9 @@ impl ResolvedModelPlan {
             ));
         }
         for node in parts.execution_plan.payload().nodes() {
-            let providers = parts.capabilities.providers_for(node.operation_id())?;
+            let providers = parts
+                .capabilities
+                .providers_for_node(node.id(), node.operation_id())?;
             let selected = providers
                 .iter()
                 .find(|provider| provider.provider_id() == node.selection().selected_provider())

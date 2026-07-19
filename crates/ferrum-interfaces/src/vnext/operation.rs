@@ -40,6 +40,38 @@ fn invalid_operation(reason: impl Into<String>) -> VNextError {
     }
 }
 
+fn operation_error_for_node(error: VNextError, node_id: &NodeId) -> VNextError {
+    match error {
+        VNextError::UnsupportedOperation {
+            node_id: None,
+            operation_id,
+            device_id,
+            reason,
+        } => VNextError::UnsupportedOperation {
+            node_id: Some(node_id.to_string()),
+            operation_id,
+            device_id,
+            reason,
+        },
+        VNextError::IncompatibleOperationVersion {
+            node_id: None,
+            operation_id,
+            required_major,
+            required_minor,
+            available_major,
+            available_minor,
+        } => VNextError::IncompatibleOperationVersion {
+            node_id: Some(node_id.to_string()),
+            operation_id,
+            required_major,
+            required_minor,
+            available_major,
+            available_minor,
+        },
+        error => error,
+    }
+}
+
 struct OperationFingerprintWriter<'a>(&'a mut Sha256);
 
 impl Write for OperationFingerprintWriter<'_> {
@@ -2255,6 +2287,66 @@ impl ProviderCompatibilityReport {
             });
         }
         Ok(())
+    }
+
+    /// Requires one compatible provider while retaining the plan node that
+    /// caused a missing capability or version failure.
+    pub fn require_compatible_for_node(
+        &self,
+        device_id: &DeviceId,
+        node_id: &NodeId,
+    ) -> Result<(), VNextError> {
+        if !self.compatible_provider_ids.is_empty() {
+            return Ok(());
+        }
+        let operation_version_mismatch = self
+            .rejected
+            .iter()
+            .flat_map(|rejection| &rejection.reasons)
+            .find_map(|reason| match reason {
+                ProviderCompatibilityRejectReason::OperationVersionMismatch {
+                    required,
+                    available,
+                } => Some((*required, *available)),
+                _ => None,
+            });
+        let provider_version_mismatch = self
+            .rejected
+            .iter()
+            .map(|rejection| {
+                rejection.reasons.iter().find_map(|reason| match reason {
+                    ProviderCompatibilityRejectReason::ProviderVersionMismatch {
+                        required,
+                        available,
+                    } => Some((*required, *available)),
+                    _ => None,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .and_then(|versions| {
+                versions
+                    .into_iter()
+                    .max_by_key(|(_, available)| (available.major, available.minor))
+            });
+        if let Some((required, available)) =
+            operation_version_mismatch.or(provider_version_mismatch)
+        {
+            return Err(VNextError::IncompatibleOperationVersion {
+                node_id: Some(node_id.to_string()),
+                operation_id: self.request.operation_id.to_string(),
+                required_major: required.major,
+                required_minor: required.minor,
+                available_major: available.major,
+                available_minor: available.minor,
+            });
+        }
+        Err(VNextError::UnsupportedOperation {
+            node_id: Some(node_id.to_string()),
+            operation_id: self.request.operation_id.to_string(),
+            device_id: device_id.to_string(),
+            reason: "all providers were rejected; inspect the typed compatibility report"
+                .to_owned(),
+        })
     }
 }
 
@@ -6688,6 +6780,16 @@ impl CapabilityCatalog {
             })
     }
 
+    /// Resolves providers with the requesting plan node attached to failures.
+    pub fn providers_for_node(
+        &self,
+        node_id: &NodeId,
+        operation_id: &OperationId,
+    ) -> Result<&[OperationProviderDescriptor], VNextError> {
+        self.providers_for(operation_id)
+            .map_err(|error| operation_error_for_node(error, node_id))
+    }
+
     pub fn operation(
         &self,
         operation_id: &OperationId,
@@ -6700,6 +6802,16 @@ impl CapabilityCatalog {
                 device_id: self.device.id.to_string(),
                 reason: "operation descriptor is not registered".to_owned(),
             })
+    }
+
+    /// Resolves an operation with the requesting plan node attached to failures.
+    pub fn operation_for_node(
+        &self,
+        node_id: &NodeId,
+        operation_id: &OperationId,
+    ) -> Result<&OperationDescriptor, VNextError> {
+        self.operation(operation_id)
+            .map_err(|error| operation_error_for_node(error, node_id))
     }
 
     pub fn provider_compatibility(
