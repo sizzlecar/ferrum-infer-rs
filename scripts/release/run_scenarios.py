@@ -50,6 +50,7 @@ SERVE_TYPES = {
     "serve_stateful_loop",
     "serve_stream",
     "serve_structured_output",
+    "serve_response_format_matrix",
     "serve_context_limit",
     "serve_concurrency_quality",
     "serve_tool_schema_priority",
@@ -263,6 +264,52 @@ def chat_payload(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+
+
+def strict_schema_case(
+    category: str, marker: str, ordinal: int
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if category == "required":
+        expected = {"required_value": marker}
+        schema = {
+            "type": "object",
+            "properties": {"required_value": {"type": "string", "const": marker}},
+            "required": ["required_value"],
+            "additionalProperties": False,
+        }
+    elif category == "type":
+        expected = {"ordinal": ordinal}
+        schema = {
+            "type": "object",
+            "properties": {"ordinal": {"type": "integer", "const": ordinal}},
+            "required": ["ordinal"],
+            "additionalProperties": False,
+        }
+    elif category == "additionalProperties":
+        expected = {"marker": marker}
+        schema = {
+            "type": "object",
+            "properties": {"marker": {"type": "string", "const": marker}},
+            "required": ["marker"],
+            "additionalProperties": False,
+        }
+    elif category == "enum":
+        value = f"accepted-{ordinal:03d}"
+        expected = {"status": value}
+        schema = {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": [value, f"rejected-{ordinal:03d}"],
+                }
+            },
+            "required": ["status"],
+            "additionalProperties": False,
+        }
+    else:
+        raise ScenarioError(f"unsupported strict schema category: {category}")
+    return expected, schema
 
 
 def parse_sse(body: str) -> dict[str, Any]:
@@ -713,6 +760,8 @@ class ScenarioRunner:
             return self.serve_stream(scenario, out)
         if typ == "serve_structured_output":
             return self.serve_structured_output(scenario, out)
+        if typ == "serve_response_format_matrix":
+            return self.serve_response_format_matrix(scenario, out)
         if typ == "serve_context_limit":
             return self.serve_context_limit(scenario, out)
         if typ == "serve_concurrency_quality":
@@ -886,6 +935,131 @@ class ScenarioRunner:
             raise ScenarioError(f"structured output content is not JSON: {text[:500]}") from exc
         require(parsed == expected, f"structured output {parsed!r} != expected {expected!r}")
         return {"status": "pass", "object": parsed}
+
+    def serve_response_format_matrix(
+        self, scenario: dict[str, Any], out: Path
+    ) -> dict[str, Any]:
+        format_type = str(scenario.get("format") or "")
+        require(
+            format_type in {"json_object", "json_schema"},
+            "serve_response_format_matrix.format must be json_object or json_schema",
+        )
+        case_count = int(scenario.get("case_count", 1))
+        require(1 <= case_count <= 70, "serve_response_format_matrix.case_count must be 1..70")
+        thinking = scenario.get("enable_thinking")
+        require(isinstance(thinking, bool), "enable_thinking must be a boolean")
+        preset = str(scenario.get("preset") or "")
+        expected_preset = "P_THINKING" if thinking else "P_NO_THINKING"
+        require(preset == expected_preset, f"preset must be {expected_preset}")
+        sampling = scenario.get("sampling")
+        require(isinstance(sampling, dict), "serve_response_format_matrix.sampling is required")
+        required_sampling = {
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "presence_penalty",
+            "repetition_penalty",
+            "seed",
+            "stop",
+        }
+        missing_sampling = sorted(required_sampling - sampling.keys())
+        require(not missing_sampling, f"sampling fields missing: {missing_sampling}")
+
+        categories = ("required", "type", "additionalProperties", "enum")
+        category_counts = {category: 0 for category in categories}
+        results: list[dict[str, Any]] = []
+        for ordinal in range(case_count):
+            marker = f"{scenario_slug(str(scenario['name']))}-{ordinal:03d}"
+            category = categories[ordinal % len(categories)]
+            if format_type == "json_schema":
+                expected, schema = strict_schema_case(category, marker, ordinal)
+                response_format: dict[str, Any] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": f"{category}_{ordinal:03d}",
+                        "strict": True,
+                        "schema": schema,
+                    },
+                }
+                category_counts[category] += 1
+            else:
+                expected = {"marker": marker, "ordinal": ordinal}
+                response_format = {"type": "json_object"}
+
+            payload = chat_payload(
+                self.model,
+                [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Return one JSON object and no other text. EXACT_JSON:"
+                            + json.dumps(expected, ensure_ascii=False, separators=(",", ":"))
+                        ),
+                    }
+                ],
+                max_tokens=int(scenario.get("max_tokens", 256)),
+                temperature=float(sampling["temperature"]),
+            )
+            for field in sorted(required_sampling - {"temperature"}):
+                payload[field] = sampling[field]
+            payload["chat_template_kwargs"] = {"enable_thinking": thinking}
+            payload["response_format"] = response_format
+
+            case_out = out / f"{ordinal:03d}"
+            case_out.mkdir(parents=True, exist_ok=True)
+            write_json(case_out / "request.json", payload)
+            status, body = post_json(self.require_base_url(), payload, timeout=self.timeout)
+            (case_out / "response.json").write_text(body, errors="replace")
+            data = parse_json_response(f"{format_type}-{ordinal:03d}", status, body)
+            choice = first_choice(data)
+            message = choice.get("message")
+            require(isinstance(message, dict), f"case {ordinal}: missing assistant message")
+            content = message.get("content")
+            require(isinstance(content, str), f"case {ordinal}: structured content is not a string")
+            require("```" not in content, f"case {ordinal}: markdown fence in structured content")
+            require(
+                "<think>" not in content and "</think>" not in content,
+                f"case {ordinal}: reasoning leaked into structured content",
+            )
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise ScenarioError(f"case {ordinal}: invalid JSON object: {content[:500]}") from exc
+            require(isinstance(parsed, dict), f"case {ordinal}: JSON root is not an object")
+            if format_type == "json_schema":
+                require(parsed == expected, f"case {ordinal}: {parsed!r} != {expected!r}")
+            else:
+                require(
+                    parsed.get("marker") == marker and parsed.get("ordinal") == ordinal,
+                    f"case {ordinal}: JSON object lost prompt identity: {parsed!r}",
+                )
+            require(choice.get("finish_reason") != "length", f"case {ordinal}: length finish")
+            reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
+            require(isinstance(reasoning, str), f"case {ordinal}: reasoning is not a string")
+            result = {
+                "ordinal": ordinal,
+                "format": format_type,
+                "category": category if format_type == "json_schema" else None,
+                "preset": preset,
+                "enable_thinking": thinking,
+                "http_status": status,
+                "finish_reason": choice.get("finish_reason"),
+                "reasoning_chars": len(reasoning),
+                "object": parsed,
+            }
+            write_json(case_out / "result.json", {"status": "pass", **result})
+            results.append(result)
+
+        return {
+            "status": "pass",
+            "format": format_type,
+            "preset": preset,
+            "enable_thinking": thinking,
+            "case_count": len(results),
+            "category_counts": category_counts if format_type == "json_schema" else {},
+            "cases": results,
+        }
 
     def serve_context_limit(self, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
         expected_status = int(scenario.get("expected_status", 400))
@@ -1219,6 +1393,7 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
                 break
         marker = re.search(r"\b(ferrum\d{2}\d{2})\b", prompt)
         square = re.search(r"(S\d{4})", prompt)
+        exact_object = self.exact_json_object(last_user)
         if echo_marker is not None:
             self.send_tool_call(
                 "echo_value",
@@ -1247,6 +1422,8 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
                     separators=(",", ":"),
                 )
             )
+        elif payload.get("response_format") and exact_object is not None:
+            self.send_chat(json.dumps(exact_object, separators=(",", ":")))
         elif payload.get("response_format"):
             self.send_chat('{"answer":"scenario-ok"}')
         elif "remembered code" in last_user.lower() or "secret code" in last_user.lower():
@@ -1284,6 +1461,17 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
                 return None
             return str(value["const"])
         return None
+
+    @staticmethod
+    def exact_json_object(prompt: str) -> dict[str, Any] | None:
+        marker = "EXACT_JSON:"
+        if marker not in prompt:
+            return None
+        try:
+            value = json.loads(prompt.split(marker, 1)[1])
+        except json.JSONDecodeError:
+            return None
+        return value if isinstance(value, dict) else None
 
     def send_json(self, status: int, data: dict[str, Any]) -> None:
         raw = json.dumps(data).encode("utf-8")
@@ -1428,6 +1616,42 @@ def self_test() -> int:
                             "type": "serve_structured_output",
                             "expected_object": {"answer": "scenario-ok"},
                         },
+                        {
+                            "name": "strict-matrix",
+                            "type": "serve_response_format_matrix",
+                            "format": "json_schema",
+                            "case_count": 4,
+                            "enable_thinking": False,
+                            "preset": "P_NO_THINKING",
+                            "sampling": {
+                                "temperature": 0.7,
+                                "top_p": 0.8,
+                                "top_k": 20,
+                                "min_p": 0.0,
+                                "presence_penalty": 1.5,
+                                "repetition_penalty": 1.0,
+                                "seed": 9271,
+                                "stop": [],
+                            },
+                        },
+                        {
+                            "name": "object-matrix",
+                            "type": "serve_response_format_matrix",
+                            "format": "json_object",
+                            "case_count": 2,
+                            "enable_thinking": True,
+                            "preset": "P_THINKING",
+                            "sampling": {
+                                "temperature": 1.0,
+                                "top_p": 0.95,
+                                "top_k": 20,
+                                "min_p": 0.0,
+                                "presence_penalty": 1.5,
+                                "repetition_penalty": 1.0,
+                                "seed": 9271,
+                                "stop": [],
+                            },
+                        },
                         {"name": "context", "type": "serve_context_limit"},
                         {
                             "name": "concurrency",
@@ -1459,8 +1683,19 @@ def self_test() -> int:
             if f"BACKEND REGRESSION SMOKE PASS: {out}" not in proc.stdout:
                 raise AssertionError(proc.stdout)
             summary = load_json_object(out / "summary.json")
-            if summary.get("status") != "pass" or summary.get("scenario_count") != 9:
+            if summary.get("status") != "pass" or summary.get("scenario_count") != 11:
                 raise AssertionError(summary)
+            strict_result = load_json_object(out / "strict-matrix" / "result.json")
+            if strict_result.get("category_counts") != {
+                "required": 1,
+                "type": 1,
+                "additionalProperties": 1,
+                "enum": 1,
+            }:
+                raise AssertionError(strict_result)
+            object_result = load_json_object(out / "object-matrix" / "result.json")
+            if object_result.get("case_count") != 2:
+                raise AssertionError(object_result)
             health = load_json_object(out / "server.health.json")
             if health.get("status") != "pass" or health.get("http_status") != 200:
                 raise AssertionError(health)

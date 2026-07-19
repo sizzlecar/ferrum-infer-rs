@@ -39,6 +39,7 @@ describes the current product contract for the always-on server path.
 | `max_tokens` | Supported | Legacy completion budget. |
 | `max_completion_tokens` | Supported | Overrides `max_tokens` when both are supplied. |
 | `temperature`, `top_p` | Supported | Mapped into Ferrum sampling parameters. |
+| `top_k`, `min_p`, `repetition_penalty` | Supported extension | vLLM-compatible sampling fields. `top_k=-1/0` and `min_p=0` disable their filters. |
 | `stop` | Supported | Accepts a string or string array and strips a trailing stop sentinel from returned text. |
 | `stream` | Supported | Emits OpenAI-shaped SSE chunks followed by `[DONE]`. |
 | `stream_options.include_usage` | Supported with `stream=true` | Emits a final usage chunk with `choices: []`; `stream_options` without streaming is rejected. |

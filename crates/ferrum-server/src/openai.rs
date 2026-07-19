@@ -32,6 +32,20 @@ pub struct ChatCompletionsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
 
+    /// vLLM-compatible top-k sampling extension. Values `-1` and `0`
+    /// disable top-k filtering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i64>,
+
+    /// vLLM-compatible minimum probability sampling extension. A value of
+    /// `0` disables minimum-probability filtering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+
+    /// vLLM-compatible repetition penalty extension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
+
     /// Number of completions to generate
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n: Option<u32>,
