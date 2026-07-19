@@ -480,6 +480,7 @@ struct VNextExecutorMetrics {
     prefill_operations: AtomicU64,
     prefill_frontier_narrowings: AtomicU64,
     decode_operations: AtomicU64,
+    prepared_wave_topology: VNextPreparedWaveTopologyMetrics,
     submitted_waves: AtomicU64,
     completed_waves: AtomicU64,
     failed_waves: AtomicU64,
@@ -547,6 +548,65 @@ struct VNextWaveTimingMetrics {
     completion_round_trip: AtomicDurationMetrics,
     host_postprocess: AtomicDurationMetrics,
     submitted_wave_total: AtomicDurationMetrics,
+}
+
+#[derive(Default)]
+struct VNextPreparedWaveTopologyMetrics {
+    wave_authorities: AtomicU64,
+    covered_nodes: AtomicU64,
+    participant_flights: AtomicU64,
+    node_participant_projections: AtomicU64,
+}
+
+impl VNextPreparedWaveTopologyMetrics {
+    fn record<R: DeviceRuntime>(&self, wave: &PreparedStepSubmissionWave<R>) {
+        self.record_counts(
+            wave.node_count(),
+            wave.prepared_participant_flight_count(),
+            wave.node_participant_projection_count(),
+        );
+    }
+
+    fn record_counts(
+        &self,
+        covered_nodes: usize,
+        participant_flights: usize,
+        node_participant_projections: usize,
+    ) {
+        self.wave_authorities.fetch_add(1, Ordering::Relaxed);
+        self.covered_nodes.fetch_add(
+            u64::try_from(covered_nodes).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.participant_flights.fetch_add(
+            u64::try_from(participant_flights).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.node_participant_projections.fetch_add(
+            u64::try_from(node_participant_projections).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "wave_authorities": self.wave_authorities.load(Ordering::Relaxed),
+            "covered_nodes": self.covered_nodes.load(Ordering::Relaxed),
+            "participant_flights": self.participant_flights.load(Ordering::Relaxed),
+            "node_participant_projections": self.node_participant_projections.load(Ordering::Relaxed),
+        })
+    }
+
+    fn reset(&self) {
+        for counter in [
+            &self.wave_authorities,
+            &self.covered_nodes,
+            &self.participant_flights,
+            &self.node_participant_projections,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 impl VNextWaveTimingMetrics {
@@ -948,6 +1008,7 @@ impl VNextExecutorMetrics {
             counter.store(0, Ordering::Relaxed);
         }
         self.wave_timing.reset();
+        self.prepared_wave_topology.reset();
         self.prefill_wave_timing.reset();
         self.decode_wave_timing.reset();
         self.device_timing.reset();
@@ -3594,7 +3655,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         loop {
             match self.try_prepare_wave_for_spans(step, spans)? {
                 StepSubmissionWaveAdmissionDecision::Prepared(wave) => {
-                    return Ok(VNextExecutionCapacityDecision::Ready(wave))
+                    self.metrics.prepared_wave_topology.record(&wave);
+                    return Ok(VNextExecutionCapacityDecision::Ready(wave));
                 }
                 StepSubmissionWaveAdmissionDecision::Deferred(deferred) => {
                     self.metrics.wave_deferrals.fetch_add(1, Ordering::Relaxed);
@@ -4722,6 +4784,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "prefill_operations": self.metrics.prefill_operations.load(Ordering::Relaxed),
                 "prefill_frontier_narrowings": self.metrics.prefill_frontier_narrowings.load(Ordering::Relaxed),
                 "decode_operations": self.metrics.decode_operations.load(Ordering::Relaxed),
+                "prepared_wave_topology": self.metrics.prepared_wave_topology.snapshot(),
                 "submitted_waves": self.metrics.submitted_waves.load(Ordering::Relaxed),
                 "completed_waves": self.metrics.completed_waves.load(Ordering::Relaxed),
                 "failed_waves": self.metrics.failed_waves.load(Ordering::Relaxed),
@@ -5327,8 +5390,9 @@ mod tests {
     use super::{
         reported_allocated_bytes, resolved_sequence_fit_policy, AdmissionFitPolicy,
         DecodeFailureDisposition, FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics,
-        VNextExecutionWaveKind, VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
-        VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics, VNextWaveTimingSink,
+        VNextExecutionWaveKind, VNextPreparedWaveTopologyMetrics, VNextReusableExecutionDescriptor,
+        VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics,
+        VNextWaveTimingSink,
     };
     use ferrum_interfaces::vnext::{
         DeviceReusableExecutionObservation, DeviceSubmissionTimingSink,
@@ -5398,6 +5462,23 @@ mod tests {
         );
         assert_eq!(VNextExecutionWaveKind::Prefill.as_str(), "prefill");
         assert_eq!(VNextExecutionWaveKind::Decode.as_str(), "decode");
+    }
+
+    #[test]
+    fn prepared_wave_topology_metrics_separate_owners_from_node_projections() {
+        let metrics = VNextPreparedWaveTopologyMetrics::default();
+
+        metrics.record_counts(131, 1, 131);
+        metrics.record_counts(131, 4, 524);
+        let snapshot = metrics.snapshot();
+
+        assert_eq!(snapshot["wave_authorities"], 2);
+        assert_eq!(snapshot["covered_nodes"], 262);
+        assert_eq!(snapshot["participant_flights"], 5);
+        assert_eq!(snapshot["node_participant_projections"], 655);
+
+        metrics.reset();
+        assert_eq!(metrics.snapshot()["wave_authorities"], 0);
     }
 
     #[test]
