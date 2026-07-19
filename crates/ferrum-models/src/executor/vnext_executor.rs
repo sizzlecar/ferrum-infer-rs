@@ -70,6 +70,7 @@ pub struct VNextExecutorConfig {
     pub static_initialization: StaticInitializationPolicy,
     pub runtime_policy: ResolvedRuntimePolicy,
     pub reusable_execution_enabled: bool,
+    pub reusable_execution_prefill_token_counts: Vec<usize>,
 }
 
 impl VNextExecutorConfig {
@@ -153,11 +154,22 @@ impl VNextExecutorConfig {
         )
         .map_err(|error| FerrumError::config(error.to_string()))?;
 
+        let mut reusable_execution_prefill_token_counts = [
+            engine.scheduler.prefill_step_chunk,
+            engine.scheduler.active_decode_prefill_chunk,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        reusable_execution_prefill_token_counts.sort_unstable_by(|left, right| right.cmp(left));
+        reusable_execution_prefill_token_counts.dedup();
+
         Ok(Self {
             maximum_model_tokens,
             static_initialization,
             runtime_policy,
             reusable_execution_enabled: engine.backend.enable_cuda_graphs,
+            reusable_execution_prefill_token_counts,
         })
     }
 }
@@ -166,10 +178,41 @@ const REUSABLE_EXECUTION_WARMUP_PASSES: usize = 1;
 const REUSABLE_EXECUTION_CAPTURE_PASSES: usize = 1;
 const REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES: usize = 1;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "topology", rename_all = "snake_case")]
+enum VNextReusableExecutionDescriptor {
+    UniformDecode {
+        query_tokens_per_sequence: usize,
+        token_capacity: usize,
+        request_capacity: usize,
+    },
+    Prefill {
+        token_capacity: usize,
+        request_capacity: usize,
+    },
+}
+
+impl VNextReusableExecutionDescriptor {
+    const fn uniform_decode(width: usize) -> Self {
+        Self::UniformDecode {
+            query_tokens_per_sequence: 1,
+            token_capacity: width,
+            request_capacity: width,
+        }
+    }
+
+    const fn prefill(token_count: usize) -> Self {
+        Self::Prefill {
+            token_capacity: token_count,
+            request_capacity: 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct VNextReusableExecutionStartupPlan {
-    decode_widths: Vec<usize>,
-    maximum_synthetic_sequence_tokens: usize,
+    descriptors: Vec<VNextReusableExecutionDescriptor>,
+    maximum_decode_sequence_tokens: usize,
     device_plan: DeviceReusableExecutionPlan,
 }
 
@@ -178,6 +221,7 @@ impl VNextReusableExecutionStartupPlan {
         maximum_active_sequences: u32,
         maximum_scheduled_tokens: u64,
         maximum_model_tokens: usize,
+        prefill_token_counts: &[usize],
         execution_node_count: usize,
     ) -> Result<Self> {
         let maximum_active_sequences = usize::try_from(maximum_active_sequences)
@@ -202,38 +246,85 @@ impl VNextReusableExecutionStartupPlan {
         }
         decode_widths.sort_unstable_by(|left, right| right.cmp(left));
 
+        let mut prefill_token_counts = prefill_token_counts
+            .iter()
+            .copied()
+            .filter(|token_count| *token_count > 0)
+            .map(|token_count| {
+                token_count
+                    .min(maximum_scheduled_tokens)
+                    .min(maximum_model_tokens)
+            })
+            .filter(|token_count| *token_count > 0)
+            .collect::<Vec<_>>();
+        prefill_token_counts.sort_unstable_by(|left, right| right.cmp(left));
+        prefill_token_counts.dedup();
+
         let passes_per_width = REUSABLE_EXECUTION_WARMUP_PASSES
             + REUSABLE_EXECUTION_CAPTURE_PASSES
             + REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES;
-        let maximum_synthetic_sequence_tokens = decode_widths
+        let maximum_decode_sequence_tokens = decode_widths
             .len()
             .checked_mul(passes_per_width)
             .and_then(|decode_tokens| decode_tokens.checked_add(1))
             .ok_or_else(|| FerrumError::config("vNext startup token ceiling overflowed"))?;
-        if maximum_synthetic_sequence_tokens > maximum_model_tokens {
+        if maximum_decode_sequence_tokens > maximum_model_tokens {
             return Err(FerrumError::config(format!(
-                "vNext model length {maximum_model_tokens} cannot cover reusable execution startup ceiling {maximum_synthetic_sequence_tokens}"
+                "vNext model length {maximum_model_tokens} cannot cover reusable execution startup ceiling {maximum_decode_sequence_tokens}"
             )));
         }
 
+        let descriptors = decode_widths
+            .into_iter()
+            .map(VNextReusableExecutionDescriptor::uniform_decode)
+            .chain(
+                prefill_token_counts
+                    .into_iter()
+                    .map(VNextReusableExecutionDescriptor::prefill),
+            )
+            .collect::<Vec<_>>();
+
         let maximum_executables = execution_node_count
             .max(1)
-            .checked_mul(decode_widths.len())
+            .checked_mul(descriptors.len())
             .ok_or_else(|| FerrumError::config("vNext reusable executable capacity overflowed"))?;
         let device_plan = DeviceReusableExecutionPlan::new(maximum_executables)
             .map_err(|error| FerrumError::config(error.to_string()))?;
         Ok(Self {
-            decode_widths,
-            maximum_synthetic_sequence_tokens,
+            descriptors,
+            maximum_decode_sequence_tokens,
             device_plan,
         })
     }
 
+    fn decode_widths(&self) -> Vec<usize> {
+        self.descriptors
+            .iter()
+            .filter_map(|descriptor| match descriptor {
+                VNextReusableExecutionDescriptor::UniformDecode {
+                    request_capacity, ..
+                } => Some(*request_capacity),
+                VNextReusableExecutionDescriptor::Prefill { .. } => None,
+            })
+            .collect()
+    }
+
+    fn prefill_token_counts(&self) -> Vec<usize> {
+        self.descriptors
+            .iter()
+            .filter_map(|descriptor| match descriptor {
+                VNextReusableExecutionDescriptor::UniformDecode { .. } => None,
+                VNextReusableExecutionDescriptor::Prefill { token_capacity, .. } => {
+                    Some(*token_capacity)
+                }
+            })
+            .collect()
+    }
+
     fn widths_for_available_sequences(&self, available: usize) -> Vec<usize> {
         let mut widths = self
-            .decode_widths
-            .iter()
-            .copied()
+            .decode_widths()
+            .into_iter()
             .filter(|width| *width <= available)
             .collect::<Vec<_>>();
         if available > 0 && !widths.contains(&available) {
@@ -247,8 +338,12 @@ impl VNextReusableExecutionStartupPlan {
 struct VNextReusableExecutionStartupReport {
     enabled: bool,
     supported: bool,
+    requested_descriptors: Vec<VNextReusableExecutionDescriptor>,
+    prepared_descriptors: Vec<VNextReusableExecutionDescriptor>,
     requested_decode_widths: Vec<usize>,
     prepared_decode_widths: Vec<usize>,
+    requested_prefill_token_counts: Vec<usize>,
+    prepared_prefill_token_counts: Vec<usize>,
     synthetic_sequences: usize,
     eager_warmup_waves: usize,
     capture_waves: usize,
@@ -2240,6 +2335,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     config.runtime_policy.memory().maximum_active_sequences,
                     config.runtime_policy.admission().maximum_scheduled_tokens,
                     config.maximum_model_tokens,
+                    &config.reusable_execution_prefill_token_counts,
                     resolved_plan.execution_plan().payload().nodes().len(),
                 )?)
             } else {
@@ -2274,8 +2370,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         })
     }
 
-    fn startup_token_tensor(token: u32) -> Result<TensorRef> {
-        let tensor = candle_core::Tensor::new(&[token], &candle_core::Device::Cpu)
+    fn startup_token_tensor(tokens: &[u32]) -> Result<TensorRef> {
+        if tokens.is_empty() {
+            return Err(FerrumError::internal(
+                "vNext startup token tensor must be non-empty",
+            ));
+        }
+        let tensor = candle_core::Tensor::new(tokens, &candle_core::Device::Cpu)
             .and_then(|tensor| tensor.unsqueeze(0))
             .map_err(|error| FerrumError::model(format!("vNext startup token tensor: {error}")))?;
         Ok(common::wrap_tensor(tensor))
@@ -2338,7 +2439,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         }
 
-        let chunk = PrefillChunk::new(0, 1, 1)?;
+        let input_token_count = input_tokens.len();
+        let chunk = PrefillChunk::new(0, input_token_count, input_token_count)?;
         let input = PrefillInput::new(Arc::clone(input_tensor))
             .with_request_context(request_id, maximum_sequence_tokens)
             .with_chunk(chunk);
@@ -2346,9 +2448,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             ExecutorPrefillOutcome::Completed(completion) => {
                 let (output, planned, completed, _) = completion.into_parts();
                 if planned != chunk || completed != chunk {
-                    return Err(FerrumError::internal(
-                        "vNext startup prefill did not complete its exact one-token frontier",
-                    ));
+                    return Err(FerrumError::internal(format!(
+                        "vNext startup prefill did not complete its exact {input_token_count}-token frontier"
+                    )));
                 }
                 resources.activate(output.kv_cache);
                 Ok(true)
@@ -2358,6 +2460,36 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 Ok(false)
             }
         }
+    }
+
+    async fn execute_startup_prefill_request(
+        &self,
+        token_count: usize,
+        phase: &'static str,
+    ) -> Result<()> {
+        let raw_tokens = vec![0_u32; token_count];
+        let input_tokens = raw_tokens
+            .iter()
+            .copied()
+            .map(TokenId::new)
+            .collect::<Vec<_>>();
+        let input_tensor = Self::startup_token_tensor(&raw_tokens)?;
+        let mut resources = VNextStartupSequenceGuard::new(self);
+        if !self
+            .admit_startup_sequence(&mut resources, &input_tokens, &input_tensor, token_count)
+            .await?
+        {
+            return Err(FerrumError::resource_exhausted(format!(
+                "vNext startup {phase} could not admit a {token_count}-token prefill descriptor"
+            )));
+        }
+        if resources.sequences.len() != 1 {
+            return Err(FerrumError::internal(format!(
+                "vNext startup {phase} retained {} sequences for one prefill descriptor",
+                resources.sequences.len()
+            )));
+        }
+        Ok(())
     }
 
     async fn execute_startup_decode_pass(
@@ -2412,8 +2544,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             return Ok(VNextReusableExecutionStartupReport {
                 enabled: self.reusable_execution_enabled,
                 supported: self.reusable_execution_supported,
+                requested_descriptors: Vec::new(),
+                prepared_descriptors: Vec::new(),
                 requested_decode_widths: Vec::new(),
                 prepared_decode_widths: Vec::new(),
+                requested_prefill_token_counts: Vec::new(),
+                prepared_prefill_token_counts: Vec::new(),
                 synthetic_sequences: 0,
                 eager_warmup_waves: 0,
                 capture_waves: 0,
@@ -2423,10 +2559,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             });
         };
 
+        let requested_descriptors = plan.descriptors.clone();
+        let requested_decode_widths = plan.decode_widths();
+        let requested_prefill_token_counts = plan.prefill_token_counts();
+        for _ in 0..REUSABLE_EXECUTION_WARMUP_PASSES {
+            for token_count in requested_prefill_token_counts.iter().copied() {
+                self.execute_startup_prefill_request(token_count, "eager prefill warmup")
+                    .await?;
+            }
+        }
+
         let input_tokens = [TokenId::new(0)];
-        let input_tensor = Self::startup_token_tensor(0)?;
+        let input_tensor = Self::startup_token_tensor(&[0])?;
         let mut resources = VNextStartupSequenceGuard::new(self);
-        let requested_sequences = plan.decode_widths.first().copied().ok_or_else(|| {
+        let requested_sequences = requested_decode_widths.first().copied().ok_or_else(|| {
             FerrumError::internal("vNext reusable execution plan has no decode widths")
         })?;
         for _ in 0..requested_sequences {
@@ -2435,7 +2581,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     &mut resources,
                     &input_tokens,
                     &input_tensor,
-                    plan.maximum_synthetic_sequence_tokens,
+                    plan.maximum_decode_sequence_tokens,
                 )
                 .await?
             {
@@ -2526,6 +2672,54 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             )));
         }
 
+        let synthetic_sequences = resources.sequences.len();
+        drop(resources);
+
+        let mut captured = replayed;
+        for token_count in requested_prefill_token_counts.iter().copied() {
+            self.execute_startup_prefill_request(token_count, "prefill capture")
+                .await?;
+            let prefill_captured =
+                self.lane
+                    .reusable_executable_preparation()
+                    .map_err(|error| {
+                        FerrumError::device(format!(
+                            "vNext {token_count}-token prefill capture inspection failed: {error}"
+                        ))
+                    })?;
+            if prefill_captured.state() != DeviceReusableExecutionPreparationState::Preparing
+                || prefill_captured.resident_executables() == 0
+                || prefill_captured.rejected_executables() != 0
+                || prefill_captured.capacity_deferred_executables() != 0
+                || prefill_captured.captured_executables()
+                    != prefill_captured.uploaded_executables()
+                || prefill_captured.uploaded_executables()
+                    != prefill_captured.resident_executables()
+                || prefill_captured.captured_executables() < captured.captured_executables()
+            {
+                return Err(FerrumError::device(format!(
+                    "vNext {token_count}-token prefill capture receipt is incomplete: before={captured:?}, after={prefill_captured:?}"
+                )));
+            }
+
+            self.execute_startup_prefill_request(token_count, "fresh-request prefill replay")
+                .await?;
+            let prefill_replayed = self
+                .lane
+                .reusable_executable_preparation()
+                .map_err(|error| {
+                    FerrumError::device(format!(
+                        "vNext {token_count}-token fresh-request prefill replay inspection failed: {error}"
+                    ))
+                })?;
+            if prefill_replayed != prefill_captured {
+                return Err(FerrumError::device(format!(
+                    "vNext {token_count}-token fresh-request prefill replay changed executable state: before={prefill_captured:?}, after={prefill_replayed:?}"
+                )));
+            }
+            captured = prefill_replayed;
+        }
+
         let device_preparation = self.lane.seal_reusable_executables().map_err(|error| {
             FerrumError::device(format!("vNext reusable execution sealing failed: {error}"))
         })?;
@@ -2539,16 +2733,32 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "vNext reusable execution sealing produced an unusable receipt: {device_preparation:?}"
             )));
         }
-        let synthetic_sequences = resources.sequences.len();
+        let prepared_descriptors = prepared_decode_widths
+            .iter()
+            .copied()
+            .map(VNextReusableExecutionDescriptor::uniform_decode)
+            .chain(
+                requested_prefill_token_counts
+                    .iter()
+                    .copied()
+                    .map(VNextReusableExecutionDescriptor::prefill),
+            )
+            .collect::<Vec<_>>();
+        let prepared_wave_shapes =
+            prepared_decode_widths.len() + requested_prefill_token_counts.len();
         Ok(VNextReusableExecutionStartupReport {
             enabled: true,
             supported: true,
-            requested_decode_widths: plan.decode_widths,
+            requested_descriptors,
+            prepared_descriptors,
+            requested_decode_widths,
             prepared_decode_widths: prepared_decode_widths.clone(),
+            requested_prefill_token_counts: requested_prefill_token_counts.clone(),
+            prepared_prefill_token_counts: requested_prefill_token_counts,
             synthetic_sequences,
-            eager_warmup_waves: prepared_decode_widths.len() * REUSABLE_EXECUTION_WARMUP_PASSES,
-            capture_waves: prepared_decode_widths.len() * REUSABLE_EXECUTION_CAPTURE_PASSES,
-            replay_validation_waves: prepared_decode_widths.len()
+            eager_warmup_waves: prepared_wave_shapes * REUSABLE_EXECUTION_WARMUP_PASSES,
+            capture_waves: prepared_wave_shapes * REUSABLE_EXECUTION_CAPTURE_PASSES,
+            replay_validation_waves: prepared_wave_shapes
                 * REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES,
             device_preparation,
             elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
@@ -4981,8 +5191,8 @@ mod tests {
     use super::{
         reported_allocated_bytes, resolved_sequence_fit_policy, AdmissionFitPolicy,
         DecodeFailureDisposition, FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics,
-        VNextExecutionWaveKind, VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan,
-        VNextWaveTimingMetrics, VNextWaveTimingSink,
+        VNextExecutionWaveKind, VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
+        VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics, VNextWaveTimingSink,
     };
     use ferrum_interfaces::vnext::{
         DeviceReusableExecutionObservation, DeviceSubmissionTimingSink,
@@ -5056,20 +5266,28 @@ mod tests {
 
     #[test]
     fn reusable_execution_startup_plan_is_policy_derived_largest_first_and_bounded() {
-        let plan = VNextReusableExecutionStartupPlan::resolve(32, 2_048, 128, 23).unwrap();
+        let plan =
+            VNextReusableExecutionStartupPlan::resolve(32, 2_048, 128, &[64, 64], 23).unwrap();
 
-        assert_eq!(plan.decode_widths, [32, 16, 8, 4, 2, 1]);
-        assert_eq!(plan.maximum_synthetic_sequence_tokens, 19);
-        assert_eq!(plan.device_plan.maximum_executables(), 138);
+        assert_eq!(plan.decode_widths(), [32, 16, 8, 4, 2, 1]);
+        assert_eq!(plan.prefill_token_counts(), [64]);
+        assert_eq!(plan.maximum_decode_sequence_tokens, 19);
+        assert_eq!(plan.device_plan.maximum_executables(), 161);
+        assert_eq!(
+            plan.descriptors.last(),
+            Some(&VNextReusableExecutionDescriptor::prefill(64))
+        );
         assert_eq!(
             plan.widths_for_available_sequences(20),
             [20, 16, 8, 4, 2, 1]
         );
 
-        let non_power_of_two = VNextReusableExecutionStartupPlan::resolve(7, 7, 64, 2).unwrap();
-        assert_eq!(non_power_of_two.decode_widths, [7, 4, 2, 1]);
-        assert_eq!(non_power_of_two.device_plan.maximum_executables(), 8);
-        assert!(VNextReusableExecutionStartupPlan::resolve(32, 2_048, 18, 23).is_err());
+        let non_power_of_two =
+            VNextReusableExecutionStartupPlan::resolve(7, 7, 64, &[64, 4], 2).unwrap();
+        assert_eq!(non_power_of_two.decode_widths(), [7, 4, 2, 1]);
+        assert_eq!(non_power_of_two.prefill_token_counts(), [7, 4]);
+        assert_eq!(non_power_of_two.device_plan.maximum_executables(), 12);
+        assert!(VNextReusableExecutionStartupPlan::resolve(32, 2_048, 18, &[64], 23).is_err());
     }
 
     #[test]
