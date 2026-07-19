@@ -8,7 +8,7 @@ use ferrum_bench_core::{ProfileMetadata, ProfileSinkConfig};
 use ferrum_models::source::ModelFormat;
 use ferrum_server::{AxumServer, HttpServer, ServerConfig};
 use ferrum_types::{
-    CompiledKernelFeatures, CompiledNativeOperatorArtifact, FerrumConfigBuilder,
+    CompiledKernelFeatures, CompiledNativeOperatorArtifact, FerrumConfigBuilder, FerrumError,
     HardwareCapabilities, ModelCapabilities, MoeCapabilities, ResolvedFerrumConfig, Result,
     RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource, WorkloadProfile,
     M3_QWEN3_30B_A3B_INT4_PRESET, QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET,
@@ -17,6 +17,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::signal;
 
 #[derive(Args)]
@@ -990,18 +991,46 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let pid_file = std::env::temp_dir().join("ferrum.pid");
     std::fs::write(&pid_file, std::process::id().to_string()).ok();
 
-    // Start server with graceful shutdown
-    tokio::select! {
-        result = server.start(&server_config) => {
-            if let Err(e) = result {
-                eprintln!("{} Server error: {}", "Error:".red().bold(), e);
-            }
+    // Keep the server future alive while stop requests graceful HTTP drain.
+    let server = Arc::new(server);
+    let mut server_task = {
+        let server = Arc::clone(&server);
+        let server_config = server_config.clone();
+        tokio::spawn(async move { server.start(&server_config).await })
+    };
+    let shutdown_timeout = Duration::from_secs(30);
+    let serve_result: Result<()> = tokio::select! {
+        joined = &mut server_task => {
+            let start_result = match joined {
+                Ok(result) => result,
+                Err(error) => Err(FerrumError::internal(format!(
+                    "serve task failed: {error}"
+                ))),
+            };
+            let stop_result = server.stop(shutdown_timeout).await;
+            start_result.and(stop_result)
         }
         _ = serve_shutdown_signal() => {
             println!();
             println!("{}", "Shutting down...".yellow());
+            let stop_result = server.stop(shutdown_timeout).await;
+            let start_result = match tokio::time::timeout(shutdown_timeout, &mut server_task).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(FerrumError::internal(format!(
+                    "serve task failed during shutdown: {error}"
+                ))),
+                Err(_) => {
+                    server_task.abort();
+                    let _ = server_task.await;
+                    Err(FerrumError::internal(format!(
+                        "serve task did not stop within {} ms",
+                        shutdown_timeout.as_millis()
+                    )))
+                }
+            };
+            stop_result.and(start_result)
         }
-    }
+    };
 
     // Clean up PID file
     std::fs::remove_file(&pid_file).ok();
@@ -1031,6 +1060,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         ),
     )?;
 
+    serve_result?;
     Ok(())
 }
 
