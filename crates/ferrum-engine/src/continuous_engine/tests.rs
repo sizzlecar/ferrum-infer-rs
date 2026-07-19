@@ -4942,25 +4942,17 @@ async fn scheduler_trace_jsonl_resource_events_balance_successful_infer() {
     let _ = std::fs::remove_file(trace_path);
 }
 
-#[test]
-fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
+fn vnext_profile_test_event() -> (
+    ferrum_interfaces::vnext::RunId,
+    ferrum_interfaces::vnext::RequestIdentity,
+    ferrum_interfaces::vnext::ExecutionEvent,
+) {
     use ferrum_interfaces::vnext::{
-        ExecutionEventDetail, ExecutionEventEmitter, ExecutionEventKind, ExecutionIdentityEnvelope,
+        ExecutionEvent, ExecutionEventDetail, ExecutionEventKind, ExecutionIdentityEnvelope,
         ExecutionIdentityParts, ExecutionPhase, MonotonicTimestamp, RequestIdentity, RunId, SpanId,
-        TrustedExecutionEventContext, EXECUTION_IDENTITY_VERSION,
+        EXECUTION_IDENTITY_VERSION,
     };
 
-    let trace_path = resource_trace_temp_path("vnext-execution-event");
-    let _ = std::fs::remove_file(&trace_path);
-    let journal = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
-    let config = EngineConfig::default();
-    let sink =
-        VNextProfileExecutionEventSink::new(journal.clone(), ProfileEntrypoint::Run, &config);
-    assert_eq!(
-        sink.capture_policy(),
-        ExecutionEventCapturePolicy::FirstFramePerRequest
-    );
-    assert_eq!(sink.capture_policy().as_str(), "first_frame_per_request");
     let run_id = RunId::new("run.vnext.engine-profile-test").unwrap();
     let request_id = RequestIdentity::new("request.vnext.engine-profile-test").unwrap();
     let event = ExecutionEvent::new(
@@ -5005,6 +4997,79 @@ fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
         ExecutionEventDetail::None,
     )
     .unwrap();
+    (run_id, request_id, event)
+}
+
+fn vnext_profile_test_operation_event() -> ferrum_interfaces::vnext::ExecutionEvent {
+    use ferrum_interfaces::vnext::{
+        DeviceId, ExecutionEvent, ExecutionEventDetail, ExecutionEventKind, ExecutionFrameId,
+        ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionPhase, MonotonicTimestamp,
+        NodeId, NodeInvocationId, OperationId, PlanHash, PlanId, ProviderId, RequestIdentity,
+        RunId, SpanId, EXECUTION_IDENTITY_VERSION,
+    };
+
+    let fingerprint = |digit: char| digit.to_string().repeat(64);
+    let plan_hash: PlanHash = serde_json::from_value(serde_json::json!(fingerprint('0'))).unwrap();
+    ExecutionEvent::new(
+        MonotonicTimestamp {
+            nanos_since_run_start: 3,
+        },
+        ExecutionPhase::Execution,
+        ExecutionEventKind::OperationSubmitted,
+        ExecutionIdentityEnvelope::new(ExecutionIdentityParts {
+            version: EXECUTION_IDENTITY_VERSION,
+            run_id: RunId::new("run.vnext.engine-profile-test").unwrap(),
+            request_id: RequestIdentity::new("request.vnext.engine-profile-test").unwrap(),
+            sequence: 3,
+            plan_id: Some(PlanId::new("plan/vnext/engine-profile-test").unwrap()),
+            plan_hash: Some(plan_hash),
+            frame_id: Some(ExecutionFrameId::try_from(1).unwrap()),
+            node_invocation_id: Some(NodeInvocationId::try_from(1).unwrap()),
+            node_id: Some(NodeId::new("node/vnext/engine-profile-test").unwrap()),
+            operation_id: Some(OperationId::new("operation/vnext/engine-profile-test").unwrap()),
+            provider_id: Some(ProviderId::new("provider/vnext/engine-profile-test").unwrap()),
+            device_id: Some(DeviceId::new("device/vnext/engine-profile-test").unwrap()),
+            resource_pool_id: None,
+            resource_pool_identity_fingerprint: None,
+            provisioning_run_id: None,
+            provisioning_request_id: None,
+            transaction_id: None,
+            active_sequence_slot: Some(1),
+            admission_generation: Some(1),
+            activation_epoch: Some(1),
+            runtime_implementation_fingerprint: Some(fingerprint('1')),
+            active_sequence_fingerprint: Some(fingerprint('2')),
+            completed_sequence_fingerprint: None,
+            aborted_sequence_fingerprint: None,
+            resource_id: None,
+            resource_generation: None,
+            resource_batch_fingerprint: None,
+            span_id: SpanId::new("vnext/request/engine-profile-test/operation/1").unwrap(),
+            parent_span_id: Some(SpanId::new("vnext/request/engine-profile-test/node/1").unwrap()),
+            async_links: Vec::new(),
+        })
+        .unwrap(),
+        ExecutionEventDetail::None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
+    use ferrum_interfaces::vnext::{ExecutionEventEmitter, TrustedExecutionEventContext};
+
+    let trace_path = resource_trace_temp_path("vnext-execution-event");
+    let _ = std::fs::remove_file(&trace_path);
+    let journal = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
+    let config = EngineConfig::default();
+    let sink =
+        VNextProfileExecutionEventSink::new(journal.clone(), ProfileEntrypoint::Run, &config);
+    assert_eq!(
+        sink.capture_policy(),
+        ExecutionEventCapturePolicy::FirstFramePerRequest
+    );
+    assert_eq!(sink.capture_policy().as_str(), "first_frame_per_request");
+    let (run_id, request_id, event) = vnext_profile_test_event();
     let mut emitter = ExecutionEventEmitter::new(&sink, run_id.clone(), request_id.clone());
     emitter
         .emit(
@@ -5028,6 +5093,64 @@ fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
         profile.attributes.get("execution_capture_policy"),
         Some(&serde_json::json!("first_frame_per_request"))
     );
+
+    let _ = std::fs::remove_file(trace_path);
+}
+
+#[test]
+#[ignore = "release-mode diagnostic for the canonical trace producer"]
+fn vnext_profile_event_producer_cost_probe() {
+    const EVENTS_PER_FRAME: usize = 399;
+    const SAMPLE_COUNT: usize = 11;
+
+    let trace_path = resource_trace_temp_path("vnext-profile-producer-cost");
+    let _ = std::fs::remove_file(&trace_path);
+    let journal = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
+    let config = EngineConfig::default();
+    let sink =
+        VNextProfileExecutionEventSink::new(journal.clone(), ProfileEntrypoint::Run, &config);
+    let event = vnext_profile_test_operation_event();
+    let mut materialize_nanos = Vec::with_capacity(SAMPLE_COUNT);
+    let mut enqueue_nanos = Vec::with_capacity(SAMPLE_COUNT);
+
+    for _ in 0..SAMPLE_COUNT {
+        let started = std::time::Instant::now();
+        let mut profiles = Vec::with_capacity(EVENTS_PER_FRAME);
+        for _ in 0..EVENTS_PER_FRAME {
+            profiles.push(
+                sink.profile_event(std::hint::black_box(&event))
+                    .expect("profile event materialization must remain valid"),
+            );
+        }
+        materialize_nanos.push(started.elapsed().as_nanos());
+
+        let started = std::time::Instant::now();
+        journal
+            .enqueue_batch(std::hint::black_box(profiles))
+            .expect("profile batch enqueue must succeed");
+        enqueue_nanos.push(started.elapsed().as_nanos());
+    }
+
+    let started = std::time::Instant::now();
+    journal.flush().unwrap();
+    let drain_nanos = started.elapsed().as_nanos();
+    materialize_nanos.sort_unstable();
+    enqueue_nanos.sort_unstable();
+    let median_index = SAMPLE_COUNT / 2;
+    let receipt = serde_json::json!({
+        "schema_version": 1,
+        "artifact_type": "runtime_vnext_trace_producer_cost",
+        "representative_event": "operation_submitted",
+        "events_per_frame": EVENTS_PER_FRAME,
+        "samples": SAMPLE_COUNT,
+        "materialize_validate_median_ns_per_frame": materialize_nanos[median_index],
+        "materialize_validate_median_ns_per_event": materialize_nanos[median_index]
+            / EVENTS_PER_FRAME as u128,
+        "enqueue_median_ns_per_frame": enqueue_nanos[median_index],
+        "writer_drain_ns": drain_nanos,
+        "diagnostic_only": true,
+    });
+    println!("FERRUM RUNTIME VNEXT TRACE PRODUCER COST: {receipt}");
 
     let _ = std::fs::remove_file(trace_path);
 }
