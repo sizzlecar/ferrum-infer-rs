@@ -1,6 +1,6 @@
 use super::{
     canonical_fingerprint, invalid_plan, CapabilityCatalog, ContractVersion, DynamicStorageProfile,
-    PlanNodeResolution, PreparedModelFamily, Serialize, VNextError,
+    PlanNodeResolution, PreparedModelFamily, ReusableExecutionPolicy, Serialize, VNextError,
 };
 
 /// Typed policy selected before planning. Memory capacity is part of the
@@ -28,6 +28,10 @@ pub trait RuntimePolicy:
     /// Ordered, non-empty allowlist used by planning after intersecting every
     /// selected provider requirement with the concrete runtime offers.
     fn dynamic_storage_profile_order(&self) -> &[DynamicStorageProfile];
+
+    /// Optional reusable-execution capacity policy selected before planning.
+    /// Core treats class identities as opaque and owns their memory derivation.
+    fn reusable_execution_policy(&self) -> Option<&ReusableExecutionPolicy>;
 
     fn validate(&self) -> Result<(), VNextError>;
 }

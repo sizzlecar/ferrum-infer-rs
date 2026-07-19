@@ -10,8 +10,8 @@ use super::model::PreparedModelFamilyWire;
 use super::{
     AdmissionFitPolicy, CapabilityCatalog, ContractVersion, DeviceDescriptor,
     DynamicStorageProfile, ExecutablePlanView, ExecutionPlan, ModelFamilyRegistry,
-    PlanNodeResolution, PreparedModelFamily, ProviderId, RuntimePolicy, SpecialTokenRole,
-    TokenizerDescriptor, UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire,
+    PlanNodeResolution, PreparedModelFamily, ProviderId, ReusableExecutionPolicy, RuntimePolicy,
+    SpecialTokenRole, TokenizerDescriptor, UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire,
     UnvalidatedPreparedModelFamily, VNextError,
 };
 
@@ -666,6 +666,7 @@ struct RuntimePolicyFingerprintPayload<'a> {
     scheduling: SchedulingDiscipline,
     memory: &'a RuntimeMemoryPolicy,
     admission: &'a AdmissionPolicy,
+    reusable_execution: &'a Option<ReusableExecutionPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -675,6 +676,7 @@ pub struct ResolvedRuntimePolicy {
     scheduling: SchedulingDiscipline,
     memory: RuntimeMemoryPolicy,
     admission: AdmissionPolicy,
+    reusable_execution: Option<ReusableExecutionPolicy>,
     fingerprint: String,
 }
 
@@ -686,6 +688,7 @@ struct ResolvedRuntimePolicyWire {
     scheduling: SchedulingDiscipline,
     memory: RuntimeMemoryPolicy,
     admission: AdmissionPolicy,
+    reusable_execution: Option<ReusableExecutionPolicy>,
     fingerprint: String,
 }
 
@@ -701,6 +704,7 @@ impl<'de> Deserialize<'de> for ResolvedRuntimePolicy {
             wire.scheduling,
             wire.memory,
             wire.admission,
+            wire.reusable_execution,
         )
         .map_err(serde::de::Error::custom)?;
         if wire.fingerprint != policy.fingerprint {
@@ -720,17 +724,31 @@ impl ResolvedRuntimePolicy {
         scheduling: SchedulingDiscipline,
         memory: RuntimeMemoryPolicy,
         admission: AdmissionPolicy,
+        reusable_execution: Option<ReusableExecutionPolicy>,
     ) -> Result<Self, VNextError> {
         let policy_id = policy_id.into();
-        Self::validate_fields(&policy_id, version, &memory, &admission)?;
-        let fingerprint =
-            Self::compute_fingerprint(&policy_id, version, scheduling, &memory, &admission)?;
+        Self::validate_fields(
+            &policy_id,
+            version,
+            &memory,
+            &admission,
+            reusable_execution.as_ref(),
+        )?;
+        let fingerprint = Self::compute_fingerprint(
+            &policy_id,
+            version,
+            scheduling,
+            &memory,
+            &admission,
+            &reusable_execution,
+        )?;
         Ok(Self {
             policy_id,
             version,
             scheduling,
             memory,
             admission,
+            reusable_execution,
             fingerprint,
         })
     }
@@ -740,6 +758,7 @@ impl ResolvedRuntimePolicy {
         version: ContractVersion,
         memory: &RuntimeMemoryPolicy,
         admission: &AdmissionPolicy,
+        reusable_execution: Option<&ReusableExecutionPolicy>,
     ) -> Result<(), VNextError> {
         validate_portable_identifier("runtime_policy.policy_id", policy_id, 160)?;
         if version.major == 0 {
@@ -774,6 +793,18 @@ impl ResolvedRuntimePolicy {
                 "queue depth, scheduled-token ceiling, and cancellation interval must be non-zero",
             ));
         }
+        if let Some(reusable_execution) = reusable_execution {
+            reusable_execution.validate()?;
+            if reusable_execution.buckets().iter().any(|bucket| {
+                bucket.capacity().maximum_sequences() > memory.maximum_active_sequences
+                    || bucket.capacity().maximum_tokens() > admission.maximum_scheduled_tokens
+            }) {
+                return Err(invalid_plan(
+                    "runtime_policy.reusable_execution",
+                    "bucket capacity exceeds the scheduler policy ceiling",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -783,6 +814,7 @@ impl ResolvedRuntimePolicy {
         scheduling: SchedulingDiscipline,
         memory: &RuntimeMemoryPolicy,
         admission: &AdmissionPolicy,
+        reusable_execution: &Option<ReusableExecutionPolicy>,
     ) -> Result<String, VNextError> {
         canonical_fingerprint(
             &RuntimePolicyFingerprintPayload {
@@ -791,6 +823,7 @@ impl ResolvedRuntimePolicy {
                 scheduling,
                 memory,
                 admission,
+                reusable_execution,
             },
             "serialize resolved runtime policy",
         )
@@ -814,6 +847,10 @@ impl ResolvedRuntimePolicy {
 
     pub fn admission(&self) -> &AdmissionPolicy {
         &self.admission
+    }
+
+    pub fn reusable_execution(&self) -> Option<&ReusableExecutionPolicy> {
+        self.reusable_execution.as_ref()
     }
 
     pub fn fingerprint_str(&self) -> &str {
@@ -846,14 +883,25 @@ impl RuntimePolicy for ResolvedRuntimePolicy {
         &self.memory.dynamic_storage_profile_order
     }
 
+    fn reusable_execution_policy(&self) -> Option<&ReusableExecutionPolicy> {
+        self.reusable_execution.as_ref()
+    }
+
     fn validate(&self) -> Result<(), VNextError> {
-        Self::validate_fields(&self.policy_id, self.version, &self.memory, &self.admission)?;
+        Self::validate_fields(
+            &self.policy_id,
+            self.version,
+            &self.memory,
+            &self.admission,
+            self.reusable_execution.as_ref(),
+        )?;
         let computed = Self::compute_fingerprint(
             &self.policy_id,
             self.version,
             self.scheduling,
             &self.memory,
             &self.admission,
+            &self.reusable_execution,
         )?;
         if self.fingerprint != computed {
             return Err(invalid_plan(

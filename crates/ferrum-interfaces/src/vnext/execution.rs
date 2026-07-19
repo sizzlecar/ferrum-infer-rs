@@ -27,6 +27,9 @@ pub(crate) use binding::*;
 mod work;
 pub use work::*;
 
+mod reusable;
+pub use reusable::*;
+
 mod workspace;
 pub use workspace::*;
 

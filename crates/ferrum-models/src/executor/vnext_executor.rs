@@ -44,7 +44,9 @@ use super::{
 };
 
 const POLICY_ID: &str = "policy.ferrum.product.vnext.default";
-const POLICY_VERSION: ContractVersion = ContractVersion::new(1, 0);
+const POLICY_VERSION: ContractVersion = ContractVersion::new(2, 0);
+const UNIFORM_QUERY_REUSABLE_CLASS: &str = "execution.uniform-query-token";
+const PACKED_TOKEN_REUSABLE_CLASS: &str = "execution.single-sequence-packed-token";
 const DEFAULT_STATIC_STAGING_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_STATIC_COMMANDS_PER_BATCH: usize = 64;
 const DEFAULT_CANCELLATION_CHECK_INTERVAL_STEPS: u32 = 1;
@@ -59,6 +61,80 @@ const fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFit
         SequenceFitPolicy::FullInputMustFit => AdmissionFitPolicy::FullInputMustFit,
         SequenceFitPolicy::ImmediateOnly => AdmissionFitPolicy::ImmediateOnly,
     }
+}
+
+fn resolve_reusable_execution_policy(
+    maximum_active_sequences: u32,
+    maximum_scheduled_tokens: u64,
+    maximum_model_tokens: usize,
+    prefill_token_counts: &[usize],
+) -> Result<ReusableExecutionPolicy> {
+    let maximum_active_sequences = usize::try_from(maximum_active_sequences)
+        .map_err(|_| FerrumError::config("vNext active sequence limit exceeds usize"))?;
+    let maximum_scheduled_tokens = usize::try_from(maximum_scheduled_tokens)
+        .map_err(|_| FerrumError::config("vNext scheduled token limit exceeds usize"))?;
+    let maximum_width = maximum_active_sequences.min(maximum_scheduled_tokens);
+    if maximum_width == 0 {
+        return Err(FerrumError::config(
+            "vNext reusable execution requires a non-zero decode width",
+        ));
+    }
+
+    let uniform_class = ReusableExecutionClassId::new(UNIFORM_QUERY_REUSABLE_CLASS)
+        .map_err(|error| FerrumError::config(error.to_string()))?;
+    let packed_class = ReusableExecutionClassId::new(PACKED_TOKEN_REUSABLE_CLASS)
+        .map_err(|error| FerrumError::config(error.to_string()))?;
+    let mut buckets = Vec::new();
+    let mut width = 1_usize;
+    loop {
+        let width_u32 = u32::try_from(width)
+            .map_err(|_| FerrumError::config("vNext decode width exceeds u32"))?;
+        let width_u64 = u64::try_from(width)
+            .map_err(|_| FerrumError::config("vNext decode width exceeds u64"))?;
+        buckets.push(
+            ReusableExecutionBucketSpec::new(
+                uniform_class.clone(),
+                ReusableExecutionCapacity::new(width_u32, width_u64, 1)
+                    .map_err(|error| FerrumError::config(error.to_string()))?,
+            )
+            .map_err(|error| FerrumError::config(error.to_string()))?,
+        );
+        if width == maximum_width {
+            break;
+        }
+        width = width.saturating_mul(2).min(maximum_width);
+    }
+
+    let mut prefill_token_counts = prefill_token_counts
+        .iter()
+        .copied()
+        .filter(|token_count| *token_count > 0)
+        .map(|token_count| {
+            token_count
+                .min(maximum_scheduled_tokens)
+                .min(maximum_model_tokens)
+        })
+        .filter(|token_count| *token_count > 0)
+        .collect::<Vec<_>>();
+    prefill_token_counts.sort_unstable();
+    prefill_token_counts.dedup();
+    for token_count in prefill_token_counts {
+        buckets.push(
+            ReusableExecutionBucketSpec::new(
+                packed_class.clone(),
+                ReusableExecutionCapacity::new(
+                    1,
+                    u64::try_from(token_count).map_err(|_| {
+                        FerrumError::config("vNext prefill token capacity exceeds u64")
+                    })?,
+                    1,
+                )
+                .map_err(|error| FerrumError::config(error.to_string()))?,
+            )
+            .map_err(|error| FerrumError::config(error.to_string()))?,
+        );
+    }
+    ReusableExecutionPolicy::new(1, buckets).map_err(|error| FerrumError::config(error.to_string()))
 }
 
 /// Typed product policy resolved before plan compilation. None of these
@@ -127,6 +203,31 @@ impl VNextExecutorConfig {
             .copied()
             .collect::<Vec<_>>();
 
+        let mut reusable_execution_prefill_token_counts = [
+            engine.scheduler.prefill_step_chunk,
+            engine.scheduler.active_decode_prefill_chunk,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        reusable_execution_prefill_token_counts.sort_unstable_by(|left, right| right.cmp(left));
+        reusable_execution_prefill_token_counts.dedup();
+        let reusable_execution_supported = descriptor
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID);
+        let reusable_execution_policy =
+            if engine.backend.enable_cuda_graphs && reusable_execution_supported {
+                Some(resolve_reusable_execution_policy(
+                    maximum_active_sequences,
+                    maximum_scheduled_tokens,
+                    maximum_model_tokens,
+                    &reusable_execution_prefill_token_counts,
+                )?)
+            } else {
+                None
+            };
+
         let runtime_policy = ResolvedRuntimePolicy::new(
             POLICY_ID,
             POLICY_VERSION,
@@ -146,6 +247,7 @@ impl VNextExecutorConfig {
                 allow_defer: true,
                 cancellation_check_interval_steps: DEFAULT_CANCELLATION_CHECK_INTERVAL_STEPS,
             },
+            reusable_execution_policy,
         )
         .map_err(|error| FerrumError::config(format!("invalid vNext policy: {error}")))?;
         let static_initialization = StaticInitializationPolicy::new(
@@ -153,16 +255,6 @@ impl VNextExecutorConfig {
             DEFAULT_STATIC_COMMANDS_PER_BATCH,
         )
         .map_err(|error| FerrumError::config(error.to_string()))?;
-
-        let mut reusable_execution_prefill_token_counts = [
-            engine.scheduler.prefill_step_chunk,
-            engine.scheduler.active_decode_prefill_chunk,
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-        reusable_execution_prefill_token_counts.sort_unstable_by(|left, right| right.cmp(left));
-        reusable_execution_prefill_token_counts.dedup();
 
         Ok(Self {
             maximum_model_tokens,

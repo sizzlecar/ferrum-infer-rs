@@ -5,7 +5,7 @@ use super::{
     ResolvedValueRole, ResourceId, SemanticValue, Serialize, StateId, TensorAccess, VNextError,
 };
 
-pub const EXECUTION_PLAN_SCHEMA: PlanSchemaVersion = PlanSchemaVersion::new(2, 0);
+pub const EXECUTION_PLAN_SCHEMA: PlanSchemaVersion = PlanSchemaVersion::new(3, 0);
 pub const MAX_EXECUTION_PLAN_WIRE_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum number of O(graph) static allocations plus dynamic descriptors.
 /// This limit is independent of the concurrency ceiling.

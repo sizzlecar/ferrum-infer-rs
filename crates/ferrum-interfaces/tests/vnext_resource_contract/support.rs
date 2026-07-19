@@ -440,6 +440,7 @@ pub(crate) fn policy_with_memory_id(
             allow_defer: true,
             cancellation_check_interval_steps: 1,
         },
+        None,
     )
     .unwrap()
 }

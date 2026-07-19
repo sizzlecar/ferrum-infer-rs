@@ -33,6 +33,10 @@ impl RuntimePolicy for Policy {
         &self.dynamic_storage_profile_order
     }
 
+    fn reusable_execution_policy(&self) -> Option<&ReusableExecutionPolicy> {
+        None
+    }
+
     fn validate(&self) -> Result<(), VNextError> {
         Ok(())
     }
