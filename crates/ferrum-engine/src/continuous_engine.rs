@@ -1602,6 +1602,7 @@ impl SequenceState {
             tokenizer,
             self.streamed_text_len,
             token,
+            None,
         ) {
             return Err(FerrumError::model(format!(
                 "model greedy argmax token decoded to forbidden output ({})",
@@ -1749,6 +1750,7 @@ impl SequenceState {
         // The grammar mask runs first. There is deliberately no invalid-token
         // fallback: a dead grammar state is a request error, not permission to
         // return malformed JSON.
+        let mut required_structured_delimiter_token_id = None;
         if let Some(processor) = &self.structured_output_processor {
             let constraint = processor.mask_logits_with_terminals(
                 logits,
@@ -1756,6 +1758,7 @@ impl SequenceState {
                 &self.stop_token_ids,
                 &self.allowed_extended_token_ids,
             )?;
+            required_structured_delimiter_token_id = constraint.required_delimiter_token_id;
             if !constraint.accepting {
                 mask_stop_token_logits(logits, &self.stop_token_ids);
             }
@@ -1811,6 +1814,7 @@ impl SequenceState {
                     tokenizer,
                     previous_streamed_text_len,
                     token,
+                    required_structured_delimiter_token_id,
                 ) {
                     break token;
                 }
@@ -1845,7 +1849,11 @@ impl SequenceState {
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
         previous_streamed_text_len: usize,
         token: TokenId,
+        required_structured_delimiter_token_id: Option<u32>,
     ) -> bool {
+        if required_structured_delimiter_token_id == Some(token.get()) {
+            return false;
+        }
         let Some(tokenizer) = tokenizer else {
             return false;
         };

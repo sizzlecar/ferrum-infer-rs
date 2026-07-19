@@ -1036,7 +1036,7 @@ impl Tokenizer for PolicyTokenizer {
             let Some(text) = self.token_text(*token) else {
                 continue;
             };
-            if skip_special && matches!(text, "<think>") {
+            if skip_special && matches!(text, "<think>" | "</think>") {
                 continue;
             }
             match text {
@@ -8185,7 +8185,7 @@ fn schema_guided_sampling_preserves_required_reasoning_delimiter_control() {
     let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
         request,
         vec![TokenId::new(0)],
-        Some(tokenizer),
+        Some(Arc::clone(&tokenizer)),
         Some(9),
     );
 
@@ -8194,7 +8194,7 @@ fn schema_guided_sampling_preserves_required_reasoning_delimiter_control() {
     reasoning_logits[7] = 100.0;
     reasoning_logits[8] = 90.0;
     let delimiter = state
-        .sample_with_processors(&mut reasoning_logits)
+        .sample_with_processors_with_tokenizer(&mut reasoning_logits, Some(tokenizer.as_ref()))
         .expect("the activation delimiter must remain selectable");
     assert_eq!(delimiter, TokenId::new(7));
     assert_eq!(reasoning_logits[7], 100.0);
@@ -8389,6 +8389,7 @@ fn sample_candidate_checks_from_streamed_text_boundary() {
         Some(tokenizer.as_ref()),
         state.streamed_text_len,
         TokenId::new(6),
+        None,
     ));
 }
 
