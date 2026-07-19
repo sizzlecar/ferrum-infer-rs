@@ -479,7 +479,7 @@ def validate_collection_manifest(root: Path, source_sha: str) -> dict[str, Any] 
 
 def phase_reusable_execution(metrics: dict[str, Any], phase: str) -> dict[str, Any]:
     try:
-        reusable = metrics["wave_timing_by_phase"][phase]["host_encode_submit"][
+        reusable = metrics["wave_timing_by_phase"][phase][
             "host_encode_submit_breakdown"
         ]["provider_encode_submit_breakdown"]["lane_reserve_submit_arm_breakdown"][
             "device_runtime_submit_breakdown"
@@ -1525,13 +1525,11 @@ def create_selftest_fixture(root: Path) -> None:
                     },
                     "wave_timing_by_phase": {
                         phase: {
-                            "host_encode_submit": {
-                                "host_encode_submit_breakdown": {
-                                    "provider_encode_submit_breakdown": {
-                                        "lane_reserve_submit_arm_breakdown": {
-                                            "device_runtime_submit_breakdown": {
-                                                "reusable_execution": reusable
-                                            }
+                            "host_encode_submit_breakdown": {
+                                "provider_encode_submit_breakdown": {
+                                    "lane_reserve_submit_arm_breakdown": {
+                                        "device_runtime_submit_breakdown": {
+                                            "reusable_execution": reusable
                                         }
                                     }
                                 }
@@ -1666,8 +1664,8 @@ def self_test() -> int:
         validate_prefill_replay(root)
         health = read_json(root / "serve" / "health.after-bench.json")
         health["cache"]["prefix_cache"]["wave_timing_by_phase"]["prefill"][
-            "host_encode_submit"
-        ]["host_encode_submit_breakdown"]["provider_encode_submit_breakdown"][
+            "host_encode_submit_breakdown"
+        ]["provider_encode_submit_breakdown"][
             "lane_reserve_submit_arm_breakdown"
         ]["device_runtime_submit_breakdown"]["reusable_execution"][
             "replayed_segments"
