@@ -324,6 +324,33 @@ fn multi_auto_tool_bare_arguments_json_does_not_guess_tool() {
 }
 
 #[test]
+fn multi_required_tool_bare_arguments_json_does_not_bind_the_first_tool() {
+    let mut request = chat_request_with_tool(Some(ApiToolChoice::Mode("required".to_string())));
+    let Some(ApiRequest::Chat(chat)) = request.api_request.as_mut() else {
+        panic!("expected chat request");
+    };
+    chat.tools.push(ApiTool {
+        tool_type: "function".to_string(),
+        function: ApiFunction {
+            name: "calendar".to_string(),
+            description: None,
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {"date": {"type": "string"}},
+                "required": ["date"]
+            })),
+            strict: None,
+        },
+    });
+
+    assert!(
+        api_response_from_generated_text(&request, r#"{"city":"Paris","unit":"c"}"#)
+            .is_none(),
+        "tool_choice=required permits any declared tool, so bare arguments must not be assigned to the first tool"
+    );
+}
+
+#[test]
 fn tool_choice_none_keeps_generated_text_unstructured() {
     let request = chat_request_with_tool(Some(ApiToolChoice::Mode("none".to_string())));
     let text = r#"{"name":"weather","arguments":{"city":"Paris"}}"#;

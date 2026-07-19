@@ -389,12 +389,8 @@ fn unwrapped_tool_arguments_target<'a>(
         return None;
     }
 
-    let mut function_tools = chat_request
-        .tools
-        .iter()
-        .filter(|tool| tool.tool_type == "function");
-    let tool = function_tools.next()?;
-    if function_tools.next().is_some() || !value_looks_like_tool_arguments(value, tool) {
+    let tool = single_function_tool(chat_request)?;
+    if !value_looks_like_tool_arguments(value, tool) {
         return None;
     }
     Some(tool)
@@ -427,12 +423,20 @@ fn forced_tool_choice_name(chat_request: &ApiChatRequest) -> Option<&str> {
         }) if tool_type == "function" && api_tool_name_allowed(chat_request, &function.name) => {
             Some(function.name.as_str())
         }
-        Some(ApiToolChoice::Mode(mode)) if mode.eq_ignore_ascii_case("required") => chat_request
-            .tools
-            .first()
-            .map(|tool| tool.function.name.as_str()),
+        Some(ApiToolChoice::Mode(mode)) if mode.eq_ignore_ascii_case("required") => {
+            single_function_tool(chat_request).map(|tool| tool.function.name.as_str())
+        }
         _ => None,
     }
+}
+
+fn single_function_tool(chat_request: &ApiChatRequest) -> Option<&ApiTool> {
+    let mut tools = chat_request
+        .tools
+        .iter()
+        .filter(|tool| tool.tool_type == "function");
+    let tool = tools.next()?;
+    tools.next().is_none().then_some(tool)
 }
 
 fn parse_legacy_function_call_from_generated_text(
