@@ -63,6 +63,29 @@ export OPENAI_API_KEY=dummy-key-not-checked
 
 Ferrum ignores API keys for local serving unless an external proxy enforces authentication.
 
+## Structured-output behavior in v0.8.0
+
+Ferrum v0.8.0 changes `response_format` from prompt steering and response repair
+to tokenizer-aware constrained decoding:
+
+- `json_object` returns exactly one valid JSON object. Markdown fences,
+  explanatory prefixes, suffixes, and non-object JSON roots are errors.
+- strict `json_schema` uses the same constrained decoder and validates the exact
+  final JSON value. Unsupported grammars fail before request admission; they do
+  not silently fall back to ordinary sampling.
+- streaming hard-structured responses are buffered until validation succeeds.
+  A generation failure produces an OpenAI-shaped error event and one `[DONE]`
+  without first exposing invalid partial JSON.
+- reasoning-capable templates may generate a reasoning block first. The grammar
+  starts at the template's structured-content boundary, and reasoning is not
+  included in the validated JSON value.
+- non-strict `json_schema` remains best-effort for compatibility.
+
+Clients migrating from Ferrum 0.7.x must not depend on outer markdown-fence
+removal or brace extraction. They should handle an explicit request or generation
+error when a schema cannot be compiled or a valid value cannot be completed
+within the request limits.
+
 ## Benchmark comparison
 
 Use Ferrum's canonical HTTP benchmark client for both Ferrum and vLLM endpoints:

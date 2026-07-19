@@ -26,8 +26,8 @@ use ferrum_types::{
     FinishReason, InferenceRequest, InferenceResponse, ModelId, Priority, ProcessMemoryObservation,
     ProcessMemorySample, ProcessMemorySampler, ProfileEntrypoint, ProfileError, ProfileEventKind,
     ProfileStatus, ReplayReference, RequestId, ResolvedFerrumConfig, ResourceAction,
-    ResourceTraceEvent, RuntimeConfigSnapshot, SamplingParams, TokenId, TokenUsage,
-    DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    ResourceTraceEvent, RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart, TokenId,
+    TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
     OBSERVABILITY_PROFILE_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
@@ -56,10 +56,13 @@ const INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidd
 const THINK_START_TAG: &str = "<think>";
 const THINK_END_TAG: &str = "</think>";
 const DEFAULT_GUIDED_TOOL_ARGUMENT_STRING_MAX_LENGTH: u64 = 128;
+const MAX_CACHED_JSON_SCHEMA_VALIDATORS: usize = 64;
 const INITIAL_STRUCTURED_CALL_FORBIDDEN_TOKEN_TEXTS: &[&str] =
     &["<|im_end|>", "<|endoftext|>", "<|eot_id|>", "</s>"];
 const FERRUM_SESSION_HEADER: &str = "x-ferrum-session";
 static PROFILE_JSONL_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static JSON_SCHEMA_VALIDATOR_CACHE: OnceLock<Mutex<HashMap<String, Arc<jsonschema::Validator>>>> =
+    OnceLock::new();
 
 /// Product defaults used when an OpenAI chat request omits sampling fields.
 /// The engine composition root consumes the same typed value so its resolved
@@ -2189,14 +2192,7 @@ async fn handle_chat_completions_stream(
             ) {
                 warn!("failed to write chat stream failure diagnostics: {}", err);
             }
-            let _ = tx.send(Ok(openai_error_sse_event(
-                error_message,
-                "internal_server_error",
-                None,
-            )));
-            let _ = tx.send(Ok(Event::default().data("[DONE]")));
-            let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
-            return Ok(Sse::new(stream).into_response());
+            return Err(server_error_from_ferrum_error(e));
         }
     };
     let request_dump_dir = state.request_dump_dir.clone();
@@ -2338,14 +2334,14 @@ async fn handle_chat_completions_stream(
                             let _ = tx.send(Ok(Event::default().data("[DONE]")));
                             break;
                         }
-                        if let Err(e) = validate_strict_json_schema_response(
+                        if let Err(e) = validate_hard_structured_response(
                             &openai_request,
                             &parsed_final.content,
                         ) {
                             let error_event = openai_error_sse_event(
                                 stream_validation_error_message(e),
                                 "internal_server_error",
-                                Some("response_format.json_schema"),
+                                structured_response_error_param(output_contract),
                             );
                             let _ = tx.send(Ok(error_event));
                             let _ = tx.send(Ok(Event::default().data("[DONE]")));
@@ -2611,25 +2607,11 @@ async fn handle_chat_completions_sync(
                 ..
             } = output;
 
-            // Post-process the completion text in two passes:
-            //   1. Strip a markdown fence when `response_format = json_object`
-            //      — JsonModeProcessor's soft biases don't hard-mask the
-            //      fence the model wants to emit. Strict json_schema does
-            //      not get this cleanup; success must come from hard masking
-            //      and final validation, not markdown repair.
-            //   2. Strip a trailing user-supplied `stop` sentinel — OpenAI
-            //      convention is that stop strings mark a boundary and are
-            //      NOT included in the returned completion.
-            // Order matters: fence-strip first reveals the actual JSON,
-            // then any stop sentinel inside that JSON gets trimmed.
-            let after_fence = match &openai_request.response_format {
-                Some(rf) if rf.format_type == "json_object" => {
-                    strip_markdown_json_fence(&output_text)
-                }
-                _ => output_text,
-            };
+            // OpenAI stop strings mark a boundary and are not included in the
+            // returned completion. Hard structured formats are never repaired
+            // here; malformed output must fail the response contract below.
             let stop_sequences = openai_request.stop.clone().unwrap_or_default();
-            let content = strip_after_stop(&after_fence, &stop_sequences);
+            let content = strip_after_stop(&output_text, &stop_sequences);
             let parsed = if started_in_think {
                 parse_reasoning_response_started_in_think(&content)
             } else {
@@ -2718,22 +2700,21 @@ async fn handle_chat_completions_sync(
                     Some("tool_choice"),
                 ));
             }
-            if let Err(error) =
-                validate_strict_json_schema_response(&openai_request, &message.content)
+            if let Err(error) = validate_hard_structured_response(&openai_request, &message.content)
             {
                 if let Err(err) = write_chat_request_profile_event(
                     &state,
                     &replay_request_id,
                     &profile_request_model,
                     false,
-                    "chat_completions_sync_strict_schema",
+                    "chat_completions_sync_structured_output",
                     profile_started_at,
                     None,
                     tokens.len(),
                     Some(&usage),
                     Some("error"),
                     Some(ProfileError {
-                        kind: "strict_schema_failure".to_string(),
+                        kind: "structured_output_failure".to_string(),
                         message: format!("{error:?}"),
                         blocking: true,
                     }),
@@ -3002,6 +2983,17 @@ fn convert_chat_request_with_template_model(
             serde_json::json!(forbidden),
         );
     }
+    let response_format = forced_response_format
+        .or(requested_response_format)
+        .or_else(|| inferred_auto_tool_response_format(request))
+        .unwrap_or(ferrum_types::ResponseFormat::Text);
+    let structured_output_start = if matches!(response_format, ferrum_types::ResponseFormat::Text)
+        || !has_unclosed_thinking_block(&prompt)
+    {
+        StructuredOutputStart::Immediate
+    } else {
+        StructuredOutputStart::AfterDelimiter(THINK_END_TAG.to_string())
+    };
 
     Ok(InferenceRequest {
         id: RequestId(Uuid::new_v4()),
@@ -3021,11 +3013,8 @@ fn convert_chat_request_with_template_model(
             tfs: None,
             typical_p: None,
             mirostat: None,
-            response_format: forced_response_format
-                .clone()
-                .or(requested_response_format)
-                .or_else(|| inferred_auto_tool_response_format(request))
-                .unwrap_or(ferrum_types::ResponseFormat::Text),
+            response_format,
+            structured_output_start,
         },
         stream: request.stream.unwrap_or(false),
         priority: Priority::Normal, // Default priority
@@ -3126,7 +3115,7 @@ fn response_format_prompt_instruction(
                 let schema = format.json_schema.as_ref()?.schema.as_ref()?;
                 let schema_text = serde_json::to_string(schema).ok()?;
                 Some(format!(
-                    "The response_format requires a single valid JSON object satisfying this JSON Schema. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text. Schema: {schema_text}"
+                    "The response_format requires a single valid JSON value satisfying this JSON Schema. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text. Schema: {schema_text}"
                 ))
             }
             _ => None,
@@ -3152,6 +3141,7 @@ fn requested_response_format_for_sampling(
         return Ok(None);
     };
     match format.format_type.as_str() {
+        "json_object" => Ok(Some(ferrum_types::ResponseFormat::JsonObject)),
         "json_schema" => {
             let Some(schema) = format.json_schema.as_ref() else {
                 return Err(Error::invalid_request(
@@ -3459,29 +3449,15 @@ fn normalize_structured_response_content(
     request: &ChatCompletionsRequest,
     content: &str,
 ) -> String {
-    if matches!(
-        EffectiveChatOutputContract::resolve(request),
-        EffectiveChatOutputContract::RequiredToolCall
-    ) {
-        return content.to_string();
-    }
-    let Some(response_format) = request.response_format.as_ref() else {
-        return content.to_string();
-    };
-    match response_format.format_type.as_str() {
-        "json_object" => extract_json_object_text(content)
-            .unwrap_or_else(|| strip_markdown_json_fence(content).to_string()),
-        "json_schema"
-            if !response_format
-                .json_schema
-                .as_ref()
-                .and_then(|schema| schema.strict)
-                .unwrap_or(false) =>
-        {
+    match EffectiveChatOutputContract::resolve(request) {
+        EffectiveChatOutputContract::BestEffortJsonSchemaContent => {
             extract_json_object_text(content)
                 .unwrap_or_else(|| strip_markdown_json_fence(content).to_string())
         }
-        _ => content.to_string(),
+        EffectiveChatOutputContract::RequiredToolCall
+        | EffectiveChatOutputContract::StrictJsonSchemaContent
+        | EffectiveChatOutputContract::JsonObjectContent
+        | EffectiveChatOutputContract::Text => content.to_string(),
     }
 }
 
@@ -3917,21 +3893,26 @@ fn ensure_response_format_supported(
         match rf.format_type.as_str() {
             "text" | "json_object" => {}
             "json_schema" => {
-                let Some(schema_json) = strict_json_schema_string(request)? else {
-                    if rf.json_schema.is_none() {
-                        return Err(ServerError::invalid_request(
-                            "response_format.json_schema.schema is required",
-                            Some("response_format.json_schema"),
-                        ));
-                    }
-                    return Ok(());
-                };
-                ferrum_sampler::schema_to_regex::schema_to_regex(&schema_json).map_err(|e| {
-                    ServerError::unsupported_feature(
-                        format!("unsupported strict json_schema: {e}"),
+                let Some(schema_config) = rf.json_schema.as_ref() else {
+                    return Err(ServerError::invalid_request(
+                        "response_format.json_schema.schema is required",
                         Some("response_format.json_schema"),
-                    )
-                })?;
+                    ));
+                };
+                let Some(schema) = schema_config.schema.as_ref() else {
+                    return Err(ServerError::invalid_request(
+                        "response_format.json_schema.schema is required",
+                        Some("response_format.json_schema"),
+                    ));
+                };
+                if schema_config.strict.unwrap_or(false) {
+                    compiled_json_schema_validator(schema).map_err(|reason| {
+                        ServerError::invalid_request(
+                            format!("unsupported strict json_schema: {reason}"),
+                            Some("response_format.json_schema"),
+                        )
+                    })?;
+                }
             }
             _ => {
                 return Err(ServerError::invalid_request(
@@ -3973,29 +3954,52 @@ fn strict_json_schema_string(
     })
 }
 
-fn validate_strict_json_schema_response(
+fn validate_hard_structured_response(
     request: &ChatCompletionsRequest,
     content: &str,
 ) -> std::result::Result<(), ServerError> {
-    if !matches!(
-        EffectiveChatOutputContract::resolve(request),
-        EffectiveChatOutputContract::StrictJsonSchemaContent
-    ) {
-        return Ok(());
+    match EffectiveChatOutputContract::resolve(request) {
+        EffectiveChatOutputContract::JsonObjectContent => {
+            let value = serde_json::from_str::<serde_json::Value>(content).map_err(|error| {
+                ServerError::InternalError(format!(
+                    "model output did not satisfy response_format.json_object: invalid JSON: {error}"
+                ))
+            })?;
+            if !value.is_object() {
+                return Err(ServerError::InternalError(
+                    "model output did not satisfy response_format.json_object: root must be an object"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
+        EffectiveChatOutputContract::StrictJsonSchemaContent => {
+            let Some(schema_json) = strict_json_schema_string(request)? else {
+                return Ok(());
+            };
+            let schema: serde_json::Value = serde_json::from_str(&schema_json).map_err(|e| {
+                ServerError::InternalError(format!(
+                    "strict json_schema could not be reconstructed after request validation: {e}"
+                ))
+            })?;
+            validate_json_text_against_schema(&schema, content).map_err(|reason| {
+                ServerError::InternalError(format!(
+                    "model output did not satisfy response_format.json_schema.strict: {reason}"
+                ))
+            })
+        }
+        EffectiveChatOutputContract::RequiredToolCall
+        | EffectiveChatOutputContract::BestEffortJsonSchemaContent
+        | EffectiveChatOutputContract::Text => Ok(()),
     }
-    let Some(schema_json) = strict_json_schema_string(request)? else {
-        return Ok(());
-    };
-    let schema: serde_json::Value = serde_json::from_str(&schema_json).map_err(|e| {
-        ServerError::InternalError(format!(
-            "strict json_schema could not be reconstructed after request validation: {e}"
-        ))
-    })?;
-    validate_json_text_against_schema(&schema, content).map_err(|reason| {
-        ServerError::InternalError(format!(
-            "model output did not satisfy response_format.json_schema.strict: {reason}"
-        ))
-    })
+}
+
+fn structured_response_error_param(contract: EffectiveChatOutputContract) -> Option<&'static str> {
+    match contract {
+        EffectiveChatOutputContract::JsonObjectContent => Some("response_format"),
+        EffectiveChatOutputContract::StrictJsonSchemaContent => Some("response_format.json_schema"),
+        _ => None,
+    }
 }
 
 fn validate_structured_tool_response(
@@ -4089,8 +4093,33 @@ fn validate_json_text_against_schema(
 ) -> std::result::Result<(), String> {
     let value = serde_json::from_str::<serde_json::Value>(content)
         .map_err(|e| format!("invalid JSON: {e}"))?;
-    ferrum_sampler::schema_validation::validate_json_schema_value(schema, &value)
-        .map_err(|e| e.to_string())
+    compiled_json_schema_validator(schema)?
+        .validate(&value)
+        .map_err(|error| error.to_string())
+}
+
+fn compiled_json_schema_validator(
+    schema: &serde_json::Value,
+) -> std::result::Result<Arc<jsonschema::Validator>, String> {
+    let cache_key = serde_json::to_string(schema)
+        .map_err(|error| format!("could not serialize JSON Schema: {error}"))?;
+    let cache = JSON_SCHEMA_VALIDATOR_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut validators = cache
+        .lock()
+        .map_err(|_| "JSON Schema validator cache lock was poisoned".to_string())?;
+    if let Some(validator) = validators.get(&cache_key) {
+        return Ok(Arc::clone(validator));
+    }
+
+    let validator = Arc::new(
+        jsonschema::validator_for(schema)
+            .map_err(|error| format!("could not compile JSON Schema: {error}"))?,
+    );
+    if validators.len() >= MAX_CACHED_JSON_SCHEMA_VALIDATORS {
+        validators.clear();
+    }
+    validators.insert(cache_key, Arc::clone(&validator));
+    Ok(validator)
 }
 
 fn stream_validation_error_message(error: ServerError) -> String {
@@ -4160,6 +4189,7 @@ fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest 
             typical_p: None,
             mirostat: None,
             response_format: ferrum_types::ResponseFormat::Text,
+            structured_output_start: StructuredOutputStart::Immediate,
         },
         stream: request.stream.unwrap_or(false),
         priority: Priority::Normal,
@@ -4975,14 +5005,8 @@ fn strip_after_stop(text: &str, stops: &[String]) -> String {
     }
 }
 
-/// When `response_format = json_object` is set, the model is meant to
-/// emit valid JSON only. Qwen / Llama instruct models frequently wrap
-/// the JSON in markdown fences anyway (```` ```json ... ``` ````)
-/// because that's how they were trained. `JsonModeProcessor` only
-/// applies soft logit biases, not a hard mask, so the fence slips
-/// through. Strip a single outermost ` ```json ... ``` ` /
-/// ` ``` ... ``` ` wrapper. Preserves inner JSON exactly. Returns the
-/// input unchanged if no fence is present.
+/// Compatibility cleanup for explicitly best-effort structured output.
+/// Hard `json_object` and strict schema contracts never call this helper.
 fn strip_markdown_json_fence(text: &str) -> String {
     let trimmed = text.trim();
     // Try the most specific marker first.
@@ -8362,9 +8386,13 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response.status(), AxumStatusCode::OK);
-        let body = response_text(response).await;
-        assert_openai_stream_error(&body, "stub stream failed");
+        assert_eq!(response.status(), AxumStatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "internal_server_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stub stream failed"));
     }
 
     #[tokio::test]
@@ -8380,9 +8408,13 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response.status(), AxumStatusCode::OK);
-        let body = response_text(response).await;
-        assert_openai_stream_error(&body, "stub stream failed");
+        assert_eq!(response.status(), AxumStatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "internal_server_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stub stream failed"));
         assert_chat_failure_replay_bundle(
             &root,
             "chat_completions_stream_start",
@@ -9819,25 +9851,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_object_strips_single_markdown_fence_as_best_effort_repair() {
+    async fn json_object_rejects_markdown_fence_instead_of_repairing() {
         let request = chat_request(json!({
             "response_format": {"type": "json_object"}
         }));
-        let response = chat_completions_handler(
+        let err = chat_completions_handler(
             State(state_with_stub("```json\n{\"answer\":\"yes\"}\n```")),
             HeaderMap::new(),
             Ok(Json(request)),
         )
         .await
-        .expect("json_object response");
-        assert_eq!(response.status(), AxumStatusCode::OK);
-        let body = response_json(response).await;
-        let content = body["choices"][0]["message"]["content"]
+        .expect_err("fenced json_object must fail");
+        let (status, body) = error_json(err).await;
+        assert_eq!(status, AxumStatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["type"], "internal_server_error");
+        assert!(body["error"]["message"]
             .as_str()
-            .expect("content string");
-        assert_eq!(content, "{\"answer\":\"yes\"}");
-        let parsed: serde_json::Value = serde_json::from_str(content).expect("parse json_object");
-        assert_eq!(parsed["answer"], "yes");
+            .unwrap_or_default()
+            .contains("response_format.json_object: invalid JSON"));
     }
 
     #[tokio::test]
@@ -9877,24 +9908,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn json_object_remains_best_effort_not_strict_validation() {
+    async fn json_object_rejects_non_json_model_output() {
         let request = chat_request(json!({
             "response_format": {"type": "json_object"}
         }));
-        let response = chat_completions_handler(
+        let err = chat_completions_handler(
             State(state_with_stub("not json")),
             HeaderMap::new(),
             Ok(Json(request)),
         )
         .await
-        .expect("json_object remains best-effort");
-        assert_eq!(response.status(), AxumStatusCode::OK);
-        let body = response_json(response).await;
-        assert_eq!(body["choices"][0]["message"]["content"], "not json");
+        .expect_err("invalid json_object must fail");
+        let (status, body) = error_json(err).await;
+        assert_eq!(status, AxumStatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["type"], "internal_server_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("response_format.json_object"));
     }
 
-    #[tokio::test]
-    async fn unsupported_strict_json_schema_is_rejected_at_boundary() {
+    #[test]
+    fn one_of_strict_json_schema_reaches_hard_decoder() {
         let request = chat_request(json!({
             "response_format": {
                 "type": "json_schema",
@@ -9905,17 +9940,23 @@ mod tests {
                 }
             }
         }));
-        let err = chat_completions_handler(
-            State(state_with_stub("unused")),
-            HeaderMap::new(),
-            Ok(Json(request)),
-        )
-        .await
-        .expect_err("unsupported strict schema should reject");
-        let (status, body) = error_json(err).await;
-        assert_eq!(status, AxumStatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["param"], "response_format.json_schema");
-        assert_eq!(body["error"]["type"], "invalid_request_error");
+        validate_chat_request(&request).expect("oneOf strict schema should validate");
+        let internal = convert_chat_request(&request).expect("convert oneOf strict schema");
+        let ferrum_types::ResponseFormat::JsonSchema(schema) =
+            internal.sampling_params.response_format
+        else {
+            panic!("strict schema did not reach hard decoder");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&schema).unwrap()["oneOf"],
+            json!([{"type": "string"}, {"type": "integer"}])
+        );
+        let schema = serde_json::from_str::<serde_json::Value>(&schema).unwrap();
+        validate_json_text_against_schema(&schema, r#""answer""#)
+            .expect("oneOf string branch should pass final validation");
+        validate_json_text_against_schema(&schema, "7")
+            .expect("oneOf integer branch should pass final validation");
+        assert!(validate_json_text_against_schema(&schema, "true").is_err());
     }
 
     #[tokio::test]
@@ -9964,7 +10005,7 @@ mod tests {
         assert!(
             internal
                 .prompt
-                .contains("response_format requires a single valid JSON object"),
+                .contains("response_format requires a single valid JSON value"),
             "response_format instruction should reach the model prompt: {}",
             internal.prompt
         );
@@ -10011,8 +10052,33 @@ mod tests {
         );
         assert_eq!(
             internal.sampling_params.response_format,
-            ferrum_types::ResponseFormat::Text,
-            "json_object response_format should use prompt instruction and final JSON cleanup, not engine-wide JSON soft bias"
+            ferrum_types::ResponseFormat::JsonObject,
+            "json_object must reach the tokenizer-aware hard decoder"
+        );
+        assert_eq!(
+            internal.sampling_params.structured_output_start,
+            StructuredOutputStart::Immediate
+        );
+    }
+
+    #[test]
+    fn json_object_thinking_template_activates_after_typed_end_delimiter() {
+        let request = chat_request(json!({
+            "response_format": {"type": "json_object"}
+        }));
+        let template = ModelChatTemplate::new(
+            "{% if add_generation_prompt %}<assistant><think>\n{% endif %}",
+            "thinking-test-template",
+        );
+
+        let internal =
+            convert_chat_request_with_template_model(&request, "stub-model", Some(&template))
+                .expect("convert thinking json_object");
+
+        assert!(internal.prompt.ends_with("<assistant><think>\n"));
+        assert_eq!(
+            internal.sampling_params.structured_output_start,
+            StructuredOutputStart::AfterDelimiter(THINK_END_TAG.to_string())
         );
     }
 
@@ -10037,7 +10103,7 @@ mod tests {
         assert!(
             internal
                 .prompt
-                .contains("response_format requires a single valid JSON object"),
+                .contains("response_format requires a single valid JSON value"),
             "response_format instruction should reach the model prompt: {}",
             internal.prompt
         );

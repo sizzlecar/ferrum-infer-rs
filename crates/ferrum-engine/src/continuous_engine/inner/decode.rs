@@ -140,7 +140,7 @@ impl EngineInner {
                 Ok(token) => token,
                 Err(error) => {
                     warn!("PlanRuntime batch decode post-process failed for {rid}: {error}");
-                    self.complete_request(rid, FinishReason::Error).await?;
+                    self.complete_request_with_error(rid, error).await?;
                     continue;
                 }
             };
@@ -519,7 +519,7 @@ impl EngineInner {
                 Ok(token) => token,
                 Err(e) => {
                     warn!("Batch decode post-process failed for {}: {}", rid, e);
-                    self.complete_request(rid, FinishReason::Error).await?;
+                    self.complete_request_with_error(rid, e).await?;
                     continue;
                 }
             };
@@ -595,7 +595,15 @@ impl EngineInner {
         // Speculative decoding path: when both a draft executor and
         // config are set, delegate to the runner and push the accepted
         // tokens onto the sequence in one shot.
-        if self.draft_executor.is_some() && self.spec_config.is_some() {
+        // Structured output requires an engine grammar decision before every
+        // token, while the speculative runner installs an accepted token batch.
+        let can_use_speculative_decode = self
+            .sequences
+            .read()
+            .get(request_id)
+            .is_some_and(|sequence| !sequence.has_structured_output_constraint());
+        if self.draft_executor.is_some() && self.spec_config.is_some() && can_use_speculative_decode
+        {
             return self.run_decode_step_speculative(request_id).await;
         }
 
@@ -638,7 +646,7 @@ impl EngineInner {
         };
         let logits_vec = decode_output.logits.to_vec_f32()?;
 
-        let next_token = {
+        let next_token_result = (|| {
             let mut sequences = self.sequences.write();
             let seq = sequences
                 .get_mut(request_id)
@@ -662,7 +670,15 @@ impl EngineInner {
                     .clone()
                     .or(input_recurrent_state),
             );
-            token
+            Ok::<TokenId, FerrumError>(token)
+        })();
+        let next_token = match next_token_result {
+            Ok(token) => token,
+            Err(error) => {
+                warn!("Decode post-process failed for {}: {}", request_id, error);
+                self.complete_request_with_error(request_id, error).await?;
+                return Ok(());
+            }
         };
 
         let generated_count = {

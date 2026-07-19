@@ -77,9 +77,8 @@ impl EngineInner {
                     request_id, num_tokens,
                 );
 
-                let cloned_kv = cached_kv.clone_handle()?;
-
-                let (first_token, model_cache_update) = {
+                let prefix_hit_result = (|| {
+                    let cloned_kv = cached_kv.clone_handle()?;
                     let mut sequences = self.sequences.write();
                     let seq = sequences
                         .get_mut(request_id)
@@ -93,7 +92,18 @@ impl EngineInner {
                     seq.generated_tokens.push(token);
                     let model_cache_update =
                         seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
-                    (token, model_cache_update)
+                    Ok::<(TokenId, ModelCacheRefUpdate), FerrumError>((token, model_cache_update))
+                })();
+                let (first_token, model_cache_update) = match prefix_hit_result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warn!(
+                            "Prefix-cache prefill post-process failed for {}: {}",
+                            request_id, error
+                        );
+                        self.complete_request_with_error(request_id, error).await?;
+                        return Ok(());
+                    }
                 };
                 self.apply_model_cache_ref_update(request_id, model_cache_update);
 
@@ -325,7 +335,8 @@ impl EngineInner {
             Err(e) => {
                 kv_lease.release(self).await;
                 recurrent_admission.release_fresh(self).await;
-                return Err(e);
+                self.complete_request_with_error(request_id, e).await?;
+                return Ok(());
             }
         };
         self.apply_model_cache_ref_update(request_id, model_cache_update);
@@ -569,7 +580,8 @@ impl EngineInner {
             Ok(value) => value,
             Err(error) => {
                 self.model_executor.release_cache(&cache_id);
-                return Err(error);
+                self.complete_request_with_error(request_id, error).await?;
+                return Ok(());
             }
         }) else {
             self.model_executor.release_cache(&cache_id);
@@ -678,11 +690,11 @@ impl EngineInner {
                     .find_prefix(&input_tokens)
                     .filter(|(prefix_id, _, _)| prefix_id.len() == input_tokens.len());
                 if let Some((_, cached_kv, cached_logits)) = hit {
-                    let cloned_kv = cached_kv.clone_handle()?;
-                    let (first_token, model_cache_update) = {
+                    let prefix_hit_result = (|| {
+                        let cloned_kv = cached_kv.clone_handle()?;
                         let mut sequences = self.sequences.write();
                         let Some(seq) = sequences.get_mut(rid) else {
-                            continue;
+                            return Ok(None);
                         };
                         seq.reset_guided_processors()?;
                         let mut logits = cached_logits;
@@ -693,7 +705,24 @@ impl EngineInner {
                         seq.generated_tokens.push(token);
                         let model_cache_update =
                             seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
-                        (token, model_cache_update)
+                        Ok::<Option<(TokenId, ModelCacheRefUpdate)>, FerrumError>(Some((
+                            token,
+                            model_cache_update,
+                        )))
+                    })();
+                    let prefix_hit = match prefix_hit_result {
+                        Ok(value) => value,
+                        Err(error) => {
+                            warn!(
+                                "Batch prefix-cache prefill post-process failed for {}: {}",
+                                rid, error
+                            );
+                            self.complete_request_with_error(rid, error).await?;
+                            continue;
+                        }
+                    };
+                    let Some((first_token, model_cache_update)) = prefix_hit else {
+                        continue;
                     };
                     self.apply_model_cache_ref_update(rid, model_cache_update);
                     self.scheduler.mark_prefill_complete(rid, num_tokens);
@@ -880,7 +909,7 @@ impl EngineInner {
                 Err(e) => {
                     warn!("Batch prefill post-process failed for {}: {}", rid, e);
                     pending.release_resources(self).await;
-                    self.complete_request(&rid, FinishReason::Error).await?;
+                    self.complete_request_with_error(&rid, e).await?;
                     continue;
                 }
             };

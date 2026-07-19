@@ -59,29 +59,21 @@ describes the current product contract for the always-on server path.
 | Request | Status | Behavior |
 |---|---|---|
 | `response_format={"type":"text"}` | Supported | Default behavior. |
-| `response_format={"type":"json_object"}` | Best-effort JSON mode | Ferrum asks the model for JSON and repairs one outer markdown fence. Release smoke tests require parseable JSON on the real-model path, but hard HTTP-boundary validation is reserved for strict `json_schema`. |
-| `response_format={"type":"json_schema","json_schema":{"strict":true,...}}` | Supported for a subset | Supported schemas are validated before non-streaming responses return. Strict-schema streaming buffers content until validation passes, then emits the content and final chunk; invalid output emits an OpenAI-shaped SSE error without invalid partial deltas. Unsupported schema subsets are rejected at request validation with `param=response_format.json_schema`. |
+| `response_format={"type":"json_object"}` | Hard constrained | Ferrum applies tokenizer-aware constrained decoding and final exact validation. The result must be one JSON object with no markdown fence or surrounding text. Ferrum does not repair malformed model output. |
+| `response_format={"type":"json_schema","json_schema":{"strict":true,...}}` | Hard constrained | Ferrum compiles the supplied JSON Schema into the same tokenizer-aware constrained-decoding runtime and validates the exact final JSON value against the schema. There is no silent fallback to prompt-only generation. |
 | non-strict `json_schema` | Best-effort | Parsed and preserved, but strict validation only applies when `strict=true`. |
 | unknown `response_format.type` | Rejected | Returns HTTP 400 with `param=response_format.type`. |
 
-Strict schema support is intentionally conservative. It currently depends on
-Ferrum's schema-to-regex subset; unsupported constructs fail fast with HTTP 400
-and `param=response_format.json_schema` rather than silently degrading to
-best-effort generation.
+Hard structured streams are buffered until final validation passes, so malformed
+partial JSON is not emitted to the client. If a grammar cannot be compiled, the
+request fails before admission. If generation reaches a token or context limit
+without a complete valid value, non-streaming requests fail and streaming
+requests emit an OpenAI-shaped SSE error followed by one `[DONE]`.
 
-Supported strict schema subset:
-
-- `type: object`
-- `properties`
-- `required`
-- `additionalProperties: false` or omitted
-- scalar `string`, `number`, `integer`, and `boolean`
-- `enum` of strings or numbers
-- arrays with homogeneous `items` drawn from the same scalar/object subset
-
-Unsupported strict schema constructs include `oneOf`, `anyOf`, `allOf`,
-`patternProperties`, recursive schemas, external `$ref`, complex string formats,
-unenforced regex `pattern`, and unenforced `minItems` / `maxItems`.
+Schema support follows the embedded grammar compiler rather than Ferrum's old
+schema-to-regex subset. Constructs such as `oneOf` are passed to that compiler;
+schemas it cannot support fail explicitly instead of degrading to best-effort
+generation.
 
 ## Usage Accounting
 

@@ -19,6 +19,22 @@ impl SequenceState {
                 .as_ref()
                 .is_some_and(tokio::sync::mpsc::Sender::is_closed)
     }
+
+    fn structured_output_terminal_error(&self, finish_reason: FinishReason) -> Option<FerrumError> {
+        let processor = self.structured_output_processor.as_ref()?;
+        match processor
+            .is_accepting_with_terminals(&self.generated_tokens, &self.stop_token_ids)
+        {
+            Ok(true) if finish_reason != FinishReason::Error => None,
+            Ok(true) => Some(FerrumError::model(
+                "structured-output generation failed after reaching an accepting state",
+            )),
+            Ok(false) => Some(FerrumError::model(format!(
+                "structured-output generation ended with {finish_reason:?} before a complete valid value"
+            ))),
+            Err(error) => Some(error),
+        }
+    }
 }
 
 impl EngineInner {
@@ -233,9 +249,36 @@ impl EngineInner {
         request_id: &RequestId,
         finish_reason: FinishReason,
     ) -> Result<()> {
-        let (response, stream_sender, response_sender, completion_resources) = {
+        self.complete_request_inner(request_id, finish_reason, None)
+            .await
+    }
+
+    pub(super) async fn complete_request_with_error(
+        &self,
+        request_id: &RequestId,
+        error: FerrumError,
+    ) -> Result<()> {
+        self.complete_request_inner(request_id, FinishReason::Error, Some(error))
+            .await
+    }
+
+    async fn complete_request_inner(
+        &self,
+        request_id: &RequestId,
+        finish_reason: FinishReason,
+        mut explicit_terminal_error: Option<FerrumError>,
+    ) -> Result<()> {
+        let (response, stream_sender, response_sender, completion_resources, terminal_error) = {
             let mut sequences = self.sequences.write();
             if let Some(mut seq) = sequences.remove(request_id) {
+                let terminal_error = explicit_terminal_error
+                    .take()
+                    .or_else(|| seq.structured_output_terminal_error(finish_reason));
+                let finish_reason = if terminal_error.is_some() {
+                    FinishReason::Error
+                } else {
+                    finish_reason
+                };
                 let text = self
                     .tokenizer
                     .decode(&seq.generated_tokens, true)
@@ -274,6 +317,7 @@ impl EngineInner {
                     seq.stream_sender.take(),
                     seq.response_sender.take(),
                     completion_resources,
+                    terminal_error,
                 )
             } else {
                 return Ok(());
@@ -286,6 +330,7 @@ impl EngineInner {
             self.model_executor.cancel_prefill_admission(request_id);
         }
 
+        let finish_reason = response.finish_reason;
         if finish_reason == FinishReason::Error {
             self.release_sequence_physical_resources(request_id, completion_resources.physical)
                 .await;
@@ -305,21 +350,28 @@ impl EngineInner {
         scheduler_complete?;
 
         if let Some(tx) = response_sender {
-            let _ = tx.send(response.clone());
+            let response_result = terminal_error
+                .as_ref()
+                .map_or_else(|| Ok(response.clone()), |error| Err(error.clone()));
+            let _ = tx.send(response_result);
         }
 
         if let Some(tx) = stream_sender {
-            let final_chunk = StreamChunk {
-                request_id: request_id.clone(),
-                text: String::new(),
-                token: None,
-                finish_reason: Some(finish_reason),
-                usage: Some(response.usage.clone()),
-                created_at: chrono::Utc::now(),
-                metadata: HashMap::new(),
-                api_response: response.api_response.clone(),
-            };
-            let _ = tx.send(Ok(final_chunk)).await;
+            if let Some(error) = terminal_error {
+                let _ = tx.send(Err(error)).await;
+            } else {
+                let final_chunk = StreamChunk {
+                    request_id: request_id.clone(),
+                    text: String::new(),
+                    token: None,
+                    finish_reason: Some(finish_reason),
+                    usage: Some(response.usage.clone()),
+                    created_at: chrono::Utc::now(),
+                    metadata: HashMap::new(),
+                    api_response: response.api_response.clone(),
+                };
+                let _ = tx.send(Ok(final_chunk)).await;
+            }
         }
 
         debug!(
