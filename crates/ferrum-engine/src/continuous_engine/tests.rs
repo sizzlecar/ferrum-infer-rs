@@ -3864,8 +3864,11 @@ async fn plan_runtime_backing_maintenance_advances_epoch_before_prefill() {
     let _ = std::fs::remove_file(trace_path);
 }
 
-#[tokio::test]
-async fn plan_runtime_capacity_pressure_waits_without_spinning_then_retries_on_release() {
+fn plan_runtime_wait_for_release_engine() -> (
+    Arc<ContinuousBatchEngine>,
+    Arc<ContinuousBatchScheduler>,
+    Arc<PlanRuntimeMaintenanceTestExecutor>,
+) {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
     let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
@@ -3888,11 +3891,10 @@ async fn plan_runtime_capacity_pressure_waits_without_spinning_then_retries_on_r
         )
         .unwrap(),
     );
-    let mut request = policy_request();
-    request.sampling_params.max_tokens = 1;
-    let infer_engine = Arc::clone(&engine);
-    let inference = tokio::spawn(async move { infer_engine.infer(request).await });
+    (engine, scheduler, executor)
+}
 
+async fn wait_for_capacity_wait(executor: &PlanRuntimeMaintenanceTestExecutor) {
     tokio::time::timeout(Duration::from_secs(1), async {
         while executor.maintenance_calls.load(Ordering::Acquire) == 0
             || executor.capacity_wait_registrations.load(Ordering::Acquire) == 0
@@ -3901,7 +3903,18 @@ async fn plan_runtime_capacity_pressure_waits_without_spinning_then_retries_on_r
         }
     })
     .await
-    .expect("typed capacity maintenance must run");
+    .expect("typed capacity maintenance must park the request");
+}
+
+#[tokio::test]
+async fn plan_runtime_capacity_pressure_waits_without_spinning_then_retries_on_release() {
+    let (engine, scheduler, executor) = plan_runtime_wait_for_release_engine();
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 1;
+    let infer_engine = Arc::clone(&engine);
+    let inference = tokio::spawn(async move { infer_engine.infer(request).await });
+
+    wait_for_capacity_wait(&executor).await;
     let parked_iteration = engine.inner.iteration_count.load(Ordering::Acquire);
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(
@@ -3933,6 +3946,61 @@ async fn plan_runtime_capacity_pressure_waits_without_spinning_then_retries_on_r
             .expect("call order mutex poisoned"),
         vec!["defer", "maintain", "admit", "prefill"]
     );
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn plan_runtime_capacity_wait_wakes_and_cancels_when_stream_is_dropped() {
+    let (engine, scheduler, executor) = plan_runtime_wait_for_release_engine();
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 1;
+    let request_id = request.id.clone();
+    let stream = engine.infer_stream(request).await.unwrap();
+
+    wait_for_capacity_wait(&executor).await;
+    let parked_iteration = engine.inner.iteration_count.load(Ordering::Acquire);
+    drop(stream);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while engine.inner.sequences.read().contains_key(&request_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping the stream must wake cancellation without a capacity release");
+    assert!(engine.inner.iteration_count.load(Ordering::Acquire) > parked_iteration);
+    assert_eq!(scheduler.trace_phase(&request_id), None);
+    assert_eq!(scheduler.trace_snapshot().cancelled_total, 1);
+    assert_eq!(scheduler.waiting_count(), 0);
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn plan_runtime_capacity_wait_wakes_and_cancels_when_sync_future_is_aborted() {
+    let (engine, scheduler, executor) = plan_runtime_wait_for_release_engine();
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 1;
+    let request_id = request.id.clone();
+    let infer_engine = Arc::clone(&engine);
+    let inference = tokio::spawn(async move { infer_engine.infer(request).await });
+
+    wait_for_capacity_wait(&executor).await;
+    inference.abort();
+    assert!(inference
+        .await
+        .expect_err("inference task must be cancelled")
+        .is_cancelled());
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while engine.inner.sequences.read().contains_key(&request_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("aborting sync inference must wake cancellation without a capacity release");
+    assert_eq!(scheduler.trace_phase(&request_id), None);
+    assert_eq!(scheduler.trace_snapshot().cancelled_total, 1);
+    assert_eq!(scheduler.waiting_count(), 0);
     engine.shutdown().await.unwrap();
 }
 

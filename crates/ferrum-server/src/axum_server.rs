@@ -2214,7 +2214,15 @@ async fn handle_chat_completions_stream(
         let mut sent_reasoning_len = 0usize;
         let mut sent_content_len = 0usize;
 
-        while let Some(result) = stream.next().await {
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                next = stream.next() => next,
+            };
+            let Some(result) = next else {
+                break;
+            };
             match result {
                 Ok(chunk) => {
                     if first_token_latency_us.is_none()
@@ -5080,6 +5088,7 @@ mod tests {
         stream_usage: Option<TokenUsage>,
         api_response: Option<ferrum_types::ApiResponse>,
         lora_metrics: Option<Value>,
+        pending_stream_drop_notify: Option<Arc<Notify>>,
         shutdown_count: AtomicUsize,
     }
 
@@ -5095,6 +5104,7 @@ mod tests {
                 stream_usage: Some(TokenUsage::new(5, 1)),
                 api_response: None,
                 lora_metrics: None,
+                pending_stream_drop_notify: None,
                 shutdown_count: AtomicUsize::new(0),
             }
         }
@@ -5135,6 +5145,34 @@ mod tests {
                 lora_metrics: Some(lora_metrics),
                 ..Self::new(text)
             }
+        }
+
+        fn with_pending_stream(drop_notify: Arc<Notify>) -> Self {
+            Self {
+                pending_stream_drop_notify: Some(drop_notify),
+                ..Self::new("")
+            }
+        }
+    }
+
+    struct PendingDropStream {
+        drop_notify: Arc<Notify>,
+    }
+
+    impl Stream for PendingDropStream {
+        type Item = ferrum_types::Result<StreamChunk>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for PendingDropStream {
+        fn drop(&mut self) {
+            self.drop_notify.notify_one();
         }
     }
 
@@ -5565,6 +5603,11 @@ mod tests {
         ) -> ferrum_types::Result<
             Pin<Box<dyn Stream<Item = ferrum_types::Result<StreamChunk>> + Send>>,
         > {
+            if let Some(drop_notify) = self.pending_stream_drop_notify.as_ref() {
+                return Ok(Box::pin(PendingDropStream {
+                    drop_notify: Arc::clone(drop_notify),
+                }));
+            }
             if let Some(chunks) = &self.stream_chunks {
                 let request_id = request.id;
                 let mut stream_chunks = Vec::with_capacity(
@@ -6848,6 +6891,26 @@ mod tests {
             !body.contains("strict json_schema") && !body.contains("invalid JSON"),
             "dormant content schema must not reject a required tool call: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_buffered_http_response_drops_the_engine_stream() {
+        let stream_dropped = Arc::new(Notify::new());
+        let response = post_json(
+            AxumServer::from_llm(Arc::new(StubLlm::with_pending_stream(Arc::clone(
+                &stream_dropped,
+            ))))
+            .build_router(),
+            "/v1/chat/completions",
+            required_tool_with_strict_response_format_request(true),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+
+        drop(response);
+        tokio::time::timeout(std::time::Duration::from_secs(1), stream_dropped.notified())
+            .await
+            .expect("client disconnect must stop a buffered structured stream promptly");
     }
 
     #[tokio::test]

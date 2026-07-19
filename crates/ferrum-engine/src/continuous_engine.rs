@@ -64,6 +64,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
@@ -2388,7 +2389,7 @@ struct EngineInner {
     /// Ensures only one iteration step runs at a time.
     iteration_lock: tokio::sync::Mutex<()>,
     /// Wakes callers or a background loop when new work is submitted.
-    work_notify: Notify,
+    work_notify: Arc<Notify>,
     /// Prefix cache: shares KV blocks across requests with common prompts.
     prefix_cache: PrefixCache,
     runtime_config: ContinuousEngineRuntimeConfig,
@@ -2418,6 +2419,49 @@ struct EngineInner {
     shutdown_started: AtomicBool,
     shutdown_lock: tokio::sync::Mutex<()>,
     background_loop: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+struct ClientReceiverDropWake {
+    work_notify: Arc<Notify>,
+    armed: bool,
+}
+
+impl ClientReceiverDropWake {
+    fn new(work_notify: Arc<Notify>) -> Self {
+        Self {
+            work_notify,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ClientReceiverDropWake {
+    fn drop(&mut self) {
+        if self.armed {
+            self.work_notify.notify_one();
+        }
+    }
+}
+
+struct CancellationAwareResponseStream {
+    receiver: tokio_stream::wrappers::ReceiverStream<Result<StreamChunk>>,
+    receiver_drop_wake: ClientReceiverDropWake,
+}
+
+impl Stream for CancellationAwareResponseStream {
+    type Item = Result<StreamChunk>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let result = Pin::new(&mut self.receiver).poll_next(cx);
+        if matches!(&result, Poll::Ready(None)) {
+            self.receiver_drop_wake.disarm();
+        }
+        result
+    }
 }
 
 impl EngineInner {
@@ -4088,7 +4132,7 @@ impl ContinuousBatchEngine {
                 is_running: AtomicBool::new(false),
                 shutdown_notify: Arc::new(Notify::new()),
                 iteration_lock: tokio::sync::Mutex::new(()),
-                work_notify: Notify::new(),
+                work_notify: Arc::new(Notify::new()),
                 iteration_count: AtomicU64::new(0),
                 prefix_cache: PrefixCache::new(256, 2),
                 runtime_config,
@@ -4247,6 +4291,8 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         // respect to the iteration driver. Typed admission must never observe
         // one without the other.
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let mut receiver_drop_wake =
+            ClientReceiverDropWake::new(Arc::clone(&self.inner.work_notify));
         let request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
         let mut seq_state = SequenceState::new_with_tokenizer_and_model_vocab_size(
             request.clone(),
@@ -4304,6 +4350,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         let result = resp_rx
             .await
             .map_err(|_| FerrumError::internal("Response channel closed before response was sent"));
+        receiver_drop_wake.disarm();
 
         gauge!("ferrum.engine.active_requests").decrement(1.0);
         let elapsed_ms = infer_start.elapsed().as_secs_f64() * 1000.0;
@@ -4328,6 +4375,7 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         mut request: InferenceRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send>>> {
         let (tx, rx) = mpsc::channel(100);
+        let receiver_drop_wake = ClientReceiverDropWake::new(Arc::clone(&self.inner.work_notify));
         let request_id = request.id.clone();
 
         maybe_trace_prompt_tokens(&*self.inner.tokenizer, &request_id, &request.prompt);
@@ -4408,7 +4456,10 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         self.ensure_bg_loop();
         self.inner.work_notify.notify_one();
 
-        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Box::pin(CancellationAwareResponseStream {
+            receiver: tokio_stream::wrappers::ReceiverStream::new(rx),
+            receiver_drop_wake,
+        }))
     }
 }
 
