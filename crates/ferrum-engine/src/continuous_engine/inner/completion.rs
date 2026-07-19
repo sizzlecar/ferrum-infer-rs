@@ -23,14 +23,19 @@ impl SequenceState {
     fn structured_output_terminal_error(&self, finish_reason: FinishReason) -> Option<FerrumError> {
         let processor = self.structured_output_processor.as_ref()?;
         match processor
-            .is_accepting_with_terminals(&self.generated_tokens, &self.stop_token_ids)
+            .progress_with_terminals(&self.generated_tokens, &self.stop_token_ids)
         {
-            Ok(true) if finish_reason != FinishReason::Error => None,
-            Ok(true) => Some(FerrumError::model(
+            Ok(progress) if progress.accepting && finish_reason != FinishReason::Error => None,
+            Ok(progress) if progress.accepting => Some(FerrumError::model(
                 "structured-output generation failed after reaching an accepting state",
             )),
-            Ok(false) => Some(FerrumError::model(format!(
-                "structured-output generation ended with {finish_reason:?} before a complete valid value"
+            Ok(progress) => Some(FerrumError::model(format!(
+                "structured-output generation ended with {finish_reason:?} before a complete valid value: phase={:?}, generated_tokens={}, consumed_tokens={}, delimiter_tokens={:?}, delimiter_prefix_tokens={}",
+                progress.phase,
+                progress.generated_token_count,
+                progress.consumed_token_count,
+                progress.delimiter_token_count,
+                progress.delimiter_prefix_token_count,
             ))),
             Err(error) => Some(error),
         }

@@ -210,6 +210,32 @@ pub struct StructuredOutputProcessor {
     vocab_size: usize,
 }
 
+/// Typed phase returned after applying a structured-output constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredOutputPhase {
+    WaitingForDelimiter,
+    EnforcingGrammar,
+}
+
+/// Allocation-free hot-path result of one structured-output mask operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuredOutputMaskOutcome {
+    pub phase: StructuredOutputPhase,
+    pub accepting: bool,
+}
+
+/// Terminal/debug snapshot that distinguishes activation failures from an
+/// incomplete grammar without retaining generated text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuredOutputProgress {
+    pub phase: StructuredOutputPhase,
+    pub generated_token_count: usize,
+    pub consumed_token_count: usize,
+    pub delimiter_token_count: Option<usize>,
+    pub delimiter_prefix_token_count: usize,
+    pub accepting: bool,
+}
+
 impl std::fmt::Debug for StructuredOutputProcessor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let state = self.state.lock();
@@ -236,10 +262,11 @@ enum Activation {
 
 impl StructuredOutputProcessor {
     /// Consume newly generated tokens and hard-mask every illegal next token.
-    /// Waiting-for-reasoning mode deliberately leaves logits untouched until
-    /// the typed delimiter has been observed.
+    /// Waiting-for-reasoning mode leaves normal logits untouched until the
+    /// typed delimiter has been observed.
     pub fn mask_logits(&self, logits: &mut [f32], generated: &[TokenId]) -> Result<()> {
-        self.mask_logits_inner(logits, generated, None).map(|_| ())
+        self.mask_logits_inner(logits, generated, None, None)
+            .map(|_| ())
     }
 
     /// Apply the grammar mask while allowing engine-resolved stop tokens once
@@ -251,8 +278,14 @@ impl StructuredOutputProcessor {
         logits: &mut [f32],
         generated: &[TokenId],
         terminal_token_ids: &HashSet<u32>,
-    ) -> Result<bool> {
-        self.mask_logits_inner(logits, generated, Some(terminal_token_ids))
+        hidden_control_token_ids: &HashSet<u32>,
+    ) -> Result<StructuredOutputMaskOutcome> {
+        self.mask_logits_inner(
+            logits,
+            generated,
+            Some(terminal_token_ids),
+            Some(hidden_control_token_ids),
+        )
     }
 
     fn mask_logits_inner(
@@ -260,11 +293,28 @@ impl StructuredOutputProcessor {
         logits: &mut [f32],
         generated: &[TokenId],
         terminal_token_ids: Option<&HashSet<u32>>,
-    ) -> Result<bool> {
+        hidden_control_token_ids: Option<&HashSet<u32>>,
+    ) -> Result<StructuredOutputMaskOutcome> {
         let mut state = self.state.lock();
         advance_state(&mut state, generated, terminal_token_ids)?;
-        if !matches!(state.activation, Activation::Active) {
-            return Ok(false);
+        if let Activation::WaitingForDelimiter { delimiter_tokens } = &state.activation {
+            let delimiter_prefix_token_count =
+                delimiter_prefix_token_count(generated, delimiter_tokens);
+            let required_control_token = delimiter_tokens.get(delimiter_prefix_token_count);
+            if let Some(hidden_control_token_ids) = hidden_control_token_ids {
+                for token_id in hidden_control_token_ids {
+                    if required_control_token == Some(token_id) {
+                        continue;
+                    }
+                    if let Some(logit) = logits.get_mut(*token_id as usize) {
+                        *logit = f32::NEG_INFINITY;
+                    }
+                }
+            }
+            return Ok(StructuredOutputMaskOutcome {
+                phase: StructuredOutputPhase::WaitingForDelimiter,
+                accepting: false,
+            });
         }
 
         let accepting = state.matcher.is_accepting().map_err(|error| {
@@ -278,7 +328,11 @@ impl StructuredOutputProcessor {
         let mut finite_allowed = 0usize;
         for (idx, logit) in logits.iter_mut().enumerate() {
             let token = idx as u32;
+            let hidden_non_terminal_control = hidden_control_token_ids
+                .is_some_and(|controls| controls.contains(&token))
+                && !terminal_token_ids.is_some_and(|terminals| terminals.contains(&token));
             let allowed = idx < self.vocab_size
+                && !hidden_non_terminal_control
                 && (mask.is_allowed(token)
                     || (accepting
                         && terminal_token_ids.is_some_and(|terminals| terminals.contains(&token))));
@@ -293,7 +347,10 @@ impl StructuredOutputProcessor {
                 "structured-output grammar has no legal finite token",
             ));
         }
-        Ok(accepting)
+        Ok(StructuredOutputMaskOutcome {
+            phase: StructuredOutputPhase::EnforcingGrammar,
+            accepting,
+        })
     }
 
     /// True only when reasoning has closed and the grammar accepts the full
@@ -317,15 +374,53 @@ impl StructuredOutputProcessor {
         generated: &[TokenId],
         terminal_token_ids: Option<&HashSet<u32>>,
     ) -> Result<bool> {
+        Ok(self
+            .progress_inner(generated, terminal_token_ids)?
+            .accepting)
+    }
+
+    /// Inspect the typed activation/grammar state after consuming `generated`.
+    pub fn progress_with_terminals(
+        &self,
+        generated: &[TokenId],
+        terminal_token_ids: &HashSet<u32>,
+    ) -> Result<StructuredOutputProgress> {
+        self.progress_inner(generated, Some(terminal_token_ids))
+    }
+
+    fn progress_inner(
+        &self,
+        generated: &[TokenId],
+        terminal_token_ids: Option<&HashSet<u32>>,
+    ) -> Result<StructuredOutputProgress> {
         let mut state = self.state.lock();
         advance_state(&mut state, generated, terminal_token_ids)?;
-        if !matches!(state.activation, Activation::Active) {
-            return Ok(false);
-        }
-        state.matcher.is_accepting().map_err(|error| {
-            FerrumError::model(format!(
-                "structured-output acceptance check failed: {error}"
-            ))
+        let (phase, delimiter_token_count, delimiter_prefix_token_count, accepting) =
+            match &state.activation {
+                Activation::WaitingForDelimiter { delimiter_tokens } => (
+                    StructuredOutputPhase::WaitingForDelimiter,
+                    Some(delimiter_tokens.len()),
+                    delimiter_prefix_token_count(generated, delimiter_tokens),
+                    false,
+                ),
+                Activation::Active => (
+                    StructuredOutputPhase::EnforcingGrammar,
+                    None,
+                    0,
+                    state.matcher.is_accepting().map_err(|error| {
+                        FerrumError::model(format!(
+                            "structured-output acceptance check failed: {error}"
+                        ))
+                    })?,
+                ),
+            };
+        Ok(StructuredOutputProgress {
+            phase,
+            generated_token_count: generated.len(),
+            consumed_token_count: state.consumed,
+            delimiter_token_count,
+            delimiter_prefix_token_count,
+            accepting,
         })
     }
 
@@ -339,6 +434,21 @@ impl StructuredOutputProcessor {
         state.consumed = 0;
         Ok(())
     }
+}
+
+fn delimiter_prefix_token_count(generated: &[TokenId], delimiter_tokens: &[u32]) -> usize {
+    let max_prefix = generated
+        .len()
+        .min(delimiter_tokens.len().saturating_sub(1));
+    (1..=max_prefix)
+        .rev()
+        .find(|prefix_len| {
+            generated[generated.len() - prefix_len..]
+                .iter()
+                .zip(&delimiter_tokens[..*prefix_len])
+                .all(|(token, expected)| token.get() == *expected)
+        })
+        .unwrap_or(0)
 }
 
 fn advance_state(
@@ -619,6 +729,40 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut generated = Vec::new();
+        let controls = HashSet::from([b'<' as u32, b'>' as u32]);
+        let mut waiting_logits = vec![0.0; EOS as usize + 1];
+        let waiting = processor
+            .mask_logits_with_terminals(&mut waiting_logits, &generated, &HashSet::new(), &controls)
+            .unwrap();
+        assert_eq!(waiting.phase, StructuredOutputPhase::WaitingForDelimiter);
+        assert!(!waiting.accepting);
+        assert!(waiting_logits[b'<' as usize].is_finite());
+        assert!(!waiting_logits[b'>' as usize].is_finite());
+
+        let delimiter_prefix = "</think"
+            .bytes()
+            .map(|byte| TokenId::new(byte as u32))
+            .collect::<Vec<_>>();
+        let mut partial_logits = vec![0.0; EOS as usize + 1];
+        let partial = processor
+            .mask_logits_with_terminals(
+                &mut partial_logits,
+                &delimiter_prefix,
+                &HashSet::new(),
+                &controls,
+            )
+            .unwrap();
+        assert_eq!(partial.phase, StructuredOutputPhase::WaitingForDelimiter);
+        assert!(!partial_logits[b'<' as usize].is_finite());
+        assert!(partial_logits[b'>' as usize].is_finite());
+        let partial_progress = processor
+            .progress_with_terminals(&delimiter_prefix, &HashSet::new())
+            .unwrap();
+        assert_eq!(partial_progress.delimiter_token_count, Some(8));
+        assert_eq!(partial_progress.delimiter_prefix_token_count, 7);
+
+        processor.reset().unwrap();
+
         assert_and_append(&processor, &mut generated, "reasoning [is free]</think>");
         let mut logits = vec![0.0; EOS as usize + 1];
         processor.mask_logits(&mut logits, &generated).unwrap();
@@ -628,5 +772,11 @@ mod tests {
 
         assert_and_append(&processor, &mut generated, r#"{"ok":true}"#);
         assert!(processor.is_accepting(&generated).unwrap());
+        let progress = processor
+            .progress_with_terminals(&generated, &HashSet::new())
+            .unwrap();
+        assert_eq!(progress.phase, StructuredOutputPhase::EnforcingGrammar);
+        assert!(progress.accepting);
+        assert_eq!(progress.generated_token_count, generated.len());
     }
 }
