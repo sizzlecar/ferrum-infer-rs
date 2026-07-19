@@ -3,7 +3,7 @@ mod resource_support;
 mod vnext_core_contract;
 
 use ferrum_interfaces::vnext::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use vnext_core_contract as core;
 
@@ -217,6 +217,17 @@ fn physical_slice_identities(
         .collect()
 }
 
+fn live_segments_by_pool(
+    root: &PlanRuntimeResources<resource_support::TestRuntime>,
+) -> BTreeMap<DynamicBackingPoolId, u64> {
+    root.dynamic_pool_status()
+        .unwrap()
+        .pools()
+        .iter()
+        .map(|pool| (pool.pool_id().clone(), pool.live_segments()))
+        .collect()
+}
+
 fn assert_physical_identities_do_not_overlap(
     left: &[PhysicalSliceIdentity],
     right: &[PhysicalSliceIdentity],
@@ -245,6 +256,45 @@ fn assert_physical_identities_do_not_overlap(
             }
         }
     }
+}
+
+#[test]
+fn eager_submission_wave_releases_invocation_backing_while_step_and_lane_remain_live() {
+    let (plan, registry) = sequential_scratch_plan();
+    let (driver, _trace) = resource_support::configured_driver(&plan, &[], &[]);
+    let lane = ExecutionLane::create(Arc::clone(&driver.runtime)).unwrap();
+    let root = resource_support::plan_runtime(&plan, driver, "eager-wave-release");
+    let sequence = resource_support::admit_logical_sequence(
+        &root,
+        "run.eager-wave-release",
+        "request.eager-wave-release",
+    );
+    let session = sequence.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let step = begin_step(&batch, &lane);
+    let before_wave = live_segments_by_pool(&root);
+
+    let wave = prepare_wave(&plan, &step);
+    let during_wave = live_segments_by_pool(&root);
+    assert!(during_wave.iter().any(|(pool_id, live_segments)| {
+        *live_segments > before_wave.get(pool_id).copied().unwrap_or_default()
+    }));
+
+    drop(wave);
+    assert_eq!(
+        live_segments_by_pool(&root),
+        before_wave,
+        "ordinary eager Invocation backing must release while its Step and lane remain live"
+    );
+
+    step.try_retire_normal().unwrap();
+    drop(batch);
+    session.try_complete().unwrap();
+    drop(session);
+    drop(sequence);
+    drop(lane);
+    drop(registry);
+    resource_support::close_plan_runtime(root);
 }
 
 #[test]
