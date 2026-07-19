@@ -1,6 +1,7 @@
 //! EngineInner iteration and request-processing implementation.
 
 use super::*;
+use ferrum_interfaces::vnext::DynamicBackingPressure;
 
 mod batch;
 mod completion;
@@ -968,17 +969,24 @@ impl EngineInner {
                 pressure,
             } => {
                 validate_current(*current)?;
-                if wait_condition.coordinator_id().get() != current.coordinator_id.get()
-                    || !matches!(
+                let valid_pressure = match pressure {
+                    DynamicBackingPressure::DeviceCapacity(pressure) => matches!(
                         pressure.scope(),
                         DeviceCapacityPressureScope::PlanBudget
                             | DeviceCapacityPressureScope::ProcessWide
-                    )
+                    ),
+                    DynamicBackingPressure::PoolResident(pressure) => {
+                        pressure.resident_bytes() <= pressure.maximum_resident_bytes()
+                            && pressure.available_bytes() < pressure.requested_bytes()
+                    }
+                };
+                if wait_condition.coordinator_id().get() != current.coordinator_id.get()
                     || pressure.requested_bytes() == 0
                     || pressure.available_bytes() >= pressure.requested_bytes()
+                    || !valid_pressure
                 {
                     return Err(FerrumError::internal(format!(
-                        "executor maintenance for {} reported invalid device pressure",
+                        "executor maintenance for {} reported invalid backing pressure",
                         deferral.request_id()
                     )));
                 }

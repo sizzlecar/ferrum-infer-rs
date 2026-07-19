@@ -1405,7 +1405,7 @@ pub enum ExecutorPrefillMaintenanceOutcome {
     WaitForRelease {
         current: ExecutorAdmissionEpochs,
         wait_condition: crate::vnext::CapacityWaitCondition,
-        pressure: crate::vnext::DeviceCapacityPressure,
+        pressure: crate::vnext::DynamicBackingPressure,
     },
     /// The executor installed real backing and published the resulting
     /// capacity epoch.

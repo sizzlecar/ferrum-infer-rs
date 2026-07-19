@@ -12,7 +12,7 @@ use super::{
     ResourceRetentionPolicy, ResourceTransactionIdentity, RunId, Serialize, StateInitialization,
     StaticProvisioningBinding, StepResourceSlotKind, TransactionId, VNextError, Weak,
 };
-use crate::vnext::DeviceCapacityPressure;
+use crate::vnext::{DeviceCapacityPressure, DynamicPoolResidentPressure};
 use sha2::{Digest, Sha256};
 
 static NEXT_DYNAMIC_POOL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -2160,8 +2160,18 @@ where
                     .provisioning()
                     .maximum_resident_bytes()
             {
-                return Err(invalid_resource(
-                    "dynamic pool growth exceeds its core-derived resident maximum",
+                return Err(VNextError::DynamicPoolResidentUnavailable(
+                    DynamicPoolResidentPressure::new(
+                        growth.pool.domain.pool_id().clone(),
+                        growth.chunk_bytes,
+                        state.resident_bytes,
+                        growth
+                            .pool
+                            .domain
+                            .pool
+                            .provisioning()
+                            .maximum_resident_bytes(),
+                    )?,
                 ));
             }
         }
