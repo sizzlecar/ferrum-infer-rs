@@ -1750,17 +1750,13 @@ impl SequenceState {
         // fallback: a dead grammar state is a request error, not permission to
         // return malformed JSON.
         if let Some(processor) = &self.structured_output_processor {
-            let accepting = processor.mask_logits_with_terminals(
+            let constraint = processor.mask_logits_with_terminals(
                 logits,
                 &self.generated_tokens,
                 &self.stop_token_ids,
-            )?;
-            mask_non_stop_control_token_logits(
-                logits,
                 &self.allowed_extended_token_ids,
-                &self.stop_token_ids,
-            );
-            if !accepting {
+            )?;
+            if !constraint.accepting {
                 mask_stop_token_logits(logits, &self.stop_token_ids);
             }
             if !logits.iter().any(|logit| logit.is_finite()) {
@@ -1941,21 +1937,6 @@ fn describe_token_for_log(
 
 fn mask_stop_token_logits(logits: &mut [f32], stop_token_ids: &HashSet<u32>) {
     for &token_id in stop_token_ids {
-        if let Some(logit) = logits.get_mut(token_id as usize) {
-            *logit = f32::NEG_INFINITY;
-        }
-    }
-}
-
-fn mask_non_stop_control_token_logits(
-    logits: &mut [f32],
-    control_token_ids: &HashSet<u32>,
-    stop_token_ids: &HashSet<u32>,
-) {
-    for &token_id in control_token_ids {
-        if stop_token_ids.contains(&token_id) {
-            continue;
-        }
         if let Some(logit) = logits.get_mut(token_id as usize) {
             *logit = f32::NEG_INFINITY;
         }
