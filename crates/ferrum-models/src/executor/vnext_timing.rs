@@ -27,6 +27,12 @@ impl AtomicDurationMetrics {
         self.max_ns.fetch_max(nanoseconds, Ordering::Relaxed);
     }
 
+    pub(super) fn reset(&self) {
+        self.samples.store(0, Ordering::Relaxed);
+        self.total_ns.store(0, Ordering::Relaxed);
+        self.max_ns.store(0, Ordering::Relaxed);
+    }
+
     pub(super) fn snapshot(&self) -> serde_json::Value {
         let samples = self.samples.load(Ordering::Relaxed);
         let total_ns = self.total_ns.load(Ordering::Relaxed);
@@ -82,5 +88,17 @@ mod tests {
 
         drop(metrics.start_if(true));
         assert_eq!(metrics.snapshot()["samples"], 1);
+    }
+
+    #[test]
+    fn reset_removes_cold_path_samples() {
+        let metrics = AtomicDurationMetrics::default();
+        metrics.record(Duration::from_micros(4));
+
+        metrics.reset();
+
+        assert_eq!(metrics.snapshot()["samples"], 0);
+        assert_eq!(metrics.snapshot()["total_ns"], 0);
+        assert_eq!(metrics.snapshot()["max_us"], 0.0);
     }
 }

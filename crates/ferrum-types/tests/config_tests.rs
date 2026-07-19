@@ -81,6 +81,7 @@ fn engine_config_applies_runtime_snapshot() {
             "1",
             RuntimeConfigSource::Env,
         ),
+        RuntimeConfigEntry::new("FERRUM_BATCHED_GRAPH", "1", RuntimeConfigSource::Cli),
         RuntimeConfigEntry::new(
             "FERRUM_SCHEDULER_TRACE_JSONL",
             "/tmp/sched.jsonl",
@@ -96,6 +97,7 @@ fn engine_config_applies_runtime_snapshot() {
     assert_eq!(cfg.scheduler.max_running_requests, 7);
     assert_eq!(cfg.memory.usable_capacity_bytes, Some(12_345));
     assert!(cfg.scheduler.prompt_token_estimate);
+    assert!(cfg.backend.enable_cuda_graphs);
     assert_eq!(
         cfg.runtime.scheduler_trace_jsonl.as_deref(),
         Some(std::path::Path::new("/tmp/sched.jsonl"))

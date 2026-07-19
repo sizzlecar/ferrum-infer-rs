@@ -13,12 +13,12 @@ use super::{
     BatchOperationIdentity, BatchParticipantAuthority, BufferUsage, CopyRegion,
     DeferredDeviceCleanupDisposition, DeferredDeviceCleanupDomainId, DeferredDeviceCleanupTask,
     DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
-    DeviceCommandBatch, DeviceDescriptor, DeviceExecutionTiming, DeviceRuntime,
-    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
-    DeviceTimingMode, DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, ExecutionLaneId,
-    FenceQuery, HostTransferLayout, IdentifiedFailure, InvocationResourceLease,
-    LogicalBackingBufferView, NodeId, PreparedStepSubmissionWave, ResourceId, StreamState,
-    VNextError,
+    DeviceCommandBatch, DeviceDescriptor, DeviceExecutionTiming, DeviceReusableExecutionPlan,
+    DeviceReusableExecutionPreparation, DeviceRuntime, DeviceSubmissionTimingSink, DeviceTerminal,
+    DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
+    DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, ExecutionLaneId, FenceQuery,
+    HostTransferLayout, IdentifiedFailure, InvocationResourceLease, LogicalBackingBufferView,
+    NodeId, PreparedStepSubmissionWave, ResourceId, StreamState, VNextError,
 };
 
 fn invalid_completion(reason: impl Into<String>) -> VNextError {
@@ -151,6 +151,91 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             .lock()
             .map(|state| state.in_flight)
             .unwrap_or(u64::MAX)
+    }
+
+    fn with_quiescent_stream<T>(
+        &self,
+        operation: &'static str,
+        action: impl FnOnce(&R, &mut R::Stream) -> Result<T, R::Error>,
+    ) -> Result<T, VNextError> {
+        if self.fail_closed.load(Ordering::Acquire) {
+            return Err(invalid_completion(format!(
+                "fail-closed execution lane cannot {operation}"
+            )));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_completion("execution lane state mutex is poisoned"))?;
+        if state.fail_closed || self.fail_closed.load(Ordering::Acquire) {
+            return Err(invalid_completion(format!(
+                "fail-closed execution lane cannot {operation}"
+            )));
+        }
+        if state.in_flight != 0
+            || !self.current_descriptor_matches_snapshot()
+            || self.runtime.stream_state(&state.stream) != StreamState::Ready
+        {
+            return Err(invalid_completion(format!(
+                "{operation} requires a stable, quiescent execution lane"
+            )));
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            action(self.runtime.as_ref(), &mut state.stream)
+        }));
+        match result {
+            Ok(Ok(value))
+                if self.current_descriptor_matches_snapshot()
+                    && self.runtime.stream_state(&state.stream) == StreamState::Ready =>
+            {
+                Ok(value)
+            }
+            Ok(Ok(_)) => {
+                state.fail_closed = true;
+                self.fail_closed.store(true, Ordering::Release);
+                Err(invalid_completion(format!(
+                    "{operation} changed the execution lane state"
+                )))
+            }
+            Ok(Err(error)) => {
+                state.fail_closed = true;
+                self.fail_closed.store(true, Ordering::Release);
+                Err(invalid_completion(format!("{operation} failed: {error}")))
+            }
+            Err(_) => {
+                state.fail_closed = true;
+                self.fail_closed.store(true, Ordering::Release);
+                Err(invalid_completion(format!(
+                    "device runtime panicked while attempting to {operation}"
+                )))
+            }
+        }
+    }
+
+    pub fn configure_reusable_executables(
+        &self,
+        plan: DeviceReusableExecutionPlan,
+    ) -> Result<DeviceReusableExecutionPreparation, VNextError> {
+        self.with_quiescent_stream("configure reusable executables", |runtime, stream| {
+            runtime.configure_reusable_executables(stream, plan)
+        })
+    }
+
+    pub fn seal_reusable_executables(
+        &self,
+    ) -> Result<DeviceReusableExecutionPreparation, VNextError> {
+        self.with_quiescent_stream("seal reusable executables", |runtime, stream| {
+            runtime.seal_reusable_executables(stream)
+        })
+    }
+
+    pub fn reusable_executable_preparation(
+        &self,
+    ) -> Result<DeviceReusableExecutionPreparation, VNextError> {
+        self.with_quiescent_stream(
+            "inspect reusable executable preparation",
+            |runtime, stream| runtime.reusable_executable_preparation(stream),
+        )
     }
 
     pub(crate) fn trim_reusable_executables_if_quiescent(&self) -> Result<bool, VNextError> {

@@ -19,7 +19,8 @@ use ferrum_interfaces::vnext::{
     BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceBufferRetention,
     DeviceClass, DeviceCommandBatch, DeviceCommandEntry, DeviceDescriptor, DeviceErrorReport,
     DeviceExecutionTiming, DeviceId, DeviceReusableAddressScope,
-    DeviceReusableExecutionObservation, DeviceReusableExecutionTrim, DeviceRuntime,
+    DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
+    DeviceReusableExecutionPreparation, DeviceReusableExecutionTrim, DeviceRuntime,
     DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt,
     DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
     DisabledDeviceSubmissionTimingSink, DynamicStorageProfile, ElementType, FenceIndeterminate,
@@ -79,7 +80,6 @@ pub struct CudaDeviceRuntimeConfig {
     pub runtime_implementation_fingerprint: String,
     pub capabilities: BTreeSet<CapabilityId>,
     pub dynamic_storage_profiles: BTreeSet<DynamicStorageProfile>,
-    pub maximum_reusable_executables_per_stream: usize,
 }
 
 #[derive(Debug)]
@@ -766,7 +766,6 @@ pub struct CudaDeviceRuntime {
     context: Arc<CudaContext>,
     allocation_stream: Arc<CudaStream>,
     quarantined: Mutex<Vec<QuarantinedSubmission>>,
-    maximum_reusable_executables_per_stream: usize,
 }
 
 impl fmt::Debug for CudaDeviceRuntime {
@@ -781,11 +780,6 @@ impl fmt::Debug for CudaDeviceRuntime {
 
 impl CudaDeviceRuntime {
     pub fn new(config: CudaDeviceRuntimeConfig) -> Result<Self, CudaDeviceRuntimeError> {
-        if config.maximum_reusable_executables_per_stream == 0 {
-            return Err(CudaDeviceRuntimeError::contract(
-                "CUDA reusable executable cache capacity must be positive",
-            ));
-        }
         let context = CudaContext::new(config.ordinal)
             .map_err(|error| CudaDeviceRuntimeError::driver("context creation", error))?;
         // vNext owns all cross-stream ordering through explicit commands and
@@ -827,7 +821,6 @@ impl CudaDeviceRuntime {
             context,
             allocation_stream,
             quarantined: Mutex::new(Vec::new()),
-            maximum_reusable_executables_per_stream: config.maximum_reusable_executables_per_stream,
         })
     }
 
@@ -976,9 +969,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
             stream,
             blas,
             state: Arc::new(CudaStreamState::new()),
-            executable_cache: CudaExecutableCache::new(
-                self.maximum_reusable_executables_per_stream,
-            ),
+            executable_cache: CudaExecutableCache::new(),
         })
     }
 
@@ -987,6 +978,55 @@ impl DeviceRuntime for CudaDeviceRuntime {
             return StreamState::Failed;
         }
         stream.state.snapshot()
+    }
+
+    fn configure_reusable_executables(
+        &self,
+        stream: &mut Self::Stream,
+        plan: DeviceReusableExecutionPlan,
+    ) -> Result<DeviceReusableExecutionPreparation, Self::Error> {
+        self.validate_stream(stream)?;
+        if !stream.state.is_quiescent() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA reusable executable preparation requires its quiescent owning stream",
+            ));
+        }
+        stream
+            .executable_cache
+            .configure(plan)
+            .map_err(CudaDeviceRuntimeError::contract)
+    }
+
+    fn seal_reusable_executables(
+        &self,
+        stream: &mut Self::Stream,
+    ) -> Result<DeviceReusableExecutionPreparation, Self::Error> {
+        self.validate_stream(stream)?;
+        if !stream.state.is_quiescent() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA reusable executable sealing requires its quiescent owning stream",
+            ));
+        }
+        stream
+            .executable_cache
+            .seal()
+            .map_err(CudaDeviceRuntimeError::contract)
+    }
+
+    fn reusable_executable_preparation(
+        &self,
+        stream: &Self::Stream,
+    ) -> Result<DeviceReusableExecutionPreparation, Self::Error> {
+        self.validate_stream(stream)?;
+        if !stream.state.is_quiescent() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA reusable executable inspection requires its quiescent owning stream",
+            ));
+        }
+        stream
+            .executable_cache
+            .preparation()
+            .map_err(CudaDeviceRuntimeError::contract)
     }
 
     fn trim_reusable_executables(
@@ -1220,6 +1260,9 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 }
                 for _ in 0..preparation.capacity_deferred_segments() {
                     replay_observation.observe_capacity_deferred_segment();
+                }
+                for _ in 0..preparation.outside_preparation_segments() {
+                    replay_observation.observe_outside_preparation_segment();
                 }
                 for _ in 0..preparation.evicted_segments() {
                     replay_observation.observe_evicted_segment();
