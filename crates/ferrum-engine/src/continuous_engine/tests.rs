@@ -8234,6 +8234,11 @@ fn schema_guided_sampling_forces_reasoning_delimiter_at_budget() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
     let mut request = policy_request();
     request.sampling_params.max_tokens = 40;
+    request.sampling_params.temperature = 0.8;
+    request.sampling_params.top_p = 0.5;
+    request.sampling_params.top_k = Some(1);
+    request.sampling_params.repetition_penalty = 1.2;
+    request.sampling_params.seed = Some(9271);
     request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonObject;
     request.sampling_params.structured_output_start =
         ferrum_types::StructuredOutputStart::AfterDelimiter("</think>".to_string());
