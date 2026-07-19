@@ -16,8 +16,8 @@ use std::time::Instant;
 use cudarc::cublas::{result::CublasError, CudaBlas};
 use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DriverError};
 use ferrum_interfaces::vnext::{
-    BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceClass,
-    DeviceCommandBatch, DeviceCommandEntry, DeviceCommandPhase, DeviceDescriptor,
+    BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceBufferRetention,
+    DeviceClass, DeviceCommandBatch, DeviceCommandEntry, DeviceCommandPhase, DeviceDescriptor,
     DeviceErrorReport, DeviceExecutionTiming, DeviceId, DeviceReusableExecutionObservation,
     DeviceRuntime, DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal,
     DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
@@ -167,9 +167,22 @@ impl fmt::Debug for CudaDeviceBuffer {
 }
 
 impl CudaDeviceBuffer {
-    pub(crate) fn region(
+    fn region(&self, range: Range<u64>) -> Result<CudaBufferRegion, CudaDeviceRuntimeError> {
+        self.region_with_retention(range, None)
+    }
+
+    pub(crate) fn retained_region(
         &self,
         range: Range<u64>,
+        retention: DeviceBufferRetention,
+    ) -> Result<CudaBufferRegion, CudaDeviceRuntimeError> {
+        self.region_with_retention(range, Some(retention))
+    }
+
+    fn region_with_retention(
+        &self,
+        range: Range<u64>,
+        core_retention: Option<DeviceBufferRetention>,
     ) -> Result<CudaBufferRegion, CudaDeviceRuntimeError> {
         if range.start >= range.end
             || range.end > self.descriptor.size_bytes
@@ -186,6 +199,7 @@ impl CudaDeviceBuffer {
             .ok_or_else(|| CudaDeviceRuntimeError::contract("CUDA buffer pointer overflow"))?;
         Ok(CudaBufferRegion {
             _allocation: Arc::clone(&self.allocation),
+            _core_retention: core_retention,
             runtime_instance: self.runtime_instance,
             device_ptr,
             length_bytes: range.end - range.start,
@@ -198,6 +212,7 @@ impl CudaDeviceBuffer {
 #[derive(Clone)]
 pub(crate) struct CudaBufferRegion {
     _allocation: Arc<CudaAllocation>,
+    _core_retention: Option<DeviceBufferRetention>,
     runtime_instance: u64,
     device_ptr: cudarc::driver::sys::CUdeviceptr,
     length_bytes: u64,

@@ -1897,6 +1897,46 @@ fn capacity_waiter_retains_root_and_close_rejects_new_work() {
     }
 }
 
+#[test]
+fn device_buffer_retention_keeps_plan_root_referenced_until_release() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Sequence,
+        'e',
+        1,
+        64,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 128);
+    let harness = harness(runtime, catalog, 128, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let sequence = admitted_sequence(&harness.root, "plan-root-retention");
+    let retention = sequence.device_buffer_retention();
+    drop(sequence);
+
+    let root = match PlanRuntimeResources::close(harness.root) {
+        Ok(PlanRuntimeCloseOutcome::Referenced {
+            resources,
+            strong_count,
+            ..
+        }) => {
+            assert_eq!(strong_count, 2);
+            resources
+        }
+        Ok(PlanRuntimeCloseOutcome::Closed(_)) => {
+            panic!("live device buffer retention unexpectedly allowed root close")
+        }
+        Err(failure) => panic!("retained root close failed: {:?}", failure.failure()),
+    };
+
+    drop(retention);
+    close_dynamic_test_root(root);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn closing_root_wakes_capacity_waiter_without_lost_notification() {
     let catalog = pool_catalog(
@@ -2734,6 +2774,48 @@ fn scoped_demand_merges_per_pool_and_release_coalesces_extents() {
         128
     );
     assert_eq!(chunk.live_segments, 0);
+}
+
+#[test]
+fn physical_region_retention_prevents_dynamic_extent_reuse() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'e',
+        1,
+        256,
+        TestDemand::Fixed,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(runtime, catalog, 256, false);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let admitted = admitted_request(&harness.root, "retained-physical-region");
+    let retained_bytes = admitted.backing_slices()[0]
+        .evidence()
+        .physical_size_bytes();
+    let retention = {
+        let view = harness
+            .root
+            .dynamic_pools
+            .view(&admitted.backing_slices()[0])
+            .unwrap();
+        view.segment_bindings()[0].retention()
+    };
+
+    drop(admitted);
+    let retained_status = harness.root.maintenance_controller.status().unwrap();
+    assert_eq!(retained_status.pools()[0].live_segments(), 1);
+    assert_eq!(retained_status.pools()[0].free_bytes(), 0);
+
+    drop(retention);
+    let released_status = harness.root.maintenance_controller.status().unwrap();
+    assert_eq!(released_status.pools()[0].live_segments(), 0);
+    assert_eq!(released_status.pools()[0].free_bytes(), retained_bytes);
+    close_dynamic_test_root(harness.root);
 }
 
 #[test]

@@ -789,8 +789,10 @@ fn contiguous_region_range(
     if physical.next().is_some() {
         return Err("CUDA operation requires contiguous physical storage".to_owned());
     }
-    let (buffer, range) = region.buffer_and_physical_range();
-    let region = buffer.region(range).map_err(|error| error.to_string())?;
+    let (buffer, range, retention) = region.buffer_and_physical_range();
+    let region = buffer
+        .retained_region(range, retention)
+        .map_err(|error| error.to_string())?;
     if region.element_type() != element_type || region.length_bytes() != logical_length_bytes {
         return Err(
             "CUDA operation physical region differs from its resolved component".to_owned(),

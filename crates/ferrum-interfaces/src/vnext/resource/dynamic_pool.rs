@@ -3,12 +3,12 @@ use super::{
     AllocationLifetime, AllocationSeal, Arc, AtomicU64, AtomicU8, BTreeMap, BackingChunkIdentity,
     BackingSegment, BufferDescriptor, BufferRequest, BufferUsage, CapacityAvailabilityEpoch,
     CapacityDomainId, CapacityEntry, CapacityEpochs, CapacityUnits, CapacityVector,
-    CapacityWaitCondition, DeviceAllocationPermit, DeviceCapacityAvailabilitySnapshot,
-    DeviceCapacityBudget, DeviceCapacityGrant, DeviceCapacityReservation, DeviceRuntime,
-    DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicResourceDescriptor,
-    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView, ElementType,
-    FreeExtentIndex, InvocationLivenessMode, LogicalAdmissionCoordinator, Mutex, Ordering,
-    PlanNode, ResourceId, ResourceReservation, ResourceRetentionPolicy,
+    CapacityWaitCondition, DeviceAllocationPermit, DeviceBufferRetention,
+    DeviceCapacityAvailabilitySnapshot, DeviceCapacityBudget, DeviceCapacityGrant,
+    DeviceCapacityReservation, DeviceRuntime, DynamicBackingPoolId, DynamicBackingPoolSpec,
+    DynamicResourceDescriptor, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView,
+    ElementType, FreeExtentIndex, InvocationLivenessMode, LogicalAdmissionCoordinator, Mutex,
+    Ordering, PlanNode, ResourceId, ResourceReservation, ResourceRetentionPolicy,
     ResourceTransactionIdentity, RunId, Serialize, StateInitialization, StaticProvisioningBinding,
     StepResourceSlotKind, TransactionId, VNextError,
 };
@@ -1242,6 +1242,7 @@ pub struct LogicalBackingBufferView<'a, B> {
 pub(crate) struct LogicalBackingSegmentBinding<B> {
     pub(super) segment: BackingSegment,
     pub(super) chunk: Arc<ResidentChunkBacking<B>>,
+    pub(super) retention: DeviceBufferRetention,
 }
 
 impl<B> LogicalBackingSegmentBinding<B> {
@@ -1259,6 +1260,10 @@ impl<B> LogicalBackingSegmentBinding<B> {
 
     pub(crate) fn descriptor(&self) -> &BufferDescriptor {
         &self.chunk.descriptor
+    }
+
+    pub(crate) fn retention(&self) -> DeviceBufferRetention {
+        self.retention.clone()
     }
 }
 
@@ -2697,6 +2702,10 @@ where
                 bindings.push(LogicalBackingSegmentBinding {
                     segment: segment.clone(),
                     chunk: Arc::clone(&chunk.backing),
+                    retention: DeviceBufferRetention::pair(
+                        Arc::clone(&authority.segment_lease),
+                        Arc::clone(&chunk.backing),
+                    ),
                 });
             }
         }
