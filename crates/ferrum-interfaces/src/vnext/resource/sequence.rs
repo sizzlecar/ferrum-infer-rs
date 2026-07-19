@@ -820,7 +820,18 @@ pub(super) struct ActiveSequenceSessionState {
     pub(super) next_frame: Option<ExecutionFrameId>,
     pub(super) active_frame: Option<ActiveSequenceFrame>,
     pub(super) participant_flights: BTreeMap<ParticipantNodeKey, ParticipantFlightPhase>,
+    pub(super) submission_wave_flight: Option<ParticipantFlightPhase>,
     pub(super) retired_frames: u64,
+}
+
+impl ActiveSequenceSessionState {
+    pub(super) fn has_participant_flights(&self) -> bool {
+        !self.participant_flights.is_empty() || self.submission_wave_flight.is_some()
+    }
+
+    pub(super) fn participant_flight_count(&self) -> usize {
+        self.participant_flights.len() + usize::from(self.submission_wave_flight.is_some())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1098,7 +1109,7 @@ where
                     "sequence backing coverage target is incomparable with committed work",
                 ));
             }
-            if active.active_frame.is_some() || !active.participant_flights.is_empty() {
+            if active.active_frame.is_some() || active.has_participant_flights() {
                 return Ok(SequenceResourceExtensionDecision::RetryRequired(current));
             }
             current
@@ -1203,7 +1214,7 @@ where
             }
             return Ok(SequenceResourceExtensionDecision::RetryRequired(current));
         }
-        if active.active_frame.is_some() || !active.participant_flights.is_empty() {
+        if active.active_frame.is_some() || active.has_participant_flights() {
             return Ok(SequenceResourceExtensionDecision::RetryRequired(
                 Arc::clone(&backing.current),
             ));
@@ -1253,7 +1264,7 @@ where
         }
         Ok(SequenceSessionCancelSnapshot {
             active_frame: active.active_frame.map(|frame| frame.frame_id),
-            participant_flights: u64::try_from(active.participant_flights.len())
+            participant_flights: u64::try_from(active.participant_flight_count())
                 .map_err(|_| invalid_resource("participant flight count exceeds u64"))?,
         })
     }
@@ -1301,7 +1312,7 @@ where
         };
         if active.phase == SequenceSessionPhase::Poisoned
             || active.active_frame.is_some()
-            || !active.participant_flights.is_empty()
+            || active.has_participant_flights()
         {
             return Err(invalid_resource(
                 "quiescent sequence abort requires an open or cancel-requested phase, no active frame, and no participant flight",
@@ -1354,8 +1365,7 @@ where
                 SequenceSessionPhase::CancelRequested | SequenceSessionPhase::Poisoned
             ),
         };
-        if !phase_matches || active.active_frame.is_some() || !active.participant_flights.is_empty()
-        {
+        if !phase_matches || active.active_frame.is_some() || active.has_participant_flights() {
             return Err(invalid_resource(
                 "sequence terminalization requires the matching phase, no active frame, and no participant flight",
             ));
@@ -2028,6 +2038,7 @@ where
             ),
             active_frame: None,
             participant_flights: BTreeMap::new(),
+            submission_wave_flight: None,
             retired_frames: 0,
         });
         *authority_source = SequenceExecutionAuthoritySource::SequenceSession;

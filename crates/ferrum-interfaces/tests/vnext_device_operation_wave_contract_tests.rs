@@ -160,7 +160,14 @@ fn immutable_plan_nodes_prepare_one_owned_submission_wave() {
     assert_eq!(wave.batch_step_id(), step.batch_step_id());
     assert_eq!(wave.node_count(), fixture.plan.payload().nodes().len());
     assert_eq!(wave.fingerprint().len(), 64);
-    assert_eq!(wave.prepared_participant_flight_count(), wave.node_count());
+    assert_eq!(
+        wave.prepared_participant_flight_count(),
+        step.participant_count() as usize
+    );
+    assert_eq!(
+        wave.node_participant_projection_count(),
+        wave.node_count() * step.participant_count() as usize
+    );
     assert_eq!(
         wave.nodes()[0].node_id(),
         fixture.plan.payload().nodes()[0].id()
