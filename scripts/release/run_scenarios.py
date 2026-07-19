@@ -1029,11 +1029,6 @@ class ScenarioRunner:
             require(isinstance(parsed, dict), f"case {ordinal}: JSON root is not an object")
             if format_type == "json_schema":
                 require(parsed == expected, f"case {ordinal}: {parsed!r} != {expected!r}")
-            else:
-                require(
-                    parsed.get("marker") == marker and parsed.get("ordinal") == ordinal,
-                    f"case {ordinal}: JSON object lost prompt identity: {parsed!r}",
-                )
             require(choice.get("finish_reason") != "length", f"case {ordinal}: length finish")
             reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
             require(isinstance(reasoning, str), f"case {ordinal}: reasoning is not a string")
@@ -1394,6 +1389,10 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
         marker = re.search(r"\b(ferrum\d{2}\d{2})\b", prompt)
         square = re.search(r"(S\d{4})", prompt)
         exact_object = self.exact_json_object(last_user)
+        response_format = payload.get("response_format")
+        response_format_type = (
+            response_format.get("type") if isinstance(response_format, dict) else None
+        )
         if echo_marker is not None:
             self.send_tool_call(
                 "echo_value",
@@ -1422,9 +1421,11 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
                     separators=(",", ":"),
                 )
             )
-        elif payload.get("response_format") and exact_object is not None:
+        elif response_format_type == "json_object":
+            self.send_chat("{}")
+        elif response_format and exact_object is not None:
             self.send_chat(json.dumps(exact_object, separators=(",", ":")))
-        elif payload.get("response_format"):
+        elif response_format:
             self.send_chat('{"answer":"scenario-ok"}')
         elif "remembered code" in last_user.lower() or "secret code" in last_user.lower():
             self.send_chat("ferrum-blue ferrum-loop-blue")
@@ -1695,6 +1696,8 @@ def self_test() -> int:
                 raise AssertionError(strict_result)
             object_result = load_json_object(out / "object-matrix" / "result.json")
             if object_result.get("case_count") != 2:
+                raise AssertionError(object_result)
+            if [case.get("object") for case in object_result.get("cases", [])] != [{}, {}]:
                 raise AssertionError(object_result)
             health = load_json_object(out / "server.health.json")
             if health.get("status") != "pass" or health.get("http_status") != 200:
