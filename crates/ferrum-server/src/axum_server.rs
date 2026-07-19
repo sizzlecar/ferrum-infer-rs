@@ -42,7 +42,7 @@ use std::{
     },
     time::Instant,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_stream::StreamExt;
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -141,6 +141,47 @@ pub fn init_prometheus_recorder() {
 pub struct AxumServer {
     state: AppState,
     config: ServerConfig,
+    lifecycle: Arc<AxumServerLifecycle>,
+}
+
+#[derive(Default)]
+struct AxumServerLifecycle {
+    shutdown_requested: AtomicBool,
+    running: AtomicBool,
+    engines_stopped: AtomicBool,
+    shutdown_notify: Notify,
+    stopped_notify: Notify,
+    stop_lock: tokio::sync::Mutex<()>,
+}
+
+impl AxumServerLifecycle {
+    fn request_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+        self.shutdown_notify.notify_waiters();
+    }
+
+    async fn wait_for_shutdown(&self) {
+        while !self.shutdown_requested.load(Ordering::Acquire) {
+            self.shutdown_notify.notified().await;
+        }
+    }
+
+    async fn wait_until_stopped(&self) {
+        while self.running.load(Ordering::Acquire) {
+            self.stopped_notify.notified().await;
+        }
+    }
+}
+
+struct AxumServerRunGuard {
+    lifecycle: Arc<AxumServerLifecycle>,
+}
+
+impl Drop for AxumServerRunGuard {
+    fn drop(&mut self) {
+        self.lifecycle.running.store(false, Ordering::Release);
+        self.lifecycle.stopped_notify.notify_waiters();
+    }
 }
 
 impl AxumServer {
@@ -149,6 +190,7 @@ impl AxumServer {
         Self {
             state,
             config: ServerConfig::default(),
+            lifecycle: Arc::new(AxumServerLifecycle::default()),
         }
     }
 
@@ -196,6 +238,37 @@ impl AxumServer {
     ) -> Self {
         self.state = self.state.with_lora_adapters(base_model_id, adapters);
         self
+    }
+
+    async fn shutdown_loaded_engines(&self) -> ferrum_types::Result<()> {
+        let mut first_error = None;
+        if let Some(engine) = &self.state.llm {
+            if let Err(error) = engine.shutdown().await {
+                first_error = Some(error);
+            }
+        }
+        if let Some(engine) = &self.state.embed {
+            if let Err(error) = engine.shutdown().await {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if let Some(engine) = &self.state.transcribe {
+            if let Err(error) = engine.shutdown().await {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if let Some(engine) = &self.state.tts {
+            if let Err(error) = engine.shutdown().await {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Build the router with all routes
@@ -843,6 +916,18 @@ fn trim_messages_to_token_budget(messages: &mut Vec<ChatMessage>, max_tokens: us
 #[async_trait]
 impl HttpServer for AxumServer {
     async fn start(&self, config: &ServerConfig) -> ferrum_types::Result<()> {
+        if self.lifecycle.shutdown_requested.load(Ordering::Acquire) {
+            return Err(Error::internal(
+                "cannot start Axum server after shutdown was requested",
+            ));
+        }
+        self.lifecycle
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::internal("Axum server is already running"))?;
+        let _run_guard = AxumServerRunGuard {
+            lifecycle: Arc::clone(&self.lifecycle),
+        };
         let addr = format!("{}:{}", config.host, config.port);
         info!("Starting Axum server on {}", addr);
 
@@ -859,22 +944,61 @@ impl HttpServer for AxumServer {
 
         info!("Server listening on {}", addr);
 
+        let lifecycle = Arc::clone(&self.lifecycle);
         axum::serve(listener, app)
+            .with_graceful_shutdown(async move { lifecycle.wait_for_shutdown().await })
             .await
             .map_err(|e| Error::internal(format!("Server error: {}", e)))?;
 
         Ok(())
     }
 
-    async fn stop(&self, _timeout: std::time::Duration) -> ferrum_types::Result<()> {
+    async fn stop(&self, timeout: std::time::Duration) -> ferrum_types::Result<()> {
+        let _stop_guard = self.lifecycle.stop_lock.lock().await;
         info!("Stopping Axum server");
-        // Axum doesn't have explicit stop - server stops when task is cancelled
-        Ok(())
+        self.lifecycle.request_shutdown();
+
+        let mut first_error = None;
+        if self.lifecycle.running.load(Ordering::Acquire) {
+            if tokio::time::timeout(timeout, self.lifecycle.wait_until_stopped())
+                .await
+                .is_err()
+            {
+                first_error = Some(Error::internal(format!(
+                    "Axum server did not drain within {} ms",
+                    timeout.as_millis()
+                )));
+            }
+        }
+
+        if !self.lifecycle.engines_stopped.load(Ordering::Acquire) {
+            match tokio::time::timeout(timeout, self.shutdown_loaded_engines()).await {
+                Ok(Ok(())) => {
+                    self.lifecycle
+                        .engines_stopped
+                        .store(true, Ordering::Release);
+                }
+                Ok(Err(error)) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error = Some(Error::internal(format!(
+                            "engine shutdown did not complete within {} ms",
+                            timeout.as_millis()
+                        )));
+                    }
+                }
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
     }
 
     fn is_running(&self) -> bool {
-        // For MVP, always return true when server object exists
-        true
+        self.lifecycle.running.load(Ordering::Acquire)
     }
 
     fn address(&self) -> Option<std::net::SocketAddr> {
@@ -4716,7 +4840,7 @@ mod tests {
     use std::{
         collections::HashMap,
         pin::Pin,
-        sync::{Arc, Mutex},
+        sync::{atomic::AtomicUsize, Arc, Mutex},
     };
     use tower::ServiceExt;
 
@@ -4731,6 +4855,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stop_drains_running_server_and_shuts_down_loaded_engine_once() {
+        let engine = Arc::new(StubLlm::new("ok"));
+        let server = Arc::new(AxumServer::from_llm(engine.clone()));
+        let config = ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            ..ServerConfig::default()
+        };
+        let server_task = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.start(&config).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !server.is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        server
+            .stop(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        server
+            .stop(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        server_task.await.unwrap().unwrap();
+
+        assert_eq!(engine.shutdown_count.load(Ordering::Acquire), 1);
+        assert!(!server.is_running());
+    }
+
     struct StubLlm {
         config: EngineConfig,
         text: String,
@@ -4739,6 +4898,7 @@ mod tests {
         stream_usage: Option<TokenUsage>,
         api_response: Option<ferrum_types::ApiResponse>,
         lora_metrics: Option<Value>,
+        shutdown_count: AtomicUsize,
     }
 
     impl StubLlm {
@@ -4753,6 +4913,7 @@ mod tests {
                 stream_usage: Some(TokenUsage::new(5, 1)),
                 api_response: None,
                 lora_metrics: None,
+                shutdown_count: AtomicUsize::new(0),
             }
         }
 
@@ -4922,6 +5083,7 @@ mod tests {
         }
 
         async fn shutdown(&self) -> ferrum_types::Result<()> {
+            self.shutdown_count.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
 
