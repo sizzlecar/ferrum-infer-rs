@@ -156,6 +156,7 @@ pub struct UnvalidatedProviderResourcePlan {
     pub(super) estimate_fingerprint: String,
     pub(super) value_alignment_bytes: u64,
     pub(super) scratch: Option<ProviderWorkspaceRequirement>,
+    pub(super) binding: Option<ProviderWorkspaceRequirement>,
     pub(super) persistent: Option<ProviderWorkspaceRequirement>,
 }
 
@@ -177,6 +178,7 @@ pub struct UnvalidatedPlanNode {
     pub(super) exact_aliases: Vec<PlanExactAlias>,
     pub(super) state_effects: Vec<PlanStateEffect>,
     pub(super) scratch_resource: Option<ResourceId>,
+    pub(super) binding_resource: Option<ResourceId>,
     pub(super) persistent_resource: Option<ResourceId>,
     pub(super) resources: Vec<ResourceId>,
 }

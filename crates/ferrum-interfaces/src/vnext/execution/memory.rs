@@ -196,7 +196,7 @@ impl MemoryPlan {
                                     || allocation.storage.logical_layout_fingerprint()
                                         != workspace_layout_fingerprint
                             }
-                            AllocationKind::Scratch { .. } => true,
+                            AllocationKind::Scratch { .. } | AllocationKind::Binding { .. } => true,
                         }
                     {
                         return Err(invalid_plan(format!(
@@ -583,8 +583,12 @@ impl MemoryPlan {
             .iter()
             .map(|node| (node.id.clone(), node))
             .collect::<BTreeMap<_, _>>();
-        let total_ordered =
-            liveness_in_execution_order
+        let contains_binding = descriptors.iter().any(|descriptor| {
+            descriptor.lifetime == AllocationLifetime::Invocation
+                && matches!(descriptor.kind, AllocationKind::Binding { .. })
+        });
+        let total_ordered = !contains_binding
+            && liveness_in_execution_order
                 .windows(2)
                 .try_fold(true, |ordered, pair| {
                     Ok::<bool, VNextError>(

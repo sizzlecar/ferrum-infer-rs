@@ -232,6 +232,7 @@ pub(crate) fn operation() -> OperationDescriptor {
         resources: ResourceRequirements {
             minimum_value_alignment_bytes: 16,
             scratch: ResourcePresenceRequirement::Forbidden,
+            binding: ResourcePresenceRequirement::Forbidden,
             persistent: ResourcePresenceRequirement::Forbidden,
         },
         oracle: OracleSpec::Exact,

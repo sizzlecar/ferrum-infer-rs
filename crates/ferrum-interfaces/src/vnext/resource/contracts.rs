@@ -425,6 +425,7 @@ impl ResourceReservation {
         let owner_node_id = match allocation.kind() {
             AllocationKind::Value => None,
             AllocationKind::Scratch { node_id, .. }
+            | AllocationKind::Binding { node_id, .. }
             | AllocationKind::Persistent { node_id, .. } => Some(node_id.clone()),
         };
         if allocation.size_bytes() == 0

@@ -307,6 +307,10 @@ impl ExecutionPlan {
                 .accepts(provider_resources.scratch.is_some())
             || !operation
                 .resources
+                .binding
+                .accepts(provider_resources.binding.is_some())
+            || !operation
+                .resources
                 .persistent
                 .accepts(provider_resources.persistent.is_some())
         {
@@ -353,6 +357,17 @@ impl ExecutionPlan {
                 )
             })
             .transpose()?;
+        let binding_resource = provider_resources
+            .binding
+            .as_ref()
+            .map(|_| {
+                workspace_base_id(
+                    &program_node.id,
+                    "binding",
+                    &provider_resources.estimate_fingerprint,
+                )
+            })
+            .transpose()?;
         let persistent_resource = provider_resources
             .persistent
             .as_ref()
@@ -370,6 +385,7 @@ impl ExecutionPlan {
             .flat_map(|binding| binding.storage().components())
             .map(|component| component.resource_id().clone())
             .chain(scratch_resource.iter().cloned())
+            .chain(binding_resource.iter().cloned())
             .chain(persistent_resource.iter().cloned())
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -392,6 +408,7 @@ impl ExecutionPlan {
             exact_aliases,
             state_effects,
             scratch_resource,
+            binding_resource,
             persistent_resource,
             resources,
         })
@@ -1023,6 +1040,7 @@ impl ExecutionPlan {
                 }
                 for (kind, workspace) in [
                     ("scratch", resources.scratch()),
+                    ("binding", resources.binding()),
                     ("persistent", resources.persistent()),
                 ] {
                     let Some(workspace) = workspace else {
@@ -1572,6 +1590,51 @@ impl ExecutionPlan {
                     node.id
                 )));
             }
+            if let Some(workspace) = &node.provider_resources.binding {
+                let resource_id = node.binding_resource.clone().ok_or_else(|| {
+                    invalid_plan(format!(
+                        "node `{}` binding workspace base identity is missing",
+                        node.id
+                    ))
+                })?;
+                if workspace.scope != ProviderWorkspaceScope::Invocation {
+                    return Err(invalid_plan(format!(
+                        "node `{}` binding workspace is not invocation scoped",
+                        node.id
+                    )));
+                }
+                let storage = DynamicStorageContract::new(
+                    *selected_resource_profiles
+                        .get(&resource_id)
+                        .ok_or_else(|| {
+                            invalid_plan(format!(
+                                "binding resource `{resource_id}` has no selected storage profile"
+                            ))
+                        })?,
+                    workspace_layout_fingerprint.clone(),
+                )?;
+                dynamic_descriptors.push(DynamicResourceDescriptor::new(
+                    resource_id,
+                    workspace
+                        .size_formula
+                        .bind_runtime_limits(maximum_active_sequences, maximum_scheduled_tokens)?,
+                    workspace.alignment_bytes,
+                    BufferUsage::Binding,
+                    ElementType::U8,
+                    AllocationLifetime::Invocation,
+                    AllocationKind::Binding {
+                        node_id: node.id.clone(),
+                    },
+                    storage,
+                    StateInitialization::None,
+                    maximum_active_sequences,
+                )?);
+            } else if node.binding_resource.is_some() {
+                return Err(invalid_plan(format!(
+                    "node `{}` has binding resources without a provider estimate",
+                    node.id
+                )));
+            }
             if let Some(workspace) = &node.provider_resources.persistent {
                 let resource_id = node.persistent_resource.clone().ok_or_else(|| {
                     invalid_plan(format!(
@@ -1925,6 +1988,7 @@ impl ExecutionPlan {
                 .flat_map(|binding| binding.storage().components())
                 .map(|component| component.resource_id().clone())
                 .chain(node.scratch_resource.iter().cloned())
+                .chain(node.binding_resource.iter().cloned())
                 .chain(node.persistent_resource.iter().cloned())
                 .collect::<BTreeSet<_>>()
                 .into_iter()
@@ -1997,6 +2061,7 @@ impl ExecutionPlan {
                 }
             }
             if node.scratch_resource.is_some() != node.provider_resources.scratch.is_some()
+                || node.binding_resource.is_some() != node.provider_resources.binding.is_some()
                 || node.persistent_resource.is_some()
                     != node.provider_resources.persistent.is_some()
             {
@@ -2029,6 +2094,34 @@ impl ExecutionPlan {
                 {
                     return Err(invalid_plan(format!(
                         "node `{}` scratch descriptor differs from its provider estimate",
+                        node.id
+                    )));
+                }
+            }
+            if let Some(resource_id) = &node.binding_resource {
+                let descriptor = dynamic_descriptors.get(resource_id).ok_or_else(|| {
+                    invalid_plan(format!("node `{}` binding descriptor is missing", node.id))
+                })?;
+                let workspace = node.provider_resources.binding.as_ref().ok_or_else(|| {
+                    invalid_plan(format!("node `{}` binding estimate is missing", node.id))
+                })?;
+                if descriptor.demand
+                    != workspace.size_formula.bind_runtime_limits(
+                        self.payload.memory.maximum_active_sequences,
+                        self.payload.maximum_scheduled_tokens,
+                    )?
+                    || descriptor.alignment_bytes != workspace.alignment_bytes
+                    || descriptor.usage != BufferUsage::Binding
+                    || descriptor.lifetime != AllocationLifetime::Invocation
+                    || descriptor.theoretical_maximum_instances
+                        != self.payload.memory.maximum_active_sequences
+                    || descriptor.kind
+                        != (AllocationKind::Binding {
+                            node_id: node.id.clone(),
+                        })
+                {
+                    return Err(invalid_plan(format!(
+                        "node `{}` binding descriptor differs from its provider estimate",
                         node.id
                     )));
                 }

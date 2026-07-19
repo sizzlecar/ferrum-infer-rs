@@ -1367,6 +1367,9 @@ impl ResourcePresenceRequirement {
 pub struct ResourceRequirements {
     pub minimum_value_alignment_bytes: u64,
     pub scratch: ResourcePresenceRequirement,
+    /// Small request-shaped control workspace whose contents are written in
+    /// the wave binding preamble and consumed by reusable compute.
+    pub binding: ResourcePresenceRequirement,
     pub persistent: ResourcePresenceRequirement,
 }
 
@@ -3617,6 +3620,7 @@ struct PreparedOperationDispatchBinding {
     resources: Vec<PreparedOperationResource>,
     binding_component_views: Vec<Vec<usize>>,
     scratch_view: Option<usize>,
+    binding_view: Option<usize>,
     persistent_view: Option<usize>,
 }
 
@@ -3674,6 +3678,10 @@ impl PreparedOperationDispatchBinding {
                 .accepts(provider_resources.scratch().is_some())
             || !operation
                 .resources
+                .binding
+                .accepts(provider_resources.binding().is_some())
+            || !operation
+                .resources
                 .persistent
                 .accepts(provider_resources.persistent().is_some())
         {
@@ -3685,6 +3693,11 @@ impl PreparedOperationDispatchBinding {
             provider_resources.scratch(),
             node.scratch_resource(),
             "scratch",
+        )?;
+        let binding_resource = select_workspace_resource(
+            provider_resources.binding(),
+            node.binding_resource(),
+            "binding",
         )?;
         let persistent_resource = select_workspace_resource(
             provider_resources.persistent(),
@@ -3700,6 +3713,7 @@ impl PreparedOperationDispatchBinding {
             .map(|component| component.resource_id().clone())
             .collect::<BTreeSet<_>>();
         required_resources.extend(scratch_resource.iter().map(|resource| (*resource).clone()));
+        required_resources.extend(binding_resource.iter().map(|resource| (*resource).clone()));
         required_resources.extend(
             persistent_resource
                 .iter()
@@ -3758,6 +3772,9 @@ impl PreparedOperationDispatchBinding {
         let scratch_view = scratch_resource
             .map(|resource| view_index_for(resource, "scratch"))
             .transpose()?;
+        let binding_view = binding_resource
+            .map(|resource| view_index_for(resource, "binding"))
+            .transpose()?;
         let persistent_view = persistent_resource
             .map(|resource| view_index_for(resource, "persistent"))
             .transpose()?;
@@ -3766,6 +3783,7 @@ impl PreparedOperationDispatchBinding {
             resources,
             binding_component_views,
             scratch_view,
+            binding_view,
             persistent_view,
         })
     }
@@ -3799,6 +3817,7 @@ pub struct OperationInvocation<'a, B> {
     attributes: &'a BTreeMap<AttributeId, SemanticValue>,
     work: &'a NodeWorkContract,
     scratch_view: Option<usize>,
+    binding_view: Option<usize>,
     persistent_view: Option<usize>,
     work_shape: &'a BatchWorkShape,
     claimed_backing_fingerprint: &'a str,
@@ -4145,6 +4164,13 @@ impl<'a, B> OperationInvocation<'a, B> {
         )?;
         validate_workspace(
             &views,
+            prepared.binding_view,
+            BufferUsage::Binding,
+            provider_resources.binding(),
+            "binding",
+        )?;
+        validate_workspace(
+            &views,
             prepared.persistent_view,
             BufferUsage::Persistent,
             provider_resources.persistent(),
@@ -4160,6 +4186,7 @@ impl<'a, B> OperationInvocation<'a, B> {
             attributes: node.attributes(),
             work: node.work(),
             scratch_view: prepared.scratch_view,
+            binding_view: prepared.binding_view,
             persistent_view: prepared.persistent_view,
             work_shape: resources.work_shape()?,
             claimed_backing_fingerprint: resources.backing_fingerprint(),
@@ -4200,6 +4227,10 @@ impl<'a, B> OperationInvocation<'a, B> {
 
     pub fn scratch_view(&self) -> Option<&OperationBufferView<'a, B>> {
         self.scratch_view.map(|index| &self.views[index])
+    }
+
+    pub fn binding_view(&self) -> Option<&OperationBufferView<'a, B>> {
+        self.binding_view.map(|index| &self.views[index])
     }
 
     pub fn persistent_view(&self) -> Option<&OperationBufferView<'a, B>> {
@@ -5886,6 +5917,7 @@ pub struct OperationResourceEstimate {
     claimed_input_fingerprint: String,
     value_alignment_bytes: u64,
     scratch: Option<ProviderWorkspaceRequirement>,
+    binding: Option<ProviderWorkspaceRequirement>,
     persistent: Option<ProviderWorkspaceRequirement>,
 }
 
@@ -5907,8 +5939,14 @@ impl OperationResourceEstimate {
             claimed_input_fingerprint: claimed_input_fingerprint.into(),
             value_alignment_bytes,
             scratch,
+            binding: None,
             persistent,
         }
+    }
+
+    pub fn with_binding(mut self, binding: ProviderWorkspaceRequirement) -> Self {
+        self.binding = Some(binding);
+        self
     }
 
     pub fn estimator_id(&self) -> &str {
@@ -5933,6 +5971,10 @@ impl OperationResourceEstimate {
 
     pub fn scratch(&self) -> Option<&ProviderWorkspaceRequirement> {
         self.scratch.as_ref()
+    }
+
+    pub fn binding(&self) -> Option<&ProviderWorkspaceRequirement> {
+        self.binding.as_ref()
     }
 
     pub fn persistent(&self) -> Option<&ProviderWorkspaceRequirement> {
