@@ -63,6 +63,10 @@ export OPENAI_API_KEY=dummy-key-not-checked
 
 Ferrum ignores API keys for local serving unless an external proxy enforces authentication.
 
+Ferrum accepts vLLM-compatible `top_k`, `min_p`, and `repetition_penalty`
+fields on chat-completion requests. `top_k=-1` or `0` and `min_p=0` disable the
+corresponding filter; invalid ranges return an OpenAI-shaped 4xx response.
+
 ## Structured-output behavior in v0.8.0
 
 Ferrum v0.8.0 changes `response_format` from prompt steering and response repair

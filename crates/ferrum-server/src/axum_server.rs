@@ -3003,13 +3003,18 @@ fn convert_chat_request_with_template_model(
             max_tokens: chat_completion_max_tokens(request) as usize,
             temperature: request.temperature.unwrap_or(DEFAULT_SAMPLING_TEMPERATURE),
             top_p: request.top_p.unwrap_or(DEFAULT_SAMPLING_TOP_P),
-            top_k: None, // OpenAI doesn't use top-k
-            repetition_penalty: DEFAULT_CHAT_REPETITION_PENALTY,
+            top_k: request
+                .top_k
+                .filter(|value| *value > 0)
+                .and_then(|value| usize::try_from(value).ok()),
+            repetition_penalty: request
+                .repetition_penalty
+                .unwrap_or(DEFAULT_CHAT_REPETITION_PENALTY),
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
             stop_sequences: request.stop.clone().unwrap_or_default(),
             seed: request.seed,
-            min_p: None,
+            min_p: request.min_p.filter(|value| *value > 0.0),
             tfs: None,
             typical_p: None,
             mirostat: None,
@@ -3757,6 +3762,31 @@ fn validate_chat_request(request: &ChatCompletionsRequest) -> std::result::Resul
             "top_logprobs is not supported",
             Some("top_logprobs"),
         ));
+    }
+
+    if let Some(top_k) = request.top_k {
+        if top_k < -1 {
+            return Err(ServerError::invalid_request(
+                "top_k must be -1, 0, or a positive integer",
+                Some("top_k"),
+            ));
+        }
+    }
+    if let Some(min_p) = request.min_p {
+        if !min_p.is_finite() || !(0.0..=1.0).contains(&min_p) {
+            return Err(ServerError::invalid_request(
+                "min_p must be in range [0, 1]",
+                Some("min_p"),
+            ));
+        }
+    }
+    if let Some(repetition_penalty) = request.repetition_penalty {
+        if !repetition_penalty.is_finite() || repetition_penalty <= 0.0 {
+            return Err(ServerError::invalid_request(
+                "repetition_penalty must be positive",
+                Some("repetition_penalty"),
+            ));
+        }
     }
 
     if request.stream_options.is_some() && !request.stream.unwrap_or(false) {
@@ -7713,6 +7743,72 @@ mod tests {
             defaults.repetition_penalty
         );
         assert_eq!(request.sampling_params.stop_sequences, vec!["<END>"]);
+    }
+
+    #[tokio::test]
+    async fn chat_maps_vllm_sampling_extensions_without_hidden_defaults() {
+        let (router, engine) = router_with_capturing_llm();
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "top_k": 20,
+                "min_p": 0.05,
+                "repetition_penalty": 1.25
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+
+        let request = engine.last_request();
+        assert_eq!(request.sampling_params.top_k, Some(20));
+        assert_eq!(request.sampling_params.min_p, Some(0.05));
+        assert_eq!(request.sampling_params.repetition_penalty, 1.25);
+    }
+
+    #[tokio::test]
+    async fn chat_normalizes_disabled_sampling_extensions_and_rejects_invalid_ranges() {
+        let (router, engine) = router_with_capturing_llm();
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "top_k": -1,
+                "min_p": 0.0,
+                "repetition_penalty": 1.0
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let request = engine.last_request();
+        assert_eq!(request.sampling_params.top_k, None);
+        assert_eq!(request.sampling_params.min_p, None);
+        assert_eq!(request.sampling_params.repetition_penalty, 1.0);
+
+        for (field, value) in [
+            ("top_k", json!(-2)),
+            ("min_p", json!(1.01)),
+            ("repetition_penalty", json!(0.0)),
+        ] {
+            let (router, _) = router_with_capturing_llm();
+            let response = post_json(
+                router,
+                "/v1/chat/completions",
+                json!({
+                    "model": "stub-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    (field): value
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST, "{field}");
+            let body = response_json(response).await;
+            assert_eq!(body["error"]["param"], field);
+        }
     }
 
     #[tokio::test]
