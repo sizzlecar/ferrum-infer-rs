@@ -3,6 +3,8 @@ use thiserror::Error;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use super::execution::DynamicBackingPoolId;
+
 /// Maximum encoded size accepted by the untrusted failure-envelope decoder.
 pub const MAX_FAILURE_ENVELOPE_WIRE_BYTES: usize = 8 * 1024;
 
@@ -286,6 +288,129 @@ impl fmt::Display for DeviceCapacityPressure {
     }
 }
 
+/// Exact pool-local resident ceiling observed while maintaining otherwise
+/// valid deferred backing.
+///
+/// Unlike device capacity pressure, this does not authorize a larger pool. It
+/// proves that existing resident owners must be released or a reusable cache
+/// entry must be evicted before the deferred transaction can be retried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DynamicPoolResidentPressure {
+    pool_id: DynamicBackingPoolId,
+    requested_bytes: u64,
+    resident_bytes: u64,
+    maximum_resident_bytes: u64,
+}
+
+impl DynamicPoolResidentPressure {
+    pub fn new(
+        pool_id: DynamicBackingPoolId,
+        requested_bytes: u64,
+        resident_bytes: u64,
+        maximum_resident_bytes: u64,
+    ) -> Result<Self, VNextError> {
+        let pressure = Self {
+            pool_id,
+            requested_bytes,
+            resident_bytes,
+            maximum_resident_bytes,
+        };
+        if pressure.requested_bytes == 0
+            || pressure.resident_bytes > pressure.maximum_resident_bytes
+            || pressure.available_bytes() >= pressure.requested_bytes
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "dynamic pool resident pressure evidence is inconsistent".to_owned(),
+            });
+        }
+        Ok(pressure)
+    }
+
+    pub fn pool_id(&self) -> &DynamicBackingPoolId {
+        &self.pool_id
+    }
+
+    pub const fn requested_bytes(&self) -> u64 {
+        self.requested_bytes
+    }
+
+    pub const fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
+    }
+
+    pub const fn maximum_resident_bytes(&self) -> u64 {
+        self.maximum_resident_bytes
+    }
+
+    pub const fn available_bytes(&self) -> u64 {
+        self.maximum_resident_bytes
+            .saturating_sub(self.resident_bytes)
+    }
+}
+
+impl fmt::Display for DynamicPoolResidentPressure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "dynamic pool `{}` resident capacity is temporarily unavailable: requested {}, resident {}/{}",
+            self.pool_id.as_str(),
+            self.requested_bytes,
+            self.resident_bytes,
+            self.maximum_resident_bytes
+        )
+    }
+}
+
+/// Recoverable physical pressure returned by deferred backing maintenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "evidence", rename_all = "snake_case")]
+pub enum DynamicBackingPressure {
+    DeviceCapacity(DeviceCapacityPressure),
+    PoolResident(DynamicPoolResidentPressure),
+}
+
+impl DynamicBackingPressure {
+    pub const fn requested_bytes(&self) -> u64 {
+        match self {
+            Self::DeviceCapacity(pressure) => pressure.requested_bytes(),
+            Self::PoolResident(pressure) => pressure.requested_bytes(),
+        }
+    }
+
+    pub const fn available_bytes(&self) -> u64 {
+        match self {
+            Self::DeviceCapacity(pressure) => pressure.available_bytes(),
+            Self::PoolResident(pressure) => pressure.available_bytes(),
+        }
+    }
+
+    pub const fn device_capacity(&self) -> Option<&DeviceCapacityPressure> {
+        match self {
+            Self::DeviceCapacity(pressure) => Some(pressure),
+            Self::PoolResident(_) => None,
+        }
+    }
+
+    pub const fn pool_resident(&self) -> Option<&DynamicPoolResidentPressure> {
+        match self {
+            Self::DeviceCapacity(_) => None,
+            Self::PoolResident(pressure) => Some(pressure),
+        }
+    }
+}
+
+impl From<DeviceCapacityPressure> for DynamicBackingPressure {
+    fn from(pressure: DeviceCapacityPressure) -> Self {
+        Self::DeviceCapacity(pressure)
+    }
+}
+
+impl From<DynamicPoolResidentPressure> for DynamicBackingPressure {
+    fn from(pressure: DynamicPoolResidentPressure) -> Self {
+        Self::PoolResident(pressure)
+    }
+}
+
 /// Structured, fail-closed errors produced by the vNext contracts.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum VNextError {
@@ -345,6 +470,8 @@ pub enum VNextError {
     },
     #[error("{0}")]
     DeviceCapacityUnavailable(DeviceCapacityPressure),
+    #[error("{0}")]
+    DynamicPoolResidentUnavailable(DynamicPoolResidentPressure),
     #[error(
         "dynamic resource admission is not connected: {descriptor_count} descriptors require at least {minimum_sequence_bytes} bytes for one runnable sequence"
     )]

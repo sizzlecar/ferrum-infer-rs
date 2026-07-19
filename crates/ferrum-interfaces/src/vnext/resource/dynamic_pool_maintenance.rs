@@ -6,7 +6,8 @@ use super::{
     DynamicPoolGrowthRequest, DynamicPoolStatus, VNextError,
 };
 use crate::vnext::{
-    CapacityShortfallKind, CapacityWaitSnapshot, DeferredAction, DeviceCapacityPressure,
+    CapacityShortfallKind, CapacityWaitSnapshot, DeferredAction, DynamicBackingPressure,
+    DynamicPoolResidentPressure,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -61,7 +62,7 @@ pub enum DynamicDeferredMaintenanceOutcome {
     WaitForRelease {
         current_epochs: CapacityEpochs,
         wait_condition: CapacityWaitCondition,
-        pressure: DeviceCapacityPressure,
+        pressure: DynamicBackingPressure,
     },
     Maintained(DynamicPoolGrowthBatchReceipt),
 }
@@ -315,7 +316,28 @@ where
         Ok(DynamicDeferredMaintenanceOutcome::WaitForRelease {
             current_epochs: logical_snapshot.epochs(),
             wait_condition,
-            pressure: blocked.pressure,
+            pressure: blocked.pressure.into(),
+        })
+    }
+
+    fn pool_resident_wait_outcome(
+        &self,
+        logical_snapshot: CapacityWaitSnapshot,
+        pressure: DynamicPoolResidentPressure,
+    ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        let domain = self
+            .pools
+            .pools
+            .get(pressure.pool_id())
+            .map(|pool| pool.domain.domain_id)
+            .ok_or_else(|| {
+                invalid_resource("dynamic pool resident pressure references an unknown pool")
+            })?;
+        let logical_snapshot = logical_snapshot.narrow_to_domains(vec![domain])?;
+        Ok(DynamicDeferredMaintenanceOutcome::WaitForRelease {
+            current_epochs: logical_snapshot.epochs(),
+            wait_condition: logical_snapshot.wait_condition().clone(),
+            pressure: pressure.into(),
         })
     }
 
@@ -431,6 +453,9 @@ where
                 logical_snapshot,
                 capacity_blocked.expect("typed capacity failure retains its exact observation"),
             ),
+            Err(VNextError::DynamicPoolResidentUnavailable(pressure)) => {
+                self.pool_resident_wait_outcome(logical_snapshot, pressure)
+            }
             Err(error) => Err(error),
         }
     }
@@ -517,6 +542,9 @@ where
                 logical_snapshot,
                 capacity_blocked.expect("typed capacity failure retains its exact observation"),
             ),
+            Err(VNextError::DynamicPoolResidentUnavailable(pressure)) => {
+                self.pool_resident_wait_outcome(logical_snapshot, pressure)
+            }
             Err(error) => Err(error),
         }
     }

@@ -846,7 +846,8 @@ impl ModelExecutor for PlanRuntimeMaintenanceTestExecutor {
                         4096,
                         4096,
                     )
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
                 })
             }
             TestMaintenanceBehavior::RetryAdmission => {

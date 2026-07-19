@@ -1242,7 +1242,10 @@ fn full_plan_budget_returns_typed_wait_and_reuses_backing_after_availability_cha
         panic!("unrelated epoch churn must preserve typed request backing pressure")
     };
     assert_eq!(current_epochs, churned);
-    assert_eq!(pressure.scope(), &DeviceCapacityPressureScope::PlanBudget);
+    assert_eq!(
+        pressure.device_capacity().unwrap().scope(),
+        &DeviceCapacityPressureScope::PlanBudget
+    );
     assert_eq!(pressure.requested_bytes(), 64);
     assert_eq!(pressure.available_bytes(), 0);
     assert_eq!(runtime.allocate_calls(), allocations_before);
@@ -1291,15 +1294,201 @@ fn theoretical_pool_ceiling_remains_terminal_after_device_budget_accepts_growth(
     let error = maintenance
         .grow_pool(&harness.pool_ids[0], 64)
         .expect_err("theoretical pool ceiling must remain fail-closed");
-    assert!(error
-        .to_string()
-        .contains("dynamic pool growth exceeds its core-derived resident maximum"));
+    let VNextError::DynamicPoolResidentUnavailable(pressure) = error else {
+        panic!("explicit pool growth must preserve typed resident pressure")
+    };
+    assert_eq!(pressure.pool_id(), &harness.pool_ids[0]);
+    assert_eq!(pressure.requested_bytes(), 64);
+    assert_eq!(pressure.resident_bytes(), 64);
+    assert_eq!(pressure.maximum_resident_bytes(), 64);
+    assert_eq!(pressure.available_bytes(), 0);
     let status = maintenance.status().unwrap();
     assert_eq!(status.budget_claimed_bytes(), 64);
     assert_eq!(status.process_claimed_bytes(), 64);
     assert_eq!(status.pools()[0].resident_bytes(), 64);
     assert_eq!(status.pools()[0].pending_growth_bytes(), 0);
     assert_eq!(runtime.allocate_calls(), allocations_before);
+}
+
+#[test]
+fn idle_lane_stable_cache_is_evicted_before_alternate_layout_retries() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'c',
+        1,
+        128,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(Arc::clone(&runtime), catalog, 256, false);
+    let lane = harness.root.create_execution_lane().unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 128)
+        .unwrap();
+    let allocations_before = runtime.allocate_calls();
+
+    let first_sequence = admitted_sequence_with_ceiling(&harness.root, "idle-cache-first", 2);
+    let first_session = first_sequence.open_session().unwrap();
+    let first_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&first_session)]).unwrap();
+    let first_request = StepResourceAdmissionRequest::new(
+        first_batch.bind_work_shape(vec![token_span(2)]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let first_step = match first_batch.try_begin_step(first_request, &lane).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("resident two-token lane-stable layout must admit"),
+    };
+    first_step.try_retire_normal().unwrap();
+    first_session.try_complete().unwrap();
+    drop(first_batch);
+    drop(first_session);
+    drop(first_sequence);
+
+    let second_sequence = admitted_sequence(&harness.root, "idle-cache-second");
+    let second_session = second_sequence.open_session().unwrap();
+    let second_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&second_session)]).unwrap();
+    let second_request = StepResourceAdmissionRequest::new(
+        second_batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let deferred = match second_batch
+        .try_begin_step(second_request.clone(), &lane)
+        .unwrap()
+    {
+        StepResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("pinned alternate lane-stable layout must defer physical backing"),
+    };
+    let outcome = deferred.maintain().unwrap();
+    assert!(matches!(
+        outcome,
+        DynamicDeferredMaintenanceOutcome::RetryAdmission { .. }
+    ));
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+    drop(deferred);
+
+    let second_step = match second_batch.try_begin_step(second_request, &lane).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("alternate layout must reuse backing after idle cache eviction"),
+    };
+    assert_eq!(second_step.backing_slices()[0].size_bytes(), 64);
+    second_step.try_retire_normal().unwrap();
+    second_session.try_complete().unwrap();
+    drop(second_batch);
+    drop(second_session);
+    drop(second_sequence);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn busy_lane_stable_cache_returns_pool_wait_then_retries_after_release() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'd',
+        1,
+        128,
+        TestDemand::Tokens,
+    );
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness(Arc::clone(&runtime), catalog, 256, false);
+    let lane = harness.root.create_execution_lane().unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 128)
+        .unwrap();
+    let allocations_before = runtime.allocate_calls();
+
+    let first_sequence = admitted_sequence_with_ceiling(&harness.root, "busy-cache-first", 2);
+    let first_session = first_sequence.open_session().unwrap();
+    let first_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&first_session)]).unwrap();
+    let first_step = match first_batch
+        .try_begin_step(
+            StepResourceAdmissionRequest::new(
+                first_batch.bind_work_shape(vec![token_span(2)]).unwrap(),
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap(),
+            &lane,
+        )
+        .unwrap()
+    {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("resident busy lane-stable layout must admit"),
+    };
+
+    let second_sequence = admitted_sequence(&harness.root, "busy-cache-second");
+    let second_session = second_sequence.open_session().unwrap();
+    let second_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&second_session)]).unwrap();
+    let second_request = StepResourceAdmissionRequest::new(
+        second_batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let deferred = match second_batch
+        .try_begin_step(second_request.clone(), &lane)
+        .unwrap()
+    {
+        StepResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("busy alternate lane-stable layout must defer physical backing"),
+    };
+    let DynamicDeferredMaintenanceOutcome::WaitForRelease {
+        wait_condition,
+        pressure,
+        ..
+    } = deferred.maintain().unwrap()
+    else {
+        panic!("busy lane-stable cache must become typed pool pressure")
+    };
+    let pool_pressure = pressure
+        .pool_resident()
+        .expect("busy cache pressure must identify its resident pool");
+    assert_eq!(pool_pressure.pool_id(), &harness.pool_ids[0]);
+    assert_eq!(pool_pressure.requested_bytes(), 64);
+    assert_eq!(pool_pressure.resident_bytes(), 128);
+    assert_eq!(pool_pressure.maximum_resident_bytes(), 128);
+    let waiter = harness
+        .root
+        .register_capacity_waiter(&wait_condition)
+        .unwrap();
+    assert!(!waiter.recheck().unwrap().should_retry());
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+
+    first_step.try_retire_normal().unwrap();
+    assert!(waiter.recheck().unwrap().should_retry());
+    assert!(matches!(
+        deferred.maintain().unwrap(),
+        DynamicDeferredMaintenanceOutcome::RetryAdmission { .. }
+    ));
+    drop(deferred);
+    let second_step = match second_batch.try_begin_step(second_request, &lane).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("released busy cache must admit the waiting alternate layout"),
+    };
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+
+    second_step.try_retire_normal().unwrap();
+    first_session.try_complete().unwrap();
+    second_session.try_complete().unwrap();
+    drop(waiter);
+    drop(first_batch);
+    drop(second_batch);
+    drop(first_session);
+    drop(second_session);
+    drop(first_sequence);
+    drop(second_sequence);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
 }
 
 #[test]
@@ -1803,7 +1992,10 @@ fn plan_budget_wait_retains_staged_parent_and_reuses_released_sequence_backing()
         panic!("retained parent must tolerate unrelated epoch churn")
     };
     assert_eq!(current_epochs, churned);
-    assert_eq!(pressure.scope(), &DeviceCapacityPressureScope::PlanBudget);
+    assert_eq!(
+        pressure.device_capacity().unwrap().scope(),
+        &DeviceCapacityPressureScope::PlanBudget
+    );
     assert_eq!(runtime.allocate_calls(), allocations_before);
 
     let retained = deferred.into_parent();
@@ -3756,7 +3948,10 @@ fn two_plans_contend_on_one_process_wide_device_account() {
     else {
         panic!("process-wide pressure must become a typed capacity wait")
     };
-    assert_eq!(pressure.scope(), &DeviceCapacityPressureScope::ProcessWide);
+    assert_eq!(
+        pressure.device_capacity().unwrap().scope(),
+        &DeviceCapacityPressureScope::ProcessWide
+    );
     assert_eq!(pressure.requested_bytes(), 64);
     assert_eq!(pressure.available_bytes(), 0);
     assert!(wait_condition
