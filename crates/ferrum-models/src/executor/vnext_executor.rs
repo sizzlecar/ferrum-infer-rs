@@ -308,8 +308,27 @@ struct VNextExecutorMetrics {
     total_prefill_us: AtomicU64,
     total_decode_us: AtomicU64,
     wave_timing: VNextWaveTimingMetrics,
+    prefill_wave_timing: VNextWaveTimingMetrics,
+    decode_wave_timing: VNextWaveTimingMetrics,
     device_timing: VNextDeviceTimingMetrics,
+    prefill_device_timing: VNextDeviceTimingMetrics,
+    decode_device_timing: VNextDeviceTimingMetrics,
     last_failure: Mutex<Option<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VNextExecutionWaveKind {
+    Prefill,
+    Decode,
+}
+
+impl VNextExecutionWaveKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -547,6 +566,32 @@ impl SubmissionWaveDispatchTimingSink for VNextWaveTimingMetrics {
     }
 }
 
+struct VNextWaveTimingSink<'metrics> {
+    aggregate: &'metrics VNextWaveTimingMetrics,
+    phase: &'metrics VNextWaveTimingMetrics,
+}
+
+impl DeviceSubmissionTimingSink for VNextWaveTimingSink<'_> {
+    const ENABLED: bool = true;
+
+    fn record_device_submission(&self, stage: DeviceSubmissionStage, elapsed: Duration) {
+        self.aggregate.record_device_submission(stage, elapsed);
+        self.phase.record_device_submission(stage, elapsed);
+    }
+
+    fn record_reusable_execution(&self, observation: DeviceReusableExecutionObservation) {
+        self.aggregate.record_reusable_execution(observation);
+        self.phase.record_reusable_execution(observation);
+    }
+}
+
+impl SubmissionWaveDispatchTimingSink for VNextWaveTimingSink<'_> {
+    fn record(&self, stage: SubmissionWaveDispatchStage, elapsed: Duration) {
+        SubmissionWaveDispatchTimingSink::record(self.aggregate, stage, elapsed);
+        SubmissionWaveDispatchTimingSink::record(self.phase, stage, elapsed);
+    }
+}
+
 #[derive(Default)]
 struct VNextDeviceTimingMetrics {
     device_execution: AtomicDurationMetrics,
@@ -659,6 +704,20 @@ impl DecodeFailureDisposition {
 }
 
 impl VNextExecutorMetrics {
+    fn wave_timing_for(&self, kind: VNextExecutionWaveKind) -> &VNextWaveTimingMetrics {
+        match kind {
+            VNextExecutionWaveKind::Prefill => &self.prefill_wave_timing,
+            VNextExecutionWaveKind::Decode => &self.decode_wave_timing,
+        }
+    }
+
+    fn device_timing_for(&self, kind: VNextExecutionWaveKind) -> &VNextDeviceTimingMetrics {
+        match kind {
+            VNextExecutionWaveKind::Prefill => &self.prefill_device_timing,
+            VNextExecutionWaveKind::Decode => &self.decode_device_timing,
+        }
+    }
+
     fn record_failure(&self, message: impl Into<String>) {
         self.failed_waves.fetch_add(1, Ordering::Relaxed);
         *self.last_failure.lock() = Some(message.into());
@@ -695,7 +754,11 @@ impl VNextExecutorMetrics {
             counter.store(0, Ordering::Relaxed);
         }
         self.wave_timing.reset();
+        self.prefill_wave_timing.reset();
+        self.decode_wave_timing.reset();
         self.device_timing.reset();
+        self.prefill_device_timing.reset();
+        self.decode_device_timing.reset();
         *self.last_failure.lock() = None;
     }
 }
@@ -3250,6 +3313,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         participants: &[VNextExecutionParticipant<'_, R>],
         wave: PreparedStepSubmissionWave<R>,
+        kind: VNextExecutionWaveKind,
     ) -> DispatchOutcome<R> {
         if participants.is_empty() {
             return DispatchOutcome::QuiescentFailure(
@@ -3262,12 +3326,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .map(|participant| participant.sequence.active_binding.as_ref())
         };
         let timing_enabled = self.host_dispatch_timing_enabled();
+        let phase_timing = self.metrics.wave_timing_for(kind);
         let uploads = match {
             let _timing = self
                 .metrics
                 .wave_timing
                 .token_upload_prepare
                 .start_if(timing_enabled);
+            let _phase_timing = phase_timing.token_upload_prepare.start_if(timing_enabled);
             participants
                 .iter()
                 .enumerate()
@@ -3341,6 +3407,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .wave_timing
                     .wave_identity_bind
                     .start_if(timing_enabled);
+                let _phase_timing = phase_timing.wave_identity_bind.start_if(timing_enabled);
                 OperationDispatch::bind_submission_wave_identity(
                     &self.resolved_plan,
                     active_bindings(),
@@ -3351,12 +3418,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 Ok(identity) => identity,
                 Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
             };
+            let timing_sink = VNextWaveTimingSink {
+                aggregate: &self.metrics.wave_timing,
+                phase: phase_timing,
+            };
             let submission = {
                 let _timing = self
                     .metrics
                     .wave_timing
                     .provider_encode_submit
                     .start_if(timing_enabled);
+                let _phase_timing = phase_timing.provider_encode_submit.start_if(timing_enabled);
                 if timing_enabled {
                     OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
                         self.providers.providers(),
@@ -3365,7 +3437,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         active_bindings(),
                         self.device_timing_mode(),
                         &uploads,
-                        &self.metrics.wave_timing,
+                        &timing_sink,
                         wave,
                         &self.lane,
                         &self.reaper,
@@ -3469,6 +3541,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     ) -> Result<Vec<f32>> {
         let prepared = {
             let _timing = self.metrics.wave_timing.resource_prepare_attempt.start();
+            let _phase_timing = self
+                .metrics
+                .decode_wave_timing
+                .resource_prepare_attempt
+                .start();
             let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&sequence.session)])
                 .map_err(|error| FerrumError::backend(error.to_string()))?;
             let step = self.begin_step(&batch, &span)?;
@@ -3478,8 +3555,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             };
             PreparedVNextPrefill { step, wave }
         };
-        self.execute_prepared_step(sequence, tokens, span, prepared)
-            .await
+        self.execute_prepared_step(
+            sequence,
+            tokens,
+            span,
+            prepared,
+            VNextExecutionWaveKind::Decode,
+        )
+        .await
     }
 
     async fn execute_batch_step(
@@ -3488,6 +3571,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         sequences: &[Arc<VNextSequence<R>>],
         token_batches: &[Vec<u32>],
         spans: &[TokenSpanWork],
+        kind: VNextExecutionWaveKind,
     ) -> Result<VNextExecutionCapacityDecision<Vec<Vec<f32>>>> {
         if sequences.is_empty()
             || sequences.len() != token_batches.len()
@@ -3505,6 +3589,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
         let prepared = {
             let _timing = self.metrics.wave_timing.resource_prepare_attempt.start();
+            let _phase_timing = self
+                .metrics
+                .wave_timing_for(kind)
+                .resource_prepare_attempt
+                .start();
             let step = match self.begin_step_for_spans_with_capacity(batch, spans)? {
                 VNextExecutionCapacityDecision::Ready(step) => step,
                 VNextExecutionCapacityDecision::Deferred(deferred) => {
@@ -3535,7 +3624,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 span,
             })
             .collect::<Vec<_>>();
-        self.execute_prepared_participants(&participants, prepared)
+        self.execute_prepared_participants(&participants, prepared, kind)
             .await
             .map(VNextExecutionCapacityDecision::Ready)
     }
@@ -3546,6 +3635,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         tokens: &[u32],
         span: TokenSpanWork,
         prepared: PreparedVNextPrefill<R>,
+        kind: VNextExecutionWaveKind,
     ) -> Result<Vec<f32>> {
         let participant = VNextExecutionParticipant {
             sequence,
@@ -3553,7 +3643,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             span: &span,
         };
         let mut logits = self
-            .execute_prepared_participants(std::slice::from_ref(&participant), prepared)
+            .execute_prepared_participants(std::slice::from_ref(&participant), prepared, kind)
             .await?;
         logits
             .pop()
@@ -3564,12 +3654,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         participants: &[VNextExecutionParticipant<'_, R>],
         prepared: PreparedVNextPrefill<R>,
+        kind: VNextExecutionWaveKind,
     ) -> Result<Vec<Vec<f32>>> {
         let _execution_timing = self.metrics.wave_timing.submitted_wave_total.start();
+        let phase_timing = self.metrics.wave_timing_for(kind);
+        let _phase_execution_timing = phase_timing.submitted_wave_total.start();
         let PreparedVNextPrefill { step, wave } = prepared;
         let dispatch = {
             let _timing = self.metrics.wave_timing.host_encode_submit.start();
-            self.dispatch_participant_wave(participants, wave)
+            let _phase_timing = phase_timing.host_encode_submit.start();
+            self.dispatch_participant_wave(participants, wave, kind)
         };
         let completion = match dispatch {
             DispatchOutcome::Submitted(completion) => completion,
@@ -3664,6 +3758,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let reaper = Arc::clone(&self.reaper);
         let observation = {
             let _timing = self.metrics.wave_timing.completion_round_trip.start();
+            let _phase_timing = phase_timing.completion_round_trip.start();
             self.completion_worker
                 .execute(VNextCompletionTaskKind::WaveReadback, move || {
                     let observation = completion.wait_with_readbacks(readbacks);
@@ -3677,6 +3772,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .map_err(|error| FerrumError::backend(error.to_string()))?
         };
         let _postprocess_timing = self.metrics.wave_timing.host_postprocess.start();
+        let _phase_postprocess_timing = phase_timing.host_postprocess.start();
         let receipt = match observation {
             CompletionReadbackBatchObservation::Terminal(receipt) => receipt,
             other => {
@@ -3688,6 +3784,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         };
         self.metrics.device_timing.record(&receipt);
+        self.metrics.device_timing_for(kind).record(&receipt);
         for participant in participants {
             if let Some(events) = &participant.sequence.events {
                 if let Err(error) = events.lock().completed(receipt.completion()) {
@@ -3977,7 +4074,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .map(|candidate| Arc::clone(&candidate.sequence))
             .collect::<Vec<_>>();
         let logits = match self
-            .execute_batch_step(&batch, &sequences, &token_batches, &spans)
+            .execute_batch_step(
+                &batch,
+                &sequences,
+                &token_batches,
+                &spans,
+                VNextExecutionWaveKind::Decode,
+            )
             .await
         {
             Ok(VNextExecutionCapacityDecision::Ready(logits)) => logits,
@@ -4160,6 +4263,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     std::slice::from_ref(&sequence),
                     std::slice::from_ref(&tokens),
                     std::slice::from_ref(&span),
+                    VNextExecutionWaveKind::Prefill,
                 )
                 .await?
             {
@@ -4286,7 +4390,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "readback_bytes": self.metrics.readback_bytes.load(Ordering::Relaxed),
             },
             "wave_timing": self.metrics.wave_timing.snapshot(),
+            "wave_timing_by_phase": {
+                VNextExecutionWaveKind::Prefill.as_str(): self.metrics.prefill_wave_timing.snapshot(),
+                VNextExecutionWaveKind::Decode.as_str(): self.metrics.decode_wave_timing.snapshot(),
+            },
             "device_timing": self.metrics.device_timing.snapshot(),
+            "device_timing_by_phase": {
+                VNextExecutionWaveKind::Prefill.as_str(): self.metrics.prefill_device_timing.snapshot(),
+                VNextExecutionWaveKind::Decode.as_str(): self.metrics.decode_device_timing.snapshot(),
+            },
             "completion_worker": self.completion_worker.metrics_snapshot(),
             "dynamic_pools": pool_status,
             "deferred_cleanup": cleanup,
@@ -4869,9 +4981,12 @@ mod tests {
     use super::{
         reported_allocated_bytes, resolved_sequence_fit_policy, AdmissionFitPolicy,
         DecodeFailureDisposition, FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics,
-        VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics,
+        VNextExecutionWaveKind, VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan,
+        VNextWaveTimingMetrics, VNextWaveTimingSink,
     };
-    use ferrum_interfaces::vnext::DeviceReusableExecutionObservation;
+    use ferrum_interfaces::vnext::{
+        DeviceReusableExecutionObservation, DeviceSubmissionTimingSink,
+    };
 
     #[test]
     fn reusable_execution_metrics_aggregate_typed_preparation_outcomes() {
@@ -4911,6 +5026,32 @@ mod tests {
             assert_eq!(snapshot[field], 2, "counter {field} must aggregate");
         }
         assert_eq!(snapshot["replayed_commands"], 8);
+    }
+
+    #[test]
+    fn wave_timing_sink_attributes_replay_to_aggregate_and_exact_phase() {
+        let aggregate = VNextWaveTimingMetrics::default();
+        let decode = VNextWaveTimingMetrics::default();
+        let sink = VNextWaveTimingSink {
+            aggregate: &aggregate,
+            phase: &decode,
+        };
+        let mut observation = DeviceReusableExecutionObservation::default();
+        observation.observe_candidate_segment();
+        observation.observe_replayed_segment(3);
+
+        sink.record_reusable_execution(observation);
+
+        assert_eq!(
+            aggregate.reusable_execution.snapshot()["candidate_segments"],
+            1
+        );
+        assert_eq!(
+            decode.reusable_execution.snapshot()["candidate_segments"],
+            1
+        );
+        assert_eq!(VNextExecutionWaveKind::Prefill.as_str(), "prefill");
+        assert_eq!(VNextExecutionWaveKind::Decode.as_str(), "decode");
     }
 
     #[test]
