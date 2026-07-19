@@ -3,6 +3,8 @@ use crate::vnext::{
     CapacityAvailabilitySource, CopyRegion, DeferredAction, DefinitelyNotSubmitted,
     DeviceCapacityPressureScope, DeviceClass, DeviceCommandBatch, DeviceErrorReport,
     DeviceTerminal, DeviceTerminalReceipt, FenceIndeterminate, FenceQuery, HostTransferLayout,
+    ResolvedReusableExecutionBucket, ReusableExecutionBucketSpec, ReusableExecutionCapacity,
+    ReusableExecutionClassId, ReusableExecutionMemoryPlan, ReusablePoolWorkspaceBudget,
     TrustedActiveSequenceBinding,
 };
 use serde_json::{json, Value};
@@ -460,6 +462,7 @@ fn pool_catalog_with_options(
             "minimum_invocation_peak_bytes": 0,
             "step_resource_slots": step_resource_slots,
             "theoretical_ceiling_bytes": theoretical_ceiling.to_string(),
+            "reusable_workspace_ceiling_bytes": 0,
             "provisioning": {
                 "mode": "demand_driven_elastic",
                 "minimum_resident_bytes": minimum,
@@ -551,6 +554,40 @@ fn harness_with_nodes(
     mismatched_coordinator: bool,
     nodes: Arc<[PlanNode]>,
 ) -> Harness {
+    harness_with_nodes_and_reusable(
+        runtime,
+        catalog,
+        usable_capacity_bytes,
+        mismatched_coordinator,
+        nodes,
+        None,
+    )
+}
+
+fn harness_with_reusable(
+    runtime: Arc<TestRuntime>,
+    catalog: PoolCatalog,
+    usable_capacity_bytes: u64,
+    reusable_execution: ReusableExecutionMemoryPlan,
+) -> Harness {
+    harness_with_nodes_and_reusable(
+        runtime,
+        catalog,
+        usable_capacity_bytes,
+        false,
+        Arc::from(Vec::<PlanNode>::new()),
+        Some(reusable_execution),
+    )
+}
+
+fn harness_with_nodes_and_reusable(
+    runtime: Arc<TestRuntime>,
+    catalog: PoolCatalog,
+    usable_capacity_bytes: u64,
+    mismatched_coordinator: bool,
+    nodes: Arc<[PlanNode]>,
+    reusable_execution: Option<ReusableExecutionMemoryPlan>,
+) -> Harness {
     let generation = issue_generation().unwrap();
     let plan_id = PlanId::new(format!("plan/dynamic-pool-test/{generation}")).unwrap();
     let plan_hash: PlanHash = serde_json::from_value(json!("1".repeat(64))).unwrap();
@@ -621,6 +658,7 @@ fn harness_with_nodes(
             logical_admission,
             domains,
             nodes,
+            reusable_execution,
         )
         .unwrap(),
     );
@@ -822,13 +860,34 @@ fn evaluated_descriptor_request<'a>(
             vec![descriptor.base_resource_id().clone()],
         )
         .unwrap(),
-        size_bytes,
+        capacity_size_bytes: size_bytes,
+        reusable_execution_bucket_id: None,
         projections: vec![EvaluatedBackingProjection {
             descriptor,
             physical_offset_bytes: 0,
-            size_bytes,
+            logical_size_bytes: size_bytes,
+            capacity_size_bytes: size_bytes,
         }],
     }
+}
+
+fn reusable_step_memory_plan(
+    pool_id: DynamicBackingPoolId,
+) -> (ReusableExecutionMemoryPlan, ReusableExecutionBucketSpec) {
+    let bucket = ReusableExecutionBucketSpec::new(
+        ReusableExecutionClassId::new("test.single-sequence-packed-token").unwrap(),
+        ReusableExecutionCapacity::new(1, 4, 1).unwrap(),
+    )
+    .unwrap();
+    let resolved = ResolvedReusableExecutionBucket::new(
+        bucket.clone(),
+        vec![ReusablePoolWorkspaceBudget::new(pool_id, 256, 0).unwrap()],
+    )
+    .unwrap();
+    (
+        ReusableExecutionMemoryPlan::new(1, 1, vec![resolved]).unwrap(),
+        bucket,
+    )
 }
 
 #[test]
@@ -1383,6 +1442,210 @@ fn idle_lane_stable_cache_is_evicted_before_alternate_layout_retries() {
     drop(second_batch);
     drop(second_session);
     drop(second_sequence);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn reusable_bucket_reuses_capacity_layout_without_widening_logical_view() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'e',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let (memory_plan, bucket) = reusable_step_memory_plan(catalog.pool_id.clone());
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness_with_reusable(Arc::clone(&runtime), catalog, 256, memory_plan);
+    let lane = harness.root.create_execution_lane().unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 256)
+        .unwrap();
+    let allocations_before = runtime.allocate_calls();
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+
+    let (first_demand, first_requests) = binding
+        .scoped_demand(
+            AllocationLifetime::Step,
+            None,
+            shape(1),
+            shape(1),
+            Some(&bucket),
+            AdmissionFitPolicy::ImmediateOnly,
+            AdmissionPressureAction::WaitForRelease,
+        )
+        .unwrap();
+    assert_eq!(
+        first_demand.immediate_claim().entries()[0].units().get(),
+        64
+    );
+    assert_eq!(first_requests[0].capacity_size_bytes, 256);
+    let LaneBackingPrepareDecision::Prepared(first_prepared) = harness
+        .root
+        .dynamic_pools
+        .prepare_lane_stable_claim(&lane, &first_requests)
+        .unwrap()
+    else {
+        panic!("resident reusable capacity bucket must prepare")
+    };
+    let (first_slices, first_slot) = first_prepared.commit().into_parts();
+    let first_evidence = first_slices[0].evidence().clone();
+    assert_eq!(first_evidence.size_bytes(), 64);
+    assert_eq!(first_evidence.capacity_size_bytes(), 256);
+    assert_eq!(first_evidence.physical_size_bytes(), 256);
+    assert_eq!(
+        first_evidence
+            .segments()
+            .iter()
+            .map(BackingSegment::length_bytes)
+            .sum::<u64>(),
+        256
+    );
+    drop(first_slices);
+    drop(first_slot);
+
+    let (second_demand, second_requests) = binding
+        .scoped_demand(
+            AllocationLifetime::Step,
+            None,
+            shape(2),
+            shape(2),
+            Some(&bucket),
+            AdmissionFitPolicy::ImmediateOnly,
+            AdmissionPressureAction::WaitForRelease,
+        )
+        .unwrap();
+    assert_eq!(
+        second_demand.immediate_claim().entries()[0].units().get(),
+        128
+    );
+    assert_eq!(second_requests[0].capacity_size_bytes, 256);
+    let LaneBackingPrepareDecision::Prepared(second_prepared) = harness
+        .root
+        .dynamic_pools
+        .prepare_lane_stable_claim(&lane, &second_requests)
+        .unwrap()
+    else {
+        panic!("same reusable bucket must reclaim its idle stable slot")
+    };
+    let (second_slices, second_slot) = second_prepared.commit().into_parts();
+    let second_evidence = second_slices[0].evidence();
+    assert_eq!(second_evidence.size_bytes(), 128);
+    assert_eq!(second_evidence.capacity_size_bytes(), 256);
+    assert_eq!(second_evidence.segments(), first_evidence.segments());
+    assert_eq!(
+        second_evidence.pool_instance_id(),
+        first_evidence.pool_instance_id()
+    );
+    let second_view = harness.root.dynamic_pools.view(&second_slices[0]).unwrap();
+    assert_eq!(second_view.size_bytes(), 128);
+    assert_eq!(second_view.capacity_size_bytes(), 256);
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+    drop(second_view);
+    drop(second_slices);
+    drop(second_slot);
+    drop(binding);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn reusable_bucket_outside_immutable_plan_is_rejected_before_allocation() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'f',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let (memory_plan, bucket) = reusable_step_memory_plan(catalog.pool_id.clone());
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness_with_reusable(Arc::clone(&runtime), catalog, 256, memory_plan);
+    let lane = harness.root.create_execution_lane().unwrap();
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    let (_, mut requests) = binding
+        .scoped_demand(
+            AllocationLifetime::Step,
+            None,
+            shape(1),
+            shape(1),
+            Some(&bucket),
+            AdmissionFitPolicy::ImmediateOnly,
+            AdmissionPressureAction::WaitForRelease,
+        )
+        .unwrap();
+    let foreign = ReusableExecutionBucketSpec::new(
+        ReusableExecutionClassId::new("test.foreign-packed-token").unwrap(),
+        bucket.capacity(),
+    )
+    .unwrap();
+    requests[0].reusable_execution_bucket_id = Some(foreign.bucket_id().clone());
+    let allocations_before = runtime.allocate_calls();
+    let error = match harness
+        .root
+        .dynamic_pools
+        .prepare_lane_stable_claim(&lane, &requests)
+    {
+        Err(error) => error,
+        Ok(_) => panic!("foreign reusable bucket must fail closed"),
+    };
+    assert!(error.to_string().contains("outside its immutable plan"));
+    assert_eq!(runtime.allocate_calls(), allocations_before);
+    drop(binding);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn reusable_bucket_step_admission_keeps_logical_claim_exact() {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        '7',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let (memory_plan, bucket) = reusable_step_memory_plan(catalog.pool_id.clone());
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness_with_reusable(Arc::clone(&runtime), catalog, 256, memory_plan);
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 256)
+        .unwrap();
+    let lane = harness.root.create_execution_lane().unwrap();
+    let sequence = admitted_sequence(&harness.root, "bucket-step-admission");
+    let session = sequence.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+    let request = StepResourceAdmissionRequest::new(
+        batch.bind_work_shape(vec![token_span(1)]).unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap()
+    .with_reusable_execution_bucket(bucket.bucket_id().clone());
+    let step = match batch.try_begin_step(request, &lane).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("plan-owned reusable bucket must admit its exact logical work"),
+    };
+    assert_eq!(
+        step.reusable_execution_bucket()
+            .map(ReusableExecutionBucketSpec::bucket_id),
+        Some(bucket.bucket_id())
+    );
+    assert_eq!(step.backing_slices()[0].size_bytes(), 64);
+    assert_eq!(step.backing_slices()[0].capacity_size_bytes(), 256);
+    step.try_retire_normal().unwrap();
+    session.try_complete().unwrap();
+    drop(batch);
+    drop(session);
+    drop(sequence);
     drop(lane);
     close_dynamic_test_root(harness.root);
 }
@@ -2929,6 +3192,7 @@ fn scoped_demand_merges_per_pool_and_release_coalesces_extents() {
             None,
             shape(1),
             shape(1),
+            None,
             AdmissionFitPolicy::ImmediateOnly,
             AdmissionPressureAction::WaitForRelease,
         )

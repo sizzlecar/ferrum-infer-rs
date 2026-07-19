@@ -2436,8 +2436,8 @@ enum OperationBufferSource<'a, B> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OperationBufferCoverage {
     Exact,
-    /// The operation sees an exact prefix while sequence authority retains the
-    /// wider backing needed by a previously admitted execution frontier.
+    /// The operation sees an exact logical prefix while resource authority
+    /// retains wider physical capacity for a frontier or reusable bucket.
     BackingPrefix,
 }
 
@@ -4053,6 +4053,7 @@ impl<'a, B> OperationInvocation<'a, B> {
                         _ => backing.size_bytes() == expected_bytes,
                     };
                     if !size_matches
+                        || backing.capacity_size_bytes() < backing.size_bytes()
                         || backing.alignment_bytes() != descriptor.alignment_bytes()
                         || backing.usage() != descriptor.usage()
                         || backing.element_type() != descriptor.element_type()
@@ -4062,9 +4063,7 @@ impl<'a, B> OperationInvocation<'a, B> {
                             "logical backing extent differs from plan descriptor `{resource_id}`"
                         )));
                     }
-                    let coverage = if descriptor.lifetime() == AllocationLifetime::Sequence
-                        && backing.size_bytes() > expected_bytes
-                    {
+                    let coverage = if backing.capacity_size_bytes() > expected_bytes {
                         OperationBufferCoverage::BackingPrefix
                     } else {
                         OperationBufferCoverage::Exact

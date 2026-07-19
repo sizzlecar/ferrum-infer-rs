@@ -20,6 +20,9 @@ use super::{
     ResourceTransactionIdentity, ResourceTransactionState, RwLock, RwLockReadGuard, Serialize,
     StaticProvisioningBinding, StaticProvisioningLease, VNextError,
 };
+use crate::vnext::{
+    ResolvedReusableExecutionBucket, ReusableExecutionBucketId, ReusableExecutionBucketSpec,
+};
 
 pub(super) const PLAN_RUNTIME_OPEN: u8 = 0;
 const PLAN_RUNTIME_CLOSING: u8 = 1;
@@ -992,6 +995,16 @@ where
         &self.dynamic_pools().nodes
     }
 
+    pub(super) fn reusable_execution_bucket(
+        &self,
+        bucket_id: &ReusableExecutionBucketId,
+    ) -> Option<&ResolvedReusableExecutionBucket> {
+        self.dynamic_pools()
+            .reusable_execution
+            .as_ref()
+            .and_then(|plan| plan.bucket(bucket_id))
+    }
+
     pub fn plan_id(&self) -> &PlanId {
         match &self.resources.static_resources {
             PlanRuntimeStatic::NoStatic { binding } => binding.plan_id(),
@@ -1045,6 +1058,7 @@ where
         node_id: Option<&NodeId>,
         immediate_shape: DynamicResourceShape,
         fit_shape: DynamicResourceShape,
+        reusable_execution_bucket: Option<&ReusableExecutionBucketSpec>,
         fit_policy: AdmissionFitPolicy,
         pressure_action: AdmissionPressureAction,
     ) -> Result<(AdmissionDemand, Vec<EvaluatedBackingRequest<'_>>), VNextError> {
@@ -1053,6 +1067,34 @@ where
                 "invocation resource demand requires one exact node identity",
             ));
         }
+        let capacity_shape = match reusable_execution_bucket {
+            Some(bucket)
+                if matches!(
+                    lifetime,
+                    AllocationLifetime::Step | AllocationLifetime::Invocation
+                ) && bucket.capacity().covers(
+                    immediate_shape.sequences(),
+                    immediate_shape.tokens(),
+                    immediate_shape.pages(),
+                ) && bucket.capacity().covers(
+                    fit_shape.sequences(),
+                    fit_shape.tokens(),
+                    fit_shape.pages(),
+                ) =>
+            {
+                DynamicResourceShape::from_validated(
+                    bucket.capacity().maximum_sequences(),
+                    bucket.capacity().maximum_tokens(),
+                    bucket.capacity().maximum_pages(),
+                )
+            }
+            Some(_) => {
+                return Err(invalid_resource(
+                    "reusable execution bucket does not cover this Step or Invocation demand",
+                ));
+            }
+            None => immediate_shape,
+        };
         let node_resources = node_id
             .map(|node_id| {
                 self.nodes()
@@ -1076,6 +1118,7 @@ where
                     let mut projections = Vec::with_capacity(slot.resource_ids().len());
                     let mut immediate_slot_bytes = 0_u64;
                     let mut fit_slot_bytes = 0_u64;
+                    let mut capacity_slot_bytes = 0_u64;
                     for resource_id in slot.resource_ids() {
                         let descriptor = domain
                             .descriptors
@@ -1091,15 +1134,19 @@ where
                                 "step physical slot references a non-Step descriptor",
                             ));
                         }
-                        let size_bytes =
+                        let logical_size_bytes =
                             descriptor.evaluate_request_bytes_for_shape(immediate_shape)?;
                         let fit_bytes = descriptor.evaluate_request_bytes_for_shape(fit_shape)?;
-                        immediate_slot_bytes = immediate_slot_bytes.max(size_bytes);
+                        let capacity_size_bytes =
+                            descriptor.evaluate_request_bytes_for_shape(capacity_shape)?;
+                        immediate_slot_bytes = immediate_slot_bytes.max(logical_size_bytes);
                         fit_slot_bytes = fit_slot_bytes.max(fit_bytes);
+                        capacity_slot_bytes = capacity_slot_bytes.max(capacity_size_bytes);
                         projections.push(EvaluatedBackingProjection {
                             descriptor,
                             physical_offset_bytes: 0,
-                            size_bytes,
+                            logical_size_bytes,
+                            capacity_size_bytes,
                         });
                     }
                     immediate_pool_bytes = immediate_pool_bytes
@@ -1116,7 +1163,9 @@ where
                             domain.pool_id().clone(),
                             slot.resource_ids().to_vec(),
                         )?,
-                        size_bytes: immediate_slot_bytes,
+                        capacity_size_bytes: capacity_slot_bytes,
+                        reusable_execution_bucket_id: reusable_execution_bucket
+                            .map(|bucket| bucket.bucket_id().clone()),
                         projections,
                     });
                     matched = true;
@@ -1131,11 +1180,13 @@ where
                         continue;
                     }
                     matched = true;
-                    let size_bytes =
+                    let logical_size_bytes =
                         descriptor.evaluate_request_bytes_for_shape(immediate_shape)?;
                     let fit_bytes = descriptor.evaluate_request_bytes_for_shape(fit_shape)?;
+                    let capacity_size_bytes =
+                        descriptor.evaluate_request_bytes_for_shape(capacity_shape)?;
                     immediate_pool_bytes = immediate_pool_bytes
-                        .checked_add(size_bytes)
+                        .checked_add(logical_size_bytes)
                         .ok_or_else(|| {
                             invalid_resource("dynamic pool immediate demand overflows u64")
                         })?;
@@ -1148,11 +1199,14 @@ where
                             domain.pool_id().clone(),
                             vec![descriptor.base_resource_id().clone()],
                         )?,
-                        size_bytes,
+                        capacity_size_bytes,
+                        reusable_execution_bucket_id: reusable_execution_bucket
+                            .map(|bucket| bucket.bucket_id().clone()),
                         projections: vec![EvaluatedBackingProjection {
                             descriptor,
                             physical_offset_bytes: 0,
-                            size_bytes,
+                            logical_size_bytes,
+                            capacity_size_bytes,
                         }],
                     });
                 }
@@ -1236,11 +1290,13 @@ where
                         domain.pool_id().clone(),
                         vec![descriptor.base_resource_id().clone()],
                     )?,
-                    size_bytes: delta_bytes,
+                    capacity_size_bytes: delta_bytes,
+                    reusable_execution_bucket_id: None,
                     projections: vec![EvaluatedBackingProjection {
                         descriptor,
                         physical_offset_bytes: 0,
-                        size_bytes: delta_bytes,
+                        logical_size_bytes: delta_bytes,
+                        capacity_size_bytes: delta_bytes,
                     }],
                 });
             }
@@ -1273,6 +1329,7 @@ where
     pub(super) fn submission_wave_demand(
         &self,
         node_shapes: &[(NodeId, DynamicResourceShape, DynamicResourceShape)],
+        reusable_execution_bucket: Option<&ReusableExecutionBucketSpec>,
         fit_policy: AdmissionFitPolicy,
         pressure_action: AdmissionPressureAction,
     ) -> Result<(AdmissionDemand, Vec<EvaluatedBackingRequest<'_>>), VNextError> {
@@ -1287,6 +1344,31 @@ where
                 "submission wave demand must cover every plan node in immutable plan order",
             ));
         }
+        let capacity_shape = reusable_execution_bucket
+            .map(|bucket| {
+                node_shapes.iter().try_for_each(|(_, immediate, fit)| {
+                    if bucket.capacity().covers(
+                        immediate.sequences(),
+                        immediate.tokens(),
+                        immediate.pages(),
+                    ) && bucket
+                        .capacity()
+                        .covers(fit.sequences(), fit.tokens(), fit.pages())
+                    {
+                        Ok(())
+                    } else {
+                        Err(invalid_resource(
+                            "reusable execution bucket does not cover every submission-wave node",
+                        ))
+                    }
+                })?;
+                Ok(DynamicResourceShape::from_validated(
+                    bucket.capacity().maximum_sequences(),
+                    bucket.capacity().maximum_tokens(),
+                    bucket.capacity().maximum_pages(),
+                ))
+            })
+            .transpose()?;
 
         let mut immediate_entries = Vec::new();
         let mut fit_entries = Vec::new();
@@ -1300,6 +1382,7 @@ where
             let mut projections = Vec::new();
             let mut immediate_pool_bytes = 0_u64;
             let mut fit_pool_bytes = 0_u64;
+            let mut capacity_pool_bytes = 0_u64;
             let mut matched_rows = 0_usize;
             for (node_id, immediate_shape, fit_shape) in node_shapes {
                 let Some(row) = domain
@@ -1313,11 +1396,12 @@ where
                 matched_rows += 1;
                 let row_base = match mode {
                     InvocationLivenessMode::TotalOrderReuse => 0,
-                    InvocationLivenessMode::ConservativeConcurrent => immediate_pool_bytes,
+                    InvocationLivenessMode::ConservativeConcurrent => capacity_pool_bytes,
                     InvocationLivenessMode::NoInvocationResources => unreachable!(),
                 };
                 let mut immediate_row_bytes = 0_u64;
                 let mut fit_row_bytes = 0_u64;
+                let mut capacity_row_bytes = 0_u64;
                 for resource_id in row.resource_ids() {
                     let descriptor = domain
                         .descriptors
@@ -1333,30 +1417,41 @@ where
                             "invocation liveness row references a non-Invocation descriptor",
                         ));
                     }
-                    let size_bytes =
+                    let logical_size_bytes =
                         descriptor.evaluate_request_bytes_for_shape(*immediate_shape)?;
                     let fit_bytes = descriptor.evaluate_request_bytes_for_shape(*fit_shape)?;
+                    let capacity_size_bytes = descriptor.evaluate_request_bytes_for_shape(
+                        capacity_shape.unwrap_or(*immediate_shape),
+                    )?;
                     let physical_offset_bytes =
-                        row_base.checked_add(immediate_row_bytes).ok_or_else(|| {
+                        row_base.checked_add(capacity_row_bytes).ok_or_else(|| {
                             invalid_resource("invocation wave projection offset overflows u64")
                         })?;
-                    immediate_row_bytes =
-                        immediate_row_bytes.checked_add(size_bytes).ok_or_else(|| {
+                    immediate_row_bytes = immediate_row_bytes
+                        .checked_add(logical_size_bytes)
+                        .ok_or_else(|| {
                             invalid_resource("invocation wave row demand overflows u64")
                         })?;
                     fit_row_bytes = fit_row_bytes.checked_add(fit_bytes).ok_or_else(|| {
                         invalid_resource("invocation wave fit row demand overflows u64")
                     })?;
+                    capacity_row_bytes = capacity_row_bytes
+                        .checked_add(capacity_size_bytes)
+                        .ok_or_else(|| {
+                            invalid_resource("invocation wave capacity row overflows u64")
+                        })?;
                     projections.push(EvaluatedBackingProjection {
                         descriptor,
                         physical_offset_bytes,
-                        size_bytes,
+                        logical_size_bytes,
+                        capacity_size_bytes,
                     });
                 }
                 match mode {
                     InvocationLivenessMode::TotalOrderReuse => {
                         immediate_pool_bytes = immediate_pool_bytes.max(immediate_row_bytes);
                         fit_pool_bytes = fit_pool_bytes.max(fit_row_bytes);
+                        capacity_pool_bytes = capacity_pool_bytes.max(capacity_row_bytes);
                     }
                     InvocationLivenessMode::ConservativeConcurrent => {
                         immediate_pool_bytes = immediate_pool_bytes
@@ -1368,6 +1463,11 @@ where
                             fit_pool_bytes.checked_add(fit_row_bytes).ok_or_else(|| {
                                 invalid_resource("invocation wave pool fit demand overflows u64")
                             })?;
+                        capacity_pool_bytes = capacity_pool_bytes
+                            .checked_add(capacity_row_bytes)
+                            .ok_or_else(|| {
+                            invalid_resource("invocation wave capacity pool demand overflows u64")
+                        })?;
                     }
                     InvocationLivenessMode::NoInvocationResources => unreachable!(),
                 }
@@ -1396,7 +1496,9 @@ where
                     domain.pool_id().clone(),
                     resource_ids,
                 )?,
-                size_bytes: immediate_pool_bytes,
+                capacity_size_bytes: capacity_pool_bytes,
+                reusable_execution_bucket_id: reusable_execution_bucket
+                    .map(|bucket| bucket.bucket_id().clone()),
                 projections,
             });
             immediate_entries.push(CapacityEntry::new(

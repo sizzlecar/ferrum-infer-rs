@@ -6,13 +6,17 @@ use super::{
     CapacityWaitCondition, DeviceAllocationPermit, DeviceBufferRetention,
     DeviceCapacityAvailabilitySnapshot, DeviceCapacityBudget, DeviceCapacityGrant,
     DeviceCapacityReservation, DeviceRuntime, DynamicBackingPoolId, DynamicBackingPoolSpec,
-    DynamicResourceDescriptor, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView,
-    ElementType, ExecutionLane, ExecutionLaneId, FreeExtentIndex, InvocationLivenessMode,
-    LogicalAdmissionCoordinator, Mutex, Ordering, PlanNode, ResourceId, ResourceReservation,
-    ResourceRetentionPolicy, ResourceTransactionIdentity, RunId, Serialize, StateInitialization,
-    StaticProvisioningBinding, StepResourceSlotKind, TransactionId, VNextError, Weak,
+    DynamicResourceDescriptor, DynamicResourceShape, DynamicStorageAllocator,
+    DynamicStorageProfile, DynamicStorageView, ElementType, ExecutionLane, ExecutionLaneId,
+    FreeExtentIndex, InvocationLivenessMode, LogicalAdmissionCoordinator, Mutex, Ordering,
+    PlanNode, ResourceId, ResourceReservation, ResourceRetentionPolicy,
+    ResourceTransactionIdentity, RunId, Serialize, StateInitialization, StaticProvisioningBinding,
+    StepResourceSlotKind, TransactionId, VNextError, Weak,
 };
-use crate::vnext::{DeviceCapacityPressure, DynamicPoolResidentPressure};
+use crate::vnext::{
+    DeviceCapacityPressure, DynamicPoolResidentPressure, ReusableExecutionBucketId,
+    ReusableExecutionMemoryPlan,
+};
 use sha2::{Digest, Sha256};
 
 static NEXT_DYNAMIC_POOL_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -961,14 +965,16 @@ impl PhysicalBackingClaimIdentity {
 pub(super) struct EvaluatedBackingProjection<'a> {
     pub(super) descriptor: &'a DynamicResourceDescriptor,
     pub(super) physical_offset_bytes: u64,
-    pub(super) size_bytes: u64,
+    pub(super) logical_size_bytes: u64,
+    pub(super) capacity_size_bytes: u64,
 }
 
 #[derive(Clone)]
 pub(super) struct EvaluatedBackingRequest<'a> {
     pub(super) domain: &'a DynamicPoolDomainSpec,
     pub(super) claim_identity: PhysicalBackingClaimIdentity,
-    pub(super) size_bytes: u64,
+    pub(super) capacity_size_bytes: u64,
+    pub(super) reusable_execution_bucket_id: Option<ReusableExecutionBucketId>,
     pub(super) projections: Vec<EvaluatedBackingProjection<'a>>,
 }
 
@@ -980,7 +986,7 @@ where
     claim_identity: PhysicalBackingClaimIdentity,
     segment_generation: u64,
     segments: Vec<BackingSegment>,
-    size_bytes: u64,
+    capacity_size_bytes: u64,
     projections: Vec<LogicalBackingSliceEvidence>,
 }
 
@@ -1022,7 +1028,7 @@ where
                 claim_identity: extent.claim_identity,
                 segment_generation: extent.segment_generation,
                 segments: extent.segments,
-                size_bytes: extent.size_bytes,
+                size_bytes: extent.capacity_size_bytes,
                 initialization,
                 released: false,
             });
@@ -1067,7 +1073,7 @@ where
         hasher.update([1]);
         hasher.update(projection.resource_id.as_str().as_bytes());
         hasher.update(projection.physical_offset_bytes.to_be_bytes());
-        hasher.update(projection.size_bytes.to_be_bytes());
+        hasher.update(projection.capacity_size_bytes.to_be_bytes());
     }
     format!("sha256/{:x}", hasher.finalize())
 }
@@ -1197,22 +1203,66 @@ impl LaneStableArenaEntry {
         &mut self,
         lane_id: ExecutionLaneId,
         now: u64,
-    ) -> Option<(
-        u64,
-        Vec<LogicalBackingSliceAuthority>,
-        Vec<CapacityDomainId>,
-    )> {
-        let slot = self.slots.values_mut().find(|slot| !slot.in_use)?;
+        requests: &[&EvaluatedBackingRequest<'_>],
+    ) -> Result<
+        Option<(
+            u64,
+            Vec<LogicalBackingSliceAuthority>,
+            Vec<CapacityDomainId>,
+        )>,
+        VNextError,
+    > {
+        let Some(slot) = self.slots.values_mut().find(|slot| !slot.in_use) else {
+            return Ok(None);
+        };
+        let stable = slot
+            .authorities
+            .iter()
+            .map(|authority| {
+                let request = requests
+                    .iter()
+                    .copied()
+                    .find(|request| {
+                        request.claim_identity == authority.evidence.physical_claim_identity
+                    })
+                    .ok_or_else(|| {
+                        invalid_resource(
+                            "lane-stable arena request lost its physical claim projection",
+                        )
+                    })?;
+                let projection = request
+                    .projections
+                    .iter()
+                    .find(|projection| {
+                        projection.descriptor.base_resource_id() == &authority.evidence.resource_id
+                    })
+                    .ok_or_else(|| {
+                        invalid_resource(
+                            "lane-stable arena request lost its logical resource projection",
+                        )
+                    })?;
+                if request.capacity_size_bytes != authority.evidence.physical_size_bytes
+                    || projection.physical_offset_bytes != authority.evidence.physical_offset_bytes
+                    || projection.capacity_size_bytes != authority.evidence.capacity_size_bytes
+                    || projection.logical_size_bytes == 0
+                    || projection.logical_size_bytes > projection.capacity_size_bytes
+                {
+                    return Err(invalid_resource(
+                        "lane-stable arena request differs from its retained capacity layout",
+                    ));
+                }
+                let mut retained = authority.retained_for_lane(lane_id);
+                retained.evidence.logical_size_bytes = projection.logical_size_bytes;
+                Ok(retained)
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
         slot.in_use = true;
         slot.last_used = now;
-        Some((
+        Ok(Some((
             slot.slot_id,
-            slot.authorities
-                .iter()
-                .map(|authority| authority.retained_for_lane(lane_id))
-                .collect(),
+            stable,
             slot.availability_domains.clone(),
-        ))
+        )))
     }
 }
 
@@ -1357,7 +1407,7 @@ fn lane_stable_layout_key(
     // This registry is owned by one immutable plan, so static descriptor fields
     // are implicit. The hot key only needs the evaluated physical layout.
     let mut hasher = Sha256::new();
-    hasher.update(b"ferrum.runtime-vnext.lane-stable-arena-layout.v2");
+    hasher.update(b"ferrum.runtime-vnext.lane-stable-arena-layout.v3");
     hasher.update((requests.len() as u64).to_le_bytes());
     for request in requests {
         update_bytes(
@@ -1368,7 +1418,14 @@ fn lane_stable_layout_key(
         for resource_id in request.claim_identity.resource_ids() {
             update_bytes(&mut hasher, resource_id.as_str().as_bytes());
         }
-        hasher.update(request.size_bytes.to_le_bytes());
+        match &request.reusable_execution_bucket_id {
+            Some(bucket_id) => {
+                hasher.update([1]);
+                update_bytes(&mut hasher, bucket_id.as_str().as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        hasher.update(request.capacity_size_bytes.to_le_bytes());
         hasher.update((request.projections.len() as u64).to_le_bytes());
         for projection in &request.projections {
             update_bytes(
@@ -1376,7 +1433,7 @@ fn lane_stable_layout_key(
                 projection.descriptor.base_resource_id().as_str().as_bytes(),
             );
             hasher.update(projection.physical_offset_bytes.to_le_bytes());
-            hasher.update(projection.size_bytes.to_le_bytes());
+            hasher.update(projection.capacity_size_bytes.to_le_bytes());
         }
     }
     Ok(LaneStableArenaKey {
@@ -1393,6 +1450,7 @@ where
     pub(super) pools: BTreeMap<DynamicBackingPoolId, Arc<DynamicBackingPool<R>>>,
     pub(super) domains: Vec<DynamicPoolDomainSpec>,
     pub(super) nodes: Arc<[PlanNode]>,
+    pub(super) reusable_execution: Option<ReusableExecutionMemoryPlan>,
     pub(super) logical_admission: LogicalAdmissionCoordinator,
     pub(super) budget: Arc<DeviceCapacityBudget>,
     lane_stable_arenas: Arc<Mutex<LaneStableArenaState>>,
@@ -1408,10 +1466,14 @@ pub struct LogicalBackingSliceEvidence {
     pub(super) resource_id: ResourceId,
     pub(super) pool_instance_id: u64,
     pub(super) physical_claim_identity: PhysicalBackingClaimIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reusable_execution_bucket_id: Option<ReusableExecutionBucketId>,
     pub(super) segment_generation: u64,
     pub(super) segments: Vec<BackingSegment>,
     pub(super) physical_offset_bytes: u64,
-    pub(super) size_bytes: u64,
+    #[serde(rename = "size_bytes")]
+    pub(super) logical_size_bytes: u64,
+    pub(super) capacity_size_bytes: u64,
     pub(super) physical_size_bytes: u64,
     pub(super) alignment_bytes: u64,
     pub(super) usage: BufferUsage,
@@ -1445,6 +1507,10 @@ impl LogicalBackingSliceEvidence {
         &self.physical_claim_identity
     }
 
+    pub fn reusable_execution_bucket_id(&self) -> Option<&ReusableExecutionBucketId> {
+        self.reusable_execution_bucket_id.as_ref()
+    }
+
     pub fn segments(&self) -> &[BackingSegment] {
         &self.segments
     }
@@ -1454,7 +1520,11 @@ impl LogicalBackingSliceEvidence {
     }
 
     pub const fn size_bytes(&self) -> u64 {
-        self.size_bytes
+        self.logical_size_bytes
+    }
+
+    pub const fn capacity_size_bytes(&self) -> u64 {
+        self.capacity_size_bytes
     }
 
     pub const fn physical_size_bytes(&self) -> u64 {
@@ -1519,7 +1589,11 @@ impl LogicalBackingSliceAuthority {
     }
 
     pub const fn size_bytes(&self) -> u64 {
-        self.evidence.size_bytes
+        self.evidence.logical_size_bytes
+    }
+
+    pub const fn capacity_size_bytes(&self) -> u64 {
+        self.evidence.capacity_size_bytes
     }
 
     pub fn initialization_status(&self) -> Result<Option<BackingInitializationStatus>, VNextError> {
@@ -1538,7 +1612,8 @@ impl LogicalBackingSliceAuthority {
 pub struct LogicalBackingBufferView<'a, B> {
     pub(super) bindings: Vec<LogicalBackingSegmentBinding<B>>,
     authorities: &'a [LogicalBackingSliceAuthority],
-    size_bytes: u64,
+    logical_size_bytes: u64,
+    capacity_size_bytes: u64,
     alignment_bytes: u64,
     usage: BufferUsage,
     element_type: ElementType,
@@ -1579,7 +1654,11 @@ impl<'a, B> LogicalBackingBufferView<'a, B> {
     }
 
     pub const fn size_bytes(&self) -> u64 {
-        self.size_bytes
+        self.logical_size_bytes
+    }
+
+    pub const fn capacity_size_bytes(&self) -> u64 {
+        self.capacity_size_bytes
     }
 
     pub const fn alignment_bytes(&self) -> u64 {
@@ -1626,6 +1705,7 @@ where
         logical_admission: LogicalAdmissionCoordinator,
         domains: Vec<DynamicPoolDomainSpec>,
         nodes: Arc<[PlanNode]>,
+        reusable_execution: Option<ReusableExecutionMemoryPlan>,
     ) -> Result<Self, VNextError> {
         let mut pools = BTreeMap::new();
         for domain in &domains {
@@ -1665,6 +1745,7 @@ where
             domains,
             pools,
             nodes,
+            reusable_execution,
             lane_stable_arenas: Arc::new(Mutex::new(LaneStableArenaState::default())),
         })
     }
@@ -2386,6 +2467,41 @@ where
         self.prepare_claim_scoped(requests, DynamicBackingClaimScope::from(lifetime))
     }
 
+    fn reusable_capacity_shape_for_requests(
+        &self,
+        requests: &[EvaluatedBackingRequest<'_>],
+    ) -> Result<Option<DynamicResourceShape>, VNextError> {
+        let reusable_execution_bucket_id = requests
+            .first()
+            .and_then(|request| request.reusable_execution_bucket_id.as_ref());
+        if requests.iter().any(|request| {
+            request.reusable_execution_bucket_id.as_ref() != reusable_execution_bucket_id
+        }) {
+            return Err(invalid_resource(
+                "one dynamic backing claim cannot mix reusable execution buckets",
+            ));
+        }
+        reusable_execution_bucket_id
+            .map(|bucket_id| {
+                let bucket = self
+                    .reusable_execution
+                    .as_ref()
+                    .and_then(|plan| plan.bucket(bucket_id))
+                    .map(|resolved| resolved.bucket())
+                    .ok_or_else(|| {
+                        invalid_resource(
+                            "dynamic backing claim references a reusable bucket outside its immutable plan",
+                        )
+                    })?;
+                Ok(DynamicResourceShape::from_validated(
+                    bucket.capacity().maximum_sequences(),
+                    bucket.capacity().maximum_tokens(),
+                    bucket.capacity().maximum_pages(),
+                ))
+            })
+            .transpose()
+    }
+
     pub(super) fn prepare_lane_stable_claim(
         self: &Arc<Self>,
         lane: &Arc<ExecutionLane<R>>,
@@ -2407,6 +2523,7 @@ where
                 },
             ));
         }
+        self.reusable_capacity_shape_for_requests(requests)?;
         let lifetime = requests
             .first()
             .and_then(|request| request.projections.first())
@@ -2462,7 +2579,7 @@ where
                         ));
                     }
                     if let Some((slot_id, stable, slot_domains)) =
-                        entry.claim_idle_slot(lane.id(), now)
+                        entry.claim_idle_slot(lane.id(), now, &canonical_requests)?
                     {
                         return Ok(LaneBackingPrepareDecision::Prepared(
                             PreparedLaneBackingClaim {
@@ -2502,7 +2619,7 @@ where
                             ));
                         }
                         if let Some((slot_id, stable, slot_domains)) =
-                            entry.claim_idle_slot(lane.id(), now)
+                            entry.claim_idle_slot(lane.id(), now, &canonical_requests)?
                         {
                             drop(arenas);
                             drop(prepared);
@@ -2587,7 +2704,7 @@ where
                             ));
                         }
                         if let Some((slot_id, stable, slot_domains)) =
-                            entry.claim_idle_slot(lane.id(), now)
+                            entry.claim_idle_slot(lane.id(), now, &canonical_requests)?
                         {
                             drop(arenas);
                             drop(deferred);
@@ -2727,6 +2844,7 @@ where
                 PreparedBackingClaim::empty(),
             ));
         }
+        let reusable_capacity_shape = self.reusable_capacity_shape_for_requests(requests)?;
         let mut grouped =
             BTreeMap::<DynamicBackingPoolId, Vec<&EvaluatedBackingRequest<'_>>>::new();
         for request in requests {
@@ -2756,9 +2874,11 @@ where
                 .iter()
                 .map(|(pool, requests)| {
                     let bytes = requests.iter().try_fold(0_u64, |total, request| {
-                        total.checked_add(request.size_bytes).ok_or_else(|| {
-                            invalid_resource("dynamic backing protection bytes overflow u64")
-                        })
+                        total
+                            .checked_add(request.capacity_size_bytes)
+                            .ok_or_else(|| {
+                                invalid_resource("dynamic backing protection bytes overflow u64")
+                            })
                     })?;
                     CapacityEntry::new(pool.domain.domain_id, CapacityUnits::new(bytes))
                 })
@@ -2786,7 +2906,8 @@ where
                         .collect::<Vec<_>>();
                     let single_projection = request.projections.len() == 1
                         && request.projections[0].physical_offset_bytes == 0
-                        && request.projections[0].size_bytes == request.size_bytes;
+                        && request.projections[0].capacity_size_bytes
+                            == request.capacity_size_bytes;
                     let shared_step_slot = request.projections.len() > 1
                         && request
                             .projections
@@ -2795,9 +2916,9 @@ where
                         && request
                             .projections
                             .iter()
-                            .map(|projection| projection.size_bytes)
+                            .map(|projection| projection.capacity_size_bytes)
                             .max()
-                            == Some(request.size_bytes)
+                            == Some(request.capacity_size_bytes)
                         && pool.domain.pool.step_resource_slots().iter().any(|slot| {
                             slot.kind() == StepResourceSlotKind::OrderedSingleFenceStepWave
                                 && slot.resource_ids() == request.claim_identity.resource_ids()
@@ -2813,23 +2934,40 @@ where
                                 >= pair[1].descriptor.base_resource_id()
                         })
                         || request.projections.iter().any(|projection| {
+                            let capacity_matches_plan = match reusable_capacity_shape {
+                                Some(shape) => {
+                                    matches!(
+                                        projection.descriptor.lifetime(),
+                                        AllocationLifetime::Step | AllocationLifetime::Invocation
+                                    ) && projection
+                                        .descriptor
+                                        .evaluate_request_bytes_for_shape(shape)
+                                        .is_ok_and(|bytes| bytes == projection.capacity_size_bytes)
+                                }
+                                None => {
+                                    projection.logical_size_bytes == projection.capacity_size_bytes
+                                }
+                            };
                             projection.descriptor.pool_id() != pool.domain.pool_id()
                                 || !scope.accepts(projection.descriptor.lifetime())
-                                || projection.size_bytes == 0
-                                || projection.size_bytes % quantum != 0
+                                || !capacity_matches_plan
+                                || projection.logical_size_bytes == 0
+                                || projection.logical_size_bytes > projection.capacity_size_bytes
+                                || projection.capacity_size_bytes == 0
+                                || projection.capacity_size_bytes % quantum != 0
                                 || projection.physical_offset_bytes % quantum != 0
                                 || projection
                                     .physical_offset_bytes
-                                    .checked_add(projection.size_bytes)
-                                    .is_none_or(|end| end > request.size_bytes)
+                                    .checked_add(projection.capacity_size_bytes)
+                                    .is_none_or(|end| end > request.capacity_size_bytes)
                                 || !request
                                     .domain
                                     .descriptors
                                     .iter()
                                     .any(|descriptor| descriptor == projection.descriptor)
                         })
-                        || request.size_bytes == 0
-                        || request.size_bytes % quantum != 0
+                        || request.capacity_size_bytes == 0
+                        || request.capacity_size_bytes % quantum != 0
                         || !(single_projection || shared_step_slot || invocation_wave)
                     {
                         return Err(invalid_resource(
@@ -2844,9 +2982,11 @@ where
                 .map(|(group_index, (pool, pool_requests))| {
                     let requested_group_bytes =
                         pool_requests.iter().try_fold(0_u64, |total, request| {
-                            total.checked_add(request.size_bytes).ok_or_else(|| {
-                                invalid_resource("dynamic backing batch bytes overflow u64")
-                            })
+                            total
+                                .checked_add(request.capacity_size_bytes)
+                                .ok_or_else(|| {
+                                    invalid_resource("dynamic backing batch bytes overflow u64")
+                                })
                         })?;
                     let state = &states[group_index];
                     if state.allocator.free_bytes >= requested_group_bytes {
@@ -2857,7 +2997,7 @@ where
                             DynamicStorageView::Contiguous => {
                                 let mut claim_bytes = pool_requests
                                     .iter()
-                                    .map(|request| request.size_bytes)
+                                    .map(|request| request.capacity_size_bytes)
                                     .collect::<Vec<_>>();
                                 claim_bytes.sort_unstable_by(|left, right| right.cmp(left));
                                 let growth = contiguous_packing_growth_bytes(
@@ -2938,19 +3078,23 @@ where
                 let mut allocation_requests = pool_requests.clone();
                 allocation_requests.sort_by(|left, right| {
                     right
-                        .size_bytes
-                        .cmp(&left.size_bytes)
+                        .capacity_size_bytes
+                        .cmp(&left.capacity_size_bytes)
                         .then_with(|| left.claim_identity.cmp(&right.claim_identity))
                 });
                 for request in allocation_requests {
                     let reserved = match match profile.view() {
                         DynamicStorageView::Contiguous => states[group_index]
                             .allocator
-                            .allocate_contiguous(pool.domain.pool_id(), request.size_bytes)
+                            .allocate_contiguous(pool.domain.pool_id(), request.capacity_size_bytes)
                             .map(|segment| segment.map(|segment| vec![segment])),
-                        DynamicStorageView::PagedRegions { block_bytes } => states[group_index]
-                            .allocator
-                            .allocate_paged(pool.domain.pool_id(), request.size_bytes, block_bytes),
+                        DynamicStorageView::PagedRegions { block_bytes } => {
+                            states[group_index].allocator.allocate_paged(
+                                pool.domain.pool_id(),
+                                request.capacity_size_bytes,
+                                block_bytes,
+                            )
+                        }
                     } {
                         Ok(reserved) => reserved,
                         Err(error) => {
@@ -2971,7 +3115,7 @@ where
                         let reason = DynamicBackingDeferralReason::FragmentedContiguous;
                         let mut claim_bytes_descending = pool_requests
                             .iter()
-                            .map(|request| request.size_bytes)
+                            .map(|request| request.capacity_size_bytes)
                             .collect::<Vec<_>>();
                         claim_bytes_descending.sort_unstable_by(|left, right| right.cmp(left));
                         let requested_bytes = contiguous_packing_growth_bytes(
@@ -3020,10 +3164,10 @@ where
                             return Err(error);
                         }
                     };
-                    if extent_bytes != request.size_bytes {
+                    if extent_bytes != request.capacity_size_bytes {
                         rollback_free_extent_journal(&mut states, &journals)?;
                         return Err(invalid_resource(
-                            "dynamic backing extents differ from their exact logical claim",
+                            "dynamic backing extents differ from their physical capacity claim",
                         ));
                     }
                     let generation =
@@ -3038,7 +3182,7 @@ where
                         if let Err(error) = backing_segment_range(
                             segments,
                             projection.physical_offset_bytes,
-                            projection.size_bytes,
+                            projection.capacity_size_bytes,
                         ) {
                             rollback_free_extent_journal(&mut states, &journals)?;
                             return Err(error);
@@ -3104,15 +3248,19 @@ where
                                 resource_id: projection.descriptor.base_resource_id().clone(),
                                 pool_instance_id: pool.instance_id,
                                 physical_claim_identity: request.claim_identity.clone(),
+                                reusable_execution_bucket_id: request
+                                    .reusable_execution_bucket_id
+                                    .clone(),
                                 segment_generation,
                                 segments: backing_segment_range(
                                     &segments,
                                     projection.physical_offset_bytes,
-                                    projection.size_bytes,
+                                    projection.capacity_size_bytes,
                                 )?,
                                 physical_offset_bytes: projection.physical_offset_bytes,
-                                size_bytes: projection.size_bytes,
-                                physical_size_bytes: request.size_bytes,
+                                logical_size_bytes: projection.logical_size_bytes,
+                                capacity_size_bytes: projection.capacity_size_bytes,
+                                physical_size_bytes: request.capacity_size_bytes,
                                 alignment_bytes: projection.descriptor.alignment_bytes(),
                                 usage: projection.descriptor.usage(),
                                 element_type: projection.descriptor.element_type(),
@@ -3126,7 +3274,7 @@ where
                         claim_identity: request.claim_identity.clone(),
                         segment_generation,
                         segments,
-                        size_bytes: request.size_bytes,
+                        capacity_size_bytes: request.capacity_size_bytes,
                         projections,
                     });
                 }
@@ -3257,7 +3405,7 @@ where
                     return Ok(false);
                 }
                 row_cursor = row_cursor
-                    .checked_add(projection.size_bytes)
+                    .checked_add(projection.capacity_size_bytes)
                     .ok_or_else(|| invalid_resource("invocation wave row size overflows u64"))?;
             }
             peak = peak.max(row_cursor);
@@ -3267,7 +3415,7 @@ where
                 })?;
             }
         }
-        Ok(request.size_bytes
+        Ok(request.capacity_size_bytes
             == match mode {
                 InvocationLivenessMode::TotalOrderReuse => peak,
                 InvocationLivenessMode::ConservativeConcurrent => concurrent_cursor,
@@ -3293,9 +3441,10 @@ where
             .pools
             .get(&first.evidence.pool_id)
             .ok_or_else(|| invalid_resource("logical backing authority has no dynamic pool"))?;
-        let mut size_bytes = 0_u64;
+        let mut logical_size_bytes = 0_u64;
+        let mut capacity_size_bytes = 0_u64;
         let mut segment_count = 0_usize;
-        for authority in authorities {
+        for (index, authority) in authorities.iter().enumerate() {
             if authority.evidence.pool_id != first.evidence.pool_id
                 || authority.evidence.resource_id != first.evidence.resource_id
                 || authority.evidence.storage_profile != first.evidence.storage_profile
@@ -3309,9 +3458,19 @@ where
                 ));
             }
             Self::validate_authority(pool, authority)?;
-            size_bytes = size_bytes
-                .checked_add(authority.evidence.size_bytes)
+            if index + 1 < authorities.len()
+                && authority.evidence.logical_size_bytes != authority.evidence.capacity_size_bytes
+            {
+                return Err(invalid_resource(
+                    "multi-extent logical backing cannot contain interior capacity slack",
+                ));
+            }
+            logical_size_bytes = logical_size_bytes
+                .checked_add(authority.evidence.logical_size_bytes)
                 .ok_or_else(|| invalid_resource("logical backing view size overflows u64"))?;
+            capacity_size_bytes = capacity_size_bytes
+                .checked_add(authority.evidence.capacity_size_bytes)
+                .ok_or_else(|| invalid_resource("logical backing capacity overflows u64"))?;
             segment_count = segment_count
                 .checked_add(authority.evidence.segments.len())
                 .ok_or_else(|| invalid_resource("logical backing segment count overflows usize"))?;
@@ -3362,7 +3521,8 @@ where
         Ok(LogicalBackingBufferView {
             bindings,
             authorities,
-            size_bytes,
+            logical_size_bytes,
+            capacity_size_bytes,
             alignment_bytes: first.evidence.alignment_bytes,
             usage: first.evidence.usage,
             element_type: first.evidence.element_type,
@@ -3388,10 +3548,12 @@ where
                 .resource_ids()
                 .binary_search(&authority.evidence.resource_id)
                 .is_err()
+            || authority.evidence.logical_size_bytes == 0
+            || authority.evidence.logical_size_bytes > authority.evidence.capacity_size_bytes
             || authority
                 .evidence
                 .physical_offset_bytes
-                .checked_add(authority.evidence.size_bytes)
+                .checked_add(authority.evidence.capacity_size_bytes)
                 .is_none_or(|end| end > authority.evidence.physical_size_bytes)
             || authority.evidence.storage_profile != pool.domain.pool.compatibility().profile()
         {
@@ -3402,7 +3564,7 @@ where
         let expected_projection = backing_segment_range(
             &authority.segment_lease.segments,
             authority.evidence.physical_offset_bytes,
-            authority.evidence.size_bytes,
+            authority.evidence.capacity_size_bytes,
         )?;
         if expected_projection != authority.evidence.segments {
             return Err(invalid_resource(
