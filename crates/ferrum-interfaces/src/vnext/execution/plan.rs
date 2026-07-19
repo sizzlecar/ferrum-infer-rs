@@ -225,7 +225,7 @@ impl ExecutionPlan {
         canonical_values: &mut BTreeMap<ProgramValueId, CanonicalValueBinding>,
         bound_values: &mut BTreeSet<ProgramValueId>,
     ) -> Result<PlanNode, VNextError> {
-        let operation = catalog.operation(&program_node.operation_id)?;
+        let operation = catalog.operation_for_node(&program_node.id, &program_node.operation_id)?;
         if !operation.version.satisfies(program_node.required_version) {
             return Err(VNextError::IncompatibleOperationVersion {
                 node_id: Some(program_node.id.to_string()),
@@ -280,7 +280,7 @@ impl ExecutionPlan {
             )));
         }
         let selected_provider = catalog
-            .providers_for(&program_node.operation_id)?
+            .providers_for_node(&program_node.id, &program_node.operation_id)?
             .iter()
             .find(|provider| provider.provider_id() == &selection.selected_provider)
             .ok_or_else(|| {
@@ -1003,7 +1003,7 @@ impl ExecutionPlan {
             let resolution = resolutions.get(&node.id).ok_or_else(|| {
                 invalid_plan(format!("node `{}` has no physical resolution", node.id))
             })?;
-            let providers = catalog.providers_for(&node.operation_id)?;
+            let providers = catalog.providers_for_node(&node.id, &node.operation_id)?;
             let mut candidates = Vec::new();
             for resources in &resolution.provider_resource_candidates {
                 let provider = providers
@@ -1322,7 +1322,7 @@ impl ExecutionPlan {
             required_quantization_formats.clone(),
         )?;
         let report = catalog.provider_compatibility(request)?;
-        report.require_compatible(&catalog.device().id)?;
+        report.require_compatible_for_node(&catalog.device().id, &node.id)?;
         if !report
             .compatible_provider_ids()
             .contains(storage_selected_provider)
@@ -1349,7 +1349,7 @@ impl ExecutionPlan {
             .collect::<Vec<_>>();
         if let Some(preferred) = preferred_provider {
             let registered = catalog
-                .providers_for(&node.operation_id)?
+                .providers_for_node(&node.id, &node.operation_id)?
                 .iter()
                 .any(|provider| provider.provider_id() == preferred);
             if !registered {

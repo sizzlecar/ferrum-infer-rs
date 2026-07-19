@@ -293,7 +293,7 @@ fn infer_value_tensors(
     }
 
     for node in program.blocks().iter().flat_map(|block| &block.nodes) {
-        let operation = catalog.operation(&node.operation_id)?;
+        let operation = catalog.operation_for_node(&node.id, &node.operation_id)?;
         if node.inputs.len() != operation.inputs.len()
             || node.outputs.len() != operation.outputs.len()
         {
@@ -780,7 +780,7 @@ fn build_value_storages(
         );
     }
     for node in program.blocks().iter().flat_map(|block| &block.nodes) {
-        let operation = catalog.operation(&node.operation_id)?;
+        let operation = catalog.operation_for_node(&node.id, &node.operation_id)?;
         for (value_id, contract) in node.outputs.iter().zip(&operation.outputs) {
             let storage = match contract.alias() {
                 AliasPolicy::MustAlias { tensor_index } => {
@@ -836,7 +836,7 @@ fn resolve_nodes<P: RuntimePolicy>(
         .iter()
         .flat_map(|block| &block.nodes)
         .map(|node| {
-            let operation = catalog.operation(&node.operation_id)?;
+            let operation = catalog.operation_for_node(&node.id, &node.operation_id)?;
             let values = node
                 .inputs
                 .iter()
