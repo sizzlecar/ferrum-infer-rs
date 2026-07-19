@@ -1096,7 +1096,7 @@ fn paged_state_regions(
         {
             return Err("causal attention paged translation lost block geometry".to_owned());
         }
-        let (buffer, range) = physical.buffer_and_physical_range();
+        let (buffer, range, retention) = physical.buffer_and_physical_range();
         let mut offset = 0_u64;
         while offset < physical.length_bytes() {
             let start = range
@@ -1107,7 +1107,7 @@ fn paged_state_regions(
                 .checked_add(VNEXT_KV_PAGE_BYTES)
                 .ok_or_else(|| "causal attention page range overflows".to_owned())?;
             let page = buffer
-                .region(start..end)
+                .retained_region(start..end, retention.clone())
                 .map_err(|error| error.to_string())?;
             if page.length_bytes() != VNEXT_KV_PAGE_BYTES || page.element_type() != ElementType::F16
             {

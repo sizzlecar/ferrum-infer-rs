@@ -1357,8 +1357,10 @@ fn scratch_region(
     if physical.next().is_some() {
         return Err("recurrent attention scratch is not physically contiguous".to_owned());
     }
-    let (buffer, range) = region.buffer_and_physical_range();
-    buffer.region(range).map_err(|error| error.to_string())
+    let (buffer, range, retention) = region.buffer_and_physical_range();
+    buffer
+        .retained_region(range, retention)
+        .map_err(|error| error.to_string())
 }
 
 fn f16_contiguous(binding: &ResolvedValueBinding) -> bool {

@@ -3,7 +3,7 @@ use super::{
     AdmissionFitPolicy, AdmissionPreflightDecision, AdmissionPressureAction, AdmissionRejected,
     AllocationLifetime, Arc, AtomicU64, BTreeMap, BTreeSet, BackingPrepareDecision, BatchStepId,
     CapacityClaimDecision, DeferredDeviceCleanupDisposition, DeferredDeviceCleanupTask,
-    DeviceRuntime, Digest, DynamicBackingClaimScope, DynamicBackingDeferred,
+    DeviceBufferRetention, DeviceRuntime, Digest, DynamicBackingClaimScope, DynamicBackingDeferred,
     DynamicDeferredMaintenanceOutcome, DynamicResourceShape, ExecutionFrameId,
     InitialSequenceAdmissionDecision, LogicalAdmissionCoordinatorId, LogicalAdmissionLease,
     LogicalBackingBufferView, LogicalBackingSliceAuthority, LogicalBackingSliceEvidence,
@@ -1882,6 +1882,10 @@ where
 
     pub fn plan_evidence(&self) -> TrustedPlanRuntimeEvidence {
         self.request.plan_evidence()
+    }
+
+    pub(crate) fn device_buffer_retention(&self) -> DeviceBufferRetention {
+        DeviceBufferRetention::new(Arc::clone(&self.request.plan.resources))
     }
 
     pub(super) fn lock_authority_source(

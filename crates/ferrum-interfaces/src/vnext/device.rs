@@ -4,7 +4,7 @@ use std::error::Error;
 use std::num::NonZeroU64;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use super::{
@@ -467,6 +467,38 @@ pub struct BufferDescriptor {
     pub alignment_bytes: u64,
     pub usage: BufferUsage,
     pub element_type: ElementType,
+}
+
+/// Opaque core ownership retained by backend commands that outlive the
+/// borrowed buffer view used to encode them. Backends may clone and store this
+/// value, but cannot inspect or manufacture resource ownership.
+#[derive(Clone)]
+pub struct DeviceBufferRetention {
+    _primary_owner: Arc<dyn Send + Sync + 'static>,
+    _secondary_owner: Option<Arc<dyn Send + Sync + 'static>>,
+}
+
+impl DeviceBufferRetention {
+    pub(crate) fn new<T>(owner: Arc<T>) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        Self {
+            _primary_owner: owner,
+            _secondary_owner: None,
+        }
+    }
+
+    pub(crate) fn pair<T, U>(primary_owner: Arc<T>, secondary_owner: Arc<U>) -> Self
+    where
+        T: Send + Sync + 'static,
+        U: Send + Sync + 'static,
+    {
+        Self {
+            _primary_owner: primary_owner,
+            _secondary_owner: Some(secondary_owner),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

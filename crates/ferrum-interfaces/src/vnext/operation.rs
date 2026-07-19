@@ -13,14 +13,14 @@ use super::{
     BatchParticipantTokenRange, BatchStepId, BatchWorkShape, BufferDescriptor, BufferUsage,
     CanonicalRational, CapabilityId, CompletionHandle, CompletionReaper, ContractVersion,
     DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
-    DeviceCommandBatch, DeviceId, DeviceRuntime, DeviceSubmissionStage, DeviceSubmissionTimingSink,
-    DeviceTimingMode, DynamicResourceDemand, DynamicResourceShape, EncodedDeviceOperation,
-    ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane,
-    ExecutionLaneId, HostTransferLayout, IdentifiedFailure, IndeterminateSubmissionHandle,
-    InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView, LogicalAdmissionCoordinatorId,
-    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId, NodeInvocationId,
-    NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId, PlanNode,
-    PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
+    DeviceBufferRetention, DeviceCommandBatch, DeviceId, DeviceRuntime, DeviceSubmissionStage,
+    DeviceSubmissionTimingSink, DeviceTimingMode, DynamicResourceDemand, DynamicResourceShape,
+    EncodedDeviceOperation, ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts,
+    ExecutionLane, ExecutionLaneId, HostTransferLayout, IdentifiedFailure,
+    IndeterminateSubmissionHandle, InvocationResourceLease, LaneSubmitOutcome, LeasedBufferView,
+    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId,
+    NodeInvocationId, NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
+    PlanNode, PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
     ProviderWorkspaceRequirement, QuantizationFormatId, ResourceId, SemanticValue,
     SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint, SpanId,
     StepParticipantFrameAssignment, StepResourceLease, TrustedActiveSequenceBinding,
@@ -2426,7 +2426,10 @@ pub enum OperationBufferStorageKind {
 }
 
 enum OperationBufferSource<'a, B> {
-    Static(LeasedBufferView<'a, B>),
+    Static {
+        view: LeasedBufferView<'a, B>,
+        retention: DeviceBufferRetention,
+    },
     Backing(LogicalBackingBufferView<'a, B>),
 }
 
@@ -2438,11 +2441,11 @@ enum OperationBufferCoverage {
     BackingPrefix,
 }
 
-#[derive(Clone, Copy)]
 enum OperationRegionSource<'a, B> {
     Contiguous {
         buffer: &'a B,
         physical_base_offset_bytes: u64,
+        retention: DeviceBufferRetention,
     },
     Paged {
         bindings: &'a [LogicalBackingSegmentBinding<B>],
@@ -2476,23 +2479,25 @@ impl<'a, B> OperationBufferRegions<'a, B> {
             .logical_offset_bytes
             .checked_add(self.logical_length_bytes)
             .expect("validated operation logical range does not overflow");
-        match self.source {
+        match &self.source {
             OperationRegionSource::Contiguous {
                 buffer,
                 physical_base_offset_bytes,
+                retention,
             } => OperationBufferRegionIter {
                 state: OperationBufferRegionIterState::Contiguous(Some(OperationPhysicalRegion {
-                    buffer,
+                    buffer: *buffer,
                     logical_offset_bytes: self.logical_offset_bytes,
                     physical_offset_bytes: physical_base_offset_bytes
                         .checked_add(self.logical_offset_bytes)
                         .expect("validated contiguous physical range does not overflow"),
                     length_bytes: self.logical_length_bytes,
+                    retention: retention.clone(),
                 })),
             },
             OperationRegionSource::Paged { bindings } => OperationBufferRegionIter {
                 state: OperationBufferRegionIterState::Paged {
-                    bindings,
+                    bindings: *bindings,
                     requested_start_bytes: self.logical_offset_bytes,
                     requested_end_bytes: logical_end_bytes,
                     next_segment: 0,
@@ -2510,6 +2515,7 @@ pub struct OperationPhysicalRegion<'a, B> {
     logical_offset_bytes: u64,
     physical_offset_bytes: u64,
     length_bytes: u64,
+    retention: DeviceBufferRetention,
 }
 
 impl<'a, B> OperationPhysicalRegion<'a, B> {
@@ -2521,7 +2527,9 @@ impl<'a, B> OperationPhysicalRegion<'a, B> {
         self.length_bytes
     }
 
-    pub fn buffer_and_physical_range(&self) -> (&'a B, std::ops::Range<u64>) {
+    pub fn buffer_and_physical_range(
+        &self,
+    ) -> (&'a B, std::ops::Range<u64>, DeviceBufferRetention) {
         (
             self.buffer,
             self.physical_offset_bytes
@@ -2529,6 +2537,7 @@ impl<'a, B> OperationPhysicalRegion<'a, B> {
                     .physical_offset_bytes
                     .checked_add(self.length_bytes)
                     .expect("validated physical region does not overflow"),
+            self.retention.clone(),
         )
     }
 }
@@ -2565,6 +2574,7 @@ impl<'a, B> Iterator for OperationBufferRegionIter<'a, B> {
                     *next_segment += 1;
                     let (segment_logical_end, region) = translate_paged_segment(
                         binding.buffer(),
+                        binding.retention(),
                         binding.segment().offset_bytes(),
                         binding.segment().length_bytes(),
                         *next_segment_logical_offset_bytes,
@@ -2584,6 +2594,7 @@ impl<'a, B> Iterator for OperationBufferRegionIter<'a, B> {
 
 fn translate_paged_segment<'a, B>(
     buffer: &'a B,
+    retention: DeviceBufferRetention,
     physical_offset_bytes: u64,
     length_bytes: u64,
     logical_start_bytes: u64,
@@ -2602,6 +2613,7 @@ fn translate_paged_segment<'a, B>(
             .checked_add(translated_start - logical_start_bytes)
             .expect("validated paged physical range does not overflow"),
         length_bytes: translated_end - translated_start,
+        retention,
     });
     (logical_end_bytes, region)
 }
@@ -2686,7 +2698,7 @@ impl<'a, B> OperationBufferView<'a, B> {
 
     pub fn storage_kind(&self) -> OperationBufferStorageKind {
         match &self.source {
-            OperationBufferSource::Static(_) => OperationBufferStorageKind::StaticContiguous,
+            OperationBufferSource::Static { .. } => OperationBufferStorageKind::StaticContiguous,
             OperationBufferSource::Backing(view) => {
                 operation_storage_kind(view.storage_profile().view())
             }
@@ -2707,13 +2719,14 @@ impl<'a, B> OperationBufferView<'a, B> {
             ));
         }
         match &self.source {
-            OperationBufferSource::Static(view) => Ok(OperationBufferRegions {
+            OperationBufferSource::Static { view, retention } => Ok(OperationBufferRegions {
                 storage_kind: OperationBufferStorageKind::StaticContiguous,
                 logical_offset_bytes,
                 logical_length_bytes,
                 source: OperationRegionSource::Contiguous {
                     buffer: view.buffer(),
                     physical_base_offset_bytes: 0,
+                    retention: retention.clone(),
                 },
             }),
             OperationBufferSource::Backing(view) => {
@@ -2744,6 +2757,7 @@ impl<'a, B> OperationBufferView<'a, B> {
                         OperationRegionSource::Contiguous {
                             buffer: binding.buffer(),
                             physical_base_offset_bytes: binding.segment().offset_bytes(),
+                            retention: binding.retention(),
                         }
                     }
                     OperationBufferStorageKind::DynamicPaged => {
@@ -2878,6 +2892,7 @@ mod operation_buffer_region_tests {
             .filter_map(|binding| {
                 let (logical_end, region) = translate_paged_segment(
                     binding.buffer,
+                    DeviceBufferRetention::new(Arc::new(())),
                     binding.physical_offset_bytes,
                     binding.length_bytes,
                     next_logical_offset,
@@ -2890,11 +2905,12 @@ mod operation_buffer_region_tests {
             .collect::<Vec<_>>();
 
         assert_eq!(translated.len(), 2);
-        let (first, first_physical) = translated[0].buffer_and_physical_range();
+        let (first, first_physical, _first_retention) = translated[0].buffer_and_physical_range();
         assert!(std::ptr::eq(first, &first_buffer));
         assert_eq!(translated[0].logical_offset_bytes(), 6);
         assert_eq!(first_physical, 70..72);
-        let (second, second_physical) = translated[1].buffer_and_physical_range();
+        let (second, second_physical, _second_retention) =
+            translated[1].buffer_and_physical_range();
         assert!(std::ptr::eq(second, &second_buffer));
         assert_eq!(translated[1].logical_offset_bytes(), 8);
         assert_eq!(second_physical, 200..208);
@@ -2977,15 +2993,53 @@ mod operation_buffer_region_tests {
             source: OperationRegionSource::Contiguous {
                 buffer: &buffer,
                 physical_base_offset_bytes: 4096,
+                retention: DeviceBufferRetention::new(Arc::new(())),
             },
         };
 
         let translated = regions.iter().collect::<Vec<_>>();
         assert_eq!(translated.len(), 1);
-        let (actual, physical) = translated[0].buffer_and_physical_range();
+        let (actual, physical, _retention) = translated[0].buffer_and_physical_range();
         assert_eq!(*actual, buffer);
         assert_eq!(translated[0].logical_offset_bytes(), 16);
         assert_eq!(physical, 4112..4144);
+    }
+
+    #[test]
+    fn physical_region_retains_opaque_owner_after_translation_source_drops() {
+        struct DropOwner(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropOwner {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let buffer = 9_u8;
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owner = Arc::new(DropOwner(Arc::clone(&dropped)));
+        let regions = OperationBufferRegions {
+            storage_kind: OperationBufferStorageKind::DynamicContiguous,
+            logical_offset_bytes: 0,
+            logical_length_bytes: 8,
+            source: OperationRegionSource::Contiguous {
+                buffer: &buffer,
+                physical_base_offset_bytes: 64,
+                retention: DeviceBufferRetention::new(Arc::clone(&owner)),
+            },
+        };
+        drop(owner);
+
+        let translated = regions.iter().collect::<Vec<_>>();
+        drop(regions);
+        assert!(!dropped.load(Ordering::Acquire));
+        let (_, physical, retention) = translated[0].buffer_and_physical_range();
+        assert_eq!(physical, 64..72);
+        drop(translated);
+        assert!(!dropped.load(Ordering::Acquire));
+
+        drop(retention);
+        assert!(dropped.load(Ordering::Acquire));
     }
 }
 
@@ -3941,7 +3995,10 @@ impl<'a, B> OperationInvocation<'a, B> {
                     let leased = lease.plan_static_view(slot_index, allocation)?;
                     views.push(OperationBufferView {
                         descriptor: leased.committed_descriptor().clone(),
-                        source: OperationBufferSource::Static(leased),
+                        source: OperationBufferSource::Static {
+                            view: leased,
+                            retention: participant.device_buffer_retention(),
+                        },
                         coverage: OperationBufferCoverage::Exact,
                     });
                 }
@@ -4029,7 +4086,9 @@ impl<'a, B> OperationInvocation<'a, B> {
 
         for view in &views {
             match &view.source {
-                OperationBufferSource::Static(static_view) => {
+                OperationBufferSource::Static {
+                    view: static_view, ..
+                } => {
                     let actual = runtime.buffer_descriptor(static_view.buffer());
                     if Some(static_view.identity()) != lease_identity
                         || &actual != static_view.committed_descriptor()
