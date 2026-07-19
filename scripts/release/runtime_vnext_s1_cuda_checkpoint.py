@@ -21,6 +21,8 @@ from typing import Any
 
 PASS_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA TRACE CHECKPOINT PASS"
 BASIC_SLICE_PASS_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA BASIC SLICE PASS"
+PREFILL_REPLAY_PASS_PREFIX = "FERRUM RUNTIME VNEXT PREFILL REPLAY CHECKPOINT PASS"
+PREFILL_REPLAY_FAIL_PREFIX = "FERRUM RUNTIME VNEXT PREFILL REPLAY CHECKPOINT FAIL"
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 REQUIRED_EVENTS = {
@@ -473,6 +475,116 @@ def validate_collection_manifest(root: Path, source_sha: str) -> dict[str, Any] 
         "collection used hidden Ferrum environment overrides",
     )
     return collection
+
+
+def phase_reusable_execution(metrics: dict[str, Any], phase: str) -> dict[str, Any]:
+    try:
+        reusable = metrics["wave_timing_by_phase"][phase]["host_encode_submit"][
+            "host_encode_submit_breakdown"
+        ]["provider_encode_submit_breakdown"]["lane_reserve_submit_arm_breakdown"][
+            "device_runtime_submit_breakdown"
+        ]["reusable_execution"]
+    except (KeyError, TypeError) as error:
+        raise ValidationError(f"missing {phase} reusable-execution metrics") from error
+    require(isinstance(reusable, dict), f"{phase} reusable-execution metrics are malformed")
+    return reusable
+
+
+def validate_prefill_replay(root: Path) -> dict[str, Any]:
+    health = read_json(root / "serve" / "health.after-bench.json")
+    try:
+        metrics = health["cache"]["prefix_cache"]
+        startup = metrics["startup_preparation"]
+        report = startup["report"]
+    except (KeyError, TypeError) as error:
+        raise ValidationError("serve health is missing typed startup preparation") from error
+    require(startup.get("state") == "ready", "typed startup preparation is not ready")
+
+    requested_prefill = report.get("requested_prefill_token_counts")
+    prepared_prefill = report.get("prepared_prefill_token_counts")
+    require(
+        isinstance(requested_prefill, list)
+        and requested_prefill
+        and all(isinstance(value, int) and not isinstance(value, bool) and value > 0 for value in requested_prefill),
+        "startup requested no positive prefill descriptors",
+    )
+    require(
+        requested_prefill == sorted(set(requested_prefill), reverse=True),
+        "startup prefill descriptors are not unique largest-first capacities",
+    )
+    require(
+        prepared_prefill == requested_prefill,
+        "startup did not prepare every requested prefill descriptor",
+    )
+    descriptors = report.get("prepared_descriptors")
+    require(isinstance(descriptors, list), "startup prepared descriptors are missing")
+    descriptor_capacities = sorted(
+        (
+            descriptor.get("token_capacity"),
+            descriptor.get("request_capacity"),
+        )
+        for descriptor in descriptors
+        if isinstance(descriptor, dict) and descriptor.get("topology") == "prefill"
+    )
+    require(
+        descriptor_capacities == sorted((token_count, 1) for token_count in prepared_prefill),
+        "typed prefill descriptor topology/capacity differs from the prepared plan",
+    )
+
+    preparation = report.get("device_preparation")
+    require(isinstance(preparation, dict), "device preparation receipt is missing")
+    require(preparation.get("state") == "ready", "device preparation receipt is not ready")
+    for field in ("captured_executables", "uploaded_executables", "resident_executables"):
+        require(
+            isinstance(preparation.get(field), int)
+            and not isinstance(preparation[field], bool)
+            and preparation[field] > 0,
+            f"device preparation {field} is not positive",
+        )
+    require(
+        preparation["captured_executables"]
+        == preparation["uploaded_executables"]
+        == preparation["resident_executables"],
+        "device preparation capture/upload/resident counts differ",
+    )
+    require(
+        preparation.get("capacity_deferred_executables") == 0
+        and preparation.get("rejected_executables") == 0,
+        "device preparation deferred or rejected an executable",
+    )
+
+    prefill = phase_reusable_execution(metrics, "prefill")
+    decode = phase_reusable_execution(metrics, "decode")
+    require(prefill.get("candidate_segments", 0) > 0, "request path observed no prefill segments")
+    require(prefill.get("replayed_segments", 0) > 0, "request path replayed no prefill segments")
+    require(prefill.get("captured_segments") == 0, "request path captured a prefill executable")
+    require(
+        prefill.get("capacity_deferred_segments") == 0
+        and prefill.get("capture_rejected_segments") == 0,
+        "request path deferred or rejected a prefill executable",
+    )
+    require(
+        prefill.get("replayed_segments", 0) + prefill.get("outside_preparation_segments", 0)
+        == prefill["candidate_segments"],
+        "prefill replay/eager fallback accounting does not cover every candidate segment",
+    )
+    require(decode.get("candidate_segments", 0) > 0, "request path observed no decode segments")
+    require(
+        decode.get("replayed_segments") == decode["candidate_segments"],
+        "request path did not replay every decode segment",
+    )
+    require(decode.get("captured_segments") == 0, "request path captured a decode executable")
+    require(
+        decode.get("outside_preparation_segments") == 0,
+        "request path used an unprepared decode segment",
+    )
+    return {
+        "schema_version": 1,
+        "artifact_type": "runtime_vnext_prefill_replay_checkpoint",
+        "status": "pass",
+        "startup_preparation": report,
+        "request_phase_reusable_execution": {"prefill": prefill, "decode": decode},
+    }
 
 
 def validate(root: Path, expected_git_sha: str | None) -> dict[str, Any]:
@@ -1265,6 +1377,28 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
 
 
+def reusable_execution_fixture(
+    candidate_segments: int,
+    replayed_segments: int,
+    outside_preparation_segments: int,
+) -> dict[str, Any]:
+    return {
+        "candidate_segments": candidate_segments,
+        "captured_segments": 0,
+        "uploaded_segments": 0,
+        "cache_hit_segments": replayed_segments,
+        "cached_rejected_segments": 0,
+        "capture_rejected_segments": 0,
+        "quiescence_deferred_segments": 0,
+        "capacity_deferred_segments": 0,
+        "outside_preparation_segments": outside_preparation_segments,
+        "evicted_segments": 0,
+        "replayed_segments": replayed_segments,
+        "replayed_commands": replayed_segments * 4,
+        "eager_commands": outside_preparation_segments * 4,
+    }
+
+
 def create_selftest_fixture(root: Path) -> None:
     (root / "run").mkdir(parents=True)
     (root / "serve").mkdir()
@@ -1350,6 +1484,64 @@ def create_selftest_fixture(root: Path) -> None:
             }
         )
         + "\n"
+    )
+    phase_metrics = {
+        "prefill": reusable_execution_fixture(64, 32, 32),
+        "decode": reusable_execution_fixture(128, 128, 0),
+    }
+    write_json(
+        root / "serve" / "health.after-bench.json",
+        {
+            "cache": {
+                "prefix_cache": {
+                    "startup_preparation": {
+                        "state": "ready",
+                        "report": {
+                            "requested_prefill_token_counts": [64],
+                            "prepared_prefill_token_counts": [64],
+                            "prepared_descriptors": [
+                                {
+                                    "topology": "uniform_decode",
+                                    "query_tokens_per_sequence": 1,
+                                    "token_capacity": 32,
+                                    "request_capacity": 32,
+                                },
+                                {
+                                    "topology": "prefill",
+                                    "token_capacity": 64,
+                                    "request_capacity": 1,
+                                },
+                            ],
+                            "device_preparation": {
+                                "state": "ready",
+                                "maximum_executables": 917,
+                                "captured_executables": 224,
+                                "uploaded_executables": 224,
+                                "resident_executables": 224,
+                                "capacity_deferred_executables": 0,
+                                "rejected_executables": 0,
+                            },
+                        },
+                    },
+                    "wave_timing_by_phase": {
+                        phase: {
+                            "host_encode_submit": {
+                                "host_encode_submit_breakdown": {
+                                    "provider_encode_submit_breakdown": {
+                                        "lane_reserve_submit_arm_breakdown": {
+                                            "device_runtime_submit_breakdown": {
+                                                "reusable_execution": reusable
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        for phase, reusable in phase_metrics.items()
+                    },
+                }
+            }
+        },
     )
 
 
@@ -1468,6 +1660,28 @@ def self_test() -> int:
             require("provider_id" in str(error), "self-test rejected mutation for wrong reason")
         else:
             raise ValidationError("self-test missing-provider mutation unexpectedly passed")
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-prefill-replay-") as temp:
+        root = Path(temp)
+        create_selftest_fixture(root)
+        validate_prefill_replay(root)
+        health = read_json(root / "serve" / "health.after-bench.json")
+        health["cache"]["prefix_cache"]["wave_timing_by_phase"]["prefill"][
+            "host_encode_submit"
+        ]["host_encode_submit_breakdown"]["provider_encode_submit_breakdown"][
+            "lane_reserve_submit_arm_breakdown"
+        ]["device_runtime_submit_breakdown"]["reusable_execution"][
+            "replayed_segments"
+        ] = 0
+        write_json(root / "serve" / "health.after-bench.json", health)
+        try:
+            validate_prefill_replay(root)
+        except ValidationError as error:
+            require(
+                "replayed no prefill" in str(error),
+                "prefill replay mutation failed for the wrong reason",
+            )
+        else:
+            raise ValidationError("zero prefill replay mutation unexpectedly passed")
     with tempfile.TemporaryDirectory(prefix="runtime-vnext-s1-telemetry-") as temp:
         directory = Path(temp) / "off1"
         create_telemetry_selftest_fixture(directory)
@@ -1500,6 +1714,7 @@ def main() -> int:
     parser.add_argument("artifact_dir", nargs="?", type=Path)
     parser.add_argument("--expected-git-sha")
     parser.add_argument("--require-bounded-overhead", action="store_true")
+    parser.add_argument("--require-prefill-replay", action="store_true")
     parser.add_argument("--out", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -1508,6 +1723,10 @@ def main() -> int:
             return self_test()
         require(args.artifact_dir is not None, "artifact_dir is required")
         summary = validate(args.artifact_dir, args.expected_git_sha)
+        require(
+            not (args.require_bounded_overhead and args.require_prefill_replay),
+            "prefill replay and bounded overhead are separate checkpoint lanes",
+        )
         if args.require_bounded_overhead:
             require(args.out is not None, "--out is required with --require-bounded-overhead")
             performance = validate_profile_overhead(args.artifact_dir.resolve())
@@ -1518,17 +1737,27 @@ def main() -> int:
                 performance,
             )
             return 0
-        require(args.out is None, "--out requires --require-bounded-overhead")
+        if args.require_prefill_replay:
+            require(args.out is None, "--out is not used by the prefill replay checkpoint")
+            prefill_replay = validate_prefill_replay(args.artifact_dir.resolve())
+            prefill_replay["source_git_sha"] = summary["source_git_sha"]
+            prefill_replay["binary_sha256"] = summary["binary_sha256"]
+            output = args.artifact_dir.resolve() / "prefill-replay-validation.json"
+            write_json(output, prefill_replay)
+            print(f"{PREFILL_REPLAY_PASS_PREFIX}: {args.artifact_dir.resolve()}")
+            return 0
+        require(args.out is None, "--out requires a specialized checkpoint lane")
         output = args.artifact_dir.resolve() / "validation.json"
         write_json(output, summary)
         print(f"{PASS_PREFIX}: {args.artifact_dir.resolve()}")
         return 0
     except (OSError, ValidationError) as error:
-        fail_prefix = (
-            "FERRUM RUNTIME VNEXT S1 CUDA BASIC SLICE FAIL"
-            if args.require_bounded_overhead
-            else "FERRUM RUNTIME VNEXT S1 CUDA TRACE CHECKPOINT FAIL"
-        )
+        if args.require_bounded_overhead:
+            fail_prefix = "FERRUM RUNTIME VNEXT S1 CUDA BASIC SLICE FAIL"
+        elif args.require_prefill_replay:
+            fail_prefix = PREFILL_REPLAY_FAIL_PREFIX
+        else:
+            fail_prefix = "FERRUM RUNTIME VNEXT S1 CUDA TRACE CHECKPOINT FAIL"
         print(f"{fail_prefix}: {error}", file=sys.stderr)
         return 1
 
