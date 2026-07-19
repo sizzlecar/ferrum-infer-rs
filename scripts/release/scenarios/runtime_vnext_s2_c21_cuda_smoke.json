@@ -1,0 +1,20 @@
+{
+  "backend": "cuda",
+  "ferrum_bin": "target/release/ferrum",
+  "model": "Qwen/Qwen3.5-4B",
+  "schema_version": 1,
+  "server": {
+    "mode": "external"
+  },
+  "timeout_sec": 180,
+  "scenarios": [
+    {
+      "name": "c21_required_tool_schema_priority",
+      "type": "serve_tool_schema_priority",
+      "case_count": 4,
+      "enable_thinking": false,
+      "marker_prefix": "vnext-c21",
+      "max_tokens": 256
+    }
+  ]
+}
