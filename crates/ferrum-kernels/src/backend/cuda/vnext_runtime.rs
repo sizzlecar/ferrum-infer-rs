@@ -17,8 +17,8 @@ use cudarc::cublas::{result::CublasError, CudaBlas};
 use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DriverError};
 use ferrum_interfaces::vnext::{
     BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceBufferRetention,
-    DeviceClass, DeviceCommandBatch, DeviceCommandEntry, DeviceCommandPhase, DeviceDescriptor,
-    DeviceErrorReport, DeviceExecutionTiming, DeviceId, DeviceReusableAddressScope,
+    DeviceClass, DeviceCommandBatch, DeviceCommandEntry, DeviceDescriptor, DeviceErrorReport,
+    DeviceExecutionTiming, DeviceId, DeviceReusableAddressScope,
     DeviceReusableExecutionObservation, DeviceReusableExecutionTrim, DeviceRuntime,
     DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt,
     DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
@@ -26,7 +26,7 @@ use ferrum_interfaces::vnext::{
     FenceQuery, HostTransferLayout, StreamState, VNextError,
 };
 
-use super::vnext_replay::{CudaCommandReplayKey, CudaExecutableCache, CudaExecutablePreparation};
+use super::vnext_replay::{cuda_executable_candidates, CudaCommandReplayKey, CudaExecutableCache};
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
 static NEXT_STREAM_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -1176,64 +1176,63 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 error,
             )));
         }
-        let mut capture_allowed = stream.state.is_quiescent();
+        let executable_candidates = match cuda_executable_candidates(&command_phases, &commands) {
+            Ok(candidates) => candidates,
+            Err(error) => return Err(DefinitelyNotSubmitted::new(error)),
+        };
+        let capture_allowed = stream.state.is_quiescent();
         if let Err(error) = stream.state.begin_submission() {
             return Err(DefinitelyNotSubmitted::new(error));
         }
         let mut replay_observation = DeviceReusableExecutionObservation::default();
-        let mut segment_start = 0;
-        while segment_start < commands.len() {
-            let Some(segment_end) =
-                replayable_segment_end(&command_phases, &commands, segment_start)
-            else {
-                segment_start += 1;
-                continue;
-            };
-            if S::ENABLED {
+        if S::ENABLED {
+            for _ in &executable_candidates {
                 replay_observation.observe_candidate_segment();
             }
-            let preparation = stream.executable_cache.prepare(
-                &self.context,
-                &stream.stream,
-                &stream.blas,
-                &commands[segment_start..segment_end],
-                capture_allowed,
-            );
-            match preparation {
-                Ok(CudaExecutablePreparation::Captured) => {
-                    // Graph upload has now queued stream work. Existing cache
-                    // hits remain replayable, but another capture or eviction
-                    // must wait for a later physically quiescent submission.
-                    capture_allowed = false;
-                    if S::ENABLED {
-                        replay_observation.observe_captured_segment();
-                    }
+        }
+        let preparation = stream.executable_cache.prepare_all(
+            &self.context,
+            &stream.stream,
+            &stream.blas,
+            &commands,
+            &executable_candidates,
+            capture_allowed,
+        );
+        match preparation {
+            Ok(preparation) if S::ENABLED => {
+                for _ in 0..preparation.captured_segments() {
+                    replay_observation.observe_captured_segment();
                 }
-                Ok(CudaExecutablePreparation::CacheHit) => {
-                    if S::ENABLED {
-                        replay_observation.observe_cache_hit_segment();
-                    }
+                for _ in 0..preparation.uploaded_segments() {
+                    replay_observation.observe_uploaded_segment();
                 }
-                Ok(CudaExecutablePreparation::Unavailable) => {}
-                Err(error) => {
-                    if !error.eager_fallback_safe() {
-                        stream.state.fail();
-                        self.quarantine(stream, commands);
-                        panic!(
-                            "CUDA submission became indeterminate while preparing a reusable executable: {error}"
-                        );
-                    }
-                    if S::ENABLED {
-                        replay_observation.observe_capture_rejection();
-                    }
-                    tracing::debug!(
-                        error = %error,
-                        command_count = segment_end - segment_start,
-                        "CUDA reusable executable capture rejected; using eager fallback"
-                    );
+                for _ in 0..preparation.cache_hit_segments() {
+                    replay_observation.observe_cache_hit_segment();
+                }
+                for _ in 0..preparation.cached_rejected_segments() {
+                    replay_observation.observe_cached_rejected_segment();
+                }
+                for _ in 0..preparation.capture_rejected_segments() {
+                    replay_observation.observe_capture_rejection();
+                }
+                for _ in 0..preparation.quiescence_deferred_segments() {
+                    replay_observation.observe_quiescence_deferred_segment();
+                }
+                for _ in 0..preparation.capacity_deferred_segments() {
+                    replay_observation.observe_capacity_deferred_segment();
+                }
+                for _ in 0..preparation.evicted_segments() {
+                    replay_observation.observe_evicted_segment();
                 }
             }
-            segment_start = segment_end;
+            Ok(_) => {}
+            Err(error) => {
+                stream.state.fail();
+                self.quarantine(stream, commands);
+                panic!(
+                    "CUDA submission became indeterminate while preparing reusable executables: {error}"
+                );
+            }
         }
         drop(validate_stage);
 
@@ -1256,14 +1255,20 @@ impl DeviceRuntime for CudaDeviceRuntime {
         let enqueue_stage =
             CudaSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::EnqueueCommands);
         let mut index = 0;
+        let mut executable_candidate_index = 0;
         while index < commands.len() {
-            let replayed_end =
-                replayable_segment_end(&command_phases, &commands, index).and_then(|segment_end| {
-                    match stream
-                        .executable_cache
-                        .launch(&stream.stream, &commands[index..segment_end])
-                    {
-                        Ok(true) => Some(Ok(segment_end)),
+            while executable_candidates
+                .get(executable_candidate_index)
+                .is_some_and(|candidate| candidate.start() < index)
+            {
+                executable_candidate_index += 1;
+            }
+            let replayed_end = executable_candidates
+                .get(executable_candidate_index)
+                .filter(|candidate| candidate.start() == index)
+                .and_then(|candidate| {
+                    match stream.executable_cache.launch(&stream.stream, candidate) {
+                        Ok(true) => Some(Ok(candidate.end())),
                         Ok(false) => None,
                         Err(error) => Some(Err(error)),
                     }
@@ -1473,24 +1478,4 @@ impl DeviceRuntime for CudaDeviceRuntime {
         };
         DeviceErrorReport::new(code, error.to_string(), retryable)
     }
-}
-
-fn replayable_segment_end(
-    phases: &[DeviceCommandPhase],
-    commands: &[CudaDeviceCommand],
-    start: usize,
-) -> Option<usize> {
-    if phases.get(start) != Some(&DeviceCommandPhase::Compute)
-        || commands.get(start)?.replay_key().is_none()
-    {
-        return None;
-    }
-    let mut end = start + 1;
-    while end < commands.len()
-        && phases.get(end) == Some(&DeviceCommandPhase::Compute)
-        && commands[end].replay_key().is_some()
-    {
-        end += 1;
-    }
-    Some(end)
 }

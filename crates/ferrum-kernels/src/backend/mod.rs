@@ -13,6 +13,9 @@ pub use types::*;
 
 mod capabilities;
 
+#[cfg(any(feature = "cuda", test))]
+mod reusable_execution;
+
 mod kv_layer;
 pub use kv_layer::*;
 
