@@ -167,6 +167,107 @@ fn execution_memory_is_core_owned_and_exact() {
 }
 
 #[test]
+fn reusable_execution_workspace_is_core_derived_plan_data() {
+    let registry = TestRegistry::new();
+    let family = registry.prepare();
+    let catalog = catalog();
+    let reusable_execution = ReusableExecutionPolicy::new(
+        2,
+        vec![
+            ReusableExecutionBucketSpec::new(
+                ReusableExecutionClassId::new("execution.test-token").unwrap(),
+                ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
+            )
+            .unwrap(),
+            ReusableExecutionBucketSpec::new(
+                ReusableExecutionClassId::new("execution.test-token").unwrap(),
+                ReusableExecutionCapacity::new(1, 64, 1).unwrap(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let policy = ResolvedRuntimePolicy::new(
+        "runtime-policy.reusable-test",
+        ContractVersion::new(2, 0),
+        SchedulingDiscipline::FirstReady,
+        RuntimeMemoryPolicy {
+            capacity_bytes: 4096,
+            reserve_bytes: 128,
+            maximum_active_sequences: 3,
+            dynamic_storage_profile_order: vec![contiguous_storage_profile()],
+        },
+        serde_json::from_value(json!({
+            "maximum_queue_depth": 8,
+            "maximum_scheduled_tokens": 4096,
+            "sequence_fit_policy": "immediate_only",
+            "allow_defer": true,
+            "cancellation_check_interval_steps": 1
+        }))
+        .unwrap(),
+        Some(reusable_execution),
+    )
+    .unwrap();
+    let planning = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::Correct);
+    let node_resolutions = vec![node_resolution(&family, &catalog, &policy, 0, &planning)];
+    let plan = ExecutionPlan::build(
+        PlanBuildRequest::new(&family, &catalog, &policy, node_resolutions.clone()).unwrap(),
+    )
+    .unwrap();
+    let memory = plan.payload().memory();
+    let reusable = memory
+        .reusable_execution()
+        .expect("reusable execution memory plan");
+
+    assert_eq!(reusable.maximum_reusable_lanes(), 2);
+    assert_eq!(reusable.buckets().len(), 2);
+    assert_eq!(
+        reusable.maximum_device_executables(),
+        u64::try_from(plan.payload().nodes().len()).unwrap() * 2 * 2
+    );
+    assert!(reusable
+        .buckets()
+        .iter()
+        .all(|bucket| !bucket.pool_budgets().is_empty()));
+
+    let reusable_bytes = memory
+        .dynamic_pools()
+        .iter()
+        .map(|pool| u128::from(pool.reusable_workspace_ceiling_bytes()))
+        .sum::<u128>();
+    let live_dynamic_bytes = memory
+        .dynamic_pools()
+        .iter()
+        .map(DynamicBackingPoolSpec::theoretical_ceiling_bytes)
+        .sum::<u128>();
+    assert!(reusable_bytes > 0);
+    assert_eq!(
+        memory.theoretical_ceiling_bytes(),
+        u128::from(memory.static_bytes()) + live_dynamic_bytes + reusable_bytes
+    );
+    for pool in memory.dynamic_pools() {
+        assert!(
+            u128::from(pool.provisioning().maximum_resident_bytes())
+                <= pool.theoretical_ceiling_bytes()
+                    + u128::from(pool.reusable_workspace_ceiling_bytes())
+        );
+    }
+
+    let mut tampered = serde_json::to_value(&plan).unwrap();
+    tampered["payload"]["memory"]["reusable_execution"]["maximum_device_executables"] =
+        json!(reusable.maximum_device_executables() + 1);
+    rehash_plan_json(&mut tampered);
+    assert!(ExecutionPlan::from_json_validated(
+        &serde_json::to_vec(&tampered).unwrap(),
+        &family,
+        &catalog,
+        &policy,
+        node_resolutions,
+    )
+    .is_err());
+}
+
+#[test]
 fn minimum_runnable_sums_lifetime_minima_and_sequential_invocation_peak() {
     let registration = TypedFamilyRegistration::new(SequentialScratchFamily);
     let family = registration.prepare(&json!({"width": 4})).unwrap();

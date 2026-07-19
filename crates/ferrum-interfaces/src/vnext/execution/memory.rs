@@ -4,10 +4,11 @@ use super::{
     validate_pool_liveness_rows, workspace_storage_layout_fingerprint, AllocationKind,
     AllocationLifetime, BTreeMap, BTreeSet, BufferRequest, BufferUsage, CanonicalU128, Deserialize,
     Deserializer, DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicResourceDemand,
-    DynamicResourceDescriptor, ElementType, InvocationLivenessMode, InvocationResourceLiveness,
-    NodeId, PlanNode, PoolAggregateEvidence, PoolCompatibilityKey, ResourceAllocation, ResourceId,
-    Serialize, StepResourceSlot, StepResourceSlotKind, VNextError,
-    MAX_EXECUTION_PLAN_RESOURCE_ROWS,
+    DynamicResourceDescriptor, DynamicResourceShape, ElementType, InvocationLivenessMode,
+    InvocationResourceLiveness, NodeId, PlanNode, PoolAggregateEvidence, PoolCompatibilityKey,
+    ResolvedReusableExecutionBucket, ResourceAllocation, ResourceId, ReusableExecutionMemoryPlan,
+    ReusableExecutionPolicy, ReusablePoolWorkspaceBudget, Serialize, StepResourceSlot,
+    StepResourceSlotKind, VNextError, MAX_EXECUTION_PLAN_RESOURCE_ROWS,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -27,6 +28,7 @@ pub struct MemoryPlan {
     pub(super) static_allocations: Vec<ResourceAllocation>,
     pub(super) dynamic_descriptors: Vec<DynamicResourceDescriptor>,
     pub(super) dynamic_pools: Vec<DynamicBackingPoolSpec>,
+    pub(super) reusable_execution: Option<ReusableExecutionMemoryPlan>,
     pub(super) invocation_liveness_mode: InvocationLivenessMode,
     pub(super) invocation_liveness: Vec<InvocationResourceLiveness>,
 }
@@ -40,6 +42,7 @@ impl MemoryPlan {
         mut static_allocations: Vec<ResourceAllocation>,
         mut dynamic_descriptors: Vec<DynamicResourceDescriptor>,
         nodes: &[PlanNode],
+        reusable_execution_policy: Option<&ReusableExecutionPolicy>,
     ) -> Result<Self, VNextError> {
         if static_allocations.len() + dynamic_descriptors.len() > MAX_EXECUTION_PLAN_RESOURCE_ROWS {
             return Err(invalid_plan(format!(
@@ -62,8 +65,29 @@ impl MemoryPlan {
         let dynamic_capacity_bytes = usable_capacity_bytes
             .checked_sub(static_bytes)
             .ok_or_else(|| invalid_plan("static memory exceeds usable capacity"))?;
-        let dynamic_pools =
+        let base_dynamic_pools =
             Self::derive_dynamic_pools(&dynamic_descriptors, nodes, dynamic_capacity_bytes)?;
+        let reusable_execution = reusable_execution_policy
+            .map(|policy| {
+                Self::derive_reusable_execution(
+                    policy,
+                    nodes.len(),
+                    &dynamic_descriptors,
+                    &base_dynamic_pools,
+                )
+            })
+            .transpose()?;
+        let reusable_workspace_ceilings = reusable_execution
+            .as_ref()
+            .map(ReusableExecutionMemoryPlan::pool_workspace_ceilings)
+            .transpose()?
+            .unwrap_or_default();
+        let dynamic_pools = Self::derive_dynamic_pools_with_reusable(
+            &dynamic_descriptors,
+            nodes,
+            dynamic_capacity_bytes,
+            &reusable_workspace_ceilings,
+        )?;
         let (invocation_liveness_mode, invocation_liveness) =
             Self::summarize_pool_invocation_liveness(&dynamic_pools)?;
         let minimum_request_bytes = dynamic_pools.iter().try_fold(0_u64, |total, pool| {
@@ -96,6 +120,9 @@ impl MemoryPlan {
             dynamic_pools.iter().try_fold(0_u128, |total, pool| {
                 total
                     .checked_add(pool.theoretical_ceiling_bytes.get())
+                    .and_then(|bytes| {
+                        bytes.checked_add(u128::from(pool.reusable_workspace_ceiling_bytes))
+                    })
                     .ok_or_else(|| invalid_plan("dynamic theoretical total overflows u128"))
             })?;
         let theoretical_ceiling_bytes = u128::from(static_bytes)
@@ -125,6 +152,7 @@ impl MemoryPlan {
             static_allocations,
             dynamic_descriptors,
             dynamic_pools,
+            reusable_execution,
             invocation_liveness_mode,
             invocation_liveness,
         };
@@ -238,8 +266,26 @@ impl MemoryPlan {
                 )
                 .ok_or_else(|| invalid_plan("dynamic ceiling total overflows u128"))?;
         }
+        let reusable_workspace_ceilings = self
+            .reusable_execution
+            .as_ref()
+            .map(|plan| {
+                plan.validate_local()?;
+                plan.pool_workspace_ceilings()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let actual_reusable_workspace =
+            reusable_workspace_ceilings
+                .values()
+                .try_fold(0_u128, |total, bytes| {
+                    total
+                        .checked_add(u128::from(*bytes))
+                        .ok_or_else(|| invalid_plan("reusable workspace total overflows u128"))
+                })?;
         let actual_theoretical = u128::from(actual_static)
             .checked_add(actual_theoretical_dynamic)
+            .and_then(|bytes| bytes.checked_add(actual_reusable_workspace))
             .ok_or_else(|| invalid_plan("theoretical plan ceiling overflows u128"))?;
         let dynamic_capacity_bytes = self
             .usable_capacity_bytes
@@ -249,6 +295,7 @@ impl MemoryPlan {
             &self.dynamic_pools,
             &dynamic_by_id,
             dynamic_capacity_bytes,
+            &reusable_workspace_ceilings,
         )?;
         let (actual_liveness_mode, actual_liveness) =
             Self::summarize_pool_invocation_liveness(&self.dynamic_pools)?;
@@ -269,6 +316,7 @@ impl MemoryPlan {
             .and_then(|bytes| bytes.checked_add(actual_invocation_peak))
             .ok_or_else(|| invalid_plan("minimum runnable request bytes overflow u64"))?;
         if aggregate.theoretical_ceiling_bytes != actual_theoretical_dynamic
+            || aggregate.reusable_workspace_ceiling_bytes != actual_reusable_workspace
             || actual_request_minimum != self.minimum_request_bytes
             || actual_sequence_minimum != self.minimum_sequence_bytes
             || actual_step_minimum != self.minimum_step_bytes
@@ -290,6 +338,20 @@ impl MemoryPlan {
         dynamic_descriptors: &[DynamicResourceDescriptor],
         nodes: &[PlanNode],
         dynamic_capacity_bytes: u64,
+    ) -> Result<Vec<DynamicBackingPoolSpec>, VNextError> {
+        Self::derive_dynamic_pools_with_reusable(
+            dynamic_descriptors,
+            nodes,
+            dynamic_capacity_bytes,
+            &BTreeMap::new(),
+        )
+    }
+
+    pub(super) fn derive_dynamic_pools_with_reusable(
+        dynamic_descriptors: &[DynamicResourceDescriptor],
+        nodes: &[PlanNode],
+        dynamic_capacity_bytes: u64,
+        reusable_workspace_ceilings: &BTreeMap<DynamicBackingPoolId, u64>,
     ) -> Result<Vec<DynamicBackingPoolSpec>, VNextError> {
         let mut groups = BTreeMap::<
             DynamicBackingPoolId,
@@ -324,7 +386,7 @@ impl MemoryPlan {
             }
         }
 
-        groups
+        let pools = groups
             .into_values()
             .map(|(compatibility, mut descriptors)| {
                 descriptors
@@ -363,6 +425,11 @@ impl MemoryPlan {
                     })?;
                 let (invocation_liveness_mode, invocation_liveness, invocation_peak) =
                     Self::derive_pool_invocation_liveness(nodes, &descriptors)?;
+                let pool_id = DynamicBackingPoolId::from_compatibility(&compatibility)?;
+                let reusable_workspace_ceiling_bytes = reusable_workspace_ceilings
+                    .get(&pool_id)
+                    .copied()
+                    .unwrap_or(0);
                 DynamicBackingPoolSpec::from_core(
                     compatibility,
                     resource_ids,
@@ -372,12 +439,145 @@ impl MemoryPlan {
                     invocation_peak,
                     step_resource_slots,
                     theoretical_ceiling_bytes,
+                    reusable_workspace_ceiling_bytes,
                     dynamic_capacity_bytes,
                     invocation_liveness_mode,
                     invocation_liveness,
                 )
             })
-            .collect()
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        if reusable_workspace_ceilings
+            .keys()
+            .any(|pool_id| !pools.iter().any(|pool| &pool.pool_id == pool_id))
+        {
+            return Err(invalid_plan(
+                "reusable workspace ceiling references an unknown dynamic pool",
+            ));
+        }
+        Ok(pools)
+    }
+
+    pub(super) fn derive_reusable_execution(
+        policy: &ReusableExecutionPolicy,
+        node_count: usize,
+        dynamic_descriptors: &[DynamicResourceDescriptor],
+        base_pools: &[DynamicBackingPoolSpec],
+    ) -> Result<ReusableExecutionMemoryPlan, VNextError> {
+        policy.validate()?;
+        let node_count = u64::try_from(node_count)
+            .ok()
+            .filter(|count| *count > 0)
+            .ok_or_else(|| invalid_plan("reusable execution requires at least one plan node"))?;
+        let bucket_count = u64::try_from(policy.buckets().len())
+            .map_err(|_| invalid_plan("reusable execution bucket count exceeds u64"))?;
+        let maximum_device_executables = node_count
+            .checked_mul(bucket_count)
+            .and_then(|count| count.checked_mul(u64::from(policy.maximum_reusable_lanes())))
+            .ok_or_else(|| invalid_plan("reusable device executable count overflows u64"))?;
+        let descriptors = dynamic_descriptors
+            .iter()
+            .map(|descriptor| (descriptor.base_resource_id.clone(), descriptor))
+            .collect::<BTreeMap<_, _>>();
+        let mut buckets = Vec::with_capacity(policy.buckets().len());
+        for bucket in policy.buckets() {
+            let capacity = bucket.capacity();
+            let shape = DynamicResourceShape::from_validated(
+                capacity.maximum_sequences(),
+                capacity.maximum_tokens(),
+                capacity.maximum_pages(),
+            );
+            let mut pool_budgets = Vec::new();
+            for pool in base_pools {
+                let step_bytes = Self::reusable_step_bytes_for_shape(pool, &descriptors, shape)?;
+                let invocation_bytes =
+                    Self::reusable_invocation_bytes_for_shape(pool, &descriptors, shape)?;
+                if step_bytes != 0 || invocation_bytes != 0 {
+                    pool_budgets.push(ReusablePoolWorkspaceBudget::new(
+                        pool.pool_id.clone(),
+                        step_bytes,
+                        invocation_bytes,
+                    )?);
+                }
+            }
+            buckets.push(ResolvedReusableExecutionBucket::new(
+                bucket.clone(),
+                pool_budgets,
+            )?);
+        }
+        ReusableExecutionMemoryPlan::new(
+            policy.maximum_reusable_lanes(),
+            maximum_device_executables,
+            buckets,
+        )
+    }
+
+    fn reusable_step_bytes_for_shape(
+        pool: &DynamicBackingPoolSpec,
+        descriptors: &BTreeMap<ResourceId, &DynamicResourceDescriptor>,
+        shape: DynamicResourceShape,
+    ) -> Result<u64, VNextError> {
+        pool.step_resource_slots
+            .iter()
+            .try_fold(0_u64, |total, slot| {
+                let slot_bytes =
+                    slot.resource_ids
+                        .iter()
+                        .try_fold(0_u64, |maximum, resource_id| {
+                            let descriptor = descriptors.get(resource_id).ok_or_else(|| {
+                                invalid_plan(
+                                    "reusable Step slot references a missing dynamic descriptor",
+                                )
+                            })?;
+                            Ok::<u64, VNextError>(
+                                maximum.max(descriptor.evaluate_request_bytes_for_shape(shape)?),
+                            )
+                        })?;
+                total
+                    .checked_add(slot_bytes)
+                    .ok_or_else(|| invalid_plan("reusable Step workspace budget overflows u64"))
+            })
+    }
+
+    fn reusable_invocation_bytes_for_shape(
+        pool: &DynamicBackingPoolSpec,
+        descriptors: &BTreeMap<ResourceId, &DynamicResourceDescriptor>,
+        shape: DynamicResourceShape,
+    ) -> Result<u64, VNextError> {
+        let row_bytes = |row: &InvocationResourceLiveness| {
+            row.resource_ids
+                .iter()
+                .try_fold(0_u64, |total, resource_id| {
+                    total
+                        .checked_add(
+                            descriptors
+                                .get(resource_id)
+                                .ok_or_else(|| {
+                                    invalid_plan(
+                                        "reusable invocation row references a missing descriptor",
+                                    )
+                                })?
+                                .evaluate_request_bytes_for_shape(shape)?,
+                        )
+                        .ok_or_else(|| invalid_plan("reusable invocation row budget overflows u64"))
+                })
+        };
+        match pool.invocation_liveness_mode {
+            InvocationLivenessMode::NoInvocationResources => Ok(0),
+            InvocationLivenessMode::TotalOrderReuse => pool
+                .invocation_liveness
+                .iter()
+                .try_fold(0_u64, |maximum, row| {
+                    Ok::<u64, VNextError>(maximum.max(row_bytes(row)?))
+                }),
+            InvocationLivenessMode::ConservativeConcurrent => pool
+                .invocation_liveness
+                .iter()
+                .try_fold(0_u64, |total, row| {
+                    total.checked_add(row_bytes(row)?).ok_or_else(|| {
+                        invalid_plan("reusable concurrent invocation budget overflows u64")
+                    })
+                }),
+        }
     }
 
     pub(super) fn derive_pool_step_slots(
@@ -648,6 +848,7 @@ impl MemoryPlan {
         pools: &[DynamicBackingPoolSpec],
         descriptors: &BTreeMap<ResourceId, &DynamicResourceDescriptor>,
         dynamic_capacity_bytes: u64,
+        reusable_workspace_ceilings: &BTreeMap<DynamicBackingPoolId, u64>,
     ) -> Result<PoolAggregateEvidence, VNextError> {
         let mut expected_members =
             BTreeMap::<DynamicBackingPoolId, (PoolCompatibilityKey, Vec<ResourceId>)>::new();
@@ -681,6 +882,14 @@ impl MemoryPlan {
         if pools.len() != expected_members.len() {
             return Err(invalid_plan(
                 "dynamic backing pool count is not derived from descriptors",
+            ));
+        }
+        if reusable_workspace_ceilings
+            .keys()
+            .any(|pool_id| !expected_members.contains_key(pool_id))
+        {
+            return Err(invalid_plan(
+                "reusable workspace ceiling references an unknown dynamic pool",
             ));
         }
         let mut aggregate = PoolAggregateEvidence::default();
@@ -767,14 +976,22 @@ impl MemoryPlan {
                 &invocation_ids,
                 descriptors,
             )?;
+            let reusable_workspace_ceiling_bytes = reusable_workspace_ceilings
+                .get(&pool.pool_id)
+                .copied()
+                .unwrap_or(0);
+            let combined_ceiling = theoretical
+                .checked_add(u128::from(reusable_workspace_ceiling_bytes))
+                .ok_or_else(|| invalid_plan("pool combined ceiling overflows u128"))?;
             let maximum_resident =
-                u64::try_from(theoretical.min(u128::from(dynamic_capacity_bytes)))
+                u64::try_from(combined_ceiling.min(u128::from(dynamic_capacity_bytes)))
                     .map_err(|_| invalid_plan("pool resident ceiling exceeds u64"))?;
             if pool.minimum_request_bytes != request
                 || pool.minimum_sequence_bytes != sequence
                 || pool.minimum_step_bytes != step
                 || pool.minimum_invocation_peak_bytes != invocation_peak
                 || pool.theoretical_ceiling_bytes.get() != theoretical
+                || pool.reusable_workspace_ceiling_bytes != reusable_workspace_ceiling_bytes
                 || pool.provisioning.maximum_resident_bytes != maximum_resident
             {
                 return Err(invalid_plan(
@@ -896,10 +1113,9 @@ impl MemoryPlan {
         &self.invocation_liveness
     }
 
-    /// Conservative checked evidence across provider formula maxima and the
-    /// protocol ceiling. It is never a reservation, admission target, or
-    /// claim. Invocation concurrency is described separately by the checked
-    /// liveness mode instead of assuming every node is mutually exclusive.
+    /// Conservative checked evidence across static allocations, live provider
+    /// formula maxima, reusable execution workspace, and the protocol ceiling.
+    /// It is never itself a reservation, admission target, or performance claim.
     pub fn theoretical_ceiling_bytes(&self) -> u128 {
         self.theoretical_ceiling_bytes.get()
     }
@@ -914,6 +1130,10 @@ impl MemoryPlan {
 
     pub fn dynamic_pools(&self) -> &[DynamicBackingPoolSpec] {
         &self.dynamic_pools
+    }
+
+    pub fn reusable_execution(&self) -> Option<&ReusableExecutionMemoryPlan> {
+        self.reusable_execution.as_ref()
     }
 
     pub fn static_buffer_requests(&self) -> Result<Vec<BufferRequest>, VNextError> {
@@ -942,6 +1162,7 @@ pub(super) struct MemoryPlanWire {
     pub(super) static_allocations: Vec<ResourceAllocation>,
     pub(super) dynamic_descriptors: Vec<DynamicResourceDescriptor>,
     pub(super) dynamic_pools: Vec<DynamicBackingPoolSpec>,
+    pub(super) reusable_execution: Option<ReusableExecutionMemoryPlan>,
     pub(super) invocation_liveness_mode: InvocationLivenessMode,
     pub(super) invocation_liveness: Vec<InvocationResourceLiveness>,
 }
@@ -968,6 +1189,7 @@ impl<'de> Deserialize<'de> for MemoryPlan {
             static_allocations: wire.static_allocations,
             dynamic_descriptors: wire.dynamic_descriptors,
             dynamic_pools: wire.dynamic_pools,
+            reusable_execution: wire.reusable_execution,
             invocation_liveness_mode: wire.invocation_liveness_mode,
             invocation_liveness: wire.invocation_liveness,
         };

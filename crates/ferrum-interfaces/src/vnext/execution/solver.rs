@@ -209,6 +209,7 @@ pub(super) struct PoolAggregateEvidence {
     pub(super) minimum_step_bytes: u64,
     pub(super) minimum_invocation_peak_bytes: u64,
     pub(super) theoretical_ceiling_bytes: u128,
+    pub(super) reusable_workspace_ceiling_bytes: u128,
 }
 
 impl PoolAggregateEvidence {
@@ -233,6 +234,10 @@ impl PoolAggregateEvidence {
             .theoretical_ceiling_bytes
             .checked_add(pool.theoretical_ceiling_bytes.get())
             .ok_or_else(|| invalid_plan("aggregate pool theoretical ceiling overflows u128"))?;
+        self.reusable_workspace_ceiling_bytes = self
+            .reusable_workspace_ceiling_bytes
+            .checked_add(u128::from(pool.reusable_workspace_ceiling_bytes))
+            .ok_or_else(|| invalid_plan("aggregate reusable workspace ceiling overflows u128"))?;
         Ok(())
     }
 }

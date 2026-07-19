@@ -1,5 +1,6 @@
 use super::{
-    canonical_fingerprint, invalid_plan, Deserialize, Deserializer, Serialize, VNextError,
+    canonical_fingerprint, invalid_plan, BTreeMap, Deserialize, Deserializer, DynamicBackingPoolId,
+    Serialize, VNextError,
 };
 
 pub const MAX_REUSABLE_EXECUTION_BUCKETS: usize = 64;
@@ -322,6 +323,261 @@ impl<'de> Deserialize<'de> for ReusableExecutionPolicy {
         };
         policy.validate().map_err(serde::de::Error::custom)?;
         Ok(policy)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReusablePoolWorkspaceBudget {
+    pool_id: DynamicBackingPoolId,
+    step_bytes: u64,
+    invocation_bytes: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReusablePoolWorkspaceBudgetWire {
+    pool_id: DynamicBackingPoolId,
+    step_bytes: u64,
+    invocation_bytes: u64,
+}
+
+impl ReusablePoolWorkspaceBudget {
+    pub(crate) fn new(
+        pool_id: DynamicBackingPoolId,
+        step_bytes: u64,
+        invocation_bytes: u64,
+    ) -> Result<Self, VNextError> {
+        let budget = Self {
+            pool_id,
+            step_bytes,
+            invocation_bytes,
+        };
+        budget.validate()?;
+        Ok(budget)
+    }
+
+    fn validate(&self) -> Result<(), VNextError> {
+        self.step_bytes
+            .checked_add(self.invocation_bytes)
+            .filter(|total| *total > 0)
+            .ok_or_else(|| {
+                invalid_plan("reusable pool workspace budget is empty or overflows u64")
+            })?;
+        Ok(())
+    }
+
+    pub fn pool_id(&self) -> &DynamicBackingPoolId {
+        &self.pool_id
+    }
+
+    pub const fn step_bytes(&self) -> u64 {
+        self.step_bytes
+    }
+
+    pub const fn invocation_bytes(&self) -> u64 {
+        self.invocation_bytes
+    }
+
+    pub fn total_bytes(&self) -> Result<u64, VNextError> {
+        self.step_bytes
+            .checked_add(self.invocation_bytes)
+            .ok_or_else(|| invalid_plan("reusable pool workspace budget overflows u64"))
+    }
+}
+
+impl<'de> Deserialize<'de> for ReusablePoolWorkspaceBudget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ReusablePoolWorkspaceBudgetWire::deserialize(deserializer)?;
+        Self::new(wire.pool_id, wire.step_bytes, wire.invocation_bytes)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedReusableExecutionBucket {
+    bucket: ReusableExecutionBucketSpec,
+    pool_budgets: Vec<ReusablePoolWorkspaceBudget>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedReusableExecutionBucketWire {
+    bucket: ReusableExecutionBucketSpec,
+    pool_budgets: Vec<ReusablePoolWorkspaceBudget>,
+}
+
+impl ResolvedReusableExecutionBucket {
+    pub(crate) fn new(
+        bucket: ReusableExecutionBucketSpec,
+        pool_budgets: Vec<ReusablePoolWorkspaceBudget>,
+    ) -> Result<Self, VNextError> {
+        let resolved = Self {
+            bucket,
+            pool_budgets,
+        };
+        resolved.validate()?;
+        Ok(resolved)
+    }
+
+    fn validate(&self) -> Result<(), VNextError> {
+        self.bucket.validate()?;
+        if self
+            .pool_budgets
+            .windows(2)
+            .any(|pair| pair[0].pool_id() >= pair[1].pool_id())
+        {
+            return Err(invalid_plan(
+                "resolved reusable bucket pool budgets are duplicate or non-canonical",
+            ));
+        }
+        for budget in &self.pool_budgets {
+            budget.validate()?;
+        }
+        Ok(())
+    }
+
+    pub fn bucket(&self) -> &ReusableExecutionBucketSpec {
+        &self.bucket
+    }
+
+    pub fn pool_budgets(&self) -> &[ReusablePoolWorkspaceBudget] {
+        &self.pool_budgets
+    }
+}
+
+impl<'de> Deserialize<'de> for ResolvedReusableExecutionBucket {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ResolvedReusableExecutionBucketWire::deserialize(deserializer)?;
+        Self::new(wire.bucket, wire.pool_budgets).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReusableExecutionMemoryPlan {
+    maximum_reusable_lanes: u32,
+    maximum_device_executables: u64,
+    buckets: Vec<ResolvedReusableExecutionBucket>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReusableExecutionMemoryPlanWire {
+    maximum_reusable_lanes: u32,
+    maximum_device_executables: u64,
+    buckets: Vec<ResolvedReusableExecutionBucket>,
+}
+
+impl ReusableExecutionMemoryPlan {
+    pub(crate) fn new(
+        maximum_reusable_lanes: u32,
+        maximum_device_executables: u64,
+        buckets: Vec<ResolvedReusableExecutionBucket>,
+    ) -> Result<Self, VNextError> {
+        let plan = Self {
+            maximum_reusable_lanes,
+            maximum_device_executables,
+            buckets,
+        };
+        plan.validate_local()?;
+        Ok(plan)
+    }
+
+    pub(crate) fn validate_local(&self) -> Result<(), VNextError> {
+        if self.maximum_reusable_lanes == 0
+            || self.maximum_device_executables == 0
+            || self.buckets.is_empty()
+            || self.buckets.len() > MAX_REUSABLE_EXECUTION_BUCKETS
+        {
+            return Err(invalid_plan(
+                "reusable execution memory plan has an invalid lane, executable, or bucket count",
+            ));
+        }
+        for bucket in &self.buckets {
+            bucket.validate()?;
+        }
+        let canonical = ReusableExecutionPolicy::new(
+            self.maximum_reusable_lanes,
+            self.buckets
+                .iter()
+                .map(|bucket| bucket.bucket().clone())
+                .collect(),
+        )?;
+        if canonical.buckets().iter().ne(self
+            .buckets
+            .iter()
+            .map(ResolvedReusableExecutionBucket::bucket))
+        {
+            return Err(invalid_plan(
+                "reusable execution memory buckets are non-canonical",
+            ));
+        }
+        Ok(())
+    }
+
+    pub const fn maximum_reusable_lanes(&self) -> u32 {
+        self.maximum_reusable_lanes
+    }
+
+    pub const fn maximum_device_executables(&self) -> u64 {
+        self.maximum_device_executables
+    }
+
+    pub fn buckets(&self) -> &[ResolvedReusableExecutionBucket] {
+        &self.buckets
+    }
+
+    pub(crate) fn policy(&self) -> Result<ReusableExecutionPolicy, VNextError> {
+        ReusableExecutionPolicy::new(
+            self.maximum_reusable_lanes,
+            self.buckets
+                .iter()
+                .map(|bucket| bucket.bucket().clone())
+                .collect(),
+        )
+    }
+
+    pub(crate) fn pool_workspace_ceilings(
+        &self,
+    ) -> Result<BTreeMap<DynamicBackingPoolId, u64>, VNextError> {
+        let lanes = u64::from(self.maximum_reusable_lanes);
+        let mut totals = BTreeMap::new();
+        for bucket in &self.buckets {
+            for budget in bucket.pool_budgets() {
+                let bytes = budget
+                    .total_bytes()?
+                    .checked_mul(lanes)
+                    .ok_or_else(|| invalid_plan("reusable lane workspace budget overflows u64"))?;
+                let total = totals.entry(budget.pool_id().clone()).or_insert(0_u64);
+                *total = total
+                    .checked_add(bytes)
+                    .ok_or_else(|| invalid_plan("reusable pool workspace ceiling overflows u64"))?;
+            }
+        }
+        Ok(totals)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReusableExecutionMemoryPlan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ReusableExecutionMemoryPlanWire::deserialize(deserializer)?;
+        Self::new(
+            wire.maximum_reusable_lanes,
+            wire.maximum_device_executables,
+            wire.buckets,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
