@@ -5073,7 +5073,7 @@ fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
     let mut emitter = ExecutionEventEmitter::new(&sink, run_id.clone(), request_id.clone());
     emitter
         .emit(
-            &event,
+            event,
             &TrustedExecutionEventContext::pre_plan(&run_id, &request_id),
         )
         .unwrap();
@@ -5098,6 +5098,47 @@ fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
 }
 
 #[test]
+fn scheduler_trace_journal_preserves_ready_and_deferred_fifo_order() {
+    let trace_path = resource_trace_temp_path("vnext-deferred-fifo");
+    let _ = std::fs::remove_file(&trace_path);
+    let journal = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
+    let config = EngineConfig::default();
+    let sink =
+        VNextProfileExecutionEventSink::new(journal.clone(), ProfileEntrypoint::Run, &config);
+    let (_, _, accepted) = vnext_profile_test_event();
+    let operation = vnext_profile_test_operation_event();
+
+    journal
+        .enqueue(sink.profile_event(&accepted).unwrap())
+        .unwrap();
+    sink.enqueue_events(vec![operation]).unwrap();
+    journal
+        .enqueue(sink.profile_event(&accepted).unwrap())
+        .unwrap();
+    journal.flush().unwrap();
+
+    let phases = std::fs::read_to_string(&trace_path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<FerrumProfileEvent>(line)
+                .unwrap()
+                .phase
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        phases,
+        [
+            "vnext.request_accepted",
+            "vnext.operation_submitted",
+            "vnext.request_accepted",
+        ]
+    );
+
+    let _ = std::fs::remove_file(trace_path);
+}
+
+#[test]
 #[ignore = "release-mode diagnostic for the canonical trace producer"]
 fn vnext_profile_event_producer_cost_probe() {
     const EVENTS_PER_FRAME: usize = 399;
@@ -5112,6 +5153,7 @@ fn vnext_profile_event_producer_cost_probe() {
     let event = vnext_profile_test_operation_event();
     let mut materialize_nanos = Vec::with_capacity(SAMPLE_COUNT);
     let mut enqueue_nanos = Vec::with_capacity(SAMPLE_COUNT);
+    let mut deferred_enqueue_nanos = Vec::with_capacity(SAMPLE_COUNT);
 
     for _ in 0..SAMPLE_COUNT {
         let started = std::time::Instant::now();
@@ -5131,11 +5173,22 @@ fn vnext_profile_event_producer_cost_probe() {
         enqueue_nanos.push(started.elapsed().as_nanos());
     }
 
+    let deferred_batches = (0..SAMPLE_COUNT)
+        .map(|_| vec![event.clone(); EVENTS_PER_FRAME])
+        .collect::<Vec<_>>();
+    for events in deferred_batches {
+        let started = std::time::Instant::now();
+        sink.enqueue_events(std::hint::black_box(events))
+            .expect("deferred profile batch enqueue must succeed");
+        deferred_enqueue_nanos.push(started.elapsed().as_nanos());
+    }
+
     let started = std::time::Instant::now();
     journal.flush().unwrap();
     let drain_nanos = started.elapsed().as_nanos();
     materialize_nanos.sort_unstable();
     enqueue_nanos.sort_unstable();
+    deferred_enqueue_nanos.sort_unstable();
     let median_index = SAMPLE_COUNT / 2;
     let receipt = serde_json::json!({
         "schema_version": 1,
@@ -5147,6 +5200,9 @@ fn vnext_profile_event_producer_cost_probe() {
         "materialize_validate_median_ns_per_event": materialize_nanos[median_index]
             / EVENTS_PER_FRAME as u128,
         "enqueue_median_ns_per_frame": enqueue_nanos[median_index],
+        "deferred_capture_enqueue_median_ns_per_frame": deferred_enqueue_nanos[median_index],
+        "producer_cost_reduction_ratio": materialize_nanos[median_index] as f64
+            / deferred_enqueue_nanos[median_index] as f64,
         "writer_drain_ns": drain_nanos,
         "diagnostic_only": true,
     });

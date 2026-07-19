@@ -423,14 +423,14 @@ pub(crate) fn emit_pre_active_prefix(
     let accepted = accepted_event(active.run_id(), active.request_id());
     emitter
         .emit(
-            &accepted,
+            accepted.clone(),
             &TrustedExecutionEventContext::pre_plan(active.run_id(), active.request_id()),
         )
         .unwrap();
     let planned = plan_event(plan, active.run_id(), active.request_id());
     emitter
         .emit(
-            &planned,
+            planned.clone(),
             &TrustedExecutionEventContext::bound(
                 active.run_id(),
                 active.request_id(),
@@ -473,7 +473,7 @@ pub(crate) fn live_witness_emitter_contract(
         passed,
         emitter
             .emit(
-                &frame,
+                frame.clone(),
                 &TrustedExecutionEventContext::active(
                     active.run_id(),
                     active.request_id(),
@@ -520,7 +520,7 @@ pub(crate) fn live_witness_emitter_contract(
         passed,
         emitter
             .emit(
-                &frame,
+                frame.clone(),
                 &TrustedExecutionEventContext::active(
                     active.run_id(),
                     active.request_id(),
@@ -564,7 +564,7 @@ pub(crate) fn live_witness_emitter_contract(
         passed,
         emitter
             .emit(
-                &frame,
+                frame.clone(),
                 &TrustedExecutionEventContext::active(
                     active.run_id(),
                     active.request_id(),
@@ -605,7 +605,7 @@ pub(crate) fn live_witness_emitter_contract(
         passed,
         emitter
             .emit(
-                &frame,
+                frame.clone(),
                 &TrustedExecutionEventContext::active(
                     active.run_id(),
                     active.request_id(),
@@ -658,7 +658,7 @@ pub(crate) fn live_witness_emitter_contract(
     ] {
         emitter
             .emit(
-                &event,
+                event.clone(),
                 &TrustedExecutionEventContext::active(
                     active.run_id(),
                     active.request_id(),
@@ -697,7 +697,7 @@ pub(crate) fn live_witness_emitter_contract(
     .unwrap();
     emitter
         .emit(
-            &first_operation,
+            first_operation.clone(),
             &TrustedExecutionEventContext::operation_submitted(
                 active.run_id(),
                 active.request_id(),
@@ -724,7 +724,7 @@ pub(crate) fn live_witness_emitter_contract(
     );
     emitter
         .emit(
-            &first_retired,
+            first_retired.clone(),
             &TrustedExecutionEventContext::node_retired(
                 active.run_id(),
                 active.request_id(),
@@ -747,7 +747,7 @@ pub(crate) fn live_witness_emitter_contract(
     );
     emitter
         .emit(
-            &second_started,
+            second_started.clone(),
             &TrustedExecutionEventContext::active(
                 active.run_id(),
                 active.request_id(),
@@ -785,7 +785,7 @@ pub(crate) fn live_witness_emitter_contract(
     session.request_cancel().unwrap();
     emitter
         .emit(
-            &second_operation,
+            second_operation.clone(),
             &TrustedExecutionEventContext::operation_submitted(
                 active.run_id(),
                 active.request_id(),
@@ -812,7 +812,7 @@ pub(crate) fn live_witness_emitter_contract(
     );
     emitter
         .emit(
-            &second_retired,
+            second_retired.clone(),
             &TrustedExecutionEventContext::node_retired(
                 active.run_id(),
                 active.request_id(),
@@ -833,7 +833,7 @@ pub(crate) fn live_witness_emitter_contract(
     );
     emitter
         .emit(
-            &frame_completed,
+            frame_completed.clone(),
             &TrustedExecutionEventContext::active(
                 active.run_id(),
                 active.request_id(),
@@ -882,7 +882,7 @@ pub(crate) fn live_witness_emitter_contract(
     );
     emitter
         .emit(
-            &frame,
+            frame.clone(),
             &TrustedExecutionEventContext::active(
                 active.run_id(),
                 active.request_id(),
@@ -907,7 +907,7 @@ pub(crate) fn live_witness_emitter_contract(
         passed,
         emitter
             .emit(
-                &node,
+                node.clone(),
                 &TrustedExecutionEventContext::active(
                     active.run_id(),
                     active.request_id(),
@@ -951,7 +951,7 @@ pub(crate) fn live_witness_emitter_contract(
         passed,
         emitter
             .emit(
-                &frame,
+                frame.clone(),
                 &TrustedExecutionEventContext::active(
                     active.run_id(),
                     active.request_id(),
