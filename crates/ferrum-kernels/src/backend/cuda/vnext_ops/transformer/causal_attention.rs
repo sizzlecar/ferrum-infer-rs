@@ -24,6 +24,7 @@ use crate::backend::cuda::vnext_ops::{
     binding, contiguous_token_region, contract_error, implementation_fingerprint,
     DENSE_SAFETENSORS_FORMAT_ID, THREADS_PER_BLOCK, VNEXT_KV_PAGE_BYTES,
 };
+use crate::backend::cuda::vnext_replay::CudaCommandReplayKeyBuilder;
 use crate::backend::cuda::vnext_runtime::{
     CudaBufferRegion, CudaDeviceBuffer, CudaDeviceCommand, CudaDeviceRuntime,
     CudaDeviceRuntimeError,
@@ -227,7 +228,12 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_attention(&self.functions, invocation).map_err(|message| {
+        encode_attention(
+            &self.functions,
+            self.descriptor.provider_implementation_fingerprint(),
+            invocation,
+        )
+        .map_err(|message| {
             OperationFailure::new(
                 identity,
                 ProfilePhase::Forward,
@@ -519,6 +525,7 @@ struct CausalAttentionBinding {
 
 fn encode_attention(
     functions: &CausalAttentionFunctions,
+    provider_fingerprint: &str,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, String> {
     if invocation.participants().is_empty()
@@ -676,10 +683,49 @@ fn encode_attention(
     )
     .map_err(|error| error.to_string())?;
 
+    let mut replay_key = CudaCommandReplayKeyBuilder::new(
+        provider_fingerprint,
+        "vnext_causal_paged_attention_compute",
+    )
+    .u64(shape.hidden_size)
+    .u64(shape.query_heads)
+    .u64(shape.key_value_heads)
+    .u64(shape.head_dim)
+    .u64(shape.query_features)
+    .u64(shape.query_projection_features)
+    .u64(shape.kv_features)
+    .u64(shape.rope_dim)
+    .u64(shape.maximum_context_tokens)
+    .f32(shape.epsilon)
+    .f32(shape.rope_theta)
+    .boolean(shape.rope_interleaved)
+    .boolean(shape.output_gate)
+    .u64(total_tokens)
+    .u64(layout.required_bytes)
+    .u64(layout.normalized)
+    .u64(layout.query_raw)
+    .u64(layout.key_raw)
+    .u64(layout.value_raw)
+    .u64(layout.query)
+    .u64(layout.context)
+    .u64(layout.projected)
+    .u64(binding_layout.required_bytes)
+    .u64(binding_layout.slot_bytes)
+    .u64(launches.len() as u64);
+    for launch in &launches {
+        replay_key = replay_key
+            .u64(launch.input_region as u64)
+            .u64(launch.output_region as u64)
+            .u64(launch.binding_offset)
+            .u64(launch.tokens)
+            .i32(launch.tokens_i32);
+    }
+
     let functions = functions.clone();
-    let compute_command = CudaDeviceCommand::operation_with_blas(
+    let compute_command = CudaDeviceCommand::replayable_operation_with_blas(
         "vnext_causal_paged_attention_compute",
         compute_regions,
+        replay_key.finish(),
         move |stream, blas, regions| {
             for launch in &launches {
                 enqueue_attention(
