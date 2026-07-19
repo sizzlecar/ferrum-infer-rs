@@ -41,8 +41,8 @@ impl CompletionHarness {
         let session = resources.open_session().unwrap();
         let active = TrustedActiveSequenceBinding::from_session(&session).unwrap();
         let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
-        let step = begin_single_participant_step(&plan_resources, &batch);
         let lane = ExecutionLane::create(Arc::clone(&runtime)).unwrap();
+        let step = begin_single_participant_step_on_lane(&batch, &lane);
         let reaper = CompletionReaper::new();
         Self {
             registry,
@@ -543,7 +543,7 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
     let second_session = second_resources.open_session().unwrap();
     let second_active = TrustedActiveSequenceBinding::from_session(&second_session).unwrap();
     let second_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&second_session)]).unwrap();
-    let second_step = begin_single_participant_step(&multiple.plan_resources, &second_batch);
+    let second_step = begin_single_participant_step_on_lane(&second_batch, &multiple.lane);
     let first = multiple.dispatch().unwrap();
     let node_id = multiple.plan.payload().nodes()[0].id().clone();
     let provider = multiple
@@ -622,12 +622,12 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
         .expect("multiple-slot harness owns its first step")
         .try_retire_normal()
         .expect("first multiple-slot step is quiescent");
-    multiple.step = Some(begin_single_participant_step(
-        &multiple.plan_resources,
+    multiple.step = Some(begin_single_participant_step_on_lane(
         &multiple.batch,
+        &multiple.lane,
     ));
     assert!(second_step.try_retire_normal().is_ok());
-    let second_step = begin_single_participant_step(&multiple.plan_resources, &second_batch);
+    let second_step = begin_single_participant_step_on_lane(&second_batch, &multiple.lane);
     multiple.set_fence_behavior_for(3, FenceBehavior::Indeterminate);
     multiple.set_fence_behavior_for(4, FenceBehavior::Succeeded);
     let drain_target = multiple.dispatch().unwrap();
@@ -792,57 +792,28 @@ fn completion_reaper_owns_invocations_until_quiescent_terminal(passed: &mut usiz
         "request.device-operation.completion.failed-lane",
     );
     let failed_lane_session = failed_lane_resources.open_session().unwrap();
-    let failed_lane_active =
-        TrustedActiveSequenceBinding::from_session(&failed_lane_session).unwrap();
     let failed_lane_batch =
         ExecutionBatchParticipants::new(vec![Arc::clone(&failed_lane_session)]).unwrap();
-    let failed_lane_step =
-        begin_single_participant_step(&recovered.plan_resources, &failed_lane_batch);
-    let failed_lane_frame = failed_lane_step
-        .participant_frames()
-        .next()
-        .unwrap()
-        .frame_id();
-    let failed_lane_invocation_id = NodeInvocationId::try_from(101).unwrap();
-    let failed_lane_identity = operation_identity(
-        &recovered.plan,
-        &failed_lane_active,
-        failed_lane_frame,
-        failed_lane_invocation_id,
-    );
-    let failed_lane_node = &recovered.plan.payload().nodes()[0];
-    let failed_lane_provider = recovered
-        .registry
-        .bind(&recovered.resolved, failed_lane_node.id())
-        .unwrap();
+    let failed_lane_request = StepResourceAdmissionRequest::new(
+        failed_lane_batch
+            .bind_work_shape(vec![one_token_span()])
+            .unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
     check(
         passed,
         matches!(
-            encode_and_submit_single(
-                &failed_lane_provider,
-                &recovered.resolved,
-                &failed_lane_identity,
-                &failed_lane_frame,
-                &failed_lane_invocation_id,
-                failed_lane_node.id(),
-                &failed_lane_active,
-                admit_single_participant_invocation(
-                    &recovered.plan_resources,
-                    &failed_lane_step,
-                    failed_lane_node.id(),
-                ),
-                &recovered.lane,
-                &recovered.reaper,
-            ),
-            Err(OperationDispatchError::Contract(_))
+            failed_lane_batch.try_begin_step(failed_lane_request, &recovered.lane),
+            Err(VNextError::InvalidExecutionPlan { .. })
         ),
     );
     check(
         passed,
         recovered.runtime_trace.lock().unwrap().submit_calls == 1,
     );
-    assert!(failed_lane_step.try_retire_normal().is_ok());
-    assert!(failed_lane_session.try_complete().is_ok());
+    assert!(failed_lane_session.try_abort_if_quiescent().is_ok());
     drop(failed_lane_batch);
     drop(failed_lane_session);
     drop(failed_lane_resources);

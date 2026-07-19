@@ -70,6 +70,7 @@ fn sequential_scratch_plan() -> (
 
 fn begin_step(
     batch: &ExecutionBatchParticipants<resource_support::TestRuntime>,
+    lane: &Arc<ExecutionLane<resource_support::TestRuntime>>,
 ) -> Arc<StepResourceLease<resource_support::TestRuntime>> {
     let request = StepResourceAdmissionRequest::new(
         batch
@@ -80,7 +81,7 @@ fn begin_step(
     )
     .unwrap();
     for attempt in 0..=3 {
-        match batch.try_begin_step(request.clone()).unwrap() {
+        match batch.try_begin_step(request.clone(), lane).unwrap() {
             StepResourceAdmissionDecision::Admitted(step) => return step,
             StepResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
                 deferred.maintain().unwrap();
@@ -128,11 +129,312 @@ fn prepare_wave(
     unreachable!("bounded wave admission returns or panics")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PhysicalSliceIdentity {
+    resource_id: ResourceId,
+    pool_instance_id: u64,
+    segment_generation: u64,
+    segments: Vec<BackingSegment>,
+    physical_offset_bytes: u64,
+    physical_size_bytes: u64,
+}
+
+fn physical_slice_identities(
+    slices: &[LogicalBackingSliceAuthority],
+) -> Vec<PhysicalSliceIdentity> {
+    slices
+        .iter()
+        .map(|slice| {
+            let evidence = slice.evidence();
+            PhysicalSliceIdentity {
+                resource_id: evidence.resource_id().clone(),
+                pool_instance_id: evidence.pool_instance_id(),
+                segment_generation: evidence.segment_generation(),
+                segments: evidence.segments().to_vec(),
+                physical_offset_bytes: evidence.physical_offset_bytes(),
+                physical_size_bytes: evidence.physical_size_bytes(),
+            }
+        })
+        .collect()
+}
+
+fn assert_physical_identities_do_not_overlap(
+    left: &[PhysicalSliceIdentity],
+    right: &[PhysicalSliceIdentity],
+) {
+    for left in left {
+        for right in right {
+            for left_segment in &left.segments {
+                for right_segment in &right.segments {
+                    if left_segment.chunk() != right_segment.chunk() {
+                        continue;
+                    }
+                    let left_end = left_segment
+                        .offset_bytes()
+                        .checked_add(left_segment.length_bytes())
+                        .unwrap();
+                    let right_end = right_segment
+                        .offset_bytes()
+                        .checked_add(right_segment.length_bytes())
+                        .unwrap();
+                    assert!(
+                        left_end <= right_segment.offset_bytes()
+                            || right_end <= left_segment.offset_bytes(),
+                        "concurrent arena slots overlap one physical extent"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn same_lane_same_shape_reuses_step_and_invocation_physical_generations() {
+    let (plan, registry) = sequential_scratch_plan();
+    let (driver, _trace) = resource_support::configured_driver(&plan, &[], &[]);
+    let lane = ExecutionLane::create(Arc::clone(&driver.runtime)).unwrap();
+    let root = resource_support::plan_runtime(&plan, driver, "lane-arena-reuse");
+    let sequence = resource_support::admit_logical_sequence(
+        &root,
+        "run.lane-arena-reuse",
+        "request.lane-arena-reuse",
+    );
+    let session = sequence.open_session().unwrap();
+    let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+
+    let first_step = begin_step(&batch, &lane);
+    let first_wave = prepare_wave(&plan, &first_step);
+    let first_step_identity = physical_slice_identities(first_step.backing_slices());
+    let first_wave_identity =
+        physical_slice_identities(first_wave.claimed_backing().backing_slices());
+    drop(first_wave);
+    first_step.try_retire_normal().unwrap();
+
+    let second_step = begin_step(&batch, &lane);
+    let second_wave = prepare_wave(&plan, &second_step);
+    assert_eq!(
+        physical_slice_identities(second_step.backing_slices()),
+        first_step_identity
+    );
+    assert_eq!(
+        physical_slice_identities(second_wave.claimed_backing().backing_slices()),
+        first_wave_identity
+    );
+
+    drop(second_wave);
+    second_step.try_retire_normal().unwrap();
+    drop(batch);
+    session.try_complete().unwrap();
+    drop(session);
+    drop(sequence);
+    drop(lane);
+    drop(registry);
+    resource_support::close_plan_runtime(root);
+}
+
+#[test]
+fn same_lane_overlapping_steps_use_disjoint_slots_then_reuse_released_slots() {
+    let (plan, registry) = sequential_scratch_plan();
+    let (driver, _trace) = resource_support::configured_driver(&plan, &[], &[]);
+    let lane = ExecutionLane::create(Arc::clone(&driver.runtime)).unwrap();
+    let root = resource_support::plan_runtime(&plan, driver, "lane-arena-overlap");
+    let first_sequence = resource_support::admit_logical_sequence(
+        &root,
+        "run.lane-arena-overlap.first",
+        "request.lane-arena-overlap.first",
+    );
+    let second_sequence = resource_support::admit_logical_sequence(
+        &root,
+        "run.lane-arena-overlap.second",
+        "request.lane-arena-overlap.second",
+    );
+    let first_session = first_sequence.open_session().unwrap();
+    let second_session = second_sequence.open_session().unwrap();
+    let first_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&first_session)]).unwrap();
+    let second_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&second_session)]).unwrap();
+
+    let first_step = begin_step(&first_batch, &lane);
+    let first_wave = prepare_wave(&plan, &first_step);
+    let first_step_identity = physical_slice_identities(first_step.backing_slices());
+    let first_wave_identity =
+        physical_slice_identities(first_wave.claimed_backing().backing_slices());
+
+    let second_step = begin_step(&second_batch, &lane);
+    let second_wave = prepare_wave(&plan, &second_step);
+    let second_step_identity = physical_slice_identities(second_step.backing_slices());
+    let second_wave_identity =
+        physical_slice_identities(second_wave.claimed_backing().backing_slices());
+    assert_physical_identities_do_not_overlap(&first_step_identity, &second_step_identity);
+    assert_physical_identities_do_not_overlap(&first_wave_identity, &second_wave_identity);
+
+    drop(first_wave);
+    first_step.try_retire_normal().unwrap();
+    let third_step = begin_step(&first_batch, &lane);
+    let third_wave = prepare_wave(&plan, &third_step);
+    assert_eq!(
+        physical_slice_identities(third_step.backing_slices()),
+        first_step_identity,
+        "the first released Step slot must be reusable while another slot remains in flight"
+    );
+    assert_eq!(
+        physical_slice_identities(third_wave.claimed_backing().backing_slices()),
+        first_wave_identity,
+        "the first released Invocation slot must be reusable while another slot remains in flight"
+    );
+
+    drop(third_wave);
+    third_step.try_retire_normal().unwrap();
+    drop(second_wave);
+    second_step.try_retire_normal().unwrap();
+    drop(first_batch);
+    drop(second_batch);
+    first_session.try_complete().unwrap();
+    second_session.try_complete().unwrap();
+    drop(first_session);
+    drop(second_session);
+    drop(first_sequence);
+    drop(second_sequence);
+    drop(lane);
+    drop(registry);
+    resource_support::close_plan_runtime(root);
+}
+
+#[test]
+fn released_lane_slot_wakes_capacity_waiter_and_retries_without_growth() {
+    let (plan, registry) = sequential_scratch_plan();
+    let (driver, _trace) = resource_support::configured_driver(&plan, &[], &[]);
+    let lane = ExecutionLane::create(Arc::clone(&driver.runtime)).unwrap();
+    let root = resource_support::plan_runtime(&plan, driver, "lane-arena-waiter");
+    let first_sequence = resource_support::admit_logical_sequence(
+        &root,
+        "run.lane-arena-waiter.first",
+        "request.lane-arena-waiter.first",
+    );
+    let second_sequence = resource_support::admit_logical_sequence(
+        &root,
+        "run.lane-arena-waiter.second",
+        "request.lane-arena-waiter.second",
+    );
+    let first_session = first_sequence.open_session().unwrap();
+    let second_session = second_sequence.open_session().unwrap();
+    let first_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&first_session)]).unwrap();
+    let second_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&second_session)]).unwrap();
+    let first_step = begin_step(&first_batch, &lane);
+    let first_wave = prepare_wave(&plan, &first_step);
+    let first_wave_identity =
+        physical_slice_identities(first_wave.claimed_backing().backing_slices());
+    let second_step = begin_step(&second_batch, &lane);
+    let requests = submission_requests(&plan, &second_step);
+
+    let deferred = match second_step
+        .try_prepare_submission_wave(requests.clone())
+        .unwrap()
+    {
+        StepSubmissionWaveAdmissionDecision::BackingDeferred(deferred) => deferred,
+        _ => panic!("a busy exact-shape slot with no resident spare must defer"),
+    };
+    let waiter = deferred.register_waiter().unwrap();
+    assert!(!waiter.recheck().unwrap().changed_since_registration());
+
+    drop(first_wave);
+    assert!(
+        waiter.recheck().unwrap().changed_since_registration(),
+        "slot release must wake an already-registered capacity waiter"
+    );
+    drop(waiter);
+    drop(deferred);
+    let second_wave = match second_step.try_prepare_submission_wave(requests).unwrap() {
+        StepSubmissionWaveAdmissionDecision::Prepared(wave) => wave,
+        _ => panic!("released exact-shape slot must be immediately reusable without growth"),
+    };
+    assert_eq!(
+        physical_slice_identities(second_wave.claimed_backing().backing_slices()),
+        first_wave_identity
+    );
+
+    drop(second_wave);
+    first_step.try_retire_normal().unwrap();
+    second_step.try_retire_normal().unwrap();
+    drop(first_batch);
+    drop(second_batch);
+    first_session.try_complete().unwrap();
+    second_session.try_complete().unwrap();
+    drop(first_session);
+    drop(second_session);
+    drop(first_sequence);
+    drop(second_sequence);
+    drop(lane);
+    drop(registry);
+    resource_support::close_plan_runtime(root);
+}
+
+#[test]
+fn concurrent_lanes_receive_disjoint_step_and_invocation_arenas() {
+    let (plan, registry) = sequential_scratch_plan();
+    let (driver, _trace) = resource_support::configured_driver(&plan, &[], &[]);
+    let first_lane = ExecutionLane::create(Arc::clone(&driver.runtime)).unwrap();
+    let second_lane = ExecutionLane::create(Arc::clone(&driver.runtime)).unwrap();
+    let root = resource_support::plan_runtime(&plan, driver, "lane-arena-isolation");
+    let first_sequence = resource_support::admit_logical_sequence(
+        &root,
+        "run.lane-arena-isolation.first",
+        "request.lane-arena-isolation.first",
+    );
+    let second_sequence = resource_support::admit_logical_sequence(
+        &root,
+        "run.lane-arena-isolation.second",
+        "request.lane-arena-isolation.second",
+    );
+    let first_session = first_sequence.open_session().unwrap();
+    let second_session = second_sequence.open_session().unwrap();
+    let first_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&first_session)]).unwrap();
+    let second_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&second_session)]).unwrap();
+
+    let first_step = begin_step(&first_batch, &first_lane);
+    let first_wave = prepare_wave(&plan, &first_step);
+    let second_step = begin_step(&second_batch, &second_lane);
+    let second_wave = prepare_wave(&plan, &second_step);
+    let first_step_identity = physical_slice_identities(first_step.backing_slices());
+    let second_step_identity = physical_slice_identities(second_step.backing_slices());
+    let first_wave_identity =
+        physical_slice_identities(first_wave.claimed_backing().backing_slices());
+    let second_wave_identity =
+        physical_slice_identities(second_wave.claimed_backing().backing_slices());
+    assert!(first_step_identity
+        .iter()
+        .zip(&second_step_identity)
+        .all(|(left, right)| left.segment_generation != right.segment_generation));
+    assert!(first_wave_identity
+        .iter()
+        .zip(&second_wave_identity)
+        .all(|(left, right)| left.segment_generation != right.segment_generation));
+    assert_physical_identities_do_not_overlap(&first_step_identity, &second_step_identity);
+    assert_physical_identities_do_not_overlap(&first_wave_identity, &second_wave_identity);
+
+    drop(first_wave);
+    drop(second_wave);
+    first_step.try_retire_normal().unwrap();
+    second_step.try_retire_normal().unwrap();
+    drop(first_batch);
+    drop(second_batch);
+    first_session.try_complete().unwrap();
+    second_session.try_complete().unwrap();
+    drop(first_session);
+    drop(second_session);
+    drop(first_sequence);
+    drop(second_sequence);
+    drop(first_lane);
+    drop(second_lane);
+    drop(registry);
+    resource_support::close_plan_runtime(root);
+}
+
 #[test]
 fn total_order_invocation_scratch_claims_peak_once_for_the_whole_wave() {
     let (plan, registry) = sequential_scratch_plan();
     assert_eq!(plan.payload().memory().minimum_invocation_peak_bytes(), 96);
     let (driver, _trace) = resource_support::configured_driver(&plan, &[], &[]);
+    let lane = ExecutionLane::create(Arc::clone(&driver.runtime)).unwrap();
     let root = resource_support::plan_runtime(&plan, driver, "submission-wave-peak");
     let sequence = resource_support::admit_logical_sequence(
         &root,
@@ -141,7 +443,7 @@ fn total_order_invocation_scratch_claims_peak_once_for_the_whole_wave() {
     );
     let session = sequence.open_session().unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
-    let step = begin_step(&batch);
+    let step = begin_step(&batch, &lane);
 
     let wave = prepare_wave(&plan, &step);
     let claimed = wave.claimed_backing();
@@ -181,6 +483,8 @@ fn total_order_invocation_scratch_claims_peak_once_for_the_whole_wave() {
 fn submission_wave_backing_deferral_retains_step_until_exact_retry() {
     let (plan, registry) = sequential_scratch_plan();
     let (driver, _trace) = resource_support::configured_driver(&plan, &[], &[]);
+    let first_lane = ExecutionLane::create(Arc::clone(&driver.runtime)).unwrap();
+    let second_lane = ExecutionLane::create(Arc::clone(&driver.runtime)).unwrap();
     let root = resource_support::plan_runtime(&plan, driver, "submission-wave-deferral-owner");
     let first_sequence = resource_support::admit_logical_sequence(
         &root,
@@ -189,7 +493,7 @@ fn submission_wave_backing_deferral_retains_step_until_exact_retry() {
     );
     let first_session = first_sequence.open_session().unwrap();
     let first_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&first_session)]).unwrap();
-    let first_step = begin_step(&first_batch);
+    let first_step = begin_step(&first_batch, &first_lane);
     let first_wave = prepare_wave(&plan, &first_step);
 
     let second_sequence = resource_support::admit_logical_sequence(
@@ -199,7 +503,7 @@ fn submission_wave_backing_deferral_retains_step_until_exact_retry() {
     );
     let second_session = second_sequence.open_session().unwrap();
     let second_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&second_session)]).unwrap();
-    let step = begin_step(&second_batch);
+    let step = begin_step(&second_batch, &second_lane);
     let requests = submission_requests(&plan, &step);
 
     let deferred = match step.try_prepare_submission_wave(requests.clone()).unwrap() {
@@ -255,6 +559,7 @@ fn submission_wave_backing_deferral_retains_step_until_exact_retry() {
 fn capacity_deferred_unsubmitted_step_rolls_back_without_poisoning_its_session() {
     let (plan, registry) = sequential_scratch_plan();
     let (driver, _trace) = resource_support::configured_driver(&plan, &[], &[]);
+    let lane = ExecutionLane::create(Arc::clone(&driver.runtime)).unwrap();
     let root = resource_support::plan_runtime(&plan, driver, "submission-wave-step-rollback");
     let sequence = resource_support::admit_logical_sequence(
         &root,
@@ -264,7 +569,7 @@ fn capacity_deferred_unsubmitted_step_rolls_back_without_poisoning_its_session()
     let session = sequence.open_session().unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
 
-    let step = begin_step(&batch);
+    let step = begin_step(&batch, &lane);
     let first_step_id = step.batch_step_id();
     let first_frame = step
         .participant_frames()
@@ -283,7 +588,7 @@ fn capacity_deferred_unsubmitted_step_rolls_back_without_poisoning_its_session()
         StepParticipantRetirementDisposition::RolledBackUnsubmitted
     );
 
-    let retry = begin_step(&batch);
+    let retry = begin_step(&batch, &lane);
     assert_ne!(retry.batch_step_id(), first_step_id);
     assert_eq!(
         retry

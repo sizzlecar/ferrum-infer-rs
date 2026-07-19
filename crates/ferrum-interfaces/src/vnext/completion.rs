@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Instant;
 
@@ -15,9 +15,10 @@ use super::{
     DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
     DeviceCommandBatch, DeviceDescriptor, DeviceExecutionTiming, DeviceRuntime,
     DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
-    DeviceTimingMode, DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, FenceQuery,
-    HostTransferLayout, IdentifiedFailure, InvocationResourceLease, LogicalBackingBufferView,
-    NodeId, PreparedStepSubmissionWave, ResourceId, StreamState, VNextError,
+    DeviceTimingMode, DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, ExecutionLaneId,
+    FenceQuery, HostTransferLayout, IdentifiedFailure, InvocationResourceLease,
+    LogicalBackingBufferView, NodeId, PreparedStepSubmissionWave, ResourceId, StreamState,
+    VNextError,
 };
 
 fn invalid_completion(reason: impl Into<String>) -> VNextError {
@@ -66,28 +67,6 @@ enum LaneReadbackError<E> {
 struct LaneReadback {
     bytes: Vec<u8>,
     timing: DeviceTimingMeasurement<CompletionReadbackTiming>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(transparent)]
-pub struct ExecutionLaneId(NonZeroU64);
-
-impl ExecutionLaneId {
-    fn mint() -> Result<Self, VNextError> {
-        static NEXT_LANE_ID: AtomicU64 = AtomicU64::new(1);
-        let raw = NEXT_LANE_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| invalid_completion("execution lane identity space is exhausted"))?;
-        NonZeroU64::new(raw)
-            .map(Self)
-            .ok_or_else(|| invalid_completion("execution lane identity must be non-zero"))
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0.get()
-    }
 }
 
 /// Scheduler-owned stream lane. It is intentionally not bound to any request
@@ -172,6 +151,67 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             .lock()
             .map(|state| state.in_flight)
             .unwrap_or(u64::MAX)
+    }
+
+    pub(crate) fn trim_reusable_executables_if_quiescent(&self) -> Result<bool, VNextError> {
+        if self.fail_closed.load(Ordering::Acquire) {
+            return Err(invalid_completion(
+                "fail-closed execution lane cannot trim reusable executables",
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_completion("execution lane state mutex is poisoned"))?;
+        if state.fail_closed || self.fail_closed.load(Ordering::Acquire) {
+            return Err(invalid_completion(
+                "fail-closed execution lane cannot trim reusable executables",
+            ));
+        }
+        if state.in_flight != 0 {
+            return Ok(false);
+        }
+        if !self.current_descriptor_matches_snapshot()
+            || self.runtime.stream_state(&state.stream) != StreamState::Ready
+        {
+            state.fail_closed = true;
+            self.fail_closed.store(true, Ordering::Release);
+            return Err(invalid_completion(
+                "reusable executable trim requires a stable, quiescent execution lane",
+            ));
+        }
+        let trimmed = catch_unwind(AssertUnwindSafe(|| {
+            self.runtime.trim_reusable_executables(&mut state.stream)
+        }));
+        match trimmed {
+            Ok(Ok(_))
+                if self.current_descriptor_matches_snapshot()
+                    && self.runtime.stream_state(&state.stream) == StreamState::Ready =>
+            {
+                Ok(true)
+            }
+            Ok(Ok(_)) => {
+                state.fail_closed = true;
+                self.fail_closed.store(true, Ordering::Release);
+                Err(invalid_completion(
+                    "reusable executable trim changed the execution lane state",
+                ))
+            }
+            Ok(Err(error)) => {
+                state.fail_closed = true;
+                self.fail_closed.store(true, Ordering::Release);
+                Err(invalid_completion(format!(
+                    "device reusable executable trim failed: {error}"
+                )))
+            }
+            Err(_) => {
+                state.fail_closed = true;
+                self.fail_closed.store(true, Ordering::Release);
+                Err(invalid_completion(
+                    "device runtime panicked while trimming reusable executables",
+                ))
+            }
+        }
     }
 
     pub(crate) fn runtime(&self) -> &R {

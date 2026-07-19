@@ -2883,6 +2883,7 @@ fn step_captures_the_exact_sequence_backing_snapshot() {
     );
     let runtime = new_runtime(&catalog, 256);
     let harness = harness(runtime, catalog, 256, false);
+    let lane = harness.root.create_execution_lane().unwrap();
     harness
         .root
         .maintenance_controller
@@ -2902,7 +2903,7 @@ fn step_captures_the_exact_sequence_backing_snapshot() {
         AdmissionPressureAction::WaitForRelease,
     )
     .unwrap();
-    let step = match batch.try_begin_step(request).unwrap() {
+    let step = match batch.try_begin_step(request, &lane).unwrap() {
         StepResourceAdmissionDecision::Admitted(step) => step,
         _ => panic!("resident sequence snapshot step must admit"),
     };
@@ -2936,6 +2937,7 @@ fn step_backing_deferral_retains_exact_participant_session_until_retry() {
     );
     let runtime = new_runtime(&catalog, 128);
     let harness = harness(runtime, catalog, 128, false);
+    let lane = harness.root.create_execution_lane().unwrap();
     let sequence = admitted_sequence(&harness.root, "step-deferral-parent");
     let session = sequence.open_session().unwrap();
     let session_weak = Arc::downgrade(&session);
@@ -2947,7 +2949,7 @@ fn step_backing_deferral_retains_exact_participant_session_until_retry() {
     )
     .unwrap();
 
-    let deferred = match batch.try_begin_step(request.clone()).unwrap() {
+    let deferred = match batch.try_begin_step(request.clone(), &lane).unwrap() {
         StepResourceAdmissionDecision::BackingDeferred(deferred) => deferred,
         _ => panic!("zero-resident step backing must defer"),
     };
@@ -2969,7 +2971,7 @@ fn step_backing_deferral_retains_exact_participant_session_until_retry() {
         .expect("step backing authority retains its exact participant session");
     drop(deferred);
     let retry_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&retained_session)]).unwrap();
-    let step = match retry_batch.try_begin_step(request).unwrap() {
+    let step = match retry_batch.try_begin_step(request, &lane).unwrap() {
         StepResourceAdmissionDecision::Admitted(step) => step,
         _ => panic!("maintained step backing must admit for the retained participant"),
     };
@@ -2997,6 +2999,7 @@ fn sequence_backing_extension_publishes_atomically_between_frames() {
     );
     let runtime = new_runtime(&catalog, 256);
     let harness = harness(runtime, catalog, 256, false);
+    let lane = harness.root.create_execution_lane().unwrap();
     harness
         .root
         .maintenance_controller
@@ -3022,6 +3025,7 @@ fn sequence_backing_extension_publishes_atomically_between_frames() {
                 AdmissionPressureAction::WaitForRelease,
             )
             .unwrap(),
+            &lane,
         )
         .unwrap()
     {
@@ -3101,6 +3105,7 @@ fn sequence_backing_extension_publishes_atomically_between_frames() {
                 AdmissionPressureAction::WaitForRelease,
             )
             .unwrap(),
+            &lane,
         )
         .unwrap()
     {
@@ -3339,6 +3344,7 @@ fn invocation_subset_maps_its_local_participant_to_the_step_snapshot() {
             NodeId::new("node/dynamic-pool-test").unwrap(),
         )]),
     );
+    let lane = harness.root.create_execution_lane().unwrap();
     harness
         .root
         .maintenance_controller
@@ -3361,7 +3367,7 @@ fn invocation_subset_maps_its_local_participant_to_the_step_snapshot() {
         AdmissionPressureAction::WaitForRelease,
     )
     .unwrap();
-    let step = match batch.try_begin_step(step_request).unwrap() {
+    let step = match batch.try_begin_step(step_request, &lane).unwrap() {
         StepResourceAdmissionDecision::Admitted(step) => step,
         _ => panic!("resident two-participant step must admit"),
     };
@@ -3406,6 +3412,7 @@ fn step_slot_projects_two_logical_activations_from_one_physical_extent() {
     let catalog = shared_step_activation_catalog(linear_profile());
     let runtime = new_runtime(&catalog, 256);
     let harness = harness(runtime, catalog, 256, false);
+    let lane = harness.root.create_execution_lane().unwrap();
     harness
         .root
         .maintenance_controller
@@ -3420,7 +3427,7 @@ fn step_slot_projects_two_logical_activations_from_one_physical_extent() {
         AdmissionPressureAction::WaitForRelease,
     )
     .unwrap();
-    let step = match batch.try_begin_step(request).unwrap() {
+    let step = match batch.try_begin_step(request, &lane).unwrap() {
         StepResourceAdmissionDecision::Admitted(step) => step,
         _ => panic!("resident shared Step slot must admit"),
     };

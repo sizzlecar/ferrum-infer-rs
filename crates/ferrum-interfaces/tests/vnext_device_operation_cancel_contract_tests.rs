@@ -24,12 +24,12 @@ fn cancel_dispatch_linearization_contract(initial_fixture: Fixture, passed: &mut
     let session = resources.open_session().unwrap();
     let active = TrustedActiveSequenceBinding::from_session(&session).unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
-    let step = begin_single_participant_step(&plan_resources, &batch);
+    let lane = ExecutionLane::create(Arc::clone(&runtime)).unwrap();
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
     let frame_id = step.participant_frames().next().unwrap().frame_id();
     let invocation_id = NodeInvocationId::try_from(1).unwrap();
     let identity = operation_identity(&plan, &active, frame_id, invocation_id);
     let invocation = admit_single_participant_invocation(&plan_resources, &step, node.id());
-    let lane = ExecutionLane::create(Arc::clone(&runtime)).unwrap();
     let reaper = CompletionReaper::new();
 
     let cancel = session.request_cancel().unwrap();
@@ -101,11 +101,11 @@ fn cancel_dispatch_linearization_contract(initial_fixture: Fixture, passed: &mut
     let session = resources.open_session().unwrap();
     let active = TrustedActiveSequenceBinding::from_session(&session).unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
-    let step = begin_single_participant_step(&plan_resources, &batch);
+    let lane = ExecutionLane::create(Arc::clone(&runtime)).unwrap();
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
     let frame_id = step.participant_frames().next().unwrap().frame_id();
     let invocation_id = NodeInvocationId::try_from(1).unwrap();
     let identity = operation_identity(&plan, &active, frame_id, invocation_id);
-    let lane = ExecutionLane::create(Arc::clone(&runtime)).unwrap();
     let reaper = CompletionReaper::new();
     let completion = encode_and_submit_single(
         &provider,

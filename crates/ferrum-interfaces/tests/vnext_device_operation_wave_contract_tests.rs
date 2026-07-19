@@ -207,7 +207,7 @@ fn unsubmitted_step_retry_keeps_the_first_physical_journal_identity() {
     );
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &retry);
     let active_bindings = wave_active_bindings(&wave, &session);
-    let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
+    let lane = Arc::clone(retry.execution_lane());
     let batch_identity = OperationDispatch::bind_submission_wave_identity(
         &fixture.resolved,
         active_bindings.iter(),
@@ -269,7 +269,7 @@ fn all_plan_nodes_encode_into_one_submission_and_one_completion() {
     let (fixture, sequence, session, batch, step) = setup();
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
     let active_bindings = wave_active_bindings(&wave, &session);
-    let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
+    let lane = Arc::clone(step.execution_lane());
     let reaper = CompletionReaper::new();
     let providers = fixture
         .plan
@@ -356,7 +356,7 @@ fn typed_input_upload_precedes_the_plan_in_one_submission() {
     let (fixture, sequence, session, batch, step) = setup();
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
     let active_bindings = wave_active_bindings(&wave, &session);
-    let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
+    let lane = Arc::clone(step.execution_lane());
     let reaper = CompletionReaper::new();
     let providers = fixture
         .plan
@@ -450,7 +450,7 @@ fn terminal_wave_reads_output_before_releasing_backing() {
     .unwrap();
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
     let active_bindings = wave_active_bindings(&wave, &session);
-    let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
+    let lane = Arc::clone(step.execution_lane());
     let reaper = CompletionReaper::new();
     let providers = fixture
         .plan
@@ -571,7 +571,7 @@ fn provider_declared_binding_compute_and_result_phases_share_one_wave() {
     *fixture.provider_behavior.lock().unwrap() = ProviderBehavior::SplitPhases;
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
     let active_bindings = wave_active_bindings(&wave, &session);
-    let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
+    let lane = Arc::clone(step.execution_lane());
     let reaper = CompletionReaper::new();
     let providers = fixture
         .plan
@@ -633,7 +633,7 @@ fn definitely_not_submitted_retries_the_same_whole_wave() {
     let first_attempt = wave.batch_invocation_id();
     let topology_fingerprint = wave.fingerprint().to_owned();
     let active_bindings = wave_active_bindings(&wave, &session);
-    let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
+    let lane = Arc::clone(step.execution_lane());
     let reaper = CompletionReaper::new();
     let providers = fixture
         .plan
@@ -720,7 +720,7 @@ fn zero_state_initialization_is_ordered_retried_and_not_repeated_after_success()
         setup_with_fixture(fixture_with_zero_state(true));
     let first_wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &first_step);
     let active_bindings = wave_active_bindings(&first_wave, &session);
-    let lane = ExecutionLane::create(Arc::clone(&fixture.runtime)).unwrap();
+    let lane = Arc::clone(first_step.execution_lane());
     let reaper = CompletionReaper::new();
     let providers = fixture
         .plan
@@ -814,7 +814,7 @@ fn zero_state_initialization_is_ordered_retried_and_not_repeated_after_success()
     drop(active_bindings);
     first_step.try_retire_normal().unwrap();
 
-    let second_step = begin_single_participant_step(&fixture.plan_resources, &batch);
+    let second_step = begin_single_participant_step_on_lane(&batch, &lane);
     let second_wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &second_step);
     let second_active_bindings = wave_active_bindings(&second_wave, &session);
     let second_identity = OperationDispatch::bind_submission_wave_identity(

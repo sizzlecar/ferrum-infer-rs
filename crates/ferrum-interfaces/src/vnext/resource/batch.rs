@@ -3,13 +3,14 @@ use super::{
     AdmissionRejected, AdmittedSequenceResources, Arc, BTreeMap, BatchInvocationId,
     BatchParticipantAuthority, BatchParticipantTokenSpan, BatchStepId, BatchWorkShape,
     CapacityDomainId, CapacityEntry, CapacityUnits, CapacityVector, DeviceRuntime, Digest,
-    DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome, ExecutionFrameId,
-    LogicalBackingSliceAuthority, LogicalBackingSliceEvidence, LogicalBatchCapacityLease, Mutex,
-    NodeId, ParticipantFlightPhase, ParticipantNodeKey, PhysicalBackingClaimIdentity,
-    PlanBackingDeferral, PlanCapacityWaitRegistration, RequestAuthorityId, SequenceAuthorityId,
-    SequenceBackingSnapshot, SequenceSession, SequenceSessionEpoch, SequenceSessionFingerprint,
-    SequenceSessionPhase, SequenceSessionSlot, SequenceSessionSlotState, Serialize, Sha256,
-    StepParticipantFrameAssignment, TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError,
+    DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome, ExecutionFrameId, ExecutionLane,
+    LaneStableArenaSlotLease, LogicalBackingSliceAuthority, LogicalBackingSliceEvidence,
+    LogicalBatchCapacityLease, Mutex, NodeId, ParticipantFlightPhase, ParticipantNodeKey,
+    PhysicalBackingClaimIdentity, PlanBackingDeferral, PlanCapacityWaitRegistration,
+    RequestAuthorityId, SequenceAuthorityId, SequenceBackingSnapshot, SequenceSession,
+    SequenceSessionEpoch, SequenceSessionFingerprint, SequenceSessionPhase, SequenceSessionSlot,
+    SequenceSessionSlotState, Serialize, Sha256, StepParticipantFrameAssignment, TokenSpanWork,
+    TrustedPlanRuntimeEvidence, VNextError,
 };
 
 /// Resources whose lifetime is one exact continuous-batch execution frame.
@@ -25,6 +26,7 @@ where
     pub(super) claimed_backing: ClaimedBackingTransaction,
     pub(super) participants: Vec<AdmittedStepParticipant<R>>,
     pub(super) invocation_registry: Arc<InvocationRegistry>,
+    pub(super) execution_lane: Arc<ExecutionLane<R>>,
     pub(super) batch_step_id: BatchStepId,
     pub(super) finalized: bool,
 }
@@ -1165,6 +1167,8 @@ pub struct ClaimedBackingTransaction {
     work_shape: BatchWorkShape,
     demand: AdmissionDemand,
     fingerprint: String,
+    // Occupancy releases after every physical/logical claim field above.
+    _lane_slot_lease: Option<LaneStableArenaSlotLease>,
 }
 
 fn validate_backing_claim(
@@ -1268,6 +1272,7 @@ impl ClaimedBackingTransaction {
         demand: AdmissionDemand,
         logical_capacity: Option<LogicalBatchCapacityLease>,
         backing_slices: Vec<LogicalBackingSliceAuthority>,
+        lane_slot_lease: Option<LaneStableArenaSlotLease>,
     ) -> Result<Self, VNextError> {
         validate_backing_claim(&backing_slices, &demand)?;
         if !logical_capacity_matches(
@@ -1318,6 +1323,7 @@ impl ClaimedBackingTransaction {
             work_shape,
             demand,
             fingerprint: format!("{:x}", Sha256::digest(bytes)),
+            _lane_slot_lease: lane_slot_lease,
         })
     }
 
@@ -1368,6 +1374,8 @@ pub struct ClaimedSubmissionWaveBacking {
     participants: Vec<BatchParticipantAuthority>,
     demand: AdmissionDemand,
     fingerprint: String,
+    // Occupancy releases only after terminal completion readback drops this claim.
+    _lane_slot_lease: Option<LaneStableArenaSlotLease>,
 }
 
 impl ClaimedSubmissionWaveBacking {
@@ -1377,6 +1385,7 @@ impl ClaimedSubmissionWaveBacking {
         demand: AdmissionDemand,
         logical_capacity: Option<LogicalBatchCapacityLease>,
         backing_slices: Vec<LogicalBackingSliceAuthority>,
+        lane_slot_lease: Option<LaneStableArenaSlotLease>,
     ) -> Result<Self, VNextError> {
         let unique_nodes = node_work_shapes
             .iter()
@@ -1474,6 +1483,7 @@ impl ClaimedSubmissionWaveBacking {
             participants,
             demand,
             fingerprint: format!("{:x}", Sha256::digest(bytes)),
+            _lane_slot_lease: lane_slot_lease,
         })
     }
 

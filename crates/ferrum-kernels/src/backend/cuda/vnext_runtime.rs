@@ -18,11 +18,12 @@ use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, D
 use ferrum_interfaces::vnext::{
     BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceBufferRetention,
     DeviceClass, DeviceCommandBatch, DeviceCommandEntry, DeviceCommandPhase, DeviceDescriptor,
-    DeviceErrorReport, DeviceExecutionTiming, DeviceId, DeviceReusableExecutionObservation,
-    DeviceRuntime, DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal,
-    DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
-    DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink, DynamicStorageProfile,
-    ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout, StreamState, VNextError,
+    DeviceErrorReport, DeviceExecutionTiming, DeviceId, DeviceReusableAddressScope,
+    DeviceReusableExecutionObservation, DeviceReusableExecutionTrim, DeviceRuntime,
+    DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt,
+    DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
+    DisabledDeviceSubmissionTimingSink, DynamicStorageProfile, ElementType, FenceIndeterminate,
+    FenceQuery, HostTransferLayout, StreamState, VNextError,
 };
 
 use super::vnext_replay::{CudaCommandReplayKey, CudaExecutableCache, CudaExecutablePreparation};
@@ -197,9 +198,13 @@ impl CudaDeviceBuffer {
             .aligned_ptr
             .checked_add(range.start)
             .ok_or_else(|| CudaDeviceRuntimeError::contract("CUDA buffer pointer overflow"))?;
+        let reusable_address_scope = core_retention
+            .as_ref()
+            .and_then(DeviceBufferRetention::reusable_address_scope);
         Ok(CudaBufferRegion {
             _allocation: Arc::clone(&self.allocation),
             _core_retention: core_retention,
+            reusable_address_scope,
             runtime_instance: self.runtime_instance,
             device_ptr,
             length_bytes: range.end - range.start,
@@ -213,6 +218,7 @@ impl CudaDeviceBuffer {
 pub(crate) struct CudaBufferRegion {
     _allocation: Arc<CudaAllocation>,
     _core_retention: Option<DeviceBufferRetention>,
+    reusable_address_scope: Option<DeviceReusableAddressScope>,
     runtime_instance: u64,
     device_ptr: cudarc::driver::sys::CUdeviceptr,
     length_bytes: u64,
@@ -257,6 +263,7 @@ pub struct CudaDeviceCommand {
     operation: &'static str,
     payload: Arc<CudaCommandPayload>,
     replay_key: Option<CudaCommandReplayKey>,
+    reusable_address_scope: Option<DeviceReusableAddressScope>,
 }
 
 impl fmt::Debug for CudaDeviceCommand {
@@ -402,7 +409,8 @@ impl CudaDeviceCommand {
                 "CUDA operation host storage contains an empty region",
             ));
         }
-        let replay_key = bind_replay_key(replay_key, operation, &regions, &host_storage);
+        let (replay_key, reusable_address_scope) =
+            bind_replay_contract(replay_key, operation, &regions, &host_storage);
         Ok(Self {
             runtime_instance,
             operation,
@@ -412,6 +420,7 @@ impl CudaDeviceCommand {
                 enqueue: Mutex::new(Box::new(enqueue)),
             }),
             replay_key,
+            reusable_address_scope,
         })
     }
 
@@ -430,7 +439,8 @@ impl CudaDeviceCommand {
     ) -> Result<Self, CudaDeviceRuntimeError> {
         let runtime_instance = common_runtime_instance(&regions)?;
         let host_storage = Vec::new();
-        let replay_key = bind_replay_key(replay_key, operation, &regions, &host_storage);
+        let (replay_key, reusable_address_scope) =
+            bind_replay_contract(replay_key, operation, &regions, &host_storage);
         Ok(Self {
             runtime_instance,
             operation,
@@ -440,6 +450,7 @@ impl CudaDeviceCommand {
                 enqueue: Mutex::new(Box::new(enqueue)),
             }),
             replay_key,
+            reusable_address_scope,
         })
     }
 
@@ -460,6 +471,7 @@ impl CudaDeviceCommand {
             operation,
             payload,
             replay_key: None,
+            reusable_address_scope: None,
         }
     }
 
@@ -485,30 +497,55 @@ impl CudaDeviceCommand {
         self.replay_key
     }
 
+    pub(crate) const fn reusable_address_scope(&self) -> Option<DeviceReusableAddressScope> {
+        self.reusable_address_scope
+    }
+
     pub(crate) fn payload(&self) -> Arc<CudaCommandPayload> {
         Arc::clone(&self.payload)
     }
 }
 
-fn bind_replay_key(
+fn bind_replay_contract(
     replay_key: Option<CudaCommandReplayKey>,
     operation: &'static str,
     regions: &[CudaBufferRegion],
     host_storage: &[Box<[u8]>],
-) -> Option<CudaCommandReplayKey> {
-    replay_key.map(|key| {
-        key.bind_runtime_payload(
-            operation,
-            regions.iter().map(|region| {
-                (
-                    region.device_ptr,
-                    region.length_bytes,
-                    region.element_type.size_bytes(),
-                )
-            }),
-            host_storage,
-        )
-    })
+) -> (
+    Option<CudaCommandReplayKey>,
+    Option<DeviceReusableAddressScope>,
+) {
+    let Some(key) = replay_key else {
+        return (None, None);
+    };
+    let mut scope = DeviceReusableAddressScope::Plan;
+    for region in regions {
+        let Some(region_scope) = region.reusable_address_scope else {
+            return (None, None);
+        };
+        match region_scope {
+            DeviceReusableAddressScope::Plan => {}
+            DeviceReusableAddressScope::ExecutionLane(lane_id) => match scope {
+                DeviceReusableAddressScope::Plan => {
+                    scope = DeviceReusableAddressScope::ExecutionLane(lane_id);
+                }
+                DeviceReusableAddressScope::ExecutionLane(current) if current == lane_id => {}
+                DeviceReusableAddressScope::ExecutionLane(_) => return (None, None),
+            },
+        }
+    }
+    (
+        Some(
+            key.bind_runtime_payload(
+                operation,
+                regions
+                    .iter()
+                    .map(|region| (region.device_ptr, region.length_bytes, region.element_type)),
+                host_storage,
+            ),
+        ),
+        Some(scope),
+    )
 }
 
 fn common_runtime_instance(regions: &[CudaBufferRegion]) -> Result<u64, CudaDeviceRuntimeError> {
@@ -950,6 +987,22 @@ impl DeviceRuntime for CudaDeviceRuntime {
             return StreamState::Failed;
         }
         stream.state.snapshot()
+    }
+
+    fn trim_reusable_executables(
+        &self,
+        stream: &mut Self::Stream,
+    ) -> Result<DeviceReusableExecutionTrim, Self::Error> {
+        if stream.runtime_instance != self.runtime_instance || !stream.state.is_quiescent() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA reusable executable trim requires its quiescent owning stream",
+            ));
+        }
+        let (released_executables, released_rejections) = stream.executable_cache.trim_quiescent();
+        Ok(DeviceReusableExecutionTrim::new(
+            released_executables,
+            released_rejections,
+        ))
     }
 
     fn encode_copy(

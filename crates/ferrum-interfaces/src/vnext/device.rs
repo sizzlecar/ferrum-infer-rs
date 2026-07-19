@@ -12,6 +12,32 @@ use super::{
     ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope, IdentifiedFailure, VNextError,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ExecutionLaneId(NonZeroU64);
+
+impl ExecutionLaneId {
+    pub(crate) fn mint() -> Result<Self, VNextError> {
+        static NEXT_LANE_ID: AtomicU64 = AtomicU64::new(1);
+        let raw = NEXT_LANE_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| VNextError::InvalidExecutionPlan {
+                reason: "execution lane identity space is exhausted".to_owned(),
+            })?;
+        NonZeroU64::new(raw)
+            .map(Self)
+            .ok_or_else(|| VNextError::InvalidExecutionPlan {
+                reason: "execution lane identity must be non-zero".to_owned(),
+            })
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
 /// Cleanup pressure is independent from model size and normal request
 /// concurrency. Once one plan accumulates this many non-quiescent owners, new
 /// execution authority is rejected until an explicit recovery worker drains
@@ -476,16 +502,24 @@ pub struct BufferDescriptor {
 pub struct DeviceBufferRetention {
     _primary_owner: Arc<dyn Send + Sync + 'static>,
     _secondary_owner: Option<Arc<dyn Send + Sync + 'static>>,
+    reusable_address_scope: Option<DeviceReusableAddressScope>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceReusableAddressScope {
+    Plan,
+    ExecutionLane(ExecutionLaneId),
 }
 
 impl DeviceBufferRetention {
-    pub(crate) fn new<T>(owner: Arc<T>) -> Self
+    pub(crate) fn plan<T>(owner: Arc<T>) -> Self
     where
         T: Send + Sync + 'static,
     {
         Self {
             _primary_owner: owner,
             _secondary_owner: None,
+            reusable_address_scope: Some(DeviceReusableAddressScope::Plan),
         }
     }
 
@@ -497,7 +531,28 @@ impl DeviceBufferRetention {
         Self {
             _primary_owner: primary_owner,
             _secondary_owner: Some(secondary_owner),
+            reusable_address_scope: None,
         }
+    }
+
+    pub(crate) fn lane_pair<T, U>(
+        lane_id: ExecutionLaneId,
+        primary_owner: Arc<T>,
+        secondary_owner: Arc<U>,
+    ) -> Self
+    where
+        T: Send + Sync + 'static,
+        U: Send + Sync + 'static,
+    {
+        Self {
+            _primary_owner: primary_owner,
+            _secondary_owner: Some(secondary_owner),
+            reusable_address_scope: Some(DeviceReusableAddressScope::ExecutionLane(lane_id)),
+        }
+    }
+
+    pub const fn reusable_address_scope(&self) -> Option<DeviceReusableAddressScope> {
+        self.reusable_address_scope
     }
 }
 
@@ -684,6 +739,31 @@ impl DeviceReusableExecutionObservation {
 
     pub const fn eager_commands(self) -> u64 {
         self.eager_commands
+    }
+}
+
+/// Cold-path receipt for releasing backend reusable executables after an
+/// execution lane has reached proven quiescence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionTrim {
+    released_executables: u64,
+    released_rejections: u64,
+}
+
+impl DeviceReusableExecutionTrim {
+    pub fn new(released_executables: usize, released_rejections: usize) -> Self {
+        Self {
+            released_executables: u64::try_from(released_executables).unwrap_or(u64::MAX),
+            released_rejections: u64::try_from(released_rejections).unwrap_or(u64::MAX),
+        }
+    }
+
+    pub const fn released_executables(self) -> u64 {
+        self.released_executables
+    }
+
+    pub const fn released_rejections(self) -> u64 {
+        self.released_rejections
     }
 }
 
@@ -1187,6 +1267,15 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     fn create_stream(&self) -> Result<Self::Stream, Self::Error>;
 
     fn stream_state(&self, stream: &Self::Stream) -> StreamState;
+
+    /// Releases reusable executable cache entries on a proven-quiescent
+    /// stream. Backends without such a cache retain the no-op default.
+    fn trim_reusable_executables(
+        &self,
+        _stream: &mut Self::Stream,
+    ) -> Result<DeviceReusableExecutionTrim, Self::Error> {
+        Ok(DeviceReusableExecutionTrim::default())
+    }
 
     fn encode_copy(
         &self,
