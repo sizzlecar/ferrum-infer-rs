@@ -25,12 +25,16 @@
 
 pub mod arrivals;
 pub mod env;
+pub mod jsonl_journal;
 pub mod profile;
 pub mod report;
 pub mod stats;
 pub mod trace;
 
 pub use env::{Env, EnvHash};
+pub use jsonl_journal::{
+    JsonlJournal, JsonlJournalConfig, JsonlJournalError, JsonlJournalOpenMode,
+};
 pub use profile::{
     configure_global_profile, flush_global_profile, global_profile, parse_profile_event_value,
     parse_profile_jsonl_str, profile_fields_from_json, ProfileEvent, ProfileJsonlWriter,

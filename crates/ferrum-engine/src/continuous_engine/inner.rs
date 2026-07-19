@@ -421,16 +421,8 @@ impl EngineInner {
             warn!("Skipping invalid executor admission trace event: {}", error);
             return;
         }
-        let mut line = match serde_json::to_string(&event) {
-            Ok(line) => line,
-            Err(error) => {
-                warn!("Failed to serialize executor admission trace: {}", error);
-                return;
-            }
-        };
-        line.push('\n');
-        if let Err(error) = sink.lock().write_all(line.as_bytes()) {
-            warn!("Failed to write executor admission trace: {}", error);
+        if let Err(error) = sink.enqueue(event) {
+            warn!("Failed to enqueue executor admission trace: {}", error);
         }
     }
 

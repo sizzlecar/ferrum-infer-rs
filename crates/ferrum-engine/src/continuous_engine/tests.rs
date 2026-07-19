@@ -1187,6 +1187,12 @@ fn read_engine_profile_events(path: &Path) -> Vec<FerrumProfileEvent> {
         .collect()
 }
 
+fn flush_engine_profile_events(engine: &ContinuousBatchEngine) {
+    if let Some(journal) = &engine.inner.scheduler_trace_jsonl {
+        journal.flush().expect("scheduler trace flush barrier");
+    }
+}
+
 fn assert_engine_resource_trace_balanced(path: &Path) -> Vec<ResourceTraceEvent> {
     let mut states: HashMap<(String, String, String), TestResourceTraceState> = HashMap::new();
     let mut resources = Vec::new();
@@ -2857,6 +2863,7 @@ async fn plan_runtime_lone_decode_self_recompute_releases_exact_cache_before_req
     assert_eq!(sequence.preemption_count, 1);
     drop(sequences);
 
+    flush_engine_profile_events(&engine);
     let profile_events = read_engine_profile_events(&trace_path);
     let completed = profile_events
         .iter()
@@ -2998,6 +3005,7 @@ async fn plan_runtime_pressure_keeps_owner_identity_across_two_physical_releases
     }
     drop(sequences);
 
+    flush_engine_profile_events(&engine);
     let profile_events = read_engine_profile_events(&trace_path);
     let completions = profile_events
         .iter()
@@ -3215,6 +3223,7 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
     assert_eq!(resumed_trace.decode_queue_len, 1);
     assert_eq!(resumed_trace.execution_capacity_blocked_decode_len, 0);
 
+    flush_engine_profile_events(&engine);
     let profile_events = read_engine_profile_events(&trace_path);
     let fence_armed = profile_events
         .iter()
@@ -3795,6 +3804,7 @@ async fn plan_runtime_backing_maintenance_advances_epoch_before_prefill() {
     assert_eq!(snapshot.dynamic_backing_growth_requested, 1);
     assert_eq!(snapshot.dynamic_admission_deferred, 1);
 
+    flush_engine_profile_events(&engine);
     let events = read_engine_profile_events(&trace_path);
     let deferred_index = events
         .iter()
@@ -4589,6 +4599,7 @@ async fn kv_release_failure_traces_reject_without_successful_release() {
         .release_kv_allocation(&request_id, request_id.clone(), 2)
         .await;
 
+    flush_engine_profile_events(&engine);
     let resources: Vec<_> = read_engine_profile_events(&trace_path)
         .into_iter()
         .filter_map(|event| event.resource)
@@ -4661,6 +4672,7 @@ async fn recurrent_release_failure_traces_reject_without_successful_release() {
         .release_recurrent_allocation(&request_id, Some(1))
         .await;
 
+    flush_engine_profile_events(&engine);
     let resources: Vec<_> = read_engine_profile_events(&trace_path)
         .into_iter()
         .filter_map(|event| event.resource)
@@ -4703,6 +4715,7 @@ fn request_owner_close_event_reports_outstanding_resources() {
     engine.inner.trace_request_admitted(&request_id);
     engine.inner.trace_request_owner_close(&request_id);
 
+    flush_engine_profile_events(&engine);
     let events = read_engine_profile_events(&trace_path);
     let close = events
         .iter()
@@ -4903,6 +4916,7 @@ async fn scheduler_trace_jsonl_resource_events_balance_successful_infer() {
     assert_eq!(response.request_id, request_id);
     assert_eq!(response.finish_reason, FinishReason::Length);
 
+    engine.shutdown().await.unwrap();
     let resources = assert_engine_resource_trace_balanced(&trace_path);
     let saw = |kind: &str, action: ResourceAction| {
         resources
@@ -4938,9 +4952,10 @@ fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
 
     let trace_path = resource_trace_temp_path("vnext-execution-event");
     let _ = std::fs::remove_file(&trace_path);
-    let file = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
+    let journal = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
     let config = EngineConfig::default();
-    let sink = VNextProfileExecutionEventSink::new(file, ProfileEntrypoint::Run, &config);
+    let sink =
+        VNextProfileExecutionEventSink::new(journal.clone(), ProfileEntrypoint::Run, &config);
     assert_eq!(
         sink.capture_policy(),
         ExecutionEventCapturePolicy::FirstFramePerRequest
@@ -4997,6 +5012,7 @@ fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
             &TrustedExecutionEventContext::pre_plan(&run_id, &request_id),
         )
         .unwrap();
+    journal.flush().unwrap();
 
     let rows = std::fs::read_to_string(&trace_path).unwrap();
     let profile: FerrumProfileEvent = serde_json::from_str(rows.trim()).unwrap();
@@ -6114,6 +6130,7 @@ async fn process_batch_releases_kv_and_recurrent_state_when_model_admission_fail
     assert!(recurrent_stats.allocation_count >= 2);
     assert_eq!(recurrent_stats.active_states, 0);
     assert_eq!(recurrent_stats.used_batch_slots, 0);
+    flush_engine_profile_events(&engine);
     let resources = assert_engine_resource_trace_balanced(&trace_path);
     let saw = |kind: &str, action: ResourceAction| {
         resources
@@ -6870,6 +6887,7 @@ async fn process_batch_unified_forward_resource_exhausted_defers_existing_kv_pre
     let recurrent_stats = recurrent_manager.stats();
     assert_eq!(recurrent_stats.active_states, 0);
     assert_eq!(recurrent_stats.used_batch_slots, 0);
+    flush_engine_profile_events(&engine);
     let resources = assert_engine_resource_trace_balanced(&trace_path);
     let saw = |kind: &str, action: ResourceAction| {
         resources

@@ -9,7 +9,7 @@ use crate::resource_lifecycle::{
     ResourceLedgerTransition, ResourceLifecycleLedger, ResourceOwnerCloseSummary,
 };
 use async_trait::async_trait;
-use ferrum_bench_core::{global_profile, profile_fields_from_json};
+use ferrum_bench_core::{global_profile, profile_fields_from_json, JsonlJournal};
 use ferrum_interfaces::{
     engine::{InferenceEngine, LlmInferenceEngine},
     kv_cache::AllocationRequest,
@@ -2390,7 +2390,7 @@ struct EngineInner {
     /// Prefix cache: shares KV blocks across requests with common prompts.
     prefix_cache: PrefixCache,
     runtime_config: ContinuousEngineRuntimeConfig,
-    scheduler_trace_jsonl: Option<Arc<Mutex<std::fs::File>>>,
+    scheduler_trace_jsonl: Option<JsonlJournal<FerrumProfileEvent>>,
     legacy_scheduler_trace_jsonl: Option<Arc<Mutex<std::fs::File>>>,
     scheduler_trace_none_streak: AtomicU64,
     resource_lifecycle: Mutex<ResourceLifecycleLedger>,
@@ -2413,6 +2413,9 @@ struct EngineInner {
     /// driver task (16 streaming requests = 16 drivers thrashing on
     /// `iteration_lock`, ~5ms/iter of tokio scheduling overhead).
     bg_loop_spawned: AtomicBool,
+    shutdown_started: AtomicBool,
+    shutdown_lock: tokio::sync::Mutex<()>,
+    background_loop: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl EngineInner {
@@ -2582,18 +2585,8 @@ impl EngineInner {
             warn!("Skipping invalid engine resource trace event: {}", error);
             return;
         }
-        let mut line = match serde_json::to_string(&event) {
-            Ok(line) => line,
-            Err(error) => {
-                warn!("Failed to serialize engine resource trace event: {}", error);
-                return;
-            }
-        };
-        line.push('\n');
-        let mut file = sink.lock();
-        if let Err(error) = file.write_all(line.as_bytes()) {
-            warn!("Failed to write engine resource trace event: {}", error);
-            return;
+        if let Err(error) = sink.enqueue(event) {
+            warn!("Failed to enqueue engine resource trace event: {}", error);
         }
     }
 
@@ -2749,21 +2742,9 @@ impl EngineInner {
             );
             return;
         }
-        let mut line = match serde_json::to_string(&event) {
-            Ok(line) => line,
-            Err(error) => {
-                warn!(
-                    "Failed to serialize engine resource close trace event: {}",
-                    error
-                );
-                return;
-            }
-        };
-        line.push('\n');
-        let mut file = sink.lock();
-        if let Err(error) = file.write_all(line.as_bytes()) {
+        if let Err(error) = sink.enqueue(event) {
             warn!(
-                "Failed to write engine resource close trace event: {}",
+                "Failed to enqueue engine resource close trace event: {}",
                 error
             );
         }
@@ -3486,7 +3467,7 @@ fn vnext_execution_event_name(kind: VNextExecutionEventKind) -> &'static str {
 }
 
 struct VNextProfileExecutionEventSink {
-    file: Arc<Mutex<std::fs::File>>,
+    journal: JsonlJournal<FerrumProfileEvent>,
     entrypoint: ProfileEntrypoint,
     model: String,
     backend_device: String,
@@ -3495,12 +3476,12 @@ struct VNextProfileExecutionEventSink {
 
 impl VNextProfileExecutionEventSink {
     fn new(
-        file: Arc<Mutex<std::fs::File>>,
+        journal: JsonlJournal<FerrumProfileEvent>,
         entrypoint: ProfileEntrypoint,
         config: &EngineConfig,
     ) -> Self {
         Self {
-            file,
+            journal,
             entrypoint,
             model: config.model.model_id.to_string(),
             backend_device: format!("{:?}", config.backend.device),
@@ -3683,29 +3664,19 @@ impl VNextProfileExecutionEventSink {
         Ok(profile)
     }
 
-    fn write_events(
+    fn enqueue_events(
         &self,
         events: &[ExecutionEvent],
     ) -> std::result::Result<(), ExecutionEventSinkError> {
-        const INITIAL_BATCH_BUFFER_LIMIT: usize = 1024 * 1024;
-        let initial_capacity = events
-            .len()
-            .checked_mul(2_048)
-            .unwrap_or(INITIAL_BATCH_BUFFER_LIMIT)
-            .min(INITIAL_BATCH_BUFFER_LIMIT);
-        let mut buffer = Vec::new();
-        buffer.try_reserve(initial_capacity).map_err(|error| {
+        let mut profiles = Vec::new();
+        profiles.try_reserve(events.len()).map_err(|error| {
             ExecutionEventSinkError::new(format!("reserve vNext profile batch: {error}"))
         })?;
         for event in events {
-            let profile = self.profile_event(event)?;
-            serde_json::to_writer(&mut buffer, &profile).map_err(|error| {
-                ExecutionEventSinkError::new(format!("serialize vNext profile event: {error}"))
-            })?;
-            buffer.push(b'\n');
+            profiles.push(self.profile_event(event)?);
         }
-        self.file.lock().write_all(&buffer).map_err(|error| {
-            ExecutionEventSinkError::new(format!("write vNext profile event: {error}"))
+        self.journal.enqueue_batch(profiles).map_err(|error| {
+            ExecutionEventSinkError::new(format!("enqueue vNext profile batch: {error}"))
         })
     }
 }
@@ -3729,24 +3700,43 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
         permit: EventEmissionPermit<'_>,
     ) -> std::result::Result<(), ExecutionEventSinkError> {
         debug_assert!(std::ptr::eq(event, permit.event()));
-        self.write_events(std::slice::from_ref(event))
+        self.journal
+            .enqueue(self.profile_event(event)?)
+            .map_err(|error| {
+                ExecutionEventSinkError::new(format!("enqueue vNext profile event: {error}"))
+            })
     }
 
     fn record_batch(
         &self,
         permit: EventBatchEmissionPermit<'_>,
     ) -> std::result::Result<(), ExecutionEventSinkError> {
-        self.write_events(permit.events())
+        self.enqueue_events(permit.events())
     }
 }
 
-fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<Arc<Mutex<std::fs::File>>> {
+fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<JsonlJournal<FerrumProfileEvent>> {
+    let path = path?;
+    match JsonlJournal::create(path.to_path_buf()) {
+        Ok(journal) => Some(journal),
+        Err(error) => {
+            warn!(
+                "Failed to open scheduler trace JSONL {}: {}",
+                path.display(),
+                error
+            );
+            None
+        }
+    }
+}
+
+fn create_legacy_scheduler_trace_sink(path: Option<&Path>) -> Option<Arc<Mutex<std::fs::File>>> {
     let path = path?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(error) = std::fs::create_dir_all(parent) {
                 warn!(
-                    "Failed to create scheduler trace directory {}: {}",
+                    "Failed to create legacy scheduler trace directory {}: {}",
                     parent.display(),
                     error
                 );
@@ -3757,7 +3747,7 @@ fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<Arc<Mutex<std::fs:
     if let Err(error) = std::fs::remove_file(path) {
         if error.kind() != std::io::ErrorKind::NotFound {
             warn!(
-                "Failed to clear scheduler trace JSONL {}: {}",
+                "Failed to clear legacy scheduler trace JSONL {}: {}",
                 path.display(),
                 error
             );
@@ -3772,7 +3762,7 @@ fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<Arc<Mutex<std::fs:
         Ok(file) => Some(Arc::new(Mutex::new(file))),
         Err(error) => {
             warn!(
-                "Failed to open scheduler trace JSONL {}: {}",
+                "Failed to open legacy scheduler trace JSONL {}: {}",
                 path.display(),
                 error
             );
@@ -3947,11 +3937,12 @@ impl ContinuousBatchEngine {
         let runtime_config = ContinuousEngineRuntimeConfig::from_engine_config(&config);
         let scheduler_trace_jsonl =
             create_scheduler_trace_sink(runtime_config.scheduler_trace_jsonl.as_deref());
-        let legacy_scheduler_trace_jsonl =
-            create_scheduler_trace_sink(runtime_config.legacy_scheduler_trace_jsonl.as_deref());
-        if let Some(file) = scheduler_trace_jsonl.as_ref() {
+        let legacy_scheduler_trace_jsonl = create_legacy_scheduler_trace_sink(
+            runtime_config.legacy_scheduler_trace_jsonl.as_deref(),
+        );
+        if let Some(journal) = scheduler_trace_jsonl.as_ref() {
             let sink: Arc<dyn ExecutionEventSink> = Arc::new(VNextProfileExecutionEventSink::new(
-                Arc::clone(file),
+                journal.clone(),
                 runtime_config
                     .profile_entrypoint
                     .unwrap_or(ProfileEntrypoint::Synthetic),
@@ -3999,6 +3990,9 @@ impl ContinuousBatchEngine {
                 total_model_execution_time_us: AtomicU64::new(0),
                 model_execution_time_samples: AtomicU64::new(0),
                 bg_loop_spawned: AtomicBool::new(false),
+                shutdown_started: AtomicBool::new(false),
+                shutdown_lock: tokio::sync::Mutex::new(()),
+                background_loop: Mutex::new(None),
             }),
         })
     }
@@ -4010,8 +4004,15 @@ impl ContinuousBatchEngine {
     /// per-iter tokio scheduling overhead at c=16). With one bg loop +
     /// per-request tasks just consuming their channel, lock is uncontested.
     fn ensure_bg_loop(&self) {
-        if !self.inner.bg_loop_spawned.swap(true, Ordering::SeqCst) {
-            let _ = self.start_loop();
+        if self.inner.bg_loop_spawned.load(Ordering::Acquire) {
+            return;
+        }
+        let mut background_loop = self.inner.background_loop.lock();
+        if self.inner.shutdown_started.load(Ordering::Acquire) {
+            return;
+        }
+        if !self.inner.bg_loop_spawned.swap(true, Ordering::AcqRel) {
+            *background_loop = Some(self.start_loop());
         }
     }
 
@@ -4363,11 +4364,38 @@ impl InferenceEngine for ContinuousBatchEngine {
     }
 
     async fn shutdown(&self) -> Result<()> {
+        let _shutdown_guard = self.inner.shutdown_lock.lock().await;
         info!("Shutting down continuous batch engine");
-        self.inner.is_running.store(false, Ordering::SeqCst);
-        self.inner.shutdown_notify.notify_one();
-        self.inner.work_notify.notify_one();
-        Ok(())
+        let background_loop = {
+            let mut background_loop = self.inner.background_loop.lock();
+            self.inner.shutdown_started.store(true, Ordering::Release);
+            self.inner.is_running.store(false, Ordering::SeqCst);
+            self.inner.shutdown_notify.notify_waiters();
+            self.inner.work_notify.notify_waiters();
+            background_loop.take()
+        };
+
+        let loop_result = match background_loop {
+            Some(background_loop) => background_loop.await.map_err(|error| {
+                FerrumError::internal(format!("background iteration loop failed: {error}"))
+            }),
+            None => Ok(()),
+        };
+
+        let trace_result = match self.inner.scheduler_trace_jsonl.clone() {
+            Some(journal) => tokio::task::spawn_blocking(move || journal.close())
+                .await
+                .map_err(|error| {
+                    FerrumError::internal(format!("scheduler trace close task failed: {error}"))
+                })?
+                .map_err(|error| {
+                    FerrumError::internal(format!("scheduler trace close failed: {error}"))
+                }),
+            None => Ok(()),
+        };
+
+        loop_result?;
+        trace_result
     }
 
     fn config(&self) -> &EngineConfig {
