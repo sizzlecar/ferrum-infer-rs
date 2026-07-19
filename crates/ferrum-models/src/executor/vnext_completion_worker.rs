@@ -49,6 +49,14 @@ impl VNextCompletionTaskClassMetrics {
             "task_run": self.task_run.snapshot(),
         })
     }
+
+    fn reset(&self) {
+        self.scheduled_tasks.store(0, Ordering::Relaxed);
+        self.completed_tasks.store(0, Ordering::Relaxed);
+        self.reservation_wait.reset();
+        self.queued_wait.reset();
+        self.task_run.reset();
+    }
 }
 
 #[derive(Default)]
@@ -216,6 +224,19 @@ impl VNextCompletionWorker {
                 VNextCompletionTaskKind::IndeterminateRecovery.as_str(): self.counters.indeterminate_recovery.snapshot(),
             },
         })
+    }
+
+    pub(super) fn reset_metrics_if_idle(&self) -> bool {
+        if self.pending_tasks() != 0 {
+            return false;
+        }
+        self.counters.scheduled_tasks.store(0, Ordering::Relaxed);
+        self.counters.completed_tasks.store(0, Ordering::Relaxed);
+        self.counters.panicked_tasks.store(0, Ordering::Relaxed);
+        self.counters.wave_readback.reset();
+        self.counters.post_submit_drain.reset();
+        self.counters.indeterminate_recovery.reset();
+        true
     }
 }
 

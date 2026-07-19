@@ -12,6 +12,10 @@ use super::{
     ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope, IdentifiedFailure, VNextError,
 };
 
+/// Backend-neutral device capability for an explicit cold-path reusable
+/// executable preparation lifecycle.
+pub const DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID: &str = "capability.device.reusable_execution.v1";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ExecutionLaneId(NonZeroU64);
@@ -684,6 +688,7 @@ pub struct DeviceReusableExecutionObservation {
     capture_rejected_segments: u64,
     quiescence_deferred_segments: u64,
     capacity_deferred_segments: u64,
+    outside_preparation_segments: u64,
     evicted_segments: u64,
     replayed_segments: u64,
     replayed_commands: u64,
@@ -721,6 +726,10 @@ impl DeviceReusableExecutionObservation {
 
     pub fn observe_capacity_deferred_segment(&mut self) {
         self.capacity_deferred_segments = self.capacity_deferred_segments.saturating_add(1);
+    }
+
+    pub fn observe_outside_preparation_segment(&mut self) {
+        self.outside_preparation_segments = self.outside_preparation_segments.saturating_add(1);
     }
 
     pub fn observe_evicted_segment(&mut self) {
@@ -770,6 +779,10 @@ impl DeviceReusableExecutionObservation {
         self.capacity_deferred_segments
     }
 
+    pub const fn outside_preparation_segments(self) -> u64 {
+        self.outside_preparation_segments
+    }
+
     pub const fn evicted_segments(self) -> u64 {
         self.evicted_segments
     }
@@ -793,6 +806,175 @@ impl DeviceReusableExecutionObservation {
 pub struct DeviceReusableExecutionTrim {
     released_executables: u64,
     released_rejections: u64,
+}
+
+/// Cold-path capacity selected by the model execution plan before reusable
+/// device executables are prepared.
+///
+/// The value is an upper bound on resident executable descriptors, not a
+/// hardware- or model-name heuristic. Product composition derives it from the
+/// immutable execution plan and the startup shape matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionPlan {
+    maximum_executables: usize,
+}
+
+impl DeviceReusableExecutionPlan {
+    pub fn new(maximum_executables: usize) -> Result<Self, super::VNextError> {
+        if maximum_executables == 0 {
+            return Err(super::VNextError::InvalidExecutionPlan {
+                reason: "reusable execution plan requires non-zero capacity".to_owned(),
+            });
+        }
+        Ok(Self {
+            maximum_executables,
+        })
+    }
+
+    pub const fn maximum_executables(self) -> usize {
+        self.maximum_executables
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceReusableExecutionPreparationState {
+    Unsupported,
+    Preparing,
+    Ready,
+}
+
+/// Backend receipt for the explicit configure -> prepare -> seal lifecycle.
+///
+/// Captures happen only between `Preparing` and `Ready`. Once sealed, a
+/// backend must replay a resident executable or use eager execution; it must
+/// not compile new work on a product request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionPreparation {
+    state: DeviceReusableExecutionPreparationState,
+    maximum_executables: u64,
+    resident_executables: u64,
+    rejected_executables: u64,
+    captured_executables: u64,
+    uploaded_executables: u64,
+    capacity_deferred_executables: u64,
+}
+
+impl DeviceReusableExecutionPreparation {
+    pub const fn unsupported() -> Self {
+        Self {
+            state: DeviceReusableExecutionPreparationState::Unsupported,
+            maximum_executables: 0,
+            resident_executables: 0,
+            rejected_executables: 0,
+            captured_executables: 0,
+            uploaded_executables: 0,
+            capacity_deferred_executables: 0,
+        }
+    }
+
+    pub fn preparing(plan: DeviceReusableExecutionPlan) -> Self {
+        Self {
+            state: DeviceReusableExecutionPreparationState::Preparing,
+            maximum_executables: u64::try_from(plan.maximum_executables()).unwrap_or(u64::MAX),
+            ..Self::unsupported()
+        }
+    }
+
+    pub fn preparing_with_progress(
+        plan: DeviceReusableExecutionPlan,
+        resident_executables: usize,
+        rejected_executables: usize,
+        captured_executables: u64,
+        uploaded_executables: u64,
+        capacity_deferred_executables: u64,
+    ) -> Result<Self, super::VNextError> {
+        Self::with_progress(
+            DeviceReusableExecutionPreparationState::Preparing,
+            plan,
+            resident_executables,
+            rejected_executables,
+            captured_executables,
+            uploaded_executables,
+            capacity_deferred_executables,
+        )
+    }
+
+    pub fn ready(
+        plan: DeviceReusableExecutionPlan,
+        resident_executables: usize,
+        rejected_executables: usize,
+        captured_executables: u64,
+        uploaded_executables: u64,
+        capacity_deferred_executables: u64,
+    ) -> Result<Self, super::VNextError> {
+        Self::with_progress(
+            DeviceReusableExecutionPreparationState::Ready,
+            plan,
+            resident_executables,
+            rejected_executables,
+            captured_executables,
+            uploaded_executables,
+            capacity_deferred_executables,
+        )
+    }
+
+    fn with_progress(
+        state: DeviceReusableExecutionPreparationState,
+        plan: DeviceReusableExecutionPlan,
+        resident_executables: usize,
+        rejected_executables: usize,
+        captured_executables: u64,
+        uploaded_executables: u64,
+        capacity_deferred_executables: u64,
+    ) -> Result<Self, super::VNextError> {
+        if resident_executables > plan.maximum_executables()
+            || uploaded_executables < u64::try_from(resident_executables).unwrap_or(u64::MAX)
+            || captured_executables < uploaded_executables
+        {
+            return Err(super::VNextError::InvalidExecutionPlan {
+                reason: "reusable execution preparation receipt is internally inconsistent"
+                    .to_owned(),
+            });
+        }
+        Ok(Self {
+            state,
+            maximum_executables: u64::try_from(plan.maximum_executables()).unwrap_or(u64::MAX),
+            resident_executables: u64::try_from(resident_executables).unwrap_or(u64::MAX),
+            rejected_executables: u64::try_from(rejected_executables).unwrap_or(u64::MAX),
+            captured_executables,
+            uploaded_executables,
+            capacity_deferred_executables,
+        })
+    }
+
+    pub const fn state(self) -> DeviceReusableExecutionPreparationState {
+        self.state
+    }
+
+    pub const fn maximum_executables(self) -> u64 {
+        self.maximum_executables
+    }
+
+    pub const fn resident_executables(self) -> u64 {
+        self.resident_executables
+    }
+
+    pub const fn rejected_executables(self) -> u64 {
+        self.rejected_executables
+    }
+
+    pub const fn captured_executables(self) -> u64 {
+        self.captured_executables
+    }
+
+    pub const fn uploaded_executables(self) -> u64 {
+        self.uploaded_executables
+    }
+
+    pub const fn capacity_deferred_executables(self) -> u64 {
+        self.capacity_deferred_executables
+    }
 }
 
 impl DeviceReusableExecutionTrim {
@@ -1313,6 +1495,36 @@ pub trait DeviceRuntime: Send + Sync + 'static {
 
     fn stream_state(&self, stream: &Self::Stream) -> StreamState;
 
+    /// Opens the bounded cold-path preparation window for one stream.
+    /// Backends without reusable executable support retain the no-op receipt.
+    fn configure_reusable_executables(
+        &self,
+        _stream: &mut Self::Stream,
+        _plan: DeviceReusableExecutionPlan,
+    ) -> Result<DeviceReusableExecutionPreparation, Self::Error> {
+        Ok(DeviceReusableExecutionPreparation::unsupported())
+    }
+
+    /// Permanently closes the preparation window for this stream. A sealed
+    /// stream may replay or fall back to eager execution but cannot capture on
+    /// a later product request.
+    fn seal_reusable_executables(
+        &self,
+        _stream: &mut Self::Stream,
+    ) -> Result<DeviceReusableExecutionPreparation, Self::Error> {
+        Ok(DeviceReusableExecutionPreparation::unsupported())
+    }
+
+    /// Returns the current preparation receipt without changing lifecycle
+    /// state. Product startup uses two snapshots to prove that its validation
+    /// pass replayed stable executables instead of compiling more work.
+    fn reusable_executable_preparation(
+        &self,
+        _stream: &Self::Stream,
+    ) -> Result<DeviceReusableExecutionPreparation, Self::Error> {
+        Ok(DeviceReusableExecutionPreparation::unsupported())
+    }
+
     /// Releases reusable executable cache entries on a proven-quiescent
     /// stream. Backends without such a cache retain the no-op default.
     fn trim_reusable_executables(
@@ -1544,6 +1756,7 @@ mod deferred_cleanup_tests {
         observation.observe_capture_rejection();
         observation.observe_quiescence_deferred_segment();
         observation.observe_capacity_deferred_segment();
+        observation.observe_outside_preparation_segment();
         observation.observe_evicted_segment();
         observation.observe_replayed_segment(3);
         observation.observe_eager_command();
@@ -1556,6 +1769,7 @@ mod deferred_cleanup_tests {
         assert_eq!(observation.capture_rejected_segments(), 1);
         assert_eq!(observation.quiescence_deferred_segments(), 1);
         assert_eq!(observation.capacity_deferred_segments(), 1);
+        assert_eq!(observation.outside_preparation_segments(), 1);
         assert_eq!(observation.evicted_segments(), 1);
         assert_eq!(observation.replayed_segments(), 1);
         assert_eq!(observation.replayed_commands(), 3);
@@ -1571,6 +1785,7 @@ mod deferred_cleanup_tests {
             "capture_rejected_segments",
             "quiescence_deferred_segments",
             "capacity_deferred_segments",
+            "outside_preparation_segments",
             "evicted_segments",
             "replayed_segments",
             "eager_commands",

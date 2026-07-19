@@ -18,10 +18,10 @@ use ferrum_interfaces::vnext::{
     ProviderStorageBindingRequirement, ResolvedTensorLayout, ResolvedValueBinding,
     ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
-    DENSE_SWIGLU_F16_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
-    LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
-    RESIDUAL_ADD_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
-    TOKEN_EMBEDDING_OPERATION_ID,
+    DENSE_SWIGLU_F16_CAPABILITY_ID, DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
+    LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
+    RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
 use sha2::{Digest, Sha256};
 
@@ -40,9 +40,6 @@ const LAST_TOKEN_DENSE_LINEAR_PROVIDER_ID: &str =
 const LAST_TOKEN_DENSE_LINEAR_ESTIMATOR_ID: &str =
     "resource-estimator.cuda.last_token_dense_linear.f16.cublas";
 const CUDA_ENGINE_PROVIDER_ID: &str = "provider.engine.cuda.vnext";
-const CUDA_REUSABLE_EXECUTABLE_CAPABILITY_ID: &str =
-    "capability.device.cuda.reusable_executable.v1";
-const DEFAULT_REUSABLE_EXECUTABLE_CACHE_ENTRIES: usize = 64;
 const DENSE_SAFETENSORS_FORMAT_ID: &str = "weight-format.safetensors.dense";
 const EMBEDDING_FUNCTION_NAME: &str = "vnext_embedding_lookup_f16";
 const VALUE_ALIGNMENT_BYTES: u64 = 16;
@@ -89,7 +86,6 @@ pub fn cuda_vnext_runtime_config(
                 },
             )?,
         ]),
-        maximum_reusable_executables_per_stream: DEFAULT_REUSABLE_EXECUTABLE_CACHE_ENTRIES,
     })
 }
 
@@ -103,7 +99,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         RESIDUAL_ADD_F16_CAPABILITY_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
-        CUDA_REUSABLE_EXECUTABLE_CAPABILITY_ID,
+        DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
     ]
     .into_iter()
     .map(CapabilityId::new)

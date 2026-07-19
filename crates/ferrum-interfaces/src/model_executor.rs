@@ -1773,6 +1773,17 @@ pub trait ModelExecutor: Send + Sync {
         None
     }
 
+    /// Complete executor-owned startup preparation before either product
+    /// entrypoint can accept a request.
+    ///
+    /// Implementations use this cold-path hook for work that requires the
+    /// fully constructed executor but must not be charged to a user's first
+    /// request, such as compiling reusable execution shapes. The default is a
+    /// no-op so existing executors remain source compatible.
+    async fn prepare_startup(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Warm up executor (load model, allocate memory, etc.)
     async fn warmup(&mut self) -> Result<()> {
         // Default no-op implementation

@@ -422,6 +422,14 @@ impl EngineBuilder {
             _ => (None, None),
         };
 
+        // This is the single product readiness boundary shared by `run` and
+        // `serve`. Executor-owned compilation and warmup must finish here so
+        // it cannot leak into the first request or diverge by entrypoint.
+        executor.prepare_startup().await?;
+        if let Some(draft) = draft_executor.as_ref() {
+            draft.prepare_startup().await?;
+        }
+
         let engine = match execution_resource_authority {
             ferrum_interfaces::model_executor::ExecutionResourceAuthority::PlanRuntime => {
                 crate::ContinuousBatchEngine::new_plan_runtime(
@@ -566,6 +574,43 @@ mod tests {
 
     struct PlanRuntimeBuilderExecutor {
         inner: ferrum_testkit::MockModelExecutor,
+    }
+
+    struct StartupProbeExecutor {
+        inner: ferrum_testkit::MockModelExecutor,
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelExecutor for StartupProbeExecutor {
+        fn info(&self) -> &ferrum_types::ModelInfo {
+            self.inner.info()
+        }
+
+        async fn prepare_startup(&self) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail {
+                return Err(FerrumError::backend("startup preparation rejected"));
+            }
+            Ok(())
+        }
+
+        async fn prefill(&self, input: &PrefillInput) -> Result<PrefillOutput> {
+            self.inner.prefill(input).await
+        }
+
+        async fn decode(&self, input: &DecodeInput) -> Result<DecodeOutput> {
+            self.inner.decode(input).await
+        }
+
+        fn capabilities(&self) -> ExecutorCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn status(&self) -> ExecutorStatus {
+            self.inner.status()
+        }
     }
 
     #[async_trait::async_trait]
@@ -927,6 +972,37 @@ mod tests {
 
         // Should succeed with stub components
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn startup_preparation_runs_once_and_blocks_engine_construction_on_failure() {
+        let success_calls = Arc::new(AtomicUsize::new(0));
+        let success: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(StartupProbeExecutor {
+            inner: ferrum_testkit::MockModelExecutor::instant(128),
+            calls: Arc::clone(&success_calls),
+            fail: false,
+        });
+        EngineBuilder::new(EngineConfig::default())
+            .with_custom_executor(success)
+            .build()
+            .await
+            .expect("successful startup preparation builds the engine");
+        assert_eq!(success_calls.load(Ordering::Relaxed), 1);
+
+        let failure_calls = Arc::new(AtomicUsize::new(0));
+        let failure: Arc<dyn ModelExecutor + Send + Sync> = Arc::new(StartupProbeExecutor {
+            inner: ferrum_testkit::MockModelExecutor::instant(128),
+            calls: Arc::clone(&failure_calls),
+            fail: true,
+        });
+        let error = EngineBuilder::new(EngineConfig::default())
+            .with_custom_executor(failure)
+            .build()
+            .await
+            .err()
+            .expect("failed startup preparation must stop engine construction");
+        assert!(error.to_string().contains("startup preparation rejected"));
+        assert_eq!(failure_calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

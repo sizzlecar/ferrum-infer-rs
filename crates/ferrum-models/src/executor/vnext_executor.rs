@@ -29,9 +29,10 @@ use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
 use ferrum_types::{
     Device, EngineConfig, FerrumError, ModelInfo, RequestId, Result, SchedulingPolicy,
-    SequenceFitPolicy,
+    SequenceFitPolicy, TokenId,
 };
 use parking_lot::{Mutex, RwLock};
+use serde::Serialize;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::vnext::PreparedProductionModel;
@@ -68,6 +69,7 @@ pub struct VNextExecutorConfig {
     pub maximum_model_tokens: usize,
     pub static_initialization: StaticInitializationPolicy,
     pub runtime_policy: ResolvedRuntimePolicy,
+    pub reusable_execution_enabled: bool,
 }
 
 impl VNextExecutorConfig {
@@ -155,7 +157,122 @@ impl VNextExecutorConfig {
             maximum_model_tokens,
             static_initialization,
             runtime_policy,
+            reusable_execution_enabled: engine.backend.enable_cuda_graphs,
         })
+    }
+}
+
+const REUSABLE_EXECUTION_WARMUP_PASSES: usize = 1;
+const REUSABLE_EXECUTION_CAPTURE_PASSES: usize = 1;
+const REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES: usize = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct VNextReusableExecutionStartupPlan {
+    decode_widths: Vec<usize>,
+    maximum_synthetic_sequence_tokens: usize,
+    device_plan: DeviceReusableExecutionPlan,
+}
+
+impl VNextReusableExecutionStartupPlan {
+    fn resolve(
+        maximum_active_sequences: u32,
+        maximum_scheduled_tokens: u64,
+        maximum_model_tokens: usize,
+        execution_node_count: usize,
+    ) -> Result<Self> {
+        let maximum_active_sequences = usize::try_from(maximum_active_sequences)
+            .map_err(|_| FerrumError::config("vNext active sequence limit exceeds usize"))?;
+        let maximum_scheduled_tokens = usize::try_from(maximum_scheduled_tokens)
+            .map_err(|_| FerrumError::config("vNext scheduled token limit exceeds usize"))?;
+        let maximum_width = maximum_active_sequences.min(maximum_scheduled_tokens);
+        if maximum_width == 0 {
+            return Err(FerrumError::config(
+                "vNext reusable execution requires a non-zero decode width",
+            ));
+        }
+
+        let mut decode_widths = Vec::new();
+        let mut width = 1_usize;
+        while width < maximum_width {
+            decode_widths.push(width);
+            width = width.checked_mul(2).unwrap_or(maximum_width);
+        }
+        if decode_widths.last().copied() != Some(maximum_width) {
+            decode_widths.push(maximum_width);
+        }
+        decode_widths.sort_unstable_by(|left, right| right.cmp(left));
+
+        let passes_per_width = REUSABLE_EXECUTION_WARMUP_PASSES
+            + REUSABLE_EXECUTION_CAPTURE_PASSES
+            + REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES;
+        let maximum_synthetic_sequence_tokens = decode_widths
+            .len()
+            .checked_mul(passes_per_width)
+            .and_then(|decode_tokens| decode_tokens.checked_add(1))
+            .ok_or_else(|| FerrumError::config("vNext startup token ceiling overflowed"))?;
+        if maximum_synthetic_sequence_tokens > maximum_model_tokens {
+            return Err(FerrumError::config(format!(
+                "vNext model length {maximum_model_tokens} cannot cover reusable execution startup ceiling {maximum_synthetic_sequence_tokens}"
+            )));
+        }
+
+        let maximum_executables = execution_node_count
+            .max(1)
+            .checked_mul(decode_widths.len())
+            .ok_or_else(|| FerrumError::config("vNext reusable executable capacity overflowed"))?;
+        let device_plan = DeviceReusableExecutionPlan::new(maximum_executables)
+            .map_err(|error| FerrumError::config(error.to_string()))?;
+        Ok(Self {
+            decode_widths,
+            maximum_synthetic_sequence_tokens,
+            device_plan,
+        })
+    }
+
+    fn widths_for_available_sequences(&self, available: usize) -> Vec<usize> {
+        let mut widths = self
+            .decode_widths
+            .iter()
+            .copied()
+            .filter(|width| *width <= available)
+            .collect::<Vec<_>>();
+        if available > 0 && !widths.contains(&available) {
+            widths.insert(0, available);
+        }
+        widths
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VNextReusableExecutionStartupReport {
+    enabled: bool,
+    supported: bool,
+    requested_decode_widths: Vec<usize>,
+    prepared_decode_widths: Vec<usize>,
+    synthetic_sequences: usize,
+    eager_warmup_waves: usize,
+    capture_waves: usize,
+    replay_validation_waves: usize,
+    device_preparation: DeviceReusableExecutionPreparation,
+    elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum VNextStartupPreparationState {
+    Pending,
+    Preparing,
+    Ready {
+        report: VNextReusableExecutionStartupReport,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+impl VNextStartupPreparationState {
+    const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready { .. })
     }
 }
 
@@ -264,6 +381,33 @@ impl VNextWaveTimingMetrics {
             ],
         })
     }
+
+    fn reset(&self) {
+        for metrics in [
+            &self.resource_prepare_attempt,
+            &self.host_encode_submit,
+            &self.token_upload_prepare,
+            &self.wave_identity_bind,
+            &self.provider_encode_submit,
+            &self.contract_validate_reserve,
+            &self.backing_input_encode,
+            &self.provider_node_encode,
+            &self.lane_reserve_submit_arm,
+            &self.lane_reserve,
+            &self.device_runtime_submit,
+            &self.device_submit_validate_prepare,
+            &self.device_submit_begin_timing,
+            &self.device_submit_enqueue_commands,
+            &self.device_submit_record_fence_account,
+            &self.completion_arm,
+            &self.completion_round_trip,
+            &self.host_postprocess,
+            &self.submitted_wave_total,
+        ] {
+            metrics.reset();
+        }
+        self.reusable_execution.reset();
+    }
 }
 
 #[derive(Default)]
@@ -276,6 +420,7 @@ struct VNextReusableExecutionMetrics {
     capture_rejected_segments: AtomicU64,
     quiescence_deferred_segments: AtomicU64,
     capacity_deferred_segments: AtomicU64,
+    outside_preparation_segments: AtomicU64,
     evicted_segments: AtomicU64,
     replayed_segments: AtomicU64,
     replayed_commands: AtomicU64,
@@ -302,6 +447,10 @@ impl VNextReusableExecutionMetrics {
         );
         self.capacity_deferred_segments
             .fetch_add(observation.capacity_deferred_segments(), Ordering::Relaxed);
+        self.outside_preparation_segments.fetch_add(
+            observation.outside_preparation_segments(),
+            Ordering::Relaxed,
+        );
         self.evicted_segments
             .fetch_add(observation.evicted_segments(), Ordering::Relaxed);
         self.replayed_segments
@@ -322,11 +471,32 @@ impl VNextReusableExecutionMetrics {
             "capture_rejected_segments": self.capture_rejected_segments.load(Ordering::Relaxed),
             "quiescence_deferred_segments": self.quiescence_deferred_segments.load(Ordering::Relaxed),
             "capacity_deferred_segments": self.capacity_deferred_segments.load(Ordering::Relaxed),
+            "outside_preparation_segments": self.outside_preparation_segments.load(Ordering::Relaxed),
             "evicted_segments": self.evicted_segments.load(Ordering::Relaxed),
             "replayed_segments": self.replayed_segments.load(Ordering::Relaxed),
             "replayed_commands": self.replayed_commands.load(Ordering::Relaxed),
             "eager_commands": self.eager_commands.load(Ordering::Relaxed),
         })
+    }
+
+    fn reset(&self) {
+        for counter in [
+            &self.candidate_segments,
+            &self.captured_segments,
+            &self.uploaded_segments,
+            &self.cache_hit_segments,
+            &self.cached_rejected_segments,
+            &self.capture_rejected_segments,
+            &self.quiescence_deferred_segments,
+            &self.capacity_deferred_segments,
+            &self.outside_preparation_segments,
+            &self.evicted_segments,
+            &self.replayed_segments,
+            &self.replayed_commands,
+            &self.eager_commands,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
     }
 }
 
@@ -455,6 +625,21 @@ impl VNextDeviceTimingMetrics {
             ],
         })
     }
+
+    fn reset(&self) {
+        self.device_execution.reset();
+        self.fence_wait_host.reset();
+        self.readback_host.reset();
+        for counter in [
+            &self.readback_calls,
+            &self.readback_bytes,
+            &self.device_unavailable,
+            &self.fence_wait_unavailable,
+            &self.readback_unavailable,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,6 +670,33 @@ impl VNextExecutorMetrics {
         } else {
             total_us as f64 / operations as f64 / 1000.0
         }
+    }
+
+    fn reset_after_startup(&self) {
+        for counter in [
+            &self.prefill_operations,
+            &self.prefill_frontier_narrowings,
+            &self.decode_operations,
+            &self.submitted_waves,
+            &self.completed_waves,
+            &self.failed_waves,
+            &self.definitely_not_submitted_retries,
+            &self.request_deferrals,
+            &self.sequence_deferrals,
+            &self.extension_deferrals,
+            &self.step_deferrals,
+            &self.wave_deferrals,
+            &self.backing_deferrals,
+            &self.uploaded_bytes,
+            &self.readback_bytes,
+            &self.total_prefill_us,
+            &self.total_decode_us,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+        self.wave_timing.reset();
+        self.device_timing.reset();
+        *self.last_failure.lock() = None;
     }
 }
 
@@ -1699,6 +1911,10 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     family_fingerprint: String,
     program_fingerprint: String,
     static_bytes: u64,
+    reusable_execution_enabled: bool,
+    reusable_execution_supported: bool,
+    reusable_execution_startup_plan: Option<VNextReusableExecutionStartupPlan>,
+    startup_preparation: Mutex<VNextStartupPreparationState>,
     sequences: Mutex<VNextSequenceRegistry<R>>,
     event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
     device_timing_mode: AtomicU8,
@@ -1718,6 +1934,69 @@ impl<R: DeviceRuntime> fmt::Debug for VNextModelExecutor<R> {
             .field("maximum_model_tokens", &self.maximum_model_tokens)
             .field("retained_sequences", &self.sequences.lock().total_len())
             .finish_non_exhaustive()
+    }
+}
+
+struct VNextStartupSequence {
+    request_id: RequestId,
+    kv_cache: Arc<dyn KvCacheHandle>,
+}
+
+struct VNextStartupSequenceGuard<'executor, R: DeviceRuntime> {
+    executor: &'executor VNextModelExecutor<R>,
+    pending_request: Option<RequestId>,
+    sequences: Vec<VNextStartupSequence>,
+}
+
+impl<'executor, R: DeviceRuntime> VNextStartupSequenceGuard<'executor, R> {
+    fn new(executor: &'executor VNextModelExecutor<R>) -> Self {
+        Self {
+            executor,
+            pending_request: None,
+            sequences: Vec::new(),
+        }
+    }
+
+    fn begin_request(&mut self, request_id: RequestId) {
+        debug_assert!(self.pending_request.is_none());
+        self.pending_request = Some(request_id);
+    }
+
+    fn activate(&mut self, kv_cache: Arc<dyn KvCacheHandle>) {
+        let request_id = self
+            .pending_request
+            .take()
+            .expect("startup sequence activation requires a pending request");
+        self.sequences.push(VNextStartupSequence {
+            request_id,
+            kv_cache,
+        });
+    }
+
+    fn cancel_pending(&mut self) {
+        if let Some(request_id) = self.pending_request.take() {
+            self.executor.sequences.lock().cancel_prefill(&request_id);
+        }
+    }
+}
+
+impl<R: DeviceRuntime> Drop for VNextStartupSequenceGuard<'_, R> {
+    fn drop(&mut self) {
+        self.cancel_pending();
+        let sequences = self
+            .sequences
+            .drain(..)
+            .filter_map(|startup| {
+                self.executor
+                    .sequences
+                    .lock()
+                    .active
+                    .remove(&startup.kv_cache.cache_id())
+            })
+            .collect::<Vec<_>>();
+        for sequence in sequences {
+            sequence.abort();
+        }
     }
 }
 
@@ -1887,6 +2166,22 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             FerrumError::device(format!("vNext completion worker creation failed: {error}"))
         })?;
         let reaper = CompletionReaper::new();
+        let reusable_execution_supported = runtime
+            .descriptor()
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID);
+        let reusable_execution_startup_plan =
+            if config.reusable_execution_enabled && reusable_execution_supported {
+                Some(VNextReusableExecutionStartupPlan::resolve(
+                    config.runtime_policy.memory().maximum_active_sequences,
+                    config.runtime_policy.admission().maximum_scheduled_tokens,
+                    config.maximum_model_tokens,
+                    resolved_plan.execution_plan().payload().nodes().len(),
+                )?)
+            } else {
+                None
+            };
 
         Ok(Self {
             info,
@@ -1905,11 +2200,311 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             family_fingerprint,
             program_fingerprint,
             static_bytes,
+            reusable_execution_enabled: config.reusable_execution_enabled,
+            reusable_execution_supported,
+            reusable_execution_startup_plan,
+            startup_preparation: Mutex::new(VNextStartupPreparationState::Pending),
             sequences: Mutex::new(VNextSequenceRegistry::default()),
             event_sink: RwLock::new(None),
             device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
             metrics: VNextExecutorMetrics::default(),
         })
+    }
+
+    fn startup_token_tensor(token: u32) -> Result<TensorRef> {
+        let tensor = candle_core::Tensor::new(&[token], &candle_core::Device::Cpu)
+            .and_then(|tensor| tensor.unsqueeze(0))
+            .map_err(|error| FerrumError::model(format!("vNext startup token tensor: {error}")))?;
+        Ok(common::wrap_tensor(tensor))
+    }
+
+    async fn admit_startup_sequence(
+        &self,
+        resources: &mut VNextStartupSequenceGuard<'_, R>,
+        input_tokens: &[TokenId],
+        input_tensor: &TensorRef,
+        maximum_sequence_tokens: usize,
+    ) -> Result<bool> {
+        let request_id = RequestId::new();
+        resources.begin_request(request_id.clone());
+        let mut maintenance_attempts = 0_u32;
+        loop {
+            match self.try_admit_prefill(ExecutorPrefillAdmission::new(
+                &request_id,
+                input_tokens,
+                maximum_sequence_tokens,
+            ))? {
+                ExecutorPrefillAdmissionDecision::Admitted(receipt) => {
+                    if receipt.request_id != request_id {
+                        return Err(FerrumError::internal(
+                            "vNext startup prefill admission changed request identity",
+                        ));
+                    }
+                    break;
+                }
+                ExecutorPrefillAdmissionDecision::MaintenanceDeferred(_) => {
+                    if maintenance_attempts >= MAX_BACKING_MAINTENANCE_ATTEMPTS {
+                        return Err(FerrumError::resource_exhausted(format!(
+                            "vNext startup prefill backing did not converge after {maintenance_attempts} attempts"
+                        )));
+                    }
+                    maintenance_attempts += 1;
+                    match self.maintain_prefill_backing(&request_id)? {
+                        ExecutorPrefillMaintenanceOutcome::Maintained { .. }
+                        | ExecutorPrefillMaintenanceOutcome::RetryAdmission { .. } => continue,
+                        ExecutorPrefillMaintenanceOutcome::WaitForRelease { .. } => {
+                            resources.cancel_pending();
+                            return Ok(false);
+                        }
+                        ExecutorPrefillMaintenanceOutcome::NoLongerPending => {
+                            return Err(FerrumError::internal(
+                                "vNext startup backing maintenance lost its retained request",
+                            ));
+                        }
+                    }
+                }
+                ExecutorPrefillAdmissionDecision::Deferred(_) => {
+                    resources.cancel_pending();
+                    return Ok(false);
+                }
+                ExecutorPrefillAdmissionDecision::PermanentRejected(rejected) => {
+                    return Err(FerrumError::resource_exhausted(format!(
+                        "vNext startup prefill was permanently rejected: {rejected:?}"
+                    )));
+                }
+            }
+        }
+
+        let chunk = PrefillChunk::new(0, 1, 1)?;
+        let input = PrefillInput::new(Arc::clone(input_tensor))
+            .with_request_context(request_id, maximum_sequence_tokens)
+            .with_chunk(chunk);
+        match self.execute_prefill_with_capacity(&input).await? {
+            ExecutorPrefillOutcome::Completed(completion) => {
+                let (output, planned, completed, _) = completion.into_parts();
+                if planned != chunk || completed != chunk {
+                    return Err(FerrumError::internal(
+                        "vNext startup prefill did not complete its exact one-token frontier",
+                    ));
+                }
+                resources.activate(output.kv_cache);
+                Ok(true)
+            }
+            ExecutorPrefillOutcome::Deferred(_) => {
+                resources.cancel_pending();
+                Ok(false)
+            }
+        }
+    }
+
+    async fn execute_startup_decode_pass(
+        &self,
+        resources: &mut VNextStartupSequenceGuard<'_, R>,
+        input_tensor: &TensorRef,
+        width: usize,
+        phase: &'static str,
+    ) -> Result<()> {
+        if width == 0 || width > resources.sequences.len() {
+            return Err(FerrumError::internal(format!(
+                "vNext startup {phase} width {width} exceeds {} retained sequences",
+                resources.sequences.len()
+            )));
+        }
+        let inputs = resources
+            .sequences
+            .iter()
+            .take(width)
+            .map(|sequence| {
+                DecodeInput::new(Arc::clone(input_tensor), Arc::clone(&sequence.kv_cache))
+                    .with_request_id(sequence.request_id.clone())
+            })
+            .collect::<Vec<_>>();
+        match self.execute_decode_batch(&inputs).await? {
+            ExecutorBatchDecodeOutcome::Completed(outputs) => {
+                if outputs.len() != width {
+                    return Err(FerrumError::internal(format!(
+                        "vNext startup {phase} returned {} outputs for width {width}",
+                        outputs.len()
+                    )));
+                }
+                for (sequence, output) in resources.sequences.iter_mut().take(width).zip(outputs) {
+                    sequence.kv_cache = output.kv_cache;
+                }
+                Ok(())
+            }
+            ExecutorBatchDecodeOutcome::Deferred(deferred) => {
+                Err(FerrumError::resource_exhausted(format!(
+                    "vNext startup {phase} width {width} deferred at {:?}",
+                    deferred.stage()
+                )))
+            }
+        }
+    }
+
+    async fn prepare_reusable_execution_startup(
+        &self,
+    ) -> Result<VNextReusableExecutionStartupReport> {
+        let started = Instant::now();
+        let Some(plan) = self.reusable_execution_startup_plan.clone() else {
+            return Ok(VNextReusableExecutionStartupReport {
+                enabled: self.reusable_execution_enabled,
+                supported: self.reusable_execution_supported,
+                requested_decode_widths: Vec::new(),
+                prepared_decode_widths: Vec::new(),
+                synthetic_sequences: 0,
+                eager_warmup_waves: 0,
+                capture_waves: 0,
+                replay_validation_waves: 0,
+                device_preparation: DeviceReusableExecutionPreparation::unsupported(),
+                elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            });
+        };
+
+        let input_tokens = [TokenId::new(0)];
+        let input_tensor = Self::startup_token_tensor(0)?;
+        let mut resources = VNextStartupSequenceGuard::new(self);
+        let requested_sequences = plan.decode_widths.first().copied().ok_or_else(|| {
+            FerrumError::internal("vNext reusable execution plan has no decode widths")
+        })?;
+        for _ in 0..requested_sequences {
+            if !self
+                .admit_startup_sequence(
+                    &mut resources,
+                    &input_tokens,
+                    &input_tensor,
+                    plan.maximum_synthetic_sequence_tokens,
+                )
+                .await?
+            {
+                break;
+            }
+        }
+        if resources.sequences.is_empty() {
+            return Err(FerrumError::resource_exhausted(
+                "vNext reusable execution startup could not admit one synthetic sequence",
+            ));
+        }
+        let prepared_decode_widths = plan.widths_for_available_sequences(resources.sequences.len());
+
+        for _ in 0..REUSABLE_EXECUTION_WARMUP_PASSES {
+            for width in prepared_decode_widths.iter().copied() {
+                self.execute_startup_decode_pass(
+                    &mut resources,
+                    &input_tensor,
+                    width,
+                    "eager warmup",
+                )
+                .await?;
+            }
+        }
+
+        let configured = self
+            .lane
+            .configure_reusable_executables(plan.device_plan)
+            .map_err(|error| {
+                FerrumError::device(format!(
+                    "vNext reusable execution configuration failed: {error}"
+                ))
+            })?;
+        if configured.state() != DeviceReusableExecutionPreparationState::Preparing {
+            return Err(FerrumError::internal(format!(
+                "vNext reusable execution capability configured as {:?}",
+                configured.state()
+            )));
+        }
+
+        for _ in 0..REUSABLE_EXECUTION_CAPTURE_PASSES {
+            for width in prepared_decode_widths.iter().copied() {
+                self.execute_startup_decode_pass(&mut resources, &input_tensor, width, "capture")
+                    .await?;
+            }
+        }
+        let captured = self
+            .lane
+            .reusable_executable_preparation()
+            .map_err(|error| {
+                FerrumError::device(format!(
+                    "vNext reusable execution capture inspection failed: {error}"
+                ))
+            })?;
+        if captured.state() != DeviceReusableExecutionPreparationState::Preparing
+            || captured.resident_executables() == 0
+            || captured.rejected_executables() != 0
+            || captured.capacity_deferred_executables() != 0
+            || captured.captured_executables() != captured.uploaded_executables()
+            || captured.uploaded_executables() != captured.resident_executables()
+        {
+            return Err(FerrumError::device(format!(
+                "vNext reusable execution capture receipt is incomplete: {captured:?}"
+            )));
+        }
+        for _ in 0..REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES {
+            for width in prepared_decode_widths.iter().copied() {
+                self.execute_startup_decode_pass(
+                    &mut resources,
+                    &input_tensor,
+                    width,
+                    "replay validation",
+                )
+                .await?;
+            }
+        }
+        let replayed = self
+            .lane
+            .reusable_executable_preparation()
+            .map_err(|error| {
+                FerrumError::device(format!(
+                    "vNext reusable execution replay inspection failed: {error}"
+                ))
+            })?;
+        if replayed != captured {
+            return Err(FerrumError::device(format!(
+                "vNext replay validation compiled or changed executable state: before={captured:?}, after={replayed:?}"
+            )));
+        }
+
+        let device_preparation = self.lane.seal_reusable_executables().map_err(|error| {
+            FerrumError::device(format!("vNext reusable execution sealing failed: {error}"))
+        })?;
+        if device_preparation.state() != DeviceReusableExecutionPreparationState::Ready
+            || device_preparation.resident_executables() == 0
+            || device_preparation.uploaded_executables() < device_preparation.resident_executables()
+            || device_preparation.captured_executables() != captured.captured_executables()
+            || device_preparation.uploaded_executables() != captured.uploaded_executables()
+        {
+            return Err(FerrumError::device(format!(
+                "vNext reusable execution sealing produced an unusable receipt: {device_preparation:?}"
+            )));
+        }
+        let synthetic_sequences = resources.sequences.len();
+        Ok(VNextReusableExecutionStartupReport {
+            enabled: true,
+            supported: true,
+            requested_decode_widths: plan.decode_widths,
+            prepared_decode_widths: prepared_decode_widths.clone(),
+            synthetic_sequences,
+            eager_warmup_waves: prepared_decode_widths.len() * REUSABLE_EXECUTION_WARMUP_PASSES,
+            capture_waves: prepared_decode_widths.len() * REUSABLE_EXECUTION_CAPTURE_PASSES,
+            replay_validation_waves: prepared_decode_widths.len()
+                * REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES,
+            device_preparation,
+            elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        })
+    }
+
+    fn reset_request_metrics_after_startup(&self) -> Result<()> {
+        if self.sequences.lock().total_len() != 0 {
+            return Err(FerrumError::internal(
+                "vNext startup cleanup retained synthetic sequence authority",
+            ));
+        }
+        if !self.completion_worker.reset_metrics_if_idle() {
+            return Err(FerrumError::internal(
+                "vNext startup cleanup left a completion task in flight",
+            ));
+        }
+        self.metrics.reset_after_startup();
+        Ok(())
     }
 
     fn device_timing_mode(&self) -> DeviceTimingMode {
@@ -3695,6 +4290,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             "completion_worker": self.completion_worker.metrics_snapshot(),
             "dynamic_pools": pool_status,
             "deferred_cleanup": cleanup,
+            "startup_preparation": serde_json::to_value(&*self.startup_preparation.lock())
+                .unwrap_or_else(|error| serde_json::json!({"state": "serialization_failed", "message": error.to_string()})),
             "last_failure": self.metrics.last_failure.lock().clone(),
         })
     }
@@ -3704,6 +4301,48 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
     fn info(&self) -> &ModelInfo {
         &self.info
+    }
+
+    async fn prepare_startup(&self) -> Result<()> {
+        {
+            let mut state = self.startup_preparation.lock();
+            match &*state {
+                VNextStartupPreparationState::Pending => {
+                    *state = VNextStartupPreparationState::Preparing;
+                }
+                VNextStartupPreparationState::Ready { .. } => return Ok(()),
+                VNextStartupPreparationState::Preparing => {
+                    return Err(FerrumError::internal(
+                        "vNext startup preparation is already running",
+                    ));
+                }
+                VNextStartupPreparationState::Failed { message } => {
+                    return Err(FerrumError::device(format!(
+                        "vNext startup preparation previously failed: {message}"
+                    )));
+                }
+            }
+        }
+
+        let preparation = self
+            .prepare_reusable_execution_startup()
+            .await
+            .and_then(|report| {
+                self.reset_request_metrics_after_startup()?;
+                Ok(report)
+            });
+        match preparation {
+            Ok(report) => {
+                *self.startup_preparation.lock() = VNextStartupPreparationState::Ready { report };
+                Ok(())
+            }
+            Err(error) => {
+                *self.startup_preparation.lock() = VNextStartupPreparationState::Failed {
+                    message: error.to_string(),
+                };
+                Err(error)
+            }
+        }
     }
 
     fn execution_resource_authority(&self) -> ExecutionResourceAuthority {
@@ -4180,13 +4819,21 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
             .unwrap_or(0);
         let used_bytes = self.static_bytes.saturating_add(used_dynamic);
         let capacity = self.policy.memory().capacity_bytes;
+        let startup = self.startup_preparation.lock();
+        let startup_ready = startup.is_ready();
+        let startup_failed = matches!(&*startup, VNextStartupPreparationState::Failed { .. });
+        drop(startup);
         ExecutorStatus {
-            state: if self.sequences.lock().total_len() == 0 {
+            state: if startup_failed {
+                ExecutorState::Error
+            } else if !startup_ready {
+                ExecutorState::Initializing
+            } else if self.sequences.lock().total_len() == 0 {
                 ExecutorState::Ready
             } else {
                 ExecutorState::Busy
             },
-            is_ready: !self.plan_resources.is_closing(),
+            is_ready: startup_ready && !self.plan_resources.is_closing(),
             current_batch_size: self.sequences.lock().active.len(),
             prefill_operations,
             decode_operations,
@@ -4222,7 +4869,7 @@ mod tests {
     use super::{
         reported_allocated_bytes, resolved_sequence_fit_policy, AdmissionFitPolicy,
         DecodeFailureDisposition, FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics,
-        VNextReusableExecutionMetrics, VNextWaveTimingMetrics,
+        VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics,
     };
     use ferrum_interfaces::vnext::DeviceReusableExecutionObservation;
 
@@ -4237,6 +4884,7 @@ mod tests {
         observation.observe_capture_rejection();
         observation.observe_quiescence_deferred_segment();
         observation.observe_capacity_deferred_segment();
+        observation.observe_outside_preparation_segment();
         observation.observe_evicted_segment();
         observation.observe_replayed_segment(4);
         observation.observe_eager_command();
@@ -4255,6 +4903,7 @@ mod tests {
             "capture_rejected_segments",
             "quiescence_deferred_segments",
             "capacity_deferred_segments",
+            "outside_preparation_segments",
             "evicted_segments",
             "replayed_segments",
             "eager_commands",
@@ -4262,6 +4911,24 @@ mod tests {
             assert_eq!(snapshot[field], 2, "counter {field} must aggregate");
         }
         assert_eq!(snapshot["replayed_commands"], 8);
+    }
+
+    #[test]
+    fn reusable_execution_startup_plan_is_policy_derived_largest_first_and_bounded() {
+        let plan = VNextReusableExecutionStartupPlan::resolve(32, 2_048, 128, 23).unwrap();
+
+        assert_eq!(plan.decode_widths, [32, 16, 8, 4, 2, 1]);
+        assert_eq!(plan.maximum_synthetic_sequence_tokens, 19);
+        assert_eq!(plan.device_plan.maximum_executables(), 138);
+        assert_eq!(
+            plan.widths_for_available_sequences(20),
+            [20, 16, 8, 4, 2, 1]
+        );
+
+        let non_power_of_two = VNextReusableExecutionStartupPlan::resolve(7, 7, 64, 2).unwrap();
+        assert_eq!(non_power_of_two.decode_widths, [7, 4, 2, 1]);
+        assert_eq!(non_power_of_two.device_plan.maximum_executables(), 8);
+        assert!(VNextReusableExecutionStartupPlan::resolve(32, 2_048, 18, 23).is_err());
     }
 
     #[test]

@@ -118,6 +118,9 @@ impl EngineConfig {
                 value,
             )?);
         }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_BATCHED_GRAPH") {
+            self.backend.enable_cuda_graphs = parse_presence_bool(value)?;
+        }
         // Engine runtime knobs (previously read by the engine from env). The
         // CLI/autosizer resolves these into the snapshot; the engine reads the
         // typed `runtime` field instead of `std::env::vars()`.

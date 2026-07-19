@@ -14,11 +14,15 @@ use std::sync::Arc;
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaStream};
-use ferrum_interfaces::vnext::{DeviceCommandPhase, DeviceReusableAddressScope, ElementType};
+use ferrum_interfaces::vnext::{
+    DeviceCommandPhase, DeviceReusableAddressScope, DeviceReusableExecutionPlan,
+    DeviceReusableExecutionPreparation, ElementType,
+};
 use sha2::{Digest, Sha256};
 
 use crate::backend::reusable_execution::{
     discover_reusable_segments, plan_bounded_reusable_execution,
+    ReusableExecutionPreparationTracker,
 };
 
 use super::vnext_runtime::{CudaCommandPayload, CudaDeviceCommand, CudaDeviceRuntimeError};
@@ -406,7 +410,7 @@ unsafe impl Send for CudaExecutableSegment {}
 pub(crate) struct CudaExecutableCache {
     entries: HashMap<CudaExecutableSegmentKey, CudaExecutableSegment>,
     rejected: HashMap<CudaExecutableSegmentKey, u64>,
-    maximum_entries: usize,
+    preparation: ReusableExecutionPreparationTracker,
     clock: u64,
 }
 
@@ -419,6 +423,7 @@ pub(crate) struct CudaExecutablePreparation {
     cached_rejected_segments: usize,
     quiescence_deferred_segments: usize,
     capacity_deferred_segments: usize,
+    outside_preparation_segments: usize,
     evicted_segments: usize,
 }
 
@@ -451,23 +456,41 @@ impl CudaExecutablePreparation {
         self.capacity_deferred_segments
     }
 
+    pub(crate) fn outside_preparation_segments(self) -> usize {
+        self.outside_preparation_segments
+    }
+
     pub(crate) fn evicted_segments(self) -> usize {
         self.evicted_segments
     }
 }
 
 impl CudaExecutableCache {
-    pub(crate) fn new(maximum_entries: usize) -> Self {
-        assert!(
-            maximum_entries > 0,
-            "CUDA executable cache must be non-empty"
-        );
+    pub(crate) fn new() -> Self {
         Self {
             entries: HashMap::new(),
             rejected: HashMap::new(),
-            maximum_entries,
+            preparation: ReusableExecutionPreparationTracker::default(),
             clock: 0,
         }
+    }
+
+    pub(crate) fn configure(
+        &mut self,
+        plan: DeviceReusableExecutionPlan,
+    ) -> Result<DeviceReusableExecutionPreparation, String> {
+        self.preparation
+            .configure(plan, self.entries.len(), self.rejected.len())
+    }
+
+    pub(crate) fn seal(&mut self) -> Result<DeviceReusableExecutionPreparation, String> {
+        self.preparation
+            .seal(self.entries.len(), self.rejected.len())
+    }
+
+    pub(crate) fn preparation(&self) -> Result<DeviceReusableExecutionPreparation, String> {
+        self.preparation
+            .snapshot(self.entries.len(), self.rejected.len())
     }
 
     fn tick(&mut self) -> u64 {
@@ -500,6 +523,13 @@ impl CudaExecutableCache {
         if candidates.is_empty() {
             return Ok(report);
         }
+        if !self.preparation.capture_is_open() {
+            report.outside_preparation_segments = candidates
+                .len()
+                .saturating_sub(report.cache_hit_segments)
+                .saturating_sub(report.cached_rejected_segments);
+            return Ok(report);
+        }
         if !capture_allowed {
             report.quiescence_deferred_segments = candidates
                 .len()
@@ -522,7 +552,9 @@ impl CudaExecutableCache {
             &candidate_keys,
             &resident_last_used,
             &rejected_keys,
-            self.maximum_entries,
+            self.preparation
+                .maximum_executables()
+                .expect("open reusable execution preparation has a capacity"),
         );
         report.capacity_deferred_segments = plan.capacity_deferred_misses().len();
 
@@ -573,12 +605,33 @@ impl CudaExecutableCache {
                 .upload(stream)?;
             report.uploaded_segments += 1;
         }
-        debug_assert!(self.entries.len() <= self.maximum_entries);
+        self.preparation
+            .record_batch(
+                report.captured_segments,
+                report.uploaded_segments,
+                report.capacity_deferred_segments,
+            )
+            .map_err(|detail| CudaReplayError {
+                stage: "record reusable executable preparation",
+                detail,
+                eager_fallback_safe: false,
+            })?;
+        debug_assert!(
+            self.entries.len()
+                <= self
+                    .preparation
+                    .maximum_executables()
+                    .expect("open reusable execution preparation has a capacity")
+        );
         Ok(report)
     }
 
     fn remember_rejected(&mut self, key: CudaExecutableSegmentKey, now: u64) {
-        if self.rejected.len() >= self.maximum_entries {
+        let maximum_entries = self
+            .preparation
+            .maximum_executables()
+            .expect("capture rejection occurs only during preparation");
+        if self.rejected.len() >= maximum_entries {
             let oldest = self
                 .rejected
                 .iter()
