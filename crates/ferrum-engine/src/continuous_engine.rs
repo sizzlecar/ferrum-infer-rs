@@ -34,7 +34,7 @@ use ferrum_interfaces::{
     Sampler, SchedulerInterface as Scheduler, TensorFactory, TensorRef, Tokenizer,
 };
 use ferrum_kv::cache::prefix::PrefixCache;
-use ferrum_sampler::json_mode::JsonModeProcessor;
+use ferrum_sampler::structured_output::{StructuredOutputFactory, StructuredOutputProcessor};
 use ferrum_scheduler::implementations::{
     ContinuousBatchScheduler, ExecutionCapacityAction, ExecutionCapacityReleaseSnapshot,
     ExecutorAdmissionProbeOutcome, ExecutorAdmissionQueueObservation, PressureYieldTransaction,
@@ -628,7 +628,7 @@ pub struct SequenceState {
     /// opt-in unified chunked prefill. Zero for the normal full-prefill path.
     pub prefill_tokens_processed: usize,
     pub stream_sender: Option<mpsc::Sender<Result<StreamChunk>>>,
-    pub response_sender: Option<tokio::sync::oneshot::Sender<InferenceResponse>>,
+    pub response_sender: Option<tokio::sync::oneshot::Sender<Result<InferenceResponse>>>,
     request_slot: Option<RequestSlotLease>,
     pub start_time: Instant,
     /// Wall-clock `Instant` at which the first SSE chunk was actually
@@ -649,10 +649,8 @@ pub struct SequenceState {
     pub tokens_this_iteration: usize,
     /// Number of times this request has been preempted.
     pub preemption_count: usize,
-    /// JSON mode logits processor (active when response_format is JsonObject).
-    pub json_processor: Option<Arc<JsonModeProcessor>>,
-    /// Regex-guided hard-mask processor (active when response_format is Regex).
-    pub regex_processor: Option<Arc<ferrum_sampler::guided::RegexGuidedProcessor>>,
+    /// Tokenizer-aware hard grammar for `json_object` and strict schema.
+    pub structured_output_processor: Option<StructuredOutputProcessor>,
     draft_kv: Option<SequenceDraftKvState>,
     /// Token frequency counts for repetition penalty.
     pub token_frequencies: HashMap<TokenId, usize>,
@@ -980,10 +978,9 @@ impl SequenceState {
         Self::new_with_tokenizer(request, input_tokens, None)
     }
 
-    /// Build sequence state, optionally wiring a tokenizer for guided-decoding
-    /// processors (`ResponseFormat::Regex` needs vocab access to compile a
-    /// token-level mask). Falling back to `None` preserves the old behaviour
-    /// for call sites that don't have a tokenizer to hand (smoke tests).
+    /// Build sequence state, optionally wiring a tokenizer for constrained
+    /// decoding. Test-only direct constructors build a local grammar factory;
+    /// product entrypoints use the fallible shared-factory constructor below.
     pub fn new_with_tokenizer(
         request: InferenceRequest,
         input_tokens: Vec<TokenId>,
@@ -998,6 +995,23 @@ impl SequenceState {
         tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
         model_vocab_size: Option<usize>,
     ) -> Self {
+        Self::try_new_with_tokenizer_model_vocab_and_structured_factory(
+            request,
+            input_tokens,
+            tokenizer,
+            model_vocab_size,
+            None,
+        )
+        .expect("direct SequenceState construction must have a valid structured-output contract")
+    }
+
+    pub fn try_new_with_tokenizer_model_vocab_and_structured_factory(
+        request: InferenceRequest,
+        input_tokens: Vec<TokenId>,
+        tokenizer: Option<Arc<dyn Tokenizer + Send + Sync>>,
+        model_vocab_size: Option<usize>,
+        shared_structured_factory: Option<&StructuredOutputFactory>,
+    ) -> Result<Self> {
         use ferrum_types::ResponseFormat;
         let rng = request
             .sampling_params
@@ -1007,41 +1021,38 @@ impl SequenceState {
                 let mut rng = rand::rng();
                 StdRng::from_rng(&mut rng)
             });
-        let json_processor = match &request.sampling_params.response_format {
-            ResponseFormat::JsonObject => Some(Arc::new(JsonModeProcessor::new())),
-            _ => None,
-        };
-        let regex_processor = match (&request.sampling_params.response_format, &tokenizer) {
-            (ResponseFormat::JsonSchema(schema), Some(tok)) => {
-                // OpenAI-style structured output: compile the JSON Schema
-                // to a regex then drive the DFA-guided processor with it.
-                match ferrum_sampler::schema_to_regex::schema_to_regex(schema) {
-                    Ok(pattern) => {
-                        let eos = tok.special_tokens().eos_token;
-                        match ferrum_sampler::guided::RegexGuidedProcessor::new(
-                            &pattern,
-                            tok.clone(),
-                            eos,
-                        ) {
-                            Ok(p) => Some(Arc::new(p)),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "json_schema guided decode disabled (regex build): {e}"
-                                );
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "json_schema guided decode disabled (schema translation): {e}"
-                        );
-                        None
-                    }
-                }
+        let needs_structured_output = !matches!(
+            request.sampling_params.response_format,
+            ResponseFormat::Text
+        );
+        let local_structured_factory = match (
+            needs_structured_output,
+            shared_structured_factory,
+            tokenizer.as_ref(),
+        ) {
+            (true, None, Some(tokenizer)) => {
+                Some(StructuredOutputFactory::new_with_model_vocab_size(
+                    Arc::clone(tokenizer),
+                    model_vocab_size,
+                )?)
+            }
+            (true, None, None) => {
+                return Err(FerrumError::config(
+                    "structured output requires a tokenizer-aware grammar factory",
+                ));
             }
             _ => None,
         };
+        let structured_output_processor = shared_structured_factory
+            .or(local_structured_factory.as_ref())
+            .map(|factory| {
+                factory.create_processor(
+                    &request.sampling_params.response_format,
+                    &request.sampling_params.structured_output_start,
+                )
+            })
+            .transpose()?
+            .flatten();
         let ignore_eos = request
             .metadata
             .get("ferrum_ignore_eos")
@@ -1088,7 +1099,7 @@ impl SequenceState {
                 )
             })
         };
-        Self {
+        Ok(Self {
             request_id: request.id.clone(),
             original_request: request.clone(),
             input_tokens,
@@ -1109,8 +1120,7 @@ impl SequenceState {
             emitted_chunks: 0,
             tokens_this_iteration: 0,
             preemption_count: 0,
-            json_processor,
-            regex_processor,
+            structured_output_processor,
             draft_kv: None,
             token_frequencies: HashMap::new(),
             stop_token_ids,
@@ -1122,7 +1132,7 @@ impl SequenceState {
             argmax_token_mask,
             initial_argmax_token_mask,
             streamed_text_len: 0,
-        }
+        })
     }
 
     pub fn total_tokens(&self) -> usize {
@@ -1528,8 +1538,7 @@ impl SequenceState {
             && params.tfs.is_none()
             && params.typical_p.is_none()
             && params.mirostat.is_none()
-            && self.json_processor.is_none()
-            && self.regex_processor.is_none()
+            && self.structured_output_processor.is_none()
             && matches!(params.response_format, ResponseFormat::Text)
     }
 
@@ -1659,12 +1668,15 @@ impl SequenceState {
     pub fn requires_engine_full_logits_for_sampling(&self) -> bool {
         use ferrum_types::ResponseFormat;
 
-        self.json_processor.is_some()
-            || self.regex_processor.is_some()
+        self.structured_output_processor.is_some()
             || matches!(
                 self.sampling_params.response_format,
                 ResponseFormat::JsonSchema(_)
             )
+    }
+
+    pub fn has_structured_output_constraint(&self) -> bool {
+        self.structured_output_processor.is_some()
     }
 
     pub fn requires_full_logits_for_sampling(&self) -> bool {
@@ -1674,11 +1686,8 @@ impl SequenceState {
     }
 
     pub fn reset_guided_processors(&self) -> Result<()> {
-        if let Some(ref jp) = self.json_processor {
-            jp.reset();
-        }
-        if let Some(ref rp) = self.regex_processor {
-            rp.reset()?;
+        if let Some(processor) = &self.structured_output_processor {
+            processor.reset()?;
         }
         Ok(())
     }
@@ -1725,7 +1734,7 @@ impl SequenceState {
     }
 
     /// Sample next token with full processor chain (temperature, top-k/p,
-    /// repetition penalty, JSON mode, regex-guided mask).
+    /// repetition penalty and tokenizer-aware structured-output mask).
     pub fn sample_with_processors(&mut self, logits: &mut [f32]) -> Result<TokenId> {
         self.sample_with_processors_with_tokenizer(logits, None)
     }
@@ -1737,44 +1746,28 @@ impl SequenceState {
     ) -> Result<TokenId> {
         use ferrum_interfaces::sampler::{SamplingConfig, SamplingContext};
 
-        // Regex-guided mask runs FIRST: it's a hard constraint (sets invalid
-        // tokens to -inf). Subsequent temperature / top-k / top-p stay
-        // correct because -inf tokens can't make it through any softmax.
-        if let Some(ref rp) = self.regex_processor {
-            let best_non_control =
-                best_finite_excluding_tokens(logits, &self.allowed_extended_token_ids);
-            rp.advance_with_tokens_public(&self.generated_tokens);
-            rp.mask_logits(logits);
+        // The grammar mask runs first. There is deliberately no invalid-token
+        // fallback: a dead grammar state is a request error, not permission to
+        // return malformed JSON.
+        if let Some(processor) = &self.structured_output_processor {
+            let accepting = processor.mask_logits_with_terminals(
+                logits,
+                &self.generated_tokens,
+                &self.stop_token_ids,
+            )?;
             mask_non_stop_control_token_logits(
                 logits,
                 &self.allowed_extended_token_ids,
                 &self.stop_token_ids,
             );
-            if !rp.can_accept() {
+            if !accepting {
                 mask_stop_token_logits(logits, &self.stop_token_ids);
-                if !logits.iter().any(|logit| logit.is_finite()) {
-                    if let Some(token) = best_non_control {
-                        force_only_token(logits, token);
-                    }
-                }
             }
-        }
-
-        // Apply JSON mode biases before the standard processor chain
-        if let Some(ref jp) = self.json_processor {
-            let generated: String = self
-                .generated_tokens
-                .iter()
-                .filter_map(|t| {
-                    let v = t.get();
-                    if v < 128 {
-                        Some(v as u8 as char)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            jp.apply_biases(logits, &generated);
+            if !logits.iter().any(|logit| logit.is_finite()) {
+                return Err(FerrumError::model(
+                    "structured-output grammar has no legal token after engine masks",
+                ));
+            }
         }
 
         for &token_id in &self.forbidden_token_ids {
@@ -1966,24 +1959,6 @@ fn mask_non_stop_control_token_logits(
         if let Some(logit) = logits.get_mut(token_id as usize) {
             *logit = f32::NEG_INFINITY;
         }
-    }
-}
-
-fn best_finite_excluding_tokens(
-    logits: &[f32],
-    excluded_token_ids: &HashSet<u32>,
-) -> Option<usize> {
-    logits
-        .iter()
-        .enumerate()
-        .filter(|(idx, logit)| logit.is_finite() && !excluded_token_ids.contains(&(*idx as u32)))
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(idx, _)| idx)
-}
-
-fn force_only_token(logits: &mut [f32], token: usize) {
-    for (idx, logit) in logits.iter_mut().enumerate() {
-        *logit = if idx == token { 0.0 } else { f32::NEG_INFINITY };
     }
 }
 
@@ -2372,6 +2347,9 @@ struct EngineInner {
     config: EngineConfig,
     scheduler: Arc<ContinuousBatchScheduler>,
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+    /// Lazily built once because most requests are plain text. Structured
+    /// requests reuse its tokenizer trie and compiled grammar templates.
+    structured_output_factory: OnceLock<std::result::Result<Arc<StructuredOutputFactory>, String>>,
     #[allow(dead_code)]
     // Retained for constructor API; sampling now uses per-request SamplingConfig
     sampler: Arc<dyn Sampler + Send + Sync>,
@@ -2424,6 +2402,24 @@ struct EngineInner {
 struct ClientReceiverDropWake {
     work_notify: Arc<Notify>,
     armed: bool,
+}
+
+impl EngineInner {
+    fn structured_output_factory(&self) -> Result<Arc<StructuredOutputFactory>> {
+        match self.structured_output_factory.get_or_init(|| {
+            StructuredOutputFactory::new_with_model_vocab_size(
+                Arc::clone(&self.tokenizer),
+                Some(self.model_executor.info().vocab_size),
+            )
+            .map(Arc::new)
+            .map_err(|error| error.to_string())
+        }) {
+            Ok(factory) => Ok(Arc::clone(factory)),
+            Err(message) => Err(FerrumError::config(format!(
+                "structured-output runtime unavailable: {message}"
+            ))),
+        }
+    }
 }
 
 impl ClientReceiverDropWake {
@@ -4122,6 +4118,7 @@ impl ContinuousBatchEngine {
                 config,
                 scheduler,
                 tokenizer,
+                structured_output_factory: OnceLock::new(),
                 sampler,
                 resource_composition,
                 model_executor,
@@ -4264,7 +4261,6 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         let request_id = request.id.clone();
         let infer_start = Instant::now();
         counter!("ferrum.engine.requests_total").increment(1);
-        gauge!("ferrum.engine.active_requests").increment(1.0);
 
         maybe_trace_prompt_tokens(&*self.inner.tokenizer, &request_id, &request.prompt);
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
@@ -4293,13 +4289,24 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let mut receiver_drop_wake =
             ClientReceiverDropWake::new(Arc::clone(&self.inner.work_notify));
+        let structured_factory = if matches!(
+            &request.sampling_params.response_format,
+            ferrum_types::ResponseFormat::Text
+        ) {
+            None
+        } else {
+            Some(self.inner.structured_output_factory()?)
+        };
+        let mut seq_state =
+            SequenceState::try_new_with_tokenizer_model_vocab_and_structured_factory(
+                request.clone(),
+                input_tokens,
+                Some(self.inner.tokenizer.clone()),
+                Some(self.inner.model_executor.info().vocab_size),
+                structured_factory.as_deref(),
+            )?;
+        gauge!("ferrum.engine.active_requests").increment(1.0);
         let request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
-        let mut seq_state = SequenceState::new_with_tokenizer_and_model_vocab_size(
-            request.clone(),
-            input_tokens,
-            Some(self.inner.tokenizer.clone()),
-            Some(self.inner.model_executor.info().vocab_size),
-        );
         seq_state.response_sender = Some(resp_tx);
         seq_state.request_slot = Some(request_slot);
         {
@@ -4347,9 +4354,11 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         self.ensure_bg_loop();
         self.inner.work_notify.notify_one();
 
-        let result = resp_rx
-            .await
-            .map_err(|_| FerrumError::internal("Response channel closed before response was sent"));
+        let result = resp_rx.await.unwrap_or_else(|_| {
+            Err(FerrumError::internal(
+                "Response channel closed before response was sent",
+            ))
+        });
         receiver_drop_wake.disarm();
 
         gauge!("ferrum.engine.active_requests").decrement(1.0);
@@ -4401,13 +4410,23 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
 
         // Publish tokenized state and the scheduler item under the same
         // iteration boundary; see the non-streaming path above.
+        let structured_factory = if matches!(
+            &request.sampling_params.response_format,
+            ferrum_types::ResponseFormat::Text
+        ) {
+            None
+        } else {
+            Some(self.inner.structured_output_factory()?)
+        };
+        let mut seq_state =
+            SequenceState::try_new_with_tokenizer_model_vocab_and_structured_factory(
+                request.clone(),
+                input_tokens,
+                Some(self.inner.tokenizer.clone()),
+                Some(self.inner.model_executor.info().vocab_size),
+                structured_factory.as_deref(),
+            )?;
         let request_slot = RequestSlotLease::open(&self.inner, request_id.clone());
-        let mut seq_state = SequenceState::new_with_tokenizer_and_model_vocab_size(
-            request.clone(),
-            input_tokens,
-            Some(self.inner.tokenizer.clone()),
-            Some(self.inner.model_executor.info().vocab_size),
-        );
         seq_state.stream_sender = Some(tx);
         seq_state.request_slot = Some(request_slot);
         {

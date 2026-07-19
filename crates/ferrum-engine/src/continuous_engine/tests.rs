@@ -7977,6 +7977,7 @@ fn model_decode_logits_policy_requires_full_for_structured_output() {
         state.model_decode_logits_policy(),
         LogitsReturnPolicy::FullLogits
     ));
+    assert!(state.has_structured_output_constraint());
 }
 
 #[test]
@@ -8050,7 +8051,7 @@ fn single_token_stop_sequence_also_matches_composite_decoded_token() {
 
 #[test]
 fn schema_guided_sampling_masks_extended_stop_tokens_before_accept() {
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+    let mut tokenizer = PolicyTokenizer::new(
         6,
         &[
             ("{", 0),
@@ -8061,16 +8062,24 @@ fn schema_guided_sampling_masks_extended_stop_tokens_before_accept() {
             ("\"", 5),
             ("<|eot_id|>", 8),
         ],
-    ));
+    );
+    tokenizer.special.bos_token = None;
+    tokenizer.special.unk_token = None;
+    tokenizer.special.pad_token = None;
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
     let mut request = policy_request();
     request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonSchema(
         r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#
             .to_string(),
     );
-    let mut state =
-        SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
+    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        vec![TokenId::new(0)],
+        Some(tokenizer),
+        Some(9),
+    );
 
-    assert!(state.regex_processor.is_some());
+    assert!(state.structured_output_processor.is_some());
     assert!(
         state.stop_token_ids.contains(&8),
         "common eot token should be a resolved stop token"
@@ -8092,7 +8101,7 @@ fn schema_guided_sampling_masks_extended_stop_tokens_before_accept() {
 
 #[test]
 fn schema_guided_sampling_masks_extended_control_tokens_before_accept() {
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+    let mut tokenizer = PolicyTokenizer::new(
         6,
         &[
             ("{", 0),
@@ -8104,16 +8113,24 @@ fn schema_guided_sampling_masks_extended_control_tokens_before_accept() {
             ("<think>", 7),
             ("<|eot_id|>", 8),
         ],
-    ));
+    );
+    tokenizer.special.bos_token = None;
+    tokenizer.special.unk_token = None;
+    tokenizer.special.pad_token = None;
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
     let mut request = policy_request();
     request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonSchema(
         r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#
             .to_string(),
     );
-    let mut state =
-        SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
+    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        vec![TokenId::new(0)],
+        Some(tokenizer),
+        Some(9),
+    );
 
-    assert!(state.regex_processor.is_some());
+    assert!(state.structured_output_processor.is_some());
     assert!(
         state.allowed_extended_token_ids.contains(&7),
         "think token should be an allowed generated control token outside base vocab"
@@ -8144,7 +8161,7 @@ fn schema_guided_sampling_masks_extended_control_tokens_before_accept() {
 
 #[test]
 fn schema_guided_sampling_allows_extended_stop_after_accept() {
-    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+    let mut tokenizer = PolicyTokenizer::new(
         6,
         &[
             ("{", 0),
@@ -8156,12 +8173,20 @@ fn schema_guided_sampling_allows_extended_stop_after_accept() {
             ("<think>", 7),
             ("<|eot_id|>", 8),
         ],
-    ));
+    );
+    tokenizer.special.bos_token = None;
+    tokenizer.special.unk_token = None;
+    tokenizer.special.pad_token = None;
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
     let mut request = policy_request();
     request.sampling_params.response_format =
         ferrum_types::ResponseFormat::JsonSchema(r#"{"enum":["x"]}"#.to_string());
-    let mut state =
-        SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer));
+    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        vec![TokenId::new(0)],
+        Some(tokenizer),
+        Some(9),
+    );
     state.generated_tokens = vec![TokenId::new(5), TokenId::new(2), TokenId::new(5)];
 
     let mut logits = vec![f32::NEG_INFINITY; 9];
@@ -8170,8 +8195,15 @@ fn schema_guided_sampling_allows_extended_stop_after_accept() {
     logits[8] = 90.0;
 
     let token = state.sample_with_processors(&mut logits).unwrap();
+    state.generated_tokens.push(token);
 
     assert_eq!(token.get(), 8);
+    assert!(state
+        .structured_output_processor
+        .as_ref()
+        .unwrap()
+        .is_accepting_with_terminals(&state.generated_tokens, &state.stop_token_ids)
+        .unwrap());
     assert!(
         logits[7].is_infinite() && logits[7].is_sign_negative(),
         "completed schema output should still reject non-stop control tokens"

@@ -44,6 +44,23 @@ pub struct SamplingParams {
     /// Response format constraint (JSON mode, schema-constrained, etc.)
     #[serde(default)]
     pub response_format: ResponseFormat,
+    /// Point at which a structured-output grammar starts constraining model
+    /// output. Thinking templates can open a reasoning block in the prompt;
+    /// in that case the grammar activates only after the typed delimiter.
+    #[serde(default)]
+    pub structured_output_start: StructuredOutputStart,
+}
+
+/// Typed activation boundary for constrained decoding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "mode", content = "delimiter", rename_all = "snake_case")]
+pub enum StructuredOutputStart {
+    /// Constrain the first generated token.
+    #[default]
+    Immediate,
+    /// Allow reasoning tokens until this exact tokenizer sequence is emitted,
+    /// then constrain every subsequent token.
+    AfterDelimiter(String),
 }
 
 /// Response format for structured output. Mirrors OpenAI's
@@ -85,6 +102,7 @@ impl Default for SamplingParams {
             typical_p: None,
             mirostat: None,
             response_format: ResponseFormat::default(),
+            structured_output_start: StructuredOutputStart::default(),
         }
     }
 }
