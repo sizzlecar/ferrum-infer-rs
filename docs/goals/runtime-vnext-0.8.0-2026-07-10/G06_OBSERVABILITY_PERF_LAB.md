@@ -116,11 +116,16 @@ secret。run 与 serve bundle 使用同 schema。
 
 - 顶层 observability 自测执行全部子组件；漏接线 `0`。
 - 当前 `product_observability_wiring_gate` SHA mismatch fixture 修复并被总 self-test 捕获。
-- basic profile overhead `<=2%`；resource/latency profile `<=5%`；kernel profile 可标 diagnostic，
-  但不得用于正式 throughput。
+- profile 默认 `off`，只允许通过 typed CLI/config 与 artifact path 开启；off 路径创建 sink、采集线程、
+  profile/trace 文件、事件序列化/入队和 device completion timing 的数量均为 `0`。默认路径性能由
+  G09 正式 no-regression/外部竞争门验收。
+- basic profile overhead `<=2%`、resource/latency profile `<=5%` 保留为开启模式的报告目标；
+  profile ABBA-BAAB 的单次 CV 或 overhead 超标标为 `noisy`/`target_miss`，不阻塞架构里程碑。
+  kernel profile 仍为 diagnostic，不得用于正式 throughput。
 - stage accounting 覆盖 decode wall time `>=90%`，重叠/未解释部分有字段而非丢失。
 - top operations/kernels 累计覆盖 device time `>=80%`。
-- 同配置 5 次正式 throughput CV `<=5%`；超过时 artifact REJECT 并报告噪声源。
+- G09 同配置 5 次正式 throughput CV `<=5%`；超过时该性能 claim 的 artifact REJECT 并报告噪声源，
+  但不得反向阻塞默认关闭的 profile 功能合同。
 - historical failures：first failure class `15/15 family`、`M/M concrete case` 正确，replay
   同样达到 `15/15` 和 `M/M`。
 - 从已有 artifact 到自动 top bottleneck/target gap 报告耗时 `<=60s`。

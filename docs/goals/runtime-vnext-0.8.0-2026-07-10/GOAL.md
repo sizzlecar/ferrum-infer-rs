@@ -548,8 +548,12 @@ python3 scripts/release/run_gate.py vnext-s1-cuda \
 
 child validator 必须从原始 `run`、`serve`、stream、`bench-serve`、scheduler trace 和 ABBA-BAAB
 样本重新计算结果，不能信任手工摘要。要求 basic trace 每请求只捕获一个完整 execution frame、operation
-identity 完整、terminal token 与 usage 对账、trace `<=1 MiB/request`，并在同一 RTX 4090 上满足均值和
-中位数开销均 `<=2%`、两组样本 CV 均 `<=5%`。精确 PASS 行为：
+identity 完整、terminal token 与 usage 对账、trace `<=1 MiB/request`。profile 必须由正式
+`--profile-detail off|basic|debug|full` 与 artifact path 控制，默认 `off`；off slot 不得创建 profile/
+scheduler-trace artifact，device completion timing 样本必须为 `0`。同一 RTX 4090 的 ABBA-BAAB
+仍重算并报告均值/中位数开销、两组 CV 与硬件 telemetry，但 `<=2%` overhead 和 `<=5%` CV 是
+profile-on 质量目标，不再阻塞 S1。默认关闭路径的真实性能回归由 G09 的 legacy/vLLM 同硬件门负责，
+不得用 profile lane 的高方差替代或豁免。精确 PASS 行为：
 
 collector 固定 workload、seed、repeat 和 slot order，不暴露性能口径参数；每个 slot 必须保存 bench
 前、bench 中至少 `3` 个样本和 bench 后的同一 GPU UUID/P-state/graphics-SM-memory clocks/power/

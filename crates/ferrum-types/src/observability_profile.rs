@@ -401,6 +401,20 @@ mod tests {
 
     #[test]
     fn observability_config_requires_artifact_path_when_detail_enabled() {
+        let disabled = FerrumObservabilityConfig::new(
+            ProfileEntrypoint::Serve,
+            "model",
+            None,
+            ObservabilityProfileDetail::Off,
+            None,
+            None,
+            None,
+            DEFAULT_OBSERVABILITY_PROFILE_SAMPLE_RATE,
+        );
+        assert!(!disabled.enabled());
+        assert!(!disabled.unified_product_profile_enabled());
+        assert!(disabled.validate().is_ok());
+
         let config = FerrumObservabilityConfig::new(
             ProfileEntrypoint::Run,
             "synthetic/no-weight",

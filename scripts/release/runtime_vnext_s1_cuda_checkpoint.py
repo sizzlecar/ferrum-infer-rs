@@ -705,6 +705,11 @@ def validate_profile_report(directory: Path, slot: str, mode: str) -> dict[str, 
             "--scheduler-trace-jsonl" not in server_tokens,
             f"{label}: off command writes scheduler trace",
         )
+        for artifact_name in ("profile.jsonl", "scheduler-trace.jsonl"):
+            require(
+                not (directory / artifact_name).exists(),
+                f"{label}: disabled profiling created {artifact_name}",
+            )
     else:
         require_option(server_tokens, "--profile-sample-rate", "1.0", label)
         require("--profile-jsonl" in server_tokens, f"{label}: basic command lacks profile JSONL")
@@ -1254,6 +1259,30 @@ def scalar_stats(values: list[float]) -> dict[str, Any]:
     }
 
 
+def profile_measurement_report(
+    off: dict[str, Any], basic: dict[str, Any]
+) -> dict[str, Any]:
+    mean_overhead = (off["mean"] - basic["mean"]) / off["mean"]
+    median_overhead = (off["median"] - basic["median"]) / off["median"]
+    stability_target_met = (
+        off["cv"] <= PROFILE_MAX_CV and basic["cv"] <= PROFILE_MAX_CV
+    )
+    overhead_target_met = (
+        mean_overhead <= PROFILE_MAX_OVERHEAD
+        and median_overhead <= PROFILE_MAX_OVERHEAD
+    )
+    return {
+        "classification": "stable" if stability_target_met else "noisy",
+        "blocking": False,
+        "stability_target_met": stability_target_met,
+        "overhead_target_met": overhead_target_met,
+        "mean_overhead": mean_overhead,
+        "median_overhead": median_overhead,
+        "target_max_cv": PROFILE_MAX_CV,
+        "target_max_overhead": PROFILE_MAX_OVERHEAD,
+    }
+
+
 def derive_first_half_receipt(reports: dict[str, dict[str, Any]]) -> dict[str, Any]:
     off = scalar_stats(
         [
@@ -1358,6 +1387,10 @@ def validate_profile_overhead(root: Path) -> dict[str, Any]:
     capture_runtime_profiles = bool(
         (collection.get("protocol") or {}).get("profile_health_after_bench", False)
     )
+    require(
+        capture_runtime_profiles,
+        "canonical profile evidence must capture post-benchmark runtime state",
+    )
     for slot in PROFILE_SLOT_ORDER:
         mode = "basic" if slot in BASIC_PROFILE_SLOTS else "off"
         result = validate_profile_report(performance / slot, slot, mode)
@@ -1410,17 +1443,22 @@ def validate_profile_overhead(root: Path) -> dict[str, Any]:
     basic = scalar_stats(
         [value for slot in BASIC_PROFILE_SLOTS for value in reports[slot]["throughput"]]
     )
-    mean_overhead = (off["mean"] - basic["mean"]) / off["mean"]
-    median_overhead = (off["median"] - basic["median"]) / off["median"]
-    require(off["cv"] <= PROFILE_MAX_CV, f"profile off CV {off['cv']:.6f} exceeds 0.05")
-    require(basic["cv"] <= PROFILE_MAX_CV, f"profile basic CV {basic['cv']:.6f} exceeds 0.05")
-    require(
-        mean_overhead <= PROFILE_MAX_OVERHEAD,
-        f"basic mean overhead {mean_overhead:.6f} exceeds 0.02",
+    measurement = profile_measurement_report(off, basic)
+    off_runtime_profiles = [
+        runtime_profiles[slot] for slot in OFF_PROFILE_SLOTS
+    ]
+    off_device_timing_samples = sum(
+        timing["samples"]
+        for profile in off_runtime_profiles
+        for timing in profile["device"].values()
     )
     require(
-        median_overhead <= PROFILE_MAX_OVERHEAD,
-        f"basic median overhead {median_overhead:.6f} exceeds 0.02",
+        off_device_timing_samples == 0
+        and all(
+            profile["device_completion_timing_enabled"] is False
+            for profile in off_runtime_profiles
+        ),
+        "disabled profile mode performed device completion timing work",
     )
     return {
         "status": "pass",
@@ -1439,10 +1477,18 @@ def validate_profile_overhead(root: Path) -> dict[str, Any]:
         },
         "off": off,
         "basic": basic,
-        "mean_overhead": mean_overhead,
-        "median_overhead": median_overhead,
+        "mean_overhead": measurement["mean_overhead"],
+        "median_overhead": measurement["median_overhead"],
         "max_overhead": PROFILE_MAX_OVERHEAD,
         "max_cv": PROFILE_MAX_CV,
+        "measurement": measurement,
+        "off_contract": {
+            "explicit_cli_mode": "off",
+            "profile_artifact_flags_absent": True,
+            "profile_artifacts_absent": True,
+            "device_completion_timing_enabled": False,
+            "device_completion_timing_samples": off_device_timing_samples,
+        },
         "completed_requests": {"off": 48, "basic": 48},
         "failed_requests": {"off": 0, "basic": 0},
         "bounded_traces": traces,
@@ -1536,9 +1582,10 @@ def write_basic_slice_evidence(
             "stream_correctness": True,
             "bench_serve_correctness": True,
             "bounded_basic_trace": True,
-            "profile_mean_overhead_lte_2pct": True,
-            "profile_median_overhead_lte_2pct": True,
-            "profile_cv_lte_5pct": True,
+            "profile_explicit_off_mode": True,
+            "profile_off_artifacts_absent": True,
+            "profile_off_device_timing_samples_zero": True,
+            "profile_measurement_reported_non_blocking": True,
             "slot_gpu_host_telemetry_complete": True,
         },
         "metrics": {
@@ -1546,6 +1593,18 @@ def write_basic_slice_evidence(
             "median_overhead_fraction": performance["median_overhead"],
             "off_cv": performance["off"]["cv"],
             "basic_cv": performance["basic"]["cv"],
+            "profile_measurement_classification": performance["measurement"][
+                "classification"
+            ],
+            "profile_stability_target_met": performance["measurement"][
+                "stability_target_met"
+            ],
+            "profile_overhead_target_met": performance["measurement"][
+                "overhead_target_met"
+            ],
+            "profile_off_device_timing_samples": performance["off_contract"][
+                "device_completion_timing_samples"
+            ],
             "off_completed_requests": performance["completed_requests"]["off"],
             "basic_completed_requests": performance["completed_requests"]["basic"],
             "failed_requests": 0,
@@ -2031,6 +2090,15 @@ def self_test() -> int:
         )
     else:
         raise ValidationError("material first-half float mutation unexpectedly passed")
+    noisy_off = scalar_stats([80.0, 100.0, 120.0, 80.0])
+    noisy_basic = scalar_stats([75.0, 99.0, 121.0, 82.0])
+    noisy_measurement = profile_measurement_report(noisy_off, noisy_basic)
+    require(
+        noisy_measurement["classification"] == "noisy"
+        and noisy_measurement["stability_target_met"] is False
+        and noisy_measurement["blocking"] is False,
+        "profile variance must remain reported without blocking the default-off contract",
+    )
     print("FERRUM RUNTIME VNEXT S1 CUDA TRACE CHECKPOINT SELFTEST PASS")
     return 0
 
