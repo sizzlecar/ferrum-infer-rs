@@ -1043,17 +1043,6 @@ impl SequenceState {
             }
             _ => None,
         };
-        let structured_output_processor = shared_structured_factory
-            .or(local_structured_factory.as_ref())
-            .map(|factory| {
-                factory.create_processor(
-                    &request.sampling_params.response_format,
-                    &request.sampling_params.structured_output_start,
-                    request.sampling_params.max_tokens,
-                )
-            })
-            .transpose()?
-            .flatten();
         let ignore_eos = request
             .metadata
             .get("ferrum_ignore_eos")
@@ -1061,6 +1050,19 @@ impl SequenceState {
             .unwrap_or(false);
         let (stop_token_ids, stop_text_seqs) =
             resolve_stop_conditions(&request.sampling_params, tokenizer.as_deref(), ignore_eos);
+        let structured_output_processor = shared_structured_factory
+            .or(local_structured_factory.as_ref())
+            .map(|factory| {
+                factory.create_processor(
+                    &request.sampling_params.response_format,
+                    &request.sampling_params.structured_output_start,
+                    request.sampling_params.max_tokens,
+                    &stop_token_ids,
+                    &stop_text_seqs,
+                )
+            })
+            .transpose()?
+            .flatten();
         let (forbidden_token_ids, tokenizer_base_vocab_size, allowed_extended_token_ids) =
             resolve_sampling_token_constraints(tokenizer.as_deref(), &stop_token_ids);
         let mut initial_forbidden_token_ids = HashSet::new();
@@ -1761,13 +1763,6 @@ impl SequenceState {
             )?;
             required_structured_delimiter_token_id = constraint.required_delimiter_token_id;
             if !constraint.accepting {
-                if required_structured_delimiter_token_id
-                    .is_some_and(|token| self.stop_token_ids.contains(&token))
-                {
-                    return Err(FerrumError::invalid_request(
-                        "structured-output delimiter conflicts with a stop token",
-                    ));
-                }
                 mask_stop_token_logits(logits, &self.stop_token_ids);
             }
             if !logits.iter().any(|logit| logit.is_finite()) {

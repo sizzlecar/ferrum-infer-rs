@@ -169,6 +169,8 @@ impl StructuredOutputFactory {
         response_format: &ResponseFormat,
         start: &StructuredOutputStart,
         max_output_tokens: usize,
+        stop_token_ids: &HashSet<u32>,
+        stop_text_sequences: &[String],
     ) -> Result<Option<StructuredOutputProcessor>> {
         let schema = match response_format {
             ResponseFormat::Text => return Ok(None),
@@ -226,6 +228,22 @@ impl StructuredOutputFactory {
                 if delimiter_tokens.is_empty() {
                     return Err(FerrumError::invalid_request(format!(
                         "structured-output delimiter {delimiter:?} did not tokenize"
+                    )));
+                }
+                if let Some(token) = delimiter_tokens
+                    .iter()
+                    .find(|token| stop_token_ids.contains(token))
+                {
+                    return Err(FerrumError::invalid_request(format!(
+                        "structured-output delimiter token {token} conflicts with a stop token"
+                    )));
+                }
+                if let Some(stop) = stop_text_sequences
+                    .iter()
+                    .find(|stop| !stop.is_empty() && delimiter.contains(stop.as_str()))
+                {
+                    return Err(FerrumError::invalid_request(format!(
+                        "structured-output delimiter {delimiter:?} conflicts with stop sequence {stop:?}"
                     )));
                 }
                 let budget = StructuredOutputBudgetPlan::automatic(
@@ -366,7 +384,7 @@ impl StructuredOutputProcessor {
     ) -> Result<StructuredOutputMaskOutcome> {
         let mut state = self.state.lock();
         advance_state(&mut state, generated, terminal_token_ids)?;
-        activate_forcing_if_due(&mut state, generated.len(), self.budget);
+        activate_forcing_if_due(&mut state, generated, self.budget);
         if let Activation::Boundary {
             delimiter_tokens,
             forcing,
@@ -482,7 +500,7 @@ impl StructuredOutputProcessor {
     ) -> Result<StructuredOutputProgress> {
         let mut state = self.state.lock();
         advance_state(&mut state, generated, terminal_token_ids)?;
-        activate_forcing_if_due(&mut state, generated.len(), self.budget);
+        activate_forcing_if_due(&mut state, generated, self.budget);
         let (phase, delimiter_token_count, delimiter_prefix_token_count, accepting) =
             match &state.activation {
                 Activation::Boundary {
@@ -541,7 +559,7 @@ impl StructuredOutputProcessor {
 
 fn activate_forcing_if_due(
     state: &mut ProcessorState,
-    generated_token_count: usize,
+    generated: &[TokenId],
     budget: Option<StructuredOutputBudgetPlan>,
 ) {
     let Some(budget) = budget else {
@@ -550,13 +568,19 @@ fn activate_forcing_if_due(
     let should_force = matches!(
         state.activation,
         Activation::Boundary { forcing: false, .. }
-    ) && generated_token_count >= budget.reasoning_token_limit;
+    ) && generated.len() >= budget.reasoning_token_limit;
     if should_force {
+        let delimiter_prefix_token_count = match &state.activation {
+            Activation::Boundary {
+                delimiter_tokens, ..
+            } => delimiter_prefix_token_count(generated, delimiter_tokens),
+            Activation::Active => 0,
+        };
         if let Activation::Boundary { forcing, .. } = &mut state.activation {
             *forcing = true;
         }
         state.boundary_forced = true;
-        state.boundary_start = Some(generated_token_count);
+        state.boundary_start = Some(generated.len() - delimiter_prefix_token_count);
     }
 }
 
@@ -809,6 +833,8 @@ mod tests {
                 &ResponseFormat::JsonObject,
                 &StructuredOutputStart::Immediate,
                 TEST_MAX_OUTPUT_TOKENS,
+                &HashSet::new(),
+                &[],
             )
             .unwrap()
             .unwrap();
@@ -827,6 +853,8 @@ mod tests {
                 &ResponseFormat::JsonObject,
                 &StructuredOutputStart::Immediate,
                 TEST_MAX_OUTPUT_TOKENS,
+                &HashSet::new(),
+                &[],
             )
             .unwrap()
             .unwrap();
@@ -856,6 +884,8 @@ mod tests {
                 &ResponseFormat::JsonSchema(schema.to_string()),
                 &StructuredOutputStart::Immediate,
                 TEST_MAX_OUTPUT_TOKENS,
+                &HashSet::new(),
+                &[],
             )
             .unwrap()
             .unwrap();
@@ -871,6 +901,8 @@ mod tests {
                 &ResponseFormat::JsonObject,
                 &StructuredOutputStart::AfterDelimiter("</think>".to_string()),
                 TEST_MAX_OUTPUT_TOKENS,
+                &HashSet::new(),
+                &[],
             )
             .unwrap()
             .unwrap();
@@ -937,6 +969,8 @@ mod tests {
                 &ResponseFormat::JsonObject,
                 &StructuredOutputStart::AfterDelimiter("</think>".to_string()),
                 48,
+                &HashSet::new(),
+                &[],
             )
             .unwrap()
             .unwrap();
@@ -996,6 +1030,17 @@ mod tests {
                 structured_reserve_tokens: 32,
             })
         );
+
+        processor.reset().unwrap();
+        let reset_progress = processor
+            .progress_with_terminals(&[], &HashSet::new())
+            .unwrap();
+        assert_eq!(
+            reset_progress.phase,
+            StructuredOutputPhase::WaitingForDelimiter
+        );
+        assert!(!reset_progress.boundary_forced);
+        assert_eq!(reset_progress.reasoning_token_count, Some(0));
     }
 
     #[test]
@@ -1005,10 +1050,71 @@ mod tests {
                 &ResponseFormat::JsonObject,
                 &StructuredOutputStart::AfterDelimiter("</think>".to_string()),
                 8,
+                &HashSet::new(),
+                &[],
             )
             .unwrap_err();
         assert!(error
             .to_string()
             .contains("max_tokens greater than its 8-token delimiter"));
+    }
+
+    #[test]
+    fn forcing_accounts_for_an_existing_delimiter_prefix() {
+        let processor = factory()
+            .create_processor(
+                &ResponseFormat::JsonObject,
+                &StructuredOutputStart::AfterDelimiter("</think>".to_string()),
+                48,
+                &HashSet::new(),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        let generated = "reason</"
+            .bytes()
+            .map(|byte| TokenId::new(byte as u32))
+            .collect::<Vec<_>>();
+        let mut logits = vec![0.0; EOS as usize + 1];
+
+        let outcome = processor
+            .mask_logits_with_terminals(&mut logits, &generated, &HashSet::new(), &HashSet::new())
+            .unwrap();
+        assert_eq!(outcome.phase, StructuredOutputPhase::ForcingDelimiter);
+        assert_eq!(outcome.required_delimiter_token_id, Some(b't' as u32));
+        let progress = processor
+            .progress_with_terminals(&generated, &HashSet::new())
+            .unwrap();
+        assert_eq!(progress.delimiter_prefix_token_count, 2);
+        assert_eq!(progress.reasoning_token_count, Some(6));
+    }
+
+    #[test]
+    fn delimiter_rejects_any_conflicting_stop_condition_up_front() {
+        let token_error = factory()
+            .create_processor(
+                &ResponseFormat::JsonObject,
+                &StructuredOutputStart::AfterDelimiter("</think>".to_string()),
+                TEST_MAX_OUTPUT_TOKENS,
+                &HashSet::from([b'/' as u32]),
+                &[],
+            )
+            .unwrap_err();
+        assert!(token_error
+            .to_string()
+            .contains("conflicts with a stop token"));
+
+        let text_error = factory()
+            .create_processor(
+                &ResponseFormat::JsonObject,
+                &StructuredOutputStart::AfterDelimiter("</think>".to_string()),
+                TEST_MAX_OUTPUT_TOKENS,
+                &HashSet::new(),
+                &["think".to_string()],
+            )
+            .unwrap_err();
+        assert!(text_error
+            .to_string()
+            .contains("conflicts with stop sequence"));
     }
 }
