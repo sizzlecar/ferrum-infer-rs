@@ -293,9 +293,13 @@ impl OperationProvider<CudaDeviceRuntime> for CudaTokenEmbeddingProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_token_embedding(&self.function, invocation)
-            .map(EncodedDeviceOperation::compute)
-            .map_err(|message| provider_failure(identity, "cuda.token_embedding.encode", message))
+        encode_token_embedding(
+            &self.function,
+            self.descriptor.provider_implementation_fingerprint(),
+            invocation,
+        )
+        .map(EncodedDeviceOperation::compute)
+        .map_err(|message| provider_failure(identity, "cuda.token_embedding.encode", message))
     }
 }
 
@@ -517,6 +521,7 @@ struct EmbeddingLaunch {
 
 fn encode_token_embedding(
     function: &CudaFunction,
+    provider_fingerprint: &str,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
     if invocation.operation().id.as_str() != TOKEN_EMBEDDING_OPERATION_ID
@@ -575,58 +580,74 @@ fn encode_token_embedding(
         });
     }
 
+    let mut replay_key =
+        CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_token_embedding")
+            .u64(launches.len() as u64);
+    for launch in &launches {
+        replay_key = replay_key
+            .u64(launch.first_region as u64)
+            .u64(launch.token_count)
+            .u32(launch.vocabulary_size)
+            .i32(launch.hidden_size)
+            .u32(launch.grid_x);
+    }
     let function = function.clone();
-    CudaDeviceCommand::operation("vnext_token_embedding", regions, move |stream, regions| {
-        for launch in &launches {
-            let table = regions[launch.first_region].device_ptr();
-            let token_ids_base = regions[launch.first_region + 1].device_ptr();
-            let output_base = regions[launch.first_region + 2].device_ptr();
-            let mut token_offset = 0_u64;
-            while token_offset < launch.token_count {
-                let chunk_tokens =
-                    (launch.token_count - token_offset).min(MAXIMUM_TOKENS_PER_LAUNCH);
-                let token_ids = checked_pointer_offset(
-                    token_ids_base,
-                    token_offset,
-                    ElementType::U32.size_bytes(),
-                    "token id",
-                )?;
-                let output_element_offset = token_offset
-                    .checked_mul(launch.hidden_size as u64)
-                    .ok_or_else(|| {
-                        CudaDeviceRuntimeError::contract(
-                            "vNext embedding output element offset overflows",
-                        )
+    CudaDeviceCommand::replayable_operation(
+        "vnext_token_embedding",
+        regions,
+        replay_key.finish(),
+        move |stream, regions| {
+            for launch in &launches {
+                let table = regions[launch.first_region].device_ptr();
+                let token_ids_base = regions[launch.first_region + 1].device_ptr();
+                let output_base = regions[launch.first_region + 2].device_ptr();
+                let mut token_offset = 0_u64;
+                while token_offset < launch.token_count {
+                    let chunk_tokens =
+                        (launch.token_count - token_offset).min(MAXIMUM_TOKENS_PER_LAUNCH);
+                    let token_ids = checked_pointer_offset(
+                        token_ids_base,
+                        token_offset,
+                        ElementType::U32.size_bytes(),
+                        "token id",
+                    )?;
+                    let output_element_offset = token_offset
+                        .checked_mul(launch.hidden_size as u64)
+                        .ok_or_else(|| {
+                            CudaDeviceRuntimeError::contract(
+                                "vNext embedding output element offset overflows",
+                            )
+                        })?;
+                    let output = checked_pointer_offset(
+                        output_base,
+                        output_element_offset,
+                        ElementType::F16.size_bytes(),
+                        "embedding output",
+                    )?;
+                    let batch = chunk_tokens as i32;
+                    let mut builder = stream.launch_builder(&function);
+                    builder.arg(&table);
+                    builder.arg(&token_ids);
+                    builder.arg(&output);
+                    builder.arg(&batch);
+                    builder.arg(&launch.hidden_size);
+                    builder.arg(&launch.vocabulary_size);
+                    unsafe {
+                        builder.launch(LaunchConfig {
+                            grid_dim: (launch.grid_x, chunk_tokens as u32, 1),
+                            block_dim: (THREADS_PER_BLOCK, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                    }
+                    .map_err(|error| {
+                        CudaDeviceRuntimeError::driver("vNext token embedding launch", error)
                     })?;
-                let output = checked_pointer_offset(
-                    output_base,
-                    output_element_offset,
-                    ElementType::F16.size_bytes(),
-                    "embedding output",
-                )?;
-                let batch = chunk_tokens as i32;
-                let mut builder = stream.launch_builder(&function);
-                builder.arg(&table);
-                builder.arg(&token_ids);
-                builder.arg(&output);
-                builder.arg(&batch);
-                builder.arg(&launch.hidden_size);
-                builder.arg(&launch.vocabulary_size);
-                unsafe {
-                    builder.launch(LaunchConfig {
-                        grid_dim: (launch.grid_x, chunk_tokens as u32, 1),
-                        block_dim: (THREADS_PER_BLOCK, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
+                    token_offset += chunk_tokens;
                 }
-                .map_err(|error| {
-                    CudaDeviceRuntimeError::driver("vNext token embedding launch", error)
-                })?;
-                token_offset += chunk_tokens;
             }
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
     .map_err(|error| error.to_string())
 }
 
