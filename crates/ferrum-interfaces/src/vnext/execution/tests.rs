@@ -727,8 +727,17 @@ fn memory_plan_wire_rejects_missing_core_derived_pool() {
     let layout = canonical_fingerprint(&"contiguous_v1", "test layout").expect("fingerprint");
     let storage = DynamicStorageContract::new(linear_profile(), layout).expect("storage");
     let descriptor = dynamic_value_descriptor("resource/state-a", storage);
-    let plan = MemoryPlan::from_core(1 << 20, 1 << 20, 4096, 1024, vec![], vec![descriptor], &[])
-        .expect("valid memory plan");
+    let plan = MemoryPlan::from_core(
+        1 << 20,
+        1 << 20,
+        4096,
+        1024,
+        vec![],
+        vec![descriptor],
+        &[],
+        None,
+    )
+    .expect("valid memory plan");
     let encoded = serde_json::to_vec(&plan).expect("serialize memory plan");
     let decoded: MemoryPlan = serde_json::from_slice(&encoded).expect("round trip memory plan");
     assert_eq!(decoded, plan);
@@ -765,8 +774,17 @@ fn plan_scope_allocation_round_trips_selected_storage_and_physical_quantum() {
     assert_eq!(allocation.instance_stride_bytes(), 4096);
     assert_eq!(allocation.storage(), &storage);
 
-    let plan = MemoryPlan::from_core(1 << 20, 1 << 20, 4096, 1024, vec![allocation], vec![], &[])
-        .expect("memory plan");
+    let plan = MemoryPlan::from_core(
+        1 << 20,
+        1 << 20,
+        4096,
+        1024,
+        vec![allocation],
+        vec![],
+        &[],
+        None,
+    )
+    .expect("memory plan");
     let encoded = serde_json::to_vec(&plan).expect("serialize");
     let decoded: MemoryPlan = serde_json::from_slice(&encoded).expect("round trip");
     assert_eq!(decoded, plan);

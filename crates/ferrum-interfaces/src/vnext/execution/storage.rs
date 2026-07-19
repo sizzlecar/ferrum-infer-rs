@@ -325,6 +325,7 @@ pub struct DynamicBackingPoolSpec {
     pub(super) minimum_invocation_peak_bytes: u64,
     pub(super) step_resource_slots: Vec<StepResourceSlot>,
     pub(super) theoretical_ceiling_bytes: CanonicalU128,
+    pub(super) reusable_workspace_ceiling_bytes: u64,
     pub(super) provisioning: DynamicPoolProvisioningPolicy,
     pub(super) invocation_liveness_mode: InvocationLivenessMode,
     pub(super) invocation_liveness: Vec<InvocationResourceLiveness>,
@@ -341,6 +342,7 @@ impl DynamicBackingPoolSpec {
         minimum_invocation_peak_bytes: u64,
         step_resource_slots: Vec<StepResourceSlot>,
         theoretical_ceiling_bytes: u128,
+        reusable_workspace_ceiling_bytes: u64,
         dynamic_capacity_bytes: u64,
         invocation_liveness_mode: InvocationLivenessMode,
         invocation_liveness: Vec<InvocationResourceLiveness>,
@@ -352,8 +354,11 @@ impl DynamicBackingPoolSpec {
             .and_then(|bytes| bytes.checked_add(minimum_step_bytes))
             .and_then(|bytes| bytes.checked_add(minimum_invocation_peak_bytes))
             .ok_or_else(|| invalid_plan("dynamic pool runnable minimum overflows u64"))?;
+        let combined_ceiling_bytes = theoretical_ceiling_bytes
+            .checked_add(u128::from(reusable_workspace_ceiling_bytes))
+            .ok_or_else(|| invalid_plan("dynamic pool combined ceiling overflows u128"))?;
         let maximum_resident_bytes =
-            u64::try_from(theoretical_ceiling_bytes.min(u128::from(dynamic_capacity_bytes)))
+            u64::try_from(combined_ceiling_bytes.min(u128::from(dynamic_capacity_bytes)))
                 .map_err(|_| invalid_plan("dynamic pool resident ceiling exceeds u64"))?;
         let spec = Self {
             pool_id,
@@ -365,6 +370,7 @@ impl DynamicBackingPoolSpec {
             minimum_invocation_peak_bytes,
             step_resource_slots,
             theoretical_ceiling_bytes: CanonicalU128::new(theoretical_ceiling_bytes),
+            reusable_workspace_ceiling_bytes,
             provisioning: DynamicPoolProvisioningPolicy::demand_driven(
                 minimum_resident_bytes,
                 maximum_resident_bytes,
@@ -394,7 +400,11 @@ impl DynamicBackingPoolSpec {
             || self.resource_ids.windows(2).any(|pair| pair[0] >= pair[1])
             || minimum_resident_bytes != self.provisioning.minimum_resident_bytes
             || u128::from(self.provisioning.maximum_resident_bytes)
-                > self.theoretical_ceiling_bytes.get()
+                > self
+                    .theoretical_ceiling_bytes
+                    .get()
+                    .checked_add(u128::from(self.reusable_workspace_ceiling_bytes))
+                    .ok_or_else(|| invalid_plan("dynamic pool combined ceiling overflows u128"))?
             || self
                 .step_resource_slots
                 .windows(2)
@@ -477,6 +487,10 @@ impl DynamicBackingPoolSpec {
         self.theoretical_ceiling_bytes.get()
     }
 
+    pub const fn reusable_workspace_ceiling_bytes(&self) -> u64 {
+        self.reusable_workspace_ceiling_bytes
+    }
+
     pub fn provisioning(&self) -> &DynamicPoolProvisioningPolicy {
         &self.provisioning
     }
@@ -502,6 +516,7 @@ pub(super) struct DynamicBackingPoolSpecWire {
     pub(super) minimum_invocation_peak_bytes: u64,
     pub(super) step_resource_slots: Vec<StepResourceSlot>,
     pub(super) theoretical_ceiling_bytes: CanonicalU128,
+    pub(super) reusable_workspace_ceiling_bytes: u64,
     pub(super) provisioning: DynamicPoolProvisioningPolicy,
     pub(super) invocation_liveness_mode: InvocationLivenessMode,
     pub(super) invocation_liveness: Vec<InvocationResourceLiveness>,
@@ -523,6 +538,7 @@ impl<'de> Deserialize<'de> for DynamicBackingPoolSpec {
             minimum_invocation_peak_bytes: wire.minimum_invocation_peak_bytes,
             step_resource_slots: wire.step_resource_slots,
             theoretical_ceiling_bytes: wire.theoretical_ceiling_bytes,
+            reusable_workspace_ceiling_bytes: wire.reusable_workspace_ceiling_bytes,
             provisioning: wire.provisioning,
             invocation_liveness_mode: wire.invocation_liveness_mode,
             invocation_liveness: wire.invocation_liveness,

@@ -17,10 +17,11 @@ use super::{
     ProgramNode, ProgramNodeWorkSpec, ProgramValueId, ProviderCompatibilityRequest, ProviderId,
     ProviderResourcePlan, ProviderSelection, ProviderSelectionReason, ProviderWorkspaceScope,
     QuantizationFormatId, RejectedProvider, ResolvedValueBinding, ResolvedValueRole,
-    ResourceAllocation, ResourceId, RuntimePolicy, Serialize, StateCapacityDemand,
-    StateDependencyTracker, StateInitialization, StateLifetime, TensorAccess,
-    UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, VNextError, ValueAllocationAccumulator,
-    ValueResourceDemand, WeightFormatId, EXECUTION_PLAN_SCHEMA, MAX_EXECUTION_PLAN_WIRE_BYTES,
+    ResourceAllocation, ResourceId, ReusableExecutionMemoryPlan, ReusableExecutionPolicy,
+    RuntimePolicy, Serialize, StateCapacityDemand, StateDependencyTracker, StateInitialization,
+    StateLifetime, TensorAccess, UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire,
+    VNextError, ValueAllocationAccumulator, ValueResourceDemand, WeightFormatId,
+    EXECUTION_PLAN_SCHEMA, MAX_EXECUTION_PLAN_WIRE_BYTES,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -174,6 +175,7 @@ impl ExecutionPlan {
             maximum_scheduled_tokens,
             &nodes,
             &selected_resource_profiles,
+            request.policy.reusable_execution_policy(),
         )?;
 
         let mut payload = ExecutionPlanPayload {
@@ -1442,6 +1444,7 @@ impl ExecutionPlan {
         maximum_scheduled_tokens: u64,
         nodes: &[PlanNode],
         selected_resource_profiles: &BTreeMap<ResourceId, DynamicStorageProfile>,
+        reusable_execution_policy: Option<&ReusableExecutionPolicy>,
     ) -> Result<MemoryPlan, VNextError> {
         validate_scheduled_token_ceiling(maximum_scheduled_tokens)?;
         let program_inputs = family
@@ -1783,6 +1786,7 @@ impl ExecutionPlan {
             static_allocations,
             dynamic_descriptors,
             nodes,
+            reusable_execution_policy,
         )
     }
 
@@ -1929,10 +1933,40 @@ impl ExecutionPlan {
             .usable_capacity_bytes
             .checked_sub(self.payload.memory.static_bytes)
             .ok_or_else(|| invalid_plan("static memory exceeds usable capacity"))?;
-        let expected_pools = MemoryPlan::derive_dynamic_pools(
+        let base_pools = MemoryPlan::derive_dynamic_pools(
             &self.payload.memory.dynamic_descriptors,
             &self.payload.nodes,
             dynamic_capacity_bytes,
+        )?;
+        let expected_reusable_execution = self
+            .payload
+            .memory
+            .reusable_execution
+            .as_ref()
+            .map(|actual| {
+                MemoryPlan::derive_reusable_execution(
+                    &actual.policy()?,
+                    self.payload.nodes.len(),
+                    &self.payload.memory.dynamic_descriptors,
+                    &base_pools,
+                )
+            })
+            .transpose()?;
+        if self.payload.memory.reusable_execution != expected_reusable_execution {
+            return Err(invalid_plan(
+                "reusable execution budgets are not derived from plan resources",
+            ));
+        }
+        let reusable_workspace_ceilings = expected_reusable_execution
+            .as_ref()
+            .map(ReusableExecutionMemoryPlan::pool_workspace_ceilings)
+            .transpose()?
+            .unwrap_or_default();
+        let expected_pools = MemoryPlan::derive_dynamic_pools_with_reusable(
+            &self.payload.memory.dynamic_descriptors,
+            &self.payload.nodes,
+            dynamic_capacity_bytes,
+            &reusable_workspace_ceilings,
         )?;
         if self.payload.memory.dynamic_pools != expected_pools {
             return Err(invalid_plan(
