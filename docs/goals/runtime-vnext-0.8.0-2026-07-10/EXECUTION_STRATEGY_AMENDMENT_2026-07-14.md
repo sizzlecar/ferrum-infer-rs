@@ -178,7 +178,9 @@ legacy entry。S4/S5 每完成一个模型立即删除对应 legacy factory/runn
 - 完整 C01-C21、正式 ABBA-BAAB、置信区间和 published asset matrix 只在 S6/S7 执行；
 - basic profile 在 S1 可用，resource/latency 在 S2 可用，kernel/replay 在 S3 前可用；
 - identity 必须贯穿 run/request/sequence/plan/node/op/resource/backend/kernel，隐藏 profile env 数 `0`；
-- basic profile overhead `<=2%`，resource/latency `<=5%`，自动 bottleneck report `<=60s`。
+- profile 默认关闭且 off 热路径不创建采集工作；basic `<=2%`、resource/latency `<=5%` 作为开启
+  模式报告目标，不再因租赁 GPU 的 profile ABBA-BAAB CV/overhead 波动阻塞 S1-S5；自动
+  bottleneck report `<=60s`。G09 默认产品路径的正式性能门不变。
 
 focused validation 不是降低 correctness。任何当前纵切的 basic correctness、resource ownership 或
 `run`/`serve` smoke 失败都阻止进入下一 S milestone；只是未受影响的完整 release matrix不再每次执行。
