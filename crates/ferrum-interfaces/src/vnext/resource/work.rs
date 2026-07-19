@@ -4,7 +4,7 @@ use super::{
     Serialize, Sha256, TokenSpanWork, VNextError,
 };
 use crate::vnext::ReusableExecutionBucketId;
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepResourceAdmissionRequest {
@@ -407,7 +407,7 @@ impl StepParticipantFrameAssignment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvocationResourceAdmissionRequest {
     pub(super) node_id: NodeId,
-    pub(super) work_shape: BatchWorkShape,
+    pub(super) work_shape: Arc<BatchWorkShape>,
     pub(super) fit_policy: AdmissionFitPolicy,
     pub(super) pressure_action: AdmissionPressureAction,
 }
@@ -415,13 +415,13 @@ pub struct InvocationResourceAdmissionRequest {
 impl InvocationResourceAdmissionRequest {
     pub fn new(
         node_id: NodeId,
-        work_shape: BatchWorkShape,
+        work_shape: impl Into<Arc<BatchWorkShape>>,
         fit_policy: AdmissionFitPolicy,
         pressure_action: AdmissionPressureAction,
     ) -> Result<Self, VNextError> {
         Ok(Self {
             node_id,
-            work_shape,
+            work_shape: work_shape.into(),
             fit_policy,
             pressure_action,
         })
@@ -429,7 +429,7 @@ impl InvocationResourceAdmissionRequest {
 
     pub fn for_all_step_participants(
         node_id: NodeId,
-        work_shape: BatchWorkShape,
+        work_shape: impl Into<Arc<BatchWorkShape>>,
         fit_policy: AdmissionFitPolicy,
         pressure_action: AdmissionPressureAction,
     ) -> Result<Self, VNextError> {
@@ -441,14 +441,14 @@ impl InvocationResourceAdmissionRequest {
     }
 
     pub fn work_shape(&self) -> &BatchWorkShape {
-        &self.work_shape
+        self.work_shape.as_ref()
     }
 
-    pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
+    pub(crate) fn immediate_shape(&self) -> DynamicResourceShape {
         self.work_shape.immediate_shape()
     }
 
-    pub(crate) const fn fit_shape(&self) -> DynamicResourceShape {
+    pub(crate) fn fit_shape(&self) -> DynamicResourceShape {
         match self.fit_policy {
             AdmissionFitPolicy::ImmediateOnly => self.work_shape.immediate_shape(),
             AdmissionFitPolicy::FullInputMustFit => self.work_shape.fit_shape(),

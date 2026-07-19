@@ -1397,7 +1397,7 @@ pub struct ClaimedSubmissionWaveBacking {
     // Physical extents release before the logical capacity claim.
     backing_slices: Vec<LogicalBackingSliceAuthority>,
     logical_capacity: Option<LogicalBatchCapacityLease>,
-    node_work_shapes: Vec<(NodeId, BatchWorkShape)>,
+    node_work_shapes: Vec<(NodeId, Arc<BatchWorkShape>)>,
     participants: Vec<BatchParticipantAuthority>,
     demand: AdmissionDemand,
     fingerprint: String,
@@ -1407,7 +1407,7 @@ pub struct ClaimedSubmissionWaveBacking {
 
 impl ClaimedSubmissionWaveBacking {
     pub(super) fn new(
-        node_work_shapes: Vec<(NodeId, BatchWorkShape)>,
+        node_work_shapes: Vec<(NodeId, Arc<BatchWorkShape>)>,
         participants: Vec<BatchParticipantAuthority>,
         demand: AdmissionDemand,
         logical_capacity: Option<LogicalBatchCapacityLease>,
@@ -1525,7 +1525,7 @@ impl ClaimedSubmissionWaveBacking {
     pub fn node_work_shapes(&self) -> impl ExactSizeIterator<Item = (&NodeId, &BatchWorkShape)> {
         self.node_work_shapes
             .iter()
-            .map(|(node_id, work_shape)| (node_id, work_shape))
+            .map(|(node_id, work_shape)| (node_id, work_shape.as_ref()))
     }
 
     pub fn participants(&self) -> &[BatchParticipantAuthority] {

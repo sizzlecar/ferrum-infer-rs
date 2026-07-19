@@ -1076,7 +1076,7 @@ where
         };
         let backing_slices = prepared.commit();
         let claimed_backing = ClaimedBackingTransaction::new(
-            work_shape,
+            Arc::unwrap_or_clone(work_shape),
             demand,
             logical_capacity,
             backing_slices,
@@ -1319,7 +1319,7 @@ where
     participant_session_identities: Vec<(SequenceSessionEpoch, SequenceSessionFingerprint)>,
     flight_candidates: Vec<ParticipantFlightCandidate>,
     node_id: NodeId,
-    work_shape: BatchWorkShape,
+    work_shape: Arc<BatchWorkShape>,
     fit_policy: AdmissionFitPolicy,
     pressure_action: AdmissionPressureAction,
 }
@@ -1444,7 +1444,7 @@ pub struct PreparedStepSubmissionNode<R>
 where
     R: DeviceRuntime,
 {
-    work_shape: BatchWorkShape,
+    work_shape: Arc<BatchWorkShape>,
     participants: Vec<Arc<AdmittedSequenceResources<R>>>,
     participant_frames: Vec<StepParticipantFrameAssignment>,
     participant_session_identities: Vec<(SequenceSessionEpoch, SequenceSessionFingerprint)>,
@@ -1485,7 +1485,7 @@ where
     }
 
     pub fn work_shape(&self) -> &BatchWorkShape {
-        &self.work_shape
+        self.work_shape.as_ref()
     }
 
     pub fn plan_evidence(&self) -> TrustedPlanRuntimeEvidence {

@@ -3540,6 +3540,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         step: &Arc<StepResourceLease<R>>,
         spans: &[TokenSpanWork],
     ) -> Result<StepSubmissionWaveAdmissionDecision<R>> {
+        let work_shape = Arc::new(
+            step.bind_all_invocation_work_shape(spans.to_vec())
+                .map_err(|error| FerrumError::backend(error.to_string()))?,
+        );
         let requests = self
             .resolved_plan
             .execution_plan()
@@ -3549,7 +3553,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .map(|node| {
                 InvocationResourceAdmissionRequest::for_all_step_participants(
                     node.id().clone(),
-                    step.bind_all_invocation_work_shape(spans.to_vec())?,
+                    Arc::clone(&work_shape),
                     AdmissionFitPolicy::ImmediateOnly,
                     AdmissionPressureAction::WaitForRelease,
                 )
