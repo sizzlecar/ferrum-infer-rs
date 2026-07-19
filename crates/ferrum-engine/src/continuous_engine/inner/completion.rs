@@ -30,12 +30,15 @@ impl SequenceState {
                 "structured-output generation failed after reaching an accepting state",
             )),
             Ok(progress) => Some(FerrumError::model(format!(
-                "structured-output generation ended with {finish_reason:?} before a complete valid value: phase={:?}, generated_tokens={}, consumed_tokens={}, delimiter_tokens={:?}, delimiter_prefix_tokens={}",
+                "structured-output generation ended with {finish_reason:?} before a complete valid value: phase={:?}, generated_tokens={}, consumed_tokens={}, delimiter_tokens={:?}, delimiter_prefix_tokens={}, reasoning_tokens={:?}, boundary_forced={}, budget={:?}",
                 progress.phase,
                 progress.generated_token_count,
                 progress.consumed_token_count,
                 progress.delimiter_token_count,
                 progress.delimiter_prefix_token_count,
+                progress.reasoning_token_count,
+                progress.boundary_forced,
+                progress.budget,
             ))),
             Err(error) => Some(error),
         }

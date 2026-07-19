@@ -21,6 +21,45 @@ use parking_lot::Mutex;
 use serde_json::json;
 
 const MAX_CACHED_GRAMMARS: usize = 64;
+const AUTO_STRUCTURED_RESERVE_DIVISOR: usize = 4;
+const MIN_AUTO_STRUCTURED_RESERVE_TOKENS: usize = 32;
+const MAX_AUTO_STRUCTURED_RESERVE_TOKENS: usize = 1024;
+
+/// Immutable per-request output budget used when a structured grammar starts
+/// after a reasoning delimiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuredOutputBudgetPlan {
+    pub total_output_tokens: usize,
+    pub reasoning_token_limit: usize,
+    pub boundary_token_count: usize,
+    pub structured_reserve_tokens: usize,
+}
+
+impl StructuredOutputBudgetPlan {
+    fn automatic(total_output_tokens: usize, boundary_token_count: usize) -> Result<Self> {
+        if boundary_token_count == 0 || total_output_tokens <= boundary_token_count {
+            return Err(FerrumError::invalid_request(format!(
+                "structured output requires max_tokens greater than its {boundary_token_count}-token delimiter"
+            )));
+        }
+        let available_after_boundary = total_output_tokens - boundary_token_count;
+        let proportional_reserve = total_output_tokens.div_ceil(AUTO_STRUCTURED_RESERVE_DIVISOR);
+        let structured_reserve_tokens = proportional_reserve
+            .clamp(
+                MIN_AUTO_STRUCTURED_RESERVE_TOKENS,
+                MAX_AUTO_STRUCTURED_RESERVE_TOKENS,
+            )
+            .min(available_after_boundary);
+        Ok(Self {
+            total_output_tokens,
+            reasoning_token_limit: total_output_tokens
+                - boundary_token_count
+                - structured_reserve_tokens,
+            boundary_token_count,
+            structured_reserve_tokens,
+        })
+    }
+}
 
 /// Shared, immutable tokenizer and grammar compilation state.
 pub struct StructuredOutputFactory {
@@ -129,6 +168,7 @@ impl StructuredOutputFactory {
         &self,
         response_format: &ResponseFormat,
         start: &StructuredOutputStart,
+        max_output_tokens: usize,
     ) -> Result<Option<StructuredOutputProcessor>> {
         let schema = match response_format {
             ResponseFormat::Text => return Ok(None),
@@ -166,8 +206,8 @@ impl StructuredOutputFactory {
                 matcher
             }
         };
-        let activation = match start {
-            StructuredOutputStart::Immediate => Activation::Active,
+        let (activation, budget) = match start {
+            StructuredOutputStart::Immediate => (Activation::Active, None),
             StructuredOutputStart::AfterDelimiter(delimiter) => {
                 if delimiter.is_empty() {
                     return Err(FerrumError::invalid_request(
@@ -188,7 +228,17 @@ impl StructuredOutputFactory {
                         "structured-output delimiter {delimiter:?} did not tokenize"
                     )));
                 }
-                Activation::WaitingForDelimiter { delimiter_tokens }
+                let budget = StructuredOutputBudgetPlan::automatic(
+                    max_output_tokens,
+                    delimiter_tokens.len(),
+                )?;
+                (
+                    Activation::Boundary {
+                        delimiter_tokens,
+                        forcing: false,
+                    },
+                    Some(budget),
+                )
             }
         };
 
@@ -198,8 +248,11 @@ impl StructuredOutputFactory {
                 activation: activation.clone(),
                 initial_activation: activation,
                 consumed: 0,
+                boundary_forced: false,
+                boundary_start: None,
             }),
             vocab_size: self.vocab_size,
+            budget,
         }))
     }
 }
@@ -208,12 +261,14 @@ impl StructuredOutputFactory {
 pub struct StructuredOutputProcessor {
     state: Mutex<ProcessorState>,
     vocab_size: usize,
+    budget: Option<StructuredOutputBudgetPlan>,
 }
 
 /// Typed phase returned after applying a structured-output constraint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StructuredOutputPhase {
     WaitingForDelimiter,
+    ForcingDelimiter,
     EnforcingGrammar,
 }
 
@@ -238,6 +293,9 @@ pub struct StructuredOutputProgress {
     pub consumed_token_count: usize,
     pub delimiter_token_count: Option<usize>,
     pub delimiter_prefix_token_count: usize,
+    pub reasoning_token_count: Option<usize>,
+    pub boundary_forced: bool,
+    pub budget: Option<StructuredOutputBudgetPlan>,
     pub accepting: bool,
 }
 
@@ -248,6 +306,7 @@ impl std::fmt::Debug for StructuredOutputProcessor {
             .field("vocab_size", &self.vocab_size)
             .field("consumed", &state.consumed)
             .field("active", &matches!(state.activation, Activation::Active))
+            .field("budget", &self.budget)
             .finish()
     }
 }
@@ -257,12 +316,17 @@ struct ProcessorState {
     activation: Activation,
     initial_activation: Activation,
     consumed: usize,
+    boundary_forced: bool,
+    boundary_start: Option<usize>,
 }
 
 #[derive(Clone)]
 enum Activation {
     Active,
-    WaitingForDelimiter { delimiter_tokens: Vec<u32> },
+    Boundary {
+        delimiter_tokens: Vec<u32>,
+        forcing: bool,
+    },
 }
 
 impl StructuredOutputProcessor {
@@ -302,13 +366,25 @@ impl StructuredOutputProcessor {
     ) -> Result<StructuredOutputMaskOutcome> {
         let mut state = self.state.lock();
         advance_state(&mut state, generated, terminal_token_ids)?;
-        if let Activation::WaitingForDelimiter { delimiter_tokens } = &state.activation {
+        activate_forcing_if_due(&mut state, generated.len(), self.budget);
+        if let Activation::Boundary {
+            delimiter_tokens,
+            forcing,
+        } = &state.activation
+        {
             let delimiter_prefix_token_count =
                 delimiter_prefix_token_count(generated, delimiter_tokens);
-            let required_control_token = delimiter_tokens.get(delimiter_prefix_token_count);
-            if let Some(hidden_control_token_ids) = hidden_control_token_ids {
+            let required_delimiter_token = delimiter_tokens
+                .get(delimiter_prefix_token_count)
+                .copied()
+                .ok_or_else(|| {
+                    FerrumError::internal("structured-output delimiter state has no next token")
+                })?;
+            if *forcing {
+                force_exact_token(logits, required_delimiter_token)?;
+            } else if let Some(hidden_control_token_ids) = hidden_control_token_ids {
                 for token_id in hidden_control_token_ids {
-                    if required_control_token == Some(token_id) {
+                    if required_delimiter_token == *token_id {
                         continue;
                     }
                     if let Some(logit) = logits.get_mut(*token_id as usize) {
@@ -317,9 +393,13 @@ impl StructuredOutputProcessor {
                 }
             }
             return Ok(StructuredOutputMaskOutcome {
-                phase: StructuredOutputPhase::WaitingForDelimiter,
+                phase: if *forcing {
+                    StructuredOutputPhase::ForcingDelimiter
+                } else {
+                    StructuredOutputPhase::WaitingForDelimiter
+                },
                 accepting: false,
-                required_delimiter_token_id: required_control_token.copied(),
+                required_delimiter_token_id: Some(required_delimiter_token),
             });
         }
 
@@ -402,10 +482,18 @@ impl StructuredOutputProcessor {
     ) -> Result<StructuredOutputProgress> {
         let mut state = self.state.lock();
         advance_state(&mut state, generated, terminal_token_ids)?;
+        activate_forcing_if_due(&mut state, generated.len(), self.budget);
         let (phase, delimiter_token_count, delimiter_prefix_token_count, accepting) =
             match &state.activation {
-                Activation::WaitingForDelimiter { delimiter_tokens } => (
-                    StructuredOutputPhase::WaitingForDelimiter,
+                Activation::Boundary {
+                    delimiter_tokens,
+                    forcing,
+                } => (
+                    if *forcing {
+                        StructuredOutputPhase::ForcingDelimiter
+                    } else {
+                        StructuredOutputPhase::WaitingForDelimiter
+                    },
                     Some(delimiter_tokens.len()),
                     delimiter_prefix_token_count(generated, delimiter_tokens),
                     false,
@@ -425,8 +513,14 @@ impl StructuredOutputProcessor {
             phase,
             generated_token_count: generated.len(),
             consumed_token_count: state.consumed,
-            delimiter_token_count,
+            delimiter_token_count: delimiter_token_count
+                .or(self.budget.map(|budget| budget.boundary_token_count)),
             delimiter_prefix_token_count,
+            reasoning_token_count: self
+                .budget
+                .map(|_| state.boundary_start.unwrap_or(generated.len())),
+            boundary_forced: state.boundary_forced,
+            budget: self.budget,
             accepting,
         })
     }
@@ -439,8 +533,44 @@ impl StructuredOutputProcessor {
             .map_err(|error| FerrumError::internal(format!("reset structured output: {error}")))?;
         state.activation = state.initial_activation.clone();
         state.consumed = 0;
+        state.boundary_forced = false;
+        state.boundary_start = None;
         Ok(())
     }
+}
+
+fn activate_forcing_if_due(
+    state: &mut ProcessorState,
+    generated_token_count: usize,
+    budget: Option<StructuredOutputBudgetPlan>,
+) {
+    let Some(budget) = budget else {
+        return;
+    };
+    let should_force = matches!(
+        state.activation,
+        Activation::Boundary { forcing: false, .. }
+    ) && generated_token_count >= budget.reasoning_token_limit;
+    if should_force {
+        if let Activation::Boundary { forcing, .. } = &mut state.activation {
+            *forcing = true;
+        }
+        state.boundary_forced = true;
+        state.boundary_start = Some(generated_token_count);
+    }
+}
+
+fn force_exact_token(logits: &mut [f32], required_token: u32) -> Result<()> {
+    let required_index = required_token as usize;
+    if required_index >= logits.len() {
+        return Err(FerrumError::model(format!(
+            "structured-output delimiter token {required_token} is outside logits width {}",
+            logits.len()
+        )));
+    }
+    logits.fill(f32::NEG_INFINITY);
+    logits[required_index] = 0.0;
+    Ok(())
 }
 
 fn delimiter_prefix_token_count(generated: &[TokenId], delimiter_tokens: &[u32]) -> usize {
@@ -469,7 +599,10 @@ fn advance_state(
         ));
     }
 
-    if let Activation::WaitingForDelimiter { delimiter_tokens } = &state.activation {
+    if let Activation::Boundary {
+        delimiter_tokens, ..
+    } = &state.activation
+    {
         let search_from = state.consumed.saturating_sub(delimiter_tokens.len());
         if let Some(offset) = generated[search_from..]
             .windows(delimiter_tokens.len())
@@ -481,6 +614,7 @@ fn advance_state(
             })
         {
             let grammar_start = search_from + offset + delimiter_tokens.len();
+            state.boundary_start = Some(grammar_start - delimiter_tokens.len());
             state.activation = Activation::Active;
             state.consumed = grammar_start;
         } else {
@@ -564,6 +698,7 @@ mod tests {
     use ferrum_types::SpecialTokens;
 
     const EOS: u32 = 256;
+    const TEST_MAX_OUTPUT_TOKENS: usize = 128;
 
     struct ByteTokenizer {
         special: SpecialTokens,
@@ -673,6 +808,7 @@ mod tests {
             .create_processor(
                 &ResponseFormat::JsonObject,
                 &StructuredOutputStart::Immediate,
+                TEST_MAX_OUTPUT_TOKENS,
             )
             .unwrap()
             .unwrap();
@@ -690,6 +826,7 @@ mod tests {
             .create_processor(
                 &ResponseFormat::JsonObject,
                 &StructuredOutputStart::Immediate,
+                TEST_MAX_OUTPUT_TOKENS,
             )
             .unwrap()
             .unwrap();
@@ -718,6 +855,7 @@ mod tests {
             .create_processor(
                 &ResponseFormat::JsonSchema(schema.to_string()),
                 &StructuredOutputStart::Immediate,
+                TEST_MAX_OUTPUT_TOKENS,
             )
             .unwrap()
             .unwrap();
@@ -732,6 +870,7 @@ mod tests {
             .create_processor(
                 &ResponseFormat::JsonObject,
                 &StructuredOutputStart::AfterDelimiter("</think>".to_string()),
+                TEST_MAX_OUTPUT_TOKENS,
             )
             .unwrap()
             .unwrap();
@@ -787,5 +926,89 @@ mod tests {
         assert_eq!(progress.phase, StructuredOutputPhase::EnforcingGrammar);
         assert!(progress.accepting);
         assert_eq!(progress.generated_token_count, generated.len());
+        assert!(!progress.boundary_forced);
+        assert_eq!(progress.reasoning_token_count, Some(19));
+    }
+
+    #[test]
+    fn reasoning_budget_forces_exact_delimiter_and_preserves_structured_reserve() {
+        let processor = factory()
+            .create_processor(
+                &ResponseFormat::JsonObject,
+                &StructuredOutputStart::AfterDelimiter("</think>".to_string()),
+                48,
+            )
+            .unwrap()
+            .unwrap();
+        let mut generated = "reason!!"
+            .bytes()
+            .map(|byte| TokenId::new(byte as u32))
+            .collect::<Vec<_>>();
+
+        for expected in "</think>".bytes() {
+            let mut logits = vec![f32::NEG_INFINITY; EOS as usize + 1];
+            let outcome = processor
+                .mask_logits_with_terminals(
+                    &mut logits,
+                    &generated,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                )
+                .unwrap();
+            assert_eq!(outcome.phase, StructuredOutputPhase::ForcingDelimiter);
+            assert_eq!(outcome.required_delimiter_token_id, Some(expected as u32));
+            assert_eq!(
+                logits
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, logit)| logit.is_finite())
+                    .map(|(token, _)| token)
+                    .collect::<Vec<_>>(),
+                vec![expected as usize]
+            );
+            generated.push(TokenId::new(expected as u32));
+        }
+
+        let mut grammar_logits = vec![0.0; EOS as usize + 1];
+        let outcome = processor
+            .mask_logits_with_terminals(
+                &mut grammar_logits,
+                &generated,
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert_eq!(outcome.phase, StructuredOutputPhase::EnforcingGrammar);
+        assert!(grammar_logits[b'{' as usize].is_finite());
+        assert!(!grammar_logits[b'[' as usize].is_finite());
+
+        let progress = processor
+            .progress_with_terminals(&generated, &HashSet::new())
+            .unwrap();
+        assert_eq!(progress.reasoning_token_count, Some(8));
+        assert!(progress.boundary_forced);
+        assert_eq!(
+            progress.budget,
+            Some(StructuredOutputBudgetPlan {
+                total_output_tokens: 48,
+                reasoning_token_limit: 8,
+                boundary_token_count: 8,
+                structured_reserve_tokens: 32,
+            })
+        );
+    }
+
+    #[test]
+    fn reasoning_delimiter_requires_room_beyond_the_boundary() {
+        let error = factory()
+            .create_processor(
+                &ResponseFormat::JsonObject,
+                &StructuredOutputStart::AfterDelimiter("</think>".to_string()),
+                8,
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("max_tokens greater than its 8-token delimiter"));
     }
 }
