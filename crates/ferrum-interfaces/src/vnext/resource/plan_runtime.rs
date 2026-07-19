@@ -9,8 +9,9 @@ use super::{
     DeferredDeviceCleanupStatus, DeviceCapacityClaim, DeviceCapacitySignal, DeviceId,
     DeviceRuntime, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome,
     DynamicPoolMaintenanceController, DynamicPoolMaintenanceStatus, DynamicPoolSet,
-    DynamicResourceShape, EvaluatedBackingProjection, EvaluatedBackingRequest, FailureEnvelope,
-    InvocationLivenessMode, LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex,
+    DynamicResourceShape, EvaluatedBackingProjection, EvaluatedBackingRequest, ExecutionLane,
+    ExecutionLaneCreationError, FailureEnvelope, InvocationLivenessMode,
+    LaneBackingPrepareDecision, LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex,
     NoStatic, NodeId, Ordering, PhysicalBackingClaimIdentity, PlanHash, PlanId, PlanNode,
     ResourceAbandonSignal, ResourceActionCursor, ResourceDriverFailure,
     ResourceLedgerEntrySnapshot, ResourceOwnershipReason, ResourceOwnershipTransferFailure,
@@ -399,9 +400,31 @@ where
         let _lifecycle = self
             .resources
             .read_lifecycle("maintain plan-owned deferred backing")?;
-        self.resources
+        // Stable lane slots own real residency. Reclaim a provably idle slot
+        // before asking the pool to grow, otherwise a reclaimable cache entry
+        // can make growth look like a terminal resident-ceiling violation.
+        if self
+            .resources
+            .dynamic_pools
+            .try_reclaim_expired_lane_slots()?
+        {
+            return self.retry_admission();
+        }
+        let outcome = self
+            .resources
             .maintenance_controller
-            .maintain_for_live_deferred(&self.evidence)
+            .maintain_for_live_deferred(&self.evidence)?;
+        if matches!(
+            &outcome,
+            DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
+        ) && self
+            .resources
+            .dynamic_pools
+            .try_reclaim_one_idle_lane_slot()?
+        {
+            return self.retry_admission();
+        }
+        Ok(outcome)
     }
 
     pub(super) fn retry_admission(&self) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
@@ -761,6 +784,15 @@ where
 
     pub fn deferred_cleanup_status(&self) -> DeferredDeviceCleanupStatus {
         deferred_device_cleanup_status(self.deferred_cleanup_domain)
+    }
+
+    pub fn create_execution_lane(
+        &self,
+    ) -> Result<Arc<ExecutionLane<R>>, ExecutionLaneCreationError<R::Error>> {
+        let _lifecycle = self
+            .read_lifecycle("create an execution lane")
+            .map_err(ExecutionLaneCreationError::Contract)?;
+        ExecutionLane::create(Arc::clone(&self.runtime))
     }
 
     /// Attempts each selected cleanup owner at most once. This may block in a
@@ -1398,6 +1430,15 @@ where
         requested_slices: Vec<EvaluatedBackingRequest<'_>>,
     ) -> Result<BackingPrepareDecision<R>, VNextError> {
         self.dynamic_pools().prepare_claim(&requested_slices)
+    }
+
+    pub(super) fn prepare_lane_stable_backing_slices(
+        &self,
+        lane: &Arc<ExecutionLane<R>>,
+        requested_slices: Vec<EvaluatedBackingRequest<'_>>,
+    ) -> Result<LaneBackingPrepareDecision, VNextError> {
+        self.dynamic_pools()
+            .prepare_lane_stable_claim(lane, &requested_slices)
     }
 
     pub(super) fn prepare_initial_sequence_backing_slices(

@@ -1885,7 +1885,7 @@ where
     }
 
     pub(crate) fn device_buffer_retention(&self) -> DeviceBufferRetention {
-        DeviceBufferRetention::new(Arc::clone(&self.request.plan.resources))
+        DeviceBufferRetention::plan(Arc::clone(&self.request.plan.resources))
     }
 
     pub(super) fn lock_authority_source(

@@ -2892,7 +2892,7 @@ mod operation_buffer_region_tests {
             .filter_map(|binding| {
                 let (logical_end, region) = translate_paged_segment(
                     binding.buffer,
-                    DeviceBufferRetention::new(Arc::new(())),
+                    DeviceBufferRetention::plan(Arc::new(())),
                     binding.physical_offset_bytes,
                     binding.length_bytes,
                     next_logical_offset,
@@ -2993,7 +2993,7 @@ mod operation_buffer_region_tests {
             source: OperationRegionSource::Contiguous {
                 buffer: &buffer,
                 physical_base_offset_bytes: 4096,
-                retention: DeviceBufferRetention::new(Arc::new(())),
+                retention: DeviceBufferRetention::plan(Arc::new(())),
             },
         };
 
@@ -3025,7 +3025,7 @@ mod operation_buffer_region_tests {
             source: OperationRegionSource::Contiguous {
                 buffer: &buffer,
                 physical_base_offset_bytes: 64,
-                retention: DeviceBufferRetention::new(Arc::clone(&owner)),
+                retention: DeviceBufferRetention::plan(Arc::clone(&owner)),
             },
         };
         drop(owner);
@@ -4961,6 +4961,7 @@ impl OperationDispatch {
             || plan_evidence.plan_hash() != plan.plan_hash()
             || plan_evidence.device_id() != plan.payload().device_id()
             || !Arc::ptr_eq(resources.runtime(), lane.runtime_arc())
+            || resources.step_resources().execution_lane().id() != lane.id()
             || lane.descriptor() != resolved.device()
             || lane.descriptor() != resolved.capabilities().device()
             || lane.descriptor().runtime_implementation_fingerprint
@@ -5090,6 +5091,7 @@ impl OperationDispatch {
     {
         let plan = resolved.execution_plan();
         if wave.nodes().is_empty()
+            || wave.execution_lane_id() != lane.id()
             || wave.nodes().len() != plan.payload().nodes().len()
             || participant_identities.len() != wave.nodes().len()
             || active_bindings.len() == 0

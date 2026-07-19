@@ -2410,7 +2410,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         )
         .map_err(|error| FerrumError::backend(error.to_string()))?;
         batch
-            .try_begin_step(request)
+            .try_begin_step(request, &self.lane)
             .map_err(|error| FerrumError::backend(error.to_string()))
     }
 

@@ -21,7 +21,7 @@ pub(crate) fn execute_sequence(
     let mut sequence = 3_u64;
     let mut invocation = 1_u64;
     for frame in 1..=frames {
-        let step = begin_single_participant_step(plan_resources, &batch);
+        let step = begin_single_participant_step_on_lane(&batch, &lane);
         let frame_id = step.participant_frames().next().unwrap().frame_id();
         assert_eq!(frame_id.get(), frame);
         sequence += 1;
@@ -94,9 +94,9 @@ pub(crate) fn execute_failure_then_complete(
     let session = resources.open_session().unwrap();
     let active = TrustedActiveSequenceBinding::from_session(&session).unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
-    let step = begin_single_participant_step(plan_resources, &batch);
-    let frame_id = step.participant_frames().next().unwrap().frame_id();
     let lane = ExecutionLane::create(Arc::clone(runtime)).unwrap();
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
+    let frame_id = step.participant_frames().next().unwrap().frame_id();
     let reaper = CompletionReaper::new();
     let operation_event = node_event(
         plan,
@@ -210,9 +210,9 @@ pub(crate) fn execute_terminal_failure_then_complete(
     let session = resources.open_session().unwrap();
     let active = TrustedActiveSequenceBinding::from_session(&session).unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
-    let step = begin_single_participant_step(plan_resources, &batch);
-    let frame_id = step.participant_frames().next().unwrap().frame_id();
     let lane = ExecutionLane::create(Arc::clone(runtime)).unwrap();
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
+    let frame_id = step.participant_frames().next().unwrap().frame_id();
     let reaper = CompletionReaper::new();
     let had_submission_fence = !matches!(
         mode,
@@ -454,7 +454,8 @@ pub(crate) fn live_witness_emitter_contract(
     let session = resources.open_session().unwrap();
     let active = TrustedActiveSequenceBinding::from_session(&session).unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
-    let step = begin_single_participant_step(plan_resources, &batch);
+    let lane = ExecutionLane::create(Arc::clone(runtime)).unwrap();
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
     let sink = RecordingSink::default();
     let mut emitter =
         ExecutionEventEmitter::new(&sink, active.run_id().clone(), active.request_id().clone());
@@ -499,7 +500,7 @@ pub(crate) fn live_witness_emitter_contract(
     let session = resources.open_session().unwrap();
     let active = TrustedActiveSequenceBinding::from_session(&session).unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
-    let step = begin_single_participant_step(plan_resources, &batch);
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
     let sink = RecordingSink::default();
     let mut emitter =
         ExecutionEventEmitter::new(&sink, active.run_id().clone(), active.request_id().clone());
@@ -627,7 +628,7 @@ pub(crate) fn live_witness_emitter_contract(
     let session = resources.open_session().unwrap();
     let active = TrustedActiveSequenceBinding::from_session(&session).unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
-    let step = begin_single_participant_step(plan_resources, &batch);
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
     let frame_id = step.participant_frames().next().unwrap().frame_id();
     let sink = RecordingSink::default();
     let mut emitter =
@@ -667,7 +668,6 @@ pub(crate) fn live_witness_emitter_contract(
             )
             .unwrap();
     }
-    let lane = ExecutionLane::create(Arc::clone(runtime)).unwrap();
     let reaper = CompletionReaper::new();
     let first_operation = node_event(
         plan,
@@ -988,9 +988,9 @@ pub(crate) fn execute_failure_then_abort(
     let session = resources.open_session().unwrap();
     let active = TrustedActiveSequenceBinding::from_session(&session).unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
-    let step = begin_single_participant_step(plan_resources, &batch);
-    let frame_id = step.participant_frames().next().unwrap().frame_id();
     let lane = ExecutionLane::create(Arc::clone(runtime)).unwrap();
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
+    let frame_id = step.participant_frames().next().unwrap().frame_id();
     let reaper = CompletionReaper::new();
     let operation_event = node_event(
         plan,

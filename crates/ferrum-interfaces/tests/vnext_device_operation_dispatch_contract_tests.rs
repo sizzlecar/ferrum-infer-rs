@@ -183,10 +183,10 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
     let session = resources.open_session().unwrap();
     let active = TrustedActiveSequenceBinding::from_session(&session).unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
-    let step = begin_single_participant_step(&plan_resources, &batch);
+    let lane = plan_resources.create_execution_lane().unwrap();
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
     let frame_id = step.participant_frames().next().unwrap().frame_id();
     let invocation_id = NodeInvocationId::try_from(1).unwrap();
-    let lane = ExecutionLane::create(Arc::clone(&runtime)).unwrap();
     let reaper = CompletionReaper::new();
     let identity = operation_identity(&plan, &active, frame_id, invocation_id);
     device_failure_contract(&runtime, &plan, &identity, passed);
@@ -220,7 +220,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
     ];
 
     for mutate in mutations {
-        let step = begin_single_participant_step(&plan_resources, &batch);
+        let step = begin_single_participant_step_on_lane(&batch, &lane);
         let frame_id = step.participant_frames().next().unwrap().frame_id();
         let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
         let mut parts = operation_identity(&plan, &active, frame_id, invocation_id)
@@ -249,7 +249,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
         assert!(step.try_retire_normal().is_ok());
     }
     for completed in [true, false] {
-        let step = begin_single_participant_step(&plan_resources, &batch);
+        let step = begin_single_participant_step_on_lane(&batch, &lane);
         let frame_id = step.participant_frames().next().unwrap().frame_id();
         let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
         let mut parts = operation_identity(&plan, &active, frame_id, invocation_id)
@@ -290,7 +290,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
     check(passed, provider_trace.lock().unwrap().encode_calls == 0);
     check(passed, runtime_trace.lock().unwrap().submit_calls == 0);
 
-    let step = begin_single_participant_step(&plan_resources, &batch);
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
     let frame_id = step.participant_frames().next().unwrap().frame_id();
     let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
     let mut resource_item = operation_identity(&plan, &active, frame_id, invocation_id)
@@ -319,7 +319,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
     );
     assert!(step.try_retire_normal().is_ok());
 
-    let step = begin_single_participant_step(&plan_resources, &batch);
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
     let frame_id = step.participant_frames().next().unwrap().frame_id();
     let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
     let mut resource_batch = operation_identity(&plan, &active, frame_id, invocation_id)
@@ -349,7 +349,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
     check(passed, provider_trace.lock().unwrap().encode_calls == 0);
 
     *provider_behavior.lock().unwrap() = ProviderBehavior::WrongIdentity;
-    let step = begin_single_participant_step(&plan_resources, &batch);
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
     let frame_id = step.participant_frames().next().unwrap().frame_id();
     let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
     let identity = operation_identity(&plan, &active, frame_id, invocation_id);
@@ -375,7 +375,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
     assert!(step.try_retire_normal().is_ok());
 
     *provider_behavior.lock().unwrap() = ProviderBehavior::WrongPhase;
-    let step = begin_single_participant_step(&plan_resources, &batch);
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
     let frame_id = step.participant_frames().next().unwrap().frame_id();
     let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
     let identity = operation_identity(&plan, &active, frame_id, invocation_id);
@@ -401,7 +401,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
     assert!(step.try_retire_normal().is_ok());
 
     *provider_behavior.lock().unwrap() = ProviderBehavior::Success;
-    let step = begin_single_participant_step(&plan_resources, &batch);
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
     let frame_id = step.participant_frames().next().unwrap().frame_id();
     let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
     let identity = operation_identity(&plan, &active, frame_id, invocation_id);
@@ -456,7 +456,7 @@ fn operation_dispatch_contract(fixture: Fixture, passed: &mut usize) {
     let encode_before_tamper = provider_trace.lock().unwrap().encode_calls;
     let submit_before_tamper = runtime_trace.lock().unwrap().submit_calls;
     runtime_trace.lock().unwrap().tamper_buffer_descriptor = true;
-    let step = begin_single_participant_step(&plan_resources, &batch);
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
     let frame_id = step.participant_frames().next().unwrap().frame_id();
     let invocation_id = NodeInvocationId::try_from(frame_id.get()).unwrap();
     let identity = operation_identity(&plan, &active, frame_id, invocation_id);
@@ -562,11 +562,11 @@ fn submit_descriptor_drift_contract(fixture: Fixture, passed: &mut usize) {
     let session = resources.open_session().unwrap();
     let active = TrustedActiveSequenceBinding::from_session(&session).unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
-    let step = begin_single_participant_step(&plan_resources, &batch);
+    let lane = plan_resources.create_execution_lane().unwrap();
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
     let frame_id = step.participant_frames().next().unwrap().frame_id();
     let invocation_id = NodeInvocationId::try_from(1).unwrap();
     let identity = operation_identity(&plan, &active, frame_id, invocation_id);
-    let lane = ExecutionLane::create(Arc::clone(&runtime)).unwrap();
     let reaper = CompletionReaper::new();
     runtime_trace.lock().unwrap().drift_on_submit = true;
     let completion = match encode_and_submit_single(

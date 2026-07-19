@@ -168,9 +168,10 @@ fn closing_error(error: &VNextError) -> bool {
 }
 
 fn begin_single_participant_step(
-    _root: &Arc<PlanRuntimeResources<TestRuntime>>,
+    root: &Arc<PlanRuntimeResources<TestRuntime>>,
     batch: &ExecutionBatchParticipants<TestRuntime>,
 ) -> Arc<StepResourceLease<TestRuntime>> {
+    let lane = root.create_execution_lane().unwrap();
     let request = StepResourceAdmissionRequest::new(
         batch.bind_work_shape(vec![one_token_span()]).unwrap(),
         AdmissionFitPolicy::ImmediateOnly,
@@ -178,7 +179,7 @@ fn begin_single_participant_step(
     )
     .unwrap();
     for attempt in 0..=3 {
-        match batch.try_begin_step(request.clone()).unwrap() {
+        match batch.try_begin_step(request.clone(), &lane).unwrap() {
             StepResourceAdmissionDecision::Admitted(step) => return step,
             StepResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
                 deferred.maintain().unwrap();
@@ -397,7 +398,7 @@ fn closing_root_rejects_every_parent_to_child_derivation() {
     )
     .unwrap();
     assert!(matches!(
-        existing_batch.try_begin_step(step_request),
+        existing_batch.try_begin_step(step_request, existing_step.execution_lane()),
         Err(error) if closing_error(&error)
     ));
     let invocation_request = InvocationResourceAdmissionRequest::for_all_step_participants(

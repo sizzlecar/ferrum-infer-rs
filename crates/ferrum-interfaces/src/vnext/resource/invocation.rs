@@ -15,9 +15,10 @@ use super::{
     BatchParticipantTokenSpan, BatchStepId, BatchWorkShape, ClaimedBackingTransaction,
     ClaimedSubmissionWaveBacking, DeferredDeviceCleanupDomainId, DeviceCommandBatch, DeviceRuntime,
     Digest, DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome, ExecutionBatchParticipants,
-    InvocationRegistry, InvocationResourceAdmissionRequest, LogicalAdmissionCoordinatorId,
-    LogicalBackingBufferView, LogicalBackingSliceAuthority, LogicalBatchCapacityLease, NodeId,
-    Ordering, ParticipantFlightCandidate, ParticipantFlightPhase, ParticipantFlightWaveCandidate,
+    ExecutionLane, ExecutionLaneId, InvocationRegistry, InvocationResourceAdmissionRequest,
+    LaneBackingPrepareDecision, LogicalAdmissionCoordinatorId, LogicalBackingBufferView,
+    LogicalBackingSliceAuthority, LogicalBatchCapacityLease, NodeId, Ordering,
+    ParticipantFlightCandidate, ParticipantFlightPhase, ParticipantFlightWaveCandidate,
     ParticipantNodeKey, PlanBackingDeferral, PlanCapacityWaitRegistration,
     PreparedParticipantFlightHold, RequestIdentity, ResourceId, RunId, SequenceAuthorityId,
     SequenceBackingSnapshot, SequenceExecutionAuthoritySource, SequenceRecoveryRegistry,
@@ -379,6 +380,7 @@ where
 {
     fn new(
         participants: Vec<AdmittedStepParticipant<R>>,
+        execution_lane: Arc<ExecutionLane<R>>,
         batch_step_id: BatchStepId,
         claimed_backing: ClaimedBackingTransaction,
     ) -> Result<Self, VNextError> {
@@ -429,6 +431,7 @@ where
             claimed_backing,
             participants,
             invocation_registry: Arc::new(InvocationRegistry::default()),
+            execution_lane,
             batch_step_id,
             finalized: false,
         })
@@ -436,6 +439,10 @@ where
 
     pub const fn batch_step_id(&self) -> BatchStepId {
         self.batch_step_id
+    }
+
+    pub fn execution_lane(&self) -> &Arc<ExecutionLane<R>> {
+        &self.execution_lane
     }
 
     pub fn try_retire_normal(
@@ -870,9 +877,11 @@ where
             .collect::<Vec<_>>();
         let (demand, requested_slices) =
             plan.submission_wave_demand(&node_shapes, fit_policy, pressure_action)?;
-        let prepared_backing = match plan.prepare_backing_slices(requested_slices)? {
-            BackingPrepareDecision::Prepared(prepared) => prepared,
-            BackingPrepareDecision::Deferred(deferred) => {
+        let prepared_backing = match plan
+            .prepare_lane_stable_backing_slices(&self.execution_lane, requested_slices)?
+        {
+            LaneBackingPrepareDecision::Prepared(prepared) => prepared,
+            LaneBackingPrepareDecision::Deferred(deferred) => {
                 return Ok(StepSubmissionWaveAdmissionDecision::BackingDeferred(
                     StepSubmissionWaveBackingDeferral::new(
                         Arc::clone(self),
@@ -929,12 +938,14 @@ where
             .iter()
             .map(|node| (node.node_id.clone(), node.work_shape.clone()))
             .collect();
+        let (backing_slices, lane_slot_lease) = prepared_backing.commit().into_parts();
         let claimed_backing = ClaimedSubmissionWaveBacking::new(
             node_work_shapes,
             wave_participants,
             demand,
             logical_capacity,
-            prepared_backing.commit(),
+            backing_slices,
+            lane_slot_lease,
         )?;
         let wave_fingerprint =
             submission_wave_fingerprint(self, &prepared_nodes, &claimed_backing)?;
@@ -969,6 +980,7 @@ where
                 prepared_participant_flights,
                 active_wave,
                 step: Arc::clone(self),
+                execution_lane_id: self.execution_lane.id(),
                 batch_invocation_id,
                 fingerprint: wave_fingerprint,
             },
@@ -1051,8 +1063,13 @@ where
             }
         };
         let backing_slices = prepared.commit();
-        let claimed_backing =
-            ClaimedBackingTransaction::new(work_shape, demand, logical_capacity, backing_slices)?;
+        let claimed_backing = ClaimedBackingTransaction::new(
+            work_shape,
+            demand,
+            logical_capacity,
+            backing_slices,
+            None,
+        )?;
         Ok(PreparedInvocationScopeDecision::Prepared(
             PreparedInvocationScope {
                 participants,
@@ -1504,6 +1521,7 @@ where
     prepared_participant_flights: Vec<PreparedParticipantFlightHold>,
     active_wave: ActiveInvocationWaveGuard,
     step: Arc<StepResourceLease<R>>,
+    execution_lane_id: ExecutionLaneId,
     batch_invocation_id: BatchInvocationId,
     fingerprint: String,
 }
@@ -1518,6 +1536,10 @@ where
 
     pub const fn batch_invocation_id(&self) -> BatchInvocationId {
         self.batch_invocation_id
+    }
+
+    pub const fn execution_lane_id(&self) -> ExecutionLaneId {
+        self.execution_lane_id
     }
 
     pub fn fingerprint(&self) -> &str {
@@ -2178,6 +2200,7 @@ where
     pub fn try_begin_step(
         &self,
         request: StepResourceAdmissionRequest,
+        lane: &Arc<ExecutionLane<R>>,
     ) -> Result<StepResourceAdmissionDecision<R>, VNextError> {
         let _lifecycle = self.sessions[0]
             .resources()
@@ -2212,6 +2235,14 @@ where
             AdmissionFitPolicy::FullInputMustFit => work_shape.fit_shape(),
         };
         let plan = &self.sessions[0].resources().request.plan;
+        if !Arc::ptr_eq(plan.runtime(), lane.runtime_arc())
+            || plan.runtime().descriptor() != lane.descriptor()
+            || !lane.is_reusable()
+        {
+            return Err(invalid_resource(
+                "step admission requires the reusable execution lane bound to its plan runtime",
+            ));
+        }
         let (demand, requested_slices) = plan.scoped_demand(
             AllocationLifetime::Step,
             None,
@@ -2220,9 +2251,9 @@ where
             fit_policy,
             pressure_action,
         )?;
-        let prepared = match plan.prepare_backing_slices(requested_slices)? {
-            BackingPrepareDecision::Prepared(prepared) => prepared,
-            BackingPrepareDecision::Deferred(deferred) => {
+        let prepared = match plan.prepare_lane_stable_backing_slices(lane, requested_slices)? {
+            LaneBackingPrepareDecision::Prepared(prepared) => prepared,
+            LaneBackingPrepareDecision::Deferred(deferred) => {
                 return Ok(StepResourceAdmissionDecision::BackingDeferred(
                     StepAdmissionBackingDeferral::new(
                         deferred,
@@ -2271,9 +2302,14 @@ where
                 }
             }
         };
-        let backing_slices = prepared.commit();
-        let claimed_backing =
-            ClaimedBackingTransaction::new(work_shape, demand, logical_capacity, backing_slices)?;
+        let (backing_slices, lane_slot_lease) = prepared.commit().into_parts();
+        let claimed_backing = ClaimedBackingTransaction::new(
+            work_shape,
+            demand,
+            logical_capacity,
+            backing_slices,
+            lane_slot_lease,
+        )?;
         let batch_step_id = issue_batch_step_id()?;
         let candidates = session_frame_capture_candidates(&self.sessions);
         let captured_frames = acquire_session_frames_with_backing(&candidates, batch_step_id)?;
@@ -2289,7 +2325,12 @@ where
             })
             .collect();
         Ok(StepResourceAdmissionDecision::Admitted(Arc::new(
-            StepResourceLease::new(participants, batch_step_id, claimed_backing)?,
+            StepResourceLease::new(
+                participants,
+                Arc::clone(lane),
+                batch_step_id,
+                claimed_backing,
+            )?,
         )))
     }
 }

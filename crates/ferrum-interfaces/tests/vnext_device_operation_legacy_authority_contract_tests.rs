@@ -63,13 +63,13 @@ fn legacy_source_seals_sequence_and_cannot_authorize_other_session(
         legacy_binding.request_id() != session_resources.request_id(),
     );
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
-    let step = begin_single_participant_step(&plan_resources, &batch);
+    let lane = ExecutionLane::create(Arc::clone(&runtime)).unwrap();
+    let step = begin_single_participant_step_on_lane(&batch, &lane);
     let node = &plan.payload().nodes()[0];
     let provider = registry.bind(&resolved, node.id()).unwrap();
     let frame_id = step.participant_frames().next().unwrap().frame_id();
     let invocation_id = NodeInvocationId::try_from(1).unwrap();
     let identity = operation_identity(&plan, &legacy_binding, frame_id, invocation_id);
-    let lane = ExecutionLane::create(Arc::clone(&runtime)).unwrap();
     let reaper = CompletionReaper::new();
     check(
         passed,

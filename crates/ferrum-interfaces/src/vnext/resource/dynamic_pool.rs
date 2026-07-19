@@ -7,10 +7,10 @@ use super::{
     DeviceCapacityAvailabilitySnapshot, DeviceCapacityBudget, DeviceCapacityGrant,
     DeviceCapacityReservation, DeviceRuntime, DynamicBackingPoolId, DynamicBackingPoolSpec,
     DynamicResourceDescriptor, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView,
-    ElementType, FreeExtentIndex, InvocationLivenessMode, LogicalAdmissionCoordinator, Mutex,
-    Ordering, PlanNode, ResourceId, ResourceReservation, ResourceRetentionPolicy,
-    ResourceTransactionIdentity, RunId, Serialize, StateInitialization, StaticProvisioningBinding,
-    StepResourceSlotKind, TransactionId, VNextError,
+    ElementType, ExecutionLane, ExecutionLaneId, FreeExtentIndex, InvocationLivenessMode,
+    LogicalAdmissionCoordinator, Mutex, Ordering, PlanNode, ResourceId, ResourceReservation,
+    ResourceRetentionPolicy, ResourceTransactionIdentity, RunId, Serialize, StateInitialization,
+    StaticProvisioningBinding, StepResourceSlotKind, TransactionId, VNextError, Weak,
 };
 use crate::vnext::DeviceCapacityPressure;
 use sha2::{Digest, Sha256};
@@ -957,12 +957,14 @@ impl PhysicalBackingClaimIdentity {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct EvaluatedBackingProjection<'a> {
     pub(super) descriptor: &'a DynamicResourceDescriptor,
     pub(super) physical_offset_bytes: u64,
     pub(super) size_bytes: u64,
 }
 
+#[derive(Clone)]
 pub(super) struct EvaluatedBackingRequest<'a> {
     pub(super) domain: &'a DynamicPoolDomainSpec,
     pub(super) claim_identity: PhysicalBackingClaimIdentity,
@@ -1028,6 +1030,7 @@ where
                 LogicalBackingSliceAuthority {
                     evidence,
                     segment_lease: Arc::clone(&segment_lease),
+                    reusable_lane: None,
                 }
             }));
         }
@@ -1091,6 +1094,298 @@ where
     Deferred(DynamicBackingDeferred),
 }
 
+pub(super) struct CommittedLaneBackingClaim {
+    backing_slices: Vec<LogicalBackingSliceAuthority>,
+    slot_lease: Option<LaneStableArenaSlotLease>,
+}
+
+impl CommittedLaneBackingClaim {
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        Vec<LogicalBackingSliceAuthority>,
+        Option<LaneStableArenaSlotLease>,
+    ) {
+        (self.backing_slices, self.slot_lease)
+    }
+}
+
+pub(super) struct PreparedLaneBackingClaim {
+    stable: Vec<LogicalBackingSliceAuthority>,
+    slot_lease: Option<LaneStableArenaSlotLease>,
+}
+
+impl PreparedLaneBackingClaim {
+    pub(super) fn commit(self) -> CommittedLaneBackingClaim {
+        CommittedLaneBackingClaim {
+            backing_slices: self.stable,
+            slot_lease: self.slot_lease,
+        }
+    }
+}
+
+pub(super) enum LaneBackingPrepareDecision {
+    Prepared(PreparedLaneBackingClaim),
+    Deferred(DynamicBackingDeferred),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LaneStableArenaKey {
+    lane_id: ExecutionLaneId,
+    lifetime: AllocationLifetime,
+    layout_fingerprint: [u8; 32],
+}
+
+struct LaneStableArenaSlot {
+    slot_id: u64,
+    authorities: Vec<LogicalBackingSliceAuthority>,
+    availability_domains: Vec<CapacityDomainId>,
+    in_use: bool,
+    last_used: u64,
+}
+
+impl LaneStableArenaSlot {
+    fn has_external_address_pins(&self) -> bool {
+        self.authorities
+            .iter()
+            .enumerate()
+            .filter(|(index, authority)| {
+                !self.authorities[..*index]
+                    .iter()
+                    .any(|prior| Arc::ptr_eq(&prior.segment_lease, &authority.segment_lease))
+            })
+            .any(|(_, authority)| {
+                let retained_by_slot = self
+                    .authorities
+                    .iter()
+                    .filter(|candidate| {
+                        Arc::ptr_eq(&candidate.segment_lease, &authority.segment_lease)
+                    })
+                    .count();
+                Arc::strong_count(&authority.segment_lease) > retained_by_slot
+            })
+    }
+}
+
+trait LaneStableArenaLane: Send + Sync {
+    fn try_trim_reusable_executables(&self) -> Result<bool, VNextError>;
+}
+
+impl<R> LaneStableArenaLane for ExecutionLane<R>
+where
+    R: DeviceRuntime,
+{
+    fn try_trim_reusable_executables(&self) -> Result<bool, VNextError> {
+        self.trim_reusable_executables_if_quiescent()
+    }
+}
+
+struct LaneStableArenaEntry {
+    lane: Weak<dyn LaneStableArenaLane>,
+    slots: BTreeMap<u64, LaneStableArenaSlot>,
+}
+
+struct LaneStableArenaEvictionCandidate {
+    key: LaneStableArenaKey,
+    slot_id: u64,
+    last_used: u64,
+    lane: Arc<dyn LaneStableArenaLane>,
+}
+
+impl LaneStableArenaEntry {
+    fn claim_idle_slot(
+        &mut self,
+        lane_id: ExecutionLaneId,
+        now: u64,
+    ) -> Option<(
+        u64,
+        Vec<LogicalBackingSliceAuthority>,
+        Vec<CapacityDomainId>,
+    )> {
+        let slot = self.slots.values_mut().find(|slot| !slot.in_use)?;
+        slot.in_use = true;
+        slot.last_used = now;
+        Some((
+            slot.slot_id,
+            slot.authorities
+                .iter()
+                .map(|authority| authority.retained_for_lane(lane_id))
+                .collect(),
+            slot.availability_domains.clone(),
+        ))
+    }
+}
+
+struct LaneStableArenaState {
+    clock: u64,
+    next_slot_id: u64,
+    poisoned: bool,
+    entries: BTreeMap<LaneStableArenaKey, LaneStableArenaEntry>,
+}
+
+impl Default for LaneStableArenaState {
+    fn default() -> Self {
+        Self {
+            clock: 0,
+            next_slot_id: 1,
+            poisoned: false,
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+impl LaneStableArenaState {
+    fn tick(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1).max(1);
+        self.clock
+    }
+
+    fn issue_slot_id(&mut self) -> Result<u64, VNextError> {
+        let slot_id = self.next_slot_id;
+        self.next_slot_id = self.next_slot_id.checked_add(1).ok_or_else(|| {
+            invalid_resource("lane-stable arena slot identity space is exhausted")
+        })?;
+        Ok(slot_id)
+    }
+
+    fn take_expired_lanes(&mut self) -> Result<Vec<LaneStableArenaEntry>, VNextError> {
+        let expired = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.lane.upgrade().is_none())
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        if expired.iter().any(|key| {
+            self.entries
+                .get(key)
+                .is_some_and(|entry| entry.slots.values().any(|slot| slot.in_use))
+        }) {
+            self.poisoned = true;
+            return Err(invalid_resource(
+                "lane-stable arena retained a busy slot after its execution lane expired",
+            ));
+        }
+        Ok(expired
+            .into_iter()
+            .filter_map(|key| self.entries.remove(&key))
+            .collect())
+    }
+}
+
+pub(super) struct LaneStableArenaSlotLease {
+    arenas: Arc<Mutex<LaneStableArenaState>>,
+    logical_admission: LogicalAdmissionCoordinator,
+    availability_domains: Vec<CapacityDomainId>,
+    key: LaneStableArenaKey,
+    slot_id: u64,
+}
+
+impl Drop for LaneStableArenaSlotLease {
+    fn drop(&mut self) {
+        let mut arenas = match self.arenas.lock() {
+            Ok(arenas) => arenas,
+            Err(poisoned) => {
+                poisoned.into_inner().poisoned = true;
+                return;
+            }
+        };
+        if arenas.poisoned {
+            return;
+        }
+        let now = arenas.tick();
+        let released = arenas
+            .entries
+            .get_mut(&self.key)
+            .and_then(|entry| entry.slots.get_mut(&self.slot_id))
+            .is_some_and(|slot| {
+                if !slot.in_use {
+                    return false;
+                }
+                slot.in_use = false;
+                slot.last_used = now;
+                true
+            });
+        if !released {
+            arenas.poisoned = true;
+            return;
+        }
+        drop(arenas);
+
+        let mut notification_failed = false;
+        for domain in &self.availability_domains {
+            notification_failed |= self
+                .logical_admission
+                .notify_domain_availability_changed(*domain)
+                .is_err();
+        }
+        if notification_failed {
+            let mut arenas = self
+                .arenas
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            arenas.poisoned = true;
+        }
+    }
+}
+
+fn lane_stable_layout_key(
+    lane_id: ExecutionLaneId,
+    lifetime: AllocationLifetime,
+    requests: &[&EvaluatedBackingRequest<'_>],
+) -> Result<LaneStableArenaKey, VNextError> {
+    fn update_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+
+    if requests.is_empty()
+        || requests
+            .windows(2)
+            .any(|pair| pair[0].claim_identity >= pair[1].claim_identity)
+        || requests.iter().any(|request| {
+            request.projections.is_empty()
+                || request
+                    .projections
+                    .iter()
+                    .any(|projection| projection.descriptor.lifetime() != lifetime)
+        })
+    {
+        return Err(invalid_resource(
+            "lane-stable arena layout is empty, non-canonical, or mixes lifetimes",
+        ));
+    }
+    // This registry is owned by one immutable plan, so static descriptor fields
+    // are implicit. The hot key only needs the evaluated physical layout.
+    let mut hasher = Sha256::new();
+    hasher.update(b"ferrum.runtime-vnext.lane-stable-arena-layout.v2");
+    hasher.update((requests.len() as u64).to_le_bytes());
+    for request in requests {
+        update_bytes(
+            &mut hasher,
+            request.claim_identity.pool_id().as_str().as_bytes(),
+        );
+        hasher.update((request.claim_identity.resource_ids().len() as u64).to_le_bytes());
+        for resource_id in request.claim_identity.resource_ids() {
+            update_bytes(&mut hasher, resource_id.as_str().as_bytes());
+        }
+        hasher.update(request.size_bytes.to_le_bytes());
+        hasher.update((request.projections.len() as u64).to_le_bytes());
+        for projection in &request.projections {
+            update_bytes(
+                &mut hasher,
+                projection.descriptor.base_resource_id().as_str().as_bytes(),
+            );
+            hasher.update(projection.physical_offset_bytes.to_le_bytes());
+            hasher.update(projection.size_bytes.to_le_bytes());
+        }
+    }
+    Ok(LaneStableArenaKey {
+        lane_id,
+        lifetime,
+        layout_fingerprint: hasher.finalize().into(),
+    })
+}
+
 pub(super) struct DynamicPoolSet<R>
 where
     R: DeviceRuntime,
@@ -1100,6 +1395,7 @@ where
     pub(super) nodes: Arc<[PlanNode]>,
     pub(super) logical_admission: LogicalAdmissionCoordinator,
     pub(super) budget: Arc<DeviceCapacityBudget>,
+    lane_stable_arenas: Arc<Mutex<LaneStableArenaState>>,
     binding: StaticProvisioningBinding,
     // Backend context must outlive every resident/quarantined buffer above.
     runtime: Arc<R>,
@@ -1190,6 +1486,7 @@ impl LogicalBackingSliceEvidence {
 pub struct LogicalBackingSliceAuthority {
     pub(super) evidence: LogicalBackingSliceEvidence,
     pub(super) segment_lease: Arc<BackingSegmentLease>,
+    reusable_lane: Option<ExecutionLaneId>,
 }
 
 impl LogicalBackingSliceAuthority {
@@ -1201,6 +1498,15 @@ impl LogicalBackingSliceAuthority {
         Self {
             evidence: self.evidence.clone(),
             segment_lease: Arc::clone(&self.segment_lease),
+            reusable_lane: self.reusable_lane,
+        }
+    }
+
+    pub(super) fn retained_for_lane(&self, lane_id: ExecutionLaneId) -> Self {
+        Self {
+            evidence: self.evidence.clone(),
+            segment_lease: Arc::clone(&self.segment_lease),
+            reusable_lane: Some(lane_id),
         }
     }
 
@@ -1359,6 +1665,7 @@ where
             domains,
             pools,
             nodes,
+            lane_stable_arenas: Arc::new(Mutex::new(LaneStableArenaState::default())),
         })
     }
 
@@ -2069,6 +2376,330 @@ where
         self.prepare_claim_scoped(requests, DynamicBackingClaimScope::from(lifetime))
     }
 
+    pub(super) fn prepare_lane_stable_claim(
+        self: &Arc<Self>,
+        lane: &Arc<ExecutionLane<R>>,
+        requests: &[EvaluatedBackingRequest<'_>],
+    ) -> Result<LaneBackingPrepareDecision, VNextError> {
+        if !Arc::ptr_eq(&self.runtime, lane.runtime_arc())
+            || lane.descriptor() != self.runtime.descriptor()
+            || !lane.is_reusable()
+        {
+            return Err(invalid_resource(
+                "lane-stable backing requires the reusable execution lane bound to this plan runtime",
+            ));
+        }
+        if requests.is_empty() {
+            return Ok(LaneBackingPrepareDecision::Prepared(
+                PreparedLaneBackingClaim {
+                    stable: Vec::new(),
+                    slot_lease: None,
+                },
+            ));
+        }
+        let lifetime = requests
+            .first()
+            .and_then(|request| request.projections.first())
+            .map(|projection| projection.descriptor.lifetime())
+            .ok_or_else(|| invalid_resource("dynamic backing request has no projection"))?;
+        if !matches!(
+            lifetime,
+            AllocationLifetime::Step | AllocationLifetime::Invocation
+        ) || requests.iter().any(|request| {
+            request.projections.is_empty()
+                || request.projections.iter().any(|projection| {
+                    projection.descriptor.lifetime() != lifetime
+                        || projection.descriptor.initialization() != StateInitialization::None
+                })
+        }) {
+            return Err(invalid_resource(
+                "lane-stable backing accepts only non-initialized Step or Invocation resources",
+            ));
+        }
+
+        let mut canonical_requests = requests.iter().collect::<Vec<_>>();
+        canonical_requests
+            .sort_unstable_by(|left, right| left.claim_identity.cmp(&right.claim_identity));
+        let key = lane_stable_layout_key(lane.id(), lifetime, &canonical_requests)?;
+        let availability_domains = requests
+            .iter()
+            .map(|request| request.domain.domain_id())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let lane_owner: Arc<dyn LaneStableArenaLane> =
+            Arc::clone(lane) as Arc<dyn LaneStableArenaLane>;
+
+        loop {
+            {
+                let mut arenas = self
+                    .lane_stable_arenas
+                    .lock()
+                    .map_err(|_| invalid_resource("lane-stable arena registry is poisoned"))?;
+                if arenas.poisoned {
+                    return Err(invalid_resource(
+                        "lane-stable arena registry is fail-closed",
+                    ));
+                }
+                let now = arenas.tick();
+                if let Some(entry) = arenas.entries.get_mut(&key) {
+                    let owner = entry.lane.upgrade().ok_or_else(|| {
+                        invalid_resource("lane-stable arena retained an expired execution lane")
+                    })?;
+                    if !Arc::ptr_eq(&owner, &lane_owner) {
+                        return Err(invalid_resource(
+                            "lane-stable arena identity aliases another execution lane",
+                        ));
+                    }
+                    if let Some((slot_id, stable, slot_domains)) =
+                        entry.claim_idle_slot(lane.id(), now)
+                    {
+                        return Ok(LaneBackingPrepareDecision::Prepared(
+                            PreparedLaneBackingClaim {
+                                stable,
+                                slot_lease: Some(LaneStableArenaSlotLease {
+                                    arenas: Arc::clone(&self.lane_stable_arenas),
+                                    logical_admission: self.logical_admission.clone(),
+                                    availability_domains: slot_domains,
+                                    key: key.clone(),
+                                    slot_id,
+                                }),
+                            },
+                        ));
+                    }
+                }
+            }
+
+            match self.prepare_claim(requests)? {
+                BackingPrepareDecision::Prepared(prepared) => {
+                    let mut arenas = self
+                        .lane_stable_arenas
+                        .lock()
+                        .map_err(|_| invalid_resource("lane-stable arena registry is poisoned"))?;
+                    if arenas.poisoned {
+                        return Err(invalid_resource(
+                            "lane-stable arena registry is fail-closed",
+                        ));
+                    }
+                    let now = arenas.tick();
+                    if let Some(entry) = arenas.entries.get_mut(&key) {
+                        let owner = entry.lane.upgrade().ok_or_else(|| {
+                            invalid_resource("lane-stable arena retained an expired execution lane")
+                        })?;
+                        if !Arc::ptr_eq(&owner, &lane_owner) {
+                            return Err(invalid_resource(
+                                "lane-stable arena identity aliases another execution lane",
+                            ));
+                        }
+                        if let Some((slot_id, stable, slot_domains)) =
+                            entry.claim_idle_slot(lane.id(), now)
+                        {
+                            drop(arenas);
+                            drop(prepared);
+                            return Ok(LaneBackingPrepareDecision::Prepared(
+                                PreparedLaneBackingClaim {
+                                    stable,
+                                    slot_lease: Some(LaneStableArenaSlotLease {
+                                        arenas: Arc::clone(&self.lane_stable_arenas),
+                                        logical_admission: self.logical_admission.clone(),
+                                        availability_domains: slot_domains,
+                                        key: key.clone(),
+                                        slot_id,
+                                    }),
+                                },
+                            ));
+                        }
+                    }
+                    let authorities = prepared.commit();
+                    let stable = authorities
+                        .iter()
+                        .map(|authority| authority.retained_for_lane(lane.id()))
+                        .collect();
+                    let slot_id = arenas.issue_slot_id()?;
+                    let entry =
+                        arenas
+                            .entries
+                            .entry(key.clone())
+                            .or_insert_with(|| LaneStableArenaEntry {
+                                lane: Arc::downgrade(&lane_owner),
+                                slots: BTreeMap::new(),
+                            });
+                    if entry
+                        .slots
+                        .insert(
+                            slot_id,
+                            LaneStableArenaSlot {
+                                slot_id,
+                                authorities,
+                                availability_domains: availability_domains.clone(),
+                                in_use: true,
+                                last_used: now,
+                            },
+                        )
+                        .is_some()
+                    {
+                        arenas.poisoned = true;
+                        return Err(invalid_resource(
+                            "lane-stable arena slot publication replaced an existing slot",
+                        ));
+                    }
+                    return Ok(LaneBackingPrepareDecision::Prepared(
+                        PreparedLaneBackingClaim {
+                            stable,
+                            slot_lease: Some(LaneStableArenaSlotLease {
+                                arenas: Arc::clone(&self.lane_stable_arenas),
+                                logical_admission: self.logical_admission.clone(),
+                                availability_domains: availability_domains.clone(),
+                                key: key.clone(),
+                                slot_id,
+                            }),
+                        },
+                    ));
+                }
+                BackingPrepareDecision::Deferred(deferred) => {
+                    let mut arenas = self
+                        .lane_stable_arenas
+                        .lock()
+                        .map_err(|_| invalid_resource("lane-stable arena registry is poisoned"))?;
+                    if arenas.poisoned {
+                        return Err(invalid_resource(
+                            "lane-stable arena registry is fail-closed",
+                        ));
+                    }
+                    let now = arenas.tick();
+                    if let Some(entry) = arenas.entries.get_mut(&key) {
+                        let owner = entry.lane.upgrade().ok_or_else(|| {
+                            invalid_resource("lane-stable arena retained an expired execution lane")
+                        })?;
+                        if !Arc::ptr_eq(&owner, &lane_owner) {
+                            return Err(invalid_resource(
+                                "lane-stable arena identity aliases another execution lane",
+                            ));
+                        }
+                        if let Some((slot_id, stable, slot_domains)) =
+                            entry.claim_idle_slot(lane.id(), now)
+                        {
+                            drop(arenas);
+                            drop(deferred);
+                            return Ok(LaneBackingPrepareDecision::Prepared(
+                                PreparedLaneBackingClaim {
+                                    stable,
+                                    slot_lease: Some(LaneStableArenaSlotLease {
+                                        arenas: Arc::clone(&self.lane_stable_arenas),
+                                        logical_admission: self.logical_admission.clone(),
+                                        availability_domains: slot_domains,
+                                        key: key.clone(),
+                                        slot_id,
+                                    }),
+                                },
+                            ));
+                        }
+                    }
+                    return Ok(LaneBackingPrepareDecision::Deferred(deferred));
+                }
+            }
+        }
+    }
+
+    pub(super) fn try_reclaim_expired_lane_slots(&self) -> Result<bool, VNextError> {
+        let expired_entries = {
+            let mut arenas = self
+                .lane_stable_arenas
+                .lock()
+                .map_err(|_| invalid_resource("lane-stable arena registry is poisoned"))?;
+            if arenas.poisoned {
+                return Err(invalid_resource(
+                    "lane-stable arena registry is fail-closed",
+                ));
+            }
+            arenas.take_expired_lanes()?
+        };
+        let reclaimed = !expired_entries.is_empty();
+        // Releasing backing owners can enter backend/pool destruction paths.
+        // Keep that work outside the arena registry's hot mutex.
+        drop(expired_entries);
+        Ok(reclaimed)
+    }
+
+    pub(super) fn try_reclaim_one_idle_lane_slot(&self) -> Result<bool, VNextError> {
+        if self.try_reclaim_expired_lane_slots()? {
+            return Ok(true);
+        }
+        let mut candidates = {
+            let arenas = self
+                .lane_stable_arenas
+                .lock()
+                .map_err(|_| invalid_resource("lane-stable arena registry is poisoned"))?;
+            if arenas.poisoned {
+                return Err(invalid_resource(
+                    "lane-stable arena registry is fail-closed",
+                ));
+            }
+            arenas
+                .entries
+                .iter()
+                .filter_map(|(key, entry)| entry.lane.upgrade().map(|lane| (key, entry, lane)))
+                .flat_map(|(key, entry, lane)| {
+                    entry
+                        .slots
+                        .values()
+                        .filter(|slot| !slot.in_use)
+                        .map(move |slot| LaneStableArenaEvictionCandidate {
+                            key: key.clone(),
+                            slot_id: slot.slot_id,
+                            last_used: slot.last_used,
+                            lane: Arc::clone(&lane),
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
+        candidates.sort_by_key(|candidate| candidate.last_used);
+
+        for candidate in candidates {
+            if !candidate.lane.try_trim_reusable_executables()? {
+                continue;
+            }
+            let victim = {
+                let mut arenas = self
+                    .lane_stable_arenas
+                    .lock()
+                    .map_err(|_| invalid_resource("lane-stable arena registry is poisoned"))?;
+                if arenas.poisoned {
+                    return Err(invalid_resource(
+                        "lane-stable arena registry is fail-closed",
+                    ));
+                }
+                let removable = arenas
+                    .entries
+                    .get(&candidate.key)
+                    .and_then(|entry| entry.slots.get(&candidate.slot_id))
+                    .is_some_and(|slot| !slot.in_use && !slot.has_external_address_pins());
+                if !removable {
+                    None
+                } else {
+                    let (victim, remove_entry) = {
+                        let entry = arenas.entries.get_mut(&candidate.key).ok_or_else(|| {
+                            invalid_resource("lane-stable arena eviction lost its entry")
+                        })?;
+                        let victim = entry.slots.remove(&candidate.slot_id).ok_or_else(|| {
+                            invalid_resource("lane-stable arena eviction lost its idle slot")
+                        })?;
+                        (victim, entry.slots.is_empty())
+                    };
+                    if remove_entry {
+                        arenas.entries.remove(&candidate.key);
+                    }
+                    Some(victim)
+                }
+            };
+            if let Some(victim) = victim {
+                drop(victim);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(super) fn prepare_initial_sequence_claim(
         &self,
         requests: &[EvaluatedBackingRequest<'_>],
@@ -2699,13 +3330,21 @@ where
                         "logical backing references a stale or out-of-bounds chunk region",
                     ));
                 }
-                bindings.push(LogicalBackingSegmentBinding {
-                    segment: segment.clone(),
-                    chunk: Arc::clone(&chunk.backing),
-                    retention: DeviceBufferRetention::pair(
+                let retention = match authority.reusable_lane {
+                    Some(lane_id) => DeviceBufferRetention::lane_pair(
+                        lane_id,
                         Arc::clone(&authority.segment_lease),
                         Arc::clone(&chunk.backing),
                     ),
+                    None => DeviceBufferRetention::pair(
+                        Arc::clone(&authority.segment_lease),
+                        Arc::clone(&chunk.backing),
+                    ),
+                };
+                bindings.push(LogicalBackingSegmentBinding {
+                    segment: segment.clone(),
+                    chunk: Arc::clone(&chunk.backing),
+                    retention,
                 });
             }
         }

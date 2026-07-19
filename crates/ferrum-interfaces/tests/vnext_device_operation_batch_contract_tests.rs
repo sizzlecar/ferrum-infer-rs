@@ -20,8 +20,8 @@ fn token_work_separates_current_backing_from_request_fit_ceiling() {
 }
 
 fn admit_batch_step(
-    _plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
     batch: &ExecutionBatchParticipants<TestRuntime>,
+    lane: &Arc<ExecutionLane<TestRuntime>>,
 ) -> Arc<StepResourceLease<TestRuntime>> {
     let request = StepResourceAdmissionRequest::new(
         batch
@@ -32,7 +32,7 @@ fn admit_batch_step(
     )
     .unwrap();
     for attempt in 0..=3 {
-        match batch.try_begin_step(request.clone()).unwrap() {
+        match batch.try_begin_step(request.clone(), lane).unwrap() {
             StepResourceAdmissionDecision::Admitted(step) => return step,
             StepResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
                 deferred.maintain().unwrap();
@@ -97,12 +97,13 @@ fn thirty_two_participant_dispatch_is_one_physical_submission() {
         .map(|resources| resources.open_session().unwrap())
         .collect::<Vec<_>>();
     let batch = ExecutionBatchParticipants::new(sessions.clone()).unwrap();
+    let lane = plan_resources.create_execution_lane().unwrap();
     let active_bindings = batch
         .sessions()
         .iter()
         .map(|session| TrustedActiveSequenceBinding::from_session(session).unwrap())
         .collect::<Vec<_>>();
-    let step = admit_batch_step(&plan_resources, &batch);
+    let step = admit_batch_step(&batch, &lane);
     let node = &plan.payload().nodes()[0];
     let invocation = admit_batch_invocation(&plan_resources, &step, node.id());
     let packed_ranges = invocation.work_shape().participant_token_ranges();
@@ -133,9 +134,19 @@ fn thirty_two_participant_dispatch_is_one_physical_submission() {
             )
         })
         .collect::<Vec<_>>();
-    let lane = ExecutionLane::create(Arc::clone(&runtime)).unwrap();
+    let foreign_lane = ExecutionLane::create(Arc::clone(&runtime)).unwrap();
     let reaper = CompletionReaper::new();
     let provider = registry.bind(&resolved, node.id()).unwrap();
+    assert!(OperationDispatch::bind_batch_identity(
+        &resolved,
+        identities.clone(),
+        &active_bindings,
+        &invocation,
+        &foreign_lane,
+    )
+    .is_err());
+    assert_eq!(provider_trace.lock().unwrap().encode_calls, 0);
+    assert_eq!(runtime_trace.lock().unwrap().submit_calls, 0);
     let batch_identity = OperationDispatch::bind_batch_identity(
         &resolved,
         identities,
@@ -256,6 +267,7 @@ fn thirty_two_participant_dispatch_is_one_physical_submission() {
     drop(sessions);
     drop(resources);
     drop(reaper);
+    drop(foreign_lane);
     drop(lane);
     drop(runtime);
     assert!(matches!(

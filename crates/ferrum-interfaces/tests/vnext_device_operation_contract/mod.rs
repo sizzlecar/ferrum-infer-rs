@@ -1644,8 +1644,16 @@ pub(crate) fn logical_resources(
 }
 
 pub(crate) fn begin_single_participant_step(
-    _plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
+    plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
     batch: &ExecutionBatchParticipants<TestRuntime>,
+) -> Arc<StepResourceLease<TestRuntime>> {
+    let lane = plan_resources.create_execution_lane().unwrap();
+    begin_single_participant_step_on_lane(batch, &lane)
+}
+
+pub(crate) fn begin_single_participant_step_on_lane(
+    batch: &ExecutionBatchParticipants<TestRuntime>,
+    lane: &Arc<ExecutionLane<TestRuntime>>,
 ) -> Arc<StepResourceLease<TestRuntime>> {
     let request = StepResourceAdmissionRequest::new(
         batch.bind_work_shape(vec![one_token_span()]).unwrap(),
@@ -1654,7 +1662,7 @@ pub(crate) fn begin_single_participant_step(
     )
     .unwrap();
     for attempt in 0..=3 {
-        match batch.try_begin_step(request.clone()).unwrap() {
+        match batch.try_begin_step(request.clone(), lane).unwrap() {
             StepResourceAdmissionDecision::Admitted(step) => {
                 assert_eq!(step.work_shape().participants().len(), 1);
                 assert_eq!(step.work_shape().immediate_sequences(), 1);

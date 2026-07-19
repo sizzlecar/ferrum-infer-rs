@@ -13,6 +13,7 @@ use std::sync::Arc;
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaStream};
+use ferrum_interfaces::vnext::{DeviceReusableAddressScope, ElementType};
 use sha2::{Digest, Sha256};
 
 use super::vnext_runtime::{CudaCommandPayload, CudaDeviceCommand, CudaDeviceRuntimeError};
@@ -27,7 +28,7 @@ impl CudaCommandReplayKey {
     pub(crate) fn bind_runtime_payload(
         self,
         operation: &'static str,
-        regions: impl IntoIterator<Item = (u64, u64, u64)>,
+        regions: impl ExactSizeIterator<Item = (u64, u64, ElementType)>,
         host_storage: &[Box<[u8]>],
     ) -> Self {
         let mut digest = Sha256::new();
@@ -35,10 +36,11 @@ impl CudaCommandReplayKey {
         digest.update(self.0);
         digest.update((operation.len() as u64).to_le_bytes());
         digest.update(operation.as_bytes());
-        for (pointer, length_bytes, element_bytes) in regions {
+        digest.update((regions.len() as u64).to_le_bytes());
+        for (pointer, length_bytes, element_type) in regions {
             digest.update(pointer.to_le_bytes());
             digest.update(length_bytes.to_le_bytes());
-            digest.update(element_bytes.to_le_bytes());
+            digest.update([element_type_tag(element_type)]);
         }
         digest.update((host_storage.len() as u64).to_le_bytes());
         for storage in host_storage {
@@ -50,6 +52,19 @@ impl CudaCommandReplayKey {
 
     fn bytes(self) -> [u8; 32] {
         self.0
+    }
+}
+
+const fn element_type_tag(element_type: ElementType) -> u8 {
+    match element_type {
+        ElementType::Bool => 0,
+        ElementType::U8 => 1,
+        ElementType::U32 => 2,
+        ElementType::I8 => 3,
+        ElementType::I32 => 4,
+        ElementType::F16 => 5,
+        ElementType::Bf16 => 6,
+        ElementType::F32 => 7,
     }
 }
 
@@ -112,7 +127,16 @@ impl CudaExecutableSegmentKey {
         let mut digest = Sha256::new();
         digest.update(SEGMENT_KEY_DOMAIN);
         digest.update((commands.len() as u64).to_le_bytes());
+        let mut lane_scope = None;
         for command in commands {
+            match command.reusable_address_scope()? {
+                DeviceReusableAddressScope::Plan => {}
+                DeviceReusableAddressScope::ExecutionLane(lane_id) => match lane_scope {
+                    Some(current) if current != lane_id => return None,
+                    Some(_) => {}
+                    None => lane_scope = Some(lane_id),
+                },
+            }
             digest.update(command.replay_key()?.bytes());
         }
         Some(Self(digest.finalize().into()))
@@ -422,6 +446,14 @@ impl CudaExecutableCache {
         };
         entry.launch(stream, now)?;
         Ok(true)
+    }
+
+    pub(crate) fn trim_quiescent(&mut self) -> (usize, usize) {
+        let released_executables = self.entries.len();
+        let released_rejections = self.rejected.len();
+        self.entries.clear();
+        self.rejected.clear();
+        (released_executables, released_rejections)
     }
 
     pub(crate) fn leak_if_in_flight(&mut self) {
