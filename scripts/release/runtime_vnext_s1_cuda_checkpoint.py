@@ -76,7 +76,11 @@ PROFILE_EXPECTED_EVENTS_PER_REQUEST = 399
 PROFILE_MAX_BYTES_PER_REQUEST = 1024 * 1024
 PROFILE_MAX_OVERHEAD = 0.02
 PROFILE_MAX_CV = 0.05
-COLLECTION_SCHEMA_VERSION = 2
+COLLECTION_SCHEMA_VERSION = 3
+LEGACY_COLLECTION_SCHEMA_VERSION = 2
+TELEMETRY_SCHEMA_VERSION = 2
+LEGACY_TELEMETRY_SCHEMA_VERSION = 1
+GPU_TELEMETRY_POLICY = "single_persistent_process"
 COLLECTOR_RELATIVE_PATH = "scripts/release/runtime_vnext_s1_cuda_basic_collector.py"
 FIRST_HALF_PROFILE_SLOTS = PROFILE_SLOT_ORDER[:4]
 GPU_QUERY_FIELDS = (
@@ -420,8 +424,9 @@ def validate_collection_manifest(root: Path, source_sha: str) -> dict[str, Any] 
     if not path.exists():
         return None
     collection = read_json(path)
+    collection_schema = collection.get("schema_version")
     require(
-        collection.get("schema_version") == COLLECTION_SCHEMA_VERSION,
+        collection_schema in (LEGACY_COLLECTION_SCHEMA_VERSION, COLLECTION_SCHEMA_VERSION),
         "S1 collection schema version mismatch",
     )
     require(
@@ -474,6 +479,11 @@ def validate_collection_manifest(root: Path, source_sha: str) -> dict[str, Any] 
         isinstance(interval, int) and not isinstance(interval, bool) and 250 <= interval <= 1000,
         "collection telemetry interval is outside 250..1000 ms",
     )
+    if collection_schema == COLLECTION_SCHEMA_VERSION:
+        require(
+            protocol.get("gpu_telemetry_policy") == GPU_TELEMETRY_POLICY,
+            "collection GPU telemetry process policy drifted",
+        )
     runtime_env = read_json(root / "runtime-env.json")
     require(
         runtime_env.get("hidden_ferrum_environment_overrides") == [],
@@ -770,8 +780,9 @@ def validate_telemetry_sample(
     mode: str,
     phase: str,
     label: str,
+    schema_version: int,
 ) -> tuple[datetime, int, str, int]:
-    require(row.get("schema_version") == 1, f"{label}: telemetry schema mismatch")
+    require(row.get("schema_version") == schema_version, f"{label}: telemetry schema mismatch")
     require(row.get("slot") == slot, f"{label}: telemetry slot mismatch")
     require(row.get("mode") == mode, f"{label}: telemetry mode mismatch")
     require(row.get("phase") == phase, f"{label}: telemetry phase mismatch")
@@ -800,13 +811,25 @@ def validate_telemetry_sample(
         require_finite_number(gpu.get(field), f"{label}.{field}", minimum=1)
     require_finite_number(gpu.get("power_draw_w"), f"{label}.power_draw_w", minimum=0)
     require_finite_number(gpu.get("power_limit_w"), f"{label}.power_limit_w", minimum=1)
-    require_finite_number(gpu.get("temperature_c"), f"{label}.temperature_c", minimum=0, maximum=125)
+    require_finite_number(
+        gpu.get("temperature_c"), f"{label}.temperature_c", minimum=0, maximum=125
+    )
     for field in ("gpu_utilization_percent", "memory_utilization_percent"):
         require_finite_number(gpu.get(field), f"{label}.{field}", minimum=0, maximum=100)
     require_finite_number(gpu.get("memory_used_mib"), f"{label}.memory_used_mib", minimum=0)
     memory_total = require_finite_number(
         gpu.get("memory_total_mib"), f"{label}.memory_total_mib", minimum=20_000
     )
+    if schema_version == TELEMETRY_SCHEMA_VERSION:
+        if phase == "during":
+            require(
+                "gpu_query_elapsed_ns" not in row,
+                f"{label}: persistent GPU stream reported per-sample process startup",
+            )
+        else:
+            require_finite_number(
+                row.get("gpu_query_elapsed_ns"), f"{label}.gpu_query_elapsed_ns", minimum=1
+            )
     host = row.get("host")
     require(isinstance(host, dict), f"{label}: host telemetry is missing")
     for field in ("load_1", "load_5", "load_15"):
@@ -837,7 +860,12 @@ def validate_slot_telemetry(directory: Path, slot: str, mode: str) -> dict[str, 
     label = f"profile-overhead/{slot}"
     require_zero_exit(directory / "telemetry.exit")
     command = read_json(directory / "telemetry.command.json")
-    require(command.get("schema_version") == 1, f"{label}: telemetry command schema mismatch")
+    telemetry_schema = command.get("schema_version")
+    require(
+        telemetry_schema in (LEGACY_TELEMETRY_SCHEMA_VERSION, TELEMETRY_SCHEMA_VERSION),
+        f"{label}: telemetry command schema mismatch",
+    )
+    persistent_stream = telemetry_schema == TELEMETRY_SCHEMA_VERSION
     require(command.get("collector_path") == COLLECTOR_RELATIVE_PATH, f"{label}: non-canonical telemetry collector")
     require(
         isinstance(command.get("collector_sha256"), str)
@@ -845,6 +873,32 @@ def validate_slot_telemetry(directory: Path, slot: str, mode: str) -> dict[str, 
         f"{label}: telemetry collector SHA256 is invalid",
     )
     require(command.get("gpu_query_fields") == list(GPU_QUERY_FIELDS), f"{label}: GPU query drifted")
+    if persistent_stream:
+        require(
+            command.get("gpu_query_policy") == GPU_TELEMETRY_POLICY,
+            f"{label}: GPU telemetry process policy drifted",
+        )
+        require(
+            command.get("gpu_query_phases") == ["before", "during", "after"],
+            f"{label}: GPU query phases drifted",
+        )
+        require(
+            command.get("during_gpu_query_processes") == 1,
+            f"{label}: performance-window GPU query process count is not one",
+        )
+        during_argv = command.get("during_gpu_query_argv")
+        require(
+            isinstance(during_argv, list)
+            and during_argv[:3]
+            == [
+                "nvidia-smi",
+                f"--query-gpu={','.join(GPU_QUERY_FIELDS)}",
+                "--format=csv,noheader,nounits",
+            ]
+            and len(during_argv) == 4
+            and during_argv[3] == f"--loop-ms={command.get('interval_ms')}",
+            f"{label}: persistent GPU telemetry command drifted",
+        )
     require(
         command.get("host_sources") == ["/proc/loadavg", "/proc/stat", "/proc/meminfo"],
         f"{label}: host telemetry sources drifted",
@@ -866,6 +920,7 @@ def validate_slot_telemetry(directory: Path, slot: str, mode: str) -> dict[str, 
             mode=mode,
             phase="before",
             label=f"{label}.telemetry.before",
+            schema_version=telemetry_schema,
         )
     ]
     normalized.extend(
@@ -875,6 +930,7 @@ def validate_slot_telemetry(directory: Path, slot: str, mode: str) -> dict[str, 
             mode=mode,
             phase="during",
             label=f"{label}.telemetry.during[{index}]",
+            schema_version=telemetry_schema,
         )
         for index, row in enumerate(during)
     )
@@ -885,6 +941,7 @@ def validate_slot_telemetry(directory: Path, slot: str, mode: str) -> dict[str, 
             mode=mode,
             phase="after",
             label=f"{label}.telemetry.after",
+            schema_version=telemetry_schema,
         )
     )
     bench_started = parse_timestamp(directory / "bench.started")
@@ -905,8 +962,8 @@ def validate_slot_telemetry(directory: Path, slot: str, mode: str) -> dict[str, 
     memory_totals = {row[3] for row in normalized}
     require(len(uuids) == 1, f"{label}: GPU UUID drifted within the slot")
     require(len(memory_totals) == 1, f"{label}: GPU total memory drifted within the slot")
-    expected_summary = {
-        "schema_version": 1,
+    expected_summary: dict[str, Any] = {
+        "schema_version": telemetry_schema,
         "slot": slot,
         "mode": mode,
         "gpu_uuid": next(iter(uuids)),
@@ -914,6 +971,17 @@ def validate_slot_telemetry(directory: Path, slot: str, mode: str) -> dict[str, 
         "before_sampled_at": before["sampled_at"],
         "after_sampled_at": after["sampled_at"],
     }
+    if persistent_stream:
+        expected_summary.update(
+            {
+                "gpu_query_policy": GPU_TELEMETRY_POLICY,
+                "during_gpu_query_processes": 1,
+                "boundary_gpu_query_elapsed_ns": {
+                    "before": before["gpu_query_elapsed_ns"],
+                    "after": after["gpu_query_elapsed_ns"],
+                },
+            }
+        )
     require(
         read_json(directory / "telemetry.summary.json") == expected_summary,
         f"{label}: telemetry summary differs from raw samples",
@@ -924,6 +992,9 @@ def validate_slot_telemetry(directory: Path, slot: str, mode: str) -> dict[str, 
         "memory_total_mib": next(iter(memory_totals)),
         "during_sample_count": len(during),
         "interval_ms": interval,
+        "gpu_query_policy": (
+            GPU_TELEMETRY_POLICY if persistent_stream else "legacy_repeated_processes"
+        ),
         "before_sampled_at": before["sampled_at"],
         "after_sampled_at": after["sampled_at"],
     }
@@ -1314,6 +1385,12 @@ def validate_profile_overhead(root: Path) -> dict[str, Any]:
             == {expected_collector_sha},
             "slot telemetry collector SHA differs from collection provenance",
         )
+        if collection.get("schema_version") == COLLECTION_SCHEMA_VERSION:
+            require(
+                {row["gpu_query_policy"] for row in telemetry.values()}
+                == {GPU_TELEMETRY_POLICY},
+                "canonical performance slots did not use one persistent GPU sampler",
+            )
         require(
             len({row["gpu_uuid"] for row in telemetry.values()}) == 1,
             "profile slots used different GPU UUIDs",
@@ -1702,29 +1779,14 @@ def telemetry_fixture_row(
     *,
     uuid: str = "GPU-selftest",
 ) -> dict[str, Any]:
-    return {
-        "schema_version": 1,
+    row: dict[str, Any] = {
+        "schema_version": TELEMETRY_SCHEMA_VERSION,
         "slot": slot,
         "mode": mode,
         "phase": phase,
         "sampled_at": sampled_at,
         "wall_time_ns": monotonic_ns + 1_000_000_000,
         "monotonic_ns": monotonic_ns,
-        "gpu": {
-            "index": 0,
-            "uuid": uuid,
-            "pstate": "P2",
-            "graphics_clock_mhz": 2500,
-            "sm_clock_mhz": 2500,
-            "memory_clock_mhz": 10501,
-            "power_draw_w": 240.0,
-            "power_limit_w": 450.0,
-            "temperature_c": 60,
-            "gpu_utilization_percent": 95,
-            "memory_utilization_percent": 40,
-            "memory_used_mib": 8000,
-            "memory_total_mib": 24564,
-        },
         "host": {
             "load_1": 1.0,
             "load_5": 1.0,
@@ -1741,6 +1803,24 @@ def telemetry_fixture_row(
             "swap_used_bytes": 0,
         },
     }
+    if phase != "during":
+        row["gpu_query_elapsed_ns"] = 50_000_000
+    row["gpu"] = {
+        "index": 0,
+        "uuid": uuid,
+        "pstate": "P2",
+        "graphics_clock_mhz": 2500,
+        "sm_clock_mhz": 2500,
+        "memory_clock_mhz": 10501,
+        "power_draw_w": 240.0,
+        "power_limit_w": 450.0,
+        "temperature_c": 60,
+        "gpu_utilization_percent": 95,
+        "memory_utilization_percent": 40,
+        "memory_used_mib": 8000,
+        "memory_total_mib": 24564,
+    }
+    return row
 
 
 def create_telemetry_selftest_fixture(directory: Path) -> None:
@@ -1764,11 +1844,20 @@ def create_telemetry_selftest_fixture(directory: Path) -> None:
     write_json(
         directory / "telemetry.command.json",
         {
-            "schema_version": 1,
+            "schema_version": TELEMETRY_SCHEMA_VERSION,
             "collector_path": COLLECTOR_RELATIVE_PATH,
             "collector_sha256": "c" * 64,
             "interval_ms": 500,
             "gpu_query_fields": list(GPU_QUERY_FIELDS),
+            "gpu_query_phases": ["before", "during", "after"],
+            "gpu_query_policy": GPU_TELEMETRY_POLICY,
+            "during_gpu_query_processes": 1,
+            "during_gpu_query_argv": [
+                "nvidia-smi",
+                f"--query-gpu={','.join(GPU_QUERY_FIELDS)}",
+                "--format=csv,noheader,nounits",
+                "--loop-ms=500",
+            ],
             "host_sources": ["/proc/loadavg", "/proc/stat", "/proc/meminfo"],
             "mutates_gpu_state": False,
         },
@@ -1779,10 +1868,16 @@ def create_telemetry_selftest_fixture(directory: Path) -> None:
     write_json(
         directory / "telemetry.summary.json",
         {
-            "schema_version": 1,
+            "schema_version": TELEMETRY_SCHEMA_VERSION,
             "slot": "off1",
             "mode": "off",
             "gpu_uuid": "GPU-selftest",
+            "gpu_query_policy": GPU_TELEMETRY_POLICY,
+            "during_gpu_query_processes": 1,
+            "boundary_gpu_query_elapsed_ns": {
+                "before": before["gpu_query_elapsed_ns"],
+                "after": after["gpu_query_elapsed_ns"],
+            },
             "during_sample_count": 3,
             "before_sampled_at": before["sampled_at"],
             "after_sampled_at": after["sampled_at"],
@@ -1875,6 +1970,21 @@ def self_test() -> int:
             require("UUID drifted" in str(error), "telemetry mutation failed for wrong reason")
         else:
             raise ValidationError("telemetry UUID drift unexpectedly passed")
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-s1-telemetry-process-") as temp:
+        directory = Path(temp) / "off1"
+        create_telemetry_selftest_fixture(directory)
+        command = read_json(directory / "telemetry.command.json")
+        command["during_gpu_query_processes"] = 2
+        write_json(directory / "telemetry.command.json", command)
+        try:
+            validate_slot_telemetry(directory, "off1", "off")
+        except ValidationError as error:
+            require(
+                "process count is not one" in str(error),
+                "GPU telemetry process-count mutation failed for wrong reason",
+            )
+        else:
+            raise ValidationError("multiple GPU telemetry processes unexpectedly passed")
     with tempfile.TemporaryDirectory(prefix="runtime-vnext-s1-runtime-profile-") as temp:
         root = Path(temp)
         off = root / "off1"

@@ -15,19 +15,22 @@ import signal
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Callable, TextIO
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COLLECTOR_PATH = Path(__file__).resolve()
 COLLECTOR_RELATIVE_PATH = COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix()
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+TELEMETRY_SCHEMA_VERSION = 2
+GPU_TELEMETRY_POLICY = "single_persistent_process"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT S1 CUDA BASIC COLLECTOR SELFTEST PASS"
 COLLECTED_PREFIX = "FERRUM RUNTIME VNEXT S1 CUDA BASIC COLLECTED"
 SLOT_ORDER = (
@@ -72,6 +75,7 @@ PROFILE_REPEAT_COUNT = 3
 PROFILE_WARMUP_REQUESTS = 1
 PROFILE_MAX_OVERHEAD = 0.02
 PROFILE_MAX_CV = 0.05
+DEFAULT_TELEMETRY_INTERVAL_MS = 1000
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -333,64 +337,140 @@ def host_state() -> dict[str, Any]:
     }
 
 
-def telemetry_sample(slot: str, mode: str, phase: str) -> dict[str, Any]:
+def boundary_telemetry_sample(slot: str, mode: str, phase: str) -> dict[str, Any]:
+    require(phase in ("before", "after"), "GPU telemetry is restricted to slot boundaries")
     query = [
         "nvidia-smi",
         f"--query-gpu={','.join(GPU_QUERY_FIELDS)}",
         "--format=csv,noheader,nounits",
     ]
+    query_started_ns = time.monotonic_ns()
     result = subprocess.run(query, text=True, capture_output=True, check=False)
+    query_finished_ns = time.monotonic_ns()
     require(result.returncode == 0, f"nvidia-smi telemetry failed: {result.stderr.strip()}")
     wall_time_ns = time.time_ns()
     return {
-        "schema_version": 1,
+        "schema_version": TELEMETRY_SCHEMA_VERSION,
         "slot": slot,
         "mode": mode,
         "phase": phase,
         "sampled_at": now_iso(),
         "wall_time_ns": wall_time_ns,
-        "monotonic_ns": time.monotonic_ns(),
+        "monotonic_ns": query_finished_ns,
+        "gpu_query_elapsed_ns": query_finished_ns - query_started_ns,
         "gpu": parse_gpu_row(result.stdout),
         "host": host_state(),
     }
 
 
+def streamed_telemetry_sample(
+    slot: str,
+    mode: str,
+    gpu_row: str,
+    host: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": TELEMETRY_SCHEMA_VERSION,
+        "slot": slot,
+        "mode": mode,
+        "phase": "during",
+        "sampled_at": now_iso(),
+        "wall_time_ns": time.time_ns(),
+        "monotonic_ns": time.monotonic_ns(),
+        "gpu": parse_gpu_row(gpu_row),
+        "host": host,
+    }
+
+
 class Telemetry:
-    def __init__(self, directory: Path, slot: str, mode: str, interval_ms: int) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        slot: str,
+        mode: str,
+        interval_ms: int,
+        *,
+        gpu_stream_command: list[str] | None = None,
+        host_state_reader: Callable[[], dict[str, Any]] = host_state,
+    ) -> None:
         self.directory = directory
         self.slot = slot
         self.mode = mode
         self.interval_ms = interval_ms
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
+        self.gpu_process: subprocess.Popen[str] | None = None
         self.error: BaseException | None = None
+        self.gpu_stream_command = gpu_stream_command
+        self.host_state_reader = host_state_reader
+
+    def gpu_stream_argv(self) -> list[str]:
+        if self.gpu_stream_command is not None:
+            return list(self.gpu_stream_command)
+        return [
+            "nvidia-smi",
+            f"--query-gpu={','.join(GPU_QUERY_FIELDS)}",
+            "--format=csv,noheader,nounits",
+            f"--loop-ms={self.interval_ms}",
+        ]
 
     def prepare(self) -> None:
         write_json(
             self.directory / "telemetry.command.json",
             {
-                "schema_version": 1,
+                "schema_version": TELEMETRY_SCHEMA_VERSION,
                 "collector_path": COLLECTOR_RELATIVE_PATH,
                 "collector_sha256": file_sha256(COLLECTOR_PATH),
                 "interval_ms": self.interval_ms,
                 "gpu_query_fields": list(GPU_QUERY_FIELDS),
+                "gpu_query_phases": ["before", "during", "after"],
+                "gpu_query_policy": GPU_TELEMETRY_POLICY,
+                "during_gpu_query_processes": 1,
+                "during_gpu_query_argv": self.gpu_stream_argv(),
                 "host_sources": ["/proc/loadavg", "/proc/stat", "/proc/meminfo"],
                 "mutates_gpu_state": False,
             },
         )
         write_json(
             self.directory / "telemetry.before.json",
-            telemetry_sample(self.slot, self.mode, "before"),
+            boundary_telemetry_sample(self.slot, self.mode, "before"),
         )
 
     def start(self) -> None:
         samples = self.directory / "telemetry.samples.jsonl"
+        self.gpu_process = subprocess.Popen(
+            self.gpu_stream_argv(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
 
         def collect() -> None:
             try:
-                while not self.stop_event.is_set():
-                    append_jsonl(samples, telemetry_sample(self.slot, self.mode, "during"))
-                    self.stop_event.wait(self.interval_ms / 1000.0)
+                require(
+                    self.gpu_process is not None and self.gpu_process.stdout is not None,
+                    f"GPU telemetry stream did not expose stdout: {self.slot}",
+                )
+                while True:
+                    line = self.gpu_process.stdout.readline()
+                    if not line:
+                        if self.stop_event.is_set():
+                            break
+                        returncode = self.gpu_process.poll()
+                        raise CollectionError(
+                            f"GPU telemetry stream exited unexpectedly ({returncode}): {self.slot}"
+                        )
+                    if line.strip():
+                        append_jsonl(
+                            samples,
+                            streamed_telemetry_sample(
+                                self.slot,
+                                self.mode,
+                                line,
+                                self.host_state_reader(),
+                            ),
+                        )
             except BaseException as error:  # Captured and re-raised on the owner thread.
                 self.error = error
                 self.stop_event.set()
@@ -400,9 +480,21 @@ class Telemetry:
 
     def stop_during(self) -> None:
         self.stop_event.set()
+        if self.gpu_process is not None and self.gpu_process.poll() is None:
+            self.gpu_process.terminate()
         if self.thread is not None:
             self.thread.join(timeout=10.0)
             require(not self.thread.is_alive(), f"telemetry thread did not stop: {self.slot}")
+        if self.gpu_process is not None:
+            try:
+                self.gpu_process.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                self.gpu_process.kill()
+                self.gpu_process.wait(timeout=10.0)
+            require(
+                self.gpu_process.returncode in (0, -signal.SIGTERM),
+                f"GPU telemetry stream failed with {self.gpu_process.returncode}: {self.slot}",
+            )
         if self.error is not None:
             raise CollectionError(f"telemetry failed for {self.slot}: {self.error}")
 
@@ -415,20 +507,29 @@ class Telemetry:
             if line.strip()
         ]
         require(len(samples) >= 3, f"telemetry captured fewer than three during samples: {self.slot}")
-        after = telemetry_sample(self.slot, self.mode, "after")
+        require(
+            all("gpu" in row and "gpu_query_elapsed_ns" not in row for row in samples),
+            f"performance-window telemetry did not use the persistent GPU stream: {self.slot}",
+        )
+        after = boundary_telemetry_sample(self.slot, self.mode, "after")
         write_json(self.directory / "telemetry.after.json", after)
-        uuids = {row["gpu"]["uuid"] for row in samples}
-        uuids.add(after["gpu"]["uuid"])
         before = json.loads((self.directory / "telemetry.before.json").read_text())
-        uuids.add(before["gpu"]["uuid"])
+        uuids = {row["gpu"]["uuid"] for row in samples}
+        uuids.update((before["gpu"]["uuid"], after["gpu"]["uuid"]))
         require(len(uuids) == 1, f"GPU UUID changed during slot {self.slot}")
         write_json(
             self.directory / "telemetry.summary.json",
             {
-                "schema_version": 1,
+                "schema_version": TELEMETRY_SCHEMA_VERSION,
                 "slot": self.slot,
                 "mode": self.mode,
                 "gpu_uuid": next(iter(uuids)),
+                "gpu_query_policy": GPU_TELEMETRY_POLICY,
+                "during_gpu_query_processes": 1,
+                "boundary_gpu_query_elapsed_ns": {
+                    "before": before["gpu_query_elapsed_ns"],
+                    "after": after["gpu_query_elapsed_ns"],
+                },
                 "during_sample_count": len(samples),
                 "before_sampled_at": before["sampled_at"],
                 "after_sampled_at": after["sampled_at"],
@@ -840,6 +941,7 @@ def collect(args: argparse.Namespace) -> int:
                 "fail_on_error": True,
                 "batched_graph": args.batched_graph,
                 "telemetry_interval_ms": args.telemetry_interval_ms,
+                "gpu_telemetry_policy": GPU_TELEMETRY_POLICY,
                 "profile_health_after_bench": True,
             },
         },
@@ -951,6 +1053,46 @@ def self_test() -> int:
         require("unavailable" in str(error), "N/A GPU mutation failed for the wrong reason")
     else:
         raise CollectionError("N/A GPU telemetry unexpectedly passed")
+    fake_host = {
+        "load_1": 1.0,
+        "load_5": 1.0,
+        "load_15": 1.0,
+        "cpu_count": 4,
+        "cpu_ticks": {"user": 1, "nice": 0, "system": 1, "idle": 1, "iowait": 0},
+        "mem_available_bytes": 1024,
+        "swap_used_bytes": 0,
+    }
+    fake_stream = (
+        "import time\n"
+        f"row = {sample.strip()!r}\n"
+        "while True:\n"
+        "    print(row, flush=True)\n"
+        "    time.sleep(0.02)\n"
+    )
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-telemetry-stream-") as temp:
+        telemetry = Telemetry(
+            Path(temp),
+            "off1",
+            "off",
+            250,
+            gpu_stream_command=[sys.executable, "-u", "-c", fake_stream],
+            host_state_reader=lambda: dict(fake_host),
+        )
+        telemetry.start()
+        samples_path = Path(temp) / "telemetry.samples.jsonl"
+        deadline = time.monotonic() + 2.0
+        rows: list[str] = []
+        while time.monotonic() < deadline:
+            rows = samples_path.read_text(encoding="utf-8").splitlines() if samples_path.exists() else []
+            if len(rows) >= 3:
+                break
+            time.sleep(0.01)
+        telemetry.stop_during()
+        require(len(rows) >= 3, "persistent GPU telemetry stream produced fewer than three rows")
+        require(
+            all(json.loads(row)["gpu"]["uuid"] == "GPU-1234" for row in rows),
+            "persistent GPU telemetry stream lost GPU identity",
+        )
     original = os.environ.get("FERRUM_SELFTEST_SECRET")
     os.environ["FERRUM_SELFTEST_SECRET"] = "forbidden"
     try:
@@ -961,6 +1103,11 @@ def self_test() -> int:
         else:
             os.environ["FERRUM_SELFTEST_SECRET"] = original
     require(SLOT_ORDER == ("off1", "basic1", "basic2", "off2", "basic3", "off3", "off4", "basic4"), "slot order drift")
+    require(
+        GPU_TELEMETRY_POLICY == "single_persistent_process",
+        "GPU telemetry process policy drifted",
+    )
+    require(DEFAULT_TELEMETRY_INTERVAL_MS == 1000, "canonical telemetry cadence drifted")
     require(SHA256_RE.fullmatch(file_sha256(COLLECTOR_PATH)) is not None, "collector SHA is malformed")
     print(SELFTEST_PASS_LINE)
     return 0
@@ -974,7 +1121,11 @@ def parse_args() -> argparse.Namespace:
     collect_parser.add_argument("--model", type=Path, required=True)
     collect_parser.add_argument("--out", type=Path, required=True)
     collect_parser.add_argument("--port-base", type=int, default=18101)
-    collect_parser.add_argument("--telemetry-interval-ms", type=int, default=500)
+    collect_parser.add_argument(
+        "--telemetry-interval-ms",
+        type=int,
+        default=DEFAULT_TELEMETRY_INTERVAL_MS,
+    )
     collect_parser.add_argument(
         "--batched-graph",
         action="store_true",
