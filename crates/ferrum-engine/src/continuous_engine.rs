@@ -1049,6 +1049,7 @@ impl SequenceState {
                 factory.create_processor(
                     &request.sampling_params.response_format,
                     &request.sampling_params.structured_output_start,
+                    request.sampling_params.max_tokens,
                 )
             })
             .transpose()?
@@ -1760,6 +1761,13 @@ impl SequenceState {
             )?;
             required_structured_delimiter_token_id = constraint.required_delimiter_token_id;
             if !constraint.accepting {
+                if required_structured_delimiter_token_id
+                    .is_some_and(|token| self.stop_token_ids.contains(&token))
+                {
+                    return Err(FerrumError::invalid_request(
+                        "structured-output delimiter conflicts with a stop token",
+                    ));
+                }
                 mask_stop_token_logits(logits, &self.stop_token_ids);
             }
             if !logits.iter().any(|logit| logit.is_finite()) {
@@ -1770,12 +1778,18 @@ impl SequenceState {
         }
 
         for &token_id in &self.forbidden_token_ids {
+            if required_structured_delimiter_token_id == Some(token_id) {
+                continue;
+            }
             if let Some(logit) = logits.get_mut(token_id as usize) {
                 *logit = f32::NEG_INFINITY;
             }
         }
         if self.generated_tokens.is_empty() {
             for &token_id in &self.initial_forbidden_token_ids {
+                if required_structured_delimiter_token_id == Some(token_id) {
+                    continue;
+                }
                 if let Some(logit) = logits.get_mut(token_id as usize) {
                     *logit = f32::NEG_INFINITY;
                 }
@@ -1784,7 +1798,9 @@ impl SequenceState {
         if let Some(base_vocab_size) = self.tokenizer_base_vocab_size {
             if logits.len() > base_vocab_size {
                 for (token_id, logit) in logits.iter_mut().enumerate().skip(base_vocab_size) {
-                    if !self.allowed_extended_token_ids.contains(&(token_id as u32)) {
+                    if required_structured_delimiter_token_id != Some(token_id as u32)
+                        && !self.allowed_extended_token_ids.contains(&(token_id as u32))
+                    {
                         *logit = f32::NEG_INFINITY;
                     }
                 }

@@ -8214,6 +8214,63 @@ fn schema_guided_sampling_preserves_required_reasoning_delimiter_control() {
 }
 
 #[test]
+fn schema_guided_sampling_forces_reasoning_delimiter_at_budget() {
+    let mut tokenizer = PolicyTokenizer::new(
+        6,
+        &[
+            ("{", 0),
+            (" ", 1),
+            ("x", 2),
+            ("</s>", 3),
+            ("}", 4),
+            ("\"", 5),
+            ("</think>", 7),
+            ("<think>", 8),
+        ],
+    );
+    tokenizer.special.bos_token = None;
+    tokenizer.special.unk_token = None;
+    tokenizer.special.pad_token = None;
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 40;
+    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonObject;
+    request.sampling_params.structured_output_start =
+        ferrum_types::StructuredOutputStart::AfterDelimiter("</think>".to_string());
+    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+        Some(9),
+    );
+    state.generated_tokens = vec![TokenId::new(0); 7];
+
+    let mut reasoning_logits = vec![f32::NEG_INFINITY; 9];
+    reasoning_logits[0] = 100.0;
+    let delimiter = state
+        .sample_with_processors_with_tokenizer(&mut reasoning_logits, Some(tokenizer.as_ref()))
+        .expect("the output budget must force the reasoning delimiter");
+    assert_eq!(delimiter, TokenId::new(7));
+    assert_eq!(reasoning_logits[7], 0.0);
+    assert!(reasoning_logits
+        .iter()
+        .enumerate()
+        .all(|(token, logit)| token == 7 || !logit.is_finite()));
+
+    state.generated_tokens.push(delimiter);
+    let mut grammar_logits = vec![0.0; 9];
+    grammar_logits[0] = 1.0;
+    grammar_logits[7] = 100.0;
+    grammar_logits[8] = 90.0;
+    let first_json_token = state
+        .sample_with_processors(&mut grammar_logits)
+        .expect("the grammar must activate after the forced delimiter");
+    assert_eq!(first_json_token, TokenId::new(0));
+    assert_eq!(grammar_logits[7], f32::NEG_INFINITY);
+    assert_eq!(grammar_logits[8], f32::NEG_INFINITY);
+}
+
+#[test]
 fn schema_guided_sampling_allows_extended_stop_after_accept() {
     let mut tokenizer = PolicyTokenizer::new(
         6,
