@@ -329,6 +329,7 @@ pub(crate) fn policy() -> ResolvedRuntimePolicy {
             allow_defer: true,
             cancellation_check_interval_steps: 1,
         },
+        None,
     )
     .unwrap()
 }

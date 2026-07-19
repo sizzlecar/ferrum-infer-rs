@@ -1184,6 +1184,7 @@ pub(crate) fn policy_with_tokens(
             "cancellation_check_interval_steps": 1
         }))
         .unwrap(),
+        None,
     )
 }
 
@@ -1217,6 +1218,10 @@ impl RuntimePolicy for AdversarialRuntimePolicy {
 
     fn dynamic_storage_profile_order(&self) -> &[DynamicStorageProfile] {
         &self.dynamic_storage_profile_order
+    }
+
+    fn reusable_execution_policy(&self) -> Option<&ReusableExecutionPolicy> {
+        None
     }
 
     fn validate(&self) -> Result<(), VNextError> {
