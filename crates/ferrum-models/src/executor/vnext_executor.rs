@@ -516,6 +516,13 @@ impl VNextExecutionWaveKind {
             Self::Decode => "decode",
         }
     }
+
+    const fn reusable_execution_class(self) -> &'static str {
+        match self {
+            Self::Prefill => PACKED_TOKEN_REUSABLE_CLASS,
+            Self::Decode => UNIFORM_QUERY_REUSABLE_CLASS,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -3375,22 +3382,50 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         batch: &ExecutionBatchParticipants<R>,
         span: &TokenSpanWork,
     ) -> Result<StepResourceAdmissionDecision<R>> {
-        self.try_begin_step_for_spans(batch, std::slice::from_ref(span))
+        self.try_begin_step_for_spans(
+            batch,
+            std::slice::from_ref(span),
+            VNextExecutionWaveKind::Decode,
+        )
     }
 
     fn try_begin_step_for_spans(
         &self,
         batch: &ExecutionBatchParticipants<R>,
         spans: &[TokenSpanWork],
+        kind: VNextExecutionWaveKind,
     ) -> Result<StepResourceAdmissionDecision<R>> {
+        let work_shape = batch
+            .bind_work_shape(spans.to_vec())
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
+        let reusable_bucket_id = self
+            .resolved_plan
+            .execution_plan()
+            .payload()
+            .memory()
+            .reusable_execution()
+            .and_then(|plan| {
+                plan.buckets().iter().find(|resolved| {
+                    let bucket = resolved.bucket();
+                    bucket.class_id().as_str() == kind.reusable_execution_class()
+                        && bucket.capacity().covers(
+                            work_shape.immediate_sequences(),
+                            work_shape.immediate_tokens(),
+                            work_shape.immediate_pages(),
+                        )
+                })
+            })
+            .map(|resolved| resolved.bucket().bucket_id().clone());
         let request = StepResourceAdmissionRequest::new(
-            batch
-                .bind_work_shape(spans.to_vec())
-                .map_err(|error| FerrumError::backend(error.to_string()))?,
+            work_shape,
             AdmissionFitPolicy::ImmediateOnly,
             AdmissionPressureAction::WaitForRelease,
         )
         .map_err(|error| FerrumError::backend(error.to_string()))?;
+        let request = match reusable_bucket_id {
+            Some(bucket_id) => request.with_reusable_execution_bucket(bucket_id),
+            None => request,
+        };
         batch
             .try_begin_step(request, &self.lane)
             .map_err(|error| FerrumError::backend(error.to_string()))
@@ -3409,7 +3444,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         batch: &ExecutionBatchParticipants<R>,
         spans: &[TokenSpanWork],
     ) -> Result<Arc<StepResourceLease<R>>> {
-        match self.begin_step_for_spans_with_capacity(batch, spans)? {
+        match self.begin_step_for_spans_with_capacity(
+            batch,
+            spans,
+            VNextExecutionWaveKind::Decode,
+        )? {
             VNextExecutionCapacityDecision::Ready(step) => Ok(step),
             VNextExecutionCapacityDecision::Deferred(deferred) => {
                 Err(Self::execution_capacity_error(&deferred))
@@ -3421,10 +3460,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         batch: &ExecutionBatchParticipants<R>,
         spans: &[TokenSpanWork],
+        kind: VNextExecutionWaveKind,
     ) -> Result<VNextExecutionCapacityDecision<Arc<StepResourceLease<R>>>> {
         let mut backing_attempts = 0;
         loop {
-            match self.try_begin_step_for_spans(batch, spans)? {
+            match self.try_begin_step_for_spans(batch, spans, kind)? {
                 StepResourceAdmissionDecision::Admitted(step) => {
                     return Ok(VNextExecutionCapacityDecision::Ready(step))
                 }
@@ -3896,7 +3936,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .wave_timing_for(kind)
                 .resource_prepare_attempt
                 .start();
-            let step = match self.begin_step_for_spans_with_capacity(batch, spans)? {
+            let step = match self.begin_step_for_spans_with_capacity(batch, spans, kind)? {
                 VNextExecutionCapacityDecision::Ready(step) => step,
                 VNextExecutionCapacityDecision::Deferred(deferred) => {
                     return Ok(VNextExecutionCapacityDecision::Deferred(deferred))

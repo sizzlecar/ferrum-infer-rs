@@ -535,6 +535,28 @@ impl ReusableExecutionMemoryPlan {
         &self.buckets
     }
 
+    pub fn bucket(
+        &self,
+        bucket_id: &ReusableExecutionBucketId,
+    ) -> Option<&ResolvedReusableExecutionBucket> {
+        self.buckets
+            .iter()
+            .find(|bucket| bucket.bucket().bucket_id() == bucket_id)
+    }
+
+    pub fn smallest_covering_bucket(
+        &self,
+        class_id: &ReusableExecutionClassId,
+        sequences: u32,
+        tokens: u64,
+        pages: u64,
+    ) -> Option<&ResolvedReusableExecutionBucket> {
+        self.buckets.iter().find(|bucket| {
+            bucket.bucket().class_id() == class_id
+                && bucket.bucket().capacity().covers(sequences, tokens, pages)
+        })
+    }
+
     pub(crate) fn policy(&self) -> Result<ReusableExecutionPolicy, VNextError> {
         ReusableExecutionPolicy::new(
             self.maximum_reusable_lanes,

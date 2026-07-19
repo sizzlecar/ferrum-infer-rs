@@ -3,6 +3,7 @@ use super::{
     ExecutionFrameId, NodeId, RequestAuthorityId, ResourceWorkShape, SequenceAuthorityId,
     Serialize, Sha256, TokenSpanWork, VNextError,
 };
+use crate::vnext::ReusableExecutionBucketId;
 use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,6 +11,7 @@ pub struct StepResourceAdmissionRequest {
     pub(super) work_shape: BatchWorkShape,
     pub(super) fit_policy: AdmissionFitPolicy,
     pub(super) pressure_action: AdmissionPressureAction,
+    pub(super) reusable_execution_bucket_id: Option<ReusableExecutionBucketId>,
 }
 
 impl StepResourceAdmissionRequest {
@@ -22,7 +24,13 @@ impl StepResourceAdmissionRequest {
             work_shape,
             fit_policy,
             pressure_action,
+            reusable_execution_bucket_id: None,
         })
+    }
+
+    pub fn with_reusable_execution_bucket(mut self, bucket_id: ReusableExecutionBucketId) -> Self {
+        self.reusable_execution_bucket_id = Some(bucket_id);
+        self
     }
 
     pub fn work_shape(&self) -> &BatchWorkShape {
@@ -46,6 +54,10 @@ impl StepResourceAdmissionRequest {
 
     pub const fn pressure_action(&self) -> AdmissionPressureAction {
         self.pressure_action
+    }
+
+    pub fn reusable_execution_bucket_id(&self) -> Option<&ReusableExecutionBucketId> {
+        self.reusable_execution_bucket_id.as_ref()
     }
 }
 

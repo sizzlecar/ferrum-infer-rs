@@ -29,6 +29,7 @@ use super::{
     StepResourceAdmissionRequest, StepResourceLease, StepRetirementReceipt, StreamState,
     TokenSpanWork, TrustedPlanRuntimeEvidence, VNextError, SEQUENCE_DISPATCH_POISONED_BIT,
 };
+use crate::vnext::ReusableExecutionBucketSpec;
 
 #[derive(Debug)]
 pub enum ExecutionStreamCreationError<E> {
@@ -381,6 +382,7 @@ where
     fn new(
         participants: Vec<AdmittedStepParticipant<R>>,
         execution_lane: Arc<ExecutionLane<R>>,
+        reusable_execution_bucket: Option<ReusableExecutionBucketSpec>,
         batch_step_id: BatchStepId,
         claimed_backing: ClaimedBackingTransaction,
     ) -> Result<Self, VNextError> {
@@ -432,6 +434,7 @@ where
             participants,
             invocation_registry: Arc::new(InvocationRegistry::default()),
             execution_lane,
+            reusable_execution_bucket,
             batch_step_id,
             finalized: false,
         })
@@ -443,6 +446,10 @@ where
 
     pub fn execution_lane(&self) -> &Arc<ExecutionLane<R>> {
         &self.execution_lane
+    }
+
+    pub fn reusable_execution_bucket(&self) -> Option<&ReusableExecutionBucketSpec> {
+        self.reusable_execution_bucket.as_ref()
     }
 
     pub fn try_retire_normal(
@@ -875,8 +882,12 @@ where
                 )
             })
             .collect::<Vec<_>>();
-        let (demand, requested_slices) =
-            plan.submission_wave_demand(&node_shapes, fit_policy, pressure_action)?;
+        let (demand, requested_slices) = plan.submission_wave_demand(
+            &node_shapes,
+            self.reusable_execution_bucket.as_ref(),
+            fit_policy,
+            pressure_action,
+        )?;
         let prepared_backing = match plan
             .prepare_lane_stable_backing_slices(&self.execution_lane, requested_slices)?
         {
@@ -1012,6 +1023,7 @@ where
             Some(&node_id),
             immediate_shape,
             fit_shape,
+            self.reusable_execution_bucket.as_ref(),
             fit_policy,
             pressure_action,
         )?;
@@ -2212,6 +2224,7 @@ where
             work_shape,
             fit_policy,
             pressure_action,
+            reusable_execution_bucket_id,
         } = request;
         let work_fingerprint = work_shape.fingerprint().to_owned();
         let expected_participants = self
@@ -2243,11 +2256,32 @@ where
                 "step admission requires the reusable execution lane bound to its plan runtime",
             ));
         }
+        let reusable_execution_bucket = reusable_execution_bucket_id
+            .as_ref()
+            .map(|bucket_id| {
+                plan.reusable_execution_bucket(bucket_id)
+                    .map(|resolved| resolved.bucket().clone())
+                    .ok_or_else(|| {
+                        invalid_resource(
+                            "step reusable execution bucket is not owned by its immutable plan",
+                        )
+                    })
+            })
+            .transpose()?;
+        if reusable_execution_bucket.as_ref().is_some_and(|bucket| {
+            let capacity = bucket.capacity();
+            !capacity.covers(fit_shape.sequences(), fit_shape.tokens(), fit_shape.pages())
+        }) {
+            return Err(invalid_resource(
+                "step work shape exceeds its selected reusable execution bucket",
+            ));
+        }
         let (demand, requested_slices) = plan.scoped_demand(
             AllocationLifetime::Step,
             None,
             immediate_shape,
             fit_shape,
+            reusable_execution_bucket.as_ref(),
             fit_policy,
             pressure_action,
         )?;
@@ -2328,6 +2362,7 @@ where
             StepResourceLease::new(
                 participants,
                 Arc::clone(lane),
+                reusable_execution_bucket,
                 batch_step_id,
                 claimed_backing,
             )?,

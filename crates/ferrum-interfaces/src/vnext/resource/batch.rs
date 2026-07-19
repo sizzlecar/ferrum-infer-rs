@@ -12,6 +12,7 @@ use super::{
     SequenceSessionSlotState, Serialize, Sha256, StepParticipantFrameAssignment, TokenSpanWork,
     TrustedPlanRuntimeEvidence, VNextError,
 };
+use crate::vnext::ReusableExecutionBucketSpec;
 
 /// Resources whose lifetime is one exact continuous-batch execution frame.
 /// Child invocation leases retain this scope through `Arc`, so shared frame
@@ -27,6 +28,7 @@ where
     pub(super) participants: Vec<AdmittedStepParticipant<R>>,
     pub(super) invocation_registry: Arc<InvocationRegistry>,
     pub(super) execution_lane: Arc<ExecutionLane<R>>,
+    pub(super) reusable_execution_bucket: Option<ReusableExecutionBucketSpec>,
     pub(super) batch_step_id: BatchStepId,
     pub(super) finalized: bool,
 }
@@ -1175,6 +1177,16 @@ fn validate_backing_claim(
     backing_slices: &[LogicalBackingSliceAuthority],
     demand: &AdmissionDemand,
 ) -> Result<(), VNextError> {
+    let reusable_execution_bucket_id = backing_slices
+        .first()
+        .and_then(|slice| slice.evidence().reusable_execution_bucket_id());
+    if backing_slices.iter().any(|slice| {
+        slice.evidence().reusable_execution_bucket_id() != reusable_execution_bucket_id
+    }) {
+        return Err(invalid_resource(
+            "one backing transaction cannot mix reusable execution buckets",
+        ));
+    }
     let mut backing_by_domain = BTreeMap::<CapacityDomainId, u64>::new();
     let mut physical_claims = BTreeMap::<
         PhysicalBackingClaimIdentity,
@@ -1191,9 +1203,11 @@ fn validate_backing_claim(
             || slice.segment_lease.claim_identity != *claim_identity
             || slice.segment_lease.segment_generation != evidence.segment_generation()
             || slice.segment_lease.size_bytes != evidence.physical_size_bytes()
+            || evidence.size_bytes() == 0
+            || evidence.size_bytes() > evidence.capacity_size_bytes()
             || evidence
                 .physical_offset_bytes()
-                .checked_add(evidence.size_bytes())
+                .checked_add(evidence.capacity_size_bytes())
                 .is_none_or(|end| end > evidence.physical_size_bytes())
         {
             return Err(invalid_resource(
@@ -1235,9 +1249,22 @@ fn validate_backing_claim(
                 .collect::<Result<Vec<_>, _>>()?,
         )?
     };
-    if backing_claim != *demand.immediate_claim() {
+    let physical_covers_logical = backing_claim.entries().len()
+        == demand.immediate_claim().entries().len()
+        && backing_claim.entries().iter().all(|physical| {
+            demand
+                .immediate_claim()
+                .units_for(physical.domain())
+                .is_some_and(|logical| physical.units().get() >= logical.get())
+        });
+    let claim_matches = if reusable_execution_bucket_id.is_some() {
+        physical_covers_logical
+    } else {
+        backing_claim == *demand.immediate_claim()
+    };
+    if !claim_matches {
         return Err(invalid_resource(
-            "physical backing differs from the exact evaluated immediate demand",
+            "physical backing does not cover the exact evaluated logical demand",
         ));
     }
     Ok(())
@@ -1294,7 +1321,7 @@ impl ClaimedBackingTransaction {
             capacity_parents: Vec<(SequenceAuthorityId, RequestAuthorityId)>,
         }
         let input = FingerprintInput {
-            domain: "ferrum.runtime-vnext.claimed-backing.v2",
+            domain: "ferrum.runtime-vnext.claimed-backing.v3",
             work_fingerprint: work_shape.fingerprint(),
             demand: &demand,
             backing: backing_slices
@@ -1447,7 +1474,7 @@ impl ClaimedSubmissionWaveBacking {
             capacity_parents: Vec<(SequenceAuthorityId, RequestAuthorityId)>,
         }
         let input = FingerprintInput {
-            domain: "ferrum.runtime-vnext.claimed-submission-wave-backing.v1",
+            domain: "ferrum.runtime-vnext.claimed-submission-wave-backing.v2",
             nodes: node_work_shapes
                 .iter()
                 .map(|(node_id, work_shape)| NodeInput {
