@@ -52,6 +52,7 @@ SERVE_TYPES = {
     "serve_structured_output",
     "serve_context_limit",
     "serve_concurrency_quality",
+    "serve_tool_schema_priority",
     "serve_tool_call",
     "serve_python_openai_sdk",
 }
@@ -271,6 +272,9 @@ def parse_sse(body: str) -> dict[str, Any]:
     output_text = ""
     usage_chunks = 0
     chunks = 0
+    finish_reasons: list[str] = []
+    tool_call_deltas: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
     for raw_line in body.splitlines():
         line = raw_line.strip()
         if not line.startswith("data: "):
@@ -287,14 +291,23 @@ def parse_sse(body: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             malformed_json += 1
             continue
+        error = parsed.get("error")
+        if isinstance(error, dict):
+            errors.append(error)
         if parsed.get("usage"):
             usage_chunks += 1
         for choice in parsed.get("choices", []):
             if not isinstance(choice, dict):
                 continue
+            reason = choice.get("finish_reason")
+            if reason is not None:
+                finish_reasons.append(str(reason))
             delta = choice.get("delta") or {}
             if not isinstance(delta, dict):
                 continue
+            calls = delta.get("tool_calls") or []
+            if isinstance(calls, list):
+                tool_call_deltas.extend(call for call in calls if isinstance(call, dict))
             text = delta.get("content") or delta.get("reasoning") or delta.get("reasoning_content") or ""
             if str(text):
                 output_text += str(text)
@@ -306,7 +319,77 @@ def parse_sse(body: str) -> dict[str, Any]:
         "usage_chunks": usage_chunks,
         "chunk_count": chunks,
         "output_text": output_text,
+        "finish_reasons": finish_reasons,
+        "tool_call_deltas": tool_call_deltas,
+        "errors": errors,
     }
+
+
+def validate_sync_tool_schema_priority(data: dict[str, Any], marker: str) -> dict[str, Any]:
+    choice = first_choice(data)
+    require(choice.get("finish_reason") == "tool_calls", f"bad finish_reason: {choice}")
+    message = choice.get("message")
+    require(isinstance(message, dict), f"missing assistant message: {choice}")
+    require(message.get("content") in (None, ""), f"tool response leaked content: {message}")
+    calls = message.get("tool_calls")
+    require(isinstance(calls, list) and len(calls) == 1, f"expected one tool call: {message}")
+    return validate_tool_call(calls[0], marker)
+
+
+def validate_stream_tool_schema_priority(parsed: dict[str, Any], marker: str) -> dict[str, Any]:
+    require(parsed["done_count"] == 1, f"stream [DONE] count {parsed['done_count']} != 1")
+    require(parsed["malformed_json"] == 0, f"stream malformed_json={parsed['malformed_json']}")
+    require(parsed["usage_chunks"] == 1, f"stream usage_chunks={parsed['usage_chunks']} != 1")
+    require(parsed["content_delta_count"] == 0, "required tool stream emitted assistant content")
+    require(not parsed["errors"], f"stream emitted errors: {parsed['errors']}")
+    require(
+        parsed["finish_reasons"] == ["tool_calls"],
+        f"stream finish reasons were {parsed['finish_reasons']}",
+    )
+    calls = reconstruct_stream_tool_calls(parsed["tool_call_deltas"])
+    require(len(calls) == 1, f"expected one streamed tool call: {calls}")
+    return validate_tool_call(calls[0], marker)
+
+
+def reconstruct_stream_tool_calls(deltas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    calls: dict[int, dict[str, Any]] = {}
+    for delta in deltas:
+        index = int(delta.get("index") or 0)
+        call = calls.setdefault(
+            index,
+            {
+                "id": "",
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            },
+        )
+        if delta.get("id"):
+            call["id"] = str(delta["id"])
+        if delta.get("type"):
+            call["type"] = str(delta["type"])
+        function = delta.get("function")
+        if isinstance(function, dict):
+            if function.get("name"):
+                call["function"]["name"] += str(function["name"])
+            if function.get("arguments"):
+                call["function"]["arguments"] += str(function["arguments"])
+    return [calls[index] for index in sorted(calls)]
+
+
+def validate_tool_call(call: Any, marker: str) -> dict[str, Any]:
+    require(isinstance(call, dict), f"tool call must be an object: {call!r}")
+    require(call.get("type") == "function", f"tool call type must be function: {call}")
+    function = call.get("function")
+    require(isinstance(function, dict), f"tool call missing function: {call}")
+    require(function.get("name") == "echo_value", f"wrong tool name: {function}")
+    raw_arguments = function.get("arguments")
+    require(isinstance(raw_arguments, str), f"tool arguments must be a JSON string: {function}")
+    try:
+        arguments = json.loads(raw_arguments)
+    except json.JSONDecodeError as exc:
+        raise ScenarioError(f"tool arguments are invalid JSON: {raw_arguments!r}") from exc
+    require(arguments == {"value": marker}, f"tool arguments {arguments!r} != marker {marker!r}")
+    return {"name": "echo_value", "arguments": arguments}
 
 
 def parse_json_events(text: str) -> list[dict[str, Any]]:
@@ -634,6 +717,8 @@ class ScenarioRunner:
             return self.serve_context_limit(scenario, out)
         if typ == "serve_concurrency_quality":
             return self.serve_concurrency_quality(scenario, out)
+        if typ == "serve_tool_schema_priority":
+            return self.serve_tool_schema_priority(scenario, out)
         if typ == "serve_tool_call":
             return self.serve_tool_call(out)
         if typ == "serve_python_openai_sdk":
@@ -832,6 +917,108 @@ class ScenarioRunner:
         )
         return {"status": "pass", "cells": result.get("cells", [])}
 
+    def serve_tool_schema_priority(
+        self, scenario: dict[str, Any], out: Path
+    ) -> dict[str, Any]:
+        case_count = int(scenario.get("case_count", 4))
+        require(1 <= case_count <= 20, "serve_tool_schema_priority.case_count must be 1..20")
+        max_tokens = int(scenario.get("max_tokens", 256))
+        prefix = str(scenario.get("marker_prefix") or "c21-priority")
+        results: list[dict[str, Any]] = []
+
+        for ordinal in range(case_count):
+            marker = f"{prefix}-{ordinal:03d}"
+            for stream in (False, True):
+                mode = "stream" if stream else "sync"
+                case_out = out / f"{ordinal:03d}-{mode}"
+                case_out.mkdir(parents=True, exist_ok=True)
+                payload = chat_payload(
+                    self.model,
+                    [
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Call echo_value for {marker}; tool choice has priority "
+                                "over the simultaneous strict response format."
+                            ),
+                        }
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=0,
+                )
+                payload["tools"] = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "echo_value",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "value": {"type": "string", "const": marker}
+                                },
+                                "required": ["value"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    }
+                ]
+                payload["tool_choice"] = "required"
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": f"conflict_{ordinal:03d}",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "result": {"type": "string", "const": marker}
+                            },
+                            "required": ["result"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+                thinking = scenario.get("enable_thinking")
+                if isinstance(thinking, bool):
+                    payload["chat_template_kwargs"] = {"enable_thinking": thinking}
+                payload["stream"] = stream
+                if stream:
+                    payload["stream_options"] = {"include_usage": True}
+                write_json(case_out / "request.json", payload)
+
+                if stream:
+                    status, body, event_times = request_sse(
+                        self.require_base_url(), payload, timeout=self.timeout
+                    )
+                    (case_out / "response.sse").write_text(body, errors="replace")
+                    require(status == 200, f"{marker} stream expected HTTP 200, got {status}")
+                    parsed = parse_sse(body)
+                    validated = validate_stream_tool_schema_priority(parsed, marker)
+                    result = {
+                        "marker": marker,
+                        "mode": mode,
+                        "http_status": status,
+                        "event_count": len(event_times),
+                        "protocol": parsed,
+                        "tool_call": validated,
+                    }
+                else:
+                    status, body = post_json(
+                        self.require_base_url(), payload, timeout=self.timeout
+                    )
+                    (case_out / "response.json").write_text(body, errors="replace")
+                    data = parse_json_response(f"{marker} sync", status, body)
+                    result = {
+                        "marker": marker,
+                        "mode": mode,
+                        "http_status": status,
+                        "tool_call": validate_sync_tool_schema_priority(data, marker),
+                    }
+                write_json(case_out / "result.json", {"status": "pass", **result})
+                results.append(result)
+
+        return {"status": "pass", "case_count": len(results), "cases": results}
+
     def serve_tool_call(self, out: Path) -> dict[str, Any]:
         result = run_tool_call_regression(self.require_base_url(), self.model, out)
         return {"status": "pass", "checks": result.get("checks", {})}
@@ -1010,8 +1197,12 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8")
         payload = json.loads(body)
+        echo_marker = self.echo_value_marker(payload)
         if payload.get("stream"):
-            self.send_stream()
+            if echo_marker is not None:
+                self.send_stream_tool_call(echo_marker)
+            else:
+                self.send_stream()
             return
         if int(payload.get("max_tokens") or 0) >= 4096:
             self.send_json(
@@ -1028,6 +1219,12 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
                 break
         marker = re.search(r"\b(ferrum\d{2}\d{2})\b", prompt)
         square = re.search(r"(S\d{4})", prompt)
+        if echo_marker is not None:
+            self.send_tool_call(
+                "echo_value",
+                json.dumps({"value": echo_marker}, separators=(",", ":")),
+            )
+            return
         if payload.get("tools") and marker and square:
             self.send_tool_call(
                 "capture_quality_marker",
@@ -1064,6 +1261,29 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
             self.send_chat("ferrum-blue ferrum-loop-blue")
         else:
             self.send_chat("scenario-ok")
+
+    @staticmethod
+    def echo_value_marker(payload: dict[str, Any]) -> str | None:
+        tools = payload.get("tools")
+        if not isinstance(tools, list):
+            return None
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            function = tool.get("function")
+            if not isinstance(function, dict) or function.get("name") != "echo_value":
+                continue
+            parameters = function.get("parameters")
+            if not isinstance(parameters, dict):
+                return None
+            properties = parameters.get("properties")
+            if not isinstance(properties, dict):
+                return None
+            value = properties.get("value")
+            if not isinstance(value, dict) or not isinstance(value.get("const"), str):
+                return None
+            return str(value["const"])
+        return None
 
     def send_json(self, status: int, data: dict[str, Any]) -> None:
         raw = json.dumps(data).encode("utf-8")
@@ -1138,6 +1358,45 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_stream_tool_call(self, marker: str) -> None:
+        arguments = json.dumps({"value": marker}, separators=(",", ":"))
+        lines = [
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_mock",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "echo_value",
+                                        "arguments": arguments,
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                "usage": None,
+            },
+            {"choices": [], "usage": {"completion_tokens": 1}},
+        ]
+        raw = "".join(f"data: {json.dumps(line)}\n\n" for line in lines) + "data: [DONE]\n\n"
+        body = raw.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
 
 def run_selftest_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, cwd=repo_root(), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1175,6 +1434,11 @@ def self_test() -> int:
                             "type": "serve_concurrency_quality",
                             "concurrency_cells": [1, 4],
                         },
+                        {
+                            "name": "tool-schema-priority",
+                            "type": "serve_tool_schema_priority",
+                            "case_count": 1,
+                        },
                         {"name": "tool", "type": "serve_tool_call"},
                     ],
                 },
@@ -1195,7 +1459,7 @@ def self_test() -> int:
             if f"BACKEND REGRESSION SMOKE PASS: {out}" not in proc.stdout:
                 raise AssertionError(proc.stdout)
             summary = load_json_object(out / "summary.json")
-            if summary.get("status") != "pass" or summary.get("scenario_count") != 8:
+            if summary.get("status") != "pass" or summary.get("scenario_count") != 9:
                 raise AssertionError(summary)
             health = load_json_object(out / "server.health.json")
             if health.get("status") != "pass" or health.get("http_status") != 200:
