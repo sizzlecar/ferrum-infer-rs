@@ -589,6 +589,63 @@ fn physical_invocation_retry_requires_not_submitted_and_a_fresh_attempt() {
 }
 
 #[test]
+fn full_plan_wave_ledger_is_one_entry_and_preserves_all_node_tombstones() {
+    let registry = Arc::new(InvocationRegistry::default());
+    let key = participant_node_key(1, 7, "main");
+    let fingerprint = "e".repeat(64);
+    let mut guard = registry
+        .enter_submission_wave(262, invocation(21), &fingerprint)
+        .unwrap();
+
+    assert_eq!(guard.physical_entry_count(), 1);
+    {
+        let state = registry.state.lock().unwrap();
+        assert!(state.entries.is_empty());
+        let wave = state.submission_wave.as_ref().unwrap();
+        assert_eq!(wave.covered_participant_nodes, 262);
+        assert_eq!(wave.ledger.work_fingerprint, fingerprint);
+        assert_eq!(wave.ledger.phase, PhysicalInvocationPhase::Prepared);
+    }
+    assert!(registry
+        .enter(vec![key.clone()], invocation(22), &"f".repeat(64))
+        .is_err());
+    assert!(registry
+        .enter_submission_wave(262, invocation(23), &fingerprint)
+        .is_err());
+
+    guard.mark_not_submitted().unwrap();
+    guard.prepare_retry(invocation(24)).unwrap();
+    guard.mark_in_flight().unwrap();
+    drop(guard);
+    {
+        let state = registry.state.lock().unwrap();
+        assert_eq!(
+            state.submission_wave.as_ref().unwrap().ledger.phase,
+            PhysicalInvocationPhase::Retired
+        );
+    }
+    assert!(registry
+        .enter(vec![key], invocation(25), &"f".repeat(64))
+        .is_err());
+
+    let node_first = Arc::new(InvocationRegistry::default());
+    let node_guard = node_first
+        .enter(
+            vec![participant_node_key(2, 2, "first")],
+            invocation(26),
+            &"a".repeat(64),
+        )
+        .unwrap();
+    assert!(node_first
+        .enter_submission_wave(262, invocation(27), &fingerprint)
+        .is_err());
+    drop(node_guard);
+    assert!(node_first
+        .enter_submission_wave(262, invocation(28), &fingerprint)
+        .is_err());
+}
+
+#[test]
 fn definitely_not_submitted_participant_flights_reset_for_exact_retry() {
     let session = active_candidate(1, "dispatch-retry");
     let mut frames = acquire_session_frames(std::slice::from_ref(&session), step(1)).unwrap();
