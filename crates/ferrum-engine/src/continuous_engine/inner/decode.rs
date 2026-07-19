@@ -595,13 +595,14 @@ impl EngineInner {
         // Speculative decoding path: when both a draft executor and
         // config are set, delegate to the runner and push the accepted
         // tokens onto the sequence in one shot.
-        // Structured output requires an engine grammar decision before every
-        // token, while the speculative runner installs an accepted token batch.
+        // The legacy speculative runner can express only raw greedy sampling.
+        // Any host processor, grammar, or token-validity mask must stay on the
+        // ordinary decode path so request semantics are never silently skipped.
         let can_use_speculative_decode = self
             .sequences
             .read()
             .get(request_id)
-            .is_some_and(|sequence| !sequence.has_structured_output_constraint());
+            .is_some_and(SequenceState::supports_raw_speculative_decode);
         if self.draft_executor.is_some() && self.spec_config.is_some() && can_use_speculative_decode
         {
             return self.run_decode_step_speculative(request_id).await;
@@ -921,6 +922,7 @@ impl EngineInner {
                 let mut sequences = self.sequences.write();
                 if let Some(seq) = sequences.get_mut(request_id) {
                     seq.generated_tokens.push(tok);
+                    *seq.token_frequencies.entry(tok).or_insert(0) += 1;
                     seq.tokens_this_iteration += 1;
                 }
             }

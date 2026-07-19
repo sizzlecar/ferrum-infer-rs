@@ -128,12 +128,12 @@ impl SamplingParams {
 
     /// Validate sampling parameters
     pub fn validate(&self) -> Result<()> {
-        if self.temperature < 0.0 {
+        if !self.temperature.is_finite() || self.temperature < 0.0 {
             return Err(FerrumError::invalid_request(
-                "Temperature must be non-negative".to_string(),
+                "temperature must be finite and non-negative".to_string(),
             ));
         }
-        if self.top_p <= 0.0 || self.top_p > 1.0 {
+        if !self.top_p.is_finite() || self.top_p <= 0.0 || self.top_p > 1.0 {
             return Err(FerrumError::invalid_request(
                 "top_p must be in range (0, 1]".to_string(),
             ));
@@ -145,27 +145,37 @@ impl SamplingParams {
                 ));
             }
         }
-        if self.repetition_penalty <= 0.0 {
+        if !self.repetition_penalty.is_finite() || self.repetition_penalty <= 0.0 {
             return Err(FerrumError::invalid_request(
-                "Repetition penalty must be positive".to_string(),
+                "repetition_penalty must be finite and positive".to_string(),
+            ));
+        }
+        if !self.presence_penalty.is_finite() || !(-2.0..=2.0).contains(&self.presence_penalty) {
+            return Err(FerrumError::invalid_request(
+                "presence_penalty must be in range [-2, 2]".to_string(),
+            ));
+        }
+        if !self.frequency_penalty.is_finite() || !(-2.0..=2.0).contains(&self.frequency_penalty) {
+            return Err(FerrumError::invalid_request(
+                "frequency_penalty must be in range [-2, 2]".to_string(),
             ));
         }
         if let Some(min_p) = self.min_p {
-            if min_p <= 0.0 || min_p > 1.0 {
+            if !min_p.is_finite() || min_p <= 0.0 || min_p > 1.0 {
                 return Err(FerrumError::invalid_request(
                     "min_p must be in range (0, 1]".to_string(),
                 ));
             }
         }
         if let Some(tfs) = self.tfs {
-            if tfs <= 0.0 || tfs > 1.0 {
+            if !tfs.is_finite() || tfs <= 0.0 || tfs > 1.0 {
                 return Err(FerrumError::invalid_request(
                     "tfs must be in range (0, 1]".to_string(),
                 ));
             }
         }
         if let Some(typical_p) = self.typical_p {
-            if typical_p <= 0.0 || typical_p > 1.0 {
+            if !typical_p.is_finite() || typical_p <= 0.0 || typical_p > 1.0 {
                 return Err(FerrumError::invalid_request(
                     "typical_p must be in range (0, 1]".to_string(),
                 ));

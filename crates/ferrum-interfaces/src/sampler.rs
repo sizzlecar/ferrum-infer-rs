@@ -7,7 +7,8 @@
 use ferrum_types::{Result, SamplingParams, TokenId};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::fmt;
 
 /// Sampling context passed to logits processors and samplers
 #[derive(Debug)]
@@ -172,6 +173,19 @@ impl LogitsProcessorChain {
     pub fn processor_names(&self) -> Vec<&str> {
         self.processors.iter().map(|p| p.name()).collect()
     }
+
+    /// Whether raw logits can be sampled without bypassing a processor.
+    pub fn is_empty(&self) -> bool {
+        self.processors.is_empty()
+    }
+}
+
+impl fmt::Debug for LogitsProcessorChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.processors.iter().map(|processor| processor.name()))
+            .finish()
+    }
 }
 
 impl Default for LogitsProcessorChain {
@@ -208,7 +222,9 @@ impl LogitsProcessor for TemperatureProcessor {
     }
 
     fn priority(&self) -> ProcessorPriority {
-        ProcessorPriority::Low // Apply temperature scaling last
+        // Penalties change raw logits first. Temperature must run before
+        // probability-relative filters such as min-p and top-p.
+        ProcessorPriority::Normal
     }
 }
 
@@ -248,6 +264,10 @@ impl LogitsProcessor for TopKProcessor {
 
     fn name(&self) -> &str {
         "top_k"
+    }
+
+    fn priority(&self) -> ProcessorPriority {
+        ProcessorPriority::Low
     }
 }
 
@@ -311,6 +331,48 @@ impl LogitsProcessor for TopPProcessor {
     fn name(&self) -> &str {
         "top_p"
     }
+
+    fn priority(&self) -> ProcessorPriority {
+        ProcessorPriority::Low
+    }
+}
+
+/// Minimum-probability filtering processor.
+///
+/// A token remains eligible when its probability is at least `min_p` times
+/// the most likely token's probability. In logit space the equivalent
+/// threshold is `max_logit + ln(min_p)`, so this needs no softmax allocation.
+pub struct MinPProcessor {
+    pub min_p: f32,
+}
+
+impl MinPProcessor {
+    pub fn new(min_p: f32) -> Self {
+        Self { min_p }
+    }
+}
+
+impl LogitsProcessor for MinPProcessor {
+    fn process(&self, ctx: &mut SamplingContext) -> Result<()> {
+        if self.min_p > 0.0 && self.min_p <= 1.0 {
+            let max_logit = ctx.logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let threshold = max_logit + self.min_p.ln();
+            for logit in ctx.logits.iter_mut() {
+                if *logit < threshold {
+                    *logit = f32::NEG_INFINITY;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "min_p"
+    }
+
+    fn priority(&self) -> ProcessorPriority {
+        ProcessorPriority::Low
+    }
 }
 
 /// Repetition penalty processor
@@ -327,9 +389,8 @@ impl RepetitionPenaltyProcessor {
 impl LogitsProcessor for RepetitionPenaltyProcessor {
     fn process(&self, ctx: &mut SamplingContext) -> Result<()> {
         if self.penalty != 1.0 {
-            let mut seen = HashSet::new();
-            for &token_id in ctx.previous_tokens {
-                if !seen.insert(token_id) || usize::from(token_id) >= ctx.logits.len() {
+            for &token_id in ctx.token_frequencies.keys() {
+                if usize::from(token_id) >= ctx.logits.len() {
                     continue;
                 }
                 let idx = usize::from(token_id);
@@ -350,6 +411,49 @@ impl LogitsProcessor for RepetitionPenaltyProcessor {
 
     fn priority(&self) -> ProcessorPriority {
         ProcessorPriority::High // Apply penalties early
+    }
+}
+
+/// OpenAI-compatible additive penalties over generated-token counts.
+///
+/// Repetition penalty is multiplicative and remains a separate processor.
+/// Presence and frequency penalties are additive and are applied afterwards:
+/// `logit -= presence * seen + frequency * count`.
+pub struct PresenceFrequencyPenaltyProcessor {
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+}
+
+impl PresenceFrequencyPenaltyProcessor {
+    pub fn new(presence_penalty: f32, frequency_penalty: f32) -> Self {
+        Self {
+            presence_penalty,
+            frequency_penalty,
+        }
+    }
+}
+
+impl LogitsProcessor for PresenceFrequencyPenaltyProcessor {
+    fn process(&self, ctx: &mut SamplingContext) -> Result<()> {
+        if self.presence_penalty == 0.0 && self.frequency_penalty == 0.0 {
+            return Ok(());
+        }
+        for (&token_id, &count) in ctx.token_frequencies {
+            let idx = usize::from(token_id);
+            if idx >= ctx.logits.len() || count == 0 {
+                continue;
+            }
+            ctx.logits[idx] -= self.presence_penalty + self.frequency_penalty * count as f32;
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "presence_frequency_penalty"
+    }
+
+    fn priority(&self) -> ProcessorPriority {
+        ProcessorPriority::High
     }
 }
 
@@ -473,11 +577,35 @@ impl SamplingConfigBuilder {
         self
     }
 
+    /// Add minimum-probability filtering.
+    pub fn with_min_p(mut self, min_p: f32) -> Self {
+        if min_p > 0.0 && min_p <= 1.0 {
+            self.processors.push(Box::new(MinPProcessor::new(min_p)));
+        }
+        self
+    }
+
     /// Add repetition penalty
     pub fn with_repetition_penalty(mut self, penalty: f32) -> Self {
         if penalty != 1.0 {
             self.processors
                 .push(Box::new(RepetitionPenaltyProcessor::new(penalty)));
+        }
+        self
+    }
+
+    /// Add OpenAI-compatible presence and frequency penalties.
+    pub fn with_presence_frequency_penalty(
+        mut self,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+    ) -> Self {
+        if presence_penalty != 0.0 || frequency_penalty != 0.0 {
+            self.processors
+                .push(Box::new(PresenceFrequencyPenaltyProcessor::new(
+                    presence_penalty,
+                    frequency_penalty,
+                )));
         }
         self
     }
@@ -516,12 +644,26 @@ pub struct SamplingConfig {
     pub sampler: Box<dyn Sampler>,
 }
 
+impl fmt::Debug for SamplingConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SamplingConfig")
+            .field("processor_chain", &self.processor_chain)
+            .field("sampler", &self.sampler.name())
+            .finish()
+    }
+}
+
 impl SamplingConfig {
     /// Create from sampling parameters
     pub fn from_params(params: &SamplingParams) -> Self {
         let mut builder = SamplingConfigBuilder::new()
             .with_temperature(params.temperature)
-            .with_repetition_penalty(params.repetition_penalty);
+            .with_repetition_penalty(params.repetition_penalty)
+            .with_presence_frequency_penalty(params.presence_penalty, params.frequency_penalty);
+
+        if let Some(min_p) = params.min_p {
+            builder = builder.with_min_p(min_p);
+        }
 
         if let Some(top_k) = params.top_k {
             builder = builder.with_top_k(top_k);
@@ -539,6 +681,14 @@ impl SamplingConfig {
         };
 
         builder.with_sampler(sampler).build()
+    }
+
+    /// Whether the current plan is exactly raw greedy argmax.
+    ///
+    /// The legacy speculative runner only represents temperature and drafts
+    /// with argmax. Any logits processor would otherwise be silently skipped.
+    pub fn supports_raw_greedy_speculation(&self) -> bool {
+        self.sampler.is_deterministic() && self.processor_chain.is_empty()
     }
 
     /// Process logits and sample token

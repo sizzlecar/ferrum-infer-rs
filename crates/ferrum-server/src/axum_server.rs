@@ -3788,6 +3788,22 @@ fn validate_chat_request(request: &ChatCompletionsRequest) -> std::result::Resul
             ));
         }
     }
+    if let Some(presence_penalty) = request.presence_penalty {
+        if !presence_penalty.is_finite() || !(-2.0..=2.0).contains(&presence_penalty) {
+            return Err(ServerError::invalid_request(
+                "presence_penalty must be in range [-2, 2]",
+                Some("presence_penalty"),
+            ));
+        }
+    }
+    if let Some(frequency_penalty) = request.frequency_penalty {
+        if !frequency_penalty.is_finite() || !(-2.0..=2.0).contains(&frequency_penalty) {
+            return Err(ServerError::invalid_request(
+                "frequency_penalty must be in range [-2, 2]",
+                Some("frequency_penalty"),
+            ));
+        }
+    }
 
     if request.stream_options.is_some() && !request.stream.unwrap_or(false) {
         return Err(ServerError::invalid_request(
@@ -7793,6 +7809,8 @@ mod tests {
             ("top_k", json!(-2)),
             ("min_p", json!(1.01)),
             ("repetition_penalty", json!(0.0)),
+            ("presence_penalty", json!(2.01)),
+            ("frequency_penalty", json!(-2.01)),
         ] {
             let (router, _) = router_with_capturing_llm();
             let response = post_json(

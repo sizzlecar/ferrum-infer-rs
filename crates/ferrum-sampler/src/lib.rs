@@ -31,9 +31,10 @@ pub mod structured_output;
 
 // Re-export all sampler types from ferrum-interfaces
 pub use ferrum_interfaces::sampler::{
-    GreedySampler, LogitsProcessor, LogitsProcessorChain, MultiSampler, MultinomialSampler,
-    ProcessorPriority, RepetitionPenaltyProcessor, Sampler, SamplingConfig, SamplingConfigBuilder,
-    SamplingContext, SamplingStats, TemperatureProcessor, TopKProcessor, TopPProcessor,
+    GreedySampler, LogitsProcessor, LogitsProcessorChain, MinPProcessor, MultiSampler,
+    MultinomialSampler, PresenceFrequencyPenaltyProcessor, ProcessorPriority,
+    RepetitionPenaltyProcessor, Sampler, SamplingConfig, SamplingConfigBuilder, SamplingContext,
+    SamplingStats, TemperatureProcessor, TopKProcessor, TopPProcessor,
 };
 
 // Re-export types from ferrum-types
