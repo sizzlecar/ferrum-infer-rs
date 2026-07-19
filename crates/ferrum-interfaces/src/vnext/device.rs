@@ -678,8 +678,13 @@ pub enum DeviceSubmissionStage {
 pub struct DeviceReusableExecutionObservation {
     candidate_segments: u64,
     captured_segments: u64,
+    uploaded_segments: u64,
     cache_hit_segments: u64,
+    cached_rejected_segments: u64,
     capture_rejected_segments: u64,
+    quiescence_deferred_segments: u64,
+    capacity_deferred_segments: u64,
+    evicted_segments: u64,
     replayed_segments: u64,
     replayed_commands: u64,
     eager_commands: u64,
@@ -694,12 +699,32 @@ impl DeviceReusableExecutionObservation {
         self.captured_segments = self.captured_segments.saturating_add(1);
     }
 
+    pub fn observe_uploaded_segment(&mut self) {
+        self.uploaded_segments = self.uploaded_segments.saturating_add(1);
+    }
+
     pub fn observe_cache_hit_segment(&mut self) {
         self.cache_hit_segments = self.cache_hit_segments.saturating_add(1);
     }
 
+    pub fn observe_cached_rejected_segment(&mut self) {
+        self.cached_rejected_segments = self.cached_rejected_segments.saturating_add(1);
+    }
+
     pub fn observe_capture_rejection(&mut self) {
         self.capture_rejected_segments = self.capture_rejected_segments.saturating_add(1);
+    }
+
+    pub fn observe_quiescence_deferred_segment(&mut self) {
+        self.quiescence_deferred_segments = self.quiescence_deferred_segments.saturating_add(1);
+    }
+
+    pub fn observe_capacity_deferred_segment(&mut self) {
+        self.capacity_deferred_segments = self.capacity_deferred_segments.saturating_add(1);
+    }
+
+    pub fn observe_evicted_segment(&mut self) {
+        self.evicted_segments = self.evicted_segments.saturating_add(1);
     }
 
     pub fn observe_replayed_segment(&mut self, command_count: usize) {
@@ -721,12 +746,32 @@ impl DeviceReusableExecutionObservation {
         self.captured_segments
     }
 
+    pub const fn uploaded_segments(self) -> u64 {
+        self.uploaded_segments
+    }
+
     pub const fn cache_hit_segments(self) -> u64 {
         self.cache_hit_segments
     }
 
+    pub const fn cached_rejected_segments(self) -> u64 {
+        self.cached_rejected_segments
+    }
+
     pub const fn capture_rejected_segments(self) -> u64 {
         self.capture_rejected_segments
+    }
+
+    pub const fn quiescence_deferred_segments(self) -> u64 {
+        self.quiescence_deferred_segments
+    }
+
+    pub const fn capacity_deferred_segments(self) -> u64 {
+        self.capacity_deferred_segments
+    }
+
+    pub const fn evicted_segments(self) -> u64 {
+        self.evicted_segments
     }
 
     pub const fn replayed_segments(self) -> u64 {
@@ -1486,6 +1531,53 @@ mod deferred_cleanup_tests {
                 .collect::<Vec<_>>(),
             vec!["bind-a", "bind-b", "compute", "writeback"]
         );
+    }
+
+    #[test]
+    fn reusable_execution_observation_preserves_each_fallback_and_replay_counter() {
+        let mut observation = DeviceReusableExecutionObservation::default();
+        observation.observe_candidate_segment();
+        observation.observe_captured_segment();
+        observation.observe_uploaded_segment();
+        observation.observe_cache_hit_segment();
+        observation.observe_cached_rejected_segment();
+        observation.observe_capture_rejection();
+        observation.observe_quiescence_deferred_segment();
+        observation.observe_capacity_deferred_segment();
+        observation.observe_evicted_segment();
+        observation.observe_replayed_segment(3);
+        observation.observe_eager_command();
+
+        assert_eq!(observation.candidate_segments(), 1);
+        assert_eq!(observation.captured_segments(), 1);
+        assert_eq!(observation.uploaded_segments(), 1);
+        assert_eq!(observation.cache_hit_segments(), 1);
+        assert_eq!(observation.cached_rejected_segments(), 1);
+        assert_eq!(observation.capture_rejected_segments(), 1);
+        assert_eq!(observation.quiescence_deferred_segments(), 1);
+        assert_eq!(observation.capacity_deferred_segments(), 1);
+        assert_eq!(observation.evicted_segments(), 1);
+        assert_eq!(observation.replayed_segments(), 1);
+        assert_eq!(observation.replayed_commands(), 3);
+        assert_eq!(observation.eager_commands(), 1);
+
+        let value = serde_json::to_value(observation).expect("observation serializes");
+        for field in [
+            "candidate_segments",
+            "captured_segments",
+            "uploaded_segments",
+            "cache_hit_segments",
+            "cached_rejected_segments",
+            "capture_rejected_segments",
+            "quiescence_deferred_segments",
+            "capacity_deferred_segments",
+            "evicted_segments",
+            "replayed_segments",
+            "eager_commands",
+        ] {
+            assert_eq!(value[field], 1, "counter {field} must remain typed");
+        }
+        assert_eq!(value["replayed_commands"], 3);
     }
 
     #[test]

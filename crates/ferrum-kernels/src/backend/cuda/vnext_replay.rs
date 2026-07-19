@@ -7,14 +7,19 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::Range;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaStream};
-use ferrum_interfaces::vnext::{DeviceReusableAddressScope, ElementType};
+use ferrum_interfaces::vnext::{DeviceCommandPhase, DeviceReusableAddressScope, ElementType};
 use sha2::{Digest, Sha256};
+
+use crate::backend::reusable_execution::{
+    discover_reusable_segments, plan_bounded_reusable_execution,
+};
 
 use super::vnext_runtime::{CudaCommandPayload, CudaDeviceCommand, CudaDeviceRuntimeError};
 
@@ -143,6 +148,49 @@ impl CudaExecutableSegmentKey {
     }
 }
 
+pub(crate) struct CudaExecutableCandidate {
+    range: Range<usize>,
+    key: CudaExecutableSegmentKey,
+}
+
+impl CudaExecutableCandidate {
+    pub(crate) fn start(&self) -> usize {
+        self.range.start
+    }
+
+    pub(crate) fn end(&self) -> usize {
+        self.range.end
+    }
+
+    fn commands<'commands>(
+        &self,
+        commands: &'commands [CudaDeviceCommand],
+    ) -> &'commands [CudaDeviceCommand] {
+        &commands[self.range.clone()]
+    }
+}
+
+pub(crate) fn cuda_executable_candidates(
+    phases: &[DeviceCommandPhase],
+    commands: &[CudaDeviceCommand],
+) -> Result<Vec<CudaExecutableCandidate>, CudaDeviceRuntimeError> {
+    if phases.len() != commands.len() {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA command phase count differs from its command count",
+        ));
+    }
+    Ok(discover_reusable_segments(phases, |index| {
+        commands[index].replay_key().is_some() && commands[index].reusable_address_scope().is_some()
+    })
+    .into_iter()
+    .filter_map(|segment| {
+        let range = segment.range();
+        CudaExecutableSegmentKey::from_commands(&commands[range.clone()])
+            .map(|key| CudaExecutableCandidate { range, key })
+    })
+    .collect())
+}
+
 #[derive(Debug)]
 pub(crate) struct CudaReplayError {
     stage: &'static str,
@@ -201,6 +249,7 @@ struct CudaExecutableSegment {
     _stream: Arc<CudaStream>,
     _blas: Arc<CudaBlas>,
     _payloads: Vec<Arc<CudaCommandPayload>>,
+    uploaded: bool,
     last_used: u64,
 }
 
@@ -287,19 +336,6 @@ impl CudaExecutableSegment {
                 true,
             ));
         }
-        let upload_status = unsafe { sys::cuGraphUpload(executable, stream.cu_stream()) };
-        if upload_status != sys::CUresult::CUDA_SUCCESS {
-            unsafe {
-                sys::cuGraphExecDestroy(executable);
-                sys::cuGraphDestroy(graph);
-            }
-            return Err(CudaReplayError::cuda(
-                "upload reusable executable",
-                upload_status,
-                false,
-            ));
-        }
-
         Ok(Self {
             graph,
             executable,
@@ -307,11 +343,32 @@ impl CudaExecutableSegment {
             _stream: Arc::clone(stream),
             _blas: Arc::clone(blas),
             _payloads: commands.iter().map(CudaDeviceCommand::payload).collect(),
+            uploaded: false,
             last_used,
         })
     }
 
+    fn upload(&mut self, stream: &CudaStream) -> Result<(), CudaReplayError> {
+        let status = unsafe { sys::cuGraphUpload(self.executable, stream.cu_stream()) };
+        if status != sys::CUresult::CUDA_SUCCESS {
+            return Err(CudaReplayError::cuda(
+                "upload reusable executable",
+                status,
+                false,
+            ));
+        }
+        self.uploaded = true;
+        Ok(())
+    }
+
     fn launch(&mut self, stream: &CudaStream, last_used: u64) -> Result<(), CudaReplayError> {
+        if !self.uploaded {
+            return Err(CudaReplayError {
+                stage: "launch reusable executable",
+                detail: "executable was not uploaded by its preparation phase".to_owned(),
+                eager_fallback_safe: false,
+            });
+        }
         let status = unsafe { sys::cuGraphLaunch(self.executable, stream.cu_stream()) };
         if status != sys::CUresult::CUDA_SUCCESS {
             return Err(CudaReplayError::cuda(
@@ -353,11 +410,50 @@ pub(crate) struct CudaExecutableCache {
     clock: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CudaExecutablePreparation {
-    Unavailable,
-    CacheHit,
-    Captured,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CudaExecutablePreparation {
+    cache_hit_segments: usize,
+    captured_segments: usize,
+    uploaded_segments: usize,
+    capture_rejected_segments: usize,
+    cached_rejected_segments: usize,
+    quiescence_deferred_segments: usize,
+    capacity_deferred_segments: usize,
+    evicted_segments: usize,
+}
+
+impl CudaExecutablePreparation {
+    pub(crate) fn cache_hit_segments(self) -> usize {
+        self.cache_hit_segments
+    }
+
+    pub(crate) fn captured_segments(self) -> usize {
+        self.captured_segments
+    }
+
+    pub(crate) fn uploaded_segments(self) -> usize {
+        self.uploaded_segments
+    }
+
+    pub(crate) fn capture_rejected_segments(self) -> usize {
+        self.capture_rejected_segments
+    }
+
+    pub(crate) fn cached_rejected_segments(self) -> usize {
+        self.cached_rejected_segments
+    }
+
+    pub(crate) fn quiescence_deferred_segments(self) -> usize {
+        self.quiescence_deferred_segments
+    }
+
+    pub(crate) fn capacity_deferred_segments(self) -> usize {
+        self.capacity_deferred_segments
+    }
+
+    pub(crate) fn evicted_segments(self) -> usize {
+        self.evicted_segments
+    }
 }
 
 impl CudaExecutableCache {
@@ -379,69 +475,129 @@ impl CudaExecutableCache {
         self.clock
     }
 
-    pub(crate) fn prepare(
+    pub(crate) fn prepare_all(
         &mut self,
         context: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
         blas: &Arc<CudaBlas>,
         commands: &[CudaDeviceCommand],
+        candidates: &[CudaExecutableCandidate],
         capture_allowed: bool,
     ) -> Result<CudaExecutablePreparation, CudaReplayError> {
-        let Some(key) = CudaExecutableSegmentKey::from_commands(commands) else {
-            return Ok(CudaExecutablePreparation::Unavailable);
-        };
-        let now = self.tick();
-        if let Some(entry) = self.entries.get_mut(&key) {
-            entry.last_used = now;
-            return Ok(CudaExecutablePreparation::CacheHit);
+        let mut report = CudaExecutablePreparation::default();
+        for candidate in candidates {
+            let now = self.tick();
+            if let Some(entry) = self.entries.get_mut(&candidate.key) {
+                entry.last_used = now;
+                report.cache_hit_segments += 1;
+            }
         }
-        if self.rejected.contains_key(&key) || !capture_allowed {
-            return Ok(CudaExecutablePreparation::Unavailable);
+        report.cached_rejected_segments = candidates
+            .iter()
+            .filter(|candidate| self.rejected.contains_key(&candidate.key))
+            .count();
+
+        if candidates.is_empty() {
+            return Ok(report);
         }
-        if self.entries.len() >= self.maximum_entries {
-            let oldest = self
-                .entries
+        if !capture_allowed {
+            report.quiescence_deferred_segments = candidates
+                .len()
+                .saturating_sub(report.cache_hit_segments)
+                .saturating_sub(report.cached_rejected_segments);
+            return Ok(report);
+        }
+
+        let candidate_keys = candidates
+            .iter()
+            .map(|candidate| candidate.key)
+            .collect::<Vec<_>>();
+        let resident_last_used = self
+            .entries
+            .iter()
+            .map(|(key, entry)| (*key, entry.last_used))
+            .collect::<Vec<_>>();
+        let rejected_keys = self.rejected.keys().copied().collect::<Vec<_>>();
+        let plan = plan_bounded_reusable_execution(
+            &candidate_keys,
+            &resident_last_used,
+            &rejected_keys,
+            self.maximum_entries,
+        );
+        report.capacity_deferred_segments = plan.capacity_deferred_misses().len();
+
+        let mut captured = Vec::with_capacity(plan.admitted_misses().len());
+        for key in plan.admitted_misses().iter().copied() {
+            let candidate = candidates
                 .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
+                .find(|candidate| candidate.key == key)
+                .expect("admitted CUDA executable key came from its candidate set");
+            let now = self.tick();
+            match CudaExecutableSegment::capture(
+                context,
+                stream,
+                blas,
+                candidate.commands(commands),
+                now,
+            ) {
+                Ok(entry) => captured.push((key, entry)),
+                Err(error) if error.eager_fallback_safe() => {
+                    self.remember_rejected(key, now);
+                    report.capture_rejected_segments += 1;
+                    tracing::debug!(
+                        error = %error,
+                        command_count = candidate.end() - candidate.start(),
+                        "CUDA reusable executable capture rejected; using eager fallback"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        for key in plan.required_evictions(captured.len()) {
+            if self.entries.remove(key).is_some() {
+                report.evicted_segments += 1;
+            }
+        }
+
+        let upload_keys = captured.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        report.captured_segments = captured.len();
+        for (key, entry) in captured {
+            let previous = self.entries.insert(key, entry);
+            debug_assert!(previous.is_none());
+        }
+        for key in upload_keys {
+            self.entries
+                .get_mut(&key)
+                .expect("captured CUDA executable was committed before upload")
+                .upload(stream)?;
+            report.uploaded_segments += 1;
+        }
+        debug_assert!(self.entries.len() <= self.maximum_entries);
+        Ok(report)
+    }
+
+    fn remember_rejected(&mut self, key: CudaExecutableSegmentKey, now: u64) {
+        if self.rejected.len() >= self.maximum_entries {
+            let oldest = self
+                .rejected
+                .iter()
+                .min_by_key(|(_, last_used)| *last_used)
                 .map(|(key, _)| *key);
             if let Some(oldest) = oldest {
-                self.entries.remove(&oldest);
+                self.rejected.remove(&oldest);
             }
         }
-        match CudaExecutableSegment::capture(context, stream, blas, commands, now) {
-            Ok(entry) => {
-                self.entries.insert(key, entry);
-                Ok(CudaExecutablePreparation::Captured)
-            }
-            Err(error) => {
-                if error.eager_fallback_safe() {
-                    if self.rejected.len() >= self.maximum_entries {
-                        let oldest = self
-                            .rejected
-                            .iter()
-                            .min_by_key(|(_, last_used)| *last_used)
-                            .map(|(key, _)| *key);
-                        if let Some(oldest) = oldest {
-                            self.rejected.remove(&oldest);
-                        }
-                    }
-                    self.rejected.insert(key, now);
-                }
-                Err(error)
-            }
-        }
+        self.rejected.insert(key, now);
     }
 
     pub(crate) fn launch(
         &mut self,
         stream: &CudaStream,
-        commands: &[CudaDeviceCommand],
+        candidate: &CudaExecutableCandidate,
     ) -> Result<bool, CudaReplayError> {
-        let Some(key) = CudaExecutableSegmentKey::from_commands(commands) else {
-            return Ok(false);
-        };
         let now = self.tick();
-        let Some(entry) = self.entries.get_mut(&key) else {
+        let Some(entry) = self.entries.get_mut(&candidate.key) else {
             return Ok(false);
         };
         entry.launch(stream, now)?;

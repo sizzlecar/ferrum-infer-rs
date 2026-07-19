@@ -270,8 +270,13 @@ impl VNextWaveTimingMetrics {
 struct VNextReusableExecutionMetrics {
     candidate_segments: AtomicU64,
     captured_segments: AtomicU64,
+    uploaded_segments: AtomicU64,
     cache_hit_segments: AtomicU64,
+    cached_rejected_segments: AtomicU64,
     capture_rejected_segments: AtomicU64,
+    quiescence_deferred_segments: AtomicU64,
+    capacity_deferred_segments: AtomicU64,
+    evicted_segments: AtomicU64,
     replayed_segments: AtomicU64,
     replayed_commands: AtomicU64,
     eager_commands: AtomicU64,
@@ -283,10 +288,22 @@ impl VNextReusableExecutionMetrics {
             .fetch_add(observation.candidate_segments(), Ordering::Relaxed);
         self.captured_segments
             .fetch_add(observation.captured_segments(), Ordering::Relaxed);
+        self.uploaded_segments
+            .fetch_add(observation.uploaded_segments(), Ordering::Relaxed);
         self.cache_hit_segments
             .fetch_add(observation.cache_hit_segments(), Ordering::Relaxed);
+        self.cached_rejected_segments
+            .fetch_add(observation.cached_rejected_segments(), Ordering::Relaxed);
         self.capture_rejected_segments
             .fetch_add(observation.capture_rejected_segments(), Ordering::Relaxed);
+        self.quiescence_deferred_segments.fetch_add(
+            observation.quiescence_deferred_segments(),
+            Ordering::Relaxed,
+        );
+        self.capacity_deferred_segments
+            .fetch_add(observation.capacity_deferred_segments(), Ordering::Relaxed);
+        self.evicted_segments
+            .fetch_add(observation.evicted_segments(), Ordering::Relaxed);
         self.replayed_segments
             .fetch_add(observation.replayed_segments(), Ordering::Relaxed);
         self.replayed_commands
@@ -299,8 +316,13 @@ impl VNextReusableExecutionMetrics {
         serde_json::json!({
             "candidate_segments": self.candidate_segments.load(Ordering::Relaxed),
             "captured_segments": self.captured_segments.load(Ordering::Relaxed),
+            "uploaded_segments": self.uploaded_segments.load(Ordering::Relaxed),
             "cache_hit_segments": self.cache_hit_segments.load(Ordering::Relaxed),
+            "cached_rejected_segments": self.cached_rejected_segments.load(Ordering::Relaxed),
             "capture_rejected_segments": self.capture_rejected_segments.load(Ordering::Relaxed),
+            "quiescence_deferred_segments": self.quiescence_deferred_segments.load(Ordering::Relaxed),
+            "capacity_deferred_segments": self.capacity_deferred_segments.load(Ordering::Relaxed),
+            "evicted_segments": self.evicted_segments.load(Ordering::Relaxed),
             "replayed_segments": self.replayed_segments.load(Ordering::Relaxed),
             "replayed_commands": self.replayed_commands.load(Ordering::Relaxed),
             "eager_commands": self.eager_commands.load(Ordering::Relaxed),
@@ -4200,8 +4222,47 @@ mod tests {
     use super::{
         reported_allocated_bytes, resolved_sequence_fit_policy, AdmissionFitPolicy,
         DecodeFailureDisposition, FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics,
-        VNextWaveTimingMetrics,
+        VNextReusableExecutionMetrics, VNextWaveTimingMetrics,
     };
+    use ferrum_interfaces::vnext::DeviceReusableExecutionObservation;
+
+    #[test]
+    fn reusable_execution_metrics_aggregate_typed_preparation_outcomes() {
+        let mut observation = DeviceReusableExecutionObservation::default();
+        observation.observe_candidate_segment();
+        observation.observe_captured_segment();
+        observation.observe_uploaded_segment();
+        observation.observe_cache_hit_segment();
+        observation.observe_cached_rejected_segment();
+        observation.observe_capture_rejection();
+        observation.observe_quiescence_deferred_segment();
+        observation.observe_capacity_deferred_segment();
+        observation.observe_evicted_segment();
+        observation.observe_replayed_segment(4);
+        observation.observe_eager_command();
+
+        let metrics = VNextReusableExecutionMetrics::default();
+        metrics.record(observation);
+        metrics.record(observation);
+        let snapshot = metrics.snapshot();
+
+        for field in [
+            "candidate_segments",
+            "captured_segments",
+            "uploaded_segments",
+            "cache_hit_segments",
+            "cached_rejected_segments",
+            "capture_rejected_segments",
+            "quiescence_deferred_segments",
+            "capacity_deferred_segments",
+            "evicted_segments",
+            "replayed_segments",
+            "eager_commands",
+        ] {
+            assert_eq!(snapshot[field], 2, "counter {field} must aggregate");
+        }
+        assert_eq!(snapshot["replayed_commands"], 8);
+    }
 
     #[test]
     fn wave_timing_snapshot_exposes_honest_host_boundaries() {
