@@ -533,6 +533,7 @@ def collect_correctness(
     model: Path,
     model_id: str,
     environment: dict[str, str],
+    batched_graph: bool = False,
 ) -> None:
     binary = "target/release/ferrum"
     run = raw / "run"
@@ -558,6 +559,8 @@ def collect_correctness(
         "--scheduler-trace-jsonl",
         str(run / "scheduler-trace.jsonl"),
     ]
+    if batched_graph:
+        run_argv.append("--batched-graph")
     run_command(
         run_argv,
         cwd=repo,
@@ -590,6 +593,8 @@ def collect_correctness(
         "--scheduler-trace-jsonl",
         str(serve / "scheduler-trace.jsonl"),
     ]
+    if batched_graph:
+        serve_argv.append("--batched-graph")
     server = Server(
         serve_argv,
         cwd=repo,
@@ -646,6 +651,7 @@ def collect_correctness(
             stderr_name="bench.stderr.log",
             timeout_seconds=600.0,
         )
+        write_json(serve / "health.after-bench.json", fetch_json(port, "/health"))
     finally:
         server.stop()
     write_json(serve / "server-stop.json", {"stopped": True, "signal": "SIGINT", "exit_code": 0})
@@ -659,6 +665,7 @@ def collect_profile_slots(
     environment: dict[str, str],
     port_base: int,
     telemetry_interval_ms: int,
+    batched_graph: bool = False,
 ) -> None:
     binary = "target/release/ferrum"
     performance = raw / "profile-overhead"
@@ -682,6 +689,8 @@ def collect_profile_slots(
             "--profile-detail",
             mode,
         ]
+        if batched_graph:
+            server_argv.append("--batched-graph")
         if mode == "basic":
             server_argv.extend(
                 [
@@ -828,6 +837,7 @@ def collect(args: argparse.Namespace) -> int:
                 "seed": 9271,
                 "require_ci": True,
                 "fail_on_error": True,
+                "batched_graph": args.batched_graph,
                 "telemetry_interval_ms": args.telemetry_interval_ms,
             },
         },
@@ -870,7 +880,14 @@ def collect(args: argparse.Namespace) -> int:
     write_text(out / "hardware.csv", hardware_query.stdout)
 
     model_id = model.name
-    collect_correctness(repo, out, model, model_id, environment)
+    collect_correctness(
+        repo,
+        out,
+        model,
+        model_id,
+        environment,
+        batched_graph=args.batched_graph,
+    )
     correctness = subprocess.run(
         [
             sys.executable,
@@ -911,6 +928,7 @@ def collect(args: argparse.Namespace) -> int:
         environment,
         args.port_base,
         args.telemetry_interval_ms,
+        batched_graph=args.batched_graph,
     )
     write_text(out / "finished", now_iso() + "\n")
     print(f"{COLLECTED_PREFIX}: {out}")
@@ -955,6 +973,11 @@ def parse_args() -> argparse.Namespace:
     collect_parser.add_argument("--out", type=Path, required=True)
     collect_parser.add_argument("--port-base", type=int, default=18101)
     collect_parser.add_argument("--telemetry-interval-ms", type=int, default=500)
+    collect_parser.add_argument(
+        "--batched-graph",
+        action="store_true",
+        help="exercise the user-visible typed CUDA graph preset",
+    )
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
 
