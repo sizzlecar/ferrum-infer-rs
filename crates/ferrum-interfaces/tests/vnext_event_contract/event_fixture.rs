@@ -10,12 +10,8 @@ impl ExecutionEventSink for RecordingSink {
         true
     }
 
-    fn record(
-        &self,
-        event: &ExecutionEvent,
-        _permit: EventEmissionPermit<'_>,
-    ) -> Result<(), ExecutionEventSinkError> {
-        self.kinds.lock().unwrap().push(event.kind());
+    fn record(&self, permit: EventEmissionPermit) -> Result<(), ExecutionEventSinkError> {
+        self.kinds.lock().unwrap().push(permit.event().kind());
         Ok(())
     }
 }
@@ -32,19 +28,15 @@ impl ExecutionEventSink for BatchRecordingSink {
         true
     }
 
-    fn record(
-        &self,
-        event: &ExecutionEvent,
-        _permit: EventEmissionPermit<'_>,
-    ) -> Result<(), ExecutionEventSinkError> {
+    fn record(&self, permit: EventEmissionPermit) -> Result<(), ExecutionEventSinkError> {
         *self.record_calls.lock().unwrap() += 1;
-        self.kinds.lock().unwrap().push(event.kind());
+        self.kinds.lock().unwrap().push(permit.event().kind());
         Ok(())
     }
 
     fn record_batch(
         &self,
-        permit: EventBatchEmissionPermit<'_>,
+        permit: EventBatchEmissionPermit,
     ) -> Result<(), ExecutionEventSinkError> {
         *self.batch_calls.lock().unwrap() += 1;
         self.kinds
@@ -62,11 +54,7 @@ impl ExecutionEventSink for FailingSink {
         true
     }
 
-    fn record(
-        &self,
-        _event: &ExecutionEvent,
-        _permit: EventEmissionPermit<'_>,
-    ) -> Result<(), ExecutionEventSinkError> {
+    fn record(&self, _permit: EventEmissionPermit) -> Result<(), ExecutionEventSinkError> {
         Err(ExecutionEventSinkError::new("injected sink failure"))
     }
 }
@@ -82,18 +70,14 @@ impl ExecutionEventSink for DisabledRecordingSink {
         false
     }
 
-    fn record(
-        &self,
-        _event: &ExecutionEvent,
-        _permit: EventEmissionPermit<'_>,
-    ) -> Result<(), ExecutionEventSinkError> {
+    fn record(&self, _permit: EventEmissionPermit) -> Result<(), ExecutionEventSinkError> {
         *self.record_calls.lock().unwrap() += 1;
         Ok(())
     }
 
     fn record_batch(
         &self,
-        _permit: EventBatchEmissionPermit<'_>,
+        _permit: EventBatchEmissionPermit,
     ) -> Result<(), ExecutionEventSinkError> {
         *self.batch_calls.lock().unwrap() += 1;
         Ok(())

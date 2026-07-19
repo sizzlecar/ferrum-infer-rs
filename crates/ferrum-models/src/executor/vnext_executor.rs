@@ -1109,7 +1109,7 @@ impl VNextExecutionJournal {
                 &journal.topology,
             ),
         ];
-        journal.emitter.emit_batch(&events, &contexts)?;
+        journal.emitter.emit_batch(events.into(), &contexts)?;
         Ok(journal)
     }
 
@@ -1332,7 +1332,7 @@ impl VNextExecutionJournal {
                 submission,
             ),
         ];
-        self.emitter.emit_batch(&events, &contexts)?;
+        self.emitter.emit_batch(events.into(), &contexts)?;
         self.pending_submission = Some(JournaledSubmission::Captured {
             receipt: submission.clone(),
             selected,
@@ -1433,7 +1433,7 @@ impl VNextExecutionJournal {
                 }
             })
             .collect::<Vec<_>>();
-        self.emitter.emit_batch(&events, &contexts)?;
+        self.emitter.emit_batch(events, &contexts)?;
         self.completed_frames = self.completed_frames.saturating_add(1);
         Ok(())
     }
@@ -1468,7 +1468,7 @@ impl VNextExecutionJournal {
             ExecutionEventDetail::None,
         )?;
         self.emitter.emit(
-            &sequence_completed,
+            sequence_completed,
             &TrustedExecutionEventContext::completed(
                 self.active.run_id(),
                 self.active.request_id(),
@@ -1494,7 +1494,7 @@ impl VNextExecutionJournal {
             },
         )?;
         self.emitter.emit(
-            &request_completed,
+            request_completed,
             &TrustedExecutionEventContext::completed(
                 self.active.run_id(),
                 self.active.request_id(),

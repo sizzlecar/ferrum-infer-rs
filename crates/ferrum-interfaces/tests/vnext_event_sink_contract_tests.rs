@@ -57,7 +57,7 @@ fn vnext_event_sink_contract() {
         ExecutionEventEmitter::new(&sink, active.run_id().clone(), active.request_id().clone());
     emitter
         .emit(
-            accepted,
+            accepted.clone(),
             &TrustedExecutionEventContext::pre_plan(active.run_id(), active.request_id()),
         )
         .unwrap();
@@ -75,7 +75,7 @@ fn vnext_event_sink_contract() {
     );
     durable_emitter
         .emit(
-            accepted,
+            accepted.clone(),
             &TrustedExecutionEventContext::pre_plan(active.run_id(), active.request_id()),
         )
         .unwrap();
@@ -94,7 +94,7 @@ fn vnext_event_sink_contract() {
         TrustedExecutionEventContext::bound(active.run_id(), active.request_id(), &topology),
     ];
     default_batch_emitter
-        .emit_batch(&journal[..2], &default_batch_contexts)
+        .emit_batch(journal[..2].to_vec(), &default_batch_contexts)
         .unwrap();
     check(
         &mut passed,
@@ -121,7 +121,7 @@ fn vnext_event_sink_contract() {
     check(
         &mut passed,
         batch_emitter
-            .emit_batch(&journal[..2], &invalid_contexts)
+            .emit_batch(journal[..2].to_vec(), &invalid_contexts)
             .is_err(),
     );
     check(
@@ -134,7 +134,9 @@ fn vnext_event_sink_contract() {
         TrustedExecutionEventContext::pre_plan(active.run_id(), active.request_id()),
         TrustedExecutionEventContext::bound(active.run_id(), active.request_id(), &topology),
     ];
-    batch_emitter.emit_batch(&journal[..2], &contexts).unwrap();
+    batch_emitter
+        .emit_batch(journal[..2].to_vec(), &contexts)
+        .unwrap();
     check(
         &mut passed,
         *batch_sink.batch_calls.lock().unwrap() == 1
@@ -157,7 +159,7 @@ fn vnext_event_sink_contract() {
     check(
         &mut passed,
         failed_batch_emitter
-            .emit_batch(&journal[..2], &contexts)
+            .emit_batch(journal[..2].to_vec(), &contexts)
             .is_err(),
     );
     check(
@@ -171,7 +173,7 @@ fn vnext_event_sink_contract() {
         active.request_id().clone(),
     );
     disabled_emitter
-        .emit_batch(&journal[..2], &contexts)
+        .emit_batch(journal[..2].to_vec(), &contexts)
         .unwrap();
     check(
         &mut passed,
@@ -191,7 +193,7 @@ fn vnext_event_sink_contract() {
         &mut passed,
         failed_emitter
             .emit(
-                accepted,
+                accepted.clone(),
                 &TrustedExecutionEventContext::pre_plan(active.run_id(), active.request_id()),
             )
             .is_err(),
@@ -204,7 +206,7 @@ fn vnext_event_sink_contract() {
         &mut passed,
         failed_emitter
             .emit(
-                accepted,
+                accepted.clone(),
                 &TrustedExecutionEventContext::pre_plan(active.run_id(), active.request_id()),
             )
             .is_err(),
@@ -212,7 +214,9 @@ fn vnext_event_sink_contract() {
     let event_sink_source = include_str!("../src/vnext/event/sink.rs");
     check(
         &mut passed,
-        event_sink_source.contains("pub struct EventEmissionPermit<'event>")
+        event_sink_source.contains("pub struct EventEmissionPermit {")
+            && event_sink_source.contains("pub fn into_event(self) -> ExecutionEvent")
+            && event_sink_source.contains("pub fn into_events(self) -> Vec<ExecutionEvent>")
             && !event_sink_source.contains("pub fn new_event_emission_permit"),
     );
 

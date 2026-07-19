@@ -9,7 +9,9 @@ use crate::resource_lifecycle::{
     ResourceLedgerTransition, ResourceLifecycleLedger, ResourceOwnerCloseSummary,
 };
 use async_trait::async_trait;
-use ferrum_bench_core::{global_profile, profile_fields_from_json, JsonlJournal};
+use ferrum_bench_core::{
+    global_profile, profile_fields_from_json, JsonlJournal, JsonlJournalError,
+};
 use ferrum_interfaces::{
     engine::{InferenceEngine, LlmInferenceEngine},
     kv_cache::AllocationRequest,
@@ -2390,7 +2392,7 @@ struct EngineInner {
     /// Prefix cache: shares KV blocks across requests with common prompts.
     prefix_cache: PrefixCache,
     runtime_config: ContinuousEngineRuntimeConfig,
-    scheduler_trace_jsonl: Option<JsonlJournal<FerrumProfileEvent>>,
+    scheduler_trace_jsonl: Option<SchedulerTraceJournal>,
     legacy_scheduler_trace_jsonl: Option<Arc<Mutex<std::fs::File>>>,
     scheduler_trace_none_streak: AtomicU64,
     resource_lifecycle: Mutex<ResourceLifecycleLedger>,
@@ -3466,38 +3468,132 @@ fn vnext_execution_event_name(kind: VNextExecutionEventKind) -> &'static str {
     }
 }
 
-struct VNextProfileExecutionEventSink {
-    journal: JsonlJournal<FerrumProfileEvent>,
+struct VNextProfileEventContext {
     entrypoint: ProfileEntrypoint,
     model: String,
     backend_device: String,
     backend_type: String,
+    capture_policy: ExecutionEventCapturePolicy,
+}
+
+struct DeferredVNextProfileEvent {
+    event: ExecutionEvent,
+    timestamp: chrono::DateTime<chrono::Utc>,
+    context: Arc<VNextProfileEventContext>,
+}
+
+enum SchedulerTraceRecord {
+    Profile(FerrumProfileEvent),
+    DeferredVNext(DeferredVNextProfileEvent),
+}
+
+impl serde::Serialize for SchedulerTraceRecord {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Profile(event) => serde::Serialize::serialize(event, serializer),
+            Self::DeferredVNext(record) => {
+                let event = record
+                    .context
+                    .profile_event(&record.event, record.timestamp.to_owned())
+                    .map_err(serde::ser::Error::custom)?;
+                serde::Serialize::serialize(&event, serializer)
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SchedulerTraceJournal {
+    inner: JsonlJournal<SchedulerTraceRecord>,
+}
+
+impl SchedulerTraceJournal {
+    fn create(path: impl Into<PathBuf>) -> std::io::Result<Self> {
+        JsonlJournal::create(path).map(|inner| Self { inner })
+    }
+
+    fn enqueue(&self, event: FerrumProfileEvent) -> std::result::Result<(), JsonlJournalError> {
+        self.inner.enqueue(SchedulerTraceRecord::Profile(event))
+    }
+
+    #[cfg(test)]
+    fn enqueue_batch(
+        &self,
+        events: Vec<FerrumProfileEvent>,
+    ) -> std::result::Result<(), JsonlJournalError> {
+        self.inner.enqueue_batch(
+            events
+                .into_iter()
+                .map(SchedulerTraceRecord::Profile)
+                .collect(),
+        )
+    }
+
+    fn enqueue_deferred_vnext(
+        &self,
+        event: DeferredVNextProfileEvent,
+    ) -> std::result::Result<(), JsonlJournalError> {
+        self.inner
+            .enqueue(SchedulerTraceRecord::DeferredVNext(event))
+    }
+
+    fn enqueue_deferred_vnext_batch(
+        &self,
+        events: Vec<DeferredVNextProfileEvent>,
+    ) -> std::result::Result<(), JsonlJournalError> {
+        self.inner.enqueue_batch(
+            events
+                .into_iter()
+                .map(SchedulerTraceRecord::DeferredVNext)
+                .collect(),
+        )
+    }
+
+    #[cfg(test)]
+    fn flush(&self) -> std::result::Result<(), JsonlJournalError> {
+        self.inner.flush()
+    }
+
+    fn close(&self) -> std::result::Result<(), JsonlJournalError> {
+        self.inner.close()
+    }
+}
+
+struct VNextProfileExecutionEventSink {
+    journal: SchedulerTraceJournal,
+    context: Arc<VNextProfileEventContext>,
 }
 
 impl VNextProfileExecutionEventSink {
     fn new(
-        journal: JsonlJournal<FerrumProfileEvent>,
+        journal: SchedulerTraceJournal,
         entrypoint: ProfileEntrypoint,
         config: &EngineConfig,
     ) -> Self {
         Self {
             journal,
-            entrypoint,
-            model: config.model.model_id.to_string(),
-            backend_device: format!("{:?}", config.backend.device),
-            backend_type: format!("{:?}", config.backend.backend_type),
+            context: Arc::new(VNextProfileEventContext {
+                entrypoint,
+                model: config.model.model_id.to_string(),
+                backend_device: format!("{:?}", config.backend.device),
+                backend_type: format!("{:?}", config.backend.backend_type),
+                capture_policy: ExecutionEventCapturePolicy::FirstFramePerRequest,
+            }),
         }
     }
 }
 
-impl VNextProfileExecutionEventSink {
+impl VNextProfileEventContext {
     fn profile_event(
         &self,
         event: &ExecutionEvent,
+        timestamp: chrono::DateTime<chrono::Utc>,
     ) -> std::result::Result<FerrumProfileEvent, ExecutionEventSinkError> {
         let identity = event.identity().parts();
         let event_name = vnext_execution_event_name(event.kind());
-        let timestamp = chrono::Utc::now();
         let failure = match event.detail() {
             ExecutionEventDetail::Failure(failure) => Some(ProfileError {
                 kind: failure.failure().code().to_string(),
@@ -3556,7 +3652,7 @@ impl VNextProfileExecutionEventSink {
             ("profile_detail".to_string(), serde_json::json!("basic")),
             (
                 "execution_capture_policy".to_string(),
-                serde_json::json!(self.capture_policy().as_str()),
+                serde_json::json!(self.capture_policy.as_str()),
             ),
             (
                 "execution_event_kind".to_string(),
@@ -3663,21 +3759,43 @@ impl VNextProfileExecutionEventSink {
         })?;
         Ok(profile)
     }
+}
+
+impl VNextProfileExecutionEventSink {
+    #[cfg(test)]
+    fn profile_event(
+        &self,
+        event: &ExecutionEvent,
+    ) -> std::result::Result<FerrumProfileEvent, ExecutionEventSinkError> {
+        self.context.profile_event(event, chrono::Utc::now())
+    }
 
     fn enqueue_events(
         &self,
-        events: &[ExecutionEvent],
+        events: Vec<ExecutionEvent>,
     ) -> std::result::Result<(), ExecutionEventSinkError> {
-        let mut profiles = Vec::new();
-        profiles.try_reserve(events.len()).map_err(|error| {
-            ExecutionEventSinkError::new(format!("reserve vNext profile batch: {error}"))
+        if events.is_empty() {
+            return Ok(());
+        }
+        let timestamp = chrono::Utc::now();
+        let mut deferred = Vec::new();
+        deferred.try_reserve(events.len()).map_err(|error| {
+            ExecutionEventSinkError::new(format!("reserve deferred vNext profile batch: {error}"))
         })?;
         for event in events {
-            profiles.push(self.profile_event(event)?);
+            deferred.push(DeferredVNextProfileEvent {
+                event,
+                timestamp,
+                context: Arc::clone(&self.context),
+            });
         }
-        self.journal.enqueue_batch(profiles).map_err(|error| {
-            ExecutionEventSinkError::new(format!("enqueue vNext profile batch: {error}"))
-        })
+        self.journal
+            .enqueue_deferred_vnext_batch(deferred)
+            .map_err(|error| {
+                ExecutionEventSinkError::new(format!(
+                    "enqueue deferred vNext profile batch: {error}"
+                ))
+            })
     }
 }
 
@@ -3691,33 +3809,34 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
     }
 
     fn capture_policy(&self) -> ExecutionEventCapturePolicy {
-        ExecutionEventCapturePolicy::FirstFramePerRequest
+        self.context.capture_policy
     }
 
     fn record(
         &self,
-        event: &ExecutionEvent,
-        permit: EventEmissionPermit<'_>,
+        permit: EventEmissionPermit,
     ) -> std::result::Result<(), ExecutionEventSinkError> {
-        debug_assert!(std::ptr::eq(event, permit.event()));
-        self.journal
-            .enqueue(self.profile_event(event)?)
-            .map_err(|error| {
-                ExecutionEventSinkError::new(format!("enqueue vNext profile event: {error}"))
-            })
+        let event = DeferredVNextProfileEvent {
+            event: permit.into_event(),
+            timestamp: chrono::Utc::now(),
+            context: Arc::clone(&self.context),
+        };
+        self.journal.enqueue_deferred_vnext(event).map_err(|error| {
+            ExecutionEventSinkError::new(format!("enqueue deferred vNext profile event: {error}"))
+        })
     }
 
     fn record_batch(
         &self,
-        permit: EventBatchEmissionPermit<'_>,
+        permit: EventBatchEmissionPermit,
     ) -> std::result::Result<(), ExecutionEventSinkError> {
-        self.enqueue_events(permit.events())
+        self.enqueue_events(permit.into_events())
     }
 }
 
-fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<JsonlJournal<FerrumProfileEvent>> {
+fn create_scheduler_trace_sink(path: Option<&Path>) -> Option<SchedulerTraceJournal> {
     let path = path?;
-    match JsonlJournal::create(path.to_path_buf()) {
+    match SchedulerTraceJournal::create(path.to_path_buf()) {
         Ok(journal) => Some(journal),
         Err(error) => {
             warn!(

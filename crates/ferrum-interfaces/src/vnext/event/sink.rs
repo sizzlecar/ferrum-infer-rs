@@ -36,28 +36,37 @@ mod event_sink_seal {
     pub struct Seal;
 }
 
-/// Capability created only after the emitter has validated the event against
-/// its transactional cursor. External callers cannot construct this value.
-pub struct EventEmissionPermit<'event> {
-    event: &'event ExecutionEvent,
+/// Owned capability created only after the emitter has validated the event
+/// against its transactional cursor. Ownership lets asynchronous sinks defer
+/// materialization without cloning the event or extending producer lifetimes.
+pub struct EventEmissionPermit {
+    event: ExecutionEvent,
     _seal: event_sink_seal::Seal,
 }
 
-impl<'event> EventEmissionPermit<'event> {
-    pub fn event(&self) -> &'event ExecutionEvent {
+impl EventEmissionPermit {
+    pub fn event(&self) -> &ExecutionEvent {
+        &self.event
+    }
+
+    pub fn into_event(self) -> ExecutionEvent {
         self.event
     }
 }
 
-/// Capability created only after the emitter has validated an ordered event
-/// batch against one transactional cursor.
-pub struct EventBatchEmissionPermit<'events> {
-    events: &'events [ExecutionEvent],
+/// Owned capability created only after the emitter has validated an ordered
+/// event batch against one transactional cursor.
+pub struct EventBatchEmissionPermit {
+    events: Vec<ExecutionEvent>,
     _seal: event_sink_seal::Seal,
 }
 
-impl<'events> EventBatchEmissionPermit<'events> {
-    pub fn events(&self) -> &'events [ExecutionEvent] {
+impl EventBatchEmissionPermit {
+    pub fn events(&self) -> &[ExecutionEvent] {
+        &self.events
+    }
+
+    pub fn into_events(self) -> Vec<ExecutionEvent> {
         self.events
     }
 }
@@ -96,26 +105,19 @@ pub trait ExecutionEventSink: Send + Sync {
         ExecutionEventCapturePolicy::AllFrames
     }
 
-    fn record(
-        &self,
-        event: &ExecutionEvent,
-        permit: EventEmissionPermit<'_>,
-    ) -> Result<(), ExecutionEventSinkError>;
+    fn record(&self, permit: EventEmissionPermit) -> Result<(), ExecutionEventSinkError>;
 
     /// Records one cursor-ordered batch. Sinks with a buffered transport should
     /// override this boundary; the default preserves compatibility and order.
     fn record_batch(
         &self,
-        permit: EventBatchEmissionPermit<'_>,
+        permit: EventBatchEmissionPermit,
     ) -> Result<(), ExecutionEventSinkError> {
-        for event in permit.events() {
-            self.record(
+        for event in permit.into_events() {
+            self.record(EventEmissionPermit {
                 event,
-                EventEmissionPermit {
-                    event,
-                    _seal: event_sink_seal::Seal,
-                },
-            )?;
+                _seal: event_sink_seal::Seal,
+            })?;
         }
         Ok(())
     }
@@ -206,7 +208,7 @@ impl<'sink> ExecutionEventEmitter<'sink> {
 
     pub fn emit(
         &mut self,
-        event: &ExecutionEvent,
+        event: ExecutionEvent,
         context: &TrustedExecutionEventContext<'_>,
     ) -> Result<(), ExecutionEventSinkError> {
         if self.sink_failed {
@@ -215,13 +217,13 @@ impl<'sink> ExecutionEventEmitter<'sink> {
             ));
         }
         let mut next_cursor = self.cursor.clone();
-        Self::validate_next(&mut next_cursor, event, context)?;
+        Self::validate_next(&mut next_cursor, &event, context)?;
         if self.sink.as_sink().is_enabled(event.kind()) {
             let permit = EventEmissionPermit {
                 event,
                 _seal: event_sink_seal::Seal,
             };
-            if let Err(error) = self.sink.as_sink().record(event, permit) {
+            if let Err(error) = self.sink.as_sink().record(permit) {
                 self.sink_failed = true;
                 return Err(error);
             }
@@ -232,7 +234,7 @@ impl<'sink> ExecutionEventEmitter<'sink> {
 
     pub fn emit_batch(
         &mut self,
-        events: &[ExecutionEvent],
+        events: Vec<ExecutionEvent>,
         contexts: &[TrustedExecutionEventContext<'_>],
     ) -> Result<(), ExecutionEventSinkError> {
         if self.sink_failed {
@@ -267,15 +269,15 @@ impl<'sink> ExecutionEventEmitter<'sink> {
                 return Err(error);
             }
         } else {
-            for event in events
-                .iter()
-                .filter(|event| self.sink.as_sink().is_enabled(event.kind()))
-            {
+            for event in events {
+                if !self.sink.as_sink().is_enabled(event.kind()) {
+                    continue;
+                }
                 let permit = EventEmissionPermit {
                     event,
                     _seal: event_sink_seal::Seal,
                 };
-                if let Err(error) = self.sink.as_sink().record(event, permit) {
+                if let Err(error) = self.sink.as_sink().record(permit) {
                     self.sink_failed = true;
                     return Err(error);
                 }
@@ -302,11 +304,7 @@ impl ExecutionEventSink for DisabledExecutionEventSink {
         false
     }
 
-    fn record(
-        &self,
-        _event: &ExecutionEvent,
-        _permit: EventEmissionPermit<'_>,
-    ) -> Result<(), ExecutionEventSinkError> {
+    fn record(&self, _permit: EventEmissionPermit) -> Result<(), ExecutionEventSinkError> {
         Ok(())
     }
 }
