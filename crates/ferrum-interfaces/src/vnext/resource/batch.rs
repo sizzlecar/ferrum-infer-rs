@@ -1133,6 +1133,7 @@ pub(super) fn finalize_session_frames(
 #[derive(Default)]
 pub(super) struct InvocationRegistryState {
     pub(super) entries: BTreeMap<ParticipantNodeKey, ParticipantNodeLedgerEntry>,
+    pub(super) submission_wave: Option<SubmissionWaveLedgerEntry>,
     pub(super) poisoned: bool,
 }
 
@@ -1151,6 +1152,14 @@ pub(super) struct ParticipantNodeLedgerEntry {
     pub(super) phase: PhysicalInvocationPhase,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct SubmissionWaveLedgerEntry {
+    // Full-plan preparation has already proved the exact node set. This compact entry is
+    // therefore the unexpanded participant x plan-node Cartesian tombstone for the step.
+    pub(super) ledger: ParticipantNodeLedgerEntry,
+    pub(super) covered_participant_nodes: usize,
+}
+
 #[derive(Default)]
 pub(super) struct InvocationRegistry {
     pub(super) state: Mutex<InvocationRegistryState>,
@@ -1162,7 +1171,7 @@ impl InvocationRegistry {
             .state
             .lock()
             .map_err(|_| invalid_resource("invocation registry is poisoned"))?;
-        if state.poisoned || !state.entries.is_empty() {
+        if state.poisoned || !state.entries.is_empty() || state.submission_wave.is_some() {
             return Err(invalid_resource(
                 "unsubmitted step rollback requires a pristine invocation registry",
             ));
@@ -1188,7 +1197,8 @@ impl InvocationRegistry {
         if state.poisoned {
             return Err(invalid_resource("invocation registry is fail-closed"));
         }
-        if keys.iter().any(|key| state.entries.contains_key(key)) {
+        if state.submission_wave.is_some() || keys.iter().any(|key| state.entries.contains_key(key))
+        {
             return Err(invalid_resource(
                 "participant/frame/node topology is already prepared, in flight, or retired in this step",
             ));
@@ -1208,23 +1218,78 @@ impl InvocationRegistry {
         }
         Ok(ActiveInvocationWaveGuard {
             registry: Arc::clone(self),
-            keys,
+            topology: ActiveInvocationLedgerTopology::ParticipantNodes(keys),
             work_fingerprint: work_fingerprint.to_owned(),
+            batch_invocation_id,
+            phase: PhysicalInvocationPhase::Prepared,
+        })
+    }
+
+    pub(super) fn enter_submission_wave(
+        self: &Arc<Self>,
+        covered_participant_nodes: usize,
+        batch_invocation_id: BatchInvocationId,
+        topology_fingerprint: &str,
+    ) -> Result<ActiveInvocationWaveGuard, VNextError> {
+        if covered_participant_nodes == 0 {
+            return Err(invalid_resource(
+                "full-plan submission wave ledger requires non-zero participant-node coverage",
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_resource("invocation registry is poisoned"))?;
+        if state.poisoned {
+            return Err(invalid_resource("invocation registry is fail-closed"));
+        }
+        if state.submission_wave.is_some() || !state.entries.is_empty() {
+            return Err(invalid_resource(
+                "full-plan submission wave overlaps prepared, in-flight, or retired participant-node topology in this step",
+            ));
+        }
+        let ledger = ParticipantNodeLedgerEntry {
+            batch_invocation_id,
+            work_fingerprint: topology_fingerprint.to_owned(),
+            phase: PhysicalInvocationPhase::Prepared,
+        };
+        state.submission_wave = Some(SubmissionWaveLedgerEntry {
+            ledger,
+            covered_participant_nodes,
+        });
+        Ok(ActiveInvocationWaveGuard {
+            registry: Arc::clone(self),
+            topology: ActiveInvocationLedgerTopology::FullPlanSubmissionWave {
+                covered_participant_nodes,
+            },
+            work_fingerprint: topology_fingerprint.to_owned(),
             batch_invocation_id,
             phase: PhysicalInvocationPhase::Prepared,
         })
     }
 }
 
+enum ActiveInvocationLedgerTopology {
+    ParticipantNodes(Vec<ParticipantNodeKey>),
+    FullPlanSubmissionWave { covered_participant_nodes: usize },
+}
+
 pub(super) struct ActiveInvocationWaveGuard {
     registry: Arc<InvocationRegistry>,
-    keys: Vec<ParticipantNodeKey>,
+    topology: ActiveInvocationLedgerTopology,
     work_fingerprint: String,
     batch_invocation_id: BatchInvocationId,
     phase: PhysicalInvocationPhase,
 }
 
 impl ActiveInvocationWaveGuard {
+    pub(super) const fn physical_entry_count(&self) -> usize {
+        match &self.topology {
+            ActiveInvocationLedgerTopology::ParticipantNodes(keys) => keys.len(),
+            ActiveInvocationLedgerTopology::FullPlanSubmissionWave { .. } => 1,
+        }
+    }
+
     fn transition(
         &mut self,
         expected: PhysicalInvocationPhase,
@@ -1246,24 +1311,50 @@ impl ActiveInvocationWaveGuard {
             work_fingerprint: self.work_fingerprint.clone(),
             phase: expected,
         };
-        if state.poisoned
-            || self
-                .keys
-                .iter()
-                .any(|key| state.entries.get(key) != Some(&expected_entry))
-        {
+        let authority_matches = match &self.topology {
+            ActiveInvocationLedgerTopology::ParticipantNodes(keys) => {
+                state.submission_wave.is_none()
+                    && keys
+                        .iter()
+                        .all(|key| state.entries.get(key) == Some(&expected_entry))
+            }
+            ActiveInvocationLedgerTopology::FullPlanSubmissionWave {
+                covered_participant_nodes,
+            } => {
+                state.entries.is_empty()
+                    && state.submission_wave
+                        == Some(SubmissionWaveLedgerEntry {
+                            ledger: expected_entry.clone(),
+                            covered_participant_nodes: *covered_participant_nodes,
+                        })
+            }
+        };
+        if state.poisoned || !authority_matches {
             state.poisoned = true;
             return Err(invalid_resource(
                 "physical invocation ledger differs from its exact transition authority",
             ));
         }
-        for key in &self.keys {
-            let entry = state
-                .entries
-                .get_mut(key)
-                .expect("validated physical invocation key remains present");
-            entry.batch_invocation_id = next_attempt;
-            entry.phase = next;
+        match &self.topology {
+            ActiveInvocationLedgerTopology::ParticipantNodes(keys) => {
+                for key in keys {
+                    let entry = state
+                        .entries
+                        .get_mut(key)
+                        .expect("validated physical invocation key remains present");
+                    entry.batch_invocation_id = next_attempt;
+                    entry.phase = next;
+                }
+            }
+            ActiveInvocationLedgerTopology::FullPlanSubmissionWave { .. } => {
+                let entry = &mut state
+                    .submission_wave
+                    .as_mut()
+                    .expect("validated full-plan submission wave remains present")
+                    .ledger;
+                entry.batch_invocation_id = next_attempt;
+                entry.phase = next;
+            }
         }
         self.batch_invocation_id = next_attempt;
         self.phase = next;
@@ -1321,20 +1412,46 @@ impl Drop for ActiveInvocationWaveGuard {
             work_fingerprint: self.work_fingerprint.clone(),
             phase: self.phase,
         };
-        if self
-            .keys
-            .iter()
-            .any(|key| state.entries.get(key) != Some(&expected))
-        {
+        let authority_matches = match &self.topology {
+            ActiveInvocationLedgerTopology::ParticipantNodes(keys) => {
+                state.submission_wave.is_none()
+                    && keys
+                        .iter()
+                        .all(|key| state.entries.get(key) == Some(&expected))
+            }
+            ActiveInvocationLedgerTopology::FullPlanSubmissionWave {
+                covered_participant_nodes,
+            } => {
+                state.entries.is_empty()
+                    && state.submission_wave
+                        == Some(SubmissionWaveLedgerEntry {
+                            ledger: expected,
+                            covered_participant_nodes: *covered_participant_nodes,
+                        })
+            }
+        };
+        if !authority_matches {
             state.poisoned = true;
             return;
         }
-        for key in &self.keys {
-            state
-                .entries
-                .get_mut(key)
-                .expect("validated physical invocation key remains present")
-                .phase = PhysicalInvocationPhase::Retired;
+        match &self.topology {
+            ActiveInvocationLedgerTopology::ParticipantNodes(keys) => {
+                for key in keys {
+                    state
+                        .entries
+                        .get_mut(key)
+                        .expect("validated physical invocation key remains present")
+                        .phase = PhysicalInvocationPhase::Retired;
+                }
+            }
+            ActiveInvocationLedgerTopology::FullPlanSubmissionWave { .. } => {
+                state
+                    .submission_wave
+                    .as_mut()
+                    .expect("validated full-plan submission wave remains present")
+                    .ledger
+                    .phase = PhysicalInvocationPhase::Retired;
+            }
         }
         self.phase = PhysicalInvocationPhase::Retired;
     }

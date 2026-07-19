@@ -556,6 +556,7 @@ struct VNextPreparedWaveTopologyMetrics {
     covered_nodes: AtomicU64,
     participant_flights: AtomicU64,
     node_participant_projections: AtomicU64,
+    physical_ledger_entries: AtomicU64,
 }
 
 impl VNextPreparedWaveTopologyMetrics {
@@ -564,6 +565,7 @@ impl VNextPreparedWaveTopologyMetrics {
             wave.node_count(),
             wave.prepared_participant_flight_count(),
             wave.node_participant_projection_count(),
+            wave.physical_invocation_ledger_entry_count(),
         );
     }
 
@@ -572,6 +574,7 @@ impl VNextPreparedWaveTopologyMetrics {
         covered_nodes: usize,
         participant_flights: usize,
         node_participant_projections: usize,
+        physical_ledger_entries: usize,
     ) {
         self.wave_authorities.fetch_add(1, Ordering::Relaxed);
         self.covered_nodes.fetch_add(
@@ -586,6 +589,10 @@ impl VNextPreparedWaveTopologyMetrics {
             u64::try_from(node_participant_projections).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+        self.physical_ledger_entries.fetch_add(
+            u64::try_from(physical_ledger_entries).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     fn snapshot(&self) -> serde_json::Value {
@@ -594,6 +601,7 @@ impl VNextPreparedWaveTopologyMetrics {
             "covered_nodes": self.covered_nodes.load(Ordering::Relaxed),
             "participant_flights": self.participant_flights.load(Ordering::Relaxed),
             "node_participant_projections": self.node_participant_projections.load(Ordering::Relaxed),
+            "physical_ledger_entries": self.physical_ledger_entries.load(Ordering::Relaxed),
         })
     }
 
@@ -603,6 +611,7 @@ impl VNextPreparedWaveTopologyMetrics {
             &self.covered_nodes,
             &self.participant_flights,
             &self.node_participant_projections,
+            &self.physical_ledger_entries,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -5468,14 +5477,15 @@ mod tests {
     fn prepared_wave_topology_metrics_separate_owners_from_node_projections() {
         let metrics = VNextPreparedWaveTopologyMetrics::default();
 
-        metrics.record_counts(131, 1, 131);
-        metrics.record_counts(131, 4, 524);
+        metrics.record_counts(131, 1, 131, 1);
+        metrics.record_counts(131, 4, 524, 1);
         let snapshot = metrics.snapshot();
 
         assert_eq!(snapshot["wave_authorities"], 2);
         assert_eq!(snapshot["covered_nodes"], 262);
         assert_eq!(snapshot["participant_flights"], 5);
         assert_eq!(snapshot["node_participant_projections"], 655);
+        assert_eq!(snapshot["physical_ledger_entries"], 2);
 
         metrics.reset();
         assert_eq!(metrics.snapshot()["wave_authorities"], 0);

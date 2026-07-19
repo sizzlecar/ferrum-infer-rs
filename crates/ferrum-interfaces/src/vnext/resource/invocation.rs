@@ -867,6 +867,19 @@ where
                 "submission wave nodes must share one canonical work authority",
             ));
         }
+        if work_shape.participants().len() != self.participants.len()
+            || work_shape
+                .participants()
+                .iter()
+                .zip(&self.participants)
+                .any(|(authority, participant)| {
+                    authority.canonical_key() != session_participant_key(&participant.session)
+                })
+        {
+            return Err(invalid_resource(
+                "full-plan submission wave must bind every step participant exactly once",
+            ));
+        }
         let participant_authority =
             Arc::new(self.prepare_participant_authority(Arc::clone(&work_shape), fit_policy)?);
         let prepared_nodes = requests
@@ -978,13 +991,12 @@ where
         let batch_invocation_id = issue_batch_invocation_id()?;
         let prepared_participant_flights =
             prepare_submission_wave_participant_flights(&participant_authority.flight_candidates)?;
-        let mut topology_keys = prepared_nodes
-            .iter()
-            .flat_map(PreparedStepSubmissionNode::participant_node_keys)
-            .collect::<Vec<_>>();
-        topology_keys.sort();
-        let active_wave = self.invocation_registry.enter(
-            topology_keys,
+        let covered_participant_nodes = prepared_nodes
+            .len()
+            .checked_mul(participant_authority.participants.len())
+            .ok_or_else(|| invalid_resource("submission wave topology size exceeds usize"))?;
+        let active_wave = self.invocation_registry.enter_submission_wave(
+            covered_participant_nodes,
             batch_invocation_id,
             &wave_fingerprint,
         )?;
@@ -1615,6 +1627,10 @@ where
             .iter()
             .map(|node| node.participant_count() as usize)
             .sum()
+    }
+
+    pub fn physical_invocation_ledger_entry_count(&self) -> usize {
+        self.active_wave.physical_entry_count()
     }
 
     pub fn step_resources(&self) -> &Arc<StepResourceLease<R>> {

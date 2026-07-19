@@ -168,6 +168,7 @@ fn immutable_plan_nodes_prepare_one_owned_submission_wave() {
         wave.node_participant_projection_count(),
         wave.node_count() * step.participant_count() as usize
     );
+    assert_eq!(wave.physical_invocation_ledger_entry_count(), 1);
     assert_eq!(
         wave.nodes()[0].node_id(),
         fixture.plan.payload().nodes()[0].id()
@@ -262,6 +263,97 @@ fn wrong_wave_topology_rejects_before_legal_wave_can_prepare() {
     session.try_complete().unwrap();
     drop(session);
     drop(sequence);
+    drop(fixture.registry);
+    drop(fixture.impostor_registry);
+    drop(fixture.runtime);
+    assert!(matches!(
+        PlanRuntimeResources::close(fixture.plan_resources),
+        Ok(PlanRuntimeCloseOutcome::Closed(_))
+    ));
+}
+
+#[test]
+fn full_plan_wave_rejects_participant_subset_before_legal_wave_can_prepare() {
+    let fixture = fixture();
+    let resources = (0..2)
+        .map(|index| {
+            logical_resources(
+                &fixture.plan_resources,
+                &format!("run.device-operation.wave-subset.{index}"),
+                &format!("request.device-operation.wave-subset.{index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let sessions = resources
+        .iter()
+        .map(|resources| resources.open_session().unwrap())
+        .collect::<Vec<_>>();
+    let batch = ExecutionBatchParticipants::new(sessions.clone()).unwrap();
+    let lane = fixture.plan_resources.create_execution_lane().unwrap();
+    let step_request = StepResourceAdmissionRequest::new(
+        batch
+            .bind_work_shape(vec![one_token_span(), one_token_span()])
+            .unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let step = (0..=3)
+        .find_map(
+            |attempt| match batch.try_begin_step(step_request.clone(), &lane).unwrap() {
+                StepResourceAdmissionDecision::Admitted(step) => Some(step),
+                StepResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
+                    deferred.maintain().unwrap();
+                    None
+                }
+                _ => panic!("two-participant step admission did not converge"),
+            },
+        )
+        .expect("bounded step admission returns or panics");
+    let subset_shape = Arc::new(
+        step.bind_invocation_work_shape(vec![(
+            BatchParticipantAuthority::new(
+                sessions[0].sequence_authority(),
+                sessions[0].request_authority(),
+            ),
+            one_token_span(),
+        )])
+        .unwrap(),
+    );
+    let subset_requests = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| {
+            InvocationResourceAdmissionRequest::for_all_step_participants(
+                node.id().clone(),
+                Arc::clone(&subset_shape),
+                AdmissionFitPolicy::ImmediateOnly,
+                AdmissionPressureAction::WaitForRelease,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let error = match step.try_prepare_submission_wave(subset_requests) {
+        Err(error) => error,
+        Ok(_) => panic!("participant-subset full-plan wave unexpectedly prepared"),
+    };
+    assert!(error
+        .to_string()
+        .contains("must bind every step participant exactly once"));
+
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    assert_eq!(wave.prepared_participant_flight_count(), 2);
+    assert_eq!(wave.node_participant_projection_count(), 4);
+    assert_eq!(wave.physical_invocation_ledger_entry_count(), 1);
+    drop(wave);
+    step.try_retire_normal().unwrap();
+    drop(batch);
+    for session in sessions {
+        session.try_complete().unwrap();
+    }
+    drop(resources);
     drop(fixture.registry);
     drop(fixture.impostor_registry);
     drop(fixture.runtime);
