@@ -7,7 +7,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use vnext_core_contract as core;
 
-fn sequential_scratch_plan() -> (
+fn sequential_scratch_plan_with_policy(
+    policy: ResolvedRuntimePolicy,
+) -> (
     ExecutionPlan,
     OperationRuntimeRegistry<core::PlanningTestRuntime>,
 ) {
@@ -16,7 +18,6 @@ fn sequential_scratch_plan() -> (
         .prepare(&serde_json::json!({"width": 4}))
         .unwrap();
     let catalog = core::catalog();
-    let policy = core::policy(4096);
     let descriptor = catalog.providers_for(&core::id("operation.main")).unwrap()[0].clone();
     let registry = OperationRuntimeRegistry::new(
         vec![Box::new(core::TestOperationContract {
@@ -68,9 +69,60 @@ fn sequential_scratch_plan() -> (
     (plan, registry)
 }
 
+fn sequential_scratch_plan() -> (
+    ExecutionPlan,
+    OperationRuntimeRegistry<core::PlanningTestRuntime>,
+) {
+    sequential_scratch_plan_with_policy(core::policy(4096))
+}
+
+fn reusable_sequential_scratch_plan() -> (
+    ExecutionPlan,
+    OperationRuntimeRegistry<core::PlanningTestRuntime>,
+    ReusableExecutionBucketSpec,
+) {
+    let bucket = ReusableExecutionBucketSpec::new(
+        ReusableExecutionClassId::new("execution.test-decode").unwrap(),
+        ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
+    )
+    .unwrap();
+    let reusable_execution = ReusableExecutionPolicy::new(1, vec![bucket.clone()]).unwrap();
+    let policy = ResolvedRuntimePolicy::new(
+        "runtime-policy.test-reusable",
+        ContractVersion::new(1, 0),
+        SchedulingDiscipline::FirstReady,
+        RuntimeMemoryPolicy {
+            capacity_bytes: 4096,
+            reserve_bytes: 128,
+            maximum_active_sequences: 3,
+            dynamic_storage_profile_order: vec![core::contiguous_storage_profile()],
+        },
+        serde_json::from_value(serde_json::json!({
+            "maximum_queue_depth": 8,
+            "maximum_scheduled_tokens": 4096,
+            "sequence_fit_policy": "immediate_only",
+            "allow_defer": true,
+            "cancellation_check_interval_steps": 1
+        }))
+        .unwrap(),
+        Some(reusable_execution),
+    )
+    .unwrap();
+    let (plan, registry) = sequential_scratch_plan_with_policy(policy);
+    (plan, registry, bucket)
+}
+
 fn begin_step(
     batch: &ExecutionBatchParticipants<resource_support::TestRuntime>,
     lane: &Arc<ExecutionLane<resource_support::TestRuntime>>,
+) -> Arc<StepResourceLease<resource_support::TestRuntime>> {
+    begin_step_with_bucket(batch, lane, None)
+}
+
+fn begin_step_with_bucket(
+    batch: &ExecutionBatchParticipants<resource_support::TestRuntime>,
+    lane: &Arc<ExecutionLane<resource_support::TestRuntime>>,
+    bucket: Option<&ReusableExecutionBucketSpec>,
 ) -> Arc<StepResourceLease<resource_support::TestRuntime>> {
     let request = StepResourceAdmissionRequest::new(
         batch
@@ -80,6 +132,10 @@ fn begin_step(
         AdmissionPressureAction::WaitForRelease,
     )
     .unwrap();
+    let request = match bucket {
+        Some(bucket) => request.with_reusable_execution_bucket(bucket.bucket_id().clone()),
+        None => request,
+    };
     for attempt in 0..=3 {
         match batch.try_begin_step(request.clone(), lane).unwrap() {
             StepResourceAdmissionDecision::Admitted(step) => return step,
@@ -192,8 +248,8 @@ fn assert_physical_identities_do_not_overlap(
 }
 
 #[test]
-fn same_lane_same_shape_reuses_step_and_invocation_physical_generations() {
-    let (plan, registry) = sequential_scratch_plan();
+fn reusable_lane_same_shape_reuses_step_and_invocation_physical_generations() {
+    let (plan, registry, bucket) = reusable_sequential_scratch_plan();
     let (driver, _trace) = resource_support::configured_driver(&plan, &[], &[]);
     let lane = ExecutionLane::create(Arc::clone(&driver.runtime)).unwrap();
     let root = resource_support::plan_runtime(&plan, driver, "lane-arena-reuse");
@@ -205,7 +261,7 @@ fn same_lane_same_shape_reuses_step_and_invocation_physical_generations() {
     let session = sequence.open_session().unwrap();
     let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
 
-    let first_step = begin_step(&batch, &lane);
+    let first_step = begin_step_with_bucket(&batch, &lane, Some(&bucket));
     let first_wave = prepare_wave(&plan, &first_step);
     let first_step_identity = physical_slice_identities(first_step.backing_slices());
     let first_wave_identity =
@@ -213,7 +269,7 @@ fn same_lane_same_shape_reuses_step_and_invocation_physical_generations() {
     drop(first_wave);
     first_step.try_retire_normal().unwrap();
 
-    let second_step = begin_step(&batch, &lane);
+    let second_step = begin_step_with_bucket(&batch, &lane, Some(&bucket));
     let second_wave = prepare_wave(&plan, &second_step);
     assert_eq!(
         physical_slice_identities(second_step.backing_slices()),
@@ -236,8 +292,8 @@ fn same_lane_same_shape_reuses_step_and_invocation_physical_generations() {
 }
 
 #[test]
-fn same_lane_overlapping_steps_use_disjoint_slots_then_reuse_released_slots() {
-    let (plan, registry) = sequential_scratch_plan();
+fn reusable_lane_overlapping_steps_use_disjoint_slots_then_reuse_released_slots() {
+    let (plan, registry, bucket) = reusable_sequential_scratch_plan();
     let (driver, _trace) = resource_support::configured_driver(&plan, &[], &[]);
     let lane = ExecutionLane::create(Arc::clone(&driver.runtime)).unwrap();
     let root = resource_support::plan_runtime(&plan, driver, "lane-arena-overlap");
@@ -256,13 +312,13 @@ fn same_lane_overlapping_steps_use_disjoint_slots_then_reuse_released_slots() {
     let first_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&first_session)]).unwrap();
     let second_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&second_session)]).unwrap();
 
-    let first_step = begin_step(&first_batch, &lane);
+    let first_step = begin_step_with_bucket(&first_batch, &lane, Some(&bucket));
     let first_wave = prepare_wave(&plan, &first_step);
     let first_step_identity = physical_slice_identities(first_step.backing_slices());
     let first_wave_identity =
         physical_slice_identities(first_wave.claimed_backing().backing_slices());
 
-    let second_step = begin_step(&second_batch, &lane);
+    let second_step = begin_step_with_bucket(&second_batch, &lane, Some(&bucket));
     let second_wave = prepare_wave(&plan, &second_step);
     let second_step_identity = physical_slice_identities(second_step.backing_slices());
     let second_wave_identity =
@@ -272,7 +328,7 @@ fn same_lane_overlapping_steps_use_disjoint_slots_then_reuse_released_slots() {
 
     drop(first_wave);
     first_step.try_retire_normal().unwrap();
-    let third_step = begin_step(&first_batch, &lane);
+    let third_step = begin_step_with_bucket(&first_batch, &lane, Some(&bucket));
     let third_wave = prepare_wave(&plan, &third_step);
     assert_eq!(
         physical_slice_identities(third_step.backing_slices()),
@@ -303,8 +359,8 @@ fn same_lane_overlapping_steps_use_disjoint_slots_then_reuse_released_slots() {
 }
 
 #[test]
-fn released_lane_slot_wakes_capacity_waiter_and_retries_without_growth() {
-    let (plan, registry) = sequential_scratch_plan();
+fn released_reusable_lane_slot_wakes_capacity_waiter_and_retries_without_growth() {
+    let (plan, registry, bucket) = reusable_sequential_scratch_plan();
     let (driver, _trace) = resource_support::configured_driver(&plan, &[], &[]);
     let lane = ExecutionLane::create(Arc::clone(&driver.runtime)).unwrap();
     let root = resource_support::plan_runtime(&plan, driver, "lane-arena-waiter");
@@ -322,11 +378,11 @@ fn released_lane_slot_wakes_capacity_waiter_and_retries_without_growth() {
     let second_session = second_sequence.open_session().unwrap();
     let first_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&first_session)]).unwrap();
     let second_batch = ExecutionBatchParticipants::new(vec![Arc::clone(&second_session)]).unwrap();
-    let first_step = begin_step(&first_batch, &lane);
+    let first_step = begin_step_with_bucket(&first_batch, &lane, Some(&bucket));
     let first_wave = prepare_wave(&plan, &first_step);
     let first_wave_identity =
         physical_slice_identities(first_wave.claimed_backing().backing_slices());
-    let second_step = begin_step(&second_batch, &lane);
+    let second_step = begin_step_with_bucket(&second_batch, &lane, Some(&bucket));
     let requests = submission_requests(&plan, &second_step);
 
     let deferred = match second_step
