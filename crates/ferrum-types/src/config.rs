@@ -43,6 +43,15 @@ impl Default for SequenceFitPolicy {
     }
 }
 
+/// Explicit diagnostic capture of semantic vNext activations. Product paths
+/// leave this unset; release tooling must supply a dedicated empty directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VNextCheckpointCaptureConfig {
+    pub output_dir: PathBuf,
+    pub value_ids: Vec<String>,
+    pub maximum_prefill_waves: usize,
+}
+
 /// Engine runtime knobs the CLI/autosizer resolves and injects via the
 /// runtime-config snapshot. The continuous engine reads these from the typed
 /// config instead of `std::env::vars()`, so the env bridge stays at the
@@ -77,6 +86,8 @@ pub struct RuntimeKnobs {
     pub dtype: Option<String>,
     pub metal_dtype: Option<String>,
     pub tp: Option<usize>,
+    #[serde(default)]
+    pub vnext_checkpoint_capture: Option<VNextCheckpointCaptureConfig>,
 }
 
 /// Engine configuration

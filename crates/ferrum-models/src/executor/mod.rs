@@ -12,6 +12,7 @@ pub mod llm_executor;
 pub mod qwen35_executor;
 pub mod stub_executor;
 pub mod tts_executor;
+mod vnext_checkpoint;
 mod vnext_completion_worker;
 pub mod vnext_executor;
 mod vnext_timing;

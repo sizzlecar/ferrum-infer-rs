@@ -24,6 +24,7 @@ use super::{
     ValueResourceDemand, WeightFormatId, EXECUTION_PLAN_SCHEMA, MAX_EXECUTION_PLAN_WIRE_BYTES,
 };
 use super::{resolve_retained_completion_values, CompletionRetentionSpec, RetainedCompletionValue};
+use crate::vnext::{CompletionReadbackRequest, HostTransferLayout, ResourceWorkShape};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutionPlan {
@@ -2318,6 +2319,51 @@ impl ExecutionPlan {
                     "semantic value `{value_id}` is not retained for completion readback"
                 ))
             })
+    }
+
+    /// Builds an exact readback for one participant's immediate work shape.
+    /// The immutable resource demand, rather than a model-shape heuristic,
+    /// determines the dynamic byte extent.
+    pub fn completion_checkpoint_readback_for_work(
+        &self,
+        value_id: &ProgramValueId,
+        participant_index: u32,
+        work: &ResourceWorkShape,
+    ) -> Result<CompletionReadbackRequest, VNextError> {
+        let checkpoint = self.completion_checkpoint(value_id)?;
+        if checkpoint.logical_offset_bytes() != 0 {
+            return Err(invalid_plan(
+                "work-shaped completion readback requires a whole-resource activation",
+            ));
+        }
+        let descriptor = self
+            .payload
+            .memory
+            .dynamic_descriptors()
+            .iter()
+            .find(|descriptor| descriptor.base_resource_id() == checkpoint.resource_id())
+            .ok_or_else(|| {
+                invalid_plan(format!(
+                    "retained completion resource `{}` has no dynamic descriptor",
+                    checkpoint.resource_id()
+                ))
+            })?;
+        if descriptor.element_type() != checkpoint.tensor().element_type() {
+            return Err(invalid_plan(
+                "retained completion resource element type differs from its tensor",
+            ));
+        }
+        let byte_len = descriptor.evaluate_logical_request_bytes(work)?;
+        let element_bytes = checkpoint.tensor().element_type().size_bytes();
+        if byte_len % element_bytes != 0 {
+            return Err(invalid_plan(
+                "retained completion byte extent is not element aligned",
+            ));
+        }
+        checkpoint.readback_request(
+            participant_index,
+            HostTransferLayout::new(checkpoint.tensor().element_type(), byte_len / element_bytes)?,
+        )
     }
 
     pub fn plan_hash(&self) -> &PlanHash {
