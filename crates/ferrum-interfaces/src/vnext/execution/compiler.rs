@@ -84,6 +84,7 @@ pub struct ProgramPlanCompilation {
     executable: ExecutablePlan,
     node_resolutions: Vec<PlanNodeResolution>,
     value_tensors: BTreeMap<ProgramValueId, ResolvedTensorSpec>,
+    completion_retention: CompletionRetentionSpec,
 }
 
 impl ProgramPlanCompilation {
@@ -99,14 +100,24 @@ impl ProgramPlanCompilation {
         &self.value_tensors
     }
 
+    pub fn completion_retention(&self) -> &CompletionRetentionSpec {
+        &self.completion_retention
+    }
+
     pub fn into_parts(
         self,
     ) -> (
         ExecutablePlan,
         Vec<PlanNodeResolution>,
         BTreeMap<ProgramValueId, ResolvedTensorSpec>,
+        CompletionRetentionSpec,
     ) {
-        (self.executable, self.node_resolutions, self.value_tensors)
+        (
+            self.executable,
+            self.node_resolutions,
+            self.value_tensors,
+            self.completion_retention,
+        )
     }
 }
 
@@ -192,6 +203,7 @@ impl ProgramPlanCompiler {
             executable,
             node_resolutions,
             value_tensors,
+            completion_retention: options.completion_retention.clone(),
         })
     }
 }
