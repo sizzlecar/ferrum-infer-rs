@@ -10,13 +10,13 @@ use std::sync::Arc;
 use ferrum_interfaces::vnext::{
     CapabilityCatalog, ContractVersion, DeviceRuntime, EngineSelection, ExecutablePlanView,
     FileFingerprint, ModelConfigFingerprint, ModelSourceKind, OperationRuntimeRegistry,
-    OriginalModelSource, ProgramPlanCompilation, RationalValue, ResolutionArtifactId,
-    ResolutionDecisionBinding, ResolutionDecisionSource, ResolutionField, ResolutionFingerprint,
-    ResolutionReasonId, ResolutionSourceEvidence, ResolutionSourceProvenance, ResolvedModelPlan,
-    ResolvedModelPlanInputs, ResolvedModelSource, ResolvedPlanValidationContext,
-    ResolvedRuntimePolicy, SamplingPolicy, SpecialTokenRole, StopPolicy, StopTokenCollisionPolicy,
-    StructuredOutputPolicy, TokenizerDescriptor, TokenizerId, TriStatePolicy,
-    JSON_RESOLUTION_SOURCE_PARSER,
+    OriginalModelSource, OriginalModelSources, ProgramPlanCompilation, RationalValue,
+    ResolutionArtifactId, ResolutionDecisionBinding, ResolutionDecisionSource, ResolutionField,
+    ResolutionFingerprint, ResolutionReasonId, ResolutionSourceEvidence,
+    ResolutionSourceProvenance, ResolvedModelPlan, ResolvedModelPlanInputs, ResolvedModelSource,
+    ResolvedModelSources, ResolvedPlanValidationContext, ResolvedRuntimePolicy, SamplingPolicy,
+    SpecialTokenRole, StopPolicy, StopTokenCollisionPolicy, StructuredOutputPolicy,
+    TokenizerDescriptor, TokenizerId, TriStatePolicy, JSON_RESOLUTION_SOURCE_PARSER,
 };
 use ferrum_models::vnext::{PreparedProductionModel, ProductionModelFamilyRegistry};
 use ferrum_models::VNextModelExecutor;
@@ -65,6 +65,16 @@ fn resolve_model_plan(
     let tokenizer_sha256 = source_file(&source_files, "tokenizer.json")?.sha256.clone();
     let (original_source, resolved_source) =
         resolve_source_identity(model_dir, engine, source_files)?;
+    let original_sources = OriginalModelSources {
+        semantic: original_source.clone(),
+        tokenizer: original_source.clone(),
+        weights: original_source,
+    };
+    let resolved_sources = ResolvedModelSources {
+        semantic: resolved_source.clone(),
+        tokenizer: resolved_source.clone(),
+        weights: resolved_source,
+    };
     let family = prepared.family();
 
     let engine_provider = match catalog
@@ -89,8 +99,8 @@ fn resolve_model_plan(
     let (sampling, stop, structured_output) = generation_defaults(engine, prepared)?;
 
     let inputs = ResolvedModelPlanInputs {
-        original_source,
-        resolved_source,
+        original_sources,
+        resolved_sources,
         config: ModelConfigFingerprint {
             source_file: "config.json".to_owned(),
             sha256: config_sha256,
@@ -369,9 +379,9 @@ fn resolution_evidence(
     Vec<ResolutionSourceEvidence<'static>>,
     Vec<ResolutionDecisionBinding>,
 )> {
-    const USER_FIELDS: &[ResolutionField] = &[ResolutionField::OriginalSource];
+    const USER_FIELDS: &[ResolutionField] = &[ResolutionField::OriginalSources];
     const MODEL_FIELDS: &[ResolutionField] = &[
-        ResolutionField::ResolvedSource,
+        ResolutionField::ResolvedSources,
         ResolutionField::Config,
         ResolutionField::ExternalMetadata,
         ResolutionField::Family,
@@ -466,8 +476,8 @@ fn resolution_evidence(
 
 fn resolution_value(inputs: &ResolvedModelPlanInputs, field: ResolutionField) -> Result<Value> {
     let value = match field {
-        ResolutionField::OriginalSource => serde_json::to_value(&inputs.original_source),
-        ResolutionField::ResolvedSource => serde_json::to_value(&inputs.resolved_source),
+        ResolutionField::OriginalSources => serde_json::to_value(&inputs.original_sources),
+        ResolutionField::ResolvedSources => serde_json::to_value(&inputs.resolved_sources),
         ResolutionField::Config => serde_json::to_value(&inputs.config),
         ResolutionField::ExternalMetadata => serde_json::to_value(&inputs.external_metadata_id),
         ResolutionField::Family => serde_json::to_value(inputs.prepared_family.family_id()),

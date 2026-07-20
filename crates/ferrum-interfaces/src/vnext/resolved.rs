@@ -620,6 +620,68 @@ pub struct ResolvedModelSource {
     pub files: Vec<FileFingerprint>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelArtifactSourceRole {
+    Semantic,
+    Tokenizer,
+    Weights,
+}
+
+impl ModelArtifactSourceRole {
+    pub const ALL: [Self; 3] = [Self::Semantic, Self::Tokenizer, Self::Weights];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::Tokenizer => "tokenizer",
+            Self::Weights => "weights",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OriginalModelSources {
+    pub semantic: OriginalModelSource,
+    pub tokenizer: OriginalModelSource,
+    pub weights: OriginalModelSource,
+}
+
+impl OriginalModelSources {
+    pub const fn for_role(&self, role: ModelArtifactSourceRole) -> &OriginalModelSource {
+        match role {
+            ModelArtifactSourceRole::Semantic => &self.semantic,
+            ModelArtifactSourceRole::Tokenizer => &self.tokenizer,
+            ModelArtifactSourceRole::Weights => &self.weights,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedModelSources {
+    pub semantic: ResolvedModelSource,
+    pub tokenizer: ResolvedModelSource,
+    pub weights: ResolvedModelSource,
+}
+
+impl ResolvedModelSources {
+    pub const fn for_role(&self, role: ModelArtifactSourceRole) -> &ResolvedModelSource {
+        match role {
+            ModelArtifactSourceRole::Semantic => &self.semantic,
+            ModelArtifactSourceRole::Tokenizer => &self.tokenizer,
+            ModelArtifactSourceRole::Weights => &self.weights,
+        }
+    }
+
+    fn for_role_mut(&mut self, role: ModelArtifactSourceRole) -> &mut ResolvedModelSource {
+        match role {
+            ModelArtifactSourceRole::Semantic => &mut self.semantic,
+            ModelArtifactSourceRole::Tokenizer => &mut self.tokenizer,
+            ModelArtifactSourceRole::Weights => &mut self.weights,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelConfigFingerprint {
     pub source_file: String,
@@ -1210,8 +1272,8 @@ pub enum StructuredOutputPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolutionField {
-    OriginalSource,
-    ResolvedSource,
+    OriginalSources,
+    ResolvedSources,
     Config,
     ExternalMetadata,
     Family,
@@ -1249,8 +1311,8 @@ pub enum ResolutionDecisionSource {
 impl ResolutionField {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::OriginalSource => "original_source",
-            Self::ResolvedSource => "resolved_source",
+            Self::OriginalSources => "original_sources",
+            Self::ResolvedSources => "resolved_sources",
             Self::Config => "config",
             Self::ExternalMetadata => "external_metadata",
             Self::Family => "family",
@@ -1280,11 +1342,11 @@ impl ResolutionField {
         use ResolutionField as Field;
 
         match self {
-            Field::OriginalSource => matches!(
+            Field::OriginalSources => matches!(
                 source,
                 Source::UserInput | Source::CommandLine | Source::ConfigFile
             ),
-            Field::ResolvedSource => {
+            Field::ResolvedSources => {
                 matches!(source, Source::ModelMetadata | Source::TypedModelResolution)
             }
             Field::Config => matches!(
@@ -1468,6 +1530,7 @@ impl fmt::Display for ResolutionArtifactId {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ResolutionSourceProvenance {
     LockedModelFile {
+        source_role: ModelArtifactSourceRole,
         relative_path: String,
     },
     Upstream {
@@ -1482,7 +1545,10 @@ pub enum ResolutionSourceProvenance {
 impl ResolutionSourceProvenance {
     fn validate(&self) -> Result<(), VNextError> {
         match self {
-            Self::LockedModelFile { relative_path } => {
+            Self::LockedModelFile {
+                source_role: _,
+                relative_path,
+            } => {
                 if !validate_source_path(relative_path) {
                     return Err(invalid_plan(
                         "resolution_source_provenance.locked_model_file",
@@ -1525,7 +1591,10 @@ impl ResolutionSourceProvenance {
 
     pub fn locator(&self) -> &str {
         match self {
-            Self::LockedModelFile { relative_path } => relative_path,
+            Self::LockedModelFile {
+                source_role: _,
+                relative_path,
+            } => relative_path,
             Self::Upstream {
                 artifact_locator, ..
             } => artifact_locator,
@@ -1537,7 +1606,19 @@ fn resolution_provenance_bytes(
     provenance: &ResolutionSourceProvenance,
 ) -> Result<usize, VNextError> {
     match provenance {
-        ResolutionSourceProvenance::LockedModelFile { relative_path } => Ok(relative_path.len()),
+        ResolutionSourceProvenance::LockedModelFile {
+            source_role,
+            relative_path,
+        } => source_role
+            .as_str()
+            .len()
+            .checked_add(relative_path.len())
+            .ok_or_else(|| {
+                invalid_plan(
+                    "resolution_source_evidence.provenance",
+                    "provenance byte count overflowed",
+                )
+            }),
         ResolutionSourceProvenance::Upstream {
             producer_id,
             producer_implementation_fingerprint,
@@ -2181,8 +2262,8 @@ impl ResolutionDecisionBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedModelPlanInputs {
-    pub original_source: OriginalModelSource,
-    pub resolved_source: ResolvedModelSource,
+    pub original_sources: OriginalModelSources,
+    pub resolved_sources: ResolvedModelSources,
     pub config: ModelConfigFingerprint,
     pub external_metadata_id: super::ExternalModelMetadataId,
     pub prepared_family: PreparedModelFamily,
@@ -2200,8 +2281,8 @@ pub struct ResolvedModelPlanInputs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedModelPlanParts {
     source_artifacts: Vec<ResolutionSourceArtifact>,
-    pub original_source: OriginalModelSource,
-    pub resolved_source: ResolvedModelSource,
+    pub original_sources: OriginalModelSources,
+    pub resolved_sources: ResolvedModelSources,
     pub config: ModelConfigFingerprint,
     pub external_metadata_id: super::ExternalModelMetadataId,
     pub prepared_family: PreparedModelFamily,
@@ -2312,8 +2393,8 @@ impl ExecutablePlanView for ResolvedModelPlan {
 #[serde(deny_unknown_fields)]
 pub struct UnvalidatedResolvedModelPlanParts {
     source_artifacts: Vec<UnvalidatedResolutionSourceArtifact>,
-    original_source: OriginalModelSource,
-    resolved_source: ResolvedModelSource,
+    original_sources: OriginalModelSources,
+    resolved_sources: ResolvedModelSources,
     config: ModelConfigFingerprint,
     external_metadata_id: super::ExternalModelMetadataId,
     prepared_family: PreparedModelFamilyWire,
@@ -2385,8 +2466,8 @@ impl UnvalidatedResolvedModelPlan {
     ) -> Result<ResolvedModelPlan, VNextError> {
         let UnvalidatedResolvedModelPlanParts {
             source_artifacts,
-            original_source,
-            resolved_source,
+            original_sources,
+            resolved_sources,
             config,
             external_metadata_id,
             prepared_family,
@@ -2436,8 +2517,8 @@ impl UnvalidatedResolvedModelPlan {
             .collect::<Result<Vec<_>, VNextError>>()?;
         let rebuilt = ResolvedModelPlan::from_verified_inputs(
             ResolvedModelPlanInputs {
-                original_source,
-                resolved_source,
+                original_sources,
+                resolved_sources,
                 config,
                 external_metadata_id,
                 prepared_family,
@@ -2540,8 +2621,8 @@ impl ResolvedModelPlan {
     ) -> Result<Self, VNextError> {
         Self::validate_external_inputs(&inputs, context)?;
         let ResolvedModelPlanInputs {
-            original_source,
-            resolved_source,
+            original_sources,
+            resolved_sources,
             config,
             external_metadata_id,
             prepared_family,
@@ -2557,8 +2638,8 @@ impl ResolvedModelPlan {
         } = inputs;
         let mut parts = ResolvedModelPlanParts {
             source_artifacts,
-            original_source,
-            resolved_source,
+            original_sources,
+            resolved_sources,
             config,
             external_metadata_id,
             prepared_family,
@@ -2770,10 +2851,13 @@ impl ResolvedModelPlan {
         parts
             .source_artifacts
             .sort_by(|left, right| left.id.cmp(&right.id));
-        parts
-            .resolved_source
-            .files
-            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        for role in ModelArtifactSourceRole::ALL {
+            parts
+                .resolved_sources
+                .for_role_mut(role)
+                .files
+                .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        }
         parts.stop.strings.sort();
         parts.decisions.sort_by_key(|decision| decision.field);
     }
@@ -2795,9 +2879,13 @@ impl ResolvedModelPlan {
             }
             artifact.provenance.validate()?;
             match &artifact.provenance {
-                ResolutionSourceProvenance::LockedModelFile { relative_path } => {
+                ResolutionSourceProvenance::LockedModelFile {
+                    source_role,
+                    relative_path,
+                } => {
                     let Some(file) = parts
-                        .resolved_source
+                        .resolved_sources
+                        .for_role(*source_role)
                         .files
                         .iter()
                         .find(|file| &file.relative_path == relative_path)
@@ -2805,8 +2893,8 @@ impl ResolvedModelPlan {
                         return Err(invalid_plan(
                             "source_artifacts.provenance",
                             format!(
-                                "artifact `{}` does not resolve to locked file `{relative_path}`",
-                                artifact.id
+                                "artifact `{}` does not resolve to {source_role:?} locked file `{relative_path}`",
+                                artifact.id,
                             ),
                         ));
                     };
@@ -2836,36 +2924,40 @@ impl ResolvedModelPlan {
                 ResolutionSourceProvenance::Upstream { .. } => {}
             }
         }
-        if parts.original_source.location.trim().is_empty()
-            || matches!(
-                parts.original_source.requested_revision.as_deref(),
-                Some(revision) if revision.trim().is_empty()
-            )
-            || parts.resolved_source.canonical_location.trim().is_empty()
-            || parts.resolved_source.resolved_revision.trim().is_empty()
-        {
-            return Err(invalid_plan(
-                "source",
-                "source locations and revisions must be non-empty",
-            ));
-        }
-        if parts.resolved_source.files.is_empty() {
-            return Err(invalid_plan(
-                "resolved_source.files",
-                "at least one fingerprinted file is required",
-            ));
-        }
-        let mut paths = BTreeSet::new();
-        if parts.resolved_source.files.iter().any(|file| {
-            !validate_source_path(&file.relative_path)
-                || file.size_bytes == 0
-                || !is_canonical_sha256(&file.sha256)
-                || !paths.insert(file.relative_path.clone())
-        }) {
-            return Err(invalid_plan(
-                "resolved_source.files",
-                "file paths, sizes, and canonical hashes must be valid and unique",
-            ));
+        for role in ModelArtifactSourceRole::ALL {
+            let original = parts.original_sources.for_role(role);
+            let resolved = parts.resolved_sources.for_role(role);
+            if original.location.trim().is_empty()
+                || matches!(
+                    original.requested_revision.as_deref(),
+                    Some(revision) if revision.trim().is_empty()
+                )
+                || resolved.canonical_location.trim().is_empty()
+                || resolved.resolved_revision.trim().is_empty()
+            {
+                return Err(invalid_plan(
+                    format!("{}_source", role.as_str()),
+                    "source locations and revisions must be non-empty",
+                ));
+            }
+            if resolved.files.is_empty() {
+                return Err(invalid_plan(
+                    format!("resolved_sources.{}.files", role.as_str()),
+                    "at least one fingerprinted file is required",
+                ));
+            }
+            let mut paths = BTreeSet::new();
+            if resolved.files.iter().any(|file| {
+                !validate_source_path(&file.relative_path)
+                    || file.size_bytes == 0
+                    || !is_canonical_sha256(&file.sha256)
+                    || !paths.insert(file.relative_path.clone())
+            }) {
+                return Err(invalid_plan(
+                    format!("resolved_sources.{}.files", role.as_str()),
+                    "file paths, sizes, and canonical hashes must be valid and unique",
+                ));
+            }
         }
         let family = &parts.prepared_family;
         let program_fingerprint = family.program().fingerprint()?;
@@ -2880,7 +2972,8 @@ impl ResolvedModelPlan {
             ));
         }
         Self::validate_source_file_binding(
-            &parts.resolved_source,
+            ModelArtifactSourceRole::Semantic,
+            &parts.resolved_sources.semantic,
             &parts.config.source_file,
             &parts.config.sha256,
             "config",
@@ -2892,13 +2985,15 @@ impl ResolvedModelPlan {
             ));
         }
         Self::validate_source_file_binding(
-            &parts.resolved_source,
+            ModelArtifactSourceRole::Tokenizer,
+            &parts.resolved_sources.tokenizer,
             &parts.tokenizer.source_file,
             &parts.tokenizer.sha256,
             "tokenizer",
         )?;
         Self::validate_source_file_binding(
-            &parts.resolved_source,
+            ModelArtifactSourceRole::Tokenizer,
+            &parts.resolved_sources.tokenizer,
             &family.metadata().template.source_file,
             &family.metadata().template.sha256,
             "template",
@@ -3058,6 +3153,19 @@ impl ResolvedModelPlan {
                     ),
                 ));
             }
+            if let ResolutionSourceProvenance::LockedModelFile { source_role, .. } =
+                &artifact.provenance
+            {
+                if !Self::locked_source_role_allowed(decision.field, *source_role) {
+                    return Err(invalid_plan(
+                        "decisions.source_role",
+                        format!(
+                            "decision for `{:?}` cannot use a {source_role:?} locked source",
+                            decision.field
+                        ),
+                    ));
+                }
+            }
             let source_field = artifact
                 .fields
                 .get(decision.evidence.source_field_path())
@@ -3117,6 +3225,7 @@ impl ResolvedModelPlan {
     }
 
     fn validate_source_file_binding(
+        role: ModelArtifactSourceRole,
         source: &ResolvedModelSource,
         source_file: &str,
         sha256: &str,
@@ -3143,8 +3252,46 @@ impl ResolvedModelPlan {
             )),
             None => Err(invalid_plan(
                 format!("{field}.source_file"),
-                format!("`{source_file}` is absent from resolved_source.files"),
+                format!(
+                    "`{source_file}` is absent from resolved_sources.{}.files",
+                    role.as_str()
+                ),
             )),
+        }
+    }
+
+    const fn locked_source_role_allowed(
+        field: ResolutionField,
+        role: ModelArtifactSourceRole,
+    ) -> bool {
+        match field {
+            ResolutionField::Config
+            | ResolutionField::ExternalMetadata
+            | ResolutionField::Family => matches!(role, ModelArtifactSourceRole::Semantic),
+            ResolutionField::Tokenizer | ResolutionField::Template => {
+                matches!(role, ModelArtifactSourceRole::Tokenizer)
+            }
+            ResolutionField::SpecialTokens => matches!(
+                role,
+                ModelArtifactSourceRole::Semantic | ModelArtifactSourceRole::Tokenizer
+            ),
+            ResolutionField::WeightSchema => matches!(
+                role,
+                ModelArtifactSourceRole::Semantic | ModelArtifactSourceRole::Weights
+            ),
+            ResolutionField::WeightFormat => matches!(role, ModelArtifactSourceRole::Weights),
+            ResolutionField::OriginalSources
+            | ResolutionField::ResolvedSources
+            | ResolutionField::Device
+            | ResolutionField::Capabilities
+            | ResolutionField::RuntimePreset
+            | ResolutionField::RuntimeMemory
+            | ResolutionField::Admission
+            | ResolutionField::Engine
+            | ResolutionField::ExecutionPlan
+            | ResolutionField::Sampling
+            | ResolutionField::Stop
+            | ResolutionField::StructuredOutput => true,
         }
     }
 
@@ -3252,14 +3399,14 @@ impl ResolvedModelPlan {
         }
 
         insert_value!(
-            ResolutionField::OriginalSource,
-            &parts.original_source,
-            "serialize original model source decision"
+            ResolutionField::OriginalSources,
+            &parts.original_sources,
+            "serialize original model sources decision"
         );
         insert_value!(
-            ResolutionField::ResolvedSource,
-            &parts.resolved_source,
-            "serialize resolved model source decision"
+            ResolutionField::ResolvedSources,
+            &parts.resolved_sources,
+            "serialize resolved model sources decision"
         );
         insert_value!(
             ResolutionField::Config,
