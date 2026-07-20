@@ -41,6 +41,9 @@ RUNTIME_VNEXT_CHECKPOINT_ARTIFACT = (
 QWEN35_GGUF_LINEAR_ATTENTION_REFERENCE = (
     REPO_ROOT / "scripts/release/qwen35_gguf_linear_attention_reference.py"
 )
+QWEN35_GGUF_FULL_ATTENTION_REFERENCE = (
+    REPO_ROOT / "scripts/release/qwen35_gguf_full_attention_reference.py"
+)
 RUNTIME_VNEXT_QWEN35_LAYER_REFERENCE_GATE = (
     REPO_ROOT / "scripts/release/runtime_vnext_qwen35_layer_reference_gate.py"
 )
@@ -494,6 +497,17 @@ def test_qwen35_gguf_linear_attention_reference_selftest() -> None:
     )
 
 
+def test_qwen35_gguf_full_attention_reference_selftest() -> None:
+    ok = run(
+        [sys.executable, str(QWEN35_GGUF_FULL_ATTENTION_REFERENCE), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "QWEN35 GGUF FULL ATTENTION REFERENCE SELF-TEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
 def test_runtime_vnext_qwen35_layer_reference_gate_selftest() -> None:
     ok = run(
         [sys.executable, str(RUNTIME_VNEXT_QWEN35_LAYER_REFERENCE_GATE), "--self-test"]
@@ -824,6 +838,7 @@ def main() -> int:
     test_runtime_vnext_numerical_tolerances_selftest()
     test_runtime_vnext_checkpoint_artifact_selftest()
     test_qwen35_gguf_linear_attention_reference_selftest()
+    test_qwen35_gguf_full_attention_reference_selftest()
     test_runtime_vnext_qwen35_layer_reference_gate_selftest()
     test_runtime_vnext_s1_cuda_checkpoint_selftest()
     test_runtime_vnext_s1_cuda_basic_collector_selftest()
