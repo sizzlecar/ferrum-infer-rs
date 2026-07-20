@@ -19,7 +19,11 @@
       "type": "run_multiturn",
       "secret": "ferrum-blue",
       "expected_recall": "ferrum-blue",
-      "min_assistant_turns": 2
+      "min_assistant_turns": 2,
+      "prompts": [
+        "Remember the exact code ferrum-blue for the next turn. Reply with only OK.",
+        "Reply with only the exact remembered code."
+      ]
     },
     {
       "name": "run_first_token_ux",
