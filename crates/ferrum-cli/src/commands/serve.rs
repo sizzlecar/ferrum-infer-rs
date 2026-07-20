@@ -445,6 +445,13 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let source = product_input.source;
     let product_engine_config = product_input.engine_config;
     let model_sources = product_input.model_sources;
+    let vnext_plan_owns_context_capacity = match model_sources.as_deref() {
+        Some(sources) => matches!(
+            ferrum_models::vnext::resolve_registered_model_from_sources(sources)?,
+            ferrum_models::vnext::ProductionModelRegistration::Registered(_)
+        ),
+        None => false,
+    };
     let model_id = crate::source_resolver::public_model_id(&source);
     let model_chat_template = match model_sources.as_deref() {
         Some(sources) => crate::source_resolver::load_product_chat_template(sources),
@@ -556,6 +563,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let serve_profile_entries = crate::source_resolver::serve_profile_runtime_entries(
         &source.local_path,
         &device,
+        vnext_plan_owns_context_capacity,
         &RuntimeConfigSnapshot::capture_current(),
         RuntimeConfigSource::Default,
     );
