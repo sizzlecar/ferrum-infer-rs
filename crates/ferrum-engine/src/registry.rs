@@ -1261,6 +1261,11 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         use ferrum_models::weight_format::WeightFormat;
 
         // Try to load model from path
+        let checkpoint_capture_enabled = config
+            .engine_config
+            .runtime
+            .vnext_checkpoint_capture
+            .is_some();
         let model_sources = config.model_sources.clone();
         let model_path = model_sources
             .as_ref()
@@ -1271,6 +1276,11 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         let model_path = match model_path {
             Some(path) => path,
             None => {
+                if checkpoint_capture_enabled {
+                    return Err(FerrumError::unsupported(
+                        "vNext checkpoint capture requires a registered model source",
+                    ));
+                }
                 info!("No model path found, falling back to stub executor");
                 return StubExecutorFactory.create(config).await;
             }
@@ -1315,6 +1325,11 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 )));
             }
             if legacy_reference_enabled {
+                if checkpoint_capture_enabled {
+                    return Err(FerrumError::unsupported(
+                        "vNext checkpoint capture cannot run through the legacy reference executor",
+                    ));
+                }
                 info!(
                     external_metadata_id = %production_registration.external_metadata_id(),
                     "Entering the explicitly allowed Qwen3.5 CPU reference path"
@@ -1333,6 +1348,11 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                         external_metadata_id,
                         ..
                     } => {
+                        if checkpoint_capture_enabled {
+                            return Err(FerrumError::unsupported(format!(
+                                "vNext checkpoint capture requires a migrated model; metadata {external_metadata_id} is still legacy"
+                            )));
+                        }
                         info!(
                             %external_metadata_id,
                             "Entering the explicitly registered legacy model path"
@@ -1340,6 +1360,11 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                     }
                 }
             }
+        }
+        if checkpoint_capture_enabled {
+            return Err(FerrumError::unsupported(
+                "vNext checkpoint capture requires a registered vNext model package",
+            ));
         }
 
         if let WeightFormat::Gguf { ref path } = weight_fmt {
@@ -2024,6 +2049,44 @@ mod tests {
                 .insert("qwen35_reference".to_string(), serde_json::json!(true));
         }
         ComponentConfig::from_engine_config(&engine_config)
+    }
+
+    fn enable_checkpoint_capture(config: &mut ComponentConfig, output_dir: PathBuf) {
+        config.engine_config.runtime.vnext_checkpoint_capture =
+            Some(ferrum_types::VNextCheckpointCaptureConfig {
+                output_dir,
+                value_ids: vec!["value.output.logits".to_owned()],
+                maximum_prefill_waves: 1,
+            });
+    }
+
+    #[test]
+    fn checkpoint_capture_rejects_stub_fallback() {
+        let mut config = ComponentConfig::from_engine_config(&EngineConfig::default());
+        enable_checkpoint_capture(&mut config, PathBuf::from("capture"));
+
+        let error = match tokio_test::block_on(LlmExecutorFactory.create(&config)) {
+            Ok(_) => panic!("checkpoint capture unexpectedly entered the stub executor"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("requires a registered model source"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_capture_rejects_legacy_reference_executor() {
+        let dir = write_qwen35_reference_model_dir();
+        let mut config = qwen35_reference_component_config(&dir, true);
+        enable_checkpoint_capture(&mut config, dir.join("capture"));
+
+        let error = match tokio_test::block_on(LlmExecutorFactory.create(&config)) {
+            Ok(_) => panic!("checkpoint capture unexpectedly entered the legacy reference"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("legacy reference executor"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

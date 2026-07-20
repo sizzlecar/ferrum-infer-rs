@@ -28,3 +28,4 @@ pub mod serve;
 pub mod stop;
 pub mod transcribe;
 pub mod tts;
+pub mod vnext_checkpoint;
