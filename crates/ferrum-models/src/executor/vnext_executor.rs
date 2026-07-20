@@ -39,6 +39,9 @@ use crate::vnext::PreparedProductionModel;
 
 use super::{
     common,
+    vnext_checkpoint::{
+        VNextCheckpointArtifactRecord, VNextCheckpointCapture, VNextCheckpointSelection,
+    },
     vnext_completion_worker::{VNextCompletionTaskKind, VNextCompletionWorker},
     vnext_timing::AtomicDurationMetrics,
 };
@@ -508,6 +511,11 @@ struct VNextExecutorMetrics {
 enum VNextExecutionWaveKind {
     Prefill,
     Decode,
+}
+
+enum VNextTerminalReadbacks {
+    Batch(CompletionReadbackBatchRequest),
+    Collection(CompletionReadbackCollectionRequest),
 }
 
 impl VNextExecutionWaveKind {
@@ -2237,6 +2245,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     run_id: RunId,
     family_fingerprint: String,
     program_fingerprint: String,
+    checkpoint_capture: Option<VNextCheckpointCapture>,
     static_bytes: u64,
     reusable_execution_enabled: bool,
     reusable_execution_supported: bool,
@@ -2348,6 +2357,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let attention_head_dimension = prepared.descriptor().attention_head_dimension();
         let config =
             VNextExecutorConfig::from_engine_config(engine_config, &info, runtime.as_ref())?;
+        let checkpoint_selection = VNextCheckpointSelection::from_config(
+            engine_config.runtime.vnext_checkpoint_capture.as_ref(),
+        )?;
         let family = prepared.family();
         let input_id = match family.program().inputs() {
             [input] => input.clone(),
@@ -2369,7 +2381,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         let input_capacity = u64::try_from(config.maximum_model_tokens)
             .map_err(|_| FerrumError::config("vNext model length exceeds u64"))?;
-        let compile_options = ProgramPlanCompileOptions::new(BTreeMap::from([(
+        let mut compile_options = ProgramPlanCompileOptions::new(BTreeMap::from([(
             input_id.clone(),
             ProgramTensorSpec {
                 dimensions: vec![input_capacity],
@@ -2378,6 +2390,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             },
         )]))
         .map_err(|error| FerrumError::model(format!("vNext compile input: {error}")))?;
+        if let Some(selection) = &checkpoint_selection {
+            selection.retain_in(&mut compile_options);
+        }
         let compilation = ProgramPlanCompiler::compile(
             family,
             &catalog,
@@ -2510,6 +2525,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             } else {
                 None
             };
+        let checkpoint_capture = checkpoint_selection
+            .map(|selection| {
+                selection.bind(
+                    resolved_plan.execution_plan(),
+                    info.model_id.to_string(),
+                    family_fingerprint.clone(),
+                    program_fingerprint.clone(),
+                    &run_id,
+                )
+            })
+            .transpose()?;
 
         Ok(Self {
             info,
@@ -2527,6 +2553,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             run_id,
             family_fingerprint,
             program_fingerprint,
+            checkpoint_capture,
             static_bytes,
             reusable_execution_enabled: config.reusable_execution_enabled,
             reusable_execution_supported,
@@ -4077,6 +4104,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let phase_timing = self.metrics.wave_timing_for(kind);
         let _phase_execution_timing = phase_timing.submitted_wave_total.start();
         let PreparedVNextPrefill { step, wave } = prepared;
+        let capture_index = if kind == VNextExecutionWaveKind::Prefill {
+            self.checkpoint_capture
+                .as_ref()
+                .and_then(VNextCheckpointCapture::claim_prefill_wave)
+        } else {
+            None
+        };
+        let readbacks = self.prepare_terminal_readbacks(participants, capture_index)?;
         let dispatch = {
             let _timing = self.metrics.wave_timing.host_encode_submit.start();
             let _phase_timing = phase_timing.host_encode_submit.start();
@@ -4154,31 +4189,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             }
         }
 
-        let readbacks = participants
-            .iter()
-            .enumerate()
-            .map(|(participant_index, _)| {
-                CompletionReadbackRequest::new(
-                    self.io.output_node_id.clone(),
-                    u32::try_from(participant_index).map_err(|_| {
-                        FerrumError::backend("vNext readback participant index exceeds u32")
-                    })?,
-                    self.io.output_resource_id.clone(),
-                    self.io.output_offset_bytes,
-                    self.io.output_layout,
-                )
-                .map_err(|error| FerrumError::backend(error.to_string()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let readbacks = CompletionReadbackBatchRequest::new(readbacks)
-            .map_err(|error| FerrumError::backend(error.to_string()))?;
         let reaper = Arc::clone(&self.reaper);
         let observation = {
             let _timing = self.metrics.wave_timing.completion_round_trip.start();
             let _phase_timing = phase_timing.completion_round_trip.start();
             self.completion_worker
                 .execute(VNextCompletionTaskKind::WaveReadback, move || {
-                    let observation = completion.wait_with_readbacks(readbacks);
+                    let observation = match readbacks {
+                        VNextTerminalReadbacks::Batch(request) => {
+                            completion.wait_with_readbacks(request)
+                        }
+                        VNextTerminalReadbacks::Collection(request) => {
+                            completion.wait_with_readback_collection(request)
+                        }
+                    };
                     drop(reaper);
                     observation
                 })
@@ -4220,31 +4244,110 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             drop(receipt);
             return Err(self.abort_step(step, message).await);
         }
-        let logits = receipt
-            .dispositions()
-            .iter()
-            .map(|disposition| match disposition {
-                CompletionReadbackDisposition::Succeeded(output) => {
-                    Self::decode_logits(output.bytes(), self.io.output_element_type)
+        let processed = (|| -> Result<(Vec<Vec<f32>>, u64, Vec<VNextCheckpointArtifactRecord>)> {
+            let mut logits = vec![None; participants.len()];
+            let mut readback_bytes = 0_u64;
+            let mut checkpoint_records = Vec::new();
+            for disposition in receipt.dispositions() {
+                let CompletionReadbackDisposition::Succeeded(output) = disposition else {
+                    return Err(FerrumError::backend(format!(
+                        "vNext terminal readback failed: {disposition:?}"
+                    )));
+                };
+                readback_bytes = readback_bytes
+                    .saturating_add(output.request().output_layout().byte_len().unwrap_or(0));
+                let request = output.request();
+                let is_logits = request.node_id() == &self.io.output_node_id
+                    && request.resource_id() == &self.io.output_resource_id
+                    && request.logical_offset_bytes() == self.io.output_offset_bytes
+                    && request.output_layout() == self.io.output_layout;
+                let checkpoint = capture_index
+                    .and_then(|_| self.checkpoint_capture.as_ref())
+                    .and_then(|capture| capture.checkpoint_for_output(output));
+                if !is_logits && checkpoint.is_none() {
+                    return Err(FerrumError::internal(format!(
+                        "vNext terminal readback returned unowned node/resource {}/{}",
+                        request.node_id(),
+                        request.resource_id()
+                    )));
                 }
-                disposition => Err(FerrumError::backend(format!(
-                    "vNext logits readback failed: {disposition:?}"
-                ))),
-            })
-            .collect::<Result<Vec<_>>>();
-        let logits = match logits {
-            Ok(logits) => logits,
+                if is_logits {
+                    let participant_index =
+                        usize::try_from(request.participant_index()).map_err(|_| {
+                            FerrumError::internal("vNext logits participant index exceeds usize")
+                        })?;
+                    let slot = logits.get_mut(participant_index).ok_or_else(|| {
+                        FerrumError::internal(
+                            "vNext logits participant index exceeds submitted participants",
+                        )
+                    })?;
+                    if slot.is_some() {
+                        return Err(FerrumError::internal(
+                            "vNext terminal readback returned duplicate participant logits",
+                        ));
+                    }
+                    *slot = Some(Self::decode_logits(
+                        output.bytes(),
+                        self.io.output_element_type,
+                    )?);
+                }
+                if let (Some(capture_index), Some(capture), Some(checkpoint)) =
+                    (capture_index, self.checkpoint_capture.as_ref(), checkpoint)
+                {
+                    let participant_index =
+                        usize::try_from(request.participant_index()).map_err(|_| {
+                            FerrumError::internal(
+                                "vNext checkpoint participant index exceeds usize",
+                            )
+                        })?;
+                    let participant = participants.get(participant_index).ok_or_else(|| {
+                        FerrumError::internal(
+                            "vNext checkpoint participant index exceeds submitted participants",
+                        )
+                    })?;
+                    checkpoint_records.push(capture.write_output(
+                        capture_index,
+                        &participant.sequence.request_id,
+                        participant.span,
+                        checkpoint,
+                        output,
+                    )?);
+                }
+            }
+            let logits = logits
+                .into_iter()
+                .enumerate()
+                .map(|(participant_index, logits)| {
+                    logits.ok_or_else(|| {
+                        FerrumError::internal(format!(
+                            "vNext terminal readback omitted participant {participant_index} logits"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((logits, readback_bytes, checkpoint_records))
+        })();
+        let (logits, readback_bytes, checkpoint_records) = match processed {
+            Ok(processed) => processed,
             Err(error) => {
                 drop(receipt);
                 return Err(self.abort_step(step, error.to_string()).await);
             }
         };
-        let readback_bytes = self
-            .io
-            .output_layout
-            .byte_len()
-            .unwrap_or(0)
-            .saturating_mul(participants.len() as u64);
+        if let (Some(capture_index), Some(capture)) =
+            (capture_index, self.checkpoint_capture.as_ref())
+        {
+            if let Err(error) = capture.finish_wave(
+                capture_index,
+                participants.len(),
+                receipt.completion().fingerprint(),
+                receipt.fingerprint(),
+                checkpoint_records,
+            ) {
+                drop(receipt);
+                return Err(self.abort_step(step, error.to_string()).await);
+            }
+        }
         self.metrics
             .readback_bytes
             .fetch_add(readback_bytes, Ordering::Relaxed);
@@ -4266,6 +4369,68 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 Err(FerrumError::backend(message))
             }
         }
+    }
+
+    fn prepare_terminal_readbacks(
+        &self,
+        participants: &[VNextExecutionParticipant<'_, R>],
+        capture_index: Option<usize>,
+    ) -> Result<VNextTerminalReadbacks> {
+        let logits_readbacks = participants
+            .iter()
+            .enumerate()
+            .map(|(participant_index, _)| {
+                CompletionReadbackRequest::new(
+                    self.io.output_node_id.clone(),
+                    u32::try_from(participant_index).map_err(|_| {
+                        FerrumError::backend("vNext readback participant index exceeds u32")
+                    })?,
+                    self.io.output_resource_id.clone(),
+                    self.io.output_offset_bytes,
+                    self.io.output_layout,
+                )
+                .map_err(|error| FerrumError::backend(error.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let logits_readbacks = CompletionReadbackBatchRequest::new(logits_readbacks)
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
+        let mut readback_batches = vec![logits_readbacks.clone()];
+        if capture_index.is_some() {
+            let capture = self.checkpoint_capture.as_ref().ok_or_else(|| {
+                FerrumError::internal("vNext checkpoint capture index has no capture owner")
+            })?;
+            let token_spans = participants
+                .iter()
+                .map(|participant| participant.span)
+                .collect::<Vec<_>>();
+            for batch in
+                capture.readback_batches(self.resolved_plan.execution_plan(), &token_spans)?
+            {
+                let first = &batch.requests()[0];
+                let logits_first = &logits_readbacks.requests()[0];
+                if first.node_id() == logits_first.node_id()
+                    && first.resource_id() == logits_first.resource_id()
+                {
+                    if batch != logits_readbacks {
+                        return Err(FerrumError::internal(
+                            "retained logits readback differs from the product logits layout",
+                        ));
+                    }
+                    continue;
+                }
+                readback_batches.push(batch);
+            }
+        }
+        if readback_batches.len() == 1 {
+            return Ok(VNextTerminalReadbacks::Batch(
+                readback_batches.pop().ok_or_else(|| {
+                    FerrumError::internal("vNext terminal readback batch disappeared")
+                })?,
+            ));
+        }
+        CompletionReadbackCollectionRequest::new(readback_batches)
+            .map(VNextTerminalReadbacks::Collection)
+            .map_err(|error| FerrumError::backend(error.to_string()))
     }
 
     fn decode_logits(bytes: &[u8], element_type: ElementType) -> Result<Vec<f32>> {
@@ -4863,6 +5028,9 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
             });
         match preparation {
             Ok(report) => {
+                if let Some(capture) = &self.checkpoint_capture {
+                    capture.arm();
+                }
                 *self.startup_preparation.lock() = VNextStartupPreparationState::Ready { report };
                 Ok(())
             }

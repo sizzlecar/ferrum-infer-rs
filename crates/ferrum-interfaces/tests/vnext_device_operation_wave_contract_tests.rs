@@ -665,6 +665,106 @@ fn terminal_wave_reads_output_before_releasing_backing() {
 }
 
 #[test]
+fn terminal_wave_reads_multiple_canonical_node_groups_under_one_fence() {
+    let (fixture, sequence, session, batch, step) = setup();
+    let executable = ExecutablePlan::new(
+        fixture.plan.clone(),
+        fixture.resolved.parts().capabilities.clone(),
+    )
+    .unwrap();
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&executable, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &executable,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let handle = OperationDispatch::encode_and_submit_wave(
+        &providers,
+        &executable,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Completion,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    let group = |node: &str, resource: &str| {
+        CompletionReadbackBatchRequest::new(vec![CompletionReadbackRequest::new(
+            id(node),
+            0,
+            id(resource),
+            0,
+            HostTransferLayout::new(ElementType::F32, 4).unwrap(),
+        )
+        .unwrap()])
+        .unwrap()
+    };
+    assert!(CompletionReadbackCollectionRequest::new(Vec::new()).is_err());
+    assert!(CompletionReadbackCollectionRequest::new(vec![
+        group("node.tail", "resource.output"),
+        group("node.tail", "resource.output"),
+    ])
+    .is_err());
+    let collection = CompletionReadbackCollectionRequest::new(vec![
+        group("node.tail", "resource.output"),
+        group("node.main", "resource.intermediate"),
+    ])
+    .unwrap();
+    assert_eq!(collection.len(), 2);
+    assert_eq!(collection.request_count(), 2);
+
+    let receipt = match handle.wait_with_readback_collection(collection).unwrap() {
+        CompletionReadbackCollectionObservation::Terminal(receipt) => receipt,
+        other => panic!("wave collection readback did not terminate: {other:?}"),
+    };
+    assert_eq!(receipt.dispositions().len(), 2);
+    assert!(receipt
+        .dispositions()
+        .iter()
+        .all(|disposition| matches!(disposition, CompletionReadbackDisposition::Succeeded(_))));
+    let groups = receipt
+        .dispositions()
+        .iter()
+        .map(|disposition| match disposition {
+            CompletionReadbackDisposition::Succeeded(output) => (
+                output.request().node_id().as_str(),
+                output.request().resource_id().as_str(),
+            ),
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        groups,
+        vec![
+            ("node.main", "resource.intermediate"),
+            ("node.tail", "resource.output"),
+        ]
+    );
+    assert_eq!(lane.in_flight_count(), 0);
+    assert_eq!(reaper.retained_count(), 0);
+
+    drop(handle);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
 fn provider_declared_binding_compute_and_result_phases_share_one_wave() {
     let (fixture, sequence, session, batch, step) = setup();
     *fixture.provider_behavior.lock().unwrap() = ProviderBehavior::SplitPhases;

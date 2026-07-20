@@ -92,6 +92,10 @@ fn completion_retention_binds_one_typed_output_and_requires_expected_wire_policy
     assert_eq!(readback.node_id(), checkpoint.producer_node_id());
     assert_eq!(readback.resource_id(), checkpoint.resource_id());
     assert_eq!(readback.participant_index(), 3);
+    let work_readback = plan
+        .completion_checkpoint_readback_for_work(&id("value.output"), 3, &resource_work(&[2]))
+        .unwrap();
+    assert_eq!(work_readback.output_layout().element_count(), 4);
     assert!(checkpoint
         .readback_request(0, HostTransferLayout::new(ElementType::U8, 4).unwrap())
         .unwrap_err()
