@@ -21,6 +21,7 @@ const CPU_OUTPUT_TOLERANCE_FINGERPRINT: &str =
     "d30006c0535a3b3172ac88db66f75f07df6256e321509188bb0949c7a64a9fdb";
 // This stricter diagnostic never substitutes for a catalog-bound release comparison.
 const SPLIT_CONTINUITY_DIAGNOSTIC_MAX_ABS: f32 = 0.001;
+const CPU_KV_STATE_DIAGNOSTIC_MAX_ABS: f32 = 0.001;
 
 #[test]
 fn fixed_page_attention_matches_cpu_and_preserves_split_decode_state_on_real_metal() {
@@ -79,6 +80,9 @@ fn fixed_page_attention_matches_cpu_and_preserves_split_decode_state_on_real_met
     ));
 
     let cpu_output = cpu_attention(&query_raw, &key_raw, &value_raw, &query_norm, &key_norm);
+    let cpu_kv_state = cpu_fixed_page_kv_state(&key_raw, &value_raw, &key_norm);
+    let full_kv_state = read_pages(&full_pages);
+    let split_kv_state = read_pages(&split_pages);
     assert!(full_output.iter().any(|value| value.abs() > 1.0e-4));
     numerical_tolerance::assert_matches(
         "Metal/CPU causal output",
@@ -91,6 +95,18 @@ fn fixed_page_attention_matches_cpu_and_preserves_split_decode_state_on_real_met
         CPU_OUTPUT_TOLERANCE_FINGERPRINT,
     )
     .expect("reviewed causal-attention numerical contract");
+    assert_close(
+        "full/cpu causal KV state",
+        &full_kv_state,
+        &cpu_kv_state,
+        CPU_KV_STATE_DIAGNOSTIC_MAX_ABS,
+    );
+    assert_close(
+        "split/cpu causal KV state",
+        &split_kv_state,
+        &cpu_kv_state,
+        CPU_KV_STATE_DIAGNOSTIC_MAX_ABS,
+    );
     assert_close(
         "full/split causal output",
         &full_output,
@@ -109,6 +125,13 @@ fn fixed_page_attention_matches_cpu_and_preserves_split_decode_state_on_real_met
         &read_f16(&split_pages[1], TEST_PAGE_ELEMENTS),
         SPLIT_CONTINUITY_DIAGNOSTIC_MAX_ABS,
     );
+}
+
+fn read_pages(pages: &[Buffer]) -> Vec<f32> {
+    pages
+        .iter()
+        .flat_map(|page| read_f16(page, TEST_PAGE_ELEMENTS))
+        .collect()
 }
 
 struct SegmentInputs<'a> {
@@ -310,6 +333,23 @@ fn cpu_attention(
         }
     }
     output
+}
+
+fn cpu_fixed_page_kv_state(key_raw: &[f16], value_raw: &[f16], key_norm: &[f16]) -> Vec<f32> {
+    let mut state = vec![0.0_f32; TOKENS * TEST_PAGE_ELEMENTS];
+    for token in 0..TOKENS {
+        let page = token * TEST_PAGE_ELEMENTS;
+        prepare_head(
+            &key_raw[token * KV_FEATURES..(token + 1) * KV_FEATURES],
+            key_norm,
+            token,
+            &mut state[page..page + KV_FEATURES],
+        );
+        for dim in 0..KV_FEATURES {
+            state[page + KV_FEATURES + dim] = f32::from(value_raw[token * KV_FEATURES + dim]);
+        }
+    }
+    state
 }
 
 fn prepare_head(source: &[f16], weight: &[f16], position: usize, output: &mut [f32]) {
