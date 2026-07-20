@@ -10,6 +10,7 @@ summary artifact plus one PASS line.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.server
 import json
 import os
@@ -162,6 +163,11 @@ def require(condition: bool, message: str) -> None:
         raise ScenarioError(message)
 
 
+def json_fingerprint(value: Any) -> str:
+    canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def post_json(
     base_url: str,
     payload: dict[str, Any],
@@ -278,11 +284,14 @@ def strict_schema_case(
             "additionalProperties": False,
         }
     elif category == "type":
-        expected = {"ordinal": ordinal}
+        expected = {"case": marker, "ordinal": ordinal}
         schema = {
             "type": "object",
-            "properties": {"ordinal": {"type": "integer", "const": ordinal}},
-            "required": ["ordinal"],
+            "properties": {
+                "case": {"type": "string", "const": marker},
+                "ordinal": {"type": "integer", "const": ordinal},
+            },
+            "required": ["case", "ordinal"],
             "additionalProperties": False,
         }
     elif category == "additionalProperties":
@@ -294,14 +303,14 @@ def strict_schema_case(
             "additionalProperties": False,
         }
     elif category == "enum":
-        value = f"accepted-{ordinal:03d}"
+        value = f"accepted-{marker}"
         expected = {"status": value}
         schema = {
             "type": "object",
             "properties": {
                 "status": {
                     "type": "string",
-                    "enum": [value, f"rejected-{ordinal:03d}"],
+                    "enum": [value, f"rejected-{marker}"],
                 }
             },
             "required": ["status"],
@@ -310,6 +319,137 @@ def strict_schema_case(
     else:
         raise ScenarioError(f"unsupported strict schema category: {category}")
     return expected, schema
+
+
+def response_format_matrix_plan(scenario: dict[str, Any]) -> dict[str, Any]:
+    name = str(scenario.get("name") or "")
+    require(name != "", "serve_response_format_matrix.name is required")
+    format_type = str(scenario.get("format") or "")
+    require(
+        format_type in {"json_object", "json_schema"},
+        "serve_response_format_matrix.format must be json_object or json_schema",
+    )
+    case_count = int(scenario.get("case_count", 1))
+    require(1 <= case_count <= 70, "serve_response_format_matrix.case_count must be 1..70")
+    thinking = scenario.get("enable_thinking")
+    require(isinstance(thinking, bool), "enable_thinking must be a boolean")
+    preset = str(scenario.get("preset") or "")
+    expected_preset = "P_THINKING" if thinking else "P_NO_THINKING"
+    require(preset == expected_preset, f"preset must be {expected_preset}")
+    sampling = scenario.get("sampling")
+    require(isinstance(sampling, dict), "serve_response_format_matrix.sampling is required")
+    required_sampling = {
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+        "repetition_penalty",
+        "seed",
+        "stop",
+    }
+    missing_sampling = sorted(required_sampling - sampling.keys())
+    require(not missing_sampling, f"sampling fields missing: {missing_sampling}")
+
+    categories = ("required", "type", "additionalProperties", "enum")
+    cases: list[dict[str, Any]] = []
+    for ordinal in range(case_count):
+        marker = f"{scenario_slug(name)}-{ordinal:03d}"
+        category = categories[ordinal % len(categories)]
+        if format_type == "json_schema":
+            expected, schema = strict_schema_case(category, marker, ordinal)
+        else:
+            expected = {"marker": marker, "ordinal": ordinal}
+            schema = None
+        cases.append(
+            {
+                "ordinal": ordinal,
+                "marker": marker,
+                "category": category if format_type == "json_schema" else None,
+                "expected": expected,
+                "schema": schema,
+            }
+        )
+    return {
+        "name": name,
+        "format": format_type,
+        "case_count": case_count,
+        "enable_thinking": thinking,
+        "preset": preset,
+        "sampling": sampling,
+        "required_sampling": required_sampling,
+        "cases": cases,
+    }
+
+
+def response_format_matrix_contract(scenarios: list[dict[str, Any]]) -> dict[str, Any]:
+    seen_names: set[str] = set()
+    expected_owners: dict[str, dict[str, str]] = {"json_schema": {}, "json_object": {}}
+    schema_owners: dict[str, str] = {}
+    category_counts = {
+        "required": 0,
+        "type": 0,
+        "additionalProperties": 0,
+        "enum": 0,
+    }
+    rows: list[dict[str, Any]] = []
+
+    for scenario in scenarios:
+        if str(scenario.get("type")) != "serve_response_format_matrix":
+            continue
+        plan = response_format_matrix_plan(scenario)
+        name = str(plan["name"])
+        require(name not in seen_names, f"duplicate response-format matrix scenario name: {name}")
+        seen_names.add(name)
+        format_type = str(plan["format"])
+        for case in plan["cases"]:
+            owner = f"{name}/{int(case['ordinal']):03d}"
+            expected_fingerprint = json_fingerprint(case["expected"])
+            previous_expected = expected_owners[format_type].get(expected_fingerprint)
+            require(
+                previous_expected is None,
+                f"duplicate {format_type} expected object: {previous_expected} and {owner}",
+            )
+            expected_owners[format_type][expected_fingerprint] = owner
+            schema_fingerprint = None
+            category = case["category"]
+            if format_type == "json_schema":
+                schema_fingerprint = json_fingerprint(case["schema"])
+                previous_schema = schema_owners.get(schema_fingerprint)
+                require(
+                    previous_schema is None,
+                    f"duplicate json_schema schema: {previous_schema} and {owner}",
+                )
+                schema_owners[schema_fingerprint] = owner
+                category_counts[str(category)] += 1
+            rows.append(
+                {
+                    "scenario": name,
+                    "ordinal": case["ordinal"],
+                    "format": format_type,
+                    "category": category,
+                    "marker": case["marker"],
+                    "expected_fingerprint": expected_fingerprint,
+                    "schema_fingerprint": schema_fingerprint,
+                }
+            )
+
+    counts = {
+        format_type: sum(row["format"] == format_type for row in rows)
+        for format_type in ("json_schema", "json_object")
+    }
+    return {
+        "schema_version": 1,
+        "status": "pass",
+        "matrix_scenario_count": len(seen_names),
+        "case_counts": counts,
+        "unique_expected_object_counts": {
+            key: len(value) for key, value in expected_owners.items()
+        },
+        "unique_json_schema_count": len(schema_owners),
+        "json_schema_category_counts": category_counts,
+        "cases": rows,
+    }
 
 
 def parse_sse(body: str) -> dict[str, Any]:
@@ -624,13 +764,17 @@ class ScenarioRunner:
     def run_all(self) -> dict[str, Any]:
         self.out.mkdir(parents=True, exist_ok=True)
         started_at = iso_now()
+        scenarios = self.scenarios()
+        matrix_contract = response_format_matrix_contract(scenarios)
+        write_json(self.out / "response_format_matrix_contract.json", matrix_contract)
+        selected = selected_scenarios(scenarios, self.args.only)
         results: list[dict[str, Any]] = []
         failures = 0
         skipped = 0
         observability: dict[str, Any] | None = None
         try:
             self.ensure_server()
-            for scenario in selected_scenarios(self.scenarios(), self.args.only):
+            for scenario in selected:
                 result = self.run_one(scenario)
                 if result["status"] == "fail":
                     failures += 1
@@ -665,6 +809,11 @@ class ScenarioRunner:
             "failed": failures,
             "skipped": skipped,
             "scenarios": results,
+            "response_format_matrix_contract": {
+                "artifact": str(self.out / "response_format_matrix_contract.json"),
+                "case_counts": matrix_contract["case_counts"],
+                "unique_json_schema_count": matrix_contract["unique_json_schema_count"],
+            },
             "observability": observability,
             "pass_line": f"BACKEND REGRESSION SMOKE PASS: {self.out}" if status == "pass" else None,
         }
@@ -939,52 +1088,35 @@ class ScenarioRunner:
     def serve_response_format_matrix(
         self, scenario: dict[str, Any], out: Path
     ) -> dict[str, Any]:
-        format_type = str(scenario.get("format") or "")
-        require(
-            format_type in {"json_object", "json_schema"},
-            "serve_response_format_matrix.format must be json_object or json_schema",
-        )
-        case_count = int(scenario.get("case_count", 1))
-        require(1 <= case_count <= 70, "serve_response_format_matrix.case_count must be 1..70")
-        thinking = scenario.get("enable_thinking")
-        require(isinstance(thinking, bool), "enable_thinking must be a boolean")
-        preset = str(scenario.get("preset") or "")
-        expected_preset = "P_THINKING" if thinking else "P_NO_THINKING"
-        require(preset == expected_preset, f"preset must be {expected_preset}")
-        sampling = scenario.get("sampling")
-        require(isinstance(sampling, dict), "serve_response_format_matrix.sampling is required")
-        required_sampling = {
-            "temperature",
-            "top_p",
-            "top_k",
-            "min_p",
-            "presence_penalty",
-            "repetition_penalty",
-            "seed",
-            "stop",
+        plan = response_format_matrix_plan(scenario)
+        format_type = str(plan["format"])
+        thinking = bool(plan["enable_thinking"])
+        preset = str(plan["preset"])
+        sampling = plan["sampling"]
+        required_sampling = plan["required_sampling"]
+        category_counts = {
+            "required": 0,
+            "type": 0,
+            "additionalProperties": 0,
+            "enum": 0,
         }
-        missing_sampling = sorted(required_sampling - sampling.keys())
-        require(not missing_sampling, f"sampling fields missing: {missing_sampling}")
-
-        categories = ("required", "type", "additionalProperties", "enum")
-        category_counts = {category: 0 for category in categories}
         results: list[dict[str, Any]] = []
-        for ordinal in range(case_count):
-            marker = f"{scenario_slug(str(scenario['name']))}-{ordinal:03d}"
-            category = categories[ordinal % len(categories)]
+        for case in plan["cases"]:
+            ordinal = int(case["ordinal"])
+            marker = str(case["marker"])
+            category = case["category"]
+            expected = case["expected"]
             if format_type == "json_schema":
-                expected, schema = strict_schema_case(category, marker, ordinal)
                 response_format: dict[str, Any] = {
                     "type": "json_schema",
                     "json_schema": {
-                        "name": f"{category}_{ordinal:03d}",
+                        "name": f"{scenario_slug(str(plan['name']))}-{category}-{ordinal:03d}",
                         "strict": True,
-                        "schema": schema,
+                        "schema": case["schema"],
                     },
                 }
-                category_counts[category] += 1
+                category_counts[str(category)] += 1
             else:
-                expected = {"marker": marker, "ordinal": ordinal}
                 response_format = {"type": "json_object"}
 
             payload = chat_payload(
@@ -1592,6 +1724,80 @@ def run_selftest_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def self_test() -> int:
+    sampling = {
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repetition_penalty": 1.0,
+        "seed": 9271,
+        "stop": [],
+    }
+    full_c14_contract = response_format_matrix_contract(
+        [
+            {
+                "name": "c14-no-thinking",
+                "type": "serve_response_format_matrix",
+                "format": "json_schema",
+                "case_count": 50,
+                "enable_thinking": False,
+                "preset": "P_NO_THINKING",
+                "sampling": sampling,
+            },
+            {
+                "name": "c14-thinking",
+                "type": "serve_response_format_matrix",
+                "format": "json_schema",
+                "case_count": 20,
+                "enable_thinking": True,
+                "preset": "P_THINKING",
+                "sampling": {**sampling, "temperature": 1.0},
+            },
+        ]
+    )
+    if full_c14_contract["case_counts"] != {"json_schema": 70, "json_object": 0}:
+        raise AssertionError(full_c14_contract)
+    if full_c14_contract["unique_json_schema_count"] != 70:
+        raise AssertionError(full_c14_contract)
+    if full_c14_contract["unique_expected_object_counts"]["json_schema"] != 70:
+        raise AssertionError(full_c14_contract)
+    if full_c14_contract["json_schema_category_counts"] != {
+        "required": 18,
+        "type": 18,
+        "additionalProperties": 17,
+        "enum": 17,
+    }:
+        raise AssertionError(full_c14_contract)
+    try:
+        response_format_matrix_contract(
+            [
+                {
+                    "name": "duplicate-matrix",
+                    "type": "serve_response_format_matrix",
+                    "format": "json_schema",
+                    "case_count": 1,
+                    "enable_thinking": False,
+                    "preset": "P_NO_THINKING",
+                    "sampling": sampling,
+                },
+                {
+                    "name": "duplicate-matrix",
+                    "type": "serve_response_format_matrix",
+                    "format": "json_schema",
+                    "case_count": 1,
+                    "enable_thinking": False,
+                    "preset": "P_NO_THINKING",
+                    "sampling": sampling,
+                },
+            ]
+        )
+    except ScenarioError as exc:
+        if "duplicate response-format matrix scenario name" not in str(exc):
+            raise AssertionError(str(exc)) from exc
+    else:
+        raise AssertionError("duplicate response-format matrix scenario unexpectedly passed")
+
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockOpenAIHandler)
     port = int(server.server_address[1])
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1699,6 +1905,16 @@ def self_test() -> int:
                 raise AssertionError(object_result)
             if [case.get("object") for case in object_result.get("cases", [])] != [{}, {}]:
                 raise AssertionError(object_result)
+            matrix_contract = load_json_object(out / "response_format_matrix_contract.json")
+            if matrix_contract.get("case_counts") != {"json_schema": 4, "json_object": 2}:
+                raise AssertionError(matrix_contract)
+            if matrix_contract.get("unique_json_schema_count") != 4:
+                raise AssertionError(matrix_contract)
+            if matrix_contract.get("unique_expected_object_counts") != {
+                "json_schema": 4,
+                "json_object": 2,
+            }:
+                raise AssertionError(matrix_contract)
             health = load_json_object(out / "server.health.json")
             if health.get("status") != "pass" or health.get("http_status") != 200:
                 raise AssertionError(health)
