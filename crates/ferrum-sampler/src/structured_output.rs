@@ -111,12 +111,7 @@ impl StructuredOutputFactory {
                 if special_ids.contains(&token.get()) {
                     special_token_marker(token)
                 } else {
-                    tokenizer
-                        .decode(&[token], false)
-                        .ok()
-                        .or_else(|| tokenizer.token_text(token).map(str::to_owned))
-                        .unwrap_or_default()
-                        .into_bytes()
+                    tokenizer.token_bytes(token).unwrap_or_default()
                 }
             })
             .collect::<Vec<_>>();
@@ -893,6 +888,155 @@ mod tests {
             .unwrap();
         let mut generated = Vec::new();
         assert_and_append(&processor, &mut generated, r#"{"answer":42}"#);
+        assert!(processor.is_accepting(&generated).unwrap());
+    }
+
+    struct FragmentedUtf8Tokenizer {
+        special: SpecialTokens,
+        token_text: Vec<String>,
+    }
+
+    impl FragmentedUtf8Tokenizer {
+        const FIRE_HEAD: u32 = 128;
+        const FIRE_TAIL: u32 = 129;
+        const EOS: u32 = 130;
+
+        fn new() -> Self {
+            let mut token_text = (0u8..=127)
+                .map(|byte| (byte as char).to_string())
+                .collect::<Vec<_>>();
+            token_text.extend(["\u{fffd}".to_string(), "\u{fffd}".to_string()]);
+            token_text.push("<eos>".to_string());
+            Self {
+                special: SpecialTokens {
+                    eos_token: Some(TokenId::new(Self::EOS)),
+                    ..SpecialTokens::default()
+                },
+                token_text,
+            }
+        }
+
+        fn raw_bytes(token: TokenId) -> Option<Vec<u8>> {
+            match token.get() {
+                byte @ 0..=127 => Some(vec![byte as u8]),
+                Self::FIRE_HEAD => Some(vec![0xf0, 0x9f]),
+                Self::FIRE_TAIL => Some(vec![0x94, 0xa5]),
+                _ => None,
+            }
+        }
+    }
+
+    impl Tokenizer for FragmentedUtf8Tokenizer {
+        fn encode(&self, text: &str, _add_special: bool) -> Result<Vec<TokenId>> {
+            let mut tokens = Vec::new();
+            let mut bytes = text.as_bytes();
+            while let Some((&byte, remaining)) = bytes.split_first() {
+                if bytes.starts_with(&[0xf0, 0x9f, 0x94, 0xa5]) {
+                    tokens.push(TokenId::new(Self::FIRE_HEAD));
+                    tokens.push(TokenId::new(Self::FIRE_TAIL));
+                    bytes = &bytes[4..];
+                } else if byte <= 127 {
+                    tokens.push(TokenId::new(byte as u32));
+                    bytes = remaining;
+                } else {
+                    return Err(FerrumError::tokenizer(
+                        "fragmented UTF-8 test tokenizer received unsupported input",
+                    ));
+                }
+            }
+            Ok(tokens)
+        }
+
+        fn decode(&self, tokens: &[TokenId], _skip_special: bool) -> Result<String> {
+            let bytes = tokens
+                .iter()
+                .filter_map(|token| Self::raw_bytes(*token))
+                .flatten()
+                .collect::<Vec<_>>();
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        fn decode_incremental(&self, _prev: &[TokenId], next: TokenId) -> Result<String> {
+            self.decode(&[next], true)
+        }
+
+        fn vocab_size(&self) -> usize {
+            self.token_text.len()
+        }
+
+        fn special_tokens(&self) -> &SpecialTokens {
+            &self.special
+        }
+
+        fn token_id(&self, text: &str) -> Option<TokenId> {
+            (text.len() == 1 && text.is_ascii()).then(|| TokenId::new(text.as_bytes()[0] as u32))
+        }
+
+        fn token_text(&self, token_id: TokenId) -> Option<&str> {
+            self.token_text
+                .get(token_id.get() as usize)
+                .map(String::as_str)
+        }
+
+        fn token_bytes(&self, token_id: TokenId) -> Option<Vec<u8>> {
+            Self::raw_bytes(token_id)
+        }
+
+        fn info(&self) -> TokenizerInfo {
+            TokenizerInfo {
+                tokenizer_type: TokenizerType::BPE,
+                vocab_size: self.vocab_size(),
+                special_tokens: self.special.clone(),
+                supports_incremental: true,
+                supports_chat_template: false,
+                max_token_length: Some(2),
+                model_name: Some("fragmented-utf8-test".to_string()),
+            }
+        }
+    }
+
+    #[test]
+    fn strict_schema_accepts_utf8_split_across_byte_level_tokens() {
+        let tokenizer = Arc::new(FragmentedUtf8Tokenizer::new());
+        assert!(tokenizer
+            .decode(&[TokenId::new(FragmentedUtf8Tokenizer::FIRE_HEAD)], false)
+            .unwrap()
+            .contains('\u{fffd}'));
+        let processor = StructuredOutputFactory::new(tokenizer)
+            .unwrap()
+            .create_processor(
+                &ResponseFormat::JsonSchema(
+                    r#"{"type":"object","properties":{"value":{"const":"\ud83d\udd25"}},"required":["value"],"additionalProperties":false}"#
+                        .to_string(),
+                ),
+                &StructuredOutputStart::Immediate,
+                TEST_MAX_OUTPUT_TOKENS,
+                &HashSet::new(),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+
+        let mut generated = Vec::new();
+        for token in r#"{"value":""#
+            .bytes()
+            .map(|byte| TokenId::new(byte as u32))
+            .chain([
+                TokenId::new(FragmentedUtf8Tokenizer::FIRE_HEAD),
+                TokenId::new(FragmentedUtf8Tokenizer::FIRE_TAIL),
+            ])
+            .chain(r#""}"#.bytes().map(|byte| TokenId::new(byte as u32)))
+        {
+            let mut logits = vec![0.0; FragmentedUtf8Tokenizer::EOS as usize + 1];
+            processor.mask_logits(&mut logits, &generated).unwrap();
+            assert!(
+                logits[token.get() as usize].is_finite(),
+                "token {} rejected after {:?}",
+                token.get(),
+                generated
+            );
+            generated.push(token);
+        }
         assert!(processor.is_accepting(&generated).unwrap());
     }
 
