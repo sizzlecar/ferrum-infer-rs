@@ -614,6 +614,58 @@ fn resolved_model_plan_closes_all_contract_links() {
 }
 
 #[test]
+fn resolved_model_plan_requires_trusted_completion_retention() {
+    let mut fixture = plan_fixture(0);
+    let retention = CompletionRetentionSpec::new(BTreeSet::from([id("value.output")]));
+    fixture.plan = ExecutionPlan::build(
+        PlanBuildRequest::new(
+            &fixture.family,
+            &fixture.catalog,
+            &fixture.policy,
+            fixture.node_resolutions.clone(),
+        )
+        .unwrap()
+        .with_completion_retention(retention.clone())
+        .unwrap(),
+    )
+    .unwrap();
+    let evidence = resolved_evidence(&fixture);
+
+    let missing_retention = ResolvedPlanValidationContext::new(
+        &fixture.registry,
+        &evidence.source_evidence,
+        &fixture.node_resolutions,
+        fixture.catalog.device(),
+        &fixture.catalog,
+        &fixture.policy,
+    );
+    assert!(ResolvedModelPlan::new(
+        evidence.inputs.clone(),
+        evidence.bindings.clone(),
+        &missing_retention,
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("not identical to its semantic rebuild"));
+
+    let trusted_retention = ResolvedPlanValidationContext::new(
+        &fixture.registry,
+        &evidence.source_evidence,
+        &fixture.node_resolutions,
+        fixture.catalog.device(),
+        &fixture.catalog,
+        &fixture.policy,
+    )
+    .with_completion_retention(retention);
+    let plan = ResolvedModelPlan::new(evidence.inputs, evidence.bindings, &trusted_retention)
+        .unwrap();
+    let restored =
+        ResolvedModelPlan::from_json_validated(&plan.to_json().unwrap(), &trusted_retention)
+            .unwrap();
+    assert_eq!(restored, plan);
+}
+
+#[test]
 fn locked_file_provenance_cannot_cross_source_roles() {
     let fixture = plan_fixture(0);
     let mut inputs = resolved_inputs(&fixture);

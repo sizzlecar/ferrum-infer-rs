@@ -124,7 +124,8 @@ fn resolve_model_plan(
         catalog.device(),
         catalog,
         runtime,
-    );
+    )
+    .with_completion_retention(compilation.completion_retention().clone());
     ResolvedModelPlan::new(inputs, bindings, &context)
         .map_err(|error| FerrumError::model(format!("resolve vNext product plan: {error}")))
 }

@@ -8,11 +8,12 @@ use std::io::{self, Write};
 
 use super::model::PreparedModelFamilyWire;
 use super::{
-    AdmissionFitPolicy, CapabilityCatalog, ContractVersion, DeviceDescriptor,
-    DynamicStorageProfile, ExecutablePlanView, ExecutionPlan, ModelFamilyRegistry,
-    PlanNodeResolution, PreparedModelFamily, ProviderId, ReusableExecutionPolicy, RuntimePolicy,
-    SpecialTokenRole, TokenizerDescriptor, UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire,
-    UnvalidatedPreparedModelFamily, VNextError,
+    AdmissionFitPolicy, CapabilityCatalog, CompletionRetentionSpec, ContractVersion,
+    DeviceDescriptor, DynamicStorageProfile, ExecutablePlanView, ExecutionPlan,
+    ModelFamilyRegistry, PlanNodeResolution, PreparedModelFamily, ProviderId,
+    ReusableExecutionPolicy, RuntimePolicy, SpecialTokenRole, TokenizerDescriptor,
+    UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, UnvalidatedPreparedModelFamily,
+    VNextError,
 };
 
 /// Maximum raw byte length accepted for one resolution source artifact.
@@ -2319,6 +2320,7 @@ pub struct ResolvedPlanValidationContext<'a> {
     device: &'a DeviceDescriptor,
     capabilities: &'a CapabilityCatalog,
     runtime: &'a ResolvedRuntimePolicy,
+    completion_retention: CompletionRetentionSpec,
 }
 
 impl<'a> ResolvedPlanValidationContext<'a> {
@@ -2337,7 +2339,19 @@ impl<'a> ResolvedPlanValidationContext<'a> {
             device,
             capabilities,
             runtime,
+            completion_retention: CompletionRetentionSpec::default(),
         }
+    }
+
+    /// Installs the trusted diagnostic retention selected before compilation.
+    /// The serialized execution plan cannot grant itself additional retained
+    /// activations during semantic revalidation.
+    pub fn with_completion_retention(
+        mut self,
+        completion_retention: CompletionRetentionSpec,
+    ) -> Self {
+        self.completion_retention = completion_retention;
+        self
     }
 
     pub fn registry(&self) -> &dyn ModelFamilyRegistry {
@@ -2365,6 +2379,10 @@ impl<'a> ResolvedPlanValidationContext<'a> {
 
     pub fn runtime(&self) -> &ResolvedRuntimePolicy {
         self.runtime
+    }
+
+    pub fn completion_retention(&self) -> &CompletionRetentionSpec {
+        &self.completion_retention
     }
 }
 
@@ -2496,12 +2514,14 @@ impl UnvalidatedResolvedModelPlan {
                 "serialized device, capability catalog, or runtime policy differs from external trusted inputs",
             ));
         }
-        let execution_plan = UnvalidatedExecutionPlan::from(execution_plan).revalidate(
-            &prepared_family,
-            context.capabilities(),
-            context.runtime(),
-            context.node_resolutions().to_vec(),
-        )?;
+        let execution_plan = UnvalidatedExecutionPlan::from(execution_plan)
+            .revalidate_with_completion_retention(
+                &prepared_family,
+                context.capabilities(),
+                context.runtime(),
+                context.node_resolutions().to_vec(),
+                context.completion_retention().clone(),
+            )?;
         let serialized_decisions = decisions;
         let decision_bindings = serialized_decisions
             .iter()
@@ -2657,7 +2677,11 @@ impl ResolvedModelPlan {
         Self::normalize(&mut parts);
         parts.decisions = Self::bind_decisions(&parts, decision_bindings)?;
         Self::normalize(&mut parts);
-        Self::validate(&parts, context.node_resolutions())?;
+        Self::validate(
+            &parts,
+            context.node_resolutions(),
+            context.completion_retention(),
+        )?;
         let fingerprint = ResolutionFingerprint::new(canonical_fingerprint(
             &parts,
             "serialize resolved model plan",
@@ -2865,6 +2889,7 @@ impl ResolvedModelPlan {
     fn validate(
         parts: &ResolvedModelPlanParts,
         node_resolutions: &[PlanNodeResolution],
+        completion_retention: &CompletionRetentionSpec,
     ) -> Result<(), VNextError> {
         let mut source_artifacts = BTreeMap::new();
         for artifact in &parts.source_artifacts {
@@ -3000,12 +3025,15 @@ impl ResolvedModelPlan {
         )?;
         Self::validate_token_contract(parts)?;
         parts.runtime.validate()?;
-        parts.execution_plan.validate_against(
-            family,
-            &parts.capabilities,
-            &parts.runtime,
-            node_resolutions,
-        )?;
+        parts
+            .execution_plan
+            .validate_against_with_completion_retention(
+                family,
+                &parts.capabilities,
+                &parts.runtime,
+                node_resolutions,
+                completion_retention.clone(),
+            )?;
         let runtime_fingerprint = super::canonical_runtime_policy_fingerprint(&parts.runtime)?;
         let capability_fingerprint = parts.capabilities.fingerprint()?;
         if &parts.device != parts.capabilities.device()
