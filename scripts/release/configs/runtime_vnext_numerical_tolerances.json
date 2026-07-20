@@ -5,8 +5,7 @@
       "checkpoint.full_vocab_logits",
       "layer.full_attention",
       "layer.linear_attention",
-      "quant_format.gguf_q4_k_m",
-      "state.causal_attention.kv_state"
+      "quant_format.gguf_q4_k_m"
     ],
     "profile": "g08a_m1_metal.v1",
     "scope": "Exact Qwen3.5-4B Metal operation/state/layer/model/logit fixtures; token sequence equality remains a separate exact gate",
@@ -66,6 +65,67 @@
       },
       "source_commit": "ecaeb5087ad45a5148d917fdab63d83cb046d678",
       "tolerance_id": "runtime-vnext.metal.causal-attention.v2.operation.fp16.none.fixed-page-split"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Metal fixed-page KV state after split decode is checked against the CPU FP32 RMSNorm/RoPE/key/value oracle with max_abs <= 0.001.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/causal_attention_tests.rs",
+        "test_name": "fixed_page_attention_matches_cpu_and_preserves_split_decode_state_on_real_metal"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "state",
+      "checkpoint_name": "kv_state",
+      "coverage_markers": [
+        "state.causal_attention.kv_state"
+      ],
+      "dtype": "fp16",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "operation_contract",
+      "operation_id": "operation.causal_paged_attention",
+      "operation_schema_version": "2.0",
+      "oracle_identity": "cpu.fp32.rust.causal_kv_state_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "none",
+      "review_commit": "3daf60864e3d20d55a463811c2d66ecf89094d60",
+      "row_fingerprint": "aa2563e94a78b77ad6d1ab25c698eca89f7d54e00b8a25f429d0cf34e034c250",
+      "shape_domain": {
+        "dimensions": {
+          "head_dim": 32,
+          "key_value_heads": 1,
+          "page_elements": 64,
+          "pages": 2,
+          "rope_dim": 16,
+          "tokens": 2
+        },
+        "fixture_id": "causal_attention.fixed_page.kv_state.split_decode",
+        "semantics": {
+          "epsilon": "1e-6",
+          "fixed_page_kv": true,
+          "key_transform": "rmsnorm_rope",
+          "page_layout": "token_kind_head_dim",
+          "rope_interleaved": false,
+          "rope_theta": "10000",
+          "split_segments": [
+            1,
+            1
+          ],
+          "value_transform": "identity"
+        }
+      },
+      "source_commit": "3daf60864e3d20d55a463811c2d66ecf89094d60",
+      "tolerance_id": "runtime-vnext.metal.causal-attention.v2.state.kv.fp16.none.fixed-page-split"
     },
     {
       "backend": "metal",
