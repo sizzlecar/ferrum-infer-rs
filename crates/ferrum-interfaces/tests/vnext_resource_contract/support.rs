@@ -467,6 +467,7 @@ pub(crate) fn binding(
         access,
         AliasPolicy::NoAlias,
         usage,
+        None,
         ResolvedValueStorage::single(
             id(resource_id),
             0,
@@ -511,6 +512,10 @@ pub(crate) fn node_resolution(
             TensorAccess::Read,
             AliasPolicy::NoAlias,
             BufferUsage::Weights,
+            Some(
+                ResolvedWeightBinding::from_schema(family.weight_schema(), &id("weight.matrix"))
+                    .unwrap(),
+            ),
             weight_storage,
         )
         .unwrap(),

@@ -6,22 +6,22 @@ use super::{
     validate_active_sequence_ceiling, validate_program_bindings, validate_scheduled_token_ceiling,
     validate_semantic_binding, workspace_base_id, workspace_storage_layout_fingerprint,
     AliasPolicy, AllocationKind, AllocationLifetime, BTreeMap, BTreeSet, BufferUsage,
-    CanonicalValueBinding, CapabilityCatalog, CapabilityId, DimensionConstraint,
+    CanonicalValueBinding, CapabilityCatalog, CapabilityId, Deserialize, DimensionConstraint,
     DynamicResourceDescriptor, DynamicStorageContract, DynamicStorageProfile,
     DynamicStorageRequirement, ElementType, ExecutionPlanPayload, GlobalValueRange,
     JointComponentSolution, JointPartialSelection, JointProviderCandidate,
     JointProviderStorageSelection, JointSelectionObjective, MemoryPlan, NodeId,
     NodeTokenBindingProjection, NodeWorkContract, OperationDescriptor, OperationRegistryAuthority,
     PlanBuildRequest, PlanExactAlias, PlanExactAliasKind, PlanHash, PlanHashMaterial, PlanId,
-    PlanNode, PlanNodeResolution, PlanProviderRejectReason, PlanStateEffect, PreparedModelFamily,
-    ProgramNode, ProgramNodeWorkSpec, ProgramValueId, ProviderCompatibilityRequest, ProviderId,
-    ProviderResourcePlan, ProviderSelection, ProviderSelectionReason, ProviderWorkspaceScope,
-    QuantizationFormatId, RejectedProvider, ResolvedValueBinding, ResolvedValueRole,
-    ResourceAllocation, ResourceId, ReusableExecutionMemoryPlan, ReusableExecutionPolicy,
-    RuntimePolicy, Serialize, StateCapacityDemand, StateDependencyTracker, StateInitialization,
-    StateLifetime, TensorAccess, UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire,
-    VNextError, ValueAllocationAccumulator, ValueResourceDemand, WeightFormatId,
-    EXECUTION_PLAN_SCHEMA, MAX_EXECUTION_PLAN_WIRE_BYTES,
+    PlanNode, PlanNodeResolution, PlanProviderRejectReason, PlanSchemaVersion, PlanStateEffect,
+    PreparedModelFamily, ProgramNode, ProgramNodeWorkSpec, ProgramValueId,
+    ProviderCompatibilityRequest, ProviderId, ProviderResourcePlan, ProviderSelection,
+    ProviderSelectionReason, ProviderWorkspaceScope, QuantizationFormatId, RejectedProvider,
+    ResolvedValueBinding, ResolvedValueRole, ResourceAllocation, ResourceId,
+    ReusableExecutionMemoryPlan, ReusableExecutionPolicy, RuntimePolicy, Serialize,
+    StateCapacityDemand, StateDependencyTracker, StateInitialization, StateLifetime, TensorAccess,
+    UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, VNextError, ValueAllocationAccumulator,
+    ValueResourceDemand, WeightFormatId, EXECUTION_PLAN_SCHEMA, MAX_EXECUTION_PLAN_WIRE_BYTES,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -30,6 +30,31 @@ pub struct ExecutionPlan {
     pub(super) plan_hash: PlanHash,
     #[serde(skip)]
     pub(super) operation_registry_authority: OperationRegistryAuthority,
+}
+
+#[derive(Deserialize)]
+struct ExecutionPlanSchemaEnvelope {
+    payload: ExecutionPlanSchemaHeader,
+}
+
+#[derive(Deserialize)]
+struct ExecutionPlanSchemaHeader {
+    schema: PlanSchemaVersion,
+}
+
+pub(super) fn validate_execution_plan_wire_size(
+    wire_size: usize,
+    context: &'static str,
+) -> Result<(), VNextError> {
+    if wire_size > MAX_EXECUTION_PLAN_WIRE_BYTES {
+        return Err(VNextError::Serialization {
+            context,
+            message: format!(
+                "execution plan wire size {wire_size} exceeds limit {MAX_EXECUTION_PLAN_WIRE_BYTES}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 impl ExecutionPlan {
@@ -2256,27 +2281,36 @@ impl ExecutionPlan {
     }
 
     pub fn to_json(&self) -> Result<Vec<u8>, VNextError> {
-        serde_json::to_vec(self).map_err(|error| VNextError::Serialization {
+        let bytes = serde_json::to_vec(self).map_err(|error| VNextError::Serialization {
             context: "serialize execution plan",
             message: error.to_string(),
-        })
+        })?;
+        validate_execution_plan_wire_size(bytes.len(), "serialize execution plan")?;
+        Ok(bytes)
     }
 
     pub fn decode_untrusted(bytes: &[u8]) -> Result<UnvalidatedExecutionPlan, VNextError> {
-        if bytes.len() > MAX_EXECUTION_PLAN_WIRE_BYTES {
-            return Err(VNextError::Serialization {
-                context: "decode untrusted execution plan",
-                message: format!(
-                    "execution plan wire size {} exceeds limit {}",
-                    bytes.len(),
-                    MAX_EXECUTION_PLAN_WIRE_BYTES
-                ),
+        const CONTEXT: &str = "decode untrusted execution plan";
+        validate_execution_plan_wire_size(bytes.len(), CONTEXT)?;
+        let header =
+            serde_json::from_slice::<ExecutionPlanSchemaEnvelope>(bytes).map_err(|error| {
+                VNextError::Serialization {
+                    context: CONTEXT,
+                    message: error.to_string(),
+                }
+            })?;
+        if header.payload.schema != EXECUTION_PLAN_SCHEMA {
+            return Err(VNextError::UnsupportedPlanSchema {
+                expected_major: EXECUTION_PLAN_SCHEMA.major,
+                expected_minor: EXECUTION_PLAN_SCHEMA.minor,
+                actual_major: header.payload.schema.major,
+                actual_minor: header.payload.schema.minor,
             });
         }
         serde_json::from_slice::<UnvalidatedExecutionPlanWire>(bytes)
             .map(UnvalidatedExecutionPlan::from)
             .map_err(|error| VNextError::Serialization {
-                context: "decode untrusted execution plan",
+                context: CONTEXT,
                 message: error.to_string(),
             })
     }

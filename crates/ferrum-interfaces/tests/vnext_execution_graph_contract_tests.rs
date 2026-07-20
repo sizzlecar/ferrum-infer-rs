@@ -137,6 +137,7 @@ fn graph_value_binding(
         access,
         alias,
         usage,
+        None,
         ResolvedValueStorage::single(id(resource_id), offset_bytes, 16, ElementType::F32).unwrap(),
     )
     .unwrap()
@@ -151,6 +152,7 @@ fn graph_weight_binding(ordinal: u32) -> ResolvedValueBinding {
         TensorAccess::Read,
         AliasPolicy::NoAlias,
         BufferUsage::Weights,
+        Some(resolved_test_weight()),
         ResolvedValueStorage::composite(vec![ResolvedStorageComponent::new(
             Some(id("weight.component")),
             id("resource.graph.weight"),

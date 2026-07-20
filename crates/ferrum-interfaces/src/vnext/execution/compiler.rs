@@ -7,8 +7,8 @@ use super::{
     OperationPlanningHandle, PlanBuildRequest, PlanNodeResolution, PreparedModelFamily,
     ProgramTensorSpec, ProgramValueId, ProviderId, ProviderResourcePlan, ResolvedStorageComponent,
     ResolvedTensorLayout, ResolvedTensorSpec, ResolvedValueBinding, ResolvedValueRole,
-    ResolvedValueStorage, ResourceId, RuntimePolicy, StrideConstraint, TensorContract, VNextError,
-    WeightId,
+    ResolvedValueStorage, ResolvedWeightBinding, ResourceId, RuntimePolicy, StrideConstraint,
+    TensorContract, VNextError, WeightId,
 };
 
 /// Explicit semantic inputs and per-node selection preferences for compiling a
@@ -894,12 +894,12 @@ fn resolved_binding(
     tensors: &BTreeMap<ProgramValueId, ResolvedTensorSpec>,
     storages: &BTreeMap<ProgramValueId, ResolvedValueStorage>,
 ) -> Result<ResolvedValueBinding, VNextError> {
-    let usage = if family
+    let program_weight = family
         .program()
         .weights()
         .iter()
-        .any(|weight| weight.value_id == *value_id)
-    {
+        .find(|weight| weight.value_id == *value_id);
+    let usage = if program_weight.is_some() {
         BufferUsage::Weights
     } else if family
         .program()
@@ -926,6 +926,11 @@ fn resolved_binding(
             contract.alias().clone()
         },
         usage,
+        program_weight
+            .map(|weight| {
+                ResolvedWeightBinding::from_schema(family.weight_schema(), &weight.weight_id)
+            })
+            .transpose()?,
         storages
             .get(value_id)
             .cloned()

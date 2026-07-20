@@ -357,6 +357,7 @@ pub(crate) fn binding(
         },
         AliasPolicy::NoAlias,
         usage,
+        None,
         ResolvedValueStorage::single(id(resource), 0, 16, ElementType::F32).unwrap(),
     )
     .unwrap()
@@ -416,6 +417,13 @@ pub(crate) fn execution_plan_with_mode(
                 TensorAccess::Read,
                 AliasPolicy::NoAlias,
                 BufferUsage::Weights,
+                Some(
+                    ResolvedWeightBinding::from_schema(
+                        family.weight_schema(),
+                        &id("weight.matrix"),
+                    )
+                    .unwrap(),
+                ),
                 ResolvedValueStorage::composite(vec![ResolvedStorageComponent::new(
                     Some(id("weight.component")),
                     id(format!("resource.weight.{suffix}")),

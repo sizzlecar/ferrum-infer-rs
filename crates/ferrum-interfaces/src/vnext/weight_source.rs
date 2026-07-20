@@ -127,7 +127,7 @@ pub trait WeightComponentSource: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vnext::{WeightComponentRole, WeightEncoding};
+    use crate::vnext::{BlockQuantizationSpec, WeightComponentRole, WeightEncoding};
 
     fn packed_component() -> WeightComponentSpec {
         WeightComponentSpec {
@@ -173,6 +173,44 @@ mod tests {
         )
         .err()
         .expect("source order is part of the packed component identity");
+        assert!(error.to_string().contains("differs from its schema"));
+    }
+
+    #[test]
+    fn block_quantized_payload_validates_block_abi_byte_size() {
+        let component = WeightComponentSpec {
+            id: WeightId::new("component.test.q4-k").unwrap(),
+            role: WeightComponentRole::PackedValues,
+            external_names: vec!["weight.q4_k".to_owned()],
+            dimensions: vec![2],
+            encoding: WeightEncoding::BlockQuantized(BlockQuantizationSpec {
+                format_id: "quantization.gguf.q4-k".to_owned().try_into().unwrap(),
+                logical_values_per_block: 256,
+                bytes_per_block: 144,
+            }),
+            required: true,
+        };
+        let payload = WeightComponentPayload::new(
+            &component,
+            "weight.q4_k",
+            "model.gguf",
+            vec![2],
+            ElementType::U8,
+            vec![0_u8; 288],
+        )
+        .unwrap();
+        assert_eq!(payload.bytes().len(), 288);
+
+        let error = WeightComponentPayload::new(
+            &component,
+            "weight.q4_k",
+            "model.gguf",
+            vec![2],
+            ElementType::U8,
+            vec![0_u8; 2],
+        )
+        .err()
+        .expect("block-grid element count must not be mistaken for byte length");
         assert!(error.to_string().contains("differs from its schema"));
     }
 }

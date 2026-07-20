@@ -21,9 +21,9 @@ use super::{
     LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeId,
     NodeInvocationId, NodeWorkContract, OperationId, ParticipantNodeKey, PlanHash, PlanId,
     PlanNode, PreparedStepSubmissionNode, PreparedStepSubmissionWave, ProgramValueId, ProviderId,
-    ProviderWorkspaceRequirement, QuantizationFormatId, ResourceId, SemanticValue,
-    SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint, SpanId,
-    StepParticipantFrameAssignment, StepResourceLease, TrustedActiveSequenceBinding,
+    ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedWeightBinding, ResourceId,
+    SemanticValue, SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint,
+    SpanId, StepParticipantFrameAssignment, StepResourceLease, TrustedActiveSequenceBinding,
     TrustedPlanRuntimeEvidence, UnvalidatedExecutionIdentityParts, VNextError, WeightFormatId,
     WeightId, EXECUTION_IDENTITY_VERSION,
 };
@@ -1252,6 +1252,7 @@ pub struct ResolvedValueBinding {
     access: TensorAccess,
     alias: AliasPolicy,
     usage: BufferUsage,
+    weight: Option<ResolvedWeightBinding>,
     storage: ResolvedValueStorage,
 }
 
@@ -1265,6 +1266,7 @@ struct ResolvedValueBindingWire {
     access: TensorAccess,
     alias: AliasPolicy,
     usage: BufferUsage,
+    weight: Option<ResolvedWeightBinding>,
     storage: ResolvedValueStorage,
 }
 
@@ -1282,6 +1284,7 @@ impl<'de> Deserialize<'de> for ResolvedValueBinding {
             wire.access,
             wire.alias,
             wire.usage,
+            wire.weight,
             wire.storage,
         )
         .map_err(serde::de::Error::custom)
@@ -1297,6 +1300,7 @@ impl ResolvedValueBinding {
         access: TensorAccess,
         alias: AliasPolicy,
         usage: BufferUsage,
+        weight: Option<ResolvedWeightBinding>,
         storage: ResolvedValueStorage,
     ) -> Result<Self, VNextError> {
         if (role == ResolvedValueRole::Input
@@ -1329,6 +1333,23 @@ impl ResolvedValueBinding {
                 "resolved value storage is smaller than its tensor span",
             ));
         }
+        match (usage, weight.as_ref()) {
+            (BufferUsage::Weights, Some(weight)) => {
+                weight.validate_logical(tensor.dimensions(), tensor.element_type())?;
+                validate_resolved_weight_storage(weight, &storage)?;
+            }
+            (BufferUsage::Weights, None) => {
+                return Err(invalid_operation(
+                    "weight value lacks its resolved physical layout contract",
+                ));
+            }
+            (_, Some(_)) => {
+                return Err(invalid_operation(
+                    "non-weight value carries a resolved weight layout contract",
+                ));
+            }
+            (_, None) => {}
+        }
         Ok(Self {
             value_id,
             role,
@@ -1337,6 +1358,7 @@ impl ResolvedValueBinding {
             access,
             alias,
             usage,
+            weight,
             storage,
         })
     }
@@ -1369,9 +1391,49 @@ impl ResolvedValueBinding {
         self.usage
     }
 
+    pub fn weight(&self) -> Option<&ResolvedWeightBinding> {
+        self.weight.as_ref()
+    }
+
     pub fn storage(&self) -> &ResolvedValueStorage {
         &self.storage
     }
+}
+
+fn validate_resolved_weight_storage(
+    weight: &ResolvedWeightBinding,
+    storage: &ResolvedValueStorage,
+) -> Result<(), VNextError> {
+    let expected = weight
+        .components()
+        .iter()
+        .map(|component| (component.component_id(), component))
+        .collect::<BTreeMap<_, _>>();
+    if storage.components().len() != expected.len() {
+        return Err(invalid_operation(
+            "resolved weight storage component count differs from its layout contract",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for stored in storage.components() {
+        let component_id = stored.component_id().ok_or_else(|| {
+            invalid_operation("resolved weight storage component lacks its physical identity")
+        })?;
+        let component = expected.get(component_id).ok_or_else(|| {
+            invalid_operation(format!(
+                "resolved weight storage contains unknown component `{component_id}`"
+            ))
+        })?;
+        if !seen.insert(component_id)
+            || stored.length_bytes() != component.physical_bytes()?
+            || stored.element_type() != component.physical_element_type()
+        {
+            return Err(invalid_operation(format!(
+                "resolved weight storage component `{component_id}` differs from its layout contract"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2890,6 +2952,7 @@ mod operation_buffer_region_tests {
             TensorAccess::Read,
             AliasPolicy::NoAlias,
             BufferUsage::Activations,
+            None,
             ResolvedValueStorage::single(resource_id.clone(), 0, 512, ElementType::U32).unwrap(),
         )
         .unwrap();

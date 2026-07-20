@@ -166,7 +166,7 @@ impl WeightComponentSource for SafetensorsArchive {
                 scale,
                 bias,
             } => (element_type, Some((scale, bias))),
-            WeightEncoding::Quantized(_) => {
+            WeightEncoding::Quantized(_) | WeightEncoding::BlockQuantized(_) => {
                 return Err(VNextError::InvalidExecutionPlan {
                     reason: format!(
                         "raw safetensors source cannot decode quantized component `{}` without a format adapter",

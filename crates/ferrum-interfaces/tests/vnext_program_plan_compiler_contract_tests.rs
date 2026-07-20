@@ -39,6 +39,14 @@ fn semantic_program_compiles_through_the_registered_provider_authority() {
         .iter()
         .find(|binding| binding.usage() == BufferUsage::Weights)
         .unwrap();
+    let resolved_weight = weight
+        .weight()
+        .expect("provider binding must retain the physical weight contract");
+    assert_eq!(resolved_weight.weight_id(), &id("weight.matrix"));
+    assert_eq!(resolved_weight.format_id(), &id("weight-format.dense"));
+    assert_eq!(resolved_weight.layout_id(), &id("weight-layout.dense"));
+    assert_eq!(resolved_weight.components().len(), 1);
+    assert_eq!(resolved_weight.components()[0].physical_dimensions(), &[4]);
     assert_eq!(weight.storage().components().len(), 1);
     let component = &weight.storage().components()[0];
     assert!(component

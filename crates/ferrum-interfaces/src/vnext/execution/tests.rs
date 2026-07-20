@@ -5,6 +5,20 @@ use crate::vnext::{
     TensorContract,
 };
 
+#[test]
+fn execution_plan_wire_limit_is_symmetric() {
+    super::plan::validate_execution_plan_wire_size(
+        MAX_EXECUTION_PLAN_WIRE_BYTES,
+        "test execution plan wire",
+    )
+    .expect("the exact wire limit must be accepted");
+    assert!(super::plan::validate_execution_plan_wire_size(
+        MAX_EXECUTION_PLAN_WIRE_BYTES + 1,
+        "test execution plan wire",
+    )
+    .is_err());
+}
+
 fn linear_profile() -> DynamicStorageProfile {
     DynamicStorageProfile::new(
         DynamicStorageAllocator::LinearArena,
@@ -85,6 +99,7 @@ fn token_binding(
         access,
         AliasPolicy::NoAlias,
         BufferUsage::Activations,
+        None,
         ResolvedValueStorage::single(
             ResourceId::new(resource).expect("valid resource id"),
             0,
