@@ -134,11 +134,33 @@ pub struct ChatCompletionsRequest {
 }
 
 /// OpenAI streaming options.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StreamOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_usage: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for StreamOptions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Object {
+            #[serde(default)]
+            include_usage: Option<bool>,
+        }
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if !value.is_object() {
+            return Err(de::Error::custom("stream_options must be a JSON object"));
+        }
+        let parsed = serde_json::from_value::<Object>(value).map_err(de::Error::custom)?;
+        Ok(Self {
+            include_usage: parsed.include_usage,
+        })
+    }
 }
 
 /// Tool definition in OpenAI chat-completion requests.
