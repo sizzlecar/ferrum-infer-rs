@@ -68,6 +68,7 @@ pub struct StructuredOutputFactory {
     parser_factory: ParserFactory,
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
     vocab_size: usize,
+    defined_token_ids: Arc<[bool]>,
     grammar_templates: Mutex<HashMap<String, Matcher>>,
 }
 
@@ -105,16 +106,26 @@ impl StructuredOutputFactory {
         }
 
         let special_ids = tokenizer_special_ids(tokenizer.as_ref());
+        let mut defined_token_ids = Vec::with_capacity(vocab_size);
         let token_bytes = (0..vocab_size)
             .map(|idx| {
                 let token = TokenId::new(idx as u32);
                 if special_ids.contains(&token.get()) {
+                    defined_token_ids.push(true);
                     special_token_marker(token)
+                } else if let Some(bytes) = tokenizer
+                    .token_bytes(token)
+                    .filter(|bytes| !bytes.is_empty())
+                {
+                    defined_token_ids.push(true);
+                    bytes
                 } else {
-                    tokenizer
-                        .token_bytes(token)
-                        .filter(|bytes| !bytes.is_empty())
-                        .unwrap_or_else(|| special_token_marker(token))
+                    // Keep vocabulary holes out of the trie. The explicit
+                    // eligibility mask below is still required because
+                    // llguidance's wildcard slice represents its root as an
+                    // all-token bitset, including IDs with no trie node.
+                    defined_token_ids.push(false);
+                    Vec::new()
                 }
             })
             .collect::<Vec<_>>();
@@ -159,6 +170,7 @@ impl StructuredOutputFactory {
             parser_factory,
             tokenizer,
             vocab_size,
+            defined_token_ids: defined_token_ids.into(),
             grammar_templates: Mutex::new(HashMap::new()),
         })
     }
@@ -270,6 +282,7 @@ impl StructuredOutputFactory {
                 boundary_start: None,
             }),
             vocab_size: self.vocab_size,
+            defined_token_ids: Arc::clone(&self.defined_token_ids),
             budget,
         }))
     }
@@ -279,6 +292,7 @@ impl StructuredOutputFactory {
 pub struct StructuredOutputProcessor {
     state: Mutex<ProcessorState>,
     vocab_size: usize,
+    defined_token_ids: Arc<[bool]>,
     budget: Option<StructuredOutputBudgetPlan>,
 }
 
@@ -390,6 +404,7 @@ impl StructuredOutputProcessor {
             forcing,
         } = &state.activation
         {
+            self.mask_undefined_token_ids(logits);
             let delimiter_prefix_token_count =
                 delimiter_prefix_token_count(generated, delimiter_tokens);
             let required_delimiter_token = delimiter_tokens
@@ -436,6 +451,7 @@ impl StructuredOutputProcessor {
                 .is_some_and(|controls| controls.contains(&token))
                 && !terminal_token_ids.is_some_and(|terminals| terminals.contains(&token));
             let allowed = idx < self.vocab_size
+                && self.defined_token_ids.get(idx).copied().unwrap_or(false)
                 && !hidden_non_terminal_control
                 && (mask.is_allowed(token)
                     || (accepting
@@ -456,6 +472,14 @@ impl StructuredOutputProcessor {
             accepting,
             required_delimiter_token_id: None,
         })
+    }
+
+    fn mask_undefined_token_ids(&self, logits: &mut [f32]) {
+        for (idx, logit) in logits.iter_mut().enumerate() {
+            if !self.defined_token_ids.get(idx).copied().unwrap_or(false) {
+                *logit = f32::NEG_INFINITY;
+            }
+        }
     }
 
     /// True only when reasoning has closed and the grammar accepts the full
@@ -847,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn undefined_model_vocab_ids_are_never_zero_width_tokens() {
+    fn undefined_model_vocab_ids_are_masked_inside_wildcard_strings() {
         let tokenizer = Arc::new(ByteTokenizer::new());
         let undefined_token = tokenizer.vocab_size() as u32;
         assert_eq!(
@@ -870,9 +894,11 @@ mod tests {
         .unwrap()
         .unwrap();
 
+        let mut generated = Vec::new();
+        assert_and_append(&processor, &mut generated, r#"{"value":"Ferrum "#);
         let mut logits = vec![0.0; undefined_token as usize + 1];
-        processor.mask_logits(&mut logits, &[]).unwrap();
-        assert!(logits[b'{' as usize].is_finite());
+        processor.mask_logits(&mut logits, &generated).unwrap();
+        assert!(logits[b'x' as usize].is_finite());
         assert!(!logits[undefined_token as usize].is_finite());
     }
 
