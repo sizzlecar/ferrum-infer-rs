@@ -69,6 +69,7 @@ run_unit() {
     scripts/release/qwen35_gguf_linear_attention_reference.py \
     scripts/release/qwen35_gguf_full_attention_reference.py \
     scripts/release/runtime_vnext_qwen35_layer_reference_gate.py \
+    scripts/release/runtime_vnext_qwen35_full_attention_gate.py \
     scripts/release/bounded_command.py \
     scripts/release/run_gate.py \
     scripts/release/run_scenarios.py \
