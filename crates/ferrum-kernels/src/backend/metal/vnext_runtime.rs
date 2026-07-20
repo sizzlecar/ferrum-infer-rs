@@ -23,7 +23,7 @@ use ferrum_interfaces::vnext::{
     DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
     StreamState, VNextError,
 };
-use metal::objc::runtime::Object;
+use metal::objc::runtime::{Object, BOOL, YES};
 use metal::objc::{msg_send, sel, sel_impl};
 use metal::{
     BlitCommandEncoder, Buffer, BufferRef, CommandBuffer, CommandBufferRef, CommandQueue,
@@ -560,7 +560,7 @@ impl MetalPendingSubmissions {
 
 enum MetalFenceTiming {
     NotRequested,
-    Unavailable,
+    CommandBuffer,
 }
 
 pub struct MetalDeviceFence {
@@ -591,15 +591,21 @@ impl MetalDeviceFence {
         }
     }
 
+    fn execution_timing(&self) -> DeviceTimingMeasurement<DeviceExecutionTiming> {
+        match self.timing {
+            MetalFenceTiming::NotRequested => DeviceTimingMeasurement::NotRequested,
+            MetalFenceTiming::CommandBuffer => {
+                metal_command_buffer_execution_timing(&self.command_buffer)
+            }
+        }
+    }
+
     fn terminal_receipt<E>(&self, terminal: DeviceTerminal<E>) -> DeviceTerminalReceipt<E> {
         match self.timing {
             MetalFenceTiming::NotRequested => DeviceTerminalReceipt::unprofiled(terminal),
-            MetalFenceTiming::Unavailable => DeviceTerminalReceipt::profiled(
-                terminal,
-                DeviceTimingMeasurement::<DeviceExecutionTiming>::Unavailable(
-                    DeviceTimingUnavailableReason::BackendMeasurementFailed,
-                ),
-            ),
+            MetalFenceTiming::CommandBuffer => {
+                DeviceTerminalReceipt::profiled(terminal, self.execution_timing())
+            }
         }
     }
 
@@ -613,6 +619,50 @@ impl MetalDeviceFence {
             MetalDeviceRuntimeError::command_buffer_failure(operation, &self.command_buffer),
         ))
     }
+}
+
+fn metal_command_buffer_execution_timing(
+    command_buffer: &CommandBufferRef,
+) -> DeviceTimingMeasurement<DeviceExecutionTiming> {
+    if command_buffer.status() != MTLCommandBufferStatus::Completed {
+        return DeviceTimingMeasurement::Unavailable(
+            DeviceTimingUnavailableReason::BackendMeasurementFailed,
+        );
+    }
+    let start_selector = sel!(GPUStartTime);
+    let end_selector = sel!(GPUEndTime);
+    let (supports_start, supports_end): (BOOL, BOOL) = unsafe {
+        (
+            msg_send![command_buffer, respondsToSelector: start_selector],
+            msg_send![command_buffer, respondsToSelector: end_selector],
+        )
+    };
+    if supports_start != YES || supports_end != YES {
+        return DeviceTimingMeasurement::Unavailable(
+            DeviceTimingUnavailableReason::BackendUnsupported,
+        );
+    }
+    let (started_seconds, ended_seconds): (f64, f64) = unsafe {
+        (
+            msg_send![command_buffer, GPUStartTime],
+            msg_send![command_buffer, GPUEndTime],
+        )
+    };
+    if !started_seconds.is_finite() || !ended_seconds.is_finite() || ended_seconds < started_seconds
+    {
+        return DeviceTimingMeasurement::Unavailable(
+            DeviceTimingUnavailableReason::BackendMeasurementFailed,
+        );
+    }
+    let elapsed_ns = (ended_seconds - started_seconds) * 1_000_000_000.0;
+    if !elapsed_ns.is_finite() || elapsed_ns > u64::MAX as f64 {
+        return DeviceTimingMeasurement::Unavailable(
+            DeviceTimingUnavailableReason::DurationOverflow,
+        );
+    }
+    DeviceTimingMeasurement::Measured(DeviceExecutionTiming::device_event_elapsed(
+        elapsed_ns.round() as u64,
+    ))
 }
 
 impl Drop for MetalDeviceFence {
@@ -799,7 +849,7 @@ impl MetalDeviceRuntime {
             MetalSubmissionStageTimer::start(timing_sink, DeviceSubmissionStage::BeginTiming);
         let timing = match timing_mode {
             DeviceTimingMode::Off => MetalFenceTiming::NotRequested,
-            DeviceTimingMode::Completion => MetalFenceTiming::Unavailable,
+            DeviceTimingMode::Completion => MetalFenceTiming::CommandBuffer,
         };
         drop(begin_timing_stage);
 
@@ -1287,6 +1337,34 @@ mod tests {
             )
             .expect("readback");
         assert_eq!(output, [1, 2, 0, 0, 0, 6, 7, 8]);
+    }
+
+    #[test]
+    fn profiled_transfer_reports_metal_command_buffer_time() {
+        let runtime = runtime();
+        let destination = runtime
+            .allocate_request(&buffer_request("resource/profiled-destination"))
+            .expect("destination allocation");
+        let mut stream = runtime.create_stream().expect("stream");
+        let command = runtime
+            .encode_zero(&destination, 0, 8)
+            .expect("zero command");
+
+        let fence = runtime
+            .submit_commands(
+                &mut stream,
+                vec![command],
+                DeviceTimingMode::Completion,
+                &DisabledDeviceSubmissionTimingSink,
+            )
+            .expect("profiled submission");
+        let terminal = runtime.wait_fence(&fence).expect("terminal fence");
+
+        assert!(terminal.terminal().is_succeeded());
+        assert!(matches!(
+            terminal.execution_timing(),
+            DeviceTimingMeasurement::Measured(timing) if timing.elapsed_ns() > 0
+        ));
     }
 
     #[test]
