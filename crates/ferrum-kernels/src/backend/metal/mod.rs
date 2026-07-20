@@ -35,6 +35,7 @@ pub mod moe;
 pub mod paged;
 pub mod quant;
 mod residency;
+pub mod vnext_runtime;
 
 // GGUF k-quant kernels (Audit #9 moved here from kernels-crate top level).
 // Re-exported via `pub use backend::metal::{...}` in `crate::lib` so the
