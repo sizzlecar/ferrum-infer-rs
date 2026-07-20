@@ -365,7 +365,7 @@ def json_value(value: Any) -> Any:
 
 
 def hf_snapshot_identity(path: Path) -> dict[str, str | None]:
-    parts = path.resolve().parts
+    parts = path.expanduser().absolute().parts
     result: dict[str, str | None] = {"repository": None, "revision": None}
     for index, part in enumerate(parts):
         if part.startswith("models--"):
@@ -445,6 +445,7 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     try:
         import numpy as np  # type: ignore
         import gguf  # type: ignore
+        import yaml  # type: ignore
         from gguf import GGUFReader  # type: ignore
         from gguf.quants import dequantize  # type: ignore
     except ImportError as error:
@@ -677,6 +678,7 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
             "llama_cpp_gguf_py_source": llama_source,
             "python_version": platform.python_version(),
             "numpy_version": np.__version__,
+            "pyyaml_version": yaml.__version__,
             "gguf_module_path": str(Path(gguf.__file__).resolve()),
         },
         "model": {
