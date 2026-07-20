@@ -556,10 +556,38 @@ def validate_trace(rows: list[dict[str, Any]], request_ids: set[str], disconnect
     return {"scheduler_tick_delta": tick_delta, "trace_release_wall_sec": wall_sec, "released_row": released_index}
 
 
+def partition_request_dump_bundles(root: Path) -> tuple[Path, list[Path]]:
+    all_bundles = sorted(path for path in root.iterdir() if path.is_dir() and not path.is_symlink())
+    startup_bundles = [path for path in all_bundles if path.name.startswith("serve-startup-")]
+    request_bundles = [path for path in all_bundles if not path.name.startswith("serve-startup-")]
+    require(len(startup_bundles) == 1, f"expected one serve startup bundle, found {len(startup_bundles)}")
+    require(len(request_bundles) == 42, f"expected 42 scenario request bundles, found {len(request_bundles)}")
+    return startup_bundles[0], request_bundles
+
+
+def validate_startup_bundle(bundle: Path) -> str:
+    request = read_json(bundle / "request.json")
+    request_id = request.get("request_id")
+    require(request_id == bundle.name, f"startup bundle identity mismatch: {bundle}")
+    require(request.get("schema_version") == 1 and request.get("entrypoint") == "serve", "startup bundle schema/entrypoint mismatch")
+    require(request.get("model") == MODEL and request.get("backend") == "actual", "startup bundle model/backend mismatch")
+    require(request.get("actual_model_smoke") is True and request.get("sanitized") is True, "startup bundle provenance mismatch")
+    require("http" not in request, "startup bundle must not masquerade as an HTTP scenario request")
+    for json_path in bundle.glob("*.json"):
+        value = read_json(json_path)
+        if value.get("request_id") is not None:
+            require(value.get("request_id") == request_id, f"startup bundle member request_id mismatch: {json_path}")
+    backend = read_json(bundle / "backend_selection.json")
+    require(backend.get("backend") == "actual" and backend.get("model") == MODEL, "startup bundle backend mismatch")
+    bad_output = read_json(bundle / "bad_output_scan.json")
+    require(bad_output.get("bad_output") is False and bad_output.get("bad_text_count") == 0, "startup bundle bad-output scan failed")
+    return request_id
+
+
 def validate_request_dumps(source: Path, trace_rows: list[dict[str, Any]]) -> dict[str, Any]:
     root = source / "observability" / "serve" / "request_dump"
-    bundles = sorted(path for path in root.iterdir() if path.is_dir() and not path.is_symlink())
-    require(len(bundles) == 42, f"expected 42 request bundles, found {len(bundles)}")
+    startup_bundle, bundles = partition_request_dump_bundles(root)
+    startup_request_id = validate_startup_bundle(startup_bundle)
     keys: dict[tuple[Any, ...], str] = {}
     request_ids: set[str] = set()
     for bundle in bundles:
@@ -608,7 +636,13 @@ def validate_request_dumps(source: Path, trace_rows: list[dict[str, Any]]) -> di
     trace = validate_trace(trace_rows, request_ids, disconnect_id)
     followup_rows = [index for index, row in enumerate(trace_rows) if row.get("request_id") == followup_id]
     require(followup_rows and min(followup_rows) > trace["released_row"], "followup began before disconnect release")
-    return {"request_count": len(request_ids), "disconnect_id": disconnect_id, "followup_id": followup_id, **trace}
+    return {
+        "request_count": len(request_ids),
+        "startup_request_id": startup_request_id,
+        "disconnect_id": disconnect_id,
+        "followup_id": followup_id,
+        **trace,
+    }
 
 
 def validate_disconnect(source: Path, recorded: Path, summary_row: dict[str, Any]) -> dict[str, Any]:
@@ -818,6 +852,31 @@ def self_test() -> None:
         require("two scheduler ticks" in str(error), "selftest tick mutation failed for wrong reason")
     else:
         raise ValidationError("selftest three-tick disconnect unexpectedly passed")
+    with tempfile.TemporaryDirectory(prefix="ferrum-s2-request-dump-selftest-") as tmp:
+        root = Path(tmp)
+        startup = root / "serve-startup-fixture"
+        startup.mkdir()
+        for index in range(42):
+            (root / f"request-{index:02d}").mkdir()
+        observed_startup, observed_requests = partition_request_dump_bundles(root)
+        require(observed_startup == startup and len(observed_requests) == 42, "selftest request bundle partition mismatch")
+        duplicate_startup = root / "serve-startup-duplicate"
+        duplicate_startup.mkdir()
+        try:
+            partition_request_dump_bundles(root)
+        except ValidationError as error:
+            require("one serve startup bundle" in str(error), "selftest duplicate startup failed for wrong reason")
+        else:
+            raise ValidationError("selftest duplicate startup bundle unexpectedly passed")
+        duplicate_startup.rmdir()
+        extra_request = root / "request-extra"
+        extra_request.mkdir()
+        try:
+            partition_request_dump_bundles(root)
+        except ValidationError as error:
+            require("42 scenario request bundles" in str(error), "selftest extra request failed for wrong reason")
+        else:
+            raise ValidationError("selftest extra scenario request bundle unexpectedly passed")
     with tempfile.TemporaryDirectory(prefix="ferrum-s2-stream-disconnect-selftest-") as tmp:
         path = Path(tmp) / "event.json"
         value = {"canonical_sha256_scope": "document_without_canonical_sha256_fields", "value": 1}
