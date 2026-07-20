@@ -632,6 +632,44 @@ fn ordered_step_activations_share_one_single_fence_slot() {
 }
 
 #[test]
+fn completion_retained_step_activation_gets_a_dedicated_physical_slot() {
+    let layout = canonical_fingerprint(&"contiguous_v1", "test layout").expect("fingerprint");
+    let storage = DynamicStorageContract::new(linear_profile(), layout).expect("storage");
+    let first = step_descriptor(
+        "resource/activation-a",
+        64,
+        BufferUsage::Activations,
+        storage.clone(),
+    );
+    let second = step_descriptor(
+        "resource/activation-b",
+        128,
+        BufferUsage::Activations,
+        storage,
+    );
+    let nodes = vec![
+        plan_node("node/a", &[], &["resource/activation-a"]),
+        plan_node("node/middle", &["node/a"], &[]),
+        plan_node("node/b", &["node/middle"], &["resource/activation-b"]),
+    ];
+
+    let pools = MemoryPlan::derive_dynamic_pools_with_completion_retention(
+        &[first, second],
+        &nodes,
+        1 << 20,
+        &BTreeSet::from([ResourceId::new("resource/activation-a").expect("valid resource id")]),
+    )
+    .expect("derive retained pools");
+    assert_eq!(pools.len(), 1);
+    assert_eq!(pools[0].minimum_step_bytes(), 192);
+    assert_eq!(pools[0].step_resource_slots().len(), 2);
+    assert!(pools[0]
+        .step_resource_slots()
+        .iter()
+        .all(|slot| slot.kind() == StepResourceSlotKind::Dedicated));
+}
+
+#[test]
 fn overlapping_step_activations_keep_distinct_physical_slots() {
     let layout = canonical_fingerprint(&"contiguous_v1", "test layout").expect("fingerprint");
     let storage = DynamicStorageContract::new(linear_profile(), layout).expect("storage");

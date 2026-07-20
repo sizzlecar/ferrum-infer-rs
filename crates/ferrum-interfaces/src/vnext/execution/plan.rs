@@ -23,6 +23,7 @@ use super::{
     UnvalidatedExecutionPlan, UnvalidatedExecutionPlanWire, VNextError, ValueAllocationAccumulator,
     ValueResourceDemand, WeightFormatId, EXECUTION_PLAN_SCHEMA, MAX_EXECUTION_PLAN_WIRE_BYTES,
 };
+use super::{resolve_retained_completion_values, CompletionRetentionSpec, RetainedCompletionValue};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutionPlan {
@@ -191,6 +192,12 @@ impl ExecutionPlan {
         }
         Self::validate_semantic_coverage(family, &bound_values)?;
         Self::validate_global_storage_aliasing(&canonical_values, &nodes)?;
+        let retained_completion_values =
+            resolve_retained_completion_values(&nodes, &request.completion_retention)?;
+        let retained_completion_resources = retained_completion_values
+            .iter()
+            .map(|value| value.resource_id().clone())
+            .collect::<BTreeSet<_>>();
         let memory = Self::build_memory_plan(
             family,
             device_capacity,
@@ -201,6 +208,7 @@ impl ExecutionPlan {
             &nodes,
             &selected_resource_profiles,
             request.policy.reusable_execution_policy(),
+            &retained_completion_resources,
         )?;
 
         let mut payload = ExecutionPlanPayload {
@@ -217,6 +225,7 @@ impl ExecutionPlan {
             maximum_scheduled_tokens,
             weight_format,
             quantization_formats,
+            retained_completion_values,
             nodes,
             memory,
         };
@@ -1470,6 +1479,7 @@ impl ExecutionPlan {
         nodes: &[PlanNode],
         selected_resource_profiles: &BTreeMap<ResourceId, DynamicStorageProfile>,
         reusable_execution_policy: Option<&ReusableExecutionPolicy>,
+        retained_completion_resources: &BTreeSet<ResourceId>,
     ) -> Result<MemoryPlan, VNextError> {
         validate_scheduled_token_ceiling(maximum_scheduled_tokens)?;
         let program_inputs = family
@@ -1803,7 +1813,7 @@ impl ExecutionPlan {
                 }
             }
         }
-        MemoryPlan::from_core(
+        MemoryPlan::from_core_with_completion_retention(
             device_capacity_bytes,
             policy_capacity_bytes,
             reserve_bytes,
@@ -1812,6 +1822,7 @@ impl ExecutionPlan {
             dynamic_descriptors,
             nodes,
             reusable_execution_policy,
+            retained_completion_resources,
         )
     }
 
@@ -1951,6 +1962,26 @@ impl ExecutionPlan {
         {
             return Err(invalid_plan("plan provenance or node set is invalid"));
         }
+        let retention_spec = CompletionRetentionSpec::new(
+            self.payload
+                .retained_completion_values
+                .iter()
+                .map(|value| value.value_id().clone())
+                .collect(),
+        );
+        let expected_retained_completion_values =
+            resolve_retained_completion_values(&self.payload.nodes, &retention_spec)?;
+        if self.payload.retained_completion_values != expected_retained_completion_values {
+            return Err(invalid_plan(
+                "retained completion values are not derived from plan outputs",
+            ));
+        }
+        let retained_completion_resources = self
+            .payload
+            .retained_completion_values
+            .iter()
+            .map(|value| value.resource_id().clone())
+            .collect::<BTreeSet<_>>();
         self.payload.memory.validate()?;
         let dynamic_capacity_bytes = self
             .payload
@@ -1958,10 +1989,11 @@ impl ExecutionPlan {
             .usable_capacity_bytes
             .checked_sub(self.payload.memory.static_bytes)
             .ok_or_else(|| invalid_plan("static memory exceeds usable capacity"))?;
-        let base_pools = MemoryPlan::derive_dynamic_pools(
+        let base_pools = MemoryPlan::derive_dynamic_pools_with_completion_retention(
             &self.payload.memory.dynamic_descriptors,
             &self.payload.nodes,
             dynamic_capacity_bytes,
+            &retained_completion_resources,
         )?;
         let expected_reusable_execution = self
             .payload
@@ -1992,6 +2024,7 @@ impl ExecutionPlan {
             &self.payload.nodes,
             dynamic_capacity_bytes,
             &reusable_workspace_ceilings,
+            &retained_completion_resources,
         )?;
         if self.payload.memory.dynamic_pools != expected_pools {
             return Err(invalid_plan(
@@ -2272,6 +2305,21 @@ impl ExecutionPlan {
         &self.payload
     }
 
+    pub fn completion_checkpoint(
+        &self,
+        value_id: &ProgramValueId,
+    ) -> Result<&RetainedCompletionValue, VNextError> {
+        self.payload
+            .retained_completion_values
+            .binary_search_by(|value| value.value_id().cmp(value_id))
+            .map(|index| &self.payload.retained_completion_values[index])
+            .map_err(|_| {
+                invalid_plan(format!(
+                    "semantic value `{value_id}` is not retained for completion readback"
+                ))
+            })
+    }
+
     pub fn plan_hash(&self) -> &PlanHash {
         &self.plan_hash
     }
@@ -2325,6 +2373,23 @@ impl ExecutionPlan {
         Self::decode_untrusted(bytes)?.revalidate(family, capabilities, policy, node_resolutions)
     }
 
+    pub fn from_json_validated_with_completion_retention<P: RuntimePolicy>(
+        bytes: &[u8],
+        family: &PreparedModelFamily,
+        capabilities: &CapabilityCatalog,
+        policy: &P,
+        node_resolutions: Vec<PlanNodeResolution>,
+        completion_retention: CompletionRetentionSpec,
+    ) -> Result<Self, VNextError> {
+        Self::decode_untrusted(bytes)?.revalidate_with_completion_retention(
+            family,
+            capabilities,
+            policy,
+            node_resolutions,
+            completion_retention,
+        )
+    }
+
     pub fn validate_against<P: RuntimePolicy>(
         &self,
         family: &PreparedModelFamily,
@@ -2332,12 +2397,27 @@ impl ExecutionPlan {
         policy: &P,
         node_resolutions: &[PlanNodeResolution],
     ) -> Result<(), VNextError> {
-        let rebuilt = ExecutionPlan::build(PlanBuildRequest::new(
+        self.validate_against_with_completion_retention(
             family,
             capabilities,
             policy,
-            node_resolutions.to_vec(),
-        )?)?;
+            node_resolutions,
+            CompletionRetentionSpec::default(),
+        )
+    }
+
+    pub fn validate_against_with_completion_retention<P: RuntimePolicy>(
+        &self,
+        family: &PreparedModelFamily,
+        capabilities: &CapabilityCatalog,
+        policy: &P,
+        node_resolutions: &[PlanNodeResolution],
+        completion_retention: CompletionRetentionSpec,
+    ) -> Result<(), VNextError> {
+        let rebuilt = ExecutionPlan::build(
+            PlanBuildRequest::new(family, capabilities, policy, node_resolutions.to_vec())?
+                .with_completion_retention(completion_retention)?,
+        )?;
         if rebuilt.operation_registry_authority != self.operation_registry_authority {
             return Err(invalid_plan(
                 "execution plan belongs to a different operation runtime registry",

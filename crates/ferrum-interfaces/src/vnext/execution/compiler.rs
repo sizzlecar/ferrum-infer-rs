@@ -3,22 +3,24 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     invalid_plan, AliasPolicy, BlockedTensorPadding, BufferUsage, CapabilityCatalog, CapabilityId,
-    DimensionConstraint, ElementType, ExecutablePlan, ExecutionPlan, LayoutConstraint, NodeId,
-    OperationPlanningHandle, PlanBuildRequest, PlanNodeResolution, PreparedModelFamily,
-    ProgramTensorSpec, ProgramValueId, ProviderId, ProviderResourcePlan, ResolvedStorageComponent,
-    ResolvedTensorLayout, ResolvedTensorSpec, ResolvedValueBinding, ResolvedValueRole,
-    ResolvedValueStorage, ResolvedWeightBinding, ResourceId, RuntimePolicy, StrideConstraint,
-    TensorContract, VNextError, WeightId,
+    CompletionRetentionSpec, DimensionConstraint, ElementType, ExecutablePlan, ExecutionPlan,
+    LayoutConstraint, NodeId, OperationPlanningHandle, PlanBuildRequest, PlanNodeResolution,
+    PreparedModelFamily, ProgramTensorSpec, ProgramValueId, ProviderId, ProviderResourcePlan,
+    ResolvedStorageComponent, ResolvedTensorLayout, ResolvedTensorSpec, ResolvedValueBinding,
+    ResolvedValueRole, ResolvedValueStorage, ResolvedWeightBinding, ResourceId, RuntimePolicy,
+    StrideConstraint, TensorContract, VNextError, WeightId,
 };
 
-/// Explicit semantic inputs and per-node selection preferences for compiling a
-/// model program. Product input capacities are required because they bound
-/// request-lifetime backing; the compiler never guesses a one-token capacity.
+/// Explicit semantic inputs, per-node selection preferences, and optional
+/// completion diagnostics for compiling a model program. Product input
+/// capacities are required because they bound request-lifetime backing; the
+/// compiler never guesses a one-token capacity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramPlanCompileOptions {
     tensor_specs: BTreeMap<ProgramValueId, ProgramTensorSpec>,
     required_capabilities: BTreeMap<NodeId, BTreeSet<CapabilityId>>,
     preferred_providers: BTreeMap<NodeId, ProviderId>,
+    completion_retention: CompletionRetentionSpec,
 }
 
 impl ProgramPlanCompileOptions {
@@ -32,6 +34,7 @@ impl ProgramPlanCompileOptions {
             tensor_specs: input_tensor_specs,
             required_capabilities: BTreeMap::new(),
             preferred_providers: BTreeMap::new(),
+            completion_retention: CompletionRetentionSpec::default(),
         })
     }
 
@@ -56,6 +59,16 @@ impl ProgramPlanCompileOptions {
 
     pub fn prefer_provider(&mut self, node_id: NodeId, provider_id: ProviderId) {
         self.preferred_providers.insert(node_id, provider_id);
+    }
+
+    /// Retains one semantic activation until the terminal completion fence for
+    /// an explicit diagnostic readback. Normal product plans leave this empty.
+    pub fn retain_completion_value(&mut self, value_id: ProgramValueId) -> bool {
+        self.completion_retention.insert(value_id)
+    }
+
+    pub fn completion_retention(&self) -> &CompletionRetentionSpec {
+        &self.completion_retention
     }
 
     pub fn tensor_specs(&self) -> &BTreeMap<ProgramValueId, ProgramTensorSpec> {
@@ -170,12 +183,10 @@ impl ProgramPlanCompiler {
         let node_resolutions = final_resolution.ok_or_else(|| {
             invalid_plan("provider value alignment did not reach a bounded monotonic fixed point")
         })?;
-        let plan = ExecutionPlan::build(PlanBuildRequest::new(
-            family,
-            catalog,
-            policy,
-            node_resolutions.clone(),
-        )?)?;
+        let plan = ExecutionPlan::build(
+            PlanBuildRequest::new(family, catalog, policy, node_resolutions.clone())?
+                .with_completion_retention(options.completion_retention.clone())?,
+        )?;
         let executable = ExecutablePlan::new(plan, catalog.clone())?;
         Ok(ProgramPlanCompilation {
             executable,
@@ -249,6 +260,20 @@ fn validate_compile_options(
     {
         return Err(invalid_plan(
             "program compile options contain an unknown semantic value",
+        ));
+    }
+    let produced_values = nodes
+        .iter()
+        .flat_map(|node| node.outputs.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    if options
+        .completion_retention
+        .values()
+        .iter()
+        .any(|value_id| !produced_values.contains(value_id))
+    {
+        return Err(invalid_plan(
+            "completion retention must reference a semantic node output",
         ));
     }
     if program

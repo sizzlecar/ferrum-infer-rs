@@ -34,7 +34,32 @@ pub struct MemoryPlan {
 }
 
 impl MemoryPlan {
+    #[cfg(test)]
     pub(super) fn from_core(
+        device_capacity_bytes: u64,
+        policy_capacity_bytes: u64,
+        reserve_bytes: u64,
+        maximum_active_sequences: u32,
+        static_allocations: Vec<ResourceAllocation>,
+        dynamic_descriptors: Vec<DynamicResourceDescriptor>,
+        nodes: &[PlanNode],
+        reusable_execution_policy: Option<&ReusableExecutionPolicy>,
+    ) -> Result<Self, VNextError> {
+        Self::from_core_with_completion_retention(
+            device_capacity_bytes,
+            policy_capacity_bytes,
+            reserve_bytes,
+            maximum_active_sequences,
+            static_allocations,
+            dynamic_descriptors,
+            nodes,
+            reusable_execution_policy,
+            &BTreeSet::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_core_with_completion_retention(
         device_capacity_bytes: u64,
         policy_capacity_bytes: u64,
         reserve_bytes: u64,
@@ -43,6 +68,7 @@ impl MemoryPlan {
         mut dynamic_descriptors: Vec<DynamicResourceDescriptor>,
         nodes: &[PlanNode],
         reusable_execution_policy: Option<&ReusableExecutionPolicy>,
+        retained_completion_resources: &BTreeSet<ResourceId>,
     ) -> Result<Self, VNextError> {
         if static_allocations.len() + dynamic_descriptors.len() > MAX_EXECUTION_PLAN_RESOURCE_ROWS {
             return Err(invalid_plan(format!(
@@ -55,6 +81,26 @@ impl MemoryPlan {
         static_allocations.sort_by(|left, right| left.resource_id.cmp(&right.resource_id));
         dynamic_descriptors
             .sort_by(|left, right| left.base_resource_id.cmp(&right.base_resource_id));
+        for resource_id in retained_completion_resources {
+            let descriptor = dynamic_descriptors
+                .iter()
+                .find(|descriptor| &descriptor.base_resource_id == resource_id)
+                .ok_or_else(|| {
+                    invalid_plan(format!(
+                        "retained completion resource `{resource_id}` has no dynamic descriptor"
+                    ))
+                })?;
+            if descriptor.usage != BufferUsage::Activations
+                || !matches!(
+                    descriptor.lifetime,
+                    AllocationLifetime::Step | AllocationLifetime::Request
+                )
+            {
+                return Err(invalid_plan(format!(
+                    "retained completion resource `{resource_id}` is not a readable activation"
+                )));
+            }
+        }
         let static_bytes = static_allocations
             .iter()
             .try_fold(0_u64, |total, allocation| {
@@ -65,8 +111,12 @@ impl MemoryPlan {
         let dynamic_capacity_bytes = usable_capacity_bytes
             .checked_sub(static_bytes)
             .ok_or_else(|| invalid_plan("static memory exceeds usable capacity"))?;
-        let base_dynamic_pools =
-            Self::derive_dynamic_pools(&dynamic_descriptors, nodes, dynamic_capacity_bytes)?;
+        let base_dynamic_pools = Self::derive_dynamic_pools_with_completion_retention(
+            &dynamic_descriptors,
+            nodes,
+            dynamic_capacity_bytes,
+            retained_completion_resources,
+        )?;
         let reusable_execution = reusable_execution_policy
             .map(|policy| {
                 Self::derive_reusable_execution(
@@ -87,6 +137,7 @@ impl MemoryPlan {
             nodes,
             dynamic_capacity_bytes,
             &reusable_workspace_ceilings,
+            retained_completion_resources,
         )?;
         let (invocation_liveness_mode, invocation_liveness) =
             Self::summarize_pool_invocation_liveness(&dynamic_pools)?;
@@ -334,6 +385,7 @@ impl MemoryPlan {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn derive_dynamic_pools(
         dynamic_descriptors: &[DynamicResourceDescriptor],
         nodes: &[PlanNode],
@@ -344,6 +396,22 @@ impl MemoryPlan {
             nodes,
             dynamic_capacity_bytes,
             &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+    }
+
+    pub(super) fn derive_dynamic_pools_with_completion_retention(
+        dynamic_descriptors: &[DynamicResourceDescriptor],
+        nodes: &[PlanNode],
+        dynamic_capacity_bytes: u64,
+        retained_completion_resources: &BTreeSet<ResourceId>,
+    ) -> Result<Vec<DynamicBackingPoolSpec>, VNextError> {
+        Self::derive_dynamic_pools_with_reusable(
+            dynamic_descriptors,
+            nodes,
+            dynamic_capacity_bytes,
+            &BTreeMap::new(),
+            retained_completion_resources,
         )
     }
 
@@ -352,6 +420,7 @@ impl MemoryPlan {
         nodes: &[PlanNode],
         dynamic_capacity_bytes: u64,
         reusable_workspace_ceilings: &BTreeMap<DynamicBackingPoolId, u64>,
+        retained_completion_resources: &BTreeSet<ResourceId>,
     ) -> Result<Vec<DynamicBackingPoolSpec>, VNextError> {
         let mut groups = BTreeMap::<
             DynamicBackingPoolId,
@@ -405,7 +474,11 @@ impl MemoryPlan {
                     AllocationLifetime::Sequence,
                     "pool sequence minimum",
                 )?;
-                let step_resource_slots = Self::derive_pool_step_slots(nodes, &descriptors)?;
+                let step_resource_slots = Self::derive_pool_step_slots(
+                    nodes,
+                    &descriptors,
+                    retained_completion_resources,
+                )?;
                 let minimum_step_bytes = Self::step_slot_bytes(
                     &step_resource_slots,
                     &descriptors,
@@ -583,6 +656,7 @@ impl MemoryPlan {
     pub(super) fn derive_pool_step_slots(
         nodes: &[PlanNode],
         descriptors: &[&DynamicResourceDescriptor],
+        retained_completion_resources: &BTreeSet<ResourceId>,
     ) -> Result<Vec<StepResourceSlot>, VNextError> {
         struct Interval<'a> {
             resource_id: &'a ResourceId,
@@ -624,7 +698,10 @@ impl MemoryPlan {
                     resource_id: &descriptor.base_resource_id,
                     first_user,
                     last_user,
-                    reusable: Self::is_reusable_step_activation(descriptor),
+                    // Completion diagnostics read after the terminal fence, so
+                    // a retained activation cannot share a liveness slot.
+                    reusable: Self::is_reusable_step_activation(descriptor)
+                        && !retained_completion_resources.contains(&descriptor.base_resource_id),
                 })
             })
             .collect::<Result<Vec<_>, VNextError>>()?;

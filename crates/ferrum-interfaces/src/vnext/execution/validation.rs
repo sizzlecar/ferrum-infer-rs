@@ -1,7 +1,7 @@
 use super::{
-    invalid_plan, CapabilityCatalog, ExecutionPlan, PlanBuildRequest, PlanNodeResolution,
-    PlanSchemaVersion, PreparedModelFamily, RuntimePolicy, UnvalidatedExecutionPlan, VNextError,
-    EXECUTION_PLAN_SCHEMA,
+    invalid_plan, CapabilityCatalog, CompletionRetentionSpec, ExecutionPlan, PlanBuildRequest,
+    PlanNodeResolution, PlanSchemaVersion, PreparedModelFamily, RuntimePolicy,
+    UnvalidatedExecutionPlan, VNextError, EXECUTION_PLAN_SCHEMA,
 };
 
 impl UnvalidatedExecutionPlan {
@@ -16,6 +16,23 @@ impl UnvalidatedExecutionPlan {
         policy: &P,
         node_resolutions: Vec<PlanNodeResolution>,
     ) -> Result<ExecutionPlan, VNextError> {
+        self.revalidate_with_completion_retention(
+            family,
+            capabilities,
+            policy,
+            node_resolutions,
+            CompletionRetentionSpec::default(),
+        )
+    }
+
+    pub fn revalidate_with_completion_retention<P: RuntimePolicy>(
+        self,
+        family: &PreparedModelFamily,
+        capabilities: &CapabilityCatalog,
+        policy: &P,
+        node_resolutions: Vec<PlanNodeResolution>,
+        completion_retention: CompletionRetentionSpec,
+    ) -> Result<ExecutionPlan, VNextError> {
         if self.payload.schema != EXECUTION_PLAN_SCHEMA {
             return Err(VNextError::UnsupportedPlanSchema {
                 expected_major: EXECUTION_PLAN_SCHEMA.major,
@@ -24,12 +41,10 @@ impl UnvalidatedExecutionPlan {
                 actual_minor: self.payload.schema.minor,
             });
         }
-        let rebuilt = ExecutionPlan::build(PlanBuildRequest::new(
-            family,
-            capabilities,
-            policy,
-            node_resolutions,
-        )?)?;
+        let rebuilt = ExecutionPlan::build(
+            PlanBuildRequest::new(family, capabilities, policy, node_resolutions)?
+                .with_completion_retention(completion_retention)?,
+        )?;
         let untrusted_payload =
             serde_json::to_value(&self.payload).map_err(|error| VNextError::Serialization {
                 context: "serialize unvalidated execution plan payload",
