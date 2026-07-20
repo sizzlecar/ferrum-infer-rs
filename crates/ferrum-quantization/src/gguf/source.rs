@@ -12,8 +12,8 @@ use crate::safetensors_archive::transcode_dense_bytes;
 /// Schema-addressed, mmap-backed GGUF source for vNext static weights.
 /// Fixed-block payloads borrow the immutable file mapping without
 /// dequantization or repacking. Dense floating-point payloads are borrowed
-/// when their type matches the schema and materialized once on the cold path
-/// when the typed execution plan requests another floating-point type.
+/// when their type matches the schema and materialized on a cold-path source
+/// request when the typed execution plan requires another floating-point type.
 pub struct GgufWeightComponentSource {
     file: GgufFile,
     source_file: String,
