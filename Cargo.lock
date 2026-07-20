@@ -1495,6 +1495,7 @@ dependencies = [
  "half",
  "metal 0.31.0",
  "rayon",
+ "serde",
  "serde_json",
  "sha2",
  "tracing",
