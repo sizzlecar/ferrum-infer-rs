@@ -1303,8 +1303,10 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         // before every legacy weight-format loader. A typed GGUF source carries
         // its semantic metadata separately, so routing it through the generic
         // GGUF loader first would silently bypass the registered vNext package.
-        // Direct GGUF paths have no semantic sidecar and retain the legacy path
-        // until their family receives an explicit product source bundle.
+        // Direct GGUF paths with colocated semantic/tokenizer metadata can
+        // carry the same typed bundle. Migrated architectures without that
+        // metadata fail closed during product source resolution; only explicit
+        // legacy registry rows may continue through the generic GGUF loader.
         let legacy_reference_requested = config
             .get_option::<bool>("qwen35_reference")
             .unwrap_or(false);
