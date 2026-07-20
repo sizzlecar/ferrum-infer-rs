@@ -1,0 +1,57 @@
+{
+  "backend": "cuda",
+  "ferrum_bin": "target/release/ferrum",
+  "model": "Qwen/Qwen3.5-4B",
+  "observability": {
+    "enabled": true,
+    "profile_detail": "basic",
+    "profile_sample_rate": 1.0
+  },
+  "schema_version": 1,
+  "server": {
+    "args": [
+      "--backend",
+      "cuda"
+    ],
+    "mode": "start"
+  },
+  "timeout_sec": 600,
+  "scenarios": [
+    {
+      "name": "m1_c16_negative_api_matrix",
+      "type": "serve_negative_api_matrix",
+      "cases_per_category": 6,
+      "enable_thinking": false,
+      "preset": "P_DETERMINISTIC",
+      "max_tokens": 1024,
+      "sampling": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "seed": 9271,
+        "stop": []
+      }
+    },
+    {
+      "name": "m1_c20_text_only_modality_matrix",
+      "type": "serve_text_only_modality_matrix",
+      "cases_per_category": 10,
+      "enable_thinking": false,
+      "preset": "P_DETERMINISTIC",
+      "max_tokens": 1024,
+      "sampling": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "seed": 9271,
+        "stop": []
+      }
+    }
+  ]
+}
