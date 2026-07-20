@@ -1170,7 +1170,11 @@ def validate_c20_case(
             "unsupported message content part type" in message,
             f"{label}: error does not prove non-text deserialization rejection",
         )
-        require(result.get("observed") == {"error": error}, f"{label}: observed media error mismatch")
+        require(
+            result.get("observed")
+            == {"error": error, "rejection_stage": "request-deserialization"},
+            f"{label}: observed media error mismatch",
+        )
     return {"category": category, "request_sha": json_fingerprint(request)}
 
 
@@ -1554,7 +1558,10 @@ def fixture_c20(source_root: Path, model: str) -> dict[str, Any]:
                         "code": None,
                     }
                 }
-                observed = {"error": response["error"]}
+                observed = {
+                    "error": response["error"],
+                    "rejection_stage": "request-deserialization",
+                }
                 preset = None
                 http_status = 400
             case_root = source_root / C20_NAME / category / f"{ordinal:03d}"
@@ -1844,7 +1851,10 @@ def refresh_case_hashes(
             text, finish = response_message_text(response, "fixture mutation")
             result["observed"] = {"finish_reason": finish, "content": text}
         else:
-            result["observed"] = {"error": response["error"]}
+            result["observed"] = {
+                "error": response["error"],
+                "rejection_stage": "request-deserialization",
+            }
 
     rewrite_case_result(source_root, scenario_name, category, ordinal, update)
 
@@ -1887,6 +1897,14 @@ def mutate_media_sampling_leak(source_root: Path) -> None:
     request["temperature"] = 0.0
     write_json(request_path, request)
     refresh_case_hashes(source_root, C20_NAME, "image-url", 0)
+    write_fixture_artifact_tree(source_root)
+
+
+def mutate_media_rejection_stage(source_root: Path) -> None:
+    def update(result: dict[str, Any]) -> None:
+        result["observed"]["rejection_stage"] = "template-render"
+
+    rewrite_case_result(source_root, C20_NAME, "image-url", 0, update)
     write_fixture_artifact_tree(source_root)
 
 
@@ -1972,6 +1990,7 @@ def self_test() -> int:
         ("duplicate-payload-contract", mutate_duplicate_payload_and_contract),
         ("wrong-preset", mutate_wrong_preset),
         ("media-sampling-leak", mutate_media_sampling_leak),
+        ("media-rejection-stage", mutate_media_rejection_stage),
         ("text-sampling-missing", mutate_text_sampling_missing),
         ("text-marker-missing", mutate_text_marker_missing),
         ("bad-modality", mutate_bad_modality),
