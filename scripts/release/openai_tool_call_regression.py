@@ -20,6 +20,12 @@ FORBIDDEN_TEXT = [
     "auto_tool_response",
 ]
 
+UNPARSED_TOOL_PROTOCOL_TEXT = [
+    "<tool_call>",
+    "<function=",
+    "<parameter=",
+]
+
 
 TOOLS = [
     {
@@ -153,11 +159,23 @@ def assert_weather_tool_call(label: str, choice: dict[str, Any]) -> dict[str, An
     return call
 
 
-def assert_omitted_tool_choice_auto_calls_weather(label: str, choice: dict[str, Any]) -> None:
+def assert_auto_tool_choice_response(label: str, choice: dict[str, Any]) -> dict[str, Any]:
     msg = message(choice)
     content = str(msg.get("content") or "")
     assert_no_forbidden_text(label, content)
-    assert_weather_tool_call(label, choice)
+    if msg.get("tool_calls"):
+        assert_weather_tool_call(label, choice)
+        return {"outcome": "tool_call", "finish_reason": choice.get("finish_reason")}
+
+    if choice.get("finish_reason") != "stop":
+        raise RuntimeError(f"{label}: content outcome did not finish with stop: {choice}")
+    if not content.strip():
+        raise RuntimeError(f"{label}: auto choice returned neither content nor tool_calls: {choice}")
+    for token in UNPARSED_TOOL_PROTOCOL_TEXT:
+        if token in content:
+            raise RuntimeError(f"{label}: leaked unparsed tool protocol {token!r}: {content[:500]}")
+    assert_not_duplicate_answer(label, content)
+    return {"outcome": "content", "finish_reason": choice.get("finish_reason")}
 
 
 def tool_payload(model: str, *, tool_choice: Any | None, prompt: str = TOOL_USER_PROMPT) -> dict[str, Any]:
@@ -183,33 +201,50 @@ def run_tool_call_regression(base_url: str, model: str, out: Path) -> dict[str, 
     out.mkdir(parents=True, exist_ok=True)
     results: dict[str, Any] = {"model": model, "checks": {}}
 
-    # BUG-1: Omitting tool_choice must still behave as auto, not return an empty stop
-    # or a plain-text fake tool result when the user explicitly asks to call a tool.
+    # Omitting tool_choice defaults to auto. Like vLLM/OpenAI, auto may either
+    # select a tool or return ordinary content; it must not return an empty or
+    # unparsed protocol response.
     status, body = post(base_url, tool_payload(model, tool_choice=None))
     write(out / "01_omitted_tool_choice.response.json", body)
     omitted = first_choice(parsed_json("omitted_tool_choice", status, body))
-    assert_omitted_tool_choice_auto_calls_weather("omitted_tool_choice", omitted)
-    results["checks"]["omitted_tool_choice"] = {"passed": True}
+    omitted_result = assert_auto_tool_choice_response("omitted_tool_choice", omitted)
+    results["checks"]["omitted_tool_choice"] = {"passed": True, **omitted_result}
 
     # Explicit auto must also work. Keep the prompt identical to the omitted
     # tool_choice case so this checks request handling rather than prompt wording.
     status, body = post(base_url, tool_payload(model, tool_choice="auto"))
     write(out / "01b_explicit_auto_tool_choice.response.json", body)
     explicit_auto = first_choice(parsed_json("explicit_auto_tool_choice", status, body))
-    assert_omitted_tool_choice_auto_calls_weather("explicit_auto_tool_choice", explicit_auto)
-    results["checks"]["explicit_auto_tool_choice"] = {"passed": True}
+    explicit_auto_result = assert_auto_tool_choice_response(
+        "explicit_auto_tool_choice", explicit_auto
+    )
+    results["checks"]["explicit_auto_tool_choice"] = {
+        "passed": True,
+        **explicit_auto_result,
+    }
 
-    # BUG-3: Some Llama templates emit {"auto":{"tool":...}} text. The server must
-    # convert that to OpenAI tool_calls and must not leak reserved template tokens.
-    required_choice = {"type": "function", "function": {"name": "get_weather"}}
+    # Required must produce one of the declared tools. This is the portable
+    # cross-model correctness contract for forced tool use.
     status, body = post(
         base_url,
-        tool_payload(model, tool_choice=required_choice, prompt=TOOL_REQUIRED_PROMPT),
+        tool_payload(model, tool_choice="required", prompt=TOOL_REQUIRED_PROMPT),
     )
     write(out / "02_required_tool_choice.response.json", body)
     required = first_choice(parsed_json("required_tool_choice", status, body))
     required_call = assert_weather_tool_call("required_tool_choice", required)
     results["checks"]["required_tool_choice"] = {"passed": True}
+
+    # Named choice must bind the exact requested function. Keep this separate
+    # from `required`; the two choices have different OpenAI semantics.
+    named_choice = {"type": "function", "function": {"name": "get_weather"}}
+    status, body = post(
+        base_url,
+        tool_payload(model, tool_choice=named_choice, prompt=TOOL_REQUIRED_PROMPT),
+    )
+    write(out / "02b_named_tool_choice.response.json", body)
+    named = first_choice(parsed_json("named_tool_choice", status, body))
+    assert_weather_tool_call("named_tool_choice", named)
+    results["checks"]["named_tool_choice"] = {"passed": True}
 
     # BUG-2: Feeding a tool result back must not leak chat-template markers such as
     # <|assistant|>, classname=..., or auto_tool_response into the final answer.

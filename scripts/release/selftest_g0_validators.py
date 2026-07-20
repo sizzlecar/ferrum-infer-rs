@@ -44,6 +44,7 @@ RUNTIME_VNEXT_S1_CUDA_DECODE_CAPACITY = (
 )
 BOUNDED_COMMAND = REPO_ROOT / "scripts/release/bounded_command.py"
 RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
+OPENAI_TOOL_CALL_REGRESSION = REPO_ROOT / "scripts/release/openai_tool_call_regression.py"
 RUNTIME_VNEXT_S2_RESPONSE_FORMAT_CHECKPOINT = (
     REPO_ROOT / "scripts/release/runtime_vnext_s2_response_format_checkpoint.py"
 )
@@ -185,6 +186,16 @@ def make_summary_artifact(root: Path) -> None:
 def load_release_binary_gate():
     spec = importlib.util.spec_from_file_location("release_binary_gate", RELEASE_BINARY_GATE)
     require(spec is not None and spec.loader is not None, "failed to load release binary gate")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_openai_tool_call_regression():
+    spec = importlib.util.spec_from_file_location(
+        "openai_tool_call_regression", OPENAI_TOOL_CALL_REGRESSION
+    )
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -486,6 +497,54 @@ def test_run_scenarios_selftest() -> None:
     require("BACKEND SCENARIO RUNNER SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
+def test_openai_tool_call_auto_choice_semantics() -> None:
+    module = load_openai_tool_call_regression()
+    content = {
+        "finish_reason": "stop",
+        "message": {"role": "assistant", "content": "I can answer without a tool."},
+    }
+    require(
+        module.assert_auto_tool_choice_response("content", content)["outcome"] == "content",
+        "auto content outcome was not accepted",
+    )
+
+    tool_call = {
+        "finish_reason": "tool_calls",
+        "message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": json.dumps({"city": "北京", "unit": "celsius"}),
+                    },
+                }
+            ],
+        },
+    }
+    require(
+        module.assert_auto_tool_choice_response("tool", tool_call)["outcome"] == "tool_call",
+        "auto tool-call outcome was not accepted",
+    )
+
+    invalid = [
+        {"finish_reason": "stop", "message": {"role": "assistant", "content": ""}},
+        {
+            "finish_reason": "stop",
+            "message": {"role": "assistant", "content": "<tool_call>broken"},
+        },
+    ]
+    for index, choice in enumerate(invalid):
+        try:
+            module.assert_auto_tool_choice_response(f"invalid-{index}", choice)
+            raise AssertionError(f"invalid auto tool outcome {index} unexpectedly passed")
+        except RuntimeError:
+            pass
+
+
 def test_runtime_vnext_s2_response_format_checkpoint_selftest() -> None:
     ok = run(
         [sys.executable, str(RUNTIME_VNEXT_S2_RESPONSE_FORMAT_CHECKPOINT), "--self-test"]
@@ -709,6 +768,7 @@ def main() -> int:
     test_bounded_command_selftest()
     test_run_gate_selftest()
     test_run_scenarios_selftest()
+    test_openai_tool_call_auto_choice_semantics()
     test_runtime_vnext_s2_response_format_checkpoint_selftest()
     test_runtime_vnext_s2_api_modality_checkpoint_selftest()
     test_runtime_vnext_s2_stream_disconnect_checkpoint_selftest()
