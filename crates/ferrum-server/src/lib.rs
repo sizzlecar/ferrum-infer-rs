@@ -18,6 +18,7 @@
 pub mod axum_server;
 pub mod chat_template;
 pub mod middleware;
+pub mod model_registry;
 pub mod openai;
 pub mod traits;
 pub mod types;
@@ -45,6 +46,8 @@ pub use middleware::{
     RateLimitConfig as MiddlewareRateLimitConfig,
 };
 
-pub use axum_server::{
-    default_chat_sampling_params, init_prometheus_recorder, AxumServer, LoraAdapterModel,
+pub use axum_server::{default_chat_sampling_params, init_prometheus_recorder, AxumServer};
+pub use model_registry::{
+    LoraAdapterModel, ServedModelEntry, ServedModelKind, ServedModelName, ServedModelRegistry,
+    ServedModelRegistryError,
 };

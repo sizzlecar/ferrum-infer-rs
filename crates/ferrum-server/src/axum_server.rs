@@ -8,6 +8,7 @@ use crate::{
         render_chat_prompt_with_model_template_options,
         render_chat_prompt_with_tools_and_model_template, ChatTemplateOptions, ModelChatTemplate,
     },
+    model_registry::{LoraAdapterModel, ServedModelKind, ServedModelRegistry},
     openai::*,
     traits::HttpServer,
     types::*,
@@ -187,6 +188,12 @@ impl Drop for AxumServerRunGuard {
     }
 }
 
+fn single_model_registry(engine_model_id: ModelId, kind: ServedModelKind) -> ServedModelRegistry {
+    let public_name = engine_model_id.to_string();
+    ServedModelRegistry::try_new(engine_model_id, kind, vec![public_name], vec![])
+        .expect("engine config must contain a valid model id")
+}
+
 impl AxumServer {
     /// Create a server with a fully populated AppState.
     pub fn from_state(state: AppState) -> Self {
@@ -233,14 +240,36 @@ impl AxumServer {
         self
     }
 
+    /// Install the public OpenAI model namespace used for request routing and
+    /// `/v1/models`. The registry keeps public aliases separate from the
+    /// engine's internal model id.
+    pub fn with_served_model_registry(mut self, registry: ServedModelRegistry) -> Self {
+        self.state = self.state.with_served_model_registry(registry);
+        self
+    }
+
     /// Attach startup-loaded LoRA adapter model ids.
     pub fn with_lora_adapters(
         mut self,
         base_model_id: impl Into<String>,
         adapters: Vec<LoraAdapterModel>,
-    ) -> Self {
-        self.state = self.state.with_lora_adapters(base_model_id, adapters);
-        self
+    ) -> ferrum_types::Result<Self> {
+        let base_model_id = base_model_id.into();
+        let registry = if self.state.served_model_registry.is_empty() {
+            ServedModelRegistry::try_new(
+                base_model_id.clone(),
+                ServedModelKind::Llm,
+                vec![base_model_id],
+                adapters,
+            )
+        } else {
+            self.state
+                .served_model_registry
+                .try_with_lora_adapters(&base_model_id, adapters)
+        }
+        .map_err(|error| Error::config(error.to_string()))?;
+        self.state = self.state.with_served_model_registry(registry);
+        Ok(self)
     }
 
     async fn shutdown_loaded_engines(&self) -> ferrum_types::Result<()> {
@@ -314,7 +343,7 @@ pub struct AppState {
     pub tts: Option<Arc<dyn TtsEngine + Send + Sync>>,
     pub auto_config: Option<ResolvedFerrumConfig>,
     pub prompt_template: Option<Arc<ModelChatTemplate>>,
-    pub lora_registry: Arc<LoraModelRegistry>,
+    pub served_model_registry: Arc<ServedModelRegistry>,
     pub request_dump_dir: Option<Arc<PathBuf>>,
     pub profile_jsonl: Option<Arc<PathBuf>>,
     pub memory_profile_jsonl: Option<Arc<PathBuf>>,
@@ -322,113 +351,44 @@ pub struct AppState {
     cache: Arc<CacheRuntimeState>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoraAdapterModel {
-    pub name: String,
-    pub model_id: String,
-    pub path: String,
-}
-
-impl LoraAdapterModel {
-    pub fn new(
-        name: impl Into<String>,
-        model_id: impl Into<String>,
-        path: impl Into<String>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            model_id: model_id.into(),
-            path: path.into(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct LoraModelRegistry {
-    base_model_id: Option<String>,
-    adapters: Vec<LoraAdapterModel>,
-}
-
-#[derive(Clone, Debug)]
-struct LoraModelResolution {
-    base_model_id: String,
-    adapter: Option<LoraAdapterModel>,
-}
-
-impl LoraModelRegistry {
-    pub fn new(base_model_id: impl Into<String>, adapters: Vec<LoraAdapterModel>) -> Self {
-        Self {
-            base_model_id: Some(base_model_id.into()),
-            adapters,
-        }
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        !self.adapters.is_empty()
-    }
-
-    fn adapter_models(&self) -> &[LoraAdapterModel] {
-        &self.adapters
-    }
-
-    fn resolve(
-        &self,
-        request_model: &str,
-        loaded_models: &[ModelId],
-    ) -> std::result::Result<Option<LoraModelResolution>, ServerError> {
-        if !self.is_enabled() {
-            if loaded_models.is_empty()
-                || loaded_models.iter().any(|model| model.0 == request_model)
-            {
-                return Ok(None);
-            }
-            return Err(ServerError::invalid_request(
-                format!("unknown model: {request_model}"),
-                Some("model"),
-            ));
-        }
-        let base = self
-            .base_model_id
-            .clone()
-            .or_else(|| loaded_models.first().map(ToString::to_string))
-            .unwrap_or_default();
-        if request_model == base || loaded_models.iter().any(|model| model.0 == request_model) {
-            return Ok(Some(LoraModelResolution {
-                base_model_id: request_model.to_string(),
-                adapter: None,
-            }));
-        }
-        if let Some(adapter) = self
-            .adapters
-            .iter()
-            .find(|adapter| adapter.model_id == request_model)
-        {
-            return Ok(Some(LoraModelResolution {
-                base_model_id: base,
-                adapter: Some(adapter.clone()),
-            }));
-        }
-        Err(ServerError::invalid_request(
-            format!("unknown LoRA adapter model: {request_model}"),
-            Some("model"),
-        ))
-    }
-}
-
 impl AppState {
     pub fn with_llm(mut self, engine: Arc<dyn LlmInferenceEngine + Send + Sync>) -> Self {
+        if self.served_model_registry.is_empty() {
+            self.served_model_registry = Arc::new(single_model_registry(
+                engine.config().model.model_id.clone(),
+                ServedModelKind::Llm,
+            ));
+        }
         self.llm = Some(engine);
         self
     }
     pub fn with_embed(mut self, engine: Arc<dyn EmbedEngine + Send + Sync>) -> Self {
+        if self.served_model_registry.is_empty() {
+            self.served_model_registry = Arc::new(single_model_registry(
+                engine.config().model.model_id.clone(),
+                ServedModelKind::Embedding,
+            ));
+        }
         self.embed = Some(engine);
         self
     }
     pub fn with_transcribe(mut self, engine: Arc<dyn TranscribeEngine + Send + Sync>) -> Self {
+        if self.served_model_registry.is_empty() {
+            self.served_model_registry = Arc::new(single_model_registry(
+                engine.config().model.model_id.clone(),
+                ServedModelKind::Transcription,
+            ));
+        }
         self.transcribe = Some(engine);
         self
     }
     pub fn with_tts(mut self, engine: Arc<dyn TtsEngine + Send + Sync>) -> Self {
+        if self.served_model_registry.is_empty() {
+            self.served_model_registry = Arc::new(single_model_registry(
+                engine.config().model.model_id.clone(),
+                ServedModelKind::Speech,
+            ));
+        }
         self.tts = Some(engine);
         self
     }
@@ -443,12 +403,8 @@ impl AppState {
         self
     }
 
-    pub fn with_lora_adapters(
-        mut self,
-        base_model_id: impl Into<String>,
-        adapters: Vec<LoraAdapterModel>,
-    ) -> Self {
-        self.lora_registry = Arc::new(LoraModelRegistry::new(base_model_id, adapters));
+    pub fn with_served_model_registry(mut self, registry: ServedModelRegistry) -> Self {
+        self.served_model_registry = Arc::new(registry);
         self
     }
 
@@ -1083,24 +1039,20 @@ async fn chat_completions_handler(
     // OpenAI spec requires at least one message. Reject empty arrays at
     // the boundary rather than synthesising a fake prompt downstream.
     validate_chat_request(&request)?;
-    let loaded_models = state.status().await.loaded_models;
-    let lora_resolution = state
-        .lora_registry
-        .resolve(&request.model, &loaded_models)?;
+    let (engine_model_id, lora_adapter) = resolve_request_model(
+        &state.served_model_registry,
+        &request.model,
+        ServedModelKind::Llm,
+    )?;
 
     // Convert OpenAI request to internal format
-    let template_model_id = lora_resolution
-        .as_ref()
-        .map(|resolution| resolution.base_model_id.clone())
-        .or_else(|| loaded_models.first().map(ToString::to_string))
-        .unwrap_or_else(|| request.model.clone());
     let mut inference_request = convert_chat_request_with_template_model(
         &request,
-        &template_model_id,
+        &engine_model_id.0,
         state.prompt_template.as_deref(),
     )
     .map_err(server_error_from_ferrum_error)?;
-    apply_lora_resolution(&mut inference_request, lora_resolution.as_ref());
+    apply_served_model_resolution(&mut inference_request, engine_model_id, lora_adapter);
     state
         .cache
         .record_prefix_prompt(&inference_request.prompt, &cache_policy);
@@ -4267,15 +4219,29 @@ fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest 
     }
 }
 
-fn apply_lora_resolution(
+fn resolve_request_model<'a>(
+    registry: &'a ServedModelRegistry,
+    request_model: &str,
+    required_kind: ServedModelKind,
+) -> std::result::Result<(ModelId, Option<&'a LoraAdapterModel>), ServerError> {
+    if registry.is_empty() {
+        return Ok((ModelId::new(request_model), None));
+    }
+    let entry = registry
+        .resolve(request_model, required_kind)
+        .ok_or_else(|| {
+            ServerError::invalid_request(format!("unknown model: {request_model}"), Some("model"))
+        })?;
+    Ok((entry.engine_model_id().clone(), entry.adapter()))
+}
+
+fn apply_served_model_resolution(
     inference_request: &mut InferenceRequest,
-    resolution: Option<&LoraModelResolution>,
+    engine_model_id: ModelId,
+    adapter: Option<&LoraAdapterModel>,
 ) {
-    let Some(resolution) = resolution else {
-        return;
-    };
-    if let Some(adapter) = &resolution.adapter {
-        inference_request.model_id = ModelId(resolution.base_model_id.clone());
+    inference_request.model_id = engine_model_id;
+    if let Some(adapter) = adapter {
         inference_request.metadata.insert(
             "ferrum_lora_adapter".to_string(),
             serde_json::json!(adapter.name),
@@ -4437,12 +4403,13 @@ async fn completions_handler(
         ServerError::invalid_request(format!("invalid completions request: {e}"), None)
     })?;
     validate_completion_request(&request)?;
-    let loaded_models = state.status().await.loaded_models;
-    let lora_resolution = state
-        .lora_registry
-        .resolve(&request.model, &loaded_models)?;
+    let (engine_model_id, lora_adapter) = resolve_request_model(
+        &state.served_model_registry,
+        &request.model,
+        ServedModelKind::Llm,
+    )?;
     let mut inference_request = convert_completion_request(&request);
-    apply_lora_resolution(&mut inference_request, lora_resolution.as_ref());
+    apply_served_model_resolution(&mut inference_request, engine_model_id, lora_adapter);
     if request.stream.unwrap_or(false) {
         handle_completions_stream(state, request, inference_request).await
     } else {
@@ -4499,6 +4466,11 @@ async fn embeddings_handler(
     let _enter = span.enter();
 
     validate_embeddings_request(&request)?;
+    resolve_request_model(
+        &state.served_model_registry,
+        &request.model,
+        ServedModelKind::Embedding,
+    )?;
 
     // Flatten input into individual items
     let items: Vec<EmbeddingItem> = match request.input {
@@ -4666,6 +4638,11 @@ async fn speech_handler(
         .map_err(|e| ServerError::invalid_request(format!("invalid speech request: {e}"), None))?;
 
     let response_format = speech_output_format(&request)?;
+    resolve_request_model(
+        &state.served_model_registry,
+        &request.model,
+        ServedModelKind::Speech,
+    )?;
 
     let span = span!(Level::INFO, "speech");
     let _guard = span.enter();
@@ -4813,34 +4790,27 @@ fn pcm_to_s16le_bytes(samples: &[f32]) -> Vec<u8> {
 async fn models_handler(
     State(state): State<AppState>,
 ) -> std::result::Result<Response, ServerError> {
-    let status = state.status().await;
     let now = chrono::Utc::now().timestamp() as u64;
-    let mut data: Vec<_> = status
-        .loaded_models
-        .into_iter()
-        .map(|model_id| crate::openai::ModelInfo {
-            id: model_id.to_string(),
+    let data = state
+        .served_model_registry
+        .entries()
+        .iter()
+        .map(|entry| crate::openai::ModelInfo {
+            id: entry.public_name().to_string(),
             object: "model".to_string(),
             created: now,
             owned_by: "ferrum".to_string(),
-            modalities: vec!["text".to_string()],
+            modalities: entry
+                .kind()
+                .modalities()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             permission: vec![],
-            root: None,
-            parent: None,
+            root: entry.parent_public_name().map(ToString::to_string),
+            parent: entry.parent_public_name().map(ToString::to_string),
         })
         .collect();
-    data.extend(state.lora_registry.adapter_models().iter().map(|adapter| {
-        crate::openai::ModelInfo {
-            id: adapter.model_id.clone(),
-            object: "model".to_string(),
-            created: now,
-            owned_by: "ferrum".to_string(),
-            modalities: vec!["text".to_string()],
-            permission: vec![],
-            root: state.lora_registry.base_model_id.as_ref().cloned(),
-            parent: state.lora_registry.base_model_id.as_ref().cloned(),
-        }
-    }));
 
     let models = ModelListResponse {
         object: "list".to_string(),
@@ -4895,8 +4865,8 @@ async fn health_handler(
         "admission": admission,
         "cache": state.cache.health_json(&cache_policy, engine_cache.as_ref()),
         "lora": engine_lora.unwrap_or_else(|| serde_json::json!({
-            "enabled": state.lora_registry.is_enabled(),
-            "adapter_count": state.lora_registry.adapter_models().len() as u64,
+            "enabled": state.served_model_registry.adapter_count() > 0,
+            "adapter_count": state.served_model_registry.adapter_count() as u64,
             "active_cache_bindings": 0u64,
             "projection_applications": 0u64,
             "position": "startup-routing",
@@ -5356,6 +5326,10 @@ mod tests {
                 .expect("capture lock")
                 .clone()
                 .expect("request captured")
+        }
+
+        fn has_captured_request(&self) -> bool {
+            self.last_request.lock().expect("capture lock").is_some()
         }
     }
 
@@ -5929,7 +5903,20 @@ mod tests {
 
     fn router_with_capturing_llm() -> (Router, Arc<CapturingLlm>) {
         let engine = Arc::new(CapturingLlm::new());
-        let router = AxumServer::from_llm(engine.clone()).build_router();
+        let registry = ServedModelRegistry::try_new(
+            "qwen3",
+            ServedModelKind::Llm,
+            vec![
+                "qwen3".to_string(),
+                "stub-model".to_string(),
+                "served-alias".to_string(),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let router = AxumServer::from_llm(engine.clone())
+            .with_served_model_registry(registry)
+            .build_router();
         (router, engine)
     }
 
@@ -6083,7 +6070,15 @@ mod tests {
         template: ModelChatTemplate,
     ) -> (Router, Arc<CapturingLlm>) {
         let engine = Arc::new(CapturingLlm::new());
+        let registry = ServedModelRegistry::try_new(
+            "qwen3",
+            ServedModelKind::Llm,
+            vec!["served-alias".to_string()],
+            vec![],
+        )
+        .unwrap();
         let router = AxumServer::from_llm(engine.clone())
+            .with_served_model_registry(registry)
             .with_prompt_template(Some(template))
             .build_router();
         (router, engine)
@@ -6100,6 +6095,7 @@ mod tests {
                     "/tmp/sql-adapter",
                 )],
             )
+            .unwrap()
             .build_router();
         (router, engine)
     }
@@ -6317,6 +6313,7 @@ mod tests {
                 "/tmp/sql-adapter",
             )],
         )
+        .unwrap()
         .build_router();
         let response = get(router, "/health").await;
         assert_eq!(response.status(), AxumStatusCode::OK);
@@ -6347,6 +6344,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_chat_public_alias_maps_to_internal_model_and_is_echoed() {
+        let engine = Arc::new(CapturingLlm::new());
+        let registry = ServedModelRegistry::try_new(
+            "qwen3",
+            ServedModelKind::Llm,
+            vec!["served-alias".to_string(), "secondary-alias".to_string()],
+            vec![],
+        )
+        .unwrap();
+        let router = AxumServer::from_llm(engine.clone())
+            .with_served_model_registry(registry)
+            .build_router();
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "secondary-alias",
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "max_tokens": 8
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["model"], "secondary-alias");
+        assert_eq!(engine.last_request().model_id, ModelId::new("qwen3"));
+    }
+
+    #[tokio::test]
+    async fn route_models_lists_public_aliases_without_internal_model_id() {
+        let registry = ServedModelRegistry::try_new(
+            "qwen3",
+            ServedModelKind::Llm,
+            vec!["served-alias".to_string(), "secondary-alias".to_string()],
+            vec![],
+        )
+        .unwrap();
+        let router = AxumServer::from_llm(Arc::new(CapturingLlm::new()))
+            .with_served_model_registry(registry)
+            .build_router();
+        let body = response_json(get(router, "/v1/models").await).await;
+        let ids = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["served-alias", "secondary-alias"]);
+        assert!(!ids.contains(&"qwen3"));
+        assert!(body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["modalities"] == json!(["text"])));
+    }
+
+    #[tokio::test]
+    async fn route_models_lists_embedding_registry_capabilities() {
+        let body = response_json(get(router_with_stub_embed(), "/v1/models").await).await;
+        let data = body["data"].as_array().unwrap();
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["id"], "stub-embed");
+        assert_eq!(data[0]["modalities"], json!(["text", "image"]));
+    }
+
+    #[tokio::test]
     async fn route_models_lists_startup_lora_adapters() {
         let router = AxumServer::from_llm(Arc::new(StubLlm::new("ok")))
             .with_lora_adapters(
@@ -6357,6 +6423,7 @@ mod tests {
                     "/tmp/sql-adapter",
                 )],
             )
+            .unwrap()
             .build_router();
         let response = get(router, "/v1/models").await;
         assert_eq!(response.status(), AxumStatusCode::OK);
@@ -6441,15 +6508,17 @@ mod tests {
             body["error"]["message"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("unknown LoRA adapter model"),
+                .contains("unknown model"),
             "body: {body}"
         );
     }
 
     #[tokio::test]
-    async fn route_chat_unknown_loaded_model_returns_openai_model_error() {
+    async fn route_chat_unknown_served_model_returns_openai_model_error() {
+        let engine = Arc::new(CapturingLlm::new());
+        let router = AxumServer::from_llm(engine.clone()).build_router();
         let response = post_json(
-            router_with_stub("unused"),
+            router,
             "/v1/chat/completions",
             json!({
                 "model": "not-a-loaded-model",
@@ -6469,6 +6538,7 @@ mod tests {
                 .contains("unknown model"),
             "body: {body}"
         );
+        assert!(!engine.has_captured_request());
     }
 
     #[tokio::test]
@@ -7900,7 +7970,7 @@ mod tests {
             router,
             "/v1/chat/completions",
             json!({
-                "model": "stub-model",
+                "model": "qwen3",
                 "messages": [{"role": "user", "content": "hello"}]
             }),
         )
@@ -8707,6 +8777,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_embeddings_public_alias_succeeds_and_unknown_alias_is_rejected() {
+        let registry = ServedModelRegistry::try_new(
+            "stub-embed",
+            ServedModelKind::Embedding,
+            vec!["public-embed".to_string()],
+            vec![],
+        )
+        .unwrap();
+        let server =
+            AxumServer::from_embed(Arc::new(StubEmbed::new())).with_served_model_registry(registry);
+        let accepted = post_json(
+            server.build_router(),
+            "/v1/embeddings",
+            json!({"model": "public-embed", "input": "hello"}),
+        )
+        .await;
+        assert_eq!(accepted.status(), AxumStatusCode::OK);
+        assert_eq!(response_json(accepted).await["model"], "public-embed");
+
+        let rejected = post_json(
+            server.build_router(),
+            "/v1/embeddings",
+            json!({"model": "stub-embed", "input": "hello"}),
+        )
+        .await;
+        assert_eq!(rejected.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(rejected).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "model");
+    }
+
+    #[tokio::test]
     async fn route_embeddings_rejects_unsupported_encoding_format() {
         let response = post_json(
             router_with_stub_embed(),
@@ -9096,6 +9198,31 @@ mod tests {
         assert_eq!(body["choices"][0]["text"], "done");
         assert_eq!(body["usage"]["prompt_tokens"], 7);
         assert_eq!(body["usage"]["completion_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn route_completions_public_alias_maps_to_internal_model() {
+        let engine = Arc::new(CapturingLlm::new());
+        let registry = ServedModelRegistry::try_new(
+            "qwen3",
+            ServedModelKind::Llm,
+            vec!["served-alias".to_string()],
+            vec![],
+        )
+        .unwrap();
+        let router = AxumServer::from_llm(engine.clone())
+            .with_served_model_registry(registry)
+            .build_router();
+        let response = post_json(
+            router,
+            "/v1/completions",
+            json!({"model": "served-alias", "prompt": "complete me"}),
+        )
+        .await;
+
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        assert_eq!(response_json(response).await["model"], "served-alias");
+        assert_eq!(engine.last_request().model_id, ModelId::new("qwen3"));
     }
 
     #[tokio::test]
@@ -10025,6 +10152,32 @@ mod tests {
         assert_eq!(status, AxumStatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["param"], "stream_options");
         assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test]
+    async fn unknown_stream_option_is_rejected_instead_of_ignored() {
+        let response = post_json(
+            router_with_stub("unused"),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+                "stream_options": {"continuous_usage_stats": true}
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("invalid chat completions request"),
+            "body: {body}"
+        );
     }
 
     #[tokio::test]

@@ -135,6 +135,7 @@ pub struct ChatCompletionsRequest {
 
 /// OpenAI streaming options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_usage: Option<bool>,
