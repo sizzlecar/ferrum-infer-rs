@@ -35,6 +35,7 @@ pub mod moe;
 pub mod paged;
 pub mod quant;
 mod residency;
+pub mod vnext_ops;
 pub mod vnext_runtime;
 
 // GGUF k-quant kernels (Audit #9 moved here from kernels-crate top level).
