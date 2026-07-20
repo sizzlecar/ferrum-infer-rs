@@ -235,6 +235,7 @@ impl ModelFamilyProvider for TestFamily {
 
 pub(crate) struct OrderedSchemaFamily {
     pub(crate) reverse: bool,
+    pub(crate) reverse_sources: bool,
 }
 
 impl ModelFamilyProvider for OrderedSchemaFamily {
@@ -270,7 +271,7 @@ impl ModelFamilyProvider for OrderedSchemaFamily {
 
     fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
         let mut schema = TestFamily.weight_schema(config)?;
-        schema.components[0].external_names = if self.reverse {
+        schema.components[0].external_names = if self.reverse_sources {
             vec!["weight.z".to_owned(), "weight.a".to_owned()]
         } else {
             vec!["weight.a".to_owned(), "weight.z".to_owned()]
@@ -279,7 +280,7 @@ impl ModelFamilyProvider for OrderedSchemaFamily {
             schema.components.push(WeightComponentSpec {
                 id: id(format!("weight.component.optional.{suffix}")),
                 role: WeightComponentRole::Values,
-                external_names: if self.reverse {
+                external_names: if self.reverse_sources {
                     vec![
                         format!("optional.{suffix}.z"),
                         format!("optional.{suffix}.a"),
@@ -1233,6 +1234,11 @@ pub(crate) fn resolved_tensor(element_type: ElementType) -> ResolvedTensorSpec {
     ResolvedTensorSpec::new(vec![4], element_type, ResolvedTensorLayout::Contiguous).unwrap()
 }
 
+pub(crate) fn resolved_test_weight() -> ResolvedWeightBinding {
+    let family = TestRegistry::new().prepare();
+    ResolvedWeightBinding::from_schema(family.weight_schema(), &id("weight.matrix")).unwrap()
+}
+
 pub(crate) fn binding(
     value_id: &str,
     role: ResolvedValueRole,
@@ -1251,6 +1257,7 @@ pub(crate) fn binding(
         access,
         AliasPolicy::NoAlias,
         usage,
+        None,
         ResolvedValueStorage::single(id(resource_id), 0, length, element_type).unwrap(),
     )
     .unwrap()
@@ -1284,6 +1291,7 @@ pub(crate) fn resolved_values(variant: usize) -> Vec<ResolvedValueBinding> {
             TensorAccess::Read,
             AliasPolicy::NoAlias,
             BufferUsage::Weights,
+            Some(resolved_test_weight()),
             weight_storage,
         )
         .unwrap(),
@@ -1341,6 +1349,7 @@ pub(crate) fn sequential_resolved_values(
             TensorAccess::Read,
             AliasPolicy::NoAlias,
             BufferUsage::Weights,
+            Some(resolved_test_weight()),
             weight_storage,
         )
         .unwrap(),

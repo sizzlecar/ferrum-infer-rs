@@ -44,6 +44,13 @@ pub(crate) fn plan_resolutions_with_mode(
                 TensorAccess::Read,
                 AliasPolicy::NoAlias,
                 BufferUsage::Weights,
+                Some(
+                    ResolvedWeightBinding::from_schema(
+                        family.weight_schema(),
+                        &id("weight.matrix"),
+                    )
+                    .unwrap(),
+                ),
                 ResolvedValueStorage::composite(vec![ResolvedStorageComponent::new(
                     Some(id("weight.component")),
                     id(format!("resource.weight.{suffix}")),

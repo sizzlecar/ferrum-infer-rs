@@ -13,9 +13,9 @@ use super::{
     PlanId, PreparedModelFamily, ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec,
     ProgramValueId, ProviderCompatibilityRejectReason, ProviderCompatibilityRequest, ProviderId,
     QuantizationFormatId, ResolvedStorageComponent, ResolvedTensorLayout, ResolvedTensorSpec,
-    ResolvedValueBinding, ResolvedValueRole, ResolvedValueStorage, ResourceId, SemanticValue,
-    StateCapacityDemand, StateId, StateInitialization, StateLifetime, StrideConstraint,
-    TensorAccess, TensorContract, VNextError, WeightEncoding, WeightFormatId, WeightId,
+    ResolvedValueBinding, ResolvedValueRole, ResolvedValueStorage, ResolvedWeightBinding,
+    ResourceId, SemanticValue, StateCapacityDemand, StateId, StateInitialization, StateLifetime,
+    StrideConstraint, TensorAccess, TensorContract, VNextError, WeightFormatId, WeightId,
 };
 
 mod foundation;

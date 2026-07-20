@@ -414,7 +414,10 @@ impl ModelFamilyRegistry for DuplicateMetadataResolvedRegistry {
 impl AlternateResolvedRegistry {
     fn new() -> Self {
         Self {
-            registration: TypedFamilyRegistration::new(OrderedSchemaFamily { reverse: false }),
+            registration: TypedFamilyRegistration::new(OrderedSchemaFamily {
+                reverse: false,
+                reverse_sources: false,
+            }),
         }
     }
 }

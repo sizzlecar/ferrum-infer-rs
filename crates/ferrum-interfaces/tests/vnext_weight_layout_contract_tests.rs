@@ -164,6 +164,356 @@ fn physical_weight_layout_tree_accepts_grouped_quantized_axis_index_fixture() {
     );
 }
 
+fn block_quantization(format_id: &str, bytes_per_block: u32) -> BlockQuantizationSpec {
+    BlockQuantizationSpec {
+        format_id: id(format_id),
+        logical_values_per_block: 256,
+        bytes_per_block,
+    }
+}
+
+fn q4_k_block_schema(logical_dimensions: Vec<u64>) -> WeightSchema {
+    let block_dimensions = vec![logical_dimensions[0], logical_dimensions[1].div_ceil(256)];
+    WeightSchema {
+        format_id: id("weight-format.gguf"),
+        layout_id: id("weight-layout.gguf-q4-k"),
+        version: ContractVersion::new(1, 0),
+        components: vec![WeightComponentSpec {
+            id: id("component.q4-k.blocks"),
+            role: WeightComponentRole::PackedValues,
+            external_names: vec!["blk.0.attn_q.weight".to_owned()],
+            dimensions: block_dimensions,
+            encoding: WeightEncoding::BlockQuantized(block_quantization(
+                "quantization.gguf.q4-k",
+                144,
+            )),
+            required: true,
+        }],
+        tensors: vec![WeightTensorSpec {
+            id: id("weight.attn-q"),
+            dimensions: logical_dimensions,
+            logical_element_type: ElementType::F32,
+            physical_layout: PhysicalWeightLayout::BlockQuantized {
+                blocks: exact_component("component.q4-k.blocks"),
+                block_axis: 1,
+                block_padding: PhysicalWeightPadding::Exact,
+            },
+            required: true,
+        }],
+    }
+}
+
+#[test]
+fn block_quantized_layout_accounts_for_gguf_q4_k_blocks_exactly() {
+    let schema = q4_k_block_schema(vec![2, 512]);
+    schema.validate(&id("family.gguf-q4-k")).unwrap();
+
+    assert_eq!(schema.physical_bytes(&id("weight.attn-q")).unwrap(), 576);
+    assert_eq!(
+        schema.quantization_formats(),
+        BTreeSet::from([id("quantization.gguf.q4-k")])
+    );
+    let components = schema
+        .physical_component_refs(&id("weight.attn-q"))
+        .unwrap();
+    assert_eq!(components.len(), 1);
+    assert_eq!(components[0].dimensions, [2, 2]);
+    assert_eq!(components[0].physical_bytes().unwrap(), 576);
+    assert_eq!(components[0].physical_element_type(), ElementType::U8);
+    let resources = schema
+        .physical_resource_requirements(&id("weight.attn-q"))
+        .unwrap();
+    assert_eq!(resources[0].physical_dimensions, [2, 2]);
+    assert_eq!(resources[0].resource_bytes, 576);
+
+    let encoded = serde_json::to_vec(&schema).unwrap();
+    let restored: WeightSchema = serde_json::from_slice(&encoded).unwrap();
+    restored.validate(&id("family.gguf-q4-k-restored")).unwrap();
+    assert_eq!(restored, schema);
+}
+
+#[test]
+fn composite_layout_supports_mixed_gguf_block_formats_without_model_cases() {
+    let schema = WeightSchema {
+        format_id: id("weight-format.gguf"),
+        layout_id: id("weight-layout.gguf-mixed-fused-projection"),
+        version: ContractVersion::new(1, 0),
+        components: vec![
+            WeightComponentSpec {
+                id: id("component.fused.q4-k"),
+                role: WeightComponentRole::PackedValues,
+                external_names: vec!["blk.0.ffn_gate.weight".to_owned()],
+                dimensions: vec![4, 1],
+                encoding: WeightEncoding::BlockQuantized(block_quantization(
+                    "quantization.gguf.q4-k",
+                    144,
+                )),
+                required: true,
+            },
+            WeightComponentSpec {
+                id: id("component.fused.q6-k"),
+                role: WeightComponentRole::PackedValues,
+                external_names: vec!["blk.0.ffn_up.weight".to_owned()],
+                dimensions: vec![2, 1],
+                encoding: WeightEncoding::BlockQuantized(block_quantization(
+                    "quantization.gguf.q6-k",
+                    210,
+                )),
+                required: true,
+            },
+        ],
+        tensors: vec![WeightTensorSpec {
+            id: id("weight.fused-gate-up"),
+            dimensions: vec![6, 256],
+            logical_element_type: ElementType::F16,
+            physical_layout: PhysicalWeightLayout::Composite {
+                parts: vec![
+                    CompositeWeightPart {
+                        layout: Box::new(PhysicalWeightLayout::BlockQuantized {
+                            blocks: exact_component("component.fused.q4-k"),
+                            block_axis: 1,
+                            block_padding: PhysicalWeightPadding::Exact,
+                        }),
+                        logical_offsets: vec![0, 0],
+                        extents: vec![4, 256],
+                    },
+                    CompositeWeightPart {
+                        layout: Box::new(PhysicalWeightLayout::BlockQuantized {
+                            blocks: exact_component("component.fused.q6-k"),
+                            block_axis: 1,
+                            block_padding: PhysicalWeightPadding::Exact,
+                        }),
+                        logical_offsets: vec![4, 0],
+                        extents: vec![2, 256],
+                    },
+                ],
+            },
+            required: true,
+        }],
+    };
+
+    schema.validate(&id("family.gguf-mixed")).unwrap();
+    assert_eq!(
+        schema.physical_bytes(&id("weight.fused-gate-up")).unwrap(),
+        996
+    );
+    assert_eq!(
+        schema.quantization_formats(),
+        BTreeSet::from([id("quantization.gguf.q4-k"), id("quantization.gguf.q6-k")])
+    );
+
+    let mut conflicting_abi = schema;
+    let WeightEncoding::BlockQuantized(spec) = &mut conflicting_abi.components[1].encoding else {
+        unreachable!();
+    };
+    spec.format_id = id("quantization.gguf.q4-k");
+    assert!(conflicting_abi
+        .validate(&id("family.gguf-conflicting-quantization-abi"))
+        .unwrap_err()
+        .to_string()
+        .contains("conflicting physical ABIs"));
+}
+
+fn q5_k_tiled_qkv_schema() -> WeightSchema {
+    WeightSchema {
+        format_id: id("weight-format.gguf"),
+        layout_id: id("weight-layout.gguf-qwen35-tiled-v-heads"),
+        version: ContractVersion::new(1, 0),
+        components: vec![WeightComponentSpec {
+            id: id("component.linear-attn-qkv.q5-k"),
+            role: WeightComponentRole::PackedValues,
+            external_names: vec!["blk.0.attn_qkv.weight".to_owned()],
+            dimensions: vec![8192, 10],
+            encoding: WeightEncoding::BlockQuantized(block_quantization(
+                "quantization.gguf.q5-k",
+                176,
+            )),
+            required: true,
+        }],
+        tensors: vec![WeightTensorSpec {
+            id: id("weight.linear-attn-qkv"),
+            dimensions: vec![8192, 2560],
+            logical_element_type: ElementType::F16,
+            physical_layout: PhysicalWeightLayout::AxisReshapePermutation {
+                values: Box::new(PhysicalWeightLayout::BlockQuantized {
+                    blocks: exact_component("component.linear-attn-qkv.q5-k"),
+                    block_axis: 1,
+                    block_padding: PhysicalWeightPadding::Exact,
+                }),
+                axis: 0,
+                logical_offset: 4096,
+                extent: 4096,
+                reshape: vec![16, 2, 128],
+                stored_axis_order: vec![1, 0, 2],
+            },
+            required: true,
+        }],
+    }
+}
+
+#[test]
+fn axis_reshape_permutation_describes_gguf_tiled_head_subranges() {
+    let schema = q5_k_tiled_qkv_schema();
+    schema.validate(&id("family.gguf-tiled-heads")).unwrap();
+    assert_eq!(
+        schema
+            .physical_bytes(&id("weight.linear-attn-qkv"))
+            .unwrap(),
+        14_417_920
+    );
+    assert_eq!(
+        schema.quantization_formats(),
+        BTreeSet::from([id("quantization.gguf.q5-k")])
+    );
+    let encoded = serde_json::to_vec(&schema).unwrap();
+    let restored: WeightSchema = serde_json::from_slice(&encoded).unwrap();
+    restored
+        .validate(&id("family.gguf-tiled-heads-restored"))
+        .unwrap();
+    assert_eq!(restored, schema);
+
+    let resolved =
+        ResolvedWeightBinding::from_schema(&schema, &id("weight.linear-attn-qkv")).unwrap();
+    assert!(matches!(
+        resolved.physical_layout(),
+        PhysicalWeightLayout::AxisReshapePermutation { .. }
+    ));
+    assert_eq!(resolved.components().len(), 1);
+    assert_eq!(
+        resolved.components()[0].physical_bytes().unwrap(),
+        14_417_920
+    );
+    let encoded = serde_json::to_vec(&resolved).unwrap();
+    let restored: ResolvedWeightBinding = serde_json::from_slice(&encoded).unwrap();
+    restored
+        .validate_logical(&[8192, 2560], ElementType::F16)
+        .unwrap();
+    assert_eq!(restored, resolved);
+}
+
+#[test]
+fn axis_reshape_permutation_rejects_ambiguous_or_out_of_range_mappings() {
+    let mut duplicate_axis = q5_k_tiled_qkv_schema();
+    let PhysicalWeightLayout::AxisReshapePermutation {
+        stored_axis_order, ..
+    } = &mut duplicate_axis.tensors[0].physical_layout
+    else {
+        unreachable!();
+    };
+    *stored_axis_order = vec![1, 1, 2];
+    assert!(duplicate_axis
+        .validate(&id("family.gguf-duplicate-stored-axis"))
+        .is_err());
+
+    let mut identity = q5_k_tiled_qkv_schema();
+    let PhysicalWeightLayout::AxisReshapePermutation {
+        stored_axis_order, ..
+    } = &mut identity.tensors[0].physical_layout
+    else {
+        unreachable!();
+    };
+    *stored_axis_order = vec![0, 1, 2];
+    assert!(identity
+        .validate(&id("family.gguf-identity-permutation"))
+        .is_err());
+
+    let mut singleton_identity = q5_k_tiled_qkv_schema();
+    let PhysicalWeightLayout::AxisReshapePermutation {
+        reshape,
+        stored_axis_order,
+        ..
+    } = &mut singleton_identity.tensors[0].physical_layout
+    else {
+        unreachable!();
+    };
+    *reshape = vec![1, 4096];
+    *stored_axis_order = vec![1, 0];
+    assert!(singleton_identity
+        .validate(&id("family.gguf-singleton-identity-permutation"))
+        .is_err());
+
+    let mut wrong_product = q5_k_tiled_qkv_schema();
+    let PhysicalWeightLayout::AxisReshapePermutation { reshape, .. } =
+        &mut wrong_product.tensors[0].physical_layout
+    else {
+        unreachable!();
+    };
+    *reshape = vec![16, 2, 64];
+    assert!(wrong_product
+        .validate(&id("family.gguf-wrong-reshape-product"))
+        .is_err());
+
+    let mut out_of_range = q5_k_tiled_qkv_schema();
+    let PhysicalWeightLayout::AxisReshapePermutation { logical_offset, .. } =
+        &mut out_of_range.tensors[0].physical_layout
+    else {
+        unreachable!();
+    };
+    *logical_offset = 4097;
+    assert!(out_of_range
+        .validate(&id("family.gguf-transform-out-of-range"))
+        .is_err());
+}
+
+#[test]
+fn block_quantized_layout_rejects_implicit_geometry_and_invalid_encodings() {
+    let mut wrong_grid = q4_k_block_schema(vec![2, 512]);
+    wrong_grid.components[0].dimensions = vec![2, 3];
+    assert!(wrong_grid.validate(&id("family.gguf-wrong-grid")).is_err());
+
+    let mut zero_block_width = q4_k_block_schema(vec![2, 512]);
+    let WeightEncoding::BlockQuantized(spec) = &mut zero_block_width.components[0].encoding else {
+        unreachable!();
+    };
+    spec.logical_values_per_block = 0;
+    assert!(zero_block_width
+        .validate(&id("family.gguf-zero-block-width"))
+        .is_err());
+
+    let mut integer_logical_weight = q4_k_block_schema(vec![2, 512]);
+    integer_logical_weight.tensors[0].logical_element_type = ElementType::U8;
+    assert!(integer_logical_weight
+        .validate(&id("family.gguf-integer-logical"))
+        .is_err());
+
+    let mut separate_scale_encoding = q4_k_block_schema(vec![2, 512]);
+    separate_scale_encoding.components[0].encoding = WeightEncoding::Quantized(QuantizationSpec {
+        format_id: id("quantization.separate-scale"),
+        bits_per_weight: 4,
+        group_size: 256,
+        packing: QuantizationPacking::Linear,
+        scale_type: ElementType::F16,
+        zero_point_type: None,
+    });
+    assert!(separate_scale_encoding
+        .validate(&id("family.gguf-wrong-encoding"))
+        .is_err());
+
+    let mut padded = q4_k_block_schema(vec![2, 300]);
+    padded.tensors[0].physical_layout = PhysicalWeightLayout::BlockQuantized {
+        blocks: exact_component("component.q4-k.blocks"),
+        block_axis: 1,
+        block_padding: PhysicalWeightPadding::ZeroFill {
+            padded_dimensions: vec![2, 512],
+        },
+    };
+    padded.validate(&id("family.gguf-minimal-padding")).unwrap();
+    assert_eq!(padded.physical_bytes(&id("weight.attn-q")).unwrap(), 576);
+
+    let mut non_minimal_padding = padded;
+    let PhysicalWeightLayout::BlockQuantized { block_padding, .. } =
+        &mut non_minimal_padding.tensors[0].physical_layout
+    else {
+        unreachable!();
+    };
+    *block_padding = PhysicalWeightPadding::ZeroFill {
+        padded_dimensions: vec![2, 768],
+    };
+    assert!(non_minimal_padding
+        .validate(&id("family.gguf-non-minimal-padding"))
+        .is_err());
+}
+
 fn recursive_quantized_expert_schema() -> WeightSchema {
     let quantization = QuantizationSpec {
         format_id: id("quantization.expert-grouped"),
@@ -281,12 +631,18 @@ fn physical_weight_layout_tree_accepts_recursive_quantized_expert_stack_fixture(
 
 #[test]
 fn weight_schema_order_is_normalized_before_fingerprinting() {
-    let canonical = TypedFamilyRegistration::new(OrderedSchemaFamily { reverse: false })
-        .prepare(&json!({"width": 4}))
-        .unwrap();
-    let reversed = TypedFamilyRegistration::new(OrderedSchemaFamily { reverse: true })
-        .prepare(&json!({"width": 4}))
-        .unwrap();
+    let canonical = TypedFamilyRegistration::new(OrderedSchemaFamily {
+        reverse: false,
+        reverse_sources: false,
+    })
+    .prepare(&json!({"width": 4}))
+    .unwrap();
+    let reversed = TypedFamilyRegistration::new(OrderedSchemaFamily {
+        reverse: true,
+        reverse_sources: false,
+    })
+    .prepare(&json!({"width": 4}))
+    .unwrap();
     assert_eq!(canonical.weight_schema(), reversed.weight_schema());
     assert_eq!(
         canonical.fingerprint().unwrap(),
@@ -306,6 +662,22 @@ fn weight_schema_order_is_normalized_before_fingerprinting() {
     };
     assert_eq!(parts[0].logical_offsets, [0]);
     assert_eq!(parts[1].logical_offsets, [2]);
+
+    let source_reversed = TypedFamilyRegistration::new(OrderedSchemaFamily {
+        reverse: false,
+        reverse_sources: true,
+    })
+    .prepare(&json!({"width": 4}))
+    .unwrap();
+    assert_ne!(canonical.weight_schema(), source_reversed.weight_schema());
+    assert_ne!(
+        canonical.fingerprint().unwrap(),
+        source_reversed.fingerprint().unwrap()
+    );
+    assert_eq!(
+        source_reversed.weight_schema().components[0].external_names,
+        ["weight.z", "weight.a"]
+    );
 }
 
 fn blocked_schema(

@@ -106,10 +106,57 @@ fn breaking_schema_versions_are_rejected_100_of_100() {
 }
 
 #[test]
+fn legacy_schema_is_rejected_before_v4_nested_binding_validation() {
+    let fixture = plan_fixture(0);
+    let mut value = serde_json::to_value(&fixture.plan).unwrap();
+    value["payload"]["schema"] = json!({"major": 3, "minor": 0});
+    let weight = value["payload"]["nodes"][0]["values"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|binding| binding["usage"] == json!("weights"))
+        .unwrap();
+    weight.as_object_mut().unwrap().remove("weight");
+
+    let error = ExecutionPlan::decode_untrusted(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+    assert!(matches!(
+        error,
+        VNextError::UnsupportedPlanSchema {
+            expected_major: 4,
+            expected_minor: 0,
+            actual_major: 3,
+            actual_minor: 0,
+        }
+    ));
+}
+
+#[test]
 fn forged_self_hashed_plan_is_rejected_by_semantic_rebuild() {
     let fixture = plan_fixture(0);
     let mut value = serde_json::to_value(&fixture.plan).unwrap();
     value["payload"]["memory"]["static_allocations"][0]["size_bytes"] = json!(1024);
+    rehash_plan_json(&mut value);
+    assert!(ExecutionPlan::from_json_validated(
+        &serde_json::to_vec(&value).unwrap(),
+        &fixture.family,
+        &fixture.catalog,
+        &fixture.policy,
+        fixture.node_resolutions.clone(),
+    )
+    .is_err());
+}
+
+#[test]
+fn resolved_weight_layout_cannot_be_stripped_from_plan_wire() {
+    let fixture = plan_fixture(0);
+    let mut value = serde_json::to_value(&fixture.plan).unwrap();
+    let weight = value["payload"]["nodes"][0]["values"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|binding| binding["usage"] == json!("weights"))
+        .unwrap();
+    weight.as_object_mut().unwrap().remove("weight");
     rehash_plan_json(&mut value);
     assert!(ExecutionPlan::from_json_validated(
         &serde_json::to_vec(&value).unwrap(),

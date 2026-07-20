@@ -534,6 +534,13 @@ pub(crate) fn resolved_tensor_for(element_type: ElementType) -> ResolvedTensorSp
     ResolvedTensorSpec::new(vec![4], element_type, ResolvedTensorLayout::Contiguous).unwrap()
 }
 
+fn resolved_weight() -> ResolvedWeightBinding {
+    let family = TypedFamilyRegistration::new(TestFamily)
+        .prepare(&json!({"width": 4}))
+        .unwrap();
+    ResolvedWeightBinding::from_schema(family.weight_schema(), &id("weight.matrix")).unwrap()
+}
+
 pub(crate) fn single_binding(
     value: &str,
     role: ResolvedValueRole,
@@ -553,6 +560,7 @@ pub(crate) fn single_binding(
         },
         AliasPolicy::NoAlias,
         usage,
+        None,
         ResolvedValueStorage::single(id(resource), 0, 16, ElementType::F32).unwrap(),
     )
     .unwrap()
@@ -580,6 +588,7 @@ pub(crate) fn node_values_for(
             TensorAccess::Read,
             AliasPolicy::NoAlias,
             BufferUsage::Weights,
+            Some(resolved_weight()),
             ResolvedValueStorage::composite(vec![
                 ResolvedStorageComponent::new(
                     Some(id("weight.component.left")),
@@ -628,6 +637,7 @@ pub(crate) fn node_values_with_zero_state_for(
             TensorAccess::Read,
             AliasPolicy::NoAlias,
             BufferUsage::State,
+            None,
             ResolvedValueStorage::single(id("resource.state"), 0, 4, ElementType::U8).unwrap(),
         )
         .unwrap(),

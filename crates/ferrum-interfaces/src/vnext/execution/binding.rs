@@ -3,8 +3,8 @@ use super::{
     BufferUsage, CapabilityId, ContractVersion, Digest, ElementType, NodeId, OperationDescriptor,
     OperationId, PreparedModelFamily, ProgramNode, ProgramTensorSpec, ProviderId,
     QuantizationFormatId, ResolvedTensorSpec, ResolvedValueBinding, ResolvedValueRole,
-    ResolvedValueStorage, ResourceId, SemanticValue, Serialize, Sha256, TensorAccess, VNextError,
-    WeightEncoding, WeightFormatId, WeightId,
+    ResolvedValueStorage, ResolvedWeightBinding, ResourceId, SemanticValue, Serialize, Sha256,
+    TensorAccess, VNextError, WeightFormatId, WeightId,
 };
 
 #[derive(Serialize)]
@@ -109,6 +109,14 @@ pub(super) fn validate_semantic_binding(
             )));
         }
         validate_program_tensor(&weight.tensor, binding.tensor(), "weight")?;
+        let expected_weight =
+            ResolvedWeightBinding::from_schema(family.weight_schema(), &weight.weight_id)?;
+        if binding.weight() != Some(&expected_weight) {
+            return Err(invalid_plan(format!(
+                "weight value `{}` resolved layout differs from the prepared model family",
+                binding.value_id()
+            )));
+        }
         validate_weight_storage(family, &weight.weight_id, binding.storage())?;
         return Ok(());
     }
@@ -210,7 +218,7 @@ pub(super) fn node_weight_requirements(
         .iter()
         .filter(|binding| binding.usage() == BufferUsage::Weights)
     {
-        let weight = family
+        let program_weight = family
             .program()
             .weights()
             .iter()
@@ -221,15 +229,20 @@ pub(super) fn node_weight_requirements(
                     binding.value_id()
                 ))
             })?;
-        weight_formats.insert(family.weight_schema().format_id.clone());
-        for component in family
-            .weight_schema()
-            .physical_component_refs(&weight.weight_id)?
-        {
-            if let WeightEncoding::Quantized(spec) = &component.encoding {
-                quantization_formats.insert(spec.format_id.clone());
-            }
+        let weight = binding.weight().ok_or_else(|| {
+            invalid_plan(format!(
+                "weight binding `{}` lacks its resolved physical layout",
+                binding.value_id()
+            ))
+        })?;
+        if weight.weight_id() != &program_weight.weight_id {
+            return Err(invalid_plan(format!(
+                "weight binding `{}` resolves the wrong logical weight",
+                binding.value_id()
+            )));
         }
+        weight_formats.insert(weight.format_id().clone());
+        quantization_formats.extend(weight.quantization_formats());
     }
     Ok((weight_formats, quantization_formats))
 }
