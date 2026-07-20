@@ -331,8 +331,15 @@ def _derived_coverage_markers(row: dict[str, Any]) -> list[str]:
     checkpoint_kind = row["checkpoint_kind"]
     checkpoint_name = row["checkpoint_name"]
     semantics = row["shape_domain"]["semantics"]
+    trusted_fp32_oracle = row["oracle_precision"] == "fp32" and row[
+        "oracle_identity"
+    ].startswith(("cpu.fp32.", "transformers.fp32."))
 
-    if checkpoint_kind == "operation_output" and checkpoint_name == "output":
+    if (
+        trusted_fp32_oracle
+        and checkpoint_kind == "operation_output"
+        and checkpoint_name == "output"
+    ):
         simple_operations = {
             ("operation.dense_linear", "1.0"),
             ("operation.dense_swiglu", "1.0"),
@@ -367,7 +374,7 @@ def _derived_coverage_markers(row: dict[str, Any]) -> list[str]:
                 markers.add(
                     "operation.gated_delta_recurrent_attention@4.0.negative_rate_interleaved"
                 )
-    elif checkpoint_kind == "state":
+    elif trusted_fp32_oracle and checkpoint_kind == "state":
         state_marker = {
             ("operation.causal_paged_attention", "2.0", "kv_state"):
                 "state.causal_attention.kv_state",
@@ -378,19 +385,31 @@ def _derived_coverage_markers(row: dict[str, Any]) -> list[str]:
         }.get((operation_id, operation_version, checkpoint_name))
         if state_marker is not None:
             markers.add(state_marker)
-    elif checkpoint_kind == "layer_output":
+    elif trusted_fp32_oracle and checkpoint_kind == "layer_output":
         layer_marker = {
             "full_attention": "layer.full_attention",
             "linear_attention": "layer.linear_attention",
         }.get(checkpoint_name)
         if layer_marker is not None:
             markers.add(layer_marker)
-    elif checkpoint_kind == "full_model" and checkpoint_name == "final_hidden_state":
+    elif (
+        trusted_fp32_oracle
+        and checkpoint_kind == "full_model"
+        and checkpoint_name == "final_hidden_state"
+    ):
         markers.add("checkpoint.full_model")
-    elif checkpoint_kind == "full_vocab_logits" and checkpoint_name == "logits":
+    elif (
+        trusted_fp32_oracle
+        and checkpoint_kind == "full_vocab_logits"
+        and checkpoint_name == "logits"
+    ):
         markers.add("checkpoint.full_vocab_logits")
 
-    if row["quant_format"] == "gguf_q4_k_m":
+    if (
+        trusted_fp32_oracle
+        and row["model_scope"] == "qwen3.5-4b"
+        and row["quant_format"] == "gguf_q4_k_m"
+    ):
         markers.add("quant_format.gguf_q4_k_m")
     return sorted(markers)
 
@@ -725,6 +744,17 @@ def _self_test() -> None:
     _expect_rejected(
         "forged complete coverage markers",
         lambda: validate_catalog_document(forged_markers, require_complete=True),
+        "do not match the typed row selector",
+    )
+
+    untrusted_oracle = copy.deepcopy(document)
+    untrusted_oracle["rows"][0]["oracle_precision"] = "fp16"
+    untrusted_oracle["rows"][0]["row_fingerprint"] = row_fingerprint(
+        untrusted_oracle["rows"][0]
+    )
+    _expect_rejected(
+        "untrusted coverage oracle",
+        lambda: validate_catalog_document(untrusted_oracle),
         "do not match the typed row selector",
     )
 
