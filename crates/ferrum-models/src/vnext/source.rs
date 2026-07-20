@@ -62,6 +62,8 @@ pub struct ProductionModelSourceBundle {
     tokenizer_json: Arc<[u8]>,
     tokenizer_config_json: Option<Arc<[u8]>>,
     generation_config_json: Option<Arc<[u8]>>,
+    chat_template_json: Option<Arc<[u8]>>,
+    chat_template_jinja: Option<Arc<[u8]>>,
 }
 
 impl fmt::Debug for ProductionModelSourceBundle {
@@ -85,6 +87,14 @@ impl fmt::Debug for ProductionModelSourceBundle {
                     .generation_config_json
                     .as_ref()
                     .map(|bytes| bytes.len()),
+            )
+            .field(
+                "chat_template_json_bytes",
+                &self.chat_template_json.as_ref().map(|bytes| bytes.len()),
+            )
+            .field(
+                "chat_template_jinja_bytes",
+                &self.chat_template_jinja.as_ref().map(|bytes| bytes.len()),
             )
             .finish()
     }
@@ -115,6 +125,8 @@ impl ProductionModelSourceBundle {
             read_optional_file(&tokenizer_root.join("tokenizer_config.json"))?;
         let generation_config_json =
             read_optional_file(&tokenizer_root.join("generation_config.json"))?;
+        let chat_template_json = read_optional_file(&tokenizer_root.join("chat_template.json"))?;
+        let chat_template_jinja = read_optional_file(&tokenizer_root.join("chat_template.jinja"))?;
 
         let resolved_sources = ResolvedModelSources {
             semantic: resolved_source(&original_sources.semantic, &semantic_root, semantic_files)?,
@@ -136,6 +148,8 @@ impl ProductionModelSourceBundle {
             tokenizer_json,
             tokenizer_config_json,
             generation_config_json,
+            chat_template_json,
+            chat_template_jinja,
         })
     }
 
@@ -199,6 +213,14 @@ impl ProductionModelSourceBundle {
 
     pub fn generation_config_json(&self) -> Option<&[u8]> {
         self.generation_config_json.as_deref()
+    }
+
+    pub fn chat_template_json(&self) -> Option<&[u8]> {
+        self.chat_template_json.as_deref()
+    }
+
+    pub fn chat_template_jinja(&self) -> Option<&[u8]> {
+        self.chat_template_jinja.as_deref()
     }
 
     pub fn fingerprint(

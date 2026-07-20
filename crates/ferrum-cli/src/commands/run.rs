@@ -21,6 +21,7 @@ use std::mem;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -153,21 +154,44 @@ struct RunBudget {
 }
 
 impl RunBudget {
-    fn from_source(source_path: &Path, snapshot: &RuntimeConfigSnapshot) -> Self {
-        let tokenizer = discover_run_tokenizer_path(source_path)
-            .and_then(|path| tokenizers::Tokenizer::from_file(path).ok());
+    fn from_product_sources(
+        explicit_tokenizer: Option<&Path>,
+        product_sources: Option<&ferrum_models::vnext::ProductionModelSourceBundle>,
+        legacy_source_path: &Path,
+        snapshot: &RuntimeConfigSnapshot,
+    ) -> Result<Self> {
+        let tokenizer = if let Some(path) = explicit_tokenizer {
+            Some(tokenizers::Tokenizer::from_file(path).map_err(|error| {
+                FerrumError::model(format!(
+                    "failed to load explicit tokenizer {}: {error}",
+                    path.display()
+                ))
+            })?)
+        } else if let Some(sources) = product_sources {
+            Some(
+                tokenizers::Tokenizer::from_bytes(sources.tokenizer_json()).map_err(|error| {
+                    FerrumError::model(format!(
+                        "failed to parse tokenizer from product source {}: {error}",
+                        sources.tokenizer_file().display()
+                    ))
+                })?,
+            )
+        } else {
+            discover_run_tokenizer_path(legacy_source_path)
+                .and_then(|path| tokenizers::Tokenizer::from_file(path).ok())
+        };
         let kv_capacity =
             crate::runtime_env::runtime_snapshot_value(snapshot, "FERRUM_KV_CAPACITY")
                 .and_then(|value| value.parse::<usize>().ok())
                 .filter(|&value| value > 0);
-        Self {
+        Ok(Self {
             tokenizer,
             kv_capacity,
             #[cfg(test)]
             prompt_token_id_mapper: None,
             #[cfg(test)]
             prompt_token_counter: None,
-        }
+        })
     }
 
     fn prompt_tokenization(&self, prompt: &str) -> RunPromptTokenization {
@@ -535,8 +559,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     let product_input = resolved.into_product_engine_input();
     let source = product_input.source;
     let mut engine_config = product_input.engine_config;
+    let model_sources = product_input.model_sources;
     let model_id = crate::source_resolver::public_model_id(&source);
-    let model_definition_for_config = load_run_model_definition(&source).await?;
+    let model_definition_for_config =
+        load_run_model_definition(&source, model_sources.as_deref()).await?;
     if let (Some(selection), Some(definition)) =
         (gpu_selection.as_mut(), model_definition_for_config.as_ref())
     {
@@ -549,7 +575,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             materialize_run_cli_runtime_entries(&startup_cli_runtime_entries);
         }
     }
-    let model_chat_template = crate::source_resolver::load_model_chat_template(&source.local_path);
+    let model_chat_template = match model_sources.as_deref() {
+        Some(sources) => crate::source_resolver::load_product_chat_template(sources),
+        None => crate::source_resolver::load_model_chat_template(&source.local_path),
+    };
     let chat_template_options = build_chat_template_options(&cmd, model_chat_template.as_ref());
     eprintln!("{}", format!("Loading {}...", model_id).dimmed());
 
@@ -613,7 +642,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         cmd.effective_config_json.as_deref(),
         cmd.decision_trace_jsonl.as_deref(),
     )?;
-    let run_budget = RunBudget::from_source(&source.local_path, &runtime_config);
+    let run_budget = RunBudget::from_product_sources(
+        cmd.tokenizer.as_deref(),
+        model_sources.as_deref(),
+        &source.local_path,
+        &runtime_config,
+    )?;
     engine_config
         .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
         .map_err(ferrum_types::FerrumError::config)?;
@@ -630,7 +664,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         .as_deref()
         .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
     apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
-    let engine = ferrum_engine::create_default_engine(engine_config).await?;
+    let engine = match model_sources {
+        Some(sources) => {
+            ferrum_engine::create_product_engine(engine_config, Arc::clone(&sources)).await?
+        }
+        None => ferrum_engine::create_default_engine(engine_config).await?,
+    };
     let model_loaded_sample = product_memory_enabled
         .then(|| memory_sampler.sample())
         .flatten();
@@ -1678,7 +1717,14 @@ fn build_chat_prompt(
 
 async fn load_run_model_definition(
     source: &ResolvedModelSource,
+    product_sources: Option<&ferrum_models::vnext::ProductionModelSourceBundle>,
 ) -> Result<Option<ferrum_models::ModelDefinition>> {
+    if let Some(sources) = product_sources {
+        let mut config_manager = ferrum_models::ConfigManager::new();
+        return config_manager
+            .load_from_bytes(sources.config_json())
+            .map(Some);
+    }
     if source.format != ModelFormat::SafeTensors {
         return Ok(None);
     }
