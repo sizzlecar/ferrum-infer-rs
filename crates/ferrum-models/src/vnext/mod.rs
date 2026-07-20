@@ -23,6 +23,7 @@ type CreateFamilyRegistration = fn() -> ferrum_types::Result<Box<dyn ModelFamily
 
 struct ModelLoaderRegistration {
     external_metadata_id: &'static str,
+    gguf_architectures: &'static [&'static str],
     execution_kind: ProductionExecutionKind,
     allows_legacy_reference: bool,
     prepare: PrepareModel,
@@ -31,11 +32,22 @@ struct ModelLoaderRegistration {
 
 const MODEL_LOADERS: &[ModelLoaderRegistration] = &[ModelLoaderRegistration {
     external_metadata_id: qwen35::EXTERNAL_METADATA_ID,
+    gguf_architectures: &["qwen35"],
     execution_kind: ProductionExecutionKind::CausalLanguage,
     allows_legacy_reference: cfg!(any(test, feature = "test-support")),
     prepare: qwen35::prepare_from_sources,
     create_family_registration: qwen35_family_registration,
 }];
+
+/// Returns whether a GGUF architecture belongs to a family whose product
+/// execution has migrated to vNext. Direct files for these architectures must
+/// provide typed semantic and tokenizer sources instead of silently falling
+/// back to a legacy executor.
+pub fn gguf_architecture_requires_typed_product_sources(architecture: &str) -> bool {
+    MODEL_LOADERS
+        .iter()
+        .any(|registration| registration.gguf_architectures.contains(&architecture))
+}
 
 fn qwen35_family_registration() -> ferrum_types::Result<Box<dyn ModelFamilyRegistration>> {
     let provider = qwen35::Qwen35FamilyProvider::new()
@@ -593,12 +605,19 @@ mod tests {
     #[test]
     fn registry_ids_are_unique_and_disjoint() {
         let mut ids = std::collections::BTreeSet::new();
+        let mut gguf_architectures = std::collections::BTreeSet::new();
         for registration in MODEL_LOADERS {
             assert!(
                 ids.insert(registration.external_metadata_id),
                 "duplicate vNext registration {}",
                 registration.external_metadata_id
             );
+            for architecture in registration.gguf_architectures {
+                assert!(
+                    gguf_architectures.insert(*architecture),
+                    "GGUF architecture {architecture} maps to more than one vNext registration"
+                );
+            }
         }
         for registration in LEGACY_MODELS {
             assert!(
@@ -607,6 +626,12 @@ mod tests {
                 registration.external_metadata_id
             );
         }
+    }
+
+    #[test]
+    fn migrated_gguf_architecture_requires_typed_product_sources() {
+        assert!(gguf_architecture_requires_typed_product_sources("qwen35"));
+        assert!(!gguf_architecture_requires_typed_product_sources("qwen3"));
     }
 
     #[test]

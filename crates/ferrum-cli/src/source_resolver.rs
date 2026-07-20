@@ -982,24 +982,57 @@ fn open_colocated_product_sources(
     source: &ResolvedModelSource,
     original_source: &ModelSource,
 ) -> Result<Option<Arc<ProductionModelSourceBundle>>> {
-    if source.format != ModelFormat::SafeTensors
-        || !source.local_path.join("tokenizer.json").is_file()
-    {
-        return Ok(None);
-    }
-    let original = original_product_source(original_source, &source.local_path)?;
-    ProductionModelSourceBundle::open(
-        &source.local_path,
-        &source.local_path,
-        ProductionWeightArtifact::safetensors_directory(&source.local_path),
-        OriginalModelSources {
-            semantic: original.clone(),
-            tokenizer: original.clone(),
-            weights: original,
-        },
-    )
-    .map(Arc::new)
-    .map(Some)
+    let (metadata_root, weights, original_sources) = match source.format {
+        ModelFormat::SafeTensors if is_complete_product_metadata_snapshot(&source.local_path) => {
+            let original = original_product_source(original_source, &source.local_path)?;
+            (
+                source.local_path.as_path(),
+                ProductionWeightArtifact::safetensors_directory(&source.local_path),
+                OriginalModelSources {
+                    semantic: original.clone(),
+                    tokenizer: original.clone(),
+                    weights: original,
+                },
+            )
+        }
+        ModelFormat::GGUF => {
+            let metadata_root = source
+                .local_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            if !is_complete_product_metadata_snapshot(metadata_root) {
+                return Ok(None);
+            }
+            let metadata_original = OriginalModelSource {
+                kind: ModelSourceKind::LocalDirectory,
+                location: metadata_root.display().to_string(),
+                requested_revision: None,
+            };
+            (
+                metadata_root,
+                ProductionWeightArtifact::gguf_file(&source.local_path),
+                OriginalModelSources {
+                    semantic: metadata_original.clone(),
+                    tokenizer: metadata_original,
+                    weights: original_product_source(original_source, &source.local_path)?,
+                },
+            )
+        }
+        _ => return Ok(None),
+    };
+    ProductionModelSourceBundle::open(metadata_root, metadata_root, weights, original_sources)
+        .map(Arc::new)
+        .map(Some)
+}
+
+fn direct_gguf_requires_typed_product_sources(path: &Path) -> bool {
+    ferrum_quantization::gguf::GgufFile::open(path)
+        .ok()
+        .and_then(|gguf| gguf.architecture().ok().map(str::to_owned))
+        .is_some_and(|architecture| {
+            ferrum_models::vnext::gguf_architecture_requires_typed_product_sources(&architecture)
+        })
 }
 
 /// Should the resolver attempt to download from HF if the model isn't
@@ -1022,8 +1055,8 @@ pub struct Resolved {
     /// an opaque snapshot path.
     original_source: ModelSource,
     /// Immutable role-specific sources for product composition. Direct GGUF
-    /// files remain on the explicit legacy path until users provide typed
-    /// semantic and tokenizer sources for them.
+    /// files use colocated semantic and tokenizer sources when present;
+    /// migrated architectures fail closed instead of entering legacy code.
     model_sources: Option<Arc<ProductionModelSourceBundle>>,
     /// `true` when the resolver also ran the GPU-memory autosizer for
     /// this snapshot. Caller can skip a redundant call.
@@ -1163,15 +1196,25 @@ pub async fn resolve_model_source(
     // 2. GGUF file path.
     if looks_like_gguf_path(model) {
         let local_path = PathBuf::from(model);
+        let source = ResolvedModelSource {
+            original: model.to_string(),
+            local_path,
+            format: ModelFormat::GGUF,
+            from_cache: false,
+        };
+        let original_source = ModelSource::Local(model.to_owned());
+        let model_sources = open_colocated_product_sources(&source, &original_source)?;
+        if model_sources.is_none() && direct_gguf_requires_typed_product_sources(&source.local_path)
+        {
+            return Err(FerrumError::unsupported(format!(
+                "GGUF architecture in '{}' has migrated to the typed vNext product runtime; use a curated GGUF alias or place config.json and tokenizer.json beside the file",
+                source.local_path.display()
+            )));
+        }
         return Ok(finalize_resolution(
-            ResolvedModelSource {
-                original: model.to_string(),
-                local_path,
-                format: ModelFormat::GGUF,
-                from_cache: false,
-            },
-            ModelSource::Local(model.to_owned()),
-            None,
+            source,
+            original_source,
+            model_sources,
             autosize,
         ));
     }
@@ -1365,10 +1408,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolves_direct_gguf_with_file_stem_product_id() {
-        let dir = temp_model_dir("direct-gguf", r#"{}"#);
+    async fn resolves_direct_gguf_package_with_file_stem_product_id() {
+        let dir = temp_model_dir(
+            "direct-gguf-package",
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5"}"#,
+        );
         let gguf = dir.join("Qwen3.5-4B-Instruct-Q4_K_M.gguf");
-        std::fs::write(&gguf, []).unwrap();
+        std::fs::write(&gguf, b"fixture-gguf").unwrap();
 
         let resolved = resolve_model_source(
             gguf.to_str().unwrap(),
@@ -1382,7 +1428,14 @@ mod tests {
 
         assert_eq!(product.source.local_path, gguf);
         assert_eq!(product.source.format, ModelFormat::GGUF);
-        assert!(product.model_sources.is_none());
+        let sources = product.model_sources.as_ref().unwrap();
+        assert_eq!(sources.semantic_root(), dir.canonicalize().unwrap());
+        assert_eq!(sources.tokenizer_root(), dir.canonicalize().unwrap());
+        assert_eq!(sources.weights().path(), gguf.canonicalize().unwrap());
+        assert!(matches!(
+            ferrum_models::vnext::resolve_registered_model_from_sources(sources).unwrap(),
+            ferrum_models::vnext::ProductionModelRegistration::Registered(_)
+        ));
         assert!(matches!(
             product.engine_config.model.source.as_ref().unwrap(),
             ModelSource::Local(path) if path == gguf.to_str().unwrap()
@@ -1391,6 +1444,35 @@ mod tests {
             product.engine_config.model.model_id.as_str(),
             "Qwen3.5-4B-Instruct-Q4_K_M"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn unresolved_direct_gguf_keeps_legacy_compatibility_for_unmigrated_architectures() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrum-source-resolver-untyped-gguf-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gguf = dir.join("legacy-model.gguf");
+        std::fs::write(&gguf, []).unwrap();
+
+        let resolved = resolve_model_source(
+            gguf.to_str().unwrap(),
+            &dir.join("unused-cache"),
+            DownloadPolicy::NoDownload,
+            None,
+        )
+        .await
+        .unwrap();
+        let product = resolved.into_product_engine_input();
+
+        assert!(product.model_sources.is_none());
+        assert_eq!(product.source.local_path, gguf);
         let _ = std::fs::remove_dir_all(dir);
     }
 
