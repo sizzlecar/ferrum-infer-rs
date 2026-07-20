@@ -155,6 +155,18 @@ TRUSTED_ORACLE_REGISTRY: dict[str, dict[str, str]] = {
             "fixed_page_attention_matches_cpu_and_preserves_split_decode_state_on_real_metal"
         ),
     },
+    "cpu.fp32.rust.causal_kv_state_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "3daf60864e3d20d55a463811c2d66ecf89094d60",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": (
+            "crates/ferrum-kernels/src/backend/metal/vnext_ops/"
+            "causal_attention_tests.rs"
+        ),
+        "test_name": (
+            "fixed_page_attention_matches_cpu_and_preserves_split_decode_state_on_real_metal"
+        ),
+    },
     "cpu.fp32.rust.gated_delta_reference": {
         "oracle_precision": "fp32",
         "source_commit": "ecaeb5087ad45a5148d917fdab63d83cb046d678",
@@ -405,6 +417,37 @@ G08A_COVERAGE_RULES: dict[str, dict[str, Any]] = {
             "semantics": {"fixed_page_kv": True, "split_segments": [1, 1]},
         },
         oracle_identity="cpu.fp32.rust.causal_attention_reference",
+    ),
+    "state.causal_attention.kv_state": _coverage_selector(
+        model_scope="operation_contract",
+        operation_id="operation.causal_paged_attention",
+        operation_schema_version="2.0",
+        checkpoint_kind="state",
+        checkpoint_name="kv_state",
+        dtype="fp16",
+        quant_format="none",
+        shape_domain={
+            "fixture_id": "causal_attention.fixed_page.kv_state.split_decode",
+            "dimensions": {
+                "head_dim": 32,
+                "key_value_heads": 1,
+                "page_elements": 64,
+                "pages": 2,
+                "rope_dim": 16,
+                "tokens": 2,
+            },
+            "semantics": {
+                "epsilon": "1e-6",
+                "fixed_page_kv": True,
+                "key_transform": "rmsnorm_rope",
+                "page_layout": "token_kind_head_dim",
+                "rope_interleaved": False,
+                "rope_theta": "10000",
+                "split_segments": [1, 1],
+                "value_transform": "identity",
+            },
+        },
+        oracle_identity="cpu.fp32.rust.causal_kv_state_reference",
     ),
 }
 
