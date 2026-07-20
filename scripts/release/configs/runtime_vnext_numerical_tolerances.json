@@ -1,12 +1,9 @@
 {
   "coverage": {
-    "missing_required_coverage": [
-      "checkpoint.full_model",
-      "checkpoint.full_vocab_logits"
-    ],
+    "missing_required_coverage": [],
     "profile": "g08a_m1_metal.v1",
     "scope": "Exact Qwen3.5-4B Metal operation/state/layer/model/logit fixtures; token sequence equality remains a separate exact gate",
-    "status": "foundation_only"
+    "status": "complete"
   },
   "rows": [
     {
@@ -671,6 +668,109 @@
       },
       "source_commit": "4877ef05ee21ef50021a077ee1766d53c1583635",
       "tolerance_id": "runtime-vnext.metal.qwen35-4b.full-attention.v2.layer.fp16.gguf-q4-k-m.tokens-24"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Qwen3.5-4B Q4_K_M Metal 32-layer final hidden state is checked against the independently streamed CPU FP32 model oracle with max_abs <= 0.25.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "scripts/release/qwen35_gguf_model_reference.py",
+        "test_name": "build_reference"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.25,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "full_model",
+      "checkpoint_name": "final_hidden",
+      "coverage_markers": [
+        "checkpoint.full_model"
+      ],
+      "dtype": "fp16",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "qwen3.5-4b",
+      "operation_id": "operation.qwen35_model_forward",
+      "operation_schema_version": "1.0",
+      "oracle_identity": "cpu.fp32.python.qwen35_gguf_model_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "gguf_q4_k_m",
+      "review_commit": "812a66b219196eee16206f3a7ffaf4f37865b632",
+      "row_fingerprint": "c25f0a0eaf8b2f2cca29ebe19e7a327fa0381961e79d80c6f9fa2138c26b4649",
+      "shape_domain": {
+        "dimensions": {
+          "hidden_size": 2560,
+          "layers": 32,
+          "tokens": 24
+        },
+        "fixture_id": "qwen35-4b.gguf-q4-k-m.full-model.tokens-24",
+        "semantics": {
+          "final_norm": "rms_norm",
+          "full_attention_interval": 4,
+          "layer_pattern": "three_linear_then_one_full",
+          "model_sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+          "prompt_token_sequence_sha256": "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f",
+          "quantized_embedding_is_model_input": true
+        }
+      },
+      "source_commit": "812a66b219196eee16206f3a7ffaf4f37865b632",
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.full-model.v1.full-model.fp16.gguf-q4-k-m.tokens-24"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Qwen3.5-4B Q4_K_M Metal last-token full-vocabulary logits are checked against the independent CPU FP32 model and tied-head oracle with max_abs <= 0.1.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "scripts/release/qwen35_gguf_model_reference.py",
+        "test_name": "build_reference"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.1,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "full_vocab_logits",
+      "checkpoint_name": "last_token_logits",
+      "coverage_markers": [
+        "checkpoint.full_vocab_logits"
+      ],
+      "dtype": "fp16",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "qwen3.5-4b",
+      "operation_id": "operation.qwen35_tied_lm_head",
+      "operation_schema_version": "1.0",
+      "oracle_identity": "cpu.fp32.python.qwen35_gguf_model_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "gguf_q4_k_m",
+      "review_commit": "812a66b219196eee16206f3a7ffaf4f37865b632",
+      "row_fingerprint": "e0d537c3e3a9003bd7c0c41a791b0de59b05a82d99ad8c0f3b915e41bb5eb5f8",
+      "shape_domain": {
+        "dimensions": {
+          "vocabulary_size": 248320
+        },
+        "fixture_id": "qwen35-4b.gguf-q4-k-m.full-vocab-logits.tokens-24",
+        "semantics": {
+          "argmax_token_id": 57590,
+          "last_token_index": 23,
+          "model_sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+          "prompt_token_sequence_sha256": "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f",
+          "tied_embedding_lm_head": true
+        }
+      },
+      "source_commit": "812a66b219196eee16206f3a7ffaf4f37865b632",
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.full-vocab-logits.v1.full-vocab-logits.fp16.gguf-q4-k-m.tokens-24"
     },
     {
       "backend": "metal",

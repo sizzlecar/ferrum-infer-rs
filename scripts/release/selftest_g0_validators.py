@@ -53,6 +53,9 @@ RUNTIME_VNEXT_QWEN35_LAYER_REFERENCE_GATE = (
 RUNTIME_VNEXT_QWEN35_FULL_ATTENTION_GATE = (
     REPO_ROOT / "scripts/release/runtime_vnext_qwen35_full_attention_gate.py"
 )
+RUNTIME_VNEXT_QWEN35_MODEL_REFERENCE_GATE = (
+    REPO_ROOT / "scripts/release/runtime_vnext_qwen35_model_reference_gate.py"
+)
 RUNTIME_VNEXT_S1_CUDA_CHECKPOINT = (
     REPO_ROOT / "scripts/release/runtime_vnext_s1_cuda_checkpoint.py"
 )
@@ -545,6 +548,17 @@ def test_runtime_vnext_qwen35_full_attention_gate_selftest() -> None:
     )
 
 
+def test_runtime_vnext_qwen35_model_reference_gate_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_QWEN35_MODEL_REFERENCE_GATE), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "RUNTIME VNEXT QWEN35 MODEL NUMERICS SELF-TEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
 def test_runtime_vnext_s1_cuda_capacity_selftest() -> None:
     ok = run([sys.executable, str(RUNTIME_VNEXT_S1_CUDA_CAPACITY), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -868,6 +882,7 @@ def main() -> int:
     test_qwen35_gguf_model_reference_selftest()
     test_runtime_vnext_qwen35_layer_reference_gate_selftest()
     test_runtime_vnext_qwen35_full_attention_gate_selftest()
+    test_runtime_vnext_qwen35_model_reference_gate_selftest()
     test_runtime_vnext_s1_cuda_checkpoint_selftest()
     test_runtime_vnext_s1_cuda_basic_collector_selftest()
     test_runtime_vnext_s1_cuda_capacity_selftest()
