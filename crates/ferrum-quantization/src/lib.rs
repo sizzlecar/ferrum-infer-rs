@@ -27,7 +27,7 @@ pub mod safetensors_archive;
 pub mod traits;
 
 pub use dense::DenseLinear;
-pub use gguf::{GgufFile, GgufLinear, GgufLoader};
+pub use gguf::{GgufFile, GgufLinear, GgufLoader, GgufWeightComponentSource};
 pub use gptq::{GptqLinear, StackedExpertLinear};
 pub use loader::{PrefixedLoader, WeightLoader};
 pub use lora::LoraLinearRef;
