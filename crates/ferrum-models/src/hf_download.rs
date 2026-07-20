@@ -135,16 +135,15 @@ impl HfDownloader {
         })
     }
 
-    /// Download a single GGUF file (plus tokenizer / config files) from a
-    /// HuggingFace repo. Returns the absolute path to the downloaded
-    /// `.gguf` file in the snapshot directory.
+    /// Download one exact GGUF weight file from a HuggingFace repo. Returns
+    /// the absolute path to the downloaded `.gguf` file in the snapshot
+    /// directory.
     ///
     /// Use this for GGUF aliases like `qwen3:8b-q4_k_m` where the repo
     /// (e.g. `Qwen/Qwen3-8B-GGUF`) hosts many quantizations and we only
-    /// want one. The accompanying tokenizer files (tokenizer.json,
-    /// tokenizer_config.json, special_tokens_map.json) are pulled along
-    /// so that `auto_discover_tokenizer_path` finds them next to the
-    /// GGUF file at serve / bench time.
+    /// want one. Semantic configuration and tokenizer artifacts are resolved
+    /// independently by product source composition; copying them beside the
+    /// weight file would erase their repository identity.
     pub async fn download_gguf(
         &self,
         model_id: &str,
@@ -165,29 +164,9 @@ impl HfDownloader {
         let gguf_lower = gguf_filename.to_ascii_lowercase();
         let files_to_download: Vec<_> = files
             .iter()
-            .filter(|f| {
-                if f.file_type.as_deref() == Some("directory") {
-                    return false;
-                }
-                let path = f.path.as_str();
-                let path_lower = path.to_ascii_lowercase();
-                // Only the requested GGUF file (case-insensitive).
-                if path_lower == gguf_lower {
-                    return true;
-                }
-                // Plus the small accompanying tokenizer / config metadata
-                // so a downstream `serve` / `bench` finds them next to
-                // the GGUF without a second download.
-                matches!(
-                    path,
-                    "tokenizer.json"
-                        | "tokenizer_config.json"
-                        | "special_tokens_map.json"
-                        | "config.json"
-                        | "generation_config.json"
-                        | "chat_template.json"
-                        | "chat_template.jinja"
-                )
+            .filter(|file| {
+                file.file_type.as_deref() != Some("directory")
+                    && file.path.to_ascii_lowercase() == gguf_lower
             })
             .collect();
         if !files_to_download

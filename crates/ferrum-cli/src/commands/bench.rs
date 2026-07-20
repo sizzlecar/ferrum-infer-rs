@@ -138,6 +138,7 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
     let product_input = resolved.into_product_engine_input();
     let source = product_input.source;
     let mut engine_config = product_input.engine_config;
+    let model_sources = product_input.model_sources;
     let model_id = crate::source_resolver::public_model_id(&source);
     eprintln!("{}", format!("Ferrum Benchmark - {}", model_id).bold());
     eprintln!("{}", "=".repeat(60).dimmed());
@@ -189,7 +190,10 @@ pub async fn execute(cmd: BenchCommand, config: CliConfig) -> Result<()> {
         .as_deref()
         .or_else(|| crate::runtime_env::runtime_snapshot_value(&runtime_config, "FERRUM_KV_DTYPE"));
     super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
-    let engine = ferrum_engine::create_default_engine(engine_config).await?;
+    let engine = match model_sources {
+        Some(sources) => ferrum_engine::create_product_engine(engine_config, sources).await?,
+        None => ferrum_engine::create_default_engine(engine_config).await?,
+    };
 
     let prompt = if cmd.long_context {
         generate_long_prompt()

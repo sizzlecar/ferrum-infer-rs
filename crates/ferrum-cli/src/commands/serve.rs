@@ -439,7 +439,12 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let product_input = resolved.into_product_engine_input();
     let source = product_input.source;
     let product_engine_config = product_input.engine_config;
+    let model_sources = product_input.model_sources;
     let model_id = crate::source_resolver::public_model_id(&source);
+    let model_chat_template = match model_sources.as_deref() {
+        Some(sources) => crate::source_resolver::load_product_chat_template(sources),
+        None => crate::source_resolver::load_model_chat_template(&source.local_path),
+    };
     let served_model_names = effective_served_model_names(&model_id, served_model_name)?;
     let primary_served_model_name = served_model_names
         .first()
@@ -575,12 +580,16 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // and route directly to the continuous-batching LLM engine — the
     // engine's LlmExecutorFactory uses WeightFormat::detect() to route GGUF.
     println!();
-    let model_definition: Option<ferrum_models::ModelDefinition> = if gguf_path.is_some() {
-        None
-    } else {
-        let mut config_manager = ferrum_models::ConfigManager::new();
-        Some(config_manager.load_from_path(&source.local_path).await?)
-    };
+    let model_definition: Option<ferrum_models::ModelDefinition> =
+        if let Some(sources) = model_sources.as_deref() {
+            let mut config_manager = ferrum_models::ConfigManager::new();
+            Some(config_manager.load_from_bytes(sources.config_json())?)
+        } else if gguf_path.is_some() {
+            None
+        } else {
+            let mut config_manager = ferrum_models::ConfigManager::new();
+            Some(config_manager.load_from_path(&source.local_path).await?)
+        };
     let arch_for_dispatch = model_definition
         .as_ref()
         .map(|model_def| model_def.architecture);
@@ -923,13 +932,16 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             }
             super::run::apply_kv_dtype_override(&mut engine_config, effective_kv_dtype)?;
             let engine: Arc<dyn ferrum_engine::LlmInferenceEngine + Send + Sync> =
-                Arc::from(ferrum_engine::create_default_engine(engine_config).await?);
+                Arc::from(match model_sources {
+                    Some(sources) => {
+                        ferrum_engine::create_product_engine(engine_config, sources).await?
+                    }
+                    None => ferrum_engine::create_default_engine(engine_config).await?,
+                });
             if product_memory_enabled {
                 cache_allocated_status = Some(engine.status().await);
             }
-            AxumServer::from_llm(engine).with_prompt_template(
-                crate::source_resolver::load_model_chat_template(&source.local_path),
-            )
+            AxumServer::from_llm(engine).with_prompt_template(model_chat_template)
         }
     }
     .with_auto_config(startup_auto_config);

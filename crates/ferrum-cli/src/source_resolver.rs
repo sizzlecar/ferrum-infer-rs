@@ -25,8 +25,11 @@
 //! [`resolve_model_source`].
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use ferrum_interfaces::vnext::{ModelSourceKind, OriginalModelSource, OriginalModelSources};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
+use ferrum_models::vnext::{ProductionModelSourceBundle, ProductionWeightArtifact};
 use ferrum_server::chat_template::ModelChatTemplate;
 use ferrum_types::{
     EngineConfig, FerrumError, ModelId, ModelSource, Result, RuntimeConfigEntry,
@@ -108,6 +111,7 @@ pub fn resolve_model_alias(name: &str) -> String {
         "qwen3:4b" => "Qwen/Qwen3-4B".to_string(),
         "qwen3:14b" => "Qwen/Qwen3-14B".to_string(),
         "qwen3:32b" => "Qwen/Qwen3-32B".to_string(),
+        "qwen3.5:4b" => "Qwen/Qwen3.5-4B".to_string(),
         "qwen3-coder:30b" | "qwen3-coder:30b-a3b" => {
             "Qwen/Qwen3-Coder-30B-A3B-Instruct".to_string()
         }
@@ -157,6 +161,12 @@ struct GgufAliasEntry {
 }
 
 const GGUF_ALIASES: &[GgufAliasEntry] = &[
+    GgufAliasEntry {
+        aliases: &["qwen3.5:4b-gguf", "qwen3.5:4b-q4_k_m"],
+        repo: "unsloth/Qwen3.5-4B-GGUF",
+        filename: "Qwen3.5-4B-Q4_K_M.gguf",
+        tokenizer_repo: Some("Qwen/Qwen3.5-4B"),
+    },
     GgufAliasEntry {
         aliases: &["qwen3:8b-q4_k_m"],
         repo: "Qwen/Qwen3-8B-GGUF",
@@ -708,30 +718,78 @@ pub fn load_model_chat_template(snapshot_path: &Path) -> Option<ModelChatTemplat
     read_tokenizer_config_template(&tokenizer_config_path)
 }
 
+/// Load the chat template from bytes retained by the immutable tokenizer
+/// source lease. The legacy path-based loader remains for direct GGUF files.
+pub fn load_product_chat_template(
+    sources: &ProductionModelSourceBundle,
+) -> Option<ModelChatTemplate> {
+    if let Some(bytes) = sources.chat_template_jinja() {
+        let template = std::str::from_utf8(bytes).ok()?;
+        if !template.trim().is_empty() {
+            return Some(ModelChatTemplate::new(
+                template.to_owned(),
+                sources
+                    .tokenizer_root()
+                    .join("chat_template.jinja")
+                    .display()
+                    .to_string(),
+            ));
+        }
+    }
+    if let Some(bytes) = sources.chat_template_json() {
+        let origin = sources
+            .tokenizer_root()
+            .join("chat_template.json")
+            .display()
+            .to_string();
+        if let Some(template) = template_json_bytes(bytes, origin) {
+            return Some(template);
+        }
+    }
+    sources.tokenizer_config_json().and_then(|bytes| {
+        tokenizer_config_template_bytes(
+            bytes,
+            sources
+                .tokenizer_root()
+                .join("tokenizer_config.json")
+                .display()
+                .to_string(),
+        )
+    })
+}
+
 fn read_template_json(path: &Path) -> Option<ModelChatTemplate> {
-    let text = std::fs::read_to_string(path).ok()?;
-    if text.trim().is_empty() {
+    let bytes = std::fs::read(path).ok()?;
+    template_json_bytes(&bytes, path.display().to_string())
+}
+
+fn template_json_bytes(bytes: &[u8], origin: String) -> Option<ModelChatTemplate> {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
         return None;
     }
-    match serde_json::from_str::<serde_json::Value>(&text).ok() {
-        Some(serde_json::Value::String(template)) => {
-            Some(ModelChatTemplate::new(template, path.display().to_string()))
-        }
+    match serde_json::from_slice::<serde_json::Value>(bytes).ok() {
+        Some(serde_json::Value::String(template)) => Some(ModelChatTemplate::new(template, origin)),
         Some(value) => template_value(&value).map(|template| {
-            let mut t = ModelChatTemplate::new(template, path.display().to_string());
+            let mut t = ModelChatTemplate::new(template, origin);
             t.bos_token = token_value(&value, "bos_token");
             t.eos_token = token_value(&value, "eos_token");
             t
         }),
-        None => Some(ModelChatTemplate::new(text, path.display().to_string())),
+        None => std::str::from_utf8(bytes)
+            .ok()
+            .map(|text| ModelChatTemplate::new(text.to_owned(), origin)),
     }
 }
 
 fn read_tokenizer_config_template(path: &Path) -> Option<ModelChatTemplate> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let value = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    let bytes = std::fs::read(path).ok()?;
+    tokenizer_config_template_bytes(&bytes, path.display().to_string())
+}
+
+fn tokenizer_config_template_bytes(bytes: &[u8], origin: String) -> Option<ModelChatTemplate> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
     let template = template_value(&value)?;
-    let mut t = ModelChatTemplate::new(template, path.display().to_string());
+    let mut t = ModelChatTemplate::new(template, origin);
     t.bos_token = token_value(&value, "bos_token");
     t.eos_token = token_value(&value, "eos_token");
     Some(t)
@@ -839,6 +897,104 @@ pub fn find_cached_gguf(cache_dir: &Path, repo: &str, filename: &str) -> Option<
         .find(|candidate| candidate.is_file())
 }
 
+const PRODUCT_SOURCE_FILES: [&str; 7] = [
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "chat_template.json",
+    "chat_template.jinja",
+    "generation_config.json",
+];
+
+fn is_complete_product_metadata_snapshot(path: &Path) -> bool {
+    path.is_dir() && path.join("config.json").is_file() && path.join("tokenizer.json").is_file()
+}
+
+/// Locate a sidecar-only repository snapshot. Unlike `find_cached_model`, this
+/// intentionally does not require a weight shard.
+fn find_cached_product_metadata(cache_dir: &Path, repo: &str) -> Option<PathBuf> {
+    let repo_dir = cache_dir
+        .join("hub")
+        .join(format!("models--{}", repo.replace('/', "--")));
+    let snapshots_dir = repo_dir.join("snapshots");
+
+    if let Ok(revision) = std::fs::read_to_string(repo_dir.join("refs/main")) {
+        let revision = revision.trim();
+        if !revision.is_empty() {
+            let candidate = snapshots_dir.join(revision);
+            if is_complete_product_metadata_snapshot(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+
+    std::fs::read_dir(&snapshots_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|candidate| is_complete_product_metadata_snapshot(candidate))
+}
+
+fn repository_source(repo: impl Into<String>) -> OriginalModelSource {
+    OriginalModelSource {
+        kind: ModelSourceKind::Repository,
+        location: repo.into(),
+        requested_revision: None,
+    }
+}
+
+fn original_product_source(
+    source: &ModelSource,
+    resolved_path: &Path,
+) -> Result<OriginalModelSource> {
+    match source {
+        ModelSource::Local(location) => Ok(OriginalModelSource {
+            kind: if resolved_path.is_file() {
+                ModelSourceKind::LocalFile
+            } else {
+                ModelSourceKind::LocalDirectory
+            },
+            location: location.clone(),
+            requested_revision: None,
+        }),
+        ModelSource::HuggingFace {
+            repo_id, revision, ..
+        } => Ok(OriginalModelSource {
+            kind: ModelSourceKind::Repository,
+            location: repo_id.clone(),
+            requested_revision: revision.clone(),
+        }),
+        ModelSource::Url { .. } | ModelSource::S3 { .. } => Err(FerrumError::unsupported(
+            "typed product source bundles do not yet resolve URL or S3 sources",
+        )),
+    }
+}
+
+fn open_colocated_product_sources(
+    source: &ResolvedModelSource,
+    original_source: &ModelSource,
+) -> Result<Option<Arc<ProductionModelSourceBundle>>> {
+    if source.format != ModelFormat::SafeTensors
+        || !source.local_path.join("tokenizer.json").is_file()
+    {
+        return Ok(None);
+    }
+    let original = original_product_source(original_source, &source.local_path)?;
+    ProductionModelSourceBundle::open(
+        &source.local_path,
+        &source.local_path,
+        ProductionWeightArtifact::safetensors_directory(&source.local_path),
+        OriginalModelSources {
+            semantic: original.clone(),
+            tokenizer: original.clone(),
+            weights: original,
+        },
+    )
+    .map(Arc::new)
+    .map(Some)
+}
+
 /// Should the resolver attempt to download from HF if the model isn't
 /// found locally? `run` / `serve` say yes; `bench` defaults to no
 /// (caller handles per-bench-flow download policy).
@@ -858,6 +1014,10 @@ pub struct Resolved {
     /// composition uses this instead of reverse-engineering a repository from
     /// an opaque snapshot path.
     original_source: ModelSource,
+    /// Immutable role-specific sources for product composition. Direct GGUF
+    /// files remain on the explicit legacy path until users provide typed
+    /// semantic and tokenizer sources for them.
+    model_sources: Option<Arc<ProductionModelSourceBundle>>,
     /// `true` when the resolver also ran the GPU-memory autosizer for
     /// this snapshot. Caller can skip a redundant call.
     autosized: bool,
@@ -869,6 +1029,7 @@ pub struct Resolved {
 pub struct ProductEngineInput {
     pub source: ResolvedModelSource,
     pub engine_config: EngineConfig,
+    pub model_sources: Option<Arc<ProductionModelSourceBundle>>,
     pub autosized: bool,
 }
 
@@ -884,6 +1045,7 @@ impl Resolved {
         ProductEngineInput {
             source: self.source,
             engine_config,
+            model_sources: self.model_sources,
             autosized: self.autosized,
         }
     }
@@ -913,6 +1075,11 @@ pub async fn resolve_model_source(
     // 1. Curated GGUF alias. Resolve this before the general HF alias table:
     // a GGUF alias names one exact file, not a safetensors repository.
     if let Some((repo, filename)) = resolve_gguf_alias(model) {
+        let metadata_repo = tokenizer_sibling_repo(&repo).ok_or_else(|| {
+            FerrumError::model(format!(
+                "GGUF repository '{repo}' has no semantic/tokenizer source"
+            ))
+        })?;
         let token = (download == DownloadPolicy::AutoDownload)
             .then(|| {
                 std::env::var("HF_TOKEN")
@@ -920,7 +1087,7 @@ pub async fn resolve_model_source(
                     .ok()
             })
             .flatten();
-        let (local_path, from_cache) = match find_cached_gguf(cache_dir, &repo, &filename) {
+        let (local_path, weights_from_cache) = match find_cached_gguf(cache_dir, &repo, &filename) {
             Some(path) => (path, true),
             None if download == DownloadPolicy::AutoDownload => {
                 let downloader =
@@ -936,21 +1103,52 @@ pub async fn resolve_model_source(
                 )))
             }
         };
-        if download == DownloadPolicy::AutoDownload {
-            ensure_gguf_tokenizer_sidecars(cache_dir, token, &repo, &local_path).await?;
-        }
+        let (metadata_root, metadata_from_cache) =
+            match find_cached_product_metadata(cache_dir, &metadata_repo) {
+                Some(path) => (path, true),
+                None if download == DownloadPolicy::AutoDownload => {
+                    let downloader =
+                        ferrum_models::HfDownloader::new(cache_dir.to_path_buf(), token)?;
+                    let path = downloader
+                        .download_sidecar_files(&metadata_repo, None, &PRODUCT_SOURCE_FILES)
+                        .await?;
+                    if !is_complete_product_metadata_snapshot(&path) {
+                        return Err(FerrumError::model(format!(
+                            "semantic/tokenizer source '{metadata_repo}' did not provide config.json and tokenizer.json"
+                        )));
+                    }
+                    (path, false)
+                }
+                None => {
+                    return Err(FerrumError::model(format!(
+                        "semantic/tokenizer source '{metadata_repo}' for GGUF alias '{model}' is not cached and DownloadPolicy::NoDownload is set"
+                    )))
+                }
+            };
+        let metadata_original = repository_source(metadata_repo);
+        let model_sources = Arc::new(ProductionModelSourceBundle::open(
+            &metadata_root,
+            &metadata_root,
+            ProductionWeightArtifact::gguf_file(&local_path),
+            OriginalModelSources {
+                semantic: metadata_original.clone(),
+                tokenizer: metadata_original,
+                weights: repository_source(&repo),
+            },
+        )?);
         return Ok(finalize_resolution(
             ResolvedModelSource {
                 original: model.to_string(),
                 local_path,
                 format: ModelFormat::GGUF,
-                from_cache,
+                from_cache: weights_from_cache && metadata_from_cache,
             },
             ModelSource::HuggingFace {
                 repo_id: repo,
                 revision: None,
                 cache_dir: Some(cache_dir.display().to_string()),
             },
+            Some(model_sources),
             autosize,
         ));
     }
@@ -966,6 +1164,7 @@ pub async fn resolve_model_source(
                 from_cache: false,
             },
             ModelSource::Local(model.to_owned()),
+            None,
             autosize,
         ));
     }
@@ -975,14 +1174,18 @@ pub async fn resolve_model_source(
     if direct.is_dir() {
         let format = detect_format(&direct);
         if format != ModelFormat::Unknown {
+            let source = ResolvedModelSource {
+                original: model.to_string(),
+                local_path: direct,
+                format,
+                from_cache: false,
+            };
+            let original_source = ModelSource::Local(model.to_owned());
+            let model_sources = open_colocated_product_sources(&source, &original_source)?;
             return Ok(finalize_resolution(
-                ResolvedModelSource {
-                    original: model.to_string(),
-                    local_path: direct,
-                    format,
-                    from_cache: false,
-                },
-                ModelSource::Local(model.to_owned()),
+                source,
+                original_source,
+                model_sources,
                 autosize,
             ));
         }
@@ -991,13 +1194,16 @@ pub async fn resolve_model_source(
     // 4. HF cache hit.
     let model_id = resolve_model_alias(model);
     if let Some(source) = find_cached_model(cache_dir, &model_id) {
+        let original_source = ModelSource::HuggingFace {
+            repo_id: model_id,
+            revision: None,
+            cache_dir: Some(cache_dir.display().to_string()),
+        };
+        let model_sources = open_colocated_product_sources(&source, &original_source)?;
         return Ok(finalize_resolution(
             source,
-            ModelSource::HuggingFace {
-                repo_id: model_id,
-                revision: None,
-                cache_dir: Some(cache_dir.display().to_string()),
-            },
+            original_source,
+            model_sources,
             autosize,
         ));
     }
@@ -1021,73 +1227,30 @@ pub async fn resolve_model_source(
             "downloaded model has unknown format (no safetensors / pytorch_model.bin)",
         ));
     }
+    let source = ResolvedModelSource {
+        original: model_id.clone(),
+        local_path: snapshot_path,
+        format,
+        from_cache: false,
+    };
+    let original_source = ModelSource::HuggingFace {
+        repo_id: model_id,
+        revision: None,
+        cache_dir: Some(cache_dir.display().to_string()),
+    };
+    let model_sources = open_colocated_product_sources(&source, &original_source)?;
     Ok(finalize_resolution(
-        ResolvedModelSource {
-            original: model_id.clone(),
-            local_path: snapshot_path,
-            format,
-            from_cache: false,
-        },
-        ModelSource::HuggingFace {
-            repo_id: model_id,
-            revision: None,
-            cache_dir: Some(cache_dir.display().to_string()),
-        },
+        source,
+        original_source,
+        model_sources,
         autosize,
     ))
-}
-
-async fn ensure_gguf_tokenizer_sidecars(
-    cache_dir: &Path,
-    token: Option<String>,
-    gguf_repo: &str,
-    gguf_path: &Path,
-) -> Result<()> {
-    const SIDECAR_FILES: [&str; 6] = [
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "chat_template.json",
-        "chat_template.jinja",
-        "generation_config.json",
-    ];
-
-    let snapshot_dir = gguf_path
-        .parent()
-        .ok_or_else(|| FerrumError::model("resolved GGUF path has no snapshot directory"))?;
-    if snapshot_dir.join("tokenizer.json").is_file() {
-        return Ok(());
-    }
-    let sibling = tokenizer_sibling_repo(gguf_repo).ok_or_else(|| {
-        FerrumError::model(format!(
-            "GGUF repository '{gguf_repo}' has no tokenizer sidecar source"
-        ))
-    })?;
-    let downloader = ferrum_models::HfDownloader::new(cache_dir.to_path_buf(), token)?;
-    let sibling_dir = downloader
-        .download_sidecar_files(&sibling, None, &SIDECAR_FILES)
-        .await?;
-    for filename in SIDECAR_FILES {
-        let source = sibling_dir.join(filename);
-        if source.is_file() {
-            std::fs::copy(&source, snapshot_dir.join(filename)).map_err(|error| {
-                FerrumError::model(format!(
-                    "copy GGUF tokenizer sidecar {filename} from {sibling}: {error}"
-                ))
-            })?;
-        }
-    }
-    if !snapshot_dir.join("tokenizer.json").is_file() {
-        return Err(FerrumError::model(format!(
-            "GGUF tokenizer source '{sibling}' did not provide tokenizer.json"
-        )));
-    }
-    Ok(())
 }
 
 fn finalize_resolution(
     source: ResolvedModelSource,
     original_source: ModelSource,
+    model_sources: Option<Arc<ProductionModelSourceBundle>>,
     autosize: Option<(AutoSizeProfile, f32)>,
 ) -> Resolved {
     let autosized = if let Some((profile, gpu_util)) = autosize {
@@ -1102,6 +1265,7 @@ fn finalize_resolution(
     Resolved {
         source,
         original_source,
+        model_sources,
         autosized,
     }
 }
@@ -1122,6 +1286,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.json"), config_json).unwrap();
+        std::fs::write(dir.join("tokenizer.json"), br#"{"version":"1.0"}"#).unwrap();
         dir
     }
 
@@ -1144,8 +1309,16 @@ mod tests {
             }
         }
         assert_eq!(resolve_model_alias("qwen3:1.7b"), "Qwen/Qwen3-1.7B");
+        assert_eq!(resolve_model_alias("qwen3.5:4b"), "Qwen/Qwen3.5-4B");
         assert!(resolve_gguf_alias("qwen3:1.7b").is_none());
         assert!(resolve_gguf_alias("qwen3:1.7b-gguf").is_some());
+        assert_eq!(
+            resolve_gguf_alias("qwen3.5:4b-q4_k_m"),
+            Some((
+                "unsloth/Qwen3.5-4B-GGUF".to_string(),
+                "Qwen3.5-4B-Q4_K_M.gguf".to_string()
+            ))
+        );
     }
 
     #[tokio::test]
@@ -1154,7 +1327,7 @@ mod tests {
             "local-product-id",
             r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5"}"#,
         );
-        std::fs::write(dir.join("model.safetensors"), []).unwrap();
+        std::fs::write(dir.join("model.safetensors"), b"fixture-weights").unwrap();
 
         let resolved = resolve_model_source(
             dir.to_str().unwrap(),
@@ -1170,6 +1343,9 @@ mod tests {
         assert_eq!(product.source.format, ModelFormat::SafeTensors);
         assert!(!product.source.from_cache);
         assert!(!product.autosized);
+        let sources = product.model_sources.as_ref().unwrap();
+        assert_eq!(sources.semantic_root(), dir.canonicalize().unwrap());
+        assert_eq!(sources.tokenizer_root(), dir.canonicalize().unwrap());
         assert!(matches!(
             product.engine_config.model.source.as_ref().unwrap(),
             ModelSource::Local(path) if path == dir.to_str().unwrap()
@@ -1199,6 +1375,7 @@ mod tests {
 
         assert_eq!(product.source.local_path, gguf);
         assert_eq!(product.source.format, ModelFormat::GGUF);
+        assert!(product.model_sources.is_none());
         assert!(matches!(
             product.engine_config.model.source.as_ref().unwrap(),
             ModelSource::Local(path) if path == gguf.to_str().unwrap()
@@ -1223,7 +1400,32 @@ mod tests {
         std::fs::create_dir_all(repo_dir.join("refs")).unwrap();
         std::fs::write(repo_dir.join("refs/main"), revision).unwrap();
         let gguf = snapshot.join(&filename);
-        std::fs::write(&gguf, []).unwrap();
+        std::fs::write(&gguf, b"fixture-gguf").unwrap();
+
+        let metadata_repo = tokenizer_sibling_repo(&repo).unwrap();
+        let metadata_repo_dir = cache
+            .join("hub")
+            .join(format!("models--{}", metadata_repo.replace('/', "--")));
+        let metadata_revision = "metadata-fixture-revision";
+        let metadata_snapshot = metadata_repo_dir.join("snapshots").join(metadata_revision);
+        std::fs::create_dir_all(&metadata_snapshot).unwrap();
+        std::fs::create_dir_all(metadata_repo_dir.join("refs")).unwrap();
+        std::fs::write(metadata_repo_dir.join("refs/main"), metadata_revision).unwrap();
+        std::fs::write(
+            metadata_snapshot.join("config.json"),
+            br#"{"architectures":["Qwen3ForCausalLM"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            metadata_snapshot.join("tokenizer.json"),
+            br#"{"version":"1.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            metadata_snapshot.join("tokenizer_config.json"),
+            br#"{"chat_template":"fixture-template"}"#,
+        )
+        .unwrap();
 
         let resolved =
             resolve_model_source("qwen3:4b-q4_k_m", &cache, DownloadPolicy::NoDownload, None)
@@ -1234,6 +1436,19 @@ mod tests {
         assert_eq!(product.source.local_path, gguf);
         assert_eq!(product.source.format, ModelFormat::GGUF);
         assert!(product.source.from_cache);
+        let sources = product.model_sources.as_ref().unwrap();
+        assert_eq!(
+            sources.semantic_root(),
+            metadata_snapshot.canonicalize().unwrap()
+        );
+        assert_eq!(
+            sources.tokenizer_root(),
+            metadata_snapshot.canonicalize().unwrap()
+        );
+        assert_eq!(sources.weights().path(), gguf.canonicalize().unwrap());
+        assert_eq!(sources.original_sources().semantic.location, metadata_repo);
+        assert_eq!(sources.original_sources().weights.location, repo);
+        assert!(!snapshot.join("tokenizer.json").exists());
         assert!(matches!(
             product.engine_config.model.source.as_ref().unwrap(),
             ModelSource::HuggingFace { repo_id, revision: None, cache_dir: Some(root) }
@@ -1573,6 +1788,32 @@ mod tests {
         let template = load_model_chat_template(&dir).unwrap();
         assert_eq!(template.template, "{{ messages[0].content }}");
         assert_eq!(template.bos_token.as_deref(), Some("<s>"));
+        assert_eq!(template.eos_token.as_deref(), Some("</s>"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn product_chat_template_uses_immutable_source_bytes() {
+        let dir = temp_model_dir(
+            "immutable-template",
+            r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3"}"#,
+        );
+        std::fs::write(dir.join("model.safetensors"), b"fixture-weights").unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"chat_template":"original-template","eos_token":"</s>"}"#,
+        )
+        .unwrap();
+        let bundle = ProductionModelSourceBundle::open_colocated_safetensors(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"chat_template":"mutated-template"}"#,
+        )
+        .unwrap();
+
+        let template = load_product_chat_template(&bundle).unwrap();
+        assert_eq!(template.template, "original-template");
         assert_eq!(template.eos_token.as_deref(), Some("</s>"));
         let _ = std::fs::remove_dir_all(dir);
     }

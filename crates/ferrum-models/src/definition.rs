@@ -155,7 +155,14 @@ impl ConfigManager {
             .await
             .map_err(|e| FerrumError::io(format!("Failed to read config.json: {}", e)))?;
 
-        let raw_config: serde_json::Value = serde_json::from_str(&content)
+        self.load_from_bytes(content.as_bytes())
+    }
+
+    /// Parse a model definition from bytes retained by a resolved product
+    /// source lease. This keeps startup decisions on the same immutable
+    /// `config.json` identity used by model-family registration.
+    pub fn load_from_bytes(&mut self, config_json: &[u8]) -> Result<ModelDefinition> {
+        let raw_config: serde_json::Value = serde_json::from_slice(config_json)
             .map_err(|e| FerrumError::model(format!("Failed to parse config.json: {}", e)))?;
 
         self.parse_config(&raw_config)
