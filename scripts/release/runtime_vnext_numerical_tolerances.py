@@ -203,6 +203,13 @@ TRUSTED_ORACLE_REGISTRY: dict[str, dict[str, str]] = {
             "recurrent_core_matches_cpu_and_preserves_split_decode_state_on_real_metal"
         ),
     },
+    "cpu.fp32.python.qwen35_gguf_linear_attention_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "578650cca7a06869ee7d33aa0a05d40c66a02729",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": "scripts/release/qwen35_gguf_linear_attention_reference.py",
+        "test_name": "build_reference",
+    },
 }
 
 
@@ -450,6 +457,34 @@ G08A_COVERAGE_RULES: dict[str, dict[str, Any]] = {
         oracle_identity="cpu.fp32.rust.causal_kv_state_reference",
     ),
 }
+
+_qwen35_linear_attention_selector = _coverage_selector(
+    model_scope="qwen3.5-4b",
+    operation_id="operation.gated_delta_recurrent_attention",
+    operation_schema_version="4.0",
+    checkpoint_kind="layer_output",
+    checkpoint_name="layer_0_attention_residual",
+    dtype="fp16",
+    quant_format="gguf_q4_k_m",
+    shape_domain={
+        "fixture_id": "qwen35-4b.gguf-q4-k-m.layer-0.linear-attention.tokens-24",
+        "dimensions": {"hidden_size": 2560, "tokens": 24},
+        "semantics": {
+            "decay_parameterization": "negative_rate",
+            "layer_index": 0,
+            "model_sha256": (
+                "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+            ),
+            "prompt_token_sequence_sha256": (
+                "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f"
+            ),
+            "value_head_mapping": "interleaved_by_key_head",
+        },
+    },
+    oracle_identity="cpu.fp32.python.qwen35_gguf_linear_attention_reference",
+)
+for _marker in ("layer.linear_attention", "quant_format.gguf_q4_k_m"):
+    G08A_COVERAGE_RULES[_marker] = copy.deepcopy(_qwen35_linear_attention_selector)
 
 for _decay, _mapping, _suffix in (
     ("log_rate", "grouped_by_key_head", "log_rate_grouped"),
