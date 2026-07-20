@@ -377,7 +377,15 @@ impl LoraModelRegistry {
         loaded_models: &[ModelId],
     ) -> std::result::Result<Option<LoraModelResolution>, ServerError> {
         if !self.is_enabled() {
-            return Ok(None);
+            if loaded_models.is_empty()
+                || loaded_models.iter().any(|model| model.0 == request_model)
+            {
+                return Ok(None);
+            }
+            return Err(ServerError::invalid_request(
+                format!("unknown model: {request_model}"),
+                Some("model"),
+            ));
         }
         let base = self
             .base_model_id
@@ -6430,6 +6438,31 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("unknown LoRA adapter model"),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_chat_unknown_loaded_model_returns_openai_model_error() {
+        let response = post_json(
+            router_with_stub("unused"),
+            "/v1/chat/completions",
+            json!({
+                "model": "not-a-loaded-model",
+                "messages": [{"role": "user", "content": "Say hi"}],
+                "max_tokens": 8
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "model");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown model"),
             "body: {body}"
         );
     }
