@@ -1208,6 +1208,11 @@ def assistant_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [event for event in events if event.get("event") == "assistant"]
 
 
+def exact_text_matches(actual: Any, expected: Any) -> bool:
+    expected_text = str(expected).strip()
+    return bool(expected_text) and str(actual).strip() == expected_text
+
+
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -2946,7 +2951,10 @@ class ScenarioRunner:
         expected = scenario.get("expected_recall") or scenario.get("secret")
         if expected:
             last = str(assistants[-1].get("content") or "")
-            require(str(expected) in last, f"run_multiturn did not recall {expected!r}: {last[:500]}")
+            require(
+                exact_text_matches(last, expected),
+                f"run_multiturn did not exactly recall {expected!r}: {last[:500]}",
+            )
         isolated = [event for event in assistants if str(event.get("content") or "").strip() == "</think>"]
         require(not isolated, "run_multiturn emitted isolated </think>")
         return {"status": "pass", "assistant_turns": len(assistants), "length_finishes": 0}
@@ -3524,6 +3532,13 @@ def run_selftest_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def self_test() -> int:
+    if not exact_text_matches("  ferrum-blue\n", "ferrum-blue"):
+        raise AssertionError("exact text matcher rejected surrounding whitespace")
+    if exact_text_matches(
+        'I cannot recall the code "ferrum-blue" from a prior turn.',
+        "ferrum-blue",
+    ):
+        raise AssertionError("exact text matcher accepted explanatory false positive")
     sampling = {
         "temperature": 0.7,
         "top_p": 0.8,
