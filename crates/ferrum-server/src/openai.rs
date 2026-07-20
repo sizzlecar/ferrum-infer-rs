@@ -508,6 +508,7 @@ pub struct ModelInfo {
     pub object: String,
     pub created: u64,
     pub owned_by: String,
+    pub modalities: Vec<String>,
     pub permission: Vec<ModelPermission>,
     pub root: Option<String>,
     pub parent: Option<String>,
