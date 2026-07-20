@@ -4,6 +4,7 @@ use std::ops::Range;
 use half::f16;
 use metal::{BufferRef, CommandQueueRef, MTLCommandBufferStatus, MTLResourceOptions};
 
+use super::super::numerical_tolerance;
 use super::*;
 
 const TOKENS: usize = 4;
@@ -16,6 +17,8 @@ const VALUE_FEATURES: usize = VALUE_HEADS * VALUE_DIM;
 const QKV_FEATURES: usize = 2 * QK_FEATURES + VALUE_FEATURES;
 const CONV_KERNEL: usize = 4;
 const CONV_STATE_WIDTH: usize = CONV_KERNEL - 1;
+// This stricter diagnostic never substitutes for a catalog-bound release comparison.
+const SPLIT_CONTINUITY_DIAGNOSTIC_MAX_ABS: f32 = 0.001;
 
 struct SegmentInputs<'a> {
     mixed_qkv: &'a [f16],
@@ -154,34 +157,122 @@ fn assert_recurrent_conformance(semantics: TestSemantics) {
         &mut cpu_delta_state,
         semantics,
     );
+    let output_tolerance = cpu_output_tolerance(semantics);
+    let conv_state_tolerance = cpu_conv_state_tolerance(semantics);
+    let delta_state_tolerance = cpu_delta_state_tolerance(semantics);
 
     assert!(full_output.iter().any(|value| value.abs() > 1.0e-4));
-    assert_close("full/cpu output", &full_output, &cpu_output, 0.012);
-    assert_close("full/split output", &full_output, &split_output, 0.001);
+    assert_close(
+        "full/cpu output",
+        &full_output,
+        &cpu_output,
+        output_tolerance.max_abs,
+    );
+    assert_close(
+        "full/split output",
+        &full_output,
+        &split_output,
+        SPLIT_CONTINUITY_DIAGNOSTIC_MAX_ABS,
+    );
     assert_close(
         "full/cpu conv state",
         &read_f16(&full_conv_state, initial_conv.len()),
         &as_f32(&cpu_conv_state),
-        0.001,
+        conv_state_tolerance.max_abs,
     );
     assert_close(
         "full/cpu delta state",
         &read_f32(&full_delta_state, initial_delta.len()),
         &cpu_delta_state,
-        0.001,
+        delta_state_tolerance.max_abs,
     );
     assert_close(
         "full/split conv state",
         &read_f16(&full_conv_state, initial_conv.len()),
         &read_f16(&split_conv_state, initial_conv.len()),
-        0.001,
+        SPLIT_CONTINUITY_DIAGNOSTIC_MAX_ABS,
     );
     assert_close(
         "full/split delta state",
         &read_f32(&full_delta_state, initial_delta.len()),
         &read_f32(&split_delta_state, initial_delta.len()),
-        0.001,
+        SPLIT_CONTINUITY_DIAGNOSTIC_MAX_ABS,
     );
+}
+
+fn cpu_output_tolerance(semantics: TestSemantics) -> numerical_tolerance::NumericalTolerance {
+    match (
+        semantics.decay_parameterization,
+        semantics.value_head_mapping,
+    ) {
+        (
+            GatedDeltaDecayParameterization::LogRate,
+            GatedDeltaValueHeadMapping::GroupedByKeyHead,
+        ) => numerical_tolerance::resolve(
+            "runtime-vnext.metal.gated-delta.v4.operation.fp16.none.log-rate-grouped",
+            "042cde4824acf50ff0c5fd4d77f0ae4c7e7424bca0ff4a09fcf176e3369c7935",
+        )
+        .expect("reviewed gated-delta log-rate output tolerance binding"),
+        (
+            GatedDeltaDecayParameterization::NegativeRate,
+            GatedDeltaValueHeadMapping::InterleavedByKeyHead,
+        ) => numerical_tolerance::resolve(
+            "runtime-vnext.metal.gated-delta.v4.operation.fp16.none.negative-rate-interleaved",
+            "2cc1888ca5453ff990ab09e788e49b3d90ffddea6e0c1e2669b81d62ee531f95",
+        )
+        .expect("reviewed gated-delta negative-rate output tolerance binding"),
+        _ => panic!("unreviewed gated-delta output tolerance selector"),
+    }
+}
+
+fn cpu_conv_state_tolerance(semantics: TestSemantics) -> numerical_tolerance::NumericalTolerance {
+    match (
+        semantics.decay_parameterization,
+        semantics.value_head_mapping,
+    ) {
+        (
+            GatedDeltaDecayParameterization::LogRate,
+            GatedDeltaValueHeadMapping::GroupedByKeyHead,
+        ) => numerical_tolerance::resolve(
+            "runtime-vnext.metal.gated-delta.v4.state.conv.fp16.none.log-rate-grouped",
+            "414482e48c100a1f7151bce38f2106432e2341ef8a501f86d7d0a91efc3b3e83",
+        )
+        .expect("reviewed gated-delta log-rate conv-state tolerance binding"),
+        (
+            GatedDeltaDecayParameterization::NegativeRate,
+            GatedDeltaValueHeadMapping::InterleavedByKeyHead,
+        ) => numerical_tolerance::resolve(
+            "runtime-vnext.metal.gated-delta.v4.state.conv.fp16.none.negative-rate-interleaved",
+            "8b50357bcb3da1cc4a2c0414744e0424f5aacfa2744e6ce120af148b3bad8342",
+        )
+        .expect("reviewed gated-delta negative-rate conv-state tolerance binding"),
+        _ => panic!("unreviewed gated-delta conv-state tolerance selector"),
+    }
+}
+
+fn cpu_delta_state_tolerance(semantics: TestSemantics) -> numerical_tolerance::NumericalTolerance {
+    match (
+        semantics.decay_parameterization,
+        semantics.value_head_mapping,
+    ) {
+        (
+            GatedDeltaDecayParameterization::LogRate,
+            GatedDeltaValueHeadMapping::GroupedByKeyHead,
+        ) => numerical_tolerance::resolve(
+            "runtime-vnext.metal.gated-delta.v4.state.delta.fp32.none.log-rate-grouped",
+            "829f052a366faa64b892c96cd00f0711660bbeb1a273cfc5b4851dd5c12d1e70",
+        )
+        .expect("reviewed gated-delta log-rate delta-state tolerance binding"),
+        (
+            GatedDeltaDecayParameterization::NegativeRate,
+            GatedDeltaValueHeadMapping::InterleavedByKeyHead,
+        ) => numerical_tolerance::resolve(
+            "runtime-vnext.metal.gated-delta.v4.state.delta.fp32.none.negative-rate-interleaved",
+            "eabe2655cb3936838465a9a74a74704b328cf818575af868624968328768e9c6",
+        )
+        .expect("reviewed gated-delta negative-rate delta-state tolerance binding"),
+        _ => panic!("unreviewed gated-delta delta-state tolerance selector"),
+    }
 }
 
 #[test]

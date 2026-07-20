@@ -29,6 +29,8 @@ use super::vnext_runtime::{
 mod causal_attention;
 mod gated_delta_attention;
 mod linear;
+#[cfg(test)]
+mod numerical_tolerance;
 mod primitives;
 mod weights;
 

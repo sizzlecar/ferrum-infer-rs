@@ -12,9 +12,7 @@
       "operation.rms_norm@1.0",
       "operation.token_embedding@1.0",
       "quant_format.gguf_q4_k_m",
-      "state.causal_attention.kv_state",
-      "state.gated_delta.conv_state",
-      "state.gated_delta.delta_state"
+      "state.causal_attention.kv_state"
     ],
     "profile": "g08a_m1_metal.v1",
     "scope": "Exact Qwen3.5-4B Metal operation/state/layer/model/logit fixtures; token sequence equality remains a separate exact gate",
@@ -186,6 +184,232 @@
       },
       "source_commit": "ecaeb5087ad45a5148d917fdab63d83cb046d678",
       "tolerance_id": "runtime-vnext.metal.gated-delta.v4.operation.fp16.none.negative-rate-interleaved"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Metal log-rate/grouped-head FP16 convolution state is checked against the CPU FP32 oracle with max_abs <= 0.001.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/gated_delta_attention_tests.rs",
+        "test_name": "recurrent_core_matches_cpu_and_preserves_split_decode_state_on_real_metal"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "state",
+      "checkpoint_name": "conv_state",
+      "coverage_markers": [
+        "state.gated_delta.conv_state"
+      ],
+      "dtype": "fp16",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "qwen3.5-4b",
+      "operation_id": "operation.gated_delta_recurrent_attention",
+      "operation_schema_version": "4.0",
+      "oracle_identity": "cpu.fp32.rust.gated_delta_conv_state_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "none",
+      "review_commit": "fe444b2bfad52f799b656a436507f1e3f4cd1ed2",
+      "row_fingerprint": "414482e48c100a1f7151bce38f2106432e2341ef8a501f86d7d0a91efc3b3e83",
+      "shape_domain": {
+        "dimensions": {
+          "conv_kernel": 4,
+          "conv_state_width": 3,
+          "key_dim": 128,
+          "key_heads": 16,
+          "qkv_features": 8192,
+          "tokens": 4,
+          "value_dim": 128,
+          "value_heads": 32
+        },
+        "fixture_id": "gated_delta.conv_state.log_rate.grouped.split_decode",
+        "semantics": {
+          "decay_parameterization": "log_rate",
+          "split_segments": [
+            3,
+            1
+          ],
+          "value_head_mapping": "grouped_by_key_head"
+        }
+      },
+      "source_commit": "ecaeb5087ad45a5148d917fdab63d83cb046d678",
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v4.state.conv.fp16.none.log-rate-grouped"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Metal negative-rate/interleaved-head FP16 convolution state is checked against the CPU FP32 oracle with max_abs <= 0.001.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/gated_delta_attention_tests.rs",
+        "test_name": "recurrent_core_matches_cpu_and_preserves_split_decode_state_on_real_metal"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "state",
+      "checkpoint_name": "conv_state",
+      "coverage_markers": [
+        "state.gated_delta.conv_state"
+      ],
+      "dtype": "fp16",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "qwen3.5-4b",
+      "operation_id": "operation.gated_delta_recurrent_attention",
+      "operation_schema_version": "4.0",
+      "oracle_identity": "cpu.fp32.rust.gated_delta_conv_state_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "none",
+      "review_commit": "fe444b2bfad52f799b656a436507f1e3f4cd1ed2",
+      "row_fingerprint": "8b50357bcb3da1cc4a2c0414744e0424f5aacfa2744e6ce120af148b3bad8342",
+      "shape_domain": {
+        "dimensions": {
+          "conv_kernel": 4,
+          "conv_state_width": 3,
+          "key_dim": 128,
+          "key_heads": 16,
+          "qkv_features": 8192,
+          "tokens": 4,
+          "value_dim": 128,
+          "value_heads": 32
+        },
+        "fixture_id": "gated_delta.conv_state.negative_rate.interleaved.split_decode",
+        "semantics": {
+          "decay_parameterization": "negative_rate",
+          "split_segments": [
+            3,
+            1
+          ],
+          "value_head_mapping": "interleaved_by_key_head"
+        }
+      },
+      "source_commit": "ecaeb5087ad45a5148d917fdab63d83cb046d678",
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v4.state.conv.fp16.none.negative-rate-interleaved"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Metal log-rate/grouped-head FP32 delta state is checked against the CPU FP32 oracle with max_abs <= 0.001.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/gated_delta_attention_tests.rs",
+        "test_name": "recurrent_core_matches_cpu_and_preserves_split_decode_state_on_real_metal"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "state",
+      "checkpoint_name": "delta_state",
+      "coverage_markers": [
+        "state.gated_delta.delta_state"
+      ],
+      "dtype": "fp32",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "qwen3.5-4b",
+      "operation_id": "operation.gated_delta_recurrent_attention",
+      "operation_schema_version": "4.0",
+      "oracle_identity": "cpu.fp32.rust.gated_delta_delta_state_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "none",
+      "review_commit": "fe444b2bfad52f799b656a436507f1e3f4cd1ed2",
+      "row_fingerprint": "829f052a366faa64b892c96cd00f0711660bbeb1a273cfc5b4851dd5c12d1e70",
+      "shape_domain": {
+        "dimensions": {
+          "key_dim": 128,
+          "key_heads": 16,
+          "tokens": 4,
+          "value_dim": 128,
+          "value_heads": 32
+        },
+        "fixture_id": "gated_delta.delta_state.log_rate.grouped.split_decode",
+        "semantics": {
+          "decay_parameterization": "log_rate",
+          "split_segments": [
+            3,
+            1
+          ],
+          "value_head_mapping": "grouped_by_key_head"
+        }
+      },
+      "source_commit": "ecaeb5087ad45a5148d917fdab63d83cb046d678",
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v4.state.delta.fp32.none.log-rate-grouped"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Metal negative-rate/interleaved-head FP32 delta state is checked against the CPU FP32 oracle with max_abs <= 0.001.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/gated_delta_attention_tests.rs",
+        "test_name": "recurrent_core_matches_cpu_and_preserves_split_decode_state_on_real_metal"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "state",
+      "checkpoint_name": "delta_state",
+      "coverage_markers": [
+        "state.gated_delta.delta_state"
+      ],
+      "dtype": "fp32",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "qwen3.5-4b",
+      "operation_id": "operation.gated_delta_recurrent_attention",
+      "operation_schema_version": "4.0",
+      "oracle_identity": "cpu.fp32.rust.gated_delta_delta_state_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "none",
+      "review_commit": "fe444b2bfad52f799b656a436507f1e3f4cd1ed2",
+      "row_fingerprint": "eabe2655cb3936838465a9a74a74704b328cf818575af868624968328768e9c6",
+      "shape_domain": {
+        "dimensions": {
+          "key_dim": 128,
+          "key_heads": 16,
+          "tokens": 4,
+          "value_dim": 128,
+          "value_heads": 32
+        },
+        "fixture_id": "gated_delta.delta_state.negative_rate.interleaved.split_decode",
+        "semantics": {
+          "decay_parameterization": "negative_rate",
+          "split_segments": [
+            3,
+            1
+          ],
+          "value_head_mapping": "interleaved_by_key_head"
+        }
+      },
+      "source_commit": "ecaeb5087ad45a5148d917fdab63d83cb046d678",
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v4.state.delta.fp32.none.negative-rate-interleaved"
     }
   ],
   "schema_version": 1
