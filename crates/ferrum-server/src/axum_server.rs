@@ -34,6 +34,7 @@ use ferrum_types::{
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
+    error::Error as StdError,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -1018,8 +1019,14 @@ async fn chat_completions_handler(
     headers: HeaderMap,
     request: std::result::Result<Json<ChatCompletionsRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ServerError> {
-    let Json(mut request) = request.map_err(|e| {
-        ServerError::invalid_request(format!("invalid chat completions request: {e}"), None)
+    let Json(mut request) = request.map_err(|error| {
+        ServerError::invalid_request(
+            format!(
+                "invalid chat completions request: {}",
+                json_rejection_detail(&error)
+            ),
+            None,
+        )
     })?;
     let cache_policy = CachePolicy::current();
     let session_context =
@@ -1068,6 +1075,22 @@ async fn chat_completions_handler(
     } else {
         handle_chat_completions_sync(state, request, inference_request, session_context).await
     }
+}
+
+fn json_rejection_detail(rejection: &JsonRejection) -> String {
+    const MAX_DETAIL_CHARS: usize = 512;
+
+    let mut details = Vec::new();
+    let mut current: Option<&(dyn StdError + 'static)> = Some(rejection);
+    while let Some(error) = current {
+        let detail = error.to_string();
+        if !detail.is_empty() && details.last() != Some(&detail) {
+            details.push(detail);
+        }
+        current = error.source();
+    }
+
+    details.join(": ").chars().take(MAX_DETAIL_CHARS).collect()
 }
 
 fn write_chat_request_replay_bundle(
@@ -7667,10 +7690,39 @@ mod tests {
             assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
             let body = response_json(response).await;
             assert_eq!(body["error"]["type"], "invalid_request_error");
-            assert!(body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("invalid chat completions request"));
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(message.contains("invalid chat completions request"));
+            assert!(
+                message.contains("unsupported message content part type"),
+                "body: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn route_rejects_non_object_stream_options() {
+        for stream_options in [json!([]), json!("yes"), json!(42), json!(true)] {
+            let response = post_json(
+                router_with_stub("unused"),
+                "/v1/chat/completions",
+                json!({
+                    "model": "stub-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": true,
+                    "stream_options": stream_options
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+            let body = response_json(response).await;
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("stream_options must be a JSON object"),
+                "body: {body}"
+            );
         }
     }
 
