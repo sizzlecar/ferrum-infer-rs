@@ -4823,6 +4823,7 @@ async fn models_handler(
             object: "model".to_string(),
             created: now,
             owned_by: "ferrum".to_string(),
+            modalities: vec!["text".to_string()],
             permission: vec![],
             root: None,
             parent: None,
@@ -4834,6 +4835,7 @@ async fn models_handler(
             object: "model".to_string(),
             created: now,
             owned_by: "ferrum".to_string(),
+            modalities: vec!["text".to_string()],
             permission: vec![],
             root: state.lora_registry.base_model_id.as_ref().cloned(),
             parent: state.lora_registry.base_model_id.as_ref().cloned(),
@@ -6338,6 +6340,7 @@ mod tests {
         assert_eq!(data[0]["object"], "model");
         assert_eq!(data[0]["owned_by"], "ferrum");
         assert!(data[0]["created"].as_u64().unwrap_or_default() > 0);
+        assert_eq!(data[0]["modalities"], json!(["text"]));
         assert!(data[0]["permission"].as_array().unwrap().is_empty());
         assert!(data[0]["root"].is_null());
         assert!(data[0]["parent"].is_null());
@@ -6371,6 +6374,7 @@ mod tests {
             .expect("adapter model");
         assert_eq!(adapter["root"], "stub-model");
         assert_eq!(adapter["parent"], "stub-model");
+        assert_eq!(adapter["modalities"], json!(["text"]));
     }
 
     #[tokio::test]
@@ -7572,28 +7576,54 @@ mod tests {
 
     #[tokio::test]
     async fn route_rejects_multimodal_content_with_400() {
+        for content in [
+            json!([{"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}]),
+            json!([{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]),
+            json!([{"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}]),
+            json!([
+                {"type": "text", "text": "describe this"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+            ]),
+        ] {
+            let response = post_json(
+                router_with_stub("unused"),
+                "/v1/chat/completions",
+                json!({
+                    "model": "stub-model",
+                    "messages": [{"role": "user", "content": content}]
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+            let body = response_json(response).await;
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert!(body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("invalid chat completions request"));
+        }
+    }
+
+    #[tokio::test]
+    async fn route_accepts_text_only_content_array() {
         let response = post_json(
-            router_with_stub("unused"),
+            router_with_stub("ok"),
             "/v1/chat/completions",
             json!({
                 "model": "stub-model",
                 "messages": [{
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "describe this"},
-                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
+                        {"type": "text", "text": "say"},
+                        {"type": "text", "text": "ok"}
                     ]
                 }]
             }),
         )
         .await;
-        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), AxumStatusCode::OK);
         let body = response_json(response).await;
-        assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("invalid chat completions request"));
+        assert_eq!(body["choices"][0]["message"]["content"], "ok");
     }
 
     #[tokio::test]
