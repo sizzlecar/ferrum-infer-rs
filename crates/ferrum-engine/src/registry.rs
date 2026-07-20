@@ -15,7 +15,9 @@ use ferrum_interfaces::{
     KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
 };
 use ferrum_models::vnext::ProductionModelSourceBundle;
-use ferrum_types::{DataType, Device, EngineConfig, FerrumError, Result, RuntimeKnobs};
+#[cfg(any(test, feature = "legacy-qwen35-reference-test"))]
+use ferrum_types::DataType;
+use ferrum_types::{Device, EngineConfig, FerrumError, Result, RuntimeKnobs};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -1303,9 +1305,19 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
         // GGUF loader first would silently bypass the registered vNext package.
         // Direct GGUF paths have no semantic sidecar and retain the legacy path
         // until their family receives an explicit product source bundle.
-        let legacy_reference_enabled = config
+        let legacy_reference_requested = config
             .get_option::<bool>("qwen35_reference")
             .unwrap_or(false);
+        #[cfg(not(any(test, feature = "legacy-qwen35-reference-test")))]
+        if legacy_reference_requested {
+            return Err(FerrumError::unsupported(
+                "the legacy Qwen3.5 reference adapter is available only in explicit test builds",
+            ));
+        }
+        #[cfg(any(test, feature = "legacy-qwen35-reference-test"))]
+        let legacy_reference_enabled = legacy_reference_requested;
+        #[cfg(not(any(test, feature = "legacy-qwen35-reference-test")))]
+        let legacy_reference_enabled = false;
         let production_registration = match model_sources.as_ref() {
             Some(sources) => Some(ferrum_models::vnext::resolve_registered_model_from_sources(
                 sources,
@@ -1656,6 +1668,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 )?;
                 Ok(Arc::new(executor))
             }
+            #[cfg(any(test, feature = "legacy-qwen35-reference-test"))]
             ferrum_models::Architecture::Qwen35 | ferrum_models::Architecture::Qwen35Moe => {
                 if !legacy_reference_enabled {
                     return Err(FerrumError::unsupported(format!(
@@ -1694,6 +1707,12 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                     _ => unreachable!("matched Qwen35 architectures above"),
                 };
                 Ok(Arc::new(executor))
+            }
+            #[cfg(not(any(test, feature = "legacy-qwen35-reference-test")))]
+            ferrum_models::Architecture::Qwen35 | ferrum_models::Architecture::Qwen35Moe => {
+                Err(FerrumError::unsupported(
+                    "Qwen3.5 legacy execution is absent from production builds; use a registered vNext model package",
+                ))
             }
             _ => Err(FerrumError::model(format!(
                 "Architecture {:?} not supported",
