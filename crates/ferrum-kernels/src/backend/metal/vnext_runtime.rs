@@ -256,6 +256,13 @@ impl MetalBufferRegion {
     pub(crate) const fn element_type(&self) -> ElementType {
         self.element_type
     }
+
+    pub(crate) fn same_physical_region(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.allocation, &other.allocation)
+            && self.offset_bytes == other.offset_bytes
+            && self.length_bytes == other.length_bytes
+            && self.element_type == other.element_type
+    }
 }
 
 /// Safe, submission-local encoder. It owns the encoder references retained
