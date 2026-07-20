@@ -6,13 +6,14 @@ use clap::Args;
 use colored::*;
 use ferrum_bench_core::{ProfileMetadata, ProfileSinkConfig};
 use ferrum_models::source::ModelFormat;
-use ferrum_server::{AxumServer, HttpServer, ServerConfig};
+use ferrum_server::{AxumServer, HttpServer, ServedModelKind, ServedModelRegistry, ServerConfig};
 use ferrum_types::{
     CompiledKernelFeatures, CompiledNativeOperatorArtifact, FerrumConfigBuilder, FerrumError,
     HardwareCapabilities, ModelCapabilities, MoeCapabilities, ResolvedFerrumConfig, Result,
     RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource, WorkloadProfile,
     M3_QWEN3_30B_A3B_INT4_PRESET, QWEN25_72B_GPTQ_INT4_2X4090_LAYER_SPLIT_PRESET,
 };
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -34,6 +35,16 @@ pub struct ServeCommand {
         conflicts_with = "model"
     )]
     pub model_option: Option<String>,
+
+    /// Public OpenAI-compatible model names. The first name is primary and
+    /// additional names are aliases for the same loaded model.
+    #[arg(
+        long = "served-model-name",
+        value_name = "NAME",
+        value_delimiter = ',',
+        action = clap::ArgAction::Append
+    )]
+    pub served_model_name: Vec<String>,
 
     /// Host to bind to
     #[arg(long)]
@@ -279,6 +290,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let ServeCommand {
         model,
         model_option,
+        served_model_name,
         host,
         port,
         tts_slots,
@@ -428,6 +440,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     let source = product_input.source;
     let product_engine_config = product_input.engine_config;
     let model_id = crate::source_resolver::public_model_id(&source);
+    let served_model_names = effective_served_model_names(&model_id, served_model_name)?;
+    let primary_served_model_name = served_model_names
+        .first()
+        .expect("effective served model names are non-empty")
+        .clone();
     let gguf_path = (source.format == ModelFormat::GGUF).then(|| source.local_path.clone());
     println!("{} {}", "Model:".dimmed(), model_id.cyan());
     println!("{} {}", "Path:".dimmed(), source.local_path.display());
@@ -461,7 +478,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         Vec::new()
     } else {
         ferrum_models::load_startup_lora_adapters(
-            &model_id,
+            &primary_served_model_name,
             Some(&lora_model_id_template),
             &lora_specs,
         )?
@@ -776,6 +793,19 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             )
         })
         .collect();
+    let served_model_kind = match arch_for_dispatch {
+        Some(ferrum_models::Architecture::Clip) => ServedModelKind::Embedding,
+        Some(ferrum_models::Architecture::Whisper) => ServedModelKind::Transcription,
+        Some(ferrum_models::Architecture::Qwen3TTS) => ServedModelKind::Speech,
+        _ => ServedModelKind::Llm,
+    };
+    let served_model_registry = ServedModelRegistry::try_new(
+        model_id.clone(),
+        served_model_kind,
+        served_model_names,
+        lora_server_models,
+    )
+    .map_err(|error| FerrumError::config(error.to_string()))?;
 
     let mut cache_allocated_status = None;
     let server = match arch_for_dispatch {
@@ -933,11 +963,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             .or_else(|| model_loaded_sample.clone()),
         cache_allocated_sample.clone(),
     );
-    let server = if lora_server_models.is_empty() {
-        server
-    } else {
-        server.with_lora_adapters(model_id.clone(), lora_server_models)
-    };
+    let server = server.with_served_model_registry(served_model_registry);
     crate::observability_product::write_actual_serve_startup_observability(
         &product_observability,
         model_loaded_duration_us,
@@ -1535,6 +1561,31 @@ fn serve_kv_cache_type_for_device(device: &ferrum_types::Device) -> ferrum_types
         ferrum_types::Device::CPU => ferrum_types::KvCacheType::Contiguous,
         _ => ferrum_types::KvCacheType::Paged,
     }
+}
+
+fn effective_served_model_names(
+    default_model_id: &str,
+    requested_names: Vec<String>,
+) -> Result<Vec<String>> {
+    let names = if requested_names.is_empty() {
+        vec![default_model_id.to_string()]
+    } else {
+        requested_names
+    };
+    let mut seen = HashSet::with_capacity(names.len());
+    for name in &names {
+        if name.is_empty() || name.trim() != name {
+            return Err(FerrumError::config(
+                "--served-model-name values must be non-empty and have no surrounding whitespace",
+            ));
+        }
+        if !seen.insert(name.clone()) {
+            return Err(FerrumError::config(format!(
+                "duplicate --served-model-name value: {name}"
+            )));
+        }
+    }
+    Ok(names)
 }
 
 pub(crate) fn write_startup_config_artifacts(
@@ -2273,6 +2324,45 @@ mod tests {
         let parsed = TestCli::parse_from(["ferrum", "--model", "qwen3.5", "--qwen35-reference"]);
 
         assert!(parsed.serve.qwen35_reference);
+    }
+
+    #[test]
+    fn serve_parses_public_model_aliases() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            serve: ServeCommand,
+        }
+
+        let parsed = TestCli::parse_from([
+            "ferrum",
+            "--model",
+            "Qwen/Qwen3.5-4B",
+            "--served-model-name",
+            "ferrum,qwen35",
+            "--port",
+            "8001",
+        ]);
+
+        assert_eq!(parsed.serve.served_model_name, ["ferrum", "qwen35"]);
+    }
+
+    #[test]
+    fn served_model_names_default_and_reject_ambiguity() {
+        assert_eq!(
+            effective_served_model_names("Qwen/Qwen3.5-4B", vec![]).unwrap(),
+            ["Qwen/Qwen3.5-4B"]
+        );
+        assert!(effective_served_model_names(
+            "Qwen/Qwen3.5-4B",
+            vec!["same".to_string(), "same".to_string()]
+        )
+        .is_err());
+        assert!(
+            effective_served_model_names("Qwen/Qwen3.5-4B", vec![" ferrum".to_string()]).is_err()
+        );
     }
 
     #[test]
