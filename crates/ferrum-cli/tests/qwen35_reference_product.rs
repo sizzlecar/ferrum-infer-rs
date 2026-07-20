@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-qwen35-reference-test")]
+
 use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
 use std::collections::HashMap;
 use std::fs;

@@ -88,6 +88,11 @@ safetensors = { workspace = true }
 
 [features]
 default = []
+# Never enable in product/release builds; retained only for reference fixtures, sunset=G08B.
+legacy-qwen35-reference-test = [
+    "ferrum-engine/legacy-qwen35-reference-test",
+    "ferrum-models/test-support",
+]
 benchmark = []  # Enable benchmarking utilities
 dev-tools = []  # Enable development tools
 interactive = [] # Enable interactive mode

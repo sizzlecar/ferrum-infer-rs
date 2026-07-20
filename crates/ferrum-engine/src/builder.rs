@@ -479,14 +479,15 @@ impl EngineBuilder {
 
 fn default_recurrent_state_manager(
     config: &EngineConfig,
-    component_config: &ComponentConfig,
+    _component_config: &ComponentConfig,
 ) -> Option<Arc<dyn RecurrentStateManager + Send + Sync>> {
     let total_batch_slots = config
         .runtime
         .recurrent_state_max_slots
         .or(config.runtime.qwen35_linear_state_max_slots)
         .unwrap_or(usize::MAX);
-    if component_config
+    #[cfg(any(test, feature = "legacy-qwen35-reference-test"))]
+    if _component_config
         .get_option::<bool>("qwen35_reference")
         .unwrap_or(false)
     {

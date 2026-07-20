@@ -32,7 +32,7 @@ struct ModelLoaderRegistration {
 const MODEL_LOADERS: &[ModelLoaderRegistration] = &[ModelLoaderRegistration {
     external_metadata_id: qwen35::EXTERNAL_METADATA_ID,
     execution_kind: ProductionExecutionKind::CausalLanguage,
-    allows_legacy_reference: true,
+    allows_legacy_reference: cfg!(any(test, feature = "test-support")),
     prepare: qwen35::prepare_from_sources,
     create_family_registration: qwen35_family_registration,
 }];
@@ -97,7 +97,7 @@ const LEGACY_MODELS: &[LegacyModelRegistration] = &[
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.Qwen3_5MoeForConditionalGeneration",
-        allows_legacy_reference: true,
+        allows_legacy_reference: cfg!(any(test, feature = "test-support")),
     },
     LegacyModelRegistration {
         external_metadata_id: "hf.architecture.Gemma3ForCausalLM",
