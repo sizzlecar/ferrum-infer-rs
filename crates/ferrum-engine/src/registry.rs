@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, info};
 
+pub use ferrum_interfaces::sampler::GreedySampler;
+
 // ============================================================================
 // Core Types
 // ============================================================================
@@ -701,33 +703,6 @@ impl ComponentFactory<Arc<dyn Sampler + Send + Sync>> for GreedySamplerFactory {
             supported_devices: vec![Device::CPU],
             capabilities: vec!["deterministic".to_string()],
         }
-    }
-}
-
-/// Greedy sampler implementation
-pub struct GreedySampler;
-
-impl Sampler for GreedySampler {
-    fn sample(
-        &self,
-        logits: &[f32],
-        _rng: &mut dyn rand::RngCore,
-    ) -> Result<ferrum_types::TokenId> {
-        let (max_idx, _) = logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .ok_or_else(|| FerrumError::internal("Empty logits"))?;
-
-        Ok(ferrum_types::TokenId::new(max_idx as u32))
-    }
-
-    fn name(&self) -> &str {
-        "greedy"
-    }
-
-    fn is_deterministic(&self) -> bool {
-        true
     }
 }
 

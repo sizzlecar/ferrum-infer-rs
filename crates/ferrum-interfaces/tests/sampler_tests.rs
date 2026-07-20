@@ -226,3 +226,38 @@ fn greedy_sampler_picks_max() {
         .unwrap();
     assert_eq!(tok, TokenId::new(1));
 }
+
+#[test]
+fn greedy_sampler_rejects_logits_without_a_finite_candidate() {
+    let sampler = GreedySampler;
+    let mut rng = StdRng::seed_from_u64(1);
+
+    for logits in [
+        vec![f32::NEG_INFINITY; 4],
+        vec![f32::NAN; 4],
+        vec![f32::NEG_INFINITY, f32::NAN, f32::INFINITY],
+    ] {
+        let error = sampler
+            .sample(&logits, &mut rng)
+            .expect_err("non-finite logits must not select an arbitrary token");
+        assert!(
+            error
+                .to_string()
+                .contains("No finite logits available for sampling"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn greedy_sampler_ignores_non_finite_logits_around_a_valid_candidate() {
+    let sampler = GreedySampler;
+    let token = sampler
+        .sample(
+            &[f32::NAN, f32::NEG_INFINITY, 3.0, f32::INFINITY],
+            &mut StdRng::seed_from_u64(1),
+        )
+        .unwrap();
+
+    assert_eq!(token, TokenId::new(2));
+}
