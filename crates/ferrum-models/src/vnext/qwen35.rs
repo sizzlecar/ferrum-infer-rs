@@ -135,6 +135,12 @@ impl Qwen35FamilyProvider {
                 "the dense Qwen3.5 family package does not accept quantized weights",
             ));
         }
+        if text.mamba_ssm_dtype != DataType::FP32 {
+            return Err(invalid_config(
+                "hf_config.text_config.mamba_ssm_dtype",
+                "the current Qwen3.5 vNext providers require float32 temporal state",
+            ));
+        }
         if config.vocab_size == 0 || config.max_position_embeddings == 0 {
             return Err(invalid_config(
                 "hf_config.text_config",
@@ -415,7 +421,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                                 .into_iter()
                                 .map(|extent| extent as u64)
                                 .collect(),
-                            ElementType::F16,
+                            data_type_to_element_type(text.mamba_ssm_dtype)
+                                .map_err(|reason| invalid_config("states.delta.dtype", reason))?,
                         ),
                         lifetime: StateLifetime::Sequence,
                         capacity_demand: StateCapacityDemand::FixedPerScope,
@@ -423,7 +430,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                     });
                     (
                         GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
-                        ContractVersion::new(2, 0),
+                        ContractVersion::new(3, 0),
                         BTreeMap::from([
                             attribute("key_heads", text.linear_attention.num_key_heads as u64)?,
                             attribute("value_heads", text.linear_attention.num_value_heads as u64)?,
@@ -1221,6 +1228,15 @@ fn gguf_source_encoding(dtype: GgmlDType) -> Result<FamilyWeightSourceEncoding, 
     Ok(FamilyWeightSourceEncoding::Dense { element_type })
 }
 
+fn data_type_to_element_type(dtype: DataType) -> Result<ElementType, String> {
+    match dtype {
+        DataType::FP16 => Ok(ElementType::F16),
+        DataType::BF16 => Ok(ElementType::Bf16),
+        DataType::FP32 => Ok(ElementType::F32),
+        _ => Err(format!("unsupported vNext state dtype {dtype}")),
+    }
+}
+
 fn append_resolved_weights(
     output: &mut Vec<FamilyWeight>,
     resolved: &[Qwen35ResolvedWeightSpec],
@@ -1870,6 +1886,7 @@ mod tests {
                 "linear_key_head_dim": 4,
                 "linear_value_head_dim": 4,
                 "linear_conv_kernel_dim": 4,
+                "mamba_ssm_dtype": "float32",
                 "head_dim": 4,
                 "num_attention_heads": 2,
                 "num_key_value_heads": 1,
@@ -2011,7 +2028,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             linear_attention.required_version,
-            ContractVersion::new(2, 0)
+            ContractVersion::new(3, 0)
         );
         for (ordinal, role) in [
             "input_layernorm",
@@ -2073,6 +2090,20 @@ mod tests {
         );
         assert!(!operation_ids.contains(&"operation.logits_projection"));
         assert_eq!(prepared.program().states().len(), 7);
+        let first_conv_state = prepared
+            .program()
+            .states()
+            .iter()
+            .find(|state| state.id.as_str() == "state.layer.0.conv")
+            .unwrap();
+        let first_delta_state = prepared
+            .program()
+            .states()
+            .iter()
+            .find(|state| state.id.as_str() == "state.layer.0.delta")
+            .unwrap();
+        assert_eq!(first_conv_state.tensor.element_type, ElementType::F16);
+        assert_eq!(first_delta_state.tensor.element_type, ElementType::F32);
         assert_eq!(
             prepared
                 .program()
@@ -2187,6 +2218,20 @@ mod tests {
             .prepare(&serde_json::to_value(malformed).unwrap())
             .expect_err("same-element axis drift must fail before backend allocation");
         assert!(error.to_string().contains("dimensions"), "{error}");
+    }
+
+    #[test]
+    fn rejects_temporal_state_dtype_not_implemented_by_vnext_providers() {
+        let mut config = test_config();
+        config.hf_config["text_config"]["mamba_ssm_dtype"] = serde_json::json!("float16");
+        let raw = serde_json::to_value(config).unwrap();
+
+        let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&raw)
+            .expect_err("F16 temporal state must fail before provider selection");
+
+        assert!(error.to_string().contains("mamba_ssm_dtype"), "{error}");
+        assert!(error.to_string().contains("float32"), "{error}");
     }
 
     #[test]

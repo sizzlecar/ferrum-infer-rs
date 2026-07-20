@@ -320,7 +320,7 @@ enum LinearPhysicalFormat {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PreparedLinearPart {
+pub(super) struct PreparedLinearPart {
     region: usize,
     format: LinearPhysicalFormat,
     output_offset: u32,
@@ -351,7 +351,7 @@ struct SwiGluParams {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct LinearLaunch {
+pub(super) struct LinearLaunch {
     input_region: usize,
     weight_region: usize,
     output_region: usize,
@@ -721,7 +721,7 @@ fn encode_dense_swiglu(
     .map_err(|error| error.to_string())
 }
 
-fn linear_launch(
+pub(super) fn linear_launch(
     part: PreparedLinearPart,
     input_region: usize,
     output_region: usize,
@@ -748,7 +748,7 @@ fn linear_launch(
     })
 }
 
-fn validate_launch_regions(
+pub(super) fn validate_launch_regions(
     regions: &[MetalBufferRegion],
     launches: &[LinearLaunch],
 ) -> Result<(), String> {
@@ -813,7 +813,7 @@ fn validate_region_span(
     Ok(())
 }
 
-fn dispatch_linear(
+pub(super) fn dispatch_linear(
     pipelines: &MetalLinearPipelines,
     encoder: &ComputeCommandEncoderRef,
     regions: &[MetalBufferRegion],
@@ -915,6 +915,41 @@ fn prepare_matrix_weight(
         regions,
         parts: vec![part],
     })
+}
+
+pub(super) fn append_shared_matrix_weight(
+    regions: &mut Vec<MetalBufferRegion>,
+    invocation: &BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+    ordinal: u32,
+    out_features: u64,
+    in_features: u64,
+    context: &str,
+) -> Result<PreparedLinearPart, String> {
+    let first = &invocation.participants()[0];
+    let resolved = resolve_weight(
+        first,
+        binding(first.bindings(), ResolvedValueRole::Input, ordinal)?,
+    )?;
+    for participant in &invocation.participants()[1..] {
+        let candidate = resolve_weight(
+            participant,
+            binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?,
+        )?;
+        if !same_resolved_weight(&resolved, &candidate) {
+            return Err(format!("{context} participants do not share one weight"));
+        }
+    }
+    let prepared = prepare_matrix_weight(resolved, out_features, in_features)?;
+    let [part] = prepared.parts.as_slice() else {
+        return Err(format!("{context} requires one physical matrix"));
+    };
+    let mut part = *part;
+    part.region = part
+        .region
+        .checked_add(regions.len())
+        .ok_or_else(|| format!("{context} region index overflows"))?;
+    regions.extend(prepared.regions);
+    Ok(part)
 }
 
 fn prepare_gate_up_weight(

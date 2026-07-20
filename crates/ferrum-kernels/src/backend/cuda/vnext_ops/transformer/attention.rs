@@ -36,8 +36,8 @@ const ESTIMATOR_ID: &str = "resource-estimator.cuda.gated_delta_recurrent_attent
 const RMS_NORM_FUNCTION: &str = "rms_norm_f16";
 const PREPARE_FUNCTION: &str = "linear_attention_prepare_varlen_f16_params_f32_state_f16";
 const QK_NORM_FUNCTION: &str = "linear_attention_qk_l2norm_f32";
-const DELTA_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_f32_state_f16";
-const DELTA_TILED_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_tiled16_f32_state_f16";
+const DELTA_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_f32";
+const DELTA_TILED_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_tiled16_f32";
 const GATED_NORM_FUNCTION: &str = "gated_rms_norm_f16_z_f32_weight";
 const F32_TO_F16_FUNCTION: &str = "f32_to_activation_f16";
 const RESIDUAL_ADD_FUNCTION: &str = "residual_add_f16";
@@ -94,7 +94,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 .fingerprint()
                 .map_err(contract_error)?,
             provider_fingerprint,
-            ContractVersion::new(2, 0),
+            contract.descriptor().version,
             runtime.descriptor().id.clone(),
             BTreeSet::from([capability]),
             BTreeSet::from([
@@ -646,7 +646,7 @@ fn encode_attention(
         regions.push(contiguous_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Input, 12)?,
-            ElementType::F16,
+            ElementType::F32,
         )?);
         let tokens_i32 = checked_i32(tokens, "attention participant token count")?;
         let host_control = host_storage.len();
@@ -1285,7 +1285,7 @@ fn validate_signature(
         (
             value(12)?,
             vec![shape.value_heads, shape.value_head_dim, shape.key_head_dim],
-            ElementType::F16,
+            ElementType::F32,
         ),
     ];
     if *tokens == 0

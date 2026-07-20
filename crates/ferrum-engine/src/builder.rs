@@ -877,8 +877,8 @@ mod tests {
                 0,
                 "delta_state",
                 vec![1, 1, 1],
+                DataType::FP32,
             )],
-            dtype: DataType::FP32,
             device: Device::CPU,
             max_batch_slots: 1,
         };
@@ -910,8 +910,8 @@ mod tests {
                 0,
                 "delta_state",
                 vec![1, 1, 1],
+                DataType::FP32,
             )],
-            dtype: DataType::FP32,
             device: Device::CUDA(0),
             max_batch_slots: 1,
         };
@@ -943,8 +943,8 @@ mod tests {
                 0,
                 "delta_state",
                 vec![1, 1, 1],
+                DataType::FP32,
             )],
-            dtype: DataType::FP32,
             device: Device::CUDA(0),
             max_batch_slots: 1,
         };

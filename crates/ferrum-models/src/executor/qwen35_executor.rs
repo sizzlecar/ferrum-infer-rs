@@ -940,6 +940,7 @@ impl Qwen35W3Executor {
             ));
         }
         let mut executor = Self::from_definition(model_id, def, dtype, device)?;
+        executor.validate_reference_execution_contract()?;
         let inventory = Qwen35WeightInventory::from_safetensors_dir(model_dir)
             .map_err(|err| FerrumError::model(format!("Qwen3.5 weight inventory failed: {err}")))?;
         let weight_plan = inventory
@@ -973,6 +974,7 @@ impl Qwen35W3Executor {
             ));
         }
         let mut executor = Self::from_definition(model_id, def, dtype, device)?;
+        executor.validate_reference_execution_contract()?;
         let inventory = Qwen35WeightInventory::from_safetensors_dir(model_dir)
             .map_err(|err| FerrumError::model(format!("Qwen3.5 weight inventory failed: {err}")))?;
         let weight_plan = inventory
@@ -1009,6 +1011,7 @@ impl Qwen35W3Executor {
         mut self,
         runtime: Qwen35DenseReferenceRuntime,
     ) -> Result<Self> {
+        self.validate_reference_execution_contract()?;
         runtime.validate_for_config(&self.config, self.info.vocab_size)?;
         self.dense_reference_runtime = Some(Arc::new(runtime));
         Ok(self)
@@ -1018,9 +1021,23 @@ impl Qwen35W3Executor {
         mut self,
         runtime: Qwen35SparseMoeReferenceRuntime,
     ) -> Result<Self> {
+        self.validate_reference_execution_contract()?;
         runtime.validate_for_config(&self.config, self.info.vocab_size)?;
         self.sparse_moe_reference_runtime = Some(Arc::new(runtime));
         Ok(self)
+    }
+
+    fn validate_reference_execution_contract(&self) -> Result<()> {
+        if self.dtype != DataType::FP32
+            || self.device != Device::CPU
+            || self.config.mamba_ssm_dtype != DataType::FP32
+        {
+            return Err(FerrumError::unsupported(format!(
+                "Qwen3.5 reference execution requires FP32 CPU tensors and FP32 temporal state, got dtype={} device={} mamba_ssm_dtype={}",
+                self.dtype, self.device, self.config.mamba_ssm_dtype
+            )));
+        }
+        Ok(())
     }
 
     fn unsupported_execution() -> FerrumError {
@@ -1134,10 +1151,20 @@ impl Qwen35W3Executor {
         }
 
         let mut cache = qwen35_state.cache();
-        if cache.dtype != DataType::FP32 || cache.device != Device::CPU {
+        if cache.device != Device::CPU
+            || cache
+                .tensors
+                .iter()
+                .any(|tensor| tensor.dtype != DataType::FP32)
+        {
             return Err(FerrumError::unsupported(format!(
                 "Qwen3.5 reference recurrent write requires FP32 CPU state, got {:?} {:?}",
-                cache.dtype, cache.device
+                cache
+                    .tensors
+                    .iter()
+                    .map(|tensor| tensor.dtype)
+                    .collect::<Vec<_>>(),
+                cache.device
             )));
         }
         let max_batch_slots = cache.max_batch_slots;
@@ -1319,9 +1346,8 @@ impl ModelExecutor for Qwen35W3Executor {
     fn capabilities(&self) -> ExecutorCapabilities {
         let recurrent_state_bytes = self
             .config
-            .recurrent_state_elements_per_slot()
-            .unwrap_or(0)
-            .saturating_mul(self.dtype.size_bytes());
+            .recurrent_state_bytes_per_slot(self.dtype)
+            .unwrap_or(0);
         ExecutorCapabilities {
             max_batch_size: 1,
             max_sequence_length: self.info.max_sequence_length,
@@ -1337,7 +1363,7 @@ impl ModelExecutor for Qwen35W3Executor {
                 parameter_memory: self.info.num_parameters.saturating_mul(2),
                 activation_memory_per_token: self.info.hidden_size,
                 kv_cache_memory_per_token: 0,
-                overhead_memory: recurrent_state_bytes as u64,
+                overhead_memory: recurrent_state_bytes,
             },
         }
     }
@@ -1404,6 +1430,7 @@ mod tests {
             "linear_key_head_dim": 1,
             "linear_value_head_dim": 1,
             "linear_conv_kernel_dim": 1,
+            "mamba_ssm_dtype": "float32",
             "head_dim": 2,
             "num_attention_heads": 1,
             "num_key_value_heads": 1,
@@ -1433,6 +1460,7 @@ mod tests {
             "linear_key_head_dim": 1,
             "linear_value_head_dim": 1,
             "linear_conv_kernel_dim": 1,
+            "mamba_ssm_dtype": "float32",
             "head_dim": 2,
             "num_attention_heads": 1,
             "num_key_value_heads": 1,
@@ -1452,6 +1480,7 @@ mod tests {
                 "linear_key_head_dim": 1,
                 "linear_value_head_dim": 1,
                 "linear_conv_kernel_dim": 1,
+                "mamba_ssm_dtype": "float32",
                 "head_dim": 2,
                 "num_attention_heads": 1,
                 "num_key_value_heads": 1,
@@ -2125,6 +2154,25 @@ mod tests {
         let status = executor.status();
         assert_eq!(status.state, ExecutorState::Error);
         assert!(!status.is_ready);
+    }
+
+    #[test]
+    fn qwen35_w3_reference_runtime_rejects_non_fp32_temporal_state_at_attachment() {
+        let mut def = toy_dense_definition();
+        def.extra_params["mamba_ssm_dtype"] = serde_json::json!("float16");
+        let executor = Qwen35W3Executor::from_definition(
+            "qwen35-reference",
+            &def,
+            DataType::FP32,
+            Device::CPU,
+        )
+        .unwrap();
+
+        let err = executor
+            .with_dense_reference_runtime(toy_dense_runtime())
+            .expect_err("reference runtime must reject unsupported temporal state before requests");
+
+        assert!(err.to_string().contains("FP32 temporal state"), "{err}");
     }
 
     #[test]

@@ -247,10 +247,9 @@ mod tests {
             request_id,
             num_layers: 2,
             tensors: vec![
-                RecurrentStateTensorSpec::new(0, "delta_state", vec![8, 16]),
-                RecurrentStateTensorSpec::new(1, "delta_state", vec![8, 16]),
+                RecurrentStateTensorSpec::new(0, "delta_state", vec![8, 16], DataType::BF16),
+                RecurrentStateTensorSpec::new(1, "delta_state", vec![8, 16], DataType::BF16),
             ],
-            dtype: DataType::BF16,
             device: Device::CPU,
             max_batch_slots: 1,
         }

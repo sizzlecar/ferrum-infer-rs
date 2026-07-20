@@ -571,6 +571,7 @@ mod tests {
                 "linear_key_head_dim": 128,
                 "linear_value_head_dim": 128,
                 "linear_conv_kernel_dim": 4,
+                "mamba_ssm_dtype": "float32",
                 "head_dim": 256,
                 "num_attention_heads": 16,
                 "num_key_value_heads": 2,
@@ -641,11 +642,13 @@ mod tests {
         assert_eq!(spec.tensors[6].layer_index, 4);
         assert_eq!(spec.tensors[0].name, "conv_state");
         assert_eq!(spec.tensors[0].shape, vec![8192, 3]);
+        assert_eq!(spec.tensors[0].dtype, ferrum_types::DataType::FP16);
         assert_eq!(spec.tensors[1].name, "delta_state");
         assert_eq!(spec.tensors[1].shape, vec![32, 128, 128]);
+        assert_eq!(spec.tensors[1].dtype, ferrum_types::DataType::FP32);
         assert_eq!(
             spec.estimated_memory_bytes(),
-            30 * (8192 * 3 + 32 * 128 * 128) * 2
+            30 * (8192 * 3 * 2 + 32 * 128 * 128 * 4)
         );
     }
 
@@ -686,9 +689,10 @@ mod tests {
         assert_eq!(spec.tensors.len(), 60);
         assert_eq!(spec.tensors[0].name, "conv_state");
         assert_eq!(spec.tensors[0].shape, vec![8192, 3]);
+        assert_eq!(spec.tensors[0].dtype, ferrum_types::DataType::FP16);
         assert_eq!(spec.tensors[1].name, "delta_state");
         assert_eq!(spec.tensors[1].shape, vec![32, 128, 128]);
-        assert_eq!(spec.dtype, ferrum_types::DataType::FP16);
+        assert_eq!(spec.tensors[1].dtype, ferrum_types::DataType::FP32);
         assert_eq!(spec.device, ferrum_types::Device::CPU);
         assert_eq!(spec.max_batch_slots, 1);
 
@@ -702,7 +706,7 @@ mod tests {
         assert!(!capabilities.supports_continuous_batching);
         assert_eq!(
             capabilities.memory_requirements.overhead_memory,
-            30 * (8192 * 3 + 32 * 128 * 128) * 2
+            30 * (8192 * 3 * 2 + 32 * 128 * 128 * 4)
         );
     }
 
