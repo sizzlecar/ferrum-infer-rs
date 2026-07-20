@@ -951,6 +951,7 @@ mod tests {
             tokenizer.token_bytes(TokenId::new(1)),
             Some(vec![0x94, 0xa5])
         );
+        assert_eq!(tokenizer.token_bytes(TokenId::new(99)), None);
     }
 
     #[tokio::test]
