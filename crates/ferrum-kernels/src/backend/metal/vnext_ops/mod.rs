@@ -4,16 +4,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
-    dense_linear_contract, dense_swiglu_contract, gated_delta_recurrent_attention_contract,
-    last_token_dense_linear_contract, residual_add_contract, rms_norm_contract,
-    token_embedding_contract, AttributeId, BatchedOperationInvocation, CapabilityCatalog,
-    CapabilityId, ContractVersion, DeviceId, DeviceRuntime, DynamicStorageAllocator,
-    DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView, ElementType,
-    EngineProviderDescriptor, ExecutionIdentityEnvelope, OperationContract, OperationFailure,
-    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationRuntimeRegistry, ProfilePhase, ProviderId,
-    ProviderStorageBindingRequirement, QuantizationFormatId, ResolvedTensorLayout,
-    ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
+    causal_paged_attention_contract, dense_linear_contract, dense_swiglu_contract,
+    gated_delta_recurrent_attention_contract, last_token_dense_linear_contract,
+    residual_add_contract, rms_norm_contract, token_embedding_contract, AttributeId,
+    BatchedOperationInvocation, CapabilityCatalog, CapabilityId, ContractVersion, DeviceId,
+    DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement,
+    DynamicStorageView, ElementType, EngineProviderDescriptor, ExecutionIdentityEnvelope,
+    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationRuntimeRegistry, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
+    QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    SemanticValue, VNextError, WeightFormatId, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
     DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
     RESIDUAL_ADD_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
@@ -25,11 +26,13 @@ use super::vnext_runtime::{
     MetalDeviceRuntimeError,
 };
 
+mod causal_attention;
 mod gated_delta_attention;
 mod linear;
 mod primitives;
 mod weights;
 
+use causal_attention::{MetalCausalAttentionPipelines, MetalCausalPagedAttentionProvider};
 use gated_delta_attention::{MetalGatedDeltaPipelines, MetalGatedDeltaRecurrentAttentionProvider};
 use linear::{
     MetalDenseLinearProvider, MetalDenseSwiGluProvider, MetalLastTokenDenseLinearProvider,
@@ -49,6 +52,7 @@ pub(crate) const Q6_K_FORMAT_ID: &str = "quantization.gguf.q6-k";
 pub(crate) const Q8_0_FORMAT_ID: &str = "quantization.gguf.q8-0";
 pub(crate) const VALUE_ALIGNMENT_BYTES: u64 = 16;
 pub(crate) const THREADS_PER_GROUP: u64 = 256;
+pub(crate) const VNEXT_KV_PAGE_BYTES: u64 = 64 * 1024;
 
 pub fn metal_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
     [
@@ -59,6 +63,7 @@ pub fn metal_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> 
         DENSE_SWIGLU_F16_CAPABILITY_ID,
         LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+        CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
     ]
     .into_iter()
     .map(CapabilityId::new)
@@ -80,12 +85,24 @@ pub fn metal_vnext_runtime_config(
             include_str!("linear.metal").as_bytes(),
             include_str!("gated_delta_attention.rs").as_bytes(),
             include_str!("gated_delta_attention.metal").as_bytes(),
+            include_str!("causal_attention.rs").as_bytes(),
+            include_str!("causal_attention.metal").as_bytes(),
         ]),
         capabilities: metal_vnext_capabilities()?,
-        dynamic_storage_profiles: BTreeSet::from([DynamicStorageProfile::new(
-            DynamicStorageAllocator::LinearArena,
-            DynamicStorageView::Contiguous,
-        )?]),
+        dynamic_storage_profiles: BTreeSet::from([
+            DynamicStorageProfile::new(
+                DynamicStorageAllocator::LinearArena,
+                DynamicStorageView::Contiguous,
+            )?,
+            DynamicStorageProfile::new(
+                DynamicStorageAllocator::FixedBlockArena {
+                    block_bytes: VNEXT_KV_PAGE_BYTES,
+                },
+                DynamicStorageView::PagedRegions {
+                    block_bytes: VNEXT_KV_PAGE_BYTES,
+                },
+            )?,
+        ]),
     })
 }
 
@@ -95,6 +112,8 @@ pub fn metal_vnext_operation_registry(
     let pipelines = Arc::new(MetalPrimitivePipelines::new(runtime.device())?);
     let linear_pipelines = Arc::new(MetalLinearPipelines::new(runtime.device())?);
     let gated_delta_pipelines = Arc::new(MetalGatedDeltaPipelines::new(runtime.device())?);
+    let causal_attention_pipelines =
+        Arc::new(MetalCausalAttentionPipelines::new(runtime.device())?);
     let contracts: Vec<Box<dyn OperationContract>> = vec![
         Box::new(token_embedding_contract().map_err(contract_error)?),
         Box::new(rms_norm_contract().map_err(contract_error)?),
@@ -103,6 +122,7 @@ pub fn metal_vnext_operation_registry(
         Box::new(dense_swiglu_contract().map_err(contract_error)?),
         Box::new(last_token_dense_linear_contract().map_err(contract_error)?),
         Box::new(gated_delta_recurrent_attention_contract().map_err(contract_error)?),
+        Box::new(causal_paged_attention_contract().map_err(contract_error)?),
     ];
     let providers: Vec<Box<dyn OperationProvider<MetalDeviceRuntime>>> = vec![
         Box::new(MetalTokenEmbeddingProvider::new(
@@ -129,6 +149,12 @@ pub fn metal_vnext_operation_registry(
         Box::new(MetalGatedDeltaRecurrentAttentionProvider::new(
             runtime,
             gated_delta_pipelines,
+            Arc::clone(&linear_pipelines),
+            Arc::clone(&pipelines),
+        )?),
+        Box::new(MetalCausalPagedAttentionProvider::new(
+            runtime,
+            causal_attention_pipelines,
             linear_pipelines,
             pipelines,
         )?),
@@ -542,6 +568,20 @@ pub(crate) fn shared_scratch_region(
     Ok(region)
 }
 
+pub(crate) fn shared_binding_region(
+    invocation: &BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+    required_bytes: u64,
+) -> Result<MetalBufferRegion, String> {
+    let region = contiguous_binding_region(&invocation.participants()[0], required_bytes)?;
+    for participant in &invocation.participants()[1..] {
+        let candidate = contiguous_binding_region(participant, required_bytes)?;
+        if !region.same_physical_region(&candidate) {
+            return Err("Metal batch binding is not one invocation-scoped region".to_owned());
+        }
+    }
+    Ok(region)
+}
+
 fn contiguous_scratch_region(
     participant: &OperationInvocation<'_, MetalDeviceBuffer>,
     required_bytes: u64,
@@ -563,6 +603,34 @@ fn contiguous_scratch_region(
         .ok_or_else(|| "Metal scratch has no physical region".to_owned())?;
     if physical.next().is_some() {
         return Err("Metal scratch is not physically contiguous".to_owned());
+    }
+    let (buffer, range, retention) = region.buffer_and_physical_range();
+    buffer
+        .retained_region(range, retention)
+        .map_err(|error| error.to_string())
+}
+
+fn contiguous_binding_region(
+    participant: &OperationInvocation<'_, MetalDeviceBuffer>,
+    required_bytes: u64,
+) -> Result<MetalBufferRegion, String> {
+    let view = participant
+        .binding_view()
+        .ok_or_else(|| "Metal invocation has no binding workspace view".to_owned())?;
+    if view.descriptor().element_type != ElementType::U8
+        || view.descriptor().size_bytes < required_bytes
+    {
+        return Err("Metal binding workspace differs from its admitted estimate".to_owned());
+    }
+    let translated = view
+        .translate(0, view.descriptor().size_bytes)
+        .map_err(|error| error.to_string())?;
+    let mut physical = translated.iter();
+    let region = physical
+        .next()
+        .ok_or_else(|| "Metal binding workspace has no physical region".to_owned())?;
+    if physical.next().is_some() {
+        return Err("Metal binding workspace is not physically contiguous".to_owned());
     }
     let (buffer, range, retention) = region.buffer_and_physical_range();
     buffer
@@ -617,17 +685,18 @@ pub(crate) fn implementation_fingerprint(parts: &[&[u8]]) -> String {
 mod tests {
     use super::*;
     use ferrum_interfaces::vnext::{
-        OperationId, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
-        GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
-        RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
+        OperationId, CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_LINEAR_OPERATION_ID,
+        DENSE_SWIGLU_OPERATION_ID, GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
+        LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID,
+        TOKEN_EMBEDDING_OPERATION_ID,
     };
 
     #[test]
     fn partial_composition_advertises_only_installed_operation_capabilities() {
         let composition = MetalVNextComposition::create(DeviceId::new("device.metal.0").unwrap())
             .expect("create Metal primitive composition");
-        assert_eq!(composition.runtime().descriptor().capabilities.len(), 7);
-        assert_eq!(composition.catalog().device().capabilities.len(), 7);
+        assert_eq!(composition.runtime().descriptor().capabilities.len(), 8);
+        assert_eq!(composition.catalog().device().capabilities.len(), 8);
         for operation_id in [
             TOKEN_EMBEDDING_OPERATION_ID,
             RMS_NORM_OPERATION_ID,
@@ -636,6 +705,7 @@ mod tests {
             DENSE_SWIGLU_OPERATION_ID,
             LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
             GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
+            CAUSAL_PAGED_ATTENTION_OPERATION_ID,
         ] {
             assert_eq!(
                 composition

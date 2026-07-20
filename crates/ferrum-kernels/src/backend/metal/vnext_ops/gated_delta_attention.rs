@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     gated_delta_recurrent_attention_contract, AttributeId, BatchedOperationInvocation,
-    DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationFailure,
+    DynamicStorageRequirement, ElementType, EncodedDeviceOperation,
+    GatedDeltaDecayParameterization, GatedDeltaValueHeadMapping, OperationFailure,
     OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, ProviderWorkspaceRequirement,
     ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
@@ -218,6 +219,8 @@ struct AttentionShape {
     conv_state_width: u64,
     epsilon: f32,
     layer_index: u64,
+    decay_parameterization: GatedDeltaDecayParameterization,
+    value_head_mapping: GatedDeltaValueHeadMapping,
 }
 
 impl AttentionShape {
@@ -234,6 +237,8 @@ impl AttentionShape {
             conv_state_width: unsigned_attribute(attributes, "conv_state_width")?,
             epsilon: rational_attribute(attributes, "epsilon")?,
             layer_index: unsigned_attribute(attributes, "layer_index")?,
+            decay_parameterization: decay_parameterization_attribute(attributes)?,
+            value_head_mapping: value_head_mapping_attribute(attributes)?,
         };
         let qk_features = shape.qk_features()?;
         let expected_qkv = qk_features
@@ -328,6 +333,14 @@ impl AttentionShape {
             conv_kernel: checked_u32(self.conv_kernel, "Metal gated-delta convolution kernel")?,
             epsilon: self.epsilon,
             scale: (self.key_dim as f32).sqrt().recip(),
+            decay_parameterization: match self.decay_parameterization {
+                GatedDeltaDecayParameterization::LogRate => 0,
+                GatedDeltaDecayParameterization::NegativeRate => 1,
+            },
+            value_head_mapping: match self.value_head_mapping {
+                GatedDeltaValueHeadMapping::GroupedByKeyHead => 0,
+                GatedDeltaValueHeadMapping::InterleavedByKeyHead => 1,
+            },
         })
     }
 
@@ -387,6 +400,39 @@ struct GatedDeltaParams {
     conv_kernel: u32,
     epsilon: f32,
     scale: f32,
+    decay_parameterization: u32,
+    value_head_mapping: u32,
+}
+
+fn text_attribute<'a>(
+    attributes: &'a BTreeMap<AttributeId, SemanticValue>,
+    name: &str,
+) -> Result<&'a str, String> {
+    match attributes
+        .iter()
+        .find(|(attribute, _)| attribute.as_str() == name)
+        .map(|(_, value)| value)
+    {
+        Some(SemanticValue::Text(value)) => Ok(value),
+        _ => Err(format!("Metal gated-delta lacks text attribute {name:?}")),
+    }
+}
+
+fn decay_parameterization_attribute(
+    attributes: &BTreeMap<AttributeId, SemanticValue>,
+) -> Result<GatedDeltaDecayParameterization, String> {
+    let value = text_attribute(attributes, "decay_parameterization")?;
+    GatedDeltaDecayParameterization::parse(value).ok_or_else(|| {
+        format!("Metal gated-delta has unsupported decay parameterization {value:?}")
+    })
+}
+
+fn value_head_mapping_attribute(
+    attributes: &BTreeMap<AttributeId, SemanticValue>,
+) -> Result<GatedDeltaValueHeadMapping, String> {
+    let value = text_attribute(attributes, "value_head_mapping")?;
+    GatedDeltaValueHeadMapping::parse(value)
+        .ok_or_else(|| format!("Metal gated-delta has unsupported value-head mapping {value:?}"))
 }
 
 #[derive(Debug, Clone, Copy)]

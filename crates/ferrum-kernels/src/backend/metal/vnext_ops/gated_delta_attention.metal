@@ -16,6 +16,8 @@ struct GatedDeltaParams {
     uint conv_kernel;
     float epsilon;
     float scale;
+    uint decay_parameterization;
+    uint value_head_mapping;
 };
 
 static inline float ferrum_silu(float value) {
@@ -78,7 +80,10 @@ kernel void vnext_gated_delta_prepare_gates_f16(
     const uint head = index % params.value_heads;
     const float a = float(a_raw[index]) + dt_bias[head];
     const float b = float(b_raw[index]);
-    g[index] = -exp(a_log[head]) * ferrum_softplus(a);
+    const float decay_rate = params.decay_parameterization == 0
+        ? -exp(a_log[head])
+        : a_log[head];
+    g[index] = decay_rate * ferrum_softplus(a);
     beta[index] = 1.0f / (1.0f + exp(-b));
 }
 
@@ -177,7 +182,9 @@ kernel void vnext_gated_delta_rule_tiled16_f32_state(
         return;
     }
     const uint repeat = params.value_heads / params.key_heads;
-    const uint key_head = value_head / repeat;
+    const uint key_head = params.value_head_mapping == 0
+        ? value_head / repeat
+        : value_head % params.key_heads;
     threadgroup float partial[VALUE_TILE][THREADS_PER_GROUP];
     threadgroup float delta[VALUE_TILE];
     float local[VALUE_TILE];

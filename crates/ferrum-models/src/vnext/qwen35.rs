@@ -11,11 +11,12 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     AttributeId, BlockQuantizationSpec, CanonicalRational, CompositeWeightPart, ContractVersion,
-    ElementType, ExternalModelMetadataId, ModelFamilyId, ModelFamilyProvider,
-    ModelFamilyRegistration, ModelProgram, ModelSemanticMetadata, NodeId, OperationId,
-    PhysicalStorageLayout, PhysicalWeightComponentBinding, PhysicalWeightLayout,
-    PhysicalWeightPadding, PreparedModelFamily, ProgramBlock, ProgramNode, ProgramNodeWorkSpec,
-    ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout, SemanticValue, SpecialTokenCollision,
+    ElementType, ExternalModelMetadataId, GatedDeltaDecayParameterization,
+    GatedDeltaValueHeadMapping, ModelFamilyId, ModelFamilyProvider, ModelFamilyRegistration,
+    ModelProgram, ModelSemanticMetadata, NodeId, OperationId, PhysicalStorageLayout,
+    PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
+    PreparedModelFamily, ProgramBlock, ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec,
+    ProgramValueId, ResolvedTensorLayout, SemanticValue, SpecialTokenCollision,
     SpecialTokenCollisionPolicy, SpecialTokenMetadata, SpecialTokenRole, StateCapacityDemand,
     StateId, StateInitialization, StateLifetime, StateSpec, TemplateMetadata,
     TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSource,
@@ -428,9 +429,19 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                         capacity_demand: StateCapacityDemand::FixedPerScope,
                         initialization: StateInitialization::Zero,
                     });
+                    let (decay_parameterization, value_head_mapping) = match config.weight_format {
+                        FamilyWeightFormat::SafetensorsDense => (
+                            GatedDeltaDecayParameterization::LogRate,
+                            GatedDeltaValueHeadMapping::GroupedByKeyHead,
+                        ),
+                        FamilyWeightFormat::GgufNative => (
+                            GatedDeltaDecayParameterization::NegativeRate,
+                            GatedDeltaValueHeadMapping::InterleavedByKeyHead,
+                        ),
+                    };
                     (
                         GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
-                        ContractVersion::new(3, 0),
+                        ContractVersion::new(4, 0),
                         BTreeMap::from([
                             attribute("key_heads", text.linear_attention.num_key_heads as u64)?,
                             attribute("value_heads", text.linear_attention.num_value_heads as u64)?,
@@ -452,6 +463,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                                 text.linear_attention.conv_kernel_dim.saturating_sub(1) as u64,
                             )?,
                             attribute("epsilon", config.rms_norm_epsilon)?,
+                            attribute("decay_parameterization", decay_parameterization)?,
+                            attribute("value_head_mapping", value_head_mapping)?,
                         ]),
                     )
                 }
@@ -1808,6 +1821,18 @@ impl IntoSemanticValue for CanonicalRational {
     }
 }
 
+impl IntoSemanticValue for GatedDeltaDecayParameterization {
+    fn into_semantic_value(self) -> SemanticValue {
+        SemanticValue::Text(self.as_str().to_owned())
+    }
+}
+
+impl IntoSemanticValue for GatedDeltaValueHeadMapping {
+    fn into_semantic_value(self) -> SemanticValue {
+        SemanticValue::Text(self.as_str().to_owned())
+    }
+}
+
 fn attribute(
     name: &str,
     value: impl IntoSemanticValue,
@@ -2028,7 +2053,25 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             linear_attention.required_version,
-            ContractVersion::new(3, 0)
+            ContractVersion::new(4, 0)
+        );
+        assert_eq!(
+            linear_attention
+                .attributes
+                .get(&AttributeId::new("decay_parameterization").unwrap()),
+            Some(&SemanticValue::Text(
+                GatedDeltaDecayParameterization::LogRate.as_str().to_owned()
+            ))
+        );
+        assert_eq!(
+            linear_attention
+                .attributes
+                .get(&AttributeId::new("value_head_mapping").unwrap()),
+            Some(&SemanticValue::Text(
+                GatedDeltaValueHeadMapping::GroupedByKeyHead
+                    .as_str()
+                    .to_owned()
+            ))
         );
         for (ordinal, role) in [
             "input_layernorm",
@@ -2468,5 +2511,34 @@ mod tests {
                 assert_eq!(first.bytes().as_ptr(), second.bytes().as_ptr());
             }
         }
+        let linear_attention = prepared.family().program().blocks()[0]
+            .nodes
+            .iter()
+            .find(|node| node.operation_id.as_str() == GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID)
+            .unwrap();
+        assert_eq!(
+            linear_attention.required_version,
+            ContractVersion::new(4, 0)
+        );
+        assert_eq!(
+            linear_attention
+                .attributes
+                .get(&AttributeId::new("decay_parameterization").unwrap()),
+            Some(&SemanticValue::Text(
+                GatedDeltaDecayParameterization::NegativeRate
+                    .as_str()
+                    .to_owned()
+            ))
+        );
+        assert_eq!(
+            linear_attention
+                .attributes
+                .get(&AttributeId::new("value_head_mapping").unwrap()),
+            Some(&SemanticValue::Text(
+                GatedDeltaValueHeadMapping::InterleavedByKeyHead
+                    .as_str()
+                    .to_owned()
+            ))
+        );
     }
 }
