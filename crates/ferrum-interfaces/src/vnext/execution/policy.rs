@@ -1,6 +1,7 @@
 use super::{
-    canonical_fingerprint, invalid_plan, CapabilityCatalog, ContractVersion, DynamicStorageProfile,
-    PlanNodeResolution, PreparedModelFamily, ReusableExecutionPolicy, Serialize, VNextError,
+    canonical_fingerprint, invalid_plan, CapabilityCatalog, CompletionRetentionSpec,
+    ContractVersion, DynamicStorageProfile, PlanNodeResolution, PreparedModelFamily,
+    ReusableExecutionPolicy, Serialize, VNextError,
 };
 
 /// Typed policy selected before planning. Memory capacity is part of the
@@ -48,6 +49,7 @@ pub struct PlanBuildRequest<'a, P: RuntimePolicy> {
     pub(super) capabilities: &'a CapabilityCatalog,
     pub(super) policy: &'a P,
     pub(super) node_resolutions: Vec<PlanNodeResolution>,
+    pub(super) completion_retention: CompletionRetentionSpec,
 }
 
 impl<'a, P: RuntimePolicy> PlanBuildRequest<'a, P> {
@@ -66,7 +68,33 @@ impl<'a, P: RuntimePolicy> PlanBuildRequest<'a, P> {
             capabilities,
             policy,
             node_resolutions,
+            completion_retention: CompletionRetentionSpec::default(),
         })
+    }
+
+    pub fn with_completion_retention(
+        mut self,
+        completion_retention: CompletionRetentionSpec,
+    ) -> Result<Self, VNextError> {
+        let produced_values = self
+            .family
+            .program()
+            .blocks()
+            .iter()
+            .flat_map(|block| block.nodes.iter())
+            .flat_map(|node| node.outputs.iter())
+            .collect::<std::collections::BTreeSet<_>>();
+        if completion_retention
+            .values()
+            .iter()
+            .any(|value_id| !produced_values.contains(value_id))
+        {
+            return Err(invalid_plan(
+                "completion retention must reference a semantic node output",
+            ));
+        }
+        self.completion_retention = completion_retention;
+        Ok(self)
     }
 
     pub fn family(&self) -> &PreparedModelFamily {

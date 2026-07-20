@@ -70,6 +70,9 @@ pub use planner::*;
 mod compiler;
 pub use compiler::*;
 
+mod checkpoint;
+pub use checkpoint::*;
+
 #[cfg(test)]
 #[path = "execution/tests.rs"]
 mod tests;

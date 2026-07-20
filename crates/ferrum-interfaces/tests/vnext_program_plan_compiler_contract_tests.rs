@@ -23,6 +23,7 @@ fn semantic_program_compiles_through_the_registered_provider_authority() {
         ProgramPlanCompiler::compile(&family, &catalog, &policy, &planning, &options).unwrap();
     let plan = compilation.executable().execution_plan();
     assert_eq!(plan.payload().nodes().len(), 1);
+    assert!(plan.payload().retained_completion_values().is_empty());
     assert_eq!(compilation.node_resolutions().len(), 1);
     assert_eq!(
         compilation
@@ -58,6 +59,116 @@ fn semantic_program_compiles_through_the_registered_provider_authority() {
         0
     );
     assert!(registry.estimator_calls.load(Ordering::SeqCst) >= 2);
+}
+
+#[test]
+fn completion_retention_binds_one_typed_output_and_requires_expected_wire_policy() {
+    let family = TestRegistry::new().prepare();
+    let catalog = catalog();
+    let policy = policy(4096);
+    let registry = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::Correct);
+    let planning = registry.planning();
+    let mut options = ProgramPlanCompileOptions::new(BTreeMap::from([(
+        id("value.input"),
+        ProgramTensorSpec {
+            dimensions: vec![4],
+            element_type: ElementType::F32,
+            layout: ResolvedTensorLayout::Contiguous,
+        },
+    )]))
+    .unwrap();
+    assert!(options.retain_completion_value(id("value.output")));
+
+    let compilation =
+        ProgramPlanCompiler::compile(&family, &catalog, &policy, &planning, &options).unwrap();
+    let plan = compilation.executable().execution_plan();
+    let checkpoint = plan.completion_checkpoint(&id("value.output")).unwrap();
+    assert_eq!(checkpoint.producer_node_id(), &id("node.main"));
+    assert_eq!(checkpoint.output_ordinal(), 0);
+    assert_eq!(checkpoint.tensor().dimensions(), &[4]);
+    let readback = checkpoint
+        .readback_request(3, HostTransferLayout::new(ElementType::F32, 4).unwrap())
+        .unwrap();
+    assert_eq!(readback.node_id(), checkpoint.producer_node_id());
+    assert_eq!(readback.resource_id(), checkpoint.resource_id());
+    assert_eq!(readback.participant_index(), 3);
+    assert!(checkpoint
+        .readback_request(0, HostTransferLayout::new(ElementType::U8, 4).unwrap())
+        .unwrap_err()
+        .to_string()
+        .contains("element type differs"));
+    assert!(checkpoint
+        .readback_request(0, HostTransferLayout::new(ElementType::F32, 5).unwrap())
+        .unwrap_err()
+        .to_string()
+        .contains("exceeds retained activation capacity"));
+
+    let wire = plan.to_json().unwrap();
+    assert!(ExecutionPlan::from_json_validated(
+        &wire,
+        &family,
+        &catalog,
+        &policy,
+        compilation.node_resolutions().to_vec(),
+    )
+    .is_err());
+    let restored = ExecutionPlan::from_json_validated_with_completion_retention(
+        &wire,
+        &family,
+        &catalog,
+        &policy,
+        compilation.node_resolutions().to_vec(),
+        CompletionRetentionSpec::new(BTreeSet::from([id("value.output")])),
+    )
+    .unwrap();
+    assert_eq!(restored, *plan);
+
+    let mut forged = serde_json::from_slice::<Value>(&wire).unwrap();
+    forged["payload"]["retained_completion_values"][0]["resource_id"] =
+        json!("resource/forged-retained-output");
+    rehash_plan_json(&mut forged);
+    let forged = serde_json::to_vec(&forged).unwrap();
+    assert!(
+        ExecutionPlan::from_json_validated_with_completion_retention(
+            &forged,
+            &family,
+            &catalog,
+            &policy,
+            compilation.node_resolutions().to_vec(),
+            CompletionRetentionSpec::new(BTreeSet::from([id("value.output")])),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn completion_retention_rejects_inputs_weights_and_unknown_values_before_planning() {
+    for value_id in ["value.input", "value.weight", "value.unknown"] {
+        let family = TestRegistry::new().prepare();
+        let catalog = catalog();
+        let policy = policy(4096);
+        let registry = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::Correct);
+        let planning = registry.planning();
+        let mut options = ProgramPlanCompileOptions::new(BTreeMap::from([(
+            id("value.input"),
+            ProgramTensorSpec {
+                dimensions: vec![4],
+                element_type: ElementType::F32,
+                layout: ResolvedTensorLayout::Contiguous,
+            },
+        )]))
+        .unwrap();
+        options.retain_completion_value(id(value_id));
+
+        let error = ProgramPlanCompiler::compile(&family, &catalog, &policy, &planning, &options)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("completion retention must reference a semantic node output"),
+            "{value_id}: {error}"
+        );
+    }
 }
 
 #[test]

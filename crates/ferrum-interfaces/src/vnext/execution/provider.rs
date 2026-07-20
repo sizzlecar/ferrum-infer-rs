@@ -4,7 +4,7 @@ use super::{
     PlanExactAlias, PlanHash, PlanId, PlanNode, PlanProviderRejectReason, PlanSchemaVersion,
     PlanStateEffect, ProviderId, ProviderResourcePlan, ProviderSelection,
     ProviderWorkspaceRequirement, QuantizationFormatId, ResolvedValueBinding, ResourceId,
-    SemanticValue, Serialize, WeightFormatId,
+    RetainedCompletionValue, SemanticValue, Serialize, WeightFormatId,
 };
 
 /// Per-node trusted physical resolution. It supplies physical bindings and a
@@ -37,6 +37,7 @@ pub struct ExecutionPlanPayload {
     pub(super) maximum_scheduled_tokens: u64,
     pub(super) weight_format: WeightFormatId,
     pub(super) quantization_formats: BTreeSet<QuantizationFormatId>,
+    pub(super) retained_completion_values: Vec<RetainedCompletionValue>,
     pub(super) nodes: Vec<PlanNode>,
     pub(super) memory: MemoryPlan,
 }
@@ -94,6 +95,10 @@ impl ExecutionPlanPayload {
         &self.quantization_formats
     }
 
+    pub fn retained_completion_values(&self) -> &[RetainedCompletionValue] {
+        &self.retained_completion_values
+    }
+
     pub fn nodes(&self) -> &[PlanNode] {
         &self.nodes
     }
@@ -117,6 +122,7 @@ pub(super) struct PlanHashMaterial<'a> {
     pub(super) maximum_scheduled_tokens: u64,
     pub(super) weight_format: &'a WeightFormatId,
     pub(super) quantization_formats: &'a BTreeSet<QuantizationFormatId>,
+    pub(super) retained_completion_values: &'a [RetainedCompletionValue],
     pub(super) nodes: &'a [PlanNode],
     pub(super) memory: &'a MemoryPlan,
 }
@@ -137,6 +143,7 @@ impl<'a> From<&'a ExecutionPlanPayload> for PlanHashMaterial<'a> {
             maximum_scheduled_tokens: payload.maximum_scheduled_tokens,
             weight_format: &payload.weight_format,
             quantization_formats: &payload.quantization_formats,
+            retained_completion_values: &payload.retained_completion_values,
             nodes: &payload.nodes,
             memory: &payload.memory,
         }
@@ -199,6 +206,7 @@ pub(super) struct UnvalidatedExecutionPlanPayload {
     pub(super) maximum_scheduled_tokens: u64,
     pub(super) weight_format: WeightFormatId,
     pub(super) quantization_formats: BTreeSet<QuantizationFormatId>,
+    pub(super) retained_completion_values: Vec<RetainedCompletionValue>,
     pub(super) nodes: Vec<UnvalidatedPlanNode>,
     pub(super) memory: MemoryPlan,
 }
