@@ -93,6 +93,56 @@ G08A_SCOPE = (
 # Coverage is awarded only to reviewed, exact oracle descriptors. An oracle name
 # that merely looks like a CPU/Transformers reference is not trusted.
 TRUSTED_ORACLE_REGISTRY: dict[str, dict[str, str]] = {
+    "cpu.fp32.rust.token_embedding_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "869d9bc74ba174a2820c934c06085c318ea1676d",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": (
+            "crates/ferrum-kernels/src/backend/metal/vnext_ops/primitives.rs"
+        ),
+        "test_name": "native_f16_primitives_match_cpu_references_on_real_metal",
+    },
+    "cpu.fp32.rust.rms_norm_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "869d9bc74ba174a2820c934c06085c318ea1676d",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": (
+            "crates/ferrum-kernels/src/backend/metal/vnext_ops/primitives.rs"
+        ),
+        "test_name": "native_f16_primitives_match_cpu_references_on_real_metal",
+    },
+    "cpu.fp32.rust.residual_add_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "869d9bc74ba174a2820c934c06085c318ea1676d",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": (
+            "crates/ferrum-kernels/src/backend/metal/vnext_ops/primitives.rs"
+        ),
+        "test_name": "native_f16_primitives_match_cpu_references_on_real_metal",
+    },
+    "cpu.fp32.rust.dense_linear_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "d718268a287d5ca6b608c4b5161cf27d5a00f6b3",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/linear.rs",
+        "test_name": "native_linear_formats_match_cpu_oracles_on_real_metal",
+    },
+    "cpu.fp32.rust.dense_swiglu_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "e838726c3c5670a1ce66d7d77893eaf1635bcf13",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/linear.rs",
+        "test_name": (
+            "native_dense_swiglu_q4k_q6k_matches_full_cpu_oracle_on_real_metal"
+        ),
+    },
+    "cpu.fp32.rust.last_token_dense_linear_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "e838726c3c5670a1ce66d7d77893eaf1635bcf13",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": "crates/ferrum-kernels/src/backend/metal/vnext_ops/linear.rs",
+        "test_name": "native_last_token_q6k_linear_selects_final_row_on_real_metal",
+    },
     "cpu.fp32.rust.causal_attention_reference": {
         "oracle_precision": "fp32",
         "source_commit": "ecaeb5087ad45a5148d917fdab63d83cb046d678",
@@ -208,6 +258,133 @@ def _coverage_selector(
 # Only finalized coverage has a rule. Missing G08A markers intentionally have no
 # rule until their exact fixture and independent oracle are reviewed.
 G08A_COVERAGE_RULES: dict[str, dict[str, Any]] = {
+    "operation.token_embedding@1.0": _coverage_selector(
+        model_scope="operation_contract",
+        operation_id="operation.token_embedding",
+        operation_schema_version="1.0",
+        checkpoint_kind="operation_output",
+        checkpoint_name="output",
+        dtype="fp16",
+        quant_format="gguf_q6_k",
+        shape_domain={
+            "fixture_id": "token_embedding.q6_k.padding",
+            "dimensions": {
+                "hidden_size": 2560,
+                "token_count": 2,
+                "vocabulary_size": 4,
+            },
+            "semantics": {
+                "out_of_range_zero_fill": True,
+                "padding_token": "u32_max",
+                "selected_token_id": 2,
+            },
+        },
+        oracle_identity="cpu.fp32.rust.token_embedding_reference",
+    ),
+    "operation.rms_norm@1.0": _coverage_selector(
+        model_scope="operation_contract",
+        operation_id="operation.rms_norm",
+        operation_schema_version="1.0",
+        checkpoint_kind="operation_output",
+        checkpoint_name="output",
+        dtype="fp16",
+        quant_format="none",
+        shape_domain={
+            "fixture_id": "rms_norm.hidden_2560",
+            "dimensions": {"hidden_size": 2560, "rows": 1},
+            "semantics": {
+                "epsilon": "1e-6",
+                "input_dtype": "fp16",
+                "weight_dtype": "fp16",
+            },
+        },
+        oracle_identity="cpu.fp32.rust.rms_norm_reference",
+    ),
+    "operation.residual_add@1.0": _coverage_selector(
+        model_scope="operation_contract",
+        operation_id="operation.residual_add",
+        operation_schema_version="1.0",
+        checkpoint_kind="operation_output",
+        checkpoint_name="output",
+        dtype="fp16",
+        quant_format="none",
+        shape_domain={
+            "fixture_id": "residual_add.hidden_2560",
+            "dimensions": {"elements": 2560, "rows": 1},
+            "semantics": {
+                "input_dtype": "fp16",
+                "output_dtype": "fp16",
+                "rounding": "ieee_f16",
+            },
+        },
+        oracle_identity="cpu.fp32.rust.residual_add_reference",
+    ),
+    "operation.dense_linear@1.0": _coverage_selector(
+        model_scope="operation_contract",
+        operation_id="operation.dense_linear",
+        operation_schema_version="1.0",
+        checkpoint_kind="operation_output",
+        checkpoint_name="output",
+        dtype="fp16",
+        quant_format="gguf_q4_k",
+        shape_domain={
+            "fixture_id": "dense_linear.q4_k.hidden_2560",
+            "dimensions": {"in_features": 2560, "out_features": 32, "rows": 2},
+            "semantics": {
+                "input_dtype": "fp16",
+                "output_dtype": "fp16",
+                "weight_format": "gguf_q4_k",
+            },
+        },
+        oracle_identity="cpu.fp32.rust.dense_linear_reference",
+    ),
+    "operation.dense_swiglu@1.0": _coverage_selector(
+        model_scope="operation_contract",
+        operation_id="operation.dense_swiglu",
+        operation_schema_version="1.0",
+        checkpoint_kind="operation_output",
+        checkpoint_name="output",
+        dtype="fp16",
+        quant_format="gguf_q4_k_q6_k",
+        shape_domain={
+            "fixture_id": "dense_swiglu.q4_k_q6_k.full_pipeline",
+            "dimensions": {
+                "hidden_size": 256,
+                "intermediate_size": 256,
+                "rows": 2,
+            },
+            "semantics": {
+                "activation": "silu",
+                "down_format": "gguf_q6_k",
+                "gate_up_format": "gguf_q4_k",
+                "packed_order": "gate_then_up",
+            },
+        },
+        oracle_identity="cpu.fp32.rust.dense_swiglu_reference",
+    ),
+    "operation.last_token_dense_linear@1.0": _coverage_selector(
+        model_scope="operation_contract",
+        operation_id="operation.last_token_dense_linear",
+        operation_schema_version="1.0",
+        checkpoint_kind="operation_output",
+        checkpoint_name="output",
+        dtype="fp16",
+        quant_format="gguf_q6_k",
+        shape_domain={
+            "fixture_id": "last_token_dense_linear.q6_k.final_row",
+            "dimensions": {
+                "hidden_size": 256,
+                "out_features": 64,
+                "sequence_rows": 3,
+            },
+            "semantics": {
+                "selected_row_index": 2,
+                "selection": "final_row",
+                "weight_format": "gguf_q6_k",
+            },
+        },
+        oracle_identity="cpu.fp32.rust.last_token_dense_linear_reference",
+    ),
     "operation.causal_paged_attention@2.0.fixed_page_split": _coverage_selector(
         model_scope="operation_contract",
         operation_id="operation.causal_paged_attention",
@@ -422,6 +599,16 @@ def _require_number(value: Any, label: str) -> float:
     return number
 
 
+def _require_fingerprint_safe_number(value: Any, label: str) -> float:
+    number = _require_number(value, label)
+    encoded = json.dumps(value, separators=(",", ":"), allow_nan=False)
+    _require(
+        "e" not in encoded.lower(),
+        f"{label} must use the shared non-exponent fingerprint number domain",
+    )
+    return number
+
+
 def _require_commit(value: Any, label: str) -> str:
     commit = _require_text(value, label, 40)
     _require(GIT_SHA_RE.fullmatch(commit) is not None, f"{label} is not a full Git SHA")
@@ -443,8 +630,9 @@ def _validate_semantic_value(value: Any, label: str) -> None:
         _require(value >= 0, f"{label} integer must be non-negative")
         return
     if isinstance(value, float):
-        _require(math.isfinite(value), f"{label} float must be finite")
-        return
+        raise CatalogError(
+            f"{label} decimal semantics must use a canonical string, not a JSON float"
+        )
     if isinstance(value, str):
         identifier = _require_identifier(value, label)
         _require(identifier not in {"any", "all"} and "+" not in identifier and ".." not in identifier,
@@ -480,14 +668,21 @@ def _validate_shape_domain(value: Any, label: str) -> dict[str, Any]:
 
 def _validate_bounds(value: Any, label: str) -> dict[str, Any]:
     bounds = _require_exact_fields(value, BOUNDS_FIELDS, label)
-    cosine = _require_number(bounds["cosine_min"], f"{label}.cosine_min")
-    relative_l2 = _require_number(bounds["relative_l2_max"], f"{label}.relative_l2_max")
-    max_abs = _require_number(bounds["max_abs_max"], f"{label}.max_abs_max")
+    cosine = _require_fingerprint_safe_number(
+        bounds["cosine_min"], f"{label}.cosine_min"
+    )
+    relative_l2 = _require_fingerprint_safe_number(
+        bounds["relative_l2_max"], f"{label}.relative_l2_max"
+    )
+    max_abs = _require_fingerprint_safe_number(
+        bounds["max_abs_max"], f"{label}.max_abs_max"
+    )
     _require(MINIMUM_COSINE <= cosine <= 1.0,
              f"{label}.cosine_min widens the MODEL_MATRIX minimum {MINIMUM_COSINE}")
     _require(0.0 <= relative_l2 <= MAXIMUM_RELATIVE_L2,
              f"{label}.relative_l2_max widens the MODEL_MATRIX maximum {MAXIMUM_RELATIVE_L2}")
-    _require(max_abs >= 0.0, f"{label}.max_abs_max must be non-negative")
+    _require(0.0 <= max_abs <= 1.0,
+             f"{label}.max_abs_max must be between zero and one")
     return bounds
 
 
@@ -930,6 +1125,28 @@ def _self_test() -> None:
         "policy widening",
         lambda: validate_catalog_document(widened),
         "widens the MODEL_MATRIX maximum",
+    )
+
+    exponent_bound = copy.deepcopy(document)
+    exponent_bound["rows"][0]["bounds"]["max_abs_max"] = 1e-6
+    exponent_bound["rows"][0]["row_fingerprint"] = row_fingerprint(
+        exponent_bound["rows"][0]
+    )
+    _expect_rejected(
+        "cross-language exponent bound",
+        lambda: validate_catalog_document(exponent_bound),
+        "shared non-exponent fingerprint number domain",
+    )
+
+    float_semantic = copy.deepcopy(document)
+    float_semantic["rows"][0]["shape_domain"]["semantics"]["epsilon"] = 1e-6
+    float_semantic["rows"][0]["row_fingerprint"] = row_fingerprint(
+        float_semantic["rows"][0]
+    )
+    _expect_rejected(
+        "cross-language float semantic",
+        lambda: validate_catalog_document(float_semantic),
+        "decimal semantics must use a canonical string",
     )
 
     false_complete = copy.deepcopy(document)
