@@ -1,6 +1,11 @@
 {
   "backend": "cuda",
   "ferrum_bin": "target/release/ferrum",
+  "goal_scope": {
+    "full_s2": false,
+    "model_matrix_c09_complete": false,
+    "model_matrix_c17_complete": false
+  },
   "model": "Qwen/Qwen3.5-4B",
   "observability": {
     "enabled": true,
