@@ -449,7 +449,13 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         Some(sources) => crate::source_resolver::load_product_chat_template(sources),
         None => crate::source_resolver::load_model_chat_template(&source.local_path),
     };
-    let served_model_names = effective_served_model_names(&model_id, served_model_name)?;
+    let requested_public_model_name = matches!(
+        product_engine_config.model.source.as_ref(),
+        Some(ferrum_types::ModelSource::HuggingFace { .. })
+    )
+    .then_some(model_name.as_str());
+    let served_model_names =
+        effective_served_model_names(&model_id, requested_public_model_name, served_model_name)?;
     let primary_served_model_name = served_model_names
         .first()
         .expect("effective served model names are non-empty")
@@ -1588,10 +1594,18 @@ fn serve_kv_cache_type_for_device(device: &ferrum_types::Device) -> ferrum_types
 
 fn effective_served_model_names(
     default_model_id: &str,
+    requested_model: Option<&str>,
     requested_names: Vec<String>,
 ) -> Result<Vec<String>> {
     let names = if requested_names.is_empty() {
-        vec![default_model_id.to_string()]
+        let mut names = Vec::with_capacity(2);
+        if let Some(requested_model) = requested_model {
+            names.push(requested_model.to_string());
+        }
+        if names.first().map(String::as_str) != Some(default_model_id) {
+            names.push(default_model_id.to_string());
+        }
+        names
     } else {
         requested_names
     };
@@ -2391,16 +2405,34 @@ mod tests {
     #[test]
     fn served_model_names_default_and_reject_ambiguity() {
         assert_eq!(
-            effective_served_model_names("Qwen/Qwen3.5-4B", vec![]).unwrap(),
+            effective_served_model_names("Qwen/Qwen3.5-4B", Some("Qwen/Qwen3.5-4B"), vec![])
+                .unwrap(),
             ["Qwen/Qwen3.5-4B"]
+        );
+        assert_eq!(
+            effective_served_model_names("Qwen3.5-4B-Q4_K_M", Some("qwen3.5:4b-q4_k_m"), vec![])
+                .unwrap(),
+            ["qwen3.5:4b-q4_k_m", "Qwen3.5-4B-Q4_K_M"]
         );
         assert!(effective_served_model_names(
             "Qwen/Qwen3.5-4B",
+            Some("qwen3.5:4b"),
             vec!["same".to_string(), "same".to_string()]
         )
         .is_err());
-        assert!(
-            effective_served_model_names("Qwen/Qwen3.5-4B", vec![" ferrum".to_string()]).is_err()
+        assert!(effective_served_model_names(
+            "Qwen/Qwen3.5-4B",
+            Some("qwen3.5:4b"),
+            vec![" ferrum".to_string()]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn served_model_names_do_not_expose_non_hugging_face_source_names() {
+        assert_eq!(
+            effective_served_model_names("local-model", None, vec![]).unwrap(),
+            ["local-model"]
         );
     }
 
