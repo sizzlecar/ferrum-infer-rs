@@ -26,13 +26,34 @@ struct SegmentInputs<'a> {
 
 struct StaticWeights<'a> {
     conv: &'a BufferRef,
-    a_log: &'a BufferRef,
+    decay_parameter: &'a BufferRef,
     dt_bias: &'a BufferRef,
     norm: &'a BufferRef,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TestSemantics {
+    decay_parameterization: GatedDeltaDecayParameterization,
+    value_head_mapping: GatedDeltaValueHeadMapping,
+}
+
 #[test]
 fn recurrent_core_matches_cpu_and_preserves_split_decode_state_on_real_metal() {
+    for semantics in [
+        TestSemantics {
+            decay_parameterization: GatedDeltaDecayParameterization::LogRate,
+            value_head_mapping: GatedDeltaValueHeadMapping::GroupedByKeyHead,
+        },
+        TestSemantics {
+            decay_parameterization: GatedDeltaDecayParameterization::NegativeRate,
+            value_head_mapping: GatedDeltaValueHeadMapping::InterleavedByKeyHead,
+        },
+    ] {
+        assert_recurrent_conformance(semantics);
+    }
+}
+
+fn assert_recurrent_conformance(semantics: TestSemantics) {
     let Some(device) = Device::system_default() else {
         eprintln!("no Metal device; skipping gated-delta conformance");
         return;
@@ -45,9 +66,15 @@ fn recurrent_core_matches_cpu_and_preserves_split_decode_state_on_real_metal() {
     let b_raw = half_values(TOKENS * VALUE_HEADS, 0.053, 0.24);
     let z = half_values(TOKENS * VALUE_FEATURES, 0.029, 0.31);
     let conv_weight = half_values(QKV_FEATURES * CONV_KERNEL, 0.011, 0.16);
-    let a_log = (0..VALUE_HEADS)
+    let log_rates = (0..VALUE_HEADS)
         .map(|index| -1.7 + index as f32 * 0.07)
         .collect::<Vec<_>>();
+    let decay_parameters = match semantics.decay_parameterization {
+        GatedDeltaDecayParameterization::LogRate => log_rates,
+        GatedDeltaDecayParameterization::NegativeRate => {
+            log_rates.into_iter().map(|value| -value.exp()).collect()
+        }
+    };
     let dt_bias = (0..VALUE_HEADS)
         .map(|index| -0.25 + index as f32 * 0.04)
         .collect::<Vec<_>>();
@@ -58,12 +85,12 @@ fn recurrent_core_matches_cpu_and_preserves_split_decode_state_on_real_metal() {
     let initial_delta = float_values(VALUE_HEADS * VALUE_DIM * KEY_DIM, 0.007, 0.025);
 
     let conv_weight_buffer = shared_buffer(&device, &conv_weight);
-    let a_log_buffer = shared_buffer(&device, &a_log);
+    let decay_parameter_buffer = shared_buffer(&device, &decay_parameters);
     let dt_bias_buffer = shared_buffer(&device, &dt_bias);
     let norm_buffer = shared_buffer(&device, &norm);
     let weights = StaticWeights {
         conv: &conv_weight_buffer,
-        a_log: &a_log_buffer,
+        decay_parameter: &decay_parameter_buffer,
         dt_bias: &dt_bias_buffer,
         norm: &norm_buffer,
     };
@@ -83,6 +110,7 @@ fn recurrent_core_matches_cpu_and_preserves_split_decode_state_on_real_metal() {
         &weights,
         &full_conv_state,
         &full_delta_state,
+        semantics,
     );
 
     let split_conv_state = shared_buffer(&device, &initial_conv);
@@ -96,6 +124,7 @@ fn recurrent_core_matches_cpu_and_preserves_split_decode_state_on_real_metal() {
         &weights,
         &split_conv_state,
         &split_delta_state,
+        semantics,
     );
     split_output.extend(run_segment(
         &device,
@@ -105,6 +134,7 @@ fn recurrent_core_matches_cpu_and_preserves_split_decode_state_on_real_metal() {
         &weights,
         &split_conv_state,
         &split_delta_state,
+        semantics,
     ));
 
     let mut cpu_conv_state = initial_conv.clone();
@@ -117,11 +147,12 @@ fn recurrent_core_matches_cpu_and_preserves_split_decode_state_on_real_metal() {
             z: &z,
         },
         &conv_weight,
-        &a_log,
+        &decay_parameters,
         &dt_bias,
         &norm,
         &mut cpu_conv_state,
         &mut cpu_delta_state,
+        semantics,
     );
 
     assert!(full_output.iter().any(|value| value.abs() > 1.0e-4));
@@ -167,6 +198,8 @@ fn launch_extent_validation_rejects_msl_uint_overflow() {
         conv_state_width: CONV_STATE_WIDTH as u64,
         epsilon: 1.0e-6,
         layer_index: 0,
+        decay_parameterization: GatedDeltaDecayParameterization::LogRate,
+        value_head_mapping: GatedDeltaValueHeadMapping::GroupedByKeyHead,
     };
     let tokens = u64::from(u32::MAX) / shape.qkv_features + 1;
     assert!(shape
@@ -203,9 +236,10 @@ fn run_segment(
     weights: &StaticWeights<'_>,
     conv_state: &BufferRef,
     delta_state: &BufferRef,
+    semantics: TestSemantics,
 ) -> Vec<f32> {
     let tokens = inputs.mixed_qkv.len() / QKV_FEATURES;
-    let params = test_params(tokens);
+    let params = test_params(tokens, semantics);
     let mixed_qkv = shared_buffer(device, inputs.mixed_qkv);
     let a_raw = shared_buffer(device, inputs.a_raw);
     let b_raw = shared_buffer(device, inputs.b_raw);
@@ -242,7 +276,7 @@ fn run_segment(
     for (index, buffer) in [
         &*a_raw,
         &*b_raw,
-        weights.a_log,
+        weights.decay_parameter,
         weights.dt_bias,
         &*g,
         &*beta,
@@ -325,11 +359,12 @@ fn run_segment(
 fn cpu_segment(
     inputs: SegmentInputs<'_>,
     conv_weight: &[f16],
-    a_log: &[f32],
+    decay_parameters: &[f32],
     dt_bias: &[f32],
     norm: &[f32],
     conv_state: &mut [f16],
     delta_state: &mut [f32],
+    semantics: TestSemantics,
 ) -> Vec<f32> {
     let tokens = inputs.mixed_qkv.len() / QKV_FEATURES;
     let previous_conv = conv_state.to_vec();
@@ -401,10 +436,16 @@ fn cpu_segment(
     let scale = (KEY_DIM as f32).sqrt().recip();
     for token in 0..tokens {
         for value_head in 0..VALUE_HEADS {
-            let key_head = value_head / repeat;
+            let key_head = match semantics.value_head_mapping {
+                GatedDeltaValueHeadMapping::GroupedByKeyHead => value_head / repeat,
+                GatedDeltaValueHeadMapping::InterleavedByKeyHead => value_head % KEY_HEADS,
+            };
             let gate_index = token * VALUE_HEADS + value_head;
-            let g = -a_log[value_head].exp()
-                * softplus(inputs.a_raw[gate_index].to_f32() + dt_bias[value_head]);
+            let decay_rate = match semantics.decay_parameterization {
+                GatedDeltaDecayParameterization::LogRate => -decay_parameters[value_head].exp(),
+                GatedDeltaDecayParameterization::NegativeRate => decay_parameters[value_head],
+            };
+            let g = decay_rate * softplus(inputs.a_raw[gate_index].to_f32() + dt_bias[value_head]);
             let beta = sigmoid(inputs.b_raw[gate_index].to_f32());
             let qk_base = (token * KEY_HEADS + key_head) * KEY_DIM;
             for value_column in 0..VALUE_DIM {
@@ -454,7 +495,7 @@ fn cpu_segment(
     output
 }
 
-fn test_params(tokens: usize) -> GatedDeltaParams {
+fn test_params(tokens: usize, semantics: TestSemantics) -> GatedDeltaParams {
     GatedDeltaParams {
         tokens: tokens as u32,
         hidden_size: 16,
@@ -467,6 +508,14 @@ fn test_params(tokens: usize) -> GatedDeltaParams {
         conv_kernel: CONV_KERNEL as u32,
         epsilon: 1.0e-6,
         scale: (KEY_DIM as f32).sqrt().recip(),
+        decay_parameterization: match semantics.decay_parameterization {
+            GatedDeltaDecayParameterization::LogRate => 0,
+            GatedDeltaDecayParameterization::NegativeRate => 1,
+        },
+        value_head_mapping: match semantics.value_head_mapping {
+            GatedDeltaValueHeadMapping::GroupedByKeyHead => 0,
+            GatedDeltaValueHeadMapping::InterleavedByKeyHead => 1,
+        },
     }
 }
 

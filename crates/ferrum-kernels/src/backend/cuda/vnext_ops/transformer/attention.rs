@@ -9,12 +9,13 @@ use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     gated_delta_recurrent_attention_contract, AttributeId, BatchedOperationInvocation,
     CapabilityId, ContractVersion, DeviceRuntime, DynamicStorageRequirement, ElementType,
-    EncodedDeviceOperation, OperationContract, OperationFailure, OperationInvocation,
-    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
-    ProviderWorkspaceRequirement, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
-    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError,
-    WeightFormatId, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+    EncodedDeviceOperation, GatedDeltaDecayParameterization, GatedDeltaValueHeadMapping,
+    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
+    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
+    OperationResourceEstimator, ProfilePhase, ProviderId, ProviderWorkspaceRequirement,
+    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
+    ResolvedValueBinding, ResolvedValueRole, SemanticValue, VNextError, WeightFormatId,
+    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
 };
 
@@ -234,6 +235,8 @@ struct AttentionShape {
     conv_state_width: u64,
     epsilon: f32,
     layer_index: u64,
+    decay_parameterization: GatedDeltaDecayParameterization,
+    value_head_mapping: GatedDeltaValueHeadMapping,
 }
 
 impl AttentionShape {
@@ -250,7 +253,17 @@ impl AttentionShape {
             conv_state_width: unsigned_attribute(attributes, "conv_state_width")?,
             epsilon: rational_attribute(attributes, "epsilon")?,
             layer_index: unsigned_attribute(attributes, "layer_index")?,
+            decay_parameterization: decay_parameterization_attribute(attributes)?,
+            value_head_mapping: value_head_mapping_attribute(attributes)?,
         };
+        if shape.decay_parameterization != GatedDeltaDecayParameterization::LogRate
+            || shape.value_head_mapping != GatedDeltaValueHeadMapping::GroupedByKeyHead
+        {
+            return Err(
+                "CUDA gated-delta safetensors provider requires log-rate decay and value heads grouped by key head"
+                    .to_owned(),
+            );
+        }
         let qk_features = shape.qk_features()?;
         let expected_qkv = qk_features
             .checked_mul(2)
@@ -1485,6 +1498,36 @@ fn rational_attribute(
         ));
     }
     Ok(value)
+}
+
+fn text_attribute<'a>(
+    attributes: &'a BTreeMap<AttributeId, SemanticValue>,
+    name: &str,
+) -> Result<&'a str, String> {
+    match attributes
+        .iter()
+        .find(|(attribute, _)| attribute.as_str() == name)
+        .map(|(_, value)| value)
+    {
+        Some(SemanticValue::Text(value)) => Ok(value),
+        _ => Err(format!("CUDA attention lacks text attribute {name:?}")),
+    }
+}
+
+fn decay_parameterization_attribute(
+    attributes: &BTreeMap<AttributeId, SemanticValue>,
+) -> Result<GatedDeltaDecayParameterization, String> {
+    let value = text_attribute(attributes, "decay_parameterization")?;
+    GatedDeltaDecayParameterization::parse(value)
+        .ok_or_else(|| format!("CUDA attention has unsupported decay parameterization {value:?}"))
+}
+
+fn value_head_mapping_attribute(
+    attributes: &BTreeMap<AttributeId, SemanticValue>,
+) -> Result<GatedDeltaValueHeadMapping, String> {
+    let value = text_attribute(attributes, "value_head_mapping")?;
+    GatedDeltaValueHeadMapping::parse(value)
+        .ok_or_else(|| format!("CUDA attention has unsupported value-head mapping {value:?}"))
 }
 
 fn invalid_plan(reason: impl Into<String>) -> VNextError {

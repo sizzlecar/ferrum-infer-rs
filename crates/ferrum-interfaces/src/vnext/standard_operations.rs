@@ -29,6 +29,52 @@ pub const CAUSAL_PAGED_ATTENTION_OPERATION_ID: &str = "operation.causal_paged_at
 pub const CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID: &str =
     "capability.operation.causal_paged_attention.f16";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatedDeltaDecayParameterization {
+    LogRate,
+    NegativeRate,
+}
+
+impl GatedDeltaDecayParameterization {
+    pub const ALL: [Self; 2] = [Self::LogRate, Self::NegativeRate];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LogRate => "log_rate",
+            Self::NegativeRate => "negative_rate",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatedDeltaValueHeadMapping {
+    GroupedByKeyHead,
+    InterleavedByKeyHead,
+}
+
+impl GatedDeltaValueHeadMapping {
+    pub const ALL: [Self; 2] = [Self::GroupedByKeyHead, Self::InterleavedByKeyHead];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GroupedByKeyHead => "grouped_by_key_head",
+            Self::InterleavedByKeyHead => "interleaved_by_key_head",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == value)
+    }
+}
+
 /// One checked-in standard operation contract. Construction stays private so
 /// production registries cannot mutate a descriptor after a provider binds its
 /// fingerprint.
@@ -314,7 +360,7 @@ pub fn residual_add_contract() -> Result<StandardOperationContract, VNextError> 
 pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
         id: OperationId::new(GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID)?,
-        version: ContractVersion::new(3, 0),
+        version: ContractVersion::new(4, 0),
         inputs: vec![
             contiguous_tensor(
                 token_hidden_dimensions(),
@@ -404,12 +450,20 @@ pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationCon
             unsigned_attribute("conv_state_width")?,
             positive_epsilon_attribute("epsilon")?,
             nonnegative_unsigned_attribute("layer_index")?,
+            text_choices_attribute(
+                "decay_parameterization",
+                GatedDeltaDecayParameterization::ALL.map(|value| value.as_str()),
+            )?,
+            text_choices_attribute(
+                "value_head_mapping",
+                GatedDeltaValueHeadMapping::ALL.map(|value| value.as_str()),
+            )?,
         ]))?,
         resources: attention_resources(),
         oracle: f16_reference_tolerance()?,
         provider: provider_requirement(
             GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
-            ContractVersion::new(3, 0),
+            ContractVersion::new(4, 0),
         )?,
         profile_phase: ProfilePhase::Forward,
     };
@@ -680,6 +734,22 @@ fn positive_epsilon_attribute(name: &str) -> Result<(AttributeId, AttributeSpec)
     ))
 }
 
+fn text_choices_attribute(
+    name: &str,
+    values: impl IntoIterator<Item = &'static str>,
+) -> Result<(AttributeId, AttributeSpec), VNextError> {
+    Ok((
+        AttributeId::new(name)?,
+        AttributeSpec {
+            value_kind: AttributeValueKind::Text,
+            required: true,
+            constraint: AttributeConstraint::TextChoices {
+                values: values.into_iter().map(str::to_owned).collect(),
+            },
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,11 +827,38 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(linear.descriptor().inputs.len(), 13);
-        assert_eq!(linear.descriptor().version, ContractVersion::new(3, 0));
+        assert_eq!(linear.descriptor().version, ContractVersion::new(4, 0));
         assert_eq!(
             linear.descriptor().provider.minimum_version,
-            ContractVersion::new(3, 0)
+            ContractVersion::new(4, 0)
         );
+        for (name, values) in [
+            (
+                "decay_parameterization",
+                GatedDeltaDecayParameterization::ALL
+                    .map(|value| value.as_str().to_owned())
+                    .into_iter()
+                    .collect(),
+            ),
+            (
+                "value_head_mapping",
+                GatedDeltaValueHeadMapping::ALL
+                    .map(|value| value.as_str().to_owned())
+                    .into_iter()
+                    .collect(),
+            ),
+        ] {
+            assert_eq!(
+                linear
+                    .descriptor()
+                    .attributes
+                    .entries()
+                    .get(&AttributeId::new(name).unwrap())
+                    .unwrap()
+                    .constraint,
+                AttributeConstraint::TextChoices { values }
+            );
+        }
         assert_eq!(
             linear.descriptor().resources.binding,
             ResourcePresenceRequirement::Forbidden
