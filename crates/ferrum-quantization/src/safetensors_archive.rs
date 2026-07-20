@@ -279,7 +279,7 @@ impl WeightComponentSource for SafetensorsArchive {
     }
 }
 
-fn transcode_dense_bytes<'source>(
+pub(crate) fn transcode_dense_bytes<'source>(
     bytes: &'source [u8],
     source: ElementType,
     destination: ElementType,

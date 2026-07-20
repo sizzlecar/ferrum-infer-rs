@@ -43,6 +43,15 @@ pub fn ferrum_to_gguf(name: &str) -> Option<String> {
 /// attention OUTPUT (GGUF `post_attention_norm`), while the same ferrum
 /// name on Llama families is the pre-MLP norm (GGUF `ffn_norm`).
 pub fn ferrum_to_gguf_with_arch(arch: &str, name: &str) -> Option<String> {
+    // Multimodal Hugging Face packages nest the text model below
+    // `model.language_model`, while GGUF stores the text tensors at its root.
+    // Normalize that packaging detail here so model programs do not carry a
+    // checkpoint-format branch.
+    let normalized = name
+        .strip_prefix("model.language_model.")
+        .map(|suffix| format!("model.{suffix}"));
+    let name = normalized.as_deref().unwrap_or(name);
+
     // Top-level tensors first — they don't fit the layer pattern.
     if let Some(out) = map_top_level(name) {
         return Some(out);
@@ -85,7 +94,7 @@ fn map_layer_scoped(rest: &str, arch: &str) -> Option<String> {
         // Gemma 3 sandwich norms: post_attention_layernorm applies to the
         // attention output (pre-residual); pre_feedforward is the pre-MLP
         // slot; post_feedforward wraps the MLP output.
-        "post_attention_layernorm" if arch == "gemma3" => "post_attention_norm",
+        "post_attention_layernorm" if matches!(arch, "gemma3" | "qwen35") => "post_attention_norm",
         "pre_feedforward_layernorm" => "ffn_norm",
         "post_feedforward_layernorm" => "post_ffw_norm",
         "post_attention_layernorm" => "ffn_norm",
@@ -97,6 +106,17 @@ fn map_layer_scoped(rest: &str, arch: &str) -> Option<String> {
         // Qwen3 QK-norm — only present on that family
         "self_attn.q_norm" => "attn_q_norm",
         "self_attn.k_norm" => "attn_k_norm",
+        // Qwen3.5 gated-delta recurrent attention. These are storage names,
+        // not operation names; execution remains selected by typed contracts.
+        "linear_attn.in_proj_qkv" if arch == "qwen35" => "attn_qkv",
+        "linear_attn.in_proj_z" if arch == "qwen35" => "attn_gate",
+        "linear_attn.in_proj_b" if arch == "qwen35" => "ssm_beta",
+        "linear_attn.in_proj_a" if arch == "qwen35" => "ssm_alpha",
+        "linear_attn.conv1d" if arch == "qwen35" => "ssm_conv1d",
+        "linear_attn.A_log" if arch == "qwen35" => "ssm_a",
+        "linear_attn.dt_bias" if arch == "qwen35" => "ssm_dt.bias",
+        "linear_attn.norm" if arch == "qwen35" => "ssm_norm",
+        "linear_attn.out_proj" if arch == "qwen35" => "ssm_out",
         // Dense MLP projections
         "mlp.gate_proj" => "ffn_gate",
         "mlp.up_proj" => "ffn_up",
@@ -197,6 +217,62 @@ mod tests {
             ferrum_to_gguf("model.layers.0.self_attn.k_norm.weight"),
             Some("blk.0.attn_k_norm.weight".into())
         );
+    }
+
+    #[test]
+    fn maps_qwen35_nested_text_and_recurrent_attention_tensors() {
+        let cases = [
+            (
+                "model.language_model.embed_tokens.weight",
+                "token_embd.weight",
+            ),
+            (
+                "model.language_model.layers.0.post_attention_layernorm.weight",
+                "blk.0.post_attention_norm.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                "blk.0.attn_qkv.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+                "blk.0.attn_gate.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+                "blk.0.ssm_beta.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+                "blk.0.ssm_alpha.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.conv1d.weight",
+                "blk.0.ssm_conv1d.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.A_log",
+                "blk.0.ssm_a",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.dt_bias",
+                "blk.0.ssm_dt.bias",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.norm.weight",
+                "blk.0.ssm_norm.weight",
+            ),
+            (
+                "model.language_model.layers.0.linear_attn.out_proj.weight",
+                "blk.0.ssm_out.weight",
+            ),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(
+                ferrum_to_gguf_with_arch("qwen35", source).as_deref(),
+                Some(expected)
+            );
+        }
     }
 
     #[test]

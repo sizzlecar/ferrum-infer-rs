@@ -8,6 +8,7 @@ use ferrum_interfaces::vnext::{
     WeightComponentSpec, WeightEncoding, WeightId,
 };
 use ferrum_quantization::GgufWeightComponentSource;
+use half::f16;
 
 fn component(
     id: &str,
@@ -96,6 +97,40 @@ fn mmap_source_returns_exact_dense_and_q4_k_payloads() {
     );
     assert_eq!(payload.external_name(), "quantized.weight");
     assert_eq!(payload.source_file(), source.source_file());
+}
+
+#[test]
+fn dense_source_materializes_the_typed_float_payload_once() {
+    let file = build_gguf();
+    let source = GgufWeightComponentSource::open(file.path()).unwrap();
+    let dense = component(
+        "component.dense-f16",
+        "dense.weight",
+        vec![2, 4],
+        WeightEncoding::Dense {
+            element_type: ElementType::F16,
+        },
+    );
+
+    let payload = source.component(&dense).unwrap();
+    let values = payload
+        .bytes()
+        .chunks_exact(2)
+        .map(|bytes| f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32())
+        .collect::<Vec<_>>();
+
+    assert_eq!(payload.element_type(), ElementType::F16);
+    assert_eq!(payload.dimensions(), [2, 4]);
+    assert_eq!(payload.bytes().len(), 16);
+    assert_eq!(values, (0..8).map(|value| value as f32).collect::<Vec<_>>());
+    assert_ne!(
+        payload.bytes().as_ptr(),
+        source
+            .file()
+            .tensor_byte_slice("dense.weight")
+            .unwrap()
+            .as_ptr()
+    );
 }
 
 #[test]
